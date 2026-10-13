@@ -152,6 +152,9 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/render-assertions.sh
 
+      - name: Per-workload Secret checksum assertions
+        run: bash charts/curie/ci/secret-checksum-assertions.sh
+
       - name: Reject chart-owned extraEnv duplicates
         run: bash charts/curie/ci/reserved-env-assertions.sh
 
@@ -847,6 +850,24 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/rustfs-resource-floor-assertions.sh
+
+      # Prove the in-chart RustFS claim defaults to 10Gi while an existing
+      # StatefulSet keeps its claim size, and that the storage-guard init
+      # container is wired with the RustFS image and only when persistence is
+      # on (issue #4408). A full inode table crash-looped RustFS for hours.
+      - name: helm render assertions (rustfs storage guard)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/rustfs-storage-guard-assertions.sh
+
+      # Run the storage guard against the real RustFS image on an
+      # inode-limited tmpfs (issue #4408): RustFS crashes on the full volume
+      # without it, and after it frees only expired event objects RustFS
+      # answers /health.
+      - name: docker behavior (rustfs storage guard)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/rustfs-storage-guard-behavior.sh
 
       # Prove the runner and both bundle init containers declare an
       # ephemeral-storage request AND limit (ADR-0059 decision 1, issue #755),

@@ -5,7 +5,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
-from aci_protocol.turn import route_identity
+from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,7 +40,7 @@ from ..threadkeys import fence_key_forms, legacy_producer_thread_key
 from ..workspace_policy import repository_allowed
 from .agents import get_agent
 from .approvals import get_approval_by_dedupe_key
-from .channels import AmbiguousRoute, binding_for_route
+from .channels import AmbiguousRoute, _normalized_reply_identity, binding_for_route
 from .deployments import get_deployment
 from .errors import PublicationLineageConflict, PublicationReplayConflict
 from .lineages import require_review_binding, select_thread_publication_lineage
@@ -92,6 +92,10 @@ async def _adopt_publication_replay(
         or approval.reply_endpoint != data.reply_endpoint
         or route_identity(approval.reply_kind, approval.reply_adapter)
         != route_identity(data.reply_kind, data.reply_adapter)
+        or _normalized_reply_identity(
+            approval.reply_kind, approval.reply_adapter, approval.reply_identity
+        )
+        != _normalized_reply_identity(data.reply_kind, data.reply_adapter, data.reply_identity)
         or publication.deployment_id != data.deployment_id
         or publication.repo_full_name.casefold() != data.repo_full_name.casefold()
         or publication.base_sha != data.base_sha
@@ -112,6 +116,10 @@ async def _adopt_publication_replay(
         or publication.reply_endpoint != data.reply_endpoint
         or route_identity(publication.reply_kind, publication.reply_adapter)
         != route_identity(data.reply_kind, data.reply_adapter)
+        or _normalized_reply_identity(
+            publication.reply_kind, publication.reply_adapter, publication.reply_identity
+        )
+        != _normalized_reply_identity(data.reply_kind, data.reply_adapter, data.reply_identity)
         or publication.lineage is None
         or publication.lineage.agent_id != deployment.agent_id
         or publication.lineage.conversation_id != workspace_conversation_id
@@ -367,7 +375,12 @@ async def create_publication(
             binding = await binding_for_route(
                 session,
                 data.reply_kind,
-                data.reply_adapter,
+                (
+                    data.reply_identity or DEFAULT_IDENTITY
+                    if data.reply_kind == SLACK_KIND
+                    and data.reply_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER
+                    else data.reply_adapter
+                ),
                 data.reply_channel,
                 agent_id=deployment.agent_id,
                 for_update=True,
@@ -525,6 +538,9 @@ async def create_publication(
         reply_placeholder=data.reply_placeholder,
         reply_endpoint=data.reply_endpoint,
         reply_adapter=data.reply_adapter,
+        reply_identity=_normalized_reply_identity(
+            data.reply_kind, data.reply_adapter, data.reply_identity
+        ),
         dedupe_key=data.dedupe_key,
         traceparent=traceparent,
         route=data.route,
@@ -580,6 +596,9 @@ async def create_publication(
         reply_placeholder=data.reply_placeholder,
         reply_endpoint=data.reply_endpoint,
         reply_adapter=data.reply_adapter,
+        reply_identity=_normalized_reply_identity(
+            data.reply_kind, data.reply_adapter, data.reply_identity
+        ),
     )
     if owned_request is not None:
         publication.execution_request_id = owned_request.id
@@ -632,14 +651,15 @@ def _binding_route_matches(
 
     The built-in cluster-message relay is not a configurable route: the channel
     API reserves its adapter, so the binding it replies for is one with no
-    route of its own (#2789) -- no endpoint, and the identity an omitted
-    adapter resolves to, which on Slack is 'default' (ADR-0168 decision 3).
+    route of its own (#2789): no endpoint, and the Slack identity its separate
+    reply selector names, or 'default' when omitted (ADR-0168 decision 3).
     Any configured route is compared through `route_identity`, not the raw
     column, so a handle that names no identity and a stored `'default'` match.
     """
 
     if data.reply_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER:
-        return endpoint is None and route_identity(kind, adapter) == route_identity(kind, None)
+        identity = data.reply_identity or DEFAULT_IDENTITY if kind == SLACK_KIND else None
+        return endpoint is None and route_identity(kind, adapter) == route_identity(kind, identity)
     return endpoint == data.reply_endpoint and route_identity(kind, adapter) == route_identity(
         data.reply_kind, data.reply_adapter
     )

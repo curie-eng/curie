@@ -618,6 +618,7 @@ class Approval(Base):
     reply_placeholder: Mapped[str | None] = mapped_column(nullable=True)
     reply_endpoint: Mapped[str | None] = mapped_column(default=None)
     reply_adapter: Mapped[str | None] = mapped_column(default=None)
+    reply_identity: Mapped[str | None] = mapped_column(default=None)
     # The approval route the request named (#247), and the channel the card
     # was actually routed to after binding resolution. The authorizer proves
     # channel membership against card_channel (falling back to reply_channel
@@ -1688,6 +1689,7 @@ class Publication(Base):
     reply_placeholder: Mapped[str | None] = mapped_column(default=None)
     reply_endpoint: Mapped[str | None] = mapped_column(default=None)
     reply_adapter: Mapped[str | None] = mapped_column(default=None)
+    reply_identity: Mapped[str | None] = mapped_column(default=None)
     # Durable initial approval-card outbox. Its lease/version are separate from
     # publication mutation, while claim_next gates Job creation on delivery so
     # even an immediate CLI approval cannot race ahead of the required card.

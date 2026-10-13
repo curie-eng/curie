@@ -135,7 +135,10 @@ if program == "helm":
         sys.exit(0)
     if args[0] == "status":
         if "json" in args:
-            if scenario == "degraded-then-hung":
+            # A non-terminal unconverged scenario would keep `cluster up` polling
+            # for its full 300 second wait; hanging the second observation ends
+            # it through the bounded read with the first observation's reasons.
+            if scenario in ["degraded-then-hung", "surplus", "evicted-terminating"]:
                 counter = root / "status-observations"
                 count = int(counter.read_text()) + 1 if counter.exists() else 1
                 counter.write_text(str(count))
@@ -225,6 +228,12 @@ if program == "helm":
 
 if program == "kubectl":
     if args[:2] == ["get", "node"]:
+        if scenario == "evicted-old-image-gone-node":
+            print(
+                'Error from server (NotFound): nodes "' + args[2] + '" not found',
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if scenario == "alias-forbidden":
             print("Forbidden PRIVATE_MESSAGE_SENTINEL", file=sys.stderr)
             sys.exit(1)
@@ -571,6 +580,57 @@ if program == "kubectl":
         old["spec"]["containers"][0]["image"] = "example.com/custom-api:old"
         old["status"]["containerStatuses"][0]["image"] = "example.com/custom-api:old"
         pods.append(old)
+    if scenario in [
+        "evicted-succeeded",
+        "evicted-failed",
+        "evicted-terminating",
+        "evicted-old-image-gone-node",
+    ]:
+        # #4496: kubelet-initiated termination leaves the pod object behind and
+        # its ReplicaSet never deletes it. Observed 2026-10-12 after a k3s node
+        # ephemeral-storage eviction: Succeeded pods (container terminated
+        # Completed, exit 0, restartCount 0, DisruptionTarget=True reason
+        # TerminationByKubelet) and Failed pods with reason Evicted, beside
+        # healthy Running replacements. The Deployment status stays 1/1 because
+        # the controller counts active pods only.
+        # https://kubernetes.io/docs/concepts/workloads/pods/disruptions/#pod-disruption-conditions
+        # https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/
+        evicted = copy.deepcopy(pods[0])
+        evicted["metadata"]["name"] = "acme-bot-api-evicted"
+        disruption = {
+            "type": "DisruptionTarget",
+            "status": "True",
+            "reason": "TerminationByKubelet",
+        }
+        evicted["status"]["conditions"] = [disruption, {"type": "Ready", "status": "False"}]
+        evicted["status"]["containerStatuses"][0].update(
+            ready=False,
+            restartCount=0,
+            state={"terminated": {"exitCode": 0, "reason": "Completed"}},
+        )
+        evicted["status"]["phase"] = "Succeeded"
+        if scenario == "evicted-failed":
+            # The kubelet stops an evicted pod's containers (SIGKILL after the
+            # grace period, exit 137) and records phase Failed, reason Evicted
+            # and a free-text message naming the starved resource.
+            evicted["status"].update(
+                phase="Failed", reason="Evicted", message="PRIVATE_MESSAGE_SENTINEL"
+            )
+            evicted["status"]["containerStatuses"][0]["state"] = {
+                "terminated": {"exitCode": 137, "reason": "Error"}
+            }
+        if scenario == "evicted-old-image-gone-node":
+            # The evicted pod ran an older tagged image on a Node that has since
+            # been deleted. The tag differs from the target, so reading its
+            # Node would be needed if the pod counted; it must not be read.
+            evicted["spec"]["nodeName"] = "acme-gone-node"
+            evicted["status"]["containerStatuses"][0].update(
+                image="example.com/custom-api:old",
+                imageID="example.com/other-api@sha256:" + "d" * 64,
+            )
+        if scenario == "evicted-terminating":
+            evicted["metadata"]["deletionTimestamp"] = "2026-10-12T14:56:00Z"
+        pods.append(evicted)
     if scenario == "mixed":
         pods[0]["status"]["containerStatuses"][0].update(
             ready=False,

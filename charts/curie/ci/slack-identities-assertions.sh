@@ -12,6 +12,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 python3 - "$CHART" "$WORK" <<'PY'
+import base64
 import json
 import pathlib
 import re
@@ -24,10 +25,30 @@ import yaml
 chart = pathlib.Path(sys.argv[1])
 work = pathlib.Path(sys.argv[2])
 
+# Compare full pod templates with stable credentials across offline renders.
+# An upgrade also needs a constant externally persisted installation identity;
+# replace only that Kubernetes lookup input in a disposable candidate copy.
+INSTALLATION_ID = "acme" + "0" * 28
+fixture = work / "chart-fixture"
+shutil.copytree(chart, fixture)
+helpers_path = fixture / "templates" / "_helpers.tpl"
+helpers = helpers_path.read_text()
+lookup_boundary = 'lookup "v1" "Secret" .Release.Namespace (include "curie.secretName" .) | default dict'
+if helpers.count(lookup_boundary) != 1:
+    raise SystemExit("identity fixture requires exactly one managed Secret lookup boundary")
+encoded_id = base64.b64encode(INSTALLATION_ID.encode()).decode()
+helpers_path.write_text(helpers.replace(
+    lookup_boundary,
+    f'(dict "data" (dict "installationId" "{encoded_id}")) | default dict',
+    1,
+))
+chart = fixture
+
 SECRET = "acme-curie-secrets"
 DECLARATION = "CURIE_SLACK_IDENTITIES"
 INDEXED = ("CURIE_SLACK_APP_TOKEN__", "CURIE_SLACK_BOT_TOKEN__", "CURIE_SLACK_SIGNING_SECRET__")
-# Generated credentials differ on every render; compare these by key set only.
+# Preserve the existing key-set checks for credential and upgrade-hook docs.
+# Workload comparisons retain checksum/secret and every other pod-template field.
 RANDOM_DOCS = {
     ("Secret", SECRET),
     ("Secret", "acme-curie-runner-token"),
@@ -50,7 +71,7 @@ def render(values, *args, source=None, ok=True):
     output = work / str(count)
     result = subprocess.run(
         ["helm", "template", "acme", str(source or chart), "-f", str(values_file),
-         "--output-dir", str(output), *args],
+         "--set", "security.allowDevDefaults=true", "--output-dir", str(output), *args],
         text=True,
         capture_output=True,
     )
@@ -132,9 +153,8 @@ def same_objects(label, left, right, ignore=(), *, is_upgrade):
             )
             continue
         if key == ("Job", "acme-curie-schema-migrate"):
-            # Offline upgrade renders mint one memoized identity per render.
-            # Validate its actual Secret binding, then normalize only this
-            # literal value; every other byte of the Job remains comparable.
+            # Validate the real identity resolution against the managed Secret
+            # and persisted lookup fixture, then compare the complete Job.
             for docs, job in ((a, a[key]), (b, b[key])):
                 containers = job["spec"]["template"]["spec"]["containers"]
                 migrate = [item for item in containers if item.get("name") == "schema-migrate"]
@@ -150,13 +170,15 @@ def same_objects(label, left, right, ignore=(), *, is_upgrade):
                 )
                 value = identity["value"]
                 assert isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9]{32}", value), (
-                    f"{label}: offline installation identity must be 32 alphanumeric characters"
+                    f"{label}: installation identity must be 32 alphanumeric characters"
                 )
                 secret = docs[("Secret", SECRET)]
                 assert value == (secret.get("stringData") or {}).get("installationId"), (
                     f"{label}: migrate identity differs from its own managed Secret installationId"
                 )
-                identity["value"] = "validated-render-installation-id"
+                assert value == INSTALLATION_ID, (
+                    f"{label}: upgrade did not retain the lookup fixture installationId"
+                )
         assert a[key] == b[key], f"{label}: {key} differs from the reference render"
 
 

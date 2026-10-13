@@ -8,7 +8,7 @@
 # informer by confining cluster LIST/WATCH to a namespaced Role (the #350
 # crash-loop). See docs/adr/0023-controller-networkpolicy-rbac-cluster-read-namespace-mutate.md.
 #
-# Eight assertions. (a)-(e) scan the FULL multi-doc render (ClusterRoles come from
+# Nine assertions. (a)-(e) scan the FULL multi-doc render (ClusterRoles come from
 # BOTH templates/agent-sandbox.yaml and the vendored
 # files/agent-sandbox/controller.yaml, so no --show-only); (f) EXECUTES the
 # rendered preflight script against a stub kubectl:
@@ -33,14 +33,17 @@
 #       only under its own branch (issue #611). (e) is presence-only and cannot
 #       see either bug.
 #   (g) Startup logs and positive successful-reconcile metrics both pass, zero
-#       success counters and failed metrics requests refuse, and every failure
-#       takes precedence over either success signal (issue #4005).
+#       success counters and failed metrics requests refuse. Current RBAC
+#       failures outrank health, and unproved restart recovery refuses.
 #   (h) An upgrade that does not restart the controller passes on a stable
 #       serving leader with no startup log and no metrics (issue #4197): rollout
 #       complete, the Lease held by a current Running/Ready pod for at least
 #       stableLeaderSeconds and renewed while the hook watches. Each missing
 #       condition refuses, the forbidden-networkpolicies log still outranks it,
 #       and a too-small stableLeaderSeconds is refused at render.
+#   (i) Namespaced NetworkPolicy refusals are reported once and do not block
+#       health. A recovered restart requires the current Ready holder to renew;
+#       previous logs are diagnostic and a rising restart count still refuses.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the
 # violated assertion.
@@ -383,13 +386,22 @@ case "$*" in
     [ -n "${LEASE_FIELDS_1:-}" ] || exit 1
     if [ "$calls" -eq 1 ]; then
       printf '%s' "$LEASE_FIELDS_1"
-    else
+    elif [ "$calls" -eq 2 ]; then
       printf '%s' "${LEASE_FIELDS_2:-$LEASE_FIELDS_1}"
+    else
+      printf '%s' "${LEASE_FIELDS_3:-${LEASE_FIELDS_2:-$LEASE_FIELDS_1}}"
     fi
     ;;
   *get*pods*jsonpath*deletionTimestamp*)
     [ -n "${POD_FIELDS:-}" ] || exit 1
-    printf '%b' "$POD_FIELDS"
+    calls=$(cat "$FDIR/pod-calls" 2>/dev/null || echo 0)
+    calls=$((calls + 1))
+    echo "$calls" > "$FDIR/pod-calls"
+    if [ "$calls" -le "${POD_FIELDS_1_READS:-1}" ]; then
+      printf '%b' "$POD_FIELDS"
+    else
+      printf '%b' "${POD_FIELDS_2:-$POD_FIELDS}"
+    fi
     ;;
   *get*--raw*)
     case "$*" in
@@ -430,9 +442,22 @@ case "$*" in
     exit 0
     ;;
   *get*pods*jsonpath*restartCount*)
+    calls=$(cat "$FDIR/restart-calls" 2>/dev/null || echo 0)
+    calls=$((calls + 1))
+    echo "$calls" > "$FDIR/restart-calls"
     case "$SCENARIO" in
-      lease_glue|rbac|rbac_*|lease_*|restart_*|leader_old_restart) printf '1' ;;
-      *) printf '0' ;;
+      restart_unreadable_*) [ "$calls" -eq 1 ] || exit 1 ;;
+    esac
+    case "$SCENARIO" in
+      restart_rising_*)
+        if [ "$calls" -eq 1 ]; then count=1; else count=2; fi
+        ;;
+      lease_glue|rbac|rbac_*|lease_*|restart_*|leader_old_restart|recovered_*|namespaced_recovered_*) count=1 ;;
+      *) count=0 ;;
+    esac
+    case "$*" in
+      *metadata.name*) printf 'agent-sandbox-controller-0 %s\n' "$count" ;;
+      *) printf '%s' "$count" ;;
     esac
     ;;
   *get*pods*jsonpath*)
@@ -442,6 +467,15 @@ case "$*" in
     printf 'agent-sandbox-controller-0   0/1   Error   1   30s\n'
     ;;
   *logs*--previous*)
+    case "$SCENARIO" in
+      recovered_rbac_*)
+        printf 'Error: cannot watch resource \\"networkpolicies\\" in API group \\"networking.k8s.io\\" at the cluster scope\n'
+        ;;
+      recovered_none_*) ;;
+      recovered_*|namespaced_recovered_*|restart_rising_*|restart_unreadable_*)
+        printf 'E0717 12:00:01 leader election lost\n'
+        ;;
+    esac
     if [ "${SCENARIO}" = "leader_old_restart" ]; then
       # A restart long before this upgrade: its previous container lost the
       # lease. That is history, not the current container's state.
@@ -465,10 +499,17 @@ case "$*" in
         printf 'I0717 12:00:00 reflector starting for networkpolicies\n'
         ;;
       rbac|rbac_*)
-        printf 'E0717 12:00:00 reflector: failed to list *v1.NetworkPolicy: networkpolicies.networking.k8s.io is forbidden: User "system:serviceaccount:agent-sandbox-system:agent-sandbox-controller" cannot list resource "networkpolicies" at the cluster scope\n'
+        printf 'E0717 12:00:00 reflector: failed to list *v1.NetworkPolicy: networkpolicies.networking.k8s.io is forbidden: User "system:serviceaccount:agent-sandbox-system:agent-sandbox-controller" cannot list resource "networkpolicies" in API group "networking.k8s.io" at the cluster scope\n'
         ;;
       lease_*)
         printf 'E0717 12:00:00 failed to renew lease agent-sandbox-system/agent-sandbox-controller: context deadline exceeded\n'
+        ;;
+    esac
+    case "$SCENARIO" in
+      namespaced_*)
+        printf 'Error: Failed to clean up unmanaged NetworkPolicy: networkpolicies.networking.k8s.io is forbidden: cannot delete resource "networkpolicies" in API group "networking.k8s.io" in the namespace "acme-consumer"\n'
+        printf 'Error: Failed to clean up unmanaged NetworkPolicy: networkpolicies.networking.k8s.io is forbidden: cannot delete resource "networkpolicies" in API group "networking.k8s.io" in the namespace "acme-consumer"\n'
+        printf 'Error: Failed to clean up unmanaged NetworkPolicy: networkpolicies.networking.k8s.io is forbidden: cannot delete resource \\"networkpolicies\\" in API group \\"networking.k8s.io\\" in the namespace \\"acme-other\\"\n'
         ;;
     esac
     ;;
@@ -483,16 +524,15 @@ chmod +x "$FDIR/bin/kubectl"
 printf '#!/bin/sh\nexit 0\n' > "$FDIR/bin/sleep"
 chmod +x "$FDIR/bin/sleep"
 
-# TIMEOUT is small so the poll loop cannot linger; every scenario breaks out on
-# the first iteration anyway. The FAIL path is expected to exit 1, so the
+# TIMEOUT is small so the poll loop cannot linger. The FAIL path exits 1, so the
 # function itself must not propagate that under set -e (it would abort this
 # script) -- it stashes the exit code in $FDIR/rc for the caller to assert on
 # instead.
 run_preflight() {
-  rm -f "$FDIR/metrics-calls" "$FDIR/lease-calls"
+  rm -f "$FDIR/metrics-calls" "$FDIR/lease-calls" "$FDIR/restart-calls" "$FDIR/pod-calls"
   local rc=0
   if PATH="$FDIR/bin:$PATH" SCENARIO="$1" \
-      CONTROLLER_NS=agent-sandbox-system DEPLOY=agent-sandbox-controller TIMEOUT=5 \
+      CONTROLLER_NS=agent-sandbox-system DEPLOY=agent-sandbox-controller TIMEOUT="${POLL_TIMEOUT:-5}" \
       LEASE="$LEASE" STABLE_LEADER_SECONDS="$STABLE_LEADER_SECONDS" \
       sh "$FDIR/preflight.sh" 2>&1; then
     rc=0
@@ -547,7 +587,20 @@ echo "$rbac_out" | grep -q "delete the controller" \
 $rbac_out"
 echo "  ok: (f.3) a genuine RBAC failure classifies as rbac, keeps its crash-loop hint, and exits 1"
 
-# --- (g) Durable health and failure precedence (issue #4005) ---
+# Issue #4461: the shared controller can refuse mutations in a consumer
+# namespace while its cluster-scoped informer is healthy.
+namespaced_out="$(run_preflight namespaced_startup)"
+namespaced_rc="$(cat "$FDIR/rc")"
+[ "$namespaced_rc" -eq 0 ] && echo "$namespaced_out" | grep -q 'RESULT: PASS.*Starting workers' \
+  || fail "(i.1) namespaced delete refusals with healthy startup must pass, got rc=$namespaced_rc:
+$namespaced_out"
+namespaced_note="$(printf '%s\n' "$namespaced_out" | grep 'NOTE:.*namespaced NetworkPolicy')"
+[[ "$(printf '%s\n' "$namespaced_note" | wc -l)" -eq 1 && "$namespaced_note" == *acme-consumer* && "$namespaced_note" == *acme-other* ]] \
+  || fail "(i.1) one nonfatal note must name both refused namespaces, got:
+$namespaced_out"
+echo "  ok: (i.1) namespaced delete refusals pass with one note naming the namespaces"
+
+# --- (g) Durable health, RBAC precedence and unproved recovery (issue #4005) ---
 startup_out="$(run_preflight startup)"
 startup_rc="$(cat "$FDIR/rc")"
 [ "$startup_rc" -eq 0 ] && echo "$startup_out" | grep -q "RESULT: PASS.*Starting workers" \
@@ -580,29 +633,33 @@ $scenario_out"
 done
 echo "  ok: (g.3) zero successful reconciles and failed metrics requests refuse"
 
+# Current RBAC failures outrank both signals. Lease/restart fixtures have no
+# readable Lease, so neither signal can establish recovery after their restart.
 for cause in rbac lease restart; do
   for signal in startup metrics; do
     scenario_out="$(run_preflight "${cause}_${signal}")"
     scenario_rc="$(cat "$FDIR/rc")"
     [ "$scenario_rc" -eq 1 ] && echo "$scenario_out" | grep -q "RESULT: FAIL" \
-      || fail "(g.4) $cause must take precedence over $signal, got rc=$scenario_rc:
+      || fail "(g.4) current RBAC or unproved restart recovery must refuse $cause/$signal, got rc=$scenario_rc:
 $scenario_out"
     echo "$scenario_out" | grep -q "RESULT: PASS" \
-      && fail "(g.4) $cause emitted a false PASS with misleading $signal:
+      && fail "(g.4) $cause/$signal emitted a false PASS despite current RBAC or unproved restart recovery:
 $scenario_out"
-    [ ! -s "$FDIR/metrics-calls" ] \
-      || fail "(g.4) $cause must be classified before requesting positive metrics"
+    if [ "$cause" = rbac ]; then
+      [ ! -s "$FDIR/metrics-calls" ] \
+        || fail "(g.4) current RBAC failure must be classified before requesting positive metrics"
+    fi
     case "$cause" in
       rbac) expected="forbidden-networkpolicies logged" ;;
       lease) expected="lost its leader-election lease" ;;
       restart) expected="restartCount>0" ;;
     esac
     echo "$scenario_out" | grep -q "$expected" \
-      || fail "(g.4) $cause classification was lost with misleading $signal:
+      || fail "(g.4) $cause diagnostic was lost with current $signal:
 $scenario_out"
   done
 done
-echo "  ok: (g.4) RBAC, lease, and restart failures take precedence over startup logs and positive metrics"
+echo "  ok: (g.4) current RBAC outranks startup and metrics; lease/restart recovery without a readable Lease refuses"
 
 
 # --- (h) A stable serving leader passes without a restart (issue #4197) ---
@@ -699,18 +756,19 @@ assert_leader_refused "an unparsable Lease timestamp" \
 echo "  ok: (h.3) a young, stale, reacquired, foreign, terminating, unready, unrolled or unreadable leader refuses"
 
 # An upgrade that does restart the controller holds a fresh Lease: a healthy
-# new pod passes on its startup log, a crashing one still fails, and the
-# forbidden-networkpolicies log outranks even a long-held Lease.
+# new pod passes on its startup log, a restart with a nonrenewing Lease refuses,
+# and the forbidden-networkpolicies log outranks even a long-held Lease.
+# Rising restart counts are covered separately in (i.5).
 restarted_out="$(run_leader leader_startup "$ROLLED_OUT" "$SERVING" "$YOUNG_LEASE" "$YOUNG_LEASE_RENEWED")"
 restarted_rc="$(cat "$FDIR/rc")"
 [ "$restarted_rc" -eq 0 ] && echo "$restarted_out" | grep -q "RESULT: PASS.*Starting workers" \
   || fail "(h.4) a controller restarted by the upgrade must still pass on its startup log, got rc=$restarted_rc:
 $restarted_out"
-crash_out="$(run_leader restart_leader "$ROLLED_OUT" "$SERVING" "$YOUNG_LEASE" "$YOUNG_LEASE_RENEWED")"
-crash_rc="$(cat "$FDIR/rc")"
-[ "$crash_rc" -eq 1 ] && echo "$crash_out" | grep -q "restartCount>0" \
-  || fail "(h.4) a controller that restarts after this upgrade restarted it must fail, got rc=$crash_rc:
-$crash_out"
+stale_restart_out="$(run_leader restart_leader "$ROLLED_OUT" "$SERVING" "$YOUNG_LEASE" "$YOUNG_LEASE")"
+stale_restart_rc="$(cat "$FDIR/rc")"
+[ "$stale_restart_rc" -eq 1 ] && echo "$stale_restart_out" | grep -q "restartCount>0" \
+  || fail "(h.4) a restarted controller with a stale nonrenewing Lease must refuse, got rc=$stale_restart_rc:
+$stale_restart_out"
 rbac_leader_out="$(run_leader rbac_leader "$ROLLED_OUT" "$SERVING" "$HELD_LEASE" "$HELD_LEASE_RENEWED")"
 rbac_leader_rc="$(cat "$FDIR/rc")"
 [ "$rbac_leader_rc" -eq 1 ] && echo "$rbac_leader_out" | grep -q "forbidden-networkpolicies logged" \
@@ -719,7 +777,103 @@ $rbac_leader_out"
 echo "$rbac_leader_out" | grep -q "RESULT: PASS" \
   && fail "(h.4) a forbidden-networkpolicies log with a long-held Lease emitted a false PASS:
 $rbac_leader_out"
-echo "  ok: (h.4) a restarted controller passes on its startup log, a crashing one fails, and RBAC outranks the Lease"
+echo "  ok: (h.4) startup passes, a restart with a stale nonrenewing Lease refuses, and RBAC outranks the Lease"
+
+# --- (i) Recovery must be proved by the current container and its Lease ---
+# These Lease terms are younger than stableLeaderSeconds. Startup or metrics
+# prove synced caches, but only a live, current holder with advancing renewal
+# can make a historical restart nonfatal.
+RECOVERED_LEASE="$HOLDER 2026-10-06T11:59:50.000000Z 2026-10-06T12:00:00.000000Z"
+RECOVERED_RENEWED="$HOLDER 2026-10-06T11:59:50.000000Z 2026-10-06T12:00:02.000000Z"
+for previous in lease rbac none; do
+  for signal in startup metrics; do
+    recovered_out="$(run_leader "recovered_${previous}_${signal}" "$ROLLED_OUT" "$SERVING" "$RECOVERED_LEASE" "$RECOVERED_RENEWED")"
+    recovered_rc="$(cat "$FDIR/rc")"
+    [ "$recovered_rc" -eq 0 ] && echo "$recovered_out" | grep -q 'RESULT: PASS' \
+      || fail "(i.2) recovered $previous restart with current $signal and renewed Ready holder must pass, got rc=$recovered_rc:
+$recovered_out"
+    [[ "$(cat "$FDIR/lease-calls")" -ge 2 ]] \
+      || fail "(i.2) recovered $signal must observe renewal before passing"
+  done
+done
+echo "  ok: (i.2) previous lease/RBAC logs and unclassified restarts permit current health with a renewing Ready holder"
+
+assert_recovery_refused() {
+  local label="$1" out rc
+  shift
+  for signal in startup metrics; do
+    out="$(run_leader "recovered_lease_${signal}" "$@")"
+    rc="$(cat "$FDIR/rc")"
+    [ "$rc" -eq 1 ] && echo "$out" | grep -q 'RESULT: FAIL' \
+      || fail "(i.3) recovered $signal with $label must refuse, got rc=$rc:
+$out"
+    echo "$out" | grep -q 'RESULT: PASS' \
+      && fail "(i.3) recovered $signal with $label emitted a false PASS:
+$out"
+  done
+  return 0
+}
+assert_recovery_refused "a foreign holder" "$ROLLED_OUT" "$SERVING" \
+  "agent-sandbox-controller-old_00000000-0000-4000-8000-000000000001 2026-10-06T11:59:50Z 2026-10-06T12:00:00Z" \
+  "agent-sandbox-controller-old_00000000-0000-4000-8000-000000000001 2026-10-06T11:59:50Z 2026-10-06T12:00:02Z"
+assert_recovery_refused "another current controller pod as holder" "$ROLLED_OUT" \
+  "$SERVING"'agent-sandbox-controller-other Running True\n' \
+  "agent-sandbox-controller-other_00000000-0000-4000-8000-000000000001 2026-10-06T11:59:50Z 2026-10-06T12:00:00Z" \
+  "agent-sandbox-controller-other_00000000-0000-4000-8000-000000000001 2026-10-06T11:59:50Z 2026-10-06T12:00:02Z"
+assert_recovery_refused "an unready holder" "$ROLLED_OUT" "${LEADER_POD} Running False\n" "$RECOVERED_LEASE" "$RECOVERED_RENEWED"
+assert_recovery_refused "a non-Running holder" "$ROLLED_OUT" "${LEADER_POD} Pending True\n" "$RECOVERED_LEASE" "$RECOVERED_RENEWED"
+assert_recovery_refused "a terminating holder" "$ROLLED_OUT" "${LEADER_POD} Running True 2026-10-06T12:00:00Z\n" "$RECOVERED_LEASE" "$RECOVERED_RENEWED"
+assert_recovery_refused "no renewal" "$ROLLED_OUT" "$SERVING" "$RECOVERED_LEASE" "$RECOVERED_LEASE"
+assert_recovery_refused "a backwards renewal" "$ROLLED_OUT" "$SERVING" "$RECOVERED_LEASE" \
+  "$HOLDER 2026-10-06T11:59:50Z 2026-10-06T11:59:58Z"
+assert_recovery_refused "a changed holder" "$ROLLED_OUT" "$SERVING" "$RECOVERED_LEASE" \
+  "${LEADER_POD}_00000000-0000-4000-8000-000000000002 2026-10-06T12:00:01Z 2026-10-06T12:00:02Z"
+assert_recovery_refused "an unreadable Lease" "$ROLLED_OUT" "$SERVING" "" ""
+POD_FIELDS_1_READS=2 POD_FIELDS_2="${LEADER_POD} Running False\n" \
+  assert_recovery_refused "a holder that becomes unready during renewal" \
+  "$ROLLED_OUT" "$SERVING" "$RECOVERED_LEASE" "$RECOVERED_RENEWED"
+echo "  ok: (i.3) current startup and metrics cannot pass without a live current holder and advancing renewal"
+
+# The first poll has the wrong holder. A later poll must establish current
+# ownership and then observe another renewal, rather than reuse its history.
+delayed_out="$(POLL_TIMEOUT=20 LEASE_FIELDS_3="$RECOVERED_RENEWED" \
+  run_leader namespaced_recovered_lease_startup "$ROLLED_OUT" "$SERVING" \
+  "agent-sandbox-controller-old_00000000-0000-4000-8000-000000000001 2026-10-06T11:59:50Z 2026-10-06T12:00:00Z" "$RECOVERED_LEASE")"
+delayed_rc="$(cat "$FDIR/rc")"
+[ "$delayed_rc" -eq 0 ] && [[ "$(cat "$FDIR/lease-calls")" -ge 3 ]] \
+  || fail "(i.4) recovery must wait for the current holder and its renewal, got rc=$delayed_rc:
+$delayed_out"
+[[ "$(printf '%s\n' "$delayed_out" | grep -c 'NOTE:.*namespaced NetworkPolicy')" -eq 1 ]] \
+  || fail "(i.4) repeated polls must print the namespaced refusal note only once:
+$delayed_out"
+echo "  ok: (i.4) a wrong holder delays recovery and repeated namespaced refusals print once"
+
+# A new crash must outrank all success signals, including a long-held leader
+# and a renewal that otherwise proves recovery during the same poll.
+for signal in startup metrics leader; do
+  if [ "$signal" = leader ]; then first="$HELD_LEASE"; second="$HELD_LEASE_RENEWED";
+  else first="$RECOVERED_LEASE"; second="$RECOVERED_RENEWED"; fi
+  rising_out="$(POLL_TIMEOUT=20 run_leader "restart_rising_${signal}" "$ROLLED_OUT" "$SERVING" "$first" "$second")"
+  rising_rc="$(cat "$FDIR/rc")"
+  [ "$rising_rc" -eq 1 ] && echo "$rising_out" | grep -Eq 'restart count increased|lost its leader-election lease' \
+    || fail "(i.5) a rising restart count must outrank $signal, got rc=$rising_rc:
+$rising_out"
+  echo "$rising_out" | grep -q 'RESULT: PASS' \
+    && fail "(i.5) a rising restart count emitted a false PASS:
+$rising_out"
+done
+echo "  ok: (i.5) a rising restart count refuses before startup, metrics or stable-leader success"
+
+for signal in startup metrics leader; do
+  if [ "$signal" = leader ]; then first="$HELD_LEASE"; second="$HELD_LEASE_RENEWED";
+  else first="$RECOVERED_LEASE"; second="$RECOVERED_RENEWED"; fi
+  unreadable_out="$(run_leader "restart_unreadable_${signal}" "$ROLLED_OUT" "$SERVING" "$first" "$second")"
+  unreadable_rc="$(cat "$FDIR/rc")"
+  [ "$unreadable_rc" -eq 1 ] && echo "$unreadable_out" | grep -q 'RESULT: FAIL' \
+    || fail "(i.6) an unreadable restart count after an observed restart must refuse $signal, got rc=$unreadable_rc:
+$unreadable_out"
+done
+echo "  ok: (i.6) an unreadable restart count cannot bypass current recovery proof"
 
 # The bound must stay above the controller's 120s cache-sync timeout, and a
 # release whose stored values predate the key (helm upgrade --reuse-values)
@@ -750,4 +904,4 @@ PY
 echo "  ok: (h.5) stableLeaderSeconds below 150 is refused and an unset value renders the 180s default"
 
 echo
-echo "PASS: controller RBAC stays read-only at cluster scope and mutate stays namespaced; preflight RBAC adds only pods/proxy get and get on the controller Lease; the gate renders and suppresses correctly, preserves cause-specific diagnostics, passes healthy startup logs, positive successful-reconcile metrics or a stable serving leader, and refuses every failure before any success signal."
+echo "PASS: controller RBAC stays read-only at cluster scope and mutate stays namespaced; preflight RBAC adds only pods/proxy get and get on the controller Lease; the gate renders and suppresses correctly, preserves cause-specific diagnostics, passes healthy startup logs, positive successful-reconcile metrics or a stable serving leader, and refuses current RBAC failures, rising restart counts and unproved restart recovery."

@@ -374,6 +374,135 @@ def test_builtin_reply_adapter_and_ref_persist_on_both_publication_rows(
     }
 
 
+@pytest.mark.parametrize(
+    ("reply_adapter", "requested_identity", "reply_identity"),
+    [
+        (CLUSTER_MESSAGE_ADAPTER, "acme-named", "acme-named"),
+        (CLUSTER_MESSAGE_ADAPTER, None, None),
+        (CLUSTER_MESSAGE_ADAPTER, "default", None),
+        ("acme-named", "acme-named", None),
+    ],
+)
+def test_relay_publication_preserves_binding_identity_and_refuses_changed_replay(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+    reply_adapter: str,
+    requested_identity: str | None,
+    reply_identity: str | None,
+) -> None:
+    from curie_api.models import Approval
+    from curie_api.resumequeue import build_resume_turn
+
+    monkeypatch.setenv(
+        "CURIE_SLACK_IDENTITIES",
+        json.dumps([
+            {
+                "name": "default",
+                "app_token_env": "SLACK_APP_TOKEN",
+                "bot_token_env": "SLACK_BOT_TOKEN",
+                "signing_secret_env": "SLACK_SIGNING_SECRET",
+            },
+            {
+                "name": "acme-named",
+                "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+                "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0",
+                "signing_secret_env": None,
+            },
+        ]),
+    )
+    get_settings.cache_clear()
+    client, runs_stream = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    named_binding = client.post(
+        f"/agents/{deployment['agent_id']}/channels",
+        json={"kind": "slack", "address": "C0EXAMPLE1", "adapter": "acme-named"},
+        headers=auth_headers,
+    )
+    assert named_binding.status_code == 201, named_binding.text
+    thread = "1700000000.000100"
+    binding_identity = (
+        reply_identity or "default"
+        if reply_adapter == CLUSTER_MESSAGE_ADAPTER
+        else reply_adapter
+    )
+    scoped_thread = channel_protocol.scoped_conversation_id(
+        "slack", "C0EXAMPLE1", thread, identity=binding_identity
+    )
+    reply_ref = str(uuid.uuid4())
+    payload = _publication_payload(deployment["id"], conversation_id=scoped_thread)
+    payload.update(
+        reply_conversation_id=thread,
+        reply_placeholder=reply_ref,
+        reply_adapter=reply_adapter,
+        reply_identity=requested_identity,
+    )
+    status, publication = _create_publication(client, payload)
+    assert status == 201
+    assert _rows(
+        "SELECT p.reply_identity AS publication_identity, a.reply_identity AS approval_identity, "
+        "p.reply_adapter AS publication_adapter, a.reply_adapter AS approval_adapter, "
+        "c.adapter AS binding_identity, c.endpoint AS binding_endpoint, "
+        "l.binding_generation = c.generation AS current "
+        "FROM curie.publications p JOIN curie.approvals a ON a.id = p.approval_id "
+        "JOIN curie.thread_publication_lineages l ON l.id = p.lineage_id "
+        "LEFT JOIN curie.agent_channels c ON c.id = l.binding_id WHERE p.id = :id",
+        {"id": publication["id"]},
+    ) == [{
+        "publication_identity": reply_identity,
+        "approval_identity": reply_identity,
+        "publication_adapter": reply_adapter,
+        "approval_adapter": reply_adapter,
+        "binding_identity": binding_identity,
+        "binding_endpoint": None,
+        "current": True,
+    }]
+    replay = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["id"] == publication["id"]
+    if reply_adapter == CLUSTER_MESSAGE_ADAPTER:
+        changed = dict(payload, reply_identity=None if reply_identity else "acme-named")
+        refused = client.post("/v1/internal/publications", json=changed, headers=WORKER_HEADERS)
+        assert refused.status_code == 409, refused.text
+        if reply_identity is None:
+            equivalent = dict(
+                payload, reply_identity="default" if requested_identity is None else None
+            )
+            accepted = client.post(
+                "/v1/internal/publications", json=equivalent, headers=WORKER_HEADERS
+            )
+            assert accepted.status_code == 200, accepted.text
+            assert accepted.json()["id"] == publication["id"]
+    else:
+        equivalent = dict(payload, reply_identity=None)
+        accepted = client.post("/v1/internal/publications", json=equivalent, headers=WORKER_HEADERS)
+        assert accepted.status_code == 200, accepted.text
+        assert accepted.json()["id"] == publication["id"]
+    assert _counts() == (1, 1)
+
+    resolved = _resolve(client, auth_headers, publication["approval_id"])
+    assert resolved.status_code == 200, resolved.text
+
+    async def stored_resume() -> Any:
+        engine = create_async_engine(get_settings().database_url)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessionmaker() as session:
+                approval = await session.get(Approval, uuid.UUID(publication["approval_id"]))
+                assert approval is not None
+                return build_resume_turn(approval)
+        finally:
+            await engine.dispose()
+
+    turn = asyncio.run(stored_resume())
+    assert turn.reply_handle.identity == reply_identity
+    assert turn.reply_handle.adapter == reply_adapter
+    assert turn.reply_handle.placeholder == reply_ref
+    assert turn.conversation_id == thread
+    assert _stream_entries(runs_stream) == []
+
+
 def test_a_named_non_slack_adapter_still_builds_the_pre_identity_workspace_key(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],

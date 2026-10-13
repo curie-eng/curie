@@ -27,7 +27,13 @@ from curie_api.config import Settings, get_settings
 from curie_api.forges.config import ForgesConfig
 from curie_api.forges.github.ci import CiDetail
 from curie_api.forges.registry import ForgeRegistry, build_registry, forges_registry
-from curie_api.forges.types import check_run_key
+from curie_api.forges.types import (
+    CheckSource,
+    CheckState,
+    NormalizedCheck,
+    check_run_key,
+    status_key,
+)
 from curie_api.workitems import lifecycle
 from forge_fakes.github import ci_view, forges_document, github_repository_binding
 from forge_fakes.github_comments import admitted, comments  # noqa: F401  (fixtures)
@@ -363,7 +369,8 @@ def test_metadata_revision_waits_for_each_stale_nonpassing_check() -> None:
     detail = _detail(old_failure, old_pending, unrelated)
     for seconds in (120, 1199):
         verdict = _decide(
-            detail, seconds,
+            detail,
+            seconds,
             fresh_after=PUBLISHED,
             metadata_ci=conversion_metadata_ci(),
         )
@@ -472,10 +479,7 @@ def test_metadata_revision_keeps_a_red_commit_check_for_next_fix_round() -> None
     )
     assert _names(effective.runs) == {"Conversion suite", "Publication description guard"}
     assert len(effective.runs) == 2
-    failing_names = [
-        run.name for run in effective.runs
-        if run.reported_state == "failure"
-    ]
+    failing_names = [run.name for run in effective.runs if run.reported_state == "failure"]
     assert failing_names == ["Conversion suite"]
 
 
@@ -483,16 +487,24 @@ def test_metadata_revision_needs_fresh_green_evidence_after_grace() -> None:
     existing = _run("build")
     existing["started_at"] = "2026-09-24T11:00:00Z"
     detail = _detail(existing)
-    assert _decide(
-        detail, 119,
-        fresh_after=PUBLISHED,
-        metadata_ci=conversion_metadata_ci(),
-    ).kind == "pending"
-    assert _decide(
-        detail, 120,
-        fresh_after=PUBLISHED,
-        metadata_ci=conversion_metadata_ci(),
-    ).kind == "pending"
+    assert (
+        _decide(
+            detail,
+            119,
+            fresh_after=PUBLISHED,
+            metadata_ci=conversion_metadata_ci(),
+        ).kind
+        == "pending"
+    )
+    assert (
+        _decide(
+            detail,
+            120,
+            fresh_after=PUBLISHED,
+            metadata_ci=conversion_metadata_ci(),
+        ).kind
+        == "pending"
+    )
     verdict = _decide(detail, 1200, fresh_after=PUBLISHED, metadata_ci=conversion_metadata_ci())
     assert verdict.kind == "unverified"
     assert verdict.reason == "checks_not_rerun"
@@ -505,7 +517,8 @@ def test_metadata_revision_does_not_accept_same_second_checks() -> None:
     status["created_at"] = "2026-09-24T12:00:00Z"
 
     verdict = _decide(
-        _detail(run, statuses=(status,)), 1200,
+        _detail(run, statuses=(status,)),
+        1200,
         fresh_after=PUBLISHED,
         metadata_ci=conversion_metadata_ci(),
     )
@@ -521,7 +534,8 @@ def test_fresh_unrelated_failure_does_not_revive_stale_red() -> None:
     fresh["started_at"] = "2026-09-24T12:00:01Z"
 
     verdict = _decide(
-        _detail(stale, fresh), 120,
+        _detail(stale, fresh),
+        120,
         fresh_after=PUBLISHED,
         metadata_ci=conversion_metadata_ci(),
     )
@@ -534,7 +548,8 @@ def test_fresh_failure_after_metadata_revision_fails_without_grace() -> None:
     failed = _run("Publication description guard", conclusion="failure")
     failed["started_at"] = "2026-09-24T12:00:01Z"
     verdict = _decide(
-        _detail(failed), 10,
+        _detail(failed),
+        10,
         fresh_after=PUBLISHED,
         metadata_ci=conversion_metadata_ci(),
     )
@@ -582,16 +597,21 @@ def test_no_checks_after_the_grace_period_is_success_with_a_note() -> None:
 @pytest.mark.parametrize("seconds", [120, 121])
 @pytest.mark.parametrize("checks", ["empty", "green", "failing", "delegated_missing"])
 def test_a_dirty_head_ends_as_merge_conflict_regardless_of_check_state(
-    seconds: int, checks: str,
+    seconds: int,
+    checks: str,
 ) -> None:
     # GitHub's pull response shape and dirty state are documented at:
     # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
-    runs = () if checks in {"empty", "delegated_missing"} else (
-        _run("build", conclusion="failure" if checks == "failing" else "success"),
+    runs = (
+        ()
+        if checks in {"empty", "delegated_missing"}
+        else (_run("build", conclusion="failure" if checks == "failing" else "success"),)
     )
     detail = _detail(*runs)
     verdict = _decide(
-        detail, seconds, pull=_pull(mergeable=False, mergeable_state="dirty", merged=False),
+        detail,
+        seconds,
+        pull=_pull(mergeable=False, mergeable_state="dirty", merged=False),
         delegated_checks=("integration-tests",) if checks == "delegated_missing" else (),
     )
     assert verdict.kind == "merge_conflict"
@@ -601,7 +621,9 @@ def test_a_dirty_head_ends_as_merge_conflict_regardless_of_check_state(
 def test_a_dirty_head_inside_the_grace_waits_instead_of_starting_a_fix() -> None:
     detail = _detail(_run("build", conclusion="failure"))
     verdict = _decide(
-        detail, 119, delegated_checks=("integration-tests",),
+        detail,
+        119,
+        delegated_checks=("integration-tests",),
         pull=_pull(mergeable=False, mergeable_state="dirty", merged=False),
     )
     assert verdict.kind == "pending"
@@ -613,8 +635,11 @@ def test_merge_conflict_precedes_the_metadata_revision_wait() -> None:
     failed = _run("Publication description guard", conclusion="failure")
     failed["started_at"] = "2026-09-24T11:00:00Z"
     verdict = _decide(
-        _detail(failed), 121, pull=_pull(mergeable=False, mergeable_state="dirty"),
-        fresh_after=PUBLISHED, metadata_ci=conversion_metadata_ci(),
+        _detail(failed),
+        121,
+        pull=_pull(mergeable=False, mergeable_state="dirty"),
+        fresh_after=PUBLISHED,
+        metadata_ci=conversion_metadata_ci(),
     )
     assert verdict.kind == "merge_conflict"
     assert verdict.reason == "merge_conflict"
@@ -636,7 +661,9 @@ def test_an_already_merged_pull_request_with_no_checks_is_no_ci(
 )
 @pytest.mark.parametrize("merged", [None, False])
 def test_no_checks_waits_for_known_mergeability_until_the_ci_deadline(
-    mergeable: bool | None, mergeable_state: str | None, merged: bool | None,
+    mergeable: bool | None,
+    mergeable_state: str | None,
+    merged: bool | None,
 ) -> None:
     detail = _detail()
     pull = _pull(mergeable=mergeable, mergeable_state=mergeable_state, merged=merged)
@@ -659,10 +686,12 @@ def test_unknown_mergeability_uses_the_earlier_execution_deadline() -> None:
 
 
 @pytest.mark.parametrize(
-    ("conclusion", "expected"), [("success", "green"), ("failure", "failing")],
+    ("conclusion", "expected"),
+    [("success", "green"), ("failure", "failing")],
 )
 def test_null_mergeability_preserves_verdicts_when_checks_exist(
-    conclusion: str, expected: str,
+    conclusion: str,
+    expected: str,
 ) -> None:
     detail = _detail(_run("build", conclusion=conclusion))
     assert _decide(detail, 121, pull=_pull()).kind == expected
@@ -890,6 +919,108 @@ def test_metadata_revision_without_a_policy_is_unverified(seconds: float) -> Non
 
     assert verdict.kind == "unverified"
     assert verdict.reason == "metadata_ci_not_configured"
+
+
+@pytest.mark.parametrize("surface", ["check", "status"])
+@pytest.mark.parametrize(
+    ("seconds", "rerun", "expected", "reason"),
+    [
+        (30, "success", "green", None),
+        (30, None, "pending", "checks_awaiting_metadata_rerun"),
+        (1200, None, "unverified", "checks_not_rerun"),
+        (30, "failure", "failing", None),
+    ],
+)
+def test_recorded_metadata_policy_requires_a_fresh_result(
+    surface: str, seconds: float, rerun: str | None, expected: str, reason: str | None
+) -> None:
+    name = "PR body (real newlines)"
+    policy = factory_ci.MetadataCiPolicy(
+        checks=(name,) if surface == "check" else (),
+        statuses=(name,) if surface == "status" else (),
+        recorded=True,
+    )
+    if surface == "check":
+        old = _run(name, conclusion="failure")
+        old["started_at"] = "2026-09-24T11:00:00Z"
+        runs = [old]
+        if rerun is not None:
+            fresh = _run(name, conclusion=rerun, run_id=2)
+            fresh["started_at"] = "2026-09-24T12:00:01Z"
+            runs.append(fresh)
+        detail = _detail(*runs)
+    else:
+        old = _status(name, "failure")
+        old["created_at"] = "2026-09-24T11:00:00Z"
+        statuses = [old]
+        if rerun is not None:
+            fresh = _status(name, rerun)
+            fresh["created_at"] = "2026-09-24T12:00:01Z"
+            statuses.append(fresh)
+        detail = _detail(statuses=tuple(statuses))
+
+    verdict = _decide(detail, seconds, fresh_after=PUBLISHED, metadata_ci=policy)
+
+    assert verdict.kind == expected
+    assert verdict.reason == reason
+    assert _names(verdict.failing) == ({name} if expected == "failing" else set())
+
+
+@pytest.mark.parametrize("stale_surface", ["check", "status"])
+def test_recorded_metadata_policy_keeps_a_partial_reruns_stale_failure_at_the_deadline(
+    stale_surface: str,
+) -> None:
+    fresh = _run("PR body (real newlines)")
+    fresh["started_at"] = "2026-09-24T12:00:01Z"
+    if stale_surface == "check":
+        stale = _run("Conversion suite", conclusion="failure", run_id=2)
+        stale["started_at"] = "2026-09-24T11:00:00Z"
+        detail = _detail(fresh, stale)
+        policy = factory_ci.MetadataCiPolicy(
+            checks=("PR body (real newlines)", "Conversion suite"), statuses=(), recorded=True
+        )
+    else:
+        stale = _status("Conversion suite", "failure")
+        stale["created_at"] = "2026-09-24T11:00:00Z"
+        detail = _detail(fresh, statuses=(stale,))
+        policy = factory_ci.MetadataCiPolicy(
+            checks=("PR body (real newlines)",), statuses=("Conversion suite",), recorded=True
+        )
+
+    pending = _decide(detail, 1199, fresh_after=PUBLISHED, metadata_ci=policy)
+    assert pending.kind == "pending"
+    assert pending.reason == "checks_awaiting_metadata_rerun"
+    assert pending.failing == []
+    failed = _decide(detail, 1200, fresh_after=PUBLISHED, metadata_ci=policy)
+    assert failed.kind == "failing"
+    assert _names(failed.failing) == {"Conversion suite"}
+    early_deadline = _decide(
+        detail,
+        600,
+        fresh_after=PUBLISHED,
+        metadata_ci=policy,
+        execution_deadline=PUBLISHED + timedelta(seconds=600),
+    )
+    assert early_deadline.kind == "failing"
+    assert _names(early_deadline.failing) == {"Conversion suite"}
+
+
+def test_unrelated_fresh_checks_do_not_prove_a_recorded_metadata_rerun() -> None:
+    stale = _run("PR body (real newlines)", conclusion="failure")
+    stale["started_at"] = "2026-09-24T12:00:00Z"
+    unrelated = _run("unrelated", run_id=2)
+    unrelated["started_at"] = "2026-09-24T12:00:01Z"
+    verdict = _decide(
+        _detail(stale, unrelated),
+        1200,
+        fresh_after=PUBLISHED,
+        metadata_ci=factory_ci.MetadataCiPolicy(
+            checks=("PR body (real newlines)",), statuses=(), recorded=True
+        ),
+    )
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "checks_not_rerun"
 
 
 def test_a_metadata_policy_does_not_change_an_ordinary_commit_verdict() -> None:
@@ -1324,9 +1455,7 @@ def test_continuation_text_bounds_and_redacts_an_actions_log_tail() -> None:
         + [f"tail line {i}" for i in range(78)]
         + [f"AssertionError: expected 2, got 1 {token}", forged]
     )
-    run = _run(
-        "unit-tests", conclusion="failure", run_id=41, title="Tests failed", summary=""
-    )
+    run = _run("unit-tests", conclusion="failure", run_id=41, title="Tests failed", summary="")
     run["app"] = {"slug": "github-actions"}
     detail = CiDetail(
         state="observed",
@@ -1358,9 +1487,7 @@ def test_continuation_text_bounds_and_redacts_an_actions_log_tail() -> None:
 
 
 def test_continuation_text_keeps_a_fixed_log_unavailable_note_with_check_details() -> None:
-    run = _run(
-        "unit-tests", conclusion="failure", run_id=41, title="Tests failed", summary=""
-    )
+    run = _run("unit-tests", conclusion="failure", run_id=41, title="Tests failed", summary="")
     run["app"] = {"slug": "github-actions"}
     detail = CiDetail(
         state="observed",
@@ -2068,3 +2195,73 @@ def test_ci_wait_uses_the_work_item_code_host_entry(
     assert _terminal(other) == ("running", None)
     assert any(repository.host == "ghe.example" for repository, _ in seen)
     assert sink.ci_observations == observed
+
+
+@pytest.mark.parametrize(
+    ("key", "name", "source"),
+    [
+        (status_key("build-key"), "Build 12", CheckSource.STATUS),
+        (check_run_key("status:lint"), "status:lint", CheckSource.RUN),
+    ],
+)
+def test_recorded_metadata_reruns_match_normalized_identity_not_display_name(
+    key: str, name: str, source: CheckSource
+) -> None:
+    old = NormalizedCheck(
+        key=key,
+        name=name,
+        state=CheckState.FAILURE,
+        head_sha=HEAD,
+        source=source,
+        started_at=PUBLISHED - timedelta(seconds=60),
+    )
+    failed = factory_ci.decide(
+        factory_ci.CiView(head_sha=HEAD, checks=(old,)),
+        published_at=PUBLISHED,
+        now=PUBLISHED + timedelta(seconds=180),
+        execution_deadline=DEADLINE,
+        ci_wait_seconds=1200,
+        changed_paths=(),
+        python_ci=None,
+        metadata_ci=None,
+    )
+    assert failed.kind == "failing"
+    assert failed.failing_keys == (key,)
+    policy = factory_ci.MetadataCiPolicy(
+        checks=() if source is CheckSource.STATUS else failed.failing_keys,
+        statuses=(key.removeprefix("status:"),) if source is CheckSource.STATUS else (),
+        recorded=True,
+    )
+    waiting = factory_ci.decide(
+        factory_ci.CiView(head_sha=HEAD, checks=(old,)),
+        published_at=PUBLISHED,
+        now=PUBLISHED + timedelta(seconds=180),
+        execution_deadline=DEADLINE,
+        ci_wait_seconds=1200,
+        changed_paths=(),
+        python_ci=None,
+        metadata_ci=policy,
+        fresh_after=PUBLISHED,
+    )
+    assert waiting.kind == "pending"
+    assert waiting.reason == "checks_awaiting_metadata_rerun"
+    fresh = NormalizedCheck(
+        key=key,
+        name=name,
+        state=CheckState.SUCCESS,
+        head_sha=HEAD,
+        source=source,
+        started_at=PUBLISHED + timedelta(seconds=1),
+    )
+    green = factory_ci.decide(
+        factory_ci.CiView(head_sha=HEAD, checks=(old, fresh)),
+        published_at=PUBLISHED,
+        now=PUBLISHED + timedelta(seconds=180),
+        execution_deadline=DEADLINE,
+        ci_wait_seconds=1200,
+        changed_paths=(),
+        python_ci=None,
+        metadata_ci=policy,
+        fresh_after=PUBLISHED,
+    )
+    assert green.kind == "green"

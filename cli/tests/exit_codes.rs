@@ -1273,8 +1273,48 @@ fn seal_rejects_invalid_connector_names_as_usage_with_a_fix() {
 }
 
 #[test]
+fn seal_rejects_reserved_connector_names_as_usage_with_a_fix() {
+    for connector in ["curie", "curie-state"] {
+        let output = run_seal(connector, true);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(ExitClass::Usage.code()),
+            "{connector:?} must be rejected as Usage\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|err| panic!("{connector:?} must emit JSON: {err}; {stdout}"));
+        assert!(
+            payload["error"]
+                .as_str()
+                .is_some_and(|error| error.contains(connector) && error.contains("reserved")),
+            "{connector:?} must be named as reserved: {payload}"
+        );
+        assert!(
+            payload["fix"]
+                .as_str()
+                .is_some_and(|fix| fix.contains("rename")),
+            "{connector:?} must include rename guidance: {payload}"
+        );
+        assert!(
+            payload.get("sealed").is_none() && payload.get("yaml").is_none(),
+            "{connector:?} must not emit a sealed value or yaml: {payload}"
+        );
+        assert!(
+            !stdout.contains(SEAL_VALUE) && !stderr.contains(SEAL_VALUE),
+            "a rejected connector must not expose the value"
+        );
+    }
+}
+
+#[test]
 fn seal_accepts_the_connector_name_length_boundary_and_interior_dash() {
-    for connector in ["a".repeat(40), "grafana-cloud".to_string()] {
+    for connector in [
+        "a".repeat(40),
+        "grafana-cloud".to_string(),
+        "curie-docs".to_string(),
+    ] {
         let output = run_seal(&connector, true);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);

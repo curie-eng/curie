@@ -30,6 +30,7 @@ from ..models import (
 )
 from ..resumequeue import parse_resume_event_id
 from .agents import get_agent
+from .channels import _normalized_reply_identity
 from .errors import PublicationSettlementConflict
 from .publication_queries import get_publication_by_approval
 
@@ -78,6 +79,9 @@ async def create_approval(
         reply_placeholder=data.reply_placeholder,
         reply_endpoint=data.reply_endpoint,
         reply_adapter=data.reply_adapter,
+        reply_identity=_normalized_reply_identity(
+            data.reply_kind, data.reply_adapter, data.reply_identity
+        ),
         dedupe_key=data.dedupe_key,
         traceparent=traceparent,
         route=data.route,

@@ -230,18 +230,22 @@ pub fn check_target_schema(
     })
 }
 
+/// Message for an application version that has no static catalog entry. A dry
+/// run without a live revision has this message but no fail-forward fix.
+pub fn missing_target_window_message(target_app: &str) -> String {
+    let target = normalize_app_version(target_app);
+    format!("refusing rollback to application {target}: no declared schema range for that version")
+}
+
 /// Refusal for an application version that has no static catalog entry.
 pub fn missing_target_window_refusal(
     target_app: &str,
     live: &str,
     history_apps: &[String],
 ) -> SchemaRefusal {
-    let target = normalize_app_version(target_app);
     let candidates: Vec<&str> = history_apps.iter().map(String::as_str).collect();
     SchemaRefusal {
-        message: format!(
-            "refusing rollback to application {target}: no declared schema range for that version"
-        ),
+        message: missing_target_window_message(target_app),
         fix: fail_forward_fix(newest_fail_forward(candidates, live), live),
     }
 }
@@ -560,8 +564,8 @@ print(json.dumps(graph))
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
         // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
-        assert_eq!(candidate.schema_min, "0105");
-        assert_eq!(candidate.schema_head, "0105");
+        assert_eq!(candidate.schema_min, "0107");
+        assert_eq!(candidate.schema_head, "0107");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -577,7 +581,7 @@ print(json.dumps(graph))
         ] {
             assert!(!live_in_window(below, &current), "{below}");
         }
-        assert!(live_in_window("0105", &current));
+        assert!(live_in_window("0107", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");
@@ -605,7 +609,7 @@ print(json.dumps(graph))
         let candidate_release = window_for("0.13.0").expect("feature candidate is catalogued");
         assert_eq!(candidate_release.schema_min, candidate.schema_min);
         assert_eq!(candidate_release.schema_head, candidate.schema_head);
-        assert!(live_in_window("0105", &candidate_release));
+        assert!(live_in_window("0107", &candidate_release));
         assert!(!live_in_window("0100", &candidate_release));
         assert!(!live_in_window("0075", &candidate_release));
         let published =
