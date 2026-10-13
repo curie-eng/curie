@@ -1,0 +1,128 @@
+[
+  {
+    "allow_failure": false,
+    "archived": false,
+    "artifacts": [
+      {
+        "file_format": null,
+        "file_type": "trace",
+        "filename": "job.log",
+        "size": 2378
+      }
+    ],
+    "artifacts_expire_at": null,
+    "commit": {
+      "author_email": "placeholder-user-1@example.invalid",
+      "author_name": "placeholder-user-1",
+      "authored_date": "2026-10-13T11:39:23.000+00:00",
+      "committed_date": "2026-10-13T11:39:23.000+00:00",
+      "committer_email": "placeholder-user-1@example.invalid",
+      "committer_name": "placeholder-user-1",
+      "created_at": "2026-10-13T11:39:23.000+00:00",
+      "extended_trailers": {},
+      "id": "7e7b7e09ed5d3e237c4f34a76b70843c918d3a5f",
+      "message": "External status\n",
+      "parent_ids": [
+        "0227e848461e4509193a881e046b594cca8ab2ba"
+      ],
+      "short_id": "7e7b7e09",
+      "title": "External status",
+      "trailers": {},
+      "web_url": "https://gitlab.example/factory-fixture/nested/widgets/-/commit/7e7b7e09ed5d3e237c4f34a76b70843c918d3a5f"
+    },
+    "coverage": null,
+    "created_at": "2026-10-13T11:39:24.581Z",
+    "duration": 0.756222,
+    "erased_at": null,
+    "failure_reason": "script_failure",
+    "finished_at": "2026-10-13T11:39:27.815Z",
+    "id": 70,
+    "name": "test",
+    "pipeline": {
+      "created_at": "2026-10-13T11:39:24.504Z",
+      "id": 62,
+      "iid": 62,
+      "project_id": 1,
+      "ref": "curie-test/status-9ef5976a",
+      "sha": "7e7b7e09ed5d3e237c4f34a76b70843c918d3a5f",
+      "source": "push",
+      "status": "failed",
+      "updated_at": "2026-10-13T11:39:27.875Z",
+      "web_url": "https://gitlab.example/factory-fixture/nested/widgets/-/pipelines/62"
+    },
+    "project": {
+      "ci_job_token_scope_enabled": false
+    },
+    "queued_duration": 2.199012,
+    "ref": "curie-test/status-9ef5976a",
+    "runner": {
+      "active": true,
+      "created_at": "2026-10-13T11:03:57.135Z",
+      "created_by": {
+        "avatar_url": "https://gitlab.example/uploads/-/system/user/avatar/placeholder/avatar.png",
+        "id": 1,
+        "locked": false,
+        "name": "Administrator",
+        "public_email": null,
+        "state": "active",
+        "username": "root",
+        "web_url": "https://gitlab.example/root"
+      },
+      "description": "curie-forge-fixture",
+      "id": 1,
+      "ip_address": null,
+      "is_shared": true,
+      "job_execution_status": "idle",
+      "name": null,
+      "online": true,
+      "paused": false,
+      "runner_type": "instance_type",
+      "status": "online"
+    },
+    "runner_manager": {
+      "architecture": "amd64",
+      "contacted_at": "2026-10-13T11:39:33.581Z",
+      "created_at": "2026-10-13T11:03:58.630Z",
+      "id": 1,
+      "ip_address": "192.0.2.10",
+      "job_execution_status": "idle",
+      "platform": "linux",
+      "revision": "ac11717a",
+      "status": "online",
+      "system_id": "r_placeholder0001",
+      "version": "19.4.0"
+    },
+    "stage": "test",
+    "started_at": "2026-10-13T11:39:27.059Z",
+    "status": "failed",
+    "tag": false,
+    "tag_list": [],
+    "user": {
+      "avatar_url": "https://gitlab.example/uploads/-/system/user/avatar/placeholder/avatar.png",
+      "bio": "",
+      "bot": true,
+      "created_at": "2026-10-13T11:03:56.807Z",
+      "discord": "",
+      "followers": 0,
+      "following": 0,
+      "github": "",
+      "id": 4,
+      "job_title": "",
+      "linkedin": "",
+      "local_time": null,
+      "location": "",
+      "locked": false,
+      "name": "Factory Bot",
+      "organization": "",
+      "pronouns": null,
+      "public_email": null,
+      "state": "active",
+      "twitter": "",
+      "username": "factory-bot",
+      "web_url": "https://gitlab.example/factory-bot",
+      "website_url": "",
+      "work_information": null
+    },
+    "web_url": "https://gitlab.example/factory-fixture/nested/widgets/-/jobs/70"
+  }
+]
