@@ -343,6 +343,7 @@ async fn rollback_hands_helm_the_selected_revision() {
             to_revision,
             skipped,
             forced,
+            resumed_interrupted_rollback,
         } => {
             assert_eq!(from_revision, 21);
             assert_eq!(to_revision, 19);
@@ -352,6 +353,10 @@ async fn rollback_hands_helm_the_selected_revision() {
                 "AC2: the passed-over revision is reported"
             );
             assert!(!forced);
+            assert!(
+                !resumed_interrupted_rollback,
+                "a plain rollback resumes nothing"
+            );
         }
         other => panic!("expected a completed rollback, got {other:?}"),
     }
@@ -542,7 +547,6 @@ fn a_pending_or_failed_newest_revision_rolls_back_to_the_serving_revision() {
     for status in [
         "pending-install",
         "pending-upgrade",
-        "pending-rollback",
         "failed",
         "unknown",
         "uninstalling",
@@ -560,6 +564,7 @@ fn a_pending_or_failed_newest_revision_rolls_back_to_the_serving_revision() {
                 to_revision: 4,
                 skipped: vec![],
                 forced: false,
+                resumes_interrupted_rollback: false,
             },
             "newest status {status} must restore serving 4 instead of downgrading to 3"
         );
@@ -623,10 +628,209 @@ fn a_pending_or_failed_newest_revision_rolls_back_to_the_serving_revision() {
                 to_revision,
                 skipped,
                 forced: false,
+                resumes_interrupted_rollback: false,
             },
             "history: {history:?}"
         );
     }
+}
+
+/// A history row with an explicit chart and description, for the
+/// interrupted-rollback cases where both carry the decision.
+fn described(revision: u32, status: &str, chart: &str, description: &str) -> HelmRevision {
+    HelmRevision {
+        revision,
+        status: status.to_string(),
+        chart: chart.to_string(),
+        app_version: chart.trim_start_matches("curie-").to_string(),
+        description: description.to_string(),
+    }
+}
+
+/// The #4497 shape: `helm rollback 9` was killed after Helm stored revision 11
+/// as `pending-rollback`, so the release still serves 10. Helm writes the
+/// pending row's description as `Rollback to <N>` (helm pkg/action/rollback.go,
+/// `Description = fmt.Sprintf("Rollback to %d", r.Version)`).
+fn interrupted_rollback_history(description: &str) -> Vec<HelmRevision> {
+    vec![
+        described(9, "superseded", "curie-0.12.4", "Upgrade complete"),
+        described(10, "deployed", "curie-0.12.5", "Upgrade complete"),
+        described(11, "pending-rollback", "curie-0.12.4", description),
+    ]
+}
+
+/// Selection error through both stages, so a refusal pins the same whether it
+/// is raised while selecting or while requiring an eligible target.
+fn selection_error(history: &[HelmRevision]) -> anyhow::Error {
+    select_rollback_revision(history)
+        .and_then(RollbackTarget::require_eligible)
+        .expect_err("an interrupted rollback with no confirmed target must refuse")
+}
+
+/// THE FIX PIN for #4497. This amends #4335 Decision 1 for `pending-rollback`
+/// only: a killed upgrade's pending row is half applied work to clear, so the
+/// serving revision is the right target, but a killed rollback's pending row
+/// records the operator's last instruction (`Rollback to 9`), and Helm history
+/// is the only place that intent survives a kill. Restoring serving 10 would
+/// keep the release on the version the operator was leaving.
+#[test]
+fn an_interrupted_rollback_resumes_toward_its_target() {
+    assert_eq!(
+        eligible(&interrupted_rollback_history("Rollback to 9")),
+        RollbackChoice {
+            from_revision: 11,
+            to_revision: 9,
+            skipped: vec![],
+            forced: false,
+            resumes_interrupted_rollback: true,
+        },
+        "the interrupted rollback must finish at 9, not restore serving 10"
+    );
+}
+
+/// Helm's description is matched after trimming, so surrounding whitespace in
+/// a stored row does not turn a resumable rollback into a refusal.
+#[test]
+fn an_interrupted_rollback_description_is_read_trimmed() {
+    let choice = eligible(&interrupted_rollback_history("  Rollback to 9\n"));
+    assert_eq!(choice.to_revision, 9);
+    assert_eq!(choice.from_revision, 11);
+    assert!(choice.resumes_interrupted_rollback);
+}
+
+/// Once a later rollback finished, the old pending row is history: the newest
+/// row is deployed, so selection is the ordinary walk below it and nothing is
+/// resumed, even though the deployed row also says `Rollback to 9`.
+#[test]
+fn a_finished_rollback_over_an_old_pending_row_selects_as_before() {
+    let history = vec![
+        described(9, "superseded", "curie-0.12.4", "Upgrade complete"),
+        described(10, "superseded", "curie-0.12.5", "Upgrade complete"),
+        described(11, "pending-rollback", "curie-0.12.4", "Rollback to 9"),
+        described(12, "deployed", "curie-0.12.4", "Rollback to 9"),
+    ];
+    assert_eq!(
+        eligible(&history),
+        RollbackChoice {
+            from_revision: 12,
+            to_revision: 10,
+            skipped: vec![11],
+            forced: false,
+            resumes_interrupted_rollback: false,
+        }
+    );
+}
+
+/// A pending upgrade keeps the #4335 behavior even when the rest of the
+/// history matches the interrupted-rollback shape.
+#[test]
+fn a_pending_upgrade_over_the_same_history_still_restores_serving() {
+    let mut history = interrupted_rollback_history("Preparing upgrade");
+    history[2].status = "pending-upgrade".to_string();
+    assert_eq!(
+        eligible(&history),
+        RollbackChoice {
+            from_revision: 11,
+            to_revision: 10,
+            skipped: vec![],
+            forced: false,
+            resumes_interrupted_rollback: false,
+        }
+    );
+}
+
+/// Every way the pending row's target can fail to be confirmed refuses with
+/// exit 1 and both explicit choices, never a silent fallback to serving 10.
+/// The `--revision <N>` choice is offered only when N is a revision in history.
+#[test]
+fn an_interrupted_rollback_without_a_confirmed_target_is_refused() {
+    let serving_choice = "curie cluster rollback --revision 10 --yes";
+    // (case, history, Some(first choice) when N is in history)
+    let cases: Vec<(&str, Vec<HelmRevision>, Option<&str>)> = vec![
+        (
+            "unparsable description",
+            interrupted_rollback_history("Preparing rollback"),
+            None,
+        ),
+        (
+            "non-numeric target",
+            interrupted_rollback_history("Rollback to nine"),
+            None,
+        ),
+        (
+            "failed target",
+            vec![
+                described(9, "failed", "curie-0.12.4", "Upgrade failed"),
+                described(10, "deployed", "curie-0.12.5", "Upgrade complete"),
+                described(11, "pending-rollback", "curie-0.12.4", "Rollback to 9"),
+            ],
+            Some("curie cluster rollback --revision 9 --yes"),
+        ),
+        (
+            "missing target",
+            interrupted_rollback_history("Rollback to 7"),
+            None,
+        ),
+        (
+            "chart mismatch",
+            vec![
+                described(9, "superseded", "curie-0.12.3", "Upgrade complete"),
+                described(10, "deployed", "curie-0.12.5", "Upgrade complete"),
+                described(11, "pending-rollback", "curie-0.12.4", "Rollback to 9"),
+            ],
+            Some("curie cluster rollback --revision 9 --yes"),
+        ),
+    ];
+    for (case, history, finish_choice) in cases {
+        let err = selection_error(&history);
+        let shown = err.to_string();
+        assert!(
+            shown.contains(
+                "revision 11 is an interrupted rollback whose target cannot be confirmed"
+            ),
+            "{case}: the refusal must name the pending revision: {shown}"
+        );
+        assert!(
+            shown.contains(serving_choice),
+            "{case}: the refusal must offer restoring serving 10: {shown}"
+        );
+        match finish_choice {
+            Some(choice) => assert!(
+                shown.contains(choice),
+                "{case}: the refusal must offer finishing the rollback: {shown}"
+            ),
+            None => assert!(
+                !shown.contains("to finish it"),
+                "{case}: no revision in history to finish toward: {shown}"
+            ),
+        }
+        assert!(
+            !shown.contains("--revision 7"),
+            "{case}: a target that is not in history is never offered: {shown}"
+        );
+        assert_eq!(
+            classify(&err).0.code(),
+            1,
+            "{case}: the refusal is a runtime failure: {shown}"
+        );
+    }
+}
+
+/// A description naming the pending row itself (or anything not below it) is
+/// not a rollback target Helm could have written, so it refuses too.
+#[test]
+fn an_interrupted_rollback_whose_target_is_not_below_it_is_refused() {
+    let err = selection_error(&interrupted_rollback_history("Rollback to 11"));
+    let shown = err.to_string();
+    assert!(
+        shown.contains("revision 11 is an interrupted rollback whose target cannot be confirmed"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("curie cluster rollback --revision 10 --yes"),
+        "{shown}"
+    );
+    assert_eq!(classify(&err).0.code(), 1, "{shown}");
 }
 
 #[test]
@@ -648,6 +852,7 @@ fn explicit_selection_is_unchanged_when_a_newer_revision_is_pending() {
             to_revision: 2,
             skipped: vec![3],
             forced: false,
+            resumes_interrupted_rollback: false,
         }
     );
 
@@ -663,6 +868,7 @@ fn explicit_selection_is_unchanged_when_a_newer_revision_is_pending() {
             to_revision: 5,
             skipped: vec![],
             forced: true,
+            resumes_interrupted_rollback: false,
         }
     );
 }
@@ -840,6 +1046,10 @@ fn rollback_hands_helm_the_serving_revision_over_a_pending_one() {
     assert_eq!(result["skipped"], serde_json::json!([]));
     assert_eq!(result["forced"], false);
     assert_eq!(
+        result["resumed_interrupted_rollback"], false,
+        "a pending upgrade is cleared, not resumed"
+    );
+    assert_eq!(
         helm_log(dir.path()),
         "history prod-release -n agent-ns -o json --max 256\nrollback prod-release 4 -n agent-ns\n",
         "the real path must pass the serving revision to Helm"
@@ -1006,6 +1216,172 @@ fn dry_run_reads_history_and_names_the_selected_revision() {
                 human_plan = Some(plan);
             }
         }
+    }
+}
+
+/// The #4497 history as fake `helm history` serves it: `helm rollback 9` was
+/// killed after storing pending revision 11, so 10 still serves. Helm writes
+/// `Rollback to <N>` as that row's description (helm pkg/action/rollback.go).
+const INTERRUPTED_ROLLBACK_HISTORY: &str = r#"[
+  {"revision":9,"status":"superseded","chart":"curie-0.12.4","app_version":"0.12.4","description":"Upgrade complete"},
+  {"revision":10,"status":"deployed","chart":"curie-0.12.5","app_version":"0.12.5","description":"Upgrade complete"},
+  {"revision":11,"status":"pending-rollback","chart":"curie-0.12.4","app_version":"0.12.4","description":"Rollback to 9"}
+]"#;
+
+/// The fake `kubectl` from `fake_helm_dir` reports live head 0039, outside the
+/// catalogued 0.12.4 window; serve 0093 so the real schema gate admits 9.
+fn serve_live_schema_0093(dir: &Path) {
+    test_executable::install_in(
+        dir,
+        "kubectl",
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\necho '0093 (head)'\n",
+            log = dir.join("kubectl-argv.log").display(),
+        ),
+    );
+}
+
+/// Through the binary, a bare rollback after an interrupted rollback says so in
+/// the dry run (human and JSON), the pre-prompt note and `--json`, and hands
+/// Helm the interrupted target 9 rather than serving 10.
+#[test]
+fn an_interrupted_rollback_is_resumed_through_the_binary() {
+    let interrupted = "revision 11 is an interrupted rollback to revision 9; resuming it";
+    let selection = "selected revision 9 (superseded, curie-0.12.4) from revision 11; skipped none";
+
+    let mut human_plan = None;
+    for json in [false, true] {
+        let dir = fake_helm_dir(INTERRUPTED_ROLLBACK_HISTORY);
+        let mut args = vec!["--dry-run"];
+        if json {
+            args.push("--json");
+        }
+        let out = run_rollback(dir.path(), &args);
+        assert!(
+            out.status.success(),
+            "a dry run must exit clean: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let plan = if json {
+            let payload: serde_json::Value =
+                serde_json::from_slice(&out.stdout).expect("one JSON dry-run result");
+            payload["plan"]
+                .as_array()
+                .expect("the DryRunPlan carries plan lines")
+                .iter()
+                .map(|line| line.as_str().expect("plan lines are strings"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let resumed_at = plan
+            .find(interrupted)
+            .unwrap_or_else(|| panic!("the plan must name the interrupted rollback: {plan}"));
+        let selected_at = plan
+            .find(selection)
+            .unwrap_or_else(|| panic!("selection detail missing: {plan}"));
+        assert!(
+            resumed_at < selected_at,
+            "the interrupted rollback line comes before the selection: {plan}"
+        );
+        assert!(
+            plan.contains("helm rollback prod-release 9 -n agent-ns"),
+            "the plan must hand Helm the interrupted target: {plan}"
+        );
+        assert_eq!(
+            helm_log(dir.path()),
+            "history prod-release -n agent-ns -o json --max 256\n",
+            "a dry run reads history once and invokes no Helm mutation"
+        );
+        if json {
+            assert_eq!(Some(plan), human_plan, "JSON and human plans must agree");
+        } else {
+            human_plan = Some(plan);
+        }
+    }
+
+    // The real run, human: the pre-prompt note on stderr says the same.
+    let dir = fake_helm_dir(INTERRUPTED_ROLLBACK_HISTORY);
+    serve_live_schema_0093(dir.path());
+    let out = run_rollback(dir.path(), &["--yes"]);
+    let shown = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "rollback failed: {shown}");
+    assert!(
+        shown.contains(interrupted),
+        "the operator must be told the rollback is being resumed: {shown}"
+    );
+    assert!(
+        helm_log(dir.path()).contains("rollback prod-release 9 -n agent-ns"),
+        "Helm must be handed the interrupted target"
+    );
+
+    // The real run, --json: the completed object records the resume.
+    let dir = fake_helm_dir(INTERRUPTED_ROLLBACK_HISTORY);
+    serve_live_schema_0093(dir.path());
+    let out = run_rollback(dir.path(), &["--yes", "--json"]);
+    assert!(
+        out.status.success(),
+        "rollback failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("rollback emits one JSON result");
+    assert_eq!(result["rolled_back"], true);
+    assert_eq!(result["from_revision"], 11);
+    assert_eq!(result["to_revision"], 9);
+    assert_eq!(result["resumed_interrupted_rollback"], true);
+    assert_eq!(
+        helm_log(dir.path()),
+        "history prod-release -n agent-ns -o json --max 256\nrollback prod-release 9 -n agent-ns\n",
+        "the real path must pass the interrupted target to Helm"
+    );
+    assert!(
+        fs::read_to_string(dir.path().join("kubectl-argv.log"))
+            .expect("the real path must probe the live schema")
+            .contains("alembic -c alembic.ini current"),
+        "the resumed target must still pass through the schema gate"
+    );
+}
+
+/// An interrupted rollback whose target's chart differs from the pending row
+/// refuses through the binary, dry run or not, with exit 1, both choices on
+/// stderr, and no Helm mutation.
+#[test]
+fn an_unconfirmed_interrupted_rollback_is_refused_through_the_binary() {
+    let history = r#"[
+      {"revision":9,"status":"superseded","chart":"curie-0.12.3","app_version":"0.12.3","description":"Upgrade complete"},
+      {"revision":10,"status":"deployed","chart":"curie-0.12.5","app_version":"0.12.5","description":"Upgrade complete"},
+      {"revision":11,"status":"pending-rollback","chart":"curie-0.12.4","app_version":"0.12.4","description":"Rollback to 9"}
+    ]"#;
+    for dry_run in [false, true] {
+        let dir = fake_helm_dir(history);
+        let mut args = vec!["--yes"];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let out = run_rollback(dir.path(), &args);
+        let shown = String::from_utf8_lossy(&out.stderr).to_string();
+        assert_eq!(out.status.code(), Some(1), "dry run {dry_run}: {shown}");
+        assert!(
+            shown.contains(
+                "revision 11 is an interrupted rollback whose target cannot be confirmed"
+            ),
+            "dry run {dry_run}: {shown}"
+        );
+        assert!(
+            shown.contains("curie cluster rollback --revision 9 --yes"),
+            "dry run {dry_run}: {shown}"
+        );
+        assert!(
+            shown.contains("curie cluster rollback --revision 10 --yes"),
+            "dry run {dry_run}: {shown}"
+        );
+        assert!(
+            !helm_log(dir.path()).contains("rollback"),
+            "dry run {dry_run}: a refused selection invokes no Helm rollback"
+        );
+        assert!(!dir.path().join("kubectl-argv.log").exists());
     }
 }
 

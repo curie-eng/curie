@@ -2187,6 +2187,29 @@ fn take_over_pending_install_and_rollback_refuse_without_recovery() {
             message.contains(scenario),
             "pending status missing: {message}"
         );
+        // #4497: a pending-rollback row records the operator's target as
+        // `Rollback to <N>`, so the refusal names it and the curie command that
+        // finishes it, and keeps the raw serving-revision helm command that
+        // still works under CLI version skew.
+        if scenario == "pending-rollback" {
+            assert!(
+                message.contains("interrupted rollback to revision 3"),
+                "the interrupted target must be named: {message}"
+            );
+            assert!(
+                message.contains("curie cluster rollback --yes"),
+                "the finishing command must be named: {message}"
+            );
+            assert!(
+                message.contains("helm rollback rel 4"),
+                "the serving-revision helm command must stay: {message}"
+            );
+        } else {
+            assert!(
+                !message.contains("interrupted rollback"),
+                "{scenario} is not a rollback: {message}"
+            );
+        }
         assert!(!fixture.issued(&["helm", "rollback"]));
         assert!(fixture.helm_upgrades().is_empty());
         assert_ownership_released(&fixture);
