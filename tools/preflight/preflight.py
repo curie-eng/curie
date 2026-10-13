@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -79,6 +80,11 @@ def private_service_environment(
         "TEST_DATABASE_URL": database,
         "TEST_VALKEY_HOST": "127.0.0.1",
         "TEST_VALKEY_PORT": str(valkey),
+        "CURIE_PRIMARY_SOURCE_RESOURCES": "1",
+        "CURIE_SETTLEMENT_TEST_REDIS_URL": (
+            f"redis://:{quote(environment.get('TEST_VALKEY_PW', 'valkeypass'), safe='')}"
+            f"@127.0.0.1:{valkey}/0"
+        ),
         "VALKEY_HOST": "127.0.0.1",
         "VALKEY_PORT": str(valkey),
         "S3_ENDPOINT_URL": f"http://127.0.0.1:{s3}",
@@ -885,6 +891,7 @@ def validate_private_config(
     configuration: dict[str, Any],
     project: str,
     published: dict[str, list[int]],
+    network_subnets: tuple[str, str],
 ) -> None:
     for service in published:
         if any(
@@ -892,8 +899,68 @@ def validate_private_config(
             for port in configuration["services"][service]["ports"]
         ):
             raise GateFailure("The private Compose configuration retained a shared binding")
-    if configuration["networks"]["curie_runner"]["name"] != f"{project}_runner":
-        raise GateFailure("The private runner network has an incorrect owner")
+    expected = {
+        "default": (f"{project}_default", network_subnets[0]),
+        "curie_runner": (f"{project}_runner", network_subnets[1]),
+    }
+    for name, (expected_name, expected_subnet) in expected.items():
+        network = configuration["networks"][name]
+        if network["name"] != expected_name:
+            raise GateFailure(f"The private {name} network has an incorrect owner")
+        actual_subnets = [
+            item.get("subnet") for item in network.get("ipam", {}).get("config", [])
+        ]
+        if expected_subnet not in actual_subnets:
+            raise GateFailure(f"The private {name} network has no owned subnet")
+
+
+def private_network_subnets(project: str, occupied: Sequence[str]) -> tuple[str, str]:
+    """Choose two unused /24s outside Docker's exhausted automatic pools."""
+    existing = [ipaddress.ip_network(value, strict=False) for value in occupied]
+    pools = (
+        ipaddress.ip_network("10.240.0.0/20"),
+        ipaddress.ip_network("172.31.240.0/20"),
+        ipaddress.ip_network("192.168.240.0/20"),
+    )
+    seed = int(hashlib.sha256(project.encode()).hexdigest(), 16)
+    selected: list[str] = []
+    for pool_index, pool in enumerate(pools):
+        candidates = list(pool.subnets(new_prefix=24))
+        start = (seed + pool_index) % len(candidates)
+        for offset in range(len(candidates)):
+            candidate = candidates[(start + offset) % len(candidates)]
+            if any(candidate.overlaps(network) for network in existing):
+                continue
+            selected.append(str(candidate))
+            existing.append(candidate)
+            if len(selected) == 2:
+                return selected[0], selected[1]
+    raise TransientError("No free private preflight subnets remain in the reserved range")
+
+
+def docker_network_subnets(root: Path, environment: dict[str, str]) -> list[str]:
+    network_ids = docker_output(root, environment, "network", "ls", "-q").splitlines()
+    if not network_ids:
+        return []
+    rendered = docker_output(
+        root,
+        environment,
+        "network",
+        "inspect",
+        *network_ids,
+        "--format",
+        "{{json .IPAM.Config}}",
+    )
+    result: list[str] = []
+    for line in rendered.splitlines():
+        configurations = json.loads(line)
+        if not isinstance(configurations, list):
+            continue
+        for configuration in configurations:
+            subnet = configuration.get("Subnet")
+            if isinstance(subnet, str):
+                result.append(subnet)
+    return result
 
 
 def free_port() -> int:
@@ -1004,7 +1071,24 @@ def private_services(root: Path, worktree: Path) -> Iterator[dict[str, str]]:
                         lines.extend(
                             (f"  {service}:", "    ports: !override " + json.dumps(bindings))
                         )
-                    lines.extend(("networks:", "  curie_runner:", f"    name: {project}_runner"))
+                    network_subnets = private_network_subnets(
+                        project, docker_network_subnets(root, environment)
+                    )
+                    lines.extend(
+                        (
+                            "networks:",
+                            "  default:",
+                            f"    name: {project}_default",
+                            "    ipam:",
+                            "      config:",
+                            f"        - subnet: {network_subnets[0]}",
+                            "  curie_runner:",
+                            f"    name: {project}_runner",
+                            "    ipam:",
+                            "      config:",
+                            f"        - subnet: {network_subnets[1]}",
+                        )
+                    )
                     override.write_text("\n".join(lines) + "\n")
                     configuration = json.loads(
                         docker_output(
@@ -1018,7 +1102,9 @@ def private_services(root: Path, worktree: Path) -> Iterator[dict[str, str]]:
                             "json",
                         )
                     )
-                    validate_private_config(configuration, project, published)
+                    validate_private_config(
+                        configuration, project, published, network_subnets
+                    )
                     environment["TEST_LANGFUSE_HOST"] = f"http://127.0.0.1:{web_port}"
                     environment["LANGFUSE_HOST"] = environment["TEST_LANGFUSE_HOST"]
                     startup = run_check(

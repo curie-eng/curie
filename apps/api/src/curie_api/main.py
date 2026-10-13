@@ -508,15 +508,20 @@ def create_app() -> FastAPI:
     log_credential_path(get_settings())
     # And whether an enabled OIDC login admits everyone its IdP signs in.
     oidc.log_admission_policy(get_settings())
-    # FastAPI 0.142 otherwise installs its own global TracerProvider with OTLP
-    # exporters when OTEL_EXPORTER_OTLP_ENDPOINT is set, opening its own request
-    # span that reparents Curie's producer span. curie_telemetry.bootstrap_service_telemetry
-    # already owns export for curie-api (#4410).
+    # Curie owns the redacted, closed-vocabulary HTTP telemetry below. FastAPI's
+    # native telemetry otherwise inserts a second server/operation span and
+    # configures independent exporters around that boundary (#4410).
     app = FastAPI(
         title="Curie API",
         version="0.1.0",
         lifespan=lifespan,
-        telemetry={"auto_configure": False},
+        telemetry={
+            "tracing": False,
+            "metrics": False,
+            "logs": False,
+            "operation_spans": False,
+            "auto_configure": False,
+        },
     )
 
     @app.get("/health", tags=["health"])

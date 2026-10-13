@@ -1,6 +1,8 @@
 """The API admission reconciliation owner, @spec PROTECTED-HOOK-LANE-4 PROTECTED-HOOK-ADMISSION-5.
 
-One ``ProtectedAdmissionReconciler`` per API process owns preparing intents
+One ``ProtectedAdmissionReconciler`` per API process releases accepted terminal
+capacity with durable owed completion or exact-generation resolution proof,
+backfills their checked event indexes, and owns preparing intents
 that hold capacity. The lifespan starts it inside the source resource scope
 and stops it before the Valkey client and engines close: a stop signal, then
 cancellation and a ten second join. Each tick starts five seconds after the
@@ -63,6 +65,7 @@ class TickCounts:
     recovered: int = 0
     failed: int = 0
     skipped: int = 0
+    released: int = 0
 
 
 def _tick(runtime: IngressRuntime) -> TickCounts:
@@ -104,6 +107,20 @@ def _tick(runtime: IngressRuntime) -> TickCounts:
                     counts.recovered += 1
                 elif result.status == "failed":
                     counts.failed += 1
+            committed = facade.committed(BACKLOG_LIMIT) if time.monotonic() < deadline else ()
+            for identity in committed:
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    release_result = facade.release_accepted(identity)
+                except AdmissionUnavailable:
+                    if time.monotonic() >= deadline:
+                        raise BrokerMetadataUnavailable() from None
+                    client.observe()
+                    counts.skipped += 1
+                    continue
+                if release_result == "released":
+                    counts.released += 1
     finally:
         if client is not None:
             try:
@@ -205,12 +222,13 @@ class ProtectedAdmissionReconciler:
         logger.log(
             logging.INFO if busy else logging.DEBUG,
             "protected admission reconciler tick outcome=ok quota=%d parked=%d "
-            "preparing=%d recovered=%d failed=%d skipped=%d",
+            "preparing=%d recovered=%d failed=%d skipped=%d released=%d",
             counts.quota,
             counts.parked,
             counts.preparing,
             counts.recovered,
             counts.failed,
             counts.skipped,
+            counts.released,
         )
         return counts
