@@ -198,6 +198,6 @@ skill/local credentials.
 | `curie local` | Docker Compose, full backend | the real queue → worker → sandbox path |
 | `curie cluster` | Kubernetes | Slack, and anything real |
 
-Same bundle at every rung. See [`README.md`](../README.md#quickstart) for the
+Same bundle at every rung. See the [CLI target guide](../cli/README.md#using-different-tiers) for the
 long-form walkthrough, and [`docs/operations.md`](operations.md) for running one
 in production.

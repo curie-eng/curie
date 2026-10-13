@@ -30,7 +30,7 @@ command proving each outcome.
 The same immutable bundle and `evals/cases.json` across `skill`, `local`, and
 `cluster` support the developer's test and deployment loop. Environment parity
 helps expose deployment differences; it cannot guarantee model behavior under
-production traffic. The [README's parity explanation](README.md#why-your-agent-breaks-when-it-leaves-your-laptop)
+production traffic. The [architecture's parity reference](ARCHITECTURE.md#local-to-production-parity)
 retains the technical rationale behind that commitment.
 
 ## Directory map

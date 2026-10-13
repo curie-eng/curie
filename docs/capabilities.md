@@ -69,7 +69,7 @@ one does not imply support for the other.
 The local platform runs through Docker Compose; cluster deployments run in an
 operator-owned Kubernetes environment. The runner-only `skill` tier has neither
 the full platform nor its durable memory and approval plane. See the
-[target guide](../README.md#which-target-do-i-want).
+[CLI target guide](../cli/README.md#using-different-tiers).
 
 Self-hosting places Curie's platform and configured backing stores under your
 control. Slack, GitHub, AgentMail, and remote model providers are external services

@@ -24,7 +24,7 @@ container on your host Docker daemon, talking straight to the agent. Here,
 `skill` names the runner only tier. The authored skill artifact lives at
 `skills/<name>/SKILL.md`. For the
 full tour across all three tiers through to production, see the
-[README Quickstart](README.md#quickstart); this doc goes deeper on the `skill`
+[CLI target guide](cli/README.md#using-different-tiers); this doc goes deeper on the `skill`
 path itself — configuring a real model, alternate providers, and example
 bundles. To go further still — a real local model, the full local/cluster
 runbooks, or working on Curie itself — see [Where to go next](#where-to-go-next).
@@ -264,5 +264,5 @@ The `skill` loop is just the runner container. From here:
   the runner image).
 - **Every command and flag** — the complete reference in
   [`cli/README.md`](cli/README.md); the
-  [README target guide](README.md#which-target-do-i-want) has a table to help
+  [CLI target guide](cli/README.md#using-different-tiers) has a table to help
   you pick `skill` vs `local` vs `cluster`.

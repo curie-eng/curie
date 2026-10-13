@@ -46,8 +46,8 @@ The runner-only skill target, full local Compose platform, and Kubernetes cluste
 use the same bundle format. Environment checks help catch deployment differences;
 they do not guarantee identical model behavior in production.
 
-- [README.md#quickstart](README.md#quickstart): local-to-cluster walkthrough.
-- [README.md#which-target-do-i-want](README.md#which-target-do-i-want): target selection.
+- [README.md#quickstart](README.md#quickstart): local factory and SRE quickstarts.
+- [cli/README.md#using-different-tiers](cli/README.md#using-different-tiers): target selection and deployment reference.
 - [cli/README.md](cli/README.md): full command/flag reference.
 - [docs/slack-local-runbook.md](docs/slack-local-runbook.md): local Slack test path.
 - [docs/release-verification.md](docs/release-verification.md): release asset verification.
