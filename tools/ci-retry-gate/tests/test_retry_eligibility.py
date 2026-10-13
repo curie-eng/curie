@@ -76,6 +76,7 @@ RETRY_ALLOWLIST = frozenset(
         ),
         ("ci.yaml", "images", "Set up QEMU"),
         ("ci.yaml", "images", "Set up Buildx"),
+        ("ci.yaml", "docker-daemon", "Set up Buildx"),
         ("ci.yaml", "repo-toolchain-proof", "Install uv"),
         ("ci.yaml", "changes", "Install uv"),
         ("ci.yaml", "e2e-ladder-cluster", "Install Helm"),
