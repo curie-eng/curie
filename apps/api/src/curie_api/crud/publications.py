@@ -40,7 +40,7 @@ from ..threadkeys import fence_key_forms, legacy_producer_thread_key
 from ..workspace_policy import repository_allowed
 from .agents import get_agent
 from .approvals import get_approval_by_dedupe_key
-from .channels import AmbiguousRoute, _normalized_reply_identity, binding_for_route
+from .channels import AmbiguousRoute, binding_for_route, normalized_reply_identity
 from .deployments import get_deployment
 from .errors import PublicationLineageConflict, PublicationReplayConflict
 from .lineages import require_review_binding, select_thread_publication_lineage
@@ -92,10 +92,10 @@ async def _adopt_publication_replay(
         or approval.reply_endpoint != data.reply_endpoint
         or route_identity(approval.reply_kind, approval.reply_adapter)
         != route_identity(data.reply_kind, data.reply_adapter)
-        or _normalized_reply_identity(
+        or normalized_reply_identity(
             approval.reply_kind, approval.reply_adapter, approval.reply_identity
         )
-        != _normalized_reply_identity(data.reply_kind, data.reply_adapter, data.reply_identity)
+        != normalized_reply_identity(data.reply_kind, data.reply_adapter, data.reply_identity)
         or publication.deployment_id != data.deployment_id
         or publication.repo_full_name.casefold() != data.repo_full_name.casefold()
         or publication.base_sha != data.base_sha
@@ -116,10 +116,10 @@ async def _adopt_publication_replay(
         or publication.reply_endpoint != data.reply_endpoint
         or route_identity(publication.reply_kind, publication.reply_adapter)
         != route_identity(data.reply_kind, data.reply_adapter)
-        or _normalized_reply_identity(
+        or normalized_reply_identity(
             publication.reply_kind, publication.reply_adapter, publication.reply_identity
         )
-        != _normalized_reply_identity(data.reply_kind, data.reply_adapter, data.reply_identity)
+        != normalized_reply_identity(data.reply_kind, data.reply_adapter, data.reply_identity)
         or publication.lineage is None
         or publication.lineage.agent_id != deployment.agent_id
         or publication.lineage.conversation_id != workspace_conversation_id
@@ -538,7 +538,7 @@ async def create_publication(
         reply_placeholder=data.reply_placeholder,
         reply_endpoint=data.reply_endpoint,
         reply_adapter=data.reply_adapter,
-        reply_identity=_normalized_reply_identity(
+        reply_identity=normalized_reply_identity(
             data.reply_kind, data.reply_adapter, data.reply_identity
         ),
         dedupe_key=data.dedupe_key,
@@ -596,7 +596,7 @@ async def create_publication(
         reply_placeholder=data.reply_placeholder,
         reply_endpoint=data.reply_endpoint,
         reply_adapter=data.reply_adapter,
-        reply_identity=_normalized_reply_identity(
+        reply_identity=normalized_reply_identity(
             data.reply_kind, data.reply_adapter, data.reply_identity
         ),
     )

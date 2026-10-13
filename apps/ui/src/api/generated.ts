@@ -4393,6 +4393,8 @@ export interface components {
             reply_channel: string;
             /** Reply Endpoint */
             reply_endpoint?: string | null;
+            /** Reply Identity */
+            reply_identity?: string | null;
             /** Reply Kind */
             reply_kind: string;
             /** Reply Placeholder */
@@ -6851,6 +6853,8 @@ export interface components {
             reply_conversation_id?: string | null;
             /** Reply Endpoint */
             reply_endpoint?: string | null;
+            /** Reply Identity */
+            reply_identity?: string | null;
             /** Reply Kind */
             reply_kind: string;
             /** Reply Placeholder */

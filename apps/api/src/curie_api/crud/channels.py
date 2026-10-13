@@ -18,7 +18,7 @@ from curie_api.schemas.channels import (
 from ..models import Agent, AgentChannel
 
 
-def _normalized_reply_identity(
+def normalized_reply_identity(
     kind: str, adapter: str | None, identity: str | None
 ) -> str | None:
     """Persist a named Slack relay selector independently of its egress adapter."""
