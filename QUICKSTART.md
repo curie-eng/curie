@@ -1,7 +1,25 @@
 # Curie quickstart
 
-Welcome. This gets you a first agent reply in about a minute — no credentials,
-no cluster, no Slack. It runs the `skill` target only: just the runner
+## Choose your starting point
+
+Curie turns supported agents into co-workers in your team's workspaces. Choose
+the outcome you want before installing or building a bundle:
+
+| You want to | Start here |
+| --- | --- |
+| Delegate a software issue and inspect the resulting PR | [Software Factory](docs/software-factory.md), then the [factory quickstart](docs/guides/dark-factory-quickstart.md) |
+| Investigate Kubernetes workloads with approved actions | [SRE co-worker](examples/sre-bot/README.md) |
+| Reuse an existing agent's skills and tools | [Bring your agent](docs/bring-your-agent.md) |
+| Evaluate the runner before connecting a workspace | Continue with the local first-reply path below |
+
+The factory is the primary path for engineering teams. Its prerequisites include
+a model credential, GitHub App setup, and Kubernetes tooling. The path below
+tests a generic bundle with a scripted model; it does not implement an issue or
+prove agent answer quality. Check [capabilities and release status](docs/capabilities.md)
+before choosing an integration.
+
+This gets you a first scripted reply with no credentials,
+no cluster, and no Slack. It runs the `skill` target only: just the runner
 container on your host Docker daemon, talking straight to the agent. Here,
 `skill` names the runner only tier. The authored skill artifact lives at
 `skills/<name>/SKILL.md`. For the

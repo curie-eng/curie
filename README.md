@@ -5,26 +5,65 @@
 [![Latest release](https://img.shields.io/github/v/release/curie-eng/curie)](https://github.com/curie-eng/curie/releases)
 [![Docs](https://img.shields.io/badge/Docs-index-blue.svg)](docs/README.md)
 
-Open-source (Apache 2.0), self-hostable delivery platform for production AI agents. Connect
-Slack — the first channel it speaks, with email and Teams next — author a Claude-Code-format
-plugin bundle (skills + tools + MCP), deploy it as a versioned bot identity and run it anywhere -
-in your development environment on your laptop or in production on your own Kubernetes cluster.
-Configure your model, so you can point an agent at Anthropic, OpenRouter, or a local model through
-Ollama. Get traces, evals, budgets, and git-driven deploys for free. One CLI, `curie`, drives all of
-it.
+**Turn agents into co-workers. Run them in your infrastructure.**
+
+Curie is an Apache-2.0 platform for deploying AI agents into team workspaces,
+with isolated execution, human approvals, memory, model configuration, and cost
+visibility. Developers delegate work; administrators operate the platform in
+their own infrastructure.
+
+**Start with the Software Factory:** assign a labelled GitHub issue, let an
+agent implement the change and run plan and diff reviews, then inspect the
+resulting pull request. Work happens asynchronously. A run that cannot finish
+reports its reason; a reviewed pull request still needs your team's acceptance
+and merge decision.
+
+| Start here | What you get |
+| --- | --- |
+| **[Try the Software Factory](docs/software-factory.md)** | An issue-to-reviewed-PR workflow, setup guide, and implementation/reviewer model controls. |
+| **[Deploy the SRE co-worker](examples/sre-bot/README.md)** | Investigate with Grafana, Tempo, and Kubernetes tools; request human approval for mutations. |
+| **[Bring your own agent](docs/bring-your-agent.md)** | Package supported skills and MCP tools into a versioned co-worker bundle. |
+
+## How the Software Factory works
+
+1. **Delegate:** add the configured label to a bounded GitHub issue.
+2. **Execute:** the agent works in an isolated sandbox and reports progress.
+3. **Review:** plan and diff reviewers check the work in bounded loops.
+4. **Publish:** Curie's trusted publisher opens the PR under your configured
+   publication policy. The trial quickstart enables automatic initial publication;
+   production agents default to human approval.
+5. **Inspect:** review the diff, verification information, and CI result before
+   accepting or merging the work. A failed run reports its reason.
+
+Curie gives the factory, SRE bundle, and your supported custom bundles the same
+platform for deployment, tracing, and supervision. See
+[how co-workers work](docs/co-workers.md) and the
+[capability and release reference](docs/capabilities.md) for current support and
+limits. Existing arbitrary agent runtimes are not a drop-in integration.
+
+The platform runs on your laptop for development and on your Kubernetes
+infrastructure for deployment. Configured workspace services and external model
+providers receive integration data. A supported local model endpoint keeps the
+model connection local.
+Budgets and explicit model settings help control spending; Curie does not
+promise automatic task-complexity routing or measured ROI without your baseline.
 
 ![Curie: build an agent in Claude Code, run it locally, ship it with git push](docs/demo/demo-loop.gif)
 
-New here? [`Quickstart`](#quickstart) gets you a first agent reply in a few minutes.
-
-Run `curie try` for a first reply without configured credentials or prompts. Run
-`curie try --keep` to retain the standard bundle at `./curie-demo` for normal
-`curie skill` commands. The [`Quickstart`](#quickstart) covers the full parity ladder.
+The demo shows the shared bundle development and deployment loop. For the
+factory workflow, begin with the [Software Factory guide](docs/software-factory.md).
+For a generic first reply, use the [Quickstart](#quickstart). `curie try` needs no
+configured credentials and falls back to a scripted fake model when none are found; `curie try --keep` retains the
+standard bundle at `./curie-demo` for normal `curie skill` commands.
 
 Join the [Curie Discord community](https://discord.gg/YZASub2d5B) to connect with other builders.
 
 ## Table of contents
 
+- [How the Software Factory works](#how-the-software-factory-works)
+- [Choose your co-worker](docs/co-workers.md)
+- [Software Factory](docs/software-factory.md)
+- [Bring your own agent](docs/bring-your-agent.md)
 - [Why your agent breaks when it leaves your laptop](#why-your-agent-breaks-when-it-leaves-your-laptop)
 - [Quickstart](#quickstart)
   - [Prerequisites](#prerequisites)
@@ -310,11 +349,16 @@ walks through `skill`, `local`, and `cluster` end to end.
 
 ## Status
 
-The core spine is built, covered by CI, and was live-verified end to end
-against a real Slack workspace on a real model. For the precise, maintained
-built-vs-deferred split, see "What is built vs deferred" in
-[`ARCHITECTURE.md`](ARCHITECTURE.md#what-is-built-vs-deferred) — this file
-does not duplicate that list, which only drifts out of sync.
+The named stable release for this documentation update is
+[v0.12.4](https://github.com/curie-eng/curie/releases/tag/v0.12.4). The `main`
+branch also contains unreleased patches. Use documentation and artifacts from
+the same release when evaluating a deployment. The
+[capability reference](docs/capabilities.md) distinguishes released support,
+current-source behavior, verification, and planned work.
+
+See [the architecture map](ARCHITECTURE.md#what-is-built-vs-deferred) for
+implementation detail. Channel wiring and a configured model do not by
+themselves establish a verified end-to-end deployment.
 
 Forward-looking work is planned and tracked in
 [GitHub issues](https://github.com/curie-eng/curie/issues), with larger

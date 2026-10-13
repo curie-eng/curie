@@ -1,4 +1,15 @@
-# Dark factory quickstart
+# Software Factory quickstart
+
+<a id="dark-factory-quickstart"></a>
+
+Turn a labelled GitHub issue into a pull request you can review, using the
+Software Factory co-worker. `dark-factory` remains its implementation name.
+See the [solution overview](../software-factory.md) for the delegation workflow,
+supported toolchains, review limits, and production differences.
+
+This canonical setup guide explicitly pins v0.12.1 and requires that version
+or later. Later release capabilities are listed separately in the
+[capability reference](../capabilities.md).
 
 `curie factory quickstart` installs Curie on a local
 [kind](https://kind.sigs.k8s.io/) cluster or an explicitly selected existing
@@ -18,6 +29,17 @@ guarantee that the whole walkthrough finishes within the allowance.
 
 Polling is the intake. There is no webhook, no tunnel, and no personal access
 token. The platform reads the issue for the sandbox.
+
+Quickstart selects automatic initial PR publication and a 5 USD configured
+session ceiling. Despite the `max_usd_per_day` field name, the SDK applies this
+limit per session; it does not aggregate daily spending across runs. See
+[budget limits](../administering-co-workers.md#configure-model-roles-and-bounded-runs).
+Production agents default to human publication approval. Neither policy merges
+the PR. A trial repository can have no CI, but that outcome carries a no-CI
+note rather than evidence that tests passed. The factory cannot publish changes
+under `.github/`. Start with a bounded issue in a small repository; larger
+builds and other toolchains need the setup described in the
+[bundle reference](../../examples/dark-factory/README.md#deploy-it-as-the-factory-agent).
 
 ## What you need
 
@@ -279,8 +301,9 @@ label to try again. Credit exhaustion continues to use the add-credit remedy.
 The recommended 5 USD of available provider credit is a planning allowance,
 not a guaranteed minimum charge per run. Actual spend depends on the task,
 including the reviewers. Separately, quickstart configures the agent's
-budget to 5 USD per day; several inexpensive runs can fit within that daily
-budget. Having provider credit does not raise the configured daily budget.
+USD ceiling to 5 USD per session despite the daily-named configuration field.
+Multiple sessions can therefore exceed 5 USD in aggregate in one day.
+Having provider credit does not raise the configured session ceiling.
 
 The second run configures these values:
 
@@ -294,7 +317,7 @@ The second run configures these values:
 | GitHub surface | `github=<owner>/<name>` |
 | Execution deadline | 10800 seconds |
 | Publication | `auto` |
-| Budget | 5 USD per day |
+| Budget | 5 USD configured session ceiling; no shared daily ledger |
 
 The card image stays a text checklist unless you later set a public
 `--card-base-url` on the cluster factory command. Polling does not need one.
@@ -324,8 +347,8 @@ A cancelled run removes all four. Curie never changes your `curie-factory` label
 ## What a repository with no CI sees
 
 1. After publishing, Curie waits on the pull request's checks. With no checks
-   within 120 seconds of the push, and no required check configured, the run
-   completes and the status comment says `Note: No CI checks appeared within 120 s.`
+   within 120 seconds of the push, no required check configured, and GitHub
+   reporting the PR mergeable or already merged, the run completes and the status comment says `Note: No CI checks appeared within 120 s.`
 2. Before the model starts, the runner runs checks declared in
    `.curie/verification.json`. With no declaration it records `not_declared`. <!-- doclint:ignore-line -->
    See [Repository toolchain in the managed sandbox](repository-toolchain-in-the-managed-sandbox.md).

@@ -1,5 +1,13 @@
 # Your first Slack agent
 
+This is the workspace deployment path for a supported bundle. To reuse
+existing instructions and tools, start with [Bring your agent](bring-your-agent.md).
+For the primary developer use case, start with the
+[Software Factory](software-factory.md). Check the
+[capability and release reference](capabilities.md) before choosing a channel.
+This manual Slack setup remains necessary; onboarding automation is tracked in
+[#1069](https://github.com/curie-eng/curie/issues/1069).
+
 From nothing to a bot that answers in Slack and redeploys itself when you push.
 
 Four commands do the work. Everything else on this page is the accounts you

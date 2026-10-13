@@ -1,43 +1,63 @@
 # Curie
 
-> A harness that runs the same immutable bundle and the same evals across three targets (skill, local, cluster), so an agent that worked locally does not silently break once deployed. Its CLI's primary user is a coding agent driven by a developer, not a human at a prompt.
+> Open-source, self-hostable platform that turns supported agents into co-workers in team workspaces. Start with Software Factory: delegate a GitHub issue and inspect a reviewed pull request or a clear failure reason. Bring supported existing skills and tools onto the same platform.
 
-The point of the three targets (`skill` in-process, `local` via docker compose, `cluster` on Kubernetes) is running the SAME bundle and the SAME `evals/cases.json` across all of them. A tier-to-tier eval divergence is the harness catching a real environment bug, not the skill's logic being wrong. Writing a `skill.md` is something an agent can already do; guaranteeing it behaves the same deployed as it did locally is the harness's job.
+The CLI can be driven by a coding agent or a developer. Use released installation
+paths for adoption; contributor builds are a separate journey. Read capability
+status before promising a channel, model runtime, memory behavior, or control.
 
 ## Start here
 
-- [QUICKSTART.md](QUICKSTART.md): first agent reply in about a minute, the fastest path in.
-* [docs/agent-install.md](docs/agent-install.md): an unattended release install, verification, and result reporting procedure for a coding agent.
-- [README.md](README.md): what Curie is, how to run it, and the target-by-target CLI walkthroughs.
-- [docs/agents.md](docs/agents.md): the verification contract for an agent driving Curie. The exact commands that prove an outcome, and the rule that a file existing or a string appearing in output is never evidence.
-- [docs/guides/repository-toolchain-in-the-managed-sandbox.md](docs/guides/repository-toolchain-in-the-managed-sandbox.md): the supported recipe for installing a repository's dependencies and running its checks in a managed sandbox. A fail-closed live-registry pip install is a refusal, not a hang: ~368s on unconfigured pip (curie-runner:0.8.7); the image now ships /etc/pip.conf with retries=0.
-- [docs/vision.md](docs/vision.md): the north star, who it is for, and the parity thesis new features are held against.
+- [README.md](README.md): product identity and three developer adoption paths.
+- [docs/software-factory.md](docs/software-factory.md): Software Factory overview.
+- [docs/guides/dark-factory-quickstart.md](docs/guides/dark-factory-quickstart.md): canonical issue-to-PR installation walkthrough.
+- [docs/bring-your-agent.md](docs/bring-your-agent.md): supported compatibility and agent adoption.
+- [examples/sre-bot/README.md](examples/sre-bot/README.md): SRE workflow, authority, and installation.
+- [QUICKSTART.md](QUICKSTART.md): use-case chooser and scripted runner evaluation without Slack.
+- [docs/capabilities.md](docs/capabilities.md): release status, limits, and future work.
+- [docs/README.md](docs/README.md): navigation by developer intent.
+- [docs/agent-install.md](docs/agent-install.md): unattended release install and result reporting.
+- [docs/agents.md](docs/agents.md): verification contract for an agent driving Curie.
+
+## Co-workers and administration
+
+- [docs/co-workers.md](docs/co-workers.md): shared platform and observable co-worker behavior.
+- [docs/administering-co-workers.md](docs/administering-co-workers.md): permissions, approvals, model roles, budgets, memory, audit, and stop controls.
+- [docs/approvals.md](docs/approvals.md): approval route declaration, binding, authority, and resume.
+- [docs/interfaces/memory/INTERFACE.md](docs/interfaces/memory/INTERFACE.md): memory scopes and credentials.
+- [docs/guides/measuring-factory-outcomes.md](docs/guides/measuring-factory-outcomes.md): accepted outcomes, estimates, and human effort.
+- [docs/operations.md](docs/operations.md): deployment, egress, credentials, upgrades, and operational limits.
+- [SECURITY.md](SECURITY.md): security posture and reporting process.
+
+## Build and adopt bundles
+
+- [docs/adopting-a-bundle.md](docs/adopting-a-bundle.md): specific legacy-project conversion.
+- [docs/your-first-slack-agent.md](docs/your-first-slack-agent.md): real workspace connection.
+- [packages/plugin-format/README.md](packages/plugin-format/README.md): validated bundle shape.
+- [examples/text-stats-engine/README.md](examples/text-stats-engine/README.md): tools as in-bundle stdio MCP servers.
+- [examples/weather/](examples/weather/): starter skill.
+- [docs/guides/repository-toolchain-in-the-managed-sandbox.md](docs/guides/repository-toolchain-in-the-managed-sandbox.md): supported repository dependencies and checks.
+- [docs/local-model.md](docs/local-model.md): opt-in local Ollama and sizing.
+- [docs/behavior-packs.md](docs/behavior-packs.md): opt-in interaction behavior.
 
 ## The parity ladder (skill -> local -> cluster)
 
-- [README.md#why-did-my-agent-work-locally-but-break-once-deployed](README.md#why-did-my-agent-work-locally-but-break-once-deployed): the parity thesis, why the same bundle on a heavier substrate is the fix.
-- [README.md#how-do-i-test-an-agent-the-same-way-locally-and-on-kubernetes](README.md#how-do-i-test-an-agent-the-same-way-locally-and-on-kubernetes): running the same `evals/cases.json` at every tier so a divergence is signal.
-- [README.md#which-target-do-i-want](README.md#which-target-do-i-want): the target table, which of skill/local/cluster answers your question.
-- [cli/README.md](cli/README.md): the full `curie` command reference across all three targets.
-- [docs/operations.md](docs/operations.md): the cluster runbook (credential model, Slack connect, zero-Slack message flow).
-- [docs/release-verification.md](docs/release-verification.md): verify a downloaded release asset (checksums, cosign signature, provenance, SBOMs) before running it.
+The runner-only skill target, full local Compose platform, and Kubernetes cluster
+use the same bundle format. Environment checks help catch deployment differences;
+they do not guarantee identical model behavior in production.
 
-## Architecture
+- [README.md#quickstart](README.md#quickstart): local-to-cluster walkthrough.
+- [README.md#which-target-do-i-want](README.md#which-target-do-i-want): target selection.
+- [cli/README.md](cli/README.md): full command/flag reference.
+- [docs/slack-local-runbook.md](docs/slack-local-runbook.md): local Slack test path.
+- [docs/release-verification.md](docs/release-verification.md): release asset verification.
 
-- [ARCHITECTURE.md](ARCHITECTURE.md): the component map, message-flow and deploy-flow sequence diagrams, and the built vs deferred split.
-- [docs/approvals.md](docs/approvals.md): the human-in-the-loop plane, which spans every component and is not derivable from the command tree. How a turn pauses for a human decision, how an approval route is declared in the bundle and bound to a channel per agent, who is authorized to resolve it, and the `[approval resolved]` resume turn a skill must handle.
-- [docs/adr/](docs/adr/): the load-bearing architecture decisions, each with the live-cluster evidence behind it.
-- [AGENTS.md](AGENTS.md): the operative rules for working in this repo (verify commands, dev stack, frozen-contract escalation).
+## Architecture and contribution
 
-## Examples
-
-- [examples/weather/](examples/weather/): the first-party example bundle, a runnable web-search skill that `curie init` scaffolds.
-- [examples/text-stats-engine/README.md](examples/text-stats-engine/README.md): a bundle that ships its own tools as an in-bundle stdio MCP server, a shape a hosted harness cannot do.
-
-## Optional
-
-- [SECURITY.md](SECURITY.md): the security posture and reporting process.
-- [docs/behavior-packs.md](docs/behavior-packs.md): reusable behavior packs for bundles.
-- [docs/onboarding.md](docs/onboarding.md): the end-to-end onboarding walkthrough.
-- [docs/local-model.md](docs/local-model.md): the offline `--local-model` demo (Ollama in a container), model sizing, and gotchas.
-- [docs/slack-local-runbook.md](docs/slack-local-runbook.md): exercising real Slack routing against the local compose stack.
+- [ARCHITECTURE.md](ARCHITECTURE.md): as-built components, flows, and verification status.
+- [docs/interfaces.md](docs/interfaces.md): seam catalog and implementation contracts.
+- [docs/adr/](docs/adr/): historical architecture decisions.
+- [docs/vision.md](docs/vision.md): co-worker platform identity and commitments.
+- [docs/onboarding.md](docs/onboarding.md): contributor onboarding from source.
+- [CONTRIBUTING.md](CONTRIBUTING.md): contributor setup and checks.
+- [AGENTS.md](AGENTS.md): operative repository instructions; docs/agents.md is for operating Curie.
