@@ -28,7 +28,7 @@ from typing import Any
 import anyio
 import pytest
 import yaml
-from channel_protocol.work_item_events import CI_FIRST_FIX_ROUND
+from channel_protocol.work_item_events import CI_FIRST_FIX_ROUND, CI_MAX_ROUNDS
 from curie_api import factory_ci
 from curie_api.workitem_outcomes import CiDetail
 from curie_runner.__main__ import _format_check_data, format_workspace_preamble
@@ -132,7 +132,8 @@ class Session:
     def pre(self, tool: str, tool_input: dict[str, Any] | None = None) -> dict[str, Any]:
         out = self.fire("PreToolUse", tool_name=tool, tool_input=tool_input or {})
         assert out is not None
-        return out["hookSpecificOutput"]
+        decision: dict[str, Any] = out["hookSpecificOutput"]
+        return decision
 
     def review(self, kind: str, reply: str) -> tuple[dict[str, Any], str]:
         """One full reviewer call: the PreToolUse rewrite, then the reply."""
@@ -727,7 +728,7 @@ def test_the_bundle_ci_marker_follows_the_platform_round_bound(
         statuses=[],
         annotations={},
     )
-    for round_ in range(CI_FIRST_FIX_ROUND, factory_ci.CI_MAX_ROUNDS + 1):
+    for round_ in range(CI_FIRST_FIX_ROUND, CI_MAX_ROUNDS + 1):
         text = factory_ci.continuation_text(
             "https://github.com/acme-corp/acme-bot/issues/9",
             "https://github.com/acme-corp/acme-bot/pull/77",
@@ -2336,7 +2337,7 @@ def _refusal_setup(
         assert [preflight_route(e) for e in summary["checks"]] == ["executable"]
         assert _delegated_checks(observed) == []
         return HooksJsonRuntime(s, bundle=bundle), s, port
-    declaration = {} if case == "undeclared_route" else None
+    declaration: dict[str, Any] | None = {} if case == "undeclared_route" else None
     s, port = _service_session(tmp_path, declaration=declaration)
     summary, observed = _preflight(s, BUNDLE, monkeypatch)
     if case == "undeclared_route":
@@ -2762,3 +2763,217 @@ def test_an_oversized_bundle_declaration_stops_the_review(tmp_path: Path) -> Non
     assert s.pre(PUBLISH)["permissionDecision"] == "deny"
     s.load_workflow()
     assert not allowed(s.edit("Write", TEST))
+
+
+# #4435: refuse GitHub metadata before editing or paying for diff review.
+
+
+def _github_gate_session(tmp_path: Path, stage: str) -> Session:
+    s = Session(tmp_path)
+    prompt = _ci_prompt(2) if stage == "ci" else ISSUE
+    assert contract() in context_of(s.fire("UserPromptSubmit", prompt=prompt))
+    if stage == "before_plan":
+        s.load_workflow()
+    elif stage in {"failing_test", "implement"}:
+        s.approve_plan()
+        if stage == "implement":
+            s.report("implement", 1)
+    return s
+
+
+def _assert_github_path_stops_run(s: Session, out: dict[str, Any] | None, path: str) -> None:
+    reason = deny_reason(out)
+    assert reason.startswith("STOP."), reason
+    assert path in reason, reason
+    assert "publish" in reason.lower(), reason
+    assert "Could not complete:" in reason, reason
+
+    diff = s.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    assert diff["permissionDecision"] == "deny", diff
+    assert diff["permissionDecisionReason"] == reason
+    publication = s.pre(PUBLISH)
+    assert publication["permissionDecision"] == "deny", publication
+    assert publication["permissionDecisionReason"] == reason
+    assert all(phase != "review_diff" for phase, _ in s.phases())
+
+    refused = [e for e in s.gate_events() if e["curie_gate"] == "github_path_refused"]
+    assert len(refused) == 1, refused
+    emitted = Path(refused[0]["path"])
+    if not emitted.is_absolute():
+        emitted = s.cwd / emitted
+    assert emitted.resolve().relative_to(s.cwd.resolve()).as_posix() == path
+
+
+@pytest.mark.parametrize("tool", EDIT_TOOLS)
+@pytest.mark.parametrize("directory", [".github", ".GitHub"])
+@pytest.mark.parametrize(
+    "stage", ["before_workflow", "before_plan", "failing_test", "implement", "ci"]
+)
+def test_github_edit_tools_stop_the_run_in_every_stage(
+    tmp_path: Path, tool: str, directory: str, stage: str
+) -> None:
+    s = _github_gate_session(tmp_path, stage)
+    path = f"{directory}/e2e-selection.yaml"
+
+    _assert_github_path_stops_run(s, s.edit(tool, path), path)
+
+
+@pytest.mark.parametrize("tool", EDIT_TOOLS)
+@pytest.mark.parametrize(
+    ("target", "refused_path"),
+    [
+        (".github/e2e-selection.yaml", ".github/e2e-selection.yaml"),
+        ("./.GitHub/e2e-selection.yaml", ".GitHub/e2e-selection.yaml"),
+        ("pkg/../.github/e2e-selection.yaml", ".github/e2e-selection.yaml"),
+        (".github/workflows/../e2e-selection.yaml", ".github/e2e-selection.yaml"),
+        ("../repo/.github/e2e-selection.yaml", ".github/e2e-selection.yaml"),
+    ],
+)
+def test_github_edit_paths_are_normalized_relative_to_the_workspace(
+    tmp_path: Path, tool: str, target: str, refused_path: str
+) -> None:
+    s = _github_gate_session(tmp_path, "implement")
+
+    _assert_github_path_stops_run(s, s.edit_with(tool, edit_input(tool, target)), refused_path)
+
+
+@pytest.mark.parametrize("tool", EDIT_TOOLS)
+@pytest.mark.parametrize(
+    "path",
+    [
+        SOURCE,
+        "pkg/.github/e2e-selection.yaml",
+        "pkg/.GitHub/e2e-selection.yaml",
+        ".github-copy/e2e-selection.yaml",
+        ".github/../pkg/calc.py",
+    ],
+)
+def test_edits_outside_the_root_github_directory_remain_allowed(
+    tmp_path: Path, tool: str, path: str
+) -> None:
+    s = _github_gate_session(tmp_path, "implement")
+
+    assert allowed(s.edit(tool, path))
+
+    _, context = s.review(DIFF, reply(DIFF, "APPROVE"))
+    assert "APPROVED" in context
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
+    assert not [e for e in s.gate_events() if e["curie_gate"] == "github_path_refused"]
+
+
+@pytest.mark.parametrize("directory", [".github", ".GitHub"])
+@pytest.mark.parametrize("change", ["modified", "untracked", "deleted"])
+def test_a_github_change_made_outside_edit_tools_stops_diff_review(
+    tmp_path: Path, directory: str, change: str
+) -> None:
+    s = Session(tmp_path)
+    path = f"{directory}/e2e-selection.yaml"
+    target = s.cwd / path
+    target.parent.mkdir()
+    if change != "untracked":
+        target.write_text("paths: []\n")
+        _git(s.cwd, "add", path)
+        _git(s.cwd, "commit", "-q", "-m", "metadata fixture")
+    assert contract() in context_of(s.fire("UserPromptSubmit", prompt=ISSUE))
+    s.approve_plan()
+    s.report("implement", 1)
+    if change == "deleted":
+        target.unlink()
+    else:
+        target.write_text("paths: [pkg/calc.py]\n")
+
+    out = s.fire(
+        "PreToolUse",
+        tool_name="Agent",
+        tool_input={"subagent_type": DIFF, "description": "d", "prompt": "p"},
+    )
+
+    _assert_github_path_stops_run(s, out, path)
+
+
+@pytest.mark.parametrize("directory", [".github", ".GitHub"])
+@pytest.mark.parametrize("direction", ["into_github", "out_of_github"])
+def test_staged_renames_check_the_source_and_destination_for_github_paths(
+    tmp_path: Path, directory: str, direction: str
+) -> None:
+    s = Session(tmp_path)
+    github_path = f"{directory}/e2e-selection.yaml"
+    ordinary_path = "pkg/e2e-selection.yaml"
+    source, destination = (
+        (ordinary_path, github_path) if direction == "into_github" else (github_path, ordinary_path)
+    )
+    initial = s.cwd / source
+    initial.parent.mkdir(exist_ok=True)
+    initial.write_text("paths: []\n")
+    _git(s.cwd, "add", source)
+    _git(s.cwd, "commit", "-q", "-m", "rename fixture")
+    assert contract() in context_of(s.fire("UserPromptSubmit", prompt=ISSUE))
+    s.approve_plan()
+    s.report("implement", 1)
+    (s.cwd / destination).parent.mkdir(exist_ok=True)
+    _git(s.cwd, "mv", source, destination)
+
+    out = s.fire(
+        "PreToolUse",
+        tool_name="Agent",
+        tool_input={"subagent_type": DIFF, "description": "d", "prompt": "p"},
+    )
+
+    _assert_github_path_stops_run(s, out, github_path)
+
+
+@pytest.mark.parametrize("path", [SOURCE, "pkg/.github/e2e-selection.yaml"])
+def test_a_change_outside_root_github_still_reaches_the_diff_reviewer(
+    tmp_path: Path, path: str
+) -> None:
+    s = _github_gate_session(tmp_path, "implement")
+    target = s.cwd / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("# changed outside the edit tools\n")
+
+    _, context = s.review(DIFF, reply(DIFF, "APPROVE"))
+
+    assert "APPROVED" in context
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
+    assert not [e for e in s.gate_events() if e["curie_gate"] == "github_path_refused"]
+
+
+@pytest.mark.parametrize("git_outcome", ["failure", "timeout"])
+def test_an_unreadable_git_status_does_not_stop_diff_review(
+    tmp_path: Path, git_outcome: str
+) -> None:
+    s = _github_gate_session(tmp_path, "implement")
+    target = s.cwd / ".github" / "e2e-selection.yaml"
+    target.parent.mkdir()
+    target.write_text("paths: []\n")
+    real_git = shutil.which("git")
+    assert real_git is not None
+    binaries = tmp_path / "git-bin"
+    binaries.mkdir()
+    invocation = tmp_path / "git-status-call"
+    replacement = binaries / "git"
+    status_outcome = "sys.exit(1)" if git_outcome == "failure" else "time.sleep(30)"
+    replacement.write_text(
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        "if 'status' in sys.argv:\n"
+        f"    Path({str(invocation)!r}).write_text(json.dumps(sys.argv))\n"
+        f"    {status_outcome}\n"
+        f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n"
+    )
+    replacement.chmod(0o755)
+    s.env["PATH"] = f"{binaries}{os.pathsep}{s.env['PATH']}"
+
+    _, context = s.review(DIFF, reply(DIFF, "APPROVE"))
+
+    assert "APPROVED" in context
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
+    assert not [e for e in s.gate_events() if e["curie_gate"] == "github_path_refused"]
+    argv = json.loads(invocation.read_text())
+    assert "--porcelain=v1" in argv
+    assert "-z" in argv
+    assert "--untracked-files=all" in argv

@@ -22,10 +22,14 @@ the same contract binds the implementer and the plan reviewer. Run
 - Every row of the verification table meets the verification contract. The
   repository's own instructions still apply.
 - Every hunk serves a criterion; no stray files, debug output, commented-out
-  code, secrets, generated caches, or unrequested `.github/` edits.
+  code, secrets, or generated caches.
 - Existing tests are intact and were not weakened.
 - The code is correct: edge cases, error handling, and consistency with the
   surrounding style.
+
+Any changed path under `.github/` is a blocking finding, requested or not.
+This applies to any first path component that casefolds to `.github`,
+including `.GitHub/`. The factory cannot publish these changes.
 
 Reply in exactly this shape and nothing else. The first line is always
 `REVIEWER: diff-reviewer`; it tells the caller the review really ran here.
