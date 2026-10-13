@@ -21,9 +21,9 @@ from sqlalchemy import select
 
 from curie_api.crud import publication_queries as crud_publication_queries
 from curie_api.forges.errors import ForgeError, NotFound, Unauthorized, Unavailable
-from curie_api.forges.hosts import code_host_for, repository_ref, resolve_stored
+from curie_api.forges.hosts import code_host_for, forge_code_host, resolve_stored
 from curie_api.forges.ports import CodeHost
-from curie_api.forges.types import PullRequest, PullRequestRef, RepositoryRef
+from curie_api.forges.types import GITHUB, PullRequest, PullRequestRef, RepositoryRef
 from curie_api.publication_pulls import (
     PullRequestContract,
     PullRequestRefused,
@@ -43,6 +43,7 @@ from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import SessionDep
 from ..models import ExecutionRequest, Publication, ThreadPublicationLineage, WorkItem
+from ..repository_access import lineage_repository
 
 # The worker's pull request, branch and commit calls (ADR 0197, "Two ports" item 6).
 router = APIRouter(
@@ -94,16 +95,18 @@ async def _stored(
     return publication, publication.lineage
 
 
-def _repository(publication: Publication, lineage: ThreadPublicationLineage) -> RepositoryRef:
-    return repository_ref(
-        get_settings(),
-        path=publication.repo_full_name,
-        project_id=lineage.repository_project_id,
-    )
+async def _code_host(
+    request: Request, session: SessionDep, lineage: ThreadPublicationLineage
+) -> tuple[CodeHost, RepositoryRef]:
+    """The lineage's repository (`lineage_repository`) and the code host it
+    names: the install's GitHub for a GitHub repository, else its forge entry."""
 
-
-def _code_host(request: Request) -> CodeHost:
-    return code_host_for(get_settings(), request.app.state.http_client)
+    settings = get_settings()
+    client = request.app.state.http_client
+    repository = await lineage_repository(session, settings, lineage)
+    if repository.kind == GITHUB:
+        return code_host_for(settings, client), repository
+    return forge_code_host(settings, client, repository), repository
 
 
 def _out(pull: PullRequest) -> PublicationPullRequestOut:
@@ -131,10 +134,9 @@ async def read_publication_pull_request(
     publication, lineage = await _stored(session, publication_id)
     if lineage.pr_number != pr_number:
         _refuse("lineage_stale", "the stored pull request number differs from the lineage")
+    code_host, repository = await _code_host(request, session, lineage)
     try:
-        pull = await _code_host(request).read_pull_request(
-            PullRequestRef(_repository(publication, lineage), str(pr_number))
-        )
+        pull = await code_host.read_pull_request(PullRequestRef(repository, str(pr_number)))
     except ForgeError as exc:
         raise _forge_failure(exc) from None
     return _out(pull)
@@ -150,11 +152,10 @@ async def read_publication_branch_head(
     """The deterministic lineage branch's head, creating nothing."""
 
     response.headers["Cache-Control"] = "no-store"
-    publication, lineage = await _stored(session, publication_id)
+    _publication, lineage = await _stored(session, publication_id)
+    code_host, repository = await _code_host(request, session, lineage)
     try:
-        head = await _code_host(request).branch_head(
-            _repository(publication, lineage), lineage.branch
-        )
+        head = await code_host.branch_head(repository, lineage.branch)
     except ForgeError as exc:
         raise _forge_failure(exc) from None
     return PublicationBranchHeadOut(head_sha=head)
@@ -176,10 +177,9 @@ async def verify_publication_revision(
         publication.expected_prior_head
     ):
         _refuse("revision_mismatch", "the verification names another publication revision")
+    code_host, repository = await _code_host(request, session, lineage)
     try:
-        commit = await _code_host(request).read_commit(
-            _repository(publication, lineage), data.commit_sha
-        )
+        commit = await code_host.read_commit(repository, data.commit_sha)
     except ForgeError as exc:
         raise _forge_failure(exc) from None
     refusal = revision_refusal(
@@ -237,8 +237,7 @@ async def recover_publication_pull_request(
         _refuse("not_approved", "the publication is not approved for a pull request")
     if lineage.status != "open":
         _refuse("lineage_terminal", "the pull request for this thread is merged or closed")
-    code_host = _code_host(request)
-    repository = _repository(publication, lineage)
+    code_host, repository = await _code_host(request, session, lineage)
     try:
         contract = PullRequestContract(
             branch=lineage.branch,
@@ -296,8 +295,7 @@ async def update_publication_pull_request_metadata(
     assert lineage.pr_number is not None
     assert publication.observed_title_sha256 is not None
     assert publication.observed_body_sha256 is not None
-    code_host = _code_host(request)
-    repository = _repository(publication, lineage)
+    code_host, repository = await _code_host(request, session, lineage)
     try:
         resolved = await resolve_stored(code_host, repository)
         contract = PullRequestContract(

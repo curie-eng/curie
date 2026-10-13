@@ -7917,7 +7917,6 @@
             "title": "Reply Placeholder"
           },
           "repo_full_name": {
-            "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?$",
             "title": "Repo Full Name",
             "type": "string"
           },
@@ -12569,6 +12568,38 @@
         "title": "WorkspaceCredentialRequest",
         "type": "object"
       },
+      "WorkspaceSelectionIn": {
+        "description": "The worker's selection: the thread and the repository path it names.\n\nThe worker never names a code host kind. The route takes it from the\nthread's factory WorkItem (GitHub when there is none) and validates the\npath under that kind's rule as a `WorkspaceSelectionRequest`.",
+        "properties": {
+          "author": {
+            "minLength": 1,
+            "title": "Author",
+            "type": "string"
+          },
+          "conversation_id": {
+            "minLength": 1,
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "repo_full_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repo Full Name"
+          }
+        },
+        "required": [
+          "conversation_id",
+          "author"
+        ],
+        "title": "WorkspaceSelectionIn",
+        "type": "object"
+      },
       "WorkspaceSelectionOut": {
         "properties": {
           "repo_full_name": {
@@ -12598,48 +12629,6 @@
           "repo_full_name"
         ],
         "title": "WorkspaceSelectionOut",
-        "type": "object"
-      },
-      "WorkspaceSelectionRequest": {
-        "properties": {
-          "author": {
-            "minLength": 1,
-            "title": "Author",
-            "type": "string"
-          },
-          "conversation_id": {
-            "minLength": 1,
-            "title": "Conversation Id",
-            "type": "string"
-          },
-          "repo_full_name": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Repo Full Name"
-          },
-          "repository_kind": {
-            "default": "github",
-            "enum": [
-              "github",
-              "gitlab",
-              "bitbucket_cloud",
-              "bitbucket_dc"
-            ],
-            "title": "Repository Kind",
-            "type": "string"
-          }
-        },
-        "required": [
-          "conversation_id",
-          "author"
-        ],
-        "title": "WorkspaceSelectionRequest",
         "type": "object"
       }
     }
@@ -25900,7 +25889,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/WorkspaceSelectionRequest"
+                "$ref": "#/components/schemas/WorkspaceSelectionIn"
               }
             }
           },

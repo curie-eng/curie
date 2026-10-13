@@ -44,7 +44,7 @@ from .threadkeys import (
     route_thread_key,
     route_thread_key_matches,
 )
-from .workspace_policy import repository_is_allowed
+from .workspace_policy import repository_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -204,9 +204,7 @@ async def _refuse(
 
 
 def _facts_conversation(facts: Any, adapter: str | None) -> str:
-    return route_thread_key(
-        facts.kind, adapter, facts.address, facts.reply_conversation_id
-    )
+    return route_thread_key(facts.kind, adapter, facts.address, facts.reply_conversation_id)
 
 
 def _snapshot_values(facts: Any) -> dict[str, str | None]:
@@ -260,9 +258,7 @@ async def _write_snapshot(
     )
     row = await reload_request(session, request_id)
     if not _snapshot_matches(row, facts):
-        return await _refuse(
-            session, "identity_mismatch", request_id=request_id
-        )
+        return await _refuse(session, "identity_mismatch", request_id=request_id)
     return row
 
 
@@ -272,13 +268,9 @@ async def _replay_existing(
     work_item = await lock_work_item(session, request.work_item_id)
     if work_item is None:
         return await _refuse(session, "not_found", request_id=request.id)
-    locked = await lock_request(
-        session, work_item_id=work_item.id, request_id=request.id
-    )
+    locked = await lock_request(session, work_item_id=work_item.id, request_id=request.id)
     if locked is None:
-        return await _refuse(
-            session, "not_found", work_item_id=work_item.id, request_id=request.id
-        )
+        return await _refuse(session, "not_found", work_item_id=work_item.id, request_id=request.id)
     if not _work_item_matches(work_item, facts, adapter):
         return await _refuse(
             session,
@@ -301,9 +293,7 @@ async def _replay_existing(
     return await outcome(session, work_item, locked, replayed=True)
 
 
-async def _admission_refusal(
-    session: AsyncSession, facts: Any
-) -> DispatchConflict | AgentChannel:
+async def _admission_refusal(session: AsyncSession, facts: Any) -> DispatchConflict | AgentChannel:
     """The binding that authorizes this admission, or the refusal.
 
     Every caller below reuses THIS binding for the rest of its own
@@ -332,9 +322,7 @@ async def _admission_refusal(
         binding = None
     if binding is None or binding.agent_id != facts.agent_id:
         return await _refuse(session, "binding_missing")
-    if not repository_is_allowed(
-        facts.repository.path, get_settings().github_repo_allowlist
-    ):
+    if not repository_allowed(get_settings(), facts.repository):
         return await _refuse(session, "repository_not_allowed")
     objective = facts.objective
     requester = facts.requester
@@ -377,23 +365,21 @@ async def admit_revision(
     if existing is not None:
         return await _replay_existing(session, existing, facts, resolved.adapter)
     work_item = await session.scalar(
-        select(WorkItem).where(*lifecycle.for_tracker_issue(facts.issue))
+        select(WorkItem)
+        .where(*lifecycle.for_tracker_issue(facts.issue))
         .with_for_update()
         .execution_options(populate_existing=True)
     )
     if work_item is None:
         return await _refuse(session, "not_found")
     if not _work_item_matches(work_item, facts, resolved.adapter):
-        return await _refuse(
-            session, "identity_mismatch", work_item_id=work_item.id
-        )
+        return await _refuse(session, "identity_mismatch", work_item_id=work_item.id)
     now = await database_now(session)
     requested = await lifecycle.create_revision_request(
         session,
         work_item_id=work_item.id,
         request_id=facts.request_id,
-        wait_deadline=now
-        + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
+        wait_deadline=now + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
         expected_work_item_version=work_item.version,
         snapshot=_snapshot_values(facts),
     )
@@ -432,16 +418,13 @@ async def readmit(
     if work_item is None:
         return await _admit_new(session, facts, resolved.adapter)
     if not _work_item_matches(work_item, facts, resolved.adapter):
-        return await _refuse(
-            session, "identity_mismatch", work_item_id=work_item.id
-        )
+        return await _refuse(session, "identity_mismatch", work_item_id=work_item.id)
     now = await database_now(session)
     readmitted = await lifecycle.readmit(
         session,
         work_item_id=work_item.id,
         request_id=facts.request_id,
-        wait_deadline=now
-        + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
+        wait_deadline=now + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
         objective=facts.objective,
         requester=facts.requester,
         base=getattr(facts, "base", None),
@@ -477,9 +460,7 @@ async def _admit_new(
     if isinstance(created, WorkItemConflict):
         return created
     now = await database_now(session)
-    wait_deadline = now + timedelta(
-        seconds=get_settings().work_item_wait_budget_seconds
-    )
+    wait_deadline = now + timedelta(seconds=get_settings().work_item_wait_budget_seconds)
     requested = await lifecycle.create_execution_request(
         session,
         work_item_id=created.work_item.id,
@@ -490,9 +471,7 @@ async def _admit_new(
     if isinstance(requested, WorkItemConflict):
         if requested.code == "identity_mismatch":
             existing = await session.scalar(
-                select(ExecutionRequest).where(
-                    ExecutionRequest.id == facts.request_id
-                )
+                select(ExecutionRequest).where(ExecutionRequest.id == facts.request_id)
             )
             if existing is not None:
                 return await _replay_existing(session, existing, facts, adapter)
@@ -502,9 +481,7 @@ async def _admit_new(
     if isinstance(written, DispatchConflict):
         return written
     work_item = await reload_work_item(session, created.work_item.id)
-    return await outcome(
-        session, work_item, written, replayed=requested.replayed
-    )
+    return await outcome(session, work_item, written, replayed=requested.replayed)
 
 
 async def claim_due(
@@ -522,8 +499,7 @@ async def claim_due(
             ),
             or_(
                 ExecutionRequest.dispatch_lease_expires_at.is_(None),
-                ExecutionRequest.dispatch_lease_expires_at
-                <= func.clock_timestamp(),
+                ExecutionRequest.dispatch_lease_expires_at <= func.clock_timestamp(),
             ),
         )
         .order_by(ExecutionRequest.dispatch_not_before)
@@ -537,8 +513,7 @@ async def claim_due(
             .values(
                 dispatch_owner=owner,
                 dispatch_epoch=ExecutionRequest.dispatch_epoch + 1,
-                dispatch_lease_expires_at=func.clock_timestamp()
-                + timedelta(seconds=lease_s),
+                dispatch_lease_expires_at=func.clock_timestamp() + timedelta(seconds=lease_s),
                 updated_at=func.clock_timestamp(),
             )
             .returning(
@@ -589,21 +564,15 @@ def _generation_refusal(generation: int, dispatch_generation: int) -> RefusalCod
 async def _lock_pair(
     session: AsyncSession, request_id: uuid.UUID
 ) -> tuple[WorkItem, ExecutionRequest] | DispatchConflict:
-    found = await session.scalar(
-        select(ExecutionRequest).where(ExecutionRequest.id == request_id)
-    )
+    found = await session.scalar(select(ExecutionRequest).where(ExecutionRequest.id == request_id))
     if found is None:
         return await _refuse(session, "not_found", request_id=request_id)
     work_item = await lock_work_item(session, found.work_item_id)
     if work_item is None:
         return await _refuse(session, "not_found", request_id=request_id)
-    request = await lock_request(
-        session, work_item_id=work_item.id, request_id=request_id
-    )
+    request = await lock_request(session, work_item_id=work_item.id, request_id=request_id)
     if request is None:
-        return await _refuse(
-            session, "not_found", work_item_id=work_item.id, request_id=request_id
-        )
+        return await _refuse(session, "not_found", work_item_id=work_item.id, request_id=request_id)
     return work_item, request
 
 
@@ -777,9 +746,7 @@ async def defer(
         or request.acquire_expires_at is None
         or request.acquire_expires_at <= now
     ):
-        return await _refuse(
-            session, "not_dispatchable", request_id=request.id
-        )
+        return await _refuse(session, "not_dispatchable", request_id=request.id)
     settings = get_settings()
     values: dict[str, Any] = {}
     if capacity:
@@ -791,8 +758,7 @@ async def defer(
         delay = _backoff_seconds(settings, request.start_deferrals)
         values["start_deferrals"] = ExecutionRequest.start_deferrals + 1
     fails_start = (
-        counts_as_start
-        and request.start_deferrals + 1 >= settings.work_item_start_deferral_limit
+        counts_as_start and request.start_deferrals + 1 >= settings.work_item_start_deferral_limit
     )
     if fails_start:
         # #4170: the sandbox never started within the limit, so the request
@@ -962,9 +928,7 @@ async def heartbeat(
         request.runtime_heartbeat_expires_at is not None
         and now >= request.runtime_heartbeat_expires_at
     )
-    past_deadline = (
-        request.execution_deadline is not None and now >= request.execution_deadline
-    )
+    past_deadline = request.execution_deadline is not None and now >= request.execution_deadline
     # The matching epoch still owns a running request, so a late heartbeat
     # can renew its lease before the execution deadline.
     if late and (request.status != "running" or past_deadline):
@@ -990,9 +954,7 @@ async def heartbeat(
             )
         )
         request = await reload_request(session, request.id)
-    work_item = await session.scalar(
-        select(WorkItem).where(WorkItem.id == request.work_item_id)
-    )
+    work_item = await session.scalar(select(WorkItem).where(WorkItem.id == request.work_item_id))
     cancelled = work_item is not None and work_item.cancelled_at is not None
     result = HeartbeatResult(
         status=request.status,
@@ -1207,9 +1169,7 @@ async def declare_owner_lost(
     return result
 
 
-def _map_finish_conflict(
-    result: WorkItemConflict, request: ExecutionRequest | None
-) -> RefusalCode:
+def _map_finish_conflict(result: WorkItemConflict, request: ExecutionRequest | None) -> RefusalCode:
     if result.code == "not_found":
         return "not_found"
     if result.code == "work_item_cancelled":
@@ -1313,9 +1273,7 @@ async def claim_termination(
     request = await lock_request_by_id(session, request_id)
     if request is None:
         return await _refuse(session, "not_found", request_id=request_id)
-    settled_teardown = (
-        request.status == "cancelled" and request.teardown_unconfirmed_at is not None
-    )
+    settled_teardown = request.status == "cancelled" and request.teardown_unconfirmed_at is not None
     # A settled teardown is re-checked against active siblings in the
     # guarded update below.
     if not settled_teardown and request.status != "cancellation_requested":
@@ -1330,11 +1288,7 @@ async def claim_termination(
         request.runtime_heartbeat_expires_at is not None
         and request.runtime_heartbeat_expires_at > now
     )
-    allowed = (
-        request.runtime_owner is None
-        or not heartbeat_live
-        or request.runtime_owner == owner
-    )
+    allowed = request.runtime_owner is None or not heartbeat_live or request.runtime_owner == owner
     if not allowed:
         return await _refuse(session, "duplicate", request_id=request.id)
     settings = get_settings()
@@ -1441,12 +1395,9 @@ async def running_for_conversation(
     if old is not None:
         # This endpoint names no agent, so the owner of the old-key row must
         # prove the old key is its route's (ADR-0168 decision 4).
-        candidate = await session.scalar(
-            select(WorkItem).where(WorkItem.conversation_id == old)
-        )
+        candidate = await session.scalar(select(WorkItem).where(WorkItem.conversation_id == old))
         if candidate is not None and (
-            await pre_identity_thread_key_for(session, candidate.agent_id, conversation_id)
-            == old
+            await pre_identity_thread_key_for(session, candidate.agent_id, conversation_id) == old
         ):
             work_item = candidate
     if work_item is None:
@@ -1467,28 +1418,21 @@ async def running_for_conversation(
     return "running", running
 
 
-async def get_request(
-    session: AsyncSession, request_id: uuid.UUID
-) -> ExecutionRequest | None:
+async def get_request(session: AsyncSession, request_id: uuid.UUID) -> ExecutionRequest | None:
     return cast(
         ExecutionRequest | None,
-        await session.scalar(
-            select(ExecutionRequest).where(ExecutionRequest.id == request_id)
-        ),
+        await session.scalar(select(ExecutionRequest).where(ExecutionRequest.id == request_id)),
     )
 
 
 async def redispatch_lapsed_acquisitions(session: AsyncSession) -> int:
     settings = get_settings()
-    not_before = func.clock_timestamp() + timedelta(
-        seconds=settings.work_item_backoff_base_seconds
-    )
+    not_before = func.clock_timestamp() + timedelta(seconds=settings.work_item_backoff_base_seconds)
     changed = await session.scalars(
         update(ExecutionRequest)
         .where(
             ExecutionRequest.status == "waiting",
-            ExecutionRequest.acquired_generation
-            == ExecutionRequest.dispatch_generation,
+            ExecutionRequest.acquired_generation == ExecutionRequest.dispatch_generation,
             ExecutionRequest.acquire_expires_at.is_not(None),
             ExecutionRequest.acquire_expires_at <= func.clock_timestamp(),
         )
@@ -1523,8 +1467,7 @@ async def claim_terminate_publishes(
                         ExecutionRequest.terminal_cause == "issue_cancelled",
                         ExecutionRequest.runtime_owner.is_(None),
                         ExecutionRequest.runtime_heartbeat_expires_at.is_(None),
-                        ExecutionRequest.runtime_heartbeat_expires_at
-                        <= func.clock_timestamp(),
+                        ExecutionRequest.runtime_heartbeat_expires_at <= func.clock_timestamp(),
                     ),
                 ),
                 # A forced settle still owes the sandbox a teardown.
@@ -1571,9 +1514,7 @@ async def claim_terminate_publishes(
         work_items = {
             found.id: found
             for found in await session.scalars(
-                select(WorkItem).where(
-                    WorkItem.id.in_({row.work_item_id for row in rows})
-                )
+                select(WorkItem).where(WorkItem.id.in_({row.work_item_id for row in rows}))
             )
         }
     published: list[TerminatePublish] = []
@@ -1610,9 +1551,7 @@ async def load_execute_wake(
     )
     if request is None:
         return None
-    work_item = await session.scalar(
-        select(WorkItem).where(WorkItem.id == request.work_item_id)
-    )
+    work_item = await session.scalar(select(WorkItem).where(WorkItem.id == request.work_item_id))
     if work_item is None:
         return None
     binding = None
@@ -1634,9 +1573,7 @@ async def load_execute_wake(
                 agent_id=work_item.agent_id,
             )
         except crud_channels.AmbiguousRoute:
-            logger.warning(
-                "execute wake for request %s names an ambiguous route", request.id
-            )
+            logger.warning("execute wake for request %s names an ambiguous route", request.id)
             binding = None
     return request, work_item, binding
 

@@ -23,15 +23,16 @@ from ..models import (
     ThreadWorkspace,
     WorkItem,
 )
-from ..publication_authority import VerifiedPublicationIdentity
+from ..publication_authority import CodeHostPublicationIdentity, PublicationIdentity
+from ..repository_access import thread_repository
 from ..threadkeys import route_thread_key_matches, thread_key_forms
-from ..workspace_policy import repository_is_allowed
+from ..workspace_policy import repository_allowed
 from .deployments import get_deployment
 from .errors import PublicationLineageConflict
 from .workspaces import get_thread_workspace
 
 # The lineage columns that hold its verified code host identity, in the order
-# `VerifiedPublicationIdentity.lineage_values` returns them.
+# a `PublicationIdentity`'s `lineage_values` returns them.
 _IDENTITY_COLUMNS = (
     "code_host_kind",
     "code_host_host",
@@ -85,7 +86,9 @@ async def _bind_running_work_item_lineage(
             WorkItem.code_host_kind == lineage.code_host_kind,
             WorkItem.code_host_host == lineage.code_host_host,
             WorkItem.repository_project_id == lineage.repository_project_id,
-            WorkItem.code_host_installation_id == lineage.code_host_installation_id,
+            WorkItem.code_host_installation_id.is_not_distinct_from(
+                lineage.code_host_installation_id
+            ),
         )
     )
     await session.execute(
@@ -144,7 +147,15 @@ async def get_thread_publication_lineage(
         raise ValueError("conversation has no selected repository workspace")
     if selected.repo_full_name.casefold() != repo_full_name.casefold():
         raise ValueError("publication repository differs from the thread workspace")
-    if not repository_is_allowed(repo_full_name, get_settings().github_repo_allowlist):
+    settings = get_settings()
+    repository = await thread_repository(
+        session,
+        settings,
+        agent_id=deployment.agent_id,
+        conversation_id=conversation_id,
+        repo_full_name=selected.repo_full_name,
+    )
+    if not repository_allowed(settings, repository):
         raise ValueError("thread workspace repository is no longer allowed")
     return await select_thread_publication_lineage(
         session,
@@ -351,7 +362,7 @@ def publication_lineage_outcome_conflict(
     lineage: ThreadPublicationLineage,
     data: PublicationLineageAdvance,
     *,
-    github_html_base: str,
+    pull_request_url: str,
 ) -> PublicationLineageConflict | None:
     """Preconditions one revision outcome must meet before it may claim a lineage.
 
@@ -359,6 +370,8 @@ def publication_lineage_outcome_conflict(
     the advancing writer can repeat the same verdict under its row locks. The
     order is load bearing and carried over unchanged. Which check fires first
     decides which conflict code the caller sees, and the worker branches on it.
+    ``pull_request_url`` is the canonical link of the outcome's pull request
+    (`outcome_pull_request_url`).
     """
 
     if lineage.status != "open":
@@ -375,8 +388,7 @@ def publication_lineage_outcome_conflict(
     # GitHub's own spelling of the repository and preserves it, so a repository
     # whose GitHub casing differs from `repo_full_name` publishes fine and must
     # not then take a stable refusal here.
-    canonical = f"{github_html_base}/{lineage.repo_full_name}/pull/{data.pr_number}"
-    if data.pr_url.casefold() != canonical.casefold():
+    if data.pr_url.casefold() != pull_request_url.casefold():
         return PublicationLineageConflict(
             "publication.lineage_stale",
             "pull request identity does not match the publication repository",
@@ -416,13 +428,32 @@ def publication_lineage_outcome_conflict(
     return None
 
 
+def outcome_pull_request_url(
+    lineage: ThreadPublicationLineage,
+    data: PublicationLineageAdvance,
+    *,
+    github_html_base: str,
+    identity: PublicationIdentity | None,
+) -> str:
+    """The canonical link of an outcome's pull request.
+
+    A code host verified through its port (`CodeHostPublicationIdentity`)
+    names its pull request itself; a GitHub lineage's is under the install's
+    HTML base.
+    """
+
+    if isinstance(identity, CodeHostPublicationIdentity):
+        return identity.pr_url
+    return f"{github_html_base}/{lineage.repo_full_name}/pull/{data.pr_number}"
+
+
 async def advance_publication_lineage(
     session: AsyncSession,
     publication_id: uuid.UUID,
     data: PublicationLineageAdvance,
     *,
     github_html_base: str,
-    identity: VerifiedPublicationIdentity | None = None,
+    identity: PublicationIdentity | None = None,
 ) -> ThreadPublicationLineage:
     """Atomically advance one approved revision and its exact lineage head."""
 
@@ -458,7 +489,12 @@ async def advance_publication_lineage(
             "publication thread pull request lineage is absent",
         )
     conflict = publication_lineage_outcome_conflict(
-        publication, lineage, data, github_html_base=github_html_base
+        publication,
+        lineage,
+        data,
+        pull_request_url=outcome_pull_request_url(
+            lineage, data, github_html_base=github_html_base, identity=identity
+        ),
     )
     if conflict is not None:
         raise conflict
@@ -596,10 +632,18 @@ async def require_current_lineage_workspace(
         with_for_update=True,
         populate_existing=True,
     )
+    settings = get_settings()
+    repository = lineage.repository or await thread_repository(
+        session,
+        settings,
+        agent_id=lineage.agent_id,
+        conversation_id=lineage.conversation_id,
+        repo_full_name=lineage.repo_full_name,
+    )
     if (
         workspace is None
         or workspace.repo_full_name.casefold() != lineage.repo_full_name.casefold()
-        or not repository_is_allowed(lineage.repo_full_name, get_settings().github_repo_allowlist)
+        or not repository_allowed(settings, repository)
         or deployment is None
         or deployment.agent_id != lineage.agent_id
         or deployment.status != "active"

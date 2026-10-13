@@ -8815,27 +8815,28 @@ export interface components {
             /** Conversation Id */
             conversation_id: string;
         };
-        /** WorkspaceSelectionOut */
-        WorkspaceSelectionOut: {
-            /** Repo Full Name */
-            repo_full_name: string | null;
-            /** Revision */
-            revision?: string | null;
-        };
-        /** WorkspaceSelectionRequest */
-        WorkspaceSelectionRequest: {
+        /**
+         * WorkspaceSelectionIn
+         * @description The worker's selection: the thread and the repository path it names.
+         *
+         *     The worker never names a code host kind. The route takes it from the
+         *     thread's factory WorkItem (GitHub when there is none) and validates the
+         *     path under that kind's rule as a `WorkspaceSelectionRequest`.
+         */
+        WorkspaceSelectionIn: {
             /** Author */
             author: string;
             /** Conversation Id */
             conversation_id: string;
             /** Repo Full Name */
             repo_full_name?: string | null;
-            /**
-             * Repository Kind
-             * @default github
-             * @enum {string}
-             */
-            repository_kind?: "github" | "gitlab" | "bitbucket_cloud" | "bitbucket_dc";
+        };
+        /** WorkspaceSelectionOut */
+        WorkspaceSelectionOut: {
+            /** Repo Full Name */
+            repo_full_name: string | null;
+            /** Revision */
+            revision?: string | null;
         };
     };
     responses: never;
@@ -15661,7 +15662,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["WorkspaceSelectionRequest"];
+                "application/json": components["schemas"]["WorkspaceSelectionIn"];
             };
         };
         responses: {

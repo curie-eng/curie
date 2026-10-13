@@ -57,6 +57,7 @@ from .forges.surfaces import agent_binding, binding_location, bound_labels
 from .forges.trackers import (
     binding_for_scope,
     issue_link,
+    mention_comment_id,
     mention_objective,
     reply_route,
     tracker_for_binding,
@@ -137,7 +138,7 @@ async def poll_trackers(
             await connection.commit()
 
 
-def _take(due: dict[str, float], key: str, clock: float, interval: float) -> bool:
+def take_due(due: dict[str, float], key: str, clock: float, interval: float) -> bool:
     """Whether ``key`` is due at ``clock``; if so, schedule it ``interval`` later."""
 
     if interval <= 0 or clock < due.get(key, clock):
@@ -159,7 +160,7 @@ async def _poll_locked(
     for tracker in config.trackers:
         if tracker.kind == GITHUB:
             continue
-        polling = _take(due, f"poll:{tracker.name}", clock, tracker.poll_interval_s)
+        polling = take_due(due, f"poll:{tracker.name}", clock, tracker.poll_interval_s)
         if polling:
             await _cancel_orphans(sessionmaker, registry, tracker)
         for binding in config.bindings:
@@ -172,7 +173,7 @@ async def _poll_locked(
             sweeps = {
                 label
                 for label in labels
-                if _take(
+                if take_due(
                     due,
                     f"sweep:{tracker.name}:{binding.name}:{label}",
                     clock,
@@ -587,7 +588,9 @@ async def _mention(
         issue=issue,
         repository=repository,
         code_host_installation_id=existing.code_host_installation_id,
-        objective=mention_objective(link, issue.kind, notice.event_id),
+        objective=mention_objective(
+            link, issue.kind, mention_comment_id(issue.kind, notice.event_id)
+        ),
         requester=f"{tracker.kind}:{notice.actor.id}:{notice.actor.login}",
         request_id=notice_request_id(notice),
     )

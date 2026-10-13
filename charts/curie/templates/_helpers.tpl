@@ -2556,12 +2556,21 @@ true
 {{- fail (printf "%s credential appId %s differs from api.githubAppId %s; the factory and git-flow must use one GitHub App" $where (include "curie.factory.str" $own) $appId) -}}
 {{- end -}}
 {{- end -}}
+{{- /* factory.enabled needs a tracker and a code host of any installed kind (#4399).
+A GitHub entry in either list keeps GitHub's own pairing: a github tracker and a
+github code host together. */ -}}
 {{- if get $factory "enabled" -}}
+{{- $anyGithub := false -}}
+{{- range concat (get $factory "trackers" | default list) (get $factory "codeHosts" | default list) }}{{ if eq (get . "kind" | default "") "github" }}{{ $anyGithub = true }}{{ end }}{{ end -}}
 {{- range $section, $key := dict "tracker" "trackers" "code host" "codeHosts" -}}
+{{- $entries := get $factory $key | default list -}}
 {{- $github := false -}}
-{{- range (get $factory $key | default list) }}{{ if eq (get . "kind" | default "") "github" }}{{ $github = true }}{{ end }}{{ end -}}
-{{- if not $github -}}
-{{- fail (printf "factory.enabled needs a github %s in factory.%s; run `curie cluster factory` to write one" $section $key) -}}
+{{- range $entries }}{{ if eq (get . "kind" | default "") "github" }}{{ $github = true }}{{ end }}{{ end -}}
+{{- if not $entries -}}
+{{- fail (printf "factory.enabled needs a %s in factory.%s; run `curie cluster factory` to write one" $section $key) -}}
+{{- end -}}
+{{- if and $anyGithub (not $github) -}}
+{{- fail (printf "factory.enabled with a github entry needs a github %s in factory.%s; run `curie cluster factory` to write one" $section $key) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

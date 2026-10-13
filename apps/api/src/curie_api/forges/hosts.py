@@ -21,7 +21,7 @@ from curie_api.forges.github.code_host import PATH_ID_PREFIX, GitHubCodeHost
 from curie_api.forges.github.connection import GitHubCodeHostConnection, GitHubTrackerConnection
 from curie_api.forges.ports import CodeHost
 from curie_api.forges.registry import ForgeRegistry, forges_registry
-from curie_api.forges.types import PullRequestRef, RepositoryRef, TrackerIssueRef
+from curie_api.forges.types import PullRequest, PullRequestRef, RepositoryRef, TrackerIssueRef
 from curie_api.github_app import GitHubAuth, GitHubCredentials, credentials_for_auth
 
 
@@ -150,14 +150,52 @@ def pull_request_ref(
     return PullRequestRef(repository_ref(settings, path=path, project_id=project_id), str(number))
 
 
+def forge_code_host(
+    settings: Settings,
+    client: httpx.AsyncClient,
+    repository: RepositoryRef,
+    *,
+    installations: Mapping[str, int] | None = None,
+) -> CodeHost:
+    """The forge registry's code host entry a stored non-GitHub repository
+    names, by its kind and host (`trackers.code_host_for_repository`)."""
+
+    from curie_api.forges import trackers
+
+    return trackers.code_host_for_repository(
+        forges_registry(settings), client, repository, installations=installations
+    )
+
+
+def pull_request_url(settings: Settings, pull: PullRequest) -> str:
+    """The canonical web link of a pull request just read from its code host.
+
+    A GitHub pull request is linked under the install's HTML base, the exact
+    text a GitHub lineage has always stored. Any other code host names its
+    pull requests itself, so the link is the one its read answered.
+    """
+
+    ref = pull.ref
+    if ref.repository.kind == types.GITHUB:
+        return f"{settings.github_html_base}/{ref.repository.path}/pull/{ref.number}"
+    return pull.url
+
+
 async def resolve_stored(code_host: CodeHost, repository: RepositoryRef) -> RepositoryRef:
-    """Read a stored repository now, refusing one whose immutable id changed.
+    """Read a stored repository now, refusing one whose identity changed.
 
     A stored GitHub row carries its path, so it resolves through that path and
     the answer's id must equal the stored one (ADR 0197 identity rule 2). A
-    row without a captured id takes the id GitHub reports.
+    row without a captured id takes the id GitHub reports. Any other code host
+    names a project by its immutable id alone, so the row resolves by that id
+    and a project whose path moved since is refused.
     """
 
+    if repository.kind != types.GITHUB:
+        resolved = await code_host.resolve_repository(repository.project_id)
+        if resolved.project_id != repository.project_id or resolved.path != repository.path:
+            raise NotFound("repository_mismatch")
+        return resolved
     resolved = await code_host.resolve_repository(f"{PATH_ID_PREFIX}{repository.path}")
     stored = repository.project_id
     if not stored.startswith(PATH_ID_PREFIX) and resolved.project_id != stored:
