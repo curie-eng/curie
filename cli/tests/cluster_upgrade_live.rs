@@ -301,6 +301,34 @@ exec "$UPGRADE_DRIVER_ROOT/recorder/helm" "$@"
         self.run(scenario, "0.9.0", "charts/curie")
     }
 
+    fn local_human(&self, scenario: &str) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_curie"))
+            .args([
+                "--color=never",
+                "cluster",
+                "upgrade",
+                "--to",
+                "0.9.0",
+                "--namespace",
+                "ns",
+                "--release",
+                "rel",
+                "--chart",
+                "charts/curie",
+                "--yes",
+            ])
+            .current_dir(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap(),
+            )
+            .env("PATH", format!("{}:/usr/bin:/bin", self.0.path().display()))
+            .env("UPGRADE_DRIVER_ROOT", self.0.path())
+            .env("UPGRADE_DRIVER_SCENARIO", scenario)
+            .output()
+            .unwrap()
+    }
+
     fn local_env(&self, scenario: &str, extra_env: &[(&str, &str)]) -> Output {
         self.run_with_env(scenario, "0.9.0", "charts/curie", &[], extra_env)
     }
@@ -5162,6 +5190,172 @@ fn helm_upgrade_failure_is_a_terminal_checkpoint_and_releases_ownership() {
     assert!(
         annotations.get(ACTION_ANNOTATION).is_none(),
         "ownership action must be released: {annotations}"
+    );
+}
+
+fn deployment_images_observed_around_apply(fixture: &Fixture) {
+    let argv = fixture.argv();
+    let apply = argv
+        .iter()
+        .position(|call| {
+            call.first().map(String::as_str) == Some("helm")
+                && call.get(1).map(String::as_str) == Some("upgrade")
+        })
+        .expect("Helm apply must have been attempted");
+    for component in ["api", "worker", "ui"] {
+        let name = format!("rel-curie-{component}");
+        let reads: Vec<_> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| {
+                call.iter().map(String::as_str).eq([
+                    "kubectl",
+                    "get",
+                    "deployment",
+                    name.as_str(),
+                    "-n",
+                    "ns",
+                    "-o",
+                    "json",
+                ])
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            reads.iter().any(|index| *index < apply) && reads.iter().any(|index| *index > apply),
+            "{name} must be observed before and after Helm apply: {argv:?}"
+        );
+    }
+}
+
+/// #4462: failed post-upgrade hooks can leave Helm's prior deployed revision
+/// in history while only the api Deployment has moved to the target image.
+#[test]
+fn upgrade_failed_after_apply_reports_previous_not_serving() {
+    let scenario = "apply-post-hook-fails-images-changed";
+    let fixture = Fixture::new(None);
+    let output = fixture.local(scenario);
+    assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], false, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    let reason = body["fail_forward"]["reason"].as_str().unwrap();
+    assert!(reason.contains("target manifests are applied"), "{reason}");
+    assert!(reason.contains("upgrade failed after apply"), "{reason}");
+    assert!(
+        reason.contains("Error: post-upgrade hooks failed: job rel-curie-extra-hook failed"),
+        "the first Helm error line must survive: {reason}"
+    );
+    assert!(
+        !reason.contains("hook failure detail"),
+        "the fail-forward reason must quote only the first error line: {reason}"
+    );
+    let command = body["fail_forward"]["command"].as_str().unwrap();
+    assert!(command.contains("cluster upgrade"), "{command}");
+    assert!(!command.contains("rollback"), "{command}");
+    deployment_images_observed_around_apply(&fixture);
+
+    let human = Fixture::new(None).local_human(scenario);
+    assert_eq!(human.status.code(), Some(1), "{}", visible(&human));
+    assert!(
+        visible(&human).contains("previous version is not serving"),
+        "{}",
+        visible(&human)
+    );
+}
+
+/// #4462: a pre-upgrade hook refusal leaves every Deployment image unchanged.
+#[test]
+fn upgrade_failed_before_apply_keeps_previous_serving() {
+    let scenario = "apply-pre-hook-fails-images-unchanged";
+    let fixture = Fixture::new(None);
+    let output = fixture.local(scenario);
+    assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], true, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    let reason = body["fail_forward"]["reason"].as_str().unwrap();
+    assert!(reason.contains("pre-upgrade hooks failed"), "{reason}");
+    assert!(!reason.contains("target manifests are applied"), "{reason}");
+    assert!(!reason.contains("upgrade failed after apply"), "{reason}");
+    assert!(
+        body["fail_forward"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("cluster rollback"),
+        "{body}"
+    );
+    deployment_images_observed_around_apply(&fixture);
+
+    let human = Fixture::new(None).local_human(scenario);
+    assert_eq!(human.status.code(), Some(1), "{}", visible(&human));
+    assert!(
+        !visible(&human).contains("previous version is not serving"),
+        "{}",
+        visible(&human)
+    );
+}
+
+/// #4462: unchanged readable images cannot prove serving when the ui
+/// Deployment becomes unreadable after the failed apply.
+#[test]
+fn upgrade_failed_with_unreadable_deployment_reports_previous_not_serving() {
+    let scenario = "apply-post-hook-fails-deployment-unreadable";
+    let fixture = Fixture::new(None);
+    let output = fixture.local(scenario);
+    assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], false, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    let reason = body["fail_forward"]["reason"].as_str().unwrap();
+    assert!(reason.contains("target manifests are applied"), "{reason}");
+    assert!(reason.contains("upgrade failed after apply"), "{reason}");
+    assert!(reason.contains("post-upgrade hooks failed"), "{reason}");
+    deployment_images_observed_around_apply(&fixture);
+
+    let human = Fixture::new(None).local_human(scenario);
+    assert_eq!(human.status.code(), Some(1), "{}", visible(&human));
+    assert!(
+        visible(&human).contains("previous version is not serving"),
+        "{}",
+        visible(&human)
+    );
+}
+
+/// #4462 Decision 2 counts any unreadable Deployment after failure as changed,
+/// including NotFound for a ui Deployment that was also absent before apply.
+#[test]
+fn upgrade_failed_with_already_absent_deployment_reports_previous_not_serving() {
+    let scenario = "apply-pre-hook-fails-ui-absent";
+    let fixture = Fixture::new(None);
+    let output = fixture.local(scenario);
+    assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], false, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    assert!(
+        body["fail_forward"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("pre-upgrade hooks failed"),
+        "{body}"
+    );
+    deployment_images_observed_around_apply(&fixture);
+
+    let human = Fixture::new(None).local_human(scenario);
+    assert_eq!(human.status.code(), Some(1), "{}", visible(&human));
+    assert!(
+        visible(&human).contains("previous version is not serving"),
+        "{}",
+        visible(&human)
     );
 }
 
