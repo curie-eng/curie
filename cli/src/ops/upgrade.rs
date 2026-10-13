@@ -3360,8 +3360,8 @@ impl LiveHost {
         if interrupted.is_some() || self.opts.take_over.is_none() || status != "pending-upgrade" {
             bail!(
                 "release {} newest revision {revision} is {status}; serving revision {serving} is version {version}; {}run `{}`, then rerun cluster upgrade",
-                interrupted.unwrap_or_default(),
                 self.opts.common.release,
+                interrupted.unwrap_or_default(),
                 rollback.display()
             );
         }

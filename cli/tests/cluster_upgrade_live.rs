@@ -2187,6 +2187,20 @@ fn take_over_pending_install_and_rollback_refuse_without_recovery() {
             message.contains(scenario),
             "pending status missing: {message}"
         );
+        // Pin the whole sentence so swapped format arguments cannot hide
+        // behind the substring checks below.
+        let interrupted = if scenario == "pending-rollback" {
+            "it is an interrupted rollback to revision 3; run curie cluster rollback --yes to finish it, or "
+        } else {
+            ""
+        };
+        let sentence = format!(
+            "release rel newest revision 5 is {scenario}; serving revision 4 is version 0.8.6; {interrupted}run `helm rollback rel 4 -n ns --wait --timeout 15m`, then rerun cluster upgrade"
+        );
+        assert!(
+            message.contains(&sentence),
+            "refusal sentence changed: want {sentence:?} in {message}"
+        );
         // #4497: a pending-rollback row records the operator's target as
         // `Rollback to <N>`, so the refusal names it and the curie command that
         // finishes it, and keeps the raw serving-revision helm command that
