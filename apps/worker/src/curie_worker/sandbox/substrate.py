@@ -77,6 +77,7 @@ from .types import (
     UnschedulableClaimError,
     agent_warm_pool_name,
     claim_warm_pool,
+    has_connector_secrets,
     is_executor_thread_key,
     repo_runner_entry,
 )
@@ -193,8 +194,7 @@ def _refuse_unsecreted_repo_claim(
 
     if runner is None:
         return
-    marker = (env or {}).get(BootEnv.env_key("connector_secret_keys"), "").strip()
-    if marker and (not agent_name or agent_name not in connector_secret_pools):
+    if has_connector_secrets(env) and (not agent_name or agent_name not in connector_secret_pools):
         raise MissingAgentPoolError(agent_name or "(unnamed)", runner.pool)
 
 
@@ -392,15 +392,7 @@ class SandboxSubstrate:
             try:
                 # A named repository's refusal is decided before any existing
                 # route is evicted, so a refusal leaves the thread as it was.
-                preflight = (
-                    None
-                    if workspace_repo is None
-                    else (self._repo_runner(workspace_repo, agent_name=agent_name),)
-                )
-                if preflight is not None:
-                    _refuse_unsecreted_repo_claim(
-                        preflight[0], env, agent_name, self._config.connector_secret_pools
-                    )
+                preflight = self._preflight_repo_runner(workspace_repo, env, agent_name)
                 record = self._affinity.get(thread_key)
                 if record is not None:
                     if record.state is RouteState.SUSPENDED:
@@ -787,10 +779,7 @@ class SandboxSubstrate:
                     boot.setdefault(HISTORY_ENV, old.history_ref)
                 # Every refusal is decided before the suspended claim is retired.
                 resume_repo = workspace_repo or old.workspace_repo
-                runner = self._repo_runner(resume_repo, agent_name=agent_name)
-                _refuse_unsecreted_repo_claim(
-                    runner, boot, agent_name, self._config.connector_secret_pools
-                )
+                runner = self._preflight_repo_runner(resume_repo, boot, agent_name)
 
                 self._retire_claim(
                     old.claim_name,
@@ -817,7 +806,7 @@ class SandboxSubstrate:
                     generation=old.generation + 1,
                     runner_resources=runner_resources,
                     caller_run=caller_run,
-                    repo_runner=(runner,),
+                    repo_runner=runner,
                 )
             except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
@@ -1525,13 +1514,30 @@ class SandboxSubstrate:
                 )
         return entry
 
+    def _preflight_repo_runner(
+        self,
+        workspace_repo: str | None,
+        env: Mapping[str, str] | None,
+        agent_name: str | None,
+    ) -> RepoRunnerPool | None:
+        """The repository's checked runner pool entry, with its secret refusal.
+
+        Raises every refusal ``_repo_runner`` and the connector secret guard
+        decide, so a caller runs it before any eviction, retirement, or
+        credential mint.
+        """
+
+        runner = self._repo_runner(workspace_repo, agent_name=agent_name)
+        _refuse_unsecreted_repo_claim(runner, env, agent_name, self._config.connector_secret_pools)
+        return runner
+
     def _route_matches_runner(
         self,
         handle: SandboxHandle,
         workspace_repo: str | None,
         *,
         agent_name: str | None = None,
-        desired: tuple[RepoRunnerPool | None] | None = None,
+        desired: RepoRunnerPool | None = None,
     ) -> bool:
         """Whether a retained route still runs the image its repository needs.
 
@@ -1540,7 +1546,9 @@ class SandboxSubstrate:
         or the route's own repository when the caller names none. With no
         entry on either side the image matches, so an installation without
         repository pools reuses as before. Docker has no repository pools.
-        ``desired`` is the caller's already checked entry for ``workspace_repo``.
+        ``desired`` is the caller's already checked entry for ``workspace_repo``;
+        None recomputes it, which for a repository without an entry is
+        deterministic and probes nothing.
         """
 
         if isinstance(self._k8s, DockerSandboxClient):
@@ -1551,12 +1559,10 @@ class SandboxSubstrate:
         ):
             return False
         if desired is not None and workspace_repo is not None:
-            entry = desired[0]
+            entry: RepoRunnerPool | None = desired
         else:
             repo = workspace_repo if workspace_repo is not None else handle.workspace_repo
             entry = self._repo_runner(repo, agent_name=agent_name)
-        if entry is None and handle.runner_digests is None:
-            return self._retained_runner_healthy(handle)
         wanted = (None, False) if entry is None else (entry.digests, entry.docker)
         if (handle.runner_digests, handle.runner_docker) != wanted:
             return False
@@ -1589,10 +1595,11 @@ class SandboxSubstrate:
         runner_resources: dict[str, Any] | None = None,
         caller_run: str | None = None,
         executor_secret_names: frozenset[str] | None = None,
-        repo_runner: tuple[RepoRunnerPool | None] | None = None,
+        repo_runner: RepoRunnerPool | None = None,
     ) -> SandboxHandle:
         # ``repo_runner`` is a caller's preflight of ``workspace_repo``'s entry,
-        # wrapped so "no entry" (``(None,)``) differs from "not checked".
+        # refusals already decided. None recomputes it: a repository without an
+        # entry resolves to None again with no probe.
         config = self._config
         nonce = uuid.uuid4().hex[:6]
         name = config.claim_name_for(thread_key, nonce)
@@ -1607,11 +1614,10 @@ class SandboxSubstrate:
         # checked before any credential is minted so a refusal has no side
         # effects. A repository without one routes exactly as before.
         runner = (
-            repo_runner[0]
+            repo_runner
             if repo_runner is not None
-            else self._repo_runner(workspace_repo, agent_name=agent_name)
+            else self._preflight_repo_runner(workspace_repo, env, agent_name)
         )
-        _refuse_unsecreted_repo_claim(runner, env, agent_name, config.connector_secret_pools)
         if isinstance(self._k8s, DockerSandboxClient):
             pool = config.warm_pool
         elif runner is not None:
@@ -1727,7 +1733,7 @@ class SandboxSubstrate:
                         winner.handle,
                         workspace_repo,
                         agent_name=agent_name,
-                        desired=(runner,),
+                        desired=runner,
                     )
                 )
             except Exception:

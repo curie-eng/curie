@@ -70,6 +70,12 @@ def agent_warm_pool_name(base_pool: str, agent_name: str | None) -> str:
     return f"{prefix}-agent-{agent_name}{_GENERIC_POOL_SUFFIX}"
 
 
+def has_connector_secrets(env: Mapping[str, str] | None) -> bool:
+    """Whether ``env`` carries a non-blank ``connector_secret_keys`` marker."""
+
+    return bool((env or {}).get(BootEnv.env_key("connector_secret_keys"), "").strip())
+
+
 def claim_warm_pool(
     base_pool: str,
     env: Mapping[str, str] | None,
@@ -94,8 +100,7 @@ def claim_warm_pool(
     if not agent_name:
         return base_pool
     pool = agent_warm_pool_name(base_pool, agent_name)
-    marker = (env or {}).get(BootEnv.env_key("connector_secret_keys"), "").strip()
-    if marker:
+    if has_connector_secrets(env):
         # A non-chart base pool yields no derivable per-agent name.
         if agent_name in connector_secret_pools and pool != base_pool:
             return pool
