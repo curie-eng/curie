@@ -1262,6 +1262,7 @@ async def _publication_run(
     approval_route: str | None = None,
     publication_creator: object | None = None,
     lease: object | None = None,
+    reply_handle: ReplyHandle | None = None,
 ) -> AsyncIterator[_PublicationRun]:
     """Drive one Slack turn that ends in a publication approval gate.
 
@@ -1375,14 +1376,14 @@ async def _publication_run(
             "curie_worker.kernel.validate_snapshot_against_base",
             lambda *_args, **_kwargs: None,
         )
-        await h.kernel.process_event(
-            _qevent(
-                "Publish https://github.com/acme-corp/acme-private",
-                thread=thread,
-                channel="C0EXAMPLE1",
-            ),
-            lease=lease,
+        event = _qevent(
+            "Publish https://github.com/acme-corp/acme-private",
+            thread=thread,
+            channel="C0EXAMPLE1",
         )
+        if reply_handle is not None:
+            event = event.model_copy(update={"reply_handle": reply_handle})
+        await h.kernel.process_event(event, lease=lease)
         yield _PublicationRun(h=h, publication_api=publication_api, workspace=workspace)
 
 
@@ -1409,6 +1410,50 @@ def test_slack_publication_ownership_uses_scoped_key_but_replies_use_bare_thread
             assert [request.reply_conversation_id for request in creates] == [thread]
             assert run.workspace.released == [thread_key]
             assert run.h.sink.completions[0].target.conversation_id == thread
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("adapter", "identity", "expected_identity"),
+    [
+        ("curie-cluster-message", "acme-named", "acme-named"),
+        ("curie-cluster-message", None, None),
+        ("curie-cluster-message", "default", None),
+        ("acme-named", "acme-named", None),
+    ],
+)
+def test_publication_request_preserves_only_the_relay_binding_identity(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: str,
+    identity: str | None,
+    expected_identity: str | None,
+) -> None:
+    """The relay transport survives while its named binding survives the pause."""
+
+    async def go() -> None:
+        handle = ReplyHandle(
+            kind="slack",
+            channel="C0EXAMPLE1",
+            placeholder=str(uuid.uuid4()),
+            adapter=adapter,
+            identity=identity,
+        )
+        async with _publication_run(
+            make_harness,
+            monkeypatch,
+            deployment_id=uuid.uuid4(),
+            thread="reply-identity-publication",
+            reply_handle=handle,
+        ) as run:
+            assert len(run.publication_api.creates) == 1
+            request = run.publication_api.creates[0]
+            assert request.reply_adapter == adapter
+            assert request.reply_identity == expected_identity
+            assert request.to_json().get("reply_identity") == expected_identity
+            assert request.reply_placeholder == handle.placeholder
+            assert request.reply_endpoint is None
 
     asyncio.run(go())
 
@@ -2936,6 +2981,44 @@ def test_a_slack_turns_record_carries_slack_and_no_adapter(make_harness) -> None
             req = approvals.requests[0]
             assert req.reply_kind == "slack"
             assert req.reply_adapter is None
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("adapter", "identity", "expected_identity"),
+    [
+        ("curie-cluster-message", "acme-named", "acme-named"),
+        ("curie-cluster-message", None, None),
+        ("curie-cluster-message", "default", None),
+        ("acme-named", "acme-named", None),
+    ],
+)
+def test_approval_request_preserves_only_the_relay_binding_identity(
+    make_harness,
+    adapter: str,
+    identity: str | None,
+    expected_identity: str | None,
+) -> None:
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        async with make_harness(approvals=approvals) as h:
+            h.runner.default_script = _awaiting_script("Approve the proposed change")
+            event = _qevent(
+                "change it",
+                adapter=adapter,
+                identity=identity,
+                placeholder=str(uuid.uuid4()),
+            )
+            await h.kernel.process_event(event)
+
+            assert len(approvals.requests) == 1
+            request = approvals.requests[0]
+            assert request.reply_adapter == adapter
+            assert request.reply_identity == expected_identity
+            assert request.model_dump()["reply_identity"] == expected_identity
+            assert request.reply_placeholder == event.reply_handle.placeholder
+            assert request.reply_endpoint is None
 
     asyncio.run(go())
 
