@@ -225,5 +225,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0211 | [A factory run that loses its sandbox is re-admitted like one that loses its worker](0211-a-factory-run-that-loses-its-sandbox-is-re-admitted-like-one-that-loses-its-worker.md) | Draft |
 | 0212 | [A work item owner rides through a store outage and stops its turn when it cannot](0212-a-work-item-owner-rides-through-a-store-outage-and-stops-its-turn-when-it-cannot.md) | Draft |
 | 0218 | [Cluster up infers gVisor off when the RuntimeClass matches no node](0218-cluster-up-infers-gvisor-off-when-the-runtimeclass-matches-no-node.md) | Accepted |
-| 0219 | [Cluster up reads the gVisor RuntimeClass for a fake-model install](0219-cluster-up-reads-the-gvisor-runtimeclass-for-a-fake-model-install.md) | Accepted |
+| 0221 | [Cluster up reads the gVisor RuntimeClass for a fake-model install](0221-cluster-up-reads-the-gvisor-runtimeclass-for-a-fake-model-install.md) | Accepted |
 <!-- END GENERATED: adr-index -->
