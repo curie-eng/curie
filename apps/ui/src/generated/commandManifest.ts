@@ -9386,6 +9386,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Install published sha images for a full 40 character lowercase hex commit, including an unreleased commit from next. Only full commit tags are published. Example: --candidate 0123456789abcdef0123456789abcdef01234567",
+              "id": "candidate",
+              "long": "candidate",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Print the steps and exit without creating a cluster or applying anything",
               "id": "dry_run",
               "long": "dry-run",
