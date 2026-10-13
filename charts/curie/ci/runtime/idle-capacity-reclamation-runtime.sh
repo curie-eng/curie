@@ -133,7 +133,7 @@ cleanup() {
                     >"$WORKDIR/failure-$component.log" 2>&1 || true
             done
         fi
-        python3 - "$WORKDIR" "$REPO_ROOT" "$RUN_ID" <<'PY_DIAGNOSTIC'
+        if ! python3 - "$WORKDIR" "$REPO_ROOT" "$RUN_ID" <<'PY_DIAGNOSTIC'
 import getpass, os, pathlib, re, sys
 source = pathlib.Path(sys.argv[1])
 slug = re.sub(r"[^A-Za-z0-9_.-]", "-", pathlib.Path(sys.argv[2]).name)
@@ -149,7 +149,9 @@ for pattern in ("*.log", "*.json"):
                 output.write(evidence.read_bytes()[-65536:])
 print("OK: bounded failure diagnostics retained privately")
 PY_DIAGNOSTIC
-        [[ $? == 0 ]] || cleanup_status=1
+        then
+            cleanup_status=1
+        fi
     fi
     if (( INSTALL_STARTED )); then
         # Let the live controller release finalizers before Helm stops it.
