@@ -2641,6 +2641,21 @@ agentSandbox:
   #   runnerImages:
   #     factory: ghcr.io/acme/factory-runner@sha256:<64 hex>
   runnerImages: {}
+  # Per-agent non-secret runner environment: agent name -> NAME: string map.
+  # Each listed agent gets its own SandboxTemplate and warm pool, including
+  # agents using the platform image. Repository runner templates inherit the
+  # same agent values. Entries are appended to runner.extraEnv; duplicate names
+  # and collisions with chart-owned env or connector secrets are refused.
+  # Environment names use uppercase letters, digits and underscores, starting
+  # with a letter or underscore. Agent names remain lowercase DNS labels.
+  # Quote every value, including empty strings, numbers and booleans.
+  # CURIE_ names, runner credential/proxy names and snapshot sealing keys are
+  # reserved. OTEL_ names are refused here because telemetry egress follows the
+  # global endpoint: configure otelCollector or runner.extraEnv instead.
+  #   runnerEnv:
+  #     dark-factory:
+  #       CLAUDE_CODE_MAX_OUTPUT_TOKENS: "16000"
+  runnerEnv: {}
   # Per-agent workspace ceiling (#3523): agent name -> the sizeLimit of that
   # agent's `workspace` emptyDir, replacing agentSandbox.runner.workspace.sizeLimit
   # (default 1Gi) for that agent only. Each listed agent gets its own
@@ -2657,7 +2672,7 @@ agentSandbox:
   # Agents that get a labeled sandbox template and warm pool so connector
   # ingress can select curietech.ai/agent=<name>. A list of agent name strings.
   # Empty by default. Agents already covered by connectorSecrets, registryEgress,
-  # runnerImages, or workspaceSizeLimits are unchanged.
+  # runnerImages, runnerEnv, or workspaceSizeLimits are unchanged.
   poolAgents: []
   controller:
     # Installs the vendored kubernetes-sigs/agent-sandbox v0.5.0 controller

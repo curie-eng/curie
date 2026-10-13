@@ -1,10 +1,9 @@
-//! #4397 commit 3 (quickstart split): the GitHub describe output is pinned to
-//! the output captured at 20fccad31 (AC 4), and the forge-kind flags behave as
-//! specified (AC 5).
+//! GitHub describe output uses current contract fixtures derived from the
+//! 20fccad31 capture (#4397 AC 4), including the selected agent's runner env.
+//! Forge-kind flags retain their specified behavior (AC 5).
 //!
 //! Set `QUICKSTART_GOLDEN_CAPTURE=<dir>` to write the goldens instead of
-//! comparing. That mode exists only to capture them from the 20fccad31
-//! checkout; the committed files are never regenerated from this tree.
+//! comparing. Fixture updates require review of the full current plan.
 
 use curie::factory_quickstart::{
     describe, quickstart_plan, PlanInput, DEFAULT_AGENT, DEFAULT_BUDGET_USD,
@@ -95,9 +94,9 @@ fn assert_golden(name: &str, input: &PlanInput) {
     let path = golden_dir().join(format!("describe_4346_{name}.txt"));
     if let Ok(dir) = std::env::var("QUICKSTART_GOLDEN_CAPTURE") {
         let header = format!(
-            "# Captured verbatim from commit 20fccad31 (the #4346 merge on next), case {name}.\n\
-             # Never hand-edited. The test applies exactly one substitution before comparing:\n\
-             # {OLD_KEY} -> {NEW_KEY} (#4397 decision 5 removes the old key).\n\
+            "# Current describe contract based on commit 20fccad31 (the #4346 merge on next), case {name}.\n\
+             # Uses {NEW_KEY} (#4397) and includes the selected agent's runnerEnv action.\n\
+             # Compare directly, without runtime substitutions.\n\
              {HEADER_END}\n"
         );
         std::fs::create_dir_all(&dir).unwrap();
@@ -115,15 +114,18 @@ fn assert_golden(name: &str, input: &PlanInput) {
         .expect("golden header ends with `# ---`");
     assert!(header.contains("20fccad31"), "{header}");
     assert!(
-        header.contains(OLD_KEY) && header.contains(NEW_KEY),
+        header.contains(NEW_KEY) && header.contains("runnerEnv"),
         "{header}"
     );
     assert!(
-        body.contains(OLD_KEY),
-        "golden must hold the captured old key"
+        body.contains(NEW_KEY),
+        "golden must use the current intake key"
     );
-    let expected = body.replace(OLD_KEY, NEW_KEY);
-    assert_eq!(actual, expected, "describe output for {name} drifted");
+    assert!(
+        !body.contains(OLD_KEY),
+        "golden must omit the removed intake key"
+    );
+    assert_eq!(actual, body, "describe output for {name} drifted");
 }
 
 #[test]

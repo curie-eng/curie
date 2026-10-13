@@ -452,6 +452,10 @@ pub enum Action {
     ForgeEgress {
         agent: String,
     },
+    /// Configure the selected agent's factory runner environment.
+    RunnerEnv {
+        agent: String,
+    },
     /// Create the trigger label on each repository that lacks it.
     TriggerLabel {
         label: String,
@@ -1293,6 +1297,9 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
                     repos: input.repos.clone(),
                 });
             }
+            actions.push(Action::RunnerEnv {
+                agent: input.agent.clone(),
+            });
             actions.push(deploy);
         }
         QuickstartPath::AddAgent => {
@@ -1307,6 +1314,9 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
                     repos: input.repos.clone(),
                 });
             }
+            actions.push(Action::RunnerEnv {
+                agent: input.agent.clone(),
+            });
             actions.push(deploy);
         }
         QuickstartPath::Register => {
@@ -1480,6 +1490,11 @@ pub fn describe(planned: &Planned) -> Vec<String> {
             Action::ForgeEgress { agent } => {
                 lines.push(format!(
                     "enroll {agent} for forge egress: helm upgrade --reset-then-reuse-values --set factory.sandboxEgress.{agent}=true unless the release already records it; the API does not roll"
+                ));
+            }
+            Action::RunnerEnv { agent } => {
+                lines.push(format!(
+                    "configure agentSandbox.runnerEnv.{agent}.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000 with helm upgrade --reuse-values unless the release already records that string; preserve sibling values"
                 ));
             }
             Action::TriggerLabel { label, repos } => {
@@ -2505,6 +2520,7 @@ mod tests {
             "kubectl --context kind-curie-factory -n kube-system scale deployment/coredns --replicas=1".to_string(),
             "curie cluster up --context kind-curie-factory --namespace curie --release curie --model z-ai/glm-5.3-flash --chart charts/curie --set security.gvisor.mode=off".to_string(),
             "configure factory intake factory.intake=poll for acme/widgets with --app-id 12345 --private-key-file /keys/app.pem and no webhook secret; the same helm upgrade binds the dark factory runner image".to_string(),
+            "configure agentSandbox.runnerEnv.dark-factory.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000 with helm upgrade --reuse-values unless the release already records that string; preserve sibling values".to_string(),
             "render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image".to_string(),
             format!("curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir {} --agent dark-factory --env prod --repo acme/widgets", dir.display()),
             "curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=acme/widgets".to_string(),
@@ -2904,6 +2920,7 @@ mod tests {
             assert!(!text.contains(banned), "{banned}: {text}");
         }
         let order: Vec<usize> = [
+            "configure agentSandbox.runnerEnv.dark-factory-fast.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000",
             "cluster deploy",
             "cluster surfaces dark-factory-fast",
             "cluster overrides dark-factory-fast",

@@ -127,15 +127,26 @@ if tool == 'helm':
             emit({'kind':'Job','metadata':{'name':release+'-preflight-gvisor'},'spec':{'template':{'spec':{'runtimeClassName':'gvisor'}}}})
         print('Error: could not find template '+template+' in chart', file=sys.stderr); sys.exit(1)
     if args[0] == 'upgrade':
+        intake_upgrade = False
+        runner_env_upgrade = any('agentSandbox.runnerEnv.' in arg for arg in args)
         for index, argument in enumerate(args[:-1]):
             if argument in ['-f','--values']:
+                overlay = Path(args[index+1]).read_text()
                 with (root / 'helm-values').open('a') as values_log:
-                    values_log.write(json.dumps(Path(args[index+1]).read_text()) + '\n')
+                    values_log.write(json.dumps(overlay) + '\n')
+                try:
+                    document = json.loads(overlay)
+                    intake_upgrade |= document.get('factory', {}).get('intake') == 'poll'
+                    runner_env_upgrade |= bool(document.get('agentSandbox', {}).get('runnerEnv'))
+                except Exception:
+                    pass
         if os.environ.get('QUICKSTART_FAIL') == 'up':
             print('Error: fixture install refused at '+str(root / 'cached-chart'), file=sys.stderr); sys.exit(1)
-        if os.environ.get('QUICKSTART_FAIL') == 'merged' and '--install' not in args and not (root / 'merged-failed').exists():
+        if os.environ.get('QUICKSTART_FAIL') == 'merged' and intake_upgrade and not (root / 'merged-failed').exists():
             (root / 'merged-failed').touch()
             print('Error: fixture merged upgrade refused', file=sys.stderr); sys.exit(1)
+        if os.environ.get('QUICKSTART_FAIL') == 'runner-env' and runner_env_upgrade:
+            print('Error: fixture runner env upgrade refused', file=sys.stderr); sys.exit(1)
         if os.environ.get('QUICKSTART_GVISOR_RETRY') == '1' and not (root / 'retried').exists():
             (root / 'retried').touch()
             time.sleep(10)
@@ -191,25 +202,30 @@ fn agent() -> Value {
     json!({"id":"agent-fixture","name":"dark-factory","channels":[{"kind":"slack","address":"C0EXAMPLE1"}],"created_at":"2026-10-04T00:00:00Z","memory":false,"memory_writes":true,"publication_policy":"auto","execution_deadline_seconds":3600})
 }
 
-fn platform(req: &Request) -> Response {
+fn platform(req: &Request, state: &std::sync::Mutex<Value>) -> Response {
     let path = req.path.split('?').next().unwrap();
+    let mut saved = state.lock().unwrap();
     let result = match (req.method.as_str(), path) {
-        ("GET", "/agents") => json!([agent()]),
-        ("POST", "/agents") | ("GET", "/agents/agent-fixture") => agent(),
+        ("GET", "/agents") => json!([saved.clone()]),
+        ("POST", "/agents") => {
+            let created: Value = serde_json::from_slice(&req.body).unwrap();
+            saved["name"] = created["name"].clone();
+            saved["channels"] = json!([]);
+            saved.clone()
+        }
+        ("GET", "/agents/agent-fixture") => saved.clone(),
         ("PATCH", "/agents/agent-fixture") => {
-            let mut saved = agent();
             let patch: Value = serde_json::from_slice(&req.body).unwrap();
             saved
                 .as_object_mut()
                 .unwrap()
                 .extend(patch.as_object().unwrap().clone());
-            saved
+            saved.clone()
         }
         ("POST", "/agents/agent-fixture/channels") => {
-            let mut saved = agent();
             let binding: Value = serde_json::from_slice(&req.body).unwrap();
             saved["channels"].as_array_mut().unwrap().push(binding);
-            saved
+            saved.clone()
         }
         ("POST", "/agents/agent-fixture/versions") => {
             json!({"id":"version-fixture","agent_id":"agent-fixture","version_label":"fixture","created_by":"fixture","created_at":"2026-10-04T00:00:00Z"})
@@ -376,10 +392,11 @@ impl Fixture {
             }
             Response::json(404, "{}")
         });
+        let agent_state = std::sync::Mutex::new(agent());
         Self {
             dir,
             github,
-            platform: serve(platform),
+            platform: serve(move |request| platform(request, &agent_state)),
             registry,
             openrouter: openrouter(account_left),
         }
@@ -933,24 +950,30 @@ fn both_default_passes_stay_within_the_line_budget_against_a_fake_cluster() {
     let upgrades = helm_upgrade_calls(&fixture);
     assert_eq!(
         upgrades.len(),
-        2,
-        "first pass installs once and the second pass upgrades once: {upgrades:?}"
+        3,
+        "first pass installs once; the second configures runner env and factory intake: {upgrades:?}"
     );
     assert!(
         upgrades[0].iter().any(|arg| arg == "--install"),
         "the first pass is cluster up: {upgrades:?}"
     );
-    assert!(
-        !upgrades[1]
-            .iter()
-            .any(|arg| arg == "--install" || arg == "--reset-then-reuse-values"),
-        "the second pass is one reuse-values upgrade: {:?}",
-        upgrades[1]
-    );
-    assert!(
-        upgrades[1].iter().any(|arg| arg == "--reuse-values"),
-        "{:?}",
-        upgrades[1]
+    for upgrade in &upgrades[1..] {
+        assert!(
+            !upgrade
+                .iter()
+                .any(|arg| arg == "--install" || arg == "--reset-then-reuse-values"),
+            "the second pass preserves release values: {upgrade:?}"
+        );
+        assert!(
+            upgrade.iter().any(|arg| arg == "--reuse-values"),
+            "{upgrade:?}"
+        );
+    }
+    let applied: Value =
+        serde_json::from_slice(&fs::read(fixture.dir.path().join("values")).unwrap()).unwrap();
+    assert_eq!(
+        applied.pointer("/agentSandbox/runnerEnv/dark-factory/CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
+        Some(&json!("16000"))
     );
     let documents = intake_documents(&fixture);
     assert_eq!(documents.len(), 1, "{documents:?}");
@@ -960,7 +983,160 @@ fn both_default_passes_stay_within_the_line_budget_against_a_fake_cluster() {
         .unwrap_or("");
     assert!(
         image.contains("@sha256:"),
-        "the one upgrade must bind the runner image: {documents:?}"
+        "the intake upgrade must bind the runner image: {documents:?}"
+    );
+}
+
+#[test]
+fn quickstart_configures_the_selected_agent_on_the_platform_runner() {
+    for add_agent in [false, true] {
+        let fixture = Fixture::new();
+        if add_agent {
+            record_factory_intake(&fixture, None);
+        }
+        let path = fixture.dir.path().join("values");
+        let mut values: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        values["agentSandbox"]["runnerEnv"] = json!({"acme-other":{"ACME_MODE":"kept"}});
+        fixture.record_values(values);
+        let bundle = fixture.dir.path().join("custom-bundle");
+        fs::create_dir_all(bundle.join(".claude-plugin")).unwrap();
+        fs::write(
+            bundle.join(".claude-plugin/plugin.json"),
+            json!({"name":"acme-custom","version":"1.0.0"}).to_string(),
+        )
+        .unwrap();
+        let args = [
+            "--color",
+            "never",
+            "--context",
+            "kind-curie-factory",
+            "--agent",
+            "dark-factory-fast",
+            "--label",
+            "curie-factory-fast",
+            "--plugin-dir",
+            bundle.to_str().unwrap(),
+        ];
+        let dry_run = fixture
+            .command(!add_agent, &args)
+            .args(["--dry-run", "--json"])
+            .env("QUICKSTART_APP_SECRET", "factory-app")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            dry_run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&dry_run.stderr)
+        );
+        let plan: Value = serde_json::from_slice(&dry_run.stdout).unwrap();
+        let lines = plan["plan"].as_array().unwrap();
+        let env_step = lines
+            .iter()
+            .position(|line| {
+                let line = line.as_str().unwrap();
+                line.contains("CLAUDE_CODE_MAX_OUTPUT_TOKENS") && line.contains("dark-factory-fast")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "add_agent={add_agent}: dry run lacks the selected agent's runner env: {plan}"
+                )
+            });
+        let deploy_step = lines
+            .iter()
+            .position(|line| line.as_str().unwrap().contains("curie cluster deploy"))
+            .unwrap();
+        assert!(
+            env_step < deploy_step,
+            "runner env must precede deploy: {plan}"
+        );
+        assert!(helm_upgrade_calls(&fixture).is_empty());
+        let output = fixture
+            .command(!add_agent, &args)
+            .env("QUICKSTART_APP_SECRET", "factory-app")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "add_agent={add_agent}: {shown}");
+        let applied: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            applied
+                .pointer("/agentSandbox/runnerEnv/dark-factory-fast/CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
+            Some(&json!("16000")),
+            "add_agent={add_agent}: {applied}"
+        );
+        assert_eq!(
+            applied.pointer("/agentSandbox/runnerEnv/acme-other"),
+            Some(&json!({"ACME_MODE":"kept"}))
+        );
+        assert!(
+            applied
+                .pointer("/agentSandbox/runnerEnv/dark-factory")
+                .is_none(),
+            "the selected agent must receive the setting: {applied}"
+        );
+        assert!(
+            applied
+                .pointer("/agentSandbox/runnerImages/dark-factory-fast")
+                .is_none(),
+            "a custom bundle without a runner layer uses the platform image: {applied}"
+        );
+    }
+}
+
+#[test]
+fn quickstart_keeps_an_existing_ceiling_without_another_env_upgrade() {
+    let fixture = Fixture::new();
+    let (code, shown) = fixture.run(false, &["--color", "never"]);
+    assert_eq!(code, 0, "{shown}");
+    let path = fixture.dir.path().join("values");
+    let mut values: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    values["agentSandbox"]["runnerEnv"] =
+        json!({"dark-factory":{"CLAUDE_CODE_MAX_OUTPUT_TOKENS":"16000","ACME_MODE":"kept"}});
+    fixture.record_values(values);
+    let before = helm_upgrade_calls(&fixture).len();
+    let (code, shown) = fixture.run(true, &["--color", "never"]);
+    assert_eq!(code, 0, "{shown}");
+    assert_eq!(
+        helm_upgrade_calls(&fixture).len(),
+        before + 1,
+        "an exact existing ceiling needs only the factory intake upgrade: {shown}"
+    );
+    let applied: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(
+        applied.pointer("/agentSandbox/runnerEnv/dark-factory"),
+        Some(&json!({"CLAUDE_CODE_MAX_OUTPUT_TOKENS":"16000","ACME_MODE":"kept"}))
+    );
+}
+
+#[test]
+fn a_runner_env_upgrade_failure_stops_before_deploy() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(true, &["--color", "never"])
+        .env("QUICKSTART_FAIL", "runner-env")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{shown}");
+    assert!(shown.contains("runner env"), "{shown}");
+    assert!(
+        fixture
+            .platform
+            .recorded()
+            .iter()
+            .all(|request| request.method == "GET"),
+        "the runner env failure must prevent agent and deployment mutations: {shown}"
     );
 }
 
@@ -1009,8 +1185,14 @@ fn a_failed_merged_upgrade_rerun_applies_the_same_values() {
         .filter(|argv| !argv.iter().any(|arg| arg == "--install"))
         .count();
     assert_eq!(
-        finish, 2,
-        "failed attempt plus the converging rerun: {upgrades:?}"
+        finish, 3,
+        "failed intake plus the converging intake and runner env upgrades: {upgrades:?}"
+    );
+    let values: Value =
+        serde_json::from_slice(&fs::read(fixture.dir.path().join("values")).unwrap()).unwrap();
+    assert_eq!(
+        values.pointer("/agentSandbox/runnerEnv/dark-factory/CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
+        Some(&json!("16000"))
     );
 }
 
@@ -1693,17 +1875,19 @@ fn factory_quickstart_rerun_preserves_the_recorded_native_model_without_a_local_
     let upgrades = helm_upgrade_calls(&fixture);
     assert_eq!(
         upgrades.len(),
-        1,
-        "only the merged intake upgrade is needed: {upgrades:?}"
+        2,
+        "the merged intake and runner env upgrades preserve the recorded model: {upgrades:?}"
     );
-    assert!(
-        upgrades[0].iter().any(|arg| arg == "--reuse-values"),
-        "the existing release must be reused: {upgrades:?}"
-    );
-    assert!(
-        !upgrades[0].iter().any(|arg| arg == "--install"),
-        "a credential-free rerun must not replace the native model: {upgrades:?}"
-    );
+    for upgrade in &upgrades {
+        assert!(
+            upgrade.iter().any(|arg| arg == "--reuse-values"),
+            "the existing release must be reused: {upgrades:?}"
+        );
+        assert!(
+            !upgrade.iter().any(|arg| arg == "--install"),
+            "a credential-free rerun must not replace the native model: {upgrades:?}"
+        );
+    }
     let recorded: Value =
         serde_json::from_slice(&fs::read(fixture.dir.path().join("values")).unwrap()).unwrap();
     assert_eq!(
