@@ -406,14 +406,7 @@ pub(crate) fn read_token(path: &Path) -> Result<String> {
 
 /// The Opaque Secret holding the Jira token under [`SECRET_KEY`].
 pub(crate) fn secret_manifest(namespace: &str, token: &str) -> Value {
-    use base64::Engine;
-    json!({
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "type": "Opaque",
-        "metadata": {"name": SECRET_NAME, "namespace": namespace},
-        "data": {SECRET_KEY: base64::engine::general_purpose::STANDARD.encode(token.as_bytes())},
-    })
+    super::token_secret_manifest(namespace, SECRET_NAME, token)
 }
 
 #[cfg(test)]

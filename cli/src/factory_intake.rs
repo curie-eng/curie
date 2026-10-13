@@ -427,19 +427,56 @@ pub fn forge_entries_values(
     })
 }
 
-/// Write the Jira tracker and binding on the release: the same helm upgrade
-/// and api rollout as the intake, over [`forge_entries_values`].
+/// One forge's `factory.codeHosts`, `factory.trackers` and `factory.bindings`
+/// entries, each replacing the recorded entry of the same name, and the
+/// ConfigMap holding the code host's CA bundle, when it needs one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeForgeEntries {
+    pub code_host: serde_json::Value,
+    pub tracker: serde_json::Value,
+    pub binding: serde_json::Value,
+    /// Set as `codeHostTrust.caBundle.configMapRef.name`, key `ca.crt`.
+    pub ca_config_map: Option<String>,
+}
+
+/// The values document a native forge quickstart (one that is both the code
+/// host and the tracker) applies with `--reuse-values -f`: the release's
+/// three `factory` lists with `entries` put in, each written complete since
+/// Helm replaces a list whole, and the CA ConfigMap reference when given. The
+/// token is not here; it lives only in the Secret the credentials name.
+pub fn native_forge_values(
+    recorded: &serde_json::Value,
+    entries: &NativeForgeEntries,
+) -> serde_json::Value {
+    let mut values = serde_json::json!({
+        "factory": {
+            "codeHosts": replace_named(recorded, "codeHosts", &entries.code_host),
+            "trackers": replace_named(recorded, "trackers", &entries.tracker),
+            "bindings": replace_named(recorded, "bindings", &entries.binding),
+        }
+    });
+    if let Some(name) = &entries.ca_config_map {
+        values["codeHostTrust"] =
+            serde_json::json!({"caBundle": {"configMapRef": {"name": name, "key": "ca.crt"}}});
+    }
+    values
+}
+
+/// Write forge entries on the release: the same helm upgrade and api rollout
+/// as the intake, over the document `values` builds from the recorded user
+/// values. `what` names the entries in the progress lines.
 pub async fn apply_forge_entries(
     common: &CommonOpts,
     chart: &str,
-    plan: &crate::factory_quickstart::JiraPlan,
+    what: &str,
+    values: impl FnOnce(&serde_json::Value) -> serde_json::Value,
 ) -> Result<()> {
     require_on_path("helm")?;
     require_on_path("kubectl")?;
     let recorded = fetch_release_values(common)
         .await?
         .unwrap_or(serde_json::Value::Null);
-    let values = forge_entries_values(&recorded, plan);
+    let values = values(&recorded);
     let timeout = effective_helm_timeout(None, release_minimum_helm_timeout(common).await);
     let ui = crate::ui::ui();
     let cl = ui.checklist();
@@ -447,10 +484,7 @@ pub async fn apply_forge_entries(
         let file = crate::ops::SecretValuesFileGuard::private_document(&values)?;
         let cmd = helm_upgrade(common, chart, file.path(), timeout);
         ui.plumbing(&format!("+ {}", cmd.display()));
-        let step = cl.step(&format!(
-            "writing the Jira tracker and binding `{}` on release {}",
-            plan.binding_name, common.release
-        ));
+        let step = cl.step(&format!("writing {what} on release {}", common.release));
         let (ok, _, stderr) = run_capture(&cmd).await?;
         if !ok {
             step.fail("helm upgrade failed");
@@ -466,15 +500,12 @@ pub async fn apply_forge_entries(
     let fullname = crate::ops::release_fullname(&common.namespace, &common.release).await;
     for cmd in crate::github_app::rollout_commands(&common.namespace, &fullname) {
         ui.plumbing(&format!("+ {}", cmd.display()));
-        let step = cl.step(&format!(
-            "rolling {} to pick up the Jira tracker",
-            common.release
-        ));
+        let step = cl.step(&format!("rolling {} to pick up {what}", common.release));
         let (ok, _, stderr) = run_capture(&cmd).await?;
         if !ok {
             step.fail("failed");
             return Err(CliError::failure(format!(
-                "api rollout failed after the Jira tracker was written: {}",
+                "api rollout failed after {what} was written: {}",
                 stderr.trim()
             ))
             .into());

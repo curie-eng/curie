@@ -112,7 +112,7 @@ pub(super) fn finish_intake_opts(input: &PlanInput, _context: &str) -> FactoryIn
 /// #4362 decision 5.3: the operator bundle exists, has a readable manifest,
 /// and passes the lock preflight `cluster deploy` runs. Returns its locked
 /// runner image, or `None` when it declares no runner layer.
-fn check_plugin_dir(dir: &Path) -> Result<Option<String>> {
+pub(super) fn check_plugin_dir(dir: &Path) -> Result<Option<String>> {
     if !dir.is_dir() {
         return Err(CliError::usage(format!(
             "--plugin-dir {} is not a directory",
@@ -484,7 +484,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
 
 /// Render the published bundle for `agent` and refuse a layer built on
 /// another runner before anything binds it (ADR 0173 decision 5).
-async fn render_and_check(common: &CommonOpts, agent: &str) -> Result<String> {
+pub(super) async fn render_and_check(common: &CommonOpts, agent: &str) -> Result<String> {
     crate::ui::ui().note("Rendering factory bundle");
     let bundle = bundle_dir(&common.namespace, &common.release, agent);
     let image = render_published_bundle(&common.namespace, &common.release, agent)
@@ -566,26 +566,8 @@ async fn execute(
             }
         }
         match action {
-            Action::External { program, args } => {
-                let step = if program == "kind" {
-                    "Creating kind cluster"
-                } else {
-                    "Scaling CoreDNS"
-                };
-                run_program(program, args, step).await?;
-            }
-            Action::Cluster { args } => {
-                // Prompted credentials become available only immediately before
-                // this action. Resolve again so an omitted model follows that key.
-                let mut args = args.clone();
-                if let Some(model) = &prompted_model {
-                    let model_index = args
-                        .iter()
-                        .position(|arg| arg == "--model")
-                        .expect("quickstart cluster up always specifies its model");
-                    args[model_index + 1] = model.clone();
-                }
-                run_self(&args, "Installing Curie").await?;
+            Action::External { .. } | Action::Cluster { .. } => {
+                run_install_action(action, prompted_model.as_ref()).await?;
             }
             Action::Register {
                 org,
@@ -733,42 +715,16 @@ async fn execute(
                 for repo in bound {
                     crate::ui::ui().note(&skip_bound_line(agent, repo));
                 }
-                run_self(
-                    &cluster_agent(
-                        "overrides",
-                        agent,
-                        context,
-                        namespace,
-                        release,
-                        &["--execution-deadline".into(), deadline_seconds.to_string()],
-                    ),
-                    "Setting execution deadline",
-                )
-                .await?;
-                run_self(
-                    &cluster_agent(
-                        "publication-policy",
-                        agent,
-                        context,
-                        namespace,
-                        release,
-                        &["--policy".into(), "auto".into()],
-                    ),
-                    "Setting publication policy",
-                )
-                .await?;
-                run_self(
-                    &cluster_agent(
-                        "budget",
-                        agent,
-                        context,
-                        namespace,
-                        release,
-                        &["--limit".into(), budget_display(*budget_usd)],
-                    ),
-                    "Setting factory budget",
-                )
-                .await?;
+                for (args, step) in agent_settings(
+                    agent,
+                    context,
+                    namespace,
+                    release,
+                    *deadline_seconds,
+                    *budget_usd,
+                ) {
+                    run_self(&args, step).await?;
+                }
                 if planned.path == QuickstartPath::AddAgent {
                     return Ok(QuickstartOutput::AgentAdded {
                         context: context.clone(),
@@ -942,28 +898,20 @@ async fn apply_jira_tracker(opts: &QuickstartOpts, jira: &JiraPlan) -> Result<()
         release: opts.release.clone(),
         dry_run: false,
     };
-    crate::ui::ui().note(&format!("Writing Secret {}", jira.secret_name));
     let token = jira_cloud::read_token(&jira.token_file)?;
-    let manifest = jira_cloud::secret_manifest(&common.namespace, &token);
-    let body = serde_json::to_vec(&manifest)?;
-    // kubectl's output is dropped: a failed apply can echo the manifest.
-    let (ok, _, _) = crate::ops::run_capture_with_stdin(
-        &crate::factory_app::secret_apply_command(&common.namespace),
-        &body,
+    apply_manifest(
+        &common.namespace,
+        &jira_cloud::secret_manifest(&common.namespace, &token),
+        &format!("Secret {}", jira.secret_name),
     )
     .await?;
-    if !ok {
-        return Err(CliError::failure(format!(
-            "writing the Jira token to Secret {} in namespace {} failed; the tracker was not written",
-            jira.secret_name, common.namespace
-        ))
-        .with_fix(format!(
-            "check access with `kubectl -n {} auth can-i create secrets` and rerun",
-            common.namespace
-        ))
-        .into());
-    }
-    crate::factory_intake::apply_forge_entries(&common, &opts.chart, jira).await
+    crate::factory_intake::apply_forge_entries(
+        &common,
+        &opts.chart,
+        &format!("the Jira tracker and binding `{}`", jira.binding_name),
+        |recorded| crate::factory_intake::forge_entries_values(recorded, jira),
+    )
+    .await
 }
 
 async fn render_published_bundle(namespace: &str, release: &str, agent: &str) -> Result<String> {
