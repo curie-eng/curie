@@ -429,8 +429,6 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     "CURIE_E2E_SOURCE_HOSTS",
     // Trust file paths are generated from a mounted ConfigMap, not migrated extraEnv paths.
     "CURIE_CODE_HOST_CA_BUNDLE",
-    "CURIE_CODE_HOST_CA_CONFIGMAP",
-    "CURIE_CODE_HOST_CA_CONFIGMAP_KEY",
     "CURIE_REPO_CA_BUNDLE",
     "GIT_SSL_CAINFO",
     "REQUESTS_CA_BUNDLE",

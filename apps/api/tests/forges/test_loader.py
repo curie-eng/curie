@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from curie_api.forges import registry as forge_registry
 from curie_api.forges.loader import load_forges_json
 from forge_fakes import config_samples as samples
 
@@ -125,20 +126,32 @@ def test_a_key_file_content_never_appears_in_an_error(tmp_path: Path) -> None:
     assert "secret-content-must-not-echo" not in message
 
 
-@pytest.mark.parametrize(
-    ("section", "entry"),
-    [
-        ("code_hosts", samples.gitlab_code_host("corp-gitlab")),
-    ],
-)
-def test_a_not_installed_kind_is_refused_at_load_naming_kind_and_entry(
-    tmp_path: Path, section: str, entry: dict[str, Any]
-) -> None:
+def _as_files(tmp_path: Path, entry: dict[str, Any]) -> dict[str, Any]:
     credential = entry["credential"]
     for inline, field in (("token", "token_file"), ("client_secret", "client_secret_file")):
         if inline in credential:
             credential[field] = str(_key_file(tmp_path, credential.pop(inline), inline))
-    _refused({section: [entry]}, entry["kind"], entry["name"], "not installed")
+    return entry
+
+
+def test_a_not_installed_kind_is_refused_at_load_naming_kind_and_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No configurable kind is reserved since #4399 installed GitLab, so the
+    refusal is proven on gitlab reserved for this test only."""
+
+    monkeypatch.delitem(forge_registry._KINDS, "gitlab")
+    forge_registry.register_not_installed("gitlab")
+    entry = _as_files(tmp_path, samples.gitlab_code_host("corp-gitlab"))
+    _refused({"code_hosts": [entry]}, entry["kind"], entry["name"], "not installed")
+
+
+def test_an_installed_gitlab_code_host_loads(tmp_path: Path) -> None:
+    """Liveness for the refusal above: the shipped build installs GitLab."""
+
+    entry = _as_files(tmp_path, samples.gitlab_code_host("corp-gitlab"))
+    (code_host,) = load_forges_json(json.dumps({"code_hosts": [entry]})).code_hosts
+    assert (code_host.name, code_host.kind) == ("corp-gitlab", "gitlab")
 
 
 @pytest.mark.parametrize("section", ["code_hosts", "trackers"])

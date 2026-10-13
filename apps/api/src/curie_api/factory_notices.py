@@ -992,6 +992,25 @@ async def _sync_comment(
     return writes
 
 
+def _lineage_pr_link(
+    settings: Settings,
+    repo_full_name: str,
+    pr_number: int,
+    stored_url: str | None,
+    code_host_kind: str | None,
+) -> str | None:
+    """The web link of a lineage's pull request.
+
+    A GitHub lineage (or one recorded before typed code hosts) is linked under
+    the install's HTML base. Any other code host's link is the one the lineage
+    stored, which its advance verified against that code host's own answer.
+    """
+
+    if code_host_kind is None or code_host_kind == GITHUB:
+        return f"{settings.github_html_base}/{repo_url_path(repo_full_name)}/pull/{pr_number}"
+    return stored_url
+
+
 async def _render(
     session: AsyncSession,
     settings: Settings,
@@ -1014,6 +1033,8 @@ async def _render(
                     select(
                         ThreadPublicationLineage.repo_full_name,
                         ThreadPublicationLineage.pr_number,
+                        ThreadPublicationLineage.pr_url,
+                        ThreadPublicationLineage.code_host_kind,
                     ).where(
                         ThreadPublicationLineage.id
                         == conversation_pr_lineage_id(
@@ -1026,10 +1047,11 @@ async def _render(
             ).one_or_none()
             pr_url = None
             if selected_pr is not None:
-                lineage_repo, pr_number = selected_pr
+                lineage_repo, pr_number, stored_url, code_host_kind = selected_pr
                 if pr_number is not None and pr_number > 0:
-                    repo_path = repo_url_path(lineage_repo)
-                    pr_url = f"{settings.github_html_base}/{repo_path}/pull/{pr_number}"
+                    pr_url = _lineage_pr_link(
+                        settings, lineage_repo, pr_number, stored_url, code_host_kind
+                    )
         # A completed issue run waits for its PR link before it is final.
         if not (
             cause == "completed"

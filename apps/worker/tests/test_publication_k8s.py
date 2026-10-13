@@ -120,12 +120,15 @@ def _build(module: Any, payload: Any, settings: Any | None = None) -> Any:
     )
 
 
-def _ca_settings(module: Any) -> Any:
-    return replace(
-        _settings(module),
-        ca_bundle_config_map="curie-code-host-trust",
-        ca_bundle_key="corporate-root.pem",
-    )
+CA_PEM = "-----BEGIN CERTIFICATE-----\nMIIBfixtureonly\n-----END CERTIFICATE-----\n"
+
+
+def _ca_settings(module: Any, directory: Path) -> Any:
+    """Settings whose worker-mounted codeHostTrust bundle holds ``CA_PEM``."""
+
+    bundle = directory / "worker-code-host-trust.crt"
+    bundle.write_text(CA_PEM, encoding="utf-8")
+    return replace(_settings(module), ca_bundle_path=str(bundle))
 
 
 def _container(resources: Any) -> dict[str, Any]:
@@ -482,28 +485,43 @@ def test_a_non_github_origin_with_a_nested_repository_path_builds(
     assert "github" not in json.dumps(resources.job).lower()
 
 
-def test_a_ca_bundle_mounts_the_configmap_read_only_and_points_every_client_at_it(
+def test_a_ca_bundle_mounts_from_the_jobs_own_configmap_and_points_every_client_at_it(
     publication_k8s: Any,
+    tmp_path: Path,
 ) -> None:
     payload = replace(
         _payload(publication_k8s),
         transport=_transport(publication_k8s, ca_bundle_ref=CA_REF),
     )
-    resources = _build(publication_k8s, payload, _ca_settings(publication_k8s))
+    resources = _build(publication_k8s, payload, _ca_settings(publication_k8s, tmp_path))
     pod_spec = resources.job["spec"]["template"]["spec"]
     container = _container(resources)
     env = _job_env(resources)
 
+    # The Job runs in the publication namespace, so the PEM travels in the
+    # per-publication ConfigMap the worker creates there, never a reference
+    # to the release namespace's codeHostTrust ConfigMap.
+    assert resources.config_map["data"]["code-host-ca.pem"] == CA_PEM
     trust_volumes = [v for v in pod_spec["volumes"] if v["name"] == "code-host-trust"]
     assert trust_volumes == [
         {
             "name": "code-host-trust",
             "configMap": {
-                "name": "curie-code-host-trust",
-                "items": [{"key": "corporate-root.pem", "path": "ca.crt"}],
+                "name": resources.names.config_map,
+                "items": [{"key": "code-host-ca.pem", "path": "ca.crt"}],
             },
         }
     ]
+    # Every object the pod references is one this publication owns.
+    referenced = {v["configMap"]["name"] for v in pod_spec["volumes"] if "configMap" in v} | {
+        v["secret"]["secretName"] for v in pod_spec["volumes"] if "secret" in v
+    }
+    assert referenced == {resources.names.config_map, resources.names.secret}
+    assert {
+        resources.config_map["metadata"]["namespace"],
+        resources.secret["metadata"]["namespace"],
+        resources.job["metadata"]["namespace"],
+    } == {"curie"}
     trust_mounts = [m for m in container["volumeMounts"] if m["name"] == "code-host-trust"]
     assert trust_mounts == [
         {
@@ -518,9 +536,11 @@ def test_a_ca_bundle_mounts_the_configmap_read_only_and_points_every_client_at_i
     assert "secret" not in trust_volumes[0]
 
 
-def test_no_ca_bundle_adds_no_volume_mount_or_trust_env(publication_k8s: Any) -> None:
-    # A configured ConfigMap alone does not mount anything; the credential's ref does.
-    for settings in (_settings(publication_k8s), _ca_settings(publication_k8s)):
+def test_no_ca_bundle_adds_no_volume_mount_or_trust_env(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    # A mounted worker bundle alone does not mount anything; the credential's ref does.
+    for settings in (_settings(publication_k8s), _ca_settings(publication_k8s, tmp_path)):
         resources = _build(publication_k8s, _payload(publication_k8s), settings)
         pod_spec = resources.job["spec"]["template"]["spec"]
         container = _container(resources)
@@ -545,14 +565,27 @@ def test_no_ca_bundle_adds_no_volume_mount_or_trust_env(publication_k8s: Any) ->
             "REQUESTS_CA_BUNDLE",
         ):
             assert name not in env, name
+        assert "code-host-ca.pem" not in resources.config_map["data"]
     # The two builds are identical, so the operator setting cannot drift a running Job.
-    assert (
-        _build(publication_k8s, _payload(publication_k8s)).job
-        == _build(publication_k8s, _payload(publication_k8s), _ca_settings(publication_k8s)).job
+    plain = _build(publication_k8s, _payload(publication_k8s))
+    with_bundle = _build(
+        publication_k8s, _payload(publication_k8s), _ca_settings(publication_k8s, tmp_path)
     )
+    assert plain.job == with_bundle.job
+    assert plain.config_map == with_bundle.config_map
 
 
-def test_a_ca_bundle_ref_without_a_configmap_is_refused(publication_k8s: Any) -> None:
+def test_a_liveness_publication_with_no_ca_builds_when_the_bundle_path_is_missing(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    # A public-trust credential never reads the worker's bundle, so a stale
+    # or absent path cannot block it.
+    settings = replace(_settings(publication_k8s), ca_bundle_path=str(tmp_path / "absent.crt"))
+    resources = _build(publication_k8s, _payload(publication_k8s), settings)
+    assert "code-host-ca.pem" not in resources.config_map["data"]
+
+
+def test_a_ca_bundle_ref_without_a_worker_bundle_is_refused(publication_k8s: Any) -> None:
     payload = replace(
         _payload(publication_k8s),
         transport=_transport(publication_k8s, ca_bundle_ref=CA_REF),
@@ -560,6 +593,44 @@ def test_a_ca_bundle_ref_without_a_configmap_is_refused(publication_k8s: Any) ->
 
     with pytest.raises(publication_k8s.PublicationResourceError, match="no codeHostTrust"):
         _build(publication_k8s, payload)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [None, b"", b"   \n", b"not a certificate\n", b"\xff\xfe-----BEGIN CERTIFICATE-----"],
+)
+def test_a_ca_bundle_ref_with_an_unusable_worker_bundle_is_refused(
+    publication_k8s: Any, tmp_path: Path, content: bytes | None
+) -> None:
+    bundle = tmp_path / "worker-code-host-trust.crt"
+    if content is not None:
+        bundle.write_bytes(content)
+    payload = replace(
+        _payload(publication_k8s),
+        transport=_transport(publication_k8s, ca_bundle_ref=CA_REF),
+    )
+    settings = replace(_settings(publication_k8s), ca_bundle_path=str(bundle))
+
+    with pytest.raises(publication_k8s.PublicationResourceError, match="CA bundle") as raised:
+        _build(publication_k8s, payload, settings)
+    # The refusal names the path, never the bundle's bytes.
+    assert str(bundle) in str(raised.value)
+    assert "not a certificate" not in str(raised.value)
+
+
+def test_a_ca_bundle_that_overflows_the_configmap_is_refused(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    bundle = tmp_path / "worker-code-host-trust.crt"
+    bundle.write_text(CA_PEM * 4_000, encoding="utf-8")
+    payload = replace(
+        _payload(publication_k8s, b"x" * publication_k8s.MAX_PATCH_BYTES),
+        transport=_transport(publication_k8s, ca_bundle_ref=CA_REF),
+    )
+    settings = replace(_settings(publication_k8s), ca_bundle_path=str(bundle))
+
+    with pytest.raises(publication_k8s.PublicationResourceError, match="ConfigMap size"):
+        _build(publication_k8s, payload, settings)
 
 
 @pytest.mark.parametrize(
@@ -576,7 +647,7 @@ def test_a_ca_bundle_ref_without_a_configmap_is_refused(publication_k8s: Any) ->
     ],
 )
 def test_a_ca_bundle_ref_that_cannot_be_mounted_safely_is_refused(
-    publication_k8s: Any, ref: str
+    publication_k8s: Any, ref: str, tmp_path: Path
 ) -> None:
     payload = replace(
         _payload(publication_k8s),
@@ -584,7 +655,7 @@ def test_a_ca_bundle_ref_that_cannot_be_mounted_safely_is_refused(
     )
 
     with pytest.raises(publication_k8s.PublicationResourceError, match="CA bundle"):
-        _build(publication_k8s, payload, _ca_settings(publication_k8s))
+        _build(publication_k8s, payload, _ca_settings(publication_k8s, tmp_path))
 
 
 @pytest.mark.parametrize(
@@ -596,7 +667,11 @@ def test_a_ca_bundle_ref_that_cannot_be_mounted_safely_is_refused(
     ],
 )
 def test_job_transport_round_trips_what_the_builder_wrote(
-    publication_k8s: Any, origin: str, header_form: str, ca_bundle_ref: str | None
+    publication_k8s: Any,
+    origin: str,
+    header_form: str,
+    ca_bundle_ref: str | None,
+    tmp_path: Path,
 ) -> None:
     transport = _transport(
         publication_k8s, origin=origin, header_form=header_form, ca_bundle_ref=ca_bundle_ref
@@ -608,7 +683,7 @@ def test_job_transport_round_trips_what_the_builder_wrote(
         clean_clone_url=f"{origin}/{repo}.git",
         transport=transport,
     )
-    resources = _build(publication_k8s, payload, _ca_settings(publication_k8s))
+    resources = _build(publication_k8s, payload, _ca_settings(publication_k8s, tmp_path))
 
     assert publication_k8s.job_transport(resources.job) == transport
     # The real client hands back a V1Job model, not a dict.
@@ -619,7 +694,7 @@ def test_job_transport_round_trips_what_the_builder_wrote(
     rebuilt = _build(
         publication_k8s,
         replace(payload, transport=publication_k8s.job_transport(model)),
-        _ca_settings(publication_k8s),
+        _ca_settings(publication_k8s, tmp_path),
     )
     publication_k8s.validate_adopted_resource("Job", rebuilt.job, model)
 
@@ -1346,9 +1421,7 @@ class _FakeCoreApi:
         self.secrets[body["metadata"]["name"]] = value
         self.created.append(("Secret", body["metadata"]["name"]))
 
-    def delete_namespaced_secret(
-        self, name: str, namespace: str, *, body: dict[str, Any]
-    ) -> None:
+    def delete_namespaced_secret(self, name: str, namespace: str, *, body: dict[str, Any]) -> None:
         self.secret_deletes.append((name, deepcopy(body)))
         del self.secrets[name]
 
@@ -1405,9 +1478,9 @@ def test_create_or_adopt_validates_immutable_spec_and_live_owner_before_mutating
         cluster.apply(resources)
     core.secrets[resources.names.secret]["data"]["credential"] = original_credential
 
-    core.config_maps[resources.names.config_map]["metadata"]["ownerReferences"][0][
-        "uid"
-    ] = "different-owner-uid"
+    core.config_maps[resources.names.config_map]["metadata"]["ownerReferences"][0]["uid"] = (
+        "different-owner-uid"
+    )
     with pytest.raises(publication_k8s.PublicationResourceError, match="metadata contract"):
         cluster.apply(resources)
 
@@ -1428,13 +1501,12 @@ def test_stale_immutable_secret_is_uid_replaced_only_when_job_is_gone(
 
     cluster.apply(rotated)
 
-    assert core.secret_deletes == [
-        (resources.names.secret, {"preconditions": {"uid": old_uid}})
-    ]
+    assert core.secret_deletes == [(resources.names.secret, {"preconditions": {"uid": old_uid}})]
     assert batch.created == [resources.names.job, resources.names.job]
-    assert base64.b64decode(
-        core.secrets[resources.names.secret]["data"]["credential"]
-    ).decode() == "rotated-publication-write-credential"
+    assert (
+        base64.b64decode(core.secrets[resources.names.secret]["data"]["credential"]).decode()
+        == "rotated-publication-write-credential"
+    )
 
 
 def _v1_job(
@@ -1520,6 +1592,7 @@ def test_observe_reads_terminal_status_from_dict_shaped_kubernetes_objects(
 
 def test_observe_reports_the_transport_the_existing_job_was_built_with(
     publication_k8s: Any,
+    tmp_path: Path,
 ) -> None:
     payload = replace(
         _gitlab_payload(publication_k8s, "authorization_bearer"),
@@ -1530,7 +1603,7 @@ def test_observe_reports_the_transport_the_existing_job_was_built_with(
             ca_bundle_ref=CA_REF,
         ),
     )
-    resources = _build(publication_k8s, payload, _ca_settings(publication_k8s))
+    resources = _build(publication_k8s, payload, _ca_settings(publication_k8s, tmp_path))
     live = deepcopy(resources.job)
     live["metadata"]["uid"] = "job-uid-live"
     live["status"] = {"active": 1}
@@ -1789,9 +1862,7 @@ def test_omitempty_tolerance_refuses_valueFrom_secretKeyRef_on_omitted_env(
     env = container["env"]
     empty_items = [item for item in env if "value" not in item]
     assert empty_items, "expected at least one omitted-value env entry to attack"
-    empty_items[0]["valueFrom"] = {
-        "secretKeyRef": {"name": secret_name, "key": "credential"}
-    }
+    empty_items[0]["valueFrom"] = {"secretKeyRef": {"name": secret_name, "key": "credential"}}
 
     with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
         publication_k8s.validate_adopted_resource("Job", resources.job, planted)
@@ -1868,9 +1939,7 @@ def _failed_owned_pod(exit_code: int = 128) -> dict[str, Any]:
             "containerStatuses": [
                 {
                     "name": "publish",
-                    "state": {
-                        "terminated": {"reason": "Error", "exitCode": exit_code}
-                    },
+                    "state": {"terminated": {"reason": "Error", "exitCode": exit_code}},
                 }
             ]
         },
@@ -1931,9 +2000,7 @@ def test_observe_failed_job_error_is_bounded_for_huge_logs(
     publication_k8s: Any,
 ) -> None:
     logs = "\n".join(f"fatal: line {index} " + "x" * 200 for index in range(60))
-    cluster = _failed_job_cluster(
-        publication_k8s, pods=[_failed_owned_pod(1)], logs=logs
-    )
+    cluster = _failed_job_cluster(publication_k8s, pods=[_failed_owned_pod(1)], logs=logs)
 
     observed = cluster.observe("curie-publication-22222222222242228222")
 
@@ -1946,12 +2013,28 @@ def test_observe_failed_job_error_is_bounded_for_huge_logs(
 def test_observe_failed_job_without_pod_says_logs_were_unavailable(
     publication_k8s: Any,
 ) -> None:
-    cluster = _failed_job_cluster(
-        publication_k8s, pods=[], logs="", reason="DeadlineExceeded"
-    )
+    cluster = _failed_job_cluster(publication_k8s, pods=[], logs="", reason="DeadlineExceeded")
 
     observed = cluster.observe("curie-publication-22222222222242228222")
 
     error = observed.error or ""
     assert "DeadlineExceeded" in error
     assert "pod logs were unavailable" in error
+
+
+def test_a_publication_without_a_ca_keeps_its_contract_hash_across_the_ca_move(
+    publication_k8s: Any,
+) -> None:
+    """A worker upgrade adopts the Jobs it left running only if their hash is unchanged.
+
+    The value is the annotation the worker wrote before the code host CA moved
+    into the Job's own ConfigMap (computed from that earlier source for this
+    exact payload and settings).
+    """
+
+    resources = _resources(publication_k8s)
+
+    assert (
+        resources.job["metadata"]["annotations"]["curietech.ai/publication-contract-sha256"]
+        == "583ff66a400a55b143deff2f55935e6548680630568ace51c65280c11c00e22f"
+    )

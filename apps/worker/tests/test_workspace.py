@@ -967,6 +967,76 @@ def test_internal_workspace_selection_sends_author_thread_and_optional_repo(
     }
 
 
+def test_internal_workspace_selection_accepts_a_nested_gitlab_path(
+    workspace: Any,
+) -> None:
+    """#4399: a GitLab project nests groups, and the API validates the path
+    under the WorkItem's code host kind, so the worker accepts the selection
+    and redeems a credential for the same nested path."""
+
+    nested = "acme/platform/widgets"
+    calls: list[dict[str, Any]] = []
+
+    def transport(**request: Any) -> Any:
+        calls.append(request)
+        if request["url"].endswith("/selection"):
+            return SimpleNamespace(
+                status=200, headers={}, body=json.dumps({"repo_full_name": nested}).encode()
+            )
+        return SimpleNamespace(
+            status=200,
+            headers={"Cache-Control": "no-store"},
+            body=json.dumps(
+                {
+                    "repo_full_name": nested,
+                    "clone_url": f"https://gitlab.example.com/{nested}.git",
+                    "authorization_header": "glpat-example-not-a-token",
+                    "origin": "https://gitlab.example.com",
+                    "header_form": "private_token",
+                }
+            ).encode(),
+        )
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+
+    assert client.select(DEPLOYMENT_ID, "thread-gitlab", "U0REQUEST1", nested) == nested
+    assert json.loads(calls[0]["body"])["repo_full_name"] == nested
+    credential = client.redeem(DEPLOYMENT_ID, "thread-gitlab")
+    assert credential.repo_full_name == nested
+    assert credential.clone_url == f"https://gitlab.example.com/{nested}.git"
+
+
+@pytest.mark.parametrize(
+    "selected",
+    ["widgets", "acme//widgets", "acme/../widgets", "acme/wid gets", "/acme/widgets", 7],
+)
+def test_internal_workspace_selection_still_refuses_a_malformed_path(
+    workspace: Any, selected: Any
+) -> None:
+    """The forge-neutral rule still refuses a one-segment, empty, dot or
+    whitespace segment, or a non-string selection."""
+
+    def transport(**_request: Any) -> Any:
+        return SimpleNamespace(
+            status=200, headers={}, body=json.dumps({"repo_full_name": selected}).encode()
+        )
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+
+    with pytest.raises(workspace.WorkspacePreparationError) as excinfo:
+        client.select(DEPLOYMENT_ID, "thread-gitlab", "U0REQUEST1", None)
+    assert excinfo.value.stage == "repository-selection"
+    assert "invalid repository selection" in str(excinfo.value)
+
+
 def test_internal_workspace_selection_http_500_preserves_stage_and_status(
     workspace: Any,
 ) -> None:

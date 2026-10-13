@@ -13,7 +13,8 @@
 //! lookup walks up for), never the real checkout's `tools/forge-fixtures`
 //! tree. That keeps them independent of which fixtures the checkout carries,
 //! so a later change that adds a GitLab or Bitbucket fixture does not break
-//! them.
+//! them. The one exception is the last test, which pins that the real checkout
+//! ships the GitLab fixture (#4399).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -277,4 +278,45 @@ fn forge_fixture_script_refuses_a_missing_fixture_without_creating_state() {
             );
         }
     }
+}
+
+#[test]
+fn forge_fixture_gitlab_is_installed_in_this_checkout() {
+    // #4399 ships tools/forge-fixtures/gitlab/fixture.py, so the real
+    // checkout's binary reaches it instead of the not-installed refusal. A
+    // self-test against an empty state dir fails fast in the fixture itself
+    // (no state.json), touches no Docker, and creates no state.
+    let fixture = repo_root().join("tools/forge-fixtures/gitlab/fixture.py");
+    assert!(fixture.is_file(), "missing {}", fixture.display());
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let state_dir = scratch.path().join("state");
+    let state_arg = state_dir.to_str().expect("utf-8 tempdir");
+    let output = run_binary(
+        &repo_root(),
+        &[
+            "dev",
+            "forge-fixture",
+            "gitlab",
+            "self-test",
+            "--state-dir",
+            state_arg,
+        ],
+    );
+    let text = output_text(&output);
+    assert!(
+        !output.status.success(),
+        "self-test with no state must fail\n{text}"
+    );
+    assert!(
+        !text.contains("not installed"),
+        "the gitlab fixture is installed in this checkout\n{text}"
+    );
+    assert!(
+        text.contains("no state.json"),
+        "the installed fixture itself refused the empty state dir\n{text}"
+    );
+    assert!(
+        !state_dir.exists(),
+        "self-test created the state dir\n{text}"
+    );
 }

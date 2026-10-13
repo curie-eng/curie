@@ -35,8 +35,9 @@ from ..publication_policy import (
     publication_branch_name,
     publication_row_prefix,
 )
+from ..repository_access import thread_repository
 from ..threadkeys import fence_key_forms, legacy_producer_thread_key
-from ..workspace_policy import repository_is_allowed
+from ..workspace_policy import repository_allowed
 from .agents import get_agent
 from .approvals import get_approval_by_dedupe_key
 from .channels import AmbiguousRoute, binding_for_route
@@ -156,9 +157,15 @@ async def _require_current_publication_workspace(
         raise ValueError("conversation has no selected repository workspace")
     if thread_workspace.repo_full_name.casefold() != data.repo_full_name.casefold():
         raise ValueError("publication repository differs from the thread workspace")
-    if not repository_is_allowed(
-        thread_workspace.repo_full_name, get_settings().github_repo_allowlist
-    ):
+    settings = get_settings()
+    repository = await thread_repository(
+        session,
+        settings,
+        agent_id=deployment.agent_id,
+        conversation_id=conversation_id,
+        repo_full_name=thread_workspace.repo_full_name,
+    )
+    if not repository_allowed(settings, repository):
         raise ValueError("thread workspace repository is no longer allowed")
     return deployment, thread_workspace
 

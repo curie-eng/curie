@@ -48,9 +48,9 @@ from ..config import get_settings
 from ..deps import SessionDep
 from ..forges.config import RepositoryBindingConfig
 from ..forges.errors import ForgeError, NotFound, Unauthorized, Unavailable
-from ..forges.hosts import code_host_for, pull_request_ref
+from ..forges.hosts import code_host_for, forge_code_host, pull_request_url
 from ..forges.trackers import tracker_for_work_item, work_item_policy
-from ..forges.types import GITHUB, CredentialScope
+from ..forges.types import GITHUB, CredentialScope, PullRequestRef, RepositoryRef
 from ..models import (
     ExecutionRequest,
     Publication,
@@ -61,7 +61,9 @@ from ..models import (
 from ..publication_authority import (
     AuthorityRefused,
     AuthorityUnavailable,
+    PublicationIdentity,
     PublicationRemoteTerminal,
+    verify_code_host_identity,
     verify_publication_identity,
 )
 from ..publication_policy import policy_still_authorizes
@@ -74,9 +76,13 @@ from ..publication_truth import (
     read_publication_authority,
     read_publication_metadata,
 )
-from ..repository_access import issue_repository_credential
+from ..repository_access import (
+    issue_stored_credential,
+    lineage_repository,
+    thread_repository,
+)
 from ..workitems import lifecycle
-from ..workspace_policy import credential_mode, repository_is_allowed
+from ..workspace_policy import credential_mode, repository_allowed
 from .publication_precheck import precheck_error
 
 logger = logging.getLogger(__name__)
@@ -307,7 +313,7 @@ async def _publication_lineage_out(
     )
 
 
-async def _refresh_publication_lineage_from_github(
+async def _refresh_publication_lineage(
     request: Request,
     session: SessionDep,
     lineage: ThreadPublicationLineage,
@@ -326,16 +332,15 @@ async def _refresh_publication_lineage_from_github(
         )
 
     settings = get_settings()
-    code_host = code_host_for(settings, request.app.state.http_client)
+    repository = await lineage_repository(session, settings, lineage)
+    client = request.app.state.http_client
+    code_host = (
+        code_host_for(settings, client)
+        if repository.kind == GITHUB
+        else forge_code_host(settings, client, repository)
+    )
     try:
-        pull = await code_host.read_pull_request(
-            pull_request_ref(
-                settings,
-                path=lineage.repo_full_name,
-                project_id=lineage.repository_project_id,
-                number=lineage.pr_number,
-            )
-        )
+        pull = await code_host.read_pull_request(PullRequestRef(repository, str(lineage.pr_number)))
     except Unauthorized as exc:
         if str(exc) == "credential_unresolved":
             raise HTTPException(
@@ -361,11 +366,10 @@ async def _refresh_publication_lineage_from_github(
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, _GITHUB_UNAVAILABLE_DETAIL
         ) from None
-    expected_url = f"{settings.github_html_base}/{lineage.repo_full_name}/pull/{lineage.pr_number}"
     if (
         pull is None
         or pull.url != lineage.pr_url
-        or lineage.pr_url != expected_url
+        or lineage.pr_url != pull_request_url(settings, pull)
         or pull.head_ref != lineage.branch
         or _FULL_COMMIT_SHA.fullmatch(pull.head_sha) is None
     ):
@@ -682,8 +686,47 @@ async def get_publication_lineage(
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     if lineage is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "publication lineage not found")
-    lineage = await _refresh_publication_lineage_from_github(request, session, lineage)
+    lineage = await _refresh_publication_lineage(request, session, lineage)
     return await _publication_lineage_out(session, lineage)
+
+
+async def _verified_identity(
+    request: Request,
+    session: AsyncSession,
+    publication: Publication,
+    data: PublicationLineageAdvance,
+) -> PublicationIdentity | None:
+    """The outcome's code host identity, after the stale-outcome check.
+
+    A GitHub lineage is checked against its canonical URL before GitHub is
+    contacted, then verified with the install's App. Any other code host names
+    its pull requests itself, so its pull request is read through its port
+    first and the outcome is checked against the link that read answered.
+    """
+
+    lineage = publication.lineage
+    assert lineage is not None
+    settings = get_settings()
+    client = request.app.state.http_client
+    repository = await lineage_repository(session, settings, lineage)
+    identity: PublicationIdentity | None = None
+    if repository.kind != GITHUB:
+        identity = await verify_code_host_identity(
+            lineage, data, forge_code_host(settings, client, repository), repository
+        )
+    conflict = crud_lineages.publication_lineage_outcome_conflict(
+        publication,
+        lineage,
+        data,
+        pull_request_url=crud_lineages.outcome_pull_request_url(
+            lineage, data, github_html_base=settings.github_html_base, identity=identity
+        ),
+    )
+    if conflict is not None:
+        raise conflict
+    if identity is None:
+        identity = await verify_publication_identity(lineage, data, settings, client)
+    return identity
 
 
 @internal_router.patch(
@@ -702,20 +745,7 @@ async def advance_publication_lineage(
         publication = await crud_publication_queries.get_publication(session, publication_id)
         if publication is None or publication.lineage is None:
             raise LookupError("publication lineage not found")
-        conflict = crud_lineages.publication_lineage_outcome_conflict(
-            publication,
-            publication.lineage,
-            data,
-            github_html_base=settings.github_html_base,
-        )
-        if conflict is not None:
-            raise conflict
-        identity = await verify_publication_identity(
-            publication.lineage,
-            data,
-            settings,
-            request.app.state.http_client,
-        )
+        identity = await _verified_identity(request, session, publication, data)
         lineage = await crud_lineages.advance_publication_lineage(
             session,
             publication_id,
@@ -805,14 +835,19 @@ async def get_publication(publication_id: uuid.UUID, session: SessionDep) -> Pub
     return PublicationOut.model_validate(publication)
 
 
-def _credential_issue_detail(settings: Any, approval: Any) -> str:
-    """Name the credential mode, and the policy when the platform resolved it."""
+def _credential_issue_detail(settings: Any, repository: RepositoryRef, approval: Any) -> str:
+    """Name the credential source, and the policy when the platform resolved it."""
 
-    detail = "server-derived repository credential issued via " + credential_mode(
-        app_id=settings.github_app_id,
-        app_private_key=settings.github_app_private_key,
-        token=settings.github_token,
+    source = (
+        credential_mode(
+            app_id=settings.github_app_id,
+            app_private_key=settings.github_app_private_key,
+            token=settings.github_token,
+        )
+        if repository.kind == GITHUB
+        else f"{repository.kind}_code_host"
     )
+    detail = "server-derived repository credential issued via " + source
     identity = getattr(approval, "policy_identity", None)
     if identity:
         detail += f" under {identity} version {approval.policy_version} by {approval.resolved_by}"
@@ -890,10 +925,21 @@ async def redeem_publication_credential(
         conversation_id=workspace_conversation_id,
     )
     settings = get_settings()
+    repository = (
+        await lineage_repository(session, settings, publication.lineage)
+        if publication.lineage is not None
+        else await thread_repository(
+            session,
+            settings,
+            agent_id=deployment.agent_id,
+            conversation_id=workspace_conversation_id,
+            repo_full_name=repo,
+        )
+    )
     if (
         selected is None
         or selected.repo_full_name.casefold() != repo.casefold()
-        or not repository_is_allowed(repo, settings.github_repo_allowlist)
+        or not repository_allowed(settings, repository)
     ):
         await refused(
             status.HTTP_403_FORBIDDEN,
@@ -919,15 +965,10 @@ async def redeem_publication_credential(
             {"code": cancelled.code, "message": cancelled.message},
         )
     try:
-        issued = await issue_repository_credential(
+        issued = await issue_stored_credential(
             settings,
             request.app.state.http_client,
-            repo_full_name=repo,
-            project_id=(
-                publication.lineage.repository_project_id
-                if publication.lineage is not None
-                else None
-            ),
+            repository=repository,
             scope=CredentialScope.PUSH,
         )
     except Exception as exc:
@@ -952,7 +993,7 @@ async def redeem_publication_credential(
         deployment_id=publication.deployment_id,
         publication_id=publication.id,
         repo_full_name=repo,
-        detail=_credential_issue_detail(settings, approval),
+        detail=_credential_issue_detail(settings, repository, approval),
     )
     return RepositoryCredentialOut(
         repo_full_name=repo,

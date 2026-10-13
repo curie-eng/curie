@@ -221,6 +221,15 @@ rules; GitLab, Jira and both Bitbucket kinds are.
 5. **Bitbucket Data Center:** `BitbucketDcCodeHost` in
    `apps/api/src/curie_api/forges/bitbucket_dc/code_host.py`, with the same
    capabilities and allowlist rule, for Data Center 9.4.0 or newer.
+6. **GitLab:** `GitLabTracker`
+   (`apps/api/src/curie_api/forges/gitlab/tracker.py::GitLabTracker`) and
+   `GitLabCodeHost`
+   (`apps/api/src/curie_api/forges/gitlab/code_host.py::GitLabCodeHost`) in
+   `apps/api/src/curie_api/forges/gitlab/`, a native pair for gitlab.com and
+   self-managed servers 17.0 or newer. It uses a static token with the `api`
+   and `write_repository` scopes held only by the API, polls issues, keeps
+   marked comments in issue and merge request notes, and supports
+   `ci_diagnostics` and `rerun_failed`.
 
 ## Known leakage
 

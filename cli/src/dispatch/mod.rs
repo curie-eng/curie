@@ -717,6 +717,7 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                 };
                 // Refuse an unusable forge selection before the chart fetch.
                 curie::factory_quickstart::select_forge(&forge)?;
+                curie::factory_quickstart::check_candidate_forge(&forge, candidate.as_deref())?;
                 let candidate = match candidate {
                     Some(commit) => {
                         Some(curie::factory_quickstart::resolve_candidate(&commit).await?)

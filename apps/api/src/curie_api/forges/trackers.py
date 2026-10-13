@@ -26,6 +26,8 @@ from curie_api.forges.types import RepositoryRef, TrackerIssueRef
 
 _GITHUB_COMMENT_PREFIX = "#issuecomment-"
 _FOCUSED_COMMENT_PREFIX = "?focusedCommentId="
+_COMMENT_PREFIXES = {types.GITHUB: _GITHUB_COMMENT_PREFIX, types.GITLAB: "#note_"}
+_GITLAB_NOTE_EVENT = "note:"
 
 
 def binding_for_scope(registry: ForgeRegistry, issue: TrackerIssueRef) -> BindingConfig | None:
@@ -201,9 +203,23 @@ def issue_link(registry: ForgeRegistry, issue: TrackerIssueRef, repository: Repo
 
 
 def comment_prefix(kind: str) -> str:
-    """What joins an issue link and one of its comment ids, per tracker kind."""
+    """What joins an issue link and one of its comment ids, per tracker kind:
+    GitHub's ``#issuecomment-``, GitLab's ``#note_`` anchor, else Jira's
+    ``?focusedCommentId=``."""
 
-    return _GITHUB_COMMENT_PREFIX if kind == types.GITHUB else _FOCUSED_COMMENT_PREFIX
+    return _COMMENT_PREFIXES.get(kind, _FOCUSED_COMMENT_PREFIX)
+
+
+def mention_comment_id(kind: str, event_id: str) -> str:
+    """The comment id inside a mention notice's ``event_id``.
+
+    A GitLab mention's event id is ``note:<id>`` (its tracker keys label events
+    and notes apart); every other kind's is the comment id itself.
+    """
+
+    if kind == types.GITLAB:
+        return event_id.removeprefix(_GITLAB_NOTE_EVENT)
+    return event_id
 
 
 def mention_objective(link: str, kind: str, comment_id: str) -> str:

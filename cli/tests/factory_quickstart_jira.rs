@@ -1368,7 +1368,8 @@ fn dry_run(cli: &Cli, args: &[String]) -> Run {
 }
 
 #[test]
-fn factory_quickstart_jira_with_a_non_github_code_host_is_still_not_installed() {
+fn factory_quickstart_jira_with_a_gitlab_code_host_is_a_pairing_refusal() {
+    // #4399: gitlab is installed and pairs only with the gitlab tracker.
     let cli = Cli::new(0);
     let mut args = jira_args("https://jira.example.com", &cli.token_file());
     args = without(&args, "--code-host");
@@ -1376,8 +1377,10 @@ fn factory_quickstart_jira_with_a_non_github_code_host_is_still_not_installed() 
     let run = dry_run(&cli, &args);
     let text = run.all();
     assert_ne!(run.code, 0, "{text}");
-    assert!(text.contains("not installed"), "{text}");
+    assert!(text.contains("pairs only with"), "{text}");
     assert!(text.contains("gitlab"), "{text}");
+    assert!(!text.contains("not installed"), "{text}");
+    assert_no_token(&text, "the pairing refusal");
 }
 
 #[test]

@@ -15,6 +15,8 @@ from typing import Any
 
 import pytest
 from curie_api.config import Settings
+from curie_api.forges import registry as forge_registry
+from forge_fakes import gitlab as gitlab_fake
 from forge_fakes.github import forges_document, forges_env_json
 from pydantic import ValidationError
 
@@ -106,6 +108,54 @@ def test_an_enabled_factory_without_a_github_code_host_is_refused() -> None:
 
 def test_an_enabled_factory_without_an_allowlist_is_refused() -> None:
     _refused("GITHUB_REPO_ALLOWLIST", github_repo_allowlist=())
+
+
+# A non-GitHub pairing (#4399 AC 8) -------------------------------------------------------
+
+
+def _gitlab_only(document: dict[str, Any] | None = None) -> Settings:
+    """An enabled factory whose CURIE_FORGES holds only a GitLab tracker, code
+    host and binding, with no GitHub allowlist."""
+
+    return Settings(
+        _env_file=None,
+        factory_enabled=True,
+        forges=gitlab_fake.forges_document() if document is None else document,
+        github_webhook_secret="example-factory-hmac-secret",
+    )
+
+
+def test_an_enabled_factory_on_a_gitlab_only_forges_document_boots() -> None:
+    settings = _gitlab_only()
+
+    assert [t.kind for t in settings.forges.trackers] == ["gitlab"]
+    assert [h.kind for h in settings.forges.code_hosts] == ["gitlab"]
+    assert settings.github_repo_allowlist == ()
+
+
+@pytest.mark.parametrize("emptied", ["trackers", "code_hosts"])
+def test_an_enabled_gitlab_only_factory_without_a_tracker_or_code_host_is_refused(
+    emptied: str,
+) -> None:
+    document = gitlab_fake.forges_document()
+    document[emptied] = []
+    document["bindings"] = []
+
+    with pytest.raises(ValidationError) as refused:
+        _gitlab_only(document)
+    assert "FACTORY_ENABLED" in str(refused.value)
+    assert "CURIE_FORGES" in str(refused.value)
+
+
+def test_a_github_tracker_beside_gitlab_still_needs_the_allowlist() -> None:
+    document = forges_document()
+    gitlab = gitlab_fake.forges_document()
+    for section in ("code_hosts", "trackers", "bindings"):
+        document[section] = [*document.get(section, []), *gitlab[section]]
+
+    with pytest.raises(ValidationError) as refused:
+        _gitlab_only(document)
+    assert "GITHUB_REPO_ALLOWLIST" in str(refused.value)
 
 
 def test_an_invalid_label_or_mention_is_refused_by_the_tracker_entry() -> None:
@@ -271,35 +321,47 @@ def test_a_github_static_token_in_curie_forges_is_refused_naming_the_entry(
     assert "ghp_fixture" not in str(refused.value)
 
 
-@pytest.mark.parametrize(
-    ("section", "entry"),
-    [
-        (
-            "code_hosts",
-            {
-                "name": "corp-gitlab",
-                "kind": "gitlab",
-                "host": "gitlab.example",
-                "api_url": "https://gitlab.example/api/v4",
-                "credential": {"type": "static_token", "token": "glpat-fixture"},
-            },
-        ),
-    ],
-)
-def test_a_reserved_kind_in_curie_forges_is_refused_at_load_naming_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, section: str, entry: dict[str, Any]
-) -> None:
-    """#4397 AC 1: the refusal is at config load, not at first use."""
+_GITLAB_CODE_HOST = {
+    "name": "corp-gitlab",
+    "kind": "gitlab",
+    "host": "gitlab.example",
+    "api_url": "https://gitlab.example/api/v4",
+    "credential": {"type": "static_token", "token": "glpat-fixture"},
+}
 
+
+def test_a_reserved_kind_in_curie_forges_is_refused_at_load_naming_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#4397 AC 1: the refusal is at config load, not at first use.
+
+    No configurable kind is reserved since #4399 installed GitLab, so the
+    refusal is proven on gitlab reserved for this test only."""
+
+    monkeypatch.delitem(forge_registry._KINDS, "gitlab")
+    forge_registry.register_not_installed("gitlab")
     document = forges_document()
-    document[section].append(entry)
+    document["code_hosts"].append(dict(_GITLAB_CODE_HOST))
     _set_factory_env(monkeypatch, forges_env_json(document, tmp_path))
 
     with pytest.raises(ValidationError) as refused:
         Settings(_env_file=None)
-    assert entry["kind"] in str(refused.value)
-    assert entry["name"] in str(refused.value)
+    assert "gitlab" in str(refused.value)
+    assert "corp-gitlab" in str(refused.value)
     assert "not installed" in str(refused.value)
+
+
+def test_an_installed_gitlab_code_host_in_curie_forges_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Liveness for the refusal above: the shipped build installs GitLab."""
+
+    document = forges_document()
+    document["code_hosts"].append(dict(_GITLAB_CODE_HOST))
+    _set_factory_env(monkeypatch, forges_env_json(document, tmp_path))
+
+    settings = Settings(_env_file=None)
+    assert {h.kind for h in settings.forges.code_hosts} == {"github", "gitlab"}
 
 
 def test_an_empty_curie_forges_env_is_an_empty_config(monkeypatch: pytest.MonkeyPatch) -> None:

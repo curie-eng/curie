@@ -8,8 +8,7 @@ from typing import Literal
 from aci_protocol.turn import SLACK_KIND, route_identity
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from ..forges import types as forge_types
-from ..forges.paths import REPOSITORY_FULL_NAME_PATTERN, valid_repository_path
+from ..forges.paths import valid_code_host_path
 from ..identities import refuse_undeclared
 from .channels import (
     BUILTIN_CLUSTER_MESSAGE_ADAPTER,
@@ -25,7 +24,7 @@ class PublicationCreate(BaseModel):
     deployment_id: uuid.UUID
     conversation_id: str = Field(min_length=1)
     reply_conversation_id: str | None = Field(default=None, min_length=1)
-    repo_full_name: str = Field(pattern=REPOSITORY_FULL_NAME_PATTERN)
+    repo_full_name: str
     author: str = Field(min_length=1)
     summary: str = Field(min_length=1)
     reply_kind: str = Field(min_length=1)
@@ -52,8 +51,10 @@ class PublicationCreate(BaseModel):
     @field_validator("repo_full_name")
     @classmethod
     def _canonical_publication_repo(cls, value: str) -> str:
-        if not valid_repository_path(forge_types.GITHUB, value):
-            raise ValueError("repo_full_name must be one canonical owner/repository name")
+        # The thread's selected workspace is the authority on the repository and
+        # its code host; the snapshot only has to name a repository path.
+        if not valid_code_host_path(value):
+            raise ValueError("repo_full_name must be a repository path")
         return value
 
     @field_validator("base_sha")

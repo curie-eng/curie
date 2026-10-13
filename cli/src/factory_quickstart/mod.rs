@@ -26,6 +26,7 @@ mod gitlab;
 mod jira_cloud;
 
 pub use github::{deploy_args, intake_args, registration_steps, RerunTarget};
+pub use gitlab::{gitlab_entries, gitlab_web_base, GitlabFacts, GITLAB_DEFAULT_URL};
 pub use jira_cloud::{preflight as jira_preflight, JiraPlan};
 
 pub const DEFAULT_KIND_NAME: &str = "curie-factory";
@@ -322,6 +323,13 @@ pub fn forge_egress_entries(
         .collect())
 }
 
+/// The addresses `host` resolves to on the operator's machine, for
+/// [`forge_egress_entries`].
+pub(super) fn resolve_host(host: &str) -> Result<Vec<std::net::IpAddr>> {
+    use std::net::ToSocketAddrs;
+    Ok((host, 0).to_socket_addrs()?.map(|addr| addr.ip()).collect())
+}
+
 /// Reads the access token from `token_file`, trimmed. The value is never
 /// put into an error.
 pub(super) fn read_token(token_file: &Path) -> Result<String> {
@@ -366,13 +374,18 @@ pub(super) fn http_client(ca_file: Option<&Path>) -> Result<reqwest::Client> {
     })
 }
 
-/// The error for a forge kind this build has no quickstart module for.
-fn forge_not_installed(kind: &str) -> anyhow::Error {
-    CliError::unsupported(format!(
-        "forge kind '{kind}' is not installed in this build"
-    ))
-    .with_fix("rerun with --code-host github and --tracker github, or omit both")
-    .into()
+/// Refuses `--candidate` on a GitLab quickstart. Pure, so it runs before the
+/// candidate's published images are resolved: the GitHub path installs those
+/// images, while a GitLab quickstart binds the release's own.
+pub fn check_candidate_forge(forge: &ForgeFlags, candidate: Option<&str>) -> Result<()> {
+    if candidate.is_some() && forge.code_host == CodeHostKind::Gitlab {
+        return Err(CliError::usage(
+            "--candidate installs published images through the GitHub quickstart; --code-host gitlab binds the release's own images",
+        )
+        .with_fix("drop --candidate, or install the candidate with `curie cluster up` before the quickstart")
+        .into());
+    }
+    Ok(())
 }
 
 /// Refuses a forge selection this build cannot run. Pure: it reads no file,
@@ -399,11 +412,13 @@ pub fn select_forge(forge: &ForgeFlags) -> Result<()> {
                 None => Ok(()),
             }
         }
+        // GitLab pairs only with itself, on either side.
+        (CodeHostKind::Gitlab, _) | (CodeHostKind::Github, TrackerKind::Gitlab) => {
+            gitlab::check(forge)
+        }
         // A reserved kind's not-installed error wins over any pairing rule.
-        (CodeHostKind::Gitlab, _) => gitlab::check(forge),
         (CodeHostKind::BitbucketCloud, _) => bitbucket_cloud::check(forge),
         (CodeHostKind::BitbucketDc, _) => bitbucket_dc::check(forge),
-        (CodeHostKind::Github, TrackerKind::Gitlab) => gitlab::check(forge),
         (CodeHostKind::Github, TrackerKind::JiraCloud) => jira_cloud::check(forge),
     }
 }
@@ -1150,6 +1165,124 @@ pub fn release_has_real_model(values: &serde_json::Value) -> bool {
     values.pointer("/agentSandbox/runner/fakeModel") == Some(&serde_json::json!(false))
 }
 
+/// Where the install steps run and what `cluster up` installs.
+pub(super) struct InstallTarget<'a> {
+    pub explicit_context: Option<&'a str>,
+    pub current_context: Option<&'a str>,
+    pub kind_name: &'a str,
+    pub existing_kind_clusters: &'a [String],
+    pub namespace: &'a str,
+    pub release: &'a str,
+    pub model: &'a str,
+    pub chart: &'a str,
+    pub release_at_target: bool,
+    /// The add agent path never touches the cluster underneath the release.
+    pub add_agent: bool,
+}
+
+/// The selected context and the kind and `cluster up` steps every forge's
+/// quickstart runs ahead of its own.
+pub(super) struct InstallSteps {
+    pub context: String,
+    /// Why `context` was selected. `--dry-run` prints this before any step.
+    pub context_reason: String,
+    pub kind_cluster: Option<String>,
+    pub actions: Vec<Action>,
+    /// `cluster up` was left out because the release is already at the target.
+    pub skipped_cluster_up: bool,
+}
+
+pub(super) fn install_steps(target: &InstallTarget<'_>) -> InstallSteps {
+    let untargeted = target.explicit_context.is_none() && target.current_context.is_none();
+    let context = target
+        .explicit_context
+        .or(target.current_context)
+        .map(str::to_string)
+        .unwrap_or_else(|| kind_context_name(target.kind_name));
+    // Kind is created only when nothing is targeted. A kind context, including
+    // the one this command created on a previous run, still gets gVisor off
+    // and the CoreDNS scale. A remote context does not.
+    let kind_target = !target.add_agent && (untargeted || is_kind_context(&context));
+    let kind_cluster = kind_target.then(|| {
+        if is_kind_context(&context) {
+            context.trim_start_matches("kind-").to_string()
+        } else {
+            target.kind_name.to_string()
+        }
+    });
+    let create_kind = untargeted
+        && kind_cluster
+            .as_ref()
+            .is_some_and(|name| !target.existing_kind_clusters.iter().any(|c| c == name));
+
+    let mut actions = Vec::new();
+    if let Some(name) = &kind_cluster {
+        if create_kind {
+            actions.push(Action::External {
+                program: "kind".into(),
+                args: vec![
+                    "create".into(),
+                    "cluster".into(),
+                    "--name".into(),
+                    name.clone(),
+                ],
+            });
+        }
+        actions.push(Action::External {
+            program: "kubectl".into(),
+            args: vec![
+                "--context".into(),
+                context.clone(),
+                "-n".into(),
+                "kube-system".into(),
+                "scale".into(),
+                "deployment/coredns".into(),
+                "--replicas=1".into(),
+            ],
+        });
+    }
+
+    let mut up = vec![
+        "cluster".into(),
+        "up".into(),
+        "--context".into(),
+        context.clone(),
+        "--namespace".into(),
+        target.namespace.to_string(),
+        "--release".into(),
+        target.release.to_string(),
+        "--model".into(),
+        target.model.to_string(),
+        "--chart".into(),
+        target.chart.to_string(),
+    ];
+    if kind_target {
+        up.push("--set".into());
+        up.push(GVISOR_OFF_SET.into());
+    }
+    // ADR 0114 and ADR 0193 keep install-fact inference inside `cluster up`.
+    // The skip stays here: quickstart does not invoke `cluster up` when the
+    // release is already that chart and these values.
+    let skipped_cluster_up = target.release_at_target && !target.add_agent;
+    if !target.release_at_target && !target.add_agent {
+        actions.push(Action::Cluster { args: up });
+    }
+    let context_reason = context_reason(
+        target.explicit_context,
+        target.current_context,
+        &context,
+        create_kind,
+        kind_cluster.as_deref(),
+    );
+    InstallSteps {
+        context,
+        context_reason,
+        kind_cluster,
+        actions,
+        skipped_cluster_up,
+    }
+}
+
 pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
     validate_repos(&input.repos)?;
     validate_agent_flags(&input.agent, input.label.as_deref())?;
@@ -1228,84 +1361,24 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
     }
     let add_agent = path == QuickstartPath::AddAgent;
 
-    let owned_kind = kind_context_name(&input.kind_name);
-    let context = input
-        .explicit_context
-        .clone()
-        .or_else(|| input.current_context.clone())
-        .unwrap_or_else(|| owned_kind.clone());
-    // Kind is created only when nothing is targeted. A kind context, including
-    // the one this command created on a previous run, still gets gVisor off
-    // and the CoreDNS scale. A remote context does not.
-    // The add agent path never touches the cluster underneath the release.
-    let kind_target = !add_agent
-        && (input.explicit_context.is_none() && input.current_context.is_none()
-            || is_kind_context(&context));
-    let kind_cluster = kind_target.then(|| {
-        if is_kind_context(&context) {
-            context.trim_start_matches("kind-").to_string()
-        } else {
-            input.kind_name.clone()
-        }
+    let InstallSteps {
+        context,
+        context_reason,
+        kind_cluster,
+        mut actions,
+        skipped_cluster_up,
+    } = install_steps(&InstallTarget {
+        explicit_context: input.explicit_context.as_deref(),
+        current_context: input.current_context.as_deref(),
+        kind_name: &input.kind_name,
+        existing_kind_clusters: &input.existing_kind_clusters,
+        namespace: &input.namespace,
+        release: &input.release,
+        model: &input.model,
+        chart: &input.chart,
+        release_at_target: input.release_at_target,
+        add_agent,
     });
-    let create_kind = input.explicit_context.is_none()
-        && input.current_context.is_none()
-        && kind_cluster
-            .as_ref()
-            .is_some_and(|name| !input.existing_kind_clusters.iter().any(|c| c == name));
-
-    let mut actions = Vec::new();
-    if let Some(name) = &kind_cluster {
-        if create_kind {
-            actions.push(Action::External {
-                program: "kind".into(),
-                args: vec![
-                    "create".into(),
-                    "cluster".into(),
-                    "--name".into(),
-                    name.clone(),
-                ],
-            });
-        }
-        actions.push(Action::External {
-            program: "kubectl".into(),
-            args: vec![
-                "--context".into(),
-                context.clone(),
-                "-n".into(),
-                "kube-system".into(),
-                "scale".into(),
-                "deployment/coredns".into(),
-                "--replicas=1".into(),
-            ],
-        });
-    }
-
-    let mut up = vec![
-        "cluster".into(),
-        "up".into(),
-        "--context".into(),
-        context.clone(),
-        "--namespace".into(),
-        input.namespace.clone(),
-        "--release".into(),
-        input.release.clone(),
-        "--model".into(),
-        input.model.clone(),
-        "--chart".into(),
-        input.chart.clone(),
-    ];
-    if kind_target {
-        up.push("--set".into());
-        up.push(GVISOR_OFF_SET.into());
-    }
-    // ADR 0114 and ADR 0193 keep install-fact inference inside `cluster up`.
-    // The skip stays here: quickstart does not invoke `cluster up` when the
-    // release is already that chart and these values.
-    let skipped_cluster_up = input.release_at_target && !add_agent;
-    if !input.release_at_target && !add_agent {
-        actions.push(Action::Cluster { args: up });
-    }
 
     let bundle = input.plugin_dir.clone();
     let deploy = Action::Deploy {
@@ -1382,13 +1455,6 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         }
     }
 
-    let context_reason = context_reason(
-        input.explicit_context.as_deref(),
-        input.current_context.as_deref(),
-        &context,
-        create_kind,
-        kind_cluster.as_deref(),
-    );
     Ok(Planned {
         context,
         context_reason,
@@ -1447,47 +1513,14 @@ pub fn describe(planned: &Planned) -> Vec<String> {
             planned.agent, planned.release
         ));
     }
-    match &planned.credential {
-        CredentialDecision::UseEnv => {
-            lines.push("model credential: use CURIE_CREDENTIALS (no prompt)".to_string());
-        }
-        CredentialDecision::PreserveRecorded => {
-            lines.push(
-                "model credential: keep the real model already recorded on the release (no prompt)"
-                    .to_string(),
-            );
-        }
-        CredentialDecision::PromptOnce => {
-            lines.push(
-                "model credential: prompt once for an Anthropic API key (sk-ant-) or OpenRouter key (sk-or-) before cluster up"
-                    .to_string(),
-            );
-        }
-        CredentialDecision::RefuseNonInteractive => {
-            lines.push(
-                "model credential: refuse because CURIE_CREDENTIALS is unset, the release has no real model, and stdin is not a terminal"
-                    .to_string(),
-            );
-        }
-        CredentialDecision::NotNeeded => {
-            lines.push(
-                "model credential: not needed; the release keeps the model it records (no prompt)"
-                    .to_string(),
-            );
-        }
-    }
+    lines.push(credential_line(&planned.credential).to_string());
     if planned.skipped_cluster_up {
-        lines.push(
-            "skip cluster up: the release is already at the target chart and values".to_string(),
-        );
+        lines.push(SKIPPED_CLUSTER_UP_LINE.to_string());
     }
     for action in &planned.actions {
         match action {
-            Action::External { program, args } => {
-                lines.push(format!("{program} {}", args.join(" ")));
-            }
-            Action::Cluster { args } => {
-                lines.push(format!("curie {}", args.join(" ")));
+            Action::External { .. } | Action::Cluster { .. } => {
+                lines.extend(install_action_line(action));
             }
             Action::Register {
                 org,
@@ -1538,9 +1571,7 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                 lines.push(jira_tracker_line(jira));
             }
             Action::ForgeEgress { agent } => {
-                lines.push(format!(
-                    "enroll {agent} for forge egress: helm upgrade --reset-then-reuse-values --set factory.sandboxEgress.{agent}=true unless the release already records it; the API does not roll"
-                ));
+                lines.push(forge_egress_line(agent));
             }
             Action::RunnerEnv { agent } => {
                 lines.push(format!(
@@ -1568,27 +1599,10 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                 jira_binding,
                 chart,
             } => {
+                lines.push(bundle_line(bundle.as_deref(), runner_image.as_deref()));
                 let dir = match bundle {
-                    None => {
-                        lines.push(format!(
-                            "render the dark factory and deploy the published {} image",
-                            crate::examples::DARK_FACTORY_RUNNER_REPOSITORY
-                        ));
-                        bundle_dir(namespace, release, agent)
-                    }
-                    Some(dir) => {
-                        lines.push(match runner_image {
-                            Some(image) => format!(
-                                "deploy the operator bundle {} as given with its locked runner image {image}",
-                                dir.display()
-                            ),
-                            None => format!(
-                                "deploy the operator bundle {} as given on the platform runner: it declares no runner layer",
-                                dir.display()
-                            ),
-                        });
-                        dir.clone()
-                    }
+                    None => bundle_dir(namespace, release, agent),
+                    Some(dir) => dir.clone(),
                 };
                 for args in deploy_args(
                     context,
@@ -1607,19 +1621,187 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                 for repo in bound {
                     lines.push(skip_bound_line(agent, repo));
                 }
-                lines.push(format!(
-                    "curie cluster overrides {agent} --context {context} --namespace {namespace} --release {release} --execution-deadline {deadline_seconds}"
-                ));
-                lines.push(format!(
-                    "curie cluster publication-policy {agent} --context {context} --namespace {namespace} --release {release} --policy auto"
-                ));
-                lines.push(format!(
-                    "curie cluster budget {agent} --context {context} --namespace {namespace} --release {release} --limit {budget_usd}"
-                ));
+                lines.extend(
+                    agent_settings(
+                        agent,
+                        context,
+                        namespace,
+                        release,
+                        *deadline_seconds,
+                        *budget_usd,
+                    )
+                    .into_iter()
+                    .map(|(args, _)| format!("curie {}", args.join(" "))),
+                );
             }
         }
     }
     lines
+}
+
+/// The plan line for enrolling `agent` for forge egress.
+fn forge_egress_line(agent: &str) -> String {
+    format!(
+        "enroll {agent} for forge egress: helm upgrade --reset-then-reuse-values --set factory.sandboxEgress.{agent}=true unless the release already records it; the API does not roll"
+    )
+}
+
+/// The plan line for the bundle a deploy ships: the published dark factory
+/// when `bundle` is `None`, else the operator bundle as given.
+fn bundle_line(bundle: Option<&Path>, runner_image: Option<&str>) -> String {
+    match (bundle, runner_image) {
+        (None, _) => format!(
+            "render the dark factory and deploy the published {} image",
+            crate::examples::DARK_FACTORY_RUNNER_REPOSITORY
+        ),
+        (Some(dir), Some(image)) => format!(
+            "deploy the operator bundle {} as given with its locked runner image {image}",
+            dir.display()
+        ),
+        (Some(dir), None) => format!(
+            "deploy the operator bundle {} as given on the platform runner: it declares no runner layer",
+            dir.display()
+        ),
+    }
+}
+
+/// The `cluster overrides`, `publication-policy` and `budget` argvs that
+/// follow a deploy, each with its progress step.
+fn agent_settings(
+    agent: &str,
+    context: &str,
+    namespace: &str,
+    release: &str,
+    deadline_seconds: u32,
+    budget_usd: f64,
+) -> Vec<(Vec<String>, &'static str)> {
+    let settings: [(&str, [String; 2], &str); 3] = [
+        (
+            "overrides",
+            ["--execution-deadline".into(), deadline_seconds.to_string()],
+            "Setting execution deadline",
+        ),
+        (
+            "publication-policy",
+            ["--policy".into(), "auto".into()],
+            "Setting publication policy",
+        ),
+        (
+            "budget",
+            ["--limit".into(), budget_display(budget_usd)],
+            "Setting factory budget",
+        ),
+    ];
+    settings
+        .into_iter()
+        .map(|(verb, extra, step)| {
+            (
+                cluster_agent(verb, agent, context, namespace, release, &extra),
+                step,
+            )
+        })
+        .collect()
+}
+
+/// The plan line for a release already at the target chart and values.
+const SKIPPED_CLUSTER_UP_LINE: &str =
+    "skip cluster up: the release is already at the target chart and values";
+
+/// The plan line for the model credential decision.
+fn credential_line(decision: &CredentialDecision) -> &'static str {
+    match decision {
+        CredentialDecision::UseEnv => "model credential: use CURIE_CREDENTIALS (no prompt)",
+        CredentialDecision::PreserveRecorded => {
+            "model credential: keep the real model already recorded on the release (no prompt)"
+        }
+        CredentialDecision::PromptOnce => {
+            "model credential: prompt once for an Anthropic API key (sk-ant-) or OpenRouter key (sk-or-) before cluster up"
+        }
+        CredentialDecision::RefuseNonInteractive => {
+            "model credential: refuse because CURIE_CREDENTIALS is unset, the release has no real model, and stdin is not a terminal"
+        }
+        CredentialDecision::NotNeeded => {
+            "model credential: not needed; the release keeps the model it records (no prompt)"
+        }
+    }
+}
+
+/// The plan line for a kind, kubectl or `cluster up` step; `None` for any
+/// other action.
+fn install_action_line(action: &Action) -> Option<String> {
+    match action {
+        Action::External { program, args } => Some(format!("{program} {}", args.join(" "))),
+        Action::Cluster { args } => Some(format!("curie {}", args.join(" "))),
+        _ => None,
+    }
+}
+
+/// Runs one kind, kubectl or `cluster up` step. `prompted_model` replaces the
+/// `cluster up` model when the credential was prompted for.
+async fn run_install_action(action: &Action, prompted_model: Option<&String>) -> Result<()> {
+    match action {
+        Action::External { program, args } => {
+            let step = if program == "kind" {
+                "Creating kind cluster"
+            } else {
+                "Scaling CoreDNS"
+            };
+            run_program(program, args, step).await
+        }
+        Action::Cluster { args } => {
+            // Prompted credentials become available only immediately before
+            // this action. Resolve again so an omitted model follows that key.
+            let mut args = args.clone();
+            if let Some(model) = prompted_model {
+                let model_index = args
+                    .iter()
+                    .position(|arg| arg == "--model")
+                    .expect("quickstart cluster up always specifies its model");
+                args[model_index + 1] = model.clone();
+            }
+            run_self(&args, "Installing Curie").await.map(|_| ())
+        }
+        _ => Err(CliError::failure("not an install step").into()),
+    }
+}
+
+/// The Opaque Secret holding a forge token under the data key `token`.
+pub(crate) fn token_secret_manifest(namespace: &str, name: &str, token: &str) -> serde_json::Value {
+    use base64::Engine;
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "type": "Opaque",
+        "metadata": {"name": name, "namespace": namespace},
+        "data": {"token": base64::engine::general_purpose::STANDARD.encode(token.as_bytes())},
+    })
+}
+
+/// Applies `manifest` with `kubectl apply -f -` on stdin. kubectl's output is
+/// dropped: a failed apply can echo the manifest, which may hold a token.
+/// `what` names the object in the refusal.
+pub(super) async fn apply_manifest(
+    namespace: &str,
+    manifest: &serde_json::Value,
+    what: &str,
+) -> Result<()> {
+    crate::ui::ui().note(&format!("Writing {what}"));
+    let body = serde_json::to_vec(manifest)?;
+    let (ok, _, _) = crate::ops::run_capture_with_stdin(
+        &crate::factory_app::secret_apply_command(namespace),
+        &body,
+    )
+    .await?;
+    if !ok {
+        return Err(CliError::failure(format!(
+            "writing {what} in namespace {namespace} failed; the forge entries were not written"
+        ))
+        .with_fix(format!(
+            "check access with `kubectl -n {namespace} auth can-i create secrets` and rerun"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// The plan line for the Jira tracker action.
@@ -1814,13 +1996,17 @@ async fn release_matches_quickstart_target(
     Ok((matches, model.to_string()))
 }
 
-/// Runs the quickstart for the selected forge: GitHub, or a Jira Cloud tracker
-/// composed into the GitHub flow. The selection is checked again here so a
-/// caller that skipped [`select_forge`] still cannot run the flow for a kind
-/// this build does not install.
+/// Runs the quickstart for the selected forge: GitLab as both code host and
+/// tracker, or GitHub with a GitHub or Jira Cloud tracker composed into the
+/// GitHub flow. The selection is checked again here so a caller that skipped
+/// [`select_forge`] still cannot run the flow for a kind this build does not
+/// install.
 pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     select_forge(&opts.forge)?;
-    github::quickstart(opts).await
+    match opts.forge.code_host {
+        CodeHostKind::Gitlab => gitlab::quickstart(opts).await,
+        _ => github::quickstart(opts).await,
+    }
 }
 
 async fn release_model_recorded(opts: &QuickstartOpts) -> Result<bool> {

@@ -74,13 +74,15 @@ after install every pod's container imageID must equal the built digest;
 both are recorded in the evidence. The default `published` installs the
 release workflow's `sha-<commit>` images as before.
 
-`forge-loop --forge <name> [--issue-file] [--revision-file]` drives the
-whole loop and observes the forge only through the ForgeDriver protocol in
-tools/factory-e2e/forges/base.py. Each module in tools/factory-e2e/forges/
-registers one forge entry: `github` (forges/github.py) is installed, and the
-drivers for GitLab, Jira Cloud, Bitbucket Cloud and Bitbucket Data Center are
-reserved and not installed, so naming one is refused with "not installed"
-before anything is installed. `github-loop` is forge-loop with the GitHub
+`forge-loop --forge <name> [--forge-target <target>] [--issue-file]
+[--revision-file]` drives the whole loop and observes the forge only through
+the ForgeDriver protocol in tools/factory-e2e/forges/base.py. Each module in
+tools/factory-e2e/forges/ registers one forge entry; a forge whose driver is
+not written registers it not installed, and naming it is refused with "not
+installed" before anything is installed. A forge with targets (gitlab:
+`fixture` or `saas`) needs `--forge-target`, and a forge that installs no
+GitHub App (gitlab) skips the App check, label, tunnel and webhook around the
+loop and binds the agent with its own setup. `github-loop` is forge-loop with the GitHub
 driver. The driver opens and labels the ticket; the labelled run opens a pull
 request; the test actor sets CI red on its first head with one failing commit
 status (the factory CI gate reads statuses, so the first head is red whatever
@@ -94,7 +96,7 @@ merged. judge_github_loop decides. Both need CURIE_FACTORY_MODEL_API_KEY. A
 new forge is a new entry file that calls register_forge; nothing shared
 changes.
 
-`acceptance --pairing <tracker>+<code host> [--dry-run]` runs one entry of
+`acceptance --pairing <tracker>+<code host>[@<target>] [--dry-run]` runs one entry of
 the acceptance table in tools/factory-e2e/acceptance.py. Each entry fixes its
 inputs, its `run` commands, a deadline per command, what the forge must show,
 the evidence fields that must hold, and the teardown checks. A real run
@@ -1272,8 +1274,13 @@ def install_values(
     local_images: bool = False,
     candidate_images: Mapping[str, CandidateImage] | None = None,
     kind: bool = False,
+    forge: str = "github",
 ) -> dict[str, Any]:
     """Helm values for the disposable install. Written to a 0600 file, never argv.
+
+    ``forge`` is the loop forge. One whose entry installs no GitHub App
+    (gitlab) gets no App values and no factory block: its entry's setup writes
+    the factory's code host, tracker and binding with the quickstart.
 
     Without ``candidate_images`` every image is the published ``sha-<candidate>``
     tag. With them, each component and the runner point at the images built
@@ -1300,41 +1307,42 @@ def install_values(
             values[component]["image"]["repository"] = repository
             values[component]["image"]["tag"] = "local"
             values[component]["image"]["pullPolicy"] = "Never"
-    values["api"].update(
-        {
-            "githubWebhookSecret": config.webhook_secret,
-            "githubAppId": config.app_id,
-            "githubAppExistingSecret": app_key_secret,
-            "githubRepoAllowlist": [config.repo],
-        }
-    )
-    # The factory reads its GitHub App from the same Secret git-flow uses, as a
-    # mounted file named by CURIE_FORGES (#4397).
-    credential = {
-        "type": "github_app",
-        "appId": config.app_id,
-        "existingSecret": app_key_secret,
-        "existingSecretKey": "privateKey",
-    }
-    github = {"name": "github", "kind": "github", "host": "github.com", "apiUrl": GITHUB_API}
-    values["factory"] = {
-        "enabled": True,
-        "intake": "poll",
-        "codeHosts": [{**github, "credential": dict(credential)}],
-        "trackers": [
+    if FORGES[forge].github_app:
+        values["api"].update(
             {
-                **github,
-                "credential": dict(credential),
-                "label": config.label,
-                "mention": config.mention,
+                "githubWebhookSecret": config.webhook_secret,
+                "githubAppId": config.app_id,
+                "githubAppExistingSecret": app_key_secret,
+                "githubRepoAllowlist": [config.repo],
             }
-        ],
-        # The github entries carry no egress, so the chart's built-in GitHub
-        # set applies to the factory agent's sandboxes (#4397).
-        "sandboxEgress": {FACTORY_AGENT: True},
-    }
-    if card_base_url:
-        values["factory"]["cardBaseUrl"] = card_base_url
+        )
+        # The factory reads its GitHub App from the same Secret git-flow uses, as a
+        # mounted file named by CURIE_FORGES (#4397).
+        credential = {
+            "type": "github_app",
+            "appId": config.app_id,
+            "existingSecret": app_key_secret,
+            "existingSecretKey": "privateKey",
+        }
+        github = {"name": "github", "kind": "github", "host": "github.com", "apiUrl": GITHUB_API}
+        values["factory"] = {
+            "enabled": True,
+            "intake": "poll",
+            "codeHosts": [{**github, "credential": dict(credential)}],
+            "trackers": [
+                {
+                    **github,
+                    "credential": dict(credential),
+                    "label": config.label,
+                    "mention": config.mention,
+                }
+            ],
+            # The github entries carry no egress, so the chart's built-in GitHub
+            # set applies to the factory agent's sandboxes (#4397).
+            "sandboxEgress": {FACTORY_AGENT: True},
+        }
+        if card_base_url:
+            values["factory"]["cardBaseUrl"] = card_base_url
     runner_values: dict[str, Any] = {"tag": "latest" if local_images else tag}
     if local_images:
         runner_values["image"] = "curie-runner"
@@ -2714,16 +2722,17 @@ class Preflight:
         # so each one must be served before the install starts.
         for crd in self.created_crds:
             self.kubectl("wait", "--for=condition=Established", f"crd/{crd}", "--timeout=120s")
-        key_file = str(self.config.private_key_file)
-        self.kubectl(
-            "-n",
-            self.namespace,
-            "create",
-            "secret",
-            "generic",
-            APP_KEY_REF,
-            f"--from-file=privateKey={key_file}",
-        )
+        if self.uses_github_app:
+            key_file = str(self.config.private_key_file)
+            self.kubectl(
+                "-n",
+                self.namespace,
+                "create",
+                "secret",
+                "generic",
+                APP_KEY_REF,
+                f"--from-file=privateKey={key_file}",
+            )
         self.chart_dir = chart
         if egress_cidrs is None:
             egress_cidrs = self.egress_cidrs()
@@ -2744,6 +2753,7 @@ class Preflight:
             sandbox_pod_quota=quota,
             candidate_images=self.candidate_images,
             kind=self.kind_cluster is not None,
+            forge=self.install_forge,
         )
         if extra_values is not None:
             values = extra_values(values)
@@ -3351,6 +3361,7 @@ class Preflight:
             card_base_url=self.tunnel_url,
             candidate_images=self.candidate_images,
             kind=self.kind_cluster is not None,
+            forge=self.install_forge,
         )
         values_file = self.workdir / "values.json"
         fd = os.open(str(values_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -3653,6 +3664,19 @@ class Preflight:
         if self._fixture_base_sha and self.default_branch_head() != self._fixture_base_sha:
             self.move_default_branch(self._fixture_base_sha)
 
+    @property
+    def install_forge(self) -> str:
+        """The forge the install is for: the loop's, else GitHub (every other scenario)."""
+
+        forge = self.evidence.get("forge")
+        return forge if isinstance(forge, str) else "github"
+
+    @property
+    def uses_github_app(self) -> bool:
+        """Whether the install and the steps around the loop use the test GitHub App."""
+
+        return FORGES[self.install_forge].github_app
+
     def loop_driver(self) -> ForgeDriver:
         """The forge driver a loop scenario observes and mutates through, built once.
 
@@ -3678,11 +3702,14 @@ class Preflight:
         driver = self.loop_driver() if self.scenario_name in LOOP_SCENARIOS else None
         entry = FORGES.get(self.evidence.get("forge") or "") if driver is not None else None
         setup = entry.setup if entry is not None else None
+        github = self.uses_github_app
         self.check_tools()
-        self._lock(f"app-{self.config.app_id}", "this App and its fixture repository")
+        if github:
+            self._lock(f"app-{self.config.app_id}", "this App and its fixture repository")
         self._lock(f"context-{self.config.kube_context}", "this kube context")
         self.check_images()
-        self.check_app()
+        if github:
+            self.check_app()
         if self.candidate_image_mode == "build":
             self.build_candidate_images()
         self.sweep_stale_namespaces()
@@ -3700,10 +3727,11 @@ class Preflight:
         # Pushed before the driver creates anything, so they run on every exit.
         for name, step in driver.teardowns() if driver is not None else ():
             self.teardown.push(name, step)
-        self.ensure_label()
-        self.tunnel()
-        self.point_card_at_tunnel()
-        self.repoint_webhook()
+        if github:
+            self.ensure_label()
+            self.tunnel()
+            self.point_card_at_tunnel()
+            self.repoint_webhook()
         if setup is not None:
             # After the card upgrade: that upgrade rewrites factory.trackers
             # whole, which would drop a tracker the setup writes.
@@ -5855,12 +5883,18 @@ class ForgeEntry:
 
     ``setup`` binds the factory agent for this forge in place of
     ``Preflight.bind_agent`` (the GitHub binding); None keeps bind_agent.
+    ``targets`` are the deployments ``run --forge-target`` picks between; a
+    forge with none takes no target. ``github_app`` False installs the release
+    without the test GitHub App and skips every GitHub step around the loop
+    (App check and lock, label, tunnel, card base and webhook).
     """
 
     name: str
     driver: Callable[[Preflight], ForgeDriver]
     installed: bool
     setup: Callable[[Preflight], None] | None = None
+    targets: tuple[str, ...] = ()
+    github_app: bool = True
 
 
 # Populated by the entry modules in tools/factory-e2e/forges/, one file per
@@ -5915,6 +5949,26 @@ def loop_forge(scenario: str, requested: str | None) -> str | None:
     if not entry.installed:
         raise ForgeNotInstalled(f"{name} forge driver is not installed")
     return name
+
+
+def loop_forge_target(forge: str | None, requested: str | None) -> str | None:
+    """The ``--forge-target`` of a loop forge that has targets; None for any other.
+
+    Decided before anything is installed: a forge with targets needs one of
+    them, and a forge without targets refuses the flag.
+    """
+
+    targets = FORGES[forge].targets if forge is not None else ()
+    if not targets:
+        if requested is not None:
+            raise ConfigError(f"--forge-target applies only to a forge with targets ({forge})")
+        return None
+    if requested not in targets:
+        raise ConfigError(
+            f"the {forge} forge needs --forge-target, one of {', '.join(targets)} "
+            f"(got {requested!r})"
+        )
+    return requested
 
 
 def forge_loop(p: Preflight) -> dict[str, Any]:
@@ -6247,6 +6301,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help=(
             "forge-loop (required) and github-loop (github only): the forge entry under "
             "tools/factory-e2e/forges/ whose driver the loop observes through"
+        ),
+    )
+    scenario.add_argument(
+        "--forge-target",
+        help=(
+            "forge-loop on a forge with targets (gitlab: fixture or saas): which "
+            "deployment of that forge the loop drives"
         ),
     )
     scenario.add_argument(
@@ -6798,10 +6859,12 @@ def main(argv: list[str] | None = None) -> int:
     expect_reasons: list[str] = []
     revision_text: str | None = None
     forge: str | None = None
+    forge_target: str | None = None
     try:
         if args.mode == "run":
             driver = resolve_scenario(args.scenario)
             forge = loop_forge(args.scenario, args.forge)
+            forge_target = loop_forge_target(forge, args.forge_target)
             if args.scenario == "issue-to-pr":
                 if args.issue_file is None:
                     print(
@@ -6919,6 +6982,8 @@ def main(argv: list[str] | None = None) -> int:
         preflight.evidence["mode"] = f"run:{args.scenario}"
     if forge is not None:
         preflight.evidence["forge"] = forge
+    if forge_target is not None:
+        preflight.evidence["forge_target"] = forge_target
 
     def _terminate(signum: int, _frame: Any) -> None:
         raise SystemExit(128 + signum)
