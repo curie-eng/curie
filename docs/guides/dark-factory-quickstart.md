@@ -551,7 +551,9 @@ tokens; replace the token before that date.
 
 ### Polling cost
 
-Intake is polling only. Every poll interval (`pollIntervalSeconds`) the factory
+Intake is polling only. Quickstart writes `factory.enabled: true` and
+`factory.intake: poll` with the GitLab entries, so a fresh install admits
+labelled issues without a separate intake step. Every poll interval (`pollIntervalSeconds`) the factory
 reads one page of the issue listing, then two reads for each issue updated since
 the last poll and one read for each issue that is running.
 ## Bitbucket Cloud and Data Center

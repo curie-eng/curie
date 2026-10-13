@@ -284,12 +284,14 @@ class _Call:
 
 
 class _Response:
-    def __init__(self, status: int, payload: Any) -> None:
+    def __init__(self, status: int, payload: Any, extra: Mapping[str, str] | None = None) -> None:
         self.status = status
         self.code = status
         self.reason = self.msg = "stub"
         self.headers = email.message.Message()
         self.headers["Content-Type"] = "application/json"
+        for key, value in (extra or {}).items():
+            self.headers[key] = value
         self._data = b"" if payload is None else json.dumps(payload).encode()
 
     def read(self, *_a: Any) -> bytes:
@@ -325,8 +327,11 @@ def _decode(request: urllib.request.Request) -> Any:
         return {key: values[-1] for key, values in pairs.items()}
 
 
-def _install(monkeypatch: pytest.MonkeyPatch, answer: Callable[[_Call], tuple[int, Any]]) -> list:
-    """Answer at the HTTPS handler under urlopen or the driver's own opener."""
+def _install(monkeypatch: pytest.MonkeyPatch, answer: Callable[[_Call], tuple[Any, ...]]) -> list:
+    """Answer at the HTTPS handler under urlopen or the driver's own opener.
+
+    ``answer`` returns ``(status, payload)`` or ``(status, payload, headers)``.
+    """
 
     calls: list[_Call] = []
 
@@ -340,7 +345,7 @@ def _install(monkeypatch: pytest.MonkeyPatch, answer: Callable[[_Call], tuple[in
                 getattr(self, "_context", None),
             )
             calls.append(call)
-            status, payload = answer(call)
+            status, payload, *extra = answer(call)
             if status >= 400:
                 raise urllib.error.HTTPError(
                     call.url,
@@ -349,7 +354,7 @@ def _install(monkeypatch: pytest.MonkeyPatch, answer: Callable[[_Call], tuple[in
                     email.message.Message(),
                     io.BytesIO(json.dumps(payload or {}).encode()),
                 )
-            return _Response(status, payload)
+            return _Response(status, payload, extra[0] if extra else None)
 
     monkeypatch.setattr(urllib.request, "HTTPSHandler", _StubHttps)
     monkeypatch.setattr(urllib.request, "_opener", None)
@@ -1039,6 +1044,46 @@ def test_fixture_requests_go_to_the_fixture_with_the_root_token_and_its_ca(
         ]
         assert CA_SUBJECT in subjects, "the fixture CA is not trusted"
     assert rig.gitlab.bad_auth == []
+
+
+@pytest.mark.parametrize("target", ["fixture", "saas"])
+@pytest.mark.parametrize("location", ["https://attacker.example.invalid/steal", "same-origin"])
+def test_every_redirect_is_refused_without_a_request_to_its_target(
+    target: str, location: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture_ca: Path
+) -> None:
+    """A 3xx is never followed: following it would copy PRIVATE-TOKEN (and a
+    fixture actor's Sudo) to the Location, another origin or plain http."""
+
+    rig = _target_rig(target, tmp_path, monkeypatch, fixture_ca)
+    pid = rig.gitlab.pid
+    redirected = (f"/projects/{pid}/merge_requests/{MR_IID}", f"/projects/{pid}/issues")
+    moved: list[str] = []
+    redirect = {"on": True}
+
+    def answer(call: _Call) -> tuple[Any, ...]:
+        if redirect["on"] and call.path.endswith(redirected):
+            where = f"{call.url}/moved" if location == "same-origin" else location
+            moved.append(where)
+            return 302, None, {"Location": where}
+        return rig.gitlab(call)
+
+    calls = _install(monkeypatch, answer)
+    driver = rig.driver()
+
+    assert driver.change_merged(CHANGE) is None
+    with pytest.raises(fe.PreflightFailed, match="HTTP 302"):
+        driver.open_and_label_ticket("Add nmi", "Please add nmi.", time.time())
+
+    originals = [c for c in calls if c.path.endswith(redirected)]
+    assert len(moved) == 2 and len(originals) == 2, [c.url for c in calls]
+    assert not {c.url for c in calls} & set(moved), "a redirect target was requested"
+    assert all(c.headers.get("private-token") for c in originals), "the token rode the original"
+    if target == "fixture":
+        assert originals[1].headers.get("sudo") == "developer"
+
+    # The neighbor: the same read answered 200 goes through.
+    redirect["on"] = False
+    assert driver.change_merged(CHANGE) in (True, False)
 
 
 def test_fixture_requests_name_the_project_by_numeric_id(

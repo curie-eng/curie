@@ -47,8 +47,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
+from email.message import Message
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import factory_e2e as fe
 
@@ -347,6 +348,21 @@ def _read_token(path: Path, what: str) -> str:
 # --- the driver -------------------------------------------------------------------------
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow no redirect: the 3xx surfaces as an HTTPError, nothing is re-sent."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: Message,
+        newurl: str,
+    ) -> None:
+        return None
+
+
 class GitLabDriver:
     """ForgeDriver (forges/base.py) for GitLab as tracker and code host."""
 
@@ -410,9 +426,11 @@ class GitLabDriver:
         return ssl.create_default_context()
 
     def _open(self, request: urllib.request.Request) -> Any:
+        # Every request carries PRIVATE-TOKEN (and Sudo for a fixture actor),
+        # which the default redirect handler would copy to the Location.
         if self._opener is None:
             self._opener = urllib.request.build_opener(
-                urllib.request.HTTPSHandler(context=self._context())
+                urllib.request.HTTPSHandler(context=self._context()), _RefuseRedirect()
             )
         return self._opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS)
 

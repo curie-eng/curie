@@ -217,7 +217,7 @@ fn describe(plan: &GitlabPlan) -> Vec<String> {
         None => "credential neverExpires".to_string(),
     };
     lines.push(format!(
-        "write factory.codeHosts and factory.trackers entry {ENTRY_NAME} (apiUrl {}/api/v4, label {}, mention {}, {expiry}) and factory.bindings entry {} (project_id and tracker_scope_id {}, path {}): helm upgrade --reuse-values of release {}, then roll the API",
+        "write factory.enabled=true, factory.intake=poll, factory.codeHosts and factory.trackers entry {ENTRY_NAME} (apiUrl {}/api/v4, label {}, mention {}, {expiry}) and factory.bindings entry {} (project_id and tracker_scope_id {}, path {}): helm upgrade --reuse-values of release {}, then roll the API",
         facts.web_base,
         facts.label,
         facts.username,

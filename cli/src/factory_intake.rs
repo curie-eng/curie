@@ -440,16 +440,21 @@ pub struct NativeForgeEntries {
 }
 
 /// The values document a native forge quickstart (one that is both the code
-/// host and the tracker) applies with `--reuse-values -f`: the release's
-/// three `factory` lists with `entries` put in, each written complete since
-/// Helm replaces a list whole, and the CA ConfigMap reference when given. The
-/// token is not here; it lives only in the Secret the credentials name.
+/// host and the tracker) applies with `--reuse-values -f`: the factory
+/// enabled with poll intake (the native forge is the install's only trigger
+/// source, and the API polls no tracker while the factory is off), the
+/// release's three `factory` lists with `entries` put in, each written
+/// complete since Helm replaces a list whole, and the CA ConfigMap reference
+/// when given. The token is not here; it lives only in the Secret the
+/// credentials name.
 pub fn native_forge_values(
     recorded: &serde_json::Value,
     entries: &NativeForgeEntries,
 ) -> serde_json::Value {
     let mut values = serde_json::json!({
         "factory": {
+            "enabled": true,
+            "intake": crate::factory_quickstart::POLL_INTAKE,
             "codeHosts": replace_named(recorded, "codeHosts", &entries.code_host),
             "trackers": replace_named(recorded, "trackers", &entries.tracker),
             "bindings": replace_named(recorded, "bindings", &entries.binding),

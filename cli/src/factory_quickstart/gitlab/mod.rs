@@ -86,21 +86,23 @@ pub(super) fn check(forge: &ForgeFlags) -> Result<()> {
 /// The GitLab web base from `--forge-url`, without a trailing `/`:
 /// [`GITLAB_DEFAULT_URL`] when the flag is absent. It must be https, or plain
 /// http on `localhost` or `127.0.0.1`, and carry no credentials, query or
-/// fragment. A path is kept, for an install under a sub-path.
+/// fragment. A path is kept, for an install under a sub-path. Every refusal
+/// is a fixed diagnostic: the raw flag may carry userinfo or a query token,
+/// so it is never echoed.
 pub fn gitlab_web_base(forge: &ForgeFlags) -> Result<String> {
     let raw = forge.forge_url.as_deref().unwrap_or(GITLAB_DEFAULT_URL);
     let forms = "pass the GitLab web address, for example https://gitlab.com or https://gitlab.example.com/gitlab";
     let url = reqwest::Url::parse(raw)
-        .map_err(|error| usage(format!("--forge-url {raw:?} is not a URL: {error}"), forms))?;
+        .map_err(|error| usage(format!("--forge-url is not a URL: {error}"), forms))?;
     let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1"));
     if !(url.scheme() == "https" || (url.scheme() == "http" && local)) {
         return Err(usage(
-            format!("--forge-url {raw} must use https; plain http is accepted only for localhost and 127.0.0.1"),
+            "--forge-url must use https; plain http is accepted only for localhost and 127.0.0.1",
             forms,
         ));
     }
     if url.host_str().is_none_or(str::is_empty) {
-        return Err(usage(format!("--forge-url {raw} names no host"), forms));
+        return Err(usage("--forge-url names no host", forms));
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(usage(
@@ -110,7 +112,7 @@ pub fn gitlab_web_base(forge: &ForgeFlags) -> Result<String> {
     }
     if url.query().is_some() || url.fragment().is_some() {
         return Err(usage(
-            format!("--forge-url {raw} must not carry a query or fragment"),
+            "--forge-url must not carry a query or fragment",
             forms,
         ));
     }

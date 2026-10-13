@@ -766,6 +766,38 @@ fn gitlab_values_golden_for_self_managed_with_a_ca_and_no_expiry() {
     );
 }
 
+/// A fresh GitLab-only install records `factory.enabled: false` (the chart
+/// default), so the entries alone would leave the API never polling the
+/// tracker: the document turns the factory on with poll intake.
+#[test]
+fn gitlab_values_enable_the_factory_with_poll_intake() {
+    let entries = NativeForgeEntries {
+        code_host: json!({"name": "gitlab", "kind": "gitlab", "host": "gitlab.com"}),
+        tracker: json!({"name": "gitlab", "kind": "gitlab", "label": "curie-factory"}),
+        binding: json!({"name": "gitlab-1234", "tracker": "gitlab"}),
+        ca_config_map: None,
+    };
+    let recorded = json!({"factory": {"enabled": false, "intake": "webhook"}});
+    for recorded in [Value::Null, recorded] {
+        let values = native_forge_values(&recorded, &entries);
+        assert_eq!(
+            values.pointer("/factory/enabled"),
+            Some(&json!(true)),
+            "{values}"
+        );
+        assert_eq!(
+            values.pointer("/factory/intake"),
+            Some(&json!("poll")),
+            "{values}"
+        );
+        assert_eq!(
+            values.pointer("/factory/trackers"),
+            Some(&json!([entries.tracker])),
+            "the entries still ride along: {values}"
+        );
+    }
+}
+
 #[test]
 fn gitlab_values_keep_the_other_recorded_entries() {
     let entries = NativeForgeEntries {
@@ -1288,4 +1320,73 @@ fn factory_quickstart_gitlab_refuses_incomplete_or_malformed_flags() {
     // Liveness: the valid flags plan.
     let run = dry_run_json(&cli, &valid);
     assert_eq!(run.code, 0, "{}", run.all());
+}
+
+/// A refused `--forge-url` is never echoed: its userinfo or query may be a
+/// credential, so every refusal path prints a fixed diagnostic.
+#[test]
+fn factory_quickstart_gitlab_never_echoes_a_refused_forge_url() {
+    let cli = Cli::new(0);
+    let server = gitlab("19.4.1-ce.0", Labels::default());
+    let token = cli.token_file(BOT_TOKEN);
+    let user = "leaky-user-4399";
+    let password = "leaky-password-4399";
+    let query = "leaky-query-token-4399";
+    let cases = [
+        // The scheme refusal runs before the credentials check.
+        (
+            "userinfo on plain http to a remote host",
+            format!("http://{user}:{password}@gitlab.example.test"),
+            "https",
+        ),
+        (
+            "userinfo on https",
+            format!("https://{user}:{password}@gitlab.example.test"),
+            "credentials",
+        ),
+        (
+            "a query token",
+            format!("https://gitlab.example.test/?private_token={query}"),
+            "query",
+        ),
+        (
+            "a query token on plain http to a remote host",
+            format!("http://gitlab.example.test/?private_token={query}"),
+            "https",
+        ),
+        (
+            "a fragment token",
+            format!("https://gitlab.example.test/#{query}"),
+            "fragment",
+        ),
+        (
+            "no host",
+            format!("https://{user}:{password}@/?private_token={query}"),
+            "--forge-url",
+        ),
+    ];
+    for (case, url, reason) in cases {
+        for json in [true, false] {
+            let mut args = gitlab_args(PROJECT_PATH, &token, &url);
+            args.push("--dry-run".to_string());
+            if json {
+                args.push("--json".to_string());
+            }
+            let run = cli.run(&refs(&args));
+            let text = run.all();
+            assert_eq!(run.code, USAGE_EXIT, "{case}: {text}");
+            assert!(text.contains("--forge-url"), "{case}: {text}");
+            assert!(text.contains(reason), "{case}: names {reason}: {text}");
+            for secret in [user, password, query] {
+                assert!(
+                    !text.contains(secret),
+                    "{case} (json {json}) echoed {secret}: {text}"
+                );
+            }
+        }
+    }
+    assert!(
+        server.recorded().is_empty(),
+        "a refused --forge-url reads nothing from GitLab"
+    );
 }
