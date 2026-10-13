@@ -2,7 +2,8 @@
 # Isolated cluster-upgrade matrix for the next-train verb (#2590).
 #
 # Upgrade rows use `curie cluster upgrade --yes --to ...`; rollback-to-serving
-# injects its interrupted history with one raw Helm upgrade.
+# injects its interrupted history with one raw Helm upgrade, and
+# rollback-uncatalogued applies an uncatalogued app version with raw Helm.
 # Refuses the permanent soak (namespace/release `curie`, namespace `default`).
 # Never mutates soak, never prints secret values, never messages a human.
 #
@@ -93,6 +94,7 @@ SCENARIOS_ALL=(
     apply-kill-takeover
     rollback-to-serving
     runner-layer-retire
+    rollback-uncatalogued
 )
 
 MATRIX_PHASES=(plan validate drain_preflight checkpoint migrate apply converge canary commit)
@@ -125,7 +127,8 @@ s13 setup converge-negative
 s14 setup previous-serves
 s15 setup runner-layer-retire
 s16 setup apply-kill-takeover
-s17 setup rollback-to-serving"
+s17 setup rollback-to-serving
+s21 setup rollback-uncatalogued"
 SHARDS="${CURIE_E2E_SHARDS_OVERRIDE:-$SHARDS_CANONICAL}"
 
 log() { printf '%s\n' "$*" >&2; }
@@ -137,7 +140,7 @@ die() {
 
 usage() {
     cat <<'EOF' >&2
-usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves|apply-kill-takeover|rollback-to-serving|runner-layer-retire] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
+usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves|apply-kill-takeover|rollback-to-serving|runner-layer-retire|rollback-uncatalogued] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
 EOF
 }
 
@@ -472,6 +475,18 @@ run_self_test() {
         log "rollback-to-serving leaves the pending revision for the CLI"
     else
         log "self-test: rollback-to-serving must leave the pending revision for the CLI without recovery helpers"
+        failed=1
+    fi
+    if awk '/^run_rollback_uncatalogued\(\)/,/^}/' "$script_path" | awk '
+        /cluster rollback --dry-run/ { dry=1 }
+        /cluster rollback --yes/ { if (dry) real=1 }
+        /fail forward to application/ { if (real) fix=1 }
+        /settle_helm_operation|recover_helm_lock|recover_killed_upgrade_ownership/ { bad=1 }
+        END { exit (fix && !bad) ? 0 : 1 }
+    '; then
+        log "rollback-uncatalogued refuses as dry run and real run and checks the fail forward fix"
+    else
+        log "self-test: rollback-uncatalogued must run cluster rollback --dry-run then --yes and check fail forward to application, without recovery helpers"
         failed=1
     fi
     if awk '/^run_migration_crash\(\)/,/^}/' "$script_path" | awk '
@@ -2725,6 +2740,125 @@ if int(json.load(sys.stdin).get("status", {}).get("readyReplicas", 0)) < 1:
     log "rollback-to-serving restored revision $serving at $V over pending revision $pending; API is Ready and healthy"
 }
 
+# Compare two `helm history -o json` captures by (revision, status, app_version).
+assert_helm_history_unchanged() {
+    local before="$1" after="$2" label="$3"
+    python3 -c '
+import json, sys
+def rows(path):
+    return sorted((int(r["revision"]), r["status"], r.get("app_version", "")) for r in json.load(open(path)))
+if rows(sys.argv[1]) != rows(sys.argv[2]):
+    raise SystemExit("Helm history changed")
+' "$before" "$after" || die "$label changed Helm history"
+}
+
+# AC4 of issue #4498: a bare rollback whose selected target has no catalog
+# window refuses before mutation, both as a dry run and as a real run.
+run_rollback_uncatalogued() {
+    local V U CHART_V CHART_U before node img ref status=0
+    V="$(awk '$1 == "version:" { print $2; exit }' "$REPO_ROOT/charts/curie/Chart.yaml")"
+    [[ -n "$V" ]] || die "rollback-uncatalogued could not read the checkout chart version"
+    # A valid image tag that no catalog window names. The CLI resolves windows
+    # from the embedded catalog by exact key, so an absent key is a miss.
+    U="sha-4498fa0"
+    python3 -c '
+import json, sys
+if sys.argv[2] in json.load(open(sys.argv[1]))["windows"]:
+    raise SystemExit("uncatalogued app version is catalogued")
+' "$REPO_ROOT/cli/src/application_schema_windows.json" "$U" \
+        || die "rollback-uncatalogued app version $U has a catalog window"
+
+    retag_candidate_versions "0.10.0" "$V" required
+    helm package "$REPO_ROOT/charts/curie" --version "$V" --app-version "$V" -d "$WORKDIR/charts" >/dev/null
+    CHART_V="$WORKDIR/charts/curie-${V}.tgz"
+    [[ -f "$CHART_V" ]] || die "rollback-uncatalogued chart package is missing"
+    # Same chart version, different app version: a separate directory keeps
+    # the two packages from overwriting each other.
+    mkdir -p "$WORKDIR/charts-uncatalogued"
+    helm package "$REPO_ROOT/charts/curie" --version "$V" --app-version "$U" \
+        -d "$WORKDIR/charts-uncatalogued" >/dev/null
+    CHART_U="$WORKDIR/charts-uncatalogued/curie-${V}.tgz"
+    [[ -f "$CHART_U" ]] || die "rollback-uncatalogued uncatalogued chart package is missing"
+
+    exclusive_kind_tag "$V"
+    cluster_upgrade "$V" "$CHART_V" || status=$?
+    record_upgrade_json "rollback-uncatalogued-setup"
+    (( status == 0 )) || die "rollback-uncatalogued setup upgrade exited $status"
+    assert_upgrade_status "succeeded"
+    wait_rollout
+
+    # untag_kind_siblings never touches V or U, so loading U alongside V keeps
+    # both tags on the node: pods for either revision start with pullPolicy
+    # Never. load_tag_images clears EXCLUSIVE_KIND_TAG while U is present.
+    retag_candidate_versions "0.10.0" "$U" required
+    load_tag_images "$U"
+    # Raw Helm on both legs: the CLI upgrade verb owns the schema gate and is
+    # not the thing under test, and the leg back to V starts from an
+    # uncatalogued current version the CLI is free to refuse.
+    helm --kubeconfig "$KUBECONFIG_FILE" "${HELM_CONTEXT_ARGS[@]}" upgrade "$RELEASE" "$CHART_U" -n "$NAMESPACE" \
+        --reuse-values --wait --timeout 10m \
+        >"$EVIDENCE_DIR/rollback-uncatalogued-apply.log" 2>&1 \
+        || die "rollback-uncatalogued helm upgrade to $U failed"
+    wait_rollout
+    helm --kubeconfig "$KUBECONFIG_FILE" "${HELM_CONTEXT_ARGS[@]}" upgrade "$RELEASE" "$CHART_V" -n "$NAMESPACE" \
+        --reuse-values --wait --timeout 10m \
+        >"$EVIDENCE_DIR/rollback-uncatalogued-return.log" 2>&1 \
+        || die "rollback-uncatalogued helm upgrade back to $V failed"
+    wait_rollout
+    # Restore V as the only app tag on the node so no later step sees U.
+    node="$(kind_node)"
+    if [[ -n "$node" ]]; then
+        for img in "${IMAGES[@]}"; do
+            for ref in "ghcr.io/curie-eng/${img}:${U}" "docker.io/library/${img}:${U}" "${img}:${U}"; do
+                docker exec "$node" crictl rmi "$ref" >/dev/null 2>&1 || true
+                docker exec "$node" ctr -n k8s.io images untag "$ref" >/dev/null 2>&1 || true
+            done
+        done
+    fi
+    EXCLUSIVE_KIND_TAG=""
+    exclusive_kind_tag "$V"
+
+    before="$EVIDENCE_DIR/rollback-uncatalogued-before.json"
+    helm_ns history "$RELEASE" -o json >"$before"
+    python3 -c '
+import json, sys
+rows = sorted(json.load(open(sys.argv[1])), key=lambda r: int(r["revision"]))
+version, uncatalogued = sys.argv[2:]
+if len(rows) < 2:
+    raise SystemExit("history has fewer than two revisions")
+newest, previous = rows[-1], rows[-2]
+if newest["status"] != "deployed" or newest["app_version"] != version:
+    raise SystemExit("newest revision is not deployed at the checkout version")
+if previous["status"] != "superseded" or previous["app_version"] != uncatalogued:
+    raise SystemExit("revision below the newest is not the superseded uncatalogued revision")
+' "$before" "$V" "$U" \
+        || die "rollback-uncatalogued setup did not leave $U as the bare rollback target"
+
+    status=0
+    "$BIN" cluster rollback --dry-run --namespace "$NAMESPACE" --release "$RELEASE" \
+        >"$EVIDENCE_DIR/rollback-uncatalogued-dry-run.out" 2>"$EVIDENCE_DIR/rollback-uncatalogued-dry-run.err" \
+        || status=$?
+    (( status == 1 )) || die "rollback-uncatalogued dry run exited $status, want 1"
+    grep -qF "refusing rollback to application $U: no declared schema range for that version" \
+        "$EVIDENCE_DIR/rollback-uncatalogued-dry-run.err" \
+        || die "rollback-uncatalogued dry run did not refuse the uncatalogued target"
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-uncatalogued-after-dry-run.json"
+    assert_helm_history_unchanged "$before" "$EVIDENCE_DIR/rollback-uncatalogued-after-dry-run.json" \
+        "rollback-uncatalogued dry run"
+
+    status=0
+    "$BIN" cluster rollback --yes --namespace "$NAMESPACE" --release "$RELEASE" \
+        >"$EVIDENCE_DIR/rollback-uncatalogued.out" 2>"$EVIDENCE_DIR/rollback-uncatalogued.err" \
+        || status=$?
+    (( status == 1 )) || die "rollback-uncatalogued rollback exited $status, want 1"
+    grep -qF "fail forward to application $V" "$EVIDENCE_DIR/rollback-uncatalogued.err" \
+        || die "rollback-uncatalogued rollback did not name fail forward to application $V"
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-uncatalogued-after.json"
+    assert_helm_history_unchanged "$before" "$EVIDENCE_DIR/rollback-uncatalogued-after.json" \
+        "rollback-uncatalogued rollback"
+    log "rollback-uncatalogued refused rollback to $U as dry run and real run, named fail forward to $V, and left Helm history unchanged"
+}
+
 # These observations come from the real claim and its bound Pod. A replacement
 # claim, a deleting claim, or a Pod on another image cannot pass the proof.
 # The Pod's labels are not checked: a platform-template Pod carries no agent
@@ -3067,6 +3201,7 @@ scenario_fn() {
         previous-serves) echo run_previous_serves ;;
         apply-kill-takeover) echo run_apply_kill_takeover ;;
         rollback-to-serving) echo run_rollback_to_serving ;;
+        rollback-uncatalogued) echo run_rollback_uncatalogued ;;
         runner-layer-retire) echo run_runner_layer_retire ;;
         *) die "no runner for scenario '$1'" ;;
     esac

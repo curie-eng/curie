@@ -394,7 +394,7 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         ids,
         [
             "s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s11", "s13", "s14",
-            "s15", "s16", "s17",
+            "s15", "s16", "s17", "s21",
         ],
         "canonical shard ids\n{manifest}"
     );
@@ -528,7 +528,8 @@ s13 setup converge-negative
 s14 setup previous-serves
 s15 setup runner-layer-retire
 s16 setup apply-kill-takeover
-s17 setup rollback-to-serving";
+s17 setup rollback-to-serving
+s21 setup rollback-uncatalogued";
 
 fn assert_override_refused(manifest: &str, what: &str) {
     assert_ne!(
@@ -574,6 +575,14 @@ fn self_test_fails_when_override_drops_rollback_to_serving() {
     assert_override_refused(
         &GOOD_SHARDS.replace("\ns17 setup rollback-to-serving", ""),
         "dropped rollback-to-serving scenario",
+    );
+}
+
+#[test]
+fn self_test_fails_when_override_drops_rollback_uncatalogued() {
+    assert_override_refused(
+        &GOOD_SHARDS.replace("\ns21 setup rollback-uncatalogued", ""),
+        "dropped rollback-uncatalogued scenario",
     );
 }
 
