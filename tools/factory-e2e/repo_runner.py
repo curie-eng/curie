@@ -1,8 +1,9 @@
 """Repository runner observations for Accepted ADR 0216.
 
 The public judge entry point is ``curie dev factory-e2e judge-repo-runner
---observation <file>``. It checks observations without contacting a cluster or
-provider. Synthetic samples prove the judge's contract only; they are not live
+--observation <file>``. The file is the Preflight evidence envelope; the judge
+reads its ``scenario`` observation without contacting a cluster or provider.
+Synthetic samples prove the judge's contract only; they are not live
 evidence of repository routing or a tool manifest.
 
 Live acceptance is deferred to the w1 runtime wave. The current API fixes a
@@ -1149,7 +1150,7 @@ def drive(p: fe.Preflight) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     """Implementation entry point for the public factory-e2e judge command."""
 
-    parser = argparse.ArgumentParser(description="Judge repository runner observations offline.")
+    parser = argparse.ArgumentParser(description="Judge a Preflight evidence file offline.")
     commands = parser.add_subparsers(dest="command", required=True)
     judge = commands.add_parser("judge")
     judge.add_argument("observation", type=Path)
