@@ -339,7 +339,53 @@ def test_scripted_model_requests_the_manifest_and_records_only_its_matching_tool
         assert model.close() == {"stopped": True}
 
 
-@pytest.mark.parametrize("invalid_request", ["wrong-tool-id", "plain-text-manifest", "extra-call"])
+def test_scripted_model_stream_emits_the_tool_command_and_terminates() -> None:
+    model = repo_runner.ScriptedManifestModel(host="127.0.0.1", port=0)
+    model.start()
+    try:
+        model.begin_turn("fixture-stream-turn")
+        body = _first_model_body()
+        body["stream"] = True
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{model.port}/v1/messages",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.status == 200
+            assert response.headers.get_content_type() == "text/event-stream"
+            stream = response.read().decode()
+        # The Messages stream ends with message_stop after its content and delta:
+        # https://platform.claude.com/docs/en/build-with-claude/streaming
+        events = [json.loads(line[6:]) for line in stream.splitlines() if line.startswith("data: ")]
+        assert events[0]["type"] == "message_start"
+        assert events[-1]["type"] == "message_stop"
+        tool = next(
+            event["content_block"] for event in events if event["type"] == "content_block_start"
+        )
+        assert tool["type"] == "tool_use"
+        assert tool["name"] == "Bash"
+        assert tool["id"] == model.snapshot()["tool_use_id"]
+        chunks = [
+            event["delta"]["partial_json"]
+            for event in events
+            if event["type"] == "content_block_delta"
+            and event["delta"]["type"] == "input_json_delta"
+        ]
+        assert json.loads("".join(chunks))["command"] == repo_runner.MANIFEST_COMMAND
+        assert any(event["type"] == "content_block_stop" for event in events)
+        delta = next(event["delta"] for event in events if event["type"] == "message_delta")
+        assert delta["stop_reason"] == "tool_use"
+        assert model.snapshot()["errors"] == []
+    finally:
+        assert model.close() == {"stopped": True}
+
+
+@pytest.mark.parametrize(
+    "invalid_request",
+    ["wrong-tool-id", "plain-text-manifest", "non-object-tool-input", "extra-call"],
+)
 def test_scripted_model_refuses_unmatched_text_and_unexpected_calls(invalid_request: str) -> None:
     model = repo_runner.ScriptedManifestModel(host="127.0.0.1", port=0)
     model.start()
@@ -356,6 +402,8 @@ def test_scripted_model_refuses_unmatched_text_and_unexpected_calls(invalid_requ
                 {"type": "text", "text": _passing()["turns"][0]["manifest_output"]}
             ]
             result["messages"][-1]["content"] = "That is the manifest"
+        elif invalid_request == "non-object-tool-input":
+            result["messages"][-2]["content"][0]["input"] = ["unexpected"]
         else:
             assert _model_request(model, result)[0] == 200
             result = first
