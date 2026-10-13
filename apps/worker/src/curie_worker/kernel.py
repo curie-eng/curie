@@ -8705,8 +8705,7 @@ class Kernel:
                         reply_adapter=handle.adapter,
                         reply_identity=(
                             handle.identity
-                            if handle.kind == SLACK_KIND
-                            and handle.adapter == CLUSTER_MESSAGE_ADAPTER
+                            if handle.adapter == CLUSTER_MESSAGE_ADAPTER
                             and handle.identity != DEFAULT_IDENTITY
                             else None
                         ),
@@ -8782,8 +8781,7 @@ class Kernel:
                         reply_adapter=handle.adapter,
                         reply_identity=(
                             handle.identity
-                            if handle.kind == SLACK_KIND
-                            and handle.adapter == CLUSTER_MESSAGE_ADAPTER
+                            if handle.adapter == CLUSTER_MESSAGE_ADAPTER
                             and handle.identity != DEFAULT_IDENTITY
                             else None
                         ),

@@ -6013,6 +6013,7 @@ def _kubernetes_resume_turn(thread: str, *, placeholder: str | None) -> QueuedTu
             reply_placeholder=placeholder,
             reply_endpoint=None,
             reply_adapter=None,
+            reply_identity=None,
         )
     )
     assert "batch/v1" in turn.text
