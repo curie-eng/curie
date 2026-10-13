@@ -2176,9 +2176,7 @@ def test_workspace_selection_http_failure_preserves_diagnostic_and_retry_policy(
                 github_api_url="https://api.github.com",
                 worker_token="workspace-test-token",
             )
-            async with make_harness(
-                binding=_workspace_binding(deployment_id), max_attempts=3
-            ) as h:
+            async with make_harness(binding=_workspace_binding(deployment_id), max_attempts=3) as h:
                 h.kernel._workspace = WorkspaceClaimCoordinator(
                     preparer=SimpleNamespace(credentials=credentials),
                     substrate=h.substrate,
@@ -2190,9 +2188,7 @@ def test_workspace_selection_http_failure_preserves_diagnostic_and_retry_policy(
                 await h.kernel.process_event(event)
 
                 assert len(requests) == expected_attempts
-                assert all(
-                    body["repo_full_name"] == "acme-corp/acme-bot" for body in requests
-                )
+                assert all(body["repo_full_name"] == "acme-corp/acme-bot" for body in requests)
                 assert h.fake_k8s.claim_envs == []
                 assert h.runner.opened == []
                 assert h.runner.steers == []
@@ -2236,9 +2232,7 @@ def test_workspace_failure_reason_is_redacted_before_clipping(make_harness) -> N
                     raise WorkspacePreparationError("clone", reason)
 
             h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
-            event = qevent(
-                "Fix https://github.com/acme-corp/acme-bot", thread="tWorkspaceSecret"
-            )
+            event = qevent("Fix https://github.com/acme-corp/acme-bot", thread="tWorkspaceSecret")
             await h.kernel.process_event(event)
 
             reply = h.sink.last_text
@@ -2274,9 +2268,7 @@ def test_prior_side_effect_does_not_retry_a_workspace_selection_failure(make_har
 
                 def select_repository(self, **_kwargs: object) -> str:
                     self.selection_calls += 1
-                    raise WorkspacePreparationError(
-                        "repository-selection", "API returned HTTP 500"
-                    )
+                    raise WorkspacePreparationError("repository-selection", "API returned HTTP 500")
 
             probe = WorkspaceProbe()
             h.kernel._workspace = probe  # type: ignore[assignment]
@@ -3198,6 +3190,99 @@ def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factor
             assert 'EmptyDir volume "workspace" exceeds the limit "1Gi"' in finish["detail"]
             assert "exampleSecretValue123456" not in finish["detail"]
             assert len(finish["detail"]) <= 300
+
+    asyncio.run(go())
+
+
+def test_publication_unrecorded_escalation_has_its_own_cause(make_harness) -> None:
+    """#4459: publication diagnosis survives both flag-clean and side-effect escalation."""
+
+    async def go() -> None:
+        for with_side_effect in (False, True):
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                publication_creator=_PublicationApi(),
+                max_attempts=3,
+            ) as h:
+                items = _WorkItems()
+                h.kernel._work_items = items
+                detail = "No valid publication was recorded after the publish attempt."
+                prefix = [SideEffectFlag(tool="deploy")] if with_side_effect else []
+                h.runner.default_script = [
+                    *prefix,
+                    ErrorEvent(message=detail, classification="publication-unrecorded"),
+                    Final(text="failed", status=FAIL),
+                ]
+                event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+                await h.kernel.process_event(event)
+
+                assert h.runner.opened == [ISSUE_PROMPT]
+                assert len(items.finishes) == 1
+                finish = items.finishes[0]
+                assert finish["outcome"] == "failed"
+                assert finish["cause"] == "publication_unrecorded"
+                assert finish["detail"] == detail
+                assert await h.kernel._markers.is_terminal(event.event_id)
+                assert (
+                    bool(await h.async_redis.exists(h.config.side_effect_key(event.event_id)))
+                    == with_side_effect
+                )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("classification", "expected_cause", "max_attempts"),
+    [
+        ("false-completion", "runner_escalated", 3),
+        ("approval-not-acted", "runner_escalated", 3),
+        ("runner-error", "runner_escalated", 1),
+        ("model-credit-exhausted", "model_credit_exhausted", 3),
+        ("model-usage-limited", "model_usage_limited", 3),
+        ("model-credential-rejected", "model_credential_rejected", 3),
+        ("rate-limit", "model_rate_limited", 1),
+        ("server-error", "model_error", 3),
+        ("model-unreachable", "model_unreachable", 1),
+        ("budget-exceeded", "budget_exceeded", 3),
+        ("runner-timeout", "runner_timeout", 1),
+        ("workspace-error", "workspace_error", 1),
+        ("history-persistence-error", "history_capacity", 3),
+        ("max-turns", "max_turns", 3),
+        ("unknown", "unclassified", 3),
+    ],
+)
+def test_other_escalation_classifications_keep_their_factory_causes(
+    make_harness, classification: str, expected_cause: str, max_attempts: int
+) -> None:
+    """#4459: naming publication failures preserves every sibling cause in this matrix."""
+
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=max_attempts,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            detail = "No valid publication was recorded after the publish attempt."
+            h.runner.default_script = [
+                ErrorEvent(message=detail, classification=classification),
+                Final(text="failed", status=FAIL),
+            ]
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [ISSUE_PROMPT]
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == expected_cause
+            assert finish["detail"] == detail
+            assert await h.kernel._markers.is_terminal(event.event_id)
 
     asyncio.run(go())
 
@@ -4554,9 +4639,7 @@ def test_quota_pressure_repeated_passes_reach_completed_route_after_four_unreada
                 # A prior phase owns only substrate resources. Its affinity
                 # records intentionally survive to reproduce stale routes.
                 for candidate in unreadable:
-                    h.fake_k8s.delete_claim(
-                        candidate.claim_name, request_timeout_seconds=1.0
-                    )
+                    h.fake_k8s.delete_claim(candidate.claim_name, request_timeout_seconds=1.0)
                     assert candidate.sandbox_name not in h.fake_k8s.sandboxes
                     record = h.substrate._affinity.get(candidate.thread_key)  # noqa: SLF001
                     assert record is not None
@@ -4566,27 +4649,23 @@ def test_quota_pressure_repeated_passes_reach_completed_route_after_four_unreada
 
             results = []
             for _ in range(3):
-                probes_before = sum(
-                    len(runner.status_headers) for runner in h.runners.values()
-                )
+                probes_before = sum(len(runner.status_headers) for runner in h.runners.values())
                 result = await h.kernel._reclaim_idle_route(  # noqa: SLF001
                     _thread_key("tPressureTrigger"),
                     _quota_rejection(),
                     remaining_s=120.0,
                 )
                 results.append(result)
-                probes_after = sum(
-                    len(runner.status_headers) for runner in h.runners.values()
-                )
+                probes_after = sum(len(runner.status_headers) for runner in h.runners.values())
                 # Fairness must not expand the existing per-pass probe cap.
                 assert probes_after - probes_before <= 4
                 for candidate in protected:
                     record = h.substrate._affinity.get(candidate.thread_key)  # noqa: SLF001
                     assert record is not None
                     assert record.handle == candidate
-                assert not (
-                    set(h.fake_k8s.deleted_claims) - deleted_before_pressure
-                ).intersection(candidate.claim_name for candidate in protected)
+                assert not (set(h.fake_k8s.deleted_claims) - deleted_before_pressure).intersection(
+                    candidate.claim_name for candidate in protected
+                )
                 if result.reclaimed:
                     break
 
