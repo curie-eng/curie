@@ -310,9 +310,9 @@ Quickstart writes the factory's forge settings for you. These flags select them:
 
 1. `--code-host <kind>` and `--tracker <kind>` choose where the factory publishes
    and where it takes issues. Both default to `github`. `--tracker jira-cloud`
-   with `--code-host github` is installed; see [Jira Cloud](#jira-cloud). The
-   kind `gitlab` is named but not installed in this build, and the command
-   refuses it. `bitbucket-cloud` and `bitbucket-dc` need `--tracker
+   with `--code-host github` is installed; see [Jira Cloud](#jira-cloud).
+   `--code-host gitlab --tracker gitlab` is installed; see [GitLab](#gitlab).
+   `bitbucket-cloud` and `bitbucket-dc` need `--tracker
    jira-cloud`, and the command refuses that pairing until its quickstart
    lands; see [Bitbucket Cloud and Data Center](#bitbucket-cloud-and-data-center).
 2. `--forge-url`, `--token-file`, `--ca-file` and `--review-account` (repeatable)
@@ -474,6 +474,86 @@ tracker polls every 45 seconds by default. Removing the label, or moving the
 issue to a done status, cancels the run. The factory never changes the
 issue's workflow status.
 
+## GitLab
+
+The factory can take issues from GitLab and publish merge requests to it, on
+gitlab.com or a self-managed server. It labels the issue, opens a merge request
+whose description says `Closes #<iid>`, follows the pipeline, answers review
+discussions in the thread, and never merges or resolves a thread. The GitLab
+server must be version 17.0 or later; only 19.4.1 has been tested.
+
+### The factory account and token
+
+The token needs the `api` and `write_repository` scopes, and its user needs the
+Developer role (access level 30) or higher on the project. A Reporter cannot
+start work, and quickstart refuses a token whose user is below Developer,
+naming the level it found. The factory never needs merge rights.
+
+1. On gitlab.com Free, create a dedicated bot user and use that user's personal
+   access token.
+2. On a self-managed server you may also use a service account, a project
+   access token or a group access token.
+
+Write the token to a file. Quickstart reads it from there and stores it in a
+Secret that only the API mounts; it never prints the token or puts it in argv.
+
+### Run quickstart
+
+```bash
+curie factory quickstart --code-host gitlab --tracker gitlab \
+  --repo <group/.../project> --token-file <path> \
+  [--forge-url <web base>] [--ca-file <pem>] [--dry-run]
+```
+
+Without `--forge-url` the target is `https://gitlab.com`. `--repo` is the full
+project path including any subgroups, for example `group/subgroup/project`.
+
+Before changing the cluster, quickstart:
+
+1. Refuses a server older than 17.0.
+2. Reads the token and refuses one that is inactive or missing `api` or
+   `write_repository`, naming the missing scope.
+3. Resolves the project to its numeric id, default branch and issues setting.
+4. Refuses an access level below 30.
+5. Creates the missing labels, as described below.
+
+`--dry-run` runs these checks and prints the steps it would take, including the
+`gitlab=<path>` surface, without writing anything.
+
+### Self-managed servers
+
+1. **Sub-path installs.** `--forge-url` is the web base, for example
+   `https://host/gitlab`. Quickstart derives the API URL by appending
+   `/api/v4`, so the tracker's `apiUrl` is `https://host/gitlab/api/v4`.
+2. **Custom CA.** `--ca-file <pem>` is written to a ConfigMap and referenced
+   from `codeHostTrust.caBundle`, so the API trusts a private certificate.
+3. **Plain http.** Only `localhost` and `127.0.0.1` are accepted without TLS.
+
+### Labels
+
+Quickstart creates the trigger label `curie-factory` and the state labels
+`curie-factory:queued`, `curie-factory:running`, `curie-factory:pr-open` and
+`curie-factory:needs-human` on the project, and leaves any that already exist.
+These are plain labels. GitLab scoped labels are not used.
+
+### Surface
+
+The agent is bound with one surface per project, `gitlab=<group/subgroup/project>`,
+added with `curie cluster surfaces`. The tracker's `mention` is the token
+user's username, and the binding records the project id as both `project_id`
+and `tracker_scope_id`.
+
+### Token expiry
+
+Quickstart prints `Token expires <YYYY-MM-DD> (<n> days)`, or `Token has no
+expiry`, and records the date in the credential. The factory does not rotate
+tokens; replace the token before that date.
+
+### Polling cost
+
+Intake is polling only. Every poll interval (`pollIntervalSeconds`) the factory
+reads one page of the issue listing, then two reads for each issue updated since
+the last poll and one read for each issue that is running.
 ## Bitbucket Cloud and Data Center
 
 Bitbucket has no issue tracker the factory reads, so a Bitbucket code host
