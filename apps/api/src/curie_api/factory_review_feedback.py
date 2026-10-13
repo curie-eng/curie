@@ -23,6 +23,7 @@ import logging
 import uuid
 
 import httpx
+from curie_internal.keyspace import WORK_ITEM_REVIEW_FEEDBACK_PREFIX
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -53,7 +54,7 @@ _CURSOR_TTL_SECONDS = 30 * 24 * 3600
 def cursor_key(lineage_id: uuid.UUID) -> str:
     """The Valkey key of one lineage's review feedback cursor."""
 
-    return f"curie:work-item:review-feedback:{lineage_id}"
+    return f"{WORK_ITEM_REVIEW_FEEDBACK_PREFIX}:{lineage_id}"
 
 
 async def poll_review_feedback(
