@@ -1366,16 +1366,19 @@ and ingress NetworkPolicy inside it. With no Docker repository nothing renders.
    claim, managed-by, selector and egress-class labels, privilege only on
    dockerd, no init or ephemeral containers (it also matches
    `pods/ephemeralcontainers`), no lifecycle hooks or exec probes, mounts only
-   at `/var/lib/docker` and `/certs` with no `volumeDevices`, no
-   ServiceAccount token, only `emptyDir` volumes with a positive `sizeLimit`
-   or `secret` volumes, no host namespaces or ports, positive cpu, memory and
-   ephemeral-storage requests and limits, and `activeDeadlineSeconds`.
+   at `/var/lib/docker` and `/certs` with no `volumeDevices`, no `env` or
+   `envFrom` (a caller environment could point the entrypoint's PATH into a
+   mounted Secret), no ServiceAccount token, only `emptyDir` volumes with a
+   positive `sizeLimit` or `secret` volumes, no host namespaces or ports,
+   positive cpu, memory and ephemeral-storage requests and limits, and
+   `activeDeadlineSeconds`.
    `<fullname>-docker-daemon-objects` holds the worker's Services to
    ClusterIP, its Secrets to Opaque or TLS, and its NetworkPolicies to
    ingress-only policies selecting their own claim, whose every peer is a
-   runner sandbox of this release in the release namespace selected by at
-   least one label beyond the release selector, with no `ipBlock`, on TCP
-   `factory.docker.port`.
+   runner sandbox of this release in the release namespace selected by a
+   label key outside the release selector keys (`name`, `instance`,
+   `component`), with no `ipBlock`, on TCP `factory.docker.port` with no
+   `endPort` range.
    `<fullname>-docker-daemon-cleanup` lets the worker delete only
    NetworkPolicies labelled `curietech.ai/sandbox-claim`, never the chart's.
 
