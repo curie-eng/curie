@@ -8,6 +8,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import tomllib
 from collections.abc import Iterator
 from pathlib import Path
@@ -26,30 +27,41 @@ _SDK_MODULE = "claude_agent_sdk"
 
 @pytest.fixture
 def boundary_probe() -> Iterator[Path]:
-    probe = _ROOT / "runner/src/curie_runner/_boundary_probe.py"
-    if probe.exists():
-        pytest.fail("the disposable boundary probe already has an owner")
-    try:
-        yield probe
-    finally:
-        probe.unlink(missing_ok=True)
+    """@spec HARNESS-BOUNDARY-ISOLATION-1."""
+    with tempfile.TemporaryDirectory(prefix="curie-boundary-") as temporary:
+        root = Path(temporary).resolve()
+        if root.is_relative_to(_ROOT):
+            pytest.fail("boundary controls need a temporary directory outside the checkout")
+        shutil.copy2(_ROOT / "pyproject.toml", root / "pyproject.toml")
+        for source in _workspace_sources(_ROOT):
+            shutil.copytree(
+                source,
+                root / source.relative_to(_ROOT),
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+        yield root / "runner/src/curie_runner/_boundary_probe.py"
 
 
 @pytest.fixture
-def lint_imports_command() -> str:
+def lint_imports_command(boundary_probe: Path) -> str:
+    """@spec HARNESS-BOUNDARY-ISOLATION-1."""
     command = shutil.which("lint-imports")
     if command is None:
         pytest.fail("lint-imports must be installed to verify the harness boundary")
-    baseline = _lint_imports(command)
+    baseline = _lint_imports(command, boundary_probe.parents[3])
     if baseline.returncode != 0:
         pytest.fail("the linter baseline is unavailable:\n" + baseline.stdout + baseline.stderr)
     return command
 
 
-def _lint_imports(command: str) -> subprocess.CompletedProcess[str]:
+def _lint_imports(command: str, root: Path) -> subprocess.CompletedProcess[str]:
+    """@spec HARNESS-BOUNDARY-ISOLATION-1."""
     return subprocess.run(
         [command, "--no-cache", "--no-logo"],
-        cwd=_ROOT,
+        cwd=root,
+        env=os.environ | {
+            "PYTHONPATH": os.pathsep.join(str(path) for path in _workspace_sources(root))
+        },
         capture_output=True,
         text=True,
         timeout=120,
@@ -60,12 +72,13 @@ def _lint_imports(command: str) -> subprocess.CompletedProcess[str]:
 def test_actual_linter_refuses_a_new_sdk_importer_and_accepts_its_control(
     boundary_probe: Path, lint_imports_command: str
 ) -> None:
+    """@spec HARNESS-BOUNDARY-ISOLATION-1."""
     boundary_probe.write_text("BOUNDARY_CONTROL = True\n", encoding="utf-8")
-    control = _lint_imports(lint_imports_command)
+    control = _lint_imports(lint_imports_command, boundary_probe.parents[3])
     assert control.returncode == 0, control.stdout + control.stderr
 
     boundary_probe.write_text("import claude_agent_sdk\n", encoding="utf-8")
-    rejected = _lint_imports(lint_imports_command)
+    rejected = _lint_imports(lint_imports_command, boundary_probe.parents[3])
     output = rejected.stdout + rejected.stderr
     assert rejected.returncode != 0, output
     assert _PROBE_MODULE in output, output
