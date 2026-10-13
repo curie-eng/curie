@@ -231,7 +231,18 @@ jobs:
       - name: Pytest
         id: pytest
         if: steps.python-runtime.outputs.pytest == 'true'
-        run: uv run pytest -q -n 4 --dist loadgroup --ci-shard ${{ matrix.shard }}/3 --reruns 1 -rsR --durations=25
+        env:
+          SHARD: ${{ matrix.shard }}
+          PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
+        run: |
+          pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/3" --reruns 1 -rsR --durations=25)
+          if [[ -n "$PYTEST_DESELECT" ]]; then
+            IFS=, read -r -a deselect_files <<< "$PYTEST_DESELECT"
+            for path in "${deselect_files[@]}"; do
+              pytest_args+=(--deselect "$path")
+            done
+          fi
+          uv run pytest "${pytest_args[@]}"
       # Record what this shard decided and did, for the required job to check.
       # Written on every outcome, so a failed shard still reports.
       - name: Record shard result
@@ -241,10 +252,12 @@ jobs:
           PYTEST_SELECTED: ${{ steps.python-runtime.outputs.pytest }}
           PYTEST_RESULT: ${{ steps.pytest.outcome }}
           STACK_RESULT: ${{ steps.dev-stack.outcome }}
+          PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
         run: |
           mkdir -p shard-result
-          printf 'shard=%s selected=%s pytest=%s stack=%s\n' \
+          printf 'shard=%s selected=%s pytest=%s stack=%s deselect=%s\n' \
             "$SHARD" "${PYTEST_SELECTED:-}" "${PYTEST_RESULT:-}" "${STACK_RESULT:-}" \
+            "${PYTEST_DESELECT:-}" \
             > "shard-result/shard-${SHARD}.txt"
           cat "shard-result/shard-${SHARD}.txt"
       - name: Upload shard result
@@ -473,9 +486,11 @@ jobs:
         if: success()
         env:
           PYTEST_SELECTED: ${{ steps.python-runtime.outputs.pytest }}
+          PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
           SHARDS_RESULT: ${{ needs.python-pytest.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           CHANGES_PYTEST: ${{ needs.changes.outputs.pytest }}
+          CHANGES_DESELECT: ${{ needs.changes.outputs.pytest_deselect }}
           SHARD_COUNT: "3"
           SHARD_RESULTS_DIR: shard-results
         run: |
@@ -486,6 +501,10 @@ jobs:
           fi
           if [[ "$CHANGES_PYTEST" != "$PYTEST_SELECTED" ]]; then
             echo "changes job selected pytest=${CHANGES_PYTEST:-<empty>}, but this job selected ${PYTEST_SELECTED:-<empty>}" >&2
+            exit 1
+          fi
+          if [[ "$CHANGES_DESELECT" != "$PYTEST_DESELECT" ]]; then
+            echo "changes job selected deselect=${CHANGES_DESELECT:-<empty>}, but this job selected ${PYTEST_DESELECT:-<empty>}" >&2
             exit 1
           fi
           if [[ "$PYTEST_SELECTED" == "false" ]]; then
@@ -516,7 +535,7 @@ jobs:
               echo "pytest shard $shard reported no result" >&2
               exit 1
             fi
-            want="shard=$shard selected=$PYTEST_SELECTED pytest=$expected stack=$expected"
+            want="shard=$shard selected=$PYTEST_SELECTED pytest=$expected stack=$expected deselect=$PYTEST_DESELECT"
             got="$(cat "$record")"
             if [[ "$got" != "$want" ]]; then
               echo "pytest shard $shard: expected '$want', got '$got'" >&2
@@ -2146,6 +2165,7 @@ jobs:
       images: ${{ steps.filter.outputs.images }}
       cli_release: ${{ steps.filter.outputs.cli_release }}
       pytest: ${{ steps.filter.outputs.pytest }}
+      pytest_deselect: ${{ steps.filter.outputs.pytest_deselect }}
       version_only: ${{ steps.filter.outputs.version_only }}
       factory: ${{ steps.filter.outputs.factory }}
       approval_resume: ${{ steps.filter.outputs.approval_resume }}
