@@ -17,11 +17,11 @@ import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 import factory_e2e as fe
 import pytest
 import repo_runner
+from channel_protocol.identity import scoped_conversation_id
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "fixtures" / "repo-runner"
@@ -217,7 +217,10 @@ class _KubernetesCli:
         self.started = False
         self.exited = False
         self.claims_enabled = True
+        self.repository = REPO_X
         self.post_exit_claim: str | None = None
+        self.retirement_queries: list[str] = []
+        self.retirement_stays = False
         self.probes = [{"status": "done", "turn_active": False}]
         self.probe_calls = 0
         self.cas_conflict = False
@@ -273,18 +276,26 @@ class _KubernetesCli:
         if "sandboxclaims.extensions.agents.x-k8s.io" in argv:
             claims = []
             if self.started and self.claims_enabled:
+                turn = _passing()["turns"][0 if self.repository == REPO_X else 1]
                 name = (
                     self.post_exit_claim
-                    if self.exited and self.post_exit_claim else "fixture-claim-x"
+                    if self.exited and self.post_exit_claim else turn["claim"]
                 )
                 claims = [{
                     "metadata": {"name": name},
-                    "spec": {"env": [{"name": "CURIE_REPO_PATH", "value": REPO_X}]},
-                    "status": {"sandbox": {"name": "fixture-sandbox-x"}},
+                    "spec": {"env": [{"name": "CURIE_REPO_PATH", "value": self.repository}]},
+                    "status": {"sandbox": {"name": turn["sandbox"]}},
                 }]
             return json.dumps({"items": claims})
+        if "sandboxclaim" in argv:
+            assert argv[argv.index("sandboxclaim") + 2 :] == ["--ignore-not-found", "-o", "name"]
+            name = argv[argv.index("sandboxclaim") + 1]
+            self.retirement_queries.append(name)
+            if self.retirement_stays or len(self.retirement_queries) == 1:
+                return f"sandboxclaim/{name}"
+            return ""
         if "pod" in argv:
-            turn = _passing()["turns"][0]
+            turn = _passing()["turns"][0 if self.repository == REPO_X else 1]
             return json.dumps({
                 "metadata": {"uid": turn["pod_uid"]},
                 "spec": {"containers": [{
@@ -294,7 +305,7 @@ class _KubernetesCli:
                 "status": {"containerStatuses": [{"name": "runner", "imageID": turn["image_id"]}]},
             })
         if "logs" in argv:
-            return _passing()["turns"][0]["boot_log"]
+            return _passing()["turns"][0 if self.repository == REPO_X else 1]["boot_log"]
         if "exec" in argv:
             assert "/status" in argv[-1]
             status = self.probes[min(self.probe_calls, len(self.probes) - 1)]
@@ -330,12 +341,21 @@ def offline_driver(
             assert argv[:5] == ["curie", "cluster", "--context", "k8", "message"]
             assert argv[argv.index("--release") + 1] == "factory-tools"
             assert argv[argv.index("--namespace") + 1] == preflight.namespace
+            text = argv[argv.index("message") + 1]
+            cli.repository = next(
+                repository for repository in (REPO_X, REPO_Y)
+                if f"https://github.com/{repository}\n" in text
+            )
             cli.started = True
+            cli.exited = False
             if cli.claims_enabled:
                 first = _first_model_body()
                 status, response = _model_request(model, first)
                 assert status == 200
-                assert _model_request(model, _result_model_body(first, response))[0] == 200
+                result = _result_model_body(first, response)
+                sample = _passing()["turns"][0 if cli.repository == REPO_X else 1]
+                result["messages"][-1]["content"][0]["content"] = sample["manifest_output"]
+                assert _model_request(model, result)[0] == 200
 
         def poll(self) -> int:
             cli.exited = True
@@ -395,7 +415,7 @@ def test_claim_selection_uses_the_scoped_thread_hash_in_the_actual_kubectl_argv(
     driver, cli = offline_driver
     thread = "fixture:thread/1"
     assert driver._claims(thread) == []
-    scoped = ":".join(quote(value, safe="-._~") for value in ("slack", driver.channel, thread))
+    scoped = scoped_conversation_id("slack", driver.channel, thread)
     digest = hashlib.sha256(scoped.encode()).hexdigest()[:10]
     command = cli.calls[-1]
     assert command[command.index("-l") + 1] == (
@@ -433,6 +453,47 @@ def test_turn_reprobes_after_cli_exit_and_includes_claims_first_seen_then(
     assert cli.probe_calls >= 2
     assert turn["claim"] == "fixture-claim-after-exit"
     assert "fixture-claim-after-exit" in turn["new_claims"]
+
+
+@pytest.mark.parametrize("stays", [False, True], ids=["claim-disappears", "claim-remains"])
+def test_repository_switch_collects_actual_retirement_and_the_judge_requires_it(
+    stays: bool,
+    offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver, cli = offline_driver
+    cli.retirement_stays = stays
+    ticks = iter(range(0, 1000, 20))
+    monkeypatch.setattr(fe.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(fe.time, "sleep", lambda _interval: None)
+    first = driver._turn(0, _plan()["turns"][0])
+    second = driver._turn(1, _plan()["turns"][1])
+    assert first["status"] == second["status"] == "completed"
+    assert first["repository"] == REPO_X and second["repository"] == REPO_Y
+    assert first["claim"] != second["claim"]
+    assert cli.retirement_queries and set(cli.retirement_queries) == {first["claim"]}
+    driver.obs["turns"].extend(copy.deepcopy(_passing()["turns"][2:]))
+    failures = repo_runner.judge_repo_runner(driver.obs)
+    if stays:
+        assert second["retired_claims"] == []
+        assert any("did not retire" in failure for failure in failures), failures
+    else:
+        assert cli.retirement_queries == [first["claim"], first["claim"]]
+        assert second["retired_claims"] == [first["claim"]]
+        assert failures == []
+
+
+def test_second_turn_in_the_same_repository_does_not_retire_its_retained_claim(
+    offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli],
+) -> None:
+    driver, cli = offline_driver
+    planned = _plan()["turns"][0]
+    first = driver._turn(0, planned)
+    second = driver._turn(1, copy.deepcopy(planned))
+    assert first["status"] == second["status"] == "completed"
+    assert first["claim"] == second["claim"]
+    assert second["retired_claims"] == []
+    assert cli.retirement_queries == []
 
 
 @pytest.mark.parametrize("missing_proof", ["finalized", "done-probe"])
