@@ -4,6 +4,8 @@
 # reconciliation establishes the durable metric without starting runner pods.
 # Issue #4197: an upgrade that does not restart a controller which restarted
 # once long before must pass on the stable serving leader and stay deployed.
+# Issue #4461: namespaced NetworkPolicy delete refusals from another namespace
+# must be reported without failing the owning release's controller preflight.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,6 +14,7 @@ REPO_ROOT="$(cd "$CHART/../.." && pwd)"
 CLUSTER=test-4005-controller-preflight
 CONTEXT="kind-$CLUSTER"
 NAMESPACE=test-4005-controller-preflight
+CONSUMER_NAMESPACE=test-4461-controller-consumer
 RELEASE=curie-controller-preflight
 CONTROLLER_NS=agent-sandbox-system
 DEPLOY=agent-sandbox-controller
@@ -70,7 +73,7 @@ cleanup() {
   fi
   rm -rf "$TMP"
   if [[ "$rc" -eq 0 && "$scenario_passed" -eq 1 ]]; then
-    echo "PASS: fresh install passes, a rotated-log upgrade passes from successful reconcile metrics without replacing or restarting the controller, an upgrade over a long-serving leader with an old restart passes and stays deployed, and an RBAC crash-loop fails the actual upgrade hook."
+    echo "PASS: fresh install, rotated logs, an old restart, and another namespace's NetworkPolicy delete refusal pass the actual upgrade hook and stay deployed; a cluster-scope RBAC crash-loop fails."
   fi
   exit "$rc"
 }
@@ -79,7 +82,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # Exercise the release archive generated from this candidate, with exactly the
-# same package for the fresh install and both upgrades.
+# same package for the fresh install and all upgrades.
 CANDIDATE_CHART="$TMP/$(python3 - "$CHART/Chart.yaml" <<'PY'
 import sys
 
@@ -256,6 +259,57 @@ leader_restarts="$(kubectl --context "$CONTEXT" -n "$CONTROLLER_NS" get pod "$po
 [[ "$leader_uid" == "$uid" && "$leader_restarts" == "$restarts" ]] \
   || fail "leader upgrade changed controller identity or restart count"
 echo "Controller after leader upgrade: uid=$leader_uid restartCount=$leader_restarts release=$release_status"
+
+# Create only the consumer SandboxTemplate in a second namespace. The
+# controller owns no NetworkPolicy Role there, and Unmanaged reconciliation
+# attempts a namespaced delete even when no policy exists. Wait for that real
+# refusal before upgrading so the case cannot pass without the trigger.
+kubectl --context "$CONTEXT" create namespace "$CONSUMER_NAMESPACE"
+if kubectl --context "$CONTEXT" auth can-i delete networkpolicies \
+    --as=system:serviceaccount:agent-sandbox-system:agent-sandbox-controller \
+    --namespace "$CONSUMER_NAMESPACE"; then
+  fail "consumer namespace unexpectedly grants the controller NetworkPolicy delete"
+fi
+helm template acme-consumer "$CANDIDATE_CHART" --namespace "$CONSUMER_NAMESPACE" \
+  "${values[@]}" --set agentSandbox.controller.deploy=false \
+  | python3 -c '
+import sys
+import yaml
+
+templates = [d for d in yaml.safe_load_all(sys.stdin) if d and d.get("kind") == "SandboxTemplate"]
+if len(templates) != 1 or templates[0].get("spec", {}).get("networkPolicyManagement") != "Unmanaged":
+    sys.exit("expected exactly one Unmanaged consumer SandboxTemplate")
+yaml.safe_dump(templates[0], sys.stdout)
+' | kubectl --context "$CONTEXT" --namespace "$CONSUMER_NAMESPACE" apply -f -
+namespaced_refusal=0
+for ((attempt=0; attempt<90; attempt++)); do
+  consumer_logs="$(kubectl --context "$CONTEXT" -n "$CONTROLLER_NS" logs "$pod")"
+  if grep -Eq "cannot delete resource [^ ]*networkpolicies[^ ]* in API group [^ ]*networking\\.k8s\\.io[^ ]* in the namespace [^ ]*${CONSUMER_NAMESPACE}[^ ]*" <<< "$consumer_logs"; then
+    namespaced_refusal=1
+    break
+  fi
+  sleep 2
+done
+[[ "$namespaced_refusal" -eq 1 ]] \
+  || fail "consumer template never produced its actual namespaced NetworkPolicy delete refusal"
+echo "Observed the consumer namespace's NetworkPolicy delete refusal before upgrading."
+if ! helm upgrade "$RELEASE" "$CANDIDATE_CHART" --kube-context "$CONTEXT" \
+    --namespace "$NAMESPACE" "${values[@]}" --timeout 300s; then
+  kubectl --context "$CONTEXT" -n "$NAMESPACE" logs "job/$HOOK" || true
+  fail "healthy owning release upgrade failed on another namespace's NetworkPolicy refusal"
+fi
+consumer_hook_logs="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" logs "job/$HOOK")"
+grep -q 'RESULT: PASS' <<< "$consumer_hook_logs" \
+  || fail "consumer-refusal upgrade hook did not report RESULT: PASS"
+grep -Eq "NOTE:.*namespaced NetworkPolicy.*${CONSUMER_NAMESPACE}" <<< "$consumer_hook_logs" \
+  || fail "consumer-refusal upgrade hook did not report the affected namespace"
+hook_succeeded="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" get job "$HOOK" -o jsonpath='{.status.succeeded}')"
+[[ "$hook_succeeded" == 1 ]] || fail "consumer-refusal upgrade hook Job did not succeed"
+release_status="$(helm status "$RELEASE" --kube-context "$CONTEXT" --namespace "$NAMESPACE" -o json \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["info"]["status"])')"
+[[ "$release_status" == deployed ]] || fail "release is $release_status after the consumer-refusal upgrade"
+printf '%s\n' "$consumer_hook_logs"
+echo "Consumer-refusal upgrade: hook succeeded and release=$release_status"
 
 # Remove only the NetworkPolicy read grant and restart its controller. The
 # negative upgrade's post-renderer removes that same one ClusterRole so Helm
