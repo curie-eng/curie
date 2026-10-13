@@ -249,7 +249,8 @@ class _KubernetesCli:
         self.calls.append(list(argv))
         assert argv[:3] == ["kubectl", "--context", "k8"]
         assert self.p.namespace in argv
-        if "get" in argv and "deployment" in argv:
+        get_resource = argv[argv.index("get") + 1] if "get" in argv else None
+        if get_resource == "deployment":
             return json.dumps(self.deployment)
         if "patch" in argv:
             patch = json.loads(argv[argv.index("-p") + 1])
@@ -273,7 +274,7 @@ class _KubernetesCli:
             return "deployment patched"
         if "rollout" in argv:
             return "deployment rolled out"
-        if "sandboxclaims.extensions.agents.x-k8s.io" in argv:
+        if get_resource == "sandboxclaims.extensions.agents.x-k8s.io":
             claims = []
             if self.started and self.claims_enabled:
                 turn = _passing()["turns"][0 if self.repository == REPO_X else 1]
@@ -287,14 +288,14 @@ class _KubernetesCli:
                     "status": {"sandbox": {"name": turn["sandbox"]}},
                 }]
             return json.dumps({"items": claims})
-        if "sandboxclaim" in argv:
+        if get_resource == "sandboxclaim":
             assert argv[argv.index("sandboxclaim") + 2 :] == ["--ignore-not-found", "-o", "name"]
             name = argv[argv.index("sandboxclaim") + 1]
             self.retirement_queries.append(name)
             if self.retirement_stays or len(self.retirement_queries) == 1:
                 return f"sandboxclaim/{name}"
             return ""
-        if "pod" in argv:
+        if get_resource == "pod":
             turn = _passing()["turns"][0 if self.repository == REPO_X else 1]
             return json.dumps({
                 "metadata": {"uid": turn["pod_uid"]},
@@ -311,7 +312,7 @@ class _KubernetesCli:
             status = self.probes[min(self.probe_calls, len(self.probes) - 1)]
             self.probe_calls += 1
             return json.dumps(status)
-        if "sandboxwarmpool" in argv:
+        if get_resource == "sandboxwarmpool":
             return "" if "absent-fixture-x" in argv else "sandboxwarmpool/fixture-x"
         raise AssertionError(f"unexpected external kubectl command {argv}")
 
