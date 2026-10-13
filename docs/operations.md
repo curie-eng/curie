@@ -701,7 +701,7 @@ curie cluster rollback
 
 `curie cluster rollback` selects the newest `deployed` revision as the serving
 revision. When the newest history row is above it and is not `deployed` or
-`superseded`, the rollback targets the serving revision. For example, deployed
+`superseded` (except `pending-rollback`, below), the rollback targets the serving revision. For example, deployed
 revision 4 followed by pending revision 5 rolls back to revision 4, clearing
 the unfinished upgrade while retaining known good state.
 
