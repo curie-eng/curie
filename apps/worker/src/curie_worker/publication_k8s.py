@@ -349,12 +349,7 @@ def publication_branch_is_valid(branch: str, branch_prefix: str | None) -> bool:
     never pass.
     """
 
-    if (
-        ".." in branch
-        or branch.startswith(("/", "."))
-        or "//" in branch
-        or branch.endswith("/")
-    ):
+    if ".." in branch or branch.startswith(("/", ".")) or "//" in branch or branch.endswith("/"):
         return False
     parts = branch.split("/")
     if any(not part or part.endswith(".lock") or part.endswith(".") for part in parts):
@@ -369,8 +364,7 @@ def publication_branch_is_valid(branch: str, branch_prefix: str | None) -> bool:
             return False
     historical = re.fullmatch(r"curie/[A-Za-z0-9._/-]+", branch) is not None
     named = (
-        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}/publication-[0-9a-f]+", branch)
-        is not None
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}/publication-[0-9a-f]+", branch) is not None
     )
     return historical or named
 
@@ -465,9 +459,7 @@ def build_publication_resources(
             "publication expected prior head must be 40-64 lowercase hexadecimal characters"
         )
     if payload.base_sha != payload.expected_prior_head:
-        raise PublicationResourceError(
-            "publication base SHA does not match expected prior head"
-        )
+        raise PublicationResourceError("publication base SHA does not match expected prior head")
     if payload.expected_remote_head is not None and (
         re.fullmatch(r"[0-9a-f]{40,64}", payload.expected_remote_head) is None
         or payload.expected_remote_head != payload.expected_prior_head
@@ -506,9 +498,11 @@ def build_publication_resources(
         "origin": payload.transport.origin,
         "header_form": payload.transport.header_form,
         "ca_bundle_ref": payload.transport.ca_bundle_ref,
-        "ca_bundle_sha256": (
-            hashlib.sha256(ca_pem.encode()).hexdigest() if ca_pem is not None else None
-        ),
+        # The Job mounts the CA from its own ConfigMap. A Job without a CA keeps
+        # exactly the hash input it had before the PEM moved there, so a worker
+        # upgrade still adopts the Jobs it left running.
+        "ca_bundle_config_map": names.config_map if ca_pem is not None else None,
+        "ca_bundle_key": _CA_CONFIG_MAP_KEY if ca_pem is not None else None,
         "base_sha": payload.base_sha,
         "expected_prior_head": payload.expected_prior_head,
         "expected_remote_head": payload.expected_remote_head,
@@ -521,6 +515,8 @@ def build_publication_resources(
         "active_deadline_seconds": settings.active_deadline_seconds,
         "git_timeout_seconds": settings.git_timeout_seconds,
     }
+    if ca_pem is not None:
+        contract["ca_bundle_sha256"] = hashlib.sha256(ca_pem.encode()).hexdigest()
     annotations = {
         "curietech.ai/publication-contract-sha256": hashlib.sha256(
             json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
@@ -694,8 +690,7 @@ def _expected_projection(observed: Any, expected: Any) -> Any:
         if not isinstance(observed, dict):
             return observed
         return {
-            key: _expected_projection(observed.get(key), value)
-            for key, value in expected.items()
+            key: _expected_projection(observed.get(key), value) for key, value in expected.items()
         }
     if isinstance(expected, list):
         if not isinstance(observed, list) or len(observed) != len(expected):
@@ -860,9 +855,7 @@ class KubernetesPublicationCluster:
         else:
             uid = getattr(getattr(owner, "metadata", None), "uid", None)
         if not uid:
-            raise PublicationResourceError(
-                f"publication owner ConfigMap {owner_name!r} has no UID"
-            )
+            raise PublicationResourceError(f"publication owner ConfigMap {owner_name!r} has no UID")
         return str(uid)
 
     @staticmethod
@@ -898,9 +891,7 @@ class KubernetesPublicationCluster:
         ]
         for obj in objects:
             obj["metadata"]["ownerReferences"][0]["uid"] = live_uid
-        existing = {
-            str(obj["kind"]): self._read_existing(str(obj["kind"]), obj) for obj in objects
-        }
+        existing = {str(obj["kind"]): self._read_existing(str(obj["kind"]), obj) for obj in objects}
         # Validate every collision before making any mutation. This prevents a
         # matching label on a hostile or stale object from authorizing partial
         # adoption. Reads are exact-name GETs; publication RBAC needs no Secret
@@ -915,9 +906,7 @@ class KubernetesPublicationCluster:
                     # A stale immutable Secret is replaced by UID below when
                     # no Job exists, so reading/comparing credential bytes is
                     # unnecessary in that recovery shape.
-                    compare_secret_value=not (
-                        kind == "Secret" and existing["Job"] is None
-                    ),
+                    compare_secret_value=not (kind == "Secret" and existing["Job"] is None),
                 )
 
         config_map, secret, job = objects
@@ -991,14 +980,10 @@ class KubernetesPublicationCluster:
             raise
         metadata = job.get("metadata") if isinstance(job, dict) else getattr(job, "metadata", None)
         job_uid = (
-            metadata.get("uid")
-            if isinstance(metadata, dict)
-            else getattr(metadata, "uid", None)
+            metadata.get("uid") if isinstance(metadata, dict) else getattr(metadata, "uid", None)
         )
         if not job_uid:
-            raise PublicationResourceError(
-                f"publication Job {job_name!r} has no stable UID"
-            )
+            raise PublicationResourceError(f"publication Job {job_name!r} has no stable UID")
         status = job.get("status") if isinstance(job, dict) else getattr(job, "status", None)
 
         def status_value(name: str, default: Any = None) -> Any:
@@ -1039,16 +1024,12 @@ class KubernetesPublicationCluster:
                 self.namespace, label_selector=f"job-name={job_name}"
             )
             items = (
-                pods.get("items")
-                if isinstance(pods, dict)
-                else getattr(pods, "items", None)
+                pods.get("items") if isinstance(pods, dict) else getattr(pods, "items", None)
             ) or []
             owned = []
             for pod in items:
                 pod_metadata = (
-                    pod.get("metadata")
-                    if isinstance(pod, dict)
-                    else getattr(pod, "metadata", None)
+                    pod.get("metadata") if isinstance(pod, dict) else getattr(pod, "metadata", None)
                 )
                 references = (
                     pod_metadata.get("ownerReferences", [])
@@ -1056,10 +1037,7 @@ class KubernetesPublicationCluster:
                     else getattr(pod_metadata, "owner_references", None) or []
                 )
                 if any(
-                    (
-                        reference.get("kind") == "Job"
-                        and str(reference.get("uid")) == str(job_uid)
-                    )
+                    (reference.get("kind") == "Job" and str(reference.get("uid")) == str(job_uid))
                     if isinstance(reference, dict)
                     else (
                         getattr(reference, "kind", None) == "Job"
@@ -1100,9 +1078,7 @@ class KubernetesPublicationCluster:
                 )
                 data = getattr(raw_log, "data", raw_log)
                 logs = (
-                    data.decode("utf-8", errors="replace")
-                    if isinstance(data, bytes)
-                    else str(data)
+                    data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
                 )
                 logs = _redact(logs)
                 logs_read = True
@@ -1140,9 +1116,7 @@ class KubernetesPublicationCluster:
                 head = _MAX_JOB_ERROR // 3
                 tail = _MAX_JOB_ERROR - head - len(" ... ")
                 error = error[:head] + " ... " + error[-tail:]
-        commit_match = re.search(
-            r"^CURIE_COMMIT_SHA=([0-9a-f]{40,64})$", logs, re.MULTILINE
-        )
+        commit_match = re.search(r"^CURIE_COMMIT_SHA=([0-9a-f]{40,64})$", logs, re.MULTILINE)
         return PublicationJobObservation(
             phase=phase,
             commit_sha=commit_match.group(1) if commit_match else None,

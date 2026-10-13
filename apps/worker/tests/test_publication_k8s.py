@@ -1421,9 +1421,7 @@ class _FakeCoreApi:
         self.secrets[body["metadata"]["name"]] = value
         self.created.append(("Secret", body["metadata"]["name"]))
 
-    def delete_namespaced_secret(
-        self, name: str, namespace: str, *, body: dict[str, Any]
-    ) -> None:
+    def delete_namespaced_secret(self, name: str, namespace: str, *, body: dict[str, Any]) -> None:
         self.secret_deletes.append((name, deepcopy(body)))
         del self.secrets[name]
 
@@ -1480,9 +1478,9 @@ def test_create_or_adopt_validates_immutable_spec_and_live_owner_before_mutating
         cluster.apply(resources)
     core.secrets[resources.names.secret]["data"]["credential"] = original_credential
 
-    core.config_maps[resources.names.config_map]["metadata"]["ownerReferences"][0][
-        "uid"
-    ] = "different-owner-uid"
+    core.config_maps[resources.names.config_map]["metadata"]["ownerReferences"][0]["uid"] = (
+        "different-owner-uid"
+    )
     with pytest.raises(publication_k8s.PublicationResourceError, match="metadata contract"):
         cluster.apply(resources)
 
@@ -1503,13 +1501,12 @@ def test_stale_immutable_secret_is_uid_replaced_only_when_job_is_gone(
 
     cluster.apply(rotated)
 
-    assert core.secret_deletes == [
-        (resources.names.secret, {"preconditions": {"uid": old_uid}})
-    ]
+    assert core.secret_deletes == [(resources.names.secret, {"preconditions": {"uid": old_uid}})]
     assert batch.created == [resources.names.job, resources.names.job]
-    assert base64.b64decode(
-        core.secrets[resources.names.secret]["data"]["credential"]
-    ).decode() == "rotated-publication-write-credential"
+    assert (
+        base64.b64decode(core.secrets[resources.names.secret]["data"]["credential"]).decode()
+        == "rotated-publication-write-credential"
+    )
 
 
 def _v1_job(
@@ -1865,9 +1862,7 @@ def test_omitempty_tolerance_refuses_valueFrom_secretKeyRef_on_omitted_env(
     env = container["env"]
     empty_items = [item for item in env if "value" not in item]
     assert empty_items, "expected at least one omitted-value env entry to attack"
-    empty_items[0]["valueFrom"] = {
-        "secretKeyRef": {"name": secret_name, "key": "credential"}
-    }
+    empty_items[0]["valueFrom"] = {"secretKeyRef": {"name": secret_name, "key": "credential"}}
 
     with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
         publication_k8s.validate_adopted_resource("Job", resources.job, planted)
@@ -1944,9 +1939,7 @@ def _failed_owned_pod(exit_code: int = 128) -> dict[str, Any]:
             "containerStatuses": [
                 {
                     "name": "publish",
-                    "state": {
-                        "terminated": {"reason": "Error", "exitCode": exit_code}
-                    },
+                    "state": {"terminated": {"reason": "Error", "exitCode": exit_code}},
                 }
             ]
         },
@@ -2007,9 +2000,7 @@ def test_observe_failed_job_error_is_bounded_for_huge_logs(
     publication_k8s: Any,
 ) -> None:
     logs = "\n".join(f"fatal: line {index} " + "x" * 200 for index in range(60))
-    cluster = _failed_job_cluster(
-        publication_k8s, pods=[_failed_owned_pod(1)], logs=logs
-    )
+    cluster = _failed_job_cluster(publication_k8s, pods=[_failed_owned_pod(1)], logs=logs)
 
     observed = cluster.observe("curie-publication-22222222222242228222")
 
@@ -2022,12 +2013,28 @@ def test_observe_failed_job_error_is_bounded_for_huge_logs(
 def test_observe_failed_job_without_pod_says_logs_were_unavailable(
     publication_k8s: Any,
 ) -> None:
-    cluster = _failed_job_cluster(
-        publication_k8s, pods=[], logs="", reason="DeadlineExceeded"
-    )
+    cluster = _failed_job_cluster(publication_k8s, pods=[], logs="", reason="DeadlineExceeded")
 
     observed = cluster.observe("curie-publication-22222222222242228222")
 
     error = observed.error or ""
     assert "DeadlineExceeded" in error
     assert "pod logs were unavailable" in error
+
+
+def test_a_publication_without_a_ca_keeps_its_contract_hash_across_the_ca_move(
+    publication_k8s: Any,
+) -> None:
+    """A worker upgrade adopts the Jobs it left running only if their hash is unchanged.
+
+    The value is the annotation the worker wrote before the code host CA moved
+    into the Job's own ConfigMap (computed from that earlier source for this
+    exact payload and settings).
+    """
+
+    resources = _resources(publication_k8s)
+
+    assert (
+        resources.job["metadata"]["annotations"]["curietech.ai/publication-contract-sha256"]
+        == "583ff66a400a55b143deff2f55935e6548680630568ace51c65280c11c00e22f"
+    )
