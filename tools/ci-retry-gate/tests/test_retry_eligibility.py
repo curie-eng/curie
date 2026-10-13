@@ -60,6 +60,7 @@ RETRY_ALLOWLIST = frozenset(
         # ci.yaml and helm-ci.yaml steps that were still a single attempt.
         ("ci.yaml", "action-pins", "Install uv"),
         ("ci.yaml", "rust-lint", "Install uv"),
+        ("ci.yaml", "runtime-assertion-registration", "Install uv for the runtime assertion gate"),
         ("ci.yaml", "rust-test", "Install uv"),
         ("ci.yaml", "rust-test", "Install Helm for CLI consumer render tests"),
         ("ci.yaml", "contracts-ts", "Install Node"),

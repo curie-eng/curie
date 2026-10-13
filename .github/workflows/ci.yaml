@@ -4206,6 +4206,56 @@ jobs:
           kubectl delete namespace acme-2590 --ignore-not-found --wait=false 2>/dev/null || true
           kind delete cluster --name curie-upgrade-matrix 2>/dev/null || true
 
+  # Needs only `changes`, so an unregistered or untiered runtime assertion
+  # fails within minutes instead of after the kind matrix. It is a separate job
+  # rather than steps in `changes` because a failed `changes` would skip every
+  # downstream job and hide their evidence; `E2E required` carries its result.
+  runtime-assertion-registration:
+    name: Runtime assertion registration
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: [changes]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install uv for the runtime assertion gate
+        id: install_uv_for_the_runtime_assertion_gate
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Back off before retrying Install uv for the runtime assertion gate
+        if: steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure'
+        run: |
+          echo "Install uv for the runtime assertion gate failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv for the runtime assertion gate (retry)
+        if: steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      # #3391: an added or changed charts/curie/ci/runtime assertion counts only
+      # when a Calico cluster job this verdict needs runs it through the
+      # receipt runner, and that exact blob left a pass receipt. The negative
+      # controls run on every verdict so the gate can never pass vacuously.
+      - name: Runtime assertion gate negative controls
+        run: |
+          set -euo pipefail
+          uv run --no-project --with pyyaml==6.0.3 python tools/runtime-assertion-gate/gate.py \
+            self-test --workflow .github/workflows/ci.yaml \
+            --registered charts/curie/ci/runtime/publication-job-assertions.sh
+      - name: Changed runtime assertions are registered
+        if: needs.changes.outputs.runtime_assertions != '[]'
+        env:
+          RUNTIME_ASSERTIONS: ${{ needs.changes.outputs.runtime_assertions }}
+          CLUSTER_SELECTED: ${{ needs.changes.outputs.cluster }}
+        run: |
+          set -euo pipefail
+          if [[ "$CLUSTER_SELECTED" != "true" ]]; then
+            echo "Changed runtime assertions need the cluster tier, which was not selected" >&2
+            exit 1
+          fi
+          uv run --no-project --with pyyaml==6.0.3 python tools/runtime-assertion-gate/gate.py \
+            registration --workflow .github/workflows/ci.yaml --scripts "$RUNTIME_ASSERTIONS"
+
   e2e-required:
     name: E2E required
     runs-on: ubuntu-latest
@@ -4215,7 +4265,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-cluster-approval-resume-restarts, e2e-scripted-factory, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
+    needs: [changes, runtime-assertion-registration, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-cluster-approval-resume-restarts, e2e-scripted-factory, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
     # A cancelled run leaves no evidence and must rerun. In a completed run,
     # every dependency outcome reaches the strict matcher below, which rejects
     # selected results other than success.
@@ -4224,6 +4274,7 @@ jobs:
       - name: Require exact selected outcomes
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
+          REGISTRATION_RESULT: ${{ needs.runtime-assertion-registration.result }}
           EVENT_NAME: ${{ github.event_name }}
           SKILL_SELECTED: ${{ needs.changes.outputs.skill }}
           LOCAL_SELECTED: ${{ needs.changes.outputs.local }}
@@ -4265,6 +4316,7 @@ jobs:
           }
 
           if [[ "$CHANGES_RESULT" != "success" ||
+                "$REGISTRATION_RESULT" != "success" ||
                 "$UPGRADE_MATRIX_SHARDS_RESULT" != "success" ||
                 ( "$SKILL_SELECTED" != "true" && "$SKILL_SELECTED" != "false" ) ||
                 ( "$LOCAL_SELECTED" != "true" && "$LOCAL_SELECTED" != "false" ) ||
@@ -4359,8 +4411,8 @@ jobs:
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       # #3391: an added or changed charts/curie/ci/runtime assertion counts only
       # when a Calico cluster job this verdict needs runs it through the
-      # receipt runner, and that exact blob left a pass receipt. The negative
-      # controls run on every verdict so the gate can never pass vacuously.
+      # receipt runner, and that exact blob left a pass receipt. Registration
+      # and the negative controls run in runtime-assertion-registration.
       - name: Back off before retrying Install uv for the runtime assertion gate
         if: ${{ !cancelled() && steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure' }}
         run: |
@@ -4369,30 +4421,6 @@ jobs:
       - name: Install uv for the runtime assertion gate (retry)
         if: ${{ !cancelled() && steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure' }}
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-      # #3391: an added or changed charts/curie/ci/runtime assertion counts only
-      # when a Calico cluster job this verdict needs runs it through the
-      # receipt runner, and that exact blob left a pass receipt. The negative
-      # controls run on every verdict so the gate can never pass vacuously.
-      - name: Runtime assertion gate negative controls
-        if: ${{ !cancelled() }}
-        run: |
-          set -euo pipefail
-          uv run --no-project --with pyyaml==6.0.3 python tools/runtime-assertion-gate/gate.py \
-            self-test --workflow .github/workflows/ci.yaml \
-            --registered charts/curie/ci/runtime/publication-job-assertions.sh
-      - name: Changed runtime assertions are registered
-        if: ${{ !cancelled() && needs.changes.outputs.runtime_assertions != '[]' }}
-        env:
-          RUNTIME_ASSERTIONS: ${{ needs.changes.outputs.runtime_assertions }}
-          CLUSTER_SELECTED: ${{ needs.changes.outputs.cluster }}
-        run: |
-          set -euo pipefail
-          if [[ "$CLUSTER_SELECTED" != "true" ]]; then
-            echo "Changed runtime assertions need the cluster tier, which was not selected" >&2
-            exit 1
-          fi
-          uv run --no-project --with pyyaml==6.0.3 python tools/runtime-assertion-gate/gate.py \
-            registration --workflow .github/workflows/ci.yaml --scripts "$RUNTIME_ASSERTIONS"
       - name: Download runtime assertion receipts
         if: ${{ !cancelled() && needs.changes.outputs.runtime_assertions != '[]' }}
         uses: actions/download-artifact@v8
