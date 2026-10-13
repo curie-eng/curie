@@ -25,6 +25,10 @@
 #       reach admission and prewarm, and appear in the worker's repository map.
 #   (h) NEGATIVE: ambiguous factory agents, long pool names, digest-prefix
 #       collisions, conflicting image metadata and a disabled substrate fail.
+#   (i) Per-agent runnerEnv creates a platform-image pool, reaches only that
+#       agent's runner containers, and survives repository-template inheritance.
+#   (j) NEGATIVE: malformed runnerEnv maps, agent and variable names, non-string
+#       values, reserved names and duplicate runner env names fail render.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly.
 set -euo pipefail
@@ -94,6 +98,24 @@ def worker_env():
     return {e["name"]: e.get("value") for c in worker["spec"]["template"]["spec"]["containers"] for e in c.get("env", [])}
 
 
+def assert_runner_env(values):
+    configured = values["agentSandbox"]["runnerEnv"]
+    custom_names = {name for env in configured.values() for name in env}
+    for name, tpl in templates.items():
+        pod = tpl["spec"]["podTemplate"]
+        agent = pod["metadata"]["labels"].get("curietech.ai/agent", "")
+        expected = configured.get(agent, {})
+        for container in pod["spec"].get("initContainers", []) + pod["spec"]["containers"]:
+            entries = container.get("env", [])
+            names = [entry["name"] for entry in entries]
+            if len(names) != len(set(names)):
+                sys.exit(f"{name}/{container['name']}: duplicate environment names")
+            actual = {entry["name"]: entry.get("value") for entry in entries if entry["name"] in custom_names}
+            want = expected if container["name"] == "runner" else {}
+            if actual != want:
+                sys.exit(f"{name}/{container['name']}: runnerEnv {actual!r}, want {want!r}")
+
+
 # Invariant (c): every runner-image container image is prewarmed.
 for name, tpl in templates.items():
     for cname, image in runner_images(tpl).items():
@@ -142,8 +164,28 @@ elif mode == "no-repositories":
         sys.exit("repositories without runner blocks rendered image-specific templates")
     if "CURIE_REPO_RUNNER_POOLS" in worker_env():
         sys.exit("repositories without runner blocks rendered CURIE_REPO_RUNNER_POOLS")
+elif mode == "runner-env":
+    values = json.load(open(args[0]))
+    configured = values["agentSandbox"]["runnerEnv"]
+    assert_runner_env(values)
+    pools = {d["metadata"]["name"]: d for d in docs if d.get("kind") == "SandboxWarmPool"}
+    if len(templates) != len(configured) + 1:
+        sys.exit("runnerEnv-only agents must each have one template beside the generic template")
+    for agent in configured:
+        tpl = by_suffix(f"-agent-{agent}-runner")
+        if tpl is None or set(runner_images(tpl).values()) != {platform}:
+            sys.exit(f"runnerEnv-only agent {agent} must use the platform image")
+        name = tpl["metadata"]["name"]
+        if pools.get(name + "-pool", {}).get("spec", {}).get("sandboxTemplateRef", {}).get("name") != name:
+            sys.exit(f"runnerEnv-only agent {agent} has no matching warm pool")
+    actual_agents = set((worker_env().get("CURIE_AGENT_SANDBOX_POOLS") or "").split(","))
+    if actual_agents != set(configured):
+        sys.exit(f"worker agent pools {actual_agents} differ from runnerEnv agents {set(configured)}")
+    if any(c["name"].startswith("prewarm-agent-") for c in pw_containers):
+        sys.exit("runnerEnv-only agents must not add duplicate platform prewarm images")
 elif mode == "repositories":
     values = json.load(open(args[0]))
+    assert_runner_env(values)
     repos = values["factory"]["bindings"][0]["repos"]
     agent = "factory"
     default = by_suffix(f"-agent-{agent}-runner")
@@ -248,6 +290,43 @@ render() { helm template t "$CHART" "$@"; }
 render >"$TMP/default.yaml" || fail "default render"
 python3 "$CHECKER" default "$TMP/default.yaml" || fail "(a) default render"
 
+# (i) Environment alone selects an agent pool, with string values preserved
+# verbatim and no copy on another agent, the generic runner or init containers.
+cat >"$TMP/runner-env-values.json" <<'JSON'
+{"agentSandbox":{"runnerEnv":{"factory":{"CLAUDE_CODE_MAX_OUTPUT_TOKENS":"16000","ACME_ZERO":"0","ACME_EMPTY":"","ACME_FALSE":"false","_ACME_TEXT":"first line\nsecond line"},"acme":{"ACME_OTHER":"17"}}},"worker":{"attachments":{"enabled":true}}}
+JSON
+render -f "$TMP/runner-env-values.json" >"$TMP/runner-env.yaml" || fail "runnerEnv-only render"
+python3 "$CHECKER" runner-env "$TMP/runner-env.yaml" "$TMP/runner-env-values.json" || fail "(i) runnerEnv-only pools and isolation"
+
+# (j) Every configured value must be a string, and no name can replace a
+# credential, a platform env entry, a connector secret or global runner extraEnv.
+expect_runner_env_fail() {
+  local want="$1"; shift
+  if render "$@" >"$TMP/env-neg.out" 2>&1; then fail "runnerEnv render succeeded, expected refusal naming $want"; fi
+  grep -qF "$want" "$TMP/env-neg.out" || { cat "$TMP/env-neg.out" >&2; fail "runnerEnv refusal does not name $want"; }
+}
+expect_runner_env_fail "agentSandbox.runnerEnv" --set-string 'agentSandbox.runnerEnv=invalid'
+for invalid in '"invalid"' '[]' '16000' 'true'; do
+  expect_runner_env_fail "agentSandbox.runnerEnv" --set-json "agentSandbox.runnerEnv={\"factory\":$invalid}"
+done
+for invalid in '[]' '16000' 'true'; do
+  expect_runner_env_fail "agentSandbox.runnerEnv" --set-json "agentSandbox.runnerEnv={\"factory\":{\"ACME_VALUE\":$invalid}}"
+done
+# A string is a valid leaf, unlike a string used as the agent's env map.
+render --set-string 'agentSandbox.runnerEnv.factory.ACME_VALUE=invalid' >"$TMP/env-string.yaml" || fail "string runnerEnv value"
+expect_runner_env_fail "agentSandbox.runnerEnv" --set-json 'agentSandbox.runnerEnv={"factory":{"ACME_VALUE":{}}}'
+for agent in 'Bad_Name' '-factory' 'factory-' "$(printf 'a%.0s' {1..41})"; do
+  expect_runner_env_fail "agentSandbox.runnerEnv" --set-json "agentSandbox.runnerEnv={\"$agent\":{\"ACME_VALUE\":\"1\"}}"
+done
+for name in '1VALUE' 'BAD-NAME' 'BAD.NAME' ''; do
+  expect_runner_env_fail "agentSandbox.runnerEnv" --set-json "agentSandbox.runnerEnv={\"factory\":{\"$name\":\"1\"}}"
+done
+for name in CURIE_FUTURE ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN HTTPS_PROXY HTTP_PROXY NODE_EXTRA_CA_CERTS ANTHROPIC_CUSTOM_HEADERS HOME GIT_CONFIG_COUNT OTEL_EXPORTER_OTLP_ENDPOINT OTEL_FUTURE SNAPSHOT_SEALING_KEY SNAPSHOT_SEALING_KEYS_RETAINED; do
+  expect_runner_env_fail "agentSandbox.runnerEnv" --set-string "agentSandbox.runnerEnv.factory.$name=placeholder"
+done
+expect_runner_env_fail "agentSandbox.runnerEnv" --set-string 'agentSandbox.runnerEnv.factory.API_TOKEN=placeholder' --set-string 'agentSandbox.connectorSecrets.factory.API_TOKEN=placeholder'
+expect_runner_env_fail "agentSandbox.runnerEnv" --set-string 'agentSandbox.runnerEnv.factory.ACME_MODE=agent' --set-json 'agentSandbox.runner.extraEnv=[{"name":"ACME_MODE","value":"global"}]'
+
 # (b) (c) (d)
 LAYERED=(--set-string "agentSandbox.runnerImages.factory=$DIGEST_A"
          --set-string "agentSandbox.connectorSecrets.acme.API_TOKEN=acme-secret"
@@ -318,6 +397,8 @@ UNCHANGED=(--show-only templates/agent-sandbox.yaml
            --show-only templates/runner-resources-admission.yaml
            --show-only templates/security-probe.yaml)
 render "${UNCHANGED[@]}" >"$TMP/no-repo-default.yaml" || fail "no repository baseline"
+render "${UNCHANGED[@]}" --set-json 'agentSandbox.runnerEnv={}' >"$TMP/no-env-empty.yaml" || fail "empty runnerEnv configuration"
+cmp -s "$TMP/no-repo-default.yaml" "$TMP/no-env-empty.yaml" || fail "empty runnerEnv changed existing workloads"
 render "${UNCHANGED[@]}" --set-json 'factory.bindings=[]' --set-json 'factory.sandboxEgress={}' >"$TMP/no-repo-empty.yaml" || fail "empty repository configuration"
 cmp -s "$TMP/no-repo-default.yaml" "$TMP/no-repo-empty.yaml" || fail "empty repository configuration changed existing workloads"
 render "${UNCHANGED[@]}" --set-json 'factory=null' >"$TMP/no-repo-absent.yaml" || fail "absent factory configuration"
@@ -341,6 +422,7 @@ values = {
     "agentSandbox": {
         "runner": {"digest": digest("d")},
         "runnerImages": {"factory": "registry.example.com/acme/agent-runner@" + digest("c")},
+        "runnerEnv": {"factory": {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "16000", "ACME_ZERO": "0", "ACME_EMPTY": ""}},
         "connectorSecrets": {"factory": {"API_TOKEN": "acme-secret"}},
         "workspaceSizeLimits": {"factory": "24Gi"},
         "warmPool": {"replicas": 2, "updateStrategy": "OnReplenish"},
@@ -546,6 +628,13 @@ assert set(pools) == {name + "-pool" for name in names}, "installed repository p
 for name in names:
     assert pools[name + "-pool"]["spec"]["sandboxTemplateRef"]["name"] == name
     assert pools[name + "-pool"]["spec"]["replicas"] == 0
+    pod = templates[name]["spec"]["podTemplate"]
+    expected_env = values["agentSandbox"]["runnerEnv"].get(pod["metadata"]["labels"].get("curietech.ai/agent", ""), {})
+    custom_names = {key for configured in values["agentSandbox"]["runnerEnv"].values() for key in configured}
+    for container in pod["spec"].get("initContainers", []) + pod["spec"]["containers"]:
+        entries = container.get("env", [])
+        actual_env = {entry["name"]: entry.get("value") for entry in entries if entry["name"] in custom_names}
+        assert actual_env == (expected_env if container["name"] == "runner" else {}), f"installed {name}/{container['name']} lost or leaked runnerEnv"
 worker = next(d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == prefix + "-worker")
 assert worker["spec"]["replicas"] == 0
 env = {e["name"]: e.get("value") for c in worker["spec"]["template"]["spec"]["containers"] for e in c.get("env", [])}
