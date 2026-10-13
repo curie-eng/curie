@@ -1301,6 +1301,8 @@ if program == "helm":
         sys.exit(0)
 
 if program == "kubectl":
+    # apps/v1 Deployment pod template container shape:
+    # https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/deployment-v1/
     if args[:2] == ["get", "deployment"]:
         name = args[2] if len(args) > 2 else ""
         component = name.removeprefix(f"{RELEASE}-curie-")
