@@ -6624,6 +6624,21 @@ def repository_builds():
     return [(number, json.loads(path.read_text()))
             for number, path in enumerate(captured("repo-bake", ".json"), 1)]
 
+# Helm GetValues.AllValues coalesces the installed chart defaults and retained
+# values: https://github.com/helm/helm/blob/v3.20.0/pkg/action/get_values.go
+def repository_computed_values():
+    values = copy.deepcopy(chart_values())
+    def merge(target, source):
+        for key, value in source.items():
+            if value is None:
+                target.pop(key, None)
+            elif isinstance(value, dict) and isinstance(target.get(key), dict):
+                merge(target[key], value)
+            else:
+                target[key] = copy.deepcopy(value)
+    merge(values, release_values(flag_value("--revision")))
+    return values
+
 ordinary_sandbox_templates = sandbox_templates
 def sandbox_templates():
     items = ordinary_sandbox_templates()
@@ -6702,6 +6717,9 @@ if program == "docker":
         emit({"linux/" + arch: {"os": "linux", "architecture": arch,
               "rootfs": {"type": "layers", "diff_ids": layers}}
               for arch in ["amd64", "arm64"]})
+
+if program == "helm" and args[:2] == ["get", "values"] and "--all" in args:
+    emit(repository_computed_values())
 
 if program == "helm" and args[:1] == ["template"] and not any(arg.startswith("--show-only") for arg in args):
     values_file = flag_value("-f")
@@ -7211,8 +7229,16 @@ fn repository_runner_upgrade_tag_only_target_refuses_before_mutation_and_in_dry_
         let output = fixture.run_with("healthy", "0.9.0", "charts/curie", flags);
         assert!(!output.status.success(), "{}", visible(&output));
         let body = json(&output);
-        assert_eq!(body["status"], "failed", "{body}");
-        assert_eq!(body["phase"], "validate", "{body}");
+        if dry_run {
+            assert_eq!(body["dry_run"], true, "{body}");
+            let refusal = plan_line(&body, "refusal at validate:");
+            assert!(refusal.to_lowercase().contains("digest"), "{refusal}");
+        } else {
+            let error = body["error"]
+                .as_str()
+                .expect("Validate refusal error string");
+            assert!(error.to_lowercase().contains("digest"), "{error}");
+        }
         assert!(
             visible(&output).to_lowercase().contains("digest"),
             "{}",
@@ -7467,7 +7493,266 @@ fn repository_runner_upgrade_missing_or_stale_template_fails_canary() {
     for fault in ["missing", "stale"] {
         let fixture = repository_runner_upgrade_fixture(&repository_runner_upgrade_values());
         let output = fixture.local_env("healthy", &[("UPGRADE_REPO_RUNNER_TEMPLATE_FAULT", fault)]);
-        assert!(!output.status.success(), "{}", visible(&output));
+        // Canary failures return a completed report, as in
+        // canary_fails_when_a_rebound_template_drops_its_layer.
+        assert_eq!(
+            repository_runner_build_calls(&fixture).len(),
+            1,
+            "{:?}",
+            fixture.argv()
+        );
+        assert_eq!(fixture.helm_upgrades().len(), 1, "{:?}", fixture.argv());
+        let body = json(&output);
+        assert_eq!(body["status"], "failed", "{body}");
+        assert_eq!(body["phase"], "canary", "{body}");
+        assert_eq!(body["canary"]["passed"], false, "{body}");
+        assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+        let reason = body["fail_forward"]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("rel-curie-agent-acme-bot-img-666666666666-runner"),
+            "{body}"
+        );
+        assert!(
+            reason.contains(&format!(
+                "{REPOSITORY_RUNNER_IMAGE}@{}",
+                repository_runner_digest('6')
+            )),
+            "{body}"
+        );
+        assert!(!record_completed(&fixture.last_record(), "commit"));
+        assert_ownership_released(&fixture);
+    }
+}
+
+/// Custom receipts still coexist with ordinary agent templates. A skipped
+/// Apply must obtain their installed fullname without a target chart lookup.
+#[test]
+fn repository_runner_upgrade_custom_only_skip_keeps_chart_default_canary_name() {
+    for resumed in [false, true] {
+        let registry = stock_registry(false);
+        let mut values = repository_runner_upgrade_values();
+        values["factory"]["bindings"][0]["repos"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        values["agentSandbox"]["runnerImages"] = serde_json::json!({"dark-factory": STOCK_OLD});
+        assert!(values.pointer("/fullnameOverride").is_none());
+        let fixture = repository_runner_upgrade_fixture(&values);
+        fixture.set_chart_values(&serde_json::json!({
+            "fullnameOverride": "acme-runner",
+            "agentSandbox": {"runner": {
+                "image": "ghcr.io/curie-eng/curie-runner",
+                "digest": index_digest(STOCK_BASE_INDEX)
+            }}
+        }));
+        if resumed {
+            fixture.seed_checkpoint(&applied_checkpoint(true));
+        }
+        let output = run_stock(&fixture, "resumed-applied", &registry.base_url, &[]);
+        assert!(output.status.success(), "{}", visible(&output));
+        let body = json(&output);
+        assert_eq!(body["status"], "succeeded", "{body}");
+        assert_eq!(body["canary"]["passed"], true, "{body}");
+        assert_eq!(body["known_good_version"], "0.9.0", "{body}");
+        if resumed {
+            assert_eq!(body["resumed"], true, "{body}");
+        } else {
+            assert_eq!(body["unchanged"], true, "{body}");
+        }
+        assert!(fixture.helm_upgrades().is_empty(), "{:?}", fixture.argv());
+        assert!(!fixture.issued(&["docker"]), "{:?}", fixture.argv());
+        assert!(
+            !fixture.issued(&["helm", "show", "values"]),
+            "{:?}",
+            fixture.argv()
+        );
+        assert!(
+            fixture.issued(&["kubectl", "-n", "ns", "get", SANDBOX_TEMPLATES]),
+            "{:?}",
+            fixture.argv()
+        );
+        assert!(
+            registry.recorded().is_empty(),
+            "a skipped Apply must not resolve a stock layer"
+        );
+        assert!(claim_deletes(&fixture).is_empty(), "{:?}", fixture.argv());
+        assert_eq!(
+            repository_runner_installed_values(&fixture)["factory"],
+            values["factory"]
+        );
+        assert_ownership_released(&fixture);
+    }
+}
+
+#[test]
+fn repository_runner_upgrade_invalid_build_inputs_refuse_before_apply() {
+    for (fault, detail) in [
+        ("tool", "unknown tool"),
+        ("probe", "empty command"),
+        ("docker", "Docker is not"),
+        ("image", "must be under"),
+    ] {
+        let mut values = repository_runner_upgrade_values();
+        let runner = &mut values["factory"]["bindings"][0]["repos"][0]["runner"];
+        match fault {
+            "tool" => runner["tools"] = serde_json::json!(["acme-unsupported-tool"]),
+            "probe" => {
+                runner["probes"] = serde_json::json!([{"name": "acme-probe", "command": []}])
+            }
+            "image" => {
+                runner["image"] = Value::from(format!(
+                    "registry.example.com/acme/other-runner@{}",
+                    repository_runner_digest('a')
+                ))
+            }
+            "docker" => {}
+            _ => unreachable!(),
+        }
+        let fixture = repository_runner_upgrade_fixture(&values);
+        let installed_before = repository_runner_installed_values(&fixture);
+        let output = if fault == "docker" {
+            fs::remove_file(fixture.0.path().join("docker")).unwrap();
+            fixture.local_env("healthy", &[("PATH", fixture.0.path().to_str().unwrap())])
+        } else {
+            fixture.local("healthy")
+        };
+        assert!(!output.status.success(), "{fault}: {}", visible(&output));
+        let body = json(&output);
+        let error = body["error"]
+            .as_str()
+            .expect("Validate refusal error string");
+        assert!(error.contains(detail), "{fault}: {error}");
+        assert!(error.contains(CATALOG_RUNNER_REPO), "{error}");
+        assert!(!fixture.issued(&["docker"]), "{:?}", fixture.argv());
+        assert!(
+            fixture.records().is_empty(),
+            "Validate must not checkpoint phases"
+        );
+        assert_stock_layer_refusal_writes_only_ownership(&fixture);
+        assert_eq!(
+            repository_runner_installed_values(&fixture),
+            installed_before
+        );
+    }
+}
+
+#[test]
+fn repository_runner_upgrade_preserves_port_in_receipt_registry() {
+    let registry = "registry.example.com:5443/acme";
+    let image = format!("{registry}/curie-repo-runner");
+    let mut values = repository_runner_upgrade_values();
+    values["factory"]["bindings"][0]["repos"][0]["runner"]["image"] = Value::from(format!(
+        "{image}:retained-tag@{}",
+        repository_runner_digest('a')
+    ));
+    let fixture = repository_runner_upgrade_fixture(&values);
+    let output = fixture.local("healthy");
+    assert!(output.status.success(), "{}", visible(&output));
+    assert_eq!(json(&output)["status"], "succeeded", "{}", visible(&output));
+    assert_eq!(
+        repository_runner_build_calls(&fixture).len(),
+        1,
+        "{:?}",
+        fixture.argv()
+    );
+    assert_eq!(fixture.helm_upgrades().len(), 1, "{:?}", fixture.argv());
+    let bake = values_doc(&fs::read_to_string(&fixture.captured_paths("repo-bake")[0]).unwrap());
+    let tag = bake["target"]["curie-runner"]["tags"][0].as_str().unwrap();
+    assert!(tag.starts_with(&format!("{image}:")), "{bake}");
+    let applied = values_doc(&fixture.values(1));
+    let receipt = &applied["factory"]["bindings"][0]["repos"][0]["runner"];
+    assert_eq!(
+        receipt["image"],
+        format!("{image}@{}", repository_runner_digest('6'))
+    );
+    assert_eq!(receipt["base"], index_digest(STOCK_BASE_INDEX));
+    assert_eq!(
+        applied["factory"]["bindings"][0]["repos"][1],
+        values["factory"]["bindings"][0]["repos"][1]
+    );
+    assert_ownership_released(&fixture);
+}
+
+/// Repeated builds may return different digests, so equal specs in one registry
+/// must share one result even when a repository declaration is repeated.
+#[test]
+fn repository_runner_upgrade_equal_specs_share_one_receipt_and_template() {
+    let mut values = repository_runner_upgrade_values();
+    let duplicate = values["factory"]["bindings"][0]["repos"][0].clone();
+    let mut shared = duplicate.clone();
+    shared["path"] = Value::from("acme-corp/acme-shared");
+    shared["alias"] = Value::from("shared");
+    values["factory"]["bindings"][1]["repos"]
+        .as_array_mut()
+        .unwrap()
+        .extend([shared, duplicate]);
+    let fixture = repository_runner_upgrade_fixture(&values);
+    let output = fixture.local("healthy");
+    assert!(output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "succeeded", "{body}");
+    assert_eq!(body["canary"]["passed"], true, "{body}");
+    assert_eq!(
+        repository_runner_build_calls(&fixture).len(),
+        1,
+        "equal spec and registry must share one build: {:?}",
+        fixture.argv()
+    );
+    assert_eq!(fixture.helm_upgrades().len(), 1, "{:?}", fixture.argv());
+    let applied = values_doc(&fixture.values(1));
+    let receipt = &applied["factory"]["bindings"][0]["repos"][0]["runner"];
+    assert_eq!(receipt["base"], index_digest(STOCK_BASE_INDEX));
+    for repo in [1, 2] {
+        assert_eq!(
+            applied["factory"]["bindings"][1]["repos"][repo]["runner"], *receipt,
+            "{applied}"
+        );
+    }
+    let templates = Command::new(fixture.0.path().join("kubectl"))
+        .args(["-n", "ns", "get", SANDBOX_TEMPLATES, "-o", "json"])
+        .env("UPGRADE_DRIVER_ROOT", fixture.0.path())
+        .env("UPGRADE_DRIVER_SCENARIO", "healthy")
+        .output()
+        .unwrap();
+    assert!(templates.status.success(), "{}", visible(&templates));
+    let templates = json(&templates);
+    let shared_templates: Vec<_> = templates["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|template| {
+            template.pointer("/spec/podTemplate/spec/containers/0/image") == Some(&receipt["image"])
+        })
+        .collect();
+    assert_eq!(shared_templates.len(), 1, "{templates}");
+    assert_eq!(
+        shared_templates[0]["metadata"]["name"],
+        "rel-curie-agent-acme-bot-img-666666666666-runner"
+    );
+    assert_ownership_released(&fixture);
+}
+
+#[test]
+fn repository_runner_upgrade_null_dockerfile_is_catalog_in_plan_and_canary() {
+    let mut values = repository_runner_upgrade_values();
+    values["factory"]["bindings"][0]["repos"][0]["runner"]["dockerfile"] = Value::Null;
+    let dry = repository_runner_upgrade_fixture(&values);
+    let output = dry.run_with("healthy", "0.9.0", "charts/curie", &["--dry-run"]);
+    assert!(output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert!(
+        body["plan"].as_array().unwrap().iter().any(|line| {
+            let line = line.as_str().unwrap();
+            line.contains(CATALOG_RUNNER_REPO) && line.contains("build catalog repository")
+        }),
+        "{body}"
+    );
+    assert!(!dry.issued(&["docker"]), "{:?}", dry.argv());
+    assert!(mutating_calls(&dry).is_empty(), "{:?}", dry.argv());
+
+    for fault in ["missing", "stale"] {
+        let fixture = repository_runner_upgrade_fixture(&values);
+        let output = fixture.local_env("healthy", &[("UPGRADE_REPO_RUNNER_TEMPLATE_FAULT", fault)]);
         assert_eq!(
             repository_runner_build_calls(&fixture).len(),
             1,
