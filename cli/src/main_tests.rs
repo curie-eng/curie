@@ -137,7 +137,10 @@ fn cluster_factory_repository_runner_requires_a_registry() {
         Ok(_) => panic!("repository runner builds must require --registry"),
         Err(error) => error,
     };
-    assert_eq!(error.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument
+    );
     assert!(error.to_string().contains("--registry"), "{error}");
 }
 

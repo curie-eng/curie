@@ -52,6 +52,31 @@ const TOOL_SHIM: &str = r#"#!/usr/bin/env bash
 tool=$(basename "$0")
 echo "$tool $*" >> "$SHIM_LOG"
 if [ "$tool" = "docker" ]; then
+  if [ "$FAKE_RUNNER_BUILD" = "1" ]; then
+    if [ "$1 $2" = "buildx bake" ]; then
+      prev=""
+      for a in "$@"; do
+        if [ "$prev" = "--metadata-file" ]; then
+          echo "$FAKE_BUILD_METADATA" > "$a"
+        fi
+        if [ "$prev" = "-f" ]; then
+          cat "$a" >> "$SHIM_LOG.bake"
+        fi
+        prev="$a"
+      done
+      exit 0
+    fi
+    if [ "$1 $2 $3" = "buildx imagetools inspect" ]; then
+      if [ "$5" = "--raw" ]; then
+        echo "$FAKE_BUILD_INDEX"
+      elif [[ "$4" = */platform/runner@* ]]; then
+        echo "$FAKE_BASE_CONFIG"
+      else
+        echo "$FAKE_IMAGE_CONFIG"
+      fi
+      exit 0
+    fi
+  fi
   echo 'shim: Docker must not be called in this scenario' >&2
   exit 1
 fi
@@ -187,6 +212,7 @@ struct Fixture {
     secret_json: String,
     values: String,
     api_prefix: &'static str,
+    runner_build: bool,
 }
 
 fn path_only(req: &Request) -> &str {
@@ -366,6 +392,7 @@ impl Fixture {
             secret_json: String::new(),
             values: r#"{"api":{"environment":"dev"}}"#.to_string(),
             api_prefix,
+            runner_build: false,
         }
     }
 
@@ -423,8 +450,12 @@ impl Fixture {
                     {"alias":"web", "codeHost":"github", "projectId":"2", "path":"acme/web", "base":"next", "runner":runner},
                 ],
             },
-            {"name":"peer", "tracker":"jira", "trackerScopeId":"3", "agent":"acme-peer", "repos":[{"alias":"peer", "codeHost":"github", "path":"acme/peer", "base":"release"}]},
+            {"name":"peer", "tracker":"jira", "trackerScopeId":"3", "agent":"acme-peer", "repos":[{"alias":"peer", "codeHost":"bitbucket", "path":"acme/peer", "base":"release"}]},
         ]);
+        values["factory"]["docker"] = serde_json::json!({
+            "daemonImage":format!("registry.example.com/acme/daemon@sha256:{}", "f".repeat(64)),
+        });
+        values["worker"] = serde_json::json!({"deploy":true});
         values["agentSandbox"] = serde_json::json!({
             "runner":{"image":"registry.example.com/platform/runner", "digest":format!("sha256:{}", "b".repeat(64))},
             "runnerImages":{"acme-bot":format!("registry.example.com/agent/runner@sha256:{}", "e".repeat(64))},
@@ -485,6 +516,17 @@ impl Fixture {
             .env("FAKE_VALUES", &self.values)
             .env("FAKE_SECRET_JSON", &self.secret_json)
             .env("SHIM_LOG", self.log_path())
+            .env("FAKE_RUNNER_BUILD", if self.runner_build { "1" } else { "0" })
+            // Docker buildx metadata/config shape follows
+            // https://docs.docker.com/reference/cli/docker/buildx/bake/#metadata-file
+            // and https://docs.docker.com/reference/cli/docker/buildx/imagetools/inspect/#format.
+            .env("FAKE_BUILD_METADATA", serde_json::json!({"curie-runner":{"containerimage.digest":format!("sha256:{}", "6".repeat(64))}}).to_string())
+            .env("FAKE_BUILD_INDEX", serde_json::json!({"schemaVersion":2,"manifests":[
+                {"digest":format!("sha256:{}", "7".repeat(64)),"platform":{"os":"linux","architecture":"amd64"}},
+                {"digest":format!("sha256:{}", "8".repeat(64)),"platform":{"os":"linux","architecture":"arm64"}},
+            ]}).to_string())
+            .env("FAKE_BASE_CONFIG", image_config(false))
+            .env("FAKE_IMAGE_CONFIG", image_config(true))
             .output()
             .unwrap_or_else(|e| panic!("run curie {}: {e}", argv.join(" ")))
     }
@@ -513,6 +555,18 @@ impl Fixture {
             .collect();
         assert!(posts.is_empty(), "a label was created: {posts:?}");
     }
+}
+
+fn image_config(built: bool) -> String {
+    let mut layers = vec![format!("sha256:{}", "1".repeat(64))];
+    if built {
+        layers.push(format!("sha256:{}", "2".repeat(64)));
+    }
+    serde_json::json!({
+        "linux/amd64":{"os":"linux", "architecture":"amd64", "rootfs":{"diff_ids":layers}},
+        "linux/arm64":{"os":"linux", "architecture":"arm64", "rootfs":{"diff_ids":layers}},
+    })
+    .to_string()
 }
 
 fn combined(output: &Output) -> String {
@@ -822,7 +876,13 @@ fn factory_repository_runner_dry_run_previews_builds_bindings_and_complete_recei
 
 #[test]
 fn factory_repository_runner_local_input_errors_are_precise_and_offline() {
-    for case in ["malformed", "wildcard", "empty-spec", "duplicate", "unknown-tool"] {
+    for case in [
+        "malformed",
+        "wildcard",
+        "empty-spec",
+        "duplicate",
+        "unknown-tool",
+    ] {
         let fx = Fixture::installed();
         let valid = fx.spec("valid.yaml", "tools: [uv]\n");
         let invalid = fx.spec("invalid.yaml", "tools: [not-a-catalog-tool]\n");
@@ -872,7 +932,11 @@ fn factory_repository_targets_must_resolve_one_recorded_binding_before_builds() 
         let mut fx = Fixture::installed();
         fx.record_repository_bindings(&["uv", "docker-cli"]);
         let mut values: serde_json::Value = serde_json::from_str(&fx.values).unwrap();
-        let target = if case == "unknown" { "acme/missing" } else { "acme/bot" };
+        let target = if case == "unknown" {
+            "acme/missing"
+        } else {
+            "acme/bot"
+        };
         if case == "unbound" {
             values["factory"]["bindings"] = serde_json::json!([]);
         } else if case == "ambiguous" {
@@ -931,7 +995,11 @@ fn factory_invalid_second_repository_spec_never_starts_the_first_build() {
 fn factory_repository_docker_requires_catalog_cli_and_replacement_keeps_it() {
     for replacement in [false, true] {
         let mut fx = Fixture::installed();
-        fx.record_repository_bindings(if replacement { &["docker-cli"] } else { &["uv"] });
+        fx.record_repository_bindings(if replacement {
+            &["docker-cli"]
+        } else {
+            &["uv"]
+        });
         let mut values: serde_json::Value = serde_json::from_str(&fx.values).unwrap();
         // A repository probe named docker does not select the catalog CLI.
         values["factory"]["bindings"][0]["repos"][0]["runner"]["probes"] =
@@ -954,7 +1022,10 @@ fn factory_repository_docker_requires_catalog_cli_and_replacement_keeps_it() {
         let output = fx.run(&strs(&argv));
         let text = combined(&output);
         assert_eq!(output.status.code(), Some(USAGE_EXIT), "{text}");
-        assert!(text.contains("acme/bot") && text.contains("docker-cli"), "{text}");
+        assert!(
+            text.contains("acme/bot") && text.contains("docker-cli"),
+            "{text}"
+        );
         fx.assert_no_mutation();
     }
 }
@@ -973,9 +1044,139 @@ fn factory_docker_only_preserves_complete_runner_receipt_binding_metadata_and_pe
     let applied: serde_json::Value = serde_json::from_str(&fx.values_file()).expect("Helm values");
     assert_eq!(applied["factory"]["bindings"], expected);
     let log = fx.log();
-    assert_eq!(log.lines().filter(|line| line.starts_with("helm upgrade")).count(), 1, "{log}");
-    assert!(!log.lines().any(|line| line.starts_with("docker ")), "{log}");
-    assert!(log.contains("rollout restart deployment/curie-worker"), "{log}");
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.starts_with("helm upgrade"))
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(
+        !log.lines().any(|line| line.starts_with("docker ")),
+        "{log}"
+    );
+    assert!(
+        log.contains("rollout restart deployment/curie-worker"),
+        "{log}"
+    );
+}
+
+#[test]
+fn factory_runner_only_uses_installed_base_and_preserves_disabled_mixed_tracker_configuration() {
+    let mut fx = Fixture::installed();
+    fx.record_repository_bindings(&["uv", "docker-cli"]);
+    fx.runner_build = true;
+    let mut before: serde_json::Value = serde_json::from_str(&fx.values).unwrap();
+    before["factory"]["enabled"] = serde_json::json!(false);
+    before["factory"]["bindings"][0]["repos"][0]["path"] = serde_json::json!("acme/projects/bot");
+    before["factory"]["trackers"].as_array_mut().unwrap().push(serde_json::json!({
+        "name":"jira", "kind":"jira_cloud", "baseUrl":"https://tracker.example.com", "credential":{"existingSecret":"jira-key"},
+    }));
+    before["factory"]["codeHosts"] = serde_json::json!([{"name":"bitbucket", "kind":"bitbucket_cloud", "baseUrl":"https://api.bitbucket.org"}]);
+    fx.values = before.to_string();
+    let spec = fx.spec("runner.yaml", "tools: [uv]\n");
+    let mut argv = repository_argv();
+    argv.extend([
+        "--repo-runner".into(),
+        format!("acme/projects/bot={spec}"),
+        "--registry".into(),
+        "registry.example.com/acme".into(),
+    ]);
+    let output = fx.run(&strs(&argv));
+    assert!(output.status.success(), "{}", combined(&output));
+    let applied: serde_json::Value = serde_json::from_str(&fx.values_file()).expect("Helm values");
+    assert!(
+        applied
+            .pointer("/factory/enabled")
+            .is_none_or(|enabled| enabled == false),
+        "{applied}"
+    );
+    for key in ["trackers", "codeHosts"] {
+        if let Some(updated) = applied["factory"].get(key) {
+            assert_eq!(updated, &before["factory"][key]);
+        }
+    }
+    let mut expected = before["factory"]["bindings"].clone();
+    let runner = &applied["factory"]["bindings"][0]["repos"][0]["runner"];
+    assert_eq!(runner["tools"], serde_json::json!(["uv"]));
+    assert_eq!(runner["base"], format!("sha256:{}", "b".repeat(64)));
+    assert!(runner["image"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("@sha256:{}", "6".repeat(64))));
+    assert_eq!(
+        runner["platformDigests"]["linux/amd64"],
+        format!("sha256:{}", "7".repeat(64))
+    );
+    assert_eq!(
+        runner["platformDigests"]["linux/arm64"],
+        format!("sha256:{}", "8".repeat(64))
+    );
+    expected[0]["repos"][0]["runner"] = runner.clone();
+    assert_eq!(applied["factory"]["bindings"], expected);
+    let bake: serde_json::Value =
+        serde_json::from_str(&fx.read("invocations.log.bake")).expect("buildx bake definition");
+    assert!(bake.to_string().contains(&format!(
+        "registry.example.com/platform/runner@sha256:{}",
+        "b".repeat(64)
+    )));
+    let log = fx.log();
+    assert!(log.contains("--revision 1"), "{log}");
+    assert!(
+        log.contains("rollout restart deployment/curie-worker"),
+        "{log}"
+    );
+    assert!(fx.github.recorded().is_empty());
+}
+
+#[test]
+fn factory_unbound_repository_without_an_app_is_a_refusal_not_registration_success() {
+    let fx = Fixture::installed();
+    let mut argv = repository_argv();
+    argv.extend(["--repo-docker".into(), "acme/bot".into()]);
+    let output = fx.run(&strs(&argv));
+    let text = combined(&output);
+    assert_eq!(output.status.code(), Some(USAGE_EXIT), "{text}");
+    assert!(
+        text.contains("acme/bot") && (text.contains("binding") || text.contains("bound")),
+        "{text}"
+    );
+    assert!(!text.contains("settings/apps/new"), "{text}");
+    fx.assert_no_mutation();
+}
+
+#[test]
+fn factory_docker_opt_in_needs_a_pinned_daemon_and_deployed_worker() {
+    for case in ["missing-daemon", "mutable-daemon", "disabled-worker"] {
+        let mut fx = Fixture::installed();
+        fx.record_repository_bindings(&["docker-cli"]);
+        let mut values: serde_json::Value = serde_json::from_str(&fx.values).unwrap();
+        if case == "disabled-worker" {
+            values["worker"]["deploy"] = serde_json::json!(false);
+        } else {
+            values["factory"]["docker"]["daemonImage"] =
+                serde_json::json!(if case == "missing-daemon" {
+                    ""
+                } else {
+                    "registry.example.com/acme/daemon:latest"
+                });
+        }
+        fx.values = values.to_string();
+        let mut argv = repository_argv();
+        argv.extend(["--repo-docker".into(), "acme/bot".into()]);
+        let output = fx.run(&strs(&argv));
+        let text = combined(&output);
+        assert_eq!(output.status.code(), Some(USAGE_EXIT), "{case}: {text}");
+        assert!(
+            text.contains(if case == "disabled-worker" {
+                "worker.deploy"
+            } else {
+                "daemonImage"
+            }),
+            "{text}"
+        );
+        fx.assert_no_mutation();
+    }
 }
 
 #[test]
