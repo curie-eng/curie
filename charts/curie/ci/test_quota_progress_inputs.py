@@ -21,18 +21,49 @@ INPUTS = (
     "CURIE_SCENARIO_RUNNER_IMAGE",
 )
 IMAGE_INPUTS = INPUTS[3:]
+SHARED_OBJECTS = (
+    "namespace/agent-sandbox-system",
+    "clusterrole/agent-sandbox-controller",
+    "clusterrole/agent-sandbox-controller-extensions",
+    "clusterrole/agent-sandbox-controller-networkpolicies-read",
+    "clusterrolebinding/agent-sandbox-controller",
+    "clusterrolebinding/agent-sandbox-controller-extensions",
+    "clusterrolebinding/agent-sandbox-controller-networkpolicies-read",
+    "priorityclass/curie-platform",
+    "priorityclass/curie-sandbox",
+)
 
-# The recording tools fail on their first call. Valid neighboring inputs can
-# reach cluster inventory, but neither valid nor invalid cases touch a cluster.
+# Recording tools normally fail on their first call. Inventory mode returns
+# one occupied object or an empty cluster, then fails the candidate install.
+# Neither mode touches a cluster.
 TOOL_STUB = r"""
 import os
 import shlex
 import sys
 from pathlib import Path
 
+tool = Path(sys.argv[0]).name
+args = sys.argv[1:]
 with Path(os.environ["QUOTA_CALL_LOG"]).open("a") as log:
-    log.write(shlex.join([Path(sys.argv[0]).name, *sys.argv[1:]]) + "\n")
-raise SystemExit(91)
+    log.write(shlex.join([tool, *args]) + "\n")
+if os.environ.get("QUOTA_INVENTORY_MODE") != "1":
+    raise SystemExit(91)
+if tool == "kubectl":
+    if "get" in args:
+        tail = args[args.index("get") + 1:]
+        kind, separator, name = tail[0].partition("/")
+        if not separator:
+            name = tail[1] if len(tail) > 1 and not tail[1].startswith("-") else ""
+        if f"{kind}/{name}" == os.environ.get("QUOTA_OCCUPIED_OBJECT"):
+            print(f"{kind}/{name}")
+        raise SystemExit(0)
+    if any(command in args for command in ("delete", "wait", "logs")):
+        raise SystemExit(0)
+if tool == "curie":
+    raise SystemExit(93)
+if tool == "helm" and any(command in args for command in ("uninstall", "list")):
+    raise SystemExit(0)
+raise SystemExit(94)
 """
 
 
@@ -197,6 +228,61 @@ def assert_reaches_cluster_inventory(scenario: Scenario) -> None:
     assert calls[0][0] == "kubectl" and "get" in calls[0], (output, calls)
     assert "--context" in calls[0] and "kind-acme-test" in calls[0], calls
     assert not any(variable in output for variable in INPUTS), output
+
+
+@pytest.mark.parametrize(
+    "occupied_object", [*SHARED_OBJECTS, "namespace/test-4368-idle-capacity-12345-1"]
+)
+def test_occupied_shared_or_private_object_refuses_before_install_or_cleanup(
+    scenario: Scenario, occupied_object: str
+) -> None:
+    scenario.environment["QUOTA_INVENTORY_MODE"] = "1"
+    scenario.environment["QUOTA_OCCUPIED_OBJECT"] = occupied_object
+    completed = scenario.run()
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, output
+    name = occupied_object.split("/", maxsplit=1)[1]
+    assert any(
+        line.startswith("FAIL:") and name in line for line in output.splitlines()
+    ), output
+    calls = scenario.calls()
+    assert calls, output
+    assert all(call[0] == "kubectl" and "get" in call for call in calls), calls
+    assert all("--context" in call and "kind-acme-test" in call for call in calls), calls
+    assert not any(
+        command in call for call in calls for command in ("delete", "apply", "uninstall", "wait")
+    ), calls
+
+
+def test_empty_inventory_advances_to_install_and_cleans_up_failed_install(
+    scenario: Scenario,
+) -> None:
+    scenario.environment["QUOTA_INVENTORY_MODE"] = "1"
+    completed = scenario.run()
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, "the failed candidate install must remain a failed scenario"
+    assert "candidate cluster install failed" in output, output
+    calls = scenario.calls()
+    installs = [call for call in calls if call[0] == "curie"]
+    assert len(installs) == 1, (output, calls)
+    install = installs[0]
+    assert "cluster" in install and "up" in install, install
+    assert "kind-acme-test" in install, install
+    assert "test-4368-idle-capacity-12345-1" in install, install
+    assert "idlecap-12345-1" in install, install
+    install_index = calls.index(install)
+    assert all(
+        call[0] == "kubectl" and "get" in call for call in calls[:install_index]
+    ), calls
+    cleanup = calls[install_index + 1 :]
+    assert any(call[0] == "helm" and "uninstall" in call for call in cleanup), cleanup
+    assert any(
+        call[0] == "kubectl"
+        and "delete" in call
+        and any(argument.endswith("test-4368-idle-capacity-12345-1") for argument in call)
+        for call in cleanup
+    ), cleanup
+    assert all(call[0] not in {"kind", "docker", "cargo"} for call in calls), calls
 
 
 def test_candidate_stack_provisioning_header_is_declared_once_in_first_twenty_lines() -> None:
