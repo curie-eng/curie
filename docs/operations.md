@@ -1113,8 +1113,12 @@ status contexts. An omitted list is empty, but at least one name is required.
 Every configured guard must appear with a timestamp after the metadata edit;
 stale passing guards and unrelated fresh checks cannot satisfy that requirement.
 Checks on the unchanged commit retain their passing, pending or failing evidence.
-Without a repository policy, a metadata revision ends as `ci_unverified` with
-reason `metadata_ci_not_configured`. Ordinary commit revisions are unaffected.
+Without a repository policy, a body-only CI fix uses the failing check names and
+status contexts recorded when its fix round was dispatched. Every recorded name
+must rerun fresh within the CI wait. No fresh rerun ends as `ci_unverified` with
+reason `checks_not_rerun`; a partial rerun retains the failures that did not rerun
+at the deadline. A metadata revision with no usable record ends as `ci_unverified`
+with reason `metadata_ci_not_configured`. Ordinary commit revisions are unaffected.
 
 Set the chart value with a values file or `--set-json`. The chart reserves the
 environment variable, so it cannot be set through `api.extraEnv`. On an install

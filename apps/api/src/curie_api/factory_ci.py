@@ -245,10 +245,11 @@ def python_ci_policy(settings: Settings, repo_full_name: str) -> PythonCiPolicy 
 
 @dataclass(frozen=True)
 class MetadataCiPolicy:
-    """Repository checks and statuses that must rerun after a metadata edit."""
+    """Checks and statuses that a configured or recorded metadata policy must refresh."""
 
     checks: tuple[str, ...]
     statuses: tuple[str, ...]
+    recorded: bool = False
 
 
 def metadata_ci_policy(settings: Settings, repo_full_name: str) -> MetadataCiPolicy | None:
@@ -258,6 +259,27 @@ def metadata_ci_policy(settings: Settings, repo_full_name: str) -> MetadataCiPol
     if value is None:
         return None
     return MetadataCiPolicy(checks=tuple(value["checks"]), statuses=tuple(value["statuses"]))
+
+
+def _recorded_metadata_ci_policy(raw: str | bytes | None) -> MetadataCiPolicy | None:
+    """Read a round's failing names; invalid or empty records cannot prove a revision."""
+
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    checks, statuses = value.get("checks"), value.get("statuses")
+    if not isinstance(checks, list) or not isinstance(statuses, list):
+        return None
+    if not checks and not statuses:
+        return None
+    if not all(isinstance(name, str) and name.strip() for name in [*checks, *statuses]):
+        return None
+    return MetadataCiPolicy(checks=tuple(checks), statuses=tuple(statuses), recorded=True)
 
 
 VerdictKind = Literal[
@@ -349,6 +371,7 @@ def _fresh_ci_detail(detail: CiDetail, fresh_after: datetime) -> CiDetail:
 def _metadata_revision_detail(
     detail: CiDetail, fresh_after: datetime, metadata_ci: MetadataCiPolicy
 ) -> CiDetail:
+    # Recorded failures remain the commit's evidence until that name reruns.
     fresh = _fresh_ci_detail(detail, fresh_after)
     fresh_names = {run.get("name") for run in fresh.check_runs}
     fresh_contexts = {item.get("context") for item in fresh.statuses}
@@ -358,14 +381,15 @@ def _metadata_revision_detail(
         + [
             run
             for run in detail.check_runs
-            if run.get("name") not in fresh_names and run.get("name") not in metadata_ci.checks
+            if run.get("name") not in fresh_names
+            and (metadata_ci.recorded or run.get("name") not in metadata_ci.checks)
         ],
         statuses=fresh.statuses
         + [
             item
             for item in detail.statuses
             if item.get("context") not in fresh_contexts
-            and item.get("context") not in metadata_ci.statuses
+            and (metadata_ci.recorded or item.get("context") not in metadata_ci.statuses)
         ],
     )
 
@@ -438,6 +462,10 @@ def decide(
         missing_rerun = missing_rerun or any(
             context not in fresh_contexts for context in metadata_ci.statuses
         )
+        recorded_rerun = metadata_ci.recorded and (
+            any(name in fresh_names for name in metadata_ci.checks)
+            or any(context in fresh_contexts for context in metadata_ci.statuses)
+        )
         effective = _metadata_revision_detail(detail, fresh_after, metadata_ci)
         # Only caused failures may end the wait for the metadata rerun.
         fresh_failure = any(
@@ -466,6 +494,9 @@ def decide(
             not fresh_failure
             and not unchanged_failure
             and (missing_rerun or not fresh_runs and not fresh_statuses)
+            # A partial recorded rerun leaves the other failures to be judged
+            # at the deadline. No recorded rerun still means no proof.
+            and not (expired and recorded_rerun)
         ):
             return Verdict(
                 kind="unverified" if expired else "pending",
@@ -1015,6 +1046,10 @@ async def gate(
         detail = await workitem_outcomes.observe_ci_detail(lineage, work_item, settings, client)
         metadata_only = not latest.changed_paths and latest.base_sha == observed_sha
         fresh_after = latest.metadata_updated_at if metadata_only else None
+        if metadata_only and metadata_ci is None:
+            metadata_ci = _recorded_metadata_ci_policy(
+                await valkey.get(f"{ci_key(request.id, round_)}:failing")
+            )
         async with sessionmaker() as session:
             now = await workitems._database_now(session)
             await session.rollback()
@@ -1088,6 +1123,7 @@ async def gate(
             owner=owner,
             now=now,
             dispatch=dispatch,
+            failing=verdict.failing,
         )
     if verdict.kind in ("green", "no_ci"):
         status: Literal["completed", "failed"] = "completed"
@@ -1611,6 +1647,7 @@ async def _continue(
     owner: str,
     now: datetime,
     dispatch: Dispatch,
+    failing: Sequence[dict[str, Any]],
 ) -> GateResult:
     """Claim the round, hold the lease, publish the turn, then confirm the claim.
 
@@ -1642,6 +1679,15 @@ async def _continue(
             # Another reconciler already enqueued this round.
             await valkey.set(key, "published", ex=ttl)
             return "fixing"
+        record = {
+            "checks": list(
+                dict.fromkeys(_str(item["name"]) for item in failing if item.get("name"))
+            ),
+            "statuses": list(
+                dict.fromkeys(_str(item["context"]) for item in failing if item.get("context"))
+            ),
+        }
+        await valkey.set(f"{key}:failing", json.dumps(record), ex=ttl)
         # ``dispatch`` sets the marker and appends the turn atomically.
         published = await dispatch(request, round_, text)
     except Exception:
