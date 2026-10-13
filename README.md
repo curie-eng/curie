@@ -245,15 +245,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contributor setup and checks, and
 Curie is released under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE)
 for attribution and [TRADEMARKS.md](TRADEMARKS.md) for use of the Curie name.
 
-See [Releases](https://github.com/curie-eng/curie/releases) for version history.
-
 If Curie is useful to you, especially if you build on it commercially, we'd
 love a link back to [github.com/curie-eng/curie](https://github.com/curie-eng/curie).
 It is a friendly request, not a license condition: nothing in the Apache License
 requires it, and you are free to use Curie whether or not you do.
 
 ## Where do I go next?
-
+- Open open the
+[interactive architecture atlas](https://htmlpreview.github.io/?https://github.com/curie-eng/curie/blob/main/docs/architecture-atlas/index.html)
+to explore current and planned flows, maturity-rated seams, ADRs, and versioned snapshots.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md#component-map) -- the component diagram, the
 message-flow and deploy-flow sequence diagrams, and the built/in-progress
 split.
