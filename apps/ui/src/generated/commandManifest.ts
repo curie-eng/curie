@@ -5371,7 +5371,7 @@ export const commandManifest = {
           "name": "github-app"
         },
         {
-          "about": "Turn on the GitHub factory intake (label or mention triggers, repo allowlist, GitHub API egress) on an existing release",
+          "about": "Configure GitHub factory intake or update already bound repository runners and Docker access on an existing release",
           "args": [
             {
               "global": false,
@@ -5387,7 +5387,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable. Sets `api.githubRepoAllowlist`. With --app-id, pass at least one --repo or use --all-installed-repos to allow the whole installation",
+              "help": "Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable. Sets `api.githubRepoAllowlist`. With --app-id, pass at least one --repo or use --all-installed-repos to allow the whole installation. With --repo-runner/--repo-docker, selects advisory discovery only; the recorded intake allowlist stays unchanged",
               "id": "repos",
               "long": "repo",
               "positional": false,
@@ -5459,7 +5459,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "The factory GitHub App's numeric App ID. Pair with --private-key-file. Without both, and with no App recorded on the release, the command prints the App registration link and applies nothing. Mention and label default from the App. Choose the allowlist with --repo (repeatable) or --all-installed-repos",
+              "help": "The factory GitHub App's numeric App ID. Pair with --private-key-file. Without both, and with no App recorded on the release, the command prints the App registration link and applies nothing. Mention and label default from the App. Choose the allowlist with --repo (repeatable) or --all-installed-repos. Repository updates accept this only for optional advisory discovery",
               "id": "app_id",
               "long": "app-id",
               "positional": false,
@@ -5467,7 +5467,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "File holding the App's PEM private key. Stored in a Kubernetes Secret through kubectl stdin; the key never enters argv",
+              "help": "File holding the App's PEM private key. Stored in a Kubernetes Secret through kubectl stdin; the key never enters argv. Repository updates use it for discovery and do not store it",
               "id": "private_key_file",
               "long": "private-key-file",
               "positional": false,
@@ -5494,6 +5494,30 @@ export const commandManifest = {
               "help": "Bind this digest-pinned runner image in the same helm upgrade as the intake settings (`AGENT=ghcr.io/example/runner@sha256:<digest>`). The chart is still `--chart`. The values mode stays `--reuse-values`",
               "id": "runner_image",
               "long": "runner-image",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Build and replace an already bound repository's runner from SPEC. Repeatable; repository updates preserve the intake allowlist",
+              "id": "repo_runners",
+              "long": "repo-runner",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Registry for repository runner builds, such as ghcr.io/acme-corp",
+              "id": "registry",
+              "long": "registry",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Enable Docker for an already bound repository. Repeatable; requires the catalog docker-cli in its replacement or recorded runner",
+              "id": "repo_docker",
+              "long": "repo-docker",
               "positional": false,
               "required": false
             },
