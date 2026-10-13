@@ -269,6 +269,9 @@ def test_repo_runner_refuses_external_model_inputs_before_any_command(
     assert "model" in capsys.readouterr().err.lower()
 
 
+# Anthropic documents tools/input_schema, assistant tool_use, matching user
+# tool_result, and non-streaming Messages responses here:
+# https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use
 def _model_request(model: Any, body: dict[str, Any]) -> tuple[int, Any]:
     request = urllib.request.Request(
         f"http://127.0.0.1:{model.port}/v1/messages",
