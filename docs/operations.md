@@ -632,7 +632,11 @@ revision and version, and the rollback command. With `--take-over`, an orphaned
 before the CLI reads retained snapshots or resumes the lifecycle. A failed
 rollback fails the command and releases ownership without changing the durable
 record. `pending-install`, `pending-rollback`, and a pending history with no
-deployed revision refuse without automated recovery.
+deployed revision refuse without automated recovery. When the newest row is
+`pending-rollback` with a parsable `Rollback to <N>` description, the refusal
+adds ``it is an interrupted rollback to revision <N>; run curie cluster rollback
+--yes to finish it, or run `helm rollback <release> <serving-revision> -n
+<namespace> --wait --timeout 15m`, then rerun cluster upgrade``.
 
 The conditional manual patch remains a fallback. After verifying that the
 holder and Helm action have stopped and no release hook Job is running, recover
@@ -710,9 +714,26 @@ curie cluster rollback
 
 `curie cluster rollback` selects the newest `deployed` revision as the serving
 revision. When the newest history row is above it and is not `deployed` or
-`superseded`, the rollback targets the serving revision. For example, deployed
+`superseded` (except `pending-rollback`, below), the rollback targets the serving revision. For example, deployed
 revision 4 followed by pending revision 5 rolls back to revision 4, clearing
 the unfinished upgrade while retaining known good state.
+
+When the newest row is `pending-rollback`, its description `Rollback to <N>`
+is read. If revision N is in history below the pending row, is `deployed` or
+`superseded`, and has the same chart as the pending row, the command finishes
+the interrupted rollback toward N. For example, superseded 9, deployed 10, and
+pending-rollback 11 described `Rollback to 9` resumes to revision 9. The dry run
+prints `revision 11 is an interrupted rollback to revision 9; resuming it`, the
+same note appears before the prompt, and `--json` reports
+`resumed_interrupted_rollback: true` (`false` otherwise). If N cannot be
+confirmed, the command exits 1 with `revision 11 is an interrupted rollback
+whose target cannot be confirmed`, naming `curie cluster rollback --revision <N>
+--yes` to finish it and `curie cluster rollback --revision <serving> --yes` to
+restore the serving revision; the first choice is omitted when N does not parse
+or is not in history. Any other ineligible newest status (`pending-install`,
+`pending-upgrade`, `failed`, `unknown`, `uninstalling`, `uninstalled`) still
+restores the serving revision. `--revision` and `--allow-failed-revision` are
+unchanged, and the schema gate still applies to N.
 
 Otherwise, it selects the newest `deployed` or `superseded` revision below
 the serving revision. If no revision is deployed, it selects below the highest

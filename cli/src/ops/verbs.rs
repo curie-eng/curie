@@ -1647,6 +1647,10 @@ pub struct RollbackChoice {
     /// True only when `--allow-failed-revision` admitted a revision whose status
     /// is not `deployed`/`superseded`.
     pub forced: bool,
+    /// True only when the newest revision is a `pending-rollback` whose
+    /// recorded target was confirmed, so this choice finishes that interrupted
+    /// rollback instead of restoring the serving revision (#4497).
+    pub resumes_interrupted_rollback: bool,
 }
 
 /// The outcome of the pure selection. `NoEligible` is a legitimate reading of a
@@ -1700,7 +1704,16 @@ impl RollbackTarget {
 /// Otherwise pick the newest eligible revision strictly below the current one.
 ///
 /// This preserves known good state after an interrupted or failed upgrade
-/// (#4335). The status filter fixes #1899: a `cluster up` against a cluster with no
+/// (#4335). A `pending-rollback` newest revision is the one exception (#4497,
+/// amending #4335 for that status only): its row records the operator's last
+/// instruction as `Rollback to <N>`, and Helm history is the only place that
+/// intent survives a kill. When N parses, is in history below the pending row,
+/// is eligible, and carries the pending row's chart, the choice finishes that
+/// rollback toward N. Otherwise selection refuses and names the explicit
+/// choices, rather than silently restoring the serving revision the operator
+/// was leaving. Every other ineligible newest status restores serving.
+///
+/// The status filter fixes #1899: a `cluster up` against a cluster with no
 /// `runsc` RuntimeClass records a FAILED revision before its successful retry,
 /// so the history alternates failed/superseded and the immediately preceding
 /// revision -- the one bare `helm rollback` targets -- is a failed one. Skipping
@@ -1715,11 +1728,19 @@ pub fn select_rollback_revision(history: &[HelmRevision]) -> Result<RollbackTarg
         .max_by_key(|row| row.revision)
         .filter(|row| row.revision > current && !is_eligible_rollback_status(&row.status))
     {
+        if newest
+            .status
+            .trim()
+            .eq_ignore_ascii_case("pending-rollback")
+        {
+            return resume_interrupted_rollback(history, newest, current);
+        }
         return Ok(RollbackTarget::Eligible(RollbackChoice {
             from_revision: newest.revision,
             to_revision: current,
             skipped: skipped_between(history, current, newest.revision),
             forced: false,
+            resumes_interrupted_rollback: false,
         }));
     }
 
@@ -1734,6 +1755,7 @@ pub fn select_rollback_revision(history: &[HelmRevision]) -> Result<RollbackTarg
             to_revision,
             skipped: skipped_between(history, to_revision, current),
             forced: false,
+            resumes_interrupted_rollback: false,
         })),
         None => Ok(RollbackTarget::NoEligible {
             current,
@@ -1781,7 +1803,60 @@ pub fn resolve_explicit_revision(
         to_revision: revision,
         skipped: skipped_between(history, revision, current),
         forced: !eligible,
+        resumes_interrupted_rollback: false,
     })
+}
+
+/// The target revision of an interrupted `helm rollback`, read from its
+/// pending row's description. Helm writes that description as
+/// `Rollback to %d` (helm pkg/action/rollback.go,
+/// `Description = fmt.Sprintf("Rollback to %d", r.Version)`), so only that
+/// exact shape, trimmed, with a nonempty run of ASCII digits that fits a
+/// `u32`, is read as a target. Anything else is `None`.
+pub(crate) fn interrupted_rollback_target(description: &str) -> Option<u32> {
+    let digits = description.trim().strip_prefix("Rollback to ")?;
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Finish a `pending-rollback` newest revision toward its recorded target, or
+/// refuse with both explicit choices when that target cannot be confirmed.
+fn resume_interrupted_rollback(
+    history: &[HelmRevision],
+    pending: &HelmRevision,
+    serving: u32,
+) -> Result<RollbackTarget> {
+    let target = interrupted_rollback_target(&pending.description)
+        .and_then(|n| history.iter().find(|row| row.revision == n));
+    if let Some(row) = target.filter(|row| {
+        row.revision < pending.revision
+            && is_eligible_rollback_status(&row.status)
+            && row.chart == pending.chart
+    }) {
+        return Ok(RollbackTarget::Eligible(RollbackChoice {
+            from_revision: pending.revision,
+            to_revision: row.revision,
+            skipped: skipped_between(history, row.revision, pending.revision),
+            forced: false,
+            resumes_interrupted_rollback: true,
+        }));
+    }
+    let restore = format!("curie cluster rollback --revision {serving} --yes");
+    let fix = match target {
+        Some(row) => format!(
+            "run curie cluster rollback --revision {} --yes to finish it, or {restore} to restore the serving revision",
+            row.revision
+        ),
+        None => format!("run {restore} to restore the serving revision"),
+    };
+    Err(crate::exit::CliError::failure(format!(
+        "revision {} is an interrupted rollback whose target cannot be confirmed; {fix}",
+        pending.revision
+    ))
+    .with_fix(fix)
+    .into())
 }
 
 /// Parse `helm history -o json`: an array of objects. Unknown fields are
@@ -1972,6 +2047,7 @@ pub enum ClusterRollbackOutput {
         to_revision: u32,
         skipped: Vec<u32>,
         forced: bool,
+        resumed_interrupted_rollback: bool,
     },
 }
 
@@ -1987,12 +2063,14 @@ impl crate::ui::CliOutput for ClusterRollbackOutput {
                 to_revision,
                 skipped,
                 forced,
+                resumed_interrupted_rollback,
             } => serde_json::json!({
                 "rolled_back": true,
                 "from_revision": from_revision,
                 "to_revision": to_revision,
                 "skipped": skipped,
                 "forced": forced,
+                "resumed_interrupted_rollback": resumed_interrupted_rollback,
             }),
         }
     }
@@ -2006,6 +2084,7 @@ impl crate::ui::CliOutput for ClusterRollbackOutput {
                 to_revision,
                 skipped,
                 forced,
+                ..
             } => {
                 ui.payload(&format!(
                     "curie rolled back from revision {from_revision} to revision {to_revision}"
@@ -2206,6 +2285,9 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
             .iter()
             .map(plan_line)
             .collect();
+        if choice.resumes_interrupted_rollback {
+            lines.push(interrupted_rollback_note(&choice));
+        }
         lines.push(format!(
             "selected revision {} ({}, {}) from revision {}; skipped {}",
             choice.to_revision, target.status, target.chart, choice.from_revision, skipped
@@ -2353,6 +2435,9 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
     // `payload` -- ADR-0021 (#474) reserves that channel for `CliOutput::render`,
     // and routing it here told an operator who then declined the prompt that the
     // release was rolling back, on stdout, while printing it twice on success.
+    if choice.resumes_interrupted_rollback {
+        ui.note(&interrupted_rollback_note(&choice));
+    }
     ui.note(&format!(
         "rolling release '{}' back from revision {} to revision {}",
         opts.common.release, choice.from_revision, choice.to_revision
@@ -2402,7 +2487,17 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
         to_revision: choice.to_revision,
         skipped: choice.skipped,
         forced: choice.forced,
+        resumed_interrupted_rollback: choice.resumes_interrupted_rollback,
     })
+}
+
+/// The sentence a dry run and the pre-prompt note share when a bare rollback
+/// finishes an interrupted one (#4497).
+fn interrupted_rollback_note(choice: &RollbackChoice) -> String {
+    format!(
+        "revision {} is an interrupted rollback to revision {}; resuming it",
+        choice.from_revision, choice.to_revision
+    )
 }
 
 /// Read a y/N confirmation from stderr/stdin for `down` when `--yes` is absent.

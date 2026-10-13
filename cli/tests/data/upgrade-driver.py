@@ -136,6 +136,8 @@ WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 #                     values say, the way a template a failed or partial render
 #                     left behind survives (#4321)
 #   pending_status    orphaned newest revision status above serving revision 4
+#   pending_description  that pending row's description; Helm writes
+#                     `Rollback to <N>` on a rollback's row (pkg/action/rollback.go)
 #   no_serving_revision  history contains only the pending revision
 #   hook_jobs_shape   "valid" | "failed" | "malformed" | "not-list"
 #   active_hook       a selected hook Job still has active pods
@@ -210,6 +212,7 @@ BASE = {
     "revision_versions": None,
     "revision_values": None,
     "pending_status": None,
+    "pending_description": "Preparing upgrade",
     "no_serving_revision": False,
     "hook_jobs_shape": "valid",
     "active_hook": False,
@@ -274,7 +277,13 @@ SCENARIOS = {
         "no_serving_revision": True,
     },
     "pending-install": {"pending_status": "pending-install"},
-    "pending-rollback": {"pending_status": "pending-rollback"},
+    # A killed `helm rollback` leaves its row pending with the target it was
+    # asked for. Revision 3 is not in this history: the upgrade refusal only
+    # reads the description (#4497).
+    "pending-rollback": {
+        "pending_status": "pending-rollback",
+        "pending_description": "Rollback to 3",
+    },
     # Keep the release cache target distinct from the running CLI version so
     # the resolver test can prove that --to owns the cache key.
     "release-cache-prior": {
@@ -550,7 +559,9 @@ def release_history():
         rows = [] if scenario["no_serving_revision"] else [
             history_row(4, "deployed", scenario["before"], "Upgrade complete")
         ]
-        rows.append(history_row(5, pending, scenario["target"], "Preparing upgrade"))
+        rows.append(
+            history_row(5, pending, scenario["target"], scenario["pending_description"])
+        )
         if rollback_attempted:
             # Helm leaves the old pending row unchanged. A successful
             # rollback supersedes deployed rows; a wait failure stores the
