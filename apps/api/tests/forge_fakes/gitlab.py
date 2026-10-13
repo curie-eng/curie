@@ -765,10 +765,18 @@ class GitLabAPI:
             pipeline = self.add_pipeline(sha)
         return self.add_job(pipeline, name, status, allow_failure=allow_failure)
 
-    def add_status(self, sha: str, name: str, state: str, *, author: Actor | None = None) -> int:
+    def add_status(
+        self,
+        sha: str,
+        name: str,
+        state: str,
+        *,
+        author: Actor | None = None,
+        description: str | None = None,
+    ) -> int:
         """An external commit status, as ``POST /projects/:id/statuses/:sha`` posts it."""
 
-        return self._post_status(sha, name, state, int((author or ROOT).id), None, None).id
+        return self._post_status(sha, name, state, int((author or ROOT).id), None, description).id
 
     # Internals: state changes -------------------------------------------------
 

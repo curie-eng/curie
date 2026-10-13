@@ -193,7 +193,10 @@ class GitLabCi:
         return redact_text("\n".join(text.splitlines()[-TRACE_LINES:]))
 
     async def diagnostics(self, rollup: CiRollup) -> tuple[CiDiagnostic, ...]:
-        """Decision 19: each failing job's trace excerpt."""
+        """Decision 19: each failing job's trace excerpt, and each failing
+        external status's description, as the GitHub adapter reports a commit
+        status. The descriptions are read again on the rollup's head, so a
+        status that could not be read says nothing rather than failing."""
 
         found = []
         for check in rollup.checks:
@@ -212,7 +215,40 @@ class GitLabCi:
                     log_unavailable=log is None,
                 )
             )
+        failing = [
+            check
+            for check in rollup.checks
+            if check.source is CheckSource.STATUS and check.state is CheckState.FAILURE
+        ]
+        if failing:
+            described = await self._descriptions(rollup.head_sha)
+            for check in failing:
+                description = described.get(check.check_id or "")
+                found.append(
+                    CiDiagnostic(
+                        check_key=check.key,
+                        excerpt=(description or "")[-EXCERPT_MAX_CHARS:],
+                        check_id=check.check_id,
+                        summary=description,
+                    )
+                )
         return tuple(found)
+
+    async def _descriptions(self, head_sha: str) -> dict[str, str]:
+        """Redacted commit status descriptions on ``head_sha`` by status id."""
+
+        try:
+            statuses = await self._transport.list_all(
+                f"{self._project}/repository/commits/{encode_segment(head_sha)}/statuses",
+                {"all": "true"},
+            )
+        except ForgeError:
+            return {}
+        return {
+            str(status["id"]): redact_text(status["description"])
+            for status in statuses
+            if isinstance(status.get("description"), str) and status.get("id") is not None
+        }
 
     async def rerun(
         self,
