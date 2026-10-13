@@ -217,7 +217,8 @@ const SHARED_FLAGS: [(&str, &str); 4] = [
 
 #[test]
 fn factory_quickstart_reserved_code_host_kind_is_not_installed() {
-    for kind in ["gitlab", "bitbucket-cloud", "bitbucket-dc"] {
+    // #4399 installs gitlab; its refusals live in factory_quickstart_gitlab.rs.
+    for kind in ["bitbucket-cloud", "bitbucket-dc"] {
         let run = quickstart(&["--code-host", kind]);
         let text = run.all();
         assert_ne!(run.code, 0, "{kind}: {text}");
@@ -227,20 +228,23 @@ fn factory_quickstart_reserved_code_host_kind_is_not_installed() {
 }
 
 #[test]
-fn factory_quickstart_reserved_tracker_kind_is_not_installed() {
-    // #4358 installs jira-cloud; its refusals live in factory_quickstart_jira.rs.
-    let kind = "gitlab";
-    let run = quickstart(&["--tracker", kind]);
-    let text = run.all();
-    assert_ne!(run.code, 0, "{kind}: {text}");
-    assert!(text.contains("not installed"), "{kind}: {text}");
-    assert!(text.contains(kind), "{kind}: {text}");
+fn factory_quickstart_gitlab_with_a_github_partner_is_a_pairing_refusal() {
+    // #4358 installs jira-cloud and #4399 gitlab, so no tracker kind is reserved.
+    // GitLab pairs only with itself, on either side.
+    for args in [["--tracker", "gitlab"], ["--code-host", "gitlab"]] {
+        let run = quickstart(&args);
+        let text = run.all();
+        assert_ne!(run.code, 0, "{args:?}: {text}");
+        assert!(text.contains("pairs only with"), "{args:?}: {text}");
+        assert!(text.contains("gitlab"), "{args:?}: {text}");
+        assert!(!text.contains("not installed"), "{args:?}: {text}");
+    }
 }
 
 #[test]
 fn factory_quickstart_shared_flags_reach_the_reserved_module_not_the_parser() {
     for (flag, value) in SHARED_FLAGS {
-        let run = quickstart(&["--code-host", "gitlab", flag, value]);
+        let run = quickstart(&["--code-host", "bitbucket-dc", flag, value]);
         let text = run.all();
         assert!(
             !text.contains("unexpected argument"),
