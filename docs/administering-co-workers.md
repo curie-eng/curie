@@ -15,8 +15,8 @@ procedures.
 
 Curie runs its platform and sandbox workloads in your Kubernetes installation.
 You own the Helm release, credentials, storage and upgrade policy. Model
-requests and workspace interactions still reach the providers and services you
-configure. Self hosting does not imply that data never leaves your infrastructure.
+requests and workspace interactions reach the providers and services you
+configure.
 
 Use the [installation procedure](operations.md#installing-and-inspecting-the-curie-platform-on-the-cluster)
 and [upgrade procedure](operations.md#upgrading-the-chart). Inspect what is running:
