@@ -1,5 +1,5 @@
 //! Binary integration contract for the gVisor preflight diagnosis in issue
-//! #1653 and the scheduling lookup in #4411. Every case drives the real
+//! #1653 and the scheduling lookups in #4411 and #4416. Every case drives the real
 //! `curie cluster up` or `curie apply` entrypoint with fake Helm and kubectl
 //! executables on PATH.
 //!
@@ -125,6 +125,7 @@ if [ "$1" = "template" ]; then
     sandbox_create="true"
     gvisor_mode="auto"
     fake_model="true"
+    sandbox_deploy="true"
     inference_deploy="false"
     install_runtimeclass="false"
     preflight_enabled="true"
@@ -144,6 +145,7 @@ if [ "$1" = "template" ]; then
                     security.gvisorPreflight.enabled=false) preflight_enabled="false" ;;
                     security.gvisorPreflight.enabled=true) preflight_enabled="true" ;;
                     agentSandbox.runner.fakeModel=*) fake_model=${1#*=} ;;
+                    agentSandbox.deploy=*) sandbox_deploy=${1#*=} ;;
                     inference.deploy=*) inference_deploy=${1#*=} ;;
                 esac
                 ;;
@@ -165,6 +167,7 @@ if [ "$1" = "template" ]; then
                         fi
                         ;;
                     agentSandbox.runner.fakeModel=*) fake_model=${1#*=} ;;
+                    agentSandbox.deploy=*) sandbox_deploy=${1#*=} ;;
                     inference.deploy=*) inference_deploy=${1#*=} ;;
                 esac
                 ;;
@@ -182,9 +185,9 @@ if [ "$1" = "template" ]; then
     if [ "$show_only" = "templates/preflight-gvisor.yaml" ]; then
         # Real execution matches curie.gvisor.preflightRequired: fakeModel is not
         # true, or inference.deploy is true. Mode off still omits the template.
-        if [ "$preflight_enabled" = "false" ] || [ "$gvisor_mode" = "off" ] || { [ "$gvisor_mode" = "auto" ] && [ "$fake_model" = "true" ] && [ "$inference_deploy" != "true" ]; }; then
-            printf '%s\n' 'Error: could not find template "templates/preflight-gvisor.yaml" in chart' >&2
-            exit 1
+        render_job="true"
+        if [ "$sandbox_deploy" = "false" ] || [ "$preflight_enabled" = "false" ] || [ "$gvisor_mode" = "off" ] || { [ "$gvisor_mode" = "auto" ] && [ "$fake_model" = "true" ] && [ "$inference_deploy" != "true" ]; }; then
+            render_job="false"
         fi
         if [ "$install_runtimeclass" = "true" ]; then
             printf '%s\n' \
@@ -194,6 +197,13 @@ if [ "$1" = "template" ]; then
                 '  name: gvisor' \
                 'handler: runsc' \
                 '---'
+        fi
+        if [ "$render_job" = "false" ]; then
+            if [ "$install_runtimeclass" = "true" ]; then
+                exit 0
+            fi
+            printf '%s\n' 'Error: could not find template "templates/preflight-gvisor.yaml" in chart' >&2
+            exit 1
         fi
         printf '%s\n' \
             'apiVersion: batch/v1' \
@@ -670,6 +680,14 @@ if [ "$1" = "get" ] && [ "$2" = "runtimeclass" ]; then
             ;;
         empty-selector)
             printf '{"apiVersion":"node.k8s.io/v1","kind":"RuntimeClass","metadata":{"name":"%s"},"handler":"runsc","scheduling":{"nodeSelector":{}}}\n' "$name"
+            exit 0
+            ;;
+        failed)
+            printf '%s\n' 'Unable to connect to the server: connection refused' >&2
+            exit 1
+            ;;
+        malformed)
+            printf '%s\n' 'invalid RuntimeClass JSON'
             exit 0
             ;;
         *)
@@ -2079,9 +2097,15 @@ fn rendered_runtimeclass_creation_does_not_infer_off_from_an_empty_node_list() {
 #[test]
 fn unschedulable_runtimeclass_does_not_infer_without_a_rendered_preflight() {
     for extra in [
-        vec!["--fake-model"],
         vec!["--set", "security.gvisorPreflight.enabled=false"],
         vec!["--dry-run"],
+        vec!["--fake-model", "--dry-run"],
+        vec!["--fake-model", "--set", "agentSandbox.deploy=false"],
+        vec![
+            "--fake-model",
+            "--set",
+            "security.gvisor.installRuntimeClass=true",
+        ],
     ] {
         let fixture = Fixture::new("nonmatching", "absent", OPENROUTER_CREDENTIAL)
             .with_runtimeclass_lookup("unschedulable");
@@ -2322,7 +2346,7 @@ fn local_inference_with_absent_runtimeclass_applies_gvisor_off_before_install() 
 }
 
 #[test]
-fn fake_model_default_does_not_lookup_or_infer_gvisor_off() {
+fn fake_model_default_with_absent_runtimeclass_does_not_infer_gvisor_off() {
     // `--fake-model` is the hermetic chart-default fake install. A bare run
     // can adopt a saved model credential and become a real install (#3848).
     let fixture = Fixture::new("nonmatching", "absent", "").with_runtimeclass_lookup("absent");
@@ -2331,27 +2355,186 @@ fn fake_model_default_does_not_lookup_or_infer_gvisor_off() {
 
     assert!(
         output.status.success(),
-        "the fake model default must install without a RuntimeClass lookup\nstdout:\n{}\nstderr:\n{shown}",
+        "the fake model default must install with an absent RuntimeClass\nstdout:\n{}\nstderr:\n{shown}",
         String::from_utf8_lossy(&output.stdout)
     );
-    assert!(
-        fixture.runtimeclass_gets().is_empty(),
-        "the fake model default must not get a RuntimeClass:\n{}",
-        fixture.runtimeclass_gets()
+    assert_eq!(fixture.upgrade_count(), 1);
+    assert_eq!(
+        fixture.runtimeclass_gets().trim(),
+        "get runtimeclass gvisor -o json"
     );
+    assert!(fixture.nodes_gets().is_empty());
     let upgrades = fs::read_to_string(&fixture.upgrade_log).unwrap_or_default();
     assert!(
         !upgrades.contains("security.gvisor.mode=off"),
         "the fake model default must not infer mode off:\n{upgrades}"
     );
     assert_neither_gvisor_inference(&shown);
+    assert!(!shown.contains("cannot schedule"), "{shown}");
+    assert!(!shown.contains("retrying"), "{shown}");
+    fixture.assert_no_event_watch();
+}
+
+#[test]
+fn fake_model_unschedulable_runtimeclass_applies_gvisor_off_before_install() {
+    let fixture =
+        Fixture::new("failed-scheduling", "absent", "").with_runtimeclass_lookup("unschedulable");
+    let (output, _) = fixture.run(&["--fake-model"]);
+    let shown = stderr(&output);
+
+    assert!(output.status.success(), "{shown}");
+    assert_eq!(fixture.upgrade_count(), 1);
+    let upgrades = fs::read_to_string(&fixture.upgrade_log).expect("read Helm upgrade log");
+    assert!(upgrades.contains("security.gvisor.mode=off"), "{upgrades}");
+    assert!(
+        !upgrades.contains("agentSandbox.runner.fakeModel=false"),
+        "{upgrades}"
+    );
+    assert!(shown.contains(GVISOR_SCHEDULING_INFERENCE), "{shown}");
+    assert_inference_once(&shown, "--set security.gvisor.mode=off");
+    assert_neither_gvisor_inference(&shown);
+    assert!(!shown.contains("retrying"), "{shown}");
+    assert_eq!(
+        fixture.runtimeclass_gets().trim(),
+        "get runtimeclass gvisor -o json"
+    );
+    assert_eq!(
+        fixture.nodes_gets().trim(),
+        format!("get nodes -l {GVISOR_NODE_SELECTOR} -o name")
+    );
+    fixture.assert_no_event_watch();
+    fixture.assert_no_failed_revision_discard();
+}
+
+#[test]
+fn fake_model_schedulable_runtimeclass_does_not_infer_gvisor_off() {
+    let fixture = Fixture::new("nonmatching", "absent", "").with_runtimeclass_lookup("schedulable");
+    let (output, _) = fixture.run(&["--fake-model"]);
+    let shown = stderr(&output);
+
+    assert!(output.status.success(), "{shown}");
+    assert_eq!(fixture.upgrade_count(), 1);
+    assert_eq!(
+        fixture.runtimeclass_gets().trim(),
+        "get runtimeclass gvisor -o json"
+    );
+    assert_eq!(
+        fixture.nodes_gets().trim(),
+        format!("get nodes -l {GVISOR_NODE_SELECTOR} -o name")
+    );
+    let upgrades = fs::read_to_string(&fixture.upgrade_log).expect("read Helm upgrade log");
+    assert!(!upgrades.contains("security.gvisor.mode=off"), "{upgrades}");
+    assert!(
+        !upgrades.contains("agentSandbox.runner.fakeModel=false"),
+        "{upgrades}"
+    );
+    assert!(!shown.contains("cannot schedule"), "{shown}");
+    assert_neither_gvisor_inference(&shown);
+    fixture.assert_no_event_watch();
+}
+
+#[test]
+fn fake_model_unreadable_node_list_installs_as_today() {
+    for lookup in ["node-list-forbidden", "node-list-failed"] {
+        let fixture = Fixture::new("nonmatching", "absent", "").with_runtimeclass_lookup(lookup);
+        let (output, _) = fixture.run(&["--fake-model", "--debug"]);
+        let shown = stderr(&output);
+
+        assert!(output.status.success(), "{lookup}: {shown}");
+        assert_eq!(fixture.upgrade_count(), 1);
+        assert_eq!(
+            fixture.runtimeclass_gets().trim(),
+            "get runtimeclass gvisor -o json"
+        );
+        assert_eq!(
+            fixture.nodes_gets().trim(),
+            format!("get nodes -l {GVISOR_NODE_SELECTOR} -o name")
+        );
+        let upgrades = fs::read_to_string(&fixture.upgrade_log).expect("read Helm upgrade log");
+        assert!(!upgrades.contains("security.gvisor.mode=off"), "{upgrades}");
+        assert!(
+            shown.contains("gVisor node selector lookup unavailable"),
+            "{shown}"
+        );
+        assert!(!shown.contains("cannot schedule"), "{shown}");
+        assert_neither_gvisor_inference(&shown);
+        fixture.assert_no_event_watch();
+    }
+}
+
+#[test]
+fn fake_model_unreadable_runtimeclass_installs_as_today() {
+    for lookup in ["forbidden", "failed", "malformed", "present"] {
+        let fixture = Fixture::new("nonmatching", "absent", "").with_runtimeclass_lookup(lookup);
+        let (output, _) = fixture.run(&["--fake-model", "--debug"]);
+        let shown = stderr(&output);
+
+        assert!(output.status.success(), "{lookup}: {shown}");
+        assert_eq!(fixture.upgrade_count(), 1);
+        assert_eq!(
+            fixture.runtimeclass_gets().trim(),
+            "get runtimeclass gvisor -o json"
+        );
+        assert!(fixture.nodes_gets().is_empty());
+        let upgrades = fs::read_to_string(&fixture.upgrade_log).expect("read Helm upgrade log");
+        assert!(!upgrades.contains("security.gvisor.mode=off"), "{upgrades}");
+        if matches!(lookup, "failed" | "malformed") {
+            assert!(
+                shown.contains("gVisor RuntimeClass lookup unavailable"),
+                "{shown}"
+            );
+        }
+        assert!(!shown.contains("cannot schedule"), "{shown}");
+        assert_neither_gvisor_inference(&shown);
+        fixture.assert_no_event_watch();
+    }
+}
+
+#[test]
+fn fake_model_off_does_not_lookup_a_runtimeclass() {
+    let fixture =
+        Fixture::new("nonmatching", "absent", "").with_runtimeclass_lookup("unschedulable");
+    let (output, _) = fixture.run(&["--fake-model", "--set", "security.gvisor.mode=off"]);
+    let shown = stderr(&output);
+
+    assert!(output.status.success(), "{shown}");
+    assert_eq!(fixture.upgrade_count(), 1);
+    assert!(fixture.runtimeclass_gets().is_empty());
+    assert!(fixture.nodes_gets().is_empty());
+    assert!(!shown.contains("cannot schedule"), "{shown}");
+    assert_neither_gvisor_inference(&shown);
+    fixture.assert_no_event_watch();
+}
+
+#[test]
+fn fake_model_explicit_auto_with_unschedulable_runtimeclass_is_a_usage_error() {
+    let fixture =
+        Fixture::new("nonmatching", "absent", "").with_runtimeclass_lookup("unschedulable");
+    let (output, _) = fixture.run(&["--fake-model", "--set", "security.gvisor.mode=auto"]);
+    let shown = stderr(&output);
+
+    assert_eq!(output.status.code(), Some(2), "{shown}");
+    assert_eq!(fixture.upgrade_count(), 0);
+    assert!(
+        shown.contains("explicit `security.gvisor.mode=auto` contradicts the detected RuntimeClass scheduling: no node matches `gvisor` nodeSelector `sandbox.gke.io/runtime=gvisor`; remove the explicit `security.gvisor.mode=auto` setting and rerun to accept the inferred gVisor posture"),
+        "{shown}"
+    );
+    assert!(!shown.contains("inferred that"), "{shown}");
+    assert!(!shown.contains("retrying"), "{shown}");
+    assert_eq!(
+        fixture.runtimeclass_gets().trim(),
+        "get runtimeclass gvisor -o json"
+    );
 }
 
 #[test]
 fn typed_false_preflight_does_not_lookup_a_runtimeclass() {
-    let fixture = Fixture::new("nonmatching", "absent", OPENROUTER_CREDENTIAL)
-        .with_runtimeclass_lookup("absent");
-    let (output, _) = fixture.run(&["--set", "security.gvisorPreflight.enabled=false"]);
+    let fixture = Fixture::new("nonmatching", "absent", "").with_runtimeclass_lookup("absent");
+    let (output, _) = fixture.run(&[
+        "--fake-model",
+        "--set",
+        "security.gvisorPreflight.enabled=false",
+    ]);
     let shown = stderr(&output);
 
     assert!(
