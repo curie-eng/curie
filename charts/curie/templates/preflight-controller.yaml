@@ -6,12 +6,14 @@ The vendored agent-sandbox controller runs a CLUSTER-scope NetworkPolicy
 informer; if its RBAC cannot satisfy that cluster LIST, the manager crash-loops
 and no SandboxClaim ever binds. The vendored Deployment has NO readiness probe,
 so `rollout status` passes while the manager still blocks on cache sync -- the
-gate first rejects a forbidden-NetworkPolicy line in the current log, then
-accepts a stable serving leader (below), then rejects observed RBAC/lease
-failures and pod restarts, and finally requires the "Starting workers" log line
-or positive successful-reconcile metrics from the current Running controller
-pod. This post-install/post-upgrade hook Job fails the Helm operation unless the
-controller reaches one of those states, so an RBAC regression fails at install.
+gate rejects a cluster-scope NetworkPolicy list/watch refusal in the current
+log and rising restart counts, then accepts a stable serving leader (below) or
+the "Starting workers" log line or positive successful-reconcile metrics.
+After a restart, those current-container health signals also require its
+Running, Ready pod to hold and renew the Lease. Namespaced refusals and previous
+container failures remain diagnostic. This post-install/post-upgrade hook Job
+fails the Helm operation unless the controller reaches one of those states,
+so an informer RBAC regression fails at install.
 
 Stable serving leader (issue #4197): the controller Deployment has completed
 its rollout for its current generation, the leader-election Lease names a
@@ -216,6 +218,43 @@ spec:
                   -o jsonpath='{.spec.holderIdentity} {.spec.acquireTime} {.spec.renewTime}' \
                   2>/dev/null
               }
+              # Record each pod/container count on the first poll. Comparing
+              # counts by pod prevents a replacement pod from hiding another
+              # current pod's new crash. Refresh after a Lease observation wait
+              # as well, before either leader-based success can pass.
+              restart_baseline_set=0
+              restart_grew=0
+              restarted=0
+              read_restart_state() {
+                restart_fields=$(kubectl get pods -n "${CONTROLLER_NS}" -l app=agent-sandbox-controller \
+                  -o jsonpath='{range .items[*]}{.metadata.name}{" "}{range .status.containerStatuses[*]}{.restartCount}{" "}{end}{"\n"}{end}' \
+                  2>/dev/null) || return 1
+                observed_restart=$(printf '%s\n' "${restart_fields}" | awk '
+                  { for (i = 2; i <= NF; i++) if ($i + 0 > 0) found = 1 }
+                  END { print found ? 1 : 0 }
+                ')
+                [ "${observed_restart}" -eq 0 ] || restarted=1
+                if [ "${restart_baseline_set}" -eq 0 ]; then
+                  restart_baseline=${restart_fields}
+                  restart_baseline_set=1
+                elif printf '%s\n%s\n%s\n' "${restart_baseline}" '__CURRENT__' "${restart_fields}" | awk '
+                  $0 == "__CURRENT__" { current = 1; next }
+                  !current { for (i = 2; i <= NF; i++) baseline[$1, i] = $i + 0; next }
+                  { for (i = 2; i <= NF; i++) if ($i + 0 > baseline[$1, i]) grew = 1 }
+                  END { exit !grew }
+                '; then
+                  restart_grew=1
+                fi
+              }
+              holder_is_ready() {
+                pod_fields=$(kubectl get pods -n "${CONTROLLER_NS}" -l app=agent-sandbox-controller \
+                  -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{" "}{.status.conditions[?(@.type=="Ready")].status}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' \
+                  2>/dev/null) || return 1
+                printf '%s\n' "${pod_fields}" | awk -v pod="${holder_pod}" '
+                  $1 == pod && $2 == "Running" && $3 == "True" && NF == 3 { found = 1 }
+                  END { exit !found }
+                '
+              }
               leader_detail=""
               stable_leader() {
                 deploy_fields=$(kubectl get deployment "${DEPLOY}" -n "${CONTROLLER_NS}" \
@@ -228,7 +267,21 @@ spec:
                   && [ "$4" = "$3" ] && [ "$5" = "$3" ] && [ "$6" = "$3" ] && [ "$7" = "$3" ] \
                   || return 1
 
-                lease_fields=$(read_lease) || return 1
+                renewing_leader "${STABLE_LEADER_SECONDS}" ""
+              }
+              # Share the holder/renewal proof with recovered containers. Their
+              # startup or reconcile signal already proves cache sync, so they
+              # require no minimum leadership duration, only their own current
+              # Ready pod holding the same Lease and renewing it while watched.
+              renewing_leader() {
+                minimum_hold=$1
+                expected_pod=$2
+                # Both success checks share this poll's initial observation;
+                # only the read after the wait can prove advancing renewal.
+                if [ -z "${lease_snapshot}" ]; then
+                  lease_snapshot=$(read_lease) || return 1
+                fi
+                lease_fields=${lease_snapshot}
                 # shellcheck disable=SC2086
                 set -- ${lease_fields}
                 [ "$#" -eq 3 ] || return 1
@@ -241,17 +294,12 @@ spec:
                   *_*) holder_pod=${holder%%_*} ;;
                   *) return 1 ;;
                 esac
+                [ -z "${expected_pod}" ] || [ "${holder_pod}" = "${expected_pod}" ] || return 1
 
-                pod_fields=$(kubectl get pods -n "${CONTROLLER_NS}" -l app=agent-sandbox-controller \
-                  -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{" "}{.status.conditions[?(@.type=="Ready")].status}{" "}{.metadata.deletionTimestamp}{"\n"}{end}' \
-                  2>/dev/null) || return 1
-                printf '%s\n' "${pod_fields}" | awk -v pod="${holder_pod}" '
-                  $1 == pod && $2 == "Running" && $3 == "True" && NF == 3 { found = 1 }
-                  END { exit !found }
-                ' || return 1
+                holder_is_ready || return 1
 
                 held=$(seconds_between "${acquired}" "${renewed}")
-                [ "${held}" -ge "${STABLE_LEADER_SECONDS}" ] 2>/dev/null || return 1
+                [ "${held}" -ge "${minimum_hold}" ] 2>/dev/null || return 1
 
                 # controller-runtime renews every 2s (RetryPeriod); one wait
                 # longer than that must show the same holder renewing. The
@@ -259,6 +307,8 @@ spec:
                 # hook timeout.
                 sleep 5
                 elapsed=$(( elapsed + 5 ))
+                read_restart_state || return 1
+                [ "${restart_grew}" -eq 0 ] || return 1
                 lease_fields=$(read_lease) || return 1
                 # shellcheck disable=SC2086
                 set -- ${lease_fields}
@@ -267,106 +317,155 @@ spec:
                 renewal_advance=$(seconds_between "${renewed}" "$3")
                 [ "${renewal_advance}" -gt 0 ] 2>/dev/null || return 1
                 held=$(seconds_between "${acquired}" "$3")
-                [ "${held}" -ge "${STABLE_LEADER_SECONDS}" ] 2>/dev/null || return 1
+                [ "${held}" -ge "${minimum_hold}" ] 2>/dev/null || return 1
 
-                leader_detail="pod ${holder_pod} has held lease ${LEASE} for ${held}s (>= ${STABLE_LEADER_SECONDS}s) and is renewing it"
+                if [ "${minimum_hold}" -eq 0 ]; then
+                  holder_is_ready || return 1
+                  leader_detail="current Ready pod ${holder_pod} holds lease ${LEASE} and is renewing it"
+                else
+                  leader_detail="pod ${holder_pod} has held lease ${LEASE} for ${held}s (>= ${STABLE_LEADER_SECONDS}s) and is renewing it"
+                fi
                 return 0
               }
 
               # Poll failure signals before accepting "Starting workers" or
               # positive successful-reconcile metrics, which both require
               # synced informer caches. The counter survives startup-log
-              # rotation. A restart is NOT diagnostic on its own: the #350
+              # rotation. A restart does not establish its cause: the #350
               # crash-loop (RBAC) and a leader-election lease timeout (#507) both
               # restart the pod, so classify the CAUSE from the logs instead of
               # blaming NetworkPolicy RBAC unconditionally.
               cause=unknown
               elapsed=0
+              namespaced_noted=0
               while [ "${elapsed}" -lt "${TIMEOUT}" ]; do
+                lease_snapshot=""
                 logs=$(kubectl logs "deployment/${DEPLOY}" -n "${CONTROLLER_NS}" --tail=-1 2>/dev/null || true)
 
-                # The current container's own forbidden-networkpolicies line is
-                # the #350 RBAC signature and outranks every success signal.
-                if printf '%s\n' "${logs}" | grep -Eq "networkpolicies.*[Ff]orbidden"; then
+                # Only a current cluster-scope list/watch refusal is the #350
+                # informer RBAC signature and outranks every success signal.
+                if printf '%s\n' "${logs}" | grep -Eq 'cannot (list|watch) resource [^ ]*networkpolicies[^ ]* in API group [^ ]*networking\.k8s\.io[^ ]* at the cluster scope'; then
                   cause=rbac
                   echo "detected controller failure (forbidden networkpolicies log)."
                   break
                 fi
 
-                # A leader that has served past the cache-sync bound has synced
-                # since any earlier restart, so this is checked before restart
-                # history (an old restart or its previous log is not current
-                # state). A controller restarted by this upgrade holds a fresh
-                # lease and falls through to the checks below.
-                if stable_leader; then
-                  echo "RESULT: PASS -- agent-sandbox-controller rollout complete and serving: ${leader_detail}."
-                  exit 0
+                # Namespaced mutation refusals concern a consumer's Role, not
+                # the controller's cluster informer. Keep them visible once
+                # without blocking the owning release's upgrade (issue #4461).
+                if [ "${namespaced_noted}" -eq 0 ]; then
+                  refused_namespaces=$(printf '%s\n' "${logs}" | awk '
+                    {
+                      line = $0; gsub(/\\/, "", line)
+                      if (line ~ /cannot [a-z]+ resource "networkpolicies" in API group "networking\.k8s\.io" in the namespace "/) {
+                        sub(/^.* in the namespace "/, "", line); sub(/".*$/, "", line)
+                        namespaces[line] = 1
+                      }
+                    }
+                    END { for (namespace in namespaces) print namespace }
+                  ' | sort | tr '\n' ' ')
+                  if [ -n "${refused_namespaces}" ]; then
+                    echo "NOTE: namespaced NetworkPolicy refusals in namespaces: ${refused_namespaces}(nonfatal; check the consumer namespace's Role)."
+                    namespaced_noted=1
+                  fi
                 fi
 
-                restarts=$(kubectl get pods -n "${CONTROLLER_NS}" -l app=agent-sandbox-controller \
-                  -o jsonpath='{.items[*].status.containerStatuses[*].restartCount}' 2>/dev/null || true)
-                restarted=0
-                for r in ${restarts}; do
-                  if [ "${r}" -gt 0 ] 2>/dev/null; then
-                    restarted=1
-                  fi
-                done
+                # Record the initial count before any leader success, then
+                # refuse new crashes rather than treating old restart history
+                # as a terminal failure.
+                read_restart_state
 
-                # A previous container's logs only exist once the pod has
-                # restarted, so only fetch --previous then -- skips a wasted
-                # kubectl call every poll on the healthy path.
+                # Previous container logs only exist after a restart. Their
+                # signatures classify a timeout but cannot end recovery while
+                # the current container can still prove health.
                 prev=""
                 if [ "${restarted}" -eq 1 ]; then
                   prev=$(kubectl logs "deployment/${DEPLOY}" -n "${CONTROLLER_NS}" --tail=-1 --previous 2>/dev/null || true)
                 fi
 
-                # Classify by the actual log signal, most-specific first. The
-                # forbidden-networkpolicies line is the #350 RBAC signature; a
-                # leader-election lease loss is the #507 signature (the manager
-                # exits and the pod restarts, but RBAC is fine).
-                #
-                # Join the two logs with a NEWLINE: command substitution strips
-                # trailing newlines, so a bare "${logs}${prev}" glues the last
-                # line of one onto the first line of the other and can fabricate
-                # a signature that appears in NEITHER log (issue #611).
-                if printf '%s\n%s' "${logs}" "${prev}" | grep -Eq "networkpolicies.*[Ff]orbidden"; then
+                # Classify a cluster-scope NetworkPolicy list/watch refusal or
+                # a lease loss, keeping log boundaries intact (issue #611).
+                if printf '%s\n%s' "${logs}" "${prev}" | grep -Eq 'cannot (list|watch) resource [^ ]*networkpolicies[^ ]* in API group [^ ]*networking\.k8s\.io[^ ]* at the cluster scope'; then
                   cause=rbac
-                  echo "detected controller failure (forbidden networkpolicies log)."
-                  break
+                  echo "observed previous controller failure (forbidden networkpolicies log; diagnostic)."
                 elif printf '%s\n%s' "${logs}" "${prev}" | grep -Eq "leader election lost|failed to renew lease|error retrieving resource lock|timed out waiting for the condition.*lease"; then
                   cause=lease
-                  echo "detected controller failure (leader-election lease not renewed)."
-                  break
+                  echo "observed controller failure (leader-election lease not renewed; diagnostic)."
                 elif [ "${restarted}" -eq 1 ]; then
                   cause=restart
-                  echo "detected controller restart (restartCount>0) with no recognized failure signature."
+                  echo "observed controller restart (restartCount>0) with no recognized failure signature; awaiting current health."
+                fi
+                if [ "${restart_grew}" -eq 1 ]; then
+                  [ "${cause}" = lease ] || cause=restart
+                  echo "detected controller failure (restart count increased during preflight)."
                   break
                 fi
 
-                if echo "${logs}" | grep -q "Starting workers"; then
-                  echo "RESULT: PASS -- agent-sandbox-controller Available and informer caches synced ('Starting workers' observed)."
+                # A leader that has served past the cache-sync bound has synced
+                # since any earlier restart; an old restart or its previous
+                # log is not current state. A controller restarted by this
+                # upgrade holds a fresh
+                # lease and falls through to the checks below.
+                if stable_leader; then
+                  echo "RESULT: PASS -- agent-sandbox-controller rollout complete and serving: ${leader_detail}."
                   exit 0
+                fi
+                if [ "${restart_grew}" -eq 1 ]; then
+                  [ "${cause}" = lease ] || cause=restart
+                  echo "detected controller failure (restart count increased during preflight)."
+                  break
                 fi
 
-                # A current pod's successful reconciles prove cache sync even
-                # when its startup log has rotated away. Select the first
-                # Running controller pod and discard stdout from failed proxy
-                # requests so partial metrics cannot establish health.
-                pod=$(kubectl get pods -n "${CONTROLLER_NS}" -l app=agent-sandbox-controller \
-                  --field-selector=status.phase=Running \
-                  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-                metrics=""
-                if [ -n "${pod}" ]; then
-                  metrics=$(kubectl get --raw "/api/v1/namespaces/${CONTROLLER_NS}/pods/${pod}:8080/proxy/metrics" \
-                    2>/dev/null) || metrics=""
+                health=""
+                if echo "${logs}" | grep -q "Starting workers"; then
+                  health=startup
                 fi
-                if printf '%s\n' "${metrics}" | awk '
-                  $1 ~ /^controller_runtime_reconcile_total[{].*[}]$/ &&
-                  $1 ~ /[,{]result="success"[,}]/ { successful += $2 }
-                  END { exit !(successful > 0) }
-                '; then
-                  echo "RESULT: PASS -- agent-sandbox-controller informer caches synced (positive controller_runtime_reconcile_total result=success observed)."
-                  exit 0
+
+                # Select the same current Running pod for metrics and the
+                # recovered-container Lease proof. A startup log keeps its
+                # existing no-restart fast path without a metrics request.
+                pod=""
+                if [ "${restarted}" -eq 1 ] || [ -z "${health}" ]; then
+                  pod=$(kubectl get pods -n "${CONTROLLER_NS}" -l app=agent-sandbox-controller \
+                    --field-selector=status.phase=Running \
+                    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+                fi
+                if [ -z "${health}" ]; then
+                  # Discard partial stdout from failed proxy requests.
+                  metrics=""
+                  if [ -n "${pod}" ]; then
+                    metrics=$(kubectl get --raw "/api/v1/namespaces/${CONTROLLER_NS}/pods/${pod}:8080/proxy/metrics" \
+                      2>/dev/null) || metrics=""
+                  fi
+                  if printf '%s\n' "${metrics}" | awk '
+                    $1 ~ /^controller_runtime_reconcile_total[{].*[}]$/ &&
+                    $1 ~ /[,{]result="success"[,}]/ { successful += $2 }
+                    END { exit !(successful > 0) }
+                  '; then
+                    health=metrics
+                  fi
+                fi
+
+                if [ -n "${health}" ]; then
+                  recovered=0
+                  if [ "${restarted}" -eq 0 ]; then
+                    recovered=1
+                  elif [ -n "${pod}" ] && renewing_leader 0 "${pod}"; then
+                    recovered=1
+                  fi
+                  if [ "${recovered}" -eq 1 ]; then
+                    if [ "${health}" = startup ]; then
+                      echo "RESULT: PASS -- agent-sandbox-controller Available and informer caches synced ('Starting workers' observed)."
+                    else
+                      echo "RESULT: PASS -- agent-sandbox-controller informer caches synced (positive controller_runtime_reconcile_total result=success observed)."
+                    fi
+                    exit 0
+                  fi
+                fi
+                if [ "${restart_grew}" -eq 1 ]; then
+                  cause=restart
+                  echo "detected controller failure (restart count increased during preflight)."
+                  break
                 fi
 
                 sleep 5

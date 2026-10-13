@@ -2526,8 +2526,9 @@ fn render_pod_table(ui: &crate::ui::Ui, pods: &[PodRow]) {
 
 /// Summarise `kubectl get pods` output into (rows, ready count, steady-state
 /// total, names of pods not Running) WITHOUT printing, so the caller can render
-/// or serialize it (#485). Terminal and terminating pods stay in the rows but are
-/// excluded from the tally.
+/// or serialize it (#485). Terminal (`Succeeded`, `Failed`, `Completed`) and
+/// terminating pods stay in the rows but are excluded from the tally; a kubelet
+/// eviction leaves a `Failed` pod its ReplicaSet never deletes (#4496).
 fn collect_pod_summary(pods: &[serde_json::Value]) -> (Vec<PodRow>, usize, usize, Vec<String>) {
     let mut ready = 0usize;
     let mut total = 0usize;
@@ -2583,7 +2584,7 @@ fn collect_pod_summary(pods: &[serde_json::Value]) -> (Vec<PodRow>, usize, usize
             status: display_status.to_string(),
             mail_channel: None,
         });
-        if phase == "Succeeded" || reason == "Completed" || terminating {
+        if phase == "Succeeded" || phase == "Failed" || reason == "Completed" || terminating {
             continue;
         }
         total += 1;
@@ -6234,6 +6235,33 @@ mod tests {
         let items: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
         let (_, ready, total, unhealthy) = collect_pod_summary(&items);
         assert_eq!((ready, total, unhealthy), (10, 10, vec![]));
+    }
+
+    #[test]
+    fn pod_summary_lists_but_does_not_tally_evicted_failed_pods() {
+        // Node-pressure eviction leaves a Failed pod with reason Evicted:
+        // https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/
+        let json = r#"[
+            {"metadata":{"name":"api0"},"status":{"phase":"Running","containerStatuses":[{"ready":true,"restartCount":0}]}},
+            {"metadata":{"name":"langfuse-evicted"},"status":{"phase":"Failed","reason":"Evicted","containerStatuses":[{"ready":false,"restartCount":0}]}},
+            {"metadata":{"name":"langfuse-evicted-deleting","deletionTimestamp":"2026-10-12T14:56:00Z"},"status":{"phase":"Failed","reason":"Evicted","containerStatuses":[{"ready":false,"restartCount":0}]}}
+        ]"#;
+
+        let items: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
+        let (rows, ready, total, unhealthy) = collect_pod_summary(&items);
+        assert_eq!((ready, total, unhealthy), (1, 1, vec![]));
+        let listed: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|row| (row.name.as_str(), row.status.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("api0", "Running"),
+                ("langfuse-evicted", "Evicted"),
+                ("langfuse-evicted-deleting", "Terminating"),
+            ]
+        );
     }
 
     #[test]
