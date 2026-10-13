@@ -16,6 +16,7 @@ REPOSITORY = "curie-eng/curie"
 CI_RUN_ID = "7601"
 CI_RUN_URL = f"https://github.com/{REPOSITORY}/actions/runs/{CI_RUN_ID}"
 NIGHTLY_RUN_URL = f"https://github.com/{REPOSITORY}/actions/runs/9100"
+TRACKING_TITLE = "Nightly kind CI on next is failing"
 
 
 def _workflow() -> dict[str, Any]:
@@ -44,18 +45,45 @@ def github(tmp_path: Path) -> dict[str, str]:
 import json
 import os
 import sys
+from urllib.parse import parse_qs, urlsplit
 
 args = sys.argv[1:]
 with open(os.environ["TEST_GH_CALLS"], "a", encoding="utf-8") as calls:
     calls.write(json.dumps({"args": args, "repo": os.environ.get("GH_REPO")}) + "\\n")
 if args[:1] == ["api"]:
-    print(os.environ["TEST_DISPATCH_RESPONSE"])
-    sys.exit(int(os.environ.get("TEST_DISPATCH_EXIT", "0")))
+    endpoint = next((arg for arg in args if arg.startswith("repos/")), "")
+    url = urlsplit(endpoint)
+    query = parse_qs(url.query)
+    repo = os.environ["GH_REPO"]
+    if url.path == f"repos/{repo}/actions/workflows/ci.yaml/dispatches":
+        print(os.environ["TEST_DISPATCH_RESPONSE"])
+        sys.exit(int(os.environ.get("TEST_DISPATCH_EXIT", "0")))
+    if url.path == f"repos/{repo}/issues":
+        assert query == {"state": ["open"], "per_page": ["100"]}, query
+        prefix = "TEST_ISSUE_LIST"
+        pages = json.loads(os.environ["TEST_ISSUE_PAGES"])
+    elif url.path == f"repos/{repo}/actions/runs/7601/jobs":
+        assert query == {"filter": ["latest"], "per_page": ["100"]}, query
+        prefix = "TEST_JOBS"
+        pages = json.loads(os.environ["TEST_JOBS_PAGES"])
+    else:
+        raise SystemExit("Unexpected GitHub API endpoint: " + repr(endpoint))
+    if prefix + "_RESPONSE" in os.environ:
+        print(os.environ[prefix + "_RESPONSE"])
+    else:
+        selected = pages if "--paginate" in args else pages[:1]
+        if "--slurp" in args:
+            print(json.dumps(selected))
+        else:
+            for page in selected:
+                print(json.dumps(page))
+    sys.exit(int(os.environ.get(prefix + "_EXIT", "0")))
 if args[:2] == ["run", "watch"]:
     print(os.environ.get("TEST_WATCH_RESULT", "success"))
     sys.exit(int(os.environ.get("TEST_WATCH_EXIT", "0")))
-if args[:2] == ["issue", "create"]:
-    sys.exit(int(os.environ.get("TEST_ISSUE_EXIT", "0")))
+if args[:2] in (["issue", "create"], ["issue", "comment"], ["issue", "close"]):
+    sys.exit(int(os.environ.get("TEST_" + args[1].upper() + "_EXIT",
+                               os.environ.get("TEST_ISSUE_EXIT", "0"))))
 if args[:2] == ["workflow", "run"]:
     print("Dispatched without observing the result")
     sys.exit(0)
@@ -64,18 +92,22 @@ raise SystemExit("Unexpected GitHub command: " + repr(args))
         encoding="utf-8",
     )
     executable.chmod(0o755)
-    environment = {
-        key: value for key, value in os.environ.items() if key not in {"GH_REPO", "GH_TOKEN"}
-    }
     return {
-        **environment,
-        "PATH": f"{tmp_path}:{environment['PATH']}",
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
         "TEST_GH_CALLS": str(tmp_path / "calls.jsonl"),
         # GitHub documents these response fields when return_run_details is true:
         # https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event
         "TEST_DISPATCH_RESPONSE": json.dumps(
             {"workflow_run_id": int(CI_RUN_ID), "html_url": CI_RUN_URL}
         ),
+        # Repository issues include pull requests and identify authors with user.login:
+        # https://docs.github.com/en/rest/issues/issues#list-repository-issues
+        "TEST_ISSUE_PAGES": json.dumps([[]]),
+        # Jobs pages contain a jobs array, with conclusions on jobs and individual steps:
+        # https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run
+        # gh api --paginate --slurp wraps either kind of page in an outer array:
+        # https://cli.github.com/manual/gh_api
+        "TEST_JOBS_PAGES": json.dumps([{"total_count": 0, "jobs": []}]),
     }
 
 
@@ -286,6 +318,316 @@ def test_separate_report_job_can_report_timeout_or_cancellation(
     assert f"Verification result: {verify_result}" in body
 
 
+def test_report_failed_night_creates_the_tracking_issue_with_failed_jobs(
+    tmp_path: Path, github: dict[str, str]
+) -> None:
+    github["TEST_JOBS_PAGES"] = json.dumps(
+        [
+            {
+                "total_count": 3,
+                "jobs": [
+                    {
+                        "id": 101,
+                        "name": "Python",
+                        "conclusion": "failure",
+                        "steps": [
+                            {"name": "Checkout", "conclusion": "success"},
+                            {"name": "Validate contracts", "conclusion": "failure"},
+                            {"name": "Run tests", "conclusion": "cancelled"},
+                        ],
+                    },
+                    {"id": 102, "name": "Formatting", "conclusion": "success", "steps": []},
+                ],
+            },
+            {
+                "total_count": 3,
+                "jobs": [
+                    {
+                        "id": 103,
+                        "name": "Kind",
+                        "conclusion": "timed_out",
+                        "steps": [{"name": "Start cluster", "conclusion": "timed_out"}],
+                    }
+                ],
+            },
+        ]
+    )
+    report = _run_job(
+        "report",
+        tmp_path,
+        github,
+        needs_result="success",
+        needs_outputs={"run_id": CI_RUN_ID, "run_url": CI_RUN_URL},
+        verify_result="failure",
+    )
+    assert report.returncode == 0, report.log
+    arguments = _calls(github, ["issue", "create"])[0]["args"]
+    assert arguments[arguments.index("--title") + 1] == TRACKING_TITLE
+    body = _issue_body(github)
+    assert "Nightly kind CI on next did not succeed." in body
+    assert f"Nightly workflow: {NIGHTLY_RUN_URL}" in body
+    assert "Dispatch result: success" in body
+    assert "Verification result: failure" in body
+    assert f"Dispatched CI run: {CI_RUN_URL}" in body
+    assert "Failed jobs:" in body
+    assert "1. Python: Validate contracts, Run tests" in body
+    assert "2. Kind: Start cluster" in body
+    assert "Formatting" not in body
+    assert "Checkout" not in body
+    assert not _calls(github, ["issue", "comment"])
+    assert not _calls(github, ["issue", "close"])
+
+
+def test_report_failed_night_comments_on_the_open_tracking_issue(
+    tmp_path: Path, github: dict[str, str]
+) -> None:
+    github["TEST_ISSUE_PAGES"] = json.dumps(
+        [
+            [{"number": 23, "title": TRACKING_TITLE, "user": {"login": "github-actions[bot]"}}],
+            [
+                {"number": 4, "title": TRACKING_TITLE, "user": {"login": "github-actions[bot]"}},
+                {
+                    "number": 2,
+                    "title": TRACKING_TITLE,
+                    "user": {"login": "github-actions[bot]"},
+                    "pull_request": {"url": "https://api.github.com/repos/curie-eng/curie/pulls/2"},
+                },
+            ],
+        ]
+    )
+    report = _run_job(
+        "report",
+        tmp_path,
+        github,
+        needs_result="success",
+        needs_outputs={"run_id": CI_RUN_ID, "run_url": CI_RUN_URL},
+        verify_result="failure",
+    )
+    assert report.returncode == 0, report.log
+    comments = _calls(github, ["issue", "comment"])
+    assert len(comments) == 1
+    arguments = comments[0]["args"]
+    assert arguments[2] == "4"
+    assert arguments[arguments.index("--repo") + 1] == REPOSITORY
+    body = arguments[arguments.index("--body") + 1]
+    assert "Nightly kind CI on next did not succeed." in body
+    assert NIGHTLY_RUN_URL in body
+    assert CI_RUN_URL in body
+    assert not _calls(github, ["issue", "create"])
+    assert not _calls(github, ["issue", "close"])
+
+
+def test_report_ignores_same_title_issue_from_another_author(
+    tmp_path: Path, github: dict[str, str]
+) -> None:
+    github["TEST_ISSUE_PAGES"] = json.dumps(
+        [[{"number": 1, "title": TRACKING_TITLE, "user": {"login": "acme-user"}}]]
+    )
+    report = _run_job("report", tmp_path, github)
+    assert report.returncode == 0, report.log
+    arguments = _calls(github, ["issue", "create"])[0]["args"]
+    assert arguments[arguments.index("--title") + 1] == TRACKING_TITLE
+    assert NIGHTLY_RUN_URL in _issue_body(github)
+    assert not _calls(github, ["issue", "comment"])
+
+
+@pytest.mark.parametrize("title", [TRACKING_TITLE + " again", TRACKING_TITLE.lower()])
+def test_report_requires_an_exact_tracking_title(
+    tmp_path: Path, github: dict[str, str], title: str
+) -> None:
+    github["TEST_ISSUE_PAGES"] = json.dumps(
+        [[{"number": 1, "title": title, "user": {"login": "github-actions[bot]"}}]]
+    )
+    report = _run_job("report", tmp_path, github)
+    assert report.returncode == 0, report.log
+    assert NIGHTLY_RUN_URL in _issue_body(github)
+    assert not _calls(github, ["issue", "comment"])
+
+
+def test_report_green_night_closes_the_tracking_issue(
+    tmp_path: Path, github: dict[str, str]
+) -> None:
+    github["TEST_ISSUE_PAGES"] = json.dumps(
+        [[], [{"number": 8, "title": TRACKING_TITLE, "user": {"login": "github-actions[bot]"}}]]
+    )
+    report = _run_job(
+        "report",
+        tmp_path,
+        github,
+        needs_result="success",
+        needs_outputs={"run_id": CI_RUN_ID, "run_url": CI_RUN_URL},
+        verify_result="success",
+    )
+    assert report.returncode == 0, report.log
+    writes = _calls(github, ["issue"])
+    assert [call["args"][:3] for call in writes] == [
+        ["issue", "comment", "8"],
+        ["issue", "close", "8"],
+    ]
+    for call in writes:
+        arguments = call["args"]
+        assert arguments[arguments.index("--repo") + 1] == REPOSITORY
+    comment_arguments = writes[0]["args"]
+    body = comment_arguments[comment_arguments.index("--body") + 1]
+    assert "Nightly kind CI on next passed." in body
+    assert f"Nightly workflow: {NIGHTLY_RUN_URL}" in body
+    assert f"Dispatched CI run: {CI_RUN_URL}" in body
+    close_arguments = writes[1]["args"]
+    assert close_arguments[close_arguments.index("--reason") + 1] == "completed"
+    assert len(_calls(github, ["api"])) == 1
+
+
+def test_report_green_night_without_issue_writes_nothing(
+    tmp_path: Path, github: dict[str, str]
+) -> None:
+    report = _run_job(
+        "report",
+        tmp_path,
+        github,
+        needs_result="success",
+        needs_outputs={"run_id": CI_RUN_ID, "run_url": CI_RUN_URL},
+        verify_result="success",
+    )
+    assert report.returncode == 0, report.log
+    assert not _calls(github, ["issue"])
+    assert len(_calls(github, ["api"])) == 1
+
+
+def test_report_dispatch_failure_has_no_job_list(tmp_path: Path, github: dict[str, str]) -> None:
+    report = _run_job("report", tmp_path, github)
+    assert report.returncode == 0, report.log
+    body = _issue_body(github)
+    assert NIGHTLY_RUN_URL in body
+    assert "Dispatch result: failure" in body
+    assert "Verification result: skipped" in body
+    assert (
+        "No CI run was confirmed. "
+        "Inspect the nightly workflow logs for the dispatch failure." in body
+    )
+    assert "Failed jobs:" not in body
+    assert CI_RUN_URL not in body
+    assert len(_calls(github, ["api"])) == 1
+
+
+@pytest.mark.parametrize(
+    "failure", [{"TEST_JOBS_EXIT": "7"}, {"TEST_JOBS_RESPONSE": "not JSON"}]
+)
+def test_report_jobs_listing_failure_still_reports(
+    tmp_path: Path, github: dict[str, str], failure: dict[str, str]
+) -> None:
+    github.update(failure)
+    report = _run_job(
+        "report",
+        tmp_path,
+        github,
+        needs_result="success",
+        needs_outputs={"run_id": CI_RUN_ID, "run_url": CI_RUN_URL},
+        verify_result="failure",
+    )
+    assert report.returncode == 0, report.log
+    body = _issue_body(github)
+    assert NIGHTLY_RUN_URL in body
+    assert CI_RUN_URL in body
+    assert "Failed jobs: could not be listed" in body
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "timed_out", "cancelled"])
+def test_report_failed_job_without_failed_steps_records_its_conclusion(
+    tmp_path: Path, github: dict[str, str], conclusion: str
+) -> None:
+    github["TEST_JOBS_PAGES"] = json.dumps(
+        [
+            {
+                "total_count": 1,
+                "jobs": [
+                    {
+                        "id": 101,
+                        "name": "Build",
+                        "conclusion": conclusion,
+                        "steps": [
+                            {"name": "Checkout", "conclusion": "success"},
+                            {"name": "Upload logs", "conclusion": "skipped"},
+                        ],
+                    }
+                ],
+            }
+        ]
+    )
+    report = _run_job(
+        "report",
+        tmp_path,
+        github,
+        needs_result="success",
+        needs_outputs={"run_id": CI_RUN_ID, "run_url": CI_RUN_URL},
+        verify_result="failure",
+    )
+    assert report.returncode == 0, report.log
+    body = _issue_body(github)
+    assert f"1. Build: no failed step recorded ({conclusion})" in body
+    assert "Checkout" not in body
+    assert "Upload logs" not in body
+
+
+@pytest.mark.parametrize("conclusion", ["success", "neutral", "skipped", "action_required", None])
+def test_report_omits_jobs_without_a_failure_conclusion(
+    tmp_path: Path, github: dict[str, str], conclusion: str | None
+) -> None:
+    github["TEST_JOBS_PAGES"] = json.dumps(
+        [{"total_count": 1, "jobs": [{"id": 101, "name": "Build", "conclusion": conclusion}]}]
+    )
+    report = _run_job(
+        "report",
+        tmp_path,
+        github,
+        needs_result="success",
+        needs_outputs={"run_id": CI_RUN_ID, "run_url": CI_RUN_URL},
+        verify_result="failure",
+    )
+    assert report.returncode == 0, report.log
+    body = _issue_body(github)
+    assert "Failed jobs:" in body
+    assert "Build" not in body
+    assert "could not be listed" not in body
+
+
+@pytest.mark.parametrize(
+    "failure", [{"TEST_ISSUE_LIST_EXIT": "7"}, {"TEST_ISSUE_LIST_RESPONSE": "not JSON"}]
+)
+def test_report_issue_listing_failure_makes_no_issue_write(
+    tmp_path: Path, github: dict[str, str], failure: dict[str, str]
+) -> None:
+    github.update(failure)
+    report = _run_job("report", tmp_path, github)
+    assert report.returncode != 0, report.log
+    assert not _calls(github, ["issue"])
+
+
+@pytest.mark.parametrize(
+    "operation,green",
+    [("create", False), ("comment", False), ("comment", True), ("close", True)],
+)
+def test_report_issue_write_failure_fails_the_job(
+    tmp_path: Path, github: dict[str, str], operation: str, green: bool
+) -> None:
+    github[f"TEST_{operation.upper()}_EXIT"] = "9"
+    if operation != "create":
+        github["TEST_ISSUE_PAGES"] = json.dumps(
+            [[{"number": 8, "title": TRACKING_TITLE, "user": {"login": "github-actions[bot]"}}]]
+        )
+    report = _run_job(
+        "report",
+        tmp_path,
+        github,
+        needs_result="success",
+        needs_outputs={"run_id": CI_RUN_ID, "run_url": CI_RUN_URL},
+        verify_result="success" if green else "failure",
+    )
+    assert report.returncode != 0, report.log
+    writes = _calls(github, ["issue"])
+    assert writes[-1]["args"][:2] == ["issue", operation]
+    assert len(writes) == (2 if operation == "close" else 1)
+
+
 def test_reporting_is_independent_bounded_and_cannot_swallow_dispatch_failure() -> None:
     workflow = _workflow()
     dispatch = workflow["jobs"]["dispatch"]
@@ -293,11 +635,12 @@ def test_reporting_is_independent_bounded_and_cannot_swallow_dispatch_failure() 
     report = workflow["jobs"]["report"]
     assert verify["needs"] == "dispatch"
     assert set(report["needs"]) == {"dispatch", "verify"}
-    assert "always()" in report["if"]
-    assert "needs.dispatch.result != 'success'" in report["if"]
-    assert "needs.verify.result != 'success'" in report["if"]
+    assert report["if"] == "${{ always() }}"
+    assert report["name"] == "Report nightly kind CI result"
     assert (workflow.get("permissions") or {}).get("issues") != "write"
-    assert report["permissions"]["issues"] == "write"
+    assert report["permissions"] == {"issues": "write", "actions": "read"}
+    assert report["timeout-minutes"] == "5"
+    assert report["steps"][0]["run"].startswith("python3 - <<'PY'\n")
     assert dispatch["permissions"].get("issues") != "write"
     assert verify["permissions"].get("issues") != "write"
     assert sum(int(job["timeout-minutes"]) for job in (dispatch, verify, report)) < 24 * 60
