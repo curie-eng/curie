@@ -619,7 +619,17 @@ DRIVER_METHODS = (
     "judge_tracker",
     "teardowns",
 )
-NOT_INSTALLED_FORGES = ("gitlab",)
+# Every forge entry in forges/ is installed since GitLab's driver landed (#4399);
+# the not-installed path is pinned on a reserved entry registered by the test.
+RESERVED_FORGE = "reservedforge"
+
+
+def _with_reserved_forge(monkeypatch: pytest.MonkeyPatch) -> None:
+    fe.load_forge_entries()
+    entry = fe.ForgeEntry(
+        name=RESERVED_FORGE, driver=fe.not_installed_driver(RESERVED_FORGE), installed=False
+    )
+    monkeypatch.setattr(fe, "FORGES", {**fe.FORGES, RESERVED_FORGE: entry})
 
 
 def test_base_defines_the_driver_protocol_without_importing_the_harness(
@@ -693,9 +703,9 @@ def test_the_jira_driver_implements_every_protocol_method() -> None:
 # --- forge registry --------------------------------------------------------------
 
 
-def test_forge_entries_register_github_installed_and_the_rest_not_installed() -> None:
+def test_forge_entries_register_github_jira_and_gitlab_installed() -> None:
     loaded = fe.load_forge_entries()
-    for name in ("github", "jira_cloud", *NOT_INSTALLED_FORGES):
+    for name in ("github", "jira_cloud", "gitlab"):
         assert name in loaded, name
         assert fe.FORGES[name].name == name
     assert fe.FORGES["github"].installed is True
@@ -704,15 +714,18 @@ def test_forge_entries_register_github_installed_and_the_rest_not_installed() ->
     assert fe.FORGES["jira_cloud"].installed is True
     jira = sys.modules["factory_e2e_forges.jira_cloud"]
     assert fe.FORGES["jira_cloud"].setup is jira.install_jira
-    for name in NOT_INSTALLED_FORGES:
-        assert fe.FORGES[name].installed is False, name
+    gitlab = sys.modules["factory_e2e_forges.gitlab"]
+    assert fe.FORGES["gitlab"].installed is True
+    assert fe.FORGES["gitlab"].setup is gitlab.install_gitlab
+    assert not [name for name, entry in fe.FORGES.items() if not entry.installed]
 
 
-@pytest.mark.parametrize("name", NOT_INSTALLED_FORGES)
-def test_a_not_installed_driver_raises_not_installed(name: str, tmp_path: Path) -> None:
-    fe.load_forge_entries()
+def test_a_not_installed_driver_raises_not_installed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _with_reserved_forge(monkeypatch)
     with pytest.raises(Exception, match="not installed") as raised:
-        fe.FORGES[name].driver(_preflight(tmp_path))
+        fe.FORGES[RESERVED_FORGE].driver(_preflight(tmp_path))
     assert type(raised.value).__name__ == "ForgeNotInstalled"
 
 
@@ -1086,11 +1099,11 @@ def test_forge_loop_needs_a_model_key(tmp_path: Path, monkeypatch: pytest.Monkey
     assert constructed == []
 
 
-@pytest.mark.parametrize("name", NOT_INSTALLED_FORGES)
 def test_a_not_installed_forge_is_refused_before_any_install(
-    name: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    fe.load_forge_entries()
+    _with_reserved_forge(monkeypatch)
+    name = RESERVED_FORGE
 
     def no_config(*_a: Any, **_k: Any) -> Any:
         raise AssertionError("load_config must not run for a forge that is not installed")
