@@ -868,6 +868,38 @@ class GitLabDriver:
         ok(status, (201,), "creating the parking branch")
         status, _ = self._json(self.admin, "PUT", base, {"default_branch": park})
         ok(status, (200,), "parking the default branch")
+        failure: fe.PreflightFailed | None = None
+        try:
+            self._recreate_default(base, name, ref, ok)
+        except fe.PreflightFailed as exc:
+            failure = exc
+        # Always move the default back off the parking branch: left parked, the
+        # reset step cannot delete it (GitLab refuses to delete HEAD, HTTP 400).
+        status, _ = self._json(self.admin, "PUT", base, {"default_branch": name})
+        park_status = 0
+        if status == 200:
+            park_status, _ = self._json(
+                self.admin,
+                "DELETE",
+                f"{base}/repository/branches/{urllib.parse.quote(park, safe='')}",
+            )
+        if failure is not None:
+            raise failure
+        ok(status, (200,), "moving the default branch back")
+        ok(park_status, (204,), "deleting the parking branch")
+        return {"restored": self.default_branch_head() == self._base_sha, "moved": True}
+
+    def _recreate_default(
+        self, base: str, name: str, ref: str, ok: Callable[[int, tuple[int, ...], str], None]
+    ) -> None:
+        """Recreate the default branch at the pinned commit with its protection.
+
+        GitLab keeps a default branch's protection rule after a 204 to its
+        DELETE, and protects the recreated branch again on its own, so posting
+        the rule answers 409 "already exists". That is success when the rule
+        GitLab kept grants what the original did (observed on the fixture).
+        """
+
         status, protection = self._json(self.admin, "GET", f"{base}/protected_branches/{ref}")
         protected = status == 200 and isinstance(protection, dict)
         if protected:
@@ -882,29 +914,30 @@ class GitLabDriver:
             {"branch": name, "ref": self._base_sha},
         )
         ok(status, (201,), "recreating the default branch")
-        if protected:
-            assert isinstance(protection, dict)
-            status, _ = self._json(
-                self.admin,
-                "POST",
-                f"{base}/protected_branches",
-                {
-                    "name": name,
-                    "push_access_level": _max_level(protection.get("push_access_levels")),
-                    "merge_access_level": _max_level(protection.get("merge_access_levels")),
-                    "allow_force_push": bool(protection.get("allow_force_push")),
-                },
-            )
-            ok(status, (201,), "protecting the default branch again")
-        status, _ = self._json(self.admin, "PUT", base, {"default_branch": name})
-        ok(status, (200,), "moving the default branch back")
+        if not protected:
+            return
+        assert isinstance(protection, dict)
+        wanted = _protection_levels(protection)
         status, _ = self._json(
             self.admin,
-            "DELETE",
-            f"{base}/repository/branches/{urllib.parse.quote(park, safe='')}",
+            "POST",
+            f"{base}/protected_branches",
+            {
+                "name": name,
+                "push_access_level": wanted[0],
+                "merge_access_level": wanted[1],
+                "allow_force_push": wanted[2],
+            },
         )
-        ok(status, (204,), "deleting the parking branch")
-        return {"restored": self.default_branch_head() == self._base_sha, "moved": True}
+        if status == 409:
+            status, kept = self._json(self.admin, "GET", f"{base}/protected_branches/{ref}")
+            if status == 200 and isinstance(kept, dict) and _protection_levels(kept) == wanted:
+                return
+            raise fe.PreflightFailed(
+                "restoring the default branch: the protection GitLab kept differs from the "
+                f"original (HTTP {status})"
+            )
+        ok(status, (201,), "protecting the default branch again")
 
     def teardowns(self) -> tuple[tuple[str, Callable[[], Any]], ...]:
         # "reset fixture repository" closes every issue and merge request the run opened.
@@ -1000,6 +1033,16 @@ class GitLabDriver:
         return failures
 
 
+def _protection_levels(rule: Mapping[str, Any]) -> tuple[int, int, bool]:
+    """A protected branch rule's push level, merge level and force push flag."""
+
+    return (
+        _max_level(rule.get("push_access_levels")),
+        _max_level(rule.get("merge_access_levels")),
+        bool(rule.get("allow_force_push")),
+    )
+
+
 def _max_level(levels: Any) -> int:
     """The highest access level a protected branch rule grants, Maintainer when unset."""
 
@@ -1093,6 +1136,75 @@ def install_gitlab(p: fe.Preflight) -> None:
         raise fe.PreflightFailed(f"curie factory quickstart --code-host gitlab failed: {tail}")
     p.evidence["gitlab"] = {"project": driver.project_path, "target": driver.target}
     p.step("factory agent bound to the GitLab project", agent=fe.FACTORY_AGENT)
+    if driver.target == "fixture":
+        _allow_fixture_bridge(p, driver.state)
+
+
+def fixture_bridge_egress(
+    values: Mapping[str, Any], subnets: Sequence[str], port: int
+) -> dict[str, Any]:
+    """The factory values that also admit the fixture's Docker bridge subnets.
+
+    The quickstart derives the GitLab egress entry from the advertised host.
+    When the fixture runs on the Kubernetes node itself, Docker's DNAT rewrites
+    a pod's connection to the container's bridge address before the
+    NetworkPolicy decides, so the publication push is refused unless the
+    bridge subnet on the fixture port is allowed too. Only the e2e fixture is
+    shaped like this; a real GitLab is never co-located with a node's Docker.
+    """
+
+    factory = values.get("factory")
+    if not isinstance(factory, Mapping):
+        raise fe.PreflightFailed("the release has no factory values after the quickstart")
+    extra = [{"cidr": s, "ports": [{"protocol": "TCP", "port": port}]} for s in subnets]
+    out: dict[str, Any] = {}
+    for key in ("codeHosts", "trackers"):
+        entries = factory.get(key) or []
+        updated = []
+        for entry in entries:
+            entry = dict(entry)
+            if entry.get("kind") == "gitlab":
+                egress = list(entry.get("egress") or [])
+                if not egress:
+                    raise fe.PreflightFailed(f"factory.{key} gitlab entry has no egress")
+                entry["egress"] = egress + [e for e in extra if e not in egress]
+            updated.append(entry)
+        out[key] = updated
+    if not any(e.get("kind") == "gitlab" for e in out["codeHosts"]):
+        raise fe.PreflightFailed("the quickstart wrote no gitlab code host")
+    return {"factory": out}
+
+
+def _allow_fixture_bridge(p: fe.Preflight, state: Mapping[str, Any]) -> None:
+    subnets = state.get("docker_subnets")
+    if not isinstance(subnets, list) or not subnets:
+        raise fe.ConfigError("the fixture state names no docker_subnets; bring it up again")
+    assert p.chart_dir is not None, "install() extracts the chart first"
+    context = p.config.kube_context
+    raw = fe.run(
+        ["helm", "--kube-context", context, "get", "values", fe.RELEASE, "-n", p.namespace]
+        + ["-o", "json"]
+    )
+    values = fixture_bridge_egress(json.loads(raw), subnets, int(state["port"]))
+    values_file = p.workdir / "gitlab-fixture-egress.json"
+    fd = os.open(str(values_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump(values, handle)
+    fe.run(
+        fe.helm_upgrade_command(
+            context=context,
+            release=fe.RELEASE,
+            chart=str(p.chart_dir),
+            namespace=p.namespace,
+            values_file=str(values_file),
+            timeout="20m",
+        )
+    )
+    for kind in ("deployment", "statefulset"):
+        for workload in p.kubectl("-n", p.namespace, "get", kind, "-o", "name").split():
+            p.kubectl("-n", p.namespace, "rollout", "status", workload, "--timeout=15m")
+    p.ensure_api()
+    p.step("fixture bridge subnets allowed for the GitLab code host", subnets=len(subnets))
 
 
 def _driver(p: fe.Preflight) -> GitLabDriver:

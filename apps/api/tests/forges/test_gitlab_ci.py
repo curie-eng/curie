@@ -268,6 +268,44 @@ async def test_an_unreadable_trace_is_log_unavailable(fake: GitLabAPI) -> None:
 
 
 @pytest.mark.anyio
+async def test_a_failing_external_status_reports_its_description(fake: GitLabAPI) -> None:
+    # Parity with the GitHub adapter's commit statuses: an external gate says
+    # what it wants only in its description, so dropping it left the factory
+    # with no CI findings and a metadata-only republish (live #4399 run).
+    _, head = _head(fake)
+    said = f"Add a CHANGELOG.md line. GITLAB_TOKEN={TOKEN_SHAPED}"
+    gate = fake.add_status(head, "loop-gate", "failed", description=said)
+    quiet = fake.add_status(head, "other-gate", "failed")
+    fake.add_status(head, "passing-gate", "success", description="fine")
+
+    report = await gitlab_code_host(fake).ci_diagnostics(fake.repository(), head, base_ref=None)
+
+    assert report.rollup.state is RollupState.FAILURE
+    by_id = {d.check_id: d for d in report.diagnostics}
+    assert set(by_id) == {str(gate), str(quiet)}
+    loud = by_id[str(gate)]
+    assert loud.summary == redact_text(said) and loud.excerpt == redact_text(said)
+    assert "CHANGELOG.md" in loud.excerpt and TOKEN_SHAPED not in loud.excerpt
+    assert (loud.log, loud.log_unavailable) == (None, False)
+    assert (by_id[str(quiet)].summary, by_id[str(quiet)].excerpt) == (None, "")
+
+
+@pytest.mark.anyio
+async def test_an_unreadable_status_listing_still_reports_the_failing_status(
+    fake: GitLabAPI,
+) -> None:
+    _, head = _head(fake)
+    gate = fake.add_status(head, "loop-gate", "failed", description="Add a line.")
+    ci = gitlab_code_host(fake)._ci(fake.repository())
+    rollup = await ci.observe(head)
+    fake.script(500, path=f"{PROJECT}/repository/commits/{head}/statuses")
+
+    (diagnostic,) = await ci.diagnostics(rollup)
+
+    assert (diagnostic.check_id, diagnostic.summary, diagnostic.excerpt) == (str(gate), None, "")
+
+
+@pytest.mark.anyio
 async def test_a_head_failure_reads_the_base_branchs_checks(fake: GitLabAPI) -> None:
     base = fake.branches["main"]
     fake.report_job(base, "unit", "failed")

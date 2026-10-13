@@ -103,6 +103,7 @@ have mode 0600. The state directory must not be inside a git repository.
   "ca_path": "<dir>/ca.crt",
   "advertise_host": "<host>",
   "port": 28443,
+  "docker_subnets": ["172.18.0.0/24"],
   "version": "19.4.1",
   "server_version": "<GET /version>",
   "root_token_file": "<dir>/token-root",
@@ -126,6 +127,12 @@ have mode 0600. The state directory must not be inside a git repository.
   "runner": {"id": 0}
 }
 ```
+
+`docker_subnets` lists the IPv4 subnets of the project's compose network. A
+pod on the Docker host's own Kubernetes node reaches the published port through
+Docker's DNAT, so its NetworkPolicy sees the container's bridge address rather
+than the advertised host. The factory-e2e GitLab install adds these subnets on
+the fixture port to the GitLab code host and tracker egress for that reason.
 
 The root token (scopes `api`, `sudo`, `admin_mode`, `read_api`,
 `write_repository`) expires after 4 days. Read tokens from their files; they
