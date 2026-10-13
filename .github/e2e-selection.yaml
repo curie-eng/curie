@@ -1,5 +1,23 @@
 version: 1
 fallback: [skill, local, local-release, cluster]
+conditional_pytest_files:
+  examples/tests/test_sre_bot_observability_runtime.py:
+    - examples/sre-bot
+    - examples/tests/test_sre_bot_observability_runtime.py
+    - runner
+    - packages/aci-protocol
+    - packages/plugin-format
+    - packages/telemetry
+    - packages/telemetry-schema
+    - otel/collector-config.yaml
+    - charts/curie/values.yaml
+    - uv.lock
+    - pyproject.toml
+    - conftest.py
+    - cli/scripts/configure-docker-hub-mirror.sh
+    - .github/workflows/ci.yaml
+    - .github/e2e-selection.yaml
+    - tools/e2e-ci-selection
 chart_scenarios:
   job: e2e-cluster-chart-regressions
   shared_inputs:

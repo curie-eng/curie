@@ -18,7 +18,7 @@ Targets, see the target comparison table in the
 |---|---|
 | `kubectl` and `helm` on PATH | Every `cluster` verb wraps one or both of them. |
 | A reachable cluster | Every verb talks to the cluster's Kubernetes API server directly -- there's nothing to install onto or inspect without one. The chart's own preflights additionally need the `agents.x-k8s.io` Agent Sandbox CRDs (Custom Resource Definitions) installable and a NetworkPolicy-enforcing CNI (Container Network Interface) already present; see `charts/curie/README.md`. |
-| `runsc` (gVisor) on every node for full kernel isolation | A real model first installs with gVisor enabled. If admission reports exactly that the `gvisor` RuntimeClass is absent, plain `cluster up` shows that attempt as retrying, applies `security.gvisor.mode=off`, and retries once. A present RuntimeClass whose nodeSelector matches no node also infers `security.gvisor.mode=off` before the first install; explicit `auto` is an error, while explicit `require` keeps the preflight gate for clusters that provision sandbox nodes on demand. Other preflight failures remain closed. Fake model installs do not need it. |
+| `runsc` (gVisor) on every node for full kernel isolation | A real model first installs with gVisor enabled. If admission reports exactly that the `gvisor` RuntimeClass is absent, plain `cluster up` shows that attempt as retrying, applies `security.gvisor.mode=off`, and retries once. A present RuntimeClass whose nodeSelector matches no node also infers `security.gvisor.mode=off` before the first install, including fake-model auto installs with the preflight enabled; explicit `auto` is an error, while explicit `require` keeps the preflight gate for clusters that provision sandbox nodes on demand. Other preflight failures remain closed. Fake model installs do not need it. |
 
 **For testing**, pick between **k3s**, **kind**, and **minikube** based on
 your host and how disposable the cluster needs to be. A single-node **k3s**
@@ -632,7 +632,11 @@ revision and version, and the rollback command. With `--take-over`, an orphaned
 before the CLI reads retained snapshots or resumes the lifecycle. A failed
 rollback fails the command and releases ownership without changing the durable
 record. `pending-install`, `pending-rollback`, and a pending history with no
-deployed revision refuse without automated recovery.
+deployed revision refuse without automated recovery. When the newest row is
+`pending-rollback` with a parsable `Rollback to <N>` description, the refusal
+adds ``it is an interrupted rollback to revision <N>; run curie cluster rollback
+--yes to finish it, or run `helm rollback <release> <serving-revision> -n
+<namespace> --wait --timeout 15m`, then rerun cluster upgrade``.
 
 The conditional manual patch remains a fallback. After verifying that the
 holder and Helm action have stopped and no release hook Job is running, recover
@@ -710,9 +714,26 @@ curie cluster rollback
 
 `curie cluster rollback` selects the newest `deployed` revision as the serving
 revision. When the newest history row is above it and is not `deployed` or
-`superseded`, the rollback targets the serving revision. For example, deployed
+`superseded` (except `pending-rollback`, below), the rollback targets the serving revision. For example, deployed
 revision 4 followed by pending revision 5 rolls back to revision 4, clearing
 the unfinished upgrade while retaining known good state.
+
+When the newest row is `pending-rollback`, its description `Rollback to <N>`
+is read. If revision N is in history below the pending row, is `deployed` or
+`superseded`, and has the same chart as the pending row, the command finishes
+the interrupted rollback toward N. For example, superseded 9, deployed 10, and
+pending-rollback 11 described `Rollback to 9` resumes to revision 9. The dry run
+prints `revision 11 is an interrupted rollback to revision 9; resuming it`, the
+same note appears before the prompt, and `--json` reports
+`resumed_interrupted_rollback: true` (`false` otherwise). If N cannot be
+confirmed, the command exits 1 with `revision 11 is an interrupted rollback
+whose target cannot be confirmed`, naming `curie cluster rollback --revision <N>
+--yes` to finish it and `curie cluster rollback --revision <serving> --yes` to
+restore the serving revision; the first choice is omitted when N does not parse
+or is not in history. Any other ineligible newest status (`pending-install`,
+`pending-upgrade`, `failed`, `unknown`, `uninstalling`, `uninstalled`) still
+restores the serving revision. `--revision` and `--allow-failed-revision` are
+unchanged, and the schema gate still applies to N.
 
 Otherwise, it selects the newest `deployed` or `superseded` revision below
 the serving revision. If no revision is deployed, it selects below the highest
@@ -1376,7 +1397,8 @@ A last `Cause:` line names the platform cause code
 (`capacity_wait_expired`, `start_failed`, `execution_deadline`, `issue_cancelled`,
 `owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
 `no_pull_request`,
-`early_stop`, `publication_denied`, `publication_expired`, `publication_failed`, or a
+`early_stop`, `publication_denied`, `publication_expired`, `publication_failed`,
+`publication_unrecorded`, or a
 classified run failure: `model_credit_exhausted`, `model_usage_limited`,
 `model_credential_rejected`, `model_rate_limited`, `model_error`, `model_unreachable`, `budget_exceeded`, `runner_timeout`,
 `sandbox_terminated`, `workspace_error`, or `history_capacity`). A sandbox
@@ -1389,7 +1411,8 @@ Other escalations use that same first line with their own token
 (`delivery-deadline`, `prior-side-effect`, `approval-route-unbound`,
 `approval-approvers-unverifiable`, `approval-no-email-approvers`, `approval-backend-missing`,
 `publication-unavailable`, or `approval-create-failed`). A failed run whose cause is `runner_escalated`,
-`sandbox_terminated`, `unclassified`, `max_turns`, or `ci_failed` still shows as needing a person.
+`sandbox_terminated`, `publication_unrecorded`, `unclassified`, `max_turns`, or `ci_failed`
+still shows as needing a person.
 A history capacity result tells the
 operator to inspect work already done and retry. A model provider that answers
 HTTP 402 or reports exhausted

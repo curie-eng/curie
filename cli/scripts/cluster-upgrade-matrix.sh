@@ -59,6 +59,7 @@ APPLY_KILL_PID=""
 APPLY_KILL_PIDS=()
 APPLY_KILL_HELM_SEEN=0
 ROLLBACK_SERVING_HELM_PID=""
+ROLLBACK_INTERRUPTED_HELM_PID=""
 RETIRE_RUNNER_ORIGINAL_ID=""
 RETIRE_RUNNER_DERIVED_TAG=""
 RETIRE_LAYER_TAG=""
@@ -93,6 +94,7 @@ SCENARIOS_ALL=(
     previous-serves
     apply-kill-takeover
     rollback-to-serving
+    rollback-interrupted
     runner-layer-retire
     hook-fail-not-serving
     terminal-pods
@@ -132,6 +134,7 @@ s16 setup apply-kill-takeover
 s17 setup rollback-to-serving
 s18 setup hook-fail-not-serving
 s19 setup terminal-pods
+s20 setup rollback-interrupted
 s21 setup rollback-uncatalogued"
 SHARDS="${CURIE_E2E_SHARDS_OVERRIDE:-$SHARDS_CANONICAL}"
 
@@ -144,7 +147,7 @@ die() {
 
 usage() {
     cat <<'EOF' >&2
-usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves|apply-kill-takeover|rollback-to-serving|runner-layer-retire|hook-fail-not-serving|terminal-pods|rollback-uncatalogued] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
+usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves|apply-kill-takeover|rollback-to-serving|rollback-interrupted|runner-layer-retire|hook-fail-not-serving|terminal-pods|rollback-uncatalogued] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
 EOF
 }
 
@@ -319,7 +322,7 @@ run_self_test() {
     fi
     if valid_scenario "all" && valid_scenario "fresh-n" && valid_scenario "fail-every-phase" \
         && valid_scenario "runner-layer-retire" && valid_scenario "hook-fail-not-serving" \
-        && valid_scenario "terminal-pods" && ! valid_scenario "not-a-scenario"; then
+        && valid_scenario "rollback-interrupted" && valid_scenario "terminal-pods" && ! valid_scenario "not-a-scenario"; then
         log "unknown scenario refused"
     else
         log "self-test: scenario helper is wrong"
@@ -482,6 +485,23 @@ run_self_test() {
         log "self-test: rollback-to-serving must leave the pending revision for the CLI without recovery helpers"
         failed=1
     fi
+    if declare -F run_rollback_interrupted >/dev/null 2>&1 \
+        && awk '/^run_rollback_interrupted\(\)/,/^}/' "$script_path" | awk '
+            /settle_helm_operation|recover_helm_lock|recover_killed_upgrade_ownership/ { forbidden=1 }
+            /^[[:space:]]*helm --kubeconfig .* rollback "\$RELEASE"/ { inbg=1; waits=0 }
+            inbg && /--wait/ { waits=1 }
+            inbg && /&[[:space:]]*$/ { bg=waits; inbg=0 }
+            /ROLLBACK_INTERRUPTED_HELM_PID=\$!/ { if (bg) pid=1 }
+            /kill -9 "\$ROLLBACK_INTERRUPTED_HELM_PID"/ { if (pid) killed=1 }
+            /"\$BIN" --json cluster rollback/ { if (killed) cli=1 }
+            killed && !cli && /(^|[^[:alnum:]_-])helm(_ns)? / && !/ history / { recovered=1 }
+            END { exit (bg && pid && killed && cli && !forbidden && !recovered) ? 0 : 1 }
+        '; then
+        log "rollback-interrupted kills a direct background helm rollback and leaves it for the CLI"
+    else
+        log "self-test: rollback-interrupted must start helm rollback --wait directly in the background, kill -9 it, and call the CLI without recovering the pending revision"
+        failed=1
+    fi
     if awk '/^run_rollback_uncatalogued\(\)/,/^}/' "$script_path" | awk '
         /cluster rollback --dry-run/ { dry=1 }
         /cluster rollback --yes/ { if (dry) real=1 }
@@ -605,6 +625,13 @@ run_self_test() {
         log "terminal-pods asserts healthy status with terminal pods, a succeeded upgrade, and the surplus refusal"
     else
         log "self-test: terminal-pods must assert healthy status with Succeeded and Failed bare pods, a succeeded 0.10.1 upgrade, then exit 1 naming the surplus for a running bare pod"
+        failed=1
+    fi
+    if [[ "$(shard_manifest lookup "$SHARDS_CANONICAL" s20)" == $'setup\nrollback-interrupted' ]] \
+        && [[ "$(scenario_fn rollback-interrupted)" == run_rollback_interrupted ]]; then
+        log "rollback-interrupted runs in setup shard s20"
+    else
+        log "self-test: rollback-interrupted must run in setup shard s20"
         failed=1
     fi
     local mutated label
@@ -1312,6 +1339,11 @@ cleanup() {
         kill -9 "$ROLLBACK_SERVING_HELM_PID" 2>/dev/null || true
         wait "$ROLLBACK_SERVING_HELM_PID" 2>/dev/null || true
         ROLLBACK_SERVING_HELM_PID=""
+    fi
+    if [[ -n "$ROLLBACK_INTERRUPTED_HELM_PID" ]]; then
+        kill -9 "$ROLLBACK_INTERRUPTED_HELM_PID" 2>/dev/null || true
+        wait "$ROLLBACK_INTERRUPTED_HELM_PID" 2>/dev/null || true
+        ROLLBACK_INTERRUPTED_HELM_PID=""
     fi
     if [[ -n "$CURRENT_LABEL" ]]; then
         record_timing_row "$CURRENT_LABEL" "$CURRENT_NAME" "$CURRENT_PHASES" failed $((SECONDS - CURRENT_STARTED))
@@ -2877,6 +2909,170 @@ if int(json.load(sys.stdin).get("status", {}).get("readyReplicas", 0)) < 1:
     log "rollback-to-serving restored revision $serving at $V over pending revision $pending; API is Ready and healthy"
 }
 
+# Prints the API Deployment's LOG_LEVEL env value, the pod template field the
+# rollback-interrupted scenario changes between revisions A and B.
+rollback_interrupted_api_log_level() {
+    kubectl_ns get deploy "$(fullname)-api" -o json | python3 -c '
+import json, sys
+spec = json.load(sys.stdin)["spec"]["template"]["spec"]
+values = [e.get("value", "") for c in spec.get("containers", []) for e in c.get("env", []) if e.get("name") == "LOG_LEVEL"]
+if not values:
+    raise SystemExit("API Deployment has no LOG_LEVEL env")
+print(values[0])
+'
+}
+
+run_rollback_interrupted() {
+    local V CHART_V target newer pending="" status=0 level_a level_b level_after
+    V="$(awk '$1 == "version:" { print $2; exit }' "$REPO_ROOT/charts/curie/Chart.yaml")"
+    [[ -n "$V" ]] || die "rollback-interrupted could not read the checkout chart version"
+    # The checkout version admits the live tree head; 0.10.x does not.
+    retag_candidate_versions "0.10.0" "$V" required
+    helm package "$REPO_ROOT/charts/curie" --version "$V" --app-version "$V" -d "$WORKDIR/charts" >/dev/null
+    CHART_V="$WORKDIR/charts/curie-${V}.tgz"
+    [[ -f "$CHART_V" ]] || die "rollback-interrupted chart package is missing"
+    exclusive_kind_tag "$V"
+    cluster_upgrade "$V" "$CHART_V" || status=$?
+    record_upgrade_json "rollback-interrupted-setup"
+    (( status == 0 )) || die "rollback-interrupted setup upgrade exited $status"
+    assert_upgrade_status "succeeded"
+    wait_rollout
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-interrupted-setup.json"
+    target="$(python3 -c '
+import json, sys
+row = max(json.load(sys.stdin), key=lambda r: int(r["revision"]))
+if row["status"] != "deployed" or row["app_version"] != sys.argv[1] or row["chart"] != "curie-" + sys.argv[1]:
+    raise SystemExit("newest revision is not deployed at the checkout version")
+print(row["revision"])
+' "$V" <"$EVIDENCE_DIR/rollback-interrupted-setup.json")" \
+        || die "rollback-interrupted setup did not establish revision A at $V"
+    level_a="$(rollback_interrupted_api_log_level)" \
+        || die "rollback-interrupted could not read the API log level at revision $target"
+    level_b="DEBUG"
+    [[ "$level_a" != "$level_b" ]] || level_b="WARNING"
+
+    # Revision B: same chart, different values, so rolling back to A changes
+    # the API pod template and the rollback --wait has pods to wait for.
+    status=0
+    helm_ns upgrade "$RELEASE" "$CHART_V" --reuse-values --set "api.logLevel=$level_b" --wait --timeout 10m \
+        >"$EVIDENCE_DIR/rollback-interrupted-revision-b.log" 2>&1 || status=$?
+    (( status == 0 )) || die "rollback-interrupted upgrade to revision B exited $status"
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-interrupted-before.json"
+    newer="$(python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+target, version = sys.argv[1:]
+newest = max(rows, key=lambda r: int(r["revision"]))
+if int(newest["revision"]) <= int(target) or newest["status"] != "deployed" or newest["chart"] != "curie-" + version:
+    raise SystemExit("revision B is not the newest deployed revision at the checkout version")
+if not any(int(r["revision"]) == int(target) and r["status"] == "superseded" and r["chart"] == "curie-" + version for r in rows):
+    raise SystemExit("revision A is not superseded at the checkout version")
+print(newest["revision"])
+' "$target" "$V" <"$EVIDENCE_DIR/rollback-interrupted-before.json")" \
+        || die "rollback-interrupted did not establish revision B over revision A"
+    [[ "$(rollback_interrupted_api_log_level)" == "$level_b" ]] \
+        || die "rollback-interrupted revision B did not change the API pod template"
+
+    # Start Helm directly so the recorded PID is the process that holds its lock.
+    helm --kubeconfig "$KUBECONFIG_FILE" "${HELM_CONTEXT_ARGS[@]}" rollback "$RELEASE" "$target" -n "$NAMESPACE" \
+        --wait --timeout 10m \
+        >"$EVIDENCE_DIR/rollback-interrupted-killed-helm.log" 2>&1 &
+    ROLLBACK_INTERRUPTED_HELM_PID=$!
+    local deadline=$((SECONDS + 300))
+    while (( SECONDS < deadline )); do
+        helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-interrupted-pending.json"
+        pending="$(python3 -c '
+import json, sys
+row = max(json.load(sys.stdin), key=lambda r: int(r["revision"]))
+if row["status"] == "pending-rollback" and int(row["revision"]) > int(sys.argv[1]):
+    print(row["revision"])
+' "$newer" <"$EVIDENCE_DIR/rollback-interrupted-pending.json")"
+        [[ -z "$pending" ]] || break
+        kill -0 "$ROLLBACK_INTERRUPTED_HELM_PID" 2>/dev/null || break
+        sleep 0.2
+    done
+    [[ -n "$pending" ]] || die "rollback-interrupted did not observe pending-rollback within 300s"
+    kill -9 "$ROLLBACK_INTERRUPTED_HELM_PID" \
+        || die "rollback-interrupted Helm exited before SIGKILL"
+    status=0
+    wait "$ROLLBACK_INTERRUPTED_HELM_PID" 2>/dev/null || status=$?
+    ROLLBACK_INTERRUPTED_HELM_PID=""
+    (( status != 0 )) || die "rollback-interrupted interrupted Helm reported success"
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-interrupted-killed.json"
+    python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+newest = max(rows, key=lambda r: int(r["revision"]))
+target, newer, pending, version = sys.argv[1:]
+if int(newest["revision"]) != int(pending) or newest["status"] != "pending-rollback":
+    raise SystemExit("killed rollback did not leave its newest revision pending-rollback")
+if (newest.get("description") or "").strip() != "Rollback to " + target or newest["chart"] != "curie-" + version:
+    raise SystemExit("pending-rollback revision does not record the rollback to revision A")
+if not any(int(r["revision"]) == int(newer) and r["status"] == "deployed" for r in rows):
+    raise SystemExit("killed rollback did not retain revision B as deployed")
+' "$target" "$newer" "$pending" "$V" <"$EVIDENCE_DIR/rollback-interrupted-killed.json" \
+        || die "rollback-interrupted did not preserve the required interrupted history"
+
+    status=0
+    "$BIN" --json cluster rollback --dry-run --namespace "$NAMESPACE" --release "$RELEASE" \
+        >"$EVIDENCE_DIR/rollback-interrupted-dry-run.json" 2>"$EVIDENCE_DIR/rollback-interrupted-dry-run.err" \
+        || status=$?
+    (( status == 0 )) || die "rollback-interrupted dry run exited $status"
+    python3 -c '
+import json, shlex, sys
+doc = json.load(sys.stdin)
+release, target, pending, version = sys.argv[1:]
+plan = doc["plan"]
+resuming = f"revision {pending} is an interrupted rollback to revision {target}; resuming it"
+summary = f"selected revision {target} (superseded, curie-{version}) from revision {pending}; skipped none"
+commands = [shlex.split(line) for line in plan]
+if doc.get("dry_run") is not True:
+    raise SystemExit("dry run output is not marked dry_run")
+if resuming not in plan:
+    raise SystemExit("dry run does not name the interrupted rollback")
+if summary not in plan:
+    raise SystemExit("dry run does not select revision A from the pending revision")
+if not any(args[:4] == ["helm", "rollback", release, target] for args in commands):
+    raise SystemExit("dry run does not name revision A in its Helm rollback command")
+' "$RELEASE" "$target" "$pending" "$V" <"$EVIDENCE_DIR/rollback-interrupted-dry-run.json" \
+        || die "rollback-interrupted dry run did not resume the interrupted rollback"
+
+    status=0
+    "$BIN" --json cluster rollback --yes --namespace "$NAMESPACE" --release "$RELEASE" \
+        >"$EVIDENCE_DIR/rollback-interrupted.json" 2>"$EVIDENCE_DIR/rollback-interrupted.err" \
+        || status=$?
+    (( status == 0 )) || die "rollback-interrupted rollback exited $status"
+    [[ "$(json_field "$EVIDENCE_DIR/rollback-interrupted.json" "to_revision")" == "$target" ]] \
+        || die "rollback-interrupted rollback did not target revision A ($target)"
+    [[ "$(json_field "$EVIDENCE_DIR/rollback-interrupted.json" "from_revision")" == "$pending" ]] \
+        || die "rollback-interrupted rollback did not start from pending revision $pending"
+    [[ "$(json_field "$EVIDENCE_DIR/rollback-interrupted.json" "resumed_interrupted_rollback")" == "true" ]] \
+        || die "rollback-interrupted rollback did not report resumed_interrupted_rollback true"
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-interrupted-after.json"
+    python3 -c '
+import json, sys
+row = max(json.load(sys.stdin), key=lambda r: int(r["revision"]))
+target, pending, version = sys.argv[1:]
+if int(row["revision"]) <= int(pending) or row["status"] != "deployed" or row["chart"] != "curie-" + version:
+    raise SystemExit("newest rollback revision is not deployed at the checkout chart")
+if (row.get("description") or "").strip() != "Rollback to " + target:
+    raise SystemExit("newest revision does not record the rollback to revision A")
+' "$target" "$pending" "$V" <"$EVIDENCE_DIR/rollback-interrupted-after.json" \
+        || die "rollback-interrupted did not finish the rollback to revision A in Helm history"
+    wait_rollout
+    level_after="$(rollback_interrupted_api_log_level)" \
+        || die "rollback-interrupted could not read the API log level after the rollback"
+    [[ "$level_after" == "$level_a" ]] \
+        || die "rollback-interrupted API pod template did not return to revision A values"
+    kubectl_ns get deploy "$(fullname)-api" -o json | python3 -c '
+import json, sys
+if int(json.load(sys.stdin).get("status", {}).get("readyReplicas", 0)) < 1:
+    raise SystemExit("API has no ready replicas")
+' || die "rollback-interrupted API is not Ready"
+    api_health >/dev/null || die "rollback-interrupted API health failed"
+    log "rollback-interrupted resumed the rollback to revision $target from pending revision $pending over revision $newer at $V; API is Ready and healthy"
+}
+
 # Compare two `helm history -o json` captures by (revision, status, app_version).
 assert_helm_history_unchanged() {
     local before="$1" after="$2" label="$3"
@@ -3445,6 +3641,7 @@ scenario_fn() {
         previous-serves) echo run_previous_serves ;;
         apply-kill-takeover) echo run_apply_kill_takeover ;;
         rollback-to-serving) echo run_rollback_to_serving ;;
+        rollback-interrupted) echo run_rollback_interrupted ;;
         rollback-uncatalogued) echo run_rollback_uncatalogued ;;
         runner-layer-retire) echo run_runner_layer_retire ;;
         hook-fail-not-serving) echo run_hook_fail_not_serving ;;

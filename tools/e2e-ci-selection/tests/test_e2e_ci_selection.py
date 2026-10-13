@@ -27,6 +27,25 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
 REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+SRE_RUNTIME = "examples/tests/test_sre_bot_observability_runtime.py"
+SRE_RUNTIME_INPUTS = (
+    "examples/sre-bot",
+    SRE_RUNTIME,
+    "runner",
+    "packages/aci-protocol",
+    "packages/plugin-format",
+    "packages/telemetry",
+    "packages/telemetry-schema",
+    "otel/collector-config.yaml",
+    "charts/curie/values.yaml",
+    "uv.lock",
+    "pyproject.toml",
+    "conftest.py",
+    "cli/scripts/configure-docker-hub-mirror.sh",
+    ".github/workflows/ci.yaml",
+    ".github/e2e-selection.yaml",
+    "tools/e2e-ci-selection",
+)
 UPGRADE_MUTANT_BUILDER = REPO_ROOT / "charts" / "curie" / "ci" / "make-upgrade-mutants.py"
 UPGRADE_MATRIX = REPO_ROOT / "cli" / "scripts" / "cluster-upgrade-matrix.sh"
 # Directories the upgrade matrix reads whole, each with the subdirectories it
@@ -242,9 +261,34 @@ def _path_needs_cli_release(path: str) -> bool:
     return path == "cli" or path.startswith("cli/")
 
 
+def _expected_conditional_deselect(*paths: str, pytest_needed: bool = True) -> str:
+    if not pytest_needed or not paths:
+        return ""
+    if any(
+        path == value or path.startswith(value + "/")
+        for path in paths
+        for value in SRE_RUNTIME_INPUTS
+    ):
+        return ""
+    rules = yaml.safe_load(REGISTRY.read_text())["rules"]
+    if any(
+        path not in rules["exact"]
+        and path not in rules["ignored_exact"]
+        and not any(
+            path == prefix or path.startswith(prefix + "/")
+            for collection in ("prefixes", "ignored_prefixes")
+            for prefix in rules[collection]
+        )
+        for path in paths
+    ):
+        return ""
+    return SRE_RUNTIME
+
+
 def _expected_output(
     *selected: str,
     pytest_needed: bool = True,
+    pytest_deselect: str = "",
     images_needed: bool = False,
     cli_release_needed: bool = False,
     released_upgrade_full: bool = False,
@@ -260,6 +304,7 @@ def _expected_output(
     skill_local = ",".join(tier for tier in TIERS[:2] if tier in selected_tiers)
     lines.append(f"skill_local_tiers={skill_local}")
     lines.append(f"pytest={'true' if pytest_needed else 'false'}")
+    lines.append(f"pytest_deselect={pytest_deselect}")
     lines.append(f"images={'true' if images_needed else 'false'}")
     lines.append(f"cli_release={'true' if cli_release_needed else 'false'}")
     lines.append(f"released_upgrade_full={'true' if released_upgrade_full else 'false'}")
@@ -287,6 +332,7 @@ def _assert_selection(
     assert output == _expected_output(
         *selected,
         pytest_needed=pytest_needed,
+        pytest_deselect=_expected_conditional_deselect(path, pytest_needed=pytest_needed),
         images_needed=_path_needs_images(path) if images_needed is None else images_needed,
         cli_release_needed=(
             _path_needs_cli_release(path) if cli_release_needed is None else cli_release_needed
@@ -1049,6 +1095,7 @@ def test_mixed_root_documentation_and_runtime_diff_selects_runtime_tiers(
     assert completed.returncode == 0, completed.stderr
     assert output == _expected_output(
         "local", "local-release", "cluster",
+        pytest_deselect=SRE_RUNTIME,
         chart_scenarios=("quota-progress", "workspace-diagnostic"),
     )
 
@@ -1186,7 +1233,7 @@ def test_revisions_select_changed_paths_and_unknown_fallback(tmp_path: Path) -> 
         cwd=repository,
     )
     assert known.returncode == 0, known.stderr
-    assert known_output == _expected_output("local")
+    assert known_output == _expected_output("local", pytest_deselect=SRE_RUNTIME)
 
     (repository / "new-surface.txt").write_text("new\n")
     subprocess.run(["git", "add", "."], cwd=repository, check=True)
@@ -1235,7 +1282,9 @@ VERSION_ONLY_SELECTION = _expected_output(
 )
 # What the same five paths selected before #3858, and still select whenever
 # the delta is not version-only.
-FULL_PREP_SELECTION = _expected_output(*TIERS, cli_release_needed=True)
+FULL_PREP_SELECTION = _expected_output(
+    *TIERS, pytest_deselect=SRE_RUNTIME, cli_release_needed=True
+)
 
 
 @pytest.mark.parametrize("omit_kind", [False, True])
@@ -1365,6 +1414,7 @@ def test_revision_mode_without_a_cargo_manifest_is_not_version_only(
 VALID_REGISTRY = """
 version: 1
 fallback: [skill, local, local-release, cluster]
+conditional_pytest_files: {}
 rules:
   exact:
     compose.dev.yaml: [local]
@@ -1558,6 +1608,7 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         "cli_release": "${{ steps.filter.outputs.cli_release }}",
         # #3858: python-pytest and rust-select read these two.
         "pytest": "${{ steps.filter.outputs.pytest }}",
+        "pytest_deselect": "${{ steps.filter.outputs.pytest_deselect }}",
         "version_only": "${{ steps.filter.outputs.version_only }}",
         "factory": "${{ steps.filter.outputs.factory }}",
         "approval_resume": "${{ steps.filter.outputs.approval_resume }}",
@@ -1664,6 +1715,7 @@ def test_upgrade_matrix_lists_every_shard_on_full_runs_and_one_on_prs(
         "s17",
         "s18",
         "s19",
+        "s20",
         "s21",
     ]
     assert _list_shards(tmp_path, "false") == 'shards=["s01"]\n'

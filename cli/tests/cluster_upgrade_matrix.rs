@@ -394,7 +394,7 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         ids,
         [
             "s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s11", "s13", "s14",
-            "s15", "s16", "s17", "s18", "s19", "s21",
+            "s15", "s16", "s17", "s18", "s19", "s20", "s21",
         ],
         "canonical shard ids\n{manifest}"
     );
@@ -543,6 +543,7 @@ s16 setup apply-kill-takeover
 s17 setup rollback-to-serving
 s18 setup hook-fail-not-serving
 s19 setup terminal-pods
+s20 setup rollback-interrupted
 s21 setup rollback-uncatalogued";
 
 fn assert_override_refused(manifest: &str, what: &str) {

@@ -128,6 +128,7 @@ class Registry:
     ignored_exact: tuple[str, ...]
     ignored_prefixes: tuple[str, ...]
     chart_scenarios: ChartScenarios
+    conditional_pytest_files: dict[str, tuple[str, ...]]
 
 
 def _mapping(value: object, label: str) -> dict[str, object]:
@@ -339,8 +340,26 @@ def _load_registry(path: Path) -> Registry:
             raise RegistryError(f"ignored prefix overlaps a selected rule: {ignored}")
 
     chart_scenarios = _chart_registry(root.get("chart_scenarios"))
+    conditional_entries = _mapping(
+        root.get("conditional_pytest_files"), "conditional_pytest_files"
+    )
+    conditional_pytest_files: dict[str, tuple[str, ...]] = {}
+    for test_file, value in conditional_entries.items():
+        if not test_file or test_file.startswith("/") or test_file.endswith("/"):
+            raise RegistryError("conditional_pytest_files contains an invalid path")
+        label = f"conditional_pytest_files.{test_file}"
+        inputs = _inputs(value, label)
+        if len(set(inputs)) != len(inputs):
+            raise RegistryError(f"{label} contains duplicate inputs")
+        conditional_pytest_files[test_file] = inputs
     return Registry(
-        fallback, exact, prefixes, tuple(ignored_exact), tuple(ignored_prefixes), chart_scenarios
+        fallback,
+        exact,
+        prefixes,
+        tuple(ignored_exact),
+        tuple(ignored_prefixes),
+        chart_scenarios,
+        conditional_pytest_files,
     )
 
 
@@ -626,6 +645,7 @@ def _is_version_only(paths: list[str], head: str | None) -> bool:
 def _render(
     selected: set[str],
     pytest_needed: bool,
+    pytest_deselect: list[str],
     images_needed: bool,
     cli_release_needed: bool,
     released_upgrade_full: bool,
@@ -638,6 +658,7 @@ def _render(
     skill_local = ",".join(tier for tier in TIERS[:2] if tier in selected)
     lines.append(f"skill_local_tiers={skill_local}")
     lines.append(f"pytest={'true' if pytest_needed else 'false'}")
+    lines.append("pytest_deselect=" + ",".join(pytest_deselect))
     lines.append(f"images={'true' if images_needed else 'false'}")
     lines.append(f"cli_release={'true' if cli_release_needed else 'false'}")
     lines.append(
@@ -728,6 +749,24 @@ def _run() -> None:
         selected = set(VERSION_ONLY_TIERS)
         pytest_needed = False
 
+    pytest_deselect = []
+    if not args.push and paths and pytest_needed and all(
+        path in registry.exact
+        or path in registry.ignored_exact
+        or any(
+            _matches_prefix(path, prefix)
+            for prefix in (*registry.prefixes, *registry.ignored_prefixes)
+        )
+        for path in paths
+    ):
+        pytest_deselect = sorted(
+            test_file
+            for test_file, inputs in registry.conditional_pytest_files.items()
+            if not any(
+                _matches_prefix(path, prefix) for path in paths for prefix in inputs
+            )
+        )
+
     # Ordinary pull requests run one upgrade matrix smoke shard. A change to
     # the upgrade jobs themselves runs the full matrix and released chart jobs
     # before merge, as do pushes and dispatches (the nightly).
@@ -747,6 +786,7 @@ def _run() -> None:
             _render(
                 selected,
                 pytest_needed,
+                pytest_deselect,
                 images_needed,
                 cli_release_needed,
                 released_upgrade_full,

@@ -1112,42 +1112,67 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     # a contract change.
     pytest_index = _single_step_index(
         steps,
-        lambda step: _string(step, "run").strip().startswith("uv run pytest -q"),
+        lambda step: step.get("id") == "pytest",
         "normal Python suite",
     )
-    pytest_command = shlex.split(_string(steps[pytest_index], "run").strip())
-    assert pytest_command[:4] == ["uv", "run", "pytest", "-q"]
-    # xdist distribution flags change where tests run, not which tests run, so
-    # they are allowed alongside reporting flags. Anything else could filter.
-    extra = pytest_command[4:]
-    # The shard flag and the one rerun are also allowed: the shards partition
-    # the unfiltered collection along xdist groups (asserted in
-    # tools/e2e-ci-selection/tests/test_python_pytest_selection.py), and a rerun
-    # changes how often a failing test runs, never which tests run.
-    distribution = [
-        "-n",
-        "4",
-        "--dist",
-        "loadgroup",
-        "--ci-shard",
-        # shlex splits the matrix expression `${{ matrix.shard }}/3`
-        "${{",
-        "matrix.shard",
-        "}}/3",
-        "--reruns",
-        "1",
-    ]
-    if extra[: len(distribution)] == distribution:
-        extra = extra[len(distribution) :]
-    report_chars = set("fEsxXpPaAR")
-    assert all(
-        argument.startswith("--durations")
-        or (argument.startswith("-r") and len(argument) > 2 and set(argument[2:]) <= report_chars)
-        for argument in extra
-    ), (
-        "the Python suite must run unfiltered: only reporting, sharding, rerun, and "
-        f"xdist distribution flags may be added to `uv run pytest -q`, got {pytest_command!r}"
-    )
+    pytest_step = steps[pytest_index]
+    pytest_script = _string(pytest_step, "run")
+    assert "${{" not in pytest_script
+    pytest_env = pytest_step.get("env")
+    assert isinstance(pytest_env, dict)
+    bindings = {}
+    for meaning, expression in {
+        "shard": "${{ matrix.shard }}",
+        "deselect": "${{ steps.python-runtime.outputs.pytest_deselect }}",
+    }.items():
+        names = [name for name, value in pytest_env.items() if value == expression]
+        assert len(names) == 1, expression
+        bindings[meaning] = names[0]
+    # Run the unmodified Bash with a recording uv function at its command boundary.
+    # Keep reporting flags flexible; only the declared file may be added by
+    # conditional selection, after the unfiltered suite's distribution flags.
+    for shard in (1, 2, 3):
+        for deselect in ("", "examples/tests/test_sre_bot_observability_runtime.py"):
+            environment = {
+                **os.environ,
+                "BASH_FUNC_uv%%": "() { printf '%s\\0' \"$@\"; }",
+                bindings["shard"]: str(shard),
+                bindings["deselect"]: deselect,
+            }
+            result = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", pytest_script],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            pytest_command = result.stdout.split("\0")
+            assert pytest_command.pop() == ""
+            assert pytest_command[:3] == ["run", "pytest", "-q"]
+            if deselect:
+                assert pytest_command.count("--deselect") == 1
+                assert pytest_command[-2:] == ["--deselect", deselect]
+                pytest_command = pytest_command[:-2]
+            distribution = [
+                "-n", "4", "--dist", "loadgroup", "--ci-shard", f"{shard}/3", "--reruns", "1",
+            ]
+            extra = pytest_command[3:]
+            assert extra[: len(distribution)] == distribution
+            extra = extra[len(distribution) :]
+            report_chars = set("fEsxXpPaAR")
+            assert all(
+                argument.startswith("--durations")
+                or (
+                    argument.startswith("-r")
+                    and len(argument) > 2
+                    and set(argument[2:]) <= report_chars
+                )
+                for argument in extra
+            ), (
+                "the Python suite permits only reporting flags after its distribution block, "
+                f"plus the selected trailing deselect pair, got {pytest_command!r}"
+            )
     assert stack_index < migration_index < pytest_index
 
     # The half that keeps the win. Nothing about the gate may drift back into
