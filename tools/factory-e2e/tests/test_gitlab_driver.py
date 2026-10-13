@@ -1556,3 +1556,110 @@ def test_install_values_default_still_write_the_github_app(tmp_path: Path) -> No
     assert values["api"]["githubAppExistingSecret"] == "factory-app"
     kinds = {entry["kind"] for entry in values["factory"]["codeHosts"]}
     assert kinds == {"github"}
+
+
+# --- restore_fixture_base: GitLab keeps the default branch's protection -----------------
+
+
+class _ProtectingGitLab:
+    """The branch and protection calls restore_fixture_base makes, answered as the
+    GitLab 19.4.1 fixture answered them in a replay: a DELETE of the default
+    branch's protection answers 204 but the rule stays, the recreated branch is
+    protected again, and the parking branch is protected once it is the
+    default. A POST for an existing rule answers 409 "already exists"."""
+
+    RULE = {
+        "name": "main",
+        "push_access_levels": [{"access_level": 40}],
+        "merge_access_levels": [{"access_level": 40}],
+        "allow_force_push": False,
+    }
+
+    def __init__(self, kept: dict[str, Any] | None = None) -> None:
+        self.branches = {"main": HEAD_FIX}
+        self.default = "main"
+        self.protected: dict[str, dict[str, Any]] = {"main": dict(kept or self.RULE)}
+        self.writes: list[tuple[str, str]] = []
+
+    def __call__(self, _actor: str, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        tail = path.split(f"/projects/{FIXTURE_PID}", 1)[1]
+        if method != "GET":
+            self.writes.append((method, tail))
+        name = urllib.parse.unquote(tail.rsplit("/", 1)[-1])
+        if tail.startswith("/repository/branches"):
+            if method == "GET":
+                sha = self.branches.get(name)
+                return (200, {"name": name, "commit": {"id": sha}}) if sha else (404, None)
+            if method == "POST":
+                self.branches[body["branch"]] = body["ref"]
+                if body["branch"] == "main":
+                    self.protected.setdefault("main", dict(self.RULE))
+                return 201, {"name": body["branch"]}
+            if name == self.default:
+                return 400, {"message": "Cannot remove HEAD branch"}
+            self.branches.pop(name, None)
+            return 204, None
+        if tail.startswith("/protected_branches"):
+            if method == "GET":
+                rule = self.protected.get(name)
+                return (200, rule) if rule else (404, None)
+            if method == "DELETE":
+                return 204, None  # the rule stays
+            if body["name"] in self.protected:
+                return 409, {"message": f"Protected branch '{body['name']}' already exists"}
+            self.protected[body["name"]] = dict(self.RULE)
+            return 201, self.protected[body["name"]]
+        if method == "PUT" and tail == "":
+            self.default = body["default_branch"]
+            self.protected.setdefault(self.default, dict(self.RULE))
+            return 200, {"default_branch": self.default}
+        raise AssertionError(f"unexpected {method} {tail}")
+
+
+def _restoring_driver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ca: Path, gitlab: _ProtectingGitLab
+) -> Any:
+    rig = _target_rig("fixture", tmp_path, monkeypatch, ca)
+    driver = rig.driver()
+    monkeypatch.setattr(driver, "_json", gitlab)
+    driver._base_sha = BASE_SHA
+    return driver
+
+
+def test_restore_accepts_the_protection_gitlab_kept_and_moves_the_default_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture_ca: Path
+) -> None:
+    # Live run 10: re-protecting answered 409, the default stayed on the
+    # parking branch, and the reset then failed deleting it with 400.
+    gitlab = _ProtectingGitLab()
+    driver = _restoring_driver(tmp_path, monkeypatch, fixture_ca, gitlab)
+
+    assert driver.restore_fixture_base() == {"restored": True, "moved": True}
+
+    assert gitlab.default == "main"
+    assert gitlab.branches == {"main": BASE_SHA}
+    assert ("PUT", "") in gitlab.writes and gitlab.writes[-1][0] == "DELETE"
+
+
+def test_restore_refuses_a_kept_protection_that_differs_but_still_unparks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture_ca: Path
+) -> None:
+    weaker = {**_ProtectingGitLab.RULE, "push_access_levels": [{"access_level": 30}]}
+    gitlab = _ProtectingGitLab()
+    driver = _restoring_driver(tmp_path, monkeypatch, fixture_ca, gitlab)
+    # The original rule is Maintainer-only; the one GitLab keeps is weaker.
+    real = gitlab.__call__
+
+    def weaken(actor: str, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        result = real(actor, method, path, body)
+        if method == "POST" and path.endswith("/repository/branches") and body["branch"] == "main":
+            gitlab.protected["main"] = dict(weaker)
+        return result
+
+    monkeypatch.setattr(driver, "_json", weaken)
+
+    with pytest.raises(fe.PreflightFailed, match="differs from the original"):
+        driver.restore_fixture_base()
+
+    assert gitlab.default == "main"
+    assert "factory-e2e-park-" not in " ".join(gitlab.branches)
