@@ -810,7 +810,7 @@ def test_body_only_fix_revision_repolls_checks_on_the_same_head(
     assert _count_requests(number) == 1
 
 
-def test_body_only_fix_without_a_metadata_policy_ends_unverified(
+def test_body_only_fix_without_a_metadata_policy_completes_from_recorded_failures(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("GITHUB_FACTORY_METADATA_CI", raising=False)
@@ -838,9 +838,204 @@ def test_body_only_fix_without_a_metadata_policy_ends_unverified(
 
     _reconcile()
 
+    assert _terminal(number) == ("completed", "completed")
+    assert len(_ci_turns(published["id"])) == 1
+    assert _body(sink, published["id"]).startswith(f"Completed: {published['pr_url']}")
+    assert _count_requests(number) == 1
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        None,
+        "not json",
+        "null",
+        "[]",
+        '{"checks": [], "statuses": []}',
+        '{"checks": "Publication description guard", "statuses": []}',
+        '{"checks": [42], "statuses": []}',
+        '{"checks": [""], "statuses": []}',
+        '{"checks": ["Publication description guard"], "statuses": [null]}',
+        b"\xff",
+    ],
+)
+def test_body_only_fix_without_a_usable_failing_record_ends_unverified(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch, record: str | bytes | None
+) -> None:
+    monkeypatch.delenv("GITHUB_FACTORY_METADATA_CI", raising=False)
+    get_settings.cache_clear()
+    client, github, sink = admitted
+    number = 9793
+    sink.ci_scripts = {
+        HEAD_A: [
+            ci_entry(check_run("Publication description guard", conclusion="failure")),
+            ci_entry(check_run("Publication description guard", started_at="2999-01-01T00:00:00Z")),
+        ]
+    }
+    published = _published(client, github, sink, number)
+    _reconcile()
+    assert len(_ci_turns(published["id"])) == 1
+    valkey = redis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
+    try:
+        key = f"{_ci_key(published['id'], 2)}:failing"
+        assert valkey.exists(key)
+        if record is None:
+            valkey.delete(key)
+        else:
+            valkey.set(key, record)
+    finally:
+        valkey.close()
+    _attach_fix(
+        published["work_item_id"], published["id"], revision=2, head_sha=HEAD_A,
+        title="Correct the pull request description", paths=[], base_sha=HEAD_A,
+    )
+
+    _reconcile()
+
     assert _terminal(number) == ("failed", "ci_unverified")
     assert len(_ci_turns(published["id"])) == 1
     assert "Reason: metadata_ci_not_configured" in _body(sink, published["id"])
+
+
+def test_configured_metadata_policy_takes_precedence_over_recorded_failures(
+    admitted: Any, _metadata_ci: None
+) -> None:
+    client, github, sink = admitted
+    number = 9794
+    old_time = "2020-01-01T00:00:00Z"
+    new_time = "2999-01-01T00:00:00Z"
+    sink.ci_scripts = {
+        HEAD_A: [
+            ci_entry(check_run("Conversion suite", conclusion="failure", started_at=old_time)),
+            ci_entry(
+                check_run("Conversion suite", started_at=new_time),
+                check_run("Publication description guard", started_at=old_time),
+            ),
+            ci_entry(
+                check_run("Conversion suite", started_at=new_time),
+                check_run("Publication description guard", started_at=new_time),
+            ),
+        ]
+    }
+    published = _published(client, github, sink, number)
+    _reconcile()
+    _attach_fix(
+        published["work_item_id"], published["id"], revision=2, head_sha=HEAD_A,
+        title="Correct the pull request description", paths=[], base_sha=HEAD_A,
+    )
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    _assert_no_final_result(sink)
+    _reconcile_later(21)
+    assert _terminal(number) == ("completed", "completed")
+    assert len(_ci_turns(published["id"])) == 1
+
+
+def test_recorded_partial_metadata_rerun_reports_the_stale_failure_at_the_deadline(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GITHUB_FACTORY_METADATA_CI", raising=False)
+    get_settings.cache_clear()
+    client, github, sink = admitted
+    number = 9796
+    old_time = "2020-01-01T00:00:00Z"
+    old_suite = check_run(
+        "Conversion suite", conclusion="failure", started_at=old_time,
+        summary="The unchanged commit still fails its suite.",
+    )
+    sink.ci_scripts = {
+        HEAD_A: [
+            ci_entry(
+                check_run(
+                    "Publication description guard", conclusion="failure", started_at=old_time
+                ),
+                old_suite,
+            ),
+            ci_entry(
+                check_run("Publication description guard", started_at="2999-01-01T00:00:00Z"),
+                old_suite,
+            ),
+        ]
+    }
+    published = _published(client, github, sink, number)
+    _reconcile()
+    _attach_fix(
+        published["work_item_id"], published["id"], revision=2, head_sha=HEAD_A,
+        title="Correct the pull request description", paths=[], base_sha=HEAD_A,
+    )
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert len(_ci_turns(published["id"])) == 1
+    _reconcile_later(1300)
+    turns = _ci_turns(published["id"])
+    assert [turn["event_id"] for turn in turns] == [
+        f"work-item-{published['id']}-ci-2", f"work-item-{published['id']}-ci-3",
+    ]
+    report = json.loads(turns[1]["text"].splitlines()[3])
+    assert [check["name"] for check in report["failing_checks"]] == ["Conversion suite"]
+    assert "The unchanged commit still fails its suite." in turns[1]["text"]
+    valkey = redis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
+    try:
+        record = valkey.get(f"{_ci_key(published['id'], 3)}:failing")
+        assert record is not None
+        assert json.loads(record) == {"checks": ["Conversion suite"], "statuses": []}
+    finally:
+        valkey.close()
+
+
+def test_ci_fix_dispatch_records_caused_failures_with_the_round_ttl_before_enqueue(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_api import factory_ci, workitems
+
+    client, github, sink = admitted
+    number = 9795
+    caused_status = {"context": "ci/description", "state": "failure"}
+    base_status = {"context": "ci/base-audit", "state": "failure"}
+    sink.ci_scripts = {
+        HEAD_A: [
+            ci_entry(
+                check_run("Publication description guard", conclusion="failure"),
+                check_run("pip-audit", conclusion="failure"),
+                statuses=(caused_status, base_status),
+            )
+        ],
+        BASE_HEAD: [
+            ci_entry(check_run("pip-audit", conclusion="failure"), statuses=(base_status,))
+        ],
+    }
+    sink.branches = {"main": BASE_HEAD}
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+    original_dispatch = WorkItemReconciler._dispatch_ci_turn
+    records: list[dict[str, Any]] = []
+
+    async def observe_record(
+        self: WorkItemReconciler, request: Any, round_: int, text_: str
+    ) -> bool:
+        key = f"{factory_ci.ci_key(request.id, round_)}:failing"
+        raw = await self._valkey.get(key)
+        assert raw is not None
+        records.append(json.loads(raw))
+        async with self._sessionmaker() as session:
+            now = await workitems._database_now(session)
+        assert await self._valkey.ttl(key) >= factory_ci.round_ttl(request, now)
+        assert _ci_turns(request.id) == []
+        return await original_dispatch(self, request, round_, text_)
+
+    monkeypatch.setattr(WorkItemReconciler, "_dispatch_ci_turn", observe_record)
+
+    _reconcile()
+
+    assert records == [
+        {"checks": ["Publication description guard"], "statuses": ["ci/description"]}
+    ]
+    assert len(_ci_turns(published["id"])) == 1
+    assert _key_exists(f"{_ci_key(published['id'], 2)}:failing")
 
 
 def test_body_only_fix_waits_for_fresh_checks_then_ends_unverified(
