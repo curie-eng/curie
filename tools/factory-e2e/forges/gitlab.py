@@ -1093,6 +1093,75 @@ def install_gitlab(p: fe.Preflight) -> None:
         raise fe.PreflightFailed(f"curie factory quickstart --code-host gitlab failed: {tail}")
     p.evidence["gitlab"] = {"project": driver.project_path, "target": driver.target}
     p.step("factory agent bound to the GitLab project", agent=fe.FACTORY_AGENT)
+    if driver.target == "fixture":
+        _allow_fixture_bridge(p, driver.state)
+
+
+def fixture_bridge_egress(
+    values: Mapping[str, Any], subnets: Sequence[str], port: int
+) -> dict[str, Any]:
+    """The factory values that also admit the fixture's Docker bridge subnets.
+
+    The quickstart derives the GitLab egress entry from the advertised host.
+    When the fixture runs on the Kubernetes node itself, Docker's DNAT rewrites
+    a pod's connection to the container's bridge address before the
+    NetworkPolicy decides, so the publication push is refused unless the
+    bridge subnet on the fixture port is allowed too. Only the e2e fixture is
+    shaped like this; a real GitLab is never co-located with a node's Docker.
+    """
+
+    factory = values.get("factory")
+    if not isinstance(factory, Mapping):
+        raise fe.PreflightFailed("the release has no factory values after the quickstart")
+    extra = [{"cidr": s, "ports": [{"protocol": "TCP", "port": port}]} for s in subnets]
+    out: dict[str, Any] = {}
+    for key in ("codeHosts", "trackers"):
+        entries = factory.get(key) or []
+        updated = []
+        for entry in entries:
+            entry = dict(entry)
+            if entry.get("kind") == "gitlab":
+                egress = list(entry.get("egress") or [])
+                if not egress:
+                    raise fe.PreflightFailed(f"factory.{key} gitlab entry has no egress")
+                entry["egress"] = egress + [e for e in extra if e not in egress]
+            updated.append(entry)
+        out[key] = updated
+    if not any(e.get("kind") == "gitlab" for e in out["codeHosts"]):
+        raise fe.PreflightFailed("the quickstart wrote no gitlab code host")
+    return {"factory": out}
+
+
+def _allow_fixture_bridge(p: fe.Preflight, state: Mapping[str, Any]) -> None:
+    subnets = state.get("docker_subnets")
+    if not isinstance(subnets, list) or not subnets:
+        raise fe.ConfigError("the fixture state names no docker_subnets; bring it up again")
+    assert p.chart_dir is not None, "install() extracts the chart first"
+    context = p.config.kube_context
+    raw = fe.run(
+        ["helm", "--kube-context", context, "get", "values", fe.RELEASE, "-n", p.namespace]
+        + ["-o", "json"]
+    )
+    values = fixture_bridge_egress(json.loads(raw), subnets, int(state["port"]))
+    values_file = p.workdir / "gitlab-fixture-egress.json"
+    fd = os.open(str(values_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump(values, handle)
+    fe.run(
+        fe.helm_upgrade_command(
+            context=context,
+            release=fe.RELEASE,
+            chart=str(p.chart_dir),
+            namespace=p.namespace,
+            values_file=str(values_file),
+            timeout="20m",
+        )
+    )
+    for kind in ("deployment", "statefulset"):
+        for workload in p.kubectl("-n", p.namespace, "get", kind, "-o", "name").split():
+            p.kubectl("-n", p.namespace, "rollout", "status", workload, "--timeout=15m")
+    p.ensure_api()
+    p.step("fixture bridge subnets allowed for the GitLab code host", subnets=len(subnets))
 
 
 def _driver(p: fe.Preflight) -> GitLabDriver:

@@ -101,6 +101,16 @@ FIXTURE_PID = 4101
 FIXTURE_PATH = "factory-fixture/nested/widgets"
 FIXTURE_HOST = "gitlab-fixture.test"
 FIXTURE_PORT = 28443
+FIXTURE_BRIDGE = "172.18.0.0/24"
+_HOST_EGRESS = {"cidr": "192.0.2.10/32", "ports": [{"protocol": "TCP", "port": FIXTURE_PORT}]}
+# The factory block `curie factory quickstart --code-host gitlab` leaves on the release.
+QUICKSTART_VALUES: dict[str, Any] = {
+    "factory": {
+        "enabled": True,
+        "codeHosts": [{"kind": "gitlab", "name": "gitlab", "egress": [_HOST_EGRESS]}],
+        "trackers": [{"kind": "gitlab", "name": "gitlab", "egress": [_HOST_EGRESS]}],
+    }
+}
 SAAS_PID = 58123
 SAAS_PROJECT = "curie-test-group/factory/widgets"
 MR_IID = 7
@@ -691,6 +701,7 @@ def _state_file(tmp_path: Path, ca: Path) -> Path:
         "ca_path": str(ca),
         "advertise_host": FIXTURE_HOST,
         "port": FIXTURE_PORT,
+        "docker_subnets": [FIXTURE_BRIDGE],
         "version": "19.4.1",
         "server_version": "19.4.1",
         "root_token_file": tokens["root"],
@@ -1386,13 +1397,16 @@ class _Processes:
 
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], Mapping[str, str] | None]] = []
+        self.upgrades: list[dict[str, Any]] = []
 
     def __call__(self, argv: Any, *_a: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         argv = [str(a) for a in argv]
         self.calls.append((argv, kwargs.get("env")))
         name = Path(argv[0]).name
         if name == "helm" and "get" in argv and "values" in argv:
-            return subprocess.CompletedProcess(argv, 0, "{}", "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(QUICKSTART_VALUES), "")
+        if name == "helm" and "upgrade" in argv:
+            self.upgrades.append(json.loads(Path(_flag(argv, "-f")[0]).read_text()))
         if name == "kubectl" and "config" in argv:
             return subprocess.CompletedProcess(argv, 0, "apiVersion: v1\nkind: Config\n", "")
         return subprocess.CompletedProcess(argv, 0, "", "")
@@ -1423,6 +1437,7 @@ def _install_rig(
         raise AssertionError("install_gitlab started a background process")
 
     monkeypatch.setattr(subprocess, "Popen", no_popen)
+    monkeypatch.setattr(rig.p, "ensure_api", lambda: None)
     return rig, processes
 
 
@@ -1459,6 +1474,51 @@ def test_install_gitlab_runs_the_gitlab_quickstart_with_token_files_only(
         _no_secret(item, "the quickstart argv")
     for value in (env or {}).values():
         _no_secret(str(value), "the quickstart environment")
+
+
+def test_install_gitlab_on_the_fixture_also_allows_its_docker_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture_ca: Path
+) -> None:
+    # A pod on the fixture's own node is DNATed to the container's bridge
+    # address, so the publication policy must allow that subnet as well
+    # (refused live: the push failed to connect with only the host /32).
+    rig, processes = _install_rig("fixture", tmp_path, monkeypatch, fixture_ca)
+    _gitlab_module().install_gitlab(rig.p)
+
+    (upgrade,) = processes.upgrades
+    bridge = {"cidr": FIXTURE_BRIDGE, "ports": [{"protocol": "TCP", "port": FIXTURE_PORT}]}
+    host = QUICKSTART_VALUES["factory"]["codeHosts"][0]["egress"][0]
+    for key in ("codeHosts", "trackers"):
+        (entry,) = upgrade["factory"][key]
+        assert entry["kind"] == "gitlab"
+        assert entry["egress"] == [host, bridge]
+    (upgrade_argv,) = [a for a, _ in processes.calls if a[0] == "helm" and "upgrade" in a]
+    assert "--reuse-values" in upgrade_argv
+    assert _flag(upgrade_argv, "--kube-context") == [rig.p.config.kube_context]
+
+
+def test_install_gitlab_on_saas_does_not_touch_the_egress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture_ca: Path
+) -> None:
+    rig, processes = _install_rig("saas", tmp_path, monkeypatch, fixture_ca)
+    _gitlab_module().install_gitlab(rig.p)
+    assert processes.upgrades == []
+
+
+def test_fixture_bridge_egress_keeps_other_kinds_and_refuses_a_missing_gitlab_host() -> None:
+    gl = _gitlab_module()
+    github = {"kind": "github", "egress": [{"cidr": "192.0.2.1/32", "ports": []}]}
+    values = {"factory": {"codeHosts": [github, *QUICKSTART_VALUES["factory"]["codeHosts"]]}}
+    out = gl.fixture_bridge_egress(values, [FIXTURE_BRIDGE], FIXTURE_PORT)
+    assert out["factory"]["codeHosts"][0] == github
+    assert len(out["factory"]["codeHosts"][1]["egress"]) == 2
+    assert out["factory"]["trackers"] == []
+    again = gl.fixture_bridge_egress(out, [FIXTURE_BRIDGE], FIXTURE_PORT)
+    assert again["factory"]["codeHosts"] == out["factory"]["codeHosts"]
+    with pytest.raises(fe.PreflightFailed, match="no gitlab code host"):
+        gl.fixture_bridge_egress({"factory": {"codeHosts": [github]}}, ["10.0.0.0/24"], 1)
+    with pytest.raises(fe.PreflightFailed, match="no factory values"):
+        gl.fixture_bridge_egress({}, ["10.0.0.0/24"], 1)
 
 
 def test_install_values_for_the_gitlab_forge_write_no_github_app(tmp_path: Path) -> None:
