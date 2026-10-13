@@ -26,6 +26,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 import factory_e2e as fe
@@ -109,6 +110,7 @@ def scripted_values(
     # The factory reads the stub through its own code host and tracker entries.
     for entry in (*values["factory"]["codeHosts"], *values["factory"]["trackers"]):
         entry["apiUrl"] = github_api
+        entry["host"] = urlsplit(github_api).netloc
     values["factory"]["trackers"][0]["pollIntervalSeconds"] = 5
     values["codeHostTrust"] = {
         "caBundle": {"configMapRef": {"name": ca_configmap, "key": "ca.pem"}}

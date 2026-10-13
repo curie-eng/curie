@@ -86,6 +86,35 @@ def test_scripted_values_put_the_proxy_on_the_worker() -> None:
     ]["networkPolicy"]["allowedEgress"]
 
 
+@pytest.mark.parametrize(
+    ("github_api", "expected_authority"),
+    [
+        ("https://github-stub.example.com:8443/api/v3", "github-stub.example.com:8443"),
+        ("http://127.0.0.1/api", "127.0.0.1"),
+    ],
+)
+def test_scripted_values_put_github_hosts_on_the_stub(
+    github_api: str,
+    expected_authority: str,
+) -> None:
+    kind = _load_kind()
+    values = kind.scripted_values(
+        model_base_url="http://10.1.2.3:8080",
+        github_api=github_api,
+        clone_base="https://10.9.9.9:8443",
+        ca_configmap="github-stub-ca",
+        runner_image="localhost:24111/curie-runner",
+    )
+    for collection in ("codeHosts", "trackers"):
+        github_entries = [
+            entry for entry in values["factory"][collection] if entry["kind"] == "github"
+        ]
+        assert github_entries, f"{collection} must contain GitHub entries"
+        for entry in github_entries:
+            assert entry["host"] == expected_authority
+            assert entry["apiUrl"] == github_api
+
+
 def test_reintroducing_curie_path_prefixes_fails_the_scenario() -> None:
     filtered = scenario.legacy_3617_paths(scenario.FIXTURE_CHANGED_PATHS)
     with pytest.raises(scenario.ScenarioAssertionError, match="unitconv"):
