@@ -19,6 +19,7 @@ from forge_fakes.contract_harness import (
     InMemoryHarness,
     JiraGitHubHarness,
 )
+from forge_fakes.gitlab_harness import GitLabHarness
 
 # A factory may patch the credential sources its adapter reads, so it is
 # handed the vector's monkeypatch, which undoes them after the vector.
@@ -31,6 +32,7 @@ HARNESSES: list[object] = [
     pytest.param(JiraGitHubHarness, id="jira-github"),
     pytest.param(BitbucketCloudHarness, id="memory-tracker+bitbucket-cloud"),
     pytest.param(BitbucketDcHarness, id="memory-tracker+bitbucket-dc"),
+    pytest.param(GitLabHarness, id="gitlab"),
 ]
 
 
