@@ -3349,19 +3349,18 @@ impl LiveHost {
         rollback
             .args
             .extend([plain("--wait"), plain("--timeout"), plain("15m")]);
-        let interrupted_target = (status == "pending-rollback")
+        let interrupted = (status == "pending-rollback")
             .then(|| super::verbs::interrupted_rollback_target(description))
-            .flatten();
-        if let Some(target) = interrupted_target {
+            .flatten()
+            .map(|target| {
+                format!(
+                    "it is an interrupted rollback to revision {target}; run curie cluster rollback --yes to finish it, or "
+                )
+            });
+        if interrupted.is_some() || self.opts.take_over.is_none() || status != "pending-upgrade" {
             bail!(
-                "release {} newest revision {revision} is {status}; serving revision {serving} is version {version}; it is an interrupted rollback to revision {target}; run curie cluster rollback --yes to finish it, or run `{}`, then rerun cluster upgrade",
-                self.opts.common.release,
-                rollback.display()
-            );
-        }
-        if self.opts.take_over.is_none() || status != "pending-upgrade" {
-            bail!(
-                "release {} newest revision {revision} is {status}; serving revision {serving} is version {version}; run `{}`, then rerun cluster upgrade",
+                "release {} newest revision {revision} is {status}; serving revision {serving} is version {version}; {}run `{}`, then rerun cluster upgrade",
+                interrupted.unwrap_or_default(),
                 self.opts.common.release,
                 rollback.display()
             );

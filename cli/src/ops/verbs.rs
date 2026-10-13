@@ -1815,7 +1815,7 @@ pub fn resolve_explicit_revision(
 /// `u32`, is read as a target. Anything else is `None`.
 pub(crate) fn interrupted_rollback_target(description: &str) -> Option<u32> {
     let digits = description.trim().strip_prefix("Rollback to ")?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     digits.parse().ok()
@@ -1830,19 +1830,18 @@ fn resume_interrupted_rollback(
 ) -> Result<RollbackTarget> {
     let target = interrupted_rollback_target(&pending.description)
         .and_then(|n| history.iter().find(|row| row.revision == n));
-    if let Some(row) = target {
-        if row.revision < pending.revision
+    if let Some(row) = target.filter(|row| {
+        row.revision < pending.revision
             && is_eligible_rollback_status(&row.status)
             && row.chart == pending.chart
-        {
-            return Ok(RollbackTarget::Eligible(RollbackChoice {
-                from_revision: pending.revision,
-                to_revision: row.revision,
-                skipped: skipped_between(history, row.revision, pending.revision),
-                forced: false,
-                resumes_interrupted_rollback: true,
-            }));
-        }
+    }) {
+        return Ok(RollbackTarget::Eligible(RollbackChoice {
+            from_revision: pending.revision,
+            to_revision: row.revision,
+            skipped: skipped_between(history, row.revision, pending.revision),
+            forced: false,
+            resumes_interrupted_rollback: true,
+        }));
     }
     let restore = format!("curie cluster rollback --revision {serving} --yes");
     let fix = match target {
