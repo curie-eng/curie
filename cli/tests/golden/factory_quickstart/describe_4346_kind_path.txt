@@ -2,7 +2,7 @@
 # Never hand-edited. The test applies exactly one substitution before comparing:
 # api.githubFactoryIntake -> factory.intake (#4397 decision 5 removes the old key).
 # ---
-infer repository toolchains before Helm from App-authenticated workflows and manifests; warn about tools or versions absent from the fixed runner
+infer repository toolchains before Helm from App-authenticated workflows and manifests; compare requirements with observed tools after selecting the runner image
 Kubernetes context: kind-curie-factory because no current context is set, so a kind cluster is created
 model credential: use CURIE_CREDENTIALS (no prompt)
 kind create cluster --name curie-factory

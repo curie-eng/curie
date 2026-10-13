@@ -1,18 +1,20 @@
-//! `curie cluster factory`: turn on the GitHub factory intake on an existing
-//! release (#3619), the sibling of `cluster github-app`.
+//! `curie cluster factory`: configure GitHub factory intake (#3619) or update
+//! already bound repository runners on an existing release.
 //!
 //! Every value rides a private 0600 values file passed with `-f` and removed
 //! after the run, so the webhook secret never reaches argv. There is no
 //! `--webhook-secret <value>` flag: the secret comes from a file or the
 //! `CURIE_GITHUB_WEBHOOK_SECRET` environment variable only.
 
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
 use crate::exit::CliError;
 use crate::ops::{
-    fetch_release_values, plain, require_on_path, run_capture, CommonOpts, OpsCommand,
+    fetch_release_computed_values, fetch_release_values, plain, require_on_path, run_capture,
+    CommonOpts, OpsCommand,
 };
 
 /// Environment variable carrying the webhook secret value.
@@ -50,6 +52,11 @@ pub struct FactoryIntakeOpts {
     /// Digest-pinned runner image bound in the same upgrade as the intake
     /// settings. `None` leaves `agentSandbox.runnerImages` unchanged.
     pub runner_binding: Option<RunnerImageBinding>,
+    /// Exact recorded repository paths paired with local runner input files.
+    pub repo_runners: Vec<String>,
+    pub registry: Option<String>,
+    /// Exact recorded repository paths whose Docker access is enabled.
+    pub repo_docker: Vec<String>,
 }
 
 /// A runner image to set at `agentSandbox.runnerImages.<agent>` (#3934).
@@ -122,13 +129,15 @@ async fn release_minimum_helm_timeout(common: &CommonOpts) -> Option<u64> {
 pub enum FactoryIntakeOutput {
     DryRun(crate::ui::DryRunPlan),
     Done { enabled: bool },
+    RepositoriesUpdated { enabled: bool, repos: Vec<String> },
 }
 
 impl crate::ui::CliOutput for FactoryIntakeOutput {
     fn to_json(&self) -> serde_json::Value {
         match self {
             FactoryIntakeOutput::DryRun(plan) => plan.to_json(),
-            FactoryIntakeOutput::Done { enabled } => {
+            FactoryIntakeOutput::Done { enabled }
+            | FactoryIntakeOutput::RepositoriesUpdated { enabled, .. } => {
                 serde_json::json!({"factory_intake_enabled": enabled})
             }
         }
@@ -142,6 +151,12 @@ impl crate::ui::CliOutput for FactoryIntakeOutput {
             } else {
                 "GitHub factory intake disabled"
             }),
+            FactoryIntakeOutput::RepositoriesUpdated { repos, .. } => {
+                ui.payload(&format!(
+                    "Updated repository bindings: {}",
+                    repos.join(", ")
+                ));
+            }
         }
     }
 }
@@ -766,6 +781,7 @@ async fn plan_app(
         api,
         app,
         publication,
+        reports: _,
     } = preflight;
     let repos_inferred = opts.all_installed_repos;
     let repos = crate::factory_app::resolve_allowlist(&opts.repos, &app, opts.all_installed_repos)?;
@@ -858,7 +874,520 @@ fn app_dry_run_lines(opts: &FactoryIntakeOpts, key_file: &Path) -> Vec<String> {
     ]
 }
 
+struct RepositoryRunnerRequest {
+    repo: String,
+    file: PathBuf,
+    spec: crate::repo_runner::RepoRunnerSpec,
+}
+
+struct RepositoryUpdates {
+    runners: Vec<RepositoryRunnerRequest>,
+    docker: BTreeSet<String>,
+    targets: BTreeSet<String>,
+}
+
+type RepositoryIndices = BTreeMap<String, (usize, usize)>;
+
+fn repository_updates_input(opts: &FactoryIntakeOpts) -> Result<RepositoryUpdates> {
+    if opts.disable
+        || opts.intake.is_some()
+        || opts.label.is_some()
+        || opts.mention.is_some()
+        || opts.card_base_url.is_some()
+        || opts.webhook_secret.is_some()
+        || !opts.forge_egress.is_empty()
+        || opts.org.is_some()
+        || opts.runner_binding.is_some()
+    {
+        return Err(CliError::usage(
+            "--repo-runner/--repo-docker cannot be combined with intake mutation or registration flags",
+        )
+        .into());
+    }
+    if !opts.repo_runners.is_empty()
+        && opts.registry.as_deref().is_none_or(|registry| {
+            !regex::Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._/:-]*$")
+                .expect("static registry syntax")
+                .is_match(registry)
+        })
+    {
+        return Err(CliError::usage("--repo-runner requires --registry REGISTRY").into());
+    }
+    if opts.repo_runners.is_empty() && opts.registry.is_some() {
+        return Err(CliError::usage("--registry requires --repo-runner OWNER/REPO=SPEC").into());
+    }
+    // Keep the chart's repository-path grammar, including nested code-host paths.
+    let grammar =
+        regex::Regex::new(r"^[A-Za-z0-9_][A-Za-z0-9._~-]*(/[A-Za-z0-9_][A-Za-z0-9._~-]*)+$")
+            .expect("static chart repository-path grammar");
+    let mut runners = Vec::new();
+    let mut targets = BTreeSet::new();
+    for raw in &opts.repo_runners {
+        let (repo, file) = raw
+            .split_once('=')
+            .filter(|(repo, file)| grammar.is_match(repo) && !file.trim().is_empty())
+            .ok_or_else(|| CliError::usage("--repo-runner expects OWNER/REPO=SPEC, an exact repository path and a nonempty input file"))?;
+        if !targets.insert(repo.to_string()) {
+            return Err(CliError::usage(format!(
+                "--repo-runner repository {repo} is listed more than once"
+            ))
+            .into());
+        }
+        let file = PathBuf::from(file);
+        let loaded = crate::repo_runner::load_spec(&file)
+            .map_err(|error| CliError::usage(format!("{repo}: {error:#}")))?;
+        runners.push(RepositoryRunnerRequest {
+            repo: repo.to_string(),
+            file,
+            spec: loaded.spec,
+        });
+    }
+    let mut docker = BTreeSet::new();
+    for repo in &opts.repo_docker {
+        if !grammar.is_match(repo) {
+            return Err(CliError::usage(
+                "--repo-docker expects OWNER/REPO, an exact repository path without wildcards",
+            )
+            .into());
+        }
+        if !docker.insert(repo.clone()) {
+            return Err(CliError::usage(format!(
+                "--repo-docker repository {repo} is listed more than once"
+            ))
+            .into());
+        }
+        targets.insert(repo.clone());
+    }
+    Ok(RepositoryUpdates {
+        runners,
+        docker,
+        targets,
+    })
+}
+
+fn repository_update_bindings(
+    recorded: &serde_json::Value,
+    updates: &RepositoryUpdates,
+) -> Result<(Vec<serde_json::Value>, RepositoryIndices)> {
+    let bindings = recorded
+        .pointer("/factory/bindings")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut indices = BTreeMap::new();
+    for target in &updates.targets {
+        let mut matches = Vec::new();
+        for (bi, binding) in bindings.iter().enumerate() {
+            if let Some(repos) = binding.get("repos").and_then(serde_json::Value::as_array) {
+                for (ri, repo) in repos.iter().enumerate() {
+                    if repo.get("path").and_then(serde_json::Value::as_str) == Some(target.as_str())
+                    {
+                        matches.push((bi, ri));
+                    }
+                }
+            }
+        }
+        if matches.len() != 1 {
+            let reason = if matches.is_empty() {
+                "has no recorded binding"
+            } else {
+                "is ambiguous: more than one recorded binding"
+            };
+            return Err(CliError::usage(format!(
+                "repository {target} {reason}; nothing was built or applied"
+            ))
+            .into());
+        }
+        indices.insert(target.clone(), matches[0]);
+    }
+    Ok((bindings, indices))
+}
+
+fn repository_update_prerequisites(
+    computed: &serde_json::Value,
+    fullname: &crate::ops::ReleaseFullname,
+    updates: &RepositoryUpdates,
+    indices: &RepositoryIndices,
+) -> Result<()> {
+    let agents = computed
+        .pointer("/factory/sandboxEgress")
+        .and_then(serde_json::Value::as_object);
+    if agents.is_none_or(|agents| {
+        agents.values().any(|enabled| !enabled.is_boolean())
+            || agents
+                .values()
+                .filter(|enabled| enabled.as_bool() == Some(true))
+                .count()
+                != 1
+    }) {
+        return Err(CliError::usage(
+            "repository runners require exactly one true factory.sandboxEgress agent",
+        )
+        .into());
+    }
+    if computed
+        .pointer("/agentSandbox/deploy")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err(CliError::usage(
+            "repository runners require agentSandbox.deploy=true for chart-managed pools",
+        )
+        .into());
+    }
+    let pool = fullname.resource("runner-pool");
+    if computed.pointer("/worker/warmPool").is_some_and(|value| {
+        value
+            .as_str()
+            .is_none_or(|name| !name.is_empty() && name != pool)
+    }) {
+        return Err(CliError::usage(format!(
+            "repository runners require worker.warmPool to be empty or {pool}"
+        ))
+        .into());
+    }
+    if computed
+        .pointer("/worker/deploy")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err(CliError::usage("repository updates require worker.deploy=true").into());
+    }
+    let daemon_syntax =
+        regex::Regex::new(r"^[^\s@]+@sha256:[0-9a-f]{64}$").expect("static daemon digest syntax");
+    for (target, &(bi, ri)) in indices {
+        let repo = &computed["factory"]["bindings"][bi]["repos"][ri];
+        if !updates.docker.contains(target)
+            && repo
+                .pointer("/docker/enabled")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            continue;
+        }
+        let has_cli = match updates
+            .runners
+            .iter()
+            .find(|request| &request.repo == target)
+        {
+            Some(request) => request.spec.tools.iter().any(|tool| tool == "docker-cli"),
+            None => repo
+                .pointer("/runner/tools")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|tools| tools.iter().any(|tool| tool.as_str() == Some("docker-cli"))),
+        };
+        if !has_cli {
+            return Err(CliError::usage(format!("repository {target} enables Docker and requires catalog docker-cli in its selected runner tools")).into());
+        }
+        let daemon = computed
+            .pointer("/factory/docker/daemonImage")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !daemon_syntax.is_match(daemon) {
+            return Err(CliError::usage(format!(
+                "repository {target} requires a digest-pinned factory.docker.daemonImage"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn advisory_repo_image(
+    values: &serde_json::Value,
+    target: &str,
+) -> std::result::Result<Option<String>, String> {
+    let mut images = Vec::new();
+    if let Some(bindings) = values
+        .pointer("/factory/bindings")
+        .and_then(serde_json::Value::as_array)
+    {
+        for binding in bindings {
+            if let Some(repos) = binding.get("repos").and_then(serde_json::Value::as_array) {
+                for repo in repos {
+                    if repo.get("path").and_then(serde_json::Value::as_str) == Some(target) {
+                        if let Some(image) = repo
+                            .pointer("/runner/image")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|image| !image.is_empty())
+                        {
+                            images.push(image.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match images.len() {
+        0 => Ok(None),
+        1 => Ok(images.pop()),
+        _ => Err("recorded repository runner selection is ambiguous".into()),
+    }
+}
+
+async fn announce_inventory(
+    reports: &BTreeMap<String, crate::factory_toolchain::Report>,
+    values: &serde_json::Value,
+    pending: Option<&RunnerImageBinding>,
+    common: &CommonOpts,
+) {
+    let ui = crate::ui::ui();
+    let agents: Vec<&str> = values
+        .pointer("/factory/sandboxEgress")
+        .and_then(serde_json::Value::as_object)
+        .map(|agents| {
+            agents
+                .iter()
+                .filter(|(_, enabled)| enabled.as_bool() == Some(true))
+                .map(|(name, _)| name.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let agent_image = if agents.len() == 1 {
+        pending
+            .filter(|binding| binding.agent == agents[0])
+            .map(|binding| binding.image.clone())
+            .or_else(|| {
+                values
+                    .pointer("/agentSandbox/runnerImages")
+                    .and_then(|images| images.get(agents[0]))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|image| !image.is_empty())
+                    .map(str::to_string)
+            })
+    } else {
+        None
+    };
+    let mut platform: Option<std::result::Result<String, String>> = None;
+    for (repo, report) in reports {
+        let image = match advisory_repo_image(values, repo) {
+            Ok(Some(image)) => Ok(image),
+            Err(reason) => Err(reason),
+            Ok(None) => match &agent_image {
+                Some(image) => Ok(image.clone()),
+                None => {
+                    if platform.is_none() {
+                        platform = Some(
+                            crate::cluster_secrets::installed_runner(common)
+                                .await
+                                .map(|(_, pin)| pin),
+                        );
+                    }
+                    platform
+                        .as_ref()
+                        .expect("resolved serving platform runner")
+                        .clone()
+                }
+            },
+        };
+        let manifest = match image {
+            Ok(image) => match crate::factory_toolchain::read_tool_manifest(&image).await {
+                Ok(Some(manifest)) => Some(manifest),
+                Ok(None) => {
+                    ui.warn(&format!("{repo}: tool inventory unknown: selected image has no readable tool manifest"));
+                    None
+                }
+                Err(error) => {
+                    ui.warn(&format!("{repo}: tool inventory unknown: {error}"));
+                    None
+                }
+            },
+            Err(reason) => {
+                ui.warn(&format!("{repo}: tool inventory unknown: {reason}"));
+                None
+            }
+        };
+        for warning in report.warnings(manifest.as_ref()) {
+            ui.warn(&format!("{repo}: {warning}"));
+        }
+    }
+}
+
+async fn update_repositories(opts: FactoryIntakeOpts) -> Result<Box<dyn crate::ui::CliOutput>> {
+    let updates = repository_updates_input(&opts)?;
+    let app_args = app_arguments(&opts)?;
+    if opts.common.dry_run {
+        let mut lines = vec![
+            "# update only the complete recorded factory.bindings list; intake allowlist unchanged"
+                .into(),
+        ];
+        if let Some((_, file)) = &app_args {
+            lines.push(format!("# App-authenticated repository discovery from {} before Helm; compare selected image tool manifests after builds", file.display()));
+        }
+        lines.push("# read recorded bindings and computed pool/Docker prerequisites; resolve exact unique targets before any build".into());
+        for request in &updates.runners {
+            lines.push(format!("# build {} from {} with registry {}; base=<installed serving platform runner pin>, store complete runner receipt including image, base and platformDigests", request.repo, request.file.display(), opts.registry.as_deref().unwrap_or_default()));
+        }
+        for repo in &updates.docker {
+            lines.push(format!(
+                "# enable docker for {repo}, preserving its runner and Docker egress metadata"
+            ));
+        }
+        lines.push(
+            helm_upgrade(
+                &opts.common,
+                &opts.chart,
+                Path::new("<private-values-file>"),
+                effective_helm_timeout(opts.timeout_seconds, None),
+            )
+            .display(),
+        );
+        lines.extend(
+            crate::comms::rollout_commands(
+                true,
+                &opts.common.namespace,
+                &crate::ops::chart_fullname(&opts.common.release),
+            )
+            .iter()
+            .map(OpsCommand::display),
+        );
+        return Ok(Box::new(FactoryIntakeOutput::DryRun(
+            crate::ui::DryRunPlan { lines },
+        )));
+    }
+    // Optional App discovery remains ahead of every Helm read, without Secret,
+    // label, publication identity or intake mutations in repository mode.
+    let reports = if let Some((id, file)) = &app_args {
+        crate::factory_toolchain::preflight(id, file, &opts.repos, opts.all_installed_repos)
+            .await?
+            .reports
+    } else {
+        crate::ui::ui().note(crate::factory_toolchain::SKIPPED_NOTE);
+        BTreeMap::new()
+    };
+    if !opts.repos.is_empty() || opts.all_installed_repos {
+        crate::ui::ui()
+            .note("repository scope is discovery only; the intake allowlist is unchanged");
+    }
+    require_on_path("helm")?;
+    require_on_path("kubectl")?;
+    let recorded = fetch_release_values(&opts.common)
+        .await?
+        .unwrap_or(serde_json::Value::Null);
+    let (mut bindings, indices) = repository_update_bindings(&recorded, &updates)?;
+    let computed = fetch_release_computed_values(&opts.common)
+        .await?
+        .ok_or_else(|| CliError::usage("repository updates require an existing Helm release"))?;
+    let fullname = crate::ops::release_fullname(&opts.common.namespace, &opts.common.release).await;
+    repository_update_prerequisites(&computed, &fullname, &updates, &indices)?;
+    let base = if updates.runners.is_empty() {
+        None
+    } else {
+        Some(
+            crate::cluster_secrets::installed_runner(&opts.common)
+                .await
+                .map_err(CliError::failure)?
+                .1,
+        )
+    };
+    let mut receipts = Vec::new();
+    for request in &updates.runners {
+        let receipt = crate::commands::build_repo_runner(crate::commands::RepoRunnerBuildOpts {
+            spec: request.file.clone(),
+            registry: opts.registry.clone().expect("validated build registry"),
+            runner_image: base.clone(),
+        })
+        .await?;
+        receipts.push((&request.repo, receipt.runner));
+    }
+    // Collect every build receipt before preparing the single values upgrade.
+    for (repo, runner) in receipts {
+        let (bi, ri) = indices[repo];
+        bindings[bi]["repos"][ri]["runner"] = serde_json::to_value(runner)?;
+    }
+    for repo in &updates.docker {
+        let (bi, ri) = indices[repo];
+        let entry = &mut bindings[bi]["repos"][ri];
+        if entry.get("docker").is_none_or(serde_json::Value::is_null) {
+            entry["docker"] = serde_json::json!({});
+        }
+        entry["docker"]["enabled"] = serde_json::json!(true);
+    }
+    let values = serde_json::json!({"factory": {"bindings": bindings}});
+    let mut selected = computed.clone();
+    selected["factory"]["bindings"] = values["factory"]["bindings"].clone();
+    announce_inventory(&reports, &selected, None, &opts.common).await;
+    let timeout = match opts.timeout_seconds {
+        Some(explicit) => explicit,
+        None => effective_helm_timeout(None, release_minimum_helm_timeout(&opts.common).await),
+    };
+    let file = crate::ops::SecretValuesFileGuard::private_document(&values)?;
+    let command = helm_upgrade(&opts.common, &opts.chart, file.path(), timeout);
+    crate::ui::ui().plumbing(&format!("+ {}", command.display()));
+    let (ok, _, stderr) = run_capture(&command).await?;
+    if !ok {
+        return Err(CliError::failure(format!(
+            "helm upgrade of repository bindings failed: {}",
+            stderr.trim()
+        ))
+        .into());
+    }
+    // The comms Slack consumer table's disconnect subset is worker and API;
+    // both consume repository runner configuration and must restart and wait.
+    for command in crate::comms::rollout_commands(true, &opts.common.namespace, &fullname) {
+        crate::ui::ui().plumbing(&format!("+ {}", command.display()));
+        let component = command
+            .argv()
+            .into_iter()
+            .find(|arg| arg.starts_with("deployment/"))
+            .unwrap_or_else(|| "deployment".into());
+        let (ok, _, stderr) = run_capture(&command).await.map_err(|error| {
+            CliError::failure(format!(
+                "{component} rollout failed after repository bindings were updated: {error}"
+            ))
+        })?;
+        if !ok {
+            return Err(CliError::failure(format!(
+                "{component} rollout failed after repository bindings were updated: {}",
+                stderr.trim()
+            ))
+            .into());
+        }
+    }
+    Ok(Box::new(FactoryIntakeOutput::RepositoriesUpdated {
+        enabled: computed
+            .pointer("/factory/enabled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true),
+        repos: updates.targets.into_iter().collect(),
+    }))
+}
+
+fn app_arguments(opts: &FactoryIntakeOpts) -> Result<Option<(String, PathBuf)>> {
+    let args = match (opts.app_id.clone(), opts.private_key_file.clone()) {
+        (Some(id), Some(file)) => {
+            if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+                return Err(CliError::usage(format!("--app-id {id:?} is not a number"))
+                    .with_fix("pass the numeric App ID from the App's settings page")
+                    .into());
+            }
+            Some((id, file))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(CliError::usage(
+                "--app-id and --private-key-file go together; pass both or neither",
+            )
+            .with_fix("add the missing --app-id <ID> or --private-key-file <PATH>")
+            .into())
+        }
+    };
+    if !opts.disable && args.is_some() && opts.repos.is_empty() && !opts.all_installed_repos {
+        return Err(crate::factory_app::repository_scope_error());
+    }
+    if opts.disable && args.is_some() {
+        return Err(CliError::usage(
+            "--disable changes nothing else; drop --app-id/--private-key-file",
+        )
+        .into());
+    }
+    Ok(args)
+}
+
 pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate::ui::CliOutput>> {
+    if !opts.repo_runners.is_empty() || !opts.repo_docker.is_empty() || opts.registry.is_some() {
+        return update_repositories(opts).await;
+    }
     if let Some(mention) = opts.mention.as_deref() {
         if !opts.disable && !valid_github_login(mention) {
             return Err(
@@ -880,33 +1409,7 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
             );
         }
     }
-    let app_args = match (opts.app_id.clone(), opts.private_key_file.clone()) {
-        (Some(id), Some(file)) => {
-            if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
-                return Err(CliError::usage(format!("--app-id {id:?} is not a number"))
-                    .with_fix("pass the numeric App ID from the App's settings page")
-                    .into());
-            }
-            Some((id, file))
-        }
-        (None, None) => None,
-        _ => {
-            return Err(CliError::usage(
-                "--app-id and --private-key-file go together; pass both or neither",
-            )
-            .with_fix("add the missing --app-id <ID> or --private-key-file <PATH>")
-            .into())
-        }
-    };
-    if !opts.disable && app_args.is_some() && opts.repos.is_empty() && !opts.all_installed_repos {
-        return Err(crate::factory_app::repository_scope_error());
-    }
-    if opts.disable && app_args.is_some() {
-        return Err(CliError::usage(
-            "--disable changes nothing else; drop --app-id/--private-key-file",
-        )
-        .into());
-    }
+    let app_args = app_arguments(&opts)?;
     if opts.common.dry_run {
         let placeholder = Path::new("<private-values-file>");
         let mut lines = Vec::new();
@@ -934,12 +1437,13 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
     }
     let mut app_plan = None;
     let mut publication = None;
+    let mut reports = BTreeMap::new();
     // A disable writes no factory entries, so it reads nothing recorded.
     let mut recorded = serde_json::Value::Null;
     if !opts.disable {
         // Repository auth and inference are a preflight, before any Helm read
         // or context-dependent setup. Reuse its tokens for the setup plan.
-        let preflight = if let Some((id, file)) = &app_args {
+        let mut preflight = if let Some((id, file)) = &app_args {
             Some(
                 crate::factory_toolchain::preflight(
                     id,
@@ -953,6 +1457,9 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
             crate::ui::ui().note(crate::factory_toolchain::SKIPPED_NOTE);
             None
         };
+        if let Some(preflight) = &mut preflight {
+            reports = std::mem::take(&mut preflight.reports);
+        }
         if let (None, Some(slug)) = (&preflight, &opts.mention) {
             publication = Some(
                 crate::factory_app::GithubApi::new()?
@@ -1017,6 +1524,41 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
     require_on_path("helm")?;
     require_on_path("kubectl")?;
     let mut values = planned_values(&opts, &recorded, app_plan.as_ref());
+    if !reports.is_empty() {
+        match fetch_release_computed_values(&opts.common).await {
+            Ok(Some(mut computed)) => {
+                if let Some(changes) = values
+                    .pointer("/factory/sandboxEgress")
+                    .and_then(serde_json::Value::as_object)
+                {
+                    let mut agents = computed
+                        .pointer("/factory/sandboxEgress")
+                        .and_then(serde_json::Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    agents.extend(changes.clone());
+                    computed["factory"]["sandboxEgress"] = serde_json::Value::Object(agents);
+                }
+                announce_inventory(
+                    &reports,
+                    &computed,
+                    opts.runner_binding.as_ref(),
+                    &opts.common,
+                )
+                .await;
+            }
+            _ => {
+                for (repo, report) in &reports {
+                    crate::ui::ui().warn(&format!(
+                        "{repo}: tool inventory unknown: computed release values are unavailable"
+                    ));
+                    for warning in report.warnings(None) {
+                        crate::ui::ui().warn(&format!("{repo}: {warning}"));
+                    }
+                }
+            }
+        }
+    }
     if let Some(identity) = &publication {
         values["worker"] = serde_json::json!({
             "publication": {
@@ -1133,6 +1675,9 @@ mod tests {
             org: None,
             intake: None,
             runner_binding: None,
+            repo_runners: Vec::new(),
+            registry: None,
+            repo_docker: Vec::new(),
         }
     }
 

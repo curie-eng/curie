@@ -933,6 +933,39 @@ The two-platform push needs a docker-container builder. Create one with
 `docker buildx create --driver docker-container --use`, or point
 `BUILDX_BUILDER` at an existing one. Docker's default driver refuses the push.
 
+#### Configure an installed factory repository
+
+Run `curie cluster --context <CONTEXT> factory --namespace <NAMESPACE>
+--release <RELEASE> --repo-runner acme-corp/acme-bot=runner.yaml --registry
+ghcr.io/acme-corp` to build that toolset on the installation's serving platform
+runner and deploy it to an already bound repository. Repeat `--repo-runner` for
+other bound repositories. Each input uses the same tools, Dockerfile and probes
+as `curie build --repo-runner`. All inputs and targets are validated before
+building; every build must succeed before the binding values are applied.
+
+The command records the image index digest, platform runner base digest and
+both platform digests, preserving other binding fields and repositories. This
+mode preserves the factory's intake state, code hosts and trackers. Configure
+intake separately. Optional App credentials and `--repo` select repositories
+for toolchain discovery; they leave the intake allowlist unchanged in this mode.
+
+Add `--repo-docker acme-corp/acme-bot` to enable Docker for that repository, or
+use it alone to update an existing runner binding. Its tool list must select
+`docker-cli`; a custom Docker probe does not satisfy that requirement. The
+installation must already configure a digest-pinned `factory.docker.daemonImage`
+and a deployed worker. Replacing a Docker-enabled runner with a toolset lacking
+`docker-cli` is refused before building.
+
+Toolchain warnings compare repository declarations with the selected pinned
+image's `/etc/curie/tool-manifest.json`. Language executables must be observed
+by a probe: `uv` and `pnpm` alone do not establish Python or Node versions.
+Inventory reads use anonymous registry access. A private registry, an absent
+manifest, an unsupported layer encoding or a read limit produces an explicit
+unknown-inventory warning. It never substitutes a fixed toolchain list.
+
+`--dry-run` validates local inputs and prints the build and binding plan with
+placeholders for digests; it performs no registry or cluster reads.
+
 ### Prototyping agents in a source checkout
 
 Two shortcuts for working with the repo's own `agents/` scratch directory:

@@ -26,7 +26,98 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 
+use support::oci_registry_stub::sha256_digest;
 use support::{serve, MockServer, Request, Response};
+
+/// External registry shapes follow the OCI Distribution manifest/blob endpoints:
+/// https://github.com/opencontainers/distribution-spec/blob/v1.1.0/spec.md
+/// https://github.com/opencontainers/image-spec/blob/v1.1.0/manifest.md
+/// Inventory bytes follow docs/schemas/tool-manifest.schema.json.
+fn inventory_registry(python: Option<&str>) -> (MockServer, String) {
+    let mut archive = tar::Builder::new(Vec::new());
+    if let Some(version) = python {
+        let inventory = serde_json::to_vec(&serde_json::json!({
+            "schema_version":1, "docker_cli":false,
+            "tools":[
+                {"name":"python3", "version":version, "path":"/usr/bin/python3", "source":"probe"},
+                {"name":"node", "version":"22.23.0", "path":"/usr/bin/node", "source":"probe"},
+            ],
+        }))
+        .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(inventory.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                "etc/curie/tool-manifest.json",
+                inventory.as_slice(),
+            )
+            .unwrap();
+    }
+    let layer = archive.into_inner().unwrap();
+    let config = serde_json::to_vec(&serde_json::json!({
+        "architecture":"amd64", "os":"linux",
+        "rootfs":{"type":"layers", "diff_ids":[sha256_digest(&layer)]},
+    }))
+    .unwrap();
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion":2, "mediaType":"application/vnd.oci.image.manifest.v1+json",
+        "config":{"mediaType":"application/vnd.oci.image.config.v1+json", "digest":sha256_digest(&config), "size":config.len()},
+        "layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar", "digest":sha256_digest(&layer), "size":layer.len()}],
+    })).unwrap();
+    let index = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion":2, "mediaType":"application/vnd.oci.image.index.v1+json",
+        "manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json", "digest":sha256_digest(&manifest), "size":manifest.len(), "platform":{"os":"linux", "architecture":"amd64"}}],
+    })).unwrap();
+    let digest = sha256_digest(&index);
+    let responses = [
+        (
+            format!("/v2/acme/runner/manifests/{digest}"),
+            "application/vnd.oci.image.index.v1+json",
+            index,
+        ),
+        (
+            format!("/v2/acme/runner/manifests/{}", sha256_digest(&manifest)),
+            "application/vnd.oci.image.manifest.v1+json",
+            manifest,
+        ),
+        (
+            format!("/v2/acme/runner/blobs/{}", sha256_digest(&layer)),
+            "application/octet-stream",
+            layer,
+        ),
+        (
+            format!("/v2/acme/runner/blobs/{}", sha256_digest(&config)),
+            "application/octet-stream",
+            config,
+        ),
+    ];
+    let server = serve(move |request| {
+        assert_eq!(request.method, "GET");
+        assert!(
+            request.header("authorization").is_none(),
+            "GitHub credentials must not reach the registry"
+        );
+        match responses
+            .iter()
+            .find(|(path, _, _)| path == path_only(request))
+        {
+            Some((_, media_type, body)) => Response {
+                status: 200,
+                content_type: (*media_type).into(),
+                body: body.clone(),
+            },
+            None => Response::json(404, r#"{"errors":[{"code":"MANIFEST_UNKNOWN"}]}"#),
+        }
+    });
+    let image = format!(
+        "{}/acme/runner@{digest}",
+        server.base_url.trim_start_matches("http://")
+    );
+    (server, image)
+}
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -213,6 +304,7 @@ struct Fixture {
     values: String,
     api_prefix: &'static str,
     runner_build: bool,
+    inventory: Option<MockServer>,
 }
 
 fn path_only(req: &Request) -> &str {
@@ -386,18 +478,55 @@ impl Fixture {
                 _ => Response::json(404, r#"{"message":"Not Found (fake)"}"#),
             }
         });
-        Self {
+        let mut fixture = Self {
             dir,
             github,
             secret_json: String::new(),
             values: r#"{"api":{"environment":"dev"}}"#.to_string(),
             api_prefix,
             runner_build: false,
+            inventory: None,
+        };
+        if matches!(
+            toolchain,
+            ToolchainFixture::Python
+                | ToolchainFixture::Go
+                | ToolchainFixture::WorkflowPython
+                | ToolchainFixture::WorkflowGo
+                | ToolchainFixture::Java
+                | ToolchainFixture::VersionFile
+                | ToolchainFixture::MissingVersionFile
+        ) {
+            fixture.record_inventory(Some("3.13.2"));
         }
+        fixture
     }
 
     fn installed() -> Self {
         Self::new(GithubConfig { installed: true })
+    }
+
+    fn record_inventory(&mut self, python: Option<&str>) {
+        let (server, image) = inventory_registry(python);
+        let mut values: serde_json::Value = serde_json::from_str(&self.values).unwrap();
+        values["factory"] = serde_json::json!({"sandboxEgress":{"acme-bot":true}});
+        values["agentSandbox"] = serde_json::json!({
+            "deploy":true, "runnerImages":{"acme-bot":image},
+        });
+        self.values = values.to_string();
+        self.inventory = Some(server);
+    }
+
+    fn assert_inventory_read(&self) {
+        let requests = self.inventory.as_ref().expect("owned registry").recorded();
+        assert!(
+            requests.iter().any(|r| r.path.contains("/manifests/")),
+            "{requests:?}"
+        );
+        assert!(
+            requests.iter().any(|r| r.path.contains("/blobs/")),
+            "{requests:?}"
+        );
     }
 
     fn record_existing_app(&mut self) {
@@ -456,7 +585,9 @@ impl Fixture {
             "daemonImage":format!("registry.example.com/acme/daemon@sha256:{}", "f".repeat(64)),
         });
         values["worker"] = serde_json::json!({"deploy":true});
+        values["factory"]["sandboxEgress"] = serde_json::json!({"acme-bot":true});
         values["agentSandbox"] = serde_json::json!({
+            "deploy":true,
             "runner":{"image":"registry.example.com/platform/runner", "digest":format!("sha256:{}", "b".repeat(64))},
             "runnerImages":{"acme-bot":format!("registry.example.com/agent/runner@sha256:{}", "e".repeat(64))},
         });
@@ -1517,6 +1648,19 @@ fn factory_toolchain_preflight_reads_the_app_repository_before_any_helm_call() {
             contents < helm,
             "repository inference must precede Helm: {log}"
         );
+        if fx.inventory.is_some() {
+            fx.assert_inventory_read();
+            assert!(!combined(&output).contains("tool inventory unknown"));
+        } else {
+            assert!(
+                !log.contains("helm history"),
+                "no requirements need no installed runner read: {log}"
+            );
+            assert!(
+                !log.contains("--all"),
+                "no requirements need no computed values read: {log}"
+            );
+        }
         assert!(
             fx.github
                 .recorded()
@@ -1582,10 +1726,16 @@ fn factory_toolchain_contents_api_reads_workflows_java_and_declared_version_file
             "{stderr}"
         );
         assert_eq!(
-            stderr.contains("fixed factory runner lacks"),
+            stderr.contains("not in selected image manifest"),
             warning,
             "{stderr}"
         );
+        assert!(!stderr.contains("tool inventory unknown"), "{stderr}");
+        assert!(
+            !stderr.contains("selected image manifest observed"),
+            "{stderr}"
+        );
+        fx.assert_inventory_read();
         let log = fx.log();
         let read = log
             .find(&format!("contents/{source}"))
@@ -1619,9 +1769,11 @@ fn missing_declared_version_file_warns_with_tool_and_path_then_continues() {
     );
     assert!(
         stderr.contains(".github/workflows/checks.yml")
-            && stderr.contains("fixed factory runner lacks"),
+            && stderr.contains("selected image manifest observed python3 3.13.2"),
         "{stderr}"
     );
+    assert!(!stderr.contains("tool inventory unknown"), "{stderr}");
+    fx.assert_inventory_read();
     assert!(!stderr.contains("no toolchain signals"), "{stderr}");
     let log = fx.log();
     let missing_read = log
@@ -1631,6 +1783,84 @@ fn missing_declared_version_file_warns_with_tool_and_path_then_continues() {
         .find("helm ")
         .expect("missing version file must still allow Helm");
     assert!(missing_read < helm, "{log}");
+}
+
+#[test]
+fn factory_toolchain_warns_with_observed_selected_image_version() {
+    let mut fx =
+        Fixture::with_toolchain(GithubConfig { installed: true }, ToolchainFixture::Python);
+    fx.record_inventory(Some("3.12.9"));
+    let output = fx.run(&strs(&happy_argv(&fx)));
+    assert!(output.status.success(), "{}", combined(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("required Python 3.13.2 from pyproject.toml: selected image manifest observed python3 3.12.9"), "{stderr}");
+    assert!(!stderr.contains("tool inventory unknown"), "{stderr}");
+    assert!(
+        !stderr.contains("not in selected image manifest"),
+        "{stderr}"
+    );
+    fx.assert_inventory_read();
+}
+
+#[test]
+fn factory_toolchain_missing_image_inventory_warns_and_continues() {
+    let mut fx =
+        Fixture::with_toolchain(GithubConfig { installed: true }, ToolchainFixture::Python);
+    fx.record_inventory(None);
+    let output = fx.run(&strs(&happy_argv(&fx)));
+    assert!(output.status.success(), "{}", combined(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("selected image has no readable tool manifest"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "required Python 3.13.2 from pyproject.toml: selected image tool inventory is unknown"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("not in selected image manifest"),
+        "{stderr}"
+    );
+    fx.assert_inventory_read();
+    assert!(fx.log().contains("helm upgrade"), "{}", fx.log());
+}
+
+#[test]
+fn factory_toolchain_uses_installed_platform_image_without_a_sole_factory_agent() {
+    let mut fx =
+        Fixture::with_toolchain(GithubConfig { installed: true }, ToolchainFixture::Python);
+    let mut values: serde_json::Value = serde_json::from_str(&fx.values).unwrap();
+    let image = values["agentSandbox"]["runnerImages"]["acme-bot"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (repository, digest) = image.split_once('@').unwrap();
+    values["factory"] = serde_json::json!({});
+    values["agentSandbox"] = serde_json::json!({
+        "deploy":true, "runner":{"image":repository, "digest":digest},
+    });
+    fx.values = values.to_string();
+    let output = fx.run(&strs(&happy_argv(&fx)));
+    assert!(output.status.success(), "{}", combined(&output));
+    assert!(
+        !combined(&output).contains("tool inventory unknown"),
+        "{}",
+        combined(&output)
+    );
+    assert!(
+        !combined(&output).contains("selected image manifest observed"),
+        "{}",
+        combined(&output)
+    );
+    fx.assert_inventory_read();
+    let log = fx.log();
+    assert!(
+        log.contains("helm history") && log.contains("--revision 1"),
+        "{log}"
+    );
 }
 
 #[test]

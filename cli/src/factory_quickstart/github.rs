@@ -93,6 +93,9 @@ pub(super) fn finish_intake_opts(input: &PlanInput, _context: &str) -> FactoryIn
         private_key_file: input.private_key_file.as_ref().map(PathBuf::from),
         org: input.org.clone(),
         intake: Some(POLL_INTAKE.into()),
+        repo_runners: Vec::new(),
+        registry: None,
+        repo_docker: Vec::new(),
         // #4362 decision 7: the published layer, an operator bundle's locked
         // image, or nothing for the platform runner.
         runner_binding: match (&input.plugin_dir, &input.runner_image) {

@@ -6,7 +6,7 @@
 # `jira=jira` instead of `github=acme/widgets`. Never regenerated from the
 # implementation.
 # ---
-infer repository toolchains before Helm from App-authenticated workflows and manifests; warn about tools or versions absent from the fixed runner
+infer repository toolchains before Helm from App-authenticated workflows and manifests; compare requirements with observed tools after selecting the runner image
 Kubernetes context: kind-curie-factory because --context was passed
 add agent jira-factory to the factory install on release curie: skip cluster up, App registration, and intake
 model credential: not needed; the release keeps the model it records (no prompt)
