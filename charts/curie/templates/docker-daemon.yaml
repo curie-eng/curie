@@ -1,0 +1,508 @@
+{{- /*
+ADR 0217: per-run Docker daemons for factory repositories that set
+docker.enabled. The worker creates each run's daemon pod, headless Service,
+certificate Secret and ingress NetworkPolicy in a dedicated namespace (decision
+2). This file renders that namespace's fixed boundary: the privileged PSA
+namespace, the worker's Role, quota and limits, default-deny and egress
+NetworkPolicies (decision 7), the Rail 1 sandbox-to-daemon allow, and the
+admission policies that hold every worker-created object to the shape the
+ADR accepts (decisions 4 and 5). Nothing renders without a Docker repository.
+*/}}
+{{- $dockerRepos := list }}
+{{- range include "curie.factory.repoRunnerDescriptors" . | fromJsonArray }}
+{{- if .docker }}
+{{- $dockerRepos = append $dockerRepos . }}
+{{- end }}
+{{- end }}
+{{- if and $dockerRepos .Values.worker.deploy }}
+{{- $kube := .Capabilities.KubeVersion.Version | default "" }}
+{{- if or (eq $kube "") (semverCompare "<1.30.0-0" $kube) }}
+{{- fail (printf "per-run Docker daemons need Kubernetes 1.30 or newer so ValidatingAdmissionPolicy can constrain daemon pods; this render is %q" $kube) }}
+{{- end }}
+{{- /* Read through default dict: factory.docker is nil under --reuse-values
+       for a release that predates it. */}}
+{{- $docker := get (.Values.factory | default dict) "docker" | default dict }}
+{{- $fullname := include "curie.fullname" . }}
+{{- $workerUser := printf "system:serviceaccount:%s:%s-worker" .Release.Namespace $fullname }}
+{{- $image := get $docker "daemonImage" | default "" | toString }}
+{{- /* Decisions 4 and 5: one digest pins the daemon and the authorization
+       plugin it ships, and it is embedded in CEL as a single-quoted literal. */}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._/:-]*@sha256:[0-9a-f]{64}$" $image) }}
+{{- fail (printf "factory.docker.daemonImage must be a digest-pinned image reference (name@sha256:<64 hex>) when a repository enables docker; got %q" $image) }}
+{{- end }}
+{{- /* hasKey, not default: an explicit 0 must be refused, not defaulted. */}}
+{{- $portRaw := "2376" }}
+{{- if hasKey $docker "port" }}
+{{- $portRaw = get $docker "port" | toString }}
+{{- end }}
+{{- if not (regexMatch "^[0-9]{1,5}$" $portRaw) }}
+{{- fail (printf "factory.docker.port must be an integer from 1 through 65535; got %q" $portRaw) }}
+{{- end }}
+{{- $port := int $portRaw }}
+{{- if or (lt $port 1) (gt $port 65535) }}
+{{- fail (printf "factory.docker.port must be an integer from 1 through 65535; got %d" $port) }}
+{{- end }}
+{{- $namespace := get $docker "namespace" | default (printf "%s-%s-docker" .Release.Namespace $fullname) | toString | trunc 63 | trimSuffix "-" }}
+{{- $createNamespace := true }}
+{{- if hasKey $docker "createNamespace" }}
+{{- $createNamespace = get $docker "createNamespace" }}
+{{- end }}
+{{- $quotaHard := dig "quota" "hard" dict $docker }}
+{{- if not $quotaHard }}
+{{- fail "factory.docker.quota.hard must be set when a repository enables docker: the daemon namespace runs privileged pods and needs a hard ceiling" }}
+{{- end }}
+{{- $limitRange := get $docker "limitRange" | default dict }}
+{{- range $k := list "max" "default" "defaultRequest" }}
+{{- if not (get $limitRange $k) }}
+{{- fail (printf "factory.docker.limitRange.%s must be set when a repository enables docker" $k) }}
+{{- end }}
+{{- end }}
+{{- /* Decision 7.3: a repository with no allowlist gets the public 80/443
+       class; one with an allowlist gets its own class keyed by
+       sha256(path)[:16], which the worker computes the same way. */}}
+{{- $public := false }}
+{{- $allowlisted := list }}
+{{- range $dockerRepos }}
+{{- if .egress }}
+{{- $repoKey := trimSuffix ".runner" .source }}
+{{- range .egress }}
+{{- $_ := include "curie.objectStore.egressEntry" (dict "key" (printf "%s.docker.egressAllowlist" $repoKey) "entry" .) }}
+{{- end }}
+{{- $allowlisted = append $allowlisted (dict "path" .path "class" (printf "repo-%s" (sha256sum .path | trunc 16)) "entries" .egress) }}
+{{- else }}
+{{- $public = true }}
+{{- end }}
+{{- end }}
+{{- $classes := list }}
+{{- if $public }}
+{{- $classes = append $classes "'public'" }}
+{{- end }}
+{{- range $allowlisted }}
+{{- $classes = append $classes (printf "'%s'" .class) }}
+{{- end }}
+{{- $classList := printf "[%s]" (join ", " $classes) }}
+{{- $s := "object.spec" }}
+{{- $np := .Values.security.networkPolicy }}
+{{- if $createNamespace }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: docker-daemon-namespace
+    {{- /* Decision 4: the daemon container is privileged, so this namespace
+           and only this one enforces the privileged Pod Security level. The
+           pods policy below is what bounds that privilege. */}}
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/enforce-version: latest
+---
+{{- end }}
+{{- /* Decision 2: the worker creates and deletes each run's daemon objects
+       here. No update or patch: per-run objects are replaced, not edited. */}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-docker-daemon-worker
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: docker-daemon
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-docker-daemon-worker
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: docker-daemon
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-docker-daemon-worker
+subjects:
+  - kind: ServiceAccount
+    name: {{ $fullname }}-worker
+    namespace: {{ .Release.Namespace }}
+---
+{{- /* Decision 5.4: bounded storage and resources, as a namespace ceiling on
+       top of the per-pod requests and limits the pods policy requires. */}}
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ $fullname }}-docker-daemon
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: docker-daemon
+spec:
+  hard:
+    {{- toYaml $quotaHard | nindent 4 }}
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: {{ $fullname }}-docker-daemon
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: docker-daemon
+spec:
+  limits:
+    - type: Container
+      max:
+        {{- toYaml (get $limitRange "max") | nindent 8 }}
+      default:
+        {{- toYaml (get $limitRange "default") | nindent 8 }}
+      defaultRequest:
+        {{- toYaml (get $limitRange "defaultRequest") | nindent 8 }}
+---
+{{- /* Decision 7: every pod in the daemon namespace is default-deny both
+       ways. Ingress opens only through the per-run policy the worker creates,
+       which admits that run's sandbox alone (7.1, 7.2). */}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-docker-daemon-default-deny
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: docker-daemon
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+{{- /* The daemon resolves registry and package hosts for pulls and builds,
+       so DNS is always allowed here (independent of the runner allowDNS). */}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-docker-daemon-allow-dns
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: docker-daemon
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" . "component" "docker-daemon") | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $np.dnsNamespace }}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+{{- if $public }}
+---
+{{- /* Decision 7.3: containers the daemon starts reach the internet on 80
+       and 443 only. curie.egress.ipBlockRules carves the metadata, private
+       and security.networkPolicy.clusterCidrs ranges out of both routes. */}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-docker-daemon-egress-public
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: docker-daemon
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" . "component" "docker-daemon") | nindent 6 }}
+      curietech.ai/docker-egress: public
+  policyTypes: [Egress]
+  egress:
+    {{- $web := list (dict "protocol" "TCP" "port" 80) (dict "protocol" "TCP" "port" 443) }}
+    {{- include "curie.egress.ipBlockRules" (dict "entries" (list (dict "cidr" "0.0.0.0/0" "ports" $web) (dict "cidr" "::/0" "ports" $web)) "root" $) | nindent 4 }}
+{{- end }}
+{{- range $allowlisted }}
+---
+# Decision 7.3: the operator's Docker egress allowlist for repository
+# {{ .path }}, replacing the public class for its daemons.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-docker-daemon-egress-{{ .class }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "curie.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: docker-daemon
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" $ "component" "docker-daemon") | nindent 6 }}
+      curietech.ai/docker-egress: {{ .class }}
+  policyTypes: [Egress]
+  egress:
+    {{- include "curie.egress.ipBlockRules" (dict "entries" .entries "root" $) | nindent 4 }}
+{{- end }}
+{{- if and .Values.agentSandbox.deploy $np.enabled }}
+---
+{{- /* Rail 1 (decision 7.1): runner sandboxes are default-deny egress, so
+       they need this allow to dial a daemon. It admits any daemon pod in the
+       daemon namespace on the daemon port; it composes with the default-deny
+       ingress there, which only the worker's per-run ingress policy opens,
+       for that run's sandbox alone. So a sandbox reaches only its own daemon. */}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-runner-allow-docker-daemon
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent-sandbox
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "curie.selectorLabels" (dict "root" . "component" "docker-daemon") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ $port }}
+{{- end }}
+---
+{{- /* Decisions 4 and 5: the only privileged pod Curie creates. This policy
+       matches every requester in the daemon namespace, so only the worker can
+       create a daemon pod and every daemon pod has the accepted shape. */}}
+{{- $resourced := "has(c.resources) && has(c.resources.requests) && has(c.resources.limits) && 'cpu' in c.resources.requests && 'memory' in c.resources.requests && 'ephemeral-storage' in c.resources.requests && 'cpu' in c.resources.limits && 'memory' in c.resources.limits && 'ephemeral-storage' in c.resources.limits && c.resources.requests['cpu'] != '' && c.resources.requests['memory'] != '' && c.resources.requests['ephemeral-storage'] != '' && c.resources.limits['cpu'] != '' && c.resources.limits['memory'] != '' && c.resources.limits['ephemeral-storage'] != ''" }}
+{{- $noCapAdd := "(!has(c.securityContext) || !has(c.securityContext.capabilities) || !has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0)" }}
+{{- $noHostPort := "(!has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))" }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $fullname }}-docker-daemon-pods
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: docker-daemon
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ $namespace | quote }}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    - expression: {{ printf "request.operation != 'CREATE' || request.userInfo.username == '%s'" $workerUser | quote }}
+      message: only the Curie worker creates pods in the Docker daemon namespace
+    - expression: >-
+        has(object.metadata.labels) &&
+        'curietech.ai/sandbox-claim' in object.metadata.labels &&
+        object.metadata.labels['curietech.ai/sandbox-claim'] != ''
+      message: daemon pods must carry a nonempty curietech.ai/sandbox-claim label
+    - expression: >-
+        has(object.metadata.labels) &&
+        'curietech.ai/managed-by' in object.metadata.labels &&
+        object.metadata.labels['curietech.ai/managed-by'] == 'curie-sandbox-substrate'
+      message: daemon pods must carry curietech.ai/managed-by=curie-sandbox-substrate
+    - expression: >-
+        has(object.metadata.labels) &&
+        'app.kubernetes.io/component' in object.metadata.labels &&
+        object.metadata.labels['app.kubernetes.io/component'] == 'docker-daemon' &&
+        'app.kubernetes.io/name' in object.metadata.labels &&
+        object.metadata.labels['app.kubernetes.io/name'] == '{{ include "curie.name" . }}' &&
+        'app.kubernetes.io/instance' in object.metadata.labels &&
+        object.metadata.labels['app.kubernetes.io/instance'] == '{{ .Release.Name }}'
+      message: daemon pods must carry this release's docker-daemon selector labels
+    - expression: >-
+        has(object.metadata.labels) &&
+        'curietech.ai/docker-egress' in object.metadata.labels &&
+        object.metadata.labels['curietech.ai/docker-egress'] in {{ $classList }}
+      message: daemon pods must carry a curietech.ai/docker-egress class the chart renders an egress policy for
+    - expression: >-
+        size({{ $s }}.containers) == 1 &&
+        {{ $s }}.containers[0].name == 'dockerd' &&
+        {{ $s }}.containers[0].image == '{{ $image }}' &&
+        (!has({{ $s }}.initContainers) || {{ $s }}.initContainers.all(c, c.image == '{{ $image }}')) &&
+        !has({{ $s }}.ephemeralContainers)
+      message: daemon pods run exactly one dockerd container and no ephemeral containers, all on factory.docker.daemonImage
+    - expression: {{ printf "%s.containers.all(c, !has(c.command))" $s | quote }}
+      message: the dockerd container must not override the image command
+    - expression: >-
+        {{ $s }}.containers.all(c, has(c.args) && size(c.args) > 0 &&
+        c.args[0] == 'dockerd' &&
+        c.args.exists(a, a == '--userns-remap=default') &&
+        c.args.all(a, !a.startsWith('--userns-remap') || a == '--userns-remap=default') &&
+        c.args.exists(a, a == '--authorization-plugin=curie-authz'))
+      message: dockerd must run with --userns-remap=default and --authorization-plugin=curie-authz
+    - expression: >-
+        {{ $s }}.containers.all(c, {{ $noCapAdd }}) &&
+        (!has({{ $s }}.initContainers) || {{ $s }}.initContainers.all(c,
+        (!has(c.securityContext) || !has(c.securityContext.privileged) || !c.securityContext.privileged) &&
+        {{ $noCapAdd }}))
+      message: only the dockerd container may be privileged, and no container may add capabilities
+    - expression: >-
+        has({{ $s }}.automountServiceAccountToken) && {{ $s }}.automountServiceAccountToken == false &&
+        (!has({{ $s }}.volumes) || {{ $s }}.volumes.all(v, !has(v.projected) ||
+        !has(v.projected.sources) || v.projected.sources.all(p, !has(p.serviceAccountToken)))) &&
+        (!has({{ $s }}.serviceAccountName) || {{ $s }}.serviceAccountName == 'default')
+      message: daemon pods must not mount a ServiceAccount token or run as a non-default ServiceAccount
+    - expression: >-
+        !has({{ $s }}.volumes) || {{ $s }}.volumes.all(v,
+        (has(v.emptyDir) && has(v.emptyDir.sizeLimit)) || has(v.secret))
+      message: daemon pod volumes must be emptyDir with a sizeLimit or secret
+    - expression: >-
+        (!has({{ $s }}.hostNetwork) || !{{ $s }}.hostNetwork) &&
+        (!has({{ $s }}.hostPID) || !{{ $s }}.hostPID) &&
+        (!has({{ $s }}.hostIPC) || !{{ $s }}.hostIPC) &&
+        {{ $s }}.containers.all(c, {{ $noHostPort }}) &&
+        (!has({{ $s }}.initContainers) || {{ $s }}.initContainers.all(c, {{ $noHostPort }}))
+      message: daemon pods must not share the host network, PID, or IPC namespace or bind a host port
+    - expression: >-
+        {{ $s }}.containers.all(c, {{ $resourced }}) &&
+        (!has({{ $s }}.initContainers) || {{ $s }}.initContainers.all(c, {{ $resourced }}))
+      message: every daemon container and init container must set cpu, memory, and ephemeral-storage requests and limits
+    - expression: {{ printf "has(%[1]s.activeDeadlineSeconds) && %[1]s.activeDeadlineSeconds > 0" $s | quote }}
+      message: daemon pods must set activeDeadlineSeconds so a leaked daemon cannot outlive its run
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $fullname }}-docker-daemon-pods
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: docker-daemon
+spec:
+  policyName: {{ $fullname }}-docker-daemon-pods
+  validationActions: ["Deny"]
+---
+{{- /* Decisions 2, 6 and 7.2: the worker's per-run Service, certificate
+       Secret and ingress NetworkPolicy. A per-run policy opens ingress to its
+       own claim's daemon only and never carries egress, so it cannot widen
+       the chart's egress classes. */}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $fullname }}-docker-daemon-objects
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: docker-daemon
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ $namespace | quote }}
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["services", "secrets"]
+      - apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["networkpolicies"]
+  matchConditions:
+    - name: worker-service-account
+      expression: {{ printf "request.userInfo.username == '%s'" $workerUser | quote }}
+  validations:
+    - expression: >-
+        has(object.metadata.labels) &&
+        'curietech.ai/sandbox-claim' in object.metadata.labels &&
+        object.metadata.labels['curietech.ai/sandbox-claim'] != '' &&
+        'curietech.ai/managed-by' in object.metadata.labels &&
+        object.metadata.labels['curietech.ai/managed-by'] == 'curie-sandbox-substrate'
+      message: worker-created daemon objects must carry a nonempty curietech.ai/sandbox-claim label and curietech.ai/managed-by=curie-sandbox-substrate
+    - expression: >-
+        request.resource.resource != 'networkpolicies' ||
+        (has(object.spec.policyTypes) && object.spec.policyTypes == ['Ingress'] &&
+        !has(object.spec.egress) &&
+        has(object.metadata.labels) &&
+        'curietech.ai/sandbox-claim' in object.metadata.labels &&
+        has(object.spec.podSelector.matchLabels) &&
+        'curietech.ai/sandbox-claim' in object.spec.podSelector.matchLabels &&
+        object.spec.podSelector.matchLabels['curietech.ai/sandbox-claim'] == object.metadata.labels['curietech.ai/sandbox-claim'])
+      message: per-run daemon NetworkPolicies are ingress-only and select only their own claim's daemon
+    - expression: >-
+        request.resource.resource != 'secrets' ||
+        !has(object.type) || object.type == 'Opaque' || object.type == 'kubernetes.io/tls'
+      message: per-run daemon Secrets must be Opaque or kubernetes.io/tls
+    - expression: >-
+        request.resource.resource != 'services' ||
+        ((!has(object.spec.type) || object.spec.type == 'ClusterIP') &&
+        (!has(object.spec.externalIPs) || size(object.spec.externalIPs) == 0))
+      message: per-run daemon Services must be ClusterIP with no externalIPs
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $fullname }}-docker-daemon-objects
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: docker-daemon
+spec:
+  policyName: {{ $fullname }}-docker-daemon-objects
+  validationActions: ["Deny"]
+---
+{{- /* Decision 3: the worker deletes per-run NetworkPolicies by claim label.
+       Only stored objects carrying that label are deletable by it, so it can
+       never remove the chart's default-deny or egress policies. */}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $fullname }}-docker-daemon-cleanup
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: docker-daemon
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ $namespace | quote }}
+    resourceRules:
+      - apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["DELETE"]
+        resources: ["networkpolicies"]
+  matchConditions:
+    - name: worker-service-account
+      expression: {{ printf "request.userInfo.username == '%s'" $workerUser | quote }}
+  validations:
+    - expression: >-
+        has(oldObject.metadata.labels) &&
+        'curietech.ai/sandbox-claim' in oldObject.metadata.labels
+      message: the worker may delete only per-run daemon NetworkPolicies labelled curietech.ai/sandbox-claim
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $fullname }}-docker-daemon-cleanup
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: docker-daemon
+spec:
+  policyName: {{ $fullname }}-docker-daemon-cleanup
+  validationActions: ["Deny"]
+{{- end }}
