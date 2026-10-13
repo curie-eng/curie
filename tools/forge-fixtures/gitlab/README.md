@@ -23,11 +23,13 @@ the fixture-backed tests at it with `CURIE_GITLAB_FIXTURE=<dir>/state.json`.
 3. A free port, 28443 by default. `up` refuses a port that already accepts
    connections on `127.0.0.1` or that any container publishes.
 
-`up` takes about 7 minutes: the first HTTP answer comes after about 4 minutes
-and the root token takes about 2 more. It gives up after 15 minutes, prints the
-last 100 GitLab log lines, and tears everything down. Setting
-`CURIE_FORGE_FIXTURE_KEEP_ON_FAILURE=1` leaves a failed fixture running for
-debugging; `down` still removes it.
+`up` takes about 3 minutes with the images already pulled (measured
+2026-10-13: first HTTP answer after 130 s, root token 28 s, seeding and runner
+registration about 10 s, 169 s in total); the gitlab-mapping spike measured
+about 7 minutes on a slower host. GitLab settles at 2 to 3 GiB. `up` gives up
+after 15 minutes, prints the last 100 GitLab log lines, and tears everything
+down. Setting `CURIE_FORGE_FIXTURE_KEEP_ON_FAILURE=1` leaves a failed fixture
+running for debugging; `down` still removes it.
 
 ## Remote daemon design
 
@@ -74,7 +76,12 @@ it through its `certs/ca.crt` and `tls-ca-file`.
    `write_repository`; `reporter` with `api` and `write_repository`; and a
    second service account token with `read_api` only.
 7. An instance runner using the shell executor that runs untagged jobs and
-   clones from `https://localhost:<port>`.
+   clones from `https://localhost:<port>`. It is created with
+   `POST /api/v4/user/runners` (`runner_type=instance_type`), and its
+   `glrt-` authentication token goes into a `config.toml` that is copied into
+   the runner container, with the CA as `/etc/gitlab-runner/certs/ca.crt` and
+   `tls-ca-file`, before the container starts. `up` waits up to 3 minutes for
+   `GET /runners/all?status=online` to list it.
 
 Git authenticates as `oauth2` with a Basic header,
 `Authorization: Basic base64(oauth2:<token>)`. GitLab refuses a Bearer header
@@ -132,11 +139,13 @@ never appear in `state.json` or in any output.
 2. `widgets-path`: `widgets` has a 3-segment path.
 3. `access-levels`: `developer` is 30 and `reporter` is 20 on `widgets`.
 4. `git-basic-oauth2`: the service account token clones `widgets` and pushes a
-   throwaway branch with the Basic header passed through `GIT_CONFIG_*`
-   environment variables and `http.sslCAInfo`; the same push with a Bearer
-   header is refused.
-5. `runner-job`: the pipeline on that branch reaches `success` or `failed` on
-   the runner within 3 minutes. The branch is deleted afterwards.
+   throwaway branch with the Basic header passed through the
+   `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0=http.extraHeader` environment variables
+   (never argv) and the CA through `GIT_SSL_CAINFO`; the same push with a
+   Bearer header is refused. The branch is deleted afterwards.
+5. `runner-job`: an instance runner is online and the pipeline on `main`
+   (created by the seed commit) has every job finished on the runner within 5
+   minutes. `failed` is the expected result because of the seeded bug.
 
 ## API throttle
 

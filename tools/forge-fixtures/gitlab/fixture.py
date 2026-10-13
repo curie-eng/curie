@@ -48,7 +48,8 @@ DEFAULT_HOST = "localhost"
 UP_DEADLINE_S = 15 * 60
 TOKEN_DAYS = 30
 ROOT_TOKEN_DAYS = 4
-RUNNER_JOB_WAIT_S = 180
+RUNNER_JOB_WAIT_S = 300
+RUNNER_ONLINE_WAIT_S = 180
 REPO_ROOT = Path(__file__).resolve().parents[3]
 # Set to 1 to leave a failed `up` running for debugging; `down` still cleans it.
 KEEP_ENV = "CURIE_FORGE_FIXTURE_KEEP_ON_FAILURE"
@@ -194,7 +195,7 @@ class Api:
         *,
         sudo: str | int | None = None,
         ok: tuple[int, ...] = (200, 201, 202, 204),
-        timeout: float = 60,
+        timeout: float = 120,
     ) -> tuple[int, Any]:
         url = self.api_url + path
         data = None
@@ -205,13 +206,25 @@ class Api:
         if sudo is not None:
             headers["Sudo"] = str(sudo)
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(req, context=self.ctx, timeout=timeout) as resp:
-                status, raw = resp.status, resp.read()
-        except urllib.error.HTTPError as exc:
-            status, raw = exc.code, exc.read()
-        except (urllib.error.URLError, OSError) as exc:
-            raise FixtureError(f"{method} {path}: transport error {type(exc).__name__}") from None
+        # Only idempotent methods retry; a retried POST could seed twice.
+        attempts = 4 if method in ("GET", "PUT", "DELETE") else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                with urllib.request.urlopen(req, context=self.ctx, timeout=timeout) as resp:
+                    status, raw = resp.status, resp.read()
+            except urllib.error.HTTPError as exc:
+                status, raw = exc.code, exc.read()
+            except (urllib.error.URLError, OSError) as exc:
+                if attempt < attempts:
+                    time.sleep(5)
+                    continue
+                raise FixtureError(
+                    f"{method} {path}: transport error {type(exc).__name__}"
+                ) from None
+            if status in (502, 503, 504) and attempt < attempts:
+                time.sleep(5)
+                continue
+            break
         payload: Any = None
         if raw:
             try:
@@ -569,14 +582,27 @@ def seed(api: Api, state: dict[str, Any], state_dir: Path) -> None:
         },
     )
     api.put(f"/projects/{widgets['id']}", {"default_branch": "main"})
-    status, _ = api.request(
-        "GET", f"/projects/{widgets['id']}/protected_branches/main", ok=(200, 404)
-    )
+    # GitLab protects the default branch asynchronously after the first
+    # commit, so a protect call can race it and get 422 "already been taken".
+    # Either way, confirm main ends up protected for Maintainers only.
+    protected = f"/projects/{widgets['id']}/protected_branches"
+    status, _ = api.request("GET", f"{protected}/main", ok=(200, 404))
     if status == 404:
-        api.post(
-            f"/projects/{widgets['id']}/protected_branches",
+        api.request(
+            "POST",
+            protected,
             {"name": "main", "push_access_level": 40, "merge_access_level": 40},
+            ok=(200, 201, 409, 422),
         )
+    for _ in range(20):
+        status, rule = api.request("GET", f"{protected}/main", ok=(200, 404))
+        if status == 200:
+            break
+        time.sleep(1)
+    else:
+        raise FixtureError("main on widgets did not become protected")
+    if any(a.get("access_level") != 40 for a in rule.get("push_access_levels", [])):
+        raise FixtureError("main on widgets is protected but not Maintainers-only for push")
     widgets = api.get(f"/projects/{widgets['id']}")
     if widgets["path_with_namespace"] != WIDGETS or not widgets.get("issues_enabled", True):
         raise FixtureError("widgets project was not created as expected")
@@ -729,20 +755,26 @@ def register_runner(api: Api, state: dict[str, Any], state_dir: Path, deadline: 
             state,
             state_dir,
             "cp",
-            str(state_dir / "tls" / "runner-certs"),
+            # The image already ships /etc/gitlab-runner/certs, so copy the
+            # directory's contents ("/."), not the directory, or it nests.
+            str(state_dir / "tls" / "runner-certs") + "/.",
             "runner:/etc/gitlab-runner/certs",
         )
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     compose(state, state_dir, "start", "runner")
     state["runner"] = {"id": runner["id"]}
-    while True:
+    end = time.monotonic() + RUNNER_ONLINE_WAIT_S
+    while time.monotonic() < end:
         deadline.check("waiting for the runner to come online")
-        info = api.get(f"/runners/{runner['id']}")
-        if info.get("status") == "online":
+        online = api.get("/runners/all?status=online&type=instance_type")
+        if any(r["id"] == runner["id"] for r in online):
             log("runner is online")
             return
         time.sleep(3)
+    proc = compose(state, state_dir, "logs", "--no-color", "--tail", "20", "runner", check=False)
+    print(proc.stdout, file=sys.stderr, end="")
+    raise FixtureError(f"runner {runner['id']} did not come online within {RUNNER_ONLINE_WAIT_S} s")
 
 
 def cmd_up(args: argparse.Namespace) -> int:
@@ -788,20 +820,24 @@ def cmd_up(args: argparse.Namespace) -> int:
         log("creating containers")
         compose(state, state_dir, "create")
         compose(
-            state, state_dir, "cp", str(state_dir / "tls" / "gitlab-ssl"), "gitlab:/etc/gitlab/ssl"
+            state,
+            state_dir,
+            "cp",
+            str(state_dir / "tls" / "gitlab-ssl") + "/.",
+            "gitlab:/etc/gitlab/ssl",
         )
         compose(
             state,
             state_dir,
             "cp",
-            str(state_dir / "tls" / "gitlab-trusted-certs"),
+            str(state_dir / "tls" / "gitlab-trusted-certs") + "/.",
             "gitlab:/etc/gitlab/trusted-certs",
         )
-        log("starting GitLab (first HTTP takes about 4 minutes)")
+        log("starting GitLab (first HTTP takes about 2 to 4 minutes)")
         compose(state, state_dir, "start", "gitlab")
         wait_http(local_base, ca_path, deadline)
 
-        log("creating the root token with gitlab-rails runner (about 2 minutes)")
+        log("creating the root token with gitlab-rails runner (under a minute to 2 minutes)")
         root_token = create_root_token(state, state_dir, deadline)
         root_file = state_dir / "token-root"
         write_private(root_file, root_token)
@@ -924,13 +960,12 @@ def git_env(header: str, ca_path: str) -> dict[str, str]:
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_ASKPASS": "",
         "SSH_ASKPASS": "",
-        "GIT_CONFIG_COUNT": "3",
+        "GIT_SSL_CAINFO": ca_path,
+        "GIT_CONFIG_COUNT": "2",
         "GIT_CONFIG_KEY_0": "http.extraHeader",
         "GIT_CONFIG_VALUE_0": header,
-        "GIT_CONFIG_KEY_1": "http.sslCAInfo",
-        "GIT_CONFIG_VALUE_1": ca_path,
-        "GIT_CONFIG_KEY_2": "credential.helper",
-        "GIT_CONFIG_VALUE_2": "",
+        "GIT_CONFIG_KEY_1": "credential.helper",
+        "GIT_CONFIG_VALUE_1": "",
     }
 
 
@@ -1043,21 +1078,28 @@ def cmd_self_test(args: argparse.Namespace) -> int:
         )
 
     def runner_check() -> tuple[bool, str]:
-        if not pushed["done"]:
-            return False, "no pushed branch to run a pipeline on"
+        online = api.get("/runners/all?status=online&type=instance_type")
+        if not online:
+            return False, "no instance runner is online"
+        pid = widgets["id"]
+        main_branch = widgets["default_branch"]
+        pipes = api.get(f"/projects/{pid}/pipelines?ref={enc(main_branch)}")
+        if not pipes:
+            pipes = [api.post(f"/projects/{pid}/pipeline?ref={enc(main_branch)}")]
+        pipe_id = pipes[0]["id"]
         end = time.monotonic() + RUNNER_JOB_WAIT_S
         status = "none"
         while time.monotonic() < end:
-            pipes = api.get(f"/projects/{widgets['id']}/pipelines?ref={enc(branch)}")
-            if pipes:
-                jobs = api.get(f"/projects/{widgets['id']}/pipelines/{pipes[0]['id']}/jobs")
-                status = ",".join(f"{j['name']}={j['status']}" for j in jobs) or pipes[0]["status"]
-                if jobs and all(
-                    j["status"] in ("success", "failed") and j.get("runner") for j in jobs
-                ):
-                    return True, f"pipeline {pipes[0]['id']} on {branch} finished: {status}"
+            jobs = api.get(f"/projects/{pid}/pipelines/{pipe_id}/jobs")
+            status = ",".join(f"{j['name']}={j['status']}" for j in jobs) or "no jobs"
+            ran = [j for j in jobs if j["status"] in ("success", "failed") and j.get("runner")]
+            if jobs and len(ran) == len(jobs):
+                return True, f"pipeline {pipe_id} on {main_branch} ran on the runner: {status}"
             time.sleep(5)
-        return False, f"no job finished within {RUNNER_JOB_WAIT_S} s (last: {status})"
+        return (
+            False,
+            f"pipeline {pipe_id} had no finished job within {RUNNER_JOB_WAIT_S} s ({status})",
+        )
 
     try:
         check("tls", tls_check)
