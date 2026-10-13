@@ -35,7 +35,7 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     )
     # The next-only migrations follow the immutable published 0.12.2 chain.
     # The minimum tracks the newest schema the app reads (#2911's tenant scope).
-    assert window == {"schema_min": "0108", "schema_head": "0108"}
+    assert window == {"schema_min": "0108", "schema_head": "0104"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -47,7 +47,7 @@ def test_current_release_fields_match_cli_version(field: str) -> None:
     else:
         chart = yaml.safe_load((ROOT / "charts/curie/Chart.yaml").read_text())
         value = chart["version" if field == "chart" else "appVersion"]
-    assert value == "0.13.0"
+    assert value == "0.14.0"
     assert value in catalog()["windows"]
 
 
@@ -59,7 +59,8 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.12.4") == {"schema_min": "0076", "schema_head": "0093"}
     assert data["windows"].get("0.12.5") == {"schema_min": "0076", "schema_head": "0106"}
     assert data["windows"].get("0.13.0") == {"schema_min": "0108", "schema_head": "0108"}
-    assert data["revisions"][-12:] == [
+    assert data["windows"].get("0.14.0") == {"schema_min": "0108", "schema_head": "0104"}
+    assert data["revisions"][-13:] == [
         "0095",
         "0096",
         "0097",
@@ -72,6 +73,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0105",
         "0107",
         "0108",
+        "0104",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -80,6 +82,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0106"] == "expand"
     assert kinds["0107"] == "expand"
     assert kinds["0108"] == "expand"
+    assert kinds["0104"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -93,7 +96,7 @@ def test_every_prior_registered_window_is_exactly_preserved() -> None:
     assert {name: actual[name] for name in expected} == expected
     assert actual["0.12.1"] == {"schema_min": "0076", "schema_head": "0076"}
     assert set(actual) - set(expected) <= {
-        "0.12.1", "0.12.2", "0.12.3", "0.12.4", "0.12.5", "0.13.0"
+        "0.12.1", "0.12.2", "0.12.3", "0.12.4", "0.12.5", "0.13.0", "0.14.0"
     }
 
 
@@ -153,7 +156,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0108"
+    assert current_revision() == "0104"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]
