@@ -4,9 +4,17 @@
 Center through it, and the server is the throwaway fixture that
 `curie dev forge-fixture bitbucket-dc up` starts. The driver reads that
 fixture's `state.json` from CURIE_BITBUCKET_DC_FIXTURE: the base URL, the test
-CA, the repository and the passwords of its seeded users. Ticket operations and
-the "close Jira test issues" teardown go to the Jira Cloud driver
-(forges/jira_cloud.py), built on first use.
+CA, the repository and the passwords of its seeded users. When the variable is
+unset the run brings a fixture up on the kube context node's address and
+removes it on teardown. Ticket operations and the "close Jira test issues"
+teardown go to the Jira Cloud driver (forges/jira_cloud.py), built on first
+use.
+
+The entry's setup, ``install_bitbucket_dc``, installs the factory with `curie
+factory quickstart --tracker jira-cloud --code-host bitbucket-dc` against the
+fixture's advertised URL and CA, with the reviewer's user id as the review
+account, then admits the fixture's Docker bridge subnets as the GitLab
+fixture entry does.
 
 The change is the pull request the WorkItem records, CI is the
 repository-scoped build statuses on its head, the review is a top-level
@@ -30,6 +38,7 @@ import json
 import os
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -44,6 +53,9 @@ from typing import IO, Any
 import factory_e2e as fe
 
 FIXTURE_VAR = "CURIE_BITBUCKET_DC_FIXTURE"
+FIXTURE_DOWN_STEP = "remove Bitbucket Data Center fixture"
+FIXTURE_UP_TIMEOUT_SECONDS = 20 * 60
+FIXTURE_DOWN_TIMEOUT_SECONDS = 10 * 60
 STATE_SCHEMA = "curie.forge-fixture.bitbucket-dc/v1"
 LOOP_GATE_KEY = "factory-e2e-loop-gate"
 LOOP_GATE_NAME = "factory-e2e loop gate"
@@ -143,6 +155,11 @@ class BitbucketDcDriver:
             reviewer_password_file = str(state["users"][REVIEWER]["password_file"])
             token_file = str(state["token_file"])
             ca_file = str(state["ca_file"])
+            self.advertised_url = str(state["advertised_url"]).rstrip("/")
+            self.reviewer_id = str(state["users"][REVIEWER]["user_id"])
+            self.repo_path = f"{project}/{slug}"
+            self.compose_project = str(state["project"])
+            self.port = int(state["port"])
         except (KeyError, TypeError) as exc:
             raise fe.ConfigError(f"{FIXTURE_VAR}: the fixture state lacks {exc}") from None
         self.p = p
@@ -158,6 +175,7 @@ class BitbucketDcDriver:
         except (OSError, ssl.SSLError) as exc:
             raise fe.ConfigError(f"{FIXTURE_VAR}: cannot load the fixture CA: {exc}") from None
         self._opener = _opener(self.context)
+        self.token_file = Path(token_file)
         self.token_auth = f"Bearer {_secret(token_file, 'factory token')}"
         self.admin_auth = _basic(self.admin_user, _secret(admin_password_file, "admin password"))
         self.reviewer_auth = _basic(REVIEWER, _secret(reviewer_password_file, "reviewer password"))
@@ -557,4 +575,118 @@ class BitbucketDcDriver:
                     )
 
 
-fe.register_forge(fe.ForgeEntry(name="bitbucket_dc", driver=BitbucketDcDriver, installed=True))
+# --- the entry's setup: the fixture and the quickstart ---------------------------------
+
+
+def _gitlab() -> Any:
+    """The gitlab forge entry module, whose fixture helpers this entry shares."""
+
+    fe.load_forge_entries()
+    return sys.modules["factory_e2e_forges.gitlab"]
+
+
+def bring_up_fixture(p: fe.Preflight) -> Path:
+    """Start a fresh fixture, push its removal, and return its state.json path."""
+
+    gitlab = _gitlab()
+    host = gitlab.node_reachable_host(p)
+    # Outside the repository and the run's workdir: the fixture refuses a state
+    # directory inside the repository, since it holds credentials.
+    state_dir = Path(tempfile.mkdtemp(prefix="curie-bitbucket-dc-fixture-"))
+    script = p.repo_root.joinpath(*gitlab.FIXTURE_SCRIPT)
+
+    def remove() -> dict[str, Any]:
+        if state_dir.exists():
+            result = subprocess.run(
+                ["bash", str(script), "bitbucket-dc", "down", "--state-dir", str(state_dir)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=FIXTURE_DOWN_TIMEOUT_SECONDS,
+            )
+            if result.returncode != 0:
+                tail = (result.stderr or result.stdout).strip()[-1500:]
+                raise fe.PreflightFailed(f"forge-fixture bitbucket-dc down failed: {tail}")
+        if state_dir.exists():
+            raise fe.PreflightFailed(f"the Bitbucket DC fixture state dir {state_dir} remains")
+        return {"state_dir": str(state_dir), "removed": True}
+
+    p.teardown.push(FIXTURE_DOWN_STEP, remove)
+    p.evidence["bitbucket_dc_fixture"] = {"state_dir": str(state_dir), "advertise_host": host}
+    fe.log(f"forge-fixture bitbucket-dc up --advertise-host {host} (about 5 to 10 minutes)")
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "bitbucket-dc",
+            "up",
+            "--state-dir",
+            str(state_dir),
+            "--advertise-host",
+            host,
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        check=False,
+        timeout=FIXTURE_UP_TIMEOUT_SECONDS,
+    )
+    state_path = state_dir / "state.json"
+    if result.returncode != 0 or not state_path.is_file():
+        raise fe.PreflightFailed(f"forge-fixture bitbucket-dc up exited {result.returncode}")
+    p.step("Bitbucket DC fixture up", advertise_host=host, state_dir=str(state_dir))
+    return state_path
+
+
+def _bridge_subnets(project: str) -> list[str]:
+    """The IPv4 subnets of the fixture's compose network."""
+
+    out = fe.run(
+        ["docker", "network", "inspect", f"{project}_default", "--format", "{{json .IPAM.Config}}"]
+    )
+    subnets: list[str] = []
+    for entry in json.loads(out or "null") or []:
+        subnet = entry.get("Subnet") if isinstance(entry, dict) else None
+        if isinstance(subnet, str) and ":" not in subnet:
+            subnets.append(subnet)
+    return subnets
+
+
+def install_bitbucket_dc(p: fe.Preflight) -> None:
+    """Install the factory on the fixture with the combined Jira quickstart."""
+
+    driver = p.loop_driver()
+    if not isinstance(driver, BitbucketDcDriver):
+        raise fe.ConfigError("install_bitbucket_dc needs the bitbucket_dc forge driver")
+    fe.load_forge_entries()
+    jira = sys.modules["factory_e2e_forges.jira_cloud"]
+    jira.install_jira_bitbucket(
+        p,
+        code_host="bitbucket-dc",
+        repo=driver.repo_path,
+        token_file=driver.token_file,
+        review_account=driver.reviewer_id,
+        forge_flags=["--forge-url", driver.advertised_url, "--ca-file", driver.ca_file],
+        secrets=[driver.token_auth.removeprefix("Bearer ")],
+    )
+    p.evidence["bitbucket_dc"] = {"repo": driver.repo_path}
+    _gitlab().allow_fixture_bridge(
+        p, _bridge_subnets(driver.compose_project), driver.port, kind="bitbucket_dc"
+    )
+
+
+def _driver(p: fe.Preflight) -> BitbucketDcDriver:
+    if not os.environ.get(FIXTURE_VAR):
+        # Read by BitbucketDcDriver; this run owns the fixture it names.
+        os.environ[FIXTURE_VAR] = str(bring_up_fixture(p))
+    return BitbucketDcDriver(p)
+
+
+fe.register_forge(
+    fe.ForgeEntry(
+        name="bitbucket_dc",
+        driver=_driver,
+        installed=True,
+        setup=install_bitbucket_dc,
+        github_app=False,
+    )
+)

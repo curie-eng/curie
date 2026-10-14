@@ -74,6 +74,7 @@ CLOUD_VARS = (
     "CURIE_BITBUCKET_CLOUD_REPO",
     "CURIE_BITBUCKET_CLOUD_TOKEN_FILE",
     "CURIE_BITBUCKET_CLOUD_REVIEWER_TOKEN_FILE",
+    "CURIE_BITBUCKET_CLOUD_REVIEWER_ACCOUNT_ID",
     "CURIE_FACTORY_JIRA_ENV_FILE",
 )
 CLOUD_API = "https://api.bitbucket.org/2.0/repositories/example-workspace/example-repo"
@@ -249,12 +250,16 @@ def _basic(user: str, password: str) -> str:
 
 
 @pytest.mark.parametrize("name", sorted(DRIVERS))
-def test_each_bitbucket_entry_registers_its_driver_installed(name: str) -> None:
+def test_each_bitbucket_entry_registers_its_driver_and_quickstart_setup(name: str) -> None:
     module = _entry_module(name)
     entry = fe.FORGES[name]
     assert entry.name == name
     assert entry.installed is True
-    assert entry.driver is getattr(module, DRIVERS[name])
+    # The Data Center entry brings its fixture up before building the driver.
+    driver = getattr(module, DRIVERS[name]) if name == "bitbucket_cloud" else module._driver
+    assert entry.driver is driver
+    assert entry.setup is getattr(module, f"install_{name}")
+    assert entry.github_app is False
 
 
 @pytest.mark.parametrize("name", sorted(DRIVERS))
@@ -279,6 +284,7 @@ def _cloud_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         "CURIE_BITBUCKET_CLOUD_REPO": "example-workspace/example-repo",
         "CURIE_BITBUCKET_CLOUD_TOKEN_FILE": str(factory),
         "CURIE_BITBUCKET_CLOUD_REVIEWER_TOKEN_FILE": str(reviewer),
+        "CURIE_BITBUCKET_CLOUD_REVIEWER_ACCOUNT_ID": "example-reviewer-account",
         "CURIE_FACTORY_JIRA_ENV_FILE": str(jira),
     }
     for name, value in values.items():
@@ -1230,21 +1236,19 @@ def _forbid_drivers(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("key", PAIRINGS)
-def test_bitbucket_pairing_dry_run_lists_every_step_and_is_refused_naming_4400(
+def test_bitbucket_pairing_dry_run_lists_every_step_and_is_installed(
     key: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _forbid_drivers(monkeypatch)
     pairing = acceptance.PAIRINGS[key]
-    assert pairing.installed is False
+    assert pairing.installed is True
     assert acceptance.unset_fields(pairing) == []
 
     out = io.StringIO()
-    assert acceptance.dry_run(key, out) == fe.EXIT_SCENARIO
+    assert acceptance.dry_run(key, out) == 0
 
     text = out.getvalue()
-    assert f"  {key} is not installed: " in text
-    assert "#4400" in text
-    assert "forge driver" not in text
+    assert "not installed" not in text
     assert "unset:" not in text
     tracker, code_host = key.split("+")
     assert f"tracker {tracker}, code host {code_host}" in text
@@ -1256,27 +1260,24 @@ def test_bitbucket_pairing_dry_run_lists_every_step_and_is_refused_naming_4400(
     ]
 
 
+def test_the_data_center_entry_asserts_its_fixture_is_removed() -> None:
+    step = acceptance.PAIRINGS["jira_cloud+bitbucket_dc"].steps[0]
+    removed = f"teardown_ok.{_entry_module('bitbucket_dc').FIXTURE_DOWN_STEP}"
+    assert (removed, True) in step.persisted_assertions
+    cloud = acceptance.PAIRINGS["jira_cloud+bitbucket_cloud"].steps[0]
+    assert not [f for f, _ in cloud.persisted_assertions if "fixture" in f and "Data" in f]
+
+
 @pytest.mark.parametrize("key", PAIRINGS)
-def test_main_dry_run_of_a_bitbucket_pairing_is_refused_naming_4400(
+def test_main_dry_run_of_a_bitbucket_pairing_launches_nothing(
     key: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _forbid_drivers(monkeypatch)
-    assert fe.main(["acceptance", "--pairing", key, "--dry-run"]) == fe.EXIT_SCENARIO
+    assert fe.main(["acceptance", "--pairing", key, "--dry-run"]) == 0
     out = capsys.readouterr().out
-    assert "not installed" in out and "#4400" in out
+    assert "not installed" not in out
     for step in acceptance.PAIRINGS[key].steps:
         assert step.name in out
-
-
-@pytest.mark.parametrize("key", PAIRINGS)
-def test_main_real_run_of_a_bitbucket_pairing_launches_nothing_naming_4400(
-    key: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    _forbid_drivers(monkeypatch)
-    monkeypatch.setattr(fe, "load_config", lambda *_a, **_k: pytest.fail("no config load"))
-    assert fe.main(["acceptance", "--pairing", key]) == fe.EXIT_SCENARIO
-    err = capsys.readouterr().err
-    assert "not installed" in err and "#4400" in err
 
 
 def test_the_bitbucket_self_pairings_are_gone() -> None:

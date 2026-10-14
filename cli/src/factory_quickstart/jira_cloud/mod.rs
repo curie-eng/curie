@@ -1,7 +1,10 @@
 //! The Jira Cloud tracker for `curie factory quickstart` (#4358).
 //!
-//! Jira Cloud pairs with the GitHub code host. The GitHub flow runs as before
-//! and this module adds to it: [`check`] refuses unusable flags before any
+//! Jira Cloud pairs with the GitHub code host or a Bitbucket code host. Beside
+//! Bitbucket, the combined run in `jira_bitbucket` reads the site through
+//! [`preflight_site`] with the Jira URL and token from `--tracker-url` and
+//! `--tracker-token-file`. Beside GitHub, the GitHub flow runs as before and
+//! this module adds to it: [`check`] refuses unusable flags before any
 //! read, [`preflight`] validates the token, site, cloud id, start authority
 //! and the bound repositories' ids, and its [`JiraPlan`] becomes one
 //! `JiraTracker` action that writes the `factory.trackers` and
@@ -16,6 +19,7 @@ mod api;
 mod recorded;
 
 pub use api::preflight;
+pub(super) use api::{preflight_site, JiraSite};
 pub(super) use recorded::check_recorded;
 
 use std::path::{Path, PathBuf};
@@ -23,7 +27,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use super::{EgressEntry, ForgeFlags};
+use super::{CodeHostKind, EgressEntry, ForgeFlags};
 use crate::exit::CliError;
 
 /// The name of the tracker entry and the binding this module writes.
@@ -81,6 +85,11 @@ pub(super) struct JiraFlags {
     pub token_file: PathBuf,
     pub username: String,
     pub start: StartAuthority,
+    /// The flags the URL and token came from, for messages: `--forge-url`
+    /// and `--token-file` beside GitHub, `--tracker-url` and
+    /// `--tracker-token-file` beside Bitbucket.
+    pub url_flag: &'static str,
+    pub token_flag: &'static str,
 }
 
 fn usage(message: impl Into<String>, fix: impl Into<String>) -> anyhow::Error {
@@ -107,31 +116,27 @@ pub(super) fn secure_scheme(url: &reqwest::Url) -> bool {
     url.scheme() == "https" || (url.scheme() == "http" && is_loopback(url))
 }
 
-fn parse_url(raw: &str) -> Result<JiraUrl> {
-    let parsed = reqwest::Url::parse(raw).map_err(|error| {
-        usage(
-            format!("--forge-url {raw:?} is not a URL: {error}"),
-            URL_FORMS,
-        )
-    })?;
+fn parse_url(raw: &str, flag: &str, token_flag: &str) -> Result<JiraUrl> {
+    let parsed = reqwest::Url::parse(raw)
+        .map_err(|error| usage(format!("{flag} {raw:?} is not a URL: {error}"), URL_FORMS))?;
     if !secure_scheme(&parsed) {
         return Err(usage(
-            format!("--forge-url {raw} must use https; plain http is accepted only for localhost"),
+            format!("{flag} {raw} must use https; plain http is accepted only for localhost"),
             URL_FORMS,
         ));
     }
     if parsed.host_str().is_none_or(str::is_empty) {
-        return Err(usage(format!("--forge-url {raw} names no host"), URL_FORMS));
+        return Err(usage(format!("{flag} {raw} names no host"), URL_FORMS));
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(usage(
-            "--forge-url must not carry credentials; the token is read from --token-file",
-            "drop the user and password from --forge-url",
+            format!("{flag} must not carry credentials; the token is read from {token_flag}"),
+            format!("drop the user and password from {flag}"),
         ));
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(usage(
-            format!("--forge-url {raw} must not carry a query or fragment"),
+            format!("{flag} {raw} must not carry a query or fragment"),
             URL_FORMS,
         ));
     }
@@ -142,14 +147,14 @@ fn parse_url(raw: &str) -> Result<JiraUrl> {
         let id = path.trim_start_matches("/ex/jira").trim_start_matches('/');
         if id.is_empty() || id.contains('/') {
             return Err(usage(
-                format!("--forge-url {raw} is the Jira API gateway but names no single cloud id"),
+                format!("{flag} {raw} is the Jira API gateway but names no single cloud id"),
                 "pass https://api.atlassian.com/ex/jira/<cloudId>, the cloud id from https://<site>.atlassian.net/_edge/tenant_info",
             ));
         }
         Some(id.to_string())
     } else {
         return Err(usage(
-            format!("--forge-url {raw} is neither a Jira site root nor the API gateway"),
+            format!("{flag} {raw} is neither a Jira site root nor the API gateway"),
             URL_FORMS,
         ));
     };
@@ -161,18 +166,51 @@ fn parse_url(raw: &str) -> Result<JiraUrl> {
 }
 
 /// Checks and parses the Jira flags. Pure: reads no file and no network.
+/// Beside GitHub the Jira URL and token are `--forge-url` and `--token-file`;
+/// beside Bitbucket, whose own they are, `--tracker-url` and
+/// `--tracker-token-file`.
 pub(super) fn flags(forge: &ForgeFlags) -> Result<JiraFlags> {
-    let raw = forge.forge_url.as_deref().ok_or_else(|| {
+    let beside_github = forge.code_host == CodeHostKind::Github;
+    if beside_github {
+        let bitbucket_only = [
+            ("--tracker-url", forge.tracker_url.is_some()),
+            ("--tracker-token-file", forge.tracker_token_file.is_some()),
+        ];
+        if let Some((flag, _)) = bitbucket_only.iter().find(|(_, set)| *set) {
+            return Err(usage(
+                format!("{flag} applies only beside a Bitbucket code host; with --code-host github the Jira URL and token are --forge-url and --token-file"),
+                format!("drop {flag}"),
+            ));
+        }
+    }
+    let (url_flag, token_flag, raw, token_file) = if beside_github {
+        (
+            "--forge-url",
+            "--token-file",
+            forge.forge_url.as_deref(),
+            forge.token_file.clone(),
+        )
+    } else {
+        (
+            "--tracker-url",
+            "--tracker-token-file",
+            forge.tracker_url.as_deref(),
+            forge.tracker_token_file.clone(),
+        )
+    };
+    let raw = raw.ok_or_else(|| {
         usage(
-            "--tracker jira-cloud needs --forge-url, the Jira Cloud site or API gateway URL",
+            format!(
+                "--tracker jira-cloud needs {url_flag}, the Jira Cloud site or API gateway URL"
+            ),
             URL_FORMS,
         )
     })?;
-    let url = parse_url(raw)?;
-    let token_file = forge.token_file.clone().ok_or_else(|| {
+    let url = parse_url(raw, url_flag, token_flag)?;
+    let token_file = token_file.ok_or_else(|| {
         usage(
-            "--tracker jira-cloud needs --token-file, a file holding the Jira API token",
-            "create an API token for the factory account at https://id.atlassian.com/manage-profile/security/api-tokens, write it to a file, and pass --token-file <PATH>",
+            format!("--tracker jira-cloud needs {token_flag}, a file holding the Jira API token"),
+            format!("create an API token for the factory account at https://id.atlassian.com/manage-profile/security/api-tokens, write it to a file, and pass {token_flag} <PATH>"),
         )
     })?;
     let username = match forge.forge_username.as_deref().map(str::trim) {
@@ -230,40 +268,33 @@ pub(super) fn flags(forge: &ForgeFlags) -> Result<JiraFlags> {
             StartAuthority::Accounts(unique)
         }
     };
-    if !forge.review_accounts.is_empty() {
-        return Err(usage(
-            "--review-account does not apply to --tracker jira-cloud; reviews are counted on the GitHub code host, which reports write access",
-            "drop --review-account",
-        ));
-    }
-    if forge.ca_file.is_some() {
-        return Err(usage(
-            "--ca-file does not apply to --tracker jira-cloud; Jira Cloud serves a public certificate",
-            "drop --ca-file",
-        ));
+    if beside_github {
+        if !forge.review_accounts.is_empty() {
+            return Err(usage(
+                "--review-account does not apply to --tracker jira-cloud; reviews are counted on the GitHub code host, which reports write access",
+                "drop --review-account",
+            ));
+        }
+        if forge.ca_file.is_some() {
+            return Err(usage(
+                "--ca-file does not apply to --tracker jira-cloud; Jira Cloud serves a public certificate",
+                "drop --ca-file",
+            ));
+        }
     }
     Ok(JiraFlags {
         url,
         token_file,
         username: username.to_string(),
         start,
+        url_flag,
+        token_flag,
     })
 }
 
 /// Refuses a Jira flag set this build cannot run, before any read.
 pub(super) fn check(forge: &ForgeFlags) -> Result<()> {
     flags(forge).map(|_| ())
-}
-
-/// The refusal for the Jira tracker with a non-GitHub code host: this build's
-/// Jira quickstart binds GitHub repositories only, and the combined Bitbucket
-/// quickstart is #4400.
-pub(super) fn code_host_not_installed(code_host: &str) -> anyhow::Error {
-    CliError::unsupported(format!(
-        "--tracker jira-cloud with --code-host {code_host} is not installed in this build"
-    ))
-    .with_fix("rerun with --code-host github, or write the factory values by hand as docs/guides/dark-factory-quickstart.md shows")
-    .into()
 }
 
 /// The binding alias for each repository: its lowercased name, or
@@ -285,9 +316,10 @@ fn aliases(repos: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The `factory.bindings[]` entry for `repos` and their GitHub ids.
+/// The `factory.bindings[]` entry for `repos` and their ids on `code_host`.
 pub(super) fn binding_value(
     cloud_id: &str,
+    code_host: &str,
     repos: &[(String, String)],
     start: &StartAuthority,
 ) -> Value {
@@ -297,7 +329,7 @@ pub(super) fn binding_value(
         .iter()
         .zip(&aliases)
         .map(|((repo, id), alias)| {
-            json!({"alias": alias, "codeHost": "github", "projectId": id, "path": repo})
+            json!({"alias": alias, "codeHost": code_host, "projectId": id, "path": repo})
         })
         .collect();
     json!({
@@ -376,7 +408,7 @@ pub(super) fn described(forge: &ForgeFlags, repos: &[String]) -> Result<(JiraPla
     let cloud_id = flags.url.cloud_id.as_deref().unwrap_or("<cloud id>");
     let plan = JiraPlan {
         tracker: tracker_value("<site>", api, &flags.username, "<factory account id>", &[]),
-        binding: binding_value(cloud_id, &ids, &flags.start),
+        binding: binding_value(cloud_id, "github", &ids, &flags.start),
         egress: Vec::new(),
         secret_name: SECRET_NAME.to_string(),
         token_file: flags.token_file,
@@ -425,14 +457,29 @@ mod tests {
 
     #[test]
     fn a_gateway_url_carries_its_cloud_id_and_a_site_root_none() {
-        let gateway = parse_url("https://api.atlassian.com/ex/jira/abc-123/").unwrap();
+        let gateway = parse_url(
+            "https://api.atlassian.com/ex/jira/abc-123/",
+            "--forge-url",
+            "--token-file",
+        )
+        .unwrap();
         assert_eq!(gateway.cloud_id.as_deref(), Some("abc-123"));
         assert_eq!(gateway.api_url, "https://api.atlassian.com/ex/jira/abc-123");
-        let site = parse_url("https://acme.atlassian.net/").unwrap();
+        let site = parse_url("https://acme.atlassian.net/", "--forge-url", "--token-file").unwrap();
         assert_eq!(site.cloud_id, None);
         assert_eq!(site.api_url, "https://acme.atlassian.net");
-        assert!(parse_url("https://acme.atlassian.net/jira/software").is_err());
-        assert!(parse_url("https://user:pw@acme.atlassian.net").is_err());
+        assert!(parse_url(
+            "https://acme.atlassian.net/jira/software",
+            "--forge-url",
+            "--token-file"
+        )
+        .is_err());
+        assert!(parse_url(
+            "https://user:pw@acme.atlassian.net",
+            "--forge-url",
+            "--token-file"
+        )
+        .is_err());
     }
 
     #[test]

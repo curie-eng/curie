@@ -16,12 +16,10 @@ use crate::exit::CliError;
 use crate::factory_intake::{apply_forge_entries, native_forge_values, NativeForgeEntries};
 use crate::factory_quickstart::{
     agent_settings, apply_manifest, bundle_dir, bundle_line, check_credit, check_prerequisites,
-    cluster_agent, confirm_remote_context, credential_decision, credential_line, credit_check_key,
-    ensure_credential, forge_egress_line, install_action_line, install_steps, is_kind_context,
-    kind_clusters, quickstart_model, read_token, release_matches_quickstart_target,
-    release_model_recorded, run_install_action, run_self, token_secret_manifest,
-    unconfirmed_remote_context, validate_agent_flags, Action, CredentialDecision, InstallSteps,
-    InstallTarget, QuickstartOpts, QuickstartOutput, DEFAULT_AGENT, SKIPPED_CLUSTER_UP_LINE,
+    cluster_agent, confirm_remote_context, credential_line, forge_egress_line, install_action_line,
+    native, read_token, run_self, token_secret_manifest, unconfirmed_remote_context,
+    validate_agent_flags, CredentialDecision, InstallSteps, QuickstartOpts, QuickstartOutput,
+    DEFAULT_AGENT, SKIPPED_CLUSTER_UP_LINE,
 };
 use crate::ops::CommonOpts;
 use crate::ui::DryRunPlan;
@@ -325,67 +323,11 @@ pub(in crate::factory_quickstart) async fn quickstart(
         }
     }
 
-    let existing = if opts.context.is_none() && current.is_none() {
-        match kind_clusters().await {
-            Ok(clusters) => clusters,
-            Err(err) if opts.dry_run => {
-                crate::ui::ui().note(&format!("kind was not queried: {err:#}"));
-                Vec::new()
-            }
-            Err(err) => return Err(err),
-        }
-    } else {
-        Vec::new()
-    };
-    let credential_in_env = crate::ops::model_credential_env()?.is_some();
-    let targeted = opts.context.clone().or_else(|| current.clone());
-    if let (Some(context), false) = (&targeted, opts.dry_run) {
-        // Helm value reads have no context flag. Pin first so a rerun against
-        // --context sees that release, not the ambient one.
-        crate::kube_context::pin_for_cluster_command(Some(context))?;
-    }
-    let release_has_real_model = if opts.dry_run || targeted.is_none() {
-        false
-    } else {
-        release_model_recorded(&opts).await?
-    };
-    let effective_credential = credit_check_key(
-        crate::ops::explicit_model_credential_env(),
-        crate::ops::saved_model_credential(),
-        release_has_real_model,
-    );
-    let model = quickstart_model(opts.model.as_deref(), effective_credential.as_deref());
-    let (release_at_target, model) = match &targeted {
-        Some(context) if !opts.dry_run => {
-            release_matches_quickstart_target(
-                &opts,
-                &model,
-                opts.model.is_none() && effective_credential.is_none() && release_has_real_model,
-                is_kind_context(context),
-            )
-            .await?
-        }
-        _ => (false, model),
-    };
-    let install = install_steps(&InstallTarget {
-        explicit_context: opts.context.as_deref(),
-        current_context: current.as_deref(),
-        kind_name: &opts.kind_name,
-        existing_kind_clusters: &existing,
-        namespace: &opts.namespace,
-        release: &opts.release,
-        model: &model,
-        chart: &opts.chart,
-        release_at_target,
-        add_agent: false,
-    });
+    let planned = native::plan_install(&opts, current.as_deref(), real_interactive).await?;
+    let release_has_real_model = planned.release_has_real_model;
     let plan = GitlabPlan {
-        install,
-        credential: credential_decision(
-            credential_in_env,
-            release_has_real_model,
-            real_interactive,
-        ),
+        install: planned.install,
+        credential: planned.credential,
         found,
         expiry,
         facts,
@@ -407,67 +349,35 @@ pub(in crate::factory_quickstart) async fn quickstart(
             lines: describe(&plan),
         }));
     }
-    if plan.credential == CredentialDecision::RefuseNonInteractive {
-        return Err(
-            CliError::usage("model credential needed and stdin is not a terminal")
-                .with_fix(
-                    "set CURIE_CREDENTIALS to an Anthropic API key starting with sk-ant- or an OpenRouter key starting with sk-or- and rerun",
-                )
-                .into(),
-        );
-    }
+    native::refuse_without_credential(&plan.credential)?;
     execute(&plan, &opts, release_has_real_model).await
 }
 
 async fn execute(
     plan: &GitlabPlan,
     opts: &QuickstartOpts,
-    mut release_has_real_model: bool,
+    release_has_real_model: bool,
 ) -> Result<QuickstartOutput> {
-    let ui = crate::ui::ui();
-    ui.note(&format!("Kubernetes context: {}", plan.install.context));
-    if plan.install.skipped_cluster_up {
-        ui.note("release already at the target chart and values; skipping cluster up");
-    }
-    let mut prompted_model = None;
-    for action in &plan.install.actions {
-        if matches!(action, Action::Cluster { .. }) {
-            if plan.install.kind_cluster.is_some() {
-                // The plan could not read the release: the context did not
-                // exist yet. Read it now, before `cluster up` records a key.
-                release_has_real_model =
-                    crate::kube_context::pin_for_cluster_command(Some(&plan.install.context))
-                        .is_err()
-                        || release_model_recorded(opts).await.unwrap_or(true);
-            }
-            ensure_credential(&plan.credential)?;
-            if plan.credential == CredentialDecision::PromptOnce {
-                let credential = crate::ops::model_credential_env()?;
-                prompted_model = Some(quickstart_model(
-                    opts.model.as_deref(),
-                    credential.as_deref(),
-                ));
-            }
-        }
-        run_install_action(action, prompted_model.as_ref()).await?;
-    }
+    let release_has_real_model = native::run_install(
+        &plan.install,
+        &plan.credential,
+        release_has_real_model,
+        opts,
+    )
+    .await?;
     let common = CommonOpts {
         namespace: plan.namespace.clone(),
         release: plan.release.clone(),
         dry_run: false,
     };
-    // The bundle's runner is checked against the installation before the
-    // first forge write, so a mismatch leaves the release as it was.
     let dir = bundle_path(plan);
-    let image = match &plan.bundle {
-        Some(dir) => {
-            crate::cluster_secrets::check_layered_runner_base(&common, dir).await?;
-            plan.runner_image.clone()
-        }
-        None => Some(
-            crate::factory_quickstart::github::render_and_check(&common, &plan.agent, None).await?,
-        ),
-    };
+    let image = native::check_bundle(
+        &common,
+        &plan.agent,
+        plan.bundle.as_deref(),
+        plan.runner_image.as_deref(),
+    )
+    .await?;
     let token = read_token(&plan.token_file)?;
     apply_manifest(
         &plan.namespace,

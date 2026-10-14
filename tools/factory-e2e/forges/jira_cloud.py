@@ -577,12 +577,82 @@ def install_jira(p: fe.Preflight) -> None:
             f"release {p.release} records no factory intake: the github factory.codeHosts "
             "credential has no existingSecret, so the quickstart would install, not add an agent"
         )
+    site = load_site(os.environ)
+    _run_quickstart(
+        p,
+        site,
+        repo=p.config.repo,
+        flags=[
+            "--code-host",
+            "github",
+            "--forge-url",
+            gateway_url(site),
+            "--token-file",
+            str(site.bot_token_file),
+        ],
+        what="--tracker jira-cloud (add the factory agent)",
+    )
+
+
+def install_jira_bitbucket(
+    p: fe.Preflight,
+    *,
+    code_host: str,
+    repo: str,
+    token_file: Path,
+    review_account: str,
+    forge_flags: Iterable[str] = (),
+    secrets: Iterable[str] = (),
+) -> None:
+    """Install the factory with the Jira tracker and a Bitbucket code host.
+
+    The release has no factory values yet (the Bitbucket entries install no
+    GitHub App), so `curie factory quickstart --tracker jira-cloud --code-host
+    <code_host>` takes its install path: the Bitbucket code host from
+    ``token_file`` and ``forge_flags``, the Jira tracker and binding, and the
+    agent bound through `jira=jira`. ``review_account`` is the Bitbucket
+    account whose review comments the factory acts on.
+    """
+
+    site = load_site(os.environ)
+    _run_quickstart(
+        p,
+        site,
+        repo=repo,
+        flags=[
+            "--code-host",
+            code_host,
+            "--token-file",
+            str(token_file),
+            "--review-account",
+            review_account,
+            *forge_flags,
+            "--tracker-url",
+            gateway_url(site),
+            "--tracker-token-file",
+            str(site.bot_token_file),
+        ],
+        what=f"--tracker jira-cloud --code-host {code_host}",
+        secrets=secrets,
+    )
+
+
+def _run_quickstart(
+    p: fe.Preflight,
+    site: JiraSite,
+    *,
+    repo: str,
+    flags: list[str],
+    what: str,
+    secrets: Iterable[str] = (),
+) -> None:
+    """Run `curie factory quickstart --tracker jira-cloud` with the code host ``flags``."""
+
     if p.config.label != QUICKSTART_LABEL:
         raise fe.ConfigError(
             f"the Jira tracker label is {QUICKSTART_LABEL}; unset CURIE_FACTORY_LABEL for "
             "a jira_cloud run"
         )
-    site = load_site(os.environ)
     start_account = _labeler_account_id(site)
     assert p.chart_dir is not None, "install() extracts the chart first"
     bundle = p.build_runner_layer(p.config.bundle_dir)
@@ -603,17 +673,12 @@ def install_jira(p: fe.Preflight) -> None:
         "--chart",
         str(p.chart_dir),
         "--repo",
-        p.config.repo,
+        repo,
         "--execution-deadline",
         str(fe.EXECUTION_BOUND_SECONDS),
         "--tracker",
         "jira-cloud",
-        "--code-host",
-        "github",
-        "--forge-url",
-        gateway_url(site),
-        "--token-file",
-        str(site.bot_token_file),
+        *flags,
         "--forge-username",
         site.bot_email,
         "--start-account",
@@ -625,18 +690,19 @@ def install_jira(p: fe.Preflight) -> None:
         "CURIE_API_KEY": p.api_key,
         "CURIE_CONFIG_DIR": str(p._curie_config_dir()),
     }
-    fe.log("curie factory quickstart --tracker jira-cloud (add the factory agent)")
+    fe.log(f"curie factory quickstart {what}")
     result = subprocess.run(argv, capture_output=True, text=True, env=env, check=False)
     if result.returncode != 0:
-        secrets = [
+        known = [
             p.api_key,
             p.config.model_api_key,
             p.worker_token,
             _token(site, "labeler"),
             _token(site, "bot"),
+            *secrets,
         ]
-        tail = fe._redact((result.stderr or result.stdout).strip(), secrets)[-1500:]
-        raise fe.PreflightFailed(f"curie factory quickstart --tracker jira-cloud failed: {tail}")
+        tail = fe._redact((result.stderr or result.stdout).strip(), known)[-1500:]
+        raise fe.PreflightFailed(f"curie factory quickstart {what} failed: {tail}")
     p.evidence["jira"] = {"project_key": site.project_key, "binding": "jira"}
     p.step("factory agent bound to the Jira tracker", agent=fe.FACTORY_AGENT)
 

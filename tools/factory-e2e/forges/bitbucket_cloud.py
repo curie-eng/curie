@@ -11,7 +11,13 @@ workspace.
 
 Two repository access tokens, each in a file: the factory's, which the
 driver reads with, and the reviewer's, the test actor that sets CI, reviews,
-merges and resets. Every request goes through an opener that refuses every
+merges and resets. A repository access token cannot read its own account, so
+the reviewer's Atlassian account id comes from
+CURIE_BITBUCKET_CLOUD_REVIEWER_ACCOUNT_ID.
+
+The entry's setup, ``install_bitbucket_cloud``, installs the factory with
+`curie factory quickstart --tracker jira-cloud --code-host bitbucket-cloud`,
+with the factory's token and the reviewer as the review account. Every request goes through an opener that refuses every
 redirect, so a token is only ever sent to the URL the driver named.
 
 Red CI is set deliberately, as the GitHub driver does: the test actor posts a
@@ -34,6 +40,7 @@ import base64
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -53,10 +60,17 @@ GIT_USER = "x-token-auth"
 REPO_VAR = "CURIE_BITBUCKET_CLOUD_REPO"
 TOKEN_FILE_VAR = "CURIE_BITBUCKET_CLOUD_TOKEN_FILE"
 REVIEWER_TOKEN_FILE_VAR = "CURIE_BITBUCKET_CLOUD_REVIEWER_TOKEN_FILE"
+REVIEWER_ACCOUNT_VAR = "CURIE_BITBUCKET_CLOUD_REVIEWER_ACCOUNT_ID"
 # What the Jira Cloud driver reads (forges/jira_cloud.py); checked here so the
 # run fails before anything is installed (#4401 decision 18.6).
 JIRA_VARS = ("CURIE_FACTORY_JIRA_ENV_FILE",)
-REQUIRED_VARS = (REPO_VAR, TOKEN_FILE_VAR, REVIEWER_TOKEN_FILE_VAR, *JIRA_VARS)
+REQUIRED_VARS = (
+    REPO_VAR,
+    TOKEN_FILE_VAR,
+    REVIEWER_TOKEN_FILE_VAR,
+    REVIEWER_ACCOUNT_VAR,
+    *JIRA_VARS,
+)
 
 LOOP_GATE_KEY = "factory-e2e-loop-gate"
 LOOP_GATE_NAME = "factory-e2e loop gate"
@@ -141,6 +155,8 @@ class BitbucketCloudDriver:
         self.p = p
         self.repo = repo
         self.api = f"{API_URL}/repositories/{workspace}/{slug}"
+        self.factory_token_file = Path(os.environ[TOKEN_FILE_VAR])
+        self.reviewer_account = os.environ[REVIEWER_ACCOUNT_VAR].strip()
         self.factory_token = _token(TOKEN_FILE_VAR)
         self.reviewer_token = _token(REVIEWER_TOKEN_FILE_VAR)
         self._opener = _opener()
@@ -559,6 +575,30 @@ class BitbucketCloudDriver:
                     )
 
 
+def install_bitbucket_cloud(p: fe.Preflight) -> None:
+    """Install the factory with the combined Jira and Bitbucket Cloud quickstart."""
+
+    driver = p.loop_driver()
+    if not isinstance(driver, BitbucketCloudDriver):
+        raise fe.ConfigError("install_bitbucket_cloud needs the bitbucket_cloud forge driver")
+    fe.load_forge_entries()
+    sys.modules["factory_e2e_forges.jira_cloud"].install_jira_bitbucket(
+        p,
+        code_host="bitbucket-cloud",
+        repo=driver.repo,
+        token_file=driver.factory_token_file,
+        review_account=driver.reviewer_account,
+        secrets=[driver.factory_token, driver.reviewer_token],
+    )
+    p.evidence["bitbucket_cloud"] = {"repo": driver.repo}
+
+
 fe.register_forge(
-    fe.ForgeEntry(name="bitbucket_cloud", driver=BitbucketCloudDriver, installed=True)
+    fe.ForgeEntry(
+        name="bitbucket_cloud",
+        driver=BitbucketCloudDriver,
+        installed=True,
+        setup=install_bitbucket_cloud,
+        github_app=False,
+    )
 )
