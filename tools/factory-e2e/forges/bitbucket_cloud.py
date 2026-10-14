@@ -318,7 +318,12 @@ class BitbucketCloudDriver:
         )
 
     def set_ci_red(self, sha: str) -> dict[str, Any]:
-        """FAILED on ``sha``, then watch the change for the revision to turn green."""
+        """FAILED on ``sha``, then green every later head of the change, as CI would.
+
+        Bitbucket Cloud reports no mergeability, so the factory cannot read a
+        head without statuses as a repository without CI: a review revision
+        with no status would wait out the CI window and fail.
+        """
 
         change = self._change
         if change is None:
@@ -337,13 +342,14 @@ class BitbucketCloudDriver:
         deadline = time.monotonic() + WATCH_LIFETIME_SECONDS
 
         def watch() -> None:
+            done = [red]
             while not stop.wait(interval) and time.monotonic() < deadline:
                 short = self._short_head(change, WATCH_HTTP_TIMEOUT_SECONDS)
-                # Still the red head: no need to expand it.
-                if not short or red.startswith(short):
+                # A head already judged: no need to expand it.
+                if not short or any(sha.startswith(short) for sha in done):
                     continue
                 head = self._full_hash(short, WATCH_HTTP_TIMEOUT_SECONDS)
-                if not head or head == red:
+                if not head or head in done:
                     continue
                 # A stop that came during the read: write nothing after it.
                 if stop.is_set():
@@ -353,7 +359,7 @@ class BitbucketCloudDriver:
                 )
                 if status in (200, 201):
                     self.green_heads.append(head)
-                    return
+                    done.append(head)
 
         thread = threading.Thread(target=watch, name="bitbucket-cloud-green-gate", daemon=True)
         self._watch_stop, self._watch_thread = stop, thread

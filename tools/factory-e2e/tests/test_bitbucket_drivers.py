@@ -956,9 +956,13 @@ def test_set_ci_red_before_the_change_is_read_refuses_and_writes_nothing(
 
 
 @pytest.mark.parametrize("forge", FORGES)
-def test_watcher_posts_green_once_on_the_first_new_head_and_never_on_the_red_one(
+def test_watcher_greens_each_new_head_once_and_never_the_red_one(
     forge: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Data Center greens only the CI fix head: its review head passes as a
+    repository without CI because Data Center reports mergeability. Cloud
+    reports none, so its watcher greens every later head, as CI would."""
+
     driver, provider, http = _driver_on(forge, tmp_path, monkeypatch)
     head, _ = driver.change_head(CHANGE)
     driver.set_ci_red(head)
@@ -970,14 +974,22 @@ def test_watcher_posts_green_once_on_the_first_new_head_and_never_on_the_red_one
     provider.push(GREEN)
     assert _until(lambda: driver.green_heads == [GREEN])
     provider.push(THIRD)
-    time.sleep(0.2)
+    greened = [GREEN, THIRD] if forge == "bitbucket_cloud" else [GREEN]
+    assert _until(lambda: driver.green_heads == greened)
+    if forge == "bitbucket_cloud":
+        # Many reads of a head already greened post nothing more.
+        reads = sum(c.method == "GET" for c in http.calls)
+        assert _until(lambda: sum(c.method == "GET" for c in http.calls) > reads + 20)
+    else:
+        time.sleep(0.2)
     driver.p.teardown.run()
 
-    assert _gate_posts(http, "SUCCESSFUL") == [_gate_url(forge, GREEN)]
+    assert _gate_posts(http, "SUCCESSFUL") == [_gate_url(forge, sha) for sha in greened]
     assert _gate_posts(http, "FAILED") == [_gate_url(forge, SHA)]
     assert driver.ci_state(GREEN)["state"] == "passing"
     assert driver.ci_state(SHA)["state"] == "failing"
-    assert driver.ci_state(THIRD)["state"] == "none"
+    third = "passing" if forge == "bitbucket_cloud" else "none"
+    assert driver.ci_state(THIRD)["state"] == third
 
 
 @pytest.mark.parametrize("forge", FORGES)
