@@ -1158,6 +1158,7 @@ def test_finance_text_without_existing_credit_match_is_not_a_subscription_limit(
     ]
     assert [event.classification for event in errors] == ["unclassified"]
 
+
 def test_empty_result_delivers_only_answer_after_tool_activity() -> None:
     state = TurnState()
     _translate(
@@ -1205,6 +1206,37 @@ def test_empty_result_after_a_tool_does_not_deliver_its_preamble() -> None:
                 ToolUseBlock(id="r1", name="Read", input={}),
             ],
             model="m",
+        ),
+        state,
+    )
+    result = ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="s",
+        result="",
+    )
+    assert _translate(result, state)[0].text == ""
+
+
+def test_hosted_tool_preamble_is_not_the_empty_result_answer():
+    # Observed installed SDK 0.2.163: hosted calls use ServerToolUseBlock
+    # on AssistantMessage, distinct from bundle ToolUseBlock.
+    from claude_agent_sdk.types import ServerToolUseBlock
+
+    state = TurnState()
+    _translate(
+        AssistantMessage(content=[TextBlock(text="Earlier candidate.")], model="synthetic"), state
+    )
+    _translate(
+        AssistantMessage(
+            content=[
+                TextBlock(text="I will search for evidence."),
+                ServerToolUseBlock(id="search", name="web_search", input={"query": "example"}),
+            ],
+            model="synthetic",
         ),
         state,
     )

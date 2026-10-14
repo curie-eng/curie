@@ -415,7 +415,9 @@ def _translate_assistant(
 ) -> list[OutboundEvent]:
     events: list[OutboundEvent] = []
     nested = message.parent_tool_use_id is not None
-    collecting = any(isinstance(block, ToolUseBlock) for block in message.content)
+    collecting = any(
+        isinstance(block, (ToolUseBlock, ServerToolUseBlock)) for block in message.content
+    )
     if not nested and collecting:
         # A message that requests more evidence is provisional, even when it
         # also contains text. History and generation diagnostics retain it;
