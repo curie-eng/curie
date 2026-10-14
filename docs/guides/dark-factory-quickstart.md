@@ -688,6 +688,11 @@ each review account once: on Cloud the `account_id` on a comment or pull
 request that person wrote, on Data Center the user's numeric `id` from
 `/rest/api/latest/users/<slug>`.
 
+To ask for a revision, a review account comments on the pull request and
+mentions the Jira tracker's `mention`, the factory account's `accountId`, as
+`@<accountId>`. The factory reads pull request comments on its poll interval
+and acts only on one that carries that mention.
+
 ### Writing the values by hand
 
 Several Bitbucket repositories in one binding, or two Bitbucket code hosts,

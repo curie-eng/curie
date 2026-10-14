@@ -17,10 +17,11 @@ network:
 5. What the drivers report passes `judge_github_loop`, the loop's judge, on a
    whole loop driven against a stubbed provider, and fails it when the
    factory never pushes the CI fix.
-6. `jira_cloud+bitbucket_cloud` and `jira_cloud+bitbucket_dc` are refused as
-   not installed, naming #4400 (the combined Jira Cloud and Bitbucket
-   quickstart), while a dry run still lists every step without constructing a
-   driver, and a real run launches nothing.
+6. `jira_cloud+bitbucket_cloud` and `jira_cloud+bitbucket_dc` are installed
+   through the combined Jira Cloud and Bitbucket quickstart, and a dry run
+   lists every step without constructing a driver.
+7. The review comment mentions the Jira factory account, the tracker's
+   `mention`, so the factory's review poll admits it.
 
 The HTTP seam is the HTTPS handler under each driver's opener: the stub
 replaces `urllib.request.HTTPSHandler`, so every request still passes through
@@ -273,13 +274,31 @@ def test_each_bitbucket_driver_implements_every_protocol_method(name: str) -> No
 # --- Bitbucket Cloud: configuration ------------------------------------------------------
 
 
+JIRA_FACTORY_ACCOUNT = "example-factory-account"
+
+
+def _jira_env(tmp_path: Path) -> Path:
+    jira = tmp_path / "jira.env"
+    facts = {
+        "site": "example.atlassian.net",
+        "cloud_id": "example-cloud",
+        "project_key": "KAN",
+        "labeler_email": "labeler@example.invalid",
+        "labeler_token_file": "labeler-token",
+        "bot_email": "bot@example.invalid",
+        "bot_account_id": JIRA_FACTORY_ACCOUNT,
+        "bot_token_file": "bot-token",
+    }
+    jira.write_text("".join(f"{key}={value}\n" for key, value in facts.items()))
+    return jira
+
+
 def _cloud_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     factory = tmp_path / "factory-token"
     factory.write_text(FACTORY_TOKEN + "\n")
     reviewer = tmp_path / "reviewer-token"
     reviewer.write_text(REVIEWER_TOKEN + "\n")
-    jira = tmp_path / "jira.env"
-    jira.write_text("site=example.atlassian.net\n")
+    jira = _jira_env(tmp_path)
     values = {
         "CURIE_BITBUCKET_CLOUD_REPO": "example-workspace/example-repo",
         "CURIE_BITBUCKET_CLOUD_TOKEN_FILE": str(factory),
@@ -833,6 +852,7 @@ def _driver_on(
         _cloud_env(tmp_path, monkeypatch)
     else:
         _dc_state(tmp_path, monkeypatch)
+        monkeypatch.setenv("CURIE_FACTORY_JIRA_ENV_FILE", str(_jira_env(tmp_path)))
     provider = _Provider(forge)
     http = _install(monkeypatch, lambda _m, _u: (200, None))
     http.answer = provider.answer(http)
@@ -1081,6 +1101,9 @@ def test_review_is_a_top_level_comment_by_the_reviewer_proved_admitted(
         assert "anchor" not in post.body and "parent" not in post.body
         assert post.headers["authorization"] == _basic("reviewer", REVIEWER_PASSWORD)
     assert provider.comments and "Add a test." in provider.comments[0]
+    # The factory admits only feedback mentioning the Jira tracker's mention,
+    # the factory account's accountId, never the GitHub App slug.
+    assert provider.comments[0].startswith(f"@{JIRA_FACTORY_ACCOUNT} ")
     assert (review["status_code"], review["comment_id"]) == (201, 501)
     assert review["delivery_id"] == "req-2"
     assert review["delivery_status_code"] == 200

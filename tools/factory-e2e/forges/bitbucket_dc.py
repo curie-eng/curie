@@ -427,7 +427,9 @@ class BitbucketDcDriver:
         if detail is None:
             raise fe.PreflightFailed("reading the WorkItem before the review failed")
         before = self._request_count(detail)
-        body = fe.revision_comment_text(fe.readme_only_review(text), self.p.config.mention)
+        fe.load_forge_entries()
+        mention = sys.modules["factory_e2e_forges.jira_cloud"].factory_mention(os.environ)
+        body = fe.revision_comment_text(fe.readme_only_review(text), mention)
         status, comment = self._call(
             "POST",
             f"/pull-requests/{change.number}/comments",

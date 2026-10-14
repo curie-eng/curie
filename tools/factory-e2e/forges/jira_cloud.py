@@ -131,6 +131,16 @@ def load_site(environ: Mapping[str, str]) -> JiraSite:
     )
 
 
+def factory_mention(environ: Mapping[str, str]) -> str:
+    """The `@` handle review feedback on a Bitbucket pull request must carry.
+
+    The factory admits only feedback that mentions the Jira tracker's
+    `mention`, which quickstart records as the factory account's accountId.
+    """
+
+    return load_site(environ).bot_account_id
+
+
 # --- pure helpers over Jira REST v3 responses -----------------------------------------
 
 
