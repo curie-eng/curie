@@ -2,7 +2,11 @@
 
 Date: 2026-10-13
 
-Status: Draft
+Status: Accepted
+
+Accepted 2026-10-14 with explicit maintainer approval, following Brian Conn's
+approval of [#4555](https://github.com/curie-eng/curie/pull/4555) and the
+maintainer's confirmation that this ADR is accepted.
 
 Tracked in [#4483](https://github.com/curie-eng/curie/issues/4483).
 The specification implementation in
