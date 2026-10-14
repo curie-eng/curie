@@ -24,7 +24,7 @@ Components deployed:
 {{- $sse42 = true }}
 {{- end }}
 {{- end }}
-  - ClickHouse ({{ include "curie.image" (dict "repository" .Values.clickhouse.image.repository "tag" .Values.clickhouse.image.tag "digest" .Values.clickhouse.image.digest) }}){{ if $sse42 }}  [SSE4.2-safe override]{{ else }}  [AVX required]{{ end }}
+  - ClickHouse ({{ include "curie.image" (dict "repository" .Values.clickhouse.image.repository "tag" .Values.clickhouse.image.tag "digest" .Values.clickhouse.image.digest) }}){{ if $sse42 }}  [SSE4.2-safe override]{{ else }}  [AVX required] on x86; not required on native ARM64{{ end }}
 {{- else }}
   - ClickHouse: BYO at {{ .Values.clickhouse.host }}
 {{- end }}
