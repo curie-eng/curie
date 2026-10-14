@@ -1205,8 +1205,8 @@ def allow_fixture_bridge(
             timeout="20m",
         )
     )
-    for kind in ("deployment", "statefulset"):
-        for workload in p.kubectl("-n", p.namespace, "get", kind, "-o", "name").split():
+    for resource in ("deployment", "statefulset"):
+        for workload in p.kubectl("-n", p.namespace, "get", resource, "-o", "name").split():
             p.kubectl("-n", p.namespace, "rollout", "status", workload, "--timeout=15m")
     p.ensure_api()
     p.step(f"fixture bridge subnets allowed for the {kind} code host", subnets=len(subnets))
