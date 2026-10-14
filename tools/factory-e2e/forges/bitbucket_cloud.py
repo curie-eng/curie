@@ -236,6 +236,9 @@ class BitbucketCloudDriver:
         return self._jira
 
     def open_and_label_ticket(self, title: str, body: str, since: float) -> str:
+        # The repository holds only a README; the default ticket is about the
+        # GitHub fixture's code.
+        title, body = fe.readme_only_ticket(title, body)
         return str(self._tracker().open_and_label_ticket(title, body, since))
 
     def teardowns(self) -> tuple[tuple[str, Callable[[], Any]], ...]:
@@ -404,7 +407,7 @@ class BitbucketCloudDriver:
         if detail is None:
             raise fe.PreflightFailed("reading the WorkItem before the review failed")
         before = self._request_count(detail)
-        body = fe.revision_comment_text(text, self.p.config.mention)
+        body = fe.revision_comment_text(fe.readme_only_review(text), self.p.config.mention)
         status, comment = self._call(
             "POST",
             f"/pullrequests/{change.number}/comments",

@@ -360,7 +360,10 @@ def test_cloud_driver_delegates_ticket_operations_to_the_jira_driver(
     driver = _cloud_driver(tmp_path)
 
     assert driver.open_and_label_ticket("Title", "Body", 12.5) == "wi-1"
-    assert opened == [("Title", "Body", 12.5)]
+    assert driver.open_and_label_ticket(*fe.DEFAULT_LOOP_ISSUE, 13.0) == "wi-1"
+    # The default ticket is about the GitHub fixture's code; the README-only
+    # repository gets its own.
+    assert opened == [("Title", "Body", 12.5), (*fe.README_ONLY_LOOP_ISSUE, 13.0)]
 
 
 # --- Bitbucket Cloud: request shapes -----------------------------------------------------
@@ -1326,3 +1329,14 @@ def test_a_fixture_that_refused_to_start_tears_down_clean(
     assert not state_dirs[0].exists()
     # An empty directory has nothing to bring down; a written state is brought down.
     assert [argv[3] for argv in calls] == (["up", "down"] if wrote_state else ["up"])
+
+
+@pytest.mark.parametrize("name", sorted(DRIVERS))
+def test_the_default_ticket_and_review_become_the_readme_only_ones(name: str) -> None:
+    # Both Bitbucket repositories hold only a README, so the default loop
+    # ticket about the GitHub fixture's unitconv code cannot be done there.
+    _entry_module(name)
+    assert fe.readme_only_ticket(*fe.DEFAULT_LOOP_ISSUE) == fe.README_ONLY_LOOP_ISSUE
+    assert fe.readme_only_ticket("own", "ticket") == ("own", "ticket")
+    assert fe.readme_only_review(fe.DEFAULT_LOOP_REVIEW_TEXT) == fe.README_ONLY_LOOP_REVIEW_TEXT
+    assert fe.readme_only_review("own review") == "own review"
