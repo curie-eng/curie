@@ -798,37 +798,97 @@ def test_private_services_unavailable_daemon_is_transient_error(
 
 def test_private_config_accepts_loopback_binding_and_owned_network() -> None:
     project = "curie-preflight-example"
+    subnets = ("10.240.0.0/24", "10.240.1.0/24")
     configuration = {
         "services": {
             "postgres": {"ports": [{"host_ip": "127.0.0.1", "target": 5432, "published": "35432"}]}
         },
-        "networks": {"curie_runner": {"name": f"{project}_runner"}},
+        "networks": {
+            "default": {
+                "name": f"{project}_default",
+                "ipam": {"config": [{"subnet": subnets[0]}]},
+            },
+            "curie_runner": {
+                "name": f"{project}_runner",
+                "ipam": {"config": [{"subnet": subnets[1]}]},
+            },
+        },
     }
-    assert load_tool().validate_private_config(configuration, project, {"postgres": [5432]}) is None
+    assert (
+        load_tool().validate_private_config(
+            configuration, project, {"postgres": [5432]}, subnets
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("host_ip", ["0.0.0.0", "::", None])
 def test_private_config_shared_binding_is_gate_failure(host_ip: str | None) -> None:
     project = "curie-preflight-example"
+    subnets = ("10.240.0.0/24", "10.240.1.0/24")
     port = {"target": 5432, "published": "35432"}
     if host_ip is not None:
         port["host_ip"] = host_ip
     configuration = {
         "services": {"postgres": {"ports": [port]}},
-        "networks": {"curie_runner": {"name": f"{project}_runner"}},
+        "networks": {
+            "default": {
+                "name": f"{project}_default",
+                "ipam": {"config": [{"subnet": subnets[0]}]},
+            },
+            "curie_runner": {
+                "name": f"{project}_runner",
+                "ipam": {"config": [{"subnet": subnets[1]}]},
+            },
+        },
     }
     module = load_tool()
     with pytest.raises(module.GateFailure, match="shared binding"):
-        module.validate_private_config(configuration, project, {"postgres": [5432]})
+        module.validate_private_config(configuration, project, {"postgres": [5432]}, subnets)
 
 
 def test_private_config_shared_network_is_gate_failure() -> None:
+    subnets = ("10.240.0.0/24", "10.240.1.0/24")
     configuration = {
         "services": {"postgres": {"ports": [{"host_ip": "127.0.0.1", "target": 5432}]}},
-        "networks": {"curie_runner": {"name": "shared_runner"}},
+        "networks": {
+            "default": {
+                "name": "curie-preflight-example_default",
+                "ipam": {"config": [{"subnet": subnets[0]}]},
+            },
+            "curie_runner": {
+                "name": "shared_runner",
+                "ipam": {"config": [{"subnet": subnets[1]}]},
+            },
+        },
     }
     module = load_tool()
     with pytest.raises(module.GateFailure, match="incorrect owner"):
         module.validate_private_config(
-            configuration, "curie-preflight-example", {"postgres": [5432]}
+            configuration, "curie-preflight-example", {"postgres": [5432]}, subnets
         )
+
+
+def test_private_preflight_networks_skip_occupied_subnets() -> None:
+    module = load_tool()
+    occupied = [
+        f"10.240.{octet}.0/24" for octet in range(16) if octet not in {0, 1}
+    ]
+    occupied.extend(f"172.31.{octet}.0/24" for octet in range(240, 256))
+    occupied.extend(f"192.168.{octet}.0/24" for octet in range(240, 256))
+
+    default_subnet, runner_subnet = module.private_network_subnets(
+        "curie-preflight-example", occupied
+    )
+
+    assert {default_subnet, runner_subnet} == {"10.240.0.0/24", "10.240.1.0/24"}
+
+
+def test_private_preflight_networks_fail_when_reserved_pool_is_full() -> None:
+    module = load_tool()
+    occupied = [f"10.240.{octet}.0/24" for octet in range(16)]
+    occupied.extend(f"172.31.{octet}.0/24" for octet in range(240, 256))
+    occupied.extend(f"192.168.{octet}.0/24" for octet in range(240, 256))
+
+    with pytest.raises(module.TransientError, match="No free private preflight subnets"):
+        module.private_network_subnets("curie-preflight-example", occupied)

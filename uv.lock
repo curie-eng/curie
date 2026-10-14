@@ -951,6 +951,7 @@ source = { editable = "packages/protected-hooks" }
 dependencies = [
     { name = "aci-protocol" },
     { name = "cryptography" },
+    { name = "curie-channel-protocol" },
     { name = "redis" },
     { name = "sqlalchemy", extra = ["asyncio"] },
 ]
@@ -959,6 +960,7 @@ dependencies = [
 requires-dist = [
     { name = "aci-protocol", editable = "packages/aci-protocol" },
     { name = "cryptography", specifier = ">=50.0.1" },
+    { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "redis", specifier = ">=8.1.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.51" },
 ]

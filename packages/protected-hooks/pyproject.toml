@@ -6,7 +6,7 @@ description = "Internal protected hook source authority primitives"
 requires-python = ">=3.13"
 
 # @spec PROTECTED-HOOK-ADMISSION-2
-dependencies = ["aci-protocol", "cryptography>=50.0.1", "redis>=8.1.0", "sqlalchemy[asyncio]>=2.0.51"]
+dependencies = ["aci-protocol", "curie-channel-protocol", "cryptography>=50.0.1", "redis>=8.1.0", "sqlalchemy[asyncio]>=2.0.51"]
 
 [build-system]
 requires = ["hatchling"]
