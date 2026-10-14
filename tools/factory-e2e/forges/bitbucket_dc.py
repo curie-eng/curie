@@ -596,6 +596,10 @@ def bring_up_fixture(p: fe.Preflight) -> Path:
     script = p.repo_root.joinpath(*gitlab.FIXTURE_SCRIPT)
 
     def remove() -> dict[str, Any]:
+        if state_dir.is_dir() and not any(state_dir.iterdir()):
+            # `up` refused before it wrote anything (a taken port): nothing to
+            # bring down, only the empty directory this run made.
+            state_dir.rmdir()
         if state_dir.exists():
             result = subprocess.run(
                 ["bash", str(script), "bitbucket-dc", "down", "--state-dir", str(state_dir)],

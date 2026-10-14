@@ -1283,3 +1283,46 @@ def test_main_dry_run_of_a_bitbucket_pairing_launches_nothing(
 def test_the_bitbucket_self_pairings_are_gone() -> None:
     assert "bitbucket_cloud+bitbucket_cloud" not in acceptance.PAIRINGS
     assert "bitbucket_dc+bitbucket_dc" not in acceptance.PAIRINGS
+
+
+# --- the Data Center fixture the run brings up --------------------------------------------
+
+
+@pytest.mark.parametrize("wrote_state", [False, True])
+def test_a_fixture_that_refused_to_start_tears_down_clean(
+    wrote_state: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _entry_module("bitbucket_dc")
+    p = _preflight(tmp_path)
+    monkeypatch.setattr(_entry_module("gitlab"), "node_reachable_host", lambda _p: "192.0.2.10")
+    state_dirs: list[Path] = []
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        state_dir = Path(argv[argv.index("--state-dir") + 1])
+        if argv[3] == "up":
+            state_dirs.append(state_dir)
+            if wrote_state:
+                (state_dir / "state.json").write_text("{}")
+            return subprocess.CompletedProcess(argv, 1, "", "port 27443 is already in use")
+        if not (state_dir / "state.json").is_file():
+            # As the real fixture does: it never deletes a directory it did not make.
+            return subprocess.CompletedProcess(argv, 1, "", "has no state.json; refusing")
+        # `down` removes what `up` made, the state directory included.
+        for child in state_dir.iterdir():
+            child.unlink()
+        state_dir.rmdir()
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(fe.PreflightFailed, match="up exited 1"):
+        module.bring_up_fixture(p)
+    (result,) = p.teardown.run()
+
+    assert result["ok"] is True, result
+    assert result["step"] == module.FIXTURE_DOWN_STEP
+    assert not state_dirs[0].exists()
+    # An empty directory has nothing to bring down; a written state is brought down.
+    assert [argv[3] for argv in calls] == (["up", "down"] if wrote_state else ["up"])
