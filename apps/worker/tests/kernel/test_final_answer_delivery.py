@@ -71,11 +71,48 @@ def test_validated_done_answer_excludes_all_platform_text_decorations():
         receipt_mode="all",
         workspace_inferred_repo="acme-corp/acme-bot",
         verbatim_answer=True,
+        final_text_mode="verbatim",
     )
     acc.receipt_rows = [
         {"tool": "Edit", "arguments": {"file_path": "example.py"}, "status": "succeeded"}
     ]
+    assert acc.delivers_verbatim
     assert acc.rendered_with_receipt() == "Approved exactly.\n"
+
+
+def test_unvalidated_done_answer_of_a_constrained_runner_keeps_rendering():
+    """A workflow-scoped bundle's ordinary lookup is not an approved answer."""
+    acc = _StreamAccumulator(
+        final_text="Here is the template.",
+        status=SessionStatus.DONE,
+        workspace_inferred_repo="acme-corp/acme-bot",
+        verbatim_answer=True,
+    )
+    assert not acc.delivers_verbatim
+    assert acc.rendered_with_receipt() != "Here is the template."
+    assert acc.rendered_with_receipt().startswith("Here is the template.")
+
+
+def test_unnegotiated_verbatim_final_fails_closed(make_harness):
+    from aci_protocol import Final
+    from curie_worker.kernel import attempt
+
+    async def run():
+        acc = _StreamAccumulator()
+        await attempt._apply_frame(
+            None,  # type: ignore[arg-type]
+            Final(text="approved", text_mode="verbatim"),
+            acc,
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            None,
+        )
+        assert acc.status is SessionStatus.CLASSIFIED_FAILURE
+        assert acc.classification == "final-answer-validation"
+        assert acc.final_text != "approved"
+        assert not acc.delivers_verbatim
+
+    asyncio.run(run())
 
 
 def test_declared_idle_outcome_keeps_ordinary_lifecycle_rendering():
@@ -88,8 +125,13 @@ def test_declared_idle_outcome_keeps_ordinary_lifecycle_rendering():
     assert acc.rendered_with_receipt().startswith("run interrupted")
 
 
-def test_real_runner_gate_and_worker_replay_preserve_approved_text(make_harness):
-    """Synthetic SDK → actual HTTP → kernel → real Valkey → replayed wire."""
+@pytest.mark.parametrize("flow", ["validated", "lookup"])
+def test_real_runner_gate_and_worker_replay_preserve_approved_text(make_harness, flow):
+    """Synthetic SDK → actual HTTP → kernel → real Valkey → replayed wire.
+
+    ``lookup`` is the same workflow-scoped bundle answering without its
+    declared trigger: delivered, but through ordinary rendering.
+    """
     import hashlib
     import json
 
@@ -134,6 +176,24 @@ def test_real_runner_gate_and_worker_replay_preserve_approved_text(make_harness)
             AssistantMessage(content=[TextBlock(text=approved)], model="synthetic"),
             _result(text=approved),
         ]
+        trigger = "mcp__deck_review__inspect_deck"
+        if flow == "validated":
+            script.insert(
+                0,
+                AssistantMessage(
+                    content=[ToolUseBlock(id="inspect", name=trigger, input={})],
+                    model="synthetic",
+                ),
+            )
+            script.insert(
+                1,
+                UserMessage(
+                    content=[ToolResultBlock(tool_use_id="inspect", content="ok", is_error=False)]
+                ),
+            )
+        else:
+            approved = "Here is the *template*."
+            script = [_result(text=approved)]
         fake = FakeModelSession(lambda: script)
         runner = SessionRunner(
             session_factory=lambda: fake,
@@ -143,7 +203,7 @@ def test_real_runner_gate_and_worker_replay_preserve_approved_text(make_harness)
             classifier=SideEffectClassifier(readonly_tools={tool}),
             trace_name="synthetic-final-answer",
             held_secrets=frozenset(),
-            final_answer=FinalAnswerPolicy(tool=tool),
+            final_answer=FinalAnswerPolicy(tool=tool, triggers=frozenset({trigger})),
         )
         await runner.start()
         try:
@@ -191,6 +251,11 @@ def test_real_runner_gate_and_worker_replay_preserve_approved_text(make_harness)
                     )
                 finally:
                     await client.close()
+                if flow == "lookup":
+                    assert outcome.terminal_ok and outcome.text.startswith(approved)
+                    assert outcome.text != approved  # receipt/notice rendering applies
+                    assert outcome.answer is not None and outcome.answer.text_mode is None
+                    return
                 assert outcome.terminal_ok and outcome.text == approved
                 assert outcome.answer is not None and outcome.answer.version == "1.2"
                 assert outcome.answer.text_mode == "verbatim" and outcome.answer.nav is None
