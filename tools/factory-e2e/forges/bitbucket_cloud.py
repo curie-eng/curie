@@ -196,15 +196,16 @@ class BitbucketCloudDriver:
         if (there.scheme, there.netloc) != (origin.scheme, origin.netloc):
             raise fe.PreflightFailed(f"refused a request off {origin.scheme}://{origin.netloc}")
         token = self.reviewer_token if as_reviewer else self.factory_token
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        # Bitbucket Cloud answers a bodiless POST that declares a JSON body
+        # with a bare 400, so only a request with a body names its type.
+        if body is not None:
+            headers["Content-Type"] = "application/json"
         request = urllib.request.Request(
             url,
             method=method,
             data=None if body is None else json.dumps(body).encode(),
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
         )
         try:
             with self._opener.open(request, timeout=timeout) as response:

@@ -457,6 +457,35 @@ def test_cloud_merge_is_posted_by_the_reviewer(
     assert (result["status_code"], result["merged"]) == (200, True)
 
 
+def test_cloud_reset_declines_an_open_pull_request_without_declaring_a_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cloud_env(tmp_path, monkeypatch)
+
+    def answer(method: str, url: str) -> tuple[int, Any]:
+        if method == "GET" and url.startswith(f"{CLOUD_API}/pullrequests?state=OPEN"):
+            return 200, {"values": [{"id": 7}]}
+        if method == "POST" and url == f"{CLOUD_API}/pullrequests/7/decline":
+            # Bitbucket Cloud refuses a bodiless POST that declares a JSON body.
+            call = http.current.call
+            return (400, None) if "content-type" in call.headers else (200, {"state": "DECLINED"})
+        if method == "GET" and url.startswith(f"{CLOUD_API}/refs/branches?"):
+            return 200, {"values": [{"name": "curie/publication-x"}, {"name": "main"}]}
+        if method == "DELETE" and url == f"{CLOUD_API}/refs/branches/curie%2Fpublication-x":
+            return 204, None
+        return _ok(method, url)
+
+    http = _install(monkeypatch, answer)
+    driver = _cloud_driver(tmp_path)
+    http.calls.clear()
+
+    assert driver.reset_fixture() == {"declined": 1, "branches_deleted": 1}
+    decline, delete = http.writes()
+    assert decline.headers["authorization"] == f"Bearer {REVIEWER_TOKEN}"
+    assert "content-type" not in decline.headers
+    assert delete.method == "DELETE"
+
+
 @pytest.mark.parametrize(
     ("status", "state", "expected"),
     [(200, "MERGED", True), (200, "OPEN", False), (200, "DECLINED", False), (500, None, None)],
