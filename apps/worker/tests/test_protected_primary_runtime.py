@@ -50,7 +50,7 @@ def primary_postgres(tmp_path_factory):
 
     def docker(*args, check=True):
         result = subprocess.run(
-            ["/usr/local/bin/docker", *args], capture_output=True, text=True, timeout=30
+            ["docker", *args], capture_output=True, text=True, timeout=30
         )
         if check and result.returncode:
             pytest.fail("owned primary Postgres Docker operation failed", pytrace=False)
