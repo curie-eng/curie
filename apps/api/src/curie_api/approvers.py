@@ -28,8 +28,9 @@ from typing import Any, Protocol
 
 from aci_protocol.turn import SLACK_KIND
 
+from curie_api.schemas.channels import EMAIL_KIND, SLACK_CHANNEL_ID
+
 from .models import Approval
-from .schemas import EMAIL_KIND, SLACK_CHANNEL_ID
 
 # The audit vocabulary is FROZEN, and each set pins its own ``audit_name`` to the
 # class name it had before ADR-0034 turned it from an authorizer into a set. The
@@ -81,6 +82,9 @@ class ApproverSet(Protocol):
     def chat_eligible(self) -> bool: ...
 
     @property
+    def test_driver_eligible(self) -> bool: ...
+
+    @property
     def ineligible_reason(self) -> str | None:
         """What to tell an ineligible principal, or None for the authorizer's
         per-kind default. A set whose eligibility is not about Slack evidence
@@ -110,6 +114,7 @@ class ExplicitUsers:
     # listed ID would let any adapter serving the binding approve as that
     # person (ADR-0177, "A separate finding").
     adapter_eligible = False
+    test_driver_eligible = True
     chat_eligible = True
     ineligible_reason = None
 
@@ -157,6 +162,7 @@ class InvalidApprovers:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    test_driver_eligible = False
     chat_eligible = True
     ineligible_reason = None
 
@@ -206,6 +212,7 @@ class UnboundRoute:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    test_driver_eligible = False
     chat_eligible = True
     ineligible_reason = None
 
@@ -287,7 +294,7 @@ class EmailApprovers:
     a Slack click cannot prove they hold an email address, so each is refused
     before membership is read, whatever address it names. The router has already
     checked that the adapter serves the thread's binding
-    (``crud._approval_served``) and that the binding's ``allowed_callers``
+    (``crud.approvals._approval_served``) and that the binding's ``allowed_callers``
     admit the sender (ADR 0175), so "a verified, listed sender of the serving
     adapter" is the conjunction of those checks and this one.
 
@@ -302,6 +309,7 @@ class EmailApprovers:
     operator_eligible = False
     console_eligible = False
     adapter_eligible = True
+    test_driver_eligible = False
     chat_eligible = False
     ineligible_reason = (
         "on email, only an address on this approval's approver list may answer, "
@@ -361,6 +369,7 @@ class NoVerifiableApprovers:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    test_driver_eligible = False
     chat_eligible = True
     ineligible_reason = None
 

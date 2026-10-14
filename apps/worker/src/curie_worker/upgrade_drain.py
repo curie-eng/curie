@@ -322,7 +322,7 @@ class UpgradeDrainGate:
 
         try:
             raw = await self._redis.get(self._config.upgrade_quiesce_key())
-        except Exception:
+        except Exception:  # noqa: BLE001 - existing broad catch retained
             # Status is diagnostic. An unreadable authority is unknown, never
             # permission to claim and never an exception containing a key or
             # credential copied onto stdout.
@@ -333,7 +333,7 @@ class UpgradeDrainGate:
         status: ClaimStatus = self._parse_marker(raw)
         try:
             pttl = await self._redis.pttl(self._config.upgrade_quiesce_key())
-        except Exception:
+        except Exception:  # noqa: BLE001 - existing broad catch retained
             # The remaining lifetime is optional diagnostics; the state read
             # above already established pause authority.
             logger.warning("quiesce marker TTL could not be read")
@@ -594,7 +594,7 @@ async def _attest_recorded_drain(redis: Redis, config: WorkerConfig) -> int:
     """
     try:
         raw = await redis.get(config.upgrade_drain_success_key())
-    except Exception:
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         logger.error(
             "refusing the upgrade: no successful drain is recorded for this "
             "revision and nothing was rolled. The success record could not be read."
@@ -617,7 +617,7 @@ async def _attest_recorded_drain(redis: Redis, config: WorkerConfig) -> int:
             _hook_revision(config),
             PAUSE_LEASE_S * 1000,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 - failure boundary
         logger.error(
             "refusing the upgrade: the recorded drain's pause authority could "
             "not be renewed and nothing was rolled."
@@ -681,7 +681,7 @@ async def run_gate(config: WorkerConfig, *, mode: str) -> int:
                     _hook_revision(config),
                     max(1, int(config.upgrade_quiesce_ttl_s * 1000)),
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - failure boundary
                 logger.error(
                     "refusing the upgrade: pause authority could not be renewed "
                     "for the roll hold and nothing was rolled."
@@ -732,7 +732,7 @@ async def run_gate(config: WorkerConfig, *, mode: str) -> int:
                 "Nothing was rolled."
             )
             return 1
-        except Exception:
+        except Exception:  # noqa: BLE001 - failure boundary
             # An unreadable lane (or any other failure) refuses the upgrade;
             # release the fleet before propagating the non-zero exit.
             await gate.clear_quiesce()
@@ -749,14 +749,14 @@ async def run_gate(config: WorkerConfig, *, mode: str) -> int:
             # refused upgrade does not leave the fleet paused.
             try:
                 await _record_drain_success(redis, config)
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 logger.error(
                     "refusing the upgrade: the drain finished but its success "
                     "record could not be written. Nothing was rolled."
                 )
                 try:
                     await gate.clear_quiesce()
-                except Exception:
+                except Exception:  # noqa: BLE001 - existing broad catch retained
                     logger.error(
                         "refusing the upgrade: the quiesce marker could not be "
                         "cleared after the success record write failed. Nothing "

@@ -6,7 +6,7 @@ import uuid
 from typing import Any
 
 from curie_api.config import get_settings
-from curie_api.sandbox_token import mint
+from curie_internal.sandbox_token import mint
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine

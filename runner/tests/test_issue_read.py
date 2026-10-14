@@ -1,9 +1,11 @@
-"""The platform ``get_issue`` tool for the GitHub factory (ADR 0187, #3748).
+"""The platform ``get_issue`` tool for the factory (ADR 0187, #3748, #4358 plan D8).
 
 The tool mounts only when the worker injected the issue read route and its
 execution scoped capability, presents the capability in its own header, and
-returns the API's answer. Every HTTP case runs against a real local aiohttp
-server that records what it received; nothing of ours is mocked.
+returns the API's answer. It takes no arguments: the capability names the one
+issue, on whichever tracker holds it, and the API answers it as markdown.
+Every HTTP case runs against a real local aiohttp server that records what it
+received; nothing of ours is mocked.
 """
 
 from __future__ import annotations
@@ -16,7 +18,11 @@ import mcp.types as mcp_types
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-from curie_runner.approval import ISSUE_TOOL_NAME, build_approval_server, is_platform_owned_tool
+from curie_runner.approval import (
+    ISSUE_TOOL_NAME,
+    is_platform_owned_tool,
+)
+from curie_runner.harness.claude.approval import build_approval_server
 from curie_runner.issue_read import (
     CAPABILITY_HEADER,
     ISSUE_READ_TOKEN_ENV,
@@ -29,14 +35,9 @@ from curie_runner.subprocess_env import platform_credential_names
 
 CAPABILITY = "wir.example-capability.signature"
 ISSUE = {
-    "repo_full_name": "acme-corp/acme-bot",
-    "issue_number": 7,
-    "title": "Add a flag",
-    "body": "Acceptance criteria:\n\n1. It works.\n",
-    "state": "open",
-    "author": "octocat",
-    "comments": [{"author": "hubot", "created_at": "2026-10-01T00:00:00Z", "body": "+1"}],
-    "comments_truncated": False,
+    "issue": "PROJ-7",
+    "url": "https://acme.atlassian.example/browse/PROJ-7",
+    "ticket": "# Add a flag\n\nAcceptance criteria:\n\n1. It works.\n\n---\n\n**hubot**: +1\n",
     "execution_deadline": "2026-10-01T03:00:00Z",
     "execution_seconds": 10800,
 }
@@ -72,7 +73,7 @@ def _call(api: _Api, args: dict[str, Any]) -> dict[str, Any]:
     return anyio.run(go)
 
 
-ARGS = {"owner": "acme-corp", "repo": "acme-bot", "issue_number": 7}
+ARGS: dict[str, Any] = {}
 
 
 def test_mounts_only_when_the_worker_injected_route_and_capability() -> None:
@@ -113,43 +114,41 @@ def test_a_read_presents_the_capability_and_returns_the_issue_verbatim() -> None
     assert returned == ISSUE
     assert returned["execution_deadline"] == ISSUE["execution_deadline"]
     assert returned["execution_seconds"] == ISSUE["execution_seconds"]
-    assert api.received == [
-        ({"repo_full_name": "acme-corp/acme-bot", "issue_number": 7}, CAPABILITY)
-    ]
+    assert returned["ticket"].startswith("# Add a flag")
+    assert api.received == [({}, CAPABILITY)]
     assert CAPABILITY not in _text(result)
+
+
+def test_the_tool_takes_no_arguments() -> None:
+    from curie_runner import issue_read
+
+    assert issue_read._SCHEMA == {"type": "object", "properties": {}}
+    assert "tracker" in issue_read._DESCRIPTION
+    assert "markdown" in issue_read._DESCRIPTION
+    assert "GitHub" not in issue_read._DESCRIPTION
 
 
 @pytest.mark.parametrize(
     "args",
     [
-        {"owner": "acme-corp", "repo": "acme-bot"},
-        {"owner": "", "repo": "acme-bot", "issue_number": 7},
-        {"owner": "acme-corp", "repo": "acme-bot", "issue_number": True},
-        {"owner": "acme-corp", "repo": "acme-bot", "issue_number": 0},
+        {"owner": "acme-corp", "repo": "acme-bot", "issue_number": 8},
+        {"issue_number": 0},
     ],
 )
-def test_malformed_arguments_are_refused_without_a_request(args: dict[str, Any]) -> None:
+def test_arguments_never_reach_the_request(args: dict[str, Any]) -> None:
+    # Only this run's issue can be read, so whatever a model passes, the body is
+    # empty and the capability alone names the issue.
     api = _Api()
     result = _call(api, args)
-    assert result.get("is_error") is True
-    assert api.received == []
+    assert result.get("is_error") is not True, _text(result)
+    assert api.received == [({}, CAPABILITY)]
 
 
 @pytest.mark.parametrize(
     ("status", "payload", "needle"),
     [
-        (
-            403,
-            {
-                "detail": {
-                    "code": "issue_not_granted",
-                    "message": "this execution may read only issue 7 of acme-corp/acme-bot",
-                }
-            },
-            "issue 7 of acme-corp/acme-bot",
-        ),
         (409, {"detail": {"code": "invalid_context"}}, "ended"),
-        (503, {"detail": {"code": "issue_unavailable"}}, "Retry"),
+        (503, {"detail": {"code": "issue_unavailable"}}, "The tracker could not answer"),
         (401, {"detail": {"code": "invalid_capability"}}, "401"),
     ],
 )

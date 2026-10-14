@@ -38,6 +38,8 @@ from curie_runner.adapter import ClaudeAgentSession, build_options
 from curie_runner.approval import (
     ApprovalGate,
     build_approval_gate,
+)
+from curie_runner.harness.claude.approval import (
     build_approval_hook,
     build_can_use_tool,
 )
@@ -52,6 +54,16 @@ from curie_telemetry import configure_meter_provider
 from curie_telemetry import metrics as curie_metrics
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+
+def _user_message(prompt: str) -> str:
+    start_marker = "[user-message"
+    end_marker = "[end-user-message"
+    if start_marker not in prompt or end_marker not in prompt:
+        return prompt
+    start = prompt.index("\n", prompt.index(start_marker)) + 1
+    body = prompt[start : prompt.index(end_marker)]
+    return body[:-1] if body.endswith("\n") else body
 
 _SERVER = Path(__file__).parent / "fixtures" / "mcp_tool_result_server.py"
 _TOOL = web.AppKey("tool", str)
@@ -540,7 +552,7 @@ def test_a_read_only_prompt_a_bundle_hook_delayed_never_runs_unrestricted(
 
     async def model(request: web.Request) -> web.StreamResponse:
         body = await request.json()
-        last = last_user_text(body)
+        last = _user_message(last_user_text(body))
         response = web.StreamResponse(headers={"content-type": "text/event-stream"})
         await response.prepare(request)
         start = {

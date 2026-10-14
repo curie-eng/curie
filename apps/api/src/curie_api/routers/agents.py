@@ -1,12 +1,13 @@
 """Agents and their versions."""
 
 import functools
+import re
 import tempfile
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from aci_protocol.turn import route_identity
 from curie_protected_hooks.source_policy_sql import (
@@ -16,40 +17,107 @@ from curie_protected_hooks.source_policy_sql import (
     ensure_source_gate_live,
 )
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from plugin_format import connector_lock
 from plugin_format.connector_render import AmbiguousObjectName
 from plugin_format.deploy_targets import connectors_for_agent, restrict_connectors
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from .. import bundles, crud, deploy, hook_signing
+from curie_api.crud import agents as crud_agents
+from curie_api.crud import channels as crud_channels
+from curie_api.crud import deployments as crud_deployments
+from curie_api.crud import versions as crud_versions
+from curie_api.forges.registry import ForgeRegistry, forges_registry
+from curie_api.forges.surfaces import TRACKER_SURFACE_KINDS, SurfaceUnconfigured, resolve_surface
+from curie_api.schemas.action_executions import DIGEST_PATTERN
+from curie_api.schemas.agents import AgentCreate, AgentOut, AgentUpdate, enforce_behavior_packs_size
+from curie_api.schemas.channels import (
+    ChannelBindingPatch,
+    ChannelBindingWrite,
+    ChannelCallersWrite,
+    ChannelRouteWrite,
+    validate_allowed_callers,
+)
+from curie_api.schemas.deployments import ConnectorManifests
+from curie_api.schemas.versions import BundleFile, BundleFiles, VersionCreate, VersionOut
+
+from .. import bundles, deploy, hook_signing
+from ..action_forward import RESTORE_TOOL
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
 from ..e2e_connector import prepare_connectors
-from ..models import Agent, AgentChannel
+from ..models import Agent, AgentChannel, ConnectorCapability
 from ..publication_policy import PublicationPolicyConflict
 from ..runner_resources import RunnerResourcesError, quota_refusal
-from ..schemas import (
-    AgentCreate,
-    AgentOut,
-    AgentUpdate,
-    BundleFile,
-    BundleFiles,
-    ChannelBindingPatch,
-    ChannelBindingWrite,
-    ChannelCallersWrite,
-    ConnectorManifests,
-    VersionCreate,
-    VersionOut,
-    enforce_behavior_packs_size,
-    validate_allowed_callers,
-)
 
-router = APIRouter(prefix="/agents", tags=["agents"], dependencies=[Depends(require_api_key)])
+
+def _carries_secret_input(error: dict[str, Any]) -> bool:
+    """Whether a validation error's ``input`` can hold connector secret values.
+
+    The ``secrets`` field's own errors carry the whole submitted map; an error
+    on the body itself carries the whole body, which may include that map. A
+    body FastAPI cannot read as an object (``text/plain``, a JSON list or
+    string, a form, no content type) arrives as raw text or a list, so every
+    error located at the body itself is redacted, whatever its ``input`` is.
+    """
+
+    loc = tuple(error.get("loc", ()))
+    if loc[:2] == ("body", "secrets") or loc == ("body",):
+        return True
+    value = error.get("input")
+    return isinstance(value, dict) and "secrets" in value
+
+
+class _SecretRedactingRoute(APIRoute):
+    """Answer a body validation failure without echoing secret values.
+
+    FastAPI's default 422 echoes pydantic's ``input``. For the agent
+    ``secrets`` map that is every submitted value, so a refused create or
+    update (a reserved name, an empty value, or a reserved snapshot sealing
+    key, @spec ACTION-EXECUTOR-16) would print them into any client or proxy
+    log of the error body. The same redaction the provider-installation and
+    channel-identity routers apply, narrowed to the errors that can hold those
+    values: every other error keeps FastAPI's default shape.
+    """
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+
+        async def redacting_handler(request: Request) -> Response:
+            try:
+                return await handler(request)
+            except RequestValidationError as exc:
+                errors = list(exc.errors())
+                if not any(_carries_secret_input(error) for error in errors):
+                    raise
+                detail = [
+                    {key: value for key, value in error.items() if key != "input"}
+                    if _carries_secret_input(error)
+                    else error
+                    for error in errors
+                ]
+                return JSONResponse(
+                    {"detail": jsonable_encoder(detail)},
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                )
+
+        return redacting_handler
+
+
+router = APIRouter(
+    prefix="/agents",
+    tags=["agents"],
+    dependencies=[Depends(require_api_key)],
+    route_class=_SecretRedactingRoute,
+)
 
 
 class HookSecretOut(BaseModel):
@@ -89,11 +157,12 @@ _UNIQUE_CONSTRAINT_MESSAGES = {
         "agent per route (move or delete the other agent, or pick another "
         "address)"
     ),
-    # Migration 0070's key: the route is the triple (ADR-0168 decision 3).
+    # Migration 0070's key: the route is the triple (ADR-0168 decision 3),
+    # widened by the trigger label in 0105 (#4361).
     "agent_channels_route_key": (
         "another agent is already bound to that channel kind and address under that "
-        "identity; one agent per route (bind another identity, move or delete the "
-        "other agent, or pick another address)"
+        "identity and trigger label; one agent per route (bind another identity or "
+        "label, move or delete the other agent, or pick another address)"
     ),
     # No entry for `agent_channels_agent_id_key`: migration 0030 drops that
     # constraint (ADR-0118), so its message can never fire again, and it said
@@ -143,6 +212,21 @@ def classify_integrity_error(exc: IntegrityError) -> tuple[int, str] | None:
     return status.HTTP_409_CONFLICT, message
 
 
+def _resolve_surface_or_422(registry: ForgeRegistry, kind: str, address: str) -> None:
+    """Refuse a tracker surface no configured tracker serves (#4397 decision 3).
+
+    A ``gitlab`` or ``jira`` location must be configured before it is bound; a
+    ``github`` surface always resolves. Every other kind passes untouched.
+    """
+
+    if kind not in TRACKER_SURFACE_KINDS:
+        return
+    try:
+        resolve_surface(registry, kind, address)
+    except SurfaceUnconfigured as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+
 @router.post("", response_model=AgentOut, status_code=status.HTTP_201_CREATED)
 async def create_agent(data: AgentCreate, session: SessionDep) -> AgentOut:
     # Reject oversized behavior packs (#936) before we touch the DB.
@@ -152,12 +236,19 @@ async def create_agent(data: AgentCreate, session: SessionDep) -> AgentOut:
     # not a server fault: catch the DB IntegrityError and map it, rather than
     # letting it bubble as an opaque 500. A non-unique violation (NOT NULL, FK)
     # is a genuine server fault -- re-raise it so it surfaces as a 500.
+    channel = data.channel
+    registry = forges_registry(get_settings())
+    _resolve_surface_or_422(registry, channel.kind, channel.address)
     try:
-        await crud.refuse_routeless_pair_sharing(
-            session, None, data.channel.kind, data.channel.address, data.channel.adapter
+        await crud_channels.refuse_routeless_pair_sharing(
+            session, None, channel.kind, channel.address, channel.adapter
         )
-        agent = await crud.create_agent(session, data)
-    except crud.RoutelessPairShared as exc:
+        # Under the pair lock, in the transaction the create commits (#4361).
+        await crud_channels.refuse_label_overlap(
+            session, registry, None, channel.kind, channel.address, channel.trigger_label
+        )
+        agent = await crud_agents.create_agent(session, data)
+    except (crud_channels.RoutelessPairShared, crud_channels.LabelOverlap) as exc:
         await session.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except IntegrityError as exc:
@@ -172,13 +263,13 @@ async def create_agent(data: AgentCreate, session: SessionDep) -> AgentOut:
 
 @router.get("", response_model=list[AgentOut])
 async def list_agents(session: SessionDep) -> list[AgentOut]:
-    agents = await crud.list_agents(session)
+    agents = await crud_agents.list_agents(session)
     return [AgentOut.model_validate(a) for a in agents]
 
 
 @router.get("/{agent_id}", response_model=AgentOut)
 async def get_agent(agent_id: uuid.UUID, session: SessionDep) -> AgentOut:
-    agent = await crud.get_agent(session, agent_id)
+    agent = await crud_agents.get_agent(session, agent_id)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     return AgentOut.model_validate(agent)
@@ -194,7 +285,7 @@ async def get_hook_secret(
         if not isinstance(gate, SourceGate):
             raise SourceSnapshotUnavailable("source_gate_unavailable")
         async with gate.hold(agent_id) as held:
-            agent = await crud.get_agent(session, agent_id)
+            agent = await crud_agents.get_agent(session, agent_id)
             if agent is None:
                 raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
             counter = agent.hook_generation
@@ -221,7 +312,7 @@ async def update_agent(
     # "move the agent's channel" has no referent and the write surface is the
     # `/agents/{agent_id}/channels` subresource below. A caller still sending the
     # retired key is refused by the schema (422), never ignored.
-    agent = await crud.get_agent(session, agent_id)
+    agent = await crud_agents.get_agent(session, agent_id)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     # The declared/bound approval-route join, judged BEFORE the first mutation
@@ -246,7 +337,7 @@ async def update_agent(
     # single fetch.
     if data.approval_routes is not None:
         proposed = {name: b.model_dump() for name, b in data.approval_routes.items()}
-        for version in await crud.list_active_deployment_versions(session, agent_id):
+        for version in await crud_deployments.list_active_deployment_versions(session, agent_id):
             try:
                 await deploy.check_approval_route_bindings(store, version, proposed)
             except deploy.BundleTooLarge as exc:
@@ -286,36 +377,40 @@ async def update_agent(
     # one beside the other would leave the sibling broken on an adjacent line.
     sent = data.model_fields_set
     if "model" in sent:
-        agent = await crud.update_agent_model(session, agent, data.model)
+        agent = await crud_agents.update_agent_model(session, agent, data.model)
     if "reviewer_model" in sent:
-        agent = await crud.update_agent_reviewer_model(session, agent, data.reviewer_model)
+        agent = await crud_agents.update_agent_reviewer_model(session, agent, data.reviewer_model)
     if "thinking" in sent:
-        agent = await crud.update_agent_thinking(session, agent, data.thinking)
+        agent = await crud_agents.update_agent_thinking(session, agent, data.thinking)
     if "execution_deadline_seconds" in sent:
-        agent = await crud.update_agent_execution_deadline(
+        agent = await crud_agents.update_agent_execution_deadline(
             session, agent, data.execution_deadline_seconds
         )
     if "runner_resources" in sent:
         # Quota was judged above, before any field committed. Null clears.
-        agent = await crud.update_agent_runner_resources(session, agent, data.runner_resources)
+        agent = await crud_agents.update_agent_runner_resources(
+            session, agent, data.runner_resources
+        )
     if data.memory is not None:
         # Omitted leaves it unchanged; unlike `model`/`thinking` there is no
         # separate "platform default" a null would clear back to, so this
         # follows the plain-None-check siblings below rather than the
         # model_fields_set pair above.
-        agent = await crud.update_agent_memory(session, agent, data.memory)
+        agent = await crud_agents.update_agent_memory(session, agent, data.memory)
     if data.memory_writes is not None:
         # Same plain-None rule as `memory`: omitted (or null) is unchanged.
-        agent = await crud.update_agent_memory_writes(session, agent, data.memory_writes)
+        agent = await crud_agents.update_agent_memory_writes(session, agent, data.memory_writes)
     if data.approval_required_tools is not None:
         # Omitted leaves the gates unchanged; an explicit [] clears them (#245).
-        agent = await crud.update_agent_approval_tools(session, agent, data.approval_required_tools)
+        agent = await crud_agents.update_agent_approval_tools(
+            session, agent, data.approval_required_tools
+        )
     if data.approval_routes is not None:
         # Omitted leaves the bindings unchanged; an explicit {} clears them (#247).
         # Only the write: the preflight at the top of this handler has already
         # judged this same map against every active deployment's declared routes
         # (#2436), because by here four other fields are already committed.
-        agent = await crud.update_agent_approval_routes(
+        agent = await crud_agents.update_agent_approval_routes(
             session,
             agent,
             {name: b.model_dump() for name, b in data.approval_routes.items()},
@@ -323,25 +418,29 @@ async def update_agent(
     if data.repo_full_name is not None:
         # Binds this agent to a repository so git-flow can route pushes to it
         # (ADR-0091). Several agents may share one, so this cannot collide.
-        agent = await crud.update_agent_repo(session, agent, data.repo_full_name)
+        agent = await crud_agents.update_agent_repo(session, agent, data.repo_full_name)
+    if data.deploy_notifications is not None:
+        agent = await crud_agents.update_agent_deploy_notifications(
+            session, agent, data.deploy_notifications
+        )
     if data.secrets is not None:
         # Omitted leaves the secrets unchanged; an explicit {} clears them (#429).
-        agent = await crud.update_agent_secrets(session, agent, data.secrets)
+        agent = await crud_agents.update_agent_secrets(session, agent, data.secrets)
     if data.hook_partitions is not None:
         # Omitted leaves the partitions unchanged; an explicit {} clears them
         # (ADR-0134). Plain `is not None` like the siblings above rather than
         # `model_fields_set`: there is no platform default a null would clear
         # back to, which is the distinction `memory` already draws.
-        agent = await crud.update_agent_hook_partitions(session, agent, data.hook_partitions)
+        agent = await crud_agents.update_agent_hook_partitions(session, agent, data.hook_partitions)
     if data.source_bindings is not None:
-        agent = await crud.update_agent_source_bindings(session, agent, data.source_bindings)
+        agent = await crud_agents.update_agent_source_bindings(session, agent, data.source_bindings)
     if (
         "publication_policy" in sent
         or "publication_draft" in sent
         or "publication_branch_prefix" in sent
     ):
         try:
-            agent = await crud.update_agent_publication_policy(
+            agent = await crud_agents.update_agent_publication_policy(
                 session,
                 agent,
                 policy=data.publication_policy if "publication_policy" in sent else None,
@@ -368,15 +467,15 @@ async def delete_agent(agent_id: uuid.UUID, session: SessionDep) -> None:
     # objects in RustFS are left as-is, out of scope). Refuse while a deployment
     # is still active so a live agent cannot be pulled out from under Slack
     # traffic; the caller must stop it (kill/undeploy) first.
-    agent = await crud.get_agent(session, agent_id)
+    agent = await crud_agents.get_agent(session, agent_id)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
-    if await crud.agent_has_active_deployment(session, agent_id):
+    if await crud_deployments.agent_has_active_deployment(session, agent_id):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "agent has an active deployment; stop it before deleting",
         )
-    await crud.delete_agent(session, agent_id)
+    await crud_agents.delete_agent(session, agent_id)
 
 
 # --- the channel-binding subresource (ADR-0118, #1525) ------------------------
@@ -392,7 +491,7 @@ async def delete_agent(agent_id: uuid.UUID, session: SessionDep) -> None:
 
 
 async def _agent_or_404(session: AsyncSession, agent_id: uuid.UUID) -> Agent:
-    agent = await crud.get_agent(session, agent_id)
+    agent = await crud_agents.get_agent(session, agent_id)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     return agent
@@ -403,7 +502,7 @@ def _binding_for(
 ) -> AgentChannel:
     """Pick the route's row out of THIS agent's locked set, or 404 or 409.
 
-    The matching RULE lives in `crud.matching_bindings`, shared with every
+    The matching RULE lives in `crud.channels.matching_bindings`, shared with every
     other reader of a route including `add_agent_channel`'s idempotence check
     below, so the two surfaces here agree on what counts as "the same
     binding". `agent_channels_route_key` lets several routes share one pair,
@@ -416,7 +515,7 @@ def _binding_for(
     404 rather than becoming a cross-agent write the caller sees a 200 for.
     """
 
-    matches = crud.matching_bindings(bindings, kind, address, adapter)
+    matches = crud_channels.matching_bindings(bindings, kind, address, adapter)
     if len(matches) > 1:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -519,7 +618,7 @@ async def _deadlock_as_conflict() -> AsyncIterator[None]:
 
 
 async def _raise_binding_conflict(
-    exc: IntegrityError, session: AsyncSession, agent_id: uuid.UUID, channel: ChannelBindingWrite
+    exc: IntegrityError, session: AsyncSession, agent_id: uuid.UUID, channel: ChannelRouteWrite
 ) -> NoReturn:
     """Turn a binding write's `IntegrityError` into an owner-accurate 409.
 
@@ -536,7 +635,7 @@ async def _raise_binding_conflict(
 
     if classify_integrity_error(exc) is None:
         raise exc
-    route_owner = await crud.agent_id_for_route(
+    route_owner = await crud_channels.agent_id_for_route(
         session, channel.kind, channel.adapter, channel.address
     )
     raise HTTPException(
@@ -551,27 +650,41 @@ async def add_agent_channel(
 ) -> AgentOut:
     """Bind this agent to one more channel. Appends; never moves."""
 
+    registry = forges_registry(get_settings())
     async with _deadlock_as_conflict():
         agent = await _agent_or_404(session, agent_id)
+        _resolve_surface_or_422(registry, data.kind, data.address)
         # Taken before the insert even though nothing is read from the set: it
         # serializes this add against a concurrent move or delete of the same
         # agent's bindings, which is what keeps the last-binding guard sound.
-        bindings = await crud.lock_agent_bindings(session, agent_id)
+        bindings = await crud_channels.lock_agent_bindings(session, agent_id)
+        tracker_surface = data.kind in TRACKER_SURFACE_KINDS
+        if tracker_surface:
+            # After the agent's rows and before the idempotence check, so a
+            # concurrent add, move or create onto this location by any agent
+            # is decided by one order (#4361 decision 5).
+            await crud_channels.lock_pair(session, data.kind, data.address)
         # A re-POST of a route this agent already holds is an idempotent
-        # success that changes nothing. `crud.matching_bindings` is the same
+        # success that changes nothing. `crud.channels.matching_bindings` is the same
         # rule `_binding_for` selects by, so "the same binding" means the same
         # thing to add, move and delete. A POST naming another identity or
         # adapter on a pair this agent holds is a second route
-        # (`agent_channels_route_key` is the triple), and is inserted.
-        if crud.matching_bindings(bindings, data.kind, data.address, data.adapter):
-            return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
+        # (`agent_channels_route_key` is the triple), and is inserted. A
+        # tracker surface is the same binding only under the same trigger
+        # label; under another one `refuse_label_overlap` answers 409 below.
+        held = crud_channels.matching_bindings(bindings, data.kind, data.address, data.adapter)
+        if any(not tracker_surface or row.trigger_label == data.trigger_label for row in held):
+            return AgentOut.model_validate(await crud_agents.refresh_with_channels(session, agent))
         try:
+            await crud_channels.refuse_label_overlap(
+                session, registry, agent_id, data.kind, data.address, data.trigger_label
+            )
             async with session.begin_nested():  # SAVEPOINT
-                await crud.add_channel_binding(session, agent_id, data)
-                await crud.refuse_routeless_pair_sharing(
+                await crud_channels.add_channel_binding(session, agent_id, data)
+                await crud_channels.refuse_routeless_pair_sharing(
                     session, agent_id, data.kind, data.address, data.adapter
                 )
-        except crud.RoutelessPairShared as exc:
+        except (crud_channels.RoutelessPairShared, crud_channels.LabelOverlap) as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except IntegrityError as exc:
             if classify_integrity_error(exc) is None:
@@ -581,11 +694,15 @@ async def add_agent_channel(
             # Once the savepoint has rolled back, treat that winner as the same
             # successful desired state when it belongs to this agent. Asked of
             # the ROUTE, the key the violated constraint enforces.
-            owner = await crud.agent_id_for_route(session, data.kind, data.adapter, data.address)
+            owner = await crud_channels.agent_id_for_route(
+                session, data.kind, data.adapter, data.address
+            )
             if owner == agent_id:
-                return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
+                return AgentOut.model_validate(
+                    await crud_agents.refresh_with_channels(session, agent)
+                )
             await _raise_binding_conflict(exc, session, agent_id, data)
-        return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
+        return AgentOut.model_validate(await crud_agents.refresh_with_channels(session, agent))
 
 
 @router.patch("/{agent_id}/channels", response_model=AgentOut)
@@ -612,9 +729,11 @@ async def move_agent_channel(
     rebind it never saw.
     """
 
+    registry = forges_registry(get_settings())
     async with _deadlock_as_conflict():
         agent = await _agent_or_404(session, agent_id)
-        bindings = await crud.lock_agent_bindings(session, agent_id)
+        _resolve_surface_or_422(registry, data.kind, data.address)
+        bindings = await crud_channels.lock_agent_bindings(session, agent_id)
         binding = _binding_for(bindings, kind, address, adapter)
         if expected_generation is not None and expected_generation != binding.generation:
             raise HTTPException(
@@ -635,22 +754,42 @@ async def move_agent_channel(
                 "(allowed_callers: null) first, then move the binding and set a "
                 "new list.",
             )
+        if binding.trigger_label is not None and data.kind not in TRACKER_SURFACE_KINDS:
+            # #4361 decision 7: a move keeps the stored label, and only a
+            # tracker surface may carry one.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{kind}:{address} carries trigger label {binding.trigger_label!r}, which "
+                f"only a tracker surface may carry, so it cannot move to a {data.kind} "
+                "surface. Remove it and add the new surface instead.",
+            )
         try:
+            # The destination is judged with the label the row keeps, never
+            # counting the row against itself (#4361 decision 7).
+            await crud_channels.refuse_label_overlap(
+                session,
+                registry,
+                agent_id,
+                data.kind,
+                data.address,
+                binding.trigger_label,
+                exclude_binding_id=binding.id,
+            )
             async with session.begin_nested():  # SAVEPOINT
-                await crud.update_channel_binding(session, binding, data)
+                await crud_channels.update_channel_binding(session, binding, data)
                 # The moved row's route, not the request's: an omitted route
                 # keeps the stored one within a kind.
-                await crud.refuse_routeless_pair_sharing(
+                await crud_channels.refuse_routeless_pair_sharing(
                     session, agent_id, binding.kind, binding.address, binding.adapter
                 )
-        except crud.RoutelessPairShared as exc:
+        except (crud_channels.RoutelessPairShared, crud_channels.LabelOverlap) as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except IntegrityError as exc:
             # The same recovery as the add: a move onto a route another agent (or
             # this one) already holds raises the identical violation and needs the
             # identical owner recheck, inside the same still-live transaction.
             await _raise_binding_conflict(exc, session, agent_id, data)
-        return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
+        return AgentOut.model_validate(await crud_agents.refresh_with_channels(session, agent))
 
 
 @router.put("/{agent_id}/channels/callers", response_model=AgentOut)
@@ -683,7 +822,7 @@ async def set_agent_channel_callers(
 
     async with _deadlock_as_conflict():
         agent = await _agent_or_404(session, agent_id)
-        bindings = await crud.lock_agent_bindings(session, agent_id)
+        bindings = await crud_channels.lock_agent_bindings(session, agent_id)
         binding = _binding_for(bindings, kind, address, adapter)
         try:
             stored = validate_allowed_callers(binding.kind, data.allowed_callers)
@@ -698,8 +837,8 @@ async def set_agent_channel_callers(
                     }
                 ]
             ) from exc
-        await crud.set_allowed_callers(session, binding, stored)
-        return AgentOut.model_validate(await crud.refresh_with_channels(session, agent))
+        await crud_channels.set_allowed_callers(session, binding, stored)
+        return AgentOut.model_validate(await crud_agents.refresh_with_channels(session, agent))
 
 
 @router.delete("/{agent_id}/channels", status_code=status.HTTP_204_NO_CONTENT)
@@ -720,7 +859,7 @@ async def remove_agent_channel(
 
     async with _deadlock_as_conflict():
         await _agent_or_404(session, agent_id)
-        bindings = await crud.lock_agent_bindings(session, agent_id)
+        bindings = await crud_channels.lock_agent_bindings(session, agent_id)
         binding = _binding_for(bindings, kind, address, adapter)
         if len(bindings) <= 1:
             raise HTTPException(
@@ -729,7 +868,7 @@ async def remove_agent_channel(
                 "binding cannot receive a turn. Add another binding first, or "
                 "delete the agent.",
             )
-        await crud.delete_channel_binding(session, binding)
+        await crud_channels.delete_channel_binding(session, binding)
         await session.commit()
 
 
@@ -741,18 +880,60 @@ async def remove_agent_channel(
 async def create_version(
     agent_id: uuid.UUID, data: VersionCreate, session: SessionDep
 ) -> VersionOut:
-    if await crud.get_agent(session, agent_id) is None:
+    if await crud_agents.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
-    version = await crud.create_version(session, agent_id, data)
+    version = await crud_versions.create_version(session, agent_id, data)
     return VersionOut.model_validate(version)
 
 
 @router.get("/{agent_id}/versions", response_model=list[VersionOut])
 async def list_versions(agent_id: uuid.UUID, session: SessionDep) -> list[VersionOut]:
-    if await crud.get_agent(session, agent_id) is None:
+    if await crud_agents.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
-    versions = await crud.list_versions(session, agent_id)
+    versions = await crud_versions.list_versions(session, agent_id)
     return [VersionOut.model_validate(v) for v in versions]
+
+
+_LOCKED_DIGEST = re.compile(DIGEST_PATTERN)
+
+
+async def _restore_capable_digests(
+    session: AsyncSession, agent_id: uuid.UUID
+) -> frozenset[tuple[str, str]]:
+    """``(connector, digest)`` pairs whose probe recorded the paired verbs."""
+
+    rows = await session.execute(
+        select(ConnectorCapability.connector, ConnectorCapability.digest).where(
+            ConnectorCapability.agent_id == agent_id,
+            ConnectorCapability.restore_capable.is_(True),
+        )
+    )
+    return frozenset((connector, digest) for connector, digest in rows.tuples())
+
+
+def _with_probed_restore(
+    connector: str,
+    gated: tuple[str, ...],
+    image: str | None,
+    capable: frozenset[tuple[str, str]],
+) -> tuple[str, ...]:
+    """The connector's gated set, plus ``restore`` once its digest is capable.
+
+    @spec ACTION-EXECUTOR-8 @spec ACTION-EXECUTOR-13: once the probe records the
+    paired verbs for the digest this version's lock pins, the proxy must refuse
+    ``restore`` without a grant, so the executor never calls an ungated restore.
+    The bundle's own approval patterns are kept. A lone ``restore`` (a row that
+    is not capable), no row, a row for another digest, or an image not pinned by
+    digest adds nothing, and ``observe_version`` is never gated.
+    """
+
+    if not image or "@" not in image:
+        return gated
+    digest = image.rsplit("@", 1)[1]
+    if not _LOCKED_DIGEST.fullmatch(digest) or (connector, digest) not in capable:
+        return gated
+    restore = f"{connector}/{RESTORE_TOOL}"
+    return gated if restore in gated else (*gated, restore)
 
 
 @router.get("/{agent_id}/versions/{version_id}/connectors", response_model=ConnectorManifests)
@@ -778,7 +959,7 @@ async def read_version_connectors(
     nameOverride live with whoever ran `cluster up`, not in the bundle.
     """
 
-    version = await crud.get_version(session, version_id)
+    version = await crud_versions.get_version(session, version_id)
     if version is None or version.agent_id != agent_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "version not found")
     if version.bundle_ref is None:
@@ -788,12 +969,13 @@ async def read_version_connectors(
     # that each declare `grafana` overwrite one another's Deployment, Service,
     # and credential with no error. The agent NAME (not the id) is used so the
     # objects stay recognisable in `kubectl get`.
-    agent = await crud.get_agent(session, agent_id)
+    agent = await crud_agents.get_agent(session, agent_id)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     data = await store.get(version.bundle_ref)
     settings = get_settings()
     agent_name = agent.name
+    capable = await _restore_capable_digests(session, agent_id)
 
     def _render() -> ConnectorManifests:
         with tempfile.TemporaryDirectory() as tmp:
@@ -813,7 +995,7 @@ async def read_version_connectors(
             # it returns to a Kubernetes cluster: the worker's connector
             # reconcile loop (`curie_worker.connector_loop.HttpManifestSource`,
             # ADR-0090) and `curie cluster deploy`'s `sync_connectors`
-            # (`cli/src/main.rs`, ADR-0086). Nothing reads these manifests for
+            # (`cli/src/dispatch/cluster_action.rs`, ADR-0086). Nothing reads these manifests for
             # display. A `local-daemon` lock records a bare docker image id that
             # names nothing a node can pull, so rendering one here yields a
             # Deployment that ImagePullBackOffs long after the deploy reported
@@ -850,8 +1032,13 @@ async def read_version_connectors(
             proxy = settings.connector_proxy()
             patterns = bundles.approval_tool_patterns(Path(tmp), agent.approval_required_tools)
             gated = {
-                name: bundles.gated_tools_for_connector(name, patterns)
-                for name in declared.connectors
+                name: _with_probed_restore(
+                    name,
+                    bundles.gated_tools_for_connector(name, patterns),
+                    spec.image if spec.is_hosted else None,
+                    capable,
+                )
+                for name, spec in declared.connectors.items()
             }
             e2e_install = settings.e2e_install()
             try:
@@ -927,7 +1114,7 @@ async def read_version_files(
     # render the bundle without pulling the raw archive. 404 covers a missing
     # agent, a version that is not this agent's, and a version with no bundle
     # stored yet -- there is nothing to read in any of those cases.
-    version = await crud.get_version(session, version_id)
+    version = await crud_versions.get_version(session, version_id)
     if version is None or version.agent_id != agent_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "version not found")
     if version.bundle_ref is None:

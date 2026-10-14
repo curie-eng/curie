@@ -80,7 +80,7 @@ pub fn registration_steps() -> Vec<String> {
         "Open the link and click Create GitHub App; the name, permissions, and the disabled webhook are already filled in.".to_string(),
         "On the new App's settings page, note the App ID and click Generate a private key to download the .pem file.".to_string(),
         "Click Install App and install it on the repositories the factory may work in.".to_string(),
-        "Rerun: curie cluster factory --intake poll --app-id <APP_ID> --private-key-file <PATH.pem>".to_string(),
+        "Rerun: curie cluster factory --intake poll --app-id <APP_ID> --private-key-file <PATH.pem> --repo <OWNER/REPO>".to_string(),
     ]
 }
 
@@ -275,6 +275,38 @@ impl GithubApi {
             .filter(|s| s.len() >= 40 && s.chars().all(|c| c.is_ascii_hexdigit()))
             .map(str::to_string)
             .ok_or_else(|| CliError::failure("GitHub commit response carries no valid sha").into())
+    }
+
+    /// The numeric id of `repo`, read with the App's installation token so a
+    /// private repository answers (#4358). A repository outside the
+    /// installation is refused with the allowlist's install fix.
+    /// https://docs.github.com/en/rest/repos/repos#get-a-repository
+    pub async fn repository_id(&self, app: &InstalledApp, repo: &str) -> Result<u64> {
+        resolve_allowlist(&[repo.to_string()], app, false)?;
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| CliError::usage("repository must be owner/repo"))?;
+        let token = app
+            .token_for(repo)
+            .ok_or_else(|| CliError::failure("repository is outside the App installation"))?;
+        let (status, metadata) = self
+            .call(
+                reqwest::Method::GET,
+                self.url(&["repos", owner, name]),
+                Some(token),
+                None,
+            )
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(unexpected(status, &format!("GET repository {repo}")));
+        }
+        metadata
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|id| *id > 0)
+            .ok_or_else(|| {
+                CliError::failure(format!("GitHub returned no repository id for {repo}")).into()
+            })
     }
 
     /// A directory is an array and a file has base64 content. Neither auth
@@ -552,10 +584,29 @@ pub async fn inspect_app(api: &GithubApi, app_id: &str, pem: &str) -> Result<Ins
     })
 }
 
-/// Validate `--repo` entries against the installation. Empty input means the
-/// installed repositories become the allowlist.
-pub fn resolve_allowlist(requested: &[String], app: &InstalledApp) -> Result<Vec<String>> {
+pub(crate) fn repository_scope_error() -> anyhow::Error {
+    let message = "--app-id needs a repository scope: pass --repo OWNER/REPO (repeatable) or --all-installed-repos; nothing was applied";
+    let fix = "rerun with --repo <owner>/<name> once per repository the factory may serve, or with --all-installed-repos to allow every repository the GitHub App is installed on";
+    let source: anyhow::Error = CliError::usage(message).with_fix(fix).into();
+    let payload = crate::exit::error_json(&source);
+    crate::exit::operator_context(
+        crate::exit::with_json_payload(source, payload),
+        message.to_string(),
+        Some(fix.to_string()),
+    )
+}
+
+/// Validate `--repo` entries against the installation. Empty input allows
+/// installed repositories only when `all_installed` is explicitly true.
+pub fn resolve_allowlist(
+    requested: &[String],
+    app: &InstalledApp,
+    all_installed: bool,
+) -> Result<Vec<String>> {
     if requested.is_empty() {
+        if !all_installed {
+            return Err(repository_scope_error());
+        }
         return Ok(app.repos.clone());
     }
     let missing: Vec<&String> = requested
@@ -904,7 +955,7 @@ pub struct Chosen<T> {
     pub inferred: bool,
 }
 
-/// `cluster factory --app-id ... --private-key-file ...` result.
+/// `cluster factory --app-id ... --private-key-file ... --repo ...` result.
 pub struct FactoryAppSetupOutput {
     pub app_id: String,
     pub slug: String,
@@ -1097,5 +1148,27 @@ mod tests {
         assert!(!repo_entry_installed("other/*", &installed));
         assert!(!repo_entry_installed("/*", &installed));
         assert!(!repo_entry_installed("acme/bot/*", &installed));
+    }
+
+    #[test]
+    fn empty_allowlist_requires_an_explicit_all_installed_choice() {
+        let app = InstalledApp {
+            slug: "acme-app".into(),
+            repos: vec!["acme/bot".into(), "acme/web".into()],
+            tokens: BTreeMap::new(),
+        };
+        let error = resolve_allowlist(&[], &app, false).expect_err("scope must be explicit");
+        assert_eq!(
+            error.to_string(),
+            "--app-id needs a repository scope: pass --repo OWNER/REPO (repeatable) or --all-installed-repos; nothing was applied"
+        );
+        let (class, fix) = crate::exit::classify(&error);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert_eq!(fix.as_deref(), Some("rerun with --repo <owner>/<name> once per repository the factory may serve, or with --all-installed-repos to allow every repository the GitHub App is installed on"));
+        assert_eq!(resolve_allowlist(&[], &app, true).unwrap(), app.repos);
+        assert_eq!(
+            resolve_allowlist(&["acme/bot".into()], &app, false).unwrap(),
+            vec!["acme/bot"]
+        );
     }
 }

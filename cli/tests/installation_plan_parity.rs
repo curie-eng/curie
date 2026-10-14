@@ -369,6 +369,7 @@ if [ -n "${{CURIE_TEST_CALL_LOG:-}}" ]; then
     printf 'KUBECTL_CALL: %s\n' "$*" >> "$CURIE_TEST_CALL_LOG"
 fi
 all="$*"
+curie_test_capacity_read "$@"
 script=""
 previous=""
 for argument in "$@"; do
@@ -488,6 +489,7 @@ case "$verb $object" in
     fi
     case "$all" in
         '-n parity rollout restart deployment/parity-curie-worker'|\
+        '-n parity rollout restart deployment/parity-curie-api'|\
         '-n parity rollout restart deployment/parity-curie-dispatcher') : ;;
         *) unexpected ;;
     esac
@@ -498,6 +500,7 @@ case "$verb $object" in
     fi
     case "$all" in
         '-n parity rollout status deployment/parity-curie-worker --timeout=120s'|\
+        '-n parity rollout status deployment/parity-curie-api --timeout=120s'|\
         '-n parity rollout status deployment/parity-curie-dispatcher --timeout=120s') : ;;
         *) unexpected ;;
     esac
@@ -2218,7 +2221,7 @@ fn declarative_comms_replaces_byo_sources_in_diff_and_apply_but_omission_preserv
             "the follow-up comms upgrade must consume the declared Slack replacement"
         );
     }
-    for component in ["worker", "dispatcher"] {
+    for component in ["worker", "api", "dispatcher"] {
         for (action, suffix) in [("restart", ""), ("status", " --timeout=120s")] {
             let expected = format!(
                 "KUBECTL_CALL: -n parity rollout {action} deployment/parity-curie-{component}{suffix}"

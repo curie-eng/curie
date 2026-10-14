@@ -150,6 +150,9 @@ roleRef:
 {{- define "curie.sandboxTemplate" -}}
 {{- $agent := .agent -}}
 {{- $secrets := .secrets -}}
+{{- $runnerImageRef := .image -}}
+{{- $templateName := .templateName -}}
+{{- $poolName := .poolName -}}
 {{- $connectorReservedEnv := dict -}}
 {{- if $agent -}}
 {{- range $name := keys $secrets -}}
@@ -158,16 +161,25 @@ roleRef:
 {{- end -}}
 {{- with .root }}
 {{- $runner := .Values.agentSandbox.runner }}
-{{- /* An agent whose bundle layers its own runner image (ADR-0173) renders
-       that digest in every container that would run the platform runner. */}}
-{{- $runnerImageRef := include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" .Chart.AppVersion) }}
+{{- $runnerEnv := include "curie.agentSandboxRunnerEnv" . | fromJson }}
+{{- $extraEnv := $runner.extraEnv | default list }}
 {{- if $agent }}
-{{- with index (.Values.agentSandbox.runnerImages | default dict) $agent }}
-{{- $runnerImageRef = . }}
+{{- $agentEnv := get $runnerEnv $agent | default dict }}
+{{- range $name := keys $agentEnv | sortAlpha }}
+{{- $extraEnv = append $extraEnv (dict "name" $name "value" (get $agentEnv $name)) }}
+{{- end }}
+{{- end }}
+{{- /* @spec ACTION-EXECUTOR-16: key custody. Both runner env sources reach
+       the runner outside the connector-secret marker, so unredacted too.
+       The snapshot sealing key must reach only the hosted connector: fail
+       the render, naming the key and never its value. */}}
+{{- $sealing := splitList " " (trim (include "curie.sealingKeyNames" .)) }}
+{{- range $extraEnv }}
+{{- if has .name $sealing }}
+{{- fail (printf "agentSandbox.runner.extraEnv contains %q, a reserved snapshot sealing key: it must reach only the hosted connector, so declare it as a SecretRef (from_secret) on that connector in the bundle, never in the runner environment" .name) }}
 {{- end }}
 {{- end }}
 {{- $bf := $runner.bundleFetch }}
-{{- $stubCa := .Values.api.githubStubCaConfigMap }}
 {{- $wf := $runner.workspace }}
 {{- if $agent }}
 {{- with index (.Values.agentSandbox.workspaceSizeLimits | default dict) $agent }}
@@ -189,12 +201,6 @@ lane ON by itself.
 */}}
 {{- if not .Values.worker.attachments.enabled }}
 {{- $af = set (deepCopy $af) "enabled" false }}
-{{- end }}
-{{- $templateName := printf "%s-runner" (include "curie.fullname" .) }}
-{{- $poolName := printf "%s-runner-pool" (include "curie.fullname" .) }}
-{{- if $agent }}
-{{- $templateName = printf "%s-agent-%s-runner" (include "curie.fullname" .) $agent }}
-{{- $poolName = printf "%s-agent-%s-runner-pool" (include "curie.fullname" .) $agent }}
 {{- end }}
 ---
 apiVersion: extensions.agents.x-k8s.io/v1beta1
@@ -245,8 +251,16 @@ spec:
       {{- end }}
       {{- if $runner.serviceAccount.create }}
       serviceAccountName: {{ include "curie.fullname" . }}-runner
-      automountServiceAccountToken: {{ $runner.serviceAccount.automountToken }}
       {{- end }}
+      {{- /* Rail 2 (#3842): the runner never calls the Kubernetes API, so no
+             template mounts a ServiceAccount token, whichever SA it runs as.
+             The runner-resources admission policy requires this on every
+             template the worker writes; any other value of the knob is
+             refused here rather than silently ignored. */}}
+      {{- if ne (toString $runner.serviceAccount.automountToken) "false" }}
+      {{- fail (printf "agentSandbox.runner.serviceAccount.automountToken must be false (Rail 2: the runner pod never mounts a Kubernetes API token, and runner template admission refuses one); got %q" (toString $runner.serviceAccount.automountToken)) }}
+      {{- end }}
+      automountServiceAccountToken: false
       {{- with .Values.priorityClasses.sandbox.name }}
       priorityClassName: {{ . }}
       {{- end }}
@@ -278,8 +292,9 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       {{- end }}
-      {{- if or $bf.enabled $wf.enabled $af.enabled $runner.hardening.enabled $stubCa }}
+      {{- if or $bf.enabled $wf.enabled $af.enabled $runner.hardening.enabled (include "curie.codeHostTrust.name" .) }}
       volumes:
+        {{- include "curie.codeHostTrust.volume" . | nindent 8 }}
         {{- if $bf.enabled }}
         # Shared bundle volume: the init pair populates <mountPath>/current, the
         # runner reads it as CURIE_PLUGIN_DIR. sizeLimit is ADR-0059 decision
@@ -323,11 +338,6 @@ spec:
           emptyDir:
             sizeLimit: {{ $runner.hardening.writablePathSizeLimit | quote }}
         {{- end }}
-        {{- end }}
-        {{- if $stubCa }}
-        - name: github-stub-ca
-          configMap:
-            name: {{ $stubCa }}
         {{- end }}
       {{- end }}
       {{- if or $bf.enabled $wf.enabled $af.enabled }}
@@ -481,7 +491,7 @@ spec:
             - -c
             - |
               import base64, hashlib, json, os, pathlib, re, shutil, signal, subprocess, sys, time, urllib.request
-              from urllib.parse import urlsplit, urlunsplit
+              from urllib.parse import urlsplit
               class NoRedirect(urllib.request.HTTPRedirectHandler):
                   def redirect_request(self, request, fp, code, message, headers, new_url):
                       return None
@@ -551,15 +561,33 @@ spec:
                   ).strip()
               except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                   raise SystemExit("workspace-init: checkout origin is unreadable")
+              # Origin and path come from the API's credential (ADR 0197).
+              trusted = os.environ.get("CURIE_REPO_ORIGIN", "")
+              path = os.environ.get("CURIE_REPO_PATH", "")
+              if not trusted or not path:
+                  raise SystemExit("workspace-init: claim names no trusted repository origin and path")
               try:
-                  api = urlsplit(os.environ.get("CURIE_GITHUB_API_URL", "https://api.github.com").rstrip("/"))
-                  authority = "github.com" if api.netloc == "api.github.com" else api.netloc
-                  html_base = urlunsplit((api.scheme, authority, api.path.removesuffix("/api/v3"), "", ""))
+                  base = urlsplit(trusted)
                   parsed = urlsplit(origin)
-                  _ = parsed.port
+                  _ = base.port, parsed.port
               except ValueError:
                   raise SystemExit("workspace-init: checkout origin is invalid")
-              repo = origin[len(html_base) + 1:].removesuffix(".git")
+              segments = path.split("/")
+              if (
+                  base.scheme != "https"
+                  or not base.hostname
+                  or base.username is not None
+                  or base.password is not None
+                  or base.query
+                  or base.fragment
+                  or trusted.endswith("/")
+                  or len(segments) < 2
+                  or any(
+                      not re.fullmatch(r"[A-Za-z0-9._-]+", segment) or segment in {".", ".."}
+                      for segment in segments
+                  )
+              ):
+                  raise SystemExit("workspace-init: trusted repository origin or path is invalid")
               if (
                   parsed.scheme != "https"
                   or not parsed.hostname
@@ -567,11 +595,7 @@ spec:
                   or parsed.password is not None
                   or parsed.query
                   or parsed.fragment
-                  or not re.fullmatch(
-                      r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?",
-                      repo,
-                  )
-                  or origin != f"{html_base}/{repo}.git"
+                  or origin != f"{trusted}/{path}.git"
               ):
                   raise SystemExit("workspace-init: checkout origin is not credential-free")
               for child in stage.iterdir():
@@ -583,8 +607,10 @@ spec:
               value: ""
             - name: CURIE_WORKSPACE_SHA256
               value: ""
-            - name: CURIE_GITHUB_API_URL
-              value: {{ .Values.api.githubApiUrl | default "https://api.github.com" | quote }}
+            - name: CURIE_REPO_ORIGIN
+              value: ""
+            - name: CURIE_REPO_PATH
+              value: ""
           volumeMounts:
             - name: workspace
               mountPath: {{ $wf.mountPath }}
@@ -612,13 +638,31 @@ spec:
         the bytes that actually landed in the store is VERIFIED before anything
         becomes visible, the operator's own size cap is enforced while
         streaming, redirects are refused (a redirect carries the fetch to a host
-        the store named rather than one we chose), a non-HTTP(S) url and a
-        closed expiry window are refused, and an uploader-supplied filename is
-        reduced to a basename so it cannot escape the mount. A refusal leaves
-        NOTHING visible: files are staged under a hidden directory and revealed
-        only once the whole set verified, because a partial set reads to an
-        agent exactly like a complete one. No reference at all -- the
-        overwhelming majority of turns -- is a clean no-op.
+        the store named rather than one we chose), and a non-HTTP(S) url is
+        refused. Each name is written exactly as the worker recorded it (ADR
+        0205 decision 4); one that is not a clean leaf, sits in the reserved
+        `.curie-` prefix or repeats refuses the boot rather than being repaired.
+        A payload with no "c" on any entry comes from a worker that predates
+        ADR 0205 and keeps the old rules whole (basename cleaning, a numeric
+        suffix for a repeat, all-or-nothing, no status file), so a new chart
+        never regresses an old worker mid-rollout.
+        A refusal leaves NOTHING visible: files are staged under a hidden
+        directory and revealed only once the whole set verified, because a
+        partial set reads to an agent exactly like a complete one. No reference
+        at all -- the overwhelming majority of turns -- is a clean no-op.
+
+        ADR 0205 decision 6: the payload also carries the thread's earlier files
+        ("c": 0). The current message's files ("c": 1) are fetched first and
+        stay all-or-nothing. An earlier file that has expired, is answered with
+        an HTTP error or a redirect, outgrows the size cap, has a name the
+        filesystem cannot hold, times out, or is reached after the overall
+        fetchTimeoutSeconds deadline is skipped, never failing the boot; a
+        digest mismatch is fatal either way, because that is integrity, not
+        availability. The outcome of every entry lands in the hidden
+        `.curie-attachments-status.json` the runner reconciles (decision 8).
+        The docker driver's `_prepare_attachments` is the twin of this program;
+        tests/vectors/attachment-init-outcomes.json pins both to one outcome
+        per payload (ci/attachment-init-behavior-assertions.sh runs this one).
         */}}
         - name: attachments-init
           image: {{ $runnerImageRef | quote }}
@@ -634,15 +678,24 @@ spec:
             - python
             - -c
             - |
-              import base64, hashlib, json, os, pathlib, shutil, signal, sys, time, urllib.request
+              import base64, hashlib, http.client, json, os, pathlib, shutil, sys, time, urllib.error, urllib.request
               class NoRedirect(urllib.request.HTTPRedirectHandler):
                   def redirect_request(self, request, fp, code, message, headers, new_url):
                       return None
+              class Unavailable(Exception):
+                  """An entry that could not be fetched; the reason is a status code."""
               ref = os.environ.get("CURIE_ATTACHMENTS_REF", "")
               root = pathlib.Path("{{ $af.mountPath }}")
               stage = root / ".curie-attachments-stage"
+              status_name = ".curie-attachments-status.json"
               if not ref:
                   sys.exit(0)
+              # One overall fetch deadline on a monotonic clock (ADR 0205 decision 6).
+              # Before every read the socket timeout is set to what is left of it, and
+              # the deadline is checked after every read, so neither a stalled nor a
+              # dripping store holds the pod past it. A process-wide alarm used to kill
+              # the whole init container, current files and all.
+              deadline = time.monotonic() + {{ $af.fetchTimeoutSeconds }}
               # An init-container restart must never leave a partial prior
               # materialization visible; every reference is fetched again.
               for child in root.iterdir():
@@ -655,62 +708,145 @@ spec:
                   entries = json.loads(raw)
                   if not isinstance(entries, list):
                       raise TypeError("attachment reference payload is not a list")
+                  # A payload with no "c" anywhere is from a worker that predates ADR
+                  # 0205 (a mixed-version rollout) and keeps the old rules whole: every
+                  # entry current, the name cleaned to a basename, a repeat renamed.
+                  legacy = not any("c" in entry for entry in entries)
+                  plan, names = [], set()
+                  for index, entry in enumerate(entries):
+                      name = entry["n"]
+                      url, expected, expires = str(entry["u"]), str(entry["s"]).lower(), int(entry["e"])
+                      # "c": 1 is the current message, 0 an earlier one.
+                      plan.append([index, name, url, expected, expires, legacy or entry.get("c", 1) != 0])
               except Exception as exc:
                   raise SystemExit(f"attachments-init: invalid attachment reference: {exc}")
-              stage.mkdir(mode=0o700)
-              opener = urllib.request.build_opener(NoRedirect())
-              staged = []
-              taken = set()
-              try:
-                  signal.alarm({{ $af.fetchTimeoutSeconds }})
-                  for index, entry in enumerate(entries):
-                      name = os.path.basename(str(entry["n"]).replace("\\", "/").strip())
-                      url, expected, expires = str(entry["u"]), str(entry["s"]), int(entry["e"])
+              # Every name is checked before anything is fetched.
+              for item in plan:
+                  index, name, url, expected, expires, current = item
+                  if legacy:
+                      name = os.path.basename(str(name).replace("\\", "/").strip())
                       if not name or name in (".", ".."):
                           raise SystemExit("attachments-init: attachment name is unusable")
-                      if not url.startswith(("http://", "https://")):
-                          raise SystemExit("attachments-init: signed reference is not HTTP(S)")
-                      if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected.lower()):
-                          raise SystemExit("attachments-init: signed reference digest is invalid")
-                      if expires <= int(time.time()):
-                          raise SystemExit("attachments-init: signed reference expired")
-                      target = stage / ("%03d.part" % index)
-                      digest, size = hashlib.sha256(), 0
-                      with opener.open(url, timeout={{ $af.fetchTimeoutSeconds }}) as source, target.open("wb") as sink:
-                          while chunk := source.read(1024 * 1024):
-                              size += len(chunk)
-                              if size > {{ .Values.worker.attachments.maxFileBytes }}:
-                                  raise SystemExit("attachments-init: attachment exceeds the size limit")
-                              digest.update(chunk)
-                              sink.write(chunk)
-                      if digest.hexdigest() != expected:
-                          raise SystemExit("attachments-init: attachment digest mismatch")
-                      staged.append((target, name))
-                  signal.alarm(0)
-                  # Two uploads sharing a filename must both survive: `os.replace`
-                  # onto the same path destroyed one of them silently, which is
-                  # the bug this lane exists to close. The twin of
-                  # curie_worker.attachments.unique_attachment_leaf -- a numeric
-                  # suffix before the extension, first file keeping the person's
-                  # own name -- reimplemented because a rendered program cannot
-                  # import the worker. ci/attachment-init-behavior-assertions.sh
-                  # executes this copy on the case the worker's is tested on.
-                  for target, name in staged:
-                      if name in taken:
+                      # Two uploads sharing a name both survive: a numeric suffix before
+                      # the extension, the first keeping the name the person sent. The
+                      # twin of curie_worker.attachments.unique_attachment_leaf.
+                      if name in names:
                           stem, extension = os.path.splitext(name)
                           bump = 2
-                          while "%s-%d%s" % (stem, bump, extension) in taken:
+                          while "%s-%d%s" % (stem, bump, extension) in names:
                               bump += 1
                           name = "%s-%d%s" % (stem, bump, extension)
-                      taken.add(name)
+                      item[1] = name
+                  else:
+                      # The worker fixed each name against the thread's whole ledger
+                      # (decision 4), so it is written exactly; one that is not already a
+                      # clean leaf, sits in the reserved .curie- prefix, or repeats is a
+                      # broken payload, never repaired.
+                      if (
+                          not isinstance(name, str)
+                          or not name.strip()
+                          or name in (".", "..")
+                          or os.path.basename(name) != name
+                          or "\0" in name
+                          or name.startswith(".curie-")
+                      ):
+                          raise SystemExit("attachments-init: attachment name %r is unusable" % (name,))
+                      if name in names:
+                          raise SystemExit("attachments-init: attachment name %r is duplicated" % (name,))
+                  names.add(item[1])
+                  if not url.startswith(("http://", "https://")):
+                      raise SystemExit("attachments-init: signed reference is not HTTP(S)")
+                  if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+                      raise SystemExit("attachments-init: signed reference digest is invalid")
+              stage.mkdir(mode=0o700)
+              opener = urllib.request.build_opener(NoRedirect())
+              def bound(source):
+                  # The socket timeout for the next read: what is left of the deadline.
+                  remaining = deadline - time.monotonic()
+                  if remaining <= 0:
+                      raise TimeoutError("past the fetch deadline")
+                  sock = getattr(getattr(getattr(source, "fp", None), "raw", None), "_sock", None)
+                  if sock is not None:
+                      sock.settimeout(remaining)
+              def fetch(index, name, url, expected, expires):
+                  if expires <= int(time.time()):
+                      raise Unavailable("expired")
+                  remaining = deadline - time.monotonic()
+                  if remaining <= 0:
+                      raise Unavailable("deadline")
+                  # A name the filesystem cannot hold is a file that cannot be delivered.
+                  if len(name.encode("utf-8", "surrogateescape")) > 255:
+                      raise Unavailable("fetch_failed")
+                  target = stage / ("%03d.part" % index)
+                  digest, size = hashlib.sha256(), 0
+                  try:
+                      with opener.open(url, timeout=remaining) as source, target.open("wb") as sink:
+                          while True:
+                              bound(source)
+                              # read1, not read: read(n) waits for n bytes, so a store
+                              # dripping a byte at a time would hold it past the deadline.
+                              chunk = source.read1(1024 * 1024)
+                              if not chunk:
+                                  break
+                              size += len(chunk)
+                              if size > {{ .Values.worker.attachments.maxFileBytes }}:
+                                  raise Unavailable("fetch_failed")
+                              digest.update(chunk)
+                              sink.write(chunk)
+                  except Unavailable:
+                      target.unlink(missing_ok=True)
+                      raise
+                  except urllib.error.HTTPError as exc:
+                      # A refused redirect lands here as its 3xx: fetch_failed.
+                      target.unlink(missing_ok=True)
+                      raise Unavailable({404: "not_found", 403: "forbidden"}.get(exc.code, "fetch_failed"))
+                  except TimeoutError:
+                      target.unlink(missing_ok=True)
+                      raise Unavailable("timeout")
+                  except urllib.error.URLError as exc:
+                      target.unlink(missing_ok=True)
+                      raise Unavailable("timeout" if isinstance(exc.reason, TimeoutError) else "fetch_failed")
+                  except (OSError, http.client.HTTPException):
+                      target.unlink(missing_ok=True)
+                      raise Unavailable("fetch_failed")
+                  # An integrity failure, never an availability one: fatal for an
+                  # earlier file too.
+                  if digest.hexdigest() != expected:
+                      raise SystemExit("attachments-init: %r digest mismatch" % (name,))
+                  return target
+              staged, outcome = [], {}
+              try:
+                  # The current message's files first, all or nothing: the person just
+                  # sent them. Then the earlier ones, each best effort with a reason.
+                  for index, name, url, expected, expires, current in sorted(plan, key=lambda p: not p[5]):
+                      try:
+                          staged.append((fetch(index, name, url, expected, expires), name))
+                          outcome[name] = ("ok", None)
+                      except Unavailable as exc:
+                          if current:
+                              raise SystemExit("attachments-init: %r is unavailable: %s" % (name, exc))
+                          outcome[name] = ("unavailable", str(exc))
+                  for target, name in staged:
                       destination = root / name
                       if destination.resolve().parent != root.resolve():
                           raise SystemExit("attachments-init: attachment name escapes the mount")
                       os.replace(target, destination)
+                  # The outcome of every reference, for the runner to reconcile against
+                  # the manifest and the disk (decision 8). Written beside the staged
+                  # files and renamed, so it is either whole or absent. A legacy payload
+                  # has no manifest to reconcile, so it gets none, as before.
+                  if not legacy:
+                      rows = [{"name": p[1], "status": outcome[p[1]][0], "reason": outcome[p[1]][1]} for p in plan]
+                      pending = stage / "status.part"
+                      pending.write_text(json.dumps({"v": 1, "files": rows}))
+                      pending.chmod(0o644)
+                      os.replace(pending, root / status_name)
               except BaseException:
+                  for target, name in staged:
+                      (root / name).unlink(missing_ok=True)
                   shutil.rmtree(stage, ignore_errors=True)
                   raise
-              stage.rmdir()
+              shutil.rmtree(stage)
               print("attachments-init: materialized %d attachment(s) into %s" % (len(staged), root))
           env:
             - name: CURIE_ATTACHMENTS_REF
@@ -741,7 +877,7 @@ spec:
             {{- $secretName := printf "%s-agent-%s-connector-secrets" (include "curie.fullname" .) $agent }}
             {{- range $name := keys $secrets | sortAlpha }}
             {{- /* ADR 0176: the test cluster kubeconfig stays on the connector. */}}
-            {{- if ne $name "E2E_CLUSTER_KUBECONFIG" }}
+            {{- if not (has $name (list "E2E_CLUSTER_KUBECONFIG" "E2E_REGISTRY_PUSH_CONFIG" "E2E_BUILD_CACHE_CONFIG")) }}
             - name: {{ $name }}
               valueFrom:
                 secretKeyRef:
@@ -786,8 +922,7 @@ spec:
             {{- end }}
             - name: CURIE_PLUGIN_DIR
               value: {{ $runner.pluginDir | quote }}
-            - name: CURIE_GITHUB_API_URL
-              value: {{ .Values.api.githubApiUrl | default "https://api.github.com" | quote }}
+            {{- include "curie.codeHostTrust.clientEnv" . | nindent 12 }}
             # Generic identity for a pre-warmed, not-yet-claimed sandbox; the
             # substrate's resume path overrides it per-claim.
             - name: CURIE_SESSION_ID
@@ -813,6 +948,17 @@ spec:
                   name: {{ include "curie.runnerTokenSecretName" . }}
                   key: runnerToken
                   optional: false
+            {{- if $af.enabled }}
+            # ADR 0205 decision 8: which on-disk files are the current
+            # message's, which are earlier, and which are unavailable or
+            # omitted. Names and outcomes only, no capability, so unlike
+            # CURIE_ATTACHMENTS_REF it is the RUNNER's. Baked empty because the
+            # claim's Overrides injection only fills env the template declares;
+            # empty means no manifest, and the runner treats every file on disk
+            # as current.
+            - name: CURIE_ATTACHMENTS_MANIFEST
+              value: ""
+            {{- end }}
             {{- if $wf.enabled }}
             # Kubernetes owns the emptyDir mount root; make the intended checkout
             # explicit without mutating repository config or carrying a secret.
@@ -823,16 +969,8 @@ spec:
             - name: GIT_CONFIG_VALUE_0
               value: {{ $wf.mountPath | quote }}
             {{- end }}
-            {{- if $stubCa }}
-            - name: SSL_CERT_FILE
-              value: /etc/curie/github-stub/ca.pem
-            - name: GIT_SSL_CAINFO
-              value: /etc/curie/github-stub/ca.pem
-            - name: REQUESTS_CA_BUNDLE
-              value: /etc/curie/github-stub/ca.pem
-            {{- end }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" $runner.extraEnv) | nindent 12 }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "agentSandbox.runner" "env" $runner.extraEnv "additionalReserved" $connectorReservedEnv) | nindent 12 }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "agentSandbox.runner" "env" $extraEnv "additionalReserved" $connectorReservedEnv) | nindent 12 }}
           readinessProbe:
             httpGet:
               path: /healthz
@@ -840,8 +978,9 @@ spec:
             {{- toYaml $runner.readinessProbe | nindent 12 }}
           resources:
             {{- toYaml $runner.resources | nindent 12 }}
-          {{- if or $bf.enabled $wf.enabled $af.enabled $runner.hardening.enabled $stubCa }}
+          {{- if or $bf.enabled $wf.enabled $af.enabled $runner.hardening.enabled (include "curie.codeHostTrust.name" .) }}
           volumeMounts:
+            {{- include "curie.codeHostTrust.volumeMount" . | nindent 12 }}
             {{- if $bf.enabled }}
             - name: bundles
               mountPath: {{ $bf.mountPath }}
@@ -864,11 +1003,6 @@ spec:
             - name: writable-{{ $i }}
               mountPath: {{ $p }}
             {{- end }}
-            {{- end }}
-            {{- if $stubCa }}
-            - name: github-stub-ca
-              mountPath: /etc/curie/github-stub
-              readOnly: true
             {{- end }}
           {{- end }}
 {{/*
@@ -899,6 +1033,7 @@ spec:
     name: {{ $templateName }}
 {{- end }}
 {{- end }}
+{{- $repoRunners := include "curie.factory.repoRunnerDescriptors" . | fromJsonArray }}
 {{- if .Values.agentSandbox.deploy }}
 {{- $root := . }}
 {{- $connectorSecrets := .Values.agentSandbox.connectorSecrets | default dict }}
@@ -926,11 +1061,23 @@ spec:
 {{- fail (printf "agentSandbox.workspaceSizeLimits.%s is set but agentSandbox.runner.workspace.enabled is false, so no workspace volume renders" $agent) }}
 {{- end }}
 {{- end }}
-{{ include "curie.sandboxTemplate" (dict "root" $root) | nindent 0 }}
+{{- $runner := .Values.agentSandbox.runner }}
+{{- $platformImage := include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" .Chart.AppVersion) }}
+{{- $fullname := include "curie.fullname" . }}
+{{ include "curie.sandboxTemplate" (dict "root" $root "agent" "" "secrets" dict "image" $platformImage "templateName" (printf "%s-runner" $fullname) "poolName" (printf "%s-runner-pool" $fullname)) | nindent 0 }}
 {{- /* A registryEgress agent needs pods labeled curietech.ai/agent=<agent> for its
        registry NetworkPolicy to select, so it gets a per-agent template even
        with no connector secrets (#3083). */}}
 {{- range $agent := include "curie.agentSandboxPoolAgents" $root | fromJsonArray }}
-{{ include "curie.sandboxTemplate" (dict "root" $root "agent" $agent "secrets" (index $connectorSecrets $agent | default dict)) | nindent 0 }}
+{{- $template := printf "%s-agent-%s-runner" $fullname $agent }}
+{{- $image := index ($root.Values.agentSandbox.runnerImages | default dict) $agent | default $platformImage }}
+{{ include "curie.sandboxTemplate" (dict "root" $root "agent" $agent "secrets" (index $connectorSecrets $agent | default dict) "image" $image "templateName" $template "poolName" (printf "%s-pool" $template)) | nindent 0 }}
+{{- end }}
+{{- $seen := dict }}
+{{- range $repoRunners }}
+{{- if not (hasKey $seen .pool) }}
+{{- $_ := set $seen .pool true }}
+{{ include "curie.sandboxTemplate" (dict "root" $root "agent" .agent "secrets" (index $connectorSecrets .agent | default dict) "image" .image "templateName" .template "poolName" .pool) | nindent 0 }}
+{{- end }}
 {{- end }}
 {{- end }}

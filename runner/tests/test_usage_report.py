@@ -28,6 +28,7 @@ from aiohttp.test_utils import TestServer
 from claude_agent_sdk import ResultMessage
 from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner.fake import FakeModelSession
+from curie_runner.sender_frame import frame_user_turn
 from curie_runner.session import SessionRunner
 from curie_runner.usage_report import UsageReporter, build_usage_body
 
@@ -1222,7 +1223,7 @@ class _UsageQueueSession:
         self.arrived.set()
 
     async def query(self, text: str) -> None:
-        if text == "slow":
+        if text == frame_user_turn("message", "U0EXAMPLE1", "slow", None):
             self._mid_tool = True
             if self._slow_reviewer is not None:
                 self._put(

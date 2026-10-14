@@ -1,7 +1,7 @@
 ---
 seam: CLI output (agent-facing `--json`)
 kind: CLEAN
-impls: 67 outputs behind one trait
+impls: 72 outputs behind one trait
 grade: not separately graded
 epics:
   - "#456"
@@ -13,7 +13,7 @@ order: 18
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 67 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 72 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -47,7 +47,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   success-path branch: under `--json` it writes `to_json()` as one compact line via
   `emit_json`; otherwise it calls `render(self)`. Handlers must not call a stdout
   emitter directly, apart from the pinned sites listed under `raw_emit_sites` in
-  `cli/schema/index.json`. `main`'s `emit<T: CliOutput>` helper (`cli/src/main.rs`) is the
+  `cli/schema/index.json`. The binary's `emit<T: CliOutput>` helper (`cli/src/dispatch/mod.rs`) is the
   dispatch-side funnel that routes every read verb's return value through it.
 - **One JSON object per invocation.** `to_json` returns a single
   `serde_json::Value`, emitted as one line. A multi-line or streamed stdout payload
@@ -59,14 +59,14 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   timed out). `CliOutput` covers only exit-0 stdout.
 - **Human and JSON render the same value.** Both methods read the same owned data,
   so the two paths cannot disagree about content — only about form. `VersionsOutput`
-  (`cli/src/commands.rs`) documents this obligation explicitly: it holds versions
+  (`cli/src/commands/agent_actions.rs`) documents this obligation explicitly: it holds versions
   newest-first, normalized once by the handler, because `to_json` and `render` each
   iterate it plainly and a constructor that broke the order would let the two paths
   silently diverge.
 
 ## Implementations today
 
-67 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
+72 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 - **`DryRunPlan`** (`cli/src/ui.rs`) — the generic `--dry-run` plan; JSON is
   `{"dry_run":true,"plan":[lines]}` and the human render is the same lines verbatim,
@@ -75,7 +75,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   re-derives argv or reads a raw secret. It is also **composed** rather than
   duplicated: the outputs whose verbs take `--dry-run` are enums carrying a `DryRun`
   variant that delegates to it instead of re-rendering the plan.
-- **`cli/src/commands.rs`**, the largest group, covering the skill and agent verbs
+- **`cli/src/commands/`**, the largest group, covering the skill and agent verbs
   and the shared lifecycle results: `InitOutput`, `CheckOutput`, `ChartCheckOutput`, `PreflightOutput`,
   `ListAgentsOutput`, `BumpVersionOutput`, `StatusOutput`, `SkillMessageOutput`,
   `EvalOutput`, `DeployOutput`, `AllTargetsDeployOutput`, `KillOutput`, `ResumeOutput`,
@@ -83,11 +83,18 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   `DeleteOutput`, `VersionsOutput`, `MemoryOutput`, `MemoryGuidanceOutput`, `HookOutput`, `ApprovalsOutput`,
   `SkillApprovalsOutput`, `OverridesOutput`, `PublicationPolicyOutput`, `WorkItemsOutput`,
   `SchedulesOutput`, `HookFireOutput`, `ChannelsOutput`, `CallersOutput`,
+  `ActionsOutput` (the `local`/`cluster actions` verbs and the action executor receipt),
+  `RemediationPolicyOutput` (the `local`/`cluster remediation-policy` verbs: one policy generation, the breaker `close-breaker` closed, or a hook's `breakers`),
+  `RemediationOutput` (the `local`/`cluster remediation` receipt verbs: a nomination list or one nomination's receipt),
+  `RemediationQualificationOutput` (the `local`/`cluster remediation-qualification` verbs: a qualification record or a verifier run),
   `ConnectorBuildOutput`. The last is
   the `curie build --plugin-dir` receipt for connector source builds (ADR-0113):
   it emits one object even when the bundle declares nothing to build, because
   under `--json` an agent cannot tell "nothing to build" from "the command
   produced nothing" — the #485 failure this seam exists to prevent.
+  `RepoRunnerBuildOutput` (`cli/src/commands/repo_runner_build.rs`, type in
+  `cli/src/repo_runner.rs`) is the `curie build --repo-runner` receipt (ADR 0216):
+  the Helm `runner` values block, rendered as YAML for humans.
 - **`cli/src/local.rs`**, **`cli/src/ops/up.rs`**, **`cli/src/ops/upgrade.rs`**, and **`cli/src/ops/verbs.rs`**, the operator verbs, one output per
   verb per tier: `LocalUpOutput`, `LocalRebuildOutput`, `LocalStatusOutput`,
   `LocalDownOutput`; `ClusterUpOutput`, `ClusterUpgradeOutput`, `ClusterStatusOutput`, `ClusterDownOutput`,
@@ -105,9 +112,8 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   module is a deliberate leaf and never bypasses `CliOutput`.
 - **Other module outputs** in `cli/src/channel_token.rs` (`ChannelTokenOutput`),
   `cli/src/comms.rs` (`CommsOutput`), `cli/src/doctor.rs`
-  (`DoctorOutput`), `cli/src/factory_intake.rs` (`FactoryIntakeOutput`), `cli/src/factory_app.rs` (`FactoryAppRegistrationOutput`, `FactoryAppSetupOutput`), `cli/src/factory_quickstart.rs` (`QuickstartOutput`), `cli/src/github_app.rs` (`GithubAppOutput`), `cli/src/guide.rs`
+  (`DoctorOutput`), `cli/src/factory_intake.rs` (`FactoryIntakeOutput`), `cli/src/factory_app.rs` (`FactoryAppRegistrationOutput`, `FactoryAppSetupOutput`), `cli/src/factory_quickstart/mod.rs` and `cli/src/factory_quickstart/github.rs` (`QuickstartOutput`), `cli/src/github_app.rs` (`GithubAppOutput`), `cli/src/guide.rs`
   (`GuideOutput`), `cli/src/migrate_store.rs` (`MigrateStoreOutput`),
-  `cli/src/openrouter_credit.rs` (`ModelCreditOutput`),
   `cli/src/release_accept.rs` (`ReleaseAcceptOutput`), `cli/src/seal.rs`
   (`SealOutput`), and `cli/src/secrets.rs` (`SecretsListOutput`).
 
@@ -126,15 +132,15 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   handler that bypasses the seam and prints to stdout directly breaks CI rather
   than sliding through on convention alone. Three accepted raw sites are pinned:
   `Ui::emit` itself in `cli/src/ui.rs`, the error path in `main` in `cli/src/main.rs`,
-  and `report_sweep` in `cli/src/commands.rs`, which emits the sweep payload through
+  and `report_sweep` in `cli/src/commands/eval.rs`, which emits the sweep payload through
   `Ui::emit_json` directly. The residual is that this is a
   syntactic call-site inventory, not a type-level proof that *every* verb returns
   a `CliOutput`.
 - **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
-  longer schema-free: there are 65 committed schemas under `cli/schema/` with an
+  longer schema-free: there are 73 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
-  against real `to_json()` output across 82 tests in `cli/tests/json_contract.rs`.
+  against real `to_json()` output across 83 tests in `cli/tests/json_contract.rs`.
   The dark factory render receipt uses schema version 2. Its `runner_image`
   and `runner_note` fields are required and accept a string or `null`; the
   binary render tests validate the actual receipt against the committed schema.

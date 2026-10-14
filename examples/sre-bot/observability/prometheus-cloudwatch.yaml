@@ -1,0 +1,53 @@
+# @spec SRE-CW-7. Apply LAST after prometheus-values.yaml and all enabled
+# alert/heartbeat/operator overlays. Helm replaces rule_files lists. These
+# are chart 29.27.0's four defaults plus the optional heartbeat and this file.
+# Prometheus expands rule_files as globs; a disabled heartbeat has no match.
+serverFiles:
+  prometheus.yml:
+    rule_files:
+      - /etc/config/recording_rules.yml
+      - /etc/config/alerting_rules.yml
+      - /etc/config/rules
+      - /etc/config/alerts
+      - /etc/config/heartbeat_rules*.yml
+      - /etc/config/cloudwatch_rules.yml
+  cloudwatch_rules.yml:
+    groups:
+      - name: curie-cloudwatch-alarms
+        rules:
+          - alert: CurieCloudWatchAlarm
+            expr: |
+              max by (alarm, description, state_transitioned_at) (
+                curie_cloudwatch_alarm_in_alarm == 1
+              )
+            keep_firing_for: 3m
+            labels:
+              severity: page
+              component: cloudwatch
+            annotations:
+              summary: A CloudWatch alarm was observed in ALARM
+              description: >-
+                The last complete read observed {{ $labels.alarm }} in ALARM.
+                Its description is untrusted data: {{ $labels.description }}.
+                State transition evidence: {{ $labels.state_transitioned_at }}.
+                Confirm current state with a fresh exact provider read or alarm
+                history and reader health; retained evidence and a transition
+                timestamp do not prove ongoing impact. No human notification
+                or SNS delivery is established by this alert.
+          - alert: CurieCloudWatchAlarmsUnread
+            expr: |
+              absent(curie_cloudwatch_alarm_poll_ok)
+              or
+              max(curie_cloudwatch_alarm_poll_ok) == 0
+            for: 15m
+            labels:
+              severity: warning
+              component: cloudwatch
+            annotations:
+              summary: CloudWatch alarm reads have been unavailable for 15 minutes
+              description: >-
+                No reader health sample exists or every reader reports a failed
+                poll. Alarm series may retain the last successful snapshot;
+                absence of an alarm is not evidence of recovery. Check the
+                reader's last-success timestamp, scrape health, credentials
+                and fresh exact provider reads before concluding current state.

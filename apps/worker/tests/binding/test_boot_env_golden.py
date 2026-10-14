@@ -31,6 +31,7 @@ import json
 import time
 import uuid
 
+from curie_internal.sandbox_token import verify
 from curie_worker.binding import (
     SANDBOX_TOKEN_TTL_SECONDS,
     BindingResolver,
@@ -38,7 +39,6 @@ from curie_worker.binding import (
     inject_connector_secrets,
 )
 from curie_worker.config import WorkerConfig
-from curie_worker.sandbox_token import verify
 from nacl.signing import SigningKey
 
 _AGENT = uuid.UUID("11111111-1111-4111-8111-111111111111")
@@ -290,16 +290,22 @@ def test_the_e2e_kubeconfig_is_withheld_from_the_sandbox() -> None:
 
     vector_path = Path(__file__).resolve().parents[4] / "tests/vectors/e2e-connector-sandbox.json"
     vector = json.loads(vector_path.read_text())
-    secret = vector["kubeconfig_secret"]
+    withheld = vector["withheld_from_sandbox"]
+    assert vector["kubeconfig_secret"] in withheld
+    assert vector["registry_push_secret"] in withheld
+    assert vector["build_cache_secret"] in withheld
+    # Each withheld name carries its own sentinel so a leak names the secret.
+    sentinels = {name: f"{name.lower()}-sentinel" for name in withheld}
     env = _boot_env(
         WorkerConfig(),
-        _resolved(secrets={secret: "kubeconfig-sentinel", "GITHUB_TOKEN": "ghp-1"}),
+        _resolved(secrets={**sentinels, "GITHUB_TOKEN": "ghp-1"}),
     )
 
     rendered = json.dumps(env)
-    assert "kubeconfig-sentinel" not in rendered
-    assert secret not in env
-    assert secret not in env.get("CURIE_CONNECTOR_SECRET_KEYS", "")
+    for secret, sentinel in sentinels.items():
+        assert sentinel not in rendered, secret
+        assert secret not in env, secret
+        assert secret not in env.get("CURIE_CONNECTOR_SECRET_KEYS", ""), secret
     assert env["GITHUB_TOKEN"] == "ghp-1"
 
 
@@ -506,4 +512,18 @@ def test_boot_env_omits_channel_bound_when_the_address_is_blank() -> None:
 
 def test_boot_env_omits_channel_bound_when_the_kind_is_blank() -> None:
     env = _boot_env_with_channel(WorkerConfig(), _resolved(), kind="", address="C0EXAMPLE1")
+    assert "CURIE_CHANNEL_BOUND" not in env
+
+
+def test_boot_env_emits_channel_kind_for_a_slack_binding() -> None:
+    env = _boot_env_with_channel(
+        WorkerConfig(), _resolved(), kind="slack", address="C0EXAMPLE1"
+    )
+    assert env["CURIE_CHANNEL_KIND"] == "slack"
+    assert env["CURIE_CHANNEL_BOUND"] == "1"
+
+
+def test_boot_env_omits_channel_kind_when_no_kind_is_passed() -> None:
+    env = _boot_env(WorkerConfig(), _resolved())
+    assert "CURIE_CHANNEL_KIND" not in env
     assert "CURIE_CHANNEL_BOUND" not in env

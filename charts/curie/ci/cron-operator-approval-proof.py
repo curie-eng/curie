@@ -559,10 +559,10 @@ class CronProof(BaseProof):
                             )
                             if reset.get("released") is not True:
                                 failures.append("owned thread")
-                        except Exception:
+                        except Exception:  # noqa: BLE001 - existing broad catch retained
                             failures.append("owned thread")
                     self.cli_json("delete", [AGENT, "--yes"])
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 failures.append(f"agent/{AGENT}")
         if self.fixture_started:
             objects = [
@@ -591,13 +591,13 @@ def main() -> int:
     try:
         proof = CronProof()
         outcome = proof.run_proof()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         error = exc
     finally:
         if proof is not None:
             try:
                 cleanup_failures = proof.cleanup()
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 cleanup_failures.append("owned cleanup raised")
     if error is not None:
         print(f"cron approval proof failed: {error}", file=sys.stderr)

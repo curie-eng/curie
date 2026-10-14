@@ -5,11 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from curie_worker.kernel import (
-    TURN_FAILURE_REPLY_PREFIX,
-    failure_class_from_reply,
-    turn_failure_reply,
-)
+from curie_worker.kernel.constants import TURN_FAILURE_REPLY_PREFIX
+from curie_worker.kernel.failures import failure_class_from_reply, turn_failure_reply
 
 _VECTOR = Path(__file__).resolve().parents[3] / "tests" / "vectors" / "turn-failure-reply.json"
 _KEYS = {"comment", "reply_prefix", "factory_class_line_prefix", "examples"}

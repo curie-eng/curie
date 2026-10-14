@@ -32,13 +32,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
+from curie_api.routers.schedules import read_triggers, resolve_agent
+from curie_api.schemas.schedules import HookFireOut, HookRunReason, ScheduleOutcome
+
 from ..auth import require_api_key
 from ..db import SCHEMA
 from ..deps import SessionDep, StoreDep
 from ..hook_partition import HOOK_NAME
 from ..models import Agent
-from ..schemas import HookFireOut, HookRunReason, ScheduleOutcome
-from .schedules import _read_triggers, _resolve_agent
 
 router = APIRouter(dependencies=[Depends(require_api_key)])
 logger = logging.getLogger(__name__)
@@ -266,7 +267,7 @@ async def fire_hook(
     @spec PROTECTED-HOOK-SOURCE-2/10.
     """
 
-    selected = await _resolve_agent(session, agent_id)
+    selected = await resolve_agent(session, agent_id)
     selected_id = uuid.UUID(str(selected.id))
     async with _source_locked_agent(request, session, selected_id) as (selected, held):
         deployment = (
@@ -278,7 +279,7 @@ async def fire_hook(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "agent has no in-force bundle")
         try:
             data = await store.get(str(deployment["bundle_ref"]))
-            declared = await run_in_threadpool(_read_triggers, data)
+            declared = await run_in_threadpool(read_triggers, data)
         except Exception as exc:
             raise HTTPException(
                 status.HTTP_409_CONFLICT, "stored bundle could not be read"
@@ -380,7 +381,7 @@ async def fire_hook(
                         (await session.execute(_sql(_FAIL_SQL), {"id": row["id"]})).mappings().one()
                     )
                 record = _record(agent_id=selected.id, agent=selected.name, name=name, row=failed)
-            except Exception:
+            except Exception:  # noqa: BLE001 - source cleanup diagnostics may contain credentials
                 # The committed claim remains recoverable when cleanup has no authority.
                 logger.warning("hook_fire_cleanup_unavailable")
             raise HTTPException(
@@ -401,7 +402,7 @@ async def get_hook_run(
 ) -> HookFireOut:
     """Read one test-fire record, including a turn that has not settled."""
 
-    selected = await _resolve_agent(session, agent_id)
+    selected = await resolve_agent(session, agent_id)
     row = (
         (
             await session.execute(

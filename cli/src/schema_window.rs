@@ -291,6 +291,87 @@ pub fn redact_probe_text(text: &str) -> String {
 mod tests {
     use super::*;
 
+    fn migration_graph(
+        versions: &std::path::Path,
+    ) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("cli is not the repo root");
+        let output = std::process::Command::new("python3")
+            .args([
+                "-c",
+                r#"
+import json
+import runpy
+import sys
+from pathlib import Path
+
+read_revision = runpy.run_path(sys.argv[1])["_revision_fields"]
+graph = {}
+for path in sorted(Path(sys.argv[2]).glob("*.py")):
+    revision, parents = read_revision(path)
+    if revision is None:
+        if path.name != "__init__.py":
+            raise ValueError(f"migration has no literal revision: {path.name}")
+        continue
+    if revision in graph:
+        raise ValueError(f"duplicate Alembic revision: {revision}")
+    graph[revision] = parents
+print(json.dumps(graph))
+"#,
+            ])
+            .arg(root.join("scripts/check-schema-window.py"))
+            .arg(versions)
+            .output()
+            .map_err(|error| format!("cannot inspect migration graph: {error}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("migration graph is invalid JSON: {error}"))
+    }
+
+    #[test]
+    fn migration_graph_reads_tuple_parents_and_refuses_duplicate_ids() {
+        let directory = tempfile::tempdir().expect("migration sources");
+        std::fs::write(
+            directory.path().join("base.py"),
+            "revision = 'base'\ndown_revision = None\n",
+        )
+        .expect("base migration");
+        std::fs::write(
+            directory.path().join("stable.py"),
+            "revision: str = 'stable'\ndown_revision: str | None = 'base'\n",
+        )
+        .expect("stable migration");
+        std::fs::write(
+            directory.path().join("feature.py"),
+            "revision: str = 'feature'\ndown_revision: str | None = 'base'\n",
+        )
+        .expect("feature migration");
+        std::fs::write(
+            directory.path().join("merge.py"),
+            "revision: str = 'merge'\ndown_revision: tuple[str, str] = (\n 'feature',\n 'stable',\n)\n",
+        )
+        .expect("merge migration");
+        let graph = migration_graph(directory.path()).expect("both merge parents are readable");
+        assert_eq!(graph["merge"], ["feature", "stable"]);
+        let parents: std::collections::BTreeSet<&String> = graph.values().flatten().collect();
+        let heads: Vec<&str> = graph
+            .keys()
+            .filter(|revision| !parents.contains(revision))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(heads, ["merge"]);
+        std::fs::write(
+            directory.path().join("duplicate.py"),
+            "revision = 'stable'\n",
+        )
+        .expect("duplicate migration");
+        let error = migration_graph(directory.path()).expect_err("duplicate IDs are invalid");
+        assert!(error.contains("duplicate Alembic revision: stable"));
+    }
+
     #[test]
     fn next_release_head_is_the_head_of_the_next_catalogued_version() {
         assert_eq!(next_release_head("0.10.0").as_deref(), Some("0058"));
@@ -481,19 +562,28 @@ mod tests {
     // @spec PROTECTED-HOOK-SOURCE-2: require the ledger without rewriting prior windows.
     #[test]
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
-        // The candidate moves with every migration between releases, so it is
-        // pinned only to the catalog: its head is the last catalogued revision
-        // and its minimum is not after its head.
+        // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
+        assert_eq!(candidate.schema_min, "0108");
+        assert_eq!(candidate.schema_head, "0108");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
         );
         let current = candidate_window(&candidate.schema_min, &candidate.schema_head)
             .expect("candidate bounds are catalogued and ordered");
-        assert!(live_in_window(&candidate.schema_min, &current));
-        assert!(live_in_window(&candidate.schema_head, &current));
-
+        // #2911: the Agent ORM and resolver read 0101's tenant-scope columns, so
+        // every revision the window admitted below it is no longer live.
+        for below in [
+            "0082", "0083", "0084", "0085", "0086", "0087", "0088", "0089", "0090", "0091a",
+            "0092a", "0093a", "0094", "0095", "0096", "0097", "0098", "0099", "0100", "0093",
+            "0101", "0102", "0103",
+        ] {
+            assert!(!live_in_window(below, &current), "{below}");
+        }
+        assert!(live_in_window("0108", &current));
+        assert!(!live_in_window("0075", &current));
+        assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");
         assert_eq!(retained.schema_min, "0070");
         assert_eq!(retained.schema_head, "0073");
@@ -504,17 +594,30 @@ mod tests {
         assert!(!live_in_window("0075", &retained));
         assert!(!live_in_window("0069", &retained));
 
-        let released_patch = window_for("0.12.1").expect("released patch remains catalogued");
-        assert_eq!(released_patch.schema_min, "0076");
-        assert_eq!(released_patch.schema_head, "0076");
-        assert!(live_in_window("0076", &released_patch));
-        assert!(!live_in_window("0079", &released_patch));
-        let released_ledger = window_for("0.12.2").expect("released 0.12.2 remains catalogued");
-        assert_eq!(released_ledger.schema_min, "0076");
-        assert_eq!(released_ledger.schema_head, "0081");
-        assert!(live_in_window("0080", &released_ledger));
-        assert!(live_in_window("0081", &released_ledger));
-        assert!(!live_in_window("0075", &released_ledger));
+        let released = window_for("0.12.2").expect("published patch is catalogued");
+        assert_eq!(released.schema_min, "0076");
+        assert_eq!(released.schema_head, "0081");
+        let published_stable = window_for("0.12.3").expect("published stable is catalogued");
+        assert_eq!(published_stable.schema_min, "0076");
+        assert_eq!(published_stable.schema_head, "0093");
+        for revision in ["0081", "0091", "0092", "0093"] {
+            assert!(live_in_window(revision, &published_stable));
+        }
+        for revision in ["0082", "0091a", "0098", "0099"] {
+            assert!(!live_in_window(revision, &published_stable));
+        }
+        let candidate_release = window_for("0.13.0").expect("feature candidate is catalogued");
+        assert_eq!(candidate_release.schema_min, candidate.schema_min);
+        assert_eq!(candidate_release.schema_head, candidate.schema_head);
+        assert!(live_in_window("0108", &candidate_release));
+        assert!(!live_in_window("0100", &candidate_release));
+        assert!(!live_in_window("0075", &candidate_release));
+        let published =
+            window_for("0.12.1").expect("released source control window remains catalogued");
+        assert_eq!(published.schema_min, "0076");
+        assert_eq!(published.schema_head, "0076");
+        assert!(live_in_window("0076", &published));
+        assert!(!live_in_window("0077", &published));
         let stable = window_for("0.12.0").expect("released window remains catalogued");
         assert_eq!(stable.schema_min, "0070");
         assert_eq!(stable.schema_head, "0073");
@@ -531,6 +634,11 @@ mod tests {
         let released = window_for("0.11.0").expect("0.11.0 remains catalogued");
         assert_eq!(released.schema_min, "0070");
         assert_eq!(released.schema_head, "0070");
+        for version in ["0.12.0", "0.12.0-rc.1"] {
+            let released = window_for(version).expect("released window remains catalogued");
+            assert_eq!(released.schema_min, "0070");
+            assert_eq!(released.schema_head, "0073");
+        }
     }
 
     // @spec PROTECTED-HOOK-SOURCE-2: new candidate metadata is distinct from prior windows.
@@ -603,42 +711,16 @@ mod tests {
             );
         }
 
-        let mut found = Vec::new();
-        let mut down_of = Vec::new();
         let versions = root.join("apps/api/alembic/versions");
-        for entry in std::fs::read_dir(&versions).expect("alembic versions") {
-            let path = entry.expect("entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("py") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("read migration");
-            let mut revision = None;
-            for line in text.lines() {
-                if let Some(rest) = line.strip_prefix("revision: str = \"") {
-                    revision = rest.strip_suffix('"').map(str::to_string);
-                }
-                if let Some(rest) = line.strip_prefix("down_revision: str | None = ") {
-                    let token = rest.trim().trim_matches('"');
-                    if token != "None" && !token.is_empty() {
-                        down_of.push(token.to_string());
-                    }
-                }
-            }
-            if let Some(id) = revision {
-                found.push(id);
-            }
-        }
-        for id in &found {
+        let graph = migration_graph(&versions).expect("migration graph has unique literal IDs");
+        for id in graph.keys() {
             assert!(
                 catalog().revisions.iter().any(|item| item == id),
                 "catalog revisions missing alembic id {id}"
             );
         }
-        let mut heads: Vec<&String> = found
-            .iter()
-            .filter(|id| !down_of.iter().any(|down| down == *id))
-            .collect();
-        heads.sort();
+        let down_of: std::collections::BTreeSet<&String> = graph.values().flatten().collect();
+        let heads: Vec<&String> = graph.keys().filter(|id| !down_of.contains(id)).collect();
         assert_eq!(heads.len(), 1, "expected one alembic head, got {heads:?}");
         let tree_head = heads[0];
         assert!(

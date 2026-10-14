@@ -1,0 +1,21 @@
+# Expected `describe` output for `curie factory quickstart --tracker jira-cloud
+# --code-host github` on the Install path (App flags passed), #4358 plan S3.3
+# and S3.4. Derived by hand from describe_4346_explicit_context.txt: one
+# JiraTracker line after the intake line, and the agent binds `jira=jira`
+# instead of `github=acme/widgets`. Never regenerated from the implementation.
+# The selected agent's runnerEnv action precedes the existing render and deploy.
+# ---
+infer repository toolchains before Helm from App-authenticated workflows and manifests; compare requirements with observed tools after selecting the runner image
+Kubernetes context: kind-curie-factory because --context was passed
+model credential: use CURIE_CREDENTIALS (no prompt)
+kubectl --context kind-curie-factory -n kube-system scale deployment/coredns --replicas=1
+curie cluster up --context kind-curie-factory --namespace curie --release curie --model z-ai/glm-5.3-flash --chart charts/curie --set security.gvisor.mode=off
+configure factory intake factory.intake=poll for acme/widgets with --app-id 12345 --private-key-file /keys/app.pem and no webhook secret; the same helm upgrade binds the dark factory runner image
+Write the Jira Cloud tracker and binding `jira` and Secret curie-jira-token
+configure agentSandbox.runnerEnv.dark-factory.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000 with helm upgrade --reuse-values unless the release already records that string; preserve sibling values
+render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image
+curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir /tmp/factory-quickstart-golden/curie-factory-quickstart-curie-curie/dark-factory --agent dark-factory --env prod --repo acme/widgets
+curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add jira=jira
+curie cluster overrides dark-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 10800
+curie cluster publication-policy dark-factory --context kind-curie-factory --namespace curie --release curie --policy auto
+curie cluster budget dark-factory --context kind-curie-factory --namespace curie --release curie --limit 5

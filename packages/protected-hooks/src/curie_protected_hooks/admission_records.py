@@ -12,7 +12,7 @@ from typing import Any, ClassVar
 from aci_protocol.ndjson import parse_queued_turn
 from aci_protocol.turn import TurnSource
 
-from .authority_records import _scalar
+from .authority_records import _canonical, _scalar
 from .source_policy_records import canonical_hook, canonical_uuid, policy_fingerprint
 
 # @spec PROTECTED-HOOK-ADMISSION-2/3
@@ -85,12 +85,26 @@ _RECEIPT = {
     "acceptance_status": "accepted",
     "tool_access": "access",
 }
+# @spec AUTOMATED-REMEDIATION-4: the remediation generation at admission, a
+# canonical generation or null; absent from records written before it existed.
+REMEDIATION_GENERATION = "remediation_generation"
 _STATE = {
     "schema_version": "version",
     "status": "status",
     "recovery_attempts": "attempts",
     "reason": "terminal",
     "receipt": "receipt",
+}
+# @spec PROTECTED-HOOK-ADMISSION-2/4
+_SELECTION = {
+    "schema_version": "version",
+    "runtime_id": "uuid",
+    "runtime_generation": "generation",
+    "manifest_digest": "sha256",
+    "qualification_id": "uuid",
+    "qualification_generation": "generation",
+    "broker_run_id": "run_id",
+    "admission_open": None,
 }
 _TERMINAL = frozenset({"deadline", "attempts_exhausted", "stream_id_unappendable"})
 _REFUSALS = frozenset(
@@ -158,9 +172,22 @@ def _logical(value: Any) -> None:
     _require(all(ord(c) >= 32 and ord(c) != 127 for c in value))
 
 
+def _remediation_generation(value: Any) -> None:
+    """A canonical generation or null, @spec AUTOMATED-REMEDIATION-4."""
+    if value is not None:
+        _scalar(value, "generation")
+
+
 def _validate(value: Any, schema: dict[str, str]) -> None:
-    """@spec PROTECTED-HOOK-ADMISSION-2/3 PROTECTED-HOOK-LANE-2."""
-    _require(type(value) is dict and value.keys() == schema.keys())
+    """@spec PROTECTED-HOOK-ADMISSION-2/3 PROTECTED-HOOK-LANE-2 AUTOMATED-REMEDIATION-4."""
+    _require(type(value) is dict)
+    if schema is _ENVELOPE or schema is _INTENT or schema is _RECEIPT:
+        extra = value.keys() - schema.keys()
+        _require(extra <= {REMEDIATION_GENERATION} and schema.keys() <= value.keys())
+        if extra:
+            _remediation_generation(value[REMEDIATION_GENERATION])
+    else:
+        _require(value.keys() == schema.keys())
     for field, kind in schema.items():
         item = value[field]
         if kind == "identity":
@@ -298,6 +325,25 @@ def parse_receipt(raw: bytes) -> Receipt:
     return Receipt(raw)
 
 
+def parse_selection(raw: bytes) -> dict[str, Any]:
+    """Closed runtime selection record, refused with ``ValueError``.
+
+    The one Selection grammar admission and the support probe both read.
+    @spec PROTECTED-HOOK-ADMISSION-2/4 @spec PROTECTED-HOOK-SOURCE-9.
+    """
+    try:
+        selection = _decode(raw, _MAX_METADATA)
+        _require(type(selection) is dict and selection.keys() == _SELECTION.keys())
+        opened = selection.pop("admission_open")
+        _require(type(opened) is bool)
+        fields = {k: v for k, v in _SELECTION.items() if k != "admission_open"}
+        _canonical(_encode(selection), fields)
+        selection["admission_open"] = opened
+        return dict(selection)
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        raise ValueError("invalid protected admission record") from None
+
+
 @dataclass(frozen=True, slots=True, repr=False, kw_only=True)
 class DeliveryIdentity:
     """@spec PROTECTED-HOOK-ADMISSION-2 PROTECTED-HOOK-SOURCE-1."""
@@ -357,6 +403,7 @@ class AdmissionRequest:
     requested_tool_access: str | None
     request_body_sha256: str
     queued_payload: bytes
+    remediation_generation: str | None
 
     def __init__(
         self,
@@ -366,8 +413,14 @@ class AdmissionRequest:
         requested_tool_access: str | None,
         request_body_sha256: str,
         queued_payload: bytes,
+        remediation_generation: str | None = None,
     ) -> None:
-        """@spec PROTECTED-HOOK-ADMISSION-2 PROTECTED-HOOK-SOURCE-6/8."""
+        """@spec PROTECTED-HOOK-ADMISSION-2 PROTECTED-HOOK-SOURCE-6/8 AUTOMATED-REMEDIATION-4.
+
+        ``remediation_generation`` is the hook's remediation policy generation
+        current at admission, read by the ingress under the agent gate, or None
+        when no policy is bound.
+        """
         try:
             _require(type(identity) is DeliveryIdentity)
             _require(isinstance(source_policy, Mapping) and set(source_policy) == _POLICY_FIELDS)
@@ -383,6 +436,7 @@ class AdmissionRequest:
                 or (type(requested_tool_access) is str and requested_tool_access == "read-only")
             )
             _scalar(request_body_sha256, "sha256")
+            _remediation_generation(remediation_generation)
             policy_bytes = _encode(policy)
             _require(len(policy_bytes) <= _MAX_METADATA)
             payload = _decode(queued_payload, _MAX_PAYLOAD)
@@ -408,6 +462,7 @@ class AdmissionRequest:
                 ("requested_tool_access", requested_tool_access),
                 ("request_body_sha256", request_body_sha256),
                 ("queued_payload", queued_payload),
+                ("remediation_generation", remediation_generation),
             ):
                 object.__setattr__(self, field, value)
         except (ValueError, TypeError, OverflowError, RecursionError):

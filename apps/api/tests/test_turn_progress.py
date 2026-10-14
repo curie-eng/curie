@@ -24,11 +24,12 @@ from typing import Any
 import pytest
 import redis
 import redis.asyncio as aioredis
-from curie_api import channel_token, sandbox_token
+from curie_api import channel_token
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.routers import turn_progress as turn_progress_router
 from curie_api.turn_progress import INBOX_MAXLEN, INBOX_TTL_S
+from curie_internal import sandbox_token
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW, connect_or_skip
 from fastapi import FastAPI
 from fastapi.testclient import TestClient

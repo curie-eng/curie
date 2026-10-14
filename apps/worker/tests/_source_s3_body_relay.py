@@ -67,7 +67,8 @@ class S3BodyRelay:
                 except (BrokenPipeError, ConnectionResetError):
                     # The exclusively owned fatal child can close before body release.
                     pass
-                except Exception as error:
+                # record every relay failure without leaking response data.
+                except Exception as error:  # noqa: BLE001
                     relay.errors.append(type(error).__name__)
 
         self.server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)

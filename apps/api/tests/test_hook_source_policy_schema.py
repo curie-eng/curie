@@ -237,7 +237,22 @@ def test_source_policy_additive_upgrade_preserves_existing_agent(
     before = sql_dicts("SELECT * FROM curie.agents WHERE id = :id", {"id": agent_id})
     command.upgrade(alembic_config(), "head")
     _columns()
-    assert sql_dicts("SELECT * FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
-        {**row, "reviewer_model": None} for row in before
-    ]
+    after = sql_dicts("SELECT * FROM curie.agents WHERE id = :id", {"id": agent_id})
+    assert len(before) == len(after) == 1
+    # Deploy notifications and the reviewer model, then tenant scope and bot
+    # identity (#2911).
+    added = {
+        "deploy_notifications": False,
+        "reviewer_model": None,
+        "tenant_id": uuid.UUID("00000000-0000-0000-0000-000000000001"),
+        "status": "active",
+        "owning_team_id": None,
+        "topic_policy_ref": None,
+        "data_classification_ref": None,
+        "retention_policy_ref": None,
+    }
+    assert not set(added) & set(before[0])
+    assert set(after[0]) == set(before[0]) | set(added)
+    assert {name: after[0][name] for name in before[0]} == before[0]
+    assert {name: after[0][name] for name in added} == added
     assert sql_dicts("SELECT * FROM curie.hook_source_policies") == []

@@ -17,7 +17,7 @@ import pytest
 from curie_api.config import Settings
 from curie_api.deps import get_eval_queue, get_session, get_store
 from curie_api.routers import github as github_router
-from curie_api.schemas import WebhookResult
+from curie_api.schemas.deployments import WebhookResult
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -46,6 +46,13 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
 
     monkeypatch.setattr(github_router, "process_push", _fake_push)
 
+    class _NoNotices:
+        """The app lifespan installs the deploy notice queue (#1331); this
+        minimal app has none, and the size gate is all these tests read."""
+
+        async def publish(self, *_args: Any, **_kwargs: Any) -> int:
+            return 0
+
     # The push arm claims and settles its delivery id on sessions of its own
     # (#3820); stub both so the endpoint test still needs no DB.
     async def _fake_claim(*_args: Any, **_kwargs: Any) -> str:
@@ -65,6 +72,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     app = FastAPI()
     app.state.sessionmaker = None
     app.include_router(github_router.router)
+    app.state.deploy_notice_queue = _NoNotices()
     app.dependency_overrides[get_session] = _NoDbSession
     app.dependency_overrides[get_store] = lambda: None
     app.dependency_overrides[get_eval_queue] = lambda: None

@@ -31,25 +31,9 @@ from opentelemetry.trace import SpanKind
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import adapter_principal, approval_principal, crud
-from ..admission import admit
-from ..approval_auth import (
-    ApprovalPrincipalDep,
-    platform_key_or_adapter,
-    require_adapter_principal,
-)
-from ..approvers import card_on_requesting_surface
-from ..auth import require_api_key, require_platform_key
-from ..authorizer import authorize_approval
-from ..config import get_settings
-from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep
-from ..models import Approval, ApprovalStatus
-from ..resumequeue import (
-    approval_trace_context,
-    build_expiry_resume_turn,
-    build_resume_turn,
-)
-from ..schemas import (
+from curie_api.crud import approvals as crud_approvals
+from curie_api.crud import channels as crud_channels
+from curie_api.schemas.approvals import (
     AdapterPrincipalMint,
     AdapterPrincipalOut,
     AdapterPrincipalRotate,
@@ -60,7 +44,36 @@ from ..schemas import (
     ApprovalPrincipalOut,
     ApprovalResolve,
 )
+
+from .. import adapter_principal, approval_principal
+from ..action_forward import ForwardRefused
+from ..admission import admit
+from ..approval_auth import (
+    ApprovalPrincipalDep,
+    platform_key_or_adapter,
+    require_adapter_principal,
+)
+from ..approvers import card_on_requesting_surface
+from ..auth import require_api_key, require_platform_key
+from ..authorizer import AuthzDecision, authorize_approval
+from ..config import get_settings
+from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep, get_store
+from ..models import Approval, ApprovalStatus
+from ..remediation_approvals import (
+    REMEDIATION_PURPOSE,
+    execute_approved,
+    resolution_refusal,
+    settle_remediation_approval,
+)
+from ..remediation_escalation import is_undo_approval, undo_subject
+from ..resumequeue import (
+    approval_trace_context,
+    build_expiry_resume_turn,
+    build_resume_turn,
+)
+from ..storage import ObjectStore
 from ..wirebody import ApprovalRequestBody
+from .actions import rule_undo
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +98,14 @@ router = APIRouter(prefix="/approvals", tags=["approvals"])
 
 def _approval_not_found() -> HTTPException:
     return HTTPException(status.HTTP_404_NOT_FOUND, APPROVAL_NOT_FOUND_DETAIL)
+
+
+def _remediation_refused(refused: ForwardRefused) -> HTTPException:
+    """The 409 naming why an approved remediation executes nothing (AUTOMATED-REMEDIATION-16)."""
+
+    return HTTPException(
+        status.HTTP_409_CONFLICT, {"code": refused.code, "message": refused.reason}
+    )
 
 
 @router.post(
@@ -157,7 +178,7 @@ async def mint_adapter_principal(
     """
 
     requested = frozenset(data.binding_ids)
-    if await crud.existing_channel_binding_ids(session, requested) != requested:
+    if await crud_channels.existing_channel_binding_ids(session, requested) != requested:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "every binding_id must name an existing channel binding",
@@ -183,7 +204,7 @@ async def rotate_adapter_principal(
     an adapter left serving nothing gets 401, as an unusable credential would.
     """
 
-    remaining = await crud.existing_channel_binding_ids(session, claims.bindings)
+    remaining = await crud_channels.existing_channel_binding_ids(session, claims.bindings)
     if not remaining:
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
@@ -223,25 +244,25 @@ async def create_approval(
 
     A request for an approval a person rejected in this thread, raised with no
     person asking since, is refused with 409 and audited on the rejected record
-    (#2885, ``crud.find_rejected_reraise``). Decided here rather than in the
+    (#2885, ``crud.approvals.find_rejected_reraise``). Decided here rather than in the
     runner, so a sandbox cannot talk its way past it.
     """
 
     traceparent = canonicalize_traceparent(
         request.headers.get(TRACEPARENT_STREAM_FIELD)
     )
-    rejected = await crud.find_rejected_reraise(session, data)
+    rejected = await crud_approvals.find_rejected_reraise(session, data)
     # An existing row for this dedupe_key is a replay of a request this route
     # already accepted, so the idempotent 200 below still owns it.
-    if rejected is not None and await crud.get_approval_by_dedupe_key(
+    if rejected is not None and await crud_approvals.get_approval_by_dedupe_key(
         session, data.dedupe_key
     ) is None:
         raise await _refuse_rejected_reraise(session, data, rejected)
     try:
-        approval = await crud.create_approval(session, data, traceparent=traceparent)
+        approval = await crud_approvals.create_approval(session, data, traceparent=traceparent)
     except IntegrityError as exc:
         await session.rollback()
-        existing = await crud.get_approval_by_dedupe_key(session, data.dedupe_key)
+        existing = await crud_approvals.get_approval_by_dedupe_key(session, data.dedupe_key)
         if existing is None:  # raced with a delete; surface the conflict as-is
             raise HTTPException(
                 status.HTTP_409_CONFLICT, "approval violates a uniqueness constraint"
@@ -249,7 +270,7 @@ async def create_approval(
         response.status_code = status.HTTP_200_OK
         approval = existing
     result = ApprovalCreateOut.model_validate(approval)
-    result.requested_by = await crud.approval_display_requester(session, approval)
+    result.requested_by = await crud_approvals.approval_display_requester(session, approval)
     return result
 
 
@@ -283,7 +304,7 @@ async def _refuse_rejected_reraise(
         f"rejected by {rejected_by}{when}, and nobody has asked for it since. Nothing "
         "was done. To raise it again, a person must ask for it in this thread."
     )
-    await crud.append_approval_audit(
+    await crud_approvals.append_approval_audit(
         session,
         approval_id=rejected_id,
         action="reraise_refused",
@@ -338,7 +359,7 @@ async def list_approvals(
     """List approvals, newest first. The platform key sees every row; an
     adapter principal sees only approvals routed to a binding it serves."""
 
-    approvals = await crud.list_approvals(
+    approvals = await crud_approvals.list_approvals(
         session,
         status=status_filter,
         agent_id=agent_id,
@@ -362,7 +383,7 @@ async def list_approvals(
     dependencies=[Depends(require_api_key)],
 )
 async def get_approval(approval_id: uuid.UUID, session: SessionDep) -> ApprovalOut:
-    approval = await crud.get_approval(session, approval_id)
+    approval = await crud_approvals.get_approval(session, approval_id)
     if approval is None:
         raise _approval_not_found()
     return ApprovalOut.model_validate(approval)
@@ -377,10 +398,10 @@ async def get_approval_audit(approval_id: uuid.UUID, session: SessionDep) -> lis
     """The approval's audit trail (#247), oldest first: every resolution
     attempt with the authorizer snapshot that counted or refused it."""
 
-    approval = await crud.get_approval(session, approval_id)
+    approval = await crud_approvals.get_approval(session, approval_id)
     if approval is None:
         raise _approval_not_found()
-    entries = await crud.list_approval_audit(session, approval_id)
+    entries = await crud_approvals.list_approval_audit(session, approval_id)
     return [ApprovalAuditOut.model_validate(e) for e in entries]
 
 
@@ -413,14 +434,14 @@ async def _admit_adapter_answer(session: AsyncSession, approval: Approval, sende
     """
 
     try:
-        row = await crud.binding_for_route(
+        row = await crud_channels.binding_for_route(
             session,
             approval.reply_kind or "",
             approval.reply_adapter,
             approval.reply_channel,
             agent_id=approval.agent_id,
         )
-    except crud.AmbiguousRoute:
+    except crud_channels.AmbiguousRoute:
         # The served check matched the asking route exactly, so this cannot
         # select two rows; if it ever does, no single list can be read and the
         # answer is refused rather than admitted.
@@ -446,6 +467,7 @@ async def resolve_approval(
     resume_queue: ResumeQueueDep,
     approver_sets: ApproverSetSelectorDep,
     principal: ApprovalPrincipalDep,
+    store: Annotated[ObjectStore | None, Depends(get_store)] = None,
 ) -> ApprovalOut:
     """Claim the resolution (resolve-once) and wake the suspended session.
 
@@ -460,13 +482,13 @@ async def resolve_approval(
     The winner's response is sent only after the resume turn is enqueued.
     """
 
-    approval = await crud.get_approval(session, approval_id)
+    approval = await crud_approvals.get_approval(session, approval_id)
     if approval is None:
         raise _approval_not_found()
     # An adapter may resolve only approvals it serves (ADR-0154), by the same
     # predicate that filters its list. Unserved reads exactly as a missing row,
     # before any authorization or audit, so it is not an existence oracle.
-    if principal.kind == "adapter" and not await crud.approval_served_by(
+    if principal.kind == "adapter" and not await crud_approvals.approval_served_by(
         session, approval, principal.adapter_bindings
     ):
         raise _approval_not_found()
@@ -474,7 +496,7 @@ async def resolve_approval(
 
     # The route binding is read fresh at resolve time (#420), so revoking an
     # approver takes effect on the next click rather than at the next restart.
-    binding = await crud.get_approval_route_binding(session, approval)
+    binding = await crud_approvals.get_approval_route_binding(session, approval)
     if principal.kind == "adapter" and card_on_requesting_surface(approval, binding):
         await _admit_adapter_answer(session, approval, principal.subject)
     approver_set = approver_sets(approval, binding)
@@ -494,11 +516,34 @@ async def resolve_approval(
         principal_kind=principal.kind,
     )
 
+    if principal.kind == "test_driver":
+        settings = get_settings()
+        declared = any(
+            driver.bot_user_id == principal.subject and driver.channel_id == principal.actor_channel
+            for driver in settings.test_installation_drivers
+        )
+        card_channel = approval.card_channel or approval.reply_channel
+        if (
+            not settings.test_installation_enabled
+            or not declared
+            or principal.actor_channel != card_channel
+        ):
+            decision = AuthzDecision(
+                allowed=False,
+                reason="This installation does not accept this test driver approval.",
+                evidence={
+                    "kind": "test_driver_admission",
+                    "enabled": settings.test_installation_enabled,
+                    "declared": declared,
+                    "card_channel_matches": principal.actor_channel == card_channel,
+                },
+            )
+
     async def _audit(action: str, *, authorized: bool, reason: str | None) -> None:
         # The audit log (#247): every authorization-relevant event, with the
         # authorizer snapshot that counted (or refused) the actor, and the
         # membership evidence it decided on (#420).
-        await crud.append_approval_audit(
+        await crud_approvals.append_approval_audit(
             session,
             approval_id=approval_id,
             action=action,
@@ -528,7 +573,7 @@ async def resolve_approval(
                 "operation": "expire",
             },
         ):
-            expired = await crud.expire_approval(session, approval_id)
+            expired = await crud_approvals.expire_approval(session, approval_id)
         # None means a concurrent resolution won the CAS before the expiry did;
         # fall through to the claim below, which will lose and report the winner.
         if expired is not None:
@@ -551,7 +596,11 @@ async def resolve_approval(
                 authorized=True,
                 reason=f"approval expired at {expires_at}",
             )
-            if expired.purpose == "publication":
+            if expired.purpose == REMEDIATION_PURPOSE:
+                # AUTOMATED-REMEDIATION-16: an expired remediation creates
+                # nothing and ends its nominations; no model wake is owed.
+                await settle_remediation_approval(session, approval_id, ApprovalStatus.expired)
+            if expired.purpose in crud_approvals.NO_WAKE_PURPOSES:
                 raise HTTPException(
                     status.HTTP_410_GONE,
                     f"approval expired at {expires_at} and can no longer be resolved",
@@ -574,7 +623,7 @@ async def resolve_approval(
                 # (#4016), a failed mark past its grace horizon.
                 # This is the sole recovery path for an expiry wake -- a flipped
                 # record is no longer pending, so no later sweep re-selects it.
-                await crud.mark_approval_resumed(session, approval_id)
+                await crud_approvals.mark_approval_resumed(session, approval_id)
             except Exception:
                 # Reset the session before raising: the mark inside the try is a
                 # DB write, so its failure leaves this session in
@@ -615,6 +664,18 @@ async def resolve_approval(
                 f"approval expired at {expires_at} and can no longer be resolved",
             )
 
+    if (
+        approval.purpose == REMEDIATION_PURPOSE
+        and not is_undo_approval(approval)
+        and data.decision == ApprovalStatus.approved
+    ):
+        # AUTOMATED-REMEDIATION-16: judged before the claim, so a refused
+        # approval executes nothing and stays undecided.
+        refused = await resolution_refusal(session, approval)
+        if refused is not None:
+            await _audit("remediation_refused", authorized=True, reason=refused.code)
+            raise _remediation_refused(refused)
+
     with operation_span(
         "curie.approval.resolve",
         kind=SpanKind.INTERNAL,
@@ -624,7 +685,7 @@ async def resolve_approval(
             "operation": "resolve",
         },
     ):
-        claimed = await crud.claim_approval_resolution(
+        claimed = await crud_approvals.claim_approval_resolution(
             session,
             approval_id,
             decision=data.decision,
@@ -632,7 +693,7 @@ async def resolve_approval(
             note=data.note,
         )
     if claimed is None:
-        current = await crud.get_approval(session, approval_id)
+        current = await crud_approvals.get_approval(session, approval_id)
         if current is None:
             raise _approval_not_found()
         if current.status == ApprovalStatus.expired:
@@ -659,6 +720,48 @@ async def resolve_approval(
         },
     )
     await _audit("resolved", authorized=True, reason=decision.reason or None)
+
+    if is_undo_approval(claimed):
+        # AUTOMATED-REMEDIATION-19: no model wake (purpose ``remediation``),
+        # and no forward execution or nomination to settle. Approval drives the undo
+        # ruling under the approving principal: exactly one restore, because
+        # only the winner of the claim above reaches here. Rejection creates
+        # nothing. A ruling refusal is returned as the ruling route returns it,
+        # with its audit row on the record; a ruling that never committed is
+        # rerun by the sweeper (``remediation_undo_recovery``).
+        out = ApprovalOut.model_validate(claimed)
+        if claimed.status == ApprovalStatus.approved:
+            subject = await undo_subject(session, claimed)
+            if subject is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, "no undoable record is bound to this approval"
+                )
+            await rule_undo(
+                session,
+                subject,
+                principal=principal,
+                approver_sets=approver_sets,
+                store=store,
+                approval_id=claimed.id,
+            )
+        return out
+
+    if claimed.purpose == REMEDIATION_PURPOSE:
+        # AUTOMATED-REMEDIATION-16: no model wake (the claim marked it owed
+        # nothing). Approval builds the one forward execution from the
+        # nomination row; rejection ends the nominations.
+        out = ApprovalOut.model_validate(claimed)
+        if claimed.status == ApprovalStatus.approved:
+            try:
+                await execute_approved(session, approval_id)
+            except ForwardRefused as exc:
+                logger.warning(
+                    "remediation approval %s approved but refused %s", approval_id, exc.code
+                )
+                raise _remediation_refused(exc) from None
+        else:
+            await settle_remediation_approval(session, approval_id, ApprovalStatus.rejected)
+        return out
 
     if claimed.purpose == "publication":
         # Publication outcomes are consumed by the trusted worker and emitted
@@ -692,7 +795,7 @@ async def resolve_approval(
         if not get_settings().resume_reconciler_enabled:
             raise
         return ApprovalOut.model_validate(claimed)
-    await crud.mark_approval_resumed(session, approval_id)
+    await crud_approvals.mark_approval_resumed(session, approval_id)
     logger.info(
         "approval %s %s by %s; resume turn enqueued (%s)",
         approval_id,

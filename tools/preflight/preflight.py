@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -79,6 +80,11 @@ def private_service_environment(
         "TEST_DATABASE_URL": database,
         "TEST_VALKEY_HOST": "127.0.0.1",
         "TEST_VALKEY_PORT": str(valkey),
+        "CURIE_PRIMARY_SOURCE_RESOURCES": "1",
+        "CURIE_SETTLEMENT_TEST_REDIS_URL": (
+            f"redis://:{quote(environment.get('TEST_VALKEY_PW', 'valkeypass'), safe='')}"
+            f"@127.0.0.1:{valkey}/0"
+        ),
         "VALKEY_HOST": "127.0.0.1",
         "VALKEY_PORT": str(valkey),
         "S3_ENDPOINT_URL": f"http://127.0.0.1:{s3}",
@@ -165,10 +171,10 @@ GITLEAKS_COMMAND = r"""docker run --rm -v "${{ github.workspace }}:/repo" \
   ${GITLEAKS_LOG_OPTS:+"$GITLEAKS_LOG_OPTS"}"""
 COMPILE_CI_COMMAND = "cargo test --locked"
 COMPILE_FAST_COMMAND = "cargo check --locked --tests"
-TYPESCRIPT_COMMAND = r"""npx --yes json-schema-to-typescript@15.0.4 \
-  packages/aci-protocol/schema/aci-protocol.schema.json \
+TYPESCRIPT_COMMAND = r"""pnpm --dir tools/contract-codegen exec json2ts \
+  "${{ github.workspace }}/packages/aci-protocol/schema/aci-protocol.schema.json" \
   --unreachableDefinitions \
-  -o packages/aci-protocol/generated/ts/aci-protocol.ts
+  -o "${{ github.workspace }}/packages/aci-protocol/generated/ts/aci-protocol.ts"
 git diff --exit-code -- packages/aci-protocol/generated/ts/aci-protocol.ts"""
 MANIFEST_COMMAND = (
     r"""pnpm gen:manifest
@@ -179,6 +185,13 @@ git diff --exit-code src/generated/commandManifest.ts \
 # A fresh hook worktree has no node_modules. This is dependency setup from CI,
 # not another selected gate, and --dry-run never runs it.
 UI_SETUP = exact("ui", "Install dependencies", "pnpm install --frozen-lockfile", "apps/ui", "setup")
+CONTRACTS_SETUP = exact(
+    "contracts-ts",
+    "Install dependencies",
+    "pnpm --dir tools/contract-codegen install --frozen-lockfile",
+    ".",
+    "setup",
+)
 CHECKS = (
     exact(
         "action-pins",
@@ -261,8 +274,8 @@ CHECKS = (
     exact(
         "contracts-ts",
         "tsc --noEmit on generated ACI types",
-        "npx --yes -p typescript@5.9.3 tsc --noEmit -p "
-        "packages/aci-protocol/generated/ts/tsconfig.json",
+        "pnpm --dir tools/contract-codegen exec tsc --noEmit -p "
+        '"${{ github.workspace }}/packages/aci-protocol/generated/ts/tsconfig.json"',
         ".",
         "contracts",
     ),
@@ -282,7 +295,7 @@ def load_workflow(root: Path, filename: str) -> dict[str, Any]:
 
 
 def validate_workflows(root: Path) -> None:
-    declarations = (*CHECKS, UI_SETUP)
+    declarations = (*CHECKS, UI_SETUP, CONTRACTS_SETUP)
     workflows = {
         name: load_workflow(root, name) for name in {check.workflow for check in declarations}
     }
@@ -334,7 +347,7 @@ def selected_checks(paths: list[str]) -> list[Check]:
             groups.add("python")
         if path.startswith(("cli/", "packages/aci-protocol/")):
             groups.add("rust")
-        if path.startswith("packages/aci-protocol/"):
+        if path.startswith(("packages/aci-protocol/", "tools/contract-codegen/")):
             groups.add("contracts")
         if path.startswith("cli/"):
             groups.add("cli")
@@ -878,6 +891,7 @@ def validate_private_config(
     configuration: dict[str, Any],
     project: str,
     published: dict[str, list[int]],
+    network_subnets: tuple[str, str],
 ) -> None:
     for service in published:
         if any(
@@ -885,8 +899,68 @@ def validate_private_config(
             for port in configuration["services"][service]["ports"]
         ):
             raise GateFailure("The private Compose configuration retained a shared binding")
-    if configuration["networks"]["curie_runner"]["name"] != f"{project}_runner":
-        raise GateFailure("The private runner network has an incorrect owner")
+    expected = {
+        "default": (f"{project}_default", network_subnets[0]),
+        "curie_runner": (f"{project}_runner", network_subnets[1]),
+    }
+    for name, (expected_name, expected_subnet) in expected.items():
+        network = configuration["networks"][name]
+        if network["name"] != expected_name:
+            raise GateFailure(f"The private {name} network has an incorrect owner")
+        actual_subnets = [
+            item.get("subnet") for item in network.get("ipam", {}).get("config", [])
+        ]
+        if expected_subnet not in actual_subnets:
+            raise GateFailure(f"The private {name} network has no owned subnet")
+
+
+def private_network_subnets(project: str, occupied: Sequence[str]) -> tuple[str, str]:
+    """Choose two unused /24s outside Docker's exhausted automatic pools."""
+    existing = [ipaddress.ip_network(value, strict=False) for value in occupied]
+    pools = (
+        ipaddress.ip_network("10.240.0.0/20"),
+        ipaddress.ip_network("172.31.240.0/20"),
+        ipaddress.ip_network("192.168.240.0/20"),
+    )
+    seed = int(hashlib.sha256(project.encode()).hexdigest(), 16)
+    selected: list[str] = []
+    for pool_index, pool in enumerate(pools):
+        candidates = list(pool.subnets(new_prefix=24))
+        start = (seed + pool_index) % len(candidates)
+        for offset in range(len(candidates)):
+            candidate = candidates[(start + offset) % len(candidates)]
+            if any(candidate.overlaps(network) for network in existing):
+                continue
+            selected.append(str(candidate))
+            existing.append(candidate)
+            if len(selected) == 2:
+                return selected[0], selected[1]
+    raise TransientError("No free private preflight subnets remain in the reserved range")
+
+
+def docker_network_subnets(root: Path, environment: dict[str, str]) -> list[str]:
+    network_ids = docker_output(root, environment, "network", "ls", "-q").splitlines()
+    if not network_ids:
+        return []
+    rendered = docker_output(
+        root,
+        environment,
+        "network",
+        "inspect",
+        *network_ids,
+        "--format",
+        "{{json .IPAM.Config}}",
+    )
+    result: list[str] = []
+    for line in rendered.splitlines():
+        configurations = json.loads(line)
+        if not isinstance(configurations, list):
+            continue
+        for configuration in configurations:
+            subnet = configuration.get("Subnet")
+            if isinstance(subnet, str):
+                result.append(subnet)
+    return result
 
 
 def free_port() -> int:
@@ -997,7 +1071,24 @@ def private_services(root: Path, worktree: Path) -> Iterator[dict[str, str]]:
                         lines.extend(
                             (f"  {service}:", "    ports: !override " + json.dumps(bindings))
                         )
-                    lines.extend(("networks:", "  curie_runner:", f"    name: {project}_runner"))
+                    network_subnets = private_network_subnets(
+                        project, docker_network_subnets(root, environment)
+                    )
+                    lines.extend(
+                        (
+                            "networks:",
+                            "  default:",
+                            f"    name: {project}_default",
+                            "    ipam:",
+                            "      config:",
+                            f"        - subnet: {network_subnets[0]}",
+                            "  curie_runner:",
+                            f"    name: {project}_runner",
+                            "    ipam:",
+                            "      config:",
+                            f"        - subnet: {network_subnets[1]}",
+                        )
+                    )
                     override.write_text("\n".join(lines) + "\n")
                     configuration = json.loads(
                         docker_output(
@@ -1011,7 +1102,9 @@ def private_services(root: Path, worktree: Path) -> Iterator[dict[str, str]]:
                             "json",
                         )
                     )
-                    validate_private_config(configuration, project, published)
+                    validate_private_config(
+                        configuration, project, published, network_subnets
+                    )
                     environment["TEST_LANGFUSE_HOST"] = f"http://127.0.0.1:{web_port}"
                     environment["LANGFUSE_HOST"] = environment["TEST_LANGFUSE_HOST"]
                     startup = run_check(
@@ -1084,6 +1177,12 @@ def render_command(root: Path, check: Check, base: str, head: str) -> str:
         '"${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"',
         shlex.quote(range_),
     )
+    if check.job == "contracts-ts":
+        command = re.sub(
+            r'"\$\{\{ github\.workspace \}\}/([^"]+)"',
+            lambda match: shlex.quote(str(root / match[1])),
+            command,
+        )
     if check.job == "gitleaks":
         workflow = load_workflow(root, "gitleaks.yaml")
         image = workflow["jobs"]["gitleaks"]["env"]["GITLEAKS_IMAGE"]
@@ -1151,6 +1250,14 @@ def execute_checks(root: Path, base: str, head: str, dry_run: bool, report: dict
                 flush=True,
             )
             command = f"{UI_SETUP.command}\n{command}"
+        elif check.job == "contracts-ts":
+            print(
+                "preflight: prerequisite "
+                f"{CONTRACTS_SETUP.workflow}:{CONTRACTS_SETUP.job}: {CONTRACTS_SETUP.step}",
+                file=sys.stderr,
+                flush=True,
+            )
+            command = f"{CONTRACTS_SETUP.command}\n{command}"
         try:
             result = run_process(["bash", "-e", "-o", "pipefail", "-c", command], root / check.cwd)
             exit_code, output = result.returncode, result.stdout

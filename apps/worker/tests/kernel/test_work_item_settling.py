@@ -126,9 +126,10 @@ class Api:
             return httpx.Response(
                 200,
                 json={
+                    "work_item_id": str(self.request_id),
                     "execution_request_id": str(self.request_id),
-                    "repo_full_name": "acme-corp/widgets",
-                    "issue_number": 123,
+                    # The tracker-neutral display reference (#4358 plan D8).
+                    "issue": "curie-eng/curie#123",
                     "capability": "example-capability",
                 },
             )
@@ -234,7 +235,7 @@ def test_settling_empty_transport_error_is_named_in_the_log(
     make_harness, monkeypatch, caplog
 ) -> None:
     from curie_worker import api_retry
-    from curie_worker import kernel as kernel_module
+    from curie_worker.kernel import work_items as kernel_work_items
 
     async def go() -> None:
         clock = ApiClock()
@@ -263,7 +264,7 @@ def test_settling_empty_transport_error_is_named_in_the_log(
 
         monkeypatch.setattr(api_retry, "_clock", clock)
         monkeypatch.setattr(api_retry, "_sleep", clock.sleep)
-        monkeypatch.setattr(kernel_module, "_settle_sleep", settle_sleep)
+        monkeypatch.setattr(kernel_work_items, "_settle_sleep", settle_sleep)
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
             client = WorkItemDispatchClient(
                 api_base_url="http://api.example", worker_token="example", client=http
@@ -315,8 +316,8 @@ def test_failed_finish_keeps_ownership_until_settlement_or_liveness_end(
     make_harness, monkeypatch, exit_reason
 ) -> None:
     from curie_worker import api_retry
-    from curie_worker import kernel as kernel_module
     from curie_worker import workitem_dispatch as dispatch_module
+    from curie_worker.kernel import work_items as kernel_work_items
 
     async def go() -> None:
         clock = ApiClock()
@@ -327,7 +328,7 @@ def test_failed_finish_keeps_ownership_until_settlement_or_liveness_end(
             def now(cls, tz=None):
                 return datetime.now(tz) + timedelta(seconds=wall_offset)
 
-        monkeypatch.setattr(kernel_module, "datetime", WallClock)
+        monkeypatch.setattr(kernel_work_items, "datetime", WallClock)
         monkeypatch.setattr(dispatch_module, "datetime", WallClock)
         request_id = uuid.uuid4()
         api = Api(request_id, clock)
@@ -347,7 +348,7 @@ def test_failed_finish_keeps_ownership_until_settlement_or_liveness_end(
 
         monkeypatch.setattr(api_retry, "_clock", clock)
         monkeypatch.setattr(api_retry, "_sleep", clock.sleep)
-        monkeypatch.setattr(kernel_module, "_settle_sleep", settle_sleep)
+        monkeypatch.setattr(kernel_work_items, "_settle_sleep", settle_sleep)
         async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as http:
             client = WorkItemDispatchClient(
                 api_base_url="http://api.example", worker_token="example", client=http
@@ -537,7 +538,7 @@ def test_settlement_finishing_before_event_finally_releases_the_sandbox_once(
     make_harness, monkeypatch
 ) -> None:
     from curie_worker import api_retry
-    from curie_worker import kernel as kernel_module
+    from curie_worker.kernel import work_items as kernel_work_items
 
     async def go() -> None:
         clock = ApiClock()
@@ -553,7 +554,7 @@ def test_settlement_finishing_before_event_finally_releases_the_sandbox_once(
 
         monkeypatch.setattr(api_retry, "_clock", clock)
         monkeypatch.setattr(api_retry, "_sleep", clock.sleep)
-        monkeypatch.setattr(kernel_module, "_settle_sleep", recover_on_settle)
+        monkeypatch.setattr(kernel_work_items, "_settle_sleep", recover_on_settle)
         async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as http:
             client = WorkItemDispatchClient(
                 api_base_url="http://api.example", worker_token="example", client=http
@@ -606,7 +607,7 @@ def test_finish_committed_before_response_loss_settles_without_rerunning(
     make_harness, monkeypatch, deferred
 ) -> None:
     from curie_worker import api_retry
-    from curie_worker import kernel as kernel_module
+    from curie_worker.kernel import work_items as kernel_work_items
 
     async def go() -> None:
         clock = ApiClock()
@@ -625,7 +626,7 @@ def test_finish_committed_before_response_loss_settles_without_rerunning(
 
         monkeypatch.setattr(api_retry, "_clock", clock)
         monkeypatch.setattr(api_retry, "_sleep", clock.sleep)
-        monkeypatch.setattr(kernel_module, "_settle_sleep", settle_sleep)
+        monkeypatch.setattr(kernel_work_items, "_settle_sleep", settle_sleep)
         async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as http:
             client = WorkItemDispatchClient(
                 api_base_url="http://api.example", worker_token="example", client=http
@@ -879,7 +880,7 @@ def test_settlement_cleanup_never_deletes_the_successor_claim(make_harness, monk
     after a successor took the thread releases nothing of the successor's."""
 
     from curie_worker import api_retry
-    from curie_worker import kernel as kernel_module
+    from curie_worker.kernel import work_items as kernel_work_items
 
     async def go() -> None:
         clock = ApiClock()
@@ -896,7 +897,7 @@ def test_settlement_cleanup_never_deletes_the_successor_claim(make_harness, monk
 
         monkeypatch.setattr(api_retry, "_clock", clock)
         monkeypatch.setattr(api_retry, "_sleep", clock.sleep)
-        monkeypatch.setattr(kernel_module, "_settle_sleep", settle_sleep)
+        monkeypatch.setattr(kernel_work_items, "_settle_sleep", settle_sleep)
         async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as http:
             client = WorkItemDispatchClient(
                 api_base_url="http://api.example", worker_token="example", client=http
@@ -954,7 +955,7 @@ def test_a_normal_finish_releases_exactly_its_own_claim_and_route(
     deletes that claim, its route, and its workspace, at both release sites."""
 
     from curie_worker import api_retry
-    from curie_worker import kernel as kernel_module
+    from curie_worker.kernel import work_items as kernel_work_items
 
     async def go() -> None:
         clock = ApiClock()
@@ -968,7 +969,7 @@ def test_a_normal_finish_releases_exactly_its_own_claim_and_route(
 
         monkeypatch.setattr(api_retry, "_clock", clock)
         monkeypatch.setattr(api_retry, "_sleep", clock.sleep)
-        monkeypatch.setattr(kernel_module, "_settle_sleep", recover_on_settle)
+        monkeypatch.setattr(kernel_work_items, "_settle_sleep", recover_on_settle)
         async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as http:
             client = WorkItemDispatchClient(
                 api_base_url="http://api.example", worker_token="example", client=http
@@ -1370,3 +1371,61 @@ def test_an_unrelated_turn_on_the_thread_never_rebinds_the_runs_claim(
                 assert h.kernel._workspace.releases == []
 
     asyncio.run(go())
+
+
+# --- The issue read context is tracker neutral (#4358 plan D8) ---------------
+
+
+def _issue_read_context(body: dict[str, Any]) -> tuple[str, str]:
+    request_id = uuid.UUID(str(body["execution_request_id"]))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/internal/work-items/issue-read/context"
+        return httpx.Response(200, json=body)
+
+    async def go() -> tuple[str, str]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = WorkItemDispatchClient(
+                api_base_url="http://api.example", worker_token="example-token", client=http
+            )
+            return await client.issue_read_context(request_id)
+
+    return asyncio.run(go())
+
+
+@pytest.mark.parametrize("issue", ["curie-eng/curie#123", "PROJ-7"], ids=["github", "jira_cloud"])
+def test_issue_read_context_returns_the_display_reference_the_api_names(issue: str) -> None:
+    request_id = uuid.uuid4()
+    named, capability = _issue_read_context(
+        {
+            "work_item_id": str(uuid.uuid4()),
+            "execution_request_id": str(request_id),
+            "issue": issue,
+            "capability": "example-capability",
+        }
+    )
+    assert (named, capability) == (issue, "example-capability")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"issue": ""},
+        {"issue": None},
+        # The removed GitHub-shaped fields are not read any more.
+        {"repo_full_name": "acme-corp/widgets", "issue_number": 123},
+    ],
+)
+def test_issue_read_context_without_an_issue_reference_is_unusable(
+    body: dict[str, Any],
+) -> None:
+    request_id = uuid.uuid4()
+    with pytest.raises(WorkItemTransportError):
+        _issue_read_context(
+            {
+                "work_item_id": str(uuid.uuid4()),
+                "execution_request_id": str(request_id),
+                "capability": "example-capability",
+                **body,
+            }
+        )

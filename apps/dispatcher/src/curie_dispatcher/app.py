@@ -22,6 +22,7 @@ from .admission import AdmissionGate
 from .config import DispatcherConfig, release_identity
 from .handlers import Clock, register_handlers
 from .identities import SlackIdentityCredentials, default_identity_credentials
+from .identity import IdentityResolver
 from .socket_presence import SocketPresence
 from .supervisor import Connection
 
@@ -83,6 +84,7 @@ def build_app(
     resolver: Any | None = None,
     identity_bots: Mapping[str, str] | None = None,
     admission: AdmissionGate | None = None,
+    identity_client: IdentityResolver | None = None,
 ) -> App:
     """Build one identity's Bolt App with the dispatcher's handlers registered.
 
@@ -94,6 +96,9 @@ def build_app(
 
     ``admission`` is the caller-list gate (ADR 0175). ``run`` passes one gate
     shared by every identity; None builds one for this app from config.
+
+    ``identity_client`` is the log-only principal lookup (#2910); None builds
+    the production one from config in ``register_handlers``.
     """
     credentials = identity if identity is not None else default_identity_credentials(config)
     signing = credentials.signing_secret or _SOCKET_MODE_SIGNING_PLACEHOLDER
@@ -128,6 +133,8 @@ def build_app(
         register_kwargs["identity_bots"] = identity_bots
     if admission is not None:
         register_kwargs["admission"] = admission
+    if identity_client is not None:
+        register_kwargs["identity_client"] = identity_client
     register_handlers(app, **register_kwargs)
     return app
 

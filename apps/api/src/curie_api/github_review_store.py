@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 import redis.asyncio as redis
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle, TurnSource
+from curie_internal.keyspace import GITHUB_REVIEW_HELD_INDEX, GITHUB_REVIEW_KEY_PREFIX, done_key
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     canonicalize_traceparent,
@@ -25,10 +26,17 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.concurrency import run_in_threadpool
 
-from . import crud
+from curie_api.crud import errors as crud_errors
+from curie_api.crud import lineages as crud_lineages
+from curie_api.forges.github.marked_comments import find_marker
+from curie_api.schemas.channels import BUILTIN_CLUSTER_MESSAGE_ADAPTER
+from curie_api.schemas.publications import ReviewRevisionReserve
+
 from .config import Settings
 from .delivery import backlog_reservation, enqueue_owned, take_backlog_slot
-from .factory_notices import _find_marker
+from .forges.github.transport import github_headers
+from .forges.hosts import github_host
+from .forges.types import GITHUB
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_review_audit import settle_review_delivery
 from .github_review_events import (
@@ -38,7 +46,7 @@ from .github_review_events import (
     UnverifiedFeedback,
 )
 from .github_review_terminal import read_review_dead_letter, worker_event_terminal_outcome
-from .github_review_truth import BoundReviewLineage, github_headers, verify_feedback_truth
+from .github_review_truth import BoundReviewLineage, verify_feedback_truth
 from .models import (
     AgentChannel,
     Deployment,
@@ -50,7 +58,6 @@ from .models import (
     ThreadWorkspace,
 )
 from .repo_full_name import repo_url_path
-from .schemas import BUILTIN_CLUSTER_MESSAGE_ADAPTER, ReviewRevisionReserve
 from .threadkeys import route_thread_key_matches
 from .wirebody import stored_turn_matches
 from .workspace_policy import repository_is_allowed
@@ -73,17 +80,17 @@ class ReviewContext:
     @property
     def truth(self) -> BoundReviewLineage:
         assert self.lineage.pr_number is not None and self.lineage.head_sha is not None
-        assert self.lineage.github_repository_id is not None
-        assert self.lineage.github_installation_id is not None
-        assert self.lineage.github_pr_node_id is not None and self.lineage.base_ref is not None
+        assert self.lineage.repository_project_id is not None
+        assert self.lineage.code_host_installation_id is not None
+        assert self.lineage.code_host_pr_id is not None and self.lineage.base_ref is not None
         return BoundReviewLineage(
             self.lineage.repo_full_name,
             self.lineage.pr_number,
             self.lineage.branch,
             self.lineage.head_sha,
-            self.lineage.github_repository_id,
-            self.lineage.github_installation_id,
-            self.lineage.github_pr_node_id,
+            int(self.lineage.repository_project_id),
+            self.lineage.code_host_installation_id,
+            self.lineage.code_host_pr_id,
             self.lineage.base_ref,
         )
 
@@ -98,7 +105,9 @@ async def review_context(
         await session.scalars(
             select(ThreadPublicationLineage)
             .where(
-                ThreadPublicationLineage.github_repository_id == feedback.repository_id,
+                ThreadPublicationLineage.code_host_kind == GITHUB,
+                ThreadPublicationLineage.code_host_host == github_host(settings),
+                ThreadPublicationLineage.repository_project_id == str(feedback.repository_id),
                 ThreadPublicationLineage.pr_number == feedback.pr_number,
                 ThreadPublicationLineage.status == "open",
             )
@@ -112,8 +121,8 @@ async def review_context(
     lineage = candidates[0]
     if (
         lineage.head_sha is None
-        or lineage.github_installation_id != feedback.installation_id
-        or lineage.github_pr_node_id is None
+        or lineage.code_host_installation_id != feedback.installation_id
+        or lineage.code_host_pr_id is None
         or lineage.base_ref is None
         or lineage.binding_id is None
         or lineage.binding_generation is None
@@ -172,7 +181,7 @@ async def _identity_pending(session: AsyncSession, feedback: UnverifiedFeedback)
         select(ThreadPublicationLineage.id)
         .where(
             ThreadPublicationLineage.status == "open",
-            ThreadPublicationLineage.github_repository_id.is_(None),
+            ThreadPublicationLineage.repository_project_id.is_(None),
             ThreadPublicationLineage.pr_number.is_(None),
             ThreadPublicationLineage.binding_id.is_not(None),
             func.lower(ThreadPublicationLineage.repo_full_name)
@@ -278,7 +287,14 @@ async def admit_feedback(
     if existing is not None:
         return existing, False
     context = await review_context(session, feedback, settings)
-    await verify_feedback_truth(feedback, context.truth, settings=settings, client=client)
+    await verify_feedback_truth(
+        feedback,
+        context.truth,
+        settings=settings,
+        client=client,
+        credentials=credentials_for(settings),
+        api_url=settings.github_api_url,
+    )
     turn = review_turn(feedback, context)
     inserted = await session.execute(
         insert(GitHubReviewFeedback)
@@ -327,7 +343,7 @@ async def validate_stored_context(
 # Held feedback lives in Valkey, not SQL, so the stable train needs no
 # migration (#2962). Losing Valkey loses held reviews, which degrades to the
 # pre-#2962 behavior: that review is never admitted and must be re-posted.
-_HELD_INDEX = "curie:github-review:held"
+_HELD_INDEX = GITHUB_REVIEW_HELD_INDEX
 
 
 def _held_key(event_id: str) -> str:
@@ -597,7 +613,7 @@ class GitHubReviewReconciler:
                             if not await take_backlog_slot(
                                 self._valkey,
                                 reservation=backlog_reservation(
-                                    key_prefix=f"curie:github-review:backlog:{row.binding_id}",
+                                    key_prefix=f"{GITHUB_REVIEW_KEY_PREFIX}:backlog:{row.binding_id}",
                                     window_s=self._settings.channel_binding_backlog_window_s,
                                 ),
                                 limit=self._settings.channel_binding_backlog_limit,
@@ -621,7 +637,7 @@ class GitHubReviewReconciler:
                             inject_trace_context(carrier)
                             _, receipt = await enqueue_owned(
                                 self._valkey,
-                                key=f"curie:github-review:{row.event_id}",
+                                key=f"{GITHUB_REVIEW_KEY_PREFIX}:{row.event_id}",
                                 stream=self._settings.runs_stream,
                                 # Lua preserves its preceding SET if XADD fails.
                                 # Reuse this row's owner so a retry can finish that
@@ -639,7 +655,7 @@ class GitHubReviewReconciler:
                             )
                     if "-" not in receipt or not all(p.isdigit() for p in receipt.split("-")):
                         raise RuntimeError("enqueue receipt unavailable")
-                except Exception:
+                except Exception:  # noqa: BLE001 - existing broad catch retained
                     row.error_code = "enqueue_unavailable"
                     row.next_attempt_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(
                         seconds=min(300, 5 * 2 ** (row.enqueue_attempts - 1))
@@ -713,7 +729,7 @@ class GitHubReviewReconciler:
                                     continue
                                 consumed = True
                             else:
-                                await crud.cancel_review_revision(
+                                await crud_lineages.cancel_review_revision(
                                     session, reservation.id, origin_key=row.event_id,
                                     expected_version=reservation.version,
                                 )
@@ -741,7 +757,7 @@ class GitHubReviewReconciler:
                 # The worker retains this marker without expiry until SQL has
                 # committed the failure, so a slow observer cannot lose it.
                 await self._valkey.expire(
-                    f"{self._settings.worker_key_prefix}:done:{candidate}",
+                    done_key(self._settings.worker_key_prefix, candidate),
                     _WORKER_DONE_RETENTION_S,
                 )
         await self._retry_history_capacity_notices(event_id)
@@ -773,7 +789,7 @@ class GitHubReviewReconciler:
                 (candidates[-1][1], candidates[-1][0]) if len(candidates) == 100 else None
             )
         for candidate, _created_at, error_code in candidates:
-            key = f"{self._settings.worker_key_prefix}:done:{candidate}"
+            key = done_key(self._settings.worker_key_prefix, candidate)
             async with self._valkey.pipeline(transaction=False) as pipe:
                 pipe.get(key)
                 pipe.ttl(key)
@@ -803,7 +819,11 @@ class GitHubReviewReconciler:
         if row.lineage_id is None:
             return False
         lineage = await session.get(ThreadPublicationLineage, row.lineage_id)
-        if lineage is None or lineage.pr_number is None or lineage.github_installation_id is None:
+        if (
+            lineage is None
+            or lineage.pr_number is None
+            or lineage.code_host_installation_id is None
+        ):
             return False
         try:
             feedback = feedback_from_row(row)
@@ -812,15 +832,16 @@ class GitHubReviewReconciler:
         if (
             feedback.repo_full_name.casefold() != lineage.repo_full_name.casefold()
             or feedback.pr_number != lineage.pr_number
-            or feedback.repository_id != lineage.github_repository_id
-            or feedback.installation_id != lineage.github_installation_id
+            or lineage.code_host_kind != GITHUB
+            or str(feedback.repository_id) != lineage.repository_project_id
+            or feedback.installation_id != lineage.code_host_installation_id
         ):
             return False
         try:
             token = await run_in_threadpool(
                 credentials_for(self._settings).token_for_verified_installation,
                 lineage.repo_full_name,
-                lineage.github_installation_id,
+                lineage.code_host_installation_id,
             )
         except (GitHubAppError, GitHubInstallationRefused, ValueError):
             return False
@@ -832,7 +853,7 @@ class GitHubReviewReconciler:
         headers = github_headers(token)
         assert row.notice_marker is not None
         marker = f"<!-- curie-review-history-capacity:{row.notice_marker} -->"
-        scan = await _find_marker(
+        scan = await find_marker(
             self._client, api, comments_path, headers, marker,
             start_page=row.notice_scan_page,
         )
@@ -884,7 +905,7 @@ class GitHubReviewReconciler:
                 await self.reconcile_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 logger.warning("GitHub feedback outbox pass failed; durable rows retained")
             await asyncio.sleep(self._settings.github_review_reconciler_interval_s)
 
@@ -911,7 +932,14 @@ async def verify_queued_feedback(
     deployment = await session.get(Deployment, deployment_id)
     if deployment is None or deployment.agent_id != row.agent_id or deployment.status != "active":
         raise FeedbackIgnored("deployment_no_longer_authorized")
-    head = await verify_feedback_truth(feedback, context.truth, settings=settings, client=client)
+    head = await verify_feedback_truth(
+        feedback,
+        context.truth,
+        settings=settings,
+        client=client,
+        credentials=credentials_for(settings),
+        api_url=settings.github_api_url,
+    )
     if row.reservation_id is not None:
         reservation = await session.get(PublicationReviewReservation, row.reservation_id)
         if (
@@ -977,11 +1005,13 @@ async def reserve_queued_feedback(
         context.truth,
         settings=settings,
         client=client,
+        credentials=credentials_for(settings),
+        api_url=settings.github_api_url,
     )
     if verified_head != expected_head_sha:
         raise FeedbackIgnored("stale_feedback_head")
     try:
-        reservation, locked_lineage, _ = await crud.reserve_review_revision(
+        reservation, locked_lineage, _ = await crud_lineages.reserve_review_revision(
             session,
             ReviewRevisionReserve(
                 repository_id=context.truth.repository_id,
@@ -990,7 +1020,7 @@ async def reserve_queued_feedback(
                 origin_key=row.event_id,
             ),
         )
-    except crud.PublicationLineageConflict:
+    except crud_errors.PublicationLineageConflict:
         raise FeedbackIgnored("feedback_revision_conflict") from None
     # reserve_review_revision refreshes and locks the lineage and its captured
     # binding. Compare the provider result and caller snapshot again only after

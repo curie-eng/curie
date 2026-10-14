@@ -86,6 +86,11 @@ class HookRunState:
     name: str
     slot_utc: datetime
     outcome: str | None
+    # The row's own clock: a sweep checkpoint stated before it is not this
+    # run's (ADR-0160, #2878).
+    started_at: datetime
+    # The agent version the run fired from, whose bundle names the trigger zone.
+    version_id: uuid.UUID | None
 
 
 @dataclass(frozen=True)
@@ -175,7 +180,8 @@ class HookRunRecorder:
                 row = (
                     await connection.execute(
                         text(
-                            f"SELECT outcome FROM {self._schema}.hook_runs "
+                            "SELECT outcome, started_at, version_id "
+                            f"FROM {self._schema}.hook_runs "
                             "WHERE agent_id = :agent_id "
                             "AND name = :name AND slot_utc = :slot_utc"
                         ),
@@ -198,6 +204,8 @@ class HookRunRecorder:
             name=key.name,
             slot_utc=key.slot_utc,
             outcome=row.outcome,
+            started_at=row.started_at,
+            version_id=row.version_id,
         )
 
     async def renew(self, ref: HookRunRef, lease_s: float) -> bool:
@@ -238,8 +246,10 @@ class HookRunRecorder:
         ref: HookRunRef,
         outcome: HookRunOutcome,
         reason: HookRunReason | None = None,
-    ) -> None:
+    ) -> bool:
         """Set one open run terminally without overwriting an earlier outcome.
+
+        Returns True only when this call closes the row.
 
         ``ran`` stores no reason. Every other outcome requires one.
         """
@@ -313,3 +323,4 @@ class HookRunRecorder:
                 )
             except Exception:
                 logger.exception("hook run metric emission failed after outcome commit")
+        return closed

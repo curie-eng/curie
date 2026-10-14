@@ -14,10 +14,11 @@ import logging
 import uuid
 from typing import Annotated, Any
 
+from curie_internal import sandbox_token
+from curie_internal.keyspace import inbox_key, inbox_pending_key, progress_key, rate_key
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
-from .. import sandbox_token
 from ..config import get_settings
 from ..turn_progress import (
     TURN_PROGRESS_PATH,
@@ -25,10 +26,6 @@ from ..turn_progress import (
     TurnProgressBody,
     append_to_inbox,
     inbox_fields,
-    inbox_key,
-    inbox_pending_key,
-    progress_key,
-    rate_key,
     take_rate_token,
 )
 

@@ -17,12 +17,10 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable
 
+from curie_internal.keyspace import KILL_CHANNEL, kill_key
 from redis.asyncio import Redis
 
 logger = logging.getLogger(__name__)
-
-KILL_CHANNEL = "curie:kill-events"
-KILL_KEY_PREFIX = "curie:kill:"
 
 # How long one kill event's dispatch to ``on_kill`` gets before the read loop
 # gives up on it and moves on to the next pubsub message (#742). ``on_kill`` is
@@ -33,10 +31,6 @@ KILL_KEY_PREFIX = "curie:kill:"
 # behind it, which is exactly the failure the surrounding try/except was
 # guarding against without actually preventing.
 _ON_KILL_TIMEOUT_S = 15.0
-
-
-def kill_key(agent_id: uuid.UUID) -> str:
-    return f"{KILL_KEY_PREFIX}{agent_id}"
 
 
 class KillSwitch:

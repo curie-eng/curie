@@ -1,0 +1,30 @@
+{
+  "name": "github-activity",
+  "version": "0.1.0",
+  "description": "Read-only GitHub activity reporter for program managers. One hosted connector reads merged pull requests, opened and closed issues, and milestone movement across several repositories since a point in time. It holds no write tool, the tool policy allows only the read tool so anything else fails closed, and the credential is read only.",
+  "license": "Apache-2.0",
+  "author": {
+    "name": "CurieTech"
+  },
+  "keywords": [
+    "example",
+    "github",
+    "read-only",
+    "activity",
+    "pull-requests",
+    "issues",
+    "milestones",
+    "program-management"
+  ],
+  "starterPrompts": [
+    "What merged across our repositories since Monday?",
+    "Which issues were opened or closed this week, by repository?",
+    "What moved between milestones since the last release?"
+  ],
+  "toolPolicy": {
+    "enforcement": "curie/mcp-tool-policy@1",
+    "allow": [
+      "github/repository_activity"
+    ]
+  }
+}

@@ -20,6 +20,7 @@ _EXACT_NPM_VERSION = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za
 _NPM_PACKAGE = re.compile(r"(?:@[0-9A-Za-z._-]+/)?[0-9A-Za-z._-]+")
 _PIP_EXECUTABLE = re.compile(r"pip(?:\d+(?:\.\d+)?)?$")
 _NPM_INSTALL_ALIASES = {"install", "i", "add"}
+_HASH = " --hash=sha256:" + "1" * 64
 _SYNTHETIC_RECURSIVE_LOCK = """\
 version = 1
 revision = 3
@@ -29,6 +30,8 @@ requires-python = ">=3.13"
 name = "registry-second-level"
 version = "3.0.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pkg.tar.gz", hash = "sha256:\
+1111111111111111111111111111111111111111111111111111111111111111" }
 dependencies = [
     { name = "registry-root" },
 ]
@@ -46,6 +49,8 @@ dependencies = [
 name = "registry-middle"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pkg.tar.gz", hash = "sha256:\
+1111111111111111111111111111111111111111111111111111111111111111" }
 dependencies = [
     { name = "registry-second-level" },
 ]
@@ -62,6 +67,8 @@ dependencies = [
 name = "registry-root"
 version = "1.0.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pkg.tar.gz", hash = "sha256:\
+1111111111111111111111111111111111111111111111111111111111111111" }
 dependencies = [
     { name = "registry-middle" },
 ]
@@ -372,9 +379,9 @@ def _dockerfile_with_python_pins(pins: dict[str, str]) -> str:
 
 def test_dependency_exporter_emits_sorted_complete_registry_closure() -> None:
     assert _export_runner_dependencies(_SYNTHETIC_RECURSIVE_LOCK) == [
-        "registry-middle==2.0.0",
-        "registry-root==1.0.0",
-        "registry-second-level==3.0.0",
+        f"registry-middle==2.0.0{_HASH}",
+        f"registry-root==1.0.0{_HASH}",
+        f"registry-second-level==3.0.0{_HASH}",
     ]
 
 
@@ -404,11 +411,15 @@ dependencies = [
 name = "always"
 version = "1.0.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pkg.tar.gz", hash = "sha256:\
+1111111111111111111111111111111111111111111111111111111111111111" }
 
 [[package]]
 name = "windows-only"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pkg.tar.gz", hash = "sha256:\
+1111111111111111111111111111111111111111111111111111111111111111" }
 dependencies = [
     { name = "windows-child" },
 ]
@@ -417,11 +428,13 @@ dependencies = [
 name = "windows-child"
 version = "3.0.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pkg.tar.gz", hash = "sha256:\
+1111111111111111111111111111111111111111111111111111111111111111" }
 """,
             [
-                "always==1.0.0",
-                "windows-child==3.0.0 ; sys_platform == 'win32'",
-                "windows-only==2.0.0 ; sys_platform == 'win32'",
+                f"always==1.0.0{_HASH}",
+                f"windows-child==3.0.0 ; sys_platform == 'win32'{_HASH}",
+                f"windows-only==2.0.0 ; sys_platform == 'win32'{_HASH}",
             ],
             id="markers-propagate-through-transitives",
         ),
@@ -440,6 +453,8 @@ source = { registry = "https://pypi.org/simple" }
 name = "windows-only"
 version = "1.0.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pkg.tar.gz", hash = "sha256:\
+1111111111111111111111111111111111111111111111111111111111111111" }
 dependencies = [
     { name = "shared" },
 ]
@@ -448,6 +463,8 @@ dependencies = [
 name = "everywhere"
 version = "1.0.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pkg.tar.gz", hash = "sha256:\
+1111111111111111111111111111111111111111111111111111111111111111" }
 dependencies = [
     { name = "shared" },
 ]
@@ -456,11 +473,13 @@ dependencies = [
 name = "shared"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pkg.tar.gz", hash = "sha256:\
+1111111111111111111111111111111111111111111111111111111111111111" }
 """,
             [
-                "everywhere==1.0.0",
-                "shared==2.0.0",
-                "windows-only==1.0.0 ; sys_platform == 'win32'",
+                f"everywhere==1.0.0{_HASH}",
+                f"shared==2.0.0{_HASH}",
+                f"windows-only==1.0.0 ; sys_platform == 'win32'{_HASH}",
             ],
             id="shared-transitive-pins-unconditionally",
         ),
@@ -473,6 +492,8 @@ source = { registry = "https://pypi.org/simple" }
 name = "provider"
 version = "1.0.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pkg.tar.gz", hash = "sha256:\
+1111111111111111111111111111111111111111111111111111111111111111" }
 
 [package.optional-dependencies]
 crypto = [
@@ -483,6 +504,8 @@ crypto = [
 name = "extra-child"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pkg.tar.gz", hash = "sha256:\
+1111111111111111111111111111111111111111111111111111111111111111" }
 dependencies = [
     { name = "extra-leaf" },
 ]
@@ -491,12 +514,14 @@ dependencies = [
 name = "extra-leaf"
 version = "3.0.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pkg.tar.gz", hash = "sha256:\
+1111111111111111111111111111111111111111111111111111111111111111" }
 optional-dependencies = "unused malformed table"
 """,
             [
-                "extra-child==2.0.0",
-                "extra-leaf==3.0.0",
-                "provider==1.0.0",
+                f"extra-child==2.0.0{_HASH}",
+                f"extra-leaf==3.0.0{_HASH}",
+                f"provider==1.0.0{_HASH}",
             ],
             id="selected-extra-closure",
         ),
@@ -514,6 +539,8 @@ def test_dependency_exporter_rejects_a_missing_referenced_transitive() -> None:
 name = "registry-second-level"
 version = "3.0.0"
 source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://example.invalid/pkg.tar.gz", hash = "sha256:\
+1111111111111111111111111111111111111111111111111111111111111111" }
 dependencies = [
     { name = "registry-root" },
 ]
@@ -537,8 +564,10 @@ def test_dependency_exporter_reflects_a_lock_version_bump() -> None:
 
     pins = _export_runner_dependencies(bumped_lock)
 
-    assert "claude-agent-sdk==" + replacement in pins
-    assert f"claude-agent-sdk=={expected['claude-agent-sdk']}" not in pins
+    assert any(pin.startswith(f"claude-agent-sdk=={replacement} ") for pin in pins)
+    assert not any(
+        pin.startswith(f"claude-agent-sdk=={expected['claude-agent-sdk']} ") for pin in pins
+    )
 
 
 @pytest.mark.parametrize(
@@ -570,6 +599,8 @@ dependencies = [
 name = "conditional"
 version = "1.0.0"
 source = {{ registry = "https://pypi.org/simple" }}
+sdist = {{ url = "https://example.invalid/pkg.tar.gz", hash = "sha256:\
+1111111111111111111111111111111111111111111111111111111111111111" }}
 """
 
     result = _run_dependency_exporter(lock_text)

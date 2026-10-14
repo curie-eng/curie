@@ -159,7 +159,7 @@ def stack(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_artifac
     environment:
       API_KEY: {api_key}
       GITHUB_REVIEW_INGRESS_ENABLED: "false"
-      GITHUB_FACTORY_INGRESS_ENABLED: "false"
+      FACTORY_ENABLED: "false"
       GITHUB_APP_ID: ""
       GITHUB_APP_PRIVATE_KEY: ""
       SLACK_BOT_TOKEN: ""

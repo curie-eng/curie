@@ -100,6 +100,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_ATTACHMENT_MAX_FILE_BYTES",
         "CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS",
         "CURIE_ATTACHMENT_RETENTION_TTL_SECONDS",
+        # ADR 0205 decision 7 (#4079): the per-thread budget every boot's
+        # rebuild is bounded by, and the worker's own prepare timeout.
+        "CURIE_ATTACHMENT_THREAD_MAX_FILES",
+        "CURIE_ATTACHMENT_THREAD_MAX_BYTES",
+        "CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS",
         "CURIE_BOOTING_TEXT",
         # Read by the worker capacity wait store, which bounds how long a
         # queued chat turn may wait. It is never sent to a sandbox.
@@ -202,8 +207,6 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_PUBLICATION_RECONCILE_MAX_ATTEMPTS",
         "CURIE_PUBLICATION_JOB_ACTIVE_DEADLINE_SECONDS",
         "CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS",
-        "CURIE_PUBLICATION_GITHUB_API_URL",
-        "CURIE_PUBLICATION_GITHUB_CA_FILE",
         "CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS",
         "CURIE_PUBLICATION_LEASE_SECONDS",
         "CURIE_PUBLICATION_IMAGE_PULL_POLICY",
@@ -215,6 +218,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_PUBLICATION_OWNER_NAME",
         "CURIE_PUBLICATION_GIT_USER_NAME",
         "CURIE_PUBLICATION_GIT_USER_EMAIL",
+        # The worker's mounted code host CA bundle (chart codeHostTrust, ADR
+        # 0197), copied into each publication Job's own ConfigMap. Worker
+        # config, not a boot key.
+        "CURIE_CODE_HOST_CA_BUNDLE",
         "CURIE_PUBLICATION_CPU_REQUEST",
         "CURIE_PUBLICATION_CPU_LIMIT",
         "CURIE_PUBLICATION_MEMORY_REQUEST",
@@ -282,6 +289,36 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # match the pod selector the connector NetworkPolicy uses.
         "CURIE_CONNECTOR_RECONCILE",
         "CURIE_CONNECTOR_RECONCILE_INTERVAL_S",
+        # The runner's executor mode switch (ACTION-EXECUTOR-5/25, #4067): set by
+        # the worker only on an executor sandbox claim and read by the runner's
+        # _serve before harness resolution. Runner-private by design, so it is
+        # deliberately not a BootEnv key (BootEnv is a frozen contract).
+        "CURIE_RUNNER_MODE",
+        # The connector action executor switch (ACTION-EXECUTOR, #4067): read by
+        # the API settings and by WorkerConfig at worker startup to decide
+        # whether executions are claimed and dispatched. Never a sandbox boot key.
+        "CURIE_ACTION_EXECUTOR_ENABLED",
+        # The automated remediation switch (AUTOMATED-REMEDIATION-1): read by the
+        # API settings and by WorkerConfig at startup. Never a sandbox boot key.
+        "CURIE_REMEDIATION_ENABLED",
+        # The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+        # executor amendment E9): read by the API settings and by WorkerConfig
+        # at startup. Never a sandbox boot key.
+        "CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES",
+        # End to end namespace reaper (#3245), read by the worker process only.
+        # The test cluster kubeconfig is not among them: the reaper reads it
+        # from the connector Secret at sweep time.
+        "CURIE_E2E_CONNECTOR_ENABLED",
+        "CURIE_E2E_NAMESPACE_PREFIX",
+        "CURIE_E2E_OWNER_LABEL_KEY",
+        "CURIE_E2E_OWNER_LABEL_VALUE",
+        "CURIE_E2E_REAPER_INTERVAL_S",
+        # Registry retention for the image build tool (#3246), read by the
+        # worker process only. The push credential is not among them: the
+        # reaper reads it from the connector Secret at sweep time.
+        "CURIE_E2E_REGISTRY",
+        "CURIE_E2E_REGISTRY_INSECURE",
+        "CURIE_E2E_REGISTRY_TOKEN_HOSTS",
         # Cron scheduler tick (#268), read by the worker process only.
         "CURIE_CRON_TICK_INTERVAL_S",
         # Cron hook run claim lease (#2931), read by the worker process only.
@@ -300,6 +337,8 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_AGENT_SANDBOX_POOLS",
         # Agents whose per-agent pool carries connector secrets (#2943), substrate only.
         "CURIE_AGENT_CONNECTOR_SECRET_POOLS",
+        # Repository runner pools (ADR 0216): run.py parses it for the substrate only.
+        "CURIE_REPO_RUNNER_POOLS",
         # The runner-facing API base (#678): WorkerConfig reads it from the
         # WORKER's env to MINT CURIE_MEMORY_REF/CURIE_HISTORY_REF (which ARE
         # declared boot keys, rendered from the declaration). It is a worker-side
@@ -362,13 +401,6 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # runner-local false-completion knob; read by the runner from its own env,
         # not a boot contract key.
         "CURIE_FALSE_COMPLETION_CHECK",
-        # Install-owned GitHub origin policy from the operator's api.githubApiUrl,
-        # read by workspace-init and runner workspace_snapshot.py. Docker's
-        # worker emits the same policy from WorkerConfig. It carries no ACI
-        # session payload and is not a frozen BootEnv field. The chart reserves
-        # it against agent extraEnv; Docker's _WORKER_OWNED_ENV drops claim
-        # overrides. Kubernetes claims use the closed BootEnv-rendered set.
-        "CURIE_GITHUB_API_URL",
         # ADR 0130 deliberately keeps ACI frozen. This direct worker-to-runner
         # sandbox boot fact is instead frozen across both declaration sites by
         # tests/vectors/turn-progress-capability.json.

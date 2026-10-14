@@ -140,8 +140,23 @@ pub struct EvalCase {
     /// suite that never wrote the field).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shared_history: bool,
+    /// Optional platform sender for this case (#3818). Omitted suites keep
+    /// decoding: absent means `None`, and serialization skips `None` so a
+    /// scaffolded case stays byte-identical to one that never wrote the field.
+    /// A set value is the turn author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
     #[serde(default)]
     pub expect_status: ExpectedStatus,
+}
+
+/// The turn author for one eval case. A missing or empty sender keeps the
+/// driver's default, so an empty string does not become an unknown person.
+pub fn eval_author<'a>(sender: &'a Option<String>, default: &'a str) -> &'a str {
+    match sender.as_deref() {
+        Some(value) if !value.is_empty() => value,
+        _ => default,
+    }
 }
 
 /// A named set of eval cases run together against one plugin version.
@@ -785,6 +800,7 @@ mod tests {
             input: "hi".into(),
             grader: g,
             shared_history: false,
+            sender: None,
             expect_status,
         }
     }
@@ -825,6 +841,32 @@ mod tests {
         let path = dir.path().join("cases.json");
         std::fs::write(&path, body).unwrap();
         (dir, path)
+    }
+
+    #[test]
+    fn an_empty_sender_keeps_the_driver_default() {
+        assert_eq!(eval_author(&None, "U-eval"), "U-eval");
+        assert_eq!(eval_author(&Some(String::new()), "U-eval"), "U-eval");
+        assert_eq!(
+            eval_author(&Some("eval-sender-acme".into()), "U-eval"),
+            "eval-sender-acme"
+        );
+        assert_eq!(eval_author(&Some(String::new()), "U123"), "U123");
+    }
+
+    #[test]
+    fn sender_loads_when_present_and_defaults_to_none() {
+        let with_sender = write(
+            r#"{"name":"s","cases":[{"id":"a","input":"b","sender":"eval-sender-acme","grader":{"kind":"contains","expected":"x"}}]}"#,
+        );
+        let suite = load_suite(&with_sender.1).unwrap();
+        assert_eq!(suite.cases[0].sender.as_deref(), Some("eval-sender-acme"));
+
+        let without_sender = write(
+            r#"{"name":"s","cases":[{"id":"a","input":"b","grader":{"kind":"contains","expected":"x"}}]}"#,
+        );
+        let suite = load_suite(&without_sender.1).unwrap();
+        assert_eq!(suite.cases[0].sender, None);
     }
 
     #[test]
@@ -1229,6 +1271,7 @@ mod tests {
                     input: "hi".into(),
                     grader: grader(GraderKind::Contains, "hi", false),
                     shared_history: false,
+                    sender: None,
                     expect_status: ExpectedStatus::Done,
                 })
                 .collect(),

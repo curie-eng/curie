@@ -151,6 +151,25 @@ APPROVAL_MARKER = "[fake:request-approval]"
 _APPROVAL_MARKER_RE = re.compile(r"\[fake:request-approval(?::([A-Za-z0-9_-]+))?\]")
 
 
+def _user_message(prompt: str) -> str:
+    """The person's words inside a sender frame, or the prompt when it is bare.
+
+    The fake model judges markers in those words. The platform fence is not
+    part of the request.
+    """
+
+    start_marker = "[user-message"
+    end_marker = "[end-user-message"
+    if start_marker not in prompt or end_marker not in prompt:
+        return prompt
+    start = prompt.index("\n", prompt.index(start_marker)) + 1
+    end = prompt.index(end_marker)
+    body = prompt[start:end]
+    if body.endswith("\n"):
+        body = body[:-1]
+    return body
+
+
 def approval_turn(summary: str, route: str | None = None) -> list[Any]:
     """A turn that calls the platform approval-request tool, then ends."""
 
@@ -324,7 +343,7 @@ class FakeModelSession:
         fake-model path) reacts to the marker.
         """
 
-        last = self.queries[-1] if self.queries else ""
+        last = _user_message(self.queries[-1] if self.queries else "")
         match = _APPROVAL_MARKER_RE.search(last)
         if match:
             summary = last[match.end() :].strip() or "unspecified request"

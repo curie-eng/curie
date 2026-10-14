@@ -326,6 +326,23 @@
           ],
           "title": "Approval Resumed Kind"
         },
+        "attachments_manifest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_ATTACHMENTS_MANIFEST",
+          "producer": [
+            "kernel",
+            "substrate"
+          ],
+          "title": "Attachments Manifest"
+        },
         "base_url": {
           "anyOf": [
             {
@@ -390,6 +407,22 @@
             "worker"
           ],
           "title": "Channel Bound"
+        },
+        "channel_kind": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_CHANNEL_KIND",
+          "producer": [
+            "worker"
+          ],
+          "title": "Channel Kind"
         },
         "channel_memory_ref": {
           "anyOf": [
@@ -780,6 +813,54 @@
           ],
           "title": "Progress Url"
         },
+        "repo_ca_bundle": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_REPO_CA_BUNDLE",
+          "producer": [
+            "worker"
+          ],
+          "title": "Repo Ca Bundle"
+        },
+        "repo_origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_REPO_ORIGIN",
+          "producer": [
+            "worker"
+          ],
+          "title": "Repo Origin"
+        },
+        "repo_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_REPO_PATH",
+          "producer": [
+            "worker"
+          ],
+          "title": "Repo Path"
+        },
         "reviewer_model": {
           "anyOf": [
             {
@@ -899,6 +980,28 @@
         "max_usd_per_day"
       ],
       "title": "Budget",
+      "type": "object"
+    },
+    "ChannelReadCapability": {
+      "description": "Dedicated proxy authority for one admitted logical turn under ADR 0100.\n\nOnly the kernel may issue and send it, over authenticated event or steer\ncontrol requests to a server advertising enforcement. The configured URL\nidentifies the trusted platform proxy, not a provider endpoint. HTTP URL\nsyntax alone establishes no trust; the implementing lanes must verify the\ntrusted configuration. The provider credential remains in the platform.\n\nThe signed token binds audience ``channel.read``, agent, deployment, bundle\ngrant, logical turn, credential generation and finite expiry. Every read\nrequires a live matching turn, current binding and adapter membership, and\natomic successful page accounting. Renewal preserves the logical turn and\nits budget, revokes the old generation, and never extends channel scope.\nA steer cannot change the original inbound binding or authenticated scope.\nTerminal paths revoke and clear the capability; null on a steer clears it.\n\nTokens must stay out of environment variables, hooks, subprocesses, model\narguments, logs, telemetry, transcripts, checkpoints and persisted state.\nThis model declares the transport contract. It issues no token and supplies\nno read operation, authorization, renewal or runtime revocation behavior.",
+      "properties": {
+        "token": {
+          "minLength": 1,
+          "title": "Token",
+          "type": "string"
+        },
+        "url": {
+          "format": "uri",
+          "minLength": 1,
+          "title": "Url",
+          "type": "string"
+        }
+      },
+      "required": [
+        "token",
+        "url"
+      ],
+      "title": "ChannelReadCapability",
       "type": "object"
     },
     "ErrorEvent": {
@@ -1053,8 +1156,19 @@
       "type": "object"
     },
     "Event": {
-      "description": "An inbound event delivered into a live session (initial or follow-up).\n\n``session_id`` and ``history_ref`` carry conversation-scoped identity to a\nrunner after its sandbox is bound. Both remain optional so older producers\ncan omit them and tolerant consumers can adopt the additive wire shape.\n\n``tool_access`` asks a server to restrict what this turn may execute\n(TOOL-ACCESS-1, TOOL-ACCESS-3); null is an unrestricted turn. It is sent\nonly to a server that advertises the value under\n``TOOL_ACCESS_STATUS_FIELD`` (TOOL-ACCESS-4), because a server that does\nnot enforce it ignores it.\n\n``memory_token`` is the per-turn signed state credential the runner's\nmemory tools present for writes (MEMORY-TOKEN-1). Null means the turn\ncarries no write credential. It is never a BootEnv key or an env var, and\nit is sent only on the runner POST (``/v1/event``, ``/v1/steer``;\nMEMORY-TOKEN-2). ``repr=False`` keeps the value out of ``repr(event)`` and\nlog ``%r``; a consumer must not place it in env, logs, hook or subprocess\ninput, or persisted state (MEMORY-TOKEN-3).",
+      "description": "An inbound event delivered into a live session (initial or follow-up).\n\n``session_id`` and ``history_ref`` carry conversation-scoped identity to a\nrunner after its sandbox is bound. Both remain optional so older producers\ncan omit them and tolerant consumers can adopt the additive wire shape.\n\n``tool_access`` asks a server to restrict what this turn may execute\n(TOOL-ACCESS-1, TOOL-ACCESS-3); null is an unrestricted turn. It is sent\nonly to a server that advertises the value under\n``TOOL_ACCESS_STATUS_FIELD`` (TOOL-ACCESS-4), because a server that does\nnot enforce it ignores it.\n\n``memory_token`` is the per-turn signed state credential the runner's\nmemory tools present for writes (MEMORY-TOKEN-1). Null means the turn\ncarries no write credential. It is never a BootEnv key or an env var, and\nit is sent only on the runner POST (``/v1/event``, ``/v1/steer``;\nMEMORY-TOKEN-2). ``repr=False`` keeps the value out of ``repr(event)`` and\nlog ``%r``; a consumer must not place it in env, logs, hook or subprocess\ninput, or persisted state (MEMORY-TOKEN-3).\n\n``channel_read`` pairs a trusted platform proxy URL with a dedicated\nephemeral signed credential for one logical turn. Only the kernel sends it\non authenticated ``/v1/event`` and ``/v1/steer`` requests after the server\nadvertises actual enforcement under ``CHANNEL_READ_STATUS_FIELD``. Missing\nor null means no capability, and a steer clears any previous capability.\nIt is not a BootEnv or SessionConfig field and reuses no other credential.\nThe nested type defines the required scope and lifecycle; these models do\nnot advertise enforcement or implement that lifecycle.",
       "properties": {
+        "channel_read": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChannelReadCapability"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "history_ref": {
           "anyOf": [
             {
@@ -1924,6 +2038,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.21",
-  "title": "ACI Protocol v0.5.21"
+  "protocolVersion": "0.5.22",
+  "title": "ACI Protocol v0.5.22"
 }

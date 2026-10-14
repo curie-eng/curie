@@ -963,7 +963,8 @@ class CronSchedulerLoop:
                     ).first()
                 if failed is not None:
                     _record_fire("failed")
-            except Exception:
+            # preserve the primary dispatch fault if failure bookkeeping fails.
+            except Exception:  # noqa: BLE001
                 pass
             raise
 

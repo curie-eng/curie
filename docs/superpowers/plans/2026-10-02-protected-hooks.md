@@ -127,3 +127,10 @@ The next atomic admission foundation is decomposed in the
 It supplies the real broker transaction and bounded recovery primitive without
 HTTP wiring, periodic reconciliation or worker activation. Those remain tasks
 3/4 above; protected source publication and installation remain closed.
+
+Administrative source route exposure, writer and reader broker composition,
+reservation and ordinary tombstone publication are decomposed in the
+[route exposure plan](2026-10-06-source-admin-routes.md), derived from the
+[administrative route exposure](../specs/2026-10-02-protected-hook-source-policy.md#administrative-route-exposure)
+amendment. Protected publication and delivery wait for the LANE-4 ingress
+admission change.

@@ -13,7 +13,7 @@ from curie_worker.consumer import (
     THREAD_RESET_RESULT_PREFIX,
     THREAD_RESET_SET,
 )
-from curie_worker.kernel import _thread_key_for
+from curie_worker.kernel.routing import _thread_key_for
 
 _VECTOR = Path(__file__).resolve().parents[3] / "tests" / "vectors" / "thread-reset-set.json"
 _EXPECTED_KEYS = {

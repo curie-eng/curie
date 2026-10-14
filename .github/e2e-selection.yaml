@@ -59,6 +59,10 @@ chart_scenarios:
         - apps/worker/src/curie_worker/connector_k8s.py
         - pyproject.toml
         - uv.lock
+    runner-template-admission:
+      step: Runner template admission refuses host escapes, token mounts, and unlisted images
+      inputs:
+        - charts/curie/ci/runtime/runner-template-admission-runtime.sh
     runner-byo-egress:
       step: Runner BYO egress enforces (not just rendered)
       inputs:
@@ -167,6 +171,9 @@ rules:
     docs: []
     apps/ui: []
     apps/dispatcher: []
+    # Nothing deploys the per-run Docker daemon image yet; its own CI job
+    # (docker-daemon) builds it and runs the escape tests against it.
+    apps/docker-daemon: []
     scripts: []
     # The revision-based selector inspects ci.yaml hunks and runs the full
     # released-upgrade tier when one of its upgrade jobs changes. Other

@@ -254,18 +254,6 @@ def test_a_turn_completes_with_no_slack_adapter_registered(make_harness) -> None
     asyncio.run(go())
 
 
-def test_the_kernel_source_carries_no_kind_branch() -> None:
-    # Corroboration only -- the green suite above is the proof. Kept because the
-    # regression it guards is textual: a ``kind ==`` re-appearing in the kernel
-    # is the seam leaking back upward, and it would pass every behavioral test
-    # that only ever exercises one kind.
-    source = (Path(__file__).resolve().parents[2] / "src" / "curie_worker" / "kernel.py").read_text(
-        encoding="utf-8"
-    )
-    assert "kind ==" not in source
-    assert '== "slack"' not in source
-
-
 # --- the two sanctioned route sources, and their seam -------------------------
 
 

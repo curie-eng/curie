@@ -8,8 +8,9 @@ import json
 import time
 from uuid import UUID
 
+from curie_internal.sandbox_token import signature
+
 from . import hook_signing
-from .sandbox_token import _signature
 
 
 def derive(api_key: str, *, agent_id: str, hook: str, generation: int) -> str:
@@ -19,7 +20,7 @@ def derive(api_key: str, *, agent_id: str, hook: str, generation: int) -> str:
         ensure_ascii=True,
         separators=(",", ":"),
     )
-    return _signature(api_key, material)
+    return signature(api_key, material)
 
 
 def sign_support(
@@ -34,7 +35,7 @@ def sign_support(
     """@spec PROTECTED-HOOK-SOURCE-9."""
     if "." in delivery_id:
         raise ValueError("a hook delivery id may not contain '.'")
-    material = b"curie.hook.support.v1\n" + hook_signing._material(
+    material = b"curie.hook.support.v1\n" + hook_signing.material(
         timestamp, delivery_id, body, hook=hook, tool_access=tool_access
     )
     digest = hmac.new(secret.encode(), material, hashlib.sha256)

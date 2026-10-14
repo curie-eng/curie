@@ -24,6 +24,32 @@ permissions:
   contents: read
 
 jobs:
+  adapter-credential-reconciliation:
+    name: SRE bot adapter credential reconciliation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Test reconciliation decisions and Kubernetes transport
+        run: uv run pytest -q examples/tests/test_adapter_credentials_sync.py examples/tests/test_adapter_credentials_transport.py
+
   action-pins:
     name: Action SHA pins
     runs-on: ubuntu-latest
@@ -122,6 +148,8 @@ jobs:
     env:
       CI_REQUIRE_VALKEY_TESTS: "1"
       CI_REQUIRE_POSTGRES_TESTS: "1"
+      CURIE_PRIMARY_SOURCE_RESOURCES: "1"
+      CURIE_SETTLEMENT_TEST_REDIS_URL: "redis://:valkeypass@127.0.0.1:26379/0"
     strategy:
       fail-fast: false
       matrix:
@@ -158,6 +186,10 @@ jobs:
           python-version: "3.13"
       - name: Sync workspace
         run: uv sync
+      - name: API private import boundaries
+        run: |
+          uv run python3 scripts/check-private-imports.py --self-test
+          uv run python3 scripts/check-private-imports.py
       # The job-level gate above already skips the shards when `changes` did
       # not select pytest. The shard still recomputes the selection itself and
       # records it, so the required job can cross-check that every shard agreed
@@ -1031,12 +1063,30 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Install pnpm
+        id: install_pnpm
+        continue-on-error: true
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 9.15.9
+      - name: Back off before retrying Install pnpm
+        if: steps.install_pnpm.outcome == 'failure'
+        run: |
+          echo "Install pnpm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install pnpm (retry)
+        if: steps.install_pnpm.outcome == 'failure'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 9.15.9
       - name: Install Node
         id: install_node
         continue-on-error: true
         uses: actions/setup-node@v7
         with:
           node-version: "22"
+          cache: pnpm
+          cache-dependency-path: tools/contract-codegen/pnpm-lock.yaml
       - name: Back off before retrying Install Node
         if: steps.install_node.outcome == 'failure'
         run: |
@@ -1047,15 +1097,19 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: "22"
+          cache: pnpm
+          cache-dependency-path: tools/contract-codegen/pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm --dir tools/contract-codegen install --frozen-lockfile
       - name: Regenerate TypeScript from the committed schema and check for drift
         run: |
-          npx --yes json-schema-to-typescript@15.0.4 \
-            packages/aci-protocol/schema/aci-protocol.schema.json \
+          pnpm --dir tools/contract-codegen exec json2ts \
+            "${{ github.workspace }}/packages/aci-protocol/schema/aci-protocol.schema.json" \
             --unreachableDefinitions \
-            -o packages/aci-protocol/generated/ts/aci-protocol.ts
+            -o "${{ github.workspace }}/packages/aci-protocol/generated/ts/aci-protocol.ts"
           git diff --exit-code -- packages/aci-protocol/generated/ts/aci-protocol.ts
       - name: tsc --noEmit on generated ACI types
-        run: npx --yes -p typescript@5.9.3 tsc --noEmit -p packages/aci-protocol/generated/ts/tsconfig.json
+        run: pnpm --dir tools/contract-codegen exec tsc --noEmit -p "${{ github.workspace }}/packages/aci-protocol/generated/ts/tsconfig.json"
       - name: Architecture atlas preview route test
         run: node --test docs/architecture-atlas/test-update-hash.mjs
 
@@ -1115,6 +1169,12 @@ jobs:
           pnpm gen:manifest
           git diff --exit-code src/generated/commandManifest.ts \
             || (echo "commandManifest.ts is stale; run 'pnpm gen:manifest' in apps/ui and commit." && exit 1)
+      - name: API types are current
+        # The committed src/api/generated.ts must match what apps/api/openapi.json
+        # generates, so a changed API response field cannot land without the UI
+        # types (and the consumers typecheck reaches through them) following it.
+        # Generation never runs inside the UI Docker build.
+        run: pnpm gen:api-types --check
       - name: Lint
         run: pnpm lint
       - name: Unit tests (vitest)
@@ -1333,7 +1393,7 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-  # The two example connectors are the only images CI does not run, and the
+  # The example connectors are the only images CI does not run, and the
   # only ones release.yaml publishes for a second architecture. They are
   # validated here, build only, for both architectures: validating only amd64
   # leaves an arm64-only Dockerfile failure to appear for the first time during
@@ -1356,6 +1416,10 @@ jobs:
           - name: sre-bot-self-upgrade
             context: examples/sre-bot/connectors/self-upgrade
             dockerfile: examples/sre-bot/connectors/self-upgrade/Dockerfile
+            platforms: linux/amd64,linux/arm64
+          - name: github-activity-github
+            context: examples/github-activity/connectors/github
+            dockerfile: examples/github-activity/connectors/github/Dockerfile
             platforms: linux/amd64,linux/arm64
     steps:
       - uses: actions/checkout@v7
@@ -1410,6 +1474,114 @@ jobs:
           # writing a single layer into the shared namespace.
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  # The per-run Docker daemon image (ADR 0217 decision 4): the curie-authz
+  # plugin crate's fmt, clippy and tests, a build for both release arches (the
+  # Dockerfile cross compiles on the build platform, so no QEMU), and the
+  # black-box escape test against the amd64 image. Self-gated rather than wired
+  # into `changes`: on a pull request it runs only when apps/docker-daemon or
+  # this workflow changed; pushes and dispatches always run it.
+  docker-daemon:
+    name: Docker daemon image (authz plugin + escape test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/docker-daemon
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scope
+        id: scope
+        working-directory: ${{ github.workspace }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT_NAME" != pull_request ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags origin "$BASE_REF"
+          if git diff --quiet "origin/${BASE_REF}...HEAD" -- apps/docker-daemon .github/workflows/ci.yaml; then
+            echo "No change under apps/docker-daemon or ci.yaml; skipping"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Toolchain
+        if: steps.scope.outputs.run == 'true'
+        run: rustup component add rustfmt clippy
+      - name: Cargo cache
+        if: steps.scope.outputs.run == 'true'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: apps/docker-daemon
+      - name: Fmt
+        if: steps.scope.outputs.run == 'true'
+        run: cargo fmt --check
+      - name: Clippy
+        if: steps.scope.outputs.run == 'true'
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        if: steps.scope.outputs.run == 'true'
+        run: cargo test --locked
+      - name: Entrypoint test
+        if: steps.scope.outputs.run == 'true'
+        working-directory: ${{ github.workspace }}
+        run: bash apps/docker-daemon/tests/entrypoint_test.sh
+      - name: Pull Docker Hub images through the mirror
+        if: steps.scope.outputs.run == 'true'
+        working-directory: ${{ github.workspace }}
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
+      - name: Set up Buildx
+        id: set_up_buildx
+        if: steps.scope.outputs.run == 'true'
+        continue-on-error: true
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - name: Back off before retrying Set up Buildx
+        if: steps.set_up_buildx.outcome == 'failure'
+        run: |
+          echo "Set up Buildx failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Set up Buildx (retry)
+        if: steps.set_up_buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - name: Build both release arches (no push)
+        if: steps.scope.outputs.run == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: apps/docker-daemon
+          file: apps/docker-daemon/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          load: false
+          cache-from: type=gha,scope=docker-daemon
+          cache-to: type=gha,mode=max,scope=docker-daemon
+      - name: Build the amd64 candidate
+        if: steps.scope.outputs.run == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: apps/docker-daemon
+          file: apps/docker-daemon/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: curie-ci/docker-daemon:candidate
+          cache-from: type=gha,scope=docker-daemon
+      - name: Escape test against the candidate
+        if: steps.scope.outputs.run == 'true'
+        working-directory: ${{ github.workspace }}
+        run: bash apps/docker-daemon/tests/e2e.sh curie-ci/docker-daemon:candidate --registry-mirror=https://mirror.gcr.io
   # only the package's DECLARED dependencies. aci-protocol is a uv workspace
   # member imported by handlers.py/queue.py; if it is not declared in
   # apps/dispatcher/pyproject.toml it stays importable from a source checkout
@@ -2055,6 +2227,48 @@ jobs:
           CURIE_BASE_TAG: ci-local
           CURIE_E2E_TIERS: ${{ needs.changes.outputs.skill_local_tiers }}
         run: bash cli/scripts/e2e-ladder.sh
+
+  # OIDC console login against a real Dex IdP (#2908, #3800). Runs whenever the
+  # local tier is selected: the API, the console UI proxy and compose wiring it
+  # drives are the local tier's surfaces. Its own runner, so it runs in parallel
+  # with the ladder. `curie dev oidc-e2e` runs the same driver locally.
+  e2e-oidc:
+    name: E2E OIDC console login (real Dex)
+    runs-on: ubuntu-latest
+    needs: [rust-build, changes, ci-images]
+    if: ${{ needs.changes.outputs.local == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Download the curie binary built by the Rust job
+        uses: actions/download-artifact@v8
+        with:
+          name: curie-x86_64-linux-${{ github.sha }}
+          path: cli/target/release
+      - name: Make the binary executable
+        run: chmod +x cli/target/release/curie
+      - name: Load the images built by the ci-images job
+        uses: ./.github/actions/load-ci-images
+        with:
+          images: "{api,ui}"
+      - name: Tag the candidate API and console UI for the driver
+        run: |
+          set -euo pipefail
+          docker tag curie-ci/api:candidate ghcr.io/curie-eng/curie-api:oidc-e2e
+          docker tag curie-ci/ui:candidate ghcr.io/curie-eng/curie-ui:oidc-e2e
+      - name: OIDC end to end (real Dex, isolated compose project)
+        env:
+          CURIE_BIN: cli/target/release/curie
+          CURIE_OIDC_E2E_IMAGE_TAG: oidc-e2e
+        run: bash cli/scripts/oidc-e2e.sh --evidence "$RUNNER_TEMP/oidc-e2e-evidence.json"
+      - name: Upload the OIDC evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: oidc-e2e-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/oidc-e2e-evidence.json
+          if-no-files-found: warn
 
   # LOCAL-RELEASE RUNG -- split into its own job (issue #695 follow-up) so it
   # runs in PARALLEL with the skill+local rung above instead of appended after
@@ -2807,6 +3021,20 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/runner-resources-assertions.sh
+      # Runner template admission (#3842). The worker's template and Secret
+      # writes are refused unless they keep the chart's shape: each denial must
+      # carry the policy's own message, and the same hostPath template from the
+      # cluster admin is admitted. Needs a real API server of 1.30 or newer.
+      # Every object is named from RUN_ID and verified gone on exit.
+      - name: Runner template admission refuses host escapes, token mounts, and unlisted images
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-template-admission') }}
+        env:
+          CURIE_ADMISSION_CONTEXT: kind-curie-e2e
+          RUN_ID: ${{ github.run_id }}${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/runner-template-admission-runtime.sh
       - name: Load the Postgres readiness fixture into the kind cluster
         run: kind load docker-image "curie-postgres-readiness:${GITHUB_SHA}" --name curie-e2e
       - name: Langfuse web waits for delayed Postgres without restarting
@@ -2858,6 +3086,9 @@ jobs:
       # undeclared control is blocked. Same non-vacuity gate as the mail
       # adapter check: a non-enforcing CNI FAILS, it does not skip. Own
       # namespace, so it neither reads nor disturbs the release above.
+      # It also holds a runner-labelled pod to the rendered policies for
+      # allowedEgress 0.0.0.0/0 and requires a private-range pod peer it reached
+      # under the pre-change shape to be refused (#3842 AC3).
       - name: Runner BYO egress enforces (not just rendered)
         if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-byo-egress') }}
         run: bash scripts/check-runner-byo-egress.sh charts/curie
@@ -4295,7 +4526,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    needs: [changes, runtime-assertion-registration, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-cluster-approval-resume-restarts, e2e-scripted-factory, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
+    needs: [changes, runtime-assertion-registration, e2e-ladder, e2e-oidc, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-cluster-approval-resume-restarts, e2e-scripted-factory, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
     # A cancelled run leaves no evidence and must rerun. In a completed run,
     # every dependency outcome reaches the strict matcher below, which rejects
     # selected results other than success.
@@ -4316,6 +4547,7 @@ jobs:
           APPROVAL_RESUME_SELECTED: ${{ needs.changes.outputs.approval_resume }}
           FACTORY_SELECTED: ${{ needs.changes.outputs.factory }}
           SKILL_LOCAL_RESULT: ${{ needs.e2e-ladder.result }}
+          OIDC_RESULT: ${{ needs.e2e-oidc.result }}
           LOCAL_RELEASE_RESULT: ${{ needs.e2e-ladder-release.result }}
           CLUSTER_RESULT: ${{ needs.e2e-ladder-cluster.result }}
           CLUSTER_CHART_RESULT: ${{ needs.e2e-cluster-chart-regressions.result }}
@@ -4331,6 +4563,7 @@ jobs:
 
           validate_selected_outcomes() {
             if [[ "$SKILL_LOCAL_RESULT" != "$skill_local_expected" ||
+                  "$OIDC_RESULT" != "$oidc_expected" ||
                   "$LOCAL_RELEASE_RESULT" != "$local_release_expected" ||
                   "$CLUSTER_RESULT" != "$cluster_expected" ||
                   "$CLUSTER_CHART_RESULT" != "$cluster_chart_expected" ||
@@ -4366,6 +4599,11 @@ jobs:
           skill_local_expected="skipped"
           if [[ "$SKILL_SELECTED" == "true" || "$LOCAL_SELECTED" == "true" ]]; then
             skill_local_expected="success"
+          fi
+          # Mirrors the OIDC job's if: it runs whenever the local tier does.
+          oidc_expected="skipped"
+          if [[ "$LOCAL_SELECTED" == "true" ]]; then
+            oidc_expected="success"
           fi
           local_release_expected="skipped"
           if [[ "$LOCAL_RELEASE_SELECTED" == "true" ]]; then
@@ -4413,7 +4651,7 @@ jobs:
 
           # Flip every checked result in turn. Each flipped verdict must be
           # rejected, so no dependency can drop out of the validator unnoticed.
-          for name in SKILL_LOCAL_RESULT LOCAL_RELEASE_RESULT CLUSTER_RESULT \
+          for name in SKILL_LOCAL_RESULT OIDC_RESULT LOCAL_RELEASE_RESULT CLUSTER_RESULT \
             CLUSTER_CHART_RESULT ROLLOUT_RECOVERY_RESULT APPROVAL_RESUME_RESULT \
             FACTORY_RESULT \
             RELEASED_UPGRADE_RESULT \
@@ -4470,3 +4708,29 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 tools/e2e-ci-selection/assert_upgrade_matrix_budget.py
+
+  turn-canary-contract:
+    name: Turn canary contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - run: uv sync --frozen
+      - run: uv run pytest -q examples/tests/test_turn_canary.py

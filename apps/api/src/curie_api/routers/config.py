@@ -8,8 +8,9 @@ from `get_settings()`, which reads it from the environment at first-call time
 
 from fastapi import APIRouter
 
+from curie_api.schemas.agents import AppConfig
+
 from ..config import get_settings
-from ..schemas import AppConfig
 
 router = APIRouter(tags=["config"])
 

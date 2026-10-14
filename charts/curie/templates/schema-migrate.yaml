@@ -156,6 +156,11 @@ spec:
             */}}
             - name: CURIE_MIGRATION_FENCE_LOCK_TIMEOUT_MS
               value: {{ .Values.api.migrate.fenceLockTimeoutMs | default 15000 | quote }}
+            {{- /* Revisions 0102 and 0103 backfill against the API's GitHub host. */}}
+            - name: GITHUB_API_URL
+              value: {{ .Values.api.githubApiUrl | quote }}
+            - name: GITHUB_CLONE_BASE
+              value: {{ .Values.api.githubCloneBase | quote }}
             {{- with .Values.api.migrate.provenanceDeclarationsSecret }}
             {{- /*
             Optional, and a FILE rather than a value, on purpose: `helm get

@@ -122,6 +122,41 @@ e2eConnector:
   workerClusterRole: ""
   ttlSeconds: 3600
   podSecurity: baseline
+  # How often the worker's reaper (#3245) deletes namespaces past their TTL or
+  # whose run has finished. Enabling e2eConnector needs
+  # worker.connectorReconciler.enabled: the reaper reads the kubeconfig from
+  # the connector Secret through the reconciler's Secret list grant.
+  reaperIntervalSeconds: 60
+  # Daemonless image builds (#3246, ADR 0176 decision 6). The registry prefix
+  # the build pushes under, as <registry>/<namespace>/<name>. Empty means
+  # image_build refuses with e2e_registry_not_configured. The push credential
+  # is E2E_REGISTRY_PUSH_CONFIG (a docker config.json stored with
+  # `curie secrets`); it never reaches the sandbox or a build container that
+  # runs Dockerfile RUN steps. The registry must allow manifest deletes and
+  # run garbage collection, because teardown deletes every image a run pushed.
+  registry: ""
+  # Remote layer cache repository. null renders <registry>/cache; an explicit
+  # "" disables the cache. The cache is used only when this is non empty AND
+  # E2E_BUILD_CACHE_CONFIG is stored, so an authenticated registry needs that
+  # config to cache at all. WARNING: that credential is mounted in the build
+  # container, so Dockerfile RUN steps can read it. Scope it to the cache
+  # repository only, never to the push repositories.
+  buildCacheRepo: null
+  # Plain http to the registry (and the cache). Never enable it on a registry
+  # that is reachable beyond the test cluster network.
+  registryInsecure: false
+  # Hosts, beyond the registry itself, whose https token realm may receive the
+  # push credential. Entries without a port mean 443.
+  registryTokenHosts: []
+  # Empty means the digest pinned default in the connector.
+  builderImage: ""
+  gitImage: ""
+  pushImage: ""
+  # Wall clock limit for one build, 60 to 3600 seconds.
+  buildTimeoutSeconds: 1200
+  # https hosts a build may fetch its commit from.
+  sourceHosts:
+    - github.com
 
 # ---------------------------------------------------------------------------
 # PriorityClass (ADR-0059 decision 5): ranks the platform -- worker, api,
@@ -748,6 +783,73 @@ connectorCaller:
   signingKeyKey: signingKey
   verifyKeyKey: verifyKey
 
+# The connector action executor (ACTION-EXECUTOR-1). One switch, rendered as
+# CURIE_ACTION_EXECUTOR_ENABLED into both the API and the worker so the two can
+# never disagree. Off: the worker claims no execution and the API refuses an undo
+# that would authorize a restore with `executor_disabled`. On, with
+# worker.connectorReconciler.enabled, the worker Role also gains a single-object
+# `get` on Deployments so it can read the digest a connector ran at
+# (ACTION-EXECUTOR-12, -14); with the executor off that grant is absent and
+# actions record no digest, so they are not undoable.
+#
+# maxConcurrentSandboxes (AUTOMATED-REMEDIATION-12, executor amendment E9) is the
+# most executions live (claimed or dispatched) across the installation at once,
+# rendered as CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES into both the API,
+# whose claim route enforces it across worker replicas, and the worker, whose
+# executor loop runs up to that many at once. While two or more slots exist one
+# is kept for write-kind executions, so remediation samples never starve a
+# write. It leaves sandbox quota to ordinary turns; an integer of at least 1.
+actionExecutor:
+  enabled: false
+  maxConcurrentSandboxes: 2
+
+# Automated remediation (AUTOMATED-REMEDIATION-1). One switch, rendered as
+# CURIE_REMEDIATION_ENABLED into both the API and the worker. Closed by default.
+# Enabling it requires actionExecutor.enabled: a render with remediation on and
+# the executor off fails. Off, the remediation policy routes stay readable and
+# writable so a policy can be staged before activation.
+remediation:
+  enabled: false
+
+# The test installation declaration (ADR 0202 decision 1). Off by default, and
+# set only here: it is never derived from a channel name, a deployment's env,
+# a bundle, or anything an agent or a message says. Rendered as
+# CURIE_TEST_INSTALLATION_ENABLED and CURIE_TEST_INSTALLATION_DRIVERS into the
+# API and the dispatcher, and neither may be set through extraEnv.
+#
+# Turning it on is the operator's statement that every credential this
+# installation's agents hold reaches only test accounts, and that a driver's
+# Slack token is reachable by no agent other than the driver itself. A test
+# installation owns its Slack app exclusively (#2248).
+#
+# The chart refuses to render it on when api.environment is prod (a tripwire,
+# not evidence), when the API key, the worker token or the approval attester
+# secret is still the published default, or when a driver has no channel. The
+# API and the dispatcher refuse to boot on a published default secret too, and
+# the dispatcher's preflight refuses a driver that is this installation's
+# authorized identity (default), a sibling driver that names no agent, and a
+# sibling driver whose identity is bound to any other agent.
+#
+# Each driver is a channel id, a Slack bot id and that bot's user id, validated
+# like a dispatcher.threadedBotAllowlist pair. A sibling driver, another Slack
+# identity of this installation (dispatcher.slack.identities), also names the
+# one agent it serves:
+#   drivers:
+#     - channel_id: C0EXAMPLE1     # ^[CG][A-Z0-9]+$
+#       bot_id: B0EXAMPLE1         # ^B[A-Z0-9]+$
+#       bot_user_id: U0EXAMPLE1    # ^U[A-Z0-9]+$
+#     - channel_id: C0EXAMPLE1
+#       bot_id: B0EXAMPLE2
+#       bot_user_id: U0EXAMPLE2
+#       agent: acme-tester         # sibling driver only
+testInstallation:
+  enabled: false
+  drivers: []
+  # Maximum driver-started turns per Slack identity/channel/thread in any ten
+  # minutes, shared by all listed drivers (1–100). Pings and duplicate deliveries
+  # spend no turn budget. Valkey reservations make the cap atomic across replicas.
+  threadTurnLimit: 10
+
 rustfs:
   deploy: true
   image: rustfs/rustfs:1.0.0-beta.12
@@ -1153,20 +1255,87 @@ grafanaConnector:
 #   - ui         static React SPA served by nginx, proxying /api to the API
 #
 # IMAGE DEFAULTS: every app image defaults to the GHCR package the Release
-# workflow publishes. The `tag` is left EMPTY so it resolves to the chart
-# `appVersion` (see Chart.yaml) -- an immutable, per-release version tag rather
-# than the mutable `latest`. That makes installs deterministic and rollback-able:
-# the same chart version always renders the same image ref (`helm template` shows
-# `...-api:<appVersion>`, not `:latest`). For the strongest guarantee set `digest`
-# to a `sha256:...` content digest instead (it wins over `tag` and pins by digest,
-# verifiable via `cosign verify-attestation` / `gh attestation verify`); the
-# Release workflow prints each published image's digest. `pullPolicy: Always` on
-# an immutable ref is a cheap no-op that still self-heals a node that cached a
-# same-named ref, so it is kept.
+# workflow publishes. In this source tree `tag` is left EMPTY so it resolves to
+# the chart `appVersion` (see Chart.yaml) -- an immutable, per-release version
+# tag rather than the mutable `latest`. The released chart asset differs: it
+# ships each first-party image's `digest` set to the signed index digest that
+# release built. `digest` wins over `tag`, so to run a different tag from the
+# released chart, clear that image's digest too (for example
+# `--set api.image.tag=X --set api.image.digest=`). Verify signatures and
+# attestations as described in docs/release-verification.md.
+# `pullPolicy: Always` on an immutable ref is a cheap no-op that still
+# self-heals a node that cached a same-named ref, so it is kept.
 # The repo and its packages are public, so NO imagePullSecret is needed by
 # default; the `imagePullSecrets` plumbing stays for private forks. For offline
 # dev/e2e use values-dev.yaml, which repoints each image at a locally-built,
 # cluster-imported image with imagePullPolicy Never (mirroring the runner pattern).
+# ---------------------------------------------------------------------------
+# Code host trust (ADR 0197): one PEM CA bundle from a ConfigMap you create,
+# for a code host no public root covers. See the README's "Code host CA
+# bundle". An empty name mounts nothing.
+codeHostTrust:
+  caBundle:
+    configMapRef:
+      name: ""
+      key: ca.crt
+# ---------------------------------------------------------------------------
+# The factory (#4397) as CURIE_FORGES; `curie cluster factory` writes it.
+# A credential names its Secret: existingSecret, existingSecretKey.
+factory:
+  enabled: false
+  intake: poll  # or webhook
+  cardBaseUrl: ""
+  ciWaitSeconds: 1200
+  codeHosts: []
+  trackers: []
+  bindings: []
+  sandboxEgress: {}
+  # Per-run Docker daemons (ADR 0217). Read only when a bindings[].repos[]
+  # entry with a runner block sets docker.enabled: true and worker.deploy is
+  # true; otherwise templates/docker-daemon.yaml renders nothing. See the
+  # README's "Factory Docker daemons" section.
+  docker:
+    # Required when a repository enables docker: a digest-pinned reference
+    # (name@sha256:<64 hex>). The Curie authorization plugin ships inside this
+    # image, so this one digest pins both (decisions 4 and 5). Admission
+    # refuses a daemon pod running any other image.
+    daemonImage: ""
+    # The daemon namespace. Empty means <release-namespace>-<fullname>-docker,
+    # truncated to 63 characters.
+    namespace: ""
+    # Create the namespace with the privileged Pod Security label. Set false
+    # when the operator creates it; it must then carry
+    # pod-security.kubernetes.io/enforce: privileged.
+    createNamespace: true
+    # The daemon's mutual TLS port. The Rail 1 sandbox allow opens only this
+    # port toward the daemon namespace.
+    port: 2376
+    # ResourceQuota spec.hard for the daemon namespace, the ceiling on every
+    # concurrent run's daemon. Required when docker is enabled. Persistent
+    # volumes, LoadBalancers and NodePorts stay at zero.
+    quota:
+      hard:
+        pods: "8"
+        requests.cpu: "8"
+        requests.memory: 16Gi
+        requests.ephemeral-storage: 160Gi
+        limits.cpu: "16"
+        limits.memory: 32Gi
+        limits.ephemeral-storage: 160Gi
+        services: "8"
+        secrets: "16"
+        persistentvolumeclaims: "0"
+        services.loadbalancers: "0"
+        services.nodeports: "0"
+    # One Container LimitRange item in the daemon namespace: per-container
+    # max, min, default limits and default requests. All four are required
+    # when docker is enabled. Admission separately refuses a zero request or
+    # limit.
+    limitRange:
+      max: { cpu: "4", memory: 8Gi, ephemeral-storage: 40Gi }
+      min: { cpu: 100m, memory: 256Mi, ephemeral-storage: 1Gi }
+      default: { cpu: "2", memory: 4Gi, ephemeral-storage: 20Gi }
+      defaultRequest: { cpu: 500m, memory: 1Gi, ephemeral-storage: 10Gi }
 # ---------------------------------------------------------------------------
 api:
   deploy: true
@@ -1269,44 +1438,6 @@ api:
   # positive reconciliation interval.
   githubReviewIngressEnabled: false
   githubReviewReconcilerIntervalSeconds: 5
-  # Signed factory issue intake is opt-in and separate from review feedback.
-  # Polling is the default. A blank webhook secret disables signed deliveries.
-  # A configured secret permits signed deliveries in either mode. The published
-  # development secret is refused whenever factory intake is enabled.
-  # Sealed installs generate and retain a real secret unless one is configured.
-  # Webhook mode requires a real secret and keeps the missed label backstop.
-  # Either mode still requires the App id and private key, a label, a mention
-  # login, and a repo allowlist.
-  githubFactoryIngressEnabled: false
-  githubFactoryIntake: poll
-  githubFactoryPollIntervalSeconds: 45
-  githubFactoryLabel: ""
-  githubFactoryMention: ""
-  # Public https origin GitHub's image proxy fetches the live factory status card
-  # from (#3077). Set, the card replaces the phase checklist (#3125); empty omits
-  # the card and the comment shows the checklist instead.
-  githubFactoryCardBaseUrl: ""
-  # Seconds a published factory run waits on its pull request's CI, from the
-  # push (#3162). The run's execution deadline still caps it. 1 to 10800.
-  githubFactoryCiWaitSeconds: 1200
-  # Required Python CI per repository (#3617), keyed by owner/name (matched
-  # case-insensitively): {check, paths, pendingCheckPrefix}. A factory Python
-  # change must fall under `paths` and pass the `check` Actions check; shard
-  # jobs named with `pendingCheckPrefix` keep the run waiting for it. A
-  # repository without an entry is judged on its own checks. Rendered as JSON
-  # into GITHUB_FACTORY_PYTHON_CI; see docs/operations.md for curie-eng/curie.
-  githubFactoryPythonCi: {}
-  # Bases a factory ticket may start from and target (#3095, ADR 0186), keyed
-  # by owner/name: {bases: [branch, ...], default_base: branch}. A ticket picks
-  # one with a `base:<branch>` label; with none it uses default_base, or the
-  # repository default branch when default_base is unset. A repository without
-  # an entry may only use its default branch. Rendered as JSON into
-  # GITHUB_FACTORY_BASES.
-  githubFactoryBases: {}
-  # Checks and commit statuses that rerun after a pull request metadata edit,
-  # keyed by owner/name: {checks: [name, ...], statuses: [name, ...]}.
-  # Rendered as JSON into GITHUB_FACTORY_METADATA_CI.
-  githubFactoryMetadataCi: {}
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed
@@ -1384,13 +1515,8 @@ api:
   # is rejected with git.origin_mismatch. Set it to a GitHub Enterprise Server
   # base to deploy from GHE.
   githubCloneBase: "https://github.com"
-  # REST base used by credential minting, polling, and managed publication.
+  # REST base for credential minting, polling and the API's pull request calls.
   githubApiUrl: "https://api.github.com"
-  # Optional ConfigMap name whose key ca.pem is a private CA for a GitHub
-  # stub. Empty leaves TLS trust on the image bundle. When set, the api,
-  # worker, and runner sandbox mount it and point SSL_CERT_FILE,
-  # GIT_SSL_CAINFO, and REQUESTS_CA_BUNDLE at that file.
-  githubStubCaConfigMap: ""
   # How often (seconds) the API scans for lapsed pending approvals and resumes
   # their stranded sessions (#412). Set to 0 (or any value <= 0) to disable the
   # expiry sweeper entirely. Default matches the app's built-in 30s cadence.
@@ -2000,6 +2126,15 @@ worker:
     # How long the parked bytes are retained so a redelivery of the same turn can
     # still fetch them. Swept by the worker's existing reap_orphans tick.
     retentionTtlSeconds: 3600
+    # ADR 0205 decision 7: every boot of a thread rebuilds the thread's whole
+    # file set, so it is bounded per thread, separately from the per-message
+    # cap. Over either bound the newest files are kept and the omitted ones are
+    # named to the agent. threadMaxBytes must fit
+    # agentSandbox.runner.attachments.sizeLimit (the chart refuses to render
+    # otherwise), and the set has to arrive within that block's
+    # fetchTimeoutSeconds.
+    threadMaxFiles: 20
+    threadMaxBytes: 268435456
   publication:
     enabled: true
     # Short-lived Jobs and their scoped token Secret live outside the platform
@@ -2021,55 +2156,6 @@ worker:
     # Opt in to new third-party dependency names in manifests and lockfiles.
     # Applies to every publication in this install, including factory work.
     allowDependencyAdditions: false
-    # GitHub publishes these address sets from https://api.github.com/meta.
-    # Override for GitHub Enterprise or refresh when GitHub changes the set.
-    githubHttpsCidrs:
-      - 192.30.252.0/22
-      - 185.199.108.0/22
-      - 140.82.112.0/20
-      - 143.55.64.0/20
-      - 2a0a:a440::/29
-      - 2606:50c0::/32
-      - 20.201.28.151/32
-      - 20.201.28.148/32
-      - 20.205.243.166/32
-      - 20.205.243.168/32
-      - 20.87.245.0/32
-      - 20.87.245.6/32
-      - 4.237.22.38/32
-      - 4.237.22.34/32
-      - 4.228.31.150/32
-      - 4.228.31.149/32
-      - 20.207.73.82/32
-      - 20.207.73.85/32
-      - 20.27.177.113/32
-      - 20.27.177.116/32
-      - 20.200.245.247/32
-      - 20.200.245.245/32
-      - 20.175.192.147/32
-      - 20.175.192.149/32
-      - 20.233.83.145/32
-      - 20.233.83.146/32
-      - 20.29.134.23/32
-      - 20.29.134.17/32
-      - 20.199.39.232/32
-      - 20.199.39.228/32
-      - 20.217.135.5/32
-      - 20.217.135.0/32
-      - 4.225.11.194/32
-      - 4.225.11.201/32
-      - 4.208.26.197/32
-      - 4.208.26.200/32
-      - 20.26.156.215/32
-      - 20.26.156.210/32
-      - 172.182.252.133/32
-      - 172.182.252.137/32
-      - 4.249.131.164/32
-      - 4.249.131.166/32
-      - 48.202.248.40/32
-      - 48.202.248.39/32
-      - 48.204.201.5/32
-      - 48.204.201.2/32
     # Empty derives release-scoped `<fullname>-publication` names.
     serviceAccountName: ""
     ownerName: ""
@@ -2559,6 +2645,21 @@ agentSandbox:
   #   runnerImages:
   #     factory: ghcr.io/acme/factory-runner@sha256:<64 hex>
   runnerImages: {}
+  # Per-agent non-secret runner environment: agent name -> NAME: string map.
+  # Each listed agent gets its own SandboxTemplate and warm pool, including
+  # agents using the platform image. Repository runner templates inherit the
+  # same agent values. Entries are appended to runner.extraEnv; duplicate names
+  # and collisions with chart-owned env or connector secrets are refused.
+  # Environment names use uppercase letters, digits and underscores, starting
+  # with a letter or underscore. Agent names remain lowercase DNS labels.
+  # Quote every value, including empty strings, numbers and booleans.
+  # CURIE_ names, runner credential/proxy names and snapshot sealing keys are
+  # reserved. OTEL_ names are refused here because telemetry egress follows the
+  # global endpoint: configure otelCollector or runner.extraEnv instead.
+  #   runnerEnv:
+  #     dark-factory:
+  #       CLAUDE_CODE_MAX_OUTPUT_TOKENS: "16000"
+  runnerEnv: {}
   # Per-agent workspace ceiling (#3523): agent name -> the sizeLimit of that
   # agent's `workspace` emptyDir, replacing agentSandbox.runner.workspace.sizeLimit
   # (default 1Gi) for that agent only. Each listed agent gets its own
@@ -2575,7 +2676,7 @@ agentSandbox:
   # Agents that get a labeled sandbox template and warm pool so connector
   # ingress can select curietech.ai/agent=<name>. A list of agent name strings.
   # Empty by default. Agents already covered by connectorSecrets, registryEgress,
-  # runnerImages, or workspaceSizeLimits are unchanged.
+  # runnerImages, runnerEnv, or workspaceSizeLimits are unchanged.
   poolAgents: []
   controller:
     # Installs the vendored kubernetes-sigs/agent-sandbox v0.5.0 controller
@@ -2717,8 +2818,16 @@ agentSandbox:
       mountPath: /attachments
       # ADR-0059 decision 2: every writable emptyDir in the sandbox pod carries
       # a ceiling, so a hostile or broken store cannot fill the node. Sized
-      # above worker.attachments.maxFileBytes x the lane's 10-file set cap.
+      # above worker.attachments.maxFileBytes x the lane's 10-file set cap,
+      # and at least worker.attachments.threadMaxBytes (ADR 0205 decision 7;
+      # the chart refuses a budget this volume cannot hold).
       sizeLimit: 512Mi
+      # The overall deadline for one boot's fetches, current and earlier
+      # files together, on a monotonic clock. Each read's socket timeout is
+      # what is left of it. A current file that misses it refuses the boot; an
+      # earlier one is skipped and named to the agent as unavailable (ADR 0205
+      # decision 6), so a thread's history never lengthens a boot past it. It
+      # must stay inside worker.claimTimeoutSeconds (90 by default).
       fetchTimeoutSeconds: 45
     # Extra env for the runner container, list of {name, value}.
     # Per-workload OTEL_EXPORTER_OTLP_* overrides still win over the
@@ -2835,6 +2944,9 @@ agentSandbox:
     serviceAccount:
       create: true
       # The runner does not call the K8s API, so its token is not mounted.
+      # Must stay false: the chart refuses any other value at render, and runner
+      # template admission refuses a worker-written template that mounts a
+      # ServiceAccount token (#3842).
       automountToken: false
       # Extra annotations on the runner ServiceAccount. The key-free object
       # store path (#1325) binds the bundle-fetch IAM role here, e.g.
@@ -2845,7 +2957,18 @@ agentSandbox:
       # Scope that role to the bundle bucket, read-only: NetworkPolicy selects
       # pods and not containers, so an identity the bundle-fetch init container
       # can reach is also reachable by the runner, which is prompt-injectable.
+      # The chart refuses a role ARN equal to the api, worker, or langfuse
+      # ServiceAccount's role ARN (#3842). It cannot see the role's IAM policy
+      # or an EKS Pod Identity association, so scoping the role stays yours.
       annotations: {}
+    # Runner template admission (#3842). The worker's SandboxTemplate writes are
+    # admitted only with images the chart itself renders into a runner template:
+    # the runner image, each agentSandbox.runnerImages digest, and the
+    # bundleFetch images when bundleFetch is enabled. List any other image the
+    # worker may write here. Each entry must match ^[A-Za-z0-9][A-Za-z0-9._/:@-]*$
+    # or the render fails naming this key.
+    admission:
+      extraImages: []
 
 # ---------------------------------------------------------------------------
 # Security rails. The four security-boundary rails shipped ON by default. They
@@ -2879,12 +3002,28 @@ security:
     # (169.254.169.254, fd00:ec2::254). `except: []` is refused, an explicit
     # except must cover those addresses, and an IPv4-mapped range such as
     # ::ffff:0:0/96 is refused because no except can carve it.
+    # Every entry (and every BYO egress list) also excepts each private range it
+    # STRICTLY contains: 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16,
+    # 172.16.0.0/12, 192.168.0.0/16, fc00::/7, fe80::/10 and the clusterCidrs
+    # below (#3842). So 0.0.0.0/0 on 443 reaches public model APIs but not pods,
+    # Services or VPC hosts. To let the runner reach a private peer (a private
+    # model endpoint, say), list its narrow CIDR as its own entry, e.g.
+    # 10.20.0.5/32: an entry equal to or inside a private range gets no private
+    # except, and NetworkPolicy allows are additive.
     allowedEgress: []
     #  - cidr: 160.79.104.0/23           # e.g. api.anthropic.com
     #    ports: [{ protocol: TCP, port: 443 }]
-    # Also restrict ingress to the runner ACI port from inside the cluster. The
-    # worker dials the claimed sandbox, so ingress is allowed from the release
-    # namespace only. Egress policies do not affect ingress; this adds the lock.
+    # Pod and Service CIDRs that sit OUTSIDE the private ranges above (for
+    # example a cluster using 198.18.0.0/15 or public space for pods). Every
+    # broad runner route that strictly contains one excepts it, like the
+    # built-in private ranges. Each entry must be a valid IPv4 or IPv6 CIDR with
+    # prefix 1 or longer, not IPv4-mapped. Empty by default: most clusters use
+    # private pod and Service ranges already covered.
+    clusterCidrs: []
+    # Also restrict ingress to the runner ACI port from inside the cluster. Only
+    # this release's worker pods dial the claimed sandbox, so ingress is allowed
+    # from those pods only (#3842). Egress policies do not affect ingress; this
+    # adds the lock.
     lockIngress: true
   # Rail: default-deny ingress + scoped-allow around the data tier (Postgres,
   # RustFS, ClickHouse, Valkey). The backing stores hold every credential and all

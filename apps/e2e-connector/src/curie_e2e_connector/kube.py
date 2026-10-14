@@ -7,7 +7,10 @@ which is a second code path the admission policy does not see.
 from __future__ import annotations
 
 import base64
+import logging
+import re
 import ssl
+import urllib.parse
 from typing import Any
 
 import httpx
@@ -15,6 +18,18 @@ import yaml
 from mcp.server.mcpserver.exceptions import ToolError
 
 from curie_e2e_connector.contract import REFUSAL_MISCONFIGURED
+
+logger = logging.getLogger(__name__)
+
+# read_text keeps at most this many trailing bytes of a text body, so a pod
+# that logs gigabytes never lands whole in connector memory.
+TEXT_LIMIT_BYTES = 1024 * 1024
+
+# Shared by image_build and run Jobs.
+JOB_TTL_S = 600
+# Polling stops this long after the Job's own activeDeadlineSeconds.
+JOB_DEADLINE_GRACE_S = 30
+DNS_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 
 
 class ClusterError(ToolError):
@@ -26,13 +41,27 @@ def load_kubeconfig(path: str) -> tuple[str, str, ssl.SSLContext | str | bool]:
 
     try:
         with open(path, encoding="utf-8") as handle:
-            cfg = yaml.safe_load(handle)
+            text = handle.read()
     except FileNotFoundError as exc:
         raise ClusterError(
             f"{REFUSAL_MISCONFIGURED}: no kubeconfig at {path}. "
             "Store E2E_CLUSTER_KUBECONFIG with curie secrets."
         ) from exc
-    except (OSError, yaml.YAMLError) as exc:
+    except OSError as exc:
+        raise ClusterError(f"{REFUSAL_MISCONFIGURED}: could not read the kubeconfig") from exc
+    return load_kubeconfig_text(text)
+
+
+def load_kubeconfig_text(text: str) -> tuple[str, str, ssl.SSLContext | str | bool]:
+    """Return ``(server, token, verify)`` from kubeconfig contents.
+
+    The worker's reaper (#3245) reads the kubeconfig from the connector Secret
+    rather than a mounted file, and gets the same refusals the connector does.
+    """
+
+    try:
+        cfg = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
         raise ClusterError(f"{REFUSAL_MISCONFIGURED}: could not read the kubeconfig") from exc
 
     try:
@@ -82,7 +111,16 @@ def load_kubeconfig(path: str) -> tuple[str, str, ssl.SSLContext | str | bool]:
 
 
 def client_from_kubeconfig(path: str, timeout: float) -> httpx.Client:
-    server, token, verify = load_kubeconfig(path)
+    return _client(*load_kubeconfig(path), timeout=timeout)
+
+
+def client_from_kubeconfig_text(text: str, timeout: float) -> httpx.Client:
+    return _client(*load_kubeconfig_text(text), timeout=timeout)
+
+
+def _client(
+    server: str, token: str, verify: ssl.SSLContext | str | bool, *, timeout: float
+) -> httpx.Client:
     return httpx.Client(
         base_url=server,
         headers={"Authorization": f"Bearer {token}"},
@@ -92,11 +130,16 @@ def client_from_kubeconfig(path: str, timeout: float) -> httpx.Client:
 
 
 class ClusterApi:
-    """The few Kubernetes calls env_create and env_destroy make."""
+    """The few Kubernetes calls the connector tools make."""
 
     def request(
         self, method: str, path: str, body: dict[str, Any] | None = None
     ) -> tuple[int, dict[str, Any]]:
+        raise NotImplementedError
+
+    def read_text(self, path: str) -> tuple[int, str]:
+        """GET a text/plain body, such as a pod log, which ``request`` drops."""
+
         raise NotImplementedError
 
 
@@ -120,3 +163,138 @@ class HttpxCluster(ClusterApi):
             if isinstance(parsed, dict):
                 payload = parsed
         return response.status_code, payload
+
+    def read_text(self, path: str) -> tuple[int, str]:
+        try:
+            with self._client.stream("GET", path) as response:
+                kept = bytearray()
+                for chunk in response.iter_bytes():
+                    kept += chunk
+                    if len(kept) > 2 * TEXT_LIMIT_BYTES:
+                        del kept[:-TEXT_LIMIT_BYTES]
+                return response.status_code, tail_text(bytes(kept), TEXT_LIMIT_BYTES)
+        except httpx.HTTPError as exc:
+            raise ClusterError("the test cluster API is unreachable") from exc
+
+
+def tail_text(data: bytes, limit: int) -> str:
+    """The last ``limit`` bytes of UTF-8 ``data`` as text.
+
+    A cut that lands inside a multibyte character drops that character's
+    leftover continuation bytes rather than showing a replacement mark.
+    """
+
+    if len(data) > limit:
+        data = data[-limit:]
+        start = 0
+        while start < min(3, len(data)) and data[start] & 0xC0 == 0x80:
+            start += 1
+        data = data[start:]
+    return data.decode("utf-8", errors="replace")
+
+
+def checked_request(
+    cluster: ClusterApi, method: str, path: str, body: dict[str, Any] | None = None
+) -> tuple[int, dict[str, Any]]:
+    code, payload = cluster.request(method, path, body)
+    if code in (401, 403):
+        raise ClusterError(f"the test cluster refused {method} {path} ({code})")
+    return code, payload
+
+
+def checked_text(cluster: ClusterApi, path: str) -> tuple[int, str]:
+    code, text = cluster.read_text(path)
+    if code in (401, 403):
+        bare = urllib.parse.urlsplit(path).path
+        raise ClusterError(f"the test cluster refused GET {bare} ({code})")
+    return code, text
+
+
+def ensure_object(cluster: ClusterApi, path: str, body: dict[str, Any]) -> None:
+    code, _payload = checked_request(cluster, "POST", path, body)
+    if code in (200, 201, 409):
+        return
+    raise ClusterError(f"the test cluster refused to create {body.get('kind')} ({code})")
+
+
+# Job and pod helpers shared by image_build and run.
+
+
+def job_state(status: Any) -> tuple[bool, str, str] | None:
+    """``(succeeded, reason, message)`` once a Job finished, else None."""
+
+    if not isinstance(status, dict):
+        return None
+    conditions = status.get("conditions")
+    for item in conditions if isinstance(conditions, list) else []:
+        if not isinstance(item, dict) or item.get("status") != "True":
+            continue
+        reason = str(item.get("reason") or "")
+        message = str(item.get("message") or "")
+        if item.get("type") == "Failed":
+            return False, reason, message
+        if item.get("type") == "Complete":
+            return True, reason, message
+    if isinstance(status.get("succeeded"), int) and status["succeeded"] > 0:
+        return True, "", ""
+    if isinstance(status.get("failed"), int) and status["failed"] > 0:
+        return False, "", ""
+    return None
+
+
+def job_pods_strict(
+    cluster: ClusterApi, namespace: str, job: str
+) -> tuple[int, list[dict[str, Any]]]:
+    """``(status code, pods)``; the caller decides what a non 200 or no pods means."""
+
+    selector = urllib.parse.quote(f"job-name={job}", safe="")
+    code, payload = checked_request(
+        cluster, "GET", f"/api/v1/namespaces/{namespace}/pods?labelSelector={selector}"
+    )
+    items = payload.get("items")
+    pods = [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+    return code, pods
+
+
+def job_pods(cluster: ClusterApi, namespace: str, job: str) -> list[dict[str, Any]]:
+    """The pods the Job controller labelled ``job-name=<job>``; empty on any non 200."""
+
+    code, pods = job_pods_strict(cluster, namespace, job)
+    return pods if code == 200 else []
+
+
+def container_statuses(pod: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    """``status.<key>`` of a pod, such as ``containerStatuses``, as a list of dicts."""
+
+    status = pod.get("status")
+    found = status.get(key) if isinstance(status, dict) else None
+    return [item for item in found if isinstance(item, dict)] if isinstance(found, list) else []
+
+
+def terminated_state(container: dict[str, Any]) -> dict[str, Any] | None:
+    state = container.get("state")
+    terminated = state.get("terminated") if isinstance(state, dict) else None
+    return terminated if isinstance(terminated, dict) else None
+
+
+def waiting_reason(container: dict[str, Any]) -> str:
+    state = container.get("state")
+    waiting = state.get("waiting") if isinstance(state, dict) else None
+    reason = waiting.get("reason") if isinstance(waiting, dict) else None
+    return reason if isinstance(reason, str) else ""
+
+
+def delete_quietly(cluster: ClusterApi, path: str, what: str) -> None:
+    """Best effort cleanup that never masks the error being raised.
+
+    ``what`` is a fixed description; the log never carries the path, which can
+    name a credential Secret.
+    """
+
+    try:
+        code, _payload = cluster.request("DELETE", path)
+    except ClusterError:
+        logger.warning("e2e cleanup could not reach the cluster to delete %s", what)
+        return
+    if not (200 <= code < 300 or code == 404):
+        logger.warning("e2e cleanup was refused deleting %s (%s)", what, code)

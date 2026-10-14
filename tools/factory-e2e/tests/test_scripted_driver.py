@@ -1365,3 +1365,114 @@ def test_present_local_images_pass_the_check_and_reach_resource_creation(
         calls.index(("docker", "image", "inspect", image)) < first_mutation for image in sk.IMAGES
     )
     assert "stop at first resource command" in _evidence(tmp_path)["error"]
+
+
+def test_failed_publication_evidence_survives_verdict_without_transport_or_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = sk.ScriptedRun(fe.parse_args(["scripted"]))
+    request_id = "00000000-0000-0000-0000-000000000001"
+    run.evidence["execution_request_id"] = request_id
+    run.evidence["final_comment"] = {"body": f"<!-- curie-execution-request:{request_id} -->"}
+    run.secrets = ["example-sensitive-token"]
+    queries: list[str] = []
+
+    def durable_observation(query: str) -> dict[str, Any]:
+        queries.append(query)
+        return {
+            "preflights": [{"outcome": "passed"}],
+            "publications": [{
+                "changed_paths": ["src/unitconv/core.py", "tests/test_core.py"],
+                "status": "failed",
+                "error": "credential refused example-sensitive-token https://stub.example.test/token",
+                "result_delivery_error": None,
+                "resource_cleanup_error": None,
+            }],
+        }
+
+    monkeypatch.setattr(run, "sql", durable_observation)
+    monkeypatch.setattr(sk, "assert_observed", lambda *_: None)
+    run.stub = type("EmptyPulls", (), {"_rows": lambda self, _: []})()
+    with pytest.raises(sk.ScriptedScenarioError, match="exactly one stub pull request"):
+        run.observe()
+    outcome = run.evidence["publication_outcomes"][0]
+    assert outcome["status"] == "failed"
+    assert outcome["error"] == "credential refused [REDACTED] https://example.com"
+    assert "patch_bytes" not in queries[0]
+    assert "'error', error" in queries[0]
+    assert "example-sensitive-token" not in json.dumps(run.evidence)
+
+
+@pytest.mark.parametrize("publication_namespace", ["example-publication", ""])
+def test_publication_trust_uses_actual_worker_namespace_or_refuses(
+    publication_namespace: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    run = sk.ScriptedRun(fe.parse_args(["scripted"]))
+    ca_file = tmp_path / "ca.pem"
+    run.stub = type("StubCa", (), {"ca_file": ca_file})()
+    calls: list[tuple[str, ...]] = []
+
+    def kubectl(*args: str, timeout: float = 300) -> str:
+        calls.append(args)
+        if "deployment/curie-worker" in args:
+            assert args[:2] == ("-n", run.namespace)
+            assert timeout == 10
+            return publication_namespace
+        assert args == (
+            "-n", publication_namespace, "create", "configmap", "github-stub-ca",
+            f"--from-file=ca.pem={ca_file}",
+        )
+        return ""
+
+    monkeypatch.setattr(run, "kubectl", kubectl)
+    if publication_namespace:
+        run.provision_publication_trust()
+        assert len(calls) == 2
+    else:
+        with pytest.raises(sk.ScriptedScenarioError, match="publication namespace is absent"):
+            run.provision_publication_trust()
+        assert len(calls) == 1
+
+
+def test_publication_runtime_keeps_bounded_redacted_pod_failure_after_removal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = sk.ScriptedRun(fe.parse_args(["scripted"]))
+    run.secrets = ["example-sensitive-token"]
+    calls: list[tuple[str, ...]] = []
+    remaining = True
+
+    def kubectl(*args: str, timeout: float) -> str:
+        calls.append(args)
+        assert timeout <= 10
+        if "deployment/curie-worker" in args:
+            assert args[:2] == ("-n", run.namespace)
+            return "example-publication-namespace"
+        assert args[:2] == ("-n", "example-publication-namespace")
+        if "get" in args:
+            return json.dumps({"items": [{
+                "kind": "Pod", "metadata": {"name": "example-publication"},
+                "spec": {"env": [{"value": "example-sensitive-token"}]},
+                "status": {"phase": "Pending", "containerStatuses": [{
+                    "restartCount": 0, "state": {"waiting": {
+                        "reason": "ImagePullBackOff",
+                        "message": "cannot pull https://registry.example.test/image",
+                    }},
+                }]},
+            }] if remaining else []})
+        assert "--tail=40" in args and "--limit-bytes=4096" in args
+        return "example-sensitive-token failed HTTPS https://stub.example.test/path"
+
+    monkeypatch.setattr(run, "kubectl", kubectl)
+    run.capture_publication_runtime()
+    snapshot = run.evidence["publication_runtime"][0]
+    assert snapshot["phase"] == "Pending"
+    assert snapshot["containers"][0]["state"]["waiting"]["reason"] == "ImagePullBackOff"
+    assert snapshot["logs"] == "[REDACTED] failed HTTPS https://example.com"
+    assert "spec" not in snapshot
+    remaining = False
+    run.capture_publication_runtime()
+    assert run.evidence["publication_runtime"] == [snapshot]
+    assert all(
+        "curietech.ai/component=publication" in call for call in calls if "jobs,pods" in call
+    )

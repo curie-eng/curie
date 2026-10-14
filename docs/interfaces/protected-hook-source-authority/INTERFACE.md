@@ -5,7 +5,7 @@ impls: 0 production resolvers (tests inject the only implementation)
 grade: not separately graded
 epics:
   - "#3603"
-order: 25
+order: 28
 ---
 # INTERFACE: Protected hook source authority
 

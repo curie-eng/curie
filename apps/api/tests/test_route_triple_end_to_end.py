@@ -129,6 +129,7 @@ def test_two_agents_bind_one_channel_under_two_identities(
             "address": CHANNEL,
             "adapter": "default",
             "allowed_callers": None,
+            "trigger_label": None,
         }
     ]
     assert listed["second-bot"] == [
@@ -137,6 +138,7 @@ def test_two_agents_bind_one_channel_under_two_identities(
             "address": CHANNEL,
             "adapter": "second",
             "allowed_callers": None,
+            "trigger_label": None,
         }
     ]
 
@@ -190,6 +192,7 @@ def test_a_repost_of_the_same_route_is_idempotent(
             "address": CHANNEL,
             "adapter": "second",
             "allowed_callers": None,
+            "trigger_label": None,
         }
     ]
 

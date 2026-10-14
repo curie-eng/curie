@@ -21,8 +21,9 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from curie_api.workitems.lifecycle import lock_active_request
+
 from .models import ExecutionRequest, ExecutionRequestPhaseReport, FactoryStatusComment
-from .workitems import _lock_active_request
 
 logger = logging.getLogger(__name__)
 
@@ -278,7 +279,7 @@ async def record_report(
     if token_request is None:
         await session.rollback()
         return RecordResult("request_not_found")
-    active = await _lock_active_request(session, token_request.work_item_id)
+    active = await lock_active_request(session, token_request.work_item_id)
     # A completed request's sandbox can carry on into a revision on the same
     # thread, so its token follows the WorkItem's newer request. A token from a
     # failed or cancelled request never writes onto the run that replaced it.
@@ -366,7 +367,7 @@ async def record_verification(
     if token_request is None:
         await session.rollback()
         return RecordResult("request_not_found")
-    active = await _lock_active_request(session, token_request.work_item_id)
+    active = await lock_active_request(session, token_request.work_item_id)
     if active is None or active.id != token_request.id:
         await session.rollback()
         return RecordResult("no_active_request")

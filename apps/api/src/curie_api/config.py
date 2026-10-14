@@ -12,7 +12,7 @@ production deployments.
 
 import json
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from aci_protocol import (
@@ -24,36 +24,41 @@ from aci_protocol import (
     derive_dead_letter_stream_name,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from curie_internal.driver_declaration import (
+    PUBLISHED_DEFAULT_API_KEY,
+    PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET,
+    PUBLISHED_DEFAULT_INTERNAL_WORKER_TOKEN,
+    TEST_INSTALLATION_DRIVERS_ENV,
+    TEST_INSTALLATION_ENABLED_ENV,
+    DeclaredDriver,
+    parse_drivers,
+    refuse_published_defaults,
+)
+from curie_internal.keyspace import WORKER_KEY_PREFIX_DEFAULT
 from curie_upgrade_pause import authoritative_key
 from plugin_format.connector_render import ConnectorProxy
 from pydantic import AliasChoices, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .e2e_connector import E2EInstall
-from .workspace_policy import valid_allowlist_entry, valid_repository_name
+from .forges import types as forge_types
+from .forges.config import ForgesConfig
+from .workspace_policy import valid_allowlist_entry
 
 # Dev-only default secrets. The production boot gate refuses to start when any of
 # these is still in place under ENVIRONMENT=prod.
-_DEV_DEFAULT_API_KEY = "curie-dev-key"
+_DEV_DEFAULT_API_KEY = PUBLISHED_DEFAULT_API_KEY
 _DEV_DEFAULT_WEBHOOK_SECRET = "dev-webhook-secret"
-_DEV_DEFAULT_INTERNAL_WORKER_TOKEN = "curie-dev-worker-token"
-_DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = "curie-dev-approval-chat-attester"
-
-
-def valid_base_branch(name: Any) -> bool:
-    """A branch name a factory base may use: no whitespace, leading ``-`` or ``..``."""
-
-    return (
-        isinstance(name, str)
-        and bool(name)
-        and not any(char.isspace() for char in name)
-        and not name.startswith("-")
-        and ".." not in name
-    )
+_DEV_DEFAULT_INTERNAL_WORKER_TOKEN = PUBLISHED_DEFAULT_INTERNAL_WORKER_TOKEN
+_DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # hide_input_in_errors: a boot ValidationError renders the whole env-sourced
+    # input dict as `input_value`, secrets included (CURIE_OIDC_CLIENT_SECRET,
+    # API_KEY, ...), and that message lands in container logs. The validators'
+    # own messages still name the offending variables, never their values.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     # Deploy environment the API boots as, "dev" or "prod" (the chart renders it
     # from api.environment onto the ENVIRONMENT var). "prod" arms the production
@@ -94,12 +99,102 @@ class Settings(BaseSettings):
             "CURIE_APPROVAL_RECOVERY_ENABLED", "approval_recovery_enabled"
         ),
     )
+    # @spec ACTION-EXECUTOR-1: the action executor is closed by default. The
+    # chart value ``actionExecutor.enabled`` and the matching compose value
+    # render this one setting into both the API and the worker. Off, the undo
+    # ruling refuses ``executor_disabled`` before it creates any execution and
+    # the claim route hands out no work.
+    action_executor_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("CURIE_ACTION_EXECUTOR_ENABLED", "action_executor_enabled"),
+    )
+    # @spec AUTOMATED-REMEDIATION-12 (executor amendment E9): the most executions
+    # live (claimed or dispatched) across the installation at once, so ordinary
+    # turns keep sandbox quota. The chart value
+    # ``actionExecutor.maxConcurrentSandboxes`` and the matching compose value
+    # render this one setting into both the API and the worker; the claim route
+    # enforces it, keeping one slot for write-kind executions while two or more
+    # exist.
+    action_executor_max_concurrent_sandboxes: int = Field(
+        default=2,
+        ge=1,
+        validation_alias=AliasChoices(
+            "CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES",
+            "action_executor_max_concurrent_sandboxes",
+        ),
+    )
+    # @spec AUTOMATED-REMEDIATION-1: automated remediation is closed by default.
+    # The chart value ``remediation.enabled`` and the matching compose value
+    # render this one setting into both the API and the worker. Enabling it
+    # requires the action executor; the policy routes stay readable and
+    # writable with it off, so a policy can be staged before activation.
+    remediation_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("CURIE_REMEDIATION_ENABLED", "remediation_enabled"),
+    )
+
+    # The test installation declaration (ADR 0202 decision 1). Rendered only
+    # by the chart from testInstallation.enabled and testInstallation.drivers,
+    # never derived from a channel name, a deployment's env or anything an
+    # agent says. Off by default. On, the boot refuses a published default
+    # secret (``_refuse_published_defaults_on_a_test_installation``).
+    test_installation_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(TEST_INSTALLATION_ENABLED_ENV, "test_installation_enabled"),
+    )
+    test_installation_drivers: Annotated[tuple[DeclaredDriver, ...], NoDecode] = Field(
+        default=(),
+        validation_alias=AliasChoices(TEST_INSTALLATION_DRIVERS_ENV, "test_installation_drivers"),
+    )
 
     # Separate trust boundary for credential redemption. The operator/CLI API
     # key can administer deployments but cannot redeem the GitHub identity.
     internal_worker_token: str = Field(
         default=_DEV_DEFAULT_INTERNAL_WORKER_TOKEN,
         validation_alias=AliasChoices("CURIE_INTERNAL_WORKER_TOKEN", "INTERNAL_WORKER_TOKEN"),
+    )
+
+    # Generic OIDC console login (#2908, ADR 0155): authorization code + PKCE
+    # against any standards-compliant IdP. OFF when the issuer is empty, which
+    # is the default, so an appliance without an IdP keeps the ADR-0083
+    # login-code flow and nothing else. Issuer, audience, JWKS URL and redirect
+    # URI are all-or-none (see `_validate_oidc`): a half-configured login would
+    # fail at the first callback instead of at boot.
+    #
+    # The audience doubles as the OIDC client_id. The ID token's `aud` must
+    # contain the client_id anyway, so a separate CLIENT_ID setting could only
+    # ever be a second copy that is allowed to disagree.
+    oidc_issuer: str = Field(default="", validation_alias="CURIE_OIDC_ISSUER")
+    oidc_audience: str = Field(default="", validation_alias="CURIE_OIDC_AUDIENCE")
+    oidc_jwks_url: str = Field(default="", validation_alias="CURIE_OIDC_JWKS_URL")
+    # Optional: empty makes Curie a public client whose code exchange is bound
+    # by the PKCE verifier alone (RFC 7636), which some IdPs require for
+    # public registrations.
+    oidc_client_secret: str = Field(default="", validation_alias="CURIE_OIDC_CLIENT_SECRET")
+    oidc_redirect_uri: str = Field(default="", validation_alias="CURIE_OIDC_REDIRECT_URI")
+    # Claims a validated ID token must carry to be admitted, as a JSON object of
+    # claim name -> required string, e.g. {"groups": "curie-admins"}. A string
+    # claim must equal the value; a list claim must contain it as an element.
+    # Authentication at the IdP says who someone is, not that they belong here:
+    # without a requirement every account the IdP will sign in is admitted.
+    # NoDecode: the validator below parses the JSON itself, so malformed input
+    # is a ValidationError naming the variable rather than a settings-source
+    # crash.
+    oidc_required_claims: Annotated[dict[str, str], NoDecode] = Field(
+        default_factory=dict, validation_alias="CURIE_OIDC_REQUIRED_CLAIMS"
+    )
+    # Space-separated scopes the authorize redirect requests. Configurable
+    # because the claims above are often released only for an extra scope
+    # (e.g. "groups"); `openid` is mandatory, since without it there is no ID
+    # token to validate.
+    oidc_scopes: str = Field(default="openid email profile", validation_alias="CURIE_OIDC_SCOPES")
+    # The explicit "every account the IdP authenticates may log in" switch.
+    # Under prod an enabled OIDC login must name its admission policy: either
+    # required claims or this flag, never neither (an IdP shared with the whole
+    # company would otherwise admit the whole company by omission) and never
+    # both (the claims would read as a restriction that does not apply).
+    oidc_admit_all_authenticated: bool = Field(
+        default=False, validation_alias="CURIE_OIDC_ADMIT_ALL_AUTHENTICATED"
     )
 
     # Human-readable org/workspace name the UI reads (open /config endpoint) to
@@ -165,6 +260,15 @@ class Settings(BaseSettings):
     # Git flow (J1). The webhook secret authenticates inbound GitHub events; the
     # two bot identities are the routing targets recorded on each deployment.
     github_webhook_secret: str = "dev-webhook-secret"
+    # Durable git-flow notice outbox retry cadence. Production keeps the
+    # reconciler on: turning it off abandons notices whose first publish
+    # failed. The API test suite turns it off, as it does the work-item
+    # reconciler, and drives reconcile_once directly.
+    deploy_notice_reconciler_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("CURIE_DEPLOY_NOTICE_RECONCILER_ENABLED"),
+    )
+    deploy_notice_reconciler_interval_s: float = Field(default=5.0, gt=0)
     # Review-feedback ingress is separately gated from push handling. Keep it
     # off unless the GitHub App identity, webhook HMAC, and reconciler cadence
     # form a complete bootable configuration.
@@ -174,61 +278,40 @@ class Settings(BaseSettings):
     # identity (#2962). Such feedback is held and replayed for this long after
     # the lineage was created, then rejected as lineage_absent_or_ambiguous.
     github_review_identity_hold_s: float = 900.0
-    # Factory issue intake is separately gated from push and review handling.
-    # The label is the initial admission convention. The mention is the login
-    # an authorized human must name to request another bounded execution.
-    github_factory_ingress_enabled: bool = False
-    github_factory_label: str = ""
-    github_factory_mention: str = ""
+    # The factory (ADR 0197, #4397). FACTORY_ENABLED switches intake on;
+    # CURIE_FORGES is the one typed config of its code hosts, trackers and
+    # bindings (`forges.config.ForgesConfig`), loaded through
+    # `forges.loader.load_forges_json`, which reads each credential from the
+    # mounted file it names and refuses an inline secret. A dict passed in code
+    # (tests) is validated directly.
+    factory_enabled: bool = False
+    # Polling is the default intake (#3745). Webhook mode is opt-in and keeps
+    # the missed-label backstop. The poll interval is the GitHub tracker's.
+    factory_intake: Literal["poll", "webhook"] = "poll"
     # A failed label delivery is never redelivered by GitHub (#3081). The work
     # item reconciler lists labeled open issues this often and admits any with
     # no WorkItem once its label is older than the grace, so a delivery still
     # in flight lands first. 0 disables the listing. Both are bounded the way
-    # GITHUB_FACTORY_CI_WAIT_S is: a negative or non finite value is refused at
-    # boot rather than surfacing as a mid-reconcile timedelta error (#3709).
-    github_factory_reconcile_interval_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
-    github_factory_reconcile_grace_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
-    # Polling is the default intake (#3745). Webhook mode is opt-in and keeps
-    # the missed-label backstop. The interval is a positive finite number of
-    # seconds; 45 sits in the 30 to 60 second band.
-    github_factory_intake: Literal["poll", "webhook"] = "poll"
-    github_factory_poll_interval_s: float = Field(default=45, gt=0, allow_inf_nan=False)
-    # Public origin GitHub's image proxy fetches the live status card from
-    # (#3077), e.g. https://curie.example.com. Empty omits the card image; the
-    # status comment still carries the checklist and the result.
-    github_factory_card_base_url: str = ""
+    # FACTORY_CI_WAIT_S is: a negative or non finite value is refused at boot
+    # rather than surfacing as a mid-reconcile timedelta error (#3709).
+    factory_reconcile_interval_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
+    factory_reconcile_grace_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
+    # How often the API reads each factory pull request still open on its
+    # lineage, to record one merged or closed outside a publication (#3831).
+    # Runs with the work item reconciler and factory ingress; 0 disables it.
+    factory_lineage_reconcile_interval_s: float = Field(default=60, ge=0, allow_inf_nan=False)
     # How long a published factory run waits on its pull request's CI, from the
     # push (#3162). The execution deadline still caps it; at most 10800 s, the
     # longest execution deadline (ADR 0171).
-    github_factory_ci_wait_s: int = Field(
+    factory_ci_wait_s: int = Field(
         default=1200,
         gt=0,
         le=10800,
-        validation_alias="GITHUB_FACTORY_CI_WAIT_S",
+        validation_alias="FACTORY_CI_WAIT_S",
     )
-    # Required Python CI per repository (#3617), a JSON object keyed by
-    # ``owner/name`` (matched case-insensitively): ``{"check": str, "paths":
-    # [str, ...], "pendingCheckPrefix": str | null}``. A repository without an
-    # entry is judged on its own checks with no path refusal. Empty by default.
-    github_factory_python_ci: dict[str, dict[str, Any]] = Field(
-        default_factory=dict,
-        validation_alias="GITHUB_FACTORY_PYTHON_CI",
-    )
-    # Checks and commit statuses that rerun after a metadata edit, per
-    # repository: {"checks": [str, ...], "statuses": [str, ...]}.
-    github_factory_metadata_ci: dict[str, dict[str, Any]] = Field(
-        default_factory=dict,
-        validation_alias="GITHUB_FACTORY_METADATA_CI",
-    )
-    # Bases a factory ticket may start from and target, per repository
-    # (#3095, ADR 0186), a JSON object keyed by ``owner/name`` (matched
-    # case-insensitively): ``{"bases": [str, ...], "default_base": str | null}``.
-    # A ``base:<branch>`` label picks one; no label picks ``default_base``, or
-    # the repository default branch when that is unset. A repository without
-    # an entry may only use its default branch. Empty by default.
-    github_factory_bases: dict[str, dict[str, Any]] = Field(
-        default_factory=dict,
-        validation_alias="GITHUB_FACTORY_BASES",
+    forges: Annotated[ForgesConfig, NoDecode] = Field(
+        default_factory=ForgesConfig,
+        validation_alias=AliasChoices("CURIE_FORGES", "forges"),
     )
     # Public model price list the factory's per-run cost estimate reads
     # (#3223), OpenRouter-shaped. Fetched at most every 6 h; any failure leaves
@@ -289,6 +372,16 @@ class Settings(BaseSettings):
     # ever reach this host (#1122). Point it at a GitHub Enterprise Server base
     # to deploy from GHE, exactly as with `github_api_url` above.
     github_clone_base: str = "https://github.com"
+    # A PEM CA bundle for a code host whose certificate no public root covers
+    # (ADR 0197, #3831): the path the chart mounts the operator's
+    # codeHostTrust.caBundle at. The API's code host HTTP clients trust it in
+    # addition to the public roots, and it is returned as ``ca_bundle_ref``
+    # with every repository credential so the worker, the sandbox and the
+    # publication Job trust the same file. Empty trusts the public roots only.
+    code_host_ca_bundle: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_CODE_HOST_CA_BUNDLE", "code_host_ca_bundle"),
+    )
     # Upper bound on the GitHub webhook request body, enforced before the body is
     # fully buffered, parsed, or HMAC-authenticated (#633) so an unauthenticated
     # oversized request cannot exhaust memory. GitHub caps webhook payloads at
@@ -320,7 +413,7 @@ class Settings(BaseSettings):
     # Terminal review reconciliation reads the worker's completion/dead-letter
     # keyspace. Match WorkerConfig's actual legacy environment contract:
     # KEY_PREFIX overrides it; CURIE_KEY_PREFIX deliberately does not.
-    worker_key_prefix: str = Field(default="curie:worker", validation_alias="KEY_PREFIX")
+    worker_key_prefix: str = Field(default=WORKER_KEY_PREFIX_DEFAULT, validation_alias="KEY_PREFIX")
     # The Helm installation the worker's upgrade quiesce marker is scoped to
     # (#2374, mirrored from WorkerConfig.installation_id). Blank is standalone
     # or Compose, which use the legacy release-wide key.
@@ -365,6 +458,14 @@ class Settings(BaseSettings):
 
     def dead_letter_stream_name(self) -> str:
         return derive_dead_letter_stream_name(self.runs_stream, self.dead_letter_stream)
+
+    def deploy_notice_stream_name(self) -> str:
+        """Keep notices in this run stream's installation, not a global lane."""
+        base = f"{self.runs_stream}:deploy-notices"
+        return f"{base}:{self.installation_id}" if self.installation_id else base
+
+    def deploy_notice_group_name(self) -> str:
+        return f"{self.runs_consumer_group}-deploy-notices"
 
     # How often the expiry sweeper scans for lapsed pending approvals (#412) and
     # resumes their stranded sessions. Values <= 0 disable the sweeper (the
@@ -569,6 +670,11 @@ class Settings(BaseSettings):
     # thread is deleted at its terminal.
     transcript_max_thread_bytes: int = 16 * 1024 * 1024  # 16 MiB per thread
     transcript_idle_ttl_seconds: int = 30 * 24 * 3600  # 30 days
+    # The thread attachment ledger (ADR 0205, #4079) lives as long as the
+    # transcript. This caps how many file references one thread may record;
+    # an append that would pass it is refused whole (413). The worker's own
+    # per-boot budget is separate and smaller.
+    thread_attachment_max_refs: int = 200
     # Cap on behavior-packs content per agent (#936, introduced by #883). Packs
     # are stored on the agent row and injected verbatim into the runner context
     # at each bind, so an uncapped pack bloats both the row and the prompt. Size
@@ -656,9 +762,17 @@ class Settings(BaseSettings):
     # with the claim unreleased until `channel_delivery_lease_s` lapses -- and
     # a negative window makes the quota script's EXPIRE delete the counter
     # immediately, silently disabling the quota. Bounded at construction the
-    # same way as GITHUB_FACTORY_RECONCILE_INTERVAL_S (#3709): refused at boot
+    # same way as FACTORY_RECONCILE_INTERVAL_S (#3709): refused at boot
     # rather than surfacing mid-delivery (#3720).
     hook_backlog_window_s: int = Field(default=60, gt=0)
+    # Protected runtime bootstrap directory (PROTECTED-HOOK-SOURCE-9). Only the
+    # out of band provisioner writes it and mounts it read only into the API:
+    # manifest.json, ca.pem and bootstrap.json, read afresh by each support probe
+    # evaluation. Unset means no protected runtime is provisioned here, so a
+    # protected row reports runtime_unavailable. Nothing in this API creates it.
+    protected_runtime_dir: str | None = Field(
+        default=None, validation_alias="CURIE_PROTECTED_RUNTIME_DIR"
+    )
     channel_binding_backlog_limit: int = 64
     channel_binding_backlog_window_s: int = Field(default=60, gt=0)
     # Sandbox ResourceQuota hard limits (#3209). The chart sets all four when
@@ -763,6 +877,44 @@ class Settings(BaseSettings):
         default="baseline",
         validation_alias=AliasChoices("CURIE_E2E_POD_SECURITY", "e2e_pod_security"),
     )
+    e2e_registry: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_REGISTRY", "e2e_registry"),
+    )
+    e2e_build_cache_repo: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_BUILD_CACHE_REPO", "e2e_build_cache_repo"),
+    )
+    e2e_registry_insecure: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("CURIE_E2E_REGISTRY_INSECURE", "e2e_registry_insecure"),
+    )
+    e2e_registry_token_hosts: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_REGISTRY_TOKEN_HOSTS", "e2e_registry_token_hosts"),
+    )
+    e2e_builder_image: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_BUILDER_IMAGE", "e2e_builder_image"),
+    )
+    e2e_git_image: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_GIT_IMAGE", "e2e_git_image"),
+    )
+    e2e_push_image: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_E2E_PUSH_IMAGE", "e2e_push_image"),
+    )
+    e2e_build_timeout_seconds: int = Field(
+        default=1200,
+        validation_alias=AliasChoices(
+            "CURIE_E2E_BUILD_TIMEOUT_SECONDS", "e2e_build_timeout_seconds"
+        ),
+    )
+    e2e_source_hosts: str = Field(
+        default="github.com",
+        validation_alias=AliasChoices("CURIE_E2E_SOURCE_HOSTS", "e2e_source_hosts"),
+    )
 
     def connector_proxy(self) -> ConnectorProxy | None:
         """The proxy each hosted connector renders with, or None for none."""
@@ -794,6 +946,15 @@ class Settings(BaseSettings):
             worker_cluster_role=self.e2e_worker_cluster_role.strip(),
             ttl_seconds=self.e2e_ttl_seconds,
             pod_security=self.e2e_pod_security.strip() or "baseline",
+            registry=self.e2e_registry.strip(),
+            build_cache_repo=self.e2e_build_cache_repo.strip(),
+            registry_insecure=self.e2e_registry_insecure,
+            registry_token_hosts=self.e2e_registry_token_hosts.strip(),
+            builder_image=self.e2e_builder_image.strip(),
+            git_image=self.e2e_git_image.strip(),
+            push_image=self.e2e_push_image.strip(),
+            build_timeout_seconds=self.e2e_build_timeout_seconds,
+            source_hosts=self.e2e_source_hosts.strip() or "github.com",
         )
 
     def valkey_dsn(self) -> str:
@@ -808,113 +969,33 @@ class Settings(BaseSettings):
     def upgrade_quiesce_key(self) -> str:
         return authoritative_key(self.worker_key_prefix, self.installation_id)
 
-    @field_validator("github_factory_python_ci", mode="before")
+    @field_validator("forges", mode="before")
     @classmethod
-    def _validate_factory_python_ci(cls, value: Any) -> dict[str, dict[str, Any]]:
-        if isinstance(value, str):
-            value = json.loads(value) if value.strip() else {}
-        if not isinstance(value, dict):
-            raise ValueError("GITHUB_FACTORY_PYTHON_CI must be a JSON object")
-        policies: dict[str, dict[str, Any]] = {}
-        for repo, policy in value.items():
-            if not isinstance(repo, str) or not valid_repository_name(repo):
-                raise ValueError(f"GITHUB_FACTORY_PYTHON_CI key {repo!r} is not owner/name")
-            if not isinstance(policy, dict) or set(policy) - {
-                "check",
-                "paths",
-                "pendingCheckPrefix",
-            }:
-                raise ValueError(f"GITHUB_FACTORY_PYTHON_CI[{repo!r}] has an invalid shape")
-            check = policy.get("check")
-            paths = policy.get("paths")
-            prefix = policy.get("pendingCheckPrefix")
-            if not isinstance(check, str) or not check.strip():
-                raise ValueError(f"GITHUB_FACTORY_PYTHON_CI[{repo!r}].check must be non-empty")
-            if (
-                not isinstance(paths, list)
-                or not paths
-                or not all(
-                    isinstance(path, str)
-                    and path.strip()
-                    and not path.startswith("/")
-                    and not path.endswith("/")
-                    for path in paths
-                )
-            ):
-                raise ValueError(
-                    f"GITHUB_FACTORY_PYTHON_CI[{repo!r}].paths must be non-empty relative"
-                    " prefixes without a leading or trailing slash"
-                )
-            if prefix is not None and (not isinstance(prefix, str) or not prefix):
-                raise ValueError(
-                    f"GITHUB_FACTORY_PYTHON_CI[{repo!r}].pendingCheckPrefix must be a"
-                    " non-empty string or null"
-                )
-            policies[repo] = {"check": check, "paths": list(paths), "pendingCheckPrefix": prefix}
-        return policies
+    def _load_forges(cls, value: Any) -> Any:
+        """Route the ``CURIE_FORGES`` string through the file loader; a mapping
+        passed in code is validated as ``ForgesConfig`` directly."""
 
-    @field_validator("github_factory_metadata_ci", mode="before")
-    @classmethod
-    def _validate_factory_metadata_ci(cls, value: Any) -> dict[str, dict[str, Any]]:
         if isinstance(value, str):
-            value = json.loads(value) if value.strip() else {}
-        if not isinstance(value, dict):
-            raise ValueError("GITHUB_FACTORY_METADATA_CI must be a JSON object")
-        policies: dict[str, dict[str, Any]] = {}
-        for repo, policy in value.items():
-            if not isinstance(repo, str) or not valid_repository_name(repo):
-                raise ValueError(f"GITHUB_FACTORY_METADATA_CI key {repo!r} is not owner/name")
-            if not isinstance(policy, dict) or set(policy) - {"checks", "statuses"}:
-                raise ValueError(f"GITHUB_FACTORY_METADATA_CI[{repo!r}] has an invalid shape")
-            names: dict[str, list[str]] = {}
-            for surface in ("checks", "statuses"):
-                entries = policy.get(surface, [])
-                if not isinstance(entries, list) or not all(
-                    isinstance(entry, str) and entry.strip() for entry in entries
-                ):
-                    raise ValueError(
-                        f"GITHUB_FACTORY_METADATA_CI[{repo!r}].{surface} must be a list"
-                        " of nonempty names"
-                    )
-                names[surface] = list(entries)
-            if not names["checks"] and not names["statuses"]:
-                raise ValueError(
-                    f"GITHUB_FACTORY_METADATA_CI[{repo!r}] must name a check or status"
-                )
-            policies[repo] = names
-        return policies
+            # Imported here: the loader imports the forge registry, which imports
+            # the adapter packages, which import this module.
+            from .forges.loader import load_forges_json
 
-    @field_validator("github_factory_bases", mode="before")
-    @classmethod
-    def _validate_factory_bases(cls, value: Any) -> dict[str, dict[str, Any]]:
-        if isinstance(value, str):
-            value = json.loads(value) if value.strip() else {}
-        if not isinstance(value, dict):
-            raise ValueError("GITHUB_FACTORY_BASES must be a JSON object")
-        entries: dict[str, dict[str, Any]] = {}
-        for repo, entry in value.items():
-            if not isinstance(repo, str) or not valid_repository_name(repo):
-                raise ValueError(f"GITHUB_FACTORY_BASES key {repo!r} is not owner/name")
-            if not isinstance(entry, dict) or set(entry) - {"bases", "default_base"}:
-                raise ValueError(f"GITHUB_FACTORY_BASES[{repo!r}] has an invalid shape")
-            bases = entry.get("bases")
-            if (
-                not isinstance(bases, list)
-                or not bases
-                or not all(valid_base_branch(base) for base in bases)
-                or len(set(bases)) != len(bases)
-            ):
-                raise ValueError(
-                    f"GITHUB_FACTORY_BASES[{repo!r}].bases must be a non-empty list of"
-                    " unique branch names"
-                )
-            default_base = entry.get("default_base")
-            if default_base is not None and default_base not in bases:
-                raise ValueError(
-                    f"GITHUB_FACTORY_BASES[{repo!r}].default_base must be one of its bases"
-                )
-            entries[repo] = {"bases": list(bases), "default_base": default_base}
-        return entries
+            return load_forges_json(value)
+        return value
+
+    @model_validator(mode="after")
+    def _remediation_requires_the_executor(self) -> "Settings":
+        """@spec AUTOMATED-REMEDIATION-1: fail closed with the executor off.
+
+        The chart refuses this combination at render; compose cannot refuse a
+        render, so the API refuses to boot with it instead.
+        """
+        if self.remediation_enabled and not self.action_executor_enabled:
+            raise ValueError(
+                "CURIE_REMEDIATION_ENABLED=true requires CURIE_ACTION_EXECUTOR_ENABLED=true "
+                "(remediation.enabled requires actionExecutor.enabled)"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_connector_proxy(self) -> "Settings":
@@ -981,69 +1062,176 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _validate_github_factory_ingress(self) -> "Settings":
-        if not self.github_factory_ingress_enabled:
-            return self
-        from .github_review_events import valid_github_login
+    def _validate_factory(self) -> "Settings":
+        """The factory's boot contract: a tracker and a code host of any
+        installed kind in CURIE_FORGES, a webhook secret fit for the intake,
+        and, when a GitHub tracker or code host is configured, a repository
+        allowlist. Label and mention validity belong to the tracker entry."""
 
+        if not self.factory_enabled:
+            return self
+        kinds: dict[str, set[str]] = {
+            "tracker": {tracker.kind for tracker in self.forges.trackers},
+            "code host": {host.kind for host in self.forges.code_hosts},
+        }
+        missing = [what for what, found in kinds.items() if not found]
         offenders = []
-        if not self.github_app_id.strip():
-            offenders.append("GITHUB_APP_ID")
-        if not self.github_app_private_key.strip():
-            offenders.append("GITHUB_APP_PRIVATE_KEY")
+        if missing:
+            offenders.append(f"CURIE_FORGES (no {' or '.join(missing)})")
         # Polling may disable signed deliveries with a blank secret, but a
         # published signing key must never authenticate factory deliveries.
         if self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET or (
-            self.github_factory_intake == "webhook"
-            and not self.github_webhook_secret.strip()
+            self.factory_intake == "webhook" and not self.github_webhook_secret.strip()
         ):
             offenders.append("GITHUB_WEBHOOK_SECRET")
-        label = self.github_factory_label
-        if (
-            not label
-            or label != label.strip()
-            or len(label) > 50
-            or any(character.isspace() for character in label)
-        ):
-            offenders.append("GITHUB_FACTORY_LABEL")
-        if not valid_github_login(self.github_factory_mention):
-            offenders.append("GITHUB_FACTORY_MENTION")
-        if not self.github_repo_allowlist:
+        github = any(forge_types.GITHUB in found for found in kinds.values())
+        if github and not self.github_repo_allowlist:
             offenders.append("GITHUB_REPO_ALLOWLIST")
         if offenders:
             raise ValueError(
-                "GitHub factory ingress (GITHUB_FACTORY_INGRESS_ENABLED) requires "
-                "complete active configuration; "
+                "the factory (FACTORY_ENABLED) requires complete active configuration; "
                 f"set valid values for: {', '.join(offenders)}"
             )
         return self
 
     @model_validator(mode="after")
-    def _check_factory_card_base_url(self) -> "Settings":
-        """Empty, or an https origin (http localhost only in dev), no query or fragment."""
-        value = self.github_factory_card_base_url.strip()
-        if value.endswith("/"):
-            value = value[:-1]
-        if value:
-            parts = urlsplit(value)
-            local_dev = (
-                self.environment.strip().lower() == "dev"
-                and parts.scheme == "http"
-                and parts.hostname in ("localhost", "127.0.0.1")
+    def _validate_forge_github_host(self) -> "Settings":
+        """A GitHub code host must live on the install's GitHub host, so stored
+        lineage rows and the non-factory lookups agree on one host (#4397)."""
+
+        github = urlsplit(self.github_html_base).netloc.lower() or "github.com"
+        wrong = sorted(
+            host.name
+            for host in self.forges.code_hosts
+            if host.kind == forge_types.GITHUB and host.host != github
+        )
+        if wrong:
+            raise ValueError(
+                f"CURIE_FORGES github code host {', '.join(wrong)} is not on the host of "
+                f"GITHUB_API_URL ({github}); set both to the same GitHub"
             )
-            if (
-                not (parts.scheme == "https" or local_dev)
-                or not parts.netloc
-                or parts.query
-                or parts.fragment
-                or "?" in value
-                or "#" in value
-            ):
+        return self
+
+    @property
+    def oidc_enabled(self) -> bool:
+        """Whether generic OIDC login is configured (the issuer is the switch)."""
+        return bool(self.oidc_issuer.strip())
+
+    @field_validator("oidc_required_claims", mode="before")
+    @classmethod
+    def _parse_oidc_required_claims(cls, value: Any) -> Any:
+        """Accept only a JSON object of non-blank claim names to string values.
+
+        Checked here rather than left to the dict[str, str] coercion so that
+        nothing is coerced: a number, boolean, null or list value is refused at
+        boot instead of becoming a requirement no token could meet as written.
+        """
+        if isinstance(value, str):
+            try:
+                value = json.loads(value) if value.strip() else {}
+            except ValueError:
+                raise ValueError("CURIE_OIDC_REQUIRED_CLAIMS must be a JSON object") from None
+        if not isinstance(value, dict):
+            raise ValueError("CURIE_OIDC_REQUIRED_CLAIMS must be a JSON object")
+        for name, required in value.items():
+            if not isinstance(name, str) or not name.strip() or not isinstance(required, str):
                 raise ValueError(
-                    "GITHUB_FACTORY_CARD_BASE_URL must be empty or an https:// URL "
-                    "with no query or fragment"
+                    "CURIE_OIDC_REQUIRED_CLAIMS maps non-blank claim names to string values"
                 )
-        self.github_factory_card_base_url = value
+        return value
+
+    @field_validator("oidc_scopes")
+    @classmethod
+    def _require_openid_scope(cls, value: str) -> str:
+        if "openid" not in value.split():
+            raise ValueError("CURIE_OIDC_SCOPES must include openid")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_oidc(self) -> "Settings":
+        """Refuse a partial OIDC configuration, and plaintext IdP URLs or a
+        missing admission policy in prod.
+
+        Every one of the four is load-bearing on the first login: without the
+        audience no token can be accepted, without the JWKS URL no signature can
+        be checked, and without the redirect URI the IdP has nowhere to send the
+        browser back. Booting with a subset would advertise a login that can
+        only fail, so the subset is a boot error instead. Under prod the issuer,
+        the key source and the redirect must be https: the redirect carries the
+        authorization code, and a plaintext JWKS fetch lets anyone on the path
+        substitute the keys every ID token is checked against.
+        """
+        values = {
+            "CURIE_OIDC_ISSUER": self.oidc_issuer,
+            "CURIE_OIDC_AUDIENCE": self.oidc_audience,
+            "CURIE_OIDC_JWKS_URL": self.oidc_jwks_url,
+            "CURIE_OIDC_REDIRECT_URI": self.oidc_redirect_uri,
+        }
+        blank = [name for name, value in values.items() if not value.strip()]
+        if len(blank) == len(values):
+            return self
+        if blank:
+            raise ValueError(
+                "OIDC login needs all of CURIE_OIDC_ISSUER, CURIE_OIDC_AUDIENCE, "
+                "CURIE_OIDC_JWKS_URL and CURIE_OIDC_REDIRECT_URI, or none of them; "
+                f"missing: {', '.join(blank)}"
+            )
+        if self.environment.strip().lower() == "prod":
+            plaintext = [
+                name
+                for name in ("CURIE_OIDC_ISSUER", "CURIE_OIDC_JWKS_URL", "CURIE_OIDC_REDIRECT_URI")
+                if not values[name].lower().startswith("https://")
+            ]
+            if plaintext:
+                raise ValueError(
+                    f"ENVIRONMENT=prod requires https URLs for: {', '.join(plaintext)}"
+                )
+            if not self.oidc_required_claims and not self.oidc_admit_all_authenticated:
+                raise ValueError(
+                    "ENVIRONMENT=prod with OIDC login needs an admission policy: set "
+                    "CURIE_OIDC_REQUIRED_CLAIMS, or CURIE_OIDC_ADMIT_ALL_AUTHENTICATED=true "
+                    "to admit every account the IdP authenticates"
+                )
+            if self.oidc_required_claims and self.oidc_admit_all_authenticated:
+                raise ValueError(
+                    "CURIE_OIDC_REQUIRED_CLAIMS and CURIE_OIDC_ADMIT_ALL_AUTHENTICATED=true "
+                    "contradict each other; set one of them"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _check_factory_card_base_url(self) -> "Settings":
+        """The card origin is https; http localhost is accepted only in dev."""
+
+        parts = urlsplit(self.forges.card_base_url)
+        if parts.scheme == "http" and self.environment.strip().lower() != "dev":
+            raise ValueError(
+                "CURIE_FORGES factory.cardBaseUrl must be an https:// URL outside ENVIRONMENT=dev"
+            )
+        return self
+
+    @field_validator("test_installation_drivers", mode="before")
+    @classmethod
+    def _parse_test_installation_drivers(cls, value: object) -> object:
+        # Parse here so JSON null is refused instead of being discarded by the
+        # settings env source and silently replaced by the empty default.
+        return parse_drivers(value)
+
+    @model_validator(mode="after")
+    def _refuse_published_defaults_on_a_test_installation(self) -> "Settings":
+        """Refuse boot on a published default secret while declared a test installation.
+
+        The chart refuses the same render, but it cannot see a secret supplied
+        another way, and a compose stack never renders the chart (ADR 0202).
+        """
+        refuse_published_defaults(
+            self.test_installation_enabled,
+            {
+                "API_KEY": self.api_key,
+                "CURIE_INTERNAL_WORKER_TOKEN": self.internal_worker_token,
+                "CURIE_APPROVAL_CHAT_ATTESTER_SECRET": self.approval_chat_attester_secret,
+            },
+        )
         return self
 
     @model_validator(mode="after")
@@ -1066,8 +1254,8 @@ class Settings(BaseSettings):
             offenders.append("API_KEY")
         empty_poll_secret = (
             self.github_webhook_secret == ""
-            and self.github_factory_ingress_enabled
-            and self.github_factory_intake == "poll"
+            and self.factory_enabled
+            and self.factory_intake == "poll"
         )
         if self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET or (
             self.github_webhook_secret == "" and not empty_poll_secret

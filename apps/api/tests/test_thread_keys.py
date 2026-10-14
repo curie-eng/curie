@@ -13,8 +13,17 @@ from typing import Any
 
 import pytest
 from channel_protocol import scoped_conversation_id
-from curie_api import crud
 from curie_api.config import get_settings
+from curie_api.crud import (
+    errors as crud_errors,
+)
+from curie_api.crud import (
+    lineages as crud_lineages,
+)
+from curie_api.crud import (
+    publications as crud_publications,
+)
+from curie_api.forges.types import GITHUB, RepositoryRef, TrackerIssueRef
 from curie_api.models import ThreadPublicationLineage
 from curie_api.threadkeys import (
     pre_identity_thread_key,
@@ -22,12 +31,14 @@ from curie_api.threadkeys import (
     route_thread_key_matches,
 )
 from curie_api.workitem_dispatch import (
+    Admission,
     admit,
     cancel,
     claim_terminate_publishes,
     readmit,
     running_for_conversation,
 )
+from curie_api.workitems.lifecycle import work_item_identity_values
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -135,22 +146,21 @@ async def _mail_agent(session: AsyncSession) -> uuid.UUID:
     return agent_id
 
 
-def _facts(agent_id: uuid.UUID, **overrides: Any) -> SimpleNamespace:
+def _facts(agent_id: uuid.UUID, **overrides: Any) -> Admission:
     values: dict[str, Any] = {
         "agent_id": agent_id,
         "kind": "email",
         "address": ADDRESS,
         "reply_conversation_id": THREAD,
-        "repo_full_name": "acme-corp/acme-bot",
-        "github_repository_id": 101,
-        "github_issue_number": 3104,
-        "github_installation_id": 202,
+        "issue": TrackerIssueRef(GITHUB, "github.com", "101", "3104"),
+        "repository": RepositoryRef(GITHUB, "github.com", "101", "acme-corp/acme-bot"),
+        "code_host_installation_id": 202,
         "objective": "Implement the admitted work item",
         "requester": "U0REQUEST1",
         "request_id": uuid.uuid4(),
     }
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return Admission(**values)
 
 
 def test_admission_keys_a_mail_work_item_by_its_identity(clean_db: None, allowlisted: None) -> None:
@@ -184,17 +194,19 @@ async def _legacy_mail_work_item(session: AsyncSession) -> tuple[uuid.UUID, uuid
     await session.execute(
         text(
             "INSERT INTO curie.work_items "
-            "(id, github_repository_id, github_issue_number, github_installation_id, "
-            "agent_id, repo_full_name, conversation_id) "
-            "VALUES (:id, :repo_id, :issue, :install, :agent_id, :repo, :conversation_id)"
+            "(id, tracker_kind, tracker_host, tracker_scope_id, tracker_issue_id, "
+            "tracker_display_key, code_host_kind, code_host_host, repository_project_id, "
+            "repository_path, code_host_installation_id, agent_id, conversation_id) "
+            "VALUES (:id, :tracker_kind, :tracker_host, :tracker_scope_id, "
+            ":tracker_issue_id, :tracker_display_key, :code_host_kind, :code_host_host, "
+            ":repository_project_id, :repository_path, :install, :agent_id, "
+            ":conversation_id)"
         ),
         {
             "id": work_item_id,
-            "repo_id": facts.github_repository_id,
-            "issue": facts.github_issue_number,
-            "install": facts.github_installation_id,
+            **work_item_identity_values(facts.issue, facts.repository),
+            "install": facts.code_host_installation_id,
             "agent_id": agent_id,
-            "repo": facts.repo_full_name,
             "conversation_id": OLD_KEY,
         },
     )
@@ -239,7 +251,7 @@ def test_a_cancelled_work_item_keyed_before_the_identity_still_fences_publicatio
         agent_id, work_item_id, version = await _legacy_mail_work_item(session)
         cancelled = await cancel(session, work_item_id=work_item_id, expected_version=version)
         assert getattr(cancelled, "work_item", None) is not None, cancelled
-        conflict = await crud.publication_cancellation_conflict(
+        conflict = await crud_publications.publication_cancellation_conflict(
             session, agent_id=agent_id, conversation_id=NEW_KEY
         )
         assert conflict is not None
@@ -305,7 +317,7 @@ def test_a_cancelled_legacy_work_item_still_fences_publication_after_its_binding
             text("DELETE FROM curie.agent_channels WHERE agent_id = :id"), {"id": agent_id}
         )
         await session.commit()
-        conflict = await crud.publication_cancellation_conflict(
+        conflict = await crud_publications.publication_cancellation_conflict(
             session, agent_id=agent_id, conversation_id=NEW_KEY
         )
         assert conflict is not None
@@ -368,8 +380,8 @@ def test_refuse_fenced_work_item_still_fences_a_cancelled_legacy_work_item(
         agent_id, work_item_id, version = await _legacy_mail_work_item(session)
         cancelled = await cancel(session, work_item_id=work_item_id, expected_version=version)
         assert getattr(cancelled, "work_item", None) is not None, cancelled
-        with pytest.raises(crud.PublicationLineageConflict) as caught:
-            await crud._refuse_fenced_work_item(
+        with pytest.raises(crud_errors.PublicationLineageConflict) as caught:
+            await crud_publications._refuse_fenced_work_item(
                 session,
                 agent_id=agent_id,
                 conversation_id=NEW_KEY,
@@ -407,10 +419,12 @@ async def _bare_lineage(
         text(
             "INSERT INTO curie.thread_publication_lineages "
             "(id, agent_id, deployment_id, conversation_id, repo_full_name, base_sha, branch, "
-            "status, pr_number, pr_url, head_sha, github_repository_id, "
-            "github_installation_id, github_pr_node_id, base_ref) VALUES "
+            "status, pr_number, pr_url, head_sha, code_host_kind, code_host_host, "
+            "repository_project_id, "
+            "code_host_installation_id, code_host_pr_id, base_ref) VALUES "
             "(:id, :agent_id, :deployment_id, :conversation_id, :repo, :base_sha, :branch, "
-            "'open', 123, :pr_url, :head_sha, :repository_id, :installation_id, "
+            "'open', 123, :pr_url, :head_sha, 'github', 'github.com', :repository_id, "
+            ":installation_id, "
             "'PR_example_123', 'main')"
         ),
         {
@@ -423,8 +437,8 @@ async def _bare_lineage(
             "branch": f"curie/bind-{lineage_id.hex[:8]}",
             "pr_url": "https://github.com/acme-corp/acme-bot/pull/123",
             "head_sha": "b" * 40,
-            "repository_id": _facts(agent_id).github_repository_id,
-            "installation_id": _facts(agent_id).github_installation_id,
+            "repository_id": _facts(agent_id).repository.project_id,
+            "installation_id": _facts(agent_id).code_host_installation_id,
         },
     )
     await session.commit()
@@ -440,7 +454,9 @@ async def _bind_lineage(
     lineage = await session.get(ThreadPublicationLineage, lineage_id)
     assert lineage is not None
     publication: Any = SimpleNamespace(execution_request_id=request_id)
-    await crud._bind_running_work_item_lineage(session, publication=publication, lineage=lineage)
+    await crud_lineages._bind_running_work_item_lineage(
+        session, publication=publication, lineage=lineage
+    )
 
 
 def test_bind_running_work_item_lineage_finds_a_legacy_work_items_running_request(

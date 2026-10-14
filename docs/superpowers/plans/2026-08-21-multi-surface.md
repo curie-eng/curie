@@ -66,8 +66,8 @@ Run: `git add apps/api/alembic/versions/0030_agent_channels_multi_binding.py app
 ### Task 2: Binding Subresource and Safe Concurrent Writes
 
 **Files:**
-- Modify: `apps/api/src/curie_api/schemas.py`
-- Modify: `apps/api/src/curie_api/crud.py`
+- Modify: `apps/api/src/curie_api/schemas/channels.py`, `apps/api/src/curie_api/schemas/agents.py`
+- Modify: `apps/api/src/curie_api/crud/channels.py`
 - Modify: `apps/api/src/curie_api/routers/agents.py`
 - Modify: `apps/api/src/curie_api/routers/channels.py`
 - Modify: `apps/api/src/curie_api/channel_token.py`
@@ -108,7 +108,7 @@ Run: `git add apps/api && git commit -m "Add the agent surfaces subresource"`
 
 **Files:**
 - Modify: `apps/worker/src/curie_worker/binding.py`
-- Modify: `apps/worker/src/curie_worker/kernel.py`
+- Modify: `apps/worker/src/curie_worker/kernel/core.py`
 - Modify: `apps/dispatcher/tests/test_dispatch.py`
 - Test: `apps/worker/tests/binding/test_resolver.py`
 - Test: `apps/worker/tests/kernel/test_multi_channel_respond_in_kind.py`
@@ -143,7 +143,7 @@ Run: `git add apps/worker apps/dispatcher/tests/test_dispatch.py && git commit -
 
 **Files:**
 - Modify: `cli/src/api.rs`
-- Modify: `cli/src/commands.rs`
+- Modify: `cli/src/commands/` (then a single `commands.rs`)
 - Modify: `cli/src/main.rs`
 - Modify: `cli/src/message.rs`
 - Create: `cli/schema/surfaces.schema.json`

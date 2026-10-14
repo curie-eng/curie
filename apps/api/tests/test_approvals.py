@@ -27,16 +27,16 @@ import redis.asyncio as aioredis
 from _migration_support import IsolatedMigrationDb, alembic_config
 from aci_protocol import QueuedTurn
 from alembic import command
-from curie_api import approval_principal, crud
+from curie_api import approval_principal
 from curie_api import sweeper as sweeper_module
 from curie_api.config import get_settings
+from curie_api.crud import approvals as crud_approvals
 from curie_api.deps import get_approver_sets
 from curie_api.main import create_app
 from curie_api.models import Approval
 from curie_api.resumequeue import ResumeQueue
 from curie_api.resumereconciler import ResumeReconciler
 from curie_api.routers import approvals as approvals_module
-from curie_api.sandbox_token import mint
 from curie_api.slack_approvers import SlackApproverSetSelector
 from curie_api.slack_usergroups import SlackUserGroupClient
 from curie_api.sweeper import (
@@ -44,6 +44,7 @@ from curie_api.sweeper import (
     run_expiry_sweeper,
     sweep_expired_approvals,
 )
+from curie_internal.sandbox_token import mint
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     extract_trace_context,
@@ -2016,7 +2017,7 @@ def test_resolve_path_expiry_returns_410_when_the_resumed_mark_fails(
     assert created["expires_at"] is not None
     lapsed_at = _lapse(created["id"])
 
-    real_mark = crud.mark_approval_resumed
+    real_mark = crud_approvals.mark_approval_resumed
 
     async def _failing_mark(session: Any, approval_id: uuid.UUID) -> Any:
         # Wrap the real collaborator: only this record's mark fails (a DB blip),
@@ -2025,7 +2026,7 @@ def test_resolve_path_expiry_returns_410_when_the_resumed_mark_fails(
             raise RuntimeError("postgres unreachable")
         return await real_mark(session, approval_id)
 
-    monkeypatch.setattr(crud, "mark_approval_resumed", _failing_mark)
+    monkeypatch.setattr(crud_approvals, "mark_approval_resumed", _failing_mark)
 
     # Observe the real 500 the error middleware would return in production rather
     # than letting TestClient re-raise it -- the regression pinned here is
@@ -2201,7 +2202,7 @@ def test_run_expiry_sweeper_loop_sweeps_and_stops(
                     )
                     await asyncio.sleep(0.1)
                     async with sessionmaker() as session:
-                        record = await crud.get_approval(session, approval_id)
+                        record = await crud_approvals.get_approval(session, approval_id)
                         assert record is not None
                         status = record.status
                 # The loop also enqueued the expiry resume turn -- but the flip

@@ -267,7 +267,8 @@ for index, template in enumerate(templates):
         "securityContext": {"runAsNonRoot": True, "runAsUser": 1000, "runAsGroup": 1000,
                             "allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True,
                             "capabilities": {"drop": ["ALL"]}, "seccompProfile": {"type": "RuntimeDefault"}},
-        "resources": {"requests": {"cpu": "10m", "memory": "16Mi"}, "limits": {"cpu": "50m", "memory": "32Mi"}},
+        "resources": {"requests": {"cpu": "10m", "memory": "16Mi", "ephemeral-storage": "16Mi"},
+                      "limits": {"cpu": "50m", "memory": "32Mi", "ephemeral-storage": "32Mi"}},
     }, *spec["initContainers"]]
     (root / f"template-{index}.patch.json").write_text(json.dumps({"spec": {"podTemplate": {"spec": spec}}}))
     with (root / "template-names").open("a") as names:

@@ -13,7 +13,9 @@ import asyncio
 import functools
 import json
 import logging
+import os
 import sys
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
@@ -41,7 +43,7 @@ from curie_worker.approvals import (
 )
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import GRANT_TOOL_ENV
-from curie_worker.kernel import _WorkspaceInferenceCarry
+from curie_worker.kernel.workspace import _WorkspaceInferenceCarry
 from curie_worker.reply_sink import TargetRoute, _ClusterMessageReplyAdapter
 from curie_worker.runner_client import RunnerError
 from curie_worker.sandbox.types import RouteState
@@ -190,7 +192,7 @@ def test_completed_lineage_can_replace_an_idle_durable_awaiting_runner() -> None
     """A failed publication suspend must not strand the dirty pre-publish route."""
 
     async def go() -> None:
-        from curie_worker.kernel import Kernel
+        from curie_worker.kernel.core import Kernel
 
         kernel = object.__new__(Kernel)
         kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
@@ -248,7 +250,7 @@ def test_lineage_handoff_keeps_busy_and_durability_fences(
     status: dict[str, object], pending: bool, reason: str
 ) -> None:
     async def go() -> None:
-        from curie_worker.kernel import Kernel
+        from curie_worker.kernel.core import Kernel
 
         kernel = object.__new__(Kernel)
         kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
@@ -268,7 +270,7 @@ def test_non_lineage_handoff_still_refuses_awaiting_approval() -> None:
     """The AWAITING_APPROVAL waiver belongs only to completed publication lineage."""
 
     async def go() -> None:
-        from curie_worker.kernel import Kernel
+        from curie_worker.kernel.core import Kernel
 
         kernel = object.__new__(Kernel)
         kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
@@ -292,7 +294,7 @@ def test_non_lineage_handoff_still_refuses_awaiting_approval() -> None:
 
 def test_open_lineage_bypasses_same_repo_adoption_and_surfaces_route_cas_loss() -> None:
     async def go() -> None:
-        from curie_worker.kernel import Kernel
+        from curie_worker.kernel.core import Kernel
 
         old_route = object()
 
@@ -331,7 +333,7 @@ def test_open_lineage_bypasses_same_repo_adoption_and_surfaces_route_cas_loss() 
 
 def test_route_cas_loss_never_steers_or_starts_the_old_lineage_runner() -> None:
     async def go() -> None:
-        from curie_worker.kernel import Kernel
+        from curie_worker.kernel.core import Kernel
         from curie_worker.sandbox.types import SandboxHandle
 
         thread_key = "slack:C0EXAMPLE1:1700000000.000100"
@@ -440,7 +442,7 @@ def test_verified_lineage_with_mismatched_route_state_cold_reconciles(
 ) -> None:
     async def go() -> None:
         from curie_worker.approvals import PublicationLineage
-        from curie_worker.kernel import Kernel
+        from curie_worker.kernel.core import Kernel
         from curie_worker.sandbox.types import SandboxHandle
 
         thread_key = "slack:C0EXAMPLE1:1700000000.000100"
@@ -547,10 +549,10 @@ def test_verified_lineage_with_mismatched_route_state_cold_reconciles(
 def test_verified_lineage_at_materialized_route_head_reuses_existing_session(
     turn_active: bool,
     lineage_head: str | None,
+    make_harness,
 ) -> None:
     async def go() -> None:
         from curie_worker.approvals import PublicationLineage
-        from curie_worker.kernel import Kernel
         from curie_worker.sandbox.types import SandboxHandle
 
         thread_key = "slack:C0EXAMPLE1:1700000000.000100"
@@ -635,45 +637,46 @@ def test_verified_lineage_at_materialized_route_head_reuses_existing_session(
                 self.starts += 1
                 return SimpleNamespace()
 
-        substrate = Substrate()
-        workspace = Workspace()
-        runner = Runner()
-        kernel = object.__new__(Kernel)
-        kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
-        kernel._work_item_runs = {}  # type: ignore[attr-defined]
-        kernel._substrate = substrate  # type: ignore[attr-defined]
-        kernel._workspace = workspace  # type: ignore[attr-defined]
-        kernel._publication_creator = PublicationApi()  # type: ignore[attr-defined]
-        kernel._runner = runner  # type: ignore[attr-defined]
-        kernel._route_ttl_seconds = 60  # type: ignore[attr-defined]
+        async with make_harness() as h:
+            substrate = Substrate()
+            workspace = Workspace()
+            runner = Runner()
+            kernel = h.kernel
+            kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
+            kernel._work_item_runs = {}  # type: ignore[attr-defined]
+            kernel._substrate = substrate  # type: ignore[attr-defined]
+            kernel._workspace = workspace  # type: ignore[attr-defined]
+            kernel._publication_creator = PublicationApi()  # type: ignore[attr-defined]
+            kernel._runner = runner  # type: ignore[attr-defined]
 
-        result = await kernel._route_and_start(
-            thread_key,
-            SimpleNamespace(
-                text="Continue https://github.com/acme-corp/acme-bot",
-                user="U0REQUEST1",
-                tool_access=None,
-            ),
-            {},
-            queued_event_id="test-event",
-            workspace_deployment_id=deployment_id,
-            agent_name="acme-bot",
-            workspace_inference=_WorkspaceInferenceCarry(),
-        )
+            result = await kernel._route_and_start(
+                thread_key,
+                SimpleNamespace(
+                    text="Continue https://github.com/acme-corp/acme-bot",
+                    user="U0REQUEST1",
+                    tool_access=None,
+                ),
+                {},
+                queued_event_id="test-event",
+                workspace_deployment_id=deployment_id,
+                agent_name="acme-bot",
+                workspace_inference=_WorkspaceInferenceCarry(),
+            )
 
-        assert substrate.adopt_calls == 1
-        assert workspace.touches == [(thread_key, 60)]
-        assert runner.steers == 1
-        assert result.steered is turn_active
-        assert runner.starts == (0 if turn_active else 1)
+            assert substrate.adopt_calls == 1
+            assert workspace.touches == [(thread_key, 60)]
+            assert runner.steers == 1
+            assert result.steered is turn_active
+            assert runner.starts == (0 if turn_active else 1)
 
     asyncio.run(go())
 
 
-def test_headless_visible_outcome_cold_reconciles_once_then_live_followup_steers() -> None:
+def test_headless_visible_outcome_cold_reconciles_once_then_live_followup_steers(
+    make_harness,
+) -> None:
     async def go() -> None:
         from curie_worker.approvals import PublicationLineage
-        from curie_worker.kernel import Kernel
         from curie_worker.sandbox.types import SandboxHandle
 
         thread_key = "slack:C0EXAMPLE1:1700000000.000100"
@@ -782,50 +785,50 @@ def test_headless_visible_outcome_cold_reconciles_once_then_live_followup_steers
                 self.starts += 1
                 return SimpleNamespace()
 
-        substrate = Substrate()
-        workspace = Workspace()
-        runner = Runner()
-        kernel = object.__new__(Kernel)
-        kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
-        kernel._work_item_runs = {}  # type: ignore[attr-defined]
-        kernel._substrate = substrate  # type: ignore[attr-defined]
-        kernel._workspace = workspace  # type: ignore[attr-defined]
-        kernel._publication_creator = PublicationApi()  # type: ignore[attr-defined]
-        kernel._runner = runner  # type: ignore[attr-defined]
-        kernel._route_ttl_seconds = 60  # type: ignore[attr-defined]
-        event = SimpleNamespace(
-            text="Continue https://github.com/acme-corp/acme-bot",
-            user="U0REQUEST1",
-            tool_access=None,
-        )
+        async with make_harness() as h:
+            substrate = Substrate()
+            workspace = Workspace()
+            runner = Runner()
+            kernel = h.kernel
+            kernel._factory_work_item_events = set()  # type: ignore[attr-defined]
+            kernel._work_item_runs = {}  # type: ignore[attr-defined]
+            kernel._substrate = substrate  # type: ignore[attr-defined]
+            kernel._workspace = workspace  # type: ignore[attr-defined]
+            kernel._publication_creator = PublicationApi()  # type: ignore[attr-defined]
+            kernel._runner = runner  # type: ignore[attr-defined]
+            event = SimpleNamespace(
+                text="Continue https://github.com/acme-corp/acme-bot",
+                user="U0REQUEST1",
+                tool_access=None,
+            )
 
-        first = await kernel._route_and_start(
-            thread_key,
-            event,
-            {},
-            queued_event_id="test-event",
-            workspace_deployment_id=deployment_id,
-            agent_name="acme-bot",
-            workspace_inference=_WorkspaceInferenceCarry(),
-        )
-        runner.live = True
-        second = await kernel._route_and_start(
-            thread_key,
-            event,
-            {},
-            queued_event_id="test-event",
-            workspace_deployment_id=deployment_id,
-            agent_name="acme-bot",
-            workspace_inference=_WorkspaceInferenceCarry(),
-        )
+            first = await kernel._route_and_start(
+                thread_key,
+                event,
+                {},
+                queued_event_id="test-event",
+                workspace_deployment_id=deployment_id,
+                agent_name="acme-bot",
+                workspace_inference=_WorkspaceInferenceCarry(),
+            )
+            runner.live = True
+            second = await kernel._route_and_start(
+                thread_key,
+                event,
+                {},
+                queued_event_id="test-event",
+                workspace_deployment_id=deployment_id,
+                agent_name="acme-bot",
+                workspace_inference=_WorkspaceInferenceCarry(),
+            )
 
-        assert first.steered is False
-        assert second.steered is True
-        assert workspace.replacements == 1
-        assert workspace.touches == 1
-        assert substrate.adopts == 1
-        assert runner.starts == 1
-        assert runner.steers == 2
+            assert first.steered is False
+            assert second.steered is True
+            assert workspace.replacements == 1
+            assert workspace.touches == 1
+            assert substrate.adopts == 1
+            assert runner.starts == 1
+            assert runner.steers == 2
 
     asyncio.run(go())
 
@@ -841,7 +844,8 @@ def test_api_pending_publication_work_is_fenced_before_lineage_handoff_probe(
 ) -> None:
     async def go() -> None:
         from curie_worker.approvals import PublicationLineage
-        from curie_worker.kernel import Kernel, ThreadBusyError
+        from curie_worker.kernel.core import Kernel
+        from curie_worker.kernel.failures import ThreadBusyError
         from curie_worker.sandbox.types import SandboxHandle
 
         thread_key = "slack:C0EXAMPLE1:1700000000.000100"
@@ -1060,7 +1064,7 @@ def test_pending_first_revision_is_a_terminal_reply_before_dirty_route_adoption(
 
 def test_api_stale_head_conflict_stops_before_workspace_or_model_for_private_repo() -> None:
     async def go() -> None:
-        from curie_worker.kernel import Kernel
+        from curie_worker.kernel.core import Kernel
 
         deployment_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
 
@@ -1373,7 +1377,7 @@ async def _publication_run(
 
         monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
         monkeypatch.setattr(
-            "curie_worker.kernel.validate_snapshot_against_base",
+            "curie_worker.kernel.attempt.validate_snapshot_against_base",
             lambda *_args, **_kwargs: None,
         )
         event = _qevent(
@@ -1643,7 +1647,7 @@ def test_publication_notice_keeps_the_announcement_above_it(
 def test_private_lineage_head_reaches_handoff_without_a_publication_credential() -> None:
     async def go() -> None:
         from curie_worker.approvals import PublicationLineage
-        from curie_worker.kernel import Kernel
+        from curie_worker.kernel.core import Kernel
         from curie_worker.sandbox.types import SandboxHandle
 
         thread_key = "slack:C0EXAMPLE1:1700000000.000100"
@@ -2168,7 +2172,7 @@ def test_a_long_refusal_is_redacted_whole_before_it_is_clipped() -> None:
     redaction would cut the PEM end line and leak the key body.
     """
 
-    from curie_worker.kernel import _ApprovalPause
+    from curie_worker.kernel.approval import _ApprovalPause
 
     body = "A" * 900
     pem = f"-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----"
@@ -2436,7 +2440,7 @@ class _FactoryWorkItems:
             work_item_id=request_id,
             conversation_id=f"work-item-{request_id}",
             wait_deadline=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
-            repo_full_name="acme-corp/widgets",
+            repository_path="acme-corp/widgets",
         )
 
     async def start(self, request_id: uuid.UUID, **_: object) -> object:
@@ -2483,7 +2487,7 @@ def test_factory_publication_turn_rides_out_two_503s_and_holds_for_approval(
 
     from aci_protocol import PublicationContext, ToolNote, TurnSource
     from curie_worker.approvals import PublicationLineage
-    from curie_worker.kernel import TURN_FAILURE_REPLY_PREFIX
+    from curie_worker.kernel.constants import TURN_FAILURE_REPLY_PREFIX
     from curie_worker.runner_client import RunnerWorkspaceSnapshot
 
     class PublicationClient(ApprovalClient):
@@ -2545,7 +2549,7 @@ def test_factory_publication_turn_rides_out_two_503s_and_holds_for_approval(
                     h.kernel._work_items = items
                     monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
                     monkeypatch.setattr(
-                        "curie_worker.kernel.validate_snapshot_against_base",
+                        "curie_worker.kernel.attempt.validate_snapshot_against_base",
                         lambda *_args, **_kwargs: None,
                     )
                     h.runner.turn_scripts = [
@@ -3726,14 +3730,14 @@ def test_publication_snapshot_inherits_the_attempts_remaining_delivery_budget(
     of the delivery deadline.
     """
 
-    from curie_worker import kernel as kernel_module
+    from curie_worker.kernel import clock as kernel_clock
 
     async def go() -> None:
         clock_s = 1000.0
         monkeypatch.setattr(
-            kernel_module,
+            kernel_clock,
             "time",
-            SimpleNamespace(monotonic=lambda: clock_s, time=kernel_module.time.time),
+            SimpleNamespace(monotonic=lambda: clock_s, time=kernel_clock.time.time),
         )
         async with make_harness() as h:
             h.runner.default_script = [
@@ -5409,7 +5413,7 @@ def test_the_remembered_approval_id_matches_the_resume_events_approval_id() -> N
     """
 
     from curie_api.resumequeue import resume_event_id
-    from curie_worker.kernel import _approval_id_from_resume_event
+    from curie_worker.kernel.approval import _approval_id_from_resume_event
 
     approval_id = uuid.UUID("6f1c8b3e-9c2a-4f5d-8a71-2b3c4d5e6f70")
     assert _approval_id_from_resume_event(resume_event_id(approval_id)) == str(approval_id)
@@ -6724,6 +6728,181 @@ def test_missing_display_sentence_boundaries_reach_notice_and_card(make_harness)
                 assert h.sink.posts[0][1].interaction.prompt == case["display"]
 
     asyncio.run(go())
+
+
+def test_production_ttls_reach_workspace_lease_during_streaming_and_pause(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_worker import run
+    from curie_worker.workspace import PreparedWorkspace, WorkspaceRef, _WorkspaceOwnership
+
+    async def exercise() -> None:
+        async with make_harness() as h:
+            bucket = f"curie-test-ttl-{uuid.uuid4().hex}"
+            config = h.config.model_copy(
+                update={
+                    "fake_model": True,
+                    "workspace_enabled": True,
+                    "publication_enabled": False,
+                    "workspace_bucket": bucket,
+                    "s3_endpoint_url": os.environ.get(
+                        "TEST_S3_ENDPOINT_URL", "http://127.0.0.1:29000"
+                    ),
+                    "s3_access_key": os.environ.get("TEST_S3_ACCESS_KEY", "rustfs"),
+                    "s3_secret_key": os.environ.get("TEST_S3_SECRET_KEY", "rustfssecret"),
+                }
+            )
+            monkeypatch.setattr(run, "_sandbox_client", lambda *_args: h.fake_k8s)
+            runtime = run.build(
+                config,
+                {
+                    "CURIE_NAMESPACE": "test-ns",
+                    "CURIE_WARM_POOL": "test-pool",
+                    "CURIE_RUNNER_PORT": str(h.substrate._config.runner_port),
+                    "CURIE_ROUTE_TTL_SECONDS": "3",
+                    "CURIE_SUSPENDED_ROUTE_TTL_SECONDS": "37",
+                },
+            )
+            thread = f"ttl-{uuid.uuid4().hex}"
+            thread_key = _thread_key(thread)
+            bucket_created = False
+            turn: asyncio.Task[None] | None = None
+            held = asyncio.Event()
+            try:
+                kernel = runtime.consumer._kernel
+                # These collaborators supply binding, reply, and approval
+                # behavior outside the TTL wiring under test. Keep the kernel,
+                # substrate, workspace, and their production TTL values intact.
+                kernel._binding = None
+                kernel._sink = h.kernel._sink
+                approvals = RecordingApprovals()
+                kernel._approvals = approvals
+                kernel._approval_reader = RecordingReader(None)
+                workspace = kernel._workspace
+                assert workspace is not None
+                objects = workspace.preparer.objects
+                client = objects._client
+                now = int(time.time())
+                digest = "a" * 64
+                prepared = PreparedWorkspace(
+                    object_key="base.tar.gz",
+                    sha256=digest,
+                    clean_clone_url="https://github.com/acme-corp/acme-bot.git",
+                    repo_full_name="acme-corp/acme-bot",
+                    base_sha="b" * 40,
+                    materialized_head="b" * 40,
+                    checkout_mode=0o700,
+                    reference=WorkspaceRef(
+                        url="https://objects.example.com/base.tar.gz",
+                        sha256=digest,
+                        expires_at_epoch=now + 120,
+                    ),
+                )
+                touches: list[int] = []
+                touched = asyncio.Event()
+                original_touch = workspace.touch
+                loop = asyncio.get_running_loop()
+
+                def observe_touch(requested_thread: str, *, ttl_seconds: int) -> bool:
+                    result = original_touch(requested_thread, ttl_seconds=ttl_seconds)
+                    assert result
+                    touches.append(ttl_seconds)
+                    loop.call_soon_threadsafe(touched.set)
+                    return result
+
+                monkeypatch.setattr(workspace, "touch", observe_touch)
+                h.runner.hold = held
+                h.runner.default_script = [TextDelta(text="waiting")]
+                h.runner.tail = [Final(text="waiting", status=DONE)]
+                await asyncio.to_thread(client.create_bucket, Bucket=bucket)
+                bucket_created = True
+                await asyncio.to_thread(objects.put_stream, prepared.object_key, (b"base",))
+                await asyncio.to_thread(
+                    workspace._store_ownership,
+                    _WorkspaceOwnership(thread_key, prepared, now + 1),
+                )
+                turn = asyncio.create_task(kernel.process_event(qevent("continue", thread=thread)))
+                await asyncio.wait_for(touched.wait(), timeout=10)
+                active = await asyncio.to_thread(workspace._load_ownership, thread_key)
+                assert active is not None
+                assert touches and set(touches) == {3}
+                assert 1 <= active.expires_at_epoch - int(time.time()) <= 3
+                held.set()
+                await asyncio.wait_for(turn, timeout=10)
+                h.runner.hold = None
+                h.runner.default_script = _awaiting_script("approve this operation")
+                h.runner.tail = []
+                await asyncio.wait_for(
+                    kernel.process_event(qevent("approval", thread=thread)), timeout=10
+                )
+                paused = await asyncio.to_thread(workspace._load_ownership, thread_key)
+                assert paused is not None
+                assert touches[-1] == 37
+                assert 34 <= paused.expires_at_epoch - int(time.time()) <= 37
+                assert approvals.create_calls == 1
+                route = kernel._substrate._affinity.get(thread_key)
+                assert route is not None and route.state == RouteState.SUSPENDED
+            finally:
+                original_error = sys.exception()
+                cleanup_errors: list[BaseException] = []
+                held.set()
+                if turn is not None and not turn.done():
+                    turn.cancel()
+                    await asyncio.gather(turn, return_exceptions=True)
+                try:
+                    await asyncio.to_thread(runtime.consumer._kernel._substrate.release, thread_key)
+                    route = runtime.consumer._kernel._substrate._affinity.get(thread_key)
+                    if route is not None:
+                        cleanup_errors.append(AssertionError("TTL test left a sandbox route"))
+                except Exception as exc:  # noqa: BLE001 - teardown collects every failure
+                    cleanup_errors.append(exc)
+                if bucket_created:
+                    try:
+                        await asyncio.to_thread(workspace.release, thread_key)
+                    except Exception as exc:  # noqa: BLE001 - teardown collects every failure
+                        cleanup_errors.append(exc)
+                    try:
+                        remaining_keys = await asyncio.to_thread(
+                            lambda: list(objects.list_keys(""))
+                        )
+                        if remaining_keys:
+                            cleanup_errors.append(
+                                AssertionError(f"TTL test left workspace objects: {remaining_keys}")
+                            )
+                        for key in remaining_keys:
+                            try:
+                                await asyncio.to_thread(objects.delete, key)
+                            except Exception as exc:  # noqa: BLE001 - teardown collects every failure
+                                cleanup_errors.append(exc)
+                    except Exception as exc:  # noqa: BLE001 - teardown collects every failure
+                        cleanup_errors.append(exc)
+                    try:
+                        await asyncio.to_thread(client.delete_bucket, Bucket=bucket)
+                    except Exception as exc:  # noqa: BLE001 - teardown collects every failure
+                        cleanup_errors.append(exc)
+                try:
+                    runtime.consumer._kernel._substrate._affinity._redis.close()
+                except Exception as exc:  # noqa: BLE001 - teardown collects every failure
+                    cleanup_errors.append(exc)
+                closed = await asyncio.gather(
+                    runtime.runner.close(),
+                    runtime.sink.aclose(),
+                    runtime.eval_http.aclose(),
+                    runtime.async_redis.aclose(),
+                    runtime.pressure_async_redis.aclose(),
+                    runtime.eval_redis.aclose(),
+                    runtime.engine.dispose(),
+                    return_exceptions=True,
+                )
+                cleanup_errors.extend(error for error in closed if isinstance(error, BaseException))
+                if cleanup_errors:
+                    if original_error is not None:
+                        for error in cleanup_errors:
+                            original_error.add_note(f"TTL test cleanup failed: {error!r}")
+                    else:
+                        raise BaseExceptionGroup("TTL test cleanup failed", cleanup_errors)
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("refused", [False, True])

@@ -16,6 +16,7 @@ members = [
     "curie-dispatcher",
     "curie-doclint",
     "curie-e2e-connector",
+    "curie-internal",
     "curie-mail-adapter",
     "curie-protected-hooks",
     "curie-runner",
@@ -764,6 +765,7 @@ dependencies = [
     { name = "boto3" },
     { name = "boto3-stubs", extra = ["s3"] },
     { name = "curie-channel-protocol" },
+    { name = "curie-internal" },
     { name = "curie-protected-hooks" },
     { name = "curie-telemetry" },
     { name = "curie-telemetry-schema" },
@@ -789,6 +791,7 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.43.55" },
     { name = "boto3-stubs", extras = ["s3"], specifier = ">=1.43.57" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
+    { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-protected-hooks", editable = "packages/protected-hooks" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "curie-telemetry-schema", editable = "packages/telemetry-schema" },
@@ -848,6 +851,7 @@ version = "0.0.0"
 source = { editable = "apps/dispatcher" }
 dependencies = [
     { name = "aci-protocol" },
+    { name = "curie-internal" },
     { name = "curie-telemetry" },
     { name = "curie-upgrade-pause" },
     { name = "httpx" },
@@ -860,6 +864,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "aci-protocol", editable = "packages/aci-protocol" },
+    { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },
     { name = "httpx", specifier = ">=0.28" },
@@ -902,6 +907,21 @@ requires-dist = [
 ]
 
 [[package]]
+name = "curie-internal"
+version = "0.0.0"
+source = { editable = "packages/curie-internal" }
+dependencies = [
+    { name = "redis" },
+    { name = "sqlalchemy", extra = ["asyncio"] },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "redis", specifier = ">=5.2" },
+    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
+]
+
+[[package]]
 name = "curie-mail-adapter"
 version = "0.0.0"
 source = { editable = "apps/mail-adapter" }
@@ -931,6 +951,7 @@ source = { editable = "packages/protected-hooks" }
 dependencies = [
     { name = "aci-protocol" },
     { name = "cryptography" },
+    { name = "curie-channel-protocol" },
     { name = "redis" },
     { name = "sqlalchemy", extra = ["asyncio"] },
 ]
@@ -939,6 +960,7 @@ dependencies = [
 requires-dist = [
     { name = "aci-protocol", editable = "packages/aci-protocol" },
     { name = "cryptography", specifier = ">=50.0.1" },
+    { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "redis", specifier = ">=8.1.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.51" },
 ]
@@ -1044,6 +1066,7 @@ dependencies = [
     { name = "curie-channel-protocol" },
     { name = "curie-dispatcher" },
     { name = "curie-e2e-connector" },
+    { name = "curie-internal" },
     { name = "curie-protected-hooks" },
     { name = "curie-telemetry" },
     { name = "curie-upgrade-pause" },
@@ -1069,6 +1092,7 @@ requires-dist = [
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "curie-dispatcher", editable = "apps/dispatcher" },
     { name = "curie-e2e-connector", editable = "apps/e2e-connector" },
+    { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-protected-hooks", editable = "packages/protected-hooks" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },
@@ -1095,6 +1119,7 @@ dependencies = [
     { name = "curie-discord-adapter" },
     { name = "curie-dispatcher" },
     { name = "curie-e2e-connector" },
+    { name = "curie-internal" },
     { name = "curie-mail-adapter" },
     { name = "curie-protected-hooks" },
     { name = "curie-runner" },
@@ -1130,6 +1155,7 @@ requires-dist = [
     { name = "curie-discord-adapter", editable = "adapters/discord" },
     { name = "curie-dispatcher", editable = "apps/dispatcher" },
     { name = "curie-e2e-connector", editable = "apps/e2e-connector" },
+    { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-mail-adapter", editable = "apps/mail-adapter" },
     { name = "curie-protected-hooks", editable = "packages/protected-hooks" },
     { name = "curie-runner", editable = "runner" },

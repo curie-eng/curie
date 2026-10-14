@@ -18,6 +18,9 @@ _DOCKERIGNORE = _REPO_ROOT / "runner" / "Dockerfile.dockerignore"
 _REQUIREMENTS_PATH = "/tmp/runner-dependency-pins.txt"
 _RUNNER_SOURCE_COPY = "COPY runner ./runner"
 _PIN_EXPORTER_COPY = "COPY runner/export_dependency_pins.py ./runner/export_dependency_pins.py"
+_PIP_REQUIREMENTS_COPY = (
+    "COPY runner/pip-requirements.txt ./runner/pip-requirements.txt"
+)
 _LOCKFILE_COPY = "COPY uv.lock ./uv.lock"
 
 # Mirror apps/api/Dockerfile.dockerignore plus the trees a repo-root build
@@ -54,6 +57,7 @@ _COPY_SOURCES = (
     "packages/telemetry-schema",
     "runner",
     "runner/export_dependency_pins.py",
+    "runner/pip-requirements.txt",
     "runner/pip.conf",
 )
 
@@ -122,7 +126,9 @@ def test_registry_layer_copies_only_lock_and_pin_exporter() -> None:
     registry_indexes = _registry_install_indexes(instructions)
     assert len(registry_indexes) == 1
     registry_index = registry_indexes[0]
-    allowed_copies = {_LOCKFILE_COPY, _PIN_EXPORTER_COPY}
+    # The hashed pip requirement is the one extra input: it pins the installer
+    # itself and is as source-independent as the lock.
+    allowed_copies = {_LOCKFILE_COPY, _PIN_EXPORTER_COPY, _PIP_REQUIREMENTS_COPY}
 
     for instruction in instructions[:registry_index]:
         first_word = instruction.split(maxsplit=1)[0].upper()
@@ -136,6 +142,7 @@ def test_registry_layer_copies_only_lock_and_pin_exporter() -> None:
 
     assert _index_of(instructions, _LOCKFILE_COPY) < registry_index
     assert _index_of(instructions, _PIN_EXPORTER_COPY) < registry_index
+    assert _index_of(instructions, _PIP_REQUIREMENTS_COPY) < registry_index
 
 
 def test_local_package_install_follows_source_copy() -> None:

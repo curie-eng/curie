@@ -319,6 +319,10 @@ def admission_service(tmp_path_factory):
                 owner,
                 "--cidfile",
                 str(cidfile),
+                "--memory",
+                "100m",
+                "--cpus",
+                "0.25",
                 "--label",
                 "curie.test.owner=" + owner,
                 "--user",
@@ -412,6 +416,7 @@ def baseline_rules(role):
         "%RW~protected:admission:commit:*",
         "%RW~protected:admission:recovery:*",
         "%RW~protected:admission:binding:*",
+        "%RW~protected:admission:event:*",
         "%RW~protected:admission:quota",
         "%RW~curie:runs",
         "+eval",
@@ -428,7 +433,7 @@ def baseline_rules(role):
             "(+eval %RW~protected:source:* %RW~protected:control:* "
             "%RW~protected:admission:intent:* %RW~protected:admission:state:* "
             "%RW~protected:admission:commit:* %RW~protected:admission:recovery:* "
-            "%RW~protected:admission:binding:* "
+            "%RW~protected:admission:binding:* %RW~protected:admission:event:* "
             "%RW~protected:admission:quota %RW~curie:runs)"
         ),
     )
@@ -518,12 +523,12 @@ def install(broker, acl):
         broker.command("ACL", "SETUSER", role, *acl.admission_acl_rules(role))
 
 
-def client(broker, role="enqueue"):
+def client(broker, role="enqueue", *, port=None):
     """Explicit caller scoped TLS connection, @spec PROTECTED-HOOK-ADMISSION-1 PROTECTED-
     HOOK-LANE-2."""
     return Redis(
         host="127.0.0.1",
-        port=broker.port,
+        port=broker.port if port is None else port,
         username=role,
         password=broker.passwords[role],
         ssl=True,
@@ -622,10 +627,11 @@ def snapshot(broker):
 
 
 def facade(broker, atomic, limit=100):
-    """Explicit trusted immutable tuple, @spec PROTECTED-HOOK-ADMISSION-1."""
+    """Explicit trusted immutable tuple: the provisioner's trusted manifest in place of a
+    bare broker identity, @spec PROTECTED-HOOK-ADMISSION-1."""
     return atomic.AtomicAdmission(
         client(broker),
-        broker_identity=broker.manifest().as_dict()["broker_identity"],
+        trusted_manifest=broker.manifest(),
         trusted_max_readiness_ms=60000,
         backlog_limit=limit,
     )
@@ -660,10 +666,11 @@ def admission_broker(admission_service):
 class ResponseDropRelay:
     """Owned TLS transport drops one actual commit reply, @spec PROTECTED-HOOK-ADMISSION-1/7."""
 
-    def __init__(self, broker, commit_key):
+    def __init__(self, broker, commit_key, *, released_digest=None):
         """@spec PROTECTED-HOOK-ADMISSION-1/7."""
         self.broker = broker
         self.commit_key = commit_key
+        self.released_digest = released_digest
         self.listener = None
         self.downstream = None
         self.upstream = None
@@ -734,6 +741,11 @@ class ResponseDropRelay:
                     reply = self.frame(replies)
                     if b"\r\n$4\r\nEVAL\r\n" in command[:32] and self.broker.command(
                         "EXISTS", self.commit_key
+                    ) and (
+                        self.released_digest is None
+                        or self.broker.command(
+                            "ZSCORE", "protected:admission:quota", self.released_digest
+                        ) is None
                     ):
                         self.dropped = True
                         self.downstream.shutdown(socket.SHUT_RDWR)

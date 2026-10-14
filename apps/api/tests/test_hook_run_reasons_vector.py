@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import get_args
 
-from curie_api.schemas import HookRunReason
+from curie_api.schemas.schedules import HookRunReason
 
 _VECTOR = Path(__file__).resolve().parents[3] / "tests" / "vectors" / "hook-run-reasons.json"
 

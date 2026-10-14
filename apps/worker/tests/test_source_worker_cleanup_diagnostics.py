@@ -84,7 +84,8 @@ def test_raising_test_warning_cannot_skip_actual_later_engine_close(
             try:
                 async with asyncio.timeout(8):
                     await owner.aclose(primary=primary)
-            except BaseException as error:
+            # observe cancellation and primary cleanup fault identity.
+            except BaseException as error:  # noqa: BLE001
                 caught = error
             assert disposed == [True], (
                 "SOURCE-2: a faulty cleanup diagnostic cannot skip later actual resources"

@@ -397,6 +397,17 @@ stale-version conflict test (match the CAS pattern in
 bounded delivery + dead-letter from the shared transport; a lane without a
 delivery cap is a bug.
 
+## Test policy
+
+1. Test behavior through the nearest executable boundary. Assert outcomes and state transitions rather than source names, syntax or implementation structure.
+2. Cross artifact contracts use shared inputs and expected outputs under `tests/vectors`. Every reader exercises its own production parser or behavior against the same vector.
+3. Text pins are permitted only for security configuration that cannot be executed by the test. Each pin names the issue requiring it.
+4. Do not pin prompt wording. Test the claimed capability with graded evals and a falsifiable control.
+5. File readers fail closed on missing, unreadable or malformed required inputs. Test those failures alongside valid input.
+6. Infrastructure tests may skip locally when their prerequisites are absent, but never in CI. Required verification treats unavailable infrastructure as an error.
+7. Harnesses use production wiring. Do not copy builder arguments or substitute private fields to prove configuration reaches its consumer.
+8. A text pin expires when a behavioral test covers its contract. Delete the pin and name the covering test in the change description.
+
 ## The dev stack: compose.dev.yaml
 
 The compose stack now has two profiles. `full` brings up the whole backing
@@ -631,7 +642,7 @@ as a whole; remembered only):
 
 - worker vs CLI credential forwarding -- `_SDK_PASSTHROUGH_ENV`
   (`apps/worker/src/curie_worker/sandbox/docker.py`) and the CLI picker
-  (`cli/src/commands.rs`) can't share code across Python/Rust, so they are frozen
+  (`cli/src/commands/credential_env.rs`) can't share code across Python/Rust, so they are frozen
   together in `tests/vectors/model-credential-forwarding.json`.
   [vector: `tests/vectors/model-credential-forwarding.json`]
 - dispatcher vs CLI approval action ids -- the approval-card action-id constants
@@ -683,7 +694,17 @@ as a whole; remembered only):
   cannot share code because the worker does not import the API package at
   runtime; the worker maps each code to its own prose and treats an unmapped
   code as an invalid refusal response (#2684).
-  [gate: `apps/worker/tests/test_workspace.py::test_selection_refusal_codes_match_the_apis_emissions`]
+  [vector: `tests/vectors/workspace-selection-refusal.json`]
+  [gate: `apps/api/tests/test_workspace_control_plane.py::test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe`]
+  [gate: `apps/worker/tests/test_workspace.py::test_internal_workspace_selection_409_maps_machine_code_not_detail_prose`]
+- API vs CLI snapshot sealing key custody -- the reserved names, refusal
+  reason and reference grammar (`packages/curie-internal/src/curie_internal/sealing_key.py`)
+  with the API's bundle check (`apps/api/src/curie_api/bundles.py::sealing_key_custody_issues`)
+  and the CLI deploy preflight's mirror (`cli/src/sealing_key.rs`) can't share
+  code across Python/Rust, so the names, the reason verbatim and every bundle's
+  refusals with their locations are frozen together in
+  `tests/vectors/sealing-key-custody.json` (ACTION-EXECUTOR-23).
+  [vector: `tests/vectors/sealing-key-custody.json`]
 - real SDK vs fake model session in the runner (`FakeModelSession`,
   `runner/src/curie_runner/fake.py`).
   [by construction: `runner/src/curie_runner/adapter.py::ModelSession`]
@@ -720,6 +741,82 @@ as a whole; remembered only):
   inbox stream the API appends to (`apps/api/src/curie_api/turn_progress.py`)
   and the worker's pump reads, cross three images, so they are frozen together.
   [vector: `tests/vectors/turn-progress-capability.json`]
+- worker vs runner executor route (ACTION-EXECUTOR-24) -- the worker's
+  `execute` client and executor mode variable
+  (`apps/worker/src/curie_worker/runner_client.py`) and the runner's
+  `/v1/execute` route and executor mode status body
+  (`runner/src/curie_runner/server.py::create_executor_app`) ship in different
+  images and cannot share code at runtime, so the request and response of every
+  phase, the route's refusal codes and the worker code each maps to, the status
+  body and the mode variable are frozen together. The `observe_version` and
+  `restore` call arguments and the reply-to-outcome mapping the two sides apply
+  around those phases are frozen beside it. The remediation `read` phase
+  (AUTOMATED-REMEDIATION-12: the request's `pointer`, one `read` per sandbox,
+  `tool_not_read_only` without dialing, the read refusals' worker codes) and
+  the codes it adds, which the API's
+  `apps/api/src/curie_api/action_execution_codes.py` also reads (the
+  worker-reported pre-dispatch code and the sample results that are never
+  refusals), are frozen in the same vector.
+  [vector: `tests/vectors/runner-execute.json`]
+  [vector: `tests/vectors/executor-restore-calls.json`]
+- runner vs worker remediation sample (AUTOMATED-REMEDIATION-12, -17) -- the
+  runner's pointer extraction in the `read` phase
+  (`runner/src/curie_runner/executor.py`: structured content, or a single text
+  block's strict JSON, otherwise `result_unstructured`) and the worker's sample
+  report (`apps/worker/src/curie_worker/action_executor.py::sample_report`) ship
+  in different images, so every pointer, result shape and sample kind is frozen
+  together with the comparator cases the API's evaluator
+  (`apps/api/src/curie_api/remediation_predicate.py::evaluate_sample`, which
+  judges each verifier sample, plan task 11) reads too: ordering comparators
+  read a JSON number or a strict numeric string, `eq`, `ne` and `in` never
+  coerce, and every unsuccessful sample (including the API's own `skipped`) is
+  `unsuccessful`. Read by `apps/api/tests/test_remediation_predicate_vector.py`.
+  [vector: `tests/vectors/remediation-predicate.json`]
+- API vs CLI remediation policy validation and policy refusal codes
+  (AUTOMATED-REMEDIATION-3) -- the API validator
+  (`apps/api/src/curie_api/remediation_policy_document.py`) and the CLI's
+  mirrored validation (`cli/src/remediation_policy.rs`) cannot share code
+  across Python/Rust, so the valid and invalid documents, each refusal's code
+  and path, and the numeric edge cases are frozen together; the closed policy
+  refusal codes the API returns (`POLICY_REFUSALS` in
+  `apps/api/src/curie_api/remediation_codes.py`) are the set the CLI renders
+  (`POLICY_REFUSALS` in `cli/src/remediation.rs`), frozen as `policy_refusals`.
+  The receipt vocabulary (AUTOMATED-REMEDIATION-20) is a third reader: the
+  worker's thread receipts (`apps/worker/src/curie_worker/remediation_receipts.py`:
+  `RECEIPT_STAGES`, `VERIFICATION_OUTCOMES`, `AUTHORITIES`, `RECEIPT_CODES`), the
+  API's nomination read (`remediation_codes.py`) and the CLI's `remediation list`
+  and `show` (`NOMINATION_STATES`, `RECEIPT_STAGES` and the rest in
+  `cli/src/remediation.rs`) all read the same frozen sets.
+  [vector: `tests/vectors/remediation-policy.json`]
+  [vector: `tests/vectors/remediation-codes.json`]
+- runner vs worker sealed envelope (ACTION-EXECUTOR-9, -10) -- the runner's
+  redactor (`runner/src/curie_runner/redact.py::OutboundRedactor`) decides
+  whether an envelope crosses unaltered and the worker's `_snapshot`
+  (`apps/worker/src/curie_worker/actions.py`) decides whether it is recorded;
+  both validate the same envelope grammar in different images, so they read one
+  sealed-reply vector, as does the API's `undoable` grammar
+  (`apps/api/src/curie_api/sealed_snapshot.py`).
+  [vector: `tests/vectors/sealed-snapshot-reply.json`]
+- API vs worker vs proxy vs runner canonical arguments (ACTION-EXECUTOR-7) --
+  the undo ruling's `arguments_sha256`
+  (`apps/api/src/curie_api/routers/actions.py::restore_arguments_sha256`), the
+  worker's canonicalizer and digest (`apps/worker/src/curie_worker/connector_grant.py`),
+  the caller proxy's production parser
+  (`apps/worker/src/curie_connector_proxy/server.py::_canonical_arguments`) and
+  the runner's `call` preflight must agree byte for byte, and they ship in
+  different images, so the canonical texts and digests are frozen together.
+  [vector: `tests/vectors/action-canonical-arguments.json`]
+- attachments-init vs docker `_prepare_attachments` (ADR 0205) -- the program
+  the chart renders into the sandbox's `attachments-init` container
+  (`charts/curie/templates/agent-sandbox.yaml`) cannot import the worker, so the
+  docker driver (`apps/worker/src/curie_worker/sandbox/docker.py`) reimplements
+  it: exact names, current files first and all-or-nothing, earlier files best
+  effort with a recorded reason, digest mismatch always fatal, and the hidden
+  `.curie-attachments-status.json`, and the pre-ADR rules for a payload
+  without "c" (mixed-version rollout). Both run one payload-to-outcome corpus
+  (`charts/curie/ci/attachment-init-behavior-assertions.sh` and
+  `apps/worker/tests/sandbox/test_docker_attachment_claim.py`).
+  [vector: `tests/vectors/attachment-init-outcomes.json`]
 
 A PR touching one side of a seam must route the behavior through a shared helper
 both sides call, change both sides in the same PR, or name the sibling in the PR
@@ -847,7 +944,7 @@ required and proved, not carried on the original classification.
 | Tier | Required when the change reaches | Command |
 | --- | --- | --- |
 | skill | plugin or skill packaging, the runner turn loop, ACI events, skill eval or check | `CURIE_E2E_TIERS=skill curie dev e2e-ladder` |
-| local | compose services, dispatcher, worker, or API wiring, boot env crossing a service boundary, the console UI, or any `curie` verb whose output, exit code, or `--json` shape changed | `CURIE_E2E_TIERS=local curie dev e2e-ladder` |
+| local | compose services, dispatcher, worker, or API wiring, boot env crossing a service boundary, the console UI, or any `curie` verb whose output, exit code, or `--json` shape changed | `CURIE_E2E_TIERS=local curie dev e2e-ladder`; for console login (OIDC against a real Dex, login codes, sessions, logout) also `curie dev oidc-e2e` |
 | local-release | released binary or image identity, the install path, version pins, release compose | `CURIE_E2E_TIERS=local-release curie dev e2e-ladder` |
 | cluster | chart templates, RBAC, securityContext, NetworkPolicy, sandbox claims, init containers | `CURIE_E2E_TIERS=cluster curie dev e2e-ladder`, or `curie dev chart-runtime-e2e` for a chart, sandbox, or bundle slice |
 | live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow; also the MCP/workspace/coding-tool path set below | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |

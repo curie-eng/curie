@@ -8,18 +8,23 @@ import uuid
 
 import httpx
 import pytest
-from curie_api.factory_notices import (
-    FINAL_MARKER,
-    _deliver,
-    _GitHub,
-    _patch,
-    marker_for,
-    result_section,
-    status_body,
-    upsert_issue_notice,
-)
+from curie_api.factory_comment_text import marker_for
+from curie_api.factory_notices import FINAL_MARKER, result_section, status_body
 from curie_api.factory_progress import PhaseSlot, PhaseView, StageSlot
-from curie_api.factory_reply_target import ReplyTarget, is_relabel_objective
+from curie_api.factory_reply_target import is_issue_follow_up, is_relabel_objective
+from curie_api.forges.github.comments import GitHubMarkedComments, static_token
+from curie_api.forges.github.marked_comments import (
+    GitHubCommentClient,
+    deliver,
+    patch_comment,
+)
+from curie_api.forges.types import (
+    GITHUB,
+    PullRequestRef,
+    ReplyTarget,
+    RepositoryRef,
+    TrackerIssueRef,
+)
 from curie_api.models import FactoryStatusComment
 
 REQUEST = uuid.UUID("00000000-0000-0000-0000-000000003125")
@@ -360,21 +365,25 @@ def test_every_factory_comment_creation_redacts_at_the_http_boundary(target_kind
                 return httpx.Response(422, json={"message": "Validation Failed"})
             return httpx.Response(201, json={"id": 3936})
 
+        repository = RepositoryRef(GITHUB, "github.com", "4401", "acme-corp/acme-bot")
+        pull = PullRequestRef(repository, "7")
         if target_kind in {"thread", "thread_fallback"}:
-            target = ReplyTarget("thread", pr_number=7, comment_id=33, url=_PR_URL)
+            target = ReplyTarget.on_thread(pull, "33")
             expected = ["/repos/acme-corp/acme-bot/pulls/7/comments/33/replies"]
             if target_kind == "thread_fallback":
                 expected.append("/repos/acme-corp/acme-bot/issues/7/comments")
         elif target_kind == "pr":
-            target = ReplyTarget("pr", pr_number=7, url=_PR_URL)
+            target = ReplyTarget.on_pull_request(pull)
             expected = ["/repos/acme-corp/acme-bot/issues/7/comments"]
         else:
-            target = ReplyTarget("issue")
+            target = ReplyTarget.on_issue(TrackerIssueRef(GITHUB, "github.com", "4401", "3936"))
             expected = ["/repos/acme-corp/acme-bot/issues/3936/comments"]
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(github)) as client:
-            outcome = await _deliver(
-                _GitHub(client, "https://api.github.com", "/repos/acme-corp/acme-bot", {}),
+            outcome = await deliver(
+                GitHubCommentClient(
+                    client, "https://api.github.com", "/repos/acme-corp/acme-bot", {}
+                ),
                 3936,
                 FactoryStatusComment(execution_request_id=REQUEST, scan_page=1),
                 target,
@@ -400,8 +409,10 @@ def test_every_factory_comment_update_redacts_at_the_http_boundary(comment_list:
             return httpx.Response(200, json={"id": 3936})
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(github)) as client:
-            outcome = await _patch(
-                _GitHub(client, "https://api.github.com", "/repos/acme-corp/acme-bot", {}),
+            outcome = await patch_comment(
+                GitHubCommentClient(
+                    client, "https://api.github.com", "/repos/acme-corp/acme-bot", {}
+                ),
                 FactoryStatusComment(comment_id=3936, comment_list=comment_list),
                 f"{_PROVIDER_DETAIL}\n{_PR_URL}\n{marker_for(REQUEST)}\n{FINAL_MARKER}\n",
             )
@@ -436,18 +447,24 @@ def test_marked_notice_create_update_and_unchanged_use_the_redacted_body(existin
             writes.append((request.method, stored))
             return httpx.Response(200 if request.method == "PATCH" else 201, json={"id": 3936})
 
+        target = ReplyTarget.on_issue(TrackerIssueRef(GITHUB, "github.com", "4401", "3936"))
         async with httpx.AsyncClient(transport=httpx.MockTransport(github)) as client:
+            comments = GitHubMarkedComments(
+                client,
+                api="https://api.github.com",
+                host="github.com",
+                repo_full_name="acme-corp/acme-bot",
+                repository_id=4401,
+                token=static_token("fixture-installation-token"),
+                app_id="42",
+            )
             for expected_outcome in ["written", "unchanged"]:
-                outcome = await upsert_issue_notice(
-                    client,
-                    api="https://api.github.com",
-                    repo_path="/repos/acme-corp/acme-bot",
-                    headers={},
-                    issue_number=3936,
-                    marker=marker_for(REQUEST),
-                    body=f"{_PROVIDER_DETAIL}\n{_PR_URL}\n{marker_for(REQUEST)}\n",
-                    app_id="42",
+                upserted = await comments.upsert_marked(
+                    target,
+                    f"curie-execution-request:{REQUEST}",
+                    f"{_PROVIDER_DETAIL}\n{_PR_URL}",
                 )
+                outcome = "written" if upserted.written else "unchanged"
                 assert outcome == expected_outcome
         assert len(writes) == 1
         assert writes[0][0] == ("PATCH" if existing else "POST")
@@ -456,20 +473,19 @@ def test_marked_notice_create_update_and_unchanged_use_the_redacted_body(existin
     asyncio.run(exercise())
 
 
-_RELABEL_BASE = "https://github.com"
 _RELABEL_URL = "https://github.com/acme-corp/acme-bot/issues/7"
+_GITHUB_PREFIX = "#issuecomment-"
+_JIRA_URL = "https://acme.atlassian.example/browse/PROJ-7"
+_JIRA_PREFIX = "?focusedCommentId="
 
 
-@pytest.mark.parametrize("clone_base", [_RELABEL_BASE, f"{_RELABEL_BASE}/"])
 @pytest.mark.parametrize(
     "objective", [_RELABEL_URL, f"{_RELABEL_URL}\n\nRelabelled by a maintainer."]
 )
-def test_a_relabel_objective_is_the_bare_issue_url(objective: str, clone_base: str) -> None:
-    """#4345 AC6: the first line is exactly the issue URL under the clone base."""
+def test_a_relabel_objective_is_the_bare_issue_url(objective: str) -> None:
+    """#4345 AC6: the first line is exactly the issue link."""
 
-    assert is_relabel_objective(
-        objective, repo_full_name="acme-corp/acme-bot", issue_number=7, clone_base=clone_base
-    )
+    assert is_relabel_objective(objective, issue_link=_RELABEL_URL, comment_prefix=_GITHUB_PREFIX)
 
 
 @pytest.mark.parametrize(
@@ -493,5 +509,52 @@ def test_anything_but_the_bare_issue_url_is_not_a_relabel_objective(
     """#4345 AC6: fragments, PR URLs, other issues or repos, and trailing paths refuse."""
 
     assert not is_relabel_objective(
-        objective, repo_full_name="acme-corp/acme-bot", issue_number=7, clone_base=_RELABEL_BASE
+        objective, issue_link=_RELABEL_URL, comment_prefix=_GITHUB_PREFIX
+    )
+
+
+# --- Tracker-neutral recognition (#4358 plan S2.12) ---------------------------------
+
+
+@pytest.mark.parametrize(
+    ("link", "prefix"),
+    [(_RELABEL_URL, _GITHUB_PREFIX), (_JIRA_URL, _JIRA_PREFIX)],
+    ids=["github", "jira_cloud"],
+)
+def test_a_follow_up_is_the_issue_link_with_a_comment_id(link: str, prefix: str) -> None:
+    assert is_issue_follow_up(f"{link}{prefix}10100", issue_link=link, comment_prefix=prefix)
+    assert is_issue_follow_up(
+        f"{link}{prefix}10100\n\nA maintainer asked again.", issue_link=link, comment_prefix=prefix
+    )
+    # The bare link is a relabel, not a follow-up, on every tracker.
+    assert not is_issue_follow_up(link, issue_link=link, comment_prefix=prefix)
+    assert is_relabel_objective(link, issue_link=link, comment_prefix=prefix)
+    assert not is_relabel_objective(f"{link}{prefix}10100", issue_link=link, comment_prefix=prefix)
+
+
+@pytest.mark.parametrize(
+    "objective",
+    [
+        f"{_JIRA_URL}?focusedCommentId=0",
+        f"{_JIRA_URL}?focusedCommentId=99999999999999999999",
+        f"{_JIRA_URL}#issuecomment-10100",
+        "https://acme.atlassian.example/browse/PROJ-8?focusedCommentId=10100",
+        f"{_JIRA_URL}?focusedCommentId=10100x",
+        None,
+    ],
+)
+def test_a_jira_follow_up_names_this_issue_and_a_valid_comment_id(objective: str | None) -> None:
+    assert not is_issue_follow_up(objective, issue_link=_JIRA_URL, comment_prefix=_JIRA_PREFIX)
+
+
+def test_github_follow_up_recognition_is_unchanged() -> None:
+    assert is_issue_follow_up(
+        f"{_RELABEL_URL}#issuecomment-{2**63 - 1}",
+        issue_link=_RELABEL_URL,
+        comment_prefix=_GITHUB_PREFIX,
+    )
+    assert not is_issue_follow_up(
+        f"{_RELABEL_URL}#issuecomment-{2**63}",
+        issue_link=_RELABEL_URL,
+        comment_prefix=_GITHUB_PREFIX,
     )

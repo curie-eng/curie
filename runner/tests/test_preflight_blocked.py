@@ -294,7 +294,7 @@ async def _replay(session: Any, prompt: str) -> list[Any]:
 
 
 def test_blocked_session_answers_each_turn_with_the_text_and_zero_usage() -> None:
-    from curie_runner.preflight_blocked import PreflightBlockedSession
+    from curie_runner.harness.claude.preflight_blocked import PreflightBlockedSession
 
     text = f"{_BLOCKED_PREFIX} Check units_rs is blocked."
 
@@ -329,7 +329,7 @@ def test_blocked_session_answers_each_turn_with_the_text_and_zero_usage() -> Non
 
 
 def test_blocked_session_has_no_model_options() -> None:
-    from curie_runner.preflight_blocked import PreflightBlockedSession
+    from curie_runner.harness.claude.preflight_blocked import PreflightBlockedSession
 
     session = PreflightBlockedSession(_BLOCKED_PREFIX, model=_MODEL)
 
@@ -337,7 +337,7 @@ def test_blocked_session_has_no_model_options() -> None:
 
 
 def test_blocked_session_without_a_model_names_no_model() -> None:
-    from curie_runner.preflight_blocked import PreflightBlockedSession
+    from curie_runner.harness.claude.preflight_blocked import PreflightBlockedSession
 
     async def run() -> list[Any]:
         session = PreflightBlockedSession(_BLOCKED_PREFIX, model=None)
@@ -351,7 +351,7 @@ def test_blocked_session_without_a_model_names_no_model() -> None:
 
 
 def test_interrupt_empties_the_next_replay() -> None:
-    from curie_runner.preflight_blocked import PreflightBlockedSession
+    from curie_runner.harness.claude.preflight_blocked import PreflightBlockedSession
 
     async def run() -> list[Any]:
         session = PreflightBlockedSession(_BLOCKED_PREFIX, model=_MODEL)

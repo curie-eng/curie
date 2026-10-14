@@ -119,7 +119,7 @@ class Supervisor:
                     connection.close()
                     break
                 connection.run()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 self._logger.warning("%sconnection failed: %s", self._prefix, exc)
             finally:
                 with self._lock:

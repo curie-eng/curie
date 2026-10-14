@@ -22,7 +22,7 @@ from curie_runner.approval import APPROVAL_SERVER_NAME
 from curie_runner.connectors import build_mcp_servers, derive_mcp_servers
 from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
 from curie_runner.plugin import PluginBundleError
-from curie_runner.state import STATE_SERVER_NAME
+from curie_runner.tool_names import STATE_SERVER_NAME
 from plugin_format.connectors import RESERVED_CONNECTOR_NAMES
 
 HOSTED = "connectors:\n  grafana:\n    image: grafana/mcp-grafana:0.17.2\n    secrets: [T]\n"
@@ -788,27 +788,46 @@ def test_a_name_in_both_channels_fails_the_boot_instead_of_picking_a_winner(
 
 
 def test_the_reserved_list_matches_the_runner_constants() -> None:
-    # plugin_format re-enumerates these names because runner depends on it and
-    # never the reverse. This is the pin that keeps the copy honest: rename
-    # either constant here and the deploy-time guard stops fencing it.
-    assert RESERVED_CONNECTOR_NAMES == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
+    from plugin_format.connectors import CHANNEL_READ_SERVER_NAME
+
+    assert RESERVED_CONNECTOR_NAMES == {
+        APPROVAL_SERVER_NAME,
+        STATE_SERVER_NAME,
+        CHANNEL_READ_SERVER_NAME,
+    }
 
 
-def test_the_boot_mounts_exactly_the_reserved_platform_servers(tmp_path, monkeypatch) -> None:
-    # #2286. Pinned against the boot MOUNT, not against another constant: the
-    # sibling above already pins RESERVED_CONNECTOR_NAMES against the two runner
-    # constants, and two constants can agree with each other and both be wrong
-    # about what this boot actually mounted. A platform server mounted without
-    # being reserved is denied for every policy-bearing bundle, which is exactly
-    # the #2286 defect recurring, so this reddens instead.
+@pytest.mark.parametrize("grant", [None, False, True], ids=["absent", "false", "true"])
+@pytest.mark.parametrize("wildcard_policy", [False, True], ids=["no-policy", "wildcard-policy"])
+def test_the_boot_mounts_only_active_platform_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grant: bool | None, wildcard_policy: bool
+) -> None:
+    # The grant alone mounts curie-slack on a real-model boot (#2877). Absent
+    # or false mounts nothing, and a wildcard policy never mounts it either:
+    # a pattern governs a mounted tool, it does not grant one.
     env = _boot_env(monkeypatch, tmp_path, "platform-set")
+    manifest_path = Path(env["CURIE_PLUGIN_DIR"]) / ".claude-plugin" / "plugin.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if grant is not None:
+        manifest["channelRead"] = grant
+    if wildcard_policy:
+        manifest["toolPolicy"] = {
+            "enforcement": "curie/mcp-tool-policy@1",
+            "allow": ["*/*"],
+        }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     mounted = _boot_options(
         monkeypatch,
         RunnerConfig.from_env(env),
         potential_write=True,
     ).mcp_servers
 
-    assert set(mounted) == set(RESERVED_CONNECTOR_NAMES)
+    if grant is True:
+        assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME, "curie-slack"}
+    else:
+        assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
+        assert "curie-slack" not in mounted
+    assert set(mounted) <= RESERVED_CONNECTOR_NAMES
 
 
 def _published_live_tool_names(mcp_servers: dict[str, Any]) -> set[str]:

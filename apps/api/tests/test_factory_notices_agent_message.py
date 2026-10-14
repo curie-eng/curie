@@ -14,7 +14,8 @@ from __future__ import annotations
 import re
 
 import pytest
-from curie_api.factory_notices import FINAL_MARKER, cause_text, marker_for, result_section
+from curie_api.factory_comment_text import marker_for
+from curie_api.factory_notices import FINAL_MARKER, cause_text, result_section
 
 AGENT_CAUSES = ("early_stop", "no_pull_request")
 

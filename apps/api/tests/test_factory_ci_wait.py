@@ -9,7 +9,7 @@ https://docs.github.com/en/rest/checks/runs#list-check-run-annotations
 
 Green, or no checks inside the grace period, completes. A failure enqueues one
 continuation turn for the SAME request (``work-item-{id}-ci-{round}``), up to
-3 rounds. Time moves only through ``workitems._database_now`` offsets; nothing
+3 rounds. Time moves only through ``workitems.database_now`` offsets; nothing
 here waits in real time. Machine fixtures drive the events.
 """
 
@@ -45,26 +45,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api.config import get_settings
-from curie_api.factory_notices import FINAL_MARKER, marker_for
+from curie_api.factory_comment_text import marker_for
+from curie_api.factory_notices import FINAL_MARKER
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from test_factory_terminus import (  # noqa: F401  (fixtures)
+from forge_fakes.github import (
+    LABEL,
+    REPO,
+    REPO_ID,
+    _issue_event,
+    _post,
+    factory_env,
+    forges_document,
+    forges_env_json,
+    github_repository_binding,
+)
+from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     HEAD_A,
     HEAD_B,
     HEAD_C,
-    _attach_publication,
     _CommentServer,
-    _label,
-    _notices,
-    _observe_termination,
-    _reconcile,
-    _reconcile_later,
-    _request,
     _rows,
-    _set_base_ref,
-    _start_running,
     admitted,
     check_run,
     ci_empty,
@@ -74,7 +75,19 @@ from test_factory_terminus import (  # noqa: F401  (fixtures)
     ci_pending,
     comments,
 )
-from test_github_factory_ingress import LABEL, REPO, REPO_ID, _issue_event, _post
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from test_factory_terminus import (  # noqa: F401  (fixtures)
+    _attach_publication,
+    _label,
+    _notices,
+    _observe_termination,
+    _reconcile,
+    _reconcile_later,
+    _request,
+    _set_base_ref,
+    _start_running,
+)
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -83,20 +96,23 @@ MARKER_RE = re.compile(r"^Curie wait_ci round ([23]) of 3: ")
 _PRS = iter(range(701, 799))
 
 
-@pytest.fixture
-def _metadata_ci(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv(
-        "GITHUB_FACTORY_METADATA_CI",
-        json.dumps(
-            {
-                REPO: {
-                    "checks": ["Publication description guard"],
-                    "statuses": [],
-                }
-            }
-        ),
+def _set_metadata_ci(
+    monkeypatch: pytest.MonkeyPatch, key_dir: Path, metadata_rerun_keys: list[str]
+) -> None:
+    """Bind ``REPO`` with the given metadata rerun keys on the running fixture's
+    GitHub host; the per-repository CI policy lives on the binding (#4397)."""
+
+    document = forges_document(
+        api_url=get_settings().github_api_url,
+        bindings=[github_repository_binding(ci={"metadata_rerun_keys": metadata_rerun_keys})],
     )
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, key_dir))
     get_settings.cache_clear()
+
+
+@pytest.fixture
+def _metadata_ci(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
+    _set_metadata_ci(monkeypatch, tmp_path / "metadata-ci", ["Publication description guard"])
     yield
     get_settings.cache_clear()
 
@@ -124,9 +140,9 @@ def _all(number: int) -> list[dict[str, Any]]:
         "w.id AS work_item_id, w.readmit_request_id "
         "FROM curie.execution_requests r "
         "JOIN curie.work_items w ON w.id = r.work_item_id "
-        "WHERE w.github_repository_id = :repo AND w.github_issue_number = :number "
+        "WHERE w.tracker_scope_id = :repo AND w.tracker_issue_id = :number "
         "ORDER BY r.sequence",
-        {"repo": REPO_ID, "number": number},
+        {"repo": str(REPO_ID), "number": str(number)},
     )
 
 
@@ -325,24 +341,24 @@ def _clock_offset(seconds: float) -> Iterator[None]:
     """Shift the database clock both the reconciler and the finish route read."""
 
     import curie_api.workitem_dispatch as workitem_dispatch
-    import curie_api.workitems as workitems
+    import curie_api.workitems.lifecycle as workitems
 
-    original = workitems._database_now
+    original = workitems.database_now
 
     async def later(session: AsyncSession) -> Any:
         real = await original(session)
         return real + timedelta(seconds=seconds)
 
-    workitems._database_now = later
-    dispatch_original = getattr(workitem_dispatch, "_database_now", None)
+    workitems.database_now = later
+    dispatch_original = getattr(workitem_dispatch, "database_now", None)
     if dispatch_original is not None:
-        workitem_dispatch._database_now = later  # type: ignore[attr-defined]
+        workitem_dispatch.database_now = later  # type: ignore[attr-defined]
     try:
         yield
     finally:
-        workitems._database_now = original
+        workitems.database_now = original
         if dispatch_original is not None:
-            workitem_dispatch._database_now = dispatch_original  # type: ignore[attr-defined]
+            workitem_dispatch.database_now = dispatch_original  # type: ignore[attr-defined]
 
 
 def _body(sink: _CommentServer, request_id: uuid.UUID) -> str:
@@ -597,7 +613,8 @@ def test_ci_failure_loops_the_same_request_to_the_cap(admitted: Any) -> None:
     turns = _ci_turns(request_id)
     assert [t["event_id"] for t in turns] == [f"work-item-{request_id}-ci-2"]
     lines = turns[0]["text"].split("\n")
-    assert lines[0] == f"https://github.com/{REPO}/issues/{number}"
+    # The tracker links the issue on the HTML base GITHUB_API_URL names.
+    assert lines[0] == f"{get_settings().github_html_base}/{REPO}/issues/{number}"
     assert lines[1] == (
         f"Curie wait_ci round 2 of 3: the checks on {published['pr_url']} failed at {HEAD_A}."
     )
@@ -813,8 +830,6 @@ def test_body_only_fix_revision_repolls_checks_on_the_same_head(
 def test_body_only_fix_without_a_metadata_policy_completes_from_recorded_failures(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("GITHUB_FACTORY_METADATA_CI", raising=False)
-    get_settings.cache_clear()
     client, github, sink = admitted
     number = 9792
     sink.ci_scripts = {
@@ -862,7 +877,6 @@ def test_body_only_fix_without_a_metadata_policy_completes_from_recorded_failure
 def test_body_only_fix_without_a_usable_failing_record_ends_unverified(
     admitted: Any, monkeypatch: pytest.MonkeyPatch, record: str | bytes | None
 ) -> None:
-    monkeypatch.delenv("GITHUB_FACTORY_METADATA_CI", raising=False)
     get_settings.cache_clear()
     client, github, sink = admitted
     number = 9793
@@ -936,7 +950,6 @@ def test_configured_metadata_policy_takes_precedence_over_recorded_failures(
 def test_recorded_partial_metadata_rerun_reports_the_stale_failure_at_the_deadline(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("GITHUB_FACTORY_METADATA_CI", raising=False)
     get_settings.cache_clear()
     client, github, sink = admitted
     number = 9796
@@ -990,7 +1003,8 @@ def test_recorded_partial_metadata_rerun_reports_the_stale_failure_at_the_deadli
 def test_ci_fix_dispatch_records_caused_failures_with_the_round_ttl_before_enqueue(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from curie_api import factory_ci, workitems
+    from curie_api import factory_ci
+    from curie_api.workitems import lifecycle
 
     client, github, sink = admitted
     number = 9795
@@ -1022,7 +1036,7 @@ def test_ci_fix_dispatch_records_caused_failures_with_the_round_ttl_before_enque
         assert raw is not None
         records.append(json.loads(raw))
         async with self._sessionmaker() as session:
-            now = await workitems._database_now(session)
+            now = await lifecycle.database_now(session)
         assert await self._valkey.ttl(key) >= factory_ci.round_ttl(request, now)
         assert _ci_turns(request.id) == []
         return await original_dispatch(self, request, round_, text_)
@@ -1082,18 +1096,13 @@ def test_body_only_fix_waits_for_fresh_checks_then_ends_unverified(
 
 
 def test_body_only_fix_reports_only_a_fresh_unrelated_failure(
-    admitted: Any, _metadata_ci: None, monkeypatch: pytest.MonkeyPatch
+    admitted: Any, _metadata_ci: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv(
-        "GITHUB_FACTORY_METADATA_CI",
-        json.dumps(
-            {REPO: {
-                "checks": ["Publication description guard"],
-                "statuses": ["ci/publication-description"],
-            }}
-        ),
+    _set_metadata_ci(
+        monkeypatch,
+        tmp_path / "metadata-ci-statuses",
+        ["Publication description guard", "status:ci/publication-description"],
     )
-    get_settings.cache_clear()
     client, github, sink = admitted
     number = 9791
     old_time = "2020-01-01T00:00:00Z"
@@ -1406,9 +1415,10 @@ def _push_during_observation(
 ) -> list[str]:
     """Land a fix push (head B) while the gate is observing head A."""
 
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
-    original = workitem_outcomes.observe_ci_detail
+    # The gate reads CI through the code host, which reads it here.
+    original = ci.read_ci_detail
     pushed: list[str] = []
 
     async def racing(*args: Any, **kwargs: Any) -> Any:
@@ -1425,7 +1435,7 @@ def _push_during_observation(
             )
         return detail
 
-    monkeypatch.setattr(workitem_outcomes, "observe_ci_detail", racing)
+    monkeypatch.setattr(ci, "read_ci_detail", racing)
     return pushed
 
 
@@ -1637,16 +1647,45 @@ def test_pending_forever_times_out_inside_the_ci_wait(admitted: Any) -> None:
     assert "build" in body
 
 
-def test_ci_timeout_wins_over_the_execution_deadline(admitted: Any) -> None:
+@pytest.mark.parametrize(
+    ("entry", "cause", "summary"),
+    [
+        (ci_failing(), "ci_failed", "Failing checks:"),
+        (ci_entry(check_status=403), "ci_unverified", "Reason: github_forbidden"),
+        (ci_pending(), "ci_timeout", "Pending checks:"),
+    ],
+    ids=["ci_failed", "ci_unverified", "ci_timeout"],
+)
+def test_ci_verdict_wins_over_the_execution_deadline(
+    admitted: Any, entry: Any, cause: str, summary: str
+) -> None:
     client, github, sink = admitted
     number = 9721
-    sink.ci_script = [ci_pending()]
+    sink.ci_script = [entry]
     published = _published(client, github, sink, number)
+    if cause == "ci_failed":
+        # A failing verdict settles only after the three publication rounds.
+        for revision, head_sha in ((2, HEAD_B), (3, HEAD_C)):
+            _attach_fix(
+                published["work_item_id"],
+                published["id"],
+                revision=revision,
+                head_sha=head_sha,
+                title=f"Fix round {revision}",
+                paths=["src/widget.txt"],
+            )
+    deadline = _all(number)[0]["execution_deadline"]
+    past = int((deadline - _database_now()).total_seconds()) + 2
 
-    _reconcile_later(1900)
+    _reconcile_later(past)
 
-    assert _terminal(number) == ("failed", "ci_timeout")
-    assert "Pending checks:" in _body(sink, published["id"])
+    assert _terminal(number) == ("failed", cause)
+    terminal_at = _rows(
+        "SELECT terminal_at FROM curie.execution_requests WHERE id = :id",
+        {"id": published["id"]},
+    )[0]["terminal_at"]
+    assert terminal_at > deadline
+    assert summary in _body(sink, published["id"])
 
 
 def test_transient_errors_until_the_deadline_end_as_ci_timeout(admitted: Any) -> None:
@@ -1882,8 +1921,9 @@ def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due
 ) -> None:
     """Each CI read takes a full poll interval, so older requests are due every pass."""
 
-    import curie_api.workitems as workitems
-    from curie_api import factory_ci, workitem_outcomes
+    import curie_api.workitems.lifecycle as workitems
+    from curie_api import factory_ci
+    from curie_api.forges.github import ci
 
     client, github, sink = admitted
     assert get_settings().work_item_batch_limit >= 5
@@ -1896,8 +1936,8 @@ def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due
     later = _published(client, github, sink, 9759, head_sha=green_head)
 
     elapsed = [0.0]
-    original_now = workitems._database_now
-    original_observe = workitem_outcomes.observe_ci_detail
+    original_now = workitems.database_now
+    original_observe = ci.read_ci_detail
 
     async def now(session: AsyncSession) -> Any:
         return await original_now(session) + timedelta(seconds=elapsed[0])
@@ -1907,8 +1947,8 @@ def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due
         elapsed[0] += factory_ci.CI_POLL_SECONDS
         return detail
 
-    monkeypatch.setattr(workitems, "_database_now", now)
-    monkeypatch.setattr(workitem_outcomes, "observe_ci_detail", slow_observe)
+    monkeypatch.setattr(workitems, "database_now", now)
+    monkeypatch.setattr(ci, "read_ci_detail", slow_observe)
 
     _passes_on_one_reconciler(3)
 
@@ -2305,7 +2345,7 @@ def recorded_github(
 
     from curie_api.main import create_app
     from fastapi.testclient import TestClient
-    from test_factory_terminus import _clear_ci_keys
+    from forge_fakes.github_comments import _clear_ci_keys
 
     stub_root = Path(__file__).resolve().parents[3] / "tools" / "github-stub"
     recording = json.loads((stub_root / "recordings" / "curie-pr-3400.json").read_text())
@@ -2334,35 +2374,31 @@ def recorded_github(
     )
     try:
         stub.start()
+        python_ci = {
+            "required": {
+                "key": "Python (ruff + mypy + pytest)",
+                "paths": ["apps/api"],
+                "pending_key_prefix": "Python pytest (shard ",
+            }
+        }
         environment = {
-            "GITHUB_API_URL": stub.base_url,
+            **factory_env(
+                tmp_path / "forges",
+                intake="webhook",
+                api_url=stub.base_url,
+                label=LABEL,
+                mention="curie",
+                private_key=app_key,
+                bindings=[github_repository_binding(ci=python_ci)],
+            ),
+            # The code host's repository credential is the clone credential,
+            # which only travels to the configured clone origin.
+            "GITHUB_CLONE_BASE": stub.base_url,
             "SSL_CERT_FILE": str(stub.ca_file),
-            "GITHUB_APP_ID": "51",
             "GITHUB_APP_PRIVATE_KEY": app_key,
-            "GITHUB_WEBHOOK_SECRET": "example-factory-hmac-secret",
-            "GITHUB_REPO_ALLOWLIST": '["acme-corp/*"]',
-            "GITHUB_TOKEN": "",
-            "GITHUB_FACTORY_INGRESS_ENABLED": "true",
-            "GITHUB_FACTORY_INTAKE": "webhook",
-            "GITHUB_FACTORY_LABEL": LABEL,
-            "GITHUB_FACTORY_MENTION": "curie",
-            "GITHUB_REVIEW_INGRESS_ENABLED": "false",
-            "GITHUB_FACTORY_CI_WAIT_S": "3600",
-            "CURIE_WORK_ITEM_RECONCILER_ENABLED": "false",
-            "RESUME_RECONCILER_ENABLED": "false",
-            "APPROVAL_SWEEP_INTERVAL_S": "0",
-            "DEAD_LETTER_WATCH_INTERVAL_S": "0",
+            "FACTORY_CI_WAIT_S": "3600",
             "RUNS_STREAM": stream,
             "INTERNAL_WORKER_TOKEN": "factory-terminus-worker",
-            "GITHUB_FACTORY_PYTHON_CI": json.dumps(
-                {
-                    REPO: {
-                        "check": "Python (ruff + mypy + pytest)",
-                        "paths": ["apps/api"],
-                        "pendingCheckPrefix": "Python pytest (shard ",
-                    }
-                }
-            ),
         }
         for key, value in environment.items():
             monkeypatch.setenv(key, value)
@@ -2690,7 +2726,6 @@ def test_managed_workspace_clones_the_tls_github_origin_through_real_api_and_sto
     )[0]
     credentials = WorkspaceCredentialClient(
         api_url=workspace_api,
-        github_api_url=stub.base_url,
         worker_token="factory-terminus-worker",
     )
     assert (

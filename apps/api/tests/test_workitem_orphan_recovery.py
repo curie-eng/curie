@@ -34,7 +34,7 @@ from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_worker.config import WorkerConfig
-from curie_worker.kernel import Kernel
+from curie_worker.kernel.core import Kernel
 from curie_worker.markers import Markers
 from curie_worker.runner_client import RunnerClient
 from curie_worker.threadlock import ThreadLock
@@ -133,10 +133,19 @@ def _admit(api: TestClient, auth_headers: dict[str, str]) -> uuid.UUID:
         "kind": "slack",
         "address": ADDRESS,
         "reply_conversation_id": "1700000000.000100",
-        "repo_full_name": REPO,
-        "github_repository_id": 101,
-        "github_issue_number": 3076,
-        "github_installation_id": 202,
+        "tracker": {
+            "kind": "github",
+            "host": "github.com",
+            "scope_id": "101",
+            "issue_id": "3076",
+        },
+        "repository": {
+            "code_host_kind": "github",
+            "host": "github.com",
+            "project_id": "101",
+            "path": REPO,
+        },
+        "code_host_installation_id": 202,
         "objective": "Recover the orphaned run",
         "requester": "U0REQUEST1",
         "request_id": str(uuid.uuid4()),

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from typing import Protocol
 
+from curie_protected_hooks.authority_evaluation import AuthorityTarget
 from curie_protected_hooks.source_fence import (
     SourceFenceConflict,
     SourceFenceExhausted,
@@ -37,7 +38,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from .hook_source_admin import SourceAdminError
+from .hook_source_admin import GATE_WAIT_SECONDS, SourceAdminError
 
 
 @dataclass(frozen=True)
@@ -130,6 +131,13 @@ class SourceControlWriter(Protocol):
         """@spec PROTECTED-HOOK-SOURCE-6/7."""
         ...
 
+    async def publish_protected(self, *, target: AuthorityTarget) -> bool:
+        """Reader bracketed protected publication once evidence is current.
+
+        @spec PROTECTED-HOOK-SOURCE-6/7.
+        """
+        ...
+
 
 @dataclass(frozen=True)
 class SourceControlSession:
@@ -173,8 +181,8 @@ def _policy_target(policy: SourcePolicySnapshot) -> DesiredSourceTarget:
     )
 
 
-def _fingerprint(policy: SourcePolicySnapshot) -> str:
-    """@spec PROTECTED-HOOK-SOURCE-6."""
+def committed_policy_fingerprint(policy: SourcePolicySnapshot) -> str:
+    """The SOURCE-6 fingerprint a committed row publishes, @spec PROTECTED-HOOK-SOURCE-6/9."""
     return policy_fingerprint(
         {
             **_policy_target(policy).as_dict(),
@@ -187,6 +195,21 @@ def _fingerprint(policy: SourcePolicySnapshot) -> str:
     )
 
 
+def committed_authority_target(policy: SourcePolicySnapshot) -> AuthorityTarget:
+    """The shared evaluation's target for a committed protected row.
+
+    @spec PROTECTED-HOOK-SOURCE-6 @spec PROTECTED-HOOK-SOURCE-9.
+    """
+    return AuthorityTarget(
+        generation=policy.generation,
+        operation_id=str(policy.operation_id),
+        policy_fingerprint=committed_policy_fingerprint(policy),
+        runtime_id=policy.runtime_id or "",
+        qualification_id=policy.qualification_id or "",
+        bundle_digest=policy.bundle_digest or "",
+    )
+
+
 class SourceMutationCoordinator:
     """@spec PROTECTED-HOOK-SOURCE-2/3/5/6/7/10."""
 
@@ -196,13 +219,20 @@ class SourceMutationCoordinator:
         work_engine: AsyncEngine,
         *,
         authority_resolver: SourceAuthorityResolver | None = None,
+        target_check: Callable[[DesiredSourceTarget], None] | None = None,
     ) -> None:
-        """@spec PROTECTED-HOOK-SOURCE-2/10."""
+        """``target_check`` applies the deployment's reference rule inside the gate.
+
+        It runs on every protected target before replay, history and CAS
+        checks, so rotate checks the current row's references before any
+        registration. @spec PROTECTED-HOOK-SOURCE-2/3/10.
+        """
         if gate.engine.pool is work_engine.pool:
             raise SourceAdminError("invalid_source_pools", 503)
         self._gate = gate
         self._work_engine = work_engine
         self._resolver = authority_resolver
+        self._target_check = target_check
 
     @asynccontextmanager
     async def _work(self) -> AsyncIterator[AsyncConnection]:
@@ -382,9 +412,18 @@ class SourceMutationCoordinator:
         committed: SourcePolicySnapshot | None = None
         try:
             async with AsyncExitStack() as authority_scope:
-                async with self._gate.hold(uuid.UUID(source.agent_id)) as held:
+                async with self._gate.hold(
+                    uuid.UUID(source.agent_id), wait_seconds=GATE_WAIT_SECONDS
+                ) as held:
                     snapshot, seen = await self._initial(held, source, operation)
                     previous = snapshot.policy
+                    if (
+                        target is not None
+                        and target.mode == "ordinary"
+                        and snapshot.never_configured
+                    ):
+                        # Removal of a hook never configured: nothing to tombstone.
+                        raise SourceAdminError("source_not_configured", 409)
                     if target is None:
                         if previous is None or previous.mode != "protected":
                             raise SourceAdminError("source_rotation_conflict", 409)
@@ -410,6 +449,8 @@ class SourceMutationCoordinator:
                             and snapshot.legacy_generation == 2147483647
                         ):
                             raise SourceAdminError("legacy_generation_exhausted", 409)
+                    if self._target_check is not None and target.mode == "protected":
+                        self._target_check(target)
                     if self._resolver is None:
                         raise _unavailable(committed)
                     session = await authority_scope.enter_async_context(
@@ -452,13 +493,19 @@ class SourceMutationCoordinator:
                             held, source, snapshot, operation, generation, target, intent
                         )
                 assert committed is not None
-                if committed.mode != "ordinary":
-                    raise _unavailable(committed)
-                published = await session.writer.publish_ordinary(
-                    generation=committed.generation,
-                    operation_id=str(committed.operation_id),
-                    fingerprint=_fingerprint(committed),
-                )
+                # After gate release, on fresh connections: an exact replay of a
+                # committed unpublished operation publishes too while its
+                # reservation still matches.
+                if committed.mode == "protected":
+                    published = await session.writer.publish_protected(
+                        target=committed_authority_target(committed)
+                    )
+                else:
+                    published = await session.writer.publish_ordinary(
+                        generation=committed.generation,
+                        operation_id=str(committed.operation_id),
+                        fingerprint=committed_policy_fingerprint(committed),
+                    )
                 if published is not True:
                     raise _unavailable(committed)
             return committed
@@ -468,10 +515,13 @@ class SourceMutationCoordinator:
             raise
         except SourceAgentNotFound:
             raise SourceAdminError("source_agent_not_found", 404) from None
+        except (SourceGateInvalid, SourceSnapshotUnavailable, SQLAlchemyError):
+            # Gate wait bound, gate loss or SQL failure, including an uncertain commit.
+            state_error = SourceAdminError("source_state_unavailable", 503)
+            if committed is not None:
+                state_error.committed_generation = str(committed.generation)
+            raise state_error from None
         except (
-            SourceGateInvalid,
-            SourceSnapshotUnavailable,
-            SQLAlchemyError,
             SourceFenceConflict,
             SourceFenceExhausted,
             SourceFenceInvalid,
@@ -499,13 +549,17 @@ class SourceMutationCoordinator:
     async def remove(
         self, agent_id: str, hook: str, expected_generation: str, operation_id: str
     ) -> SourcePolicySnapshot:
-        """@spec PROTECTED-HOOK-SOURCE-3/6/10."""
-        return await self.mutate(
-            agent_id,
-            hook,
+        """Target the ordinary tombstone.
+
+        An absent row without attempt history is 409 ``source_not_configured``
+        right after the agent lookup; pending history alone still commits a
+        fresh tombstone. @spec PROTECTED-HOOK-SOURCE-3/6/10.
+        """
+        return await self._execute(
+            SourceIdentity(agent_id, hook),
             expected_generation,
             operation_id,
-            DesiredSourceTarget("ordinary", None, None, None, None).as_dict(),
+            DesiredSourceTarget("ordinary", None, None, None, None),
         )
 
     async def rotate(

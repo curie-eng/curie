@@ -62,8 +62,8 @@ class _FakeBundleStore:
 class _RecordingDocker(DockerSandboxClient):
     """Captures every docker argv and returns canned stdout per subcommand."""
 
-    def __init__(self, *, github_api_url: str = "https://api.github.com", **kwargs: object) -> None:
-        super().__init__(github_api_url=github_api_url, **kwargs)  # type: ignore[arg-type]
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
         self.calls: list[list[str]] = []
         self.timeouts: list[float] = []
         self.outputs: dict[str, str] = {}
@@ -164,6 +164,8 @@ class FakeClaim:
     quota_rejection: QuotaRejection | None = None
     ready_reason: str | None = None
     ready_message: str | None = None
+    # The executor claim's header set (ACTION-EXECUTOR-5); None is an ordinary claim.
+    executor_secret_names: frozenset[str] | None = None
 
 
 @dataclass
@@ -201,6 +203,10 @@ class FakeSandboxClient:
     termination_reads: list[str] = field(default_factory=list)
     created: list[str] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
+    # Every claim-scoped template sweep the substrate asked for, as
+    # ``(keep, created_before)``; ``template_reap_error`` makes the sweep raise.
+    template_reaps: list[tuple[set[str], datetime]] = field(default_factory=list)
+    template_reap_error: BaseException | None = None
 
     def create_claim(
         self,
@@ -211,6 +217,7 @@ class FakeSandboxClient:
         labels: dict[str, str] | None = None,
         runner_resources: dict[str, object] | None = None,
         agent_name: str | None = None,
+        executor_secret_names: frozenset[str] | None = None,
     ) -> None:
         sandbox_name = f"sbx-{name}"
         self.claims[name] = FakeClaim(
@@ -224,6 +231,7 @@ class FakeSandboxClient:
             quota_rejection=self.quota_rejection,
             ready_reason=self.ready_reason,
             ready_message=self.ready_message,
+            executor_secret_names=executor_secret_names,
         )
         self.sandboxes[sandbox_name] = FakeSandbox(
             name=sandbox_name,
@@ -231,9 +239,7 @@ class FakeSandboxClient:
         )
         self.created.append(name)
 
-    def get_claim(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> ClaimView | None:
+    def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
         assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None:
@@ -267,9 +273,13 @@ class FakeSandboxClient:
                 views.append(view)
         return views
 
-    def get_sandbox(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> SandboxView | None:
+    def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
+        self.template_reaps.append((set(keep), created_before))
+        if self.template_reap_error is not None:
+            raise self.template_reap_error
+        return []
+
+    def get_sandbox(self, name: str, *, request_timeout_seconds: float) -> SandboxView | None:
         assert request_timeout_seconds > 0
         sandbox = self.sandboxes.get(name)
         if sandbox is None:
@@ -316,3 +326,30 @@ class FakeSandboxClient:
 @pytest.fixture
 def fake_k8s() -> FakeSandboxClient:
     return FakeSandboxClient()
+
+
+@dataclass
+class PoolProbingFakeSandboxClient(FakeSandboxClient):
+    """A ``FakeSandboxClient`` that also answers ``warm_pool_exists``.
+
+    A separate class, because the substrate already probes for a derived
+    per-agent pool whenever the client can answer: adding the probe to the base
+    fake would move every existing agent-pool test onto the derived pool.
+    ``warm_pools`` None means every pool exists; a set names the pools that do.
+    ``warm_pool_error`` makes the probe raise, as an apiserver outage would.
+    """
+
+    warm_pools: frozenset[str] | None = None
+    warm_pool_error: BaseException | None = None
+    warm_pool_probes: list[str] = field(default_factory=list)
+
+    def warm_pool_exists(self, name: str) -> bool:
+        self.warm_pool_probes.append(name)
+        if self.warm_pool_error is not None:
+            raise self.warm_pool_error
+        return self.warm_pools is None or name in self.warm_pools
+
+
+@pytest.fixture
+def probing_k8s() -> PoolProbingFakeSandboxClient:
+    return PoolProbingFakeSandboxClient()

@@ -101,8 +101,13 @@ credential as the main loop. Pin a reviewer model with
 `--clear-reviewer-model` restores the credential default without changing the
 bundle. The local overrides command accepts the same flags.
 
-The runner image caps every model request at 16000 output tokens
-(`CLAUDE_CODE_MAX_OUTPUT_TOKENS` in [`runner.Dockerfile`](runner.Dockerfile)).
+The Helm overlay [`values.yaml`](values.yaml) caps every factory model request
+at 16000 output tokens through
+`agentSandbox.runnerEnv.dark-factory.CLAUDE_CODE_MAX_OUTPUT_TOKENS`.
+Apply it to the release before deploying this bundle. `curie factory quickstart`
+sets the same value for its selected agent, including an operator bundle that
+uses the platform runner. The setting belongs to the agent and applies to its
+repository runner templates too.
 Claude Code otherwise asks for up to 64000 output tokens per Opus request, and
 OpenRouter reserves credit for that whole ceiling, so a low balance refused
 every reviewer call. A verdict needs a few thousand tokens. Claude Code has no
@@ -118,16 +123,16 @@ out-of-credits cause and the review is not retried.
   gives every session the built-in file tools. The sandbox has no general
   network access. The operator may allow package registry routes for locked
   dependency fetches, and the sandbox holds no push or publication credential.
-- **The issue.** The platform tool `mcp__curie__get_issue` (arguments
-  `owner`, `repo`, `issue_number`), mounted for executions that have a
-  WorkItem. The tool presents an execution scoped capability the API minted
-  for that execution. The API checks that it names this execution and the
-  WorkItem's issue, reads the issue and its comments with the GitHub App
-  installation token (minted fresh per read, so runs longer than one hour
-  keep reading), and returns the title, body, state, author and comments
-  verbatim, along with the execution's absolute UTC `execution_deadline` and
-  total duration in seconds as `execution_seconds`. It stores nothing. The
-  sandbox holds no GitHub credential at all.
+- **The issue.** The platform tool `mcp__curie__get_issue` (no arguments),
+  mounted for executions that have a WorkItem. The tool presents an
+  execution scoped capability the API minted for that execution. The API
+  checks that it names this execution and the WorkItem's issue, reads the
+  ticket through its tracker (a GitHub issue with the App installation token
+  minted fresh per read, so runs longer than one hour keep reading; a Jira
+  issue with the tracker's own credential), and returns it as markdown with
+  its comments, its link, the execution's absolute UTC `execution_deadline`
+  and total duration in seconds as `execution_seconds`. It stores nothing.
+  The sandbox holds no tracker credential at all.
   A failed or capped review ends the reply with `Could not complete:` and the
   unresolved findings, and the platform's factory status comment on the issue
   carries that result.
@@ -141,6 +146,51 @@ For a laptop trial on a small repository, follow the
 [quickstart](../../docs/guides/dark-factory-quickstart.md) instead; it needs
 none of the long run sizing below. This section is the production recipe for a
 repository the size of Curie itself.
+
+To try an unreleased commit from `next`, pass `--candidate` to quickstart.
+Replace the illustrative commit below with a published full 40 character
+lowercase hex commit from `next`. Only full commit tags are published, so
+branch names and short commits are refused.
+
+```bash
+curie factory quickstart \
+  --candidate 0123456789abcdef0123456789abcdef01234567 \
+  --repo acme-corp/acme-bot --context <context> \
+  --namespace <namespace> --release <release> \
+  --app-id <app-id> --private-key-file ./app.pem
+```
+
+This works with a released CLI or a CLI built from source. Quickstart resolves
+all seven Curie images at `sha-<commit>` before any kubectl, Helm or GitHub call
+and refuses the install if any image is missing, naming each one. It installs
+those tags for the API, dispatcher, mail adapter, worker, UI and platform
+runner, clearing their chart digest overrides so the tags take effect on
+released charts too. It locks the dark factory runner layer and its base to
+the resolved digests. The chart still comes from the CLI's default or `--chart`.
+Add `--dry-run` to resolve the tags and print the candidate, image overrides
+and runner lock without installing.
+
+The rendered bundle comes from the CLI build; the candidate selects the
+published images. When adding an agent to an existing factory install without
+App flags, use a candidate that matches the images already installed. That
+path runs no `cluster up` and checks the runner base before binding the agent.
+
+Candidate image pins persist in Helm user values. Omitting `--candidate` or
+running `curie cluster upgrade` does not restore release images. Resetting
+only some image settings can leave mixed versions, including the retained
+mail adapter.
+
+For a disposable trial in a namespace created by quickstart, remove the trial
+installation and its data with the command below. Then use a released CLI to
+run quickstart without `--candidate` in a fresh namespace. This teardown is
+not a migration procedure for an installation whose data must be kept.
+
+```bash
+curie cluster down --context <context> --namespace <namespace> --release <release> --yes
+curie factory quickstart --repo acme-corp/acme-bot --context <context> \
+  --namespace <fresh-namespace> --release <release> \
+  --app-id <app-id> --private-key-file ./app.pem
+```
 
 Write the bundle out first. No clone of this repository is needed:
 
@@ -170,6 +220,7 @@ curie cluster up --model z-ai/glm-5.3-flash --allow-egress-host openrouter
 # minimum Helm timeout of 21900 seconds in its annotation.
 helm upgrade curie <chart> -n curie --reuse-values \
   --timeout 21900s \
+  -f ./dark-factory/values.yaml \
   --set worker.deliveryBudgetSeconds=10800 \
   --set worker.runnerTotalTimeoutSeconds=10800
 curie cluster overrides dark-factory --execution-deadline 10800
@@ -183,9 +234,10 @@ curie cluster overrides dark-factory --execution-deadline 10800
 curie cluster factory
 
 # The rerun confirms the App with GET /app, takes the mention from its slug,
-# and uses its installed repositories as the allowlist (--repo, repeatable,
-# is checked against them instead). The label defaults to curie-factory and
-# is created in each repository. The key goes into the Secret
+# and checks each --repo (repeatable) against its installed repositories.
+# Use --all-installed-repos explicitly to allow the whole installation.
+# The label defaults to curie-factory and is created in each allowlisted
+# repository. The key goes into the Secret
 # curie-github-app (key privateKey) through kubectl stdin; a Secret that
 # holds another App's key is refused. Polling does not need a webhook secret.
 # Pass --webhook-secret-file (or CURIE_GITHUB_WEBHOOK_SECRET) only for webhook
@@ -193,7 +245,8 @@ curie cluster factory
 # against the API boot gate and applies nothing if one value is missing. The
 # values survive a later `curie cluster up`.
 curie cluster factory \
-  --app-id <app-id> --private-key-file ./app.pem --intake poll
+  --app-id <app-id> --private-key-file ./app.pem --intake poll \
+  --repo acme-corp/acme-bot
 
 curie cluster deploy --plugin-dir ./dark-factory \
   --agent dark-factory --env prod --repo acme-corp/acme-bot
@@ -204,6 +257,16 @@ curie cluster surfaces dark-factory --add github=acme-corp/acme-bot
 # Optional. Human approval of each pull request stays the default.
 curie cluster publication-policy dark-factory --policy auto
 ```
+
+For a different agent name, change the `dark-factory` key in the rendered
+`values.yaml` before applying it. The overlay contains non-secret environment
+strings; quote every value. Environment names use uppercase letters, digits and
+underscores, starting with a letter or underscore. Agent names use lowercase
+DNS labels. The chart rejects reserved platform and credential
+names and names already supplied by the chart, connector secrets or global
+`agentSandbox.runner.extraEnv`. Agent `OTEL_*` entries are also refused because
+the chart derives telemetry egress from global configuration. Configure
+`otelCollector` or `agentSandbox.runner.extraEnv` for telemetry instead.
 
 `curie cluster factory --disable` turns intake off. See "Admitting a labelled
 GitHub issue" in [`docs/operations.md`](../../docs/operations.md) for what the

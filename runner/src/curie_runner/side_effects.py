@@ -28,6 +28,8 @@ reads as an escape hatch that silently does nothing (#488).
 
 from collections.abc import Iterable
 
+from .tool_names import CANVAS_READ_ONLY_TOOL_NAMES, CHANNEL_READ_TOOL_NAMES
+
 # The platform's in-process approval-request tool (ADR-0010) is idempotent under
 # EVERY harness: it executes no real-world action (it only marks the turn
 # awaiting-approval), and when applicable it is injected by the platform rather
@@ -40,13 +42,21 @@ from collections.abc import Iterable
 # deliberate ``progress`` tool (ADR 0130): it reports task state to the
 # platform and acts on nothing, so it is never a side effect and never on the
 # turn's receipt. The factory ``get_issue`` (ADR 0187) only reads its own issue.
-PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = frozenset(
-    {
-        "mcp__curie__request_approval",
-        "mcp__curie__report_progress",
-        "mcp__curie__progress",
-        "mcp__curie__get_issue",
-    }
+# The channel read tools (ADR 0100) only read the agent's own bound channels
+# through the platform, so a retry after one repeats no real-world action. The
+# canvas list and read tools (ADR 0200) only read too; ``edit_canvas_cell``
+# writes to the provider and is deliberately absent, so it stays a side effect.
+PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = (
+    frozenset(
+        {
+            "mcp__curie__request_approval",
+            "mcp__curie__report_progress",
+            "mcp__curie__progress",
+            "mcp__curie__get_issue",
+        }
+    )
+    | CHANNEL_READ_TOOL_NAMES
+    | CANVAS_READ_ONLY_TOOL_NAMES
 )
 
 # The Claude Code harness adapter's declared read-only tool set. Names match the

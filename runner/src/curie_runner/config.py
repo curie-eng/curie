@@ -75,11 +75,9 @@ class RunnerConfig:
     # loudly instead of being silently dropped on every turn. The vocabulary is
     # this lane's (curie_runner.thinking), not the boot contract's.
     thinking: dict[str, Any] | None
-    # The harness whose contribution manifest drives this runner (ADR-0060,
-    # #844): read from the runner-local CURIE_HARNESS knob (default the
-    # built-in Claude), NOT a BootEnv contract key -- the same runner-local read
-    # pattern as false_completion_check below. ``__main__`` resolves this name
-    # through the harness registry; an unregistered selection fails the boot.
+    # Internal harness selection (ADR 0140), read from CURIE_HARNESS rather than
+    # the frozen BootEnv contract. __main__ admits only Claude and its existing
+    # aliases, and refuses every other name before registry discovery.
     harness: str
     max_turns: int
     # Where this sandbox's hosted connectors live (ADR-0086, #1118). Absent as
@@ -153,6 +151,13 @@ class RunnerConfig:
     # the operator's CURIE_MEMORY_MAX_FACTS or the default of 200. One number
     # for both, so a saved fact is never left out of the prompt.
     memory_max_facts: int = MAX_FACTS_PER_MEMORY
+    # Channel kind of this boot (#3818). None is an unbound boot.
+    channel_kind: str | None = None
+    # The managed workspace's code host origin and repository path (ADR 0197),
+    # which the publication snapshot trusts instead of the configured GitHub
+    # host and an owner/name path. None for both is a GitHub boot.
+    repo_origin: str | None = None
+    repo_path: str | None = None
     # The runner-local CURIE_RUNNER_ALLOW_TOKENLESS dev flag as parsed (#3821).
     # Only require_serving_token consumes it; a set token always wins.
     allow_tokenless: bool = False
@@ -227,8 +232,8 @@ class RunnerConfig:
         # reachable on a hand-run local runner.
         false_completion_raw = env.get("CURIE_FALSE_COMPLETION_CHECK", "")
         false_completion_check = false_completion_raw.strip().lower() in ("1", "true", "yes")
-        # Runner-local harness selection (ADR-0060, #844), not a BootEnv key:
-        # empty/unset selects the built-in Claude harness.
+        # Internal harness selection (ADR 0140), not a BootEnv key.
+        # Empty or unset selects the supported Claude harness.
         harness = env.get("CURIE_HARNESS", "").strip() or DEFAULT_HARNESS
         disallowed_tools = tuple(
             name.strip()
@@ -270,4 +275,7 @@ class RunnerConfig:
                 if boot.memory_max_facts is not None
                 else MAX_FACTS_PER_MEMORY
             ),
+            channel_kind=boot.channel_kind,
+            repo_origin=boot.repo_origin,
+            repo_path=boot.repo_path,
         )

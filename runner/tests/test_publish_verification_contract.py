@@ -25,7 +25,7 @@ assertion must kill are named alongside it.
 
 import re
 
-from curie_runner.approval import _PUBLISH_DESCRIPTION
+from curie_runner.harness.claude.approval import _PUBLISH_DESCRIPTION
 
 
 def test_publication_description_requires_a_reported_verification_first() -> None:

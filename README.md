@@ -225,14 +225,30 @@ Administrators control deployment, credentials, approvals, model settings,
 memory, and bounded runs. Configured model providers and workspace services
 receive the integration data they need.
 
-- [Production operations](docs/operations.md): installation, backing stores,
-  egress, upgrades, and operational limits.
-- [Administrator guide](docs/administering-co-workers.md): approvals, memory,
-  models, budgets, inspection, and stop controls.
-- [Factory outcome measurement](docs/guides/measuring-factory-outcomes.md):
-  accepted work, estimated spend, and human review effort.
-- [Capabilities](docs/capabilities.md): supported integrations and their limits.
-- [Documentation](docs/README.md): guides and technical references.
+1. [Production operations](docs/operations.md): installation, backing stores,
+   egress, upgrades, and operational limits.
+2. [Administrator guide](docs/administering-co-workers.md): approvals, memory,
+   models, budgets, inspection, and stop controls.
+3. [Factory outcome measurement](docs/guides/measuring-factory-outcomes.md):
+   accepted work, estimated spend, and human review effort.
+4. [Capabilities](docs/capabilities.md): supported integrations and their limits.
+5. [Documentation](docs/README.md): guides and technical references.
+
+Plain `curie cluster up` infers Anthropic or OpenRouter egress from an unambiguous
+credential prefix. Before Helm runs, a `NotFound` GET for the rendered gVisor
+RuntimeClass makes Curie apply `security.gvisor.mode=off`, unless the chart
+creates that RuntimeClass. A `Forbidden` GET retains one retry only after
+admission reports `RuntimeClass "gvisor" not found`. Other read errors and
+admission refusals stay closed. Each inference is printed with the equivalent
+override. Ambiguous credential shapes still need an explicit
+`--allow-egress-host`, and explicit values that contradict detected facts are
+errors.
+
+For the `skill`, `local`, and `cluster` tiers, see the
+[CLI target guide](cli/README.md#using-different-tiers) and
+[bundle quickstart](QUICKSTART.md). The architecture reference covers
+[local to production parity](ARCHITECTURE.md#local-to-production-parity) and
+[what is built vs deferred](ARCHITECTURE.md#what-is-built-vs-deferred).
 
 ## Contributing to Curie
 

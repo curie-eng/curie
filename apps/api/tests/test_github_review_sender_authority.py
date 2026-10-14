@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import httpx
 import pytest
-from curie_api.github_app import _RESOLVERS
+from curie_api.github_app import _RESOLVERS, credentials_for
 from curie_api.github_review_events import FeedbackIgnored, FeedbackUnavailable, parse_feedback
 from curie_api.github_review_truth import verify_feedback_truth
 
@@ -205,7 +205,12 @@ def test_permission_revocation_is_observed_within_the_same_verifier_client(
         async with httpx.AsyncClient(transport=httpx.MockTransport(truth.handle)) as client:
             async def verify():
                 return await verify_feedback_truth(
-                    truth.feedback, truth.lineage, settings=truth.settings, client=client
+                    truth.feedback,
+                    truth.lineage,
+                    settings=truth.settings,
+                    client=client,
+                    credentials=credentials_for(truth.settings),
+                    api_url=truth.settings.github_api_url,
                 )
             assert await verify() == HEAD
             truth.permission["permission"] = "read"

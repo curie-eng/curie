@@ -13,12 +13,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from curie_api import crud
 from curie_api.auth import require_api_key, verify_platform_key
 from curie_api.config import get_settings
+from curie_api.crud import console as crud_console
 from curie_api.models import ConsoleSession
 from curie_api.routers.console import SESSION_COOKIE
-from curie_api.sandbox_token import mint
+from curie_internal.sandbox_token import mint
 from fastapi import FastAPI, HTTPException
 from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -212,7 +212,7 @@ def test_a_revoked_session_is_refused_while_unexpired(
         row = (await session.execute(select(ConsoleSession))).scalars().one()
         assert row.session_expires_at is not None
         assert row.session_expires_at > datetime.now(UTC).replace(tzinfo=None)
-        await crud.revoke_console_session(session, row)
+        await crud_console.revoke_console_session(session, row)
 
     _with_session(revoke)
     _assert_api_key_refusal(client.get("/agents", headers=headers))

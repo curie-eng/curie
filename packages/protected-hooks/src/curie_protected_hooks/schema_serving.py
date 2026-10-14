@@ -249,7 +249,7 @@ async def _observe_servable(engine: AsyncEngine, *, metadata_schema: str) -> str
                 return current
     except SchemaServingUnavailable:
         raise
-    except Exception:
+    except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
         raise SchemaServingUnavailable("schema_probe_unavailable") from None
 
 

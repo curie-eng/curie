@@ -369,3 +369,42 @@ Postgres INTEGER with default zero, not the new source policy's BIGINT.
 This read measured type/default/nullability only; it did not mutate a counter
 or exercise overflow. Source administration must check the positive int4
 limit before revocation rather than assume BIGINT allocation or reset a key.
+
+## Enqueue recipe ZRANGE on the quota key
+
+Observed 2026-10-06 against an owned disposable `valkey/valkey:8.1.10-alpine`
+container (resolved digest
+`sha256:d2e18f3410b6f616de1417f570fa55261af2898b9c5b2cfb6781ce2373ea43d1`),
+started with a unique owner label, persistence disabled, loopback only, and
+removed by that exact name afterward. `INFO server` returned
+`valkey_version=8.1.10`; Python `redis` 8.1.0 with RESP3, a two second timeout
+and `Retry(NoBackoff(), 0)`. The default user was disabled and a fixture
+provisioner seeded keys. ACL evaluation does not depend on the transport, so
+this measurement used plaintext loopback; the TLS transport cases run in
+`packages/protected-hooks/tests/test_enqueue_transport.py`. No credential or
+endpoint is recorded here.
+
+The candidate enqueue principal was installed with
+`ACL SETUSER enqueue reset on >(secret)` and exactly the existing
+`admission_acl_rules("enqueue")` recipe, except that the quota selector became
+`(+type +zadd +zcard +zrem +zscore +zrange %RW~protected:admission:quota)`.
+With members `a`, `b` and `c` at scores 10, 20 and 30 seeded on
+`protected:admission:quota`, the enqueue principal executed:
+
+* `ZRANGE protected:admission:quota 0 63` returned `[a, b, c]`, score order.
+* `ZRANGE protected:admission:quota 0 -1 WITHSCORES` returned the members with
+  scores 10.0, 20.0 and 30.0.
+* `EVAL "return redis.call('ZRANGE',KEYS[1],0,-1)" 1 protected:admission:quota`
+  returned `[a, b, c]`.
+* `ZRANGE` directly on `protected:admission:intent:x`,
+  `protected:admission:quota:other`, `curie:runs`, `protected:source:x` and
+  `protected:control:x` each refused with `NoPermissionError`.
+* The same EVAL declaring each of those keys refused with a NOPERM error
+  (inner command refusal, or declared key refusal for
+  `protected:admission:quota:other`, which no EVAL selector names).
+* `ZRANGESTORE protected:admission:binding:x protected:admission:quota 0 -1`
+  and `ZPOPMIN protected:admission:quota` refused with `NoPermissionError`.
+
+ZRANGE therefore reads the quota members in score order and is granted on no
+other key. The recipe in `admission_acl.py` adds `+zrange` to the quota
+selector only, after this record.

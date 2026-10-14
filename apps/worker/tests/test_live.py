@@ -523,7 +523,7 @@ def test_live_slack_pdf_reaches_the_model(caplog: pytest.LogCaptureFixture) -> N
             time.sleep(min(0.2, max(0.05, deadline - time.monotonic())))
         else:
             raise _ProofError("worker did not acknowledge the live proof before the deadline")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         failure = (
             str(exc)
             if isinstance(exc, _ProofError)
@@ -540,7 +540,7 @@ def test_live_slack_pdf_reaches_the_model(caplog: pytest.LogCaptureFixture) -> N
                     timeout=cleanup_timeout,
                     data={"channel": config.slack_channel, "ts": placeholder_ts},
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 cleanup_failures.append("Slack message cleanup")
         if file_id is not None:
             try:
@@ -551,7 +551,7 @@ def test_live_slack_pdf_reaches_the_model(caplog: pytest.LogCaptureFixture) -> N
                     timeout=cleanup_timeout,
                     data={"file": file_id},
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 cleanup_failures.append("Slack file cleanup")
         # The external driver owns this isolated Valkey database. Leaving the
         # entry avoids racing the worker between its visible Slack edit and ACK.

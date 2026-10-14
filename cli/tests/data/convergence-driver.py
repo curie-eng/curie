@@ -201,11 +201,15 @@ if program == "helm":
         print("STATUS: deployed\nREVISION: 2")
         sys.exit(0)
     if args[0] == "template":
-        print(
-            "Error: could not find template " + args[args.index("--show-only") + 1] + " in chart",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        if "--show-only" in args:
+            print(
+                "Error: could not find template "
+                + args[args.index("--show-only") + 1]
+                + " in chart",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        emit(deployment)
     if args[0] == "upgrade":
         if scenario == "helm-hook-fails":
             print("Error: pre-upgrade hook failed", file=sys.stderr)
@@ -351,9 +355,28 @@ if program == "kubectl":
         sys.exit(0)
     if "label" in args:
         sys.exit(0)
+    if "nodes" in args:
+        # Advisory capacity reads use NodeList, not workload convergence data.
+        # https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/
+        emit(
+            {
+                "apiVersion": "v1",
+                "kind": "NodeList",
+                "items": [
+                    {
+                        "metadata": {"name": "acme-capacity-node"},
+                        "spec": {},
+                        "status": {
+                            "allocatable": {"cpu": "64", "memory": "128Gi"},
+                            "conditions": [{"type": "Ready", "status": "True"}],
+                        },
+                    }
+                ],
+            }
+        )
     if any(
         a in args
-        for a in ["service", "services", "svc", "nodes", "priorityclass", "priorityclasses"]
+        for a in ["service", "services", "svc", "priorityclass", "priorityclasses"]
     ):
         emit({"items": []})
     if scenario == "mixed":

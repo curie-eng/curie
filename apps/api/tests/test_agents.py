@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 from curie_api.config import get_settings
-from curie_api.schemas import AgentCreate, AgentUpdate
+from curie_api.schemas.agents import AgentCreate, AgentUpdate
 from pydantic import ValidationError
 from sqlalchemy import event
 from sqlalchemy import text as sql_text
@@ -61,7 +61,13 @@ def _slack_out(address: str) -> dict[str, str | None]:
     and reads back the default identity by name (ADR-0168 decision 3), with no
     caller restriction by default."""
 
-    return {"kind": "slack", "address": address, "adapter": "default", "allowed_callers": None}
+    return {
+        "kind": "slack",
+        "address": address,
+        "adapter": "default",
+        "allowed_callers": None,
+        "trigger_label": None,
+    }
 
 
 def _create(client: Any, headers: dict[str, str], **fields: Any) -> Any:
@@ -348,7 +354,13 @@ def test_a_non_slack_kind_binds_and_reads_back_through_the_api(
     )
     assert created.status_code == 201, created.text
     assert created.json()["channels"] == [
-        {"kind": "webhook", "address": "acme-room-7", "adapter": None, "allowed_callers": None}
+        {
+            "kind": "webhook",
+            "address": "acme-room-7",
+            "adapter": None,
+            "allowed_callers": None,
+            "trigger_label": None,
+        }
     ]
 
     fetched = client.get(f"/agents/{created.json()['id']}", headers=auth_headers)
@@ -356,7 +368,13 @@ def test_a_non_slack_kind_binds_and_reads_back_through_the_api(
     bindings = fetched.json()["channels"]
     assert isinstance(bindings, list), bindings
     assert bindings == [
-        {"kind": "webhook", "address": "acme-room-7", "adapter": None, "allowed_callers": None}
+        {
+            "kind": "webhook",
+            "address": "acme-room-7",
+            "adapter": None,
+            "allowed_callers": None,
+            "trigger_label": None,
+        }
     ]
 
 
@@ -373,7 +391,13 @@ def test_the_slack_address_shape_check_survives_the_rename(
     ok = _create(client, auth_headers, name="slack-ok", channel=_slack("C0EXAMPLE1"))
     assert ok.status_code == 201, ok.text
     assert ok.json()["channels"] == [
-        {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default", "allowed_callers": None}
+        {
+            "kind": "slack",
+            "address": "C0EXAMPLE1",
+            "adapter": "default",
+            "allowed_callers": None,
+            "trigger_label": None,
+        }
     ]
 
     bad = _create(client, auth_headers, name="slack-bad", channel=_slack("#general"))
@@ -418,7 +442,13 @@ def test_the_pair_is_identity_and_the_address_alone_is_not(
     )
     assert other_kind.status_code == 201, other_kind.text
     assert other_kind.json()["channels"] == [
-        {"kind": "email", "address": "C0EXAMPLE1", "adapter": None, "allowed_callers": None}
+        {
+            "kind": "email",
+            "address": "C0EXAMPLE1",
+            "adapter": None,
+            "allowed_callers": None,
+            "trigger_label": None,
+        }
     ]
 
     # And the pair itself is still identity: the SAME pair still conflicts, with
@@ -469,7 +499,13 @@ def test_patching_a_binding_moves_it_rather_than_adding_a_second(
     )
     assert moved.status_code == 200, moved.text
     assert moved.json()["channels"] == [
-        {"kind": "webhook", "address": "moved-here", "adapter": None, "allowed_callers": None}
+        {
+            "kind": "webhook",
+            "address": "moved-here",
+            "adapter": None,
+            "allowed_callers": None,
+            "trigger_label": None,
+        }
     ]
 
     # The move REPLACED the binding; the old address is now free for another
@@ -479,7 +515,13 @@ def test_patching_a_binding_moves_it_rather_than_adding_a_second(
 
     fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert fetched.json()["channels"] == [
-        {"kind": "webhook", "address": "moved-here", "adapter": None, "allowed_callers": None}
+        {
+            "kind": "webhook",
+            "address": "moved-here",
+            "adapter": None,
+            "allowed_callers": None,
+            "trigger_label": None,
+        }
     ]
 
 

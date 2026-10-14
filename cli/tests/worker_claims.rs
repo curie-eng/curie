@@ -563,6 +563,7 @@ fn assert_existing_cluster_status_shape(value: &serde_json::Value) {
     assert_eq!(
         keys,
         BTreeSet::from([
+            "credentials",
             "delivery",
             "healthy",
             "namespace",

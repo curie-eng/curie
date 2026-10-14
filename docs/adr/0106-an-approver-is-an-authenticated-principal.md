@@ -4,6 +4,9 @@ Date: 2026-08-14
 
 Status: Accepted
 
+Amended by [ADR 0202](0202-a-test-installation-admits-a-listed-bots-actions-and-approval-replies.md): one new principal kind, `test_driver`, which only an
+explicit approver list accepts.
+
 Raised by [#1531](https://github.com/curie-eng/curie/issues/1531) (findings 1
 and 2) and by the 2026-08-14 comment on
 [#1495](https://github.com/curie-eng/curie/issues/1495).

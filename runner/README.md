@@ -277,6 +277,61 @@ turn whose `Event.tool_access` is `read-only`:
   recorded in the thread's durable history, so a later boot of that thread
   replays them.
 
+## Channel read and canvases (ADR 0100, ADR 0200)
+
+A bundle granting `channelRead: true` lets its agent read its own bound
+channels through the platform; `canvasList`, `canvasRead` and `canvasEdit`
+let it list, read and edit table cells of canvases shared into those
+channels. The runner side has four rules.
+
+1. **RUNNER-CHANNEL-READ-1:** Only a real-model boot whose bundle grants at
+   least one of `channelRead`, `canvasList`, `canvasRead`, `canvasEdit` (each a
+   literal `true`) mounts the platform `curie-slack` server, and each tool on
+   it is present only with its own grant: `channelRead` brings
+   `read_channel_history`, `read_thread_replies` and `read_channel_message`;
+   `canvasList` brings `list_channel_canvases`; `canvasRead` brings
+   `read_canvas`; `canvasEdit` brings `edit_canvas_cell`. No grant implies
+   another, and no canvas grant brings the history tools. No grant, or the
+   fake model, mounts nothing. The tools are governed by `toolPolicy` like a
+   connector's (the gate counts `curie-slack` as a connector server) and are
+   never platform exempt. Policy denials hide them from the model's
+   catalogue. The history tools, `list_channel_canvases` and `read_canvas`
+   are idempotent for `side_effect_flag`; `edit_canvas_cell` writes to the
+   provider and is not.
+2. **RUNNER-CHANNEL-READ-2:** `GET /status` and `GET /v1/status` carry
+   `"channel_read": true` only when the server is mounted, and omit the key
+   otherwise, so the kernel refuses a granted turn on a runner that cannot
+   enforce it.
+3. **RUNNER-CHANNEL-READ-3:** The capability arrives on `/v1/event` and
+   `/v1/steer` only and lives in one per-turn holder
+   (`platform_slack/capability.py`). Turn open admits its scope (agent,
+   deployment, logical turn, default channel) and generation. A steer with null
+   or no capability clears the credential and keeps the scope; a steer naming
+   another scope, an unreadable token or a capability with no admitted scope is
+   rejected and clears it; a steer at or below the highest accepted generation
+   is stale and changes nothing. A capability is accepted only when its URL has
+   the boot `CURIE_STATE_URL` origin and a path ending `/channel-read`. The
+   canvas tools post to the sibling `/channel-canvas` route derived from that
+   admitted URL; no second URL is accepted.
+   Completion, interrupt, an accepted timeout (after its epoch check), reset
+   and abandonment clear it before any await. The token never reaches the
+   environment, tool arguments, results, logs, telemetry or the transcript; a
+   tool with no credential refuses `channel_read.no_capability` without a
+   request.
+4. **RUNNER-CHANNEL-READ-4:** A successful result is JSON labelled
+   `content_trust: "untrusted"`, `source: "channel"` (history) or
+   `source: "canvas"` (canvas tools). The persisted turn record keeps a
+   provenance stub (ids, timestamps, permalinks, `bodies_retained: false`) in
+   place of each successful read result; a canvas stub keeps only canvas ids,
+   section ids and creation times, never titles or cell or paragraph text. Once
+   a read or canvas tool has returned a result, the session exports no native
+   replay checkpoint until a new SDK session replaces it. A platform refusal comes back to the model as a
+   named `channel_read.*` code with its message (and, when the platform sends
+   one, `Retry after N seconds`), `channel_read.refused` for an unnamed one;
+   an unreachable platform returns `channel_read.unavailable`. The runner keeps
+   no retry or page counter of its own: the 8 page per turn budget, the 7 day
+   window and the 100 message page ceiling are enforced by the API.
+
 ## Portable assistant message groups
 
 Structured history preserves the logical assistant message that produced each

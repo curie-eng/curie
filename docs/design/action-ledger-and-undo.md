@@ -54,7 +54,7 @@ of not discarding what is already computed.
 
 - **There is already a pre-execution seam that sees the arguments.**
   `build_can_use_tool` in
-  [`runner/src/curie_runner/approval.py`](../../runner/src/curie_runner/approval.py)
+  [`runner/src/curie_runner/harness/claude/approval.py`](../../runner/src/curie_runner/harness/claude/approval.py)
   is the SDK permission callback, and it receives `tool_name` **and
   `tool_input`** *before the call executes*. Its own docstring draws the
   distinction this design needs: the decision is "proactive -- the call is

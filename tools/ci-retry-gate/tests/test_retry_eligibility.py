@@ -47,9 +47,11 @@ ACQUISITION_ACTIONS = frozenset(
 # one entry covers all three steps of a single wrap.
 RETRY_ALLOWLIST = frozenset(
     {
+        ("ci.yaml", "adapter-credential-reconciliation", "Install uv"),
         ("ci.yaml", "python", "Install uv"),
         ("ci.yaml", "python-static", "Install uv"),
         ("ci.yaml", "python-pytest", "Install uv"),
+        ("ci.yaml", "turn-canary-contract", "Install uv"),
         ("fix-pin.yaml", "fix-pin", "Install uv"),
         ("ci.yaml", "e2e-ladder-cluster", "Create the kind cluster"),
         ("ci.yaml", "e2e-cluster-chart-regressions", "Create the kind cluster"),
@@ -63,6 +65,8 @@ RETRY_ALLOWLIST = frozenset(
         ("ci.yaml", "runtime-assertion-registration", "Install uv for the runtime assertion gate"),
         ("ci.yaml", "rust-test", "Install uv"),
         ("ci.yaml", "rust-test", "Install Helm for CLI consumer render tests"),
+        # Like the UI job, this acquires pnpm before repository code runs.
+        ("ci.yaml", "contracts-ts", "Install pnpm"),
         ("ci.yaml", "contracts-ts", "Install Node"),
         ("ci.yaml", "ui", "Install pnpm"),
         ("ci.yaml", "ui", "Install Node"),
@@ -74,6 +78,7 @@ RETRY_ALLOWLIST = frozenset(
         ),
         ("ci.yaml", "images", "Set up QEMU"),
         ("ci.yaml", "images", "Set up Buildx"),
+        ("ci.yaml", "docker-daemon", "Set up Buildx"),
         ("ci.yaml", "repo-toolchain-proof", "Install uv"),
         ("ci.yaml", "changes", "Install uv"),
         ("ci.yaml", "e2e-ladder-cluster", "Install Helm"),
@@ -263,7 +268,7 @@ Identity = tuple[str, str, str]
 class LocatedStep(NamedTuple):
     """A step together with the position that fixes its order within its job."""
 
-    index: int
+    step_index: int
     step: dict[str, Any]
 
 
@@ -516,7 +521,7 @@ def _trio_problems(base: str, trio: Trio) -> list[str]:
         problems.append(f"no `{base}{RETRY_SUFFIX}` step")
     if backoff is None or retry is None:
         return problems
-    if not (attempt.index < backoff.index < retry.index):
+    if not (attempt.step_index < backoff.step_index < retry.step_index):
         problems.append("attempt, backoff, and retry are out of order")
     if not _continue_on_error(attempt.step):
         problems.append("attempt carries no `continue-on-error: true`, so the retry is dead")

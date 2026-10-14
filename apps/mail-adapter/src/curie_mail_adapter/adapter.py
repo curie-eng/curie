@@ -414,7 +414,7 @@ class MailAdapter:
             try:
                 rejection = self._listing_rejection(pending["summary"])
                 self._refuse_inbound(pending["message_id"], rejection)
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 logger.error(
                     "poll: retrying correlation=%s failed unexpectedly",
                     _correlation(pending["message_id"]),

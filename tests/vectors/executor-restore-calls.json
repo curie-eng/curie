@@ -1,0 +1,218 @@
+{
+  "comment": "@spec ACTION-EXECUTOR-15. The two connector calls a restore makes in one executor sandbox. `observe_version` is the read verb: it is called with exactly `observe_arguments` built from the recorded target, and each `observe_replies` entry gives the connector's structured reply and the `version` the runner's `observe` phase returns for it (a string is passed through unjudged for the API to compare; anything else is null, which the API refuses as a conflict). `restore` is called with `target` and `prior_state`, plus `expected_version` set to the recorded version only when the connector's `restore` input schema declares it; `ruling_sha256` is the digest the undo ruling stored over the two-key form, which the worker checks before adding `expected_version`, and `canonical` is the exact text the call sends. `call_replies` map a connector's reply to a restore (or forward) call onto the execution's terminal state and code. Read by apps/api/tests/test_action_canonical_arguments_vector.py (ruling_sha256), apps/worker/tests/test_executor_restore_calls_vector.py and runner/tests/test_runner_execute_vector.py, each of which rejects an unknown key.",
+  "observe_tool": "observe_version",
+  "restore_tool": "restore",
+  "observe_arguments": {
+    "target": {
+      "kind": "Deployment",
+      "namespace": "example-ns",
+      "name": "example-web"
+    }
+  },
+  "observe_replies": [
+    {
+      "name": "version_string",
+      "structured": {
+        "version": "rv-1041"
+      },
+      "version": "rv-1041"
+    },
+    {
+      "name": "version_with_other_keys",
+      "structured": {
+        "version": "rv-1042",
+        "observed_at": "2026-10-06T00:00:00Z"
+      },
+      "version": "rv-1042"
+    },
+    {
+      "name": "empty_version_passes_through",
+      "structured": {
+        "version": ""
+      },
+      "version": ""
+    },
+    {
+      "name": "version_not_a_string",
+      "structured": {
+        "version": 1041
+      },
+      "version": null
+    },
+    {
+      "name": "version_missing",
+      "structured": {
+        "current": "rv-1041"
+      },
+      "version": null
+    },
+    {
+      "name": "unstructured_reply",
+      "structured": null,
+      "version": null
+    }
+  ],
+  "restore_calls": [
+    {
+      "name": "schema_without_expected_version",
+      "restore_input_schema": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "object"
+          },
+          "prior_state": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "target",
+          "prior_state"
+        ]
+      },
+      "target": {
+        "kind": "Deployment",
+        "namespace": "example-ns",
+        "name": "example-web"
+      },
+      "prior_state": {
+        "sealed": "curie.snapshot.v1",
+        "kid": "example-key-2026-10",
+        "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+      },
+      "recorded_version": "rv-1041",
+      "arguments": {
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        },
+        "prior_state": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        }
+      },
+      "canonical": "{\"prior_state\":{\"ciphertext\":\"ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE=\",\"kid\":\"example-key-2026-10\",\"sealed\":\"curie.snapshot.v1\"},\"target\":{\"kind\":\"Deployment\",\"name\":\"example-web\",\"namespace\":\"example-ns\"}}",
+      "ruling_sha256": "f92f74a4e9772d57c7642e95c619bb52669fcc00fd37aa70f1b06ecd4cbf2495"
+    },
+    {
+      "name": "schema_declares_expected_version",
+      "restore_input_schema": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "object"
+          },
+          "prior_state": {
+            "type": "object"
+          },
+          "expected_version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "target",
+          "prior_state"
+        ]
+      },
+      "target": {
+        "kind": "Deployment",
+        "namespace": "example-ns",
+        "name": "example-web"
+      },
+      "prior_state": {
+        "sealed": "curie.snapshot.v1",
+        "kid": "example-key-2026-10",
+        "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+      },
+      "recorded_version": "rv-1041",
+      "arguments": {
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        },
+        "prior_state": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "expected_version": "rv-1041"
+      },
+      "canonical": "{\"expected_version\":\"rv-1041\",\"prior_state\":{\"ciphertext\":\"ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE=\",\"kid\":\"example-key-2026-10\",\"sealed\":\"curie.snapshot.v1\"},\"target\":{\"kind\":\"Deployment\",\"name\":\"example-web\",\"namespace\":\"example-ns\"}}",
+      "ruling_sha256": "f92f74a4e9772d57c7642e95c619bb52669fcc00fd37aa70f1b06ecd4cbf2495"
+    }
+  ],
+  "call_replies": [
+    {
+      "name": "confirmed",
+      "is_error": false,
+      "structured": {
+        "ok": true,
+        "version": "rv-1043",
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      "state": "confirmed",
+      "code": null
+    },
+    {
+      "name": "version_conflict_at_write",
+      "is_error": false,
+      "structured": {
+        "ok": false,
+        "refused": "version_conflict"
+      },
+      "state": "failed",
+      "code": "version_conflict_at_write"
+    },
+    {
+      "name": "sealing_key_unavailable",
+      "is_error": false,
+      "structured": {
+        "ok": false,
+        "refused": "sealing_key_unavailable"
+      },
+      "state": "failed",
+      "code": "sealing_key_unavailable"
+    },
+    {
+      "name": "snapshot_unopenable",
+      "is_error": false,
+      "structured": {
+        "ok": false,
+        "refused": "snapshot_unopenable"
+      },
+      "state": "failed",
+      "code": "snapshot_unopenable"
+    },
+    {
+      "name": "unknown_refusal_normalized",
+      "is_error": false,
+      "structured": {
+        "ok": false,
+        "refused": "example_unknown"
+      },
+      "state": "failed",
+      "code": "connector_error"
+    },
+    {
+      "name": "tool_error_without_structure",
+      "is_error": true,
+      "structured": null,
+      "state": "failed",
+      "code": "connector_error"
+    },
+    {
+      "name": "unstructured_success",
+      "is_error": false,
+      "structured": null,
+      "state": "failed",
+      "code": "unstructured_reply"
+    }
+  ]
+}

@@ -442,7 +442,14 @@ class _FakeK8s:
                 out.append(view)
         return out
 
-    def get_sandbox(self, name: str, *, request_timeout_seconds: float) -> SandboxView | None:
+    def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
+        # The eval lane creates no claim-scoped templates the fake must sweep.
+        del keep, created_before
+        return []
+
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
         assert request_timeout_seconds > 0
         if not any(c.sandbox_name == name for c in self.claims.values()):
             return None

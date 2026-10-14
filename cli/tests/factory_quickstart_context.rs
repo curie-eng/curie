@@ -17,13 +17,13 @@ use std::time::Duration;
 
 use curie::exit::{classify, ExitClass};
 use curie::factory_quickstart::{
-    describe, quickstart_plan, PlanInput, DEFAULT_BUDGET_USD, DEFAULT_DEADLINE_SECONDS,
-    DEFAULT_KIND_NAME, DEFAULT_MODEL,
+    describe, quickstart_plan, PlanInput, DEFAULT_AGENT, DEFAULT_BUDGET_USD,
+    DEFAULT_DEADLINE_SECONDS, DEFAULT_KIND_NAME, DEFAULT_MODEL,
 };
 
 fn plan_input() -> PlanInput {
     PlanInput {
-        repo: "acme/widgets".into(),
+        repos: vec!["acme/widgets".into()],
         app_id: None,
         private_key_file: None,
         explicit_context: None,
@@ -39,8 +39,17 @@ fn plan_input() -> PlanInput {
         chart: "charts/curie".into(),
         credential_in_env: false,
         release_has_real_model: false,
+        chart_explicit: false,
         interactive: false,
         release_at_target: false,
+        agent: DEFAULT_AGENT.into(),
+        label: None,
+        plugin_dir: None,
+        model_explicit: false,
+        recorded: None,
+        bindings: Vec::new(),
+        runner_image: None,
+        jira: None,
     }
 }
 

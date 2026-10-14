@@ -33,19 +33,38 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
-from curie_api.factory_notices import FINAL_MARKER, marker_for, result_section, sync_status_comments
+from curie_api.factory_comment_text import marker_for
+from curie_api.factory_notices import FINAL_MARKER, result_section, sync_status_comments
 from curie_api.github_app import GitHubAppError
 from curie_api.workitem_dispatch import DispatchConflict, acquire, defer
+from forge_fakes.github import (
+    LABEL,
+    _issue_event,
+    _post,
+    fake_installation_tokens,
+    forges_document,
+    forges_env_json,
+)
+from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
+    _LABELS,
+    HEAD_A,
+    _Credentials,
+    _rows,
+    admitted,
+    check_run,
+    ci_entry,
+    comments,
+)
 from sqlalchemy import make_url, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from test_factory_progress import ACTIVITY, DECLARATION, STAGED_DECLARATION, progress_token, report
 from test_factory_terminus import (  # noqa: F401  (fixtures)
-    _LABELS,
-    HEAD_A,
+    ISSUE_REPLY,
     REPO,
+    REVISION_REPLY_COLUMNS,
+    REVISION_REPLY_VALUES,
     _attach_publication,
     _attach_revision_publication,
-    _Credentials,
     _insert_revision,
     _notices,
     _patches,
@@ -54,15 +73,10 @@ from test_factory_terminus import (  # noqa: F401  (fixtures)
     _reconcile,
     _request,
     _revision_objective,
-    _rows,
+    _revision_reply,
     _set_base_ref,
     _start_running,
-    admitted,
-    check_run,
-    ci_entry,
-    comments,
 )
-from test_github_factory_ingress import LABEL, _issue_event, _post
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -584,9 +598,7 @@ def test_credential_mint_failure_releases_status_claim_and_next_pass_retries(
             raise GitHubAppError("fixture installation token mint refused")
 
     async def go() -> None:
-        monkeypatch.setattr(
-            "curie_api.factory_notices.credentials_for", lambda _settings: RefusedCredentials()
-        )
+        fake_installation_tokens(monkeypatch, RefusedCredentials())
         assert (
             await sync_status_comments(
                 client.app.state.sessionmaker, get_settings(), owner="retry-owner", limit=1
@@ -614,9 +626,7 @@ def test_credential_mint_failure_releases_status_claim_and_next_pass_retries(
             "refused_at": None,
         }
         assert sink.requests == []
-        monkeypatch.setattr(
-            "curie_api.factory_notices.credentials_for", lambda _settings: _Credentials()
-        )
+        fake_installation_tokens(monkeypatch, _Credentials())
         assert (
             await sync_status_comments(
                 client.app.state.sessionmaker, get_settings(), owner="retry-owner", limit=1
@@ -637,6 +647,7 @@ def test_slow_github_call_logs_one_sanitized_warning_and_row_summary(
     number = 9957
     _admit(client, github, sink, number)
     caplog.set_level(logging.INFO, logger="curie_api.factory_notices")
+    caplog.set_level(logging.INFO, logger="curie_api.forges.github.marked_comments")
 
     async def go() -> None:
         async with _blocked_status_sync(client, sink, number) as (sync, released):
@@ -648,7 +659,8 @@ def test_slow_github_call_logs_one_sanitized_warning_and_row_summary(
     warnings = [
         record
         for record in caplog.records
-        if record.name == "curie_api.factory_notices" and record.levelno == logging.WARNING
+        if record.name == "curie_api.forges.github.marked_comments"
+        and record.levelno == logging.WARNING
     ]
     assert len(warnings) == 1
     message = warnings[0].getMessage()
@@ -673,19 +685,19 @@ def test_slow_github_call_logs_one_sanitized_warning_and_row_summary(
 def _reconcile_later(seconds: int) -> None:
     """Advance only the reconciler clock. Stored deadlines stay write-once."""
 
-    import curie_api.workitems as workitems
+    import curie_api.workitems.lifecycle as workitems
 
-    original = workitems._database_now
+    original = workitems.database_now
 
     async def later(session: AsyncSession) -> Any:
         real = await original(session)
         return real + timedelta(seconds=seconds)
 
-    workitems._database_now = later
+    workitems.database_now = later
     try:
         _reconcile()
     finally:
-        workitems._database_now = original
+        workitems.database_now = original
 
 
 def _observe_termination(client: Any, request_id: uuid.UUID) -> None:
@@ -732,13 +744,21 @@ def test_admission_creates_one_queued_status_comment(admitted: Any) -> None:  # 
     assert row["finalized_at"] is None
 
 
+def _set_card_base_url(monkeypatch: pytest.MonkeyPatch, key_dir: Path) -> None:
+    """Give the running factory's forge config a public card origin."""
+
+    document = forges_document(api_url=get_settings().github_api_url, card_base_url=CARD_BASE)
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, key_dir))
+    get_settings.cache_clear()
+
+
 def test_the_card_image_is_linked_when_a_base_url_is_set(
     admitted: Any,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+    tmp_path: Path,
 ) -> None:
     client, github, sink = admitted
-    monkeypatch.setenv("GITHUB_FACTORY_CARD_BASE_URL", CARD_BASE)
-    get_settings.cache_clear()
+    _set_card_base_url(monkeypatch, tmp_path)
     number = 9902
     request_id = _admit(client, github, sink, number)
     _reconcile()
@@ -755,10 +775,10 @@ def test_the_card_image_is_linked_when_a_base_url_is_set(
 def test_a_card_url_replaces_the_checklist_as_phases_advance(
     admitted: Any,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+    tmp_path: Path,
 ) -> None:
     client, github, sink = admitted
-    monkeypatch.setenv("GITHUB_FACTORY_CARD_BASE_URL", CARD_BASE)
-    get_settings.cache_clear()
+    _set_card_base_url(monkeypatch, tmp_path)
     number = 9912
     request_id = _admit(client, github, sink, number)
     _reconcile()
@@ -1090,8 +1110,8 @@ def _issue_requests(number: int) -> list[dict[str, Any]]:
     return _rows(
         "SELECT r.id, r.sequence, r.status, r.terminal_cause "
         "FROM curie.execution_requests r JOIN curie.work_items w ON w.id = r.work_item_id "
-        "WHERE w.github_issue_number = :n ORDER BY r.sequence",
-        {"n": number},
+        "WHERE w.tracker_issue_id = :n ORDER BY r.sequence",
+        {"n": str(number)},
     )
 
 
@@ -1451,8 +1471,8 @@ def test_relabel_while_waiting_finalizes_the_old_comment_and_opens_a_new_one(
     assert again.json()["status"] == "factory_admitted"
     rows = _rows(
         "SELECT r.id FROM curie.execution_requests r JOIN curie.work_items w "
-        "ON w.id = r.work_item_id WHERE w.github_issue_number = :n ORDER BY r.sequence",
-        {"n": number},
+        "ON w.id = r.work_item_id WHERE w.tracker_issue_id = :n ORDER BY r.sequence",
+        {"n": str(number)},
     )
     new_id = rows[1]["id"]
     _reconcile()
@@ -1647,7 +1667,9 @@ def test_later_request_status_comments_continue_on_the_existing_pr_until_termina
         "SELECT * FROM curie.publications WHERE execution_request_id = :id",
         {"id": first["id"]},
     )
-    successor = _insert_revision(first["work_item_id"], number, "Continue the requested issue work")
+    successor = _insert_revision(
+        first["work_item_id"], number, "Continue the requested issue work", ISSUE_REPLY
+    )
     _execute(
         "INSERT INTO curie.factory_terminal_notices (execution_request_id, work_item_id) "
         "VALUES (:request, :item)",
@@ -1701,7 +1723,10 @@ def test_queued_review_revision_replies_that_it_waits_for_the_current_run(
     sink.by_path = True
     number, pr, first = _published_issue(client, github, sink)
     running = _insert_revision(
-        first["work_item_id"], number, _revision_objective(pr, "discussion_r88203")
+        first["work_item_id"],
+        number,
+        _revision_objective(pr, "discussion_r88203"),
+        _revision_reply(pr, "discussion_r88203"),
     )
     _start_running(running)
     assert report(client, running, "implement", round=1).status_code == 201
@@ -1711,15 +1736,16 @@ def test_queued_review_revision_replies_that_it_waits_for_the_current_run(
     _execute(
         "INSERT INTO curie.execution_requests "
         "(id, work_item_id, sequence, status, wait_deadline, objective, requester, reply_kind, "
-        "reply_address, reply_conversation_id) VALUES "
+        f"reply_address, reply_conversation_id, {REVISION_REPLY_COLUMNS}) VALUES "
         "(:id, :work_item, 3, 'queued', NULL, :objective, "
-        "'github:6601:octocat', 'github', :repo, :conversation)",
+        f"'github:6601:octocat', 'github', :repo, :conversation, {REVISION_REPLY_VALUES})",
         {
             "id": queued,
             "work_item": first["work_item_id"],
             "objective": _revision_objective(pr, "discussion_r88204"),
             "repo": REPO,
             "conversation": f"issue-{number}",
+            **_revision_reply(pr, "discussion_r88204"),
         },
     )
     _execute(
@@ -1768,15 +1794,16 @@ def test_closed_lineage_queue_keeps_the_completed_runs_pr_open_label(
     _execute(
         "INSERT INTO curie.execution_requests "
         "(id, work_item_id, sequence, status, wait_deadline, objective, requester, reply_kind, "
-        "reply_address, reply_conversation_id) VALUES "
+        f"reply_address, reply_conversation_id, {REVISION_REPLY_COLUMNS}) VALUES "
         "(:id, :work_item, 2, 'queued', NULL, :objective, "
-        "'github:6601:octocat', 'github', :repo, :conversation)",
+        f"'github:6601:octocat', 'github', :repo, :conversation, {REVISION_REPLY_VALUES})",
         {
             "id": queued,
             "work_item": first["work_item_id"],
             "objective": _revision_objective(pr, "issuecomment-88205"),
             "repo": REPO,
             "conversation": f"issue-{number}",
+            **_revision_reply(pr, "issuecomment-88205"),
         },
     )
     _execute(
@@ -1811,7 +1838,12 @@ def _live_revision(
 ) -> tuple[int, int, uuid.UUID, Any]:
     number, pr, first = _published_issue(client, github, sink)
     sink.requests.clear()
-    revision = _insert_revision(first["work_item_id"], number, _revision_objective(pr, fragment))
+    revision = _insert_revision(
+        first["work_item_id"],
+        number,
+        _revision_objective(pr, fragment),
+        _revision_reply(pr, fragment),
+    )
     _start_running(revision)
     # A revision inserted without a status row gets one from its first report.
     assert report(client, revision, "implement", round=1).status_code == 201

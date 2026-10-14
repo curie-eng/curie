@@ -99,6 +99,11 @@ spec:
       # The runner-logs proxy lists pods and reads pod logs via the K8s API, so
       # the API pod runs as its own ServiceAccount (see api-rbac.yaml).
       serviceAccountName: {{ include "curie.fullname" . }}-api
+      {{- if include "curie.factory.hasCredentials" . }}
+      # The api runs as gid 1000: fsGroup reads the 0440 forge credentials.
+      securityContext:
+        fsGroup: 1000
+      {{- end }}
       {{- with .Values.priorityClasses.platform.name }}
       priorityClassName: {{ . }}
       {{- end }}
@@ -225,6 +230,28 @@ spec:
                   name: {{ include "curie.secretName" . }}
                   key: installationId
                   optional: false
+            # The action executor switch (ACTION-EXECUTOR-1). The worker
+            # renders the same value from the same helper; the two must never
+            # differ.
+            - name: CURIE_ACTION_EXECUTOR_ENABLED
+              value: {{ include "curie.actionExecutorEnabled" . | quote }}
+            # The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+            # executor amendment E9), enforced by the claim route. The worker
+            # renders the same value from the same helper.
+            - name: CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES
+              value: {{ include "curie.actionExecutorMaxConcurrentSandboxes" . | quote }}
+            # The automated remediation switch (AUTOMATED-REMEDIATION-1). The
+            # worker renders the same value from the same helper, which fails
+            # the render when it is on and the executor is off.
+            - name: CURIE_REMEDIATION_ENABLED
+              value: {{ include "curie.remediationEnabled" . | quote }}
+            # The test installation declaration (ADR 0202 decision 1). The
+            # dispatcher renders the same two values from the same helpers;
+            # secrets.yaml refuses the render when it is on and unsafe.
+            - name: CURIE_TEST_INSTALLATION_ENABLED
+              value: {{ include "curie.testInstallation.enabled" . | quote }}
+            - name: CURIE_TEST_INSTALLATION_DRIVERS
+              value: {{ include "curie.testInstallation.drivers" . | quote }}
             # The connector caller public keys and the proxy image (ADR-0168
             # decision 7). The API renders a caller proxy into every hosted
             # connector it renders when the current key is set; the worker
@@ -266,6 +293,29 @@ spec:
               value: {{ $e2e.ttlSeconds | quote }}
             - name: CURIE_E2E_POD_SECURITY
               value: {{ $e2e.podSecurity | quote }}
+            - name: CURIE_E2E_REGISTRY
+              value: {{ $e2e.registry | default "" | quote }}
+            - name: CURIE_E2E_BUILD_CACHE_REPO
+              {{- /* null means <registry>/cache; an explicit empty string disables the cache. */}}
+              {{- if kindIs "invalid" $e2e.buildCacheRepo }}
+              value: {{ ternary (printf "%s/cache" (trimSuffix "/" ($e2e.registry | default ""))) "" (ne ($e2e.registry | default "") "") | quote }}
+              {{- else }}
+              value: {{ $e2e.buildCacheRepo | quote }}
+              {{- end }}
+            - name: CURIE_E2E_REGISTRY_INSECURE
+              value: {{ $e2e.registryInsecure | default false | quote }}
+            - name: CURIE_E2E_REGISTRY_TOKEN_HOSTS
+              value: {{ join "," ($e2e.registryTokenHosts | default list) | quote }}
+            - name: CURIE_E2E_BUILDER_IMAGE
+              value: {{ $e2e.builderImage | default "" | quote }}
+            - name: CURIE_E2E_GIT_IMAGE
+              value: {{ $e2e.gitImage | default "" | quote }}
+            - name: CURIE_E2E_PUSH_IMAGE
+              value: {{ $e2e.pushImage | default "" | quote }}
+            - name: CURIE_E2E_BUILD_TIMEOUT_SECONDS
+              value: {{ $e2e.buildTimeoutSeconds | default 1200 | quote }}
+            - name: CURIE_E2E_SOURCE_HOSTS
+              value: {{ join "," ($e2e.sourceHosts | default (list "github.com")) | quote }}
             - name: CURIE_PUBLICATION_PATCH_MAX_BYTES
               value: {{ .Values.worker.publication.patchMaxBytes | quote }}
             - name: CURIE_PUBLICATION_RETENTION_SECONDS
@@ -292,26 +342,14 @@ spec:
               value: {{ .Values.api.githubReviewIngressEnabled | quote }}
             - name: GITHUB_REVIEW_RECONCILER_INTERVAL_S
               value: {{ .Values.api.githubReviewReconcilerIntervalSeconds | quote }}
-            - name: GITHUB_FACTORY_INGRESS_ENABLED
-              value: {{ .Values.api.githubFactoryIngressEnabled | quote }}
-            - name: GITHUB_FACTORY_INTAKE
-              value: {{ .Values.api.githubFactoryIntake | quote }}
-            - name: GITHUB_FACTORY_POLL_INTERVAL_S
-              value: {{ .Values.api.githubFactoryPollIntervalSeconds | quote }}
-            - name: GITHUB_FACTORY_LABEL
-              value: {{ .Values.api.githubFactoryLabel | quote }}
-            - name: GITHUB_FACTORY_MENTION
-              value: {{ .Values.api.githubFactoryMention | quote }}
-            - name: GITHUB_FACTORY_CARD_BASE_URL
-              value: {{ .Values.api.githubFactoryCardBaseUrl | quote }}
-            - name: GITHUB_FACTORY_CI_WAIT_S
-              value: {{ .Values.api.githubFactoryCiWaitSeconds | quote }}
-            - name: GITHUB_FACTORY_PYTHON_CI
-              value: {{ .Values.api.githubFactoryPythonCi | default dict | toJson | quote }}
-            - name: GITHUB_FACTORY_BASES
-              value: {{ .Values.api.githubFactoryBases | default dict | toJson | quote }}
-            - name: GITHUB_FACTORY_METADATA_CI
-              value: {{ .Values.api.githubFactoryMetadataCi | default dict | toJson | quote }}
+            - name: FACTORY_ENABLED
+              value: {{ get (.Values.factory | default dict) "enabled" | default false | quote }}
+            - name: FACTORY_INTAKE
+              value: {{ get (.Values.factory | default dict) "intake" | default "poll" | quote }}
+            - name: FACTORY_CI_WAIT_S
+              value: {{ include "curie.factory.str" (get (.Values.factory | default dict) "ciWaitSeconds" | default 1200) | quote }}
+            - name: CURIE_FORGES
+              value: {{ include "curie.factory.forgesJson" . | quote }}
             - name: GITHUB_API_URL
               value: {{ .Values.api.githubApiUrl | quote }}
             # Outbound GitHub credential: the eval commit status AND the
@@ -366,6 +404,13 @@ spec:
               value: {{ .Values.api.commitPollIntervalSeconds | quote }}
             - name: GITHUB_CLONE_BASE
               value: {{ .Values.api.githubCloneBase | quote }}
+            {{- if include "curie.codeHostTrust.name" . }}
+            # The code host CA bundle (ADR 0197).
+            - name: CURIE_CODE_HOST_CA_BUNDLE
+              value: {{ include "curie.codeHostTrust.path" . | quote }}
+            - name: GIT_SSL_CAINFO
+              value: {{ include "curie.codeHostTrust.path" . | quote }}
+            {{- end }}
             - name: LANGFUSE_HOST
               value: {{ include "curie.langfuse.url" . }}
             - name: LANGFUSE_PUBLIC_KEY
@@ -431,14 +476,6 @@ spec:
             # Per-thread conversation transcript cap in bytes (#3301).
             - name: TRANSCRIPT_MAX_THREAD_BYTES
               value: {{ .Values.api.transcriptMaxThreadBytes | int64 | quote }}
-            {{- if .Values.api.githubStubCaConfigMap }}
-            - name: SSL_CERT_FILE
-              value: /etc/curie/github-stub/ca.pem
-            - name: GIT_SSL_CAINFO
-              value: /etc/curie/github-stub/ca.pem
-            - name: REQUESTS_CA_BUNDLE
-              value: /etc/curie/github-stub/ca.pem
-            {{- end }}
             {{- $checksumExtraEnv | nindent 12 }}
           ports:
             - name: http
@@ -455,16 +492,16 @@ spec:
             {{- toYaml .Values.api.livenessProbe | nindent 12 }}
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
-          {{- if .Values.api.githubStubCaConfigMap }}
+          {{- $codeHostTrust := include "curie.codeHostTrust.name" . }}
+          {{- $forgeCredentials := include "curie.factory.hasCredentials" . }}
+          {{- if or $codeHostTrust $forgeCredentials }}
           volumeMounts:
-            - name: github-stub-ca
-              mountPath: /etc/curie/github-stub
-              readOnly: true
+            {{- include "curie.codeHostTrust.volumeMount" . | nindent 12 }}
+            {{- include "curie.factory.credentialMount" . | nindent 12 }}
           {{- end }}
-      {{- if .Values.api.githubStubCaConfigMap }}
+      {{- if or $codeHostTrust $forgeCredentials }}
       volumes:
-        - name: github-stub-ca
-          configMap:
-            name: {{ .Values.api.githubStubCaConfigMap }}
+        {{- include "curie.codeHostTrust.volume" . | nindent 8 }}
+        {{- include "curie.factory.credentialVolume" . | nindent 8 }}
       {{- end }}
 {{- end }}

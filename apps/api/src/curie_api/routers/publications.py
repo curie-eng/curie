@@ -9,32 +9,61 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import replace
 from typing import Any, Literal, cast
 
-import httpx
+from aci_protocol import PublicationContext
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, canonicalize_traceparent
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from starlette.concurrency import run_in_threadpool
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import crud, factory_ci, factory_progress, workitems
+from curie_api.crud import agents as crud_agents
+from curie_api.crud import approvals as crud_approvals
+from curie_api.crud import deployments as crud_deployments
+from curie_api.crud import errors as crud_errors
+from curie_api.crud import lineages as crud_lineages
+from curie_api.crud import publication_queries as crud_publication_queries
+from curie_api.crud import publications as crud_publications
+from curie_api.crud import workspaces as crud_workspaces
+from curie_api.schemas.publications import (
+    PublicationContextMint,
+    PublicationCreate,
+    PublicationLineageAdvance,
+    PublicationLineageOut,
+    PublicationOut,
+    ReviewRevisionCancel,
+    ReviewRevisionOut,
+    ReviewRevisionReserve,
+)
+from curie_api.schemas.workspaces import RepositoryCredentialOut
+
+from .. import factory_ci, factory_progress
 from ..auth import (
     require_api_key,
     require_internal_worker_token,
 )
 from ..config import get_settings
 from ..deps import SessionDep
+from ..forges.config import RepositoryBindingConfig
+from ..forges.errors import ForgeError, NotFound, Unauthorized, Unavailable
+from ..forges.hosts import code_host_for, forge_code_host, pull_request_url
+from ..forges.trackers import tracker_for_work_item, work_item_policy
+from ..forges.types import GITHUB, CredentialScope, PullRequestRef, RepositoryRef
 from ..models import (
     ExecutionRequest,
     Publication,
     PublicationReviewReservation,
     ThreadPublicationLineage,
+    WorkItem,
 )
 from ..publication_authority import (
     AuthorityRefused,
     AuthorityUnavailable,
+    PublicationIdentity,
     PublicationRemoteTerminal,
+    verify_code_host_identity,
     verify_publication_identity,
 )
 from ..publication_policy import policy_still_authorizes
@@ -47,24 +76,96 @@ from ..publication_truth import (
     read_publication_authority,
     read_publication_metadata,
 )
-from ..repo_full_name import repo_url_path
-from ..repository_auth import resolve_repository_credential
-from ..schemas import (
-    PublicationContext,
-    PublicationContextMint,
-    PublicationCreate,
-    PublicationLineageAdvance,
-    PublicationLineageOut,
-    PublicationOut,
-    RepositoryCredentialOut,
-    ReviewRevisionCancel,
-    ReviewRevisionOut,
-    ReviewRevisionReserve,
+from ..repository_access import (
+    issue_stored_credential,
+    lineage_repository,
+    thread_repository,
 )
-from ..workspace_policy import credential_mode, repository_is_allowed
+from ..workitems import lifecycle
+from ..workspace_policy import credential_mode, repository_allowed
 from .publication_precheck import precheck_error
 
 logger = logging.getLogger(__name__)
+
+
+async def _closing_reference(
+    session: AsyncSession, request: Request, execution_request_id: uuid.UUID
+) -> str | None:
+    """The WorkItem tracker's closing reference for the request's issue.
+
+    None when the request or its WorkItem is unknown (creation refuses it), or
+    for a GitHub WorkItem on an install with no GitHub tracker (a WorkItem the
+    work-items API admitted with no factory intake), which publishes as it
+    always has. Any other WorkItem whose tracker or binding is not configured
+    is refused 409 ``publication.closing_reference_unconfigured``, and a
+    tracker that cannot answer now 503 retryable, so no tracker-admitted body
+    is stored without its reference.
+    """
+
+    execution = await session.get(ExecutionRequest, execution_request_id)
+    if execution is None:
+        return None
+    item = await session.get(WorkItem, execution.work_item_id)
+    if item is None:
+        return None
+    unavailable = HTTPException(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        {
+            "code": "publication.closing_reference_unavailable",
+            "message": "the tracker could not name the issue; retry shortly",
+        },
+        headers={"Retry-After": "10"},
+    )
+    try:
+        tracker = tracker_for_work_item(
+            request.app.state.forges,
+            request.app.state.http_client,
+            item.tracker_issue,
+            item.repository,
+            item.code_host_installation_id,
+        )
+    except NotFound:
+        if item.tracker_issue.kind == GITHUB:
+            return None
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.closing_reference_unconfigured",
+                "message": (
+                    "no configured tracker binding serves the work item's issue, so the"
+                    " pull request body cannot reference it"
+                ),
+            },
+        ) from None
+    except ForgeError:
+        raise unavailable from None
+    try:
+        reference: str = await tracker.closing_reference(item.tracker_issue, item.repository)
+    except ForgeError:
+        raise unavailable from None
+    return reference
+
+
+async def _work_item_policy(
+    session: AsyncSession,
+    request: Request,
+    execution_request_id: uuid.UUID,
+    repo_full_name: str,
+) -> RepositoryBindingConfig | None:
+    """The policy of the binding that chose the request's repository
+    (`work_item_policy`); None when the request or its WorkItem is unknown,
+    which creation refuses."""
+
+    execution = await session.get(ExecutionRequest, execution_request_id)
+    item = None if execution is None else await session.get(WorkItem, execution.work_item_id)
+    if item is None:
+        return None
+    return work_item_policy(
+        request.app.state.forges,
+        item.tracker_issue,
+        replace(item.repository, path=repo_full_name),
+    )
+
 
 router = APIRouter(
     prefix="/publications",
@@ -73,7 +174,8 @@ router = APIRouter(
 )
 internal_router = APIRouter(prefix="/v1/internal/publications", tags=["internal-publications"])
 
-_GITHUB_API_VERSION = "2022-11-28"
+# Code host reasons for a pull request whose facts do not match the request.
+_INVALID_PULL_REASONS = frozenset({"malformed_response", "pull_request_mismatch"})
 _FULL_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}")
 _GITHUB_UNAVAILABLE_DETAIL = {
     "code": "publication.github_unavailable",
@@ -100,7 +202,7 @@ async def mint_publication_context(
     settings = get_settings()
     try:
         async with asyncio.timeout(PRECHECK_TIMEOUT_SECONDS):
-            await workitems.adopt_orphan_publication_lineage(
+            await lifecycle.adopt_orphan_publication_lineage(
                 session,
                 deployment_id=data.deployment_id,
                 work_item_id=data.work_item_id,
@@ -193,9 +295,13 @@ async def _publication_lineage_out(
 ) -> PublicationLineageOut:
     """Render the one safe private-state fact alongside public lineage data."""
 
-    has_pending_revision = await crud.publication_lineage_has_pending_revision(session, lineage)
-    has_pending_outcome = await crud.publication_lineage_has_pending_outcome(session, lineage)
-    visible_outcome_revision = await crud.publication_lineage_visible_outcome_revision(
+    has_pending_revision = await crud_lineages.publication_lineage_has_pending_revision(
+        session, lineage
+    )
+    has_pending_outcome = await crud_lineages.publication_lineage_has_pending_outcome(
+        session, lineage
+    )
+    visible_outcome_revision = await crud_lineages.publication_lineage_visible_outcome_revision(
         session, lineage
     )
     return PublicationLineageOut.model_validate(lineage).model_copy(
@@ -207,52 +313,12 @@ async def _publication_lineage_out(
     )
 
 
-def _validated_github_pr_truth(
-    payload: Any,
-    *,
-    github_html_base: str,
-    repo_full_name: str,
-    pr_number: int,
-    pr_url: str,
-    branch: str,
-) -> tuple[str, str]:
-    """Validate identity-bound GitHub fields and return state plus head SHA."""
-
-    if not isinstance(payload, dict):
-        raise ValueError("GitHub returned an invalid pull request body")
-    number = payload.get("number")
-    html_url = payload.get("html_url")
-    remote_state = payload.get("state")
-    merged = payload.get("merged")
-    head = payload.get("head")
-    expected_url = f"{github_html_base}/{repo_full_name}/pull/{pr_number}"
-    if (
-        not isinstance(number, int)
-        or isinstance(number, bool)
-        or number != pr_number
-        or html_url != pr_url
-        or pr_url != expected_url
-        or not isinstance(head, dict)
-        or head.get("ref") != branch
-    ):
-        raise ValueError("GitHub pull request identity differs from the stored lineage")
-    actual_head_sha = head.get("sha")
-    if not isinstance(actual_head_sha, str) or _FULL_COMMIT_SHA.fullmatch(actual_head_sha) is None:
-        raise ValueError("GitHub returned an invalid pull request head")
-    if remote_state not in ("open", "closed") or not isinstance(merged, bool):
-        raise ValueError("GitHub returned an invalid pull request state")
-    if merged and remote_state != "closed":
-        raise ValueError("GitHub returned an inconsistent pull request state")
-    state = "merged" if merged else ("closed" if remote_state == "closed" else "open")
-    return state, actual_head_sha.lower()
-
-
-async def _refresh_publication_lineage_from_github(
+async def _refresh_publication_lineage(
     request: Request,
     session: SessionDep,
     lineage: ThreadPublicationLineage,
 ) -> ThreadPublicationLineage:
-    """Refresh a stored PR by number while keeping credentials API-private."""
+    """Refresh a stored PR by number through the code host; credentials stay API-private."""
 
     if lineage.pr_number is None and lineage.pr_url is None:
         return lineage
@@ -266,69 +332,58 @@ async def _refresh_publication_lineage_from_github(
         )
 
     settings = get_settings()
-    try:
-        _, authorization_header = await run_in_threadpool(
-            resolve_repository_credential, lineage.repo_full_name, settings
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status.HTTP_502_BAD_GATEWAY,
-            {
-                "code": "publication.github_unavailable",
-                "message": "operator repository credential could not be resolved",
-            },
-        ) from exc
-
-    url = (
-        f"{settings.github_api_url.rstrip('/')}"
-        f"/repos/{repo_url_path(lineage.repo_full_name)}/pulls/{lineage.pr_number}"
+    repository = await lineage_repository(session, settings, lineage)
+    client = request.app.state.http_client
+    code_host = (
+        code_host_for(settings, client)
+        if repository.kind == GITHUB
+        else forge_code_host(settings, client, repository)
     )
     try:
-        response = await request.app.state.http_client.get(
-            url,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "Authorization": authorization_header,
-                "X-GitHub-Api-Version": _GITHUB_API_VERSION,
-            },
-            # This request carries operator authority. Refuse every redirect at
-            # this callsite even when the shared client follows redirects for a
-            # different API consumer.
-            follow_redirects=False,
-        )
-    except httpx.HTTPError as exc:
+        pull = await code_host.read_pull_request(PullRequestRef(repository, str(lineage.pr_number)))
+    except Unauthorized as exc:
+        if str(exc) == "credential_unresolved":
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                {
+                    "code": "publication.github_unavailable",
+                    "message": "operator repository credential could not be resolved",
+                },
+            ) from None
         raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            _GITHUB_UNAVAILABLE_DETAIL,
-        ) from exc
-    if response.status_code != status.HTTP_200_OK:
+            status.HTTP_503_SERVICE_UNAVAILABLE, _GITHUB_UNAVAILABLE_DETAIL
+        ) from None
+    except Unavailable as exc:
+        if str(exc) not in _INVALID_PULL_REASONS:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, _GITHUB_UNAVAILABLE_DETAIL
+            ) from None
+        pull = None
+    except ForgeError:
         # A missing PR, rejected credential, rate limit, redirect, or upstream
         # failure is not verified-open lineage. Keep the durable row unchanged
         # and make the caller refuse this turn before route adoption/model use.
         raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            _GITHUB_UNAVAILABLE_DETAIL,
-        )
-    try:
-        remote_state, actual_head_sha = _validated_github_pr_truth(
-            response.json(),
-            github_html_base=settings.github_html_base,
-            repo_full_name=lineage.repo_full_name,
-            pr_number=lineage.pr_number,
-            pr_url=lineage.pr_url,
-            branch=lineage.branch,
-        )
-    except (ValueError, TypeError) as exc:
+            status.HTTP_503_SERVICE_UNAVAILABLE, _GITHUB_UNAVAILABLE_DETAIL
+        ) from None
+    if (
+        pull is None
+        or pull.url != lineage.pr_url
+        or lineage.pr_url != pull_request_url(settings, pull)
+        or pull.head_ref != lineage.branch
+        or _FULL_COMMIT_SHA.fullmatch(pull.head_sha) is None
+    ):
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
             {
                 "code": "publication.github_invalid_response",
                 "message": "GitHub returned pull request facts that do not match the lineage",
             },
-        ) from exc
+        )
+    remote_state, actual_head_sha = pull.state.value, pull.head_sha.lower()
 
     if actual_head_sha != lineage.head_sha and (
-        await crud.publication_lineage_has_inflight_push(session, lineage)
+        await crud_lineages.publication_lineage_has_inflight_push(session, lineage)
     ):
         # The authorized revision may have pushed its exact commit while its
         # lineage CAS is still pending. Keep the durable expected head as the
@@ -338,13 +393,13 @@ async def _refresh_publication_lineage_from_github(
     expected_head_sha = lineage.head_sha
     if expected_head_sha is None:
         try:
-            lineage = await crud.initialize_publication_lineage_head(
+            lineage = await crud_lineages.initialize_publication_lineage_head(
                 session,
                 lineage,
                 expected_version=lineage.version,
                 head_sha=actual_head_sha,
             )
-        except crud.PublicationLineageConflict as exc:
+        except crud_errors.PublicationLineageConflict as exc:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 {"code": exc.code, "message": exc.message},
@@ -353,14 +408,14 @@ async def _refresh_publication_lineage_from_github(
     assert expected_head_sha is not None
     if remote_state in ("merged", "closed") and lineage.status == "open":
         try:
-            lineage = await crud.mark_publication_lineage_terminal(
+            lineage = await crud_lineages.mark_publication_lineage_terminal(
                 session,
                 lineage,
                 expected_version=lineage.version,
                 expected_head_sha=expected_head_sha,
                 state=remote_state,
             )
-        except crud.PublicationLineageConflict as exc:
+        except crud_errors.PublicationLineageConflict as exc:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 {"code": exc.code, "message": exc.message},
@@ -404,6 +459,7 @@ async def create_publication(
     traceparent = canonicalize_traceparent(request.headers.get(TRACEPARENT_STREAM_FIELD))
 
     if data.work_item_request_id is not None:
+        work_item_request_id = data.work_item_request_id
         prior_paths = (
             await session.scalars(
                 select(Publication.changed_paths).where(
@@ -413,8 +469,10 @@ async def create_publication(
             )
         ).all()
         changed_paths = [path for paths in prior_paths for path in paths] + data.changed_paths
-        python_ci = factory_ci.python_ci_policy(settings, data.repo_full_name)
-        unselected = factory_ci._unselected_python_path(changed_paths, python_ci)
+        python_ci = factory_ci.python_ci_policy(
+            await _work_item_policy(session, request, work_item_request_id, data.repo_full_name)
+        )
+        unselected = factory_ci.unselected_python_path(changed_paths, python_ci)
         if unselected is not None:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -423,7 +481,7 @@ async def create_publication(
                     "message": f"required Python CI does not select {unselected}",
                 },
             )
-        if factory_ci._python_paths(changed_paths):
+        if factory_ci.python_paths(changed_paths):
             try:
                 observations = await factory_progress.read_verification_observations(
                     session, data.work_item_request_id
@@ -491,6 +549,12 @@ async def create_publication(
             if missing:
                 body = f"{body.rstrip()}\n\n{'\n'.join(missing)}"
                 data = data.model_copy(update={"body": body})
+        # Every factory pull request body references its ticket (#4358 plan D7),
+        # in the tracker's own form; a body that already carries it is kept.
+        reference = await _closing_reference(session, request, work_item_request_id)
+        if reference is not None and reference not in (data.body or ""):
+            body = f"{data.body}\n\n{reference}" if data.body else reference
+            data = data.model_copy(update={"body": body})
 
     async def metadata_check() -> None:
         if patch:
@@ -505,7 +569,7 @@ async def create_publication(
             or data.title is None
             or data.body is None
         ):
-            raise crud.PublicationLineageConflict(
+            raise crud_errors.PublicationLineageConflict(
                 "publication.metadata_context_required",
                 "metadata-only publication requires a current factory observation",
             )
@@ -549,13 +613,13 @@ async def create_publication(
         ):
             raise PublicationPrecheckRefused
         if (metadata.title, metadata.body) == (data.title, data.body):
-            raise crud.PublicationLineageConflict(
+            raise crud_errors.PublicationLineageConflict(
                 "publication.no_change",
                 "neither files nor pull request metadata changed",
             )
 
     try:
-        publication, created = await crud.create_publication(
+        publication, created = await crud_publications.create_publication(
             session,
             data,
             patch=patch,
@@ -578,9 +642,9 @@ async def create_publication(
                 "message": "current pull request metadata could not be verified",
             },
         ) from exc
-    except crud.PublicationReplayConflict as exc:
+    except crud_errors.PublicationReplayConflict as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except crud.PublicationLineageConflict as exc:
+    except crud_errors.PublicationLineageConflict as exc:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             {"code": exc.code, "message": exc.message},
@@ -610,7 +674,7 @@ async def get_publication_lineage(
     session: SessionDep,
 ) -> PublicationLineageOut:
     try:
-        lineage = await crud.get_thread_publication_lineage(
+        lineage = await crud_lineages.get_thread_publication_lineage(
             session,
             deployment_id=deployment_id,
             conversation_id=conversation_id,
@@ -622,8 +686,47 @@ async def get_publication_lineage(
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     if lineage is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "publication lineage not found")
-    lineage = await _refresh_publication_lineage_from_github(request, session, lineage)
+    lineage = await _refresh_publication_lineage(request, session, lineage)
     return await _publication_lineage_out(session, lineage)
+
+
+async def _verified_identity(
+    request: Request,
+    session: AsyncSession,
+    publication: Publication,
+    data: PublicationLineageAdvance,
+) -> PublicationIdentity | None:
+    """The outcome's code host identity, after the stale-outcome check.
+
+    A GitHub lineage is checked against its canonical URL before GitHub is
+    contacted, then verified with the install's App. Any other code host names
+    its pull requests itself, so its pull request is read through its port
+    first and the outcome is checked against the link that read answered.
+    """
+
+    lineage = publication.lineage
+    assert lineage is not None
+    settings = get_settings()
+    client = request.app.state.http_client
+    repository = await lineage_repository(session, settings, lineage)
+    identity: PublicationIdentity | None = None
+    if repository.kind != GITHUB:
+        identity = await verify_code_host_identity(
+            lineage, data, forge_code_host(settings, client, repository), repository
+        )
+    conflict = crud_lineages.publication_lineage_outcome_conflict(
+        publication,
+        lineage,
+        data,
+        pull_request_url=crud_lineages.outcome_pull_request_url(
+            lineage, data, github_html_base=settings.github_html_base, identity=identity
+        ),
+    )
+    if conflict is not None:
+        raise conflict
+    if identity is None:
+        identity = await verify_publication_identity(lineage, data, settings, client)
+    return identity
 
 
 @internal_router.patch(
@@ -639,24 +742,11 @@ async def advance_publication_lineage(
 ) -> PublicationLineageOut:
     settings = get_settings()
     try:
-        publication = await crud.get_publication(session, publication_id)
+        publication = await crud_publication_queries.get_publication(session, publication_id)
         if publication is None or publication.lineage is None:
             raise LookupError("publication lineage not found")
-        conflict = crud.publication_lineage_outcome_conflict(
-            publication,
-            publication.lineage,
-            data,
-            github_html_base=settings.github_html_base,
-        )
-        if conflict is not None:
-            raise conflict
-        identity = await verify_publication_identity(
-            publication.lineage,
-            data,
-            settings,
-            request.app.state.http_client,
-        )
-        lineage = await crud.advance_publication_lineage(
+        identity = await _verified_identity(request, session, publication, data)
+        lineage = await crud_lineages.advance_publication_lineage(
             session,
             publication_id,
             data,
@@ -698,7 +788,7 @@ async def advance_publication_lineage(
         ) from None
     except LookupError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except crud.PublicationLineageConflict as exc:
+    except crud_errors.PublicationLineageConflict as exc:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             {"code": exc.code, "message": exc.message},
@@ -716,42 +806,48 @@ async def _replay_held_review_feedback(request: Request, lineage: ThreadPublicat
     if (
         not get_settings().github_review_ingress_enabled
         or lineage.status != "open"
-        or lineage.github_repository_id is None
+        or lineage.code_host_kind != GITHUB
+        or lineage.repository_project_id is None
         or lineage.pr_number is None
     ):
         return
     try:
         async with asyncio.timeout(10):
             await request.app.state.github_review_reconciler.replay_held(
-                repository_id=lineage.github_repository_id,
+                repository_id=int(lineage.repository_project_id),
                 pr_number=lineage.pr_number,
             )
-    except Exception:
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         logger.warning("held GitHub review replay after identity failed; reconciler retries")
 
 
 @router.get("", response_model=list[PublicationOut])
 async def list_publications(session: SessionDep, limit: int = 100) -> list[PublicationOut]:
-    rows = await crud.list_publications(session, limit=min(max(limit, 1), 200))
+    rows = await crud_publication_queries.list_publications(session, limit=min(max(limit, 1), 200))
     return [PublicationOut.model_validate(row) for row in rows]
 
 
 @router.get("/{publication_id}", response_model=PublicationOut)
 async def get_publication(publication_id: uuid.UUID, session: SessionDep) -> PublicationOut:
-    publication = await crud.get_publication(session, publication_id)
+    publication = await crud_publication_queries.get_publication(session, publication_id)
     if publication is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "publication not found")
     return PublicationOut.model_validate(publication)
 
 
-def _credential_issue_detail(settings: Any, approval: Any) -> str:
-    """Name the credential mode, and the policy when the platform resolved it."""
+def _credential_issue_detail(settings: Any, repository: RepositoryRef, approval: Any) -> str:
+    """Name the credential source, and the policy when the platform resolved it."""
 
-    detail = "server-derived repository credential issued via " + credential_mode(
-        app_id=settings.github_app_id,
-        app_private_key=settings.github_app_private_key,
-        token=settings.github_token,
+    source = (
+        credential_mode(
+            app_id=settings.github_app_id,
+            app_private_key=settings.github_app_private_key,
+            token=settings.github_token,
+        )
+        if repository.kind == GITHUB
+        else f"{repository.kind}_code_host"
     )
+    detail = "server-derived repository credential issued via " + source
     identity = getattr(approval, "policy_identity", None)
     if identity:
         detail += f" under {identity} version {approval.policy_version} by {approval.resolved_by}"
@@ -765,17 +861,18 @@ def _credential_issue_detail(settings: Any, approval: Any) -> str:
 )
 async def redeem_publication_credential(
     publication_id: uuid.UUID,
+    request: Request,
     session: SessionDep,
     response: Response,
 ) -> RepositoryCredentialOut:
     response.headers["Cache-Control"] = "no-store"
-    publication = await crud.get_publication(session, publication_id)
+    publication = await crud_publication_queries.get_publication(session, publication_id)
     repo = publication.repo_full_name if publication is not None else None
     deployment_id = publication.deployment_id if publication is not None else None
 
     async def refused(code: int, detail: str | dict[str, str]) -> None:
         audit_detail = detail if isinstance(detail, str) else detail["message"]
-        await crud.append_credential_redemption_audit(
+        await crud_publications.append_credential_redemption_audit(
             session,
             purpose="publication_push",
             outcome="refused",
@@ -804,8 +901,8 @@ async def redeem_publication_credential(
             status.HTTP_409_CONFLICT,
             "publication must be approved before a write credential can be redeemed",
         )
-    deployment = await crud.get_deployment(session, publication.deployment_id)
-    approval = await crud.get_approval(session, publication.approval_id)
+    deployment = await crud_deployments.get_deployment(session, publication.deployment_id)
+    approval = await crud_approvals.get_approval(session, publication.approval_id)
     if deployment is None or approval is None:
         await refused(status.HTTP_409_CONFLICT, "publication workspace binding is absent")
     assert deployment is not None and approval is not None
@@ -822,22 +919,33 @@ async def redeem_publication_credential(
             "publication canonical workspace identity is absent",
         )
     assert workspace_conversation_id is not None
-    selected = await crud.get_thread_workspace(
+    selected = await crud_workspaces.get_thread_workspace(
         session,
         agent_id=deployment.agent_id,
         conversation_id=workspace_conversation_id,
     )
     settings = get_settings()
+    repository = (
+        await lineage_repository(session, settings, publication.lineage)
+        if publication.lineage is not None
+        else await thread_repository(
+            session,
+            settings,
+            agent_id=deployment.agent_id,
+            conversation_id=workspace_conversation_id,
+            repo_full_name=repo,
+        )
+    )
     if (
         selected is None
         or selected.repo_full_name.casefold() != repo.casefold()
-        or not repository_is_allowed(repo, settings.github_repo_allowlist)
+        or not repository_allowed(settings, repository)
     ):
         await refused(
             status.HTTP_403_FORBIDDEN,
             "publication repository is no longer authorized for this thread",
         )
-    agent = await crud.get_agent(session, deployment.agent_id)
+    agent = await crud_agents.get_agent(session, deployment.agent_id)
     if not policy_still_authorizes(agent, approval):
         await refused(
             status.HTTP_409_CONFLICT,
@@ -846,7 +954,7 @@ async def redeem_publication_credential(
                 "message": "publication policy no longer authorizes this approval",
             },
         )
-    cancelled = await crud.publication_cancellation_conflict(
+    cancelled = await crud_publications.publication_cancellation_conflict(
         session,
         agent_id=deployment.agent_id,
         conversation_id=workspace_conversation_id,
@@ -857,11 +965,14 @@ async def redeem_publication_credential(
             {"code": cancelled.code, "message": cancelled.message},
         )
     try:
-        clone_url, authorization_header = await run_in_threadpool(
-            resolve_repository_credential, repo, settings
+        issued = await issue_stored_credential(
+            settings,
+            request.app.state.http_client,
+            repository=repository,
+            scope=CredentialScope.PUSH,
         )
     except Exception as exc:
-        await crud.append_credential_redemption_audit(
+        await crud_publications.append_credential_redemption_audit(
             session,
             purpose="publication_push",
             outcome="refused",
@@ -875,19 +986,22 @@ async def redeem_publication_credential(
             "operator repository credential could not be resolved",
             headers={"Cache-Control": "no-store"},
         ) from exc
-    await crud.append_credential_redemption_audit(
+    await crud_publications.append_credential_redemption_audit(
         session,
         purpose="publication_push",
         outcome="issued",
         deployment_id=publication.deployment_id,
         publication_id=publication.id,
         repo_full_name=repo,
-        detail=_credential_issue_detail(settings, approval),
+        detail=_credential_issue_detail(settings, repository, approval),
     )
     return RepositoryCredentialOut(
         repo_full_name=repo,
-        clone_url=clone_url,
-        authorization_header=authorization_header,
+        clone_url=issued.clone_url,
+        authorization_header=issued.authorization_header,
+        origin=issued.origin,
+        header_form=issued.header_form,
+        ca_bundle_ref=issued.ca_bundle_ref,
     )
 
 
@@ -896,9 +1010,9 @@ def _review_revision_out(
     lineage: ThreadPublicationLineage,
 ) -> ReviewRevisionOut:
     assert lineage.reply_conversation_id is not None
-    assert lineage.github_repository_id is not None
-    assert lineage.github_installation_id is not None
-    assert lineage.github_pr_node_id is not None
+    assert lineage.repository_project_id is not None
+    assert lineage.code_host_installation_id is not None
+    assert lineage.code_host_pr_id is not None
     assert lineage.pr_number is not None
     assert lineage.base_ref is not None
     return ReviewRevisionOut(
@@ -909,9 +1023,9 @@ def _review_revision_out(
         reply_conversation_id=lineage.reply_conversation_id,
         binding_id=row.binding_id,
         binding_generation=row.binding_generation,
-        repository_id=lineage.github_repository_id,
-        installation_id=lineage.github_installation_id,
-        pr_node_id=lineage.github_pr_node_id,
+        repository_id=int(lineage.repository_project_id),
+        installation_id=lineage.code_host_installation_id,
+        pr_node_id=lineage.code_host_pr_id,
         base_ref=lineage.base_ref,
         repo_full_name=lineage.repo_full_name,
         pr_number=lineage.pr_number,
@@ -937,9 +1051,9 @@ async def reserve_review_revision(
 ) -> ReviewRevisionOut:
     response.headers["Cache-Control"] = "no-store"
     try:
-        row, lineage, created = await crud.reserve_review_revision(session, data)
+        row, lineage, created = await crud_lineages.reserve_review_revision(session, data)
         await session.commit()
-    except crud.PublicationLineageConflict as exc:
+    except crud_errors.PublicationLineageConflict as exc:
         await session.rollback()
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -962,7 +1076,7 @@ async def cancel_review_revision(
 ) -> ReviewRevisionOut:
     response.headers["Cache-Control"] = "no-store"
     try:
-        row = await crud.cancel_review_revision(
+        row = await crud_lineages.cancel_review_revision(
             session,
             reservation_id,
             origin_key=data.origin_key,
@@ -980,7 +1094,7 @@ async def cancel_review_revision(
             status.HTTP_404_NOT_FOUND,
             "review reservation not found",
         ) from None
-    except crud.PublicationLineageConflict as exc:
+    except crud_errors.PublicationLineageConflict as exc:
         await session.rollback()
         raise HTTPException(
             status.HTTP_409_CONFLICT,

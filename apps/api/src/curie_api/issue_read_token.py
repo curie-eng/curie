@@ -2,7 +2,7 @@
 
 It follows the ADR 0174 publication precheck capability: an HMAC signed claim
 set the sandbox presents to exactly one API route. It names one execution and
-its WorkItem's repository and issue, so it can read nothing else.
+its WorkItem's tracker issue, so it can read nothing else.
 """
 
 from __future__ import annotations
@@ -13,9 +13,9 @@ import time
 import uuid
 from typing import Literal
 
+from curie_internal import sandbox_token
+from curie_internal.sandbox_token import b64url, b64url_decode
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-
-from .sandbox_token import _b64url, _b64url_decode, _signature
 
 _PREFIX = "wir"
 
@@ -28,9 +28,10 @@ class IssueReadClaims(BaseModel):
     scope: Literal["work_item.issue_read"]
     work_item_id: uuid.UUID
     execution_request_id: uuid.UUID
-    repo_full_name: str = Field(min_length=3, max_length=512)
-    github_repository_id: int = Field(gt=0)
-    issue_number: int = Field(gt=0)
+    tracker_kind: str = Field(min_length=1, max_length=512)
+    tracker_host: str = Field(min_length=1, max_length=512)
+    tracker_scope_id: str = Field(min_length=1, max_length=512)
+    tracker_issue_id: str = Field(min_length=1, max_length=512)
     iat: int = Field(ge=0)
     exp: int = Field(gt=0)
 
@@ -39,8 +40,8 @@ def mint(api_key: str, claims: IssueReadClaims) -> str:
     payload = json.dumps(
         claims.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
     ).encode()
-    signed = f"{_PREFIX}.{_b64url(payload)}"
-    return f"{signed}.{_signature(api_key, signed)}"
+    signed = f"{_PREFIX}.{b64url(payload)}"
+    return f"{signed}.{sandbox_token.signature(api_key, signed)}"
 
 
 def verify_claims(token: str, api_key: str) -> IssueReadClaims | None:
@@ -51,10 +52,10 @@ def verify_claims(token: str, api_key: str) -> IssueReadClaims | None:
     try:
         prefix, payload, signature = token.split(".")
         if prefix != _PREFIX or not hmac.compare_digest(
-            signature, _signature(api_key, f"{prefix}.{payload}")
+            signature, sandbox_token.signature(api_key, f"{prefix}.{payload}")
         ):
             return None
-        claims = IssueReadClaims.model_validate_json(_b64url_decode(payload))
+        claims = IssueReadClaims.model_validate_json(b64url_decode(payload))
     except (ValueError, TypeError, ValidationError):
         return None
     now = time.time()

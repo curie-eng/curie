@@ -6,7 +6,7 @@ grade: not separately graded
 epics:
   - "#3273"
   - "#3308"
-order: 23
+order: 27
 ---
 # INTERFACE: MCP service-key authentication
 
@@ -115,7 +115,7 @@ with no fallback between the two modes.
    forwarding detail.
 8. **The tool grant, `ccg`, is a second token.** For a turn resuming an approved
    connector call, `_connector_tool_grant`
-   (`apps/worker/src/curie_worker/kernel.py::_connector_tool_grant`) mints one
+   (`apps/worker/src/curie_worker/kernel/claim.py::_connector_tool_grant`) mints one
    with `mint` (`apps/worker/src/curie_worker/connector_grant.py::mint`): claims
    exactly `agent`, `connector`, `tool`, `args` (canonical JSON), `exp` and a
    random `jti`. It uses the same signing key as `cct` and is told apart by
@@ -180,7 +180,7 @@ and no grant check (`cli/src/docker.rs`, `cli/src/connector_build.rs`).
    the same name and keys changes no checksum and needs a manual rollout.
 5. **The Docker dev path checks a key it never uses.** Both Docker emitters
    refuse a hosted connector without a caller public key, and the CLI satisfies
-   that by generating a throwaway pair on each start (`cli/src/commands.rs`). No
+   that by generating a throwaway pair on each start (`cli/src/commands/connector_images.rs`). No
    proxy holds it, so the refusal guards nothing on that path.
 6. **Docs and comments still describe the keyless install.** The chart values
    comment and the connector-host file say an install with no key renders no

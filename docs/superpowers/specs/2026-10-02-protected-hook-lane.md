@@ -140,6 +140,107 @@ The provisioner-owned qualification authorization record contains exactly `schem
 
 The runtime ID/generation, manifest digest, qualification ID, broker identity and execution/guard identities match the immutable manifest exactly. The provisioner assigns a never-reused qualification authorization generation; readiness binds it. The immutable measurement record contains the actual qualified artifact tuple and enforcement observations. An old measurement may be historical input to a new authorization, but cannot authorize a new live broker run_id without the runtime epoch and source-floor recovery already required by SOURCE-7 and LANE-5. Application identities cannot create or overwrite this authorization.
 
+### Content-addressed artifact measurement v1
+
+<!-- @spec PROTECTED-HOOK-LANE-2 -->
+The file-distributed artifact measurement uses the existing
+`measurement_record_id` grammar with the spelling `sha256:<sha256>`. Its issuer
+remains the provisioner; this encoding introduces no application-held signing
+key, additional issuer or frozen wire field. The currently authenticated
+qualification authorization selects the measurement, never a source, runner,
+launch receipt or caller-supplied filename. Readiness measurement identity
+remains independent and does not substitute for artifact qualification.
+
+The measurement contains exactly:
+
+| Field | Type and constraint |
+| --- | --- |
+| `schema_version` | Strict integer literal 1. |
+| `kind` | Literal `protected-artifact-qualification`. |
+| `manifest_digest` | sha256; equals the selected qualification authorization's manifest digest. |
+| `execution_config_digest` | sha256; equals that manifest and authorization. |
+| `substrate` | SubstrateIdentity; equals that manifest. |
+| `guard_identity` | GuardIdentity; equals that manifest and authorization. |
+| `platform_mappings` | List of 1 through 32 distinct platform mappings defined below. |
+| `launch_projection` | Object containing exactly `schema_version: 1`, `format: opaque_ref`, `sha256: sha256`; its digest equals `substrate.launch_config_sha256`. |
+| `delivery_slots` | Closed validation-mode object defined below. |
+| `enforcement_evidence_ref` | Content-addressed `sha256:<sha256>` reference to immutable provisioner-owned enforcement observations. |
+
+Each platform mapping contains exactly `os`, `architecture`, `variant`,
+`runtime_profile`, `pinned_image_reference`, `oci_digest`, `observed_image_id`
+and `image_config_id`. OS and architecture match
+`[a-z0-9][a-z0-9._-]{0,63}`; variant is null or matches that same grammar.
+Runtime profile is an `opaque_ref`. Pinned image reference and observed image
+ID are nonempty strings of at most 2048 printable ASCII characters without
+whitespace. Image config ID is null or follows that same string grammar.
+OCI digest uses `oci_digest` grammar and equals the manifest runner digest.
+The pinned reference has a nonempty repository prefix followed by `@` and
+that exact digest. Platform identity `(os, architecture, variant,
+runtime_profile)` is unique within the list. Sort mappings lexicographically
+by that identity, treating null variant as an empty string, before encoding;
+noncanonical stored order refuses.
+
+Observed platform, runtime profile and image/config identities must match one
+measured row exactly. Missing or unsupported observations refuse. Do not strip
+an image-ID scheme, infer a platform or equate an OCI index digest with a
+runtime image/config ID. Registry metadata or a runner image report alone
+does not establish this mapping.
+
+`delivery_slots` contains exactly `schema_version: 1` and these string literals:
+`execution_identity: "verified-delivery-v1"`,
+`history_binding: "protected-history-v1"`,
+`runner_token: "fresh-owned-launch-v1"`,
+`history_token: "scoped-history-credential-v1"`,
+`workload_identity: "control-plane-cold-create-v1"` and
+`dial_identity: "owned-workload-endpoint-v1"`. These name fixed validators,
+not expressions or arbitrary override paths. They bind delivery-derived
+execution/history identity, a fresh owned runner token, a credential scoped
+to the exact protected transcript, and control-plane-issued workload/dial
+identity. Model and history issuer reference generations remain static profile
+inputs. Credential bytes are excluded from measurement and receipt artifacts;
+owned credential assignment evidence, including the runner token digest, must
+come from the controlled launcher, not a worker's self-declaration.
+
+This measurement's byte cap is 262144, independently of the 16384-byte cap on
+manifest/authorization/readiness records. Apply the existing strict recursive
+duplicate/unknown-member, type, UTF-8 and number checks; null is allowed only
+for the two mapping fields explicitly named above. Canonicalization uses the
+existing ASCII JSON algorithm after mapping order validation. Stored bytes
+must equal canonical bytes, and their SHA256 must equal the selected reference.
+No embedded self-digest or mutable decoded record state is permitted.
+
+The loader receives an explicit provisioner-owned read-only directory. It
+derives a single filename consisting of the validated 64-character digest and
+the literal `.json` suffix, opens relative to the bound directory descriptor,
+refuses symlinks and nonregular files, and bounds the read before parsing.
+The configured root must itself be opened without following symlink components.
+No URI fetch, parent traversal, environment-discovered directory, ordinary API
+fallback or arbitrary snapshot callback is a production loading path. Missing,
+changing-to-different-content or mismatched files refuse. Content hashing
+authenticates bytes against the current qualification selection; filesystem
+UID/mode checks alone cannot authenticate ownership of a host or mount.
+LANE-8 qualification must independently establish that application identities
+cannot change the actual mounted directory, its configuration or its contents.
+Absent that provisioned boundary, production construction remains unavailable.
+
+The referenced launch projection is a versioned canonical **static** creation
+profile, covering code, credential references, command/environment, mounts,
+security, resources, network and template authority. Its provider-specific
+closed schema, default handling and extraction rules require a concrete
+implementation contract before that format can authorize a launch. Only the
+listed delivery-variable slots may differ, and each needs independent
+validation against the verified delivery and controlled launch assignment.
+A raw Docker inspect or Kubernetes Pod document hash includes changing facts
+and is not the qualified static projection digest. Merely parsing the projection
+reference, measurement or a receipt dataclass grants no launch authority.
+
+Unsupported projection formats, credential assignment proofs and controlled
+launch receipt adapters refuse. The receipt registry transport and provider
+projection schemas remain separate follow-up contracts; this subsection
+defines no successful ordinary-substrate fallback or self-attestation path.
+Codec, file-loader and synthetic control-plane tests establish source behavior,
+not preventive provisioning or runtime qualification.
+
 ## Readiness evidence v1
 
 <!-- @spec PROTECTED-HOOK-LANE-2 -->
@@ -205,8 +306,10 @@ The source writer grants GET, SET and the script operations used by the
 existing SourceFence only on `protected:source:*`, plus connection handshake
 commands. It has no control, admission, execution stream, consumption, INFO,
 TIME or broker administration authority. Existing reservation and ordinary
-publication retain their SOURCE-6/7 semantics. Protected publication remains
-unavailable.
+publication retain their SOURCE-6/7 semantics, and the
+[route exposure contract](2026-10-02-protected-hook-source-policy.md#administrative-route-exposure)
+brackets every writer effect with control reader identity reads. Protected
+publication remains unavailable until the LANE-4 ingress admission change.
 
 The control reader grants GET on `protected:source:*` and
 `protected:control:*`, INFO server and TIME, plus connection handshake and
@@ -237,8 +340,11 @@ operations. Do not change a shared backing service's ACLs to run them.
 These subsets are not the complete enqueue, worker or verifier inventories.
 They issue no authority, authenticate no TLS or provisioning boundary and
 do not enable source administration, runtime qualification or protected
-delivery. The default resolver remains unavailable until the separate
-authority, admission, provisioning and execution requirements pass.
+delivery. The resolver remains unavailable unless the provisioner supplies
+the runtime directory, including its source writer file, under that route
+exposure contract, and then serves only reservation and ordinary publication;
+protected publication and delivery still await the separate admission,
+provisioning and execution requirements.
 
 ## Authenticated metadata reader transport
 
@@ -311,9 +417,13 @@ credential and live run_id. Wrong CA/name/pin must transmit no authentication.
 A failed named principal must never attempt default authentication. Retained
 connection and forced reconnect cases must verify pin and run_id enforcement,
 and close must prevent reuse. Validated wrong tuple/input refusals precede
-connection attempts. The reader remains unwired: no source administration,
+connection attempts. These tests enable no source administration,
 activation, admission, runtime evidence issuance, protected worker startup or
-qualification is enabled by these tests.
+qualification. Its consumers are the observational support probe under
+[PROTECTED-HOOK-SOURCE-9](2026-10-02-protected-hook-source-policy.md#surface-parity-and-smallest-implementation-task),
+which reads through it and writes nothing, and the administrative source
+routes, which use it for tombstone activation reads and to bracket source
+writer effects without writing through it.
 
 ## Atomic admission, duplicate receipt and activation
 
@@ -410,6 +520,28 @@ is closed; it cannot make a stale generation enqueue. Dedupe retention stays
 at least the existing declared delivery retention; it is not silently extended
 into permanent unbounded payload storage.
 
+<!-- @spec PROTECTED-HOOK-LANE-4 -->
+The [ingress admission wiring](2026-10-02-protected-hook-source-policy.md#ingress-admission-wiring)
+section realizes this criterion for the API: the provisioner supplied
+`enqueue.json` principal, protected turn construction without a placeholder
+or workspace, receipts and duplicates across the ordinary and protected
+stores, the fixed global quota, the reconciliation owner's lifecycle in the
+API process, and behavior with no protected worker deployed. The support
+probe and admission decide on one shared authority evaluation there. LANE-6,
+LANE-7 and LANE-8 remain separate work, so that change carries no delivery
+beyond the private stream.
+
+<!-- @spec PROTECTED-HOOK-LANE-3 -->
+The enqueue role is realized by a new `AuthenticatedEnqueueClient` beside the
+metadata reader and source writer. It applies the same input validation, TLS,
+CA, hostname, SPKI pin, RESP3 HELLO AUTH, two second timeouts, disabled
+retries, redaction and budget watchdog, verifies the live `INFO server` run_id
+on connection as the reader does, and never reconnects. It exports only the
+admission facade bound to its private connection, the source and control
+reads and observation used by the shared evaluation, a presence check of one
+delivery's private intent key, and `close`. It exports no raw client or
+generic command.
+
 <!-- @spec PROTECTED-HOOK-LANE-5 -->
 Source activation and recovery use
 [PROTECTED-HOOK-SOURCE-6/7](2026-10-02-protected-hook-source-policy.md#broker-authoritative-activation-and-recovery).
@@ -464,6 +596,11 @@ Existing max-delivery, positive-idle reclaim, live-owner fencing,
 XADD-before-XACK, no-auto-retry-after-effects, retry classifications and bounded
 graveyard semantics remain unchanged. Refused work follows existing bounded
 terminal/reply handling rather than an endless retry classification.
+Execution refusal alone does not establish terminal settlement authority.
+Unavailable binding, control or commit proof may recover; retain the protected
+entry until independently established terminal authority permits settlement.
+The parking-only implementation retains every entry carrying a protected
+envelope and does not yet implement protected terminal replies or dispatch.
 
 <!-- @spec PROTECTED-HOOK-LANE-7 -->
 The external conversation identity and reply coordinates remain unchanged.
@@ -503,6 +640,28 @@ or a worker-provided label is insufficient. Missing facts or mismatch refuses
 without model work. SDK session contamination remains a refusal even for the
 right image. Immutable digest-platform mapping must be qualified on the actual
 architecture; do not assume OCI index digest equals runtime imageID.
+
+The guarded runner surface checks the complete delivery, live broker,
+owned receipt, substrate facts, qualified projection/platform mapping and
+authenticated runner enforcement chain before every `start_turn`. It repeats
+that chain immediately before `admit_turn(allow=True)`: opening a
+capacity-wait stream does not authorize the later model start. The admitted
+epoch must be the exact epoch returned by this delivery's guarded capacity
+start, bound to the same receipt, dial target and token, with authenticated
+capacity status for that epoch. The active waiting turn expected at admission
+is distinct from the idle state checked before opening it. Generic `steer`
+refuses in this release because it can inject work outside either start guard.
+
+Read-only `status` and `capacity_status` use the exact owned authenticated
+target and grant no execution authority. `admit_turn(allow=False)`, `interrupt`
+and `timeout_turn` remain bounded stop-only operations on previously established
+owned targets and, where applicable, owned epochs even after execution proof
+is lost. Proof loss must not disable fencing. A pure `turn_deadline_s` calculation
+may be forwarded. Expose this explicit control surface without dynamic method
+forwarding or inherited unguarded model-start capabilities. Retirement must
+fence further starts on the owned runner; a receipt-state read followed by an
+unfenced POST does not establish that guarantee. Missing launch/retirement
+enforcement leaves guarded execution unavailable.
 
 Release one requires dedicated protected reply threads with ingress/controller
 ownership identifying protected investigation dispatch separately from human

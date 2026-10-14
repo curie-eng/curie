@@ -157,19 +157,35 @@ regexes = [
   # Historical redaction regression input. Every token component is a repeated
   # zero or the literal FAKE marker, so it cannot identify a real Slack app.
   '''\bxapp-0-0000000000-0000000000-FAKEFAKEFAKEFAKE\b''',
+  # This is a fixed, public validator name in the protected delivery schema,
+  # not an authentication credential. Keep the exception scoped to its schema,
+  # test, and spec occurrences.
+  '''fresh-owned-launch-v1''',
 ]
 
 paths = [
   # Build output and caches. Without these the scan walks >1GB of target/ and
   # node_modules and takes minutes, which is how a gate gets skipped in practice.
-  '''(^|/)(target|node_modules|\.venv|venv|dist|build)/''',
-  '''(^|/)\.(pytest_cache|mypy_cache|ruff_cache|curie)/''',
-  '''(^|/)target-linux-[^/]+/''',
+  #
+  # Anchored to the roots where those directories are actually generated (#3843).
+  # The earlier any-depth `build/` and `dist/` skips also hid a committed file
+  # under e.g. docs/build/, so a leak there was never scanned. The roots come
+  # from .gitignore (repo root caches, cli/target, apps/ui node_modules and
+  # dist, per-project Python build and cache dirs) and from the release
+  # workflow's dist/ at the repo root. A new generated root gets its own entry.
+  '''^(\.venv|venv|node_modules|dist|build|target|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.curie)/''',
+  '''^cli/(target|target-linux-[^/]+)/''',
+  '''^apps/ui/(node_modules|dist)/''',
+  '''^((apps|adapters|packages|tools)/[^/]+|runner)/(build|dist|\.venv|\.pytest_cache|\.mypy_cache|\.ruff_cache)/''',
   # Lockfiles and generated code carry hashes that look like ids and are not.
   '''(^|/)(pnpm-lock\.yaml|Cargo\.lock|uv\.lock)$''',
   '''(^|/)packages/[^/]+/generated/''',
   # This file names the patterns it forbids.
   '''^\.gitleaks\.toml$''',
+  '''^packages/protected-hooks/src/curie_protected_hooks/artifact_measurement\.py$''',
+  '''^packages/protected-hooks/tests/test_artifact_measurement\.py$''',
+  '''^apps/worker/tests/test_protected_kubernetes_projection\.py$''',
+  '''^docs/superpowers/specs/2026-10-02-protected-hook-lane\.md$''',
 ]
 
 # Gitleaks stopwords are case insensitive substring matches, so an entry

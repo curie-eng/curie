@@ -84,6 +84,8 @@ function Matrix({ suite }: { suite: string }) {
   // rows = cases, columns = versions. First column is the case id; the rest are
   // one per version, newest first (the order the API returns them in).
   const grid = `minmax(180px, 1.6fr) repeat(${data.versions.length}, minmax(72px, 1fr))`;
+  // The API may omit the per-model rollup; an absent list renders no table.
+  const modelSummaries = data.model_summaries ?? [];
   const headers: ReactNode[] = [
     <span key="case" style={{ fontSize: 12, color: C.muted }}>
       Case
@@ -166,14 +168,14 @@ function Matrix({ suite }: { suite: string }) {
         </div>
       </Card>
 
-      {data.model_summaries.length > 0 ? (
+      {modelSummaries.length > 0 ? (
         <Card>
           <div style={{ fontSize: 13, fontWeight: 500, color: C.text, marginBottom: 4 }}>By model</div>
           <div style={{ fontSize: 12, color: C.muted, marginBottom: 14 }}>
             Pass-rate and cost per model across the shown versions. A model with runs but zero completed turns never
             produced an answer — distinct from a real 0%.
           </div>
-          <ModelSummaryTable summaries={data.model_summaries} />
+          <ModelSummaryTable summaries={modelSummaries} />
         </Card>
       ) : null}
     </div>
@@ -200,7 +202,10 @@ function ModelSummaryTable({ summaries }: { summaries: EvalModelSummary[] }) {
         ))}
       </div>
       {summaries.map((s, i) => {
-        const neverCompleted = s.total > 0 && s.completed === 0;
+        // completed and plumbing default to zero when the API omits them.
+        const completed = s.completed ?? 0;
+        const plumbing = s.plumbing ?? 0;
+        const neverCompleted = s.total > 0 && completed === 0;
         return (
           <div
             key={s.model ?? `unlabelled-${i}`}
@@ -217,9 +222,9 @@ function ModelSummaryTable({ summaries }: { summaries: EvalModelSummary[] }) {
           >
             <span style={{ fontFamily: C.mono, fontSize: 12.5, color: C.text, display: "flex", alignItems: "center", gap: 8 }}>
               {s.model ?? "unlabelled"}
-              {s.plumbing > 0 ? (
+              {plumbing > 0 ? (
                 <Chip color={C.warn} border="rgba(191,135,0,.4)">
-                  {s.plumbing} not graded
+                  {plumbing} not graded
                 </Chip>
               ) : null}
             </span>
@@ -230,7 +235,7 @@ function ModelSummaryTable({ summaries }: { summaries: EvalModelSummary[] }) {
               {s.passed}/{s.total}
             </span>
             <span style={{ color: C.text2, fontFamily: C.mono, fontSize: 12.5 }}>
-              {s.completed}/{s.total}
+              {completed}/{s.total}
             </span>
             <span style={{ color: C.text2, fontFamily: C.mono, fontSize: 12.5 }}>
               {s.cost_usd == null ? "—" : `$${s.cost_usd.toFixed(4)}`}

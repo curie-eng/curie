@@ -49,6 +49,7 @@ _RECONCILER_STEPS = [
     "settle_overdue_cancellations",
     "readmit_pending",
     "reconcile_missed_labels",
+    "poll_trackers",
     "sync_status_comments",
     "redispatch_lapsed_acquisitions",
     "publish_execute_wakes",
@@ -620,6 +621,39 @@ def test_deadline_halted_is_a_declared_terminal_turn_outcome(
         assert manifest[name]["cardinality_bound"] == 240
 
 
+def test_deploy_notice_suppressed_is_two_closed_series() -> None:
+    """Withheld git-flow notices are counted by reason, never by repository."""
+
+    definition = _read(_MANIFEST)["metrics"]["curie.deploy_notice.suppressed"]
+    assert definition["type"] == "counter"
+    assert definition["unit"] == "{outcome}"
+    assert definition["monotonic"] is True
+    assert definition["attributes"] == {
+        "service.name": ["curie-api"],
+        "reason": ["no_nonprod_recipient", "rate_limited"],
+    }
+    assert definition["cardinality_bound"] == 2
+
+
+def test_deploy_notice_suppressed_rejects_a_repository_label_by_execution(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    del metrics
+    record_metric(
+        "curie.deploy_notice.suppressed",
+        attributes={"service.name": "curie-api", "reason": "rate_limited"},
+    )
+    with pytest.raises(ValueError, match="undeclared attribute"):
+        record_metric(
+            "curie.deploy_notice.suppressed",
+            attributes={
+                "service.name": "curie-api",
+                "reason": "rate_limited",
+                "repository": "acme-corp/acme-bot",
+            },
+        )
+
+
 def test_supervised_restart_metric_declares_closed_operation_domain() -> None:
     manifest = _read(_MANIFEST)["metrics"]
     definition = manifest["curie.worker.supervised.restart"]
@@ -636,14 +670,15 @@ def test_supervised_restart_metric_declares_closed_operation_domain() -> None:
             "heartbeat",
             "connectors",
             "publications",
+            "e2e-reaper",
             "other",
         ],
         "outcome": ["restart", "give_up"],
     }
-    assert definition["cardinality_bound"] == 14
+    assert definition["cardinality_bound"] == 16
 
 
-def test_reconciler_step_metrics_declare_only_the_api_and_eleven_steps() -> None:
+def test_reconciler_step_metrics_declare_only_the_api_and_twelve_steps() -> None:
     manifest = _read(_MANIFEST)["metrics"]
     for name, instrument_type, monotonic in (
         (_RECONCILER_FAILURE_METRIC, "counter", True),
@@ -656,7 +691,7 @@ def test_reconciler_step_metrics_declare_only_the_api_and_eleven_steps() -> None
             "service.name": ["curie-api"],
             "step": _RECONCILER_STEPS,
         }
-        assert definition["cardinality_bound"] == 11
+        assert definition["cardinality_bound"] == 12
 
 
 def test_reconciler_step_metrics_export_failures_and_a_resettable_gauge(
@@ -1026,3 +1061,71 @@ def test_one_thousand_forbidden_ids_do_not_create_metric_series(
             assert point["source"] in manifest[metric_name]["attributes"]["source"]
             assert point["outcome"] in manifest[metric_name]["attributes"]["outcome"]
             assert forbidden_values.isdisjoint(point.values())
+
+
+def test_e2e_reaper_health_gauges_are_declared_with_one_worker_series_each() -> None:
+    """#3245: the reaper's liveness timestamp and its namespace counts (ADR 0176)."""
+
+    manifest = _read(_MANIFEST)["metrics"]
+    worker_only = {"service.name": ["curie-worker"]}
+
+    last_success = manifest["curie.e2e.reaper.last_success"]
+    assert last_success["type"] == "gauge"
+    assert last_success["unit"] == "s"
+    assert last_success["monotonic"] is False
+    assert last_success["attributes"] == worker_only
+    assert last_success["cardinality_bound"] == 1
+
+    expired = manifest["curie.e2e.namespaces.expired"]
+    assert expired["type"] == "gauge"
+    assert expired["unit"] == "{namespace}"
+    assert expired["monotonic"] is False
+    assert expired["attributes"] == worker_only
+    assert expired["cardinality_bound"] == 1
+
+    # Namespaces at least ten minutes past their TTL, or with none: what the
+    # page keys on, since a healthy reaper always sees a few just expired.
+    overdue = manifest["curie.e2e.namespaces.overdue"]
+    assert overdue["type"] == "gauge"
+    assert overdue["unit"] == "{namespace}"
+    assert overdue["monotonic"] is False
+    assert overdue["attributes"] == worker_only
+    assert overdue["cardinality_bound"] == 1
+
+    restart = manifest["curie.worker.supervised.restart"]["attributes"]["operation"]
+    assert "e2e-reaper" in restart
+
+
+def test_thread_attachment_ledger_append_is_a_closed_worker_counter() -> None:
+    """ADR 0205 (#4141): a failed append after install loses that message's
+    files from later boots without failing the turn, so it is counted.
+
+    Closed on purpose: no thread, agent or event label, only the outcome.
+    """
+
+    definition = _read(_MANIFEST)["metrics"]["curie.attachments.ledger.append"]
+    assert definition["type"] == "counter"
+    assert definition["monotonic"] is True
+    assert set(definition["attributes"]) == {"service.name", "outcome"}
+    assert definition["attributes"]["service.name"] == ["curie-worker"]
+    assert "failure" in definition["attributes"]["outcome"]
+    assert definition["cardinality_bound"] <= 2
+
+
+def test_thread_attachment_ledger_append_rejects_a_thread_label_by_execution(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    del metrics
+    record_metric(
+        "curie.attachments.ledger.append",
+        attributes={"service.name": "curie-worker", "outcome": "failure"},
+    )
+    with pytest.raises(ValueError, match="undeclared attribute"):
+        record_metric(
+            "curie.attachments.ledger.append",
+            attributes={
+                "service.name": "curie-worker",
+                "outcome": "failure",
+                "thread_key": "slack:C1:1700000000.000100",
+            },
+        )

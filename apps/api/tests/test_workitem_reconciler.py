@@ -22,15 +22,17 @@ from aci_protocol import (
     TurnSource,
 )
 from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
-from curie_api import workitems
 from curie_api.config import get_settings
+from curie_api.forges.hosts import github_issue_ref, repository_ref
 from curie_api.main import create_app
 from curie_api.workitem_dispatch import acquire, admit, defer, fence_published
 from curie_api.workitem_reconciler import WorkItemReconciler
+from curie_api.workitems import lifecycle as workitems
 from curie_telemetry import build_resource, configure_meter_provider
 from curie_telemetry import metrics as telemetry_metrics
 from curie_telemetry import tracing as telemetry_tracing
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
+from forge_fakes.github_comments import ci_pending
 from opentelemetry import trace
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
@@ -52,7 +54,6 @@ from test_factory_terminus import (  # noqa: F401 (fixtures)
     _request,
     _start_running,
     admitted,
-    ci_pending,
     comments,
 )
 
@@ -70,6 +71,7 @@ RECONCILER_STEPS = (
     "_settle_overdue_cancellations",
     "_readmit_pending",
     "_reconcile_missed_labels",
+    "_poll_trackers",
     "_redispatch_lapsed_acquisitions",
     "_publish_execute_wakes",
 )
@@ -386,19 +388,22 @@ async def _agent_with_channel(session: AsyncSession) -> uuid.UUID:
     return agent_id
 
 
-def _facts(agent_id: uuid.UUID, **overrides: Any) -> SimpleNamespace:
+def _facts(
+    agent_id: uuid.UUID, *, issue_number: int = 2573, **overrides: Any
+) -> SimpleNamespace:
+    settings = get_settings()
     values: dict[str, Any] = {
         "agent_id": agent_id,
         "kind": "slack",
         "address": ADDRESS,
         "reply_conversation_id": WIRE_CONVERSATION,
-        "repo_full_name": REPO,
-        "github_repository_id": 101,
-        "github_issue_number": 2573,
-        "github_installation_id": 202,
+        "issue": github_issue_ref(settings, repository_id=101, issue_number=issue_number),
+        "repository": repository_ref(settings, path=REPO, project_id=101),
+        "code_host_installation_id": 202,
         "objective": OBJECTIVE,
         "requester": REQUESTER,
         "request_id": uuid.uuid4(),
+        "trigger_label": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -957,7 +962,7 @@ def test_deadline_and_owner_lost_cancellation_are_requested(
         async with maker() as session:
             agent_id = await _agent_with_channel(session)
             deadline_facts = _facts(agent_id)
-            owner_facts = _facts(agent_id, github_issue_number=2574)
+            owner_facts = _facts(agent_id, issue_number=2574)
             await admit(session, deadline_facts)
             await admit(session, owner_facts)
             await session.execute(
@@ -1032,8 +1037,8 @@ def test_owner_lost_waits_one_runtime_ttl_after_heartbeat_expiry(
         async with maker() as session:
             agent_id = await _agent_with_channel(session)
             grace = _facts(agent_id)
-            lost = _facts(agent_id, github_issue_number=2574)
-            absent = _facts(agent_id, github_issue_number=2575)
+            lost = _facts(agent_id, issue_number=2574)
+            absent = _facts(agent_id, issue_number=2575)
             now = await _now(session)
             ttl = get_settings().work_item_runtime_ttl_seconds
             assert ttl == runtime_ttl_seconds
@@ -1472,7 +1477,7 @@ def test_start_failed_request_gets_no_execute_wake_while_a_waiting_sibling_does(
         async with maker() as session:
             agent_id = await _agent_with_channel(session)
             doomed = _facts(agent_id)
-            sibling = _facts(agent_id, github_issue_number=2574)
+            sibling = _facts(agent_id, issue_number=2574)
             await admit(session, doomed)
             await admit(session, sibling)
             for _ in range(5):

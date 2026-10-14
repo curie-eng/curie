@@ -1,10 +1,11 @@
-"""@spec PROTECTED-HOOK-SOURCE-3."""
+"""@spec PROTECTED-HOOK-SOURCE-3 PROTECTED-HOOK-SOURCE-9."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Annotated, Literal, Self
 
+from aci_protocol import ToolAccess
 from curie_protected_hooks.source_policy_records import (
     canonical_bundle_digest,
     canonical_decimal,
@@ -87,6 +88,22 @@ class HookSourcePolicyOut(_SourceModel):
         return self
 
 
+class HookSourceRefusalDetail(_SourceModel):
+    """A source service refusal: a stable code and, only after a confirmed commit, its generation.
+
+    @spec PROTECTED-HOOK-SOURCE-3.
+    """
+
+    code: Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,62}$")]
+    committed_generation: SourceDecimal | None
+
+
+class HookSourceRefusal(_SourceModel):
+    """@spec PROTECTED-HOOK-SOURCE-3."""
+
+    detail: HookSourceRefusalDetail
+
+
 class HookSourceSecretOut(_SourceModel):
     """@spec PROTECTED-HOOK-SOURCE-3."""
 
@@ -100,3 +117,46 @@ class HookSourceSecretOut(_SourceModel):
     def _positive(cls, value: str) -> str:
         """@spec PROTECTED-HOOK-SOURCE-3."""
         return canonical_decimal(value, positive=True)
+
+
+HookSupportReason = Literal[
+    "supported",
+    "source_unconfigured",
+    "source_closed",
+    "runtime_unavailable",
+    "qualification_unavailable",
+    "evidence_missing",
+    "evidence_expired",
+    "broker_unavailable",
+    "broker_identity_mismatch",
+    "configuration_unsupported",
+]
+
+
+class HookSupportIn(_SourceModel):
+    """Signed requested policy, not configuration. @spec PROTECTED-HOOK-SOURCE-9."""
+
+    tool_access: ToolAccess | None = None
+
+
+class HookSupportOut(_SourceModel):
+    """Safe support resolution. @spec PROTECTED-HOOK-SOURCE-9."""
+
+    requested_tool_access: ToolAccess | None
+    effective_tool_access: ToolAccess | None
+    source_generation: SourceDecimal | None
+    runtime_id: SourceUuid | None
+    runtime_generation: SourceDecimal | None
+    qualification_id: SourceUuid | None
+    supported: bool
+    reason: HookSupportReason
+
+    @model_validator(mode="after")
+    def _support_shape(self) -> Self:
+        """@spec PROTECTED-HOOK-SOURCE-9."""
+        runtime = (self.runtime_id, self.runtime_generation, self.qualification_id)
+        if self.supported != (self.reason == "supported"):
+            raise ValueError("invalid_support_reason")
+        if self.supported and any(value is None for value in runtime):
+            raise ValueError("invalid_support_runtime")
+        return self

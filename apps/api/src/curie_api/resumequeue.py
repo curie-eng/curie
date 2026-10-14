@@ -220,7 +220,7 @@ def build_expiry_resume_turn(approval: Approval) -> QueuedTurn:
     done-marker and not re-run; the ``-resolved`` suffix in the key is
     historical and must NOT be forked, or that redelivery guard silently
     breaks. This is not a mid-turn dedupe: the single-wakeup guarantee for the
-    expiry vs. resolve race comes from the CAS in ``crud.expire_approval``, not
+    expiry vs. resolve race comes from the CAS in ``crud.approvals.expire_approval``, not
     from this shared key.
     """
 
@@ -240,7 +240,7 @@ def resume_turn_for(approval: Approval) -> QueuedTurn:
     resumable status cannot be added without extending it, and so the one
     status-agnostic caller (the reconciler, #418) stays mapping-free. Raises
     ValueError for a status that owes no wake (pending), mirroring how
-    ``crud._RESUMABLE_STATUSES`` fences the reconciler's finder and its per-row
+    ``crud.approvals._RESUMABLE_STATUSES`` fences the reconciler's finder and its per-row
     claim.
 
     The three inline callers do NOT come through here: each just performed the
@@ -331,7 +331,7 @@ class ResumeQueue:
             fields.update(carrier)
             try:
                 stream_id = await self._client.xadd(self._stream, fields)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 span.set_status(StatusCode.ERROR)
                 span.add_event("queue.enqueue.failed", {"outcome": "failure"})

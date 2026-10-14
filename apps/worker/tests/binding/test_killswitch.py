@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 import redis.asyncio as aredis
+from curie_internal.keyspace import KILL_CHANNEL, kill_key
 from curie_test_support.valkey import (
     VALKEY_HOST as _VALKEY_HOST,
 )
@@ -26,7 +27,7 @@ from curie_test_support.valkey import (
     VALKEY_PW as _VALKEY_PW,
 )
 from curie_worker import killswitch as killswitch_module
-from curie_worker.killswitch import KILL_CHANNEL, KillSwitch, kill_key
+from curie_worker.killswitch import KillSwitch
 
 # importlib import mode does not add the test root to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))

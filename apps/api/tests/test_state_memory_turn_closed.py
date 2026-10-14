@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 from curie_api.config import get_settings
-from curie_api.sandbox_token import mint
+from curie_internal.sandbox_token import mint
 from curie_test_support.valkey import connect_or_skip
 
 _FAR_FUTURE = 4102444800  # 2100-01-01: the credential is nowhere near expiry

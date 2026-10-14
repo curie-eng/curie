@@ -1,5 +1,69 @@
 {
   "metrics": {
+    "curie.action_executor.execution": {
+      "attributes": {
+        "code": [
+          "agent_stopped",
+          "authority_unavailable",
+          "reserved_verb_via_forward",
+          "arguments_mismatch",
+          "tool_not_grant_bound",
+          "connector_not_hosted",
+          "connector_digest_unavailable",
+          "restore_not_advertised",
+          "restore_schema_mismatch",
+          "tool_not_advertised",
+          "version_conflict",
+          "sandbox_unavailable",
+          "runner_unavailable",
+          "connector_unreachable",
+          "tool_not_read_only",
+          "version_conflict_at_write",
+          "sealing_key_unavailable",
+          "snapshot_unopenable",
+          "connector_error",
+          "unstructured_reply",
+          "response_lost",
+          "deadline_exceeded",
+          "none"
+        ],
+        "connector": {
+          "ceiling": 16,
+          "kind": "bounded",
+          "overflow": "other",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+          "reserved": [
+            "other"
+          ]
+        },
+        "kind": [
+          "restore",
+          "probe",
+          "other"
+        ],
+        "service.name": [
+          "curie-worker"
+        ],
+        "stage": [
+          "pre_dispatch",
+          "connector_refusal",
+          "post_dispatch",
+          "none"
+        ],
+        "state": [
+          "confirmed",
+          "failed",
+          "indeterminate",
+          "refused",
+          "unreported"
+        ]
+      },
+      "cardinality_bound": 23460,
+      "description": "Connector action executions by kind, terminal state, stage, code and connector.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{execution}"
+    },
     "curie.agent.turn.completed": {
       "attributes": {
         "agent": {
@@ -103,6 +167,22 @@
       "monotonic": false,
       "type": "gauge",
       "unit": "s"
+    },
+    "curie.attachments.ledger.append": {
+      "attributes": {
+        "outcome": [
+          "success",
+          "failure"
+        ],
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 2,
+      "description": "Thread attachment ledger appends after install.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{append}"
     },
     "curie.background.last_success.age": {
       "attributes": {
@@ -225,6 +305,58 @@
       "type": "gauge",
       "unit": "{agent}"
     },
+    "curie.deploy_notice.suppressed": {
+      "attributes": {
+        "reason": [
+          "no_nonprod_recipient",
+          "rate_limited"
+        ],
+        "service.name": [
+          "curie-api"
+        ]
+      },
+      "cardinality_bound": 2,
+      "description": "Git-flow push outcomes whose Slack deploy notices were withheld.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{outcome}"
+    },
+    "curie.e2e.namespaces.expired": {
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 1,
+      "description": "End to end namespaces past their TTL at the reaper's last pass.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "{namespace}"
+    },
+    "curie.e2e.namespaces.overdue": {
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 1,
+      "description": "End to end namespaces at least ten minutes past their TTL, or without one, at the reaper's last pass.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "{namespace}"
+    },
+    "curie.e2e.reaper.last_success": {
+      "attributes": {
+        "service.name": [
+          "curie-worker"
+        ]
+      },
+      "cardinality_bound": 1,
+      "description": "Unix time of the end to end namespace reaper's last successful sweep, 0 if none.",
+      "monotonic": false,
+      "type": "gauge",
+      "unit": "s"
+    },
     "curie.eval.process": {
       "attributes": {
         "outcome": [
@@ -289,6 +421,13 @@
     "curie.http.server.active": {
       "attributes": {
         "operation": [
+          "/action-executions/claim",
+          "/action-executions/{execution_id}",
+          "/action-executions/{execution_id}/arguments",
+          "/action-executions/{execution_id}/dispatch",
+          "/action-executions/{execution_id}/observation",
+          "/action-executions/{execution_id}/outcome",
+          "/action-executions/{execution_id}/samples",
           "/actions",
           "/actions/{action_id}",
           "/actions/{action_id}/audit",
@@ -317,6 +456,17 @@
           "/agents/{agent_id}/state/{namespace}/{key}",
           "/agents/{agent_id}/state/{namespace}/{key}/append",
           "/agents/{agent_id}/threads/{thread_key}/reset",
+          "/agents/{agent_id}/hooks/{hook}/source-policy",
+          "/agents/{agent_id}/hooks/{hook}/source-policy/rotate",
+          "/agents/{agent_id}/hooks/{hook}/source-policy/secret",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
+          "/agents/{agent_id}/remediation-qualifications/{qualification_id}",
+          "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs",
+          "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}",
           "/agents/{agent_id}/hooks/{name}/fire",
           "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
           "/agents/{agent_id}/versions",
@@ -332,12 +482,19 @@
           "/approvals/{approval_id}/resolve",
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
+          "/channel-canvas",
+          "/channel-read",
           "/channels/admission",
           "/channels/token",
           "/channels/turns",
           "/cluster-message-replies/{reply_ref}",
           "/config",
+          "/connector-capabilities/probes",
           "/console/login-codes",
+          "/console/logout",
+          "/console/oidc/callback",
+          "/console/oidc/login",
+          "/console/principal",
           "/console/session",
           "/deploy-targets/list",
           "/deploy-targets/resolve",
@@ -351,6 +508,7 @@
           "/health",
           "/ready",
           "/hooks/{agent_id}/{hook}",
+          "/hooks/{agent_id}/{hook}/support",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
           "/langfuse/traces/{trace_id}/eval-case",
@@ -362,6 +520,12 @@
           "/observability/metrics/summary",
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
+          "/channel-identities",
+          "/channel-identities/{identity_id}",
+          "/provider-installations",
+          "/provider-installations/{installation_id}",
+          "/identity/resolve",
+          "/identity/slack-reports",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -377,6 +541,10 @@
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
           "/v1/internal/publications/{publication_id}/lineage",
           "/v1/internal/publications/{publication_id}/credential",
+          "/v1/internal/publications/{publication_id}/pull-request",
+          "/v1/internal/publications/{publication_id}/pull-request/metadata",
+          "/v1/internal/publications/{publication_id}/branch-head",
+          "/v1/internal/publications/{publication_id}/revision-commit",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
           "/v1/internal/work-items/admissions",
@@ -394,11 +562,17 @@
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/internal/work-items/issue-read/context",
+          "/v1/internal/channel-read/context",
+          "/v1/internal/thread-attachments/query",
+          "/v1/internal/thread-attachments/append",
+          "/v1/internal/remediation/nominations",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
           "/v1/turn-progress/{progress_id}",
           "/v1/factory/cards/{token}.svg",
+          "/remediation-nominations",
+          "/remediation-nominations/{nomination_id}",
           "/schedules",
           "/schedules/{agent}/{name}/pause",
           "/schedules/{agent}/{name}/resume",
@@ -425,7 +599,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 944,
+      "cardinality_bound": 1280,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -434,6 +608,13 @@
     "curie.http.server.request": {
       "attributes": {
         "operation": [
+          "/action-executions/claim",
+          "/action-executions/{execution_id}",
+          "/action-executions/{execution_id}/arguments",
+          "/action-executions/{execution_id}/dispatch",
+          "/action-executions/{execution_id}/observation",
+          "/action-executions/{execution_id}/outcome",
+          "/action-executions/{execution_id}/samples",
           "/actions",
           "/actions/{action_id}",
           "/actions/{action_id}/audit",
@@ -462,6 +643,17 @@
           "/agents/{agent_id}/state/{namespace}/{key}",
           "/agents/{agent_id}/state/{namespace}/{key}/append",
           "/agents/{agent_id}/threads/{thread_key}/reset",
+          "/agents/{agent_id}/hooks/{hook}/source-policy",
+          "/agents/{agent_id}/hooks/{hook}/source-policy/rotate",
+          "/agents/{agent_id}/hooks/{hook}/source-policy/secret",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
+          "/agents/{agent_id}/remediation-qualifications/{qualification_id}",
+          "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs",
+          "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}",
           "/agents/{agent_id}/hooks/{name}/fire",
           "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
           "/agents/{agent_id}/versions",
@@ -477,12 +669,19 @@
           "/approvals/{approval_id}/resolve",
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
+          "/channel-canvas",
+          "/channel-read",
           "/channels/admission",
           "/channels/token",
           "/channels/turns",
           "/cluster-message-replies/{reply_ref}",
           "/config",
+          "/connector-capabilities/probes",
           "/console/login-codes",
+          "/console/logout",
+          "/console/oidc/callback",
+          "/console/oidc/login",
+          "/console/principal",
           "/console/session",
           "/deploy-targets/list",
           "/deploy-targets/resolve",
@@ -496,6 +695,7 @@
           "/health",
           "/ready",
           "/hooks/{agent_id}/{hook}",
+          "/hooks/{agent_id}/{hook}/support",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
           "/langfuse/traces/{trace_id}/eval-case",
@@ -507,6 +707,12 @@
           "/observability/metrics/summary",
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
+          "/channel-identities",
+          "/channel-identities/{identity_id}",
+          "/provider-installations",
+          "/provider-installations/{installation_id}",
+          "/identity/resolve",
+          "/identity/slack-reports",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -522,6 +728,10 @@
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
           "/v1/internal/publications/{publication_id}/lineage",
           "/v1/internal/publications/{publication_id}/credential",
+          "/v1/internal/publications/{publication_id}/pull-request",
+          "/v1/internal/publications/{publication_id}/pull-request/metadata",
+          "/v1/internal/publications/{publication_id}/branch-head",
+          "/v1/internal/publications/{publication_id}/revision-commit",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
           "/v1/internal/work-items/admissions",
@@ -539,11 +749,17 @@
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/internal/work-items/issue-read/context",
+          "/v1/internal/channel-read/context",
+          "/v1/internal/thread-attachments/query",
+          "/v1/internal/thread-attachments/append",
+          "/v1/internal/remediation/nominations",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
           "/v1/turn-progress/{progress_id}",
           "/v1/factory/cards/{token}.svg",
+          "/remediation-nominations",
+          "/remediation-nominations/{nomination_id}",
           "/schedules",
           "/schedules/{agent}/{name}/pause",
           "/schedules/{agent}/{name}/resume",
@@ -577,7 +793,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 4720,
+      "cardinality_bound": 6400,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -586,6 +802,13 @@
     "curie.http.server.request.duration": {
       "attributes": {
         "operation": [
+          "/action-executions/claim",
+          "/action-executions/{execution_id}",
+          "/action-executions/{execution_id}/arguments",
+          "/action-executions/{execution_id}/dispatch",
+          "/action-executions/{execution_id}/observation",
+          "/action-executions/{execution_id}/outcome",
+          "/action-executions/{execution_id}/samples",
           "/actions",
           "/actions/{action_id}",
           "/actions/{action_id}/audit",
@@ -614,6 +837,17 @@
           "/agents/{agent_id}/state/{namespace}/{key}",
           "/agents/{agent_id}/state/{namespace}/{key}/append",
           "/agents/{agent_id}/threads/{thread_key}/reset",
+          "/agents/{agent_id}/hooks/{hook}/source-policy",
+          "/agents/{agent_id}/hooks/{hook}/source-policy/rotate",
+          "/agents/{agent_id}/hooks/{hook}/source-policy/secret",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
+          "/agents/{agent_id}/remediation-qualifications/{qualification_id}",
+          "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs",
+          "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}",
           "/agents/{agent_id}/hooks/{name}/fire",
           "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
           "/agents/{agent_id}/versions",
@@ -629,12 +863,19 @@
           "/approvals/{approval_id}/resolve",
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
+          "/channel-canvas",
+          "/channel-read",
           "/channels/admission",
           "/channels/token",
           "/channels/turns",
           "/cluster-message-replies/{reply_ref}",
           "/config",
+          "/connector-capabilities/probes",
           "/console/login-codes",
+          "/console/logout",
+          "/console/oidc/callback",
+          "/console/oidc/login",
+          "/console/principal",
           "/console/session",
           "/deploy-targets/list",
           "/deploy-targets/resolve",
@@ -648,6 +889,7 @@
           "/health",
           "/ready",
           "/hooks/{agent_id}/{hook}",
+          "/hooks/{agent_id}/{hook}/support",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
           "/langfuse/traces/{trace_id}/eval-case",
@@ -659,6 +901,12 @@
           "/observability/metrics/summary",
           "/observability/runners",
           "/observability/runners/{namespace}/{pod}/logs",
+          "/channel-identities",
+          "/channel-identities/{identity_id}",
+          "/provider-installations",
+          "/provider-installations/{installation_id}",
+          "/identity/resolve",
+          "/identity/slack-reports",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -674,6 +922,10 @@
           "/v1/internal/publications/review-reservations/{reservation_id}/cancel",
           "/v1/internal/publications/{publication_id}/lineage",
           "/v1/internal/publications/{publication_id}/credential",
+          "/v1/internal/publications/{publication_id}/pull-request",
+          "/v1/internal/publications/{publication_id}/pull-request/metadata",
+          "/v1/internal/publications/{publication_id}/branch-head",
+          "/v1/internal/publications/{publication_id}/revision-commit",
           "/v1/internal/workspaces/{deployment_id}/credential",
           "/v1/internal/workspaces/{deployment_id}/selection",
           "/v1/internal/work-items/admissions",
@@ -691,11 +943,17 @@
           "/v1/internal/work-items/requests/{request_id}/termination/claim",
           "/v1/internal/work-items/requests/{request_id}/termination",
           "/v1/internal/work-items/issue-read/context",
+          "/v1/internal/channel-read/context",
+          "/v1/internal/thread-attachments/query",
+          "/v1/internal/thread-attachments/append",
+          "/v1/internal/remediation/nominations",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
           "/v1/turn-progress/{progress_id}",
           "/v1/factory/cards/{token}.svg",
+          "/remediation-nominations",
+          "/remediation-nominations/{nomination_id}",
           "/schedules",
           "/schedules/{agent}/{name}/pause",
           "/schedules/{agent}/{name}/resume",
@@ -729,7 +987,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 4720,
+      "cardinality_bound": 6400,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",
@@ -1061,6 +1319,74 @@
       "type": "histogram",
       "unit": "s"
     },
+    "curie.remediation.lifecycle": {
+      "attributes": {
+        "authority": [
+          "policy",
+          "approval",
+          "none"
+        ],
+        "code": [
+          "nomination_malformed",
+          "unknown_action",
+          "nomination_duplicate",
+          "arguments_schema_mismatch",
+          "agent_stopped",
+          "reply_surface_unavailable",
+          "tune_execution_not_automated",
+          "generation_not_current",
+          "policy_disarmed",
+          "not_automatic",
+          "qualification_missing",
+          "qualification_stale",
+          "verifier_not_independent",
+          "out_of_bounds",
+          "not_reversible_now",
+          "breaker_open",
+          "policy_rate_limit",
+          "action_rate_limit",
+          "incident_limit",
+          "turn_limit",
+          "target_live",
+          "precondition_not_met",
+          "precondition_unavailable",
+          "admission_unreadable",
+          "policy_changed",
+          "arguments_mismatch",
+          "verified",
+          "not-recovered",
+          "verifier-unavailable",
+          "superseded",
+          "none"
+        ],
+        "kind": [
+          "remediate",
+          "prevent",
+          "tune"
+        ],
+        "service.name": [
+          "curie-worker"
+        ],
+        "stage": [
+          "nominated",
+          "refused",
+          "approval_requested",
+          "executed",
+          "verified",
+          "not-recovered",
+          "verifier-unavailable",
+          "superseded",
+          "undo_requested",
+          "undone",
+          "escalated"
+        ]
+      },
+      "cardinality_bound": 3069,
+      "description": "Remediation lifecycle receipts posted, by stage, kind, authority and code.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{receipt}"
+    },
     "curie.reply.delivery": {
       "attributes": {
         "operation": [
@@ -1172,7 +1498,8 @@
           "reset",
           "status",
           "timeout",
-          "turn-admit"
+          "turn-admit",
+          "execute"
         ],
         "outcome": [
           "success",
@@ -1187,7 +1514,7 @@
           "curie-worker"
         ]
       },
-      "cardinality_bound": 28,
+      "cardinality_bound": 32,
       "description": "Runner RPC request duration.",
       "monotonic": false,
       "type": "histogram",
@@ -1202,7 +1529,8 @@
           "reset",
           "status",
           "timeout",
-          "turn-admit"
+          "turn-admit",
+          "execute"
         ],
         "outcome": [
           "success",
@@ -1217,7 +1545,7 @@
           "curie-worker"
         ]
       },
-      "cardinality_bound": 28,
+      "cardinality_bound": 32,
       "description": "Runner RPC outcomes.",
       "monotonic": true,
       "type": "counter",
@@ -1784,12 +2112,13 @@
           "settle_overdue_cancellations",
           "readmit_pending",
           "reconcile_missed_labels",
+          "poll_trackers",
           "sync_status_comments",
           "redispatch_lapsed_acquisitions",
           "publish_execute_wakes"
         ]
       },
-      "cardinality_bound": 11,
+      "cardinality_bound": 12,
       "description": "Consecutive failed passes for each WorkItem reconciler step.",
       "monotonic": false,
       "type": "gauge",
@@ -1809,12 +2138,13 @@
           "settle_overdue_cancellations",
           "readmit_pending",
           "reconcile_missed_labels",
+          "poll_trackers",
           "sync_status_comments",
           "redispatch_lapsed_acquisitions",
           "publish_execute_wakes"
         ]
       },
-      "cardinality_bound": 11,
+      "cardinality_bound": 12,
       "description": "Failed WorkItem reconciler steps.",
       "monotonic": true,
       "type": "counter",
@@ -1829,6 +2159,7 @@
           "heartbeat",
           "connectors",
           "publications",
+          "e2e-reaper",
           "other"
         ],
         "outcome": [
@@ -1839,7 +2170,7 @@
           "curie-worker"
         ]
       },
-      "cardinality_bound": 14,
+      "cardinality_bound": 16,
       "description": "In-process supervised worker task restarts.",
       "monotonic": true,
       "type": "counter",

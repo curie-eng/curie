@@ -215,7 +215,7 @@ class EgressHandler(BaseHTTPRequestHandler):
             return self._respond(422, {"detail": "event_id must not be empty"})
         try:
             status, ref = self.dispatch(event)
-        except Exception:
+        except Exception:  # noqa: BLE001 - existing broad catch retained
             logger.error("dispatching event type=%s failed unexpectedly", event.event)
             return self._respond(500, {"detail": "adapter error"})
         if status == 410:

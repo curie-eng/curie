@@ -17,11 +17,7 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
-    "noUncheckedSideEffectImports": true,
-
-    "paths": {
-      "@aci/*": ["../../packages/aci-protocol/generated/ts/*"]
-    }
+    "noUncheckedSideEffectImports": true
   },
   "include": ["src"]
 }

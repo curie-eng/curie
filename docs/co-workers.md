@@ -57,9 +57,9 @@ routing by task complexity or an ROI calculation without a comparison baseline.
 Slack is the primary documented workspace path. Other adapters have different
 configuration, deployment, security, and verification limits. In particular,
 the AgentMail inbound path currently rejects messages when sender authentication
-cannot be verified. Use the [capability reference](capabilities.md) before
-planning a channel rollout; Teams, GitLab, Bitbucket, and Jira support are not
-implied by this platform vision.
+cannot be verified. Teams has no supported first-party channel. Use the
+[capability reference](capabilities.md) for channel rollout limits and the
+scope of GitLab, Jira Cloud, and Bitbucket factory integrations.
 
 The platform and its backing services can run in your infrastructure. Configured
 external model providers, GitHub, and workspace services receive the data needed

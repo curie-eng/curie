@@ -6,7 +6,7 @@ import asyncio
 import json
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 import httpx
@@ -15,10 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from starlette.concurrency import run_in_threadpool
 
-from . import crud
+from curie_api.crud import lineages as crud_lineages
+
 from .config import Settings
-from .github_app import GitHubAppError, GitHubCredentials
-from .github_review_truth import github_headers, repository_identity_matches
+from .forges.errors import ForgeError
+from .forges.github.transport import github_headers, repository_identity_matches
+from .forges.hosts import forge_code_host
+from .forges.types import GITHUB, PullRequestRef, PullRequestState, RepositoryRef
+from .github_app import GitHubAppError, GitHubAuth, GitHubCredentials
 from .models import Deployment, ExecutionRequest, ThreadPublicationLineage, WorkItem
 from .repo_full_name import repo_url_path
 
@@ -53,10 +57,14 @@ class PublicationReadAuthority:
     execution_deadline: datetime
     repo_full_name: str
     pr_number: int
+    pr_url: str
     branch: str
-    repository_id: int
-    installation_id: int
-    pr_node_id: str
+    # The lineage's verified code host identity (ADR 0197): its repository,
+    # the GitHub App installation that verified it (None on a code host with
+    # no installations), and the pull request's immutable id.
+    repository: RepositoryRef
+    installation_id: int | None
+    pr_id: str
     base_ref: str
     has_inflight_push: bool
 
@@ -114,7 +122,7 @@ async def read_publication_authority(
         conversation_pr_lineage_id(
             agent_id=WorkItem.agent_id,
             conversation_id=WorkItem.conversation_id,
-            repo_full_name=WorkItem.repo_full_name,
+            repo_full_name=WorkItem.repository_path,
         )
         .correlate(WorkItem)
         .scalar_subquery()
@@ -156,7 +164,7 @@ async def read_publication_authority(
     if lineage is not None and (
         lineage.agent_id != item.agent_id
         or item.conversation_id != lineage.conversation_id
-        or item.repo_full_name.casefold() != lineage.repo_full_name.casefold()
+        or item.repository_path.casefold() != lineage.repo_full_name.casefold()
         or lineage.status != "open"
     ):
         raise PublicationPrecheckRefused
@@ -168,20 +176,30 @@ async def read_publication_authority(
         if lineage is None and item.publication_lineage_id is not None:
             raise PublicationPrecheckRefused
         return None
+    # A GitHub pull request's link is checked here, before GitHub is read. Any
+    # other code host names its pull requests itself, so its stored link is
+    # compared with the one its read answers (`read_publication_metadata`).
+    repository = lineage.repository
+    github = lineage.code_host_kind == GITHUB
     if (
         lineage.pr_number <= 0
-        or lineage.pr_url != f"{github_html_base}/{lineage.repo_full_name}/pull/{lineage.pr_number}"
+        or not lineage.pr_url
+        or (
+            github
+            and lineage.pr_url
+            != f"{github_html_base}/{lineage.repo_full_name}/pull/{lineage.pr_number}"
+        )
         or lineage.head_sha is None
         or re.fullmatch(r"[0-9a-f]{40}", lineage.head_sha) is None
-        or lineage.github_repository_id is None
-        or lineage.github_installation_id is None
-        or not lineage.github_pr_node_id
+        or repository is None
+        or (github and lineage.code_host_installation_id is None)
+        or not lineage.code_host_pr_id
         or not lineage.base_ref
     ):
         raise PublicationPrecheckUnavailable
     if (
-        item.github_repository_id != lineage.github_repository_id
-        or item.github_installation_id != lineage.github_installation_id
+        lineage.repository != item.repository
+        or item.code_host_installation_id != lineage.code_host_installation_id
     ):
         raise PublicationPrecheckRefused
     return PublicationReadAuthority(
@@ -197,12 +215,15 @@ async def read_publication_authority(
         execution_deadline=execution.execution_deadline,
         repo_full_name=lineage.repo_full_name,
         pr_number=lineage.pr_number,
+        pr_url=lineage.pr_url,
         branch=lineage.branch,
-        repository_id=lineage.github_repository_id,
-        installation_id=lineage.github_installation_id,
-        pr_node_id=lineage.github_pr_node_id,
+        repository=repository,
+        installation_id=lineage.code_host_installation_id,
+        pr_id=lineage.code_host_pr_id,
         base_ref=lineage.base_ref,
-        has_inflight_push=await crud.publication_lineage_has_inflight_push(session, lineage),
+        has_inflight_push=await crud_lineages.publication_lineage_has_inflight_push(
+            session, lineage
+        ),
     )
 
 
@@ -212,18 +233,52 @@ async def read_publication_metadata(
     settings: Settings,
     client: httpx.AsyncClient,
 ) -> PublicationMetadata:
-    """One bounded PR GET using only identities resolved from durable state."""
+    """One bounded PR read using only identities resolved from durable state.
 
+    A GitHub pull request is read with a token minted for its verified
+    installation; any other through the code host its repository names.
+    """
+
+    if authority.repository.kind == GITHUB:
+        return await _github_metadata(authority, settings=settings, client=client)
+    code_host = forge_code_host(settings, client, authority.repository)
+    try:
+        async with asyncio.timeout(PRECHECK_TIMEOUT_SECONDS):
+            pull = await code_host.read_pull_request(
+                PullRequestRef(authority.repository, str(authority.pr_number))
+            )
+    except (ForgeError, TimeoutError):
+        raise PublicationPrecheckUnavailable from None
+    if (
+        pull.ref.number != str(authority.pr_number)
+        or pull.ref.number != authority.pr_id
+        or pull.url != authority.pr_url
+        or pull.state is not PullRequestState.OPEN
+        or pull.head_ref != authority.branch
+        or pull.head_sha != authority.expected_head
+        or pull.base_ref != authority.base_ref
+        or not pull.title.strip()
+        or len(pull.title) > 256
+        or len(pull.body) > 65_536
+    ):
+        raise PublicationPrecheckUnavailable
+    return PublicationMetadata(pull.title, pull.body, datetime.now(UTC))
+
+
+async def _github_metadata(
+    authority: PublicationReadAuthority,
+    *,
+    settings: Settings,
+    client: httpx.AsyncClient,
+) -> PublicationMetadata:
+    """One bounded GitHub PR GET for the verified installation."""
+
+    assert authority.installation_id is not None
     # This resolver has its own short request budget. Reusing the general
     # resolver would inherit its longer configured timeout and shared locks.
+    auth = GitHubAuth.from_settings(settings)
     resolver = GitHubCredentials(
-        settings=settings.model_copy(
-            update={
-                "github_app_timeout_seconds": min(
-                    settings.github_app_timeout_seconds, _PROVIDER_TIMEOUT_SECONDS
-                ),
-            }
-        )
+        auth=replace(auth, timeout_s=min(auth.timeout_s, _PROVIDER_TIMEOUT_SECONDS))
     )
     try:
         async with asyncio.timeout(PRECHECK_TIMEOUT_SECONDS):
@@ -257,7 +312,7 @@ async def read_publication_metadata(
     if (
         type(payload.get("number")) is not int
         or payload["number"] != authority.pr_number
-        or payload.get("node_id") != authority.pr_node_id
+        or payload.get("node_id") != authority.pr_id
         or payload.get("html_url")
         != f"{settings.github_html_base}/{authority.repo_full_name}/pull/{authority.pr_number}"
         or payload.get("state") != "open"
@@ -283,7 +338,7 @@ async def read_publication_metadata(
     for side in (head, base):
         if not repository_identity_matches(
             side.get("repo"),
-            repository_id=authority.repository_id,
+            repository_id=int(authority.repository.project_id),
             repo_full_name=authority.repo_full_name,
         ):
             raise PublicationPrecheckUnavailable

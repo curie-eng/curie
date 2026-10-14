@@ -23,6 +23,7 @@ import redis
 from aci_protocol import QueuedTurn
 from curie_api import hook_signing
 from curie_api.config import get_settings
+from curie_api.crud import workspaces as crud_workspaces
 from curie_api.routers import channels as channels_router
 from curie_api.routers import hooks as hooks_router
 from fastapi.testclient import TestClient
@@ -381,14 +382,14 @@ def test_workspace_selection_failure_releases_hook_claim_and_refunds_slot(
     )
     assert configured.status_code == 200, configured.text
     original_error = RuntimeError("workspace selection result was lost")
-    real_select = hooks_router.crud.select_thread_workspace
+    real_select = crud_workspaces.select_thread_workspace
 
     async def select_then_fail(*args: Any, **kwargs: Any) -> Any:
         await real_select(*args, **kwargs)
         raise original_error
 
     with monkeypatch.context() as fault:
-        fault.setattr(hooks_router.crud, "select_thread_workspace", select_then_fail)
+        fault.setattr(crud_workspaces, "select_thread_workspace", select_then_fail)
         with pytest.raises(RuntimeError) as caught:
             ingress.post()
         assert caught.value is original_error

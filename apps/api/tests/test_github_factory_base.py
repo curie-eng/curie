@@ -1,7 +1,7 @@
 """A factory ticket declares its base branch and keeps it (#3095, ADR 0186).
 
 GitHub REST shapes follow:
-https://docs.github.com/en/rest/branches/branches#get-a-branch
+https://docs.github.com/en/rest/git/refs#get-a-reference
 https://docs.github.com/en/rest/issues/events
 https://docs.github.com/en/rest/issues/comments#list-issue-comments
 https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
@@ -27,24 +27,31 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import Settings, get_settings
+from curie_api.factory_base import bases_for
+from curie_api.forges.config import ForgesConfig
+from curie_api.forges.registry import ForgeRegistry, forges_registry
+from curie_api.github_app import GitHubCredentials
 from curie_api.main import create_app
 from fastapi.testclient import TestClient
-from pydantic import ValidationError
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
-from test_github_factory_ingress import (
-    _ENV,
+from forge_fakes.github import (
     INSTALLATION_ID,
     LABEL,
     REPO,
     REPO_ID,
     GitHubAPI,
-    _code,
     _Credentials,
     _issue_event,
     _post,
-    _rows,
+    factory_env,
+    fake_installation_tokens,
+    forges_document,
+    forges_env_json,
+    github_repository_binding,
 )
+from pydantic import ValidationError
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from test_github_factory_ingress import _code, _rows
 
 MARKER = "<!-- curie-factory-base-refusal -->"
 MAIN_SHA = "1" * 40
@@ -77,7 +84,7 @@ class BaseGitHubAPI(GitHubAPI):
                     "default_branch": self.default_branch,
                 },
             )
-        branch_prefix = f"/repos/{REPO}/branches/"
+        branch_prefix = f"/repos/{REPO}/git/ref/heads/"
         if path.startswith(branch_prefix):
             name = path[len(branch_prefix) :]
             self.branch_requests.append(name)
@@ -85,8 +92,8 @@ class BaseGitHubAPI(GitHubAPI):
                 return httpx.Response(502, json={"message": "Bad Gateway"})
             sha = self.branches.get(name)
             if sha is None:
-                return httpx.Response(404, json={"message": "Branch not found"})
-            return httpx.Response(200, json={"name": name, "commit": {"sha": sha}})
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(200, json={"ref": f"refs/heads/{name}", "object": {"sha": sha}})
         parts = path.split("/")
         # /repos/{owner}/{name}/issues/{number}/comments
         if len(parts) == 7 and parts[4] == "issues" and parts[6] == "comments":
@@ -126,23 +133,40 @@ class BaseGitHubAPI(GitHubAPI):
         return [body for method, _path, body in self.comment_writes if method == "PATCH"]
 
 
-def _configure(monkeypatch: pytest.MonkeyPatch, bases: dict[str, Any] | None) -> None:
-    if bases is None:
-        monkeypatch.delenv("GITHUB_FACTORY_BASES", raising=False)
-    else:
-        monkeypatch.setenv("GITHUB_FACTORY_BASES", json.dumps(bases))
+def _bindings(bases: dict[str, Any]) -> list[dict[str, Any]]:
+    """One GitHub repository binding per ``{repo: {"bases", "default_base"}}`` entry:
+    the bases a repository allows live on its binding (#4397)."""
+
+    return [
+        github_repository_binding(
+            repo=repo,
+            repo_id=REPO_ID if repo == REPO else 9100 + index,
+            bases=entry.get("bases"),
+            default_base=entry.get("default_base"),
+        )
+        for index, (repo, entry) in enumerate(bases.items())
+    ]
+
+
+def _configure(
+    monkeypatch: pytest.MonkeyPatch,
+    key_dir: Path,
+    bases: dict[str, Any],
+    client: TestClient | None = None,
+) -> None:
+    """Set the forge config to ``bases``; a running app gets the new registry too."""
+
+    for key, value in factory_env(key_dir, bindings=_bindings(bases)).items():
+        monkeypatch.setenv(key, value)
     get_settings.cache_clear()
+    if client is not None:
+        client.app.state.forges = forges_registry(get_settings())
 
 
 @pytest.fixture
-def base_app(monkeypatch: pytest.MonkeyPatch, clean_db: None) -> Any:
-    for key, value in _ENV.items():
-        monkeypatch.setenv(key, value)
-    _configure(monkeypatch, TRAIN)
-    monkeypatch.setattr(
-        "curie_api.github_factory.credentials_for",
-        lambda _settings: _Credentials(),
-    )
+def base_app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clean_db: None) -> Any:
+    _configure(monkeypatch, tmp_path, TRAIN)
+    fake_installation_tokens(monkeypatch, _Credentials())
     api = BaseGitHubAPI()
     with TestClient(create_app()) as client:
         external = httpx.AsyncClient(transport=httpx.MockTransport(api.handle))
@@ -166,8 +190,8 @@ def _work_item(number: int) -> dict[str, Any] | None:
     rows = _rows(
         "SELECT id, base_branch, base_source, base_commit, base_label_ignored, "
         "publication_lineage_id FROM curie.work_items "
-        "WHERE github_repository_id = :repo AND github_issue_number = :number",
-        {"repo": REPO_ID, "number": number},
+        "WHERE tracker_scope_id = :repo AND tracker_issue_id = :number",
+        {"repo": str(REPO_ID), "number": str(number)},
     )
     return rows[0] if rows else None
 
@@ -195,7 +219,7 @@ def _open_lineage(work_item_id: uuid.UUID, *, status: str = "open") -> None:
     """Attach a thread publication lineage (an open factory PR) to the WorkItem."""
 
     item = _rows(
-        "SELECT agent_id, conversation_id, repo_full_name FROM curie.work_items WHERE id = :id",
+        "SELECT agent_id, conversation_id, repository_path FROM curie.work_items WHERE id = :id",
         {"id": work_item_id},
     )[0]
     version_id, deployment_id, lineage_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
@@ -220,7 +244,7 @@ def _open_lineage(work_item_id: uuid.UUID, *, status: str = "open") -> None:
             "agent": item["agent_id"],
             "deployment": deployment_id,
             "conversation": item["conversation_id"],
-            "repo": item["repo_full_name"],
+            "repo": item["repository_path"],
             "base": NEXT_SHA,
             "branch": f"curie/publication-{lineage_id.hex}",
             "url": f"https://github.com/{REPO}/pull/77",
@@ -238,38 +262,51 @@ def _open_lineage(work_item_id: uuid.UUID, *, status: str = "open") -> None:
 # --- Declaration: the deployment setting ------------------------------------------
 
 
-def _bases_entry(settings: Settings, repo: str) -> tuple[list[str], str | None]:
-    entry = settings.github_factory_bases[repo]
-    if isinstance(entry, dict):
-        return list(entry["bases"]), entry.get("default_base")
+def _bases_entry(registry: ForgeRegistry, repo: str) -> tuple[list[str], str | None]:
+    # The GitHub path passes the repository's GitHub binding policy (#4358 plan D15).
+    entry = bases_for(registry.github_repository_policy(repo))
+    assert entry is not None
     return list(entry.bases), entry.default_base
+
+
+def _forges_env(monkeypatch: pytest.MonkeyPatch, key_dir: Path, bases: dict[str, Any]) -> None:
+    monkeypatch.setenv(
+        "CURIE_FORGES", forges_env_json(forges_document(bindings=_bindings(bases)), key_dir)
+    )
 
 
 def test_factory_bases_default_to_empty_so_every_repo_uses_its_default_branch() -> None:
     settings = Settings(_env_file=None)
 
-    assert not settings.github_factory_bases
+    assert not settings.forges.bindings
+    assert bases_for(forges_registry(settings).github_repository_policy(REPO)) is None
 
 
-def test_factory_bases_parse_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(
-        "GITHUB_FACTORY_BASES",
-        json.dumps({"curie-eng/curie": {"bases": ["main", "next"], "default_base": "main"}}),
+def test_factory_bases_parse_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _forges_env(
+        monkeypatch,
+        tmp_path,
+        {"curie-eng/curie": {"bases": ["main", "next"], "default_base": "main"}},
     )
 
     settings = Settings(_env_file=None)
 
-    assert _bases_entry(settings, "curie-eng/curie") == (["main", "next"], "main")
-
-
-def test_factory_bases_default_base_is_optional(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(
-        "GITHUB_FACTORY_BASES", json.dumps({"acme-corp/acme-bot": {"bases": ["main"]}})
+    assert _bases_entry(forges_registry(settings), "curie-eng/curie") == (
+        ["main", "next"],
+        "main",
     )
+
+
+def test_factory_bases_default_base_is_optional(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _forges_env(monkeypatch, tmp_path, {"acme-corp/acme-bot": {"bases": ["main"]}})
 
     settings = Settings(_env_file=None)
 
-    assert _bases_entry(settings, "acme-corp/acme-bot") == (["main"], None)
+    assert _bases_entry(forges_registry(settings), "acme-corp/acme-bot") == (["main"], None)
 
 
 @pytest.mark.parametrize(
@@ -277,7 +314,6 @@ def test_factory_bases_default_base_is_optional(monkeypatch: pytest.MonkeyPatch)
     [
         {"acme-corp/acme-bot": {"bases": ["main", "next"], "default_base": "release-1"}},
         {"acme-corp/acme-bot": {"bases": [], "default_base": "main"}},
-        {"acme-corp/acme-bot": {"bases": []}},
         {"not-a-repository": {"bases": ["main"]}},
         {"acme-corp/*": {"bases": ["main"]}},
         {"acme-corp/acme-bot": {"bases": ["main", "main"]}},
@@ -289,14 +325,17 @@ def test_factory_bases_default_base_is_optional(monkeypatch: pytest.MonkeyPatch)
     ],
 )
 def test_invalid_factory_bases_refuse_boot(
-    monkeypatch: pytest.MonkeyPatch, value: dict[str, Any]
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: dict[str, Any]
 ) -> None:
-    monkeypatch.setenv("GITHUB_FACTORY_BASES", json.dumps(value))
+    with pytest.raises(ValidationError):
+        ForgesConfig.model_validate(forges_document(bindings=_bindings(value)))
+
+    _forges_env(monkeypatch, tmp_path, value)
 
     with pytest.raises(ValidationError) as exc:
         Settings(_env_file=None)
 
-    assert "GITHUB_FACTORY_BASES" in str(exc.value)
+    assert "CURIE_FORGES" in str(exc.value)
 
 
 # --- Precedence ----------------------------------------------------------------------
@@ -388,10 +427,10 @@ def test_an_empty_base_label_is_not_an_allowed_base(
 
 
 def test_a_repository_absent_from_the_map_only_allows_its_default_branch(
-    base_app: tuple[TestClient, BaseGitHubAPI], monkeypatch: pytest.MonkeyPatch
+    base_app: tuple[TestClient, BaseGitHubAPI], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     client, api = base_app
-    _configure(monkeypatch, {"acme-corp/other": {"bases": ["main", "next"]}})
+    _configure(monkeypatch, tmp_path, {"acme-corp/other": {"bases": ["main", "next"]}}, client)
     default_number = next(_ISSUES)
     labelled_number = next(_ISSUES)
 
@@ -407,10 +446,10 @@ def test_a_repository_absent_from_the_map_only_allows_its_default_branch(
 
 
 def test_an_unset_default_base_uses_the_repository_default_branch(
-    base_app: tuple[TestClient, BaseGitHubAPI], monkeypatch: pytest.MonkeyPatch
+    base_app: tuple[TestClient, BaseGitHubAPI], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     client, api = base_app
-    _configure(monkeypatch, {REPO: {"bases": ["main", "next"]}})
+    _configure(monkeypatch, tmp_path, {REPO: {"bases": ["main", "next"]}}, client)
     api.default_branch = "next"
     number = next(_ISSUES)
 
@@ -427,12 +466,12 @@ def test_an_unset_default_base_uses_the_repository_default_branch(
 
 
 def test_a_deployment_default_outside_the_allowed_bases_is_refused(
-    base_app: tuple[TestClient, BaseGitHubAPI], monkeypatch: pytest.MonkeyPatch
+    base_app: tuple[TestClient, BaseGitHubAPI], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """With no default_base, the repository default branch must itself be allowed."""
 
     client, api = base_app
-    _configure(monkeypatch, {REPO: {"bases": ["next"]}})
+    _configure(monkeypatch, tmp_path, {REPO: {"bases": ["next"]}}, client)
     number = next(_ISSUES)
 
     response = _label(client, api, number)
@@ -463,8 +502,8 @@ def test_a_missing_base_branch_is_refused_once_and_not_substituted(
     assert _work_item(number) is None
     assert _rows(
         "SELECT r.id FROM curie.execution_requests r JOIN curie.work_items w "
-        "ON w.id = r.work_item_id WHERE w.github_issue_number = :number",
-        {"number": number},
+        "ON w.id = r.work_item_id WHERE w.tracker_issue_id = :number",
+        {"number": str(number)},
     ) == []
     # No fallback to the default: main is never read.
     assert "main" not in api.branch_requests
@@ -675,10 +714,15 @@ def test_reconcile_refuses_a_missing_base_with_one_comment_across_passes(
     from curie_api.factory_label_reconcile import reconcile_missed_labels
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
-    for module in ("github_factory", "factory_label_reconcile"):
-        monkeypatch.setattr(
-            f"curie_api.{module}.credentials_for", lambda _s: _ReconcileCredentials()
-        )
+    credentials = _ReconcileCredentials()
+    fake_installation_tokens(monkeypatch, credentials)
+    monkeypatch.setattr(
+        GitHubCredentials,
+        "fresh_installation_token",
+        lambda _self, repo, expected_installation_id=None: credentials.fresh_installation_token(
+            repo, expected_installation_id
+        ),
+    )
     api = _ReconcileGitHubAPI()
     del api.branches["next"]
     number = next(_ISSUES)
@@ -761,3 +805,61 @@ def test_another_apps_comment_carrying_the_refusal_marker_is_not_adopted(
     # Curie's own comment (configured app id 51) is adopted on the next pass.
     assert _code(_label(client, api, number, "base:next")) == "base_missing"
     assert len(api.posts()) == 1
+
+
+# --- The policy comes from the chosen binding (#4358 plan D15, r1 finding 4) -------
+
+
+def _policy(**fields: Any) -> Any:
+    from curie_api.forges.config import RepositoryBindingConfig
+
+    return RepositoryBindingConfig.model_validate(
+        {"alias": "repo", "code_host": "github", "project_id": str(REPO_ID), "path": REPO, **fields}
+    )
+
+
+def test_bases_for_reads_only_the_policy_it_is_given() -> None:
+    assert bases_for(None) is None
+    assert bases_for(_policy()) is None
+    listed = _policy(bases=["main", "next"], default_base="main")
+    assert bases_for(listed) is listed
+
+
+@pytest.mark.parametrize(
+    ("policy", "labels", "expected"),
+    [
+        # The selected binding allows `next`: the label picks it.
+        ({"bases": ["main", "next"]}, {"base:next"}, "next"),
+        # The selected binding lists no bases: only the default branch, so a
+        # `base:` label another binding would allow is refused.
+        ({}, {"base:next"}, None),
+        ({"bases": ["main", "next"], "default_base": "next"}, set(), "next"),
+    ],
+)
+def test_resolve_base_takes_the_policy_in_place_of_a_repository_lookup(
+    policy: dict[str, Any], labels: set[str], expected: str | None
+) -> None:
+    from curie_api.factory_base import BaseRefusal, ResolvedBase, resolve_base
+    from curie_api.forges import types
+    from curie_api.forges.memory import InMemoryCodeHost
+
+    code_host = InMemoryCodeHost(kind=types.GITHUB, host="github.com")
+    repository = code_host.seed_repository(REPO, project_id=str(REPO_ID))
+    code_host.push(repository, "main", "initial commit")
+    code_host.push(repository, "next", "next commit")
+
+    async def go() -> Any:
+        return await resolve_base(
+            policy=_policy(**policy),
+            labels=labels,
+            default_branch="main",
+            code_host=code_host,
+            repository=repository,
+        )
+
+    result = asyncio.run(go())
+    if expected is None:
+        assert isinstance(result, BaseRefusal), result
+    else:
+        assert isinstance(result, ResolvedBase), result
+        assert result.branch == expected

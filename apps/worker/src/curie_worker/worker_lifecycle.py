@@ -19,7 +19,8 @@ def fatal_worker_exit(log: logging.Logger, code: str, primary: str) -> NoReturn:
         """@spec PROTECTED-HOOK-SOURCE-2."""
         try:
             log.error("%s primary=%s", code, primary)
-        except Exception:
+        # a failed diagnostic must never prevent fatal process exit.
+        except Exception:  # noqa: BLE001
             pass
 
     try:
@@ -42,7 +43,8 @@ async def worker_warning(log: logging.Logger, code: str, primary: str) -> None:
         """@spec PROTECTED-HOOK-SOURCE-2."""
         try:
             log.warning("%s primary=%s", code, primary)
-        except Exception:
+        # a failed diagnostic must never prevent remaining resource cleanup.
+        except Exception:  # noqa: BLE001
             pass
 
     diagnostic = asyncio.create_task(asyncio.to_thread(emit))
@@ -51,7 +53,8 @@ async def worker_warning(log: logging.Logger, code: str, primary: str) -> None:
         fatal_worker_exit(log, "worker_diagnostic_deadline", primary)
     try:
         diagnostic.result()
-    except Exception:
+    # diagnostic task faults must not interrupt cleanup.
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -128,7 +131,8 @@ class WorkerResources:
         for stop in self._stops.values():
             try:
                 stop()
-            except Exception:
+            # attempt every owned stop even when one callback fails.
+            except Exception:  # noqa: BLE001
                 failed = True
                 await worker_warning(logger, "worker_stop_unavailable", self._cause())
         failed = await self._join_tasks(deadline) or failed
@@ -140,7 +144,8 @@ class WorkerResources:
                 if pending:
                     self._fatal("worker_resource_close_deadline")
                 task.result()
-            except (Exception, asyncio.CancelledError):
+            # close every owned resource and redact secondary failures.
+            except (Exception, asyncio.CancelledError):  # noqa: BLE001
                 failed = True
                 await worker_warning(logger, "worker_resource_close_unavailable", self._cause())
         if failed:
@@ -162,11 +167,13 @@ class WorkerResources:
             except asyncio.CancelledError as error:
                 if self._primary is None:
                     self._primary = error
-            except Exception:
+            # defer cleanup faults to the sanitized result path.
+            except Exception:  # noqa: BLE001
                 break
         try:
             self._cleanup.result()
-        except (Exception, asyncio.CancelledError):
+        # preserve the primary fault and sanitize secondary cleanup failures.
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001
             if self._primary is None:
                 raise WorkerLifecycleUnavailable("worker_cleanup_unavailable") from None
         if self._primary is not None:

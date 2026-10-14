@@ -28,7 +28,21 @@ from claude_agent_sdk import (
 )
 from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner import session as session_module
+from curie_runner.sender_frame import frame_user_turn
 from curie_runner.session import SessionRunner
+
+
+def _inner(text: str) -> str:
+    marker = "[user-message"
+    if marker not in text:
+        return text
+    start = text.index("\n", text.index(marker)) + 1
+    end = text.index("[end-user-message")
+    return text[start:end].removesuffix("\n")
+
+
+def _sent(text: str, user: str = "U1") -> str:
+    return frame_user_turn("message", user, text, None)
 
 
 def _result(text: str, *, is_error: bool = False, subtype: str = "success") -> ResultMessage:
@@ -78,7 +92,7 @@ class _SharedQueueSession:
 
     async def query(self, text: str) -> None:
         self.queries.append(text)
-        if text == "slow":
+        if _inner(text) == "slow":
             self._mid_tool = True
             self._put(
                 AssistantMessage(
@@ -166,12 +180,12 @@ async def test_turn_after_abandoned_turn_answers_its_own_prompt() -> None:
 
     second = await _final(runner, "second")
     assert second.status is SessionStatus.DONE
-    assert second.text == "answer to second"
+    assert second.text == f"answer to {_sent('second')}"
 
     # The shift must not persist: every later turn answers its own prompt.
     third = await _final(runner, "third")
     assert third.status is SessionStatus.DONE
-    assert third.text == "answer to third"
+    assert third.text == f"answer to {_sent('third')}"
     assert session.queue == []
 
 
@@ -195,7 +209,7 @@ async def test_unfinished_abandoned_turn_fails_next_turn_without_querying(
 
     second = await _final(runner, "second")
     assert second.status is SessionStatus.CLASSIFIED_FAILURE
-    assert session.queries == ["slow"]
+    assert [_inner(query) for query in session.queries] == ["slow"]
     assert not session.closed
     assert calls == [1]
 
@@ -205,8 +219,8 @@ async def test_unfinished_abandoned_turn_fails_next_turn_without_querying(
 
     third = await _final(runner, "third")
     assert third.status is SessionStatus.DONE
-    assert third.text == "answer to third"
-    assert session.queries == ["slow", "third"]
+    assert third.text == f"answer to {_sent('third')}"
+    assert [_inner(query) for query in session.queries] == ["slow", "third"]
 
 
 @pytest.mark.anyio
@@ -238,7 +252,7 @@ async def test_steer_is_refused_while_the_old_turn_drains(
     assert steer_results == [False]
     assert "steered" not in session.queries
     assert second.status is SessionStatus.DONE
-    assert second.text == "answer to second"
+    assert second.text == f"answer to {_sent('second')}"
 
 
 @pytest.mark.anyio
@@ -250,7 +264,7 @@ async def test_completed_turns_do_not_drain_or_recycle() -> None:
     runner = _runner(session, calls)
     await runner.start()
 
-    assert (await _final(runner, "one")).text == "answer to one"
-    assert (await _final(runner, "two")).text == "answer to two"
+    assert (await _final(runner, "one")).text == f"answer to {_sent('one')}"
+    assert (await _final(runner, "two")).text == f"answer to {_sent('two')}"
     assert calls == [1]
     assert session.interrupts == 0

@@ -1005,13 +1005,23 @@ def test_an_unreachable_store_boots_without_a_facts_block(
 STEER_TEXT = "actually, remember this from me"
 
 
+def _user_message(prompt: str) -> str:
+    start_marker = "[user-message"
+    end_marker = "[end-user-message"
+    if start_marker not in prompt or end_marker not in prompt:
+        return prompt
+    start = prompt.index("\n", prompt.index(start_marker)) + 1
+    body = prompt[start : prompt.index(end_marker)]
+    return body[:-1] if body.endswith("\n") else body
+
+
 class _SteerSession(_ScriptedSession):
     """The model calls ``remember`` only once the steered message has arrived."""
 
     steered: anyio.Event
 
     async def query(self, text: str) -> None:
-        if text != STEER_TEXT:
+        if _user_message(text) != STEER_TEXT:
             return
         await super().query(text)
         type(self).steered.set()

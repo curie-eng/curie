@@ -123,6 +123,35 @@ return 1
 """
 )
 
+# @spec PROTECTED-HOOK-SOURCE-6: the protected sibling. It sets the active
+# protected record only when floor and operation equal the committed row and no
+# other active record exists, and it is idempotent for the same record.
+_PUBLISH_PROTECTED = (
+    _VALIDATE_SOURCE
+    + """
+-- @spec PROTECTED-HOOK-SOURCE-6
+local raw = redis.call('GET', KEYS[1])
+if not raw then return 0 end
+local current = decode_source(raw)
+if not current then return -1 end
+if current.floor ~= ARGV[1] or current.operation_id ~= ARGV[2] then return 0 end
+if current.active ~= cjson.null and current.active ~= nil then
+    local active = current.active
+    if active.generation == ARGV[1] and active.operation_id == ARGV[2]
+       and active.mode == 'protected' and active.policy_fingerprint == ARGV[3] then
+        return 1
+    end
+    return 0
+end
+current.active = {
+    generation = ARGV[1], operation_id = ARGV[2], mode = 'protected',
+    policy_fingerprint = ARGV[3]
+}
+redis.call('SET', KEYS[1], cjson.encode(current))
+return 1
+"""
+)
+
 
 class SourceFenceConflict(Exception):
     """Reservation CAS refused, @spec PROTECTED-HOOK-SOURCE-6/7."""
@@ -293,6 +322,36 @@ class SourceFence:
             raise ValueError("policy fingerprint must be lowercase SHA256 hex")
         result: Any = self._client.eval(
             _PUBLISH_ORDINARY, 1, key, revision, operation, policy_fingerprint
+        )
+        if result == -1:
+            raise SourceFenceInvalid("invalid stored source authority")
+        return bool(result == 1)
+
+    def publish_protected(
+        self,
+        agent_id: str,
+        hook: str,
+        generation: int,
+        operation_id: str,
+        policy_fingerprint: str,
+    ) -> bool:
+        """Publish the exact protected reservation, @spec PROTECTED-HOOK-SOURCE-6/7.
+
+        The caller has confirmed current runtime evidence with the control
+        reader first; that check is not atomic with this CAS, which is safe
+        because every delivery repeats the full evaluation atomically.
+        """
+        key = _source_key(agent_id, hook)
+        revision = _generation(generation)
+        if generation == 0:
+            raise ValueError("published generation must be positive")
+        operation = _canonical_uuid(operation_id)
+        if not isinstance(policy_fingerprint, str) or not _FINGERPRINT.fullmatch(
+            policy_fingerprint
+        ):
+            raise ValueError("policy fingerprint must be lowercase SHA256 hex")
+        result: Any = self._client.eval(
+            _PUBLISH_PROTECTED, 1, key, revision, operation, policy_fingerprint
         )
         if result == -1:
             raise SourceFenceInvalid("invalid stored source authority")

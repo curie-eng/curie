@@ -244,6 +244,10 @@ if [ "$1" = "template" ]; then
         exit 0
     fi
 
+    if [ -z "$show_only" ]; then
+        printf '%s\n' 'apiVersion: apps/v1' 'kind: Deployment' 'metadata:' '  name: acme-platform' 'spec:' '  template:' '    spec:' '      containers:' '        - name: platform' '          resources:' '            requests:' '              cpu: 100m' '              memory: 128Mi'
+        exit 0
+    fi
     printf 'unexpected helm template invocation: %s\n' "$*" >&2
     exit 64
 fi
@@ -371,6 +375,12 @@ exit 64
             &bin_dir,
             "kubectl",
             r#"#!/bin/sh
+# Selector-specific node reads belong to this fixture's gVisor cases.
+# The shared helper answers only the unrelated capacity advisory reads.
+case "$1:${2:-}:${3:-}" in
+    get:nodes:-l) ;;
+    *) curie_test_capacity_read "$@" ;;
+esac
 if [ "$1" = "get" ] && [ "$2" = "namespace" ]; then
     if [ "$3" = "target-namespace" ] && [ "$CURIE_TEST_EVENT_MODE" = "fresh-namespace" ] && [ ! -e "$CURIE_TEST_NAMESPACE_READY" ]; then
         # `--ignore-not-found -o json`: absence is exit 0 plus empty stdout.

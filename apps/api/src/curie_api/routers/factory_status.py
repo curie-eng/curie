@@ -19,11 +19,11 @@ import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
+from curie_internal import sandbox_token
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
-from .. import sandbox_token
 from ..config import get_settings
 from ..deps import SessionDep
 from ..factory_card import CardInput, render_card
@@ -45,7 +45,11 @@ from ..models import (
     ThreadPublicationLineage,
     WorkItem,
 )
-from ..workitems import OWNER_LOST_RETRY_LIMIT, owner_lost_streak, owner_lost_successor_admitted
+from ..workitems.lifecycle import (
+    OWNER_LOST_RETRY_LIMIT,
+    owner_lost_streak,
+    owner_lost_successor_admitted,
+)
 
 router = APIRouter(tags=["factory-status"])
 
@@ -194,8 +198,8 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
     )
     body = render_card(
         CardInput(
-            repo=work_item.repo_full_name,
-            issue_number=work_item.github_issue_number,
+            repo=work_item.repository_path,
+            issue_number=int(work_item.tracker_issue_id),
             title=row.subject_title,
             revision_pr=revision_pr,
             status=request.status,

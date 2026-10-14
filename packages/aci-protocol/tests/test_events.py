@@ -57,6 +57,142 @@ def _event_fields() -> dict[str, object]:
     }
 
 
+def _channel_read() -> dict[str, object]:
+    return {
+        "url": "https://api.example.com/channel-read",
+        "token": "channel.read.example.signature-sentinel",
+    }
+
+
+def test_channel_read_status_marker_is_the_canonical_contract_key() -> None:
+    from aci_protocol import CHANNEL_READ_STATUS_FIELD
+
+    assert CHANNEL_READ_STATUS_FIELD == "channel_read"
+
+
+def test_event_channel_read_is_optional_and_null_by_default() -> None:
+    for payload in (_event_fields(), {**_event_fields(), "channel_read": None}):
+        produced = Event.model_validate(payload)
+        consumed = parse_inbound(to_inbound_json(produced))
+        assert produced.channel_read is None
+        assert isinstance(consumed, Event)
+        assert consumed.channel_read is None
+        assert produced.model_dump(mode="json")["channel_read"] is None
+
+
+@pytest.mark.parametrize(
+    "url", ["http://proxy.example.com/channel-read", "https://proxy.example.com/channel-read"]
+)
+def test_event_channel_read_round_trips_as_a_dedicated_capability(url: str) -> None:
+    from aci_protocol import ChannelReadCapability
+
+    capability = {**_channel_read(), "url": url}
+    produced = Event.model_validate({**_event_fields(), "channel_read": capability})
+    consumed = parse_inbound(to_inbound_json(produced))
+    assert isinstance(produced.channel_read, ChannelReadCapability)
+    assert produced.channel_read.url == url
+    assert produced.channel_read.token == capability["token"]
+    assert isinstance(consumed, Event)
+    assert consumed == produced
+    assert consumed.model_dump(mode="json")["channel_read"] == capability
+    assert produced.memory_token is None
+    assert produced.publication_context is None
+    assert produced.tool_access is None
+
+
+@pytest.mark.parametrize("missing", ["url", "token"])
+def test_present_channel_read_requires_url_and_token_together(missing: str) -> None:
+    capability = _channel_read()
+    del capability[missing]
+    payload = {**_event_fields(), "channel_read": capability}
+    with pytest.raises(ValidationError):
+        Event.model_validate(payload)
+    with pytest.raises(ValidationError):
+        parse_inbound(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("url", ""),
+        ("url", None),
+        ("url", 1),
+        ("url", True),
+        ("url", []),
+        ("url", {}),
+        ("url", b"https://api.example.com/channel-read"),
+        ("url", "file:///tmp/channel-read"),
+        ("url", "ftp://proxy.example.com/channel-read"),
+        ("url", "not a URL"),
+        ("token", ""),
+        ("token", None),
+        ("token", 1),
+        ("token", True),
+        ("token", []),
+        ("token", {}),
+        ("token", b"channel.read.example.signature-sentinel"),
+    ],
+)
+def test_channel_read_rejects_empty_wrong_typed_and_unsupported_pair_values(
+    field: str, value: object
+) -> None:
+    payload = {**_event_fields(), "channel_read": {**_channel_read(), field: value}}
+    with pytest.raises(ValidationError):
+        Event.model_validate(payload)
+    with pytest.raises(ValidationError):
+        parse_inbound(payload)
+
+
+@pytest.mark.parametrize("capability", ["example-token", [], 1, True])
+def test_channel_read_requires_a_nested_object(capability: object) -> None:
+    payload = {**_event_fields(), "channel_read": capability}
+    with pytest.raises(ValidationError):
+        Event.model_validate(payload)
+    with pytest.raises(ValidationError):
+        parse_inbound(payload)
+
+
+def test_channel_read_producers_reject_unknown_nested_fields() -> None:
+    from aci_protocol import ChannelReadCapability
+
+    capability = {**_channel_read(), "channels": ["C0EXAMPLE1"]}
+    with pytest.raises(ValidationError):
+        ChannelReadCapability.model_validate(capability)
+    with pytest.raises(ValidationError):
+        Event.model_validate({**_event_fields(), "channel_read": capability})
+
+
+def test_channel_read_readers_ignore_unknown_nested_and_event_fields() -> None:
+    from aci_protocol import ChannelReadCapability
+
+    decoded = parse_inbound(
+        {
+            **_event_fields(),
+            "channel_read": {**_channel_read(), "future_capability_field": 42},
+            "future_event_field": 42,
+        }
+    )
+    assert isinstance(decoded, Event)
+    assert isinstance(decoded.channel_read, ChannelReadCapability)
+    assert decoded.channel_read.model_dump() == _channel_read()
+    assert "future_event_field" not in decoded.model_dump()
+
+
+def test_channel_read_token_is_hidden_in_capability_and_event_representations() -> None:
+    from aci_protocol import ChannelReadCapability
+
+    capability = ChannelReadCapability.model_validate(_channel_read())
+    event = Event.model_validate({**_event_fields(), "channel_read": _channel_read()})
+    token = str(_channel_read()["token"])
+    for value in (capability, event, [capability, event]):
+        assert token not in repr(value)
+        assert "signature-sentinel" not in str(value)
+        assert token not in f"{value!r}"
+    assert "token" not in repr(capability)
+    assert "channel_read" not in repr(event)
+    assert token in event.model_dump_json()
+
+
 class _Event_0_5_1(_AciModel):
     kind: Literal["event"] = "event"
     type: Literal["message", "job", "eval_case"]

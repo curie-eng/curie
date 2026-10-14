@@ -7,7 +7,15 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+
+use crate::api_requests::{
+    ActionUndo, AgentCreate, AgentUpdate, ApprovalPrincipalMint, ApprovalRecover, ApprovalResolve,
+    ChannelBindingWrite, ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint,
+    DeploymentCreate, EvalTriggerRequest, MemoryEntryCreate, MemoryGuidanceIn,
+    RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
+    RemediationQualificationWrite, RemediationVerifierRunStart, ResolveTargetRequest,
+    RoutingCheckRequest, VersionCreate,
+};
 
 pub struct ApiClient {
     base_url: String,
@@ -97,6 +105,12 @@ pub(crate) struct ClusterMessageProgress {
 /// so this is a valid Slack channel-ID shape, not a `#name`.
 pub const DEFAULT_SLACK_CHANNEL: &str = "C0LOCALDEV";
 
+/// What an absent target `env` means: `ResolvedTarget.env` and
+/// `NamedTarget.env` default to `"dev"` in the committed OpenAPI schema.
+fn default_target_env() -> String {
+    "dev".to_string()
+}
+
 /// @spec ADR-0168 d8. What an absent `identity` means on a target the API
 /// resolved: the API predates this decision, and every target it knows is on
 /// the default.
@@ -113,6 +127,8 @@ fn default_identity() -> String {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ResolvedTarget {
     pub agent: Option<String>,
+    /// Optional on the wire; an omitted env is the API's own default.
+    #[serde(default = "default_target_env")]
     pub env: String,
     pub slack_channel: Option<String>,
     /// @spec ADR-0168 d8. The identity the binding speaks through.
@@ -169,6 +185,8 @@ fn yes() -> bool {
 pub struct NamedTarget {
     pub name: String,
     pub agent: Option<String>,
+    /// Optional on the wire; an omitted env is the API's own default.
+    #[serde(default = "default_target_env")]
     pub env: String,
     pub slack_channel: Option<String>,
     /// @spec ADR-0168 d8. The identity the binding speaks through.
@@ -202,7 +220,9 @@ pub struct ConnectorManifests {
     pub mcp_entries: std::collections::BTreeMap<String, serde_json::Value>,
     /// The version whose bundle was read. Required on the wire.
     pub version_id: String,
-    /// plugin.json triggers as stored. Required on the wire, even when empty.
+    /// plugin.json triggers as stored. Optional on the wire, where an omitted
+    /// list means no triggers (the schema's empty default).
+    #[serde(default)]
     pub triggers: Vec<serde_json::Value>,
 }
 
@@ -233,6 +253,11 @@ pub struct ChannelBinding {
     pub adapter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_callers: Option<Vec<String>>,
+    /// The label that starts factory work through a tracker surface (#4361).
+    /// `None` serves the configured tracker label, and is what a platform that
+    /// predates the field reads as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_label: Option<String>,
 }
 
 /// The identity every Slack binding had before ADR-0168: the installation's one
@@ -337,12 +362,12 @@ pub struct Agent {
 /// An operator authored hook configuration file. Absent maps are omitted from
 /// PATCH so changing one map leaves the other untouched. An empty map clears
 /// that map. The API remains the authority for pointer and name validation.
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookConfigInput {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     hook_partitions: Option<std::collections::BTreeMap<String, HookPartitionInput>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     source_bindings: Option<std::collections::BTreeMap<String, SourceBindingInput>>,
 }
 
@@ -350,24 +375,37 @@ impl HookConfigInput {
     pub fn is_empty(&self) -> bool {
         self.hook_partitions.is_none() && self.source_bindings.is_none()
     }
+
+    /// The `PATCH /agents/{id}` body carrying exactly the maps the file names.
+    pub fn into_update(self) -> AgentUpdate {
+        AgentUpdate {
+            hook_partitions: self.hook_partitions,
+            source_bindings: self.source_bindings,
+            ..AgentUpdate::default()
+        }
+    }
 }
 
-#[derive(Deserialize, Serialize)]
+/// One hook's conversation partition pointer, as an operator file writes it
+/// and as `AgentUpdate.hook_partitions` sends it (`HookPartitionConfig`).
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct HookPartitionInput {
+pub struct HookPartitionInput {
     pointer: String,
 }
 
-#[derive(Deserialize, Serialize)]
+/// One hook's allowlisted workload mapping (`SourceBindingConfig`).
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SourceBindingInput {
+pub struct SourceBindingInput {
     workload_pointer: String,
     map: std::collections::BTreeMap<String, SourceBindingEntryInput>,
 }
 
-#[derive(Deserialize, Serialize)]
+/// One allowlisted repository and revision (`SourceBindingEntry`).
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SourceBindingEntryInput {
+pub struct SourceBindingEntryInput {
     repository: String,
     revision: String,
 }
@@ -769,6 +807,17 @@ pub struct MemoryEntry {
     pub provenance: MemoryProvenance,
 }
 
+/// A row from the existing state routes (`StateEntryOut`). The memory command
+/// validates the open value only after selecting a canonical fact key.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StateEntry {
+    pub namespace: String,
+    pub key: String,
+    pub value: serde_json::Value,
+    pub version: u64,
+    pub updated_at: String,
+}
+
 /// An agent's effective memory guidance (`MemoryGuidanceOut`, #1461): the
 /// text the runner shows beside its memory tools, and whether it is the
 /// platform `default` or `operator`-set.
@@ -1107,6 +1156,166 @@ pub struct WorkItemList {
     pub truncated: bool,
 }
 
+// @spec ACTION-EXECUTOR-23
+/// One ledger action as `GET /actions` and `GET /actions/{id}` serialize it
+/// (`ActionOut`), hand-mirrored the way [`WorkItemOutcome`] is. The sealed
+/// `prior_state` and `post_state` envelopes are deliberately NOT mirrored:
+/// serde drops them on decode, so no operator surface can print snapshot
+/// material. `undoable` is the API's derived answer, never recomputed here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionRecord {
+    pub id: String,
+    pub agent_id: Option<String>,
+    pub conversation_id: String,
+    pub call_id: String,
+    pub tool: String,
+    pub arguments: Option<serde_json::Value>,
+    pub result: Option<serde_json::Value>,
+    pub target: Option<serde_json::Value>,
+    pub detail: Option<String>,
+    pub gate_approval_id: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+    pub undone_at: Option<String>,
+    pub undone_by: Option<String>,
+    pub undoable: bool,
+}
+
+// @spec ACTION-EXECUTOR-23 @spec ACTION-EXECUTOR-3
+/// The undo ruling's `202` answer (`ActionUndoOut`): the execution it created
+/// and that execution's state. Only these two fields are mirrored, so any
+/// other field a response carries (a `target`, a `prior_state`) is dropped on
+/// decode and never reaches the terminal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionUndoReceipt {
+    pub execution_id: String,
+    pub state: String,
+}
+
+// @spec ACTION-EXECUTOR-23 @spec ACTION-EXECUTOR-18
+/// One execution as `GET /action-executions/{id}` serializes it
+/// (`ExecutionOut`): what ran and how it ended, never a version, an argument
+/// or a state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionExecution {
+    pub id: String,
+    pub kind: String,
+    pub state: String,
+    pub agent_id: String,
+    pub connector: String,
+    pub tool: Option<String>,
+    pub subject_action_id: Option<String>,
+    pub requested_by: Option<String>,
+    pub attempt: i64,
+    pub refusal_code: Option<String>,
+    pub failure_code: Option<String>,
+    pub dispatched_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub created_at: String,
+}
+
+// @spec AUTOMATED-REMEDIATION-11
+/// One circuit breaker as the close route answers it (`RemediationBreakerOut`):
+/// the action and target it holds open, and, once closed, when, by whom (the
+/// operator principal's subject, never its token) and why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationBreaker {
+    pub id: String,
+    pub agent_id: String,
+    pub connector: String,
+    pub tool: String,
+    pub target: String,
+    pub opened_at: String,
+    pub closed_at: Option<String>,
+    pub closed_by: Option<String>,
+    pub close_reason: Option<String>,
+}
+
+// @spec AUTOMATED-REMEDIATION-3 @spec AUTOMATED-REMEDIATION-20 @spec AUTOMATED-REMEDIATION-22
+/// What a `404` from a remediation route tells the operator to check.
+const POLICY_NOT_FOUND_FIX: &str =
+    "check the agent and hook names; the hook must be a protected hook";
+const NOMINATION_FIX: &str = "check the nomination id with `remediation list`";
+const QUALIFICATION_FIX: &str =
+    "check the agent, qualification id and run id; the agent must exist";
+
+// @spec AUTOMATED-REMEDIATION-20
+/// One nomination as the operator receipt (`RemediationNominationOut`): the
+/// fields `GET /remediation-nominations` and `.../{id}` answer with, never the
+/// arguments or the model's reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationNomination {
+    pub id: String,
+    pub agent_id: String,
+    pub hook: String,
+    pub kind: Option<String>,
+    pub action: Option<String>,
+    pub target: Option<String>,
+    pub state: String,
+    pub stage: String,
+    pub authority: String,
+    pub code: Option<String>,
+    pub verification_outcome: Option<String>,
+    pub approval_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub created_at: String,
+    pub decided_at: Option<String>,
+}
+
+// @spec AUTOMATED-REMEDIATION-22
+/// One qualification record (`RemediationQualificationOut`). The operator
+/// principal that recorded it is its subject, never a token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationQualificationOut {
+    pub id: String,
+    pub agent_id: String,
+    pub hook: Option<String>,
+    pub action: Option<String>,
+    pub generation: Option<String>,
+    pub connector: String,
+    pub tool: String,
+    pub connector_digest: String,
+    pub verifier_sha256: String,
+    pub reversibility: String,
+    pub recorded_by: String,
+    pub worst_case: String,
+    pub evidence: serde_json::Value,
+    pub created_at: String,
+}
+
+// @spec AUTOMATED-REMEDIATION-22
+/// One qualification verifier run (`RemediationVerifierRunOut`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationVerifierRunOut {
+    pub id: String,
+    pub qualification_id: String,
+    pub hook: String,
+    pub action: String,
+    pub target: serde_json::Value,
+    pub generation: String,
+    pub started_by: String,
+    pub started_at: String,
+    pub outcome: Option<String>,
+    pub decided_at: Option<String>,
+}
+
+// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+/// One committed remediation policy generation as the policy routes serialize
+/// it (`RemediationPolicyOut`). The generation is a canonical decimal string;
+/// `bound_by` is the operator principal's subject, never its token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationPolicyGeneration {
+    pub agent_id: String,
+    pub hook: String,
+    pub generation: String,
+    pub armed: bool,
+    pub active: bool,
+    pub bound_by: String,
+    pub policy: serde_json::Value,
+    pub updated_at: String,
+}
+
 /// One factory work item outcome (`WorkItemOutcomeOut`, #2577). `state` and
 /// `actionable_cause` are API-derived strings the CLI renders verbatim.
 /// Unknown API fields are dropped on decode, so the `--json` envelope cannot
@@ -1115,9 +1324,8 @@ pub struct WorkItemList {
 pub struct WorkItemOutcome {
     pub id: String,
     pub agent_id: String,
-    pub repo_full_name: String,
-    pub github_issue_number: u64,
-    pub issue_url: String,
+    pub tracker: WorkItemTracker,
+    pub repository: WorkItemRepository,
     pub cancelled_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -1131,6 +1339,29 @@ pub struct WorkItemOutcome {
     pub correctness: WorkItemCorrectness,
     pub ci: Option<WorkItemCi>,
     pub requests: Vec<WorkItemRequest>,
+}
+
+/// `WorkItemTrackerOut`: the tracker issue that keys the work item (ADR 0197).
+/// `scope_id` and `issue_id` are the tracker's immutable ids as text;
+/// `display_key` (a Jira key) is display only; `url` is the tracker's own link.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemTracker {
+    pub kind: String,
+    pub host: String,
+    pub scope_id: String,
+    pub issue_id: String,
+    pub display_key: Option<String>,
+    pub url: String,
+}
+
+/// `WorkItemRepositoryOut`: the repository frozen on the work item at
+/// admission. `path` is display; `project_id` is the identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemRepository {
+    pub code_host_kind: String,
+    pub host: String,
+    pub project_id: String,
+    pub path: String,
 }
 
 /// `WorkItemPrOut`.
@@ -1152,8 +1383,17 @@ pub struct WorkItemPublication {
 /// `WorkItemCorrectnessOut`: the platform never asserts correctness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItemCorrectness {
+    /// Optional on the wire with the schema's constant default `false`.
+    #[serde(default)]
     pub asserted: bool,
+    /// Optional on the wire with the schema's constant default `"bundle"`.
+    #[serde(default = "default_correctness_owner")]
     pub owner: String,
+}
+
+/// `WorkItemCorrectnessOut.owner`'s schema default and only value.
+fn default_correctness_owner() -> String {
+    "bundle".to_string()
 }
 
 /// `WorkItemCiOut`: live CI for the published head (detail only).
@@ -1756,18 +1996,20 @@ fn agent_create_body(
     slack_channel: &str,
     repo_full_name: Option<&str>,
     identity: Option<&str>,
-) -> serde_json::Value {
-    let mut channel = json!({"kind": "slack", "address": slack_channel});
-    // @spec ADR-0168 d8: only a named identity travels; the default is omitted,
-    // exactly as every create sent it before the identity existed.
-    if let Some(identity) = named_identity("slack", identity) {
-        channel["adapter"] = json!(identity);
+) -> AgentCreate {
+    AgentCreate {
+        channel: ChannelBindingWrite {
+            // @spec ADR-0168 d8: only a named identity travels; the default is
+            // omitted, exactly as every create sent it before the identity existed.
+            adapter: named_identity("slack", identity).map(str::to_string),
+            address: slack_channel.to_string(),
+            endpoint: None,
+            kind: "slack".to_string(),
+            trigger_label: None,
+        },
+        name: name.to_string(),
+        repo_full_name: repo_full_name.map(str::to_string),
     }
-    let mut body = json!({"name": name, "channel": channel});
-    if let Some(repo) = repo_full_name {
-        body["repo_full_name"] = json!(repo);
-    }
-    body
 }
 
 /// `adapter` as a request names it, with the default Slack identity dropped,
@@ -1777,12 +2019,16 @@ fn named_identity<'a>(kind: &str, adapter: Option<&'a str>) -> Option<&'a str> {
     adapter.filter(|adapter| !(kind == "slack" && *adapter == DEFAULT_SLACK_IDENTITY))
 }
 
-/// A binding write the platform refused over the identity it names.
-///
-/// @spec ADR-0168 d8. The refusal's own text is the answer (an undeclared
-/// identity, for instance), so it is carried verbatim rather than restated.
-fn identity_refusal(kind: &str, address: &str, identity: &str, body: &str) -> anyhow::Error {
-    let detail = serde_json::from_str::<serde_json::Value>(body)
+// @spec ACTION-EXECUTOR-23
+/// The undo ruling's `503` reason when the executor is switched off
+/// (`_EXECUTOR_DISABLED_REASON` in `apps/api/src/curie_api/routers/actions.py`).
+const ACTION_EXECUTOR_DISABLED_REASON: &str =
+    "the action executor is not enabled on this installation";
+
+/// The reason a FastAPI error body states: its `detail` string, or the joined
+/// `msg`s of a validation error's `detail` list. `None` for any other body.
+fn api_detail_reason(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|value| match &value["detail"] {
             serde_json::Value::String(text) => Some(text.clone()),
@@ -1795,7 +2041,14 @@ fn identity_refusal(kind: &str, address: &str, identity: &str, body: &str) -> an
             ),
             _ => None,
         })
-        .unwrap_or_else(|| body.trim().to_string());
+}
+
+/// A binding write the platform refused over the identity it names.
+///
+/// @spec ADR-0168 d8. The refusal's own text is the answer (an undeclared
+/// identity, for instance), so it is carried verbatim rather than restated.
+fn identity_refusal(kind: &str, address: &str, identity: &str, body: &str) -> anyhow::Error {
+    let detail = api_detail_reason(body).unwrap_or_else(|| body.trim().to_string());
     crate::exit::CliError::usage(format!(
         "the platform refused the {kind} binding on {address} under identity `{identity}`: {detail}"
     ))
@@ -1816,12 +2069,11 @@ fn identity_refusal(kind: &str, address: &str, identity: &str, body: &str) -> an
 /// and Pydantic decodes a `null` and an absent key to the same `None`, so a
 /// `null` would read as "omitted" while looking on the wire like an intent to
 /// clear (#1071, the same trap documented on [`ApiClient::set_approval_routes`]).
-fn agent_update_body(repo_full_name: Option<&str>) -> serde_json::Value {
-    let mut body = json!({});
-    if let Some(repo) = repo_full_name {
-        body["repo_full_name"] = json!(repo);
+fn agent_update_body(repo_full_name: Option<&str>) -> AgentUpdate {
+    AgentUpdate {
+        repo_full_name: repo_full_name.map(str::to_string),
+        ..AgentUpdate::default()
     }
-    body
 }
 
 /// The `POST /agents/{id}/channels` body: the binding PAIR, plus the identity
@@ -1833,20 +2085,23 @@ fn agent_update_body(repo_full_name: Option<&str>) -> serde_json::Value {
 /// refuses a Slack `endpoint`, and a non-Slack `adapter` with no `endpoint`,
 /// before this function ever sees the arguments, and clap's `--endpoint`
 /// `requires` `--adapter` covers the other direction.
+///
+/// `trigger_label` travels only when named (#4361); `ChannelChange::resolve`
+/// has already refused it on any kind but a tracker surface.
 fn add_channel_body(
     kind: &str,
     address: &str,
     endpoint: Option<&str>,
     adapter: Option<&str>,
-) -> serde_json::Value {
-    let mut body = json!({"kind": kind, "address": address});
-    if let Some(endpoint) = endpoint {
-        body["endpoint"] = json!(endpoint);
+    trigger_label: Option<&str>,
+) -> ChannelBindingWrite {
+    ChannelBindingWrite {
+        adapter: adapter.map(str::to_string),
+        address: address.to_string(),
+        endpoint: endpoint.map(str::to_string),
+        kind: kind.to_string(),
+        trigger_label: trigger_label.map(str::to_string),
     }
-    if let Some(adapter) = adapter {
-        body["adapter"] = json!(adapter);
-    }
-    body
 }
 
 /// The `POST /channels/token` body. Pure so the shape is testable without a
@@ -1858,13 +2113,13 @@ fn mint_channel_token_body(
     address: &str,
     adapter: Option<&str>,
     ttl_s: i64,
-) -> serde_json::Value {
-    let mut body = json!({"kind": kind, "address": address});
-    if let Some(adapter) = adapter {
-        body["adapter"] = json!(adapter);
+) -> ChannelTokenRequest {
+    ChannelTokenRequest {
+        adapter: adapter.map(str::to_string),
+        address: address.to_string(),
+        kind: kind.to_string(),
+        ttl_s: Some(ttl_s),
     }
-    body["ttl_s"] = json!(ttl_s);
-    body
 }
 
 /// Is this 404 a MISSING ENDPOINT rather than a missing resource?
@@ -1936,6 +2191,34 @@ fn hook_agent_path(agent: &str, name: &str, tail: &[&str]) -> String {
         }
     }
     url.path().to_string()
+}
+
+/// Build the existing agent or binding memory state route. Every identity is
+/// pushed as a path segment, including addresses containing literal escapes.
+pub(crate) fn memory_state_url(
+    base_url: &str,
+    agent_id: &str,
+    channel: Option<(&str, &str)>,
+    key: Option<&str>,
+) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base_url)?;
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("api URL cannot hold path segments"))?;
+        path.pop_if_empty()
+            .push("agents")
+            .push(agent_id)
+            .push("state");
+        if let Some((kind, address)) = channel {
+            path.push("bindings").push(kind).push(address);
+        }
+        path.push("memory");
+        if let Some(key) = key {
+            path.push(key);
+        }
+    }
+    Ok(url)
 }
 
 impl ApiClient {
@@ -2319,7 +2602,7 @@ impl ApiClient {
                 self.http
                     .post(format!("{}/agents", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&body),
+                    .json::<AgentCreate>(&body),
                 "POST /agents",
             )
             .await?;
@@ -2348,16 +2631,17 @@ impl ApiClient {
         self.create_agent(name, slack_channel, None, None).await
     }
 
-    /// `PATCH /agents/{id}` with a body the caller already built (see
-    /// [`agent_update_body`]). The returned `Agent` is the row as the API
-    /// stored it, so callers report what took rather than what they intended.
-    pub async fn update_agent(&self, agent_id: &str, body: &serde_json::Value) -> Result<Agent> {
+    /// `PATCH /agents/{id}` with a typed body the caller already built (see
+    /// [`AgentUpdate`]: an omitted key is unchanged, an explicit clear sends
+    /// `null`). The returned `Agent` is the row as the API stored it, so
+    /// callers report what took rather than what they intended.
+    pub async fn update_agent(&self, agent_id: &str, body: &AgentUpdate) -> Result<Agent> {
         let resp = self
             .send_request(
                 self.http
                     .patch(format!("{}/agents/{agent_id}", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(body),
+                    .json::<AgentUpdate>(body),
                 "PATCH /agents/{id}",
             )
             .await?;
@@ -2394,7 +2678,7 @@ impl ApiClient {
     /// agent, when a concurrent deploy won the race to add the same route. This
     /// is ensure-bound, a statement about the END STATE, so the conflict is
     /// rechecked against a fresh read and answered as success only when this
-    /// agent now owns the route.
+    /// agent now owns the route, under the same trigger label.
     pub async fn add_agent_channel(
         &self,
         agent_id: &str,
@@ -2402,13 +2686,20 @@ impl ApiClient {
         address: &str,
         endpoint: Option<&str>,
         adapter: Option<&str>,
+        trigger_label: Option<&str>,
     ) -> Result<Agent> {
         let wanted = named_identity(kind, adapter);
         let resp = self
             .http
             .post(format!("{}/agents/{agent_id}/channels", self.base_url))
             .header("X-API-Key", &self.api_key)
-            .json(&add_channel_body(kind, address, endpoint, adapter))
+            .json::<ChannelBindingWrite>(&add_channel_body(
+                kind,
+                address,
+                endpoint,
+                adapter,
+                trigger_label,
+            ))
             .send()
             .await
             .context("POST /agents/{id}/channels")?;
@@ -2423,11 +2714,12 @@ impl ApiClient {
                 .await
                 .expect_err("a 409 is never a success");
             let agent = self.get_agent(agent_id).await?;
-            if agent
-                .channels
-                .iter()
-                .any(|b| b.kind == kind && b.address == address && b.named_adapter() == wanted)
-            {
+            if agent.channels.iter().any(|b| {
+                b.kind == kind
+                    && b.address == address
+                    && b.named_adapter() == wanted
+                    && b.trigger_label.as_deref() == trigger_label
+            }) {
                 return Ok(agent);
             }
             return Err(conflict);
@@ -2501,7 +2793,9 @@ impl ApiClient {
             ))
             .query(&query)
             .header("X-API-Key", &self.api_key)
-            .json(&serde_json::json!({ "allowed_callers": callers }))
+            .json::<ChannelCallersWrite>(&ChannelCallersWrite {
+                allowed_callers: callers.map(<[String]>::to_vec),
+            })
             .send()
             .await
             .context("PUT /agents/{id}/channels/callers")?;
@@ -2532,7 +2826,7 @@ impl ApiClient {
             .http
             .post(format!("{}/channels/token", self.base_url))
             .header("X-API-Key", &self.api_key)
-            .json(&mint_channel_token_body(kind, address, adapter, ttl_s))
+            .json::<ChannelTokenRequest>(&mint_channel_token_body(kind, address, adapter, ttl_s))
             .send()
             .await
             .context("POST /channels/token")?;
@@ -2562,7 +2856,10 @@ impl ApiClient {
                 self.http
                     .patch(format!("{}/agents/{agent_id}", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({ "secrets": secrets })),
+                    .json::<AgentUpdate>(&AgentUpdate {
+                        secrets: Some(secrets.clone()),
+                        ..AgentUpdate::default()
+                    }),
                 "PATCH /agents/{id}",
             )
             .await?;
@@ -2658,7 +2955,7 @@ impl ApiClient {
                 // with no channel does not.
                 let agent = match channel_add {
                     Some(address) => {
-                        self.add_agent_channel(&agent.id, "slack", address, None, identity)
+                        self.add_agent_channel(&agent.id, "slack", address, None, identity, None)
                             .await?
                     }
                     None => agent,
@@ -2726,11 +3023,11 @@ impl ApiClient {
                 self.http
                     .post(format!("{}/agents/{agent_id}/versions", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({
-                        "version_label": version_label,
-                        "created_by": created_by,
-                        "commit_sha": commit_sha,
-                    })),
+                    .json::<VersionCreate>(&VersionCreate {
+                        commit_sha: commit_sha.map(str::to_string),
+                        created_by: created_by.to_string(),
+                        version_label: version_label.to_string(),
+                    }),
                 "POST /agents/{id}/versions",
             )
             .await?;
@@ -2779,21 +3076,19 @@ impl ApiClient {
         commit_sha: Option<&str>,
         workspace_enabled: Option<bool>,
     ) -> Result<Deployment> {
-        let mut body = json!({
-            "agent_id": agent_id,
-            "version_id": version_id,
-            "environment": environment,
-            "commit_sha": commit_sha,
-        });
-        if let Some(enabled) = workspace_enabled {
-            body["workspace_enabled"] = json!(enabled);
-        }
+        let body = DeploymentCreate {
+            agent_id: agent_id.to_string(),
+            commit_sha: commit_sha.map(str::to_string),
+            environment: environment.to_string(),
+            version_id: version_id.to_string(),
+            workspace_enabled,
+        };
         let resp = self
             .send_request(
                 self.http
                     .post(format!("{}/deployments", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&body),
+                    .json::<DeploymentCreate>(&body),
                 "POST /deployments",
             )
             .await?;
@@ -3077,7 +3372,7 @@ impl ApiClient {
                 self.http
                     .put(format!("{}/agents/{agent_id}/budget", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(budget),
+                    .json::<BudgetConfig>(budget),
                 "PUT /agents/{id}/budget",
             )
             .await?;
@@ -3112,7 +3407,10 @@ impl ApiClient {
                 self.http
                     .post(format!("{}/deploy-targets/resolve", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&serde_json::json!({"content": content, "target": target})),
+                    .json::<ResolveTargetRequest>(&ResolveTargetRequest {
+                        content: content.to_string(),
+                        target: target.to_string(),
+                    }),
                 "resolving the deploy target",
             )
             .await?;
@@ -3165,7 +3463,10 @@ impl ApiClient {
                 self.http
                     .post(format!("{}/deploy-targets/list", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&serde_json::json!({"content": content, "target": ""})),
+                    .json::<ResolveTargetRequest>(&ResolveTargetRequest {
+                        content: content.to_string(),
+                        target: String::new(),
+                    }),
                 "listing the deploy targets",
             )
             .await?;
@@ -3227,10 +3528,10 @@ impl ApiClient {
                 self.http
                     .post(format!("{}/git-flow/routing-check", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&serde_json::json!({
-                        "repo_full_name": repo_full_name,
-                        "content": content,
-                    }))
+                    .json::<RoutingCheckRequest>(&RoutingCheckRequest {
+                        content: content.map(str::to_string),
+                        repo_full_name: repo_full_name.to_string(),
+                    })
                     .timeout(std::time::Duration::from_secs(10)),
                 "checking git-flow routing",
             )
@@ -3384,6 +3685,70 @@ impl ApiClient {
             .context("decoding hook run")
     }
 
+    /// Read canonical fact candidates from agent or channel memory state.
+    pub async fn list_memory_facts(
+        &self,
+        agent_id: &str,
+        channel: Option<(&str, &str)>,
+    ) -> Result<Vec<StateEntry>> {
+        let url = memory_state_url(&self.base_url, agent_id, channel, None)?;
+        let response = self
+            .send_request(
+                self.http.get(url).header("X-API-Key", &self.api_key),
+                "GET memory state namespace",
+            )
+            .await?;
+        Self::expect_ok(response, "listing memory facts")
+            .await?
+            .json()
+            .await
+            .context("decoding memory fact state rows")
+    }
+
+    /// Read the current selected row before a versioned fact deletion.
+    pub async fn get_memory_fact(
+        &self,
+        agent_id: &str,
+        channel: Option<(&str, &str)>,
+        id: &str,
+    ) -> Result<StateEntry> {
+        let url = memory_state_url(&self.base_url, agent_id, channel, Some(id))?;
+        let response = self
+            .send_request(
+                self.http.get(url).header("X-API-Key", &self.api_key),
+                "GET memory state fact",
+            )
+            .await?;
+        Self::expect_ok(response, "reading memory fact")
+            .await?
+            .json()
+            .await
+            .context("decoding memory fact state row")
+    }
+
+    /// Delete exactly the selected row version. A conflict is returned without
+    /// retrying or falling back to an unversioned deletion.
+    pub async fn delete_memory_fact(
+        &self,
+        agent_id: &str,
+        channel: Option<(&str, &str)>,
+        id: &str,
+        version: u64,
+    ) -> Result<()> {
+        let url = memory_state_url(&self.base_url, agent_id, channel, Some(id))?;
+        let response = self
+            .send_request(
+                self.http
+                    .delete(url)
+                    .query(&[("expected_version", version)])
+                    .header("X-API-Key", &self.api_key),
+                "DELETE memory state fact",
+            )
+            .await?;
+        Self::expect_ok(response, "deleting memory fact").await?;
+        Ok(())
+    }
+
     /// List an agent's learned memory, oldest first: `GET /agents/{id}/memory`.
     pub async fn list_memory(&self, agent_id: &str) -> Result<Vec<MemoryEntry>> {
         let resp = self
@@ -3408,7 +3773,9 @@ impl ApiClient {
                 self.http
                     .post(format!("{}/agents/{agent_id}/memory", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({ "content": content })),
+                    .json::<MemoryEntryCreate>(&MemoryEntryCreate {
+                        content: content.to_string(),
+                    }),
                 "POST /agents/{id}/memory",
             )
             .await?;
@@ -3450,7 +3817,9 @@ impl ApiClient {
                         self.base_url
                     ))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({ "text": text })),
+                    .json::<MemoryGuidanceIn>(&MemoryGuidanceIn {
+                        text: text.to_string(),
+                    }),
                 "PUT /agents/{id}/memory/guidance",
             )
             .await?;
@@ -3574,6 +3943,595 @@ impl ApiClient {
         Err(anyhow::Error::from(error))
     }
 
+    /// The server's max page for `GET /actions` (`limit` is clamped to 200 by
+    /// the route), requested explicitly so a full page reads as truncated.
+    pub const ACTIONS_LIST_LIMIT: usize = 200;
+
+    // @spec ACTION-EXECUTOR-23
+    /// Ledger actions: `GET /actions[?agent_id=..][&conversation_id=..]&limit=..`,
+    /// on the platform key.
+    /// The API answers oldest first, so a full page is the oldest actions.
+    pub async fn list_actions(
+        &self,
+        agent_id: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<Vec<ActionRecord>> {
+        let limit = Self::ACTIONS_LIST_LIMIT.to_string();
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(agent_id) = agent_id {
+            query.push(("agent_id", agent_id));
+        }
+        if let Some(conversation_id) = conversation_id {
+            query.push(("conversation_id", conversation_id));
+        }
+        query.push(("limit", limit.as_str()));
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/actions", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .query(&query),
+                "GET /actions",
+            )
+            .await?;
+        Self::expect_actions_ok(resp, "listing actions")
+            .await?
+            .json()
+            .await
+            .context("decoding actions")
+    }
+
+    // @spec ACTION-EXECUTOR-23
+    /// One ledger action: `GET /actions/{id}`, on the platform key.
+    pub async fn get_action(&self, action_id: &str) -> Result<ActionRecord> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/actions/{action_id}", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "GET /actions/{id}",
+            )
+            .await?;
+        Self::expect_actions_ok(resp, "reading the action")
+            .await?
+            .json()
+            .await
+            .context("decoding the action")
+    }
+
+    // @spec ACTION-EXECUTOR-23 @spec ACTION-EXECUTOR-3
+    /// Ask for an undo: `POST /actions/{id}/undo`. The ruling is authenticated
+    /// by the ADR-0106 principal alone (the route is deliberately not on the
+    /// platform key), and the body is `{}`: the actor is the principal, never
+    /// a claim in the body, and the platform observes the live state itself.
+    pub async fn undo_action(
+        &self,
+        action_id: &str,
+        principal_token: &str,
+    ) -> Result<ActionUndoReceipt> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!("{}/actions/{action_id}/undo", self.base_url))
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .json::<ActionUndo>(&ActionUndo {}),
+                "POST /actions/{id}/undo",
+            )
+            .await?;
+        Self::expect_actions_ok(resp, "undo refused")
+            .await?
+            .json()
+            .await
+            .context("decoding the undo ruling")
+    }
+
+    // @spec ACTION-EXECUTOR-23 @spec ACTION-EXECUTOR-18
+    /// The receipt: `GET /action-executions/{id}`, on the platform key.
+    pub async fn get_action_execution(&self, execution_id: &str) -> Result<ActionExecution> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/action-executions/{execution_id}",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /action-executions/{id}",
+            )
+            .await?;
+        Self::expect_actions_ok(resp, "reading the execution")
+            .await?
+            .json()
+            .await
+            .context("decoding the execution")
+    }
+
+    // @spec ACTION-EXECUTOR-23
+    /// ADR-0021 status classes for the action routes. A refusal's `detail` is
+    /// the API's stated reason and is carried verbatim, because the reason
+    /// (a restore in flight, an unauthorized principal, a missing record) is
+    /// the whole answer to the operator: 401/403/404/409 are failures (exit
+    /// 1), 400/422 usage (exit 2), 5xx transient (exit 3). An unrouted 404
+    /// still reads as a platform older than this CLI.
+    async fn expect_actions_ok(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+        use crate::exit::CliError;
+        use reqwest::StatusCode;
+        let status = resp.status();
+        if status.is_success() || status.is_redirection() {
+            return Self::expect_ok(resp, what).await;
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if is_unrouted(status, &body) {
+            bail!(
+                "{what} failed: this platform release does not have that endpoint, so it is \
+                 older than this CLI. Upgrade the release, or use a CLI matching it."
+            );
+        }
+        let reason = api_detail_reason(&body).unwrap_or_else(|| status.to_string());
+        let message = format!("{what}: {reason}");
+        let error = match status {
+            StatusCode::NOT_FOUND => CliError::failure(message)
+                .with_fix("check the id with `actions list`; an undo's execution id is printed by `actions undo`"),
+            StatusCode::UNAUTHORIZED => CliError::failure(message).with_fix(
+                "verify --api-key or CURIE_API_KEY, and for undo CURIE_APPROVAL_PRINCIPAL_TOKEN, \
+                 match the selected platform API",
+            ),
+            StatusCode::FORBIDDEN | StatusCode::CONFLICT => CliError::failure(message),
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                CliError::usage(message).with_fix("pass the action or execution id as a UUID")
+            }
+            // A disabled executor is a configuration refusal, not an outage:
+            // retrying cannot change the answer, only the operator can.
+            StatusCode::SERVICE_UNAVAILABLE if reason == ACTION_EXECUTOR_DISABLED_REASON => {
+                CliError::failure(message).with_fix(
+                    "enable the action executor: set the chart value actionExecutor.enabled=true \
+                     on the release (cluster), or CURIE_ACTION_EXECUTOR_ENABLED=true for the API \
+                     and worker (local), then ask for the undo again",
+                )
+            }
+            s if s.is_server_error() => CliError::transient(message),
+            _ => CliError::failure(message),
+        };
+        Err(anyhow::Error::from(error))
+    }
+
+    // @spec AUTOMATED-REMEDIATION-3
+    /// The current policy generation of a hook:
+    /// `GET /agents/{agent_id}/hooks/{hook}/remediation-policy`, on the
+    /// platform key. Reads need no principal.
+    pub async fn get_remediation_policy(
+        &self,
+        agent_id: &str,
+        hook: &str,
+    ) -> Result<RemediationPolicyGeneration> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/hooks/{hook}/remediation-policy",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/hooks/{hook}/remediation-policy",
+            )
+            .await?;
+        Self::expect_remediation_policy_ok(resp, "reading the remediation policy")
+            .await?
+            .json()
+            .await
+            .context("decoding the remediation policy")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+    /// Bind or replace a hook's policy: `PUT .../remediation-policy` with the
+    /// CAS pair and the document, on the platform key and the operator
+    /// principal.
+    pub async fn put_remediation_policy(
+        &self,
+        agent_id: &str,
+        hook: &str,
+        body: &RemediationPolicyWrite,
+        principal_token: &str,
+    ) -> Result<RemediationPolicyGeneration> {
+        let resp = self
+            .send_request(
+                self.http
+                    .put(format!(
+                        "{}/agents/{agent_id}/hooks/{hook}/remediation-policy",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .json::<RemediationPolicyWrite>(body),
+                "PUT /agents/{id}/hooks/{hook}/remediation-policy",
+            )
+            .await?;
+        Self::expect_remediation_policy_ok(resp, "the remediation policy write was refused")
+            .await?
+            .json()
+            .await
+            .context("decoding the remediation policy")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+    /// Arm the current policy: `POST .../remediation-policy/arm`.
+    pub async fn arm_remediation_policy(
+        &self,
+        agent_id: &str,
+        hook: &str,
+        body: &RemediationPolicyMutation,
+        principal_token: &str,
+    ) -> Result<RemediationPolicyGeneration> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/hooks/{hook}/remediation-policy/arm",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .json::<RemediationPolicyMutation>(body),
+                "POST /agents/{id}/hooks/{hook}/remediation-policy/arm",
+            )
+            .await?;
+        Self::expect_remediation_policy_ok(resp, "arming the remediation policy was refused")
+            .await?
+            .json()
+            .await
+            .context("decoding the remediation policy")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+    /// Disarm the current policy: `POST .../remediation-policy/disarm`.
+    pub async fn disarm_remediation_policy(
+        &self,
+        agent_id: &str,
+        hook: &str,
+        body: &RemediationPolicyMutation,
+        principal_token: &str,
+    ) -> Result<RemediationPolicyGeneration> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .json::<RemediationPolicyMutation>(body),
+                "POST /agents/{id}/hooks/{hook}/remediation-policy/disarm",
+            )
+            .await?;
+        Self::expect_remediation_policy_ok(resp, "disarming the remediation policy was refused")
+            .await?
+            .json()
+            .await
+            .context("decoding the remediation policy")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+    /// Remove the policy: `DELETE .../remediation-policy` with the CAS pair in
+    /// the query, as the route reads it. The answer is the new, inactive
+    /// generation.
+    pub async fn remove_remediation_policy(
+        &self,
+        agent_id: &str,
+        hook: &str,
+        cas: &RemediationPolicyMutation,
+        principal_token: &str,
+    ) -> Result<RemediationPolicyGeneration> {
+        let resp = self
+            .send_request(
+                self.http
+                    .delete(format!(
+                        "{}/agents/{agent_id}/hooks/{hook}/remediation-policy",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .query(&[
+                        ("expected_generation", cas.expected_generation.as_str()),
+                        ("operation_id", cas.operation_id.as_str()),
+                    ]),
+                "DELETE /agents/{id}/hooks/{hook}/remediation-policy",
+            )
+            .await?;
+        Self::expect_remediation_policy_ok(resp, "removing the remediation policy was refused")
+            .await?
+            .json()
+            .await
+            .context("decoding the remediation policy")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-11
+    /// Close an open circuit breaker:
+    /// `POST .../remediation-policy/breakers/{breaker_id}/close` with the
+    /// operator's reason, on the platform key and the operator principal.
+    pub async fn close_remediation_breaker(
+        &self,
+        agent_id: &str,
+        hook: &str,
+        breaker_id: &str,
+        body: &RemediationBreakerClose,
+        principal_token: &str,
+    ) -> Result<RemediationBreaker> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .json::<RemediationBreakerClose>(body),
+                "POST /agents/{id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
+            )
+            .await?;
+        Self::expect_remediation_policy_ok(resp, "closing the circuit breaker was refused")
+            .await?
+            .json()
+            .await
+            .context("decoding the circuit breaker")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-11
+    /// A hook's breakers, newest opened first:
+    /// `GET .../remediation-policy/breakers[?state=..]`, on the platform key.
+    /// Reads need no principal.
+    pub async fn list_remediation_breakers(
+        &self,
+        agent_id: &str,
+        hook: &str,
+        state: Option<&str>,
+    ) -> Result<Vec<RemediationBreaker>> {
+        let mut request = self
+            .http
+            .get(format!(
+                "{}/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers",
+                self.base_url
+            ))
+            .header("X-API-Key", &self.api_key);
+        if let Some(state) = state {
+            request = request.query(&[("state", state)]);
+        }
+        let resp = self
+            .send_request(
+                request,
+                "GET /agents/{id}/hooks/{hook}/remediation-policy/breakers",
+            )
+            .await?;
+        Self::expect_remediation_policy_ok(resp, "listing the circuit breakers")
+            .await?
+            .json()
+            .await
+            .context("decoding the circuit breakers")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-20
+    /// Nominations, newest first: `GET /remediation-nominations`, on the
+    /// platform key, with the optional agent, state and limit filters.
+    pub async fn list_remediation_nominations(
+        &self,
+        agent_id: Option<&str>,
+        state: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<RemediationNomination>> {
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(agent_id) = agent_id {
+            query.push(("agent_id", agent_id.to_string()));
+        }
+        if let Some(state) = state {
+            query.push(("state", state.to_string()));
+        }
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/remediation-nominations", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .query(&query),
+                "GET /remediation-nominations",
+            )
+            .await?;
+        Self::expect_remediation_ok(resp, "listing remediation nominations", NOMINATION_FIX)
+            .await?
+            .json()
+            .await
+            .context("decoding the remediation nominations")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-20
+    /// One nomination's receipt: `GET /remediation-nominations/{id}`.
+    pub async fn get_remediation_nomination(&self, id: &str) -> Result<RemediationNomination> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/remediation-nominations/{id}", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "GET /remediation-nominations/{id}",
+            )
+            .await?;
+        Self::expect_remediation_ok(resp, "reading the remediation nomination", NOMINATION_FIX)
+            .await?
+            .json()
+            .await
+            .context("decoding the remediation nomination")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-22
+    /// Record a qualification: `PUT /agents/{agent_id}/remediation-qualifications/{id}`
+    /// on the platform key and the operator principal.
+    pub async fn put_remediation_qualification(
+        &self,
+        agent_id: &str,
+        qualification_id: &str,
+        body: &RemediationQualificationWrite,
+        principal_token: &str,
+    ) -> Result<RemediationQualificationOut> {
+        let resp = self
+            .send_request(
+                self.http
+                    .put(format!(
+                        "{}/agents/{agent_id}/remediation-qualifications/{qualification_id}",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .json::<RemediationQualificationWrite>(body),
+                "PUT /agents/{id}/remediation-qualifications/{qualification_id}",
+            )
+            .await?;
+        Self::expect_remediation_ok(resp, "recording the qualification", QUALIFICATION_FIX)
+            .await?
+            .json()
+            .await
+            .context("decoding the qualification record")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-22
+    /// Start a verifier run: `POST .../remediation-qualifications/{id}/verifier-runs`
+    /// on the platform key and the operator principal.
+    pub async fn start_remediation_verifier_run(
+        &self,
+        agent_id: &str,
+        qualification_id: &str,
+        body: &RemediationVerifierRunStart,
+        principal_token: &str,
+    ) -> Result<RemediationVerifierRunOut> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .json::<RemediationVerifierRunStart>(body),
+                "POST /agents/{id}/remediation-qualifications/{qualification_id}/verifier-runs",
+            )
+            .await?;
+        Self::expect_remediation_ok(resp, "starting the verifier run", QUALIFICATION_FIX)
+            .await?
+            .json()
+            .await
+            .context("decoding the verifier run")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-22
+    /// Read a verifier run: `GET .../verifier-runs/{run_id}`; no principal.
+    pub async fn get_remediation_verifier_run(
+        &self,
+        agent_id: &str,
+        qualification_id: &str,
+        run_id: &str,
+    ) -> Result<RemediationVerifierRunOut> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}",
+            )
+            .await?;
+        Self::expect_remediation_ok(resp, "reading the verifier run", QUALIFICATION_FIX)
+            .await?
+            .json()
+            .await
+            .context("decoding the verifier run")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-3
+    /// ADR-0021 status classes for the remediation policy routes, whose every
+    /// refusal is `{"detail": {"code", "path"?, "message"?}}`. The code (and
+    /// path) is carried into the error so a script can match it: 401/403/404/409
+    /// are failures (exit 1), 400/422 usage (exit 2), 5xx transient (exit 3).
+    async fn expect_remediation_policy_ok(
+        resp: reqwest::Response,
+        what: &str,
+    ) -> Result<reqwest::Response> {
+        Self::expect_remediation_ok(resp, what, POLICY_NOT_FOUND_FIX).await
+    }
+
+    // @spec AUTOMATED-REMEDIATION-3 @spec AUTOMATED-REMEDIATION-20 @spec AUTOMATED-REMEDIATION-22
+    /// The same classes for any remediation route; `not_found_fix` is what a
+    /// `404` without a policy code tells the operator to check.
+    async fn expect_remediation_ok(
+        resp: reqwest::Response,
+        what: &str,
+        not_found_fix: &str,
+    ) -> Result<reqwest::Response> {
+        use crate::exit::CliError;
+        use reqwest::StatusCode;
+        let status = resp.status();
+        if status.is_success() || status.is_redirection() {
+            return Self::expect_ok(resp, what).await;
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if is_unrouted(status, &body) {
+            bail!(
+                "{what}: this platform release does not have the remediation policy routes, so \
+                 it is older than this CLI. Upgrade the release, or use a CLI matching it."
+            );
+        }
+        let detail = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .map(|value| value["detail"].clone());
+        let code = detail
+            .as_ref()
+            .and_then(|detail| detail["code"].as_str())
+            .map(str::to_string);
+        let reason = match (&code, &detail) {
+            (Some(code), Some(detail)) => {
+                let mut reason = code.clone();
+                if let Some(path) = detail["path"].as_str() {
+                    reason.push_str(&format!(" at {path}"));
+                }
+                if let Some(message) = detail["message"].as_str() {
+                    reason.push_str(&format!(": {message}"));
+                }
+                reason
+            }
+            _ => api_detail_reason(&body).unwrap_or_else(|| status.to_string()),
+        };
+        let message = format!("{what}: {reason}");
+        let error = match (status, code.as_deref()) {
+            (StatusCode::CONFLICT, Some("stale_policy_generation")) => CliError::failure(message)
+                .with_fix(
+                    "read the current generation with `remediation-policy show <AGENT> <HOOK>` \
+                     and retry with it as --expected-generation",
+                ),
+            (StatusCode::NOT_FOUND, Some("remediation_policy_absent")) => {
+                CliError::failure(message).with_fix(
+                    "bind a policy with `remediation-policy apply <AGENT> <HOOK> --file <PATH> \
+                     --expected-generation 0`",
+                )
+            }
+            (StatusCode::NOT_FOUND, _) => CliError::failure(message).with_fix(not_found_fix),
+            (StatusCode::FORBIDDEN, _) => CliError::failure(message).with_fix(
+                "export an operator principal as CURIE_APPROVAL_PRINCIPAL_TOKEN (mint one with \
+                 `curie <local|cluster> approvals <AGENT> --mint-operator-principal <SUBJECT>`)",
+            ),
+            (StatusCode::UNAUTHORIZED, _) => CliError::failure(message)
+                .with_fix("verify --api-key or CURIE_API_KEY matches the selected platform API"),
+            (StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY, _) => {
+                CliError::usage(message)
+                    .with_fix("correct the policy document or arguments the refusal names")
+            }
+            (s, _) if s.is_server_error() => CliError::transient(message),
+            _ => CliError::failure(message),
+        };
+        Err(anyhow::Error::from(error))
+    }
+
     /// The pending approval records for an agent: `GET /approvals?status_filter=
     /// pending&agent_id=<id>&limit=<APPROVALS_LIST_LIMIT>`. Hand-mirrors the
     /// committed `ApprovalOut` shape (only the fields the CLI renders; serde
@@ -3648,17 +4606,17 @@ impl ApiClient {
         principal_token: &str,
         note: Option<&str>,
     ) -> Result<ApprovalRecord> {
-        let mut body = json!({ "decision": decision });
-        if let Some(note) = note {
-            body["note"] = json!(note);
-        }
+        let body = ApprovalResolve {
+            decision: decision.to_string(),
+            note: note.map(str::to_string),
+        };
         let resp = self
             .send_request(
                 self.http
                     .post(format!("{}/approvals/{approval_id}/resolve", self.base_url))
                     .header("X-API-Key", &self.api_key)
                     .header("X-Curie-Approval-Principal", principal_token)
-                    .json(&body),
+                    .json::<ApprovalResolve>(&body),
                 "POST /approvals/{id}/resolve",
             )
             .await?;
@@ -3715,11 +4673,11 @@ impl ApiClient {
                     .post(format!("{}/approvals/{approval_id}/recover", self.base_url))
                     .header("X-API-Key", &self.api_key)
                     .header("X-Curie-Approval-Principal", principal_token)
-                    .json(&json!({
-                        "disposition": "rejected",
-                        "reason": reason,
-                        "recovery_key": recovery_key,
-                    })),
+                    .json::<ApprovalRecover>(&ApprovalRecover {
+                        disposition: "rejected".to_string(),
+                        reason: reason.to_string(),
+                        recovery_key: recovery_key.to_string(),
+                    }),
                 "POST /approvals/{id}/recover",
             )
             .await?;
@@ -3741,7 +4699,9 @@ impl ApiClient {
                 self.http
                     .post(format!("{}/approvals/principals/operator", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({ "subject": subject })),
+                    .json::<ApprovalPrincipalMint>(&ApprovalPrincipalMint {
+                        subject: subject.to_string(),
+                    }),
                 "POST /approvals/principals/operator",
             )
             .await?;
@@ -3769,7 +4729,9 @@ impl ApiClient {
                 self.http
                     .post(format!("{}/console/login-codes", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({ "subject": subject })),
+                    .json::<ConsoleLoginCodeMint>(&ConsoleLoginCodeMint {
+                        subject: subject.to_string(),
+                    }),
                 "POST /console/login-codes",
             )
             .await?;
@@ -3798,7 +4760,10 @@ impl ApiClient {
                 self.http
                     .patch(format!("{}/agents/{agent_id}", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({ "approval_required_tools": tools })),
+                    .json::<AgentUpdate>(&AgentUpdate {
+                        approval_required_tools: Some(tools.to_vec()),
+                        ..AgentUpdate::default()
+                    }),
                 "PATCH /agents/{id} (approval gates)",
             )
             .await?;
@@ -3829,7 +4794,10 @@ impl ApiClient {
                 self.http
                     .patch(format!("{}/agents/{agent_id}", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&json!({ "approval_routes": routes })),
+                    .json::<AgentUpdate>(&AgentUpdate {
+                        approval_routes: Some(routes.clone()),
+                        ..AgentUpdate::default()
+                    }),
                 "PATCH /agents/{id} (approval routes)",
             )
             .await?;
@@ -3850,19 +4818,17 @@ impl ApiClient {
         suite: Option<&str>,
         model: Option<&str>,
     ) -> Result<EvalTriggerResult> {
-        let mut body = json!({ "agent_id": agent_id });
-        if let Some(suite) = suite {
-            body["suite"] = json!(suite);
-        }
-        if let Some(model) = model {
-            body["model"] = json!(model);
-        }
+        let body = EvalTriggerRequest {
+            agent_id: agent_id.to_string(),
+            model: model.map(str::to_string),
+            suite: suite.map(str::to_string),
+        };
         let resp = self
             .send_request(
                 self.http
                     .post(format!("{}/evals/trigger", self.base_url))
                     .header("X-API-Key", &self.api_key)
-                    .json(&body),
+                    .json::<EvalTriggerRequest>(&body),
                 "POST /evals/trigger",
             )
             .await?;
@@ -3987,6 +4953,11 @@ mod tests {
         validate_allowlist_entry, ChannelBinding, ListedTargets, ResolvedTarget,
         DEFAULT_SLACK_IDENTITY,
     };
+
+    /// A typed request body as it goes on the wire.
+    fn wire<T: serde::Serialize>(body: &T) -> serde_json::Value {
+        serde_json::to_value(body).expect("request bodies serialize")
+    }
 
     /// The pre-dispatch span guard allows exactly the cap (#1948): 1,000 hour
     /// buckets from 1970-01-01T00:00:00Z is legal, one more is not.
@@ -4141,7 +5112,7 @@ mod tests {
         // A value the caller did not pass is not a binding the caller intended.
         // The column is no longer unique (ADR-0091, migration 0018), so an
         // unsolicited value would silently bind rather than 409.
-        let body = agent_create_body("bot", "C123", None, None);
+        let body = wire(&agent_create_body("bot", "C123", None, None));
         assert_eq!(body["name"], "bot");
         assert_eq!(body["channel"]["kind"], "slack");
         assert_eq!(body["channel"]["address"], "C123");
@@ -4152,7 +5123,7 @@ mod tests {
     fn create_agent_body_binds_the_repo_when_asked() {
         // Creation is the first chance to bind, and the only one that needs no
         // second request: AgentUpdate carries repo_full_name too (#1194).
-        let body = agent_create_body("bot", "C123", Some("acme/bundle"), None);
+        let body = wire(&agent_create_body("bot", "C123", Some("acme/bundle"), None));
         assert_eq!(body["repo_full_name"], "acme/bundle");
     }
 
@@ -4160,7 +5131,7 @@ mod tests {
     fn agent_update_body_omits_both_when_neither_is_asked() {
         // Omission is how the wire says "leave this alone", so a PATCH with
         // nothing to change carries nothing at all.
-        let body = agent_update_body(None);
+        let body = wire(&agent_update_body(None));
         assert!(
             body.as_object().expect("an object").is_empty(),
             "was {body}"
@@ -4173,7 +5144,7 @@ mod tests {
         // guards both fields behind `is not None`, and Pydantic decodes a null
         // and an omitted key identically, so a null would read as "omitted"
         // while looking on the wire like an intent to clear (#1071).
-        let repo = agent_update_body(Some("acme/bundle"));
+        let repo = wire(&agent_update_body(Some("acme/bundle")));
         assert_eq!(repo["repo_full_name"], "acme/bundle");
     }
 
@@ -4184,8 +5155,8 @@ mod tests {
         // not merely send something unnecessary, it 422s the whole PATCH --
         // taking the repo bind travelling beside it down with it.
         for body in [
-            agent_update_body(None),
-            agent_update_body(Some("acme/bundle")),
+            wire(&agent_update_body(None)),
+            wire(&agent_update_body(Some("acme/bundle"))),
         ] {
             assert!(
                 body.get("channel").is_none() && body.get("channels").is_none(),
@@ -4193,7 +5164,7 @@ mod tests {
             );
         }
         assert_eq!(
-            agent_update_body(Some("acme/bundle")),
+            wire(&agent_update_body(Some("acme/bundle"))),
             serde_json::json!({"repo_full_name": "acme/bundle"}),
             "the repo bind is the only thing left in this body"
         );
@@ -4205,13 +5176,19 @@ mod tests {
         // the assertion, so a stray `agent_id` echoed back into the body, or a
         // bare address string standing in for the pair, both fail.
         assert_eq!(
-            add_channel_body("slack", "C0EXAMPLE1", None, None),
+            wire(&add_channel_body("slack", "C0EXAMPLE1", None, None, None)),
             serde_json::json!({"kind": "slack", "address": "C0EXAMPLE1"})
         );
         // The kind is never inferred: a non-Slack ingress passes through
         // verbatim, which is the whole point of a channel-neutral binding.
         assert_eq!(
-            add_channel_body("email", "ops@example.com", None, None),
+            wire(&add_channel_body(
+                "email",
+                "ops@example.com",
+                None,
+                None,
+                None
+            )),
             serde_json::json!({"kind": "email", "address": "ops@example.com"})
         );
     }
@@ -4222,7 +5199,13 @@ mod tests {
         // endpoint -- Slack is an in-process ingress, so it has nothing to
         // configure a transport for.
         assert_eq!(
-            add_channel_body("slack", "C0EXAMPLE1", None, Some("default")),
+            wire(&add_channel_body(
+                "slack",
+                "C0EXAMPLE1",
+                None,
+                Some("default"),
+                None,
+            )),
             serde_json::json!({"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default"})
         );
     }
@@ -4231,12 +5214,13 @@ mod tests {
     fn add_channel_body_sends_a_non_slack_route_whole() {
         // A non-Slack route's endpoint and adapter travel together.
         assert_eq!(
-            add_channel_body(
+            wire(&add_channel_body(
                 "discord",
                 "111111111111111111",
                 Some("https://discord-adapter.example.com/replies"),
                 Some("discord-main"),
-            ),
+                None,
+            )),
             serde_json::json!({
                 "kind": "discord",
                 "address": "111111111111111111",
@@ -4259,7 +5243,12 @@ mod tests {
     #[test]
     fn mint_token_body_carries_the_adapter_when_known() {
         assert_eq!(
-            mint_channel_token_body("slack", "C0EXAMPLE1", Some("second"), 3600),
+            wire(&mint_channel_token_body(
+                "slack",
+                "C0EXAMPLE1",
+                Some("second"),
+                3600
+            )),
             serde_json::json!({
                 "kind": "slack",
                 "address": "C0EXAMPLE1",
@@ -4276,6 +5265,7 @@ mod tests {
             address: "C0EXAMPLE1".into(),
             adapter: adapter.map(str::to_string),
             allowed_callers: None,
+            trigger_label: None,
         };
         assert_eq!(binding("slack", Some("default")).named_adapter(), None);
         assert_eq!(
@@ -4295,7 +5285,12 @@ mod tests {
         // Omission resolves the way the platform did before the identity
         // existed (ADR-0168 decision 3).
         assert_eq!(
-            mint_channel_token_body("email", "ops@example.com", None, 3600),
+            wire(&mint_channel_token_body(
+                "email",
+                "ops@example.com",
+                None,
+                3600
+            )),
             serde_json::json!({"kind": "email", "address": "ops@example.com", "ttl_s": 3600})
         );
     }

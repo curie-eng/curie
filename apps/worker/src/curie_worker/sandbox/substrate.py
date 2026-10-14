@@ -37,6 +37,7 @@ from curie_telemetry.redact import redact_text
 from opentelemetry.trace import SpanKind, StatusCode
 
 from ..binding import (
+    BUNDLE_REF_ENV,
     CONNECTOR_CALLER_TOKEN_ENV,
     HISTORY_TOKEN_ENV,
     MAX_TURNS_ENV,
@@ -44,12 +45,14 @@ from ..binding import (
     SANDBOX_TOKEN_TTL_SECONDS,
     boot_token_facts,
 )
+from ..repo_runner_pools import RepoRunnerPool
 from ..workitem_dispatch import TerminationObservation
 from .affinity import AffinityStore
 from .docker import DockerSandboxClient
 from .k8s import KubernetesSandboxClient
 from .types import (
     AGENT_LABEL,
+    EXECUTOR_THREAD_KEY_PREFIX,
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     THREAD_HASH_LABEL,
@@ -57,9 +60,11 @@ from .types import (
     CapacityExhaustedError,
     ClaimTimeoutError,
     KubeTransientError,
+    MissingAgentPoolError,
     NoRouteError,
     PressureScanResult,
     QuotaRejection,
+    RepoRunnerPoolRefused,
     RouteChangedError,
     RouteRecord,
     RouteState,
@@ -72,6 +77,9 @@ from .types import (
     UnschedulableClaimError,
     agent_warm_pool_name,
     claim_warm_pool,
+    has_connector_secrets,
+    is_executor_thread_key,
+    repo_runner_entry,
 )
 
 # The resume overlay writes these into the replacement claim's per-claim env, and
@@ -158,6 +166,36 @@ def _sandbox_attributes(operation: str, outcome: str) -> dict[str, str]:
         "operation": operation,
         "outcome": outcome,
     }
+
+
+def _refuse_executor_key(thread_key: str, operation: str) -> None:
+    """Refuse an executor route on a path that cannot strip its template."""
+
+    if is_executor_thread_key(thread_key):
+        raise ValueError(
+            f"{operation} refuses an {EXECUTOR_THREAD_KEY_PREFIX!r} route; an executor "
+            "sandbox is claimed fresh and released, never carried over"
+        )
+
+
+def _refuse_unsecreted_repo_claim(
+    runner: RepoRunnerPool | None,
+    env: Mapping[str, str] | None,
+    agent_name: str | None,
+    connector_secret_pools: frozenset[str],
+) -> None:
+    """Refuse a connector-secret claim a repository pool cannot serve (#2943).
+
+    The repository pool's template must carry the agent's connector secrets
+    (rendered per agent and digest, ADR 0216 d5); the values are stripped from
+    the claim env, so an agent without a secret pool is refused, as is an
+    unnamed one, before any credential is minted or anything is written.
+    """
+
+    if runner is None:
+        return
+    if has_connector_secrets(env) and (not agent_name or agent_name not in connector_secret_pools):
+        raise MissingAgentPoolError(agent_name or "(unnamed)", runner.pool)
 
 
 def _record_inventory(*, active: float, suspended: float) -> None:
@@ -313,6 +351,7 @@ class SandboxSubstrate:
         fresh_only: bool = False,
         runner_resources: dict[str, Any] | None = None,
         caller_run: str | None = None,
+        executor_secret_names: frozenset[str] | None = None,
     ) -> SandboxHandle:
         """Return the thread's live sandbox, claiming a warm one if needed.
 
@@ -326,8 +365,21 @@ class SandboxSubstrate:
         a concurrent winner of the route race, raises ``RouteChangedError``
         instead of being reused. Suspended routes still raise
         ``SuspendedThreadError``.
+
+        ``executor_secret_names`` marks an executor claim (@spec
+        ACTION-EXECUTOR-5): ``None`` is an ordinary claim, a set (possibly
+        empty) names the connector secrets the target connector's headers
+        expand, and the claim runs from a stripped per-claim template. It must
+        agree with the ``action-exec:`` thread key prefix, which is what
+        pressure filtering keys on; a mismatch raises ``ValueError`` before any
+        route read or Kubernetes write.
         """
 
+        if (executor_secret_names is not None) != is_executor_thread_key(thread_key):
+            raise ValueError(
+                "executor_secret_names must be given exactly for an "
+                f"{EXECUTOR_THREAD_KEY_PREFIX!r} thread key"
+            )
         started = time.monotonic()
         handle: SandboxHandle | None = None
         error: Exception | None = None
@@ -338,6 +390,9 @@ class SandboxSubstrate:
             attributes={"service.name": "curie-worker", "operation": "claim"},
         ) as span:
             try:
+                # A named repository's refusal is decided before any existing
+                # route is evicted, so a refusal leaves the thread as it was.
+                preflight = self._preflight_repo_runner(workspace_repo, env, agent_name)
                 record = self._affinity.get(thread_key)
                 if record is not None:
                     if record.state is RouteState.SUSPENDED:
@@ -346,13 +401,26 @@ class SandboxSubstrate:
                         record.handle.sandbox_name,
                         request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
                     )
-                    if sandbox is not None and sandbox.operating_mode == "Running":
+                    # A refusal raised by the policy check propagates with the
+                    # route untouched: a refusal is a decision, not a fault.
+                    if (
+                        sandbox is not None
+                        and sandbox.operating_mode == "Running"
+                        and self._route_matches_runner(
+                            record.handle,
+                            workspace_repo,
+                            agent_name=agent_name,
+                            desired=preflight,
+                        )
+                    ):
                         if fresh_only:
                             raise RouteChangedError(thread_key)
                         self._affinity.touch(thread_key, self._config.route_ttl_seconds)
                         handle = record.handle
                         outcome = "reused"
                     else:
+                        # A stopped sandbox, or a runner image its repository's
+                        # policy no longer names (ADR 0216).
                         # Never hand back a stale route or let it win the fresh claim.
                         self._evict_stale(thread_key, record)
                 if handle is None:
@@ -367,9 +435,11 @@ class SandboxSubstrate:
                         fresh_only=fresh_only,
                         runner_resources=runner_resources,
                         caller_run=caller_run,
+                        executor_secret_names=executor_secret_names,
+                        repo_runner=preflight,
                     )
                     outcome = "claimed"
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
@@ -443,11 +513,14 @@ class SandboxSubstrate:
         )
         if result.outcome != "complete":
             return result
+        # Executor routes never reach the kernel's reclamation (@spec
+        # ACTION-EXECUTOR-5): the loop releases its own sandbox on every path.
         return PressureScanResult(
             tuple(
                 candidate
                 for candidate in result.candidates
                 if candidate.record.handle.namespace == self._config.namespace
+                and not is_executor_thread_key(candidate.thread_key)
             ),
             "complete",
         )
@@ -515,6 +588,12 @@ class SandboxSubstrate:
             self._evict_stale(thread_key, record)
             return None
 
+        # A runner whose image its repository's entry no longer names is
+        # retired, so the caller's fresh claim boots the current one (ADR 0216).
+        if not self._route_matches_runner(record.handle, None):
+            self._evict_stale(thread_key, record)
+            return None
+
         if not self._affinity.touch(thread_key, self._config.route_ttl_seconds):
             return None
         return record.handle
@@ -539,8 +618,13 @@ class SandboxSubstrate:
         the claim+generation fence deletes only the unexposed candidate. After
         a successful swap the old claim is cleanup-only; a failed deletion is
         intentionally recoverable by the ordinary orphan reaper.
+
+        An executor route is refused with ``ValueError`` before any write: its
+        replacement would boot from the unstripped pool template (@spec
+        ACTION-EXECUTOR-5).
         """
 
+        _refuse_executor_key(thread_key, "handoff")
         boot = dict(env)
         boot[SESSION_ENV] = expected.session_id
         if expected.history_ref is not None:
@@ -622,7 +706,7 @@ class SandboxSubstrate:
                 self._affinity.mark_suspended(
                     thread_key, history_ref, self._config.suspended_route_ttl_seconds
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
@@ -666,8 +750,13 @@ class SandboxSubstrate:
         session identity and any recorded history ref are preserved on top,
         and the runner token is minted fresh when the caller did not already
         mint one (issue #63: the old token died with the old claim).
+
+        An executor route is refused with ``ValueError`` before any route read
+        or write: executor routes are never suspended, and a replacement would
+        boot from the unstripped pool template (@spec ACTION-EXECUTOR-5).
         """
 
+        _refuse_executor_key(thread_key, "resume")
         started = time.monotonic()
         handle: SandboxHandle | None = None
         old: SandboxHandle | None = None
@@ -688,6 +777,9 @@ class SandboxSubstrate:
                     boot[RUNNER_TOKEN_ENV] = secrets.token_urlsafe(32)
                 if old.history_ref is not None:
                     boot.setdefault(HISTORY_ENV, old.history_ref)
+                # Every refusal is decided before the suspended claim is retired.
+                resume_repo = workspace_repo or old.workspace_repo
+                runner = self._preflight_repo_runner(resume_repo, boot, agent_name)
 
                 self._retire_claim(
                     old.claim_name,
@@ -702,7 +794,7 @@ class SandboxSubstrate:
                     session_id=old.session_id,
                     history_ref=old.history_ref,
                     agent_name=agent_name,
-                    workspace_repo=workspace_repo or old.workspace_repo,
+                    workspace_repo=resume_repo,
                     workspace_materialized_head=(
                         workspace_materialized_head or old.workspace_materialized_head
                     ),
@@ -714,8 +806,9 @@ class SandboxSubstrate:
                     generation=old.generation + 1,
                     runner_resources=runner_resources,
                     caller_run=caller_run,
+                    repo_runner=runner,
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
@@ -777,7 +870,7 @@ class SandboxSubstrate:
                     released = True
                     if wait_gone:
                         self._await_quota_freed(claim_name, sandbox_name)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
@@ -801,6 +894,37 @@ class SandboxSubstrate:
         if error is not None:
             raise error
         return released
+
+    def executor_routes(self) -> dict[str, SandboxHandle]:
+        """The handle of every executor route (``action-exec:<id>``), by thread key.
+
+        @spec AUTOMATED-REMEDIATION-12: read by the executor loop to release a
+        crashed holder's sandbox once the API has ended its execution; the
+        release itself is ``release_claim`` of exactly the handle read here.
+        """
+
+        return {key: record.handle for key, record in self._affinity.executor_routes().items()}
+
+    def release_claim(self, thread_key: str, handle: SandboxHandle) -> bool:
+        """Release exactly the claim ``handle`` names (@spec ACTION-EXECUTOR-5).
+
+        For a holder that may have been fenced out: its own claim is retired
+        (an idempotent delete) and the route is dropped only while it still
+        names that claim, so a later holder's live sandbox on the same thread
+        key is never touched. True when the route was dropped.
+        """
+
+        self._retire_claim(
+            handle.claim_name,
+            request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+            handle=handle,
+        )
+        dropped = self._affinity.delete_if_claim(thread_key, handle.claim_name)
+        record_metric(
+            "curie.sandbox.lifecycle",
+            attributes=_sandbox_attributes("release", "released" if dropped else "observed"),
+        )
+        return dropped
 
     def release_if_claim(self, thread_key: str, claim_name: str) -> bool:
         """Release the thread's session only while its route names ``claim_name``.
@@ -835,7 +959,7 @@ class SandboxSubstrate:
                     )
                     self._affinity.delete_if_claim(thread_key, claim_name)
                     released = True
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - failure boundary
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
@@ -910,7 +1034,7 @@ class SandboxSubstrate:
                         "sandbox.terminated",
                         {"outcome": "terminated"},
                     )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
@@ -1187,6 +1311,14 @@ class SandboxSubstrate:
             )
             return False
 
+    def claim_bundle_ref(self, claim_name: str) -> str | None:
+        """The ``CURIE_BUNDLE_REF`` a claim was created with, or None (ADR 0100).
+
+        Sync control plane read, like the rest of this seam."""
+
+        view = self._k8s.get_claim(claim_name, request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S)
+        return None if view is None else view.bundle_ref
+
     def reap_orphans(self) -> list[str]:
         """Measure orphan cleanup at the substrate seam for every backend."""
 
@@ -1203,7 +1335,7 @@ class SandboxSubstrate:
                 self._retry_unreported_credentials()
                 inventory = self._affinity.route_inventory()
                 deleted, observed_claims = self._reap_orphans(inventory)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
@@ -1307,6 +1439,23 @@ class SandboxSubstrate:
             )
             deleted.append(claim.name)
         observed = {claim.name for claim in claims} - set(deleted)
+        # A claim carrying scoped tokens owns a per-claim template (and through
+        # it the token Secret and pool) only once ``create_claim`` patches the
+        # template's ownerReference to the claim (#3842). A worker crash
+        # between creating that template and the patch leaves it owned by
+        # nothing, so garbage collection never removes it or its Secret. Sweep
+        # those with the same cutoff as claims, keeping every claim still
+        # observed. Best effort: a failed sweep must not cost claim reaping or
+        # the inventory metric, and only the exception class is logged because
+        # the API error body can carry object detail.
+        try:
+            self._k8s.reap_claim_templates(keep=observed, created_before=cutoff)
+        except Exception as exc:  # noqa: BLE001 - a failed sweep retries next tick
+            logger.warning(
+                "sandbox claim-template sweep failed (%s); orphaned per-claim "
+                "templates are retried on the next tick",
+                type(exc).__name__,
+            )
         return deleted, observed
 
     # -- internals --------------------------------------------------------------
@@ -1332,6 +1481,112 @@ class SandboxSubstrate:
             return None
         return derived if present else None
 
+    def _repo_runner(
+        self, workspace_repo: str | None, *, agent_name: str | None = None
+    ) -> RepoRunnerPool | None:
+        """The repository's runner pool entry, checked usable, or None (ADR 0216).
+
+        None on the Docker substrate (no warm pools) and for a repository
+        without an entry, which keeps today's agent pool routing. An entry
+        built on another platform runner, or whose pool was not rendered,
+        raises RepoRunnerPoolRefused; an unreadable pool is transient.
+        """
+
+        if isinstance(self._k8s, DockerSandboxClient):
+            return None
+        found = repo_runner_entry(workspace_repo, self._config.repo_runner_pools)
+        if found is None:
+            return None
+        repo, entry = found
+        platform = self._config.platform_runner_digest
+        if platform is None or platform != entry.base:
+            raise RepoRunnerPoolRefused(
+                repo=repo,
+                pool=entry.pool,
+                reason="stale_base",
+                agent_name=agent_name,
+                base=entry.base,
+                platform_digest=platform,
+            )
+        probe = getattr(self._k8s, "warm_pool_exists", None)
+        if callable(probe):
+            try:
+                present = bool(probe(entry.pool))
+            except Exception as exc:
+                # Only the class: an API error body can carry object detail.
+                logger.warning(
+                    "could not read SandboxWarmPool %s (%s)", entry.pool, type(exc).__name__
+                )
+                raise KubeTransientError(f"could not read SandboxWarmPool {entry.pool}") from exc
+            if not present:
+                raise RepoRunnerPoolRefused(
+                    repo=repo, pool=entry.pool, reason="missing_pool", agent_name=agent_name
+                )
+        return entry
+
+    def _preflight_repo_runner(
+        self,
+        workspace_repo: str | None,
+        env: Mapping[str, str] | None,
+        agent_name: str | None,
+    ) -> RepoRunnerPool | None:
+        """The repository's checked runner pool entry, with its secret refusal.
+
+        Raises every refusal ``_repo_runner`` and the connector secret guard
+        decide, so a caller runs it before any eviction, retirement, or
+        credential mint.
+        """
+
+        runner = self._repo_runner(workspace_repo, agent_name=agent_name)
+        _refuse_unsecreted_repo_claim(runner, env, agent_name, self._config.connector_secret_pools)
+        return runner
+
+    def _route_matches_runner(
+        self,
+        handle: SandboxHandle,
+        workspace_repo: str | None,
+        *,
+        agent_name: str | None = None,
+        desired: RepoRunnerPool | None = None,
+    ) -> bool:
+        """Whether a retained route still runs the image its repository needs.
+
+        A caller naming a repository never adopts a route prepared for another
+        one (or for none). The desired entry is the one for ``workspace_repo``,
+        or the route's own repository when the caller names none. With no
+        entry on either side the image matches, so an installation without
+        repository pools reuses as before. Docker has no repository pools.
+        ``desired`` is the caller's already checked entry for ``workspace_repo``;
+        None recomputes it, which for a repository without an entry is
+        deterministic and probes nothing.
+        """
+
+        if isinstance(self._k8s, DockerSandboxClient):
+            return True
+        if workspace_repo is not None and (
+            handle.workspace_repo is None
+            or handle.workspace_repo.casefold() != workspace_repo.casefold()
+        ):
+            return False
+        if desired is not None and workspace_repo is not None:
+            entry: RepoRunnerPool | None = desired
+        else:
+            repo = workspace_repo if workspace_repo is not None else handle.workspace_repo
+            entry = self._repo_runner(repo, agent_name=agent_name)
+        wanted = (None, False) if entry is None else (entry.digests, entry.docker)
+        if (handle.runner_digests, handle.runner_docker) != wanted:
+            return False
+        return self._retained_runner_healthy(handle)
+
+    def _retained_runner_healthy(self, handle: SandboxHandle) -> bool:
+        """Whether a retained repository runner may serve another turn.
+
+        Always True for now. The per-run Docker daemon ping from ADR 0217
+        lands here, so a route whose daemon died is replaced, not reused.
+        """
+
+        return True
+
     def _claim_fresh(
         self,
         thread_key: str,
@@ -1349,7 +1604,12 @@ class SandboxSubstrate:
         fresh_only: bool = False,
         runner_resources: dict[str, Any] | None = None,
         caller_run: str | None = None,
+        executor_secret_names: frozenset[str] | None = None,
+        repo_runner: RepoRunnerPool | None = None,
     ) -> SandboxHandle:
+        # ``repo_runner`` is a caller's preflight of ``workspace_repo``'s entry,
+        # refusals already decided. None recomputes it: a repository without an
+        # entry resolves to None again with no probe.
         config = self._config
         nonce = uuid.uuid4().hex[:6]
         name = config.claim_name_for(thread_key, nonce)
@@ -1360,8 +1620,18 @@ class SandboxSubstrate:
 
         # Docker has no warm pools and passes connector secrets directly to
         # the runner. The rendered pool check applies only to Kubernetes.
+        # A repository bound to a runner pool (ADR 0216) claims that pool,
+        # checked before any credential is minted so a refusal has no side
+        # effects. A repository without one routes exactly as before.
+        runner = (
+            repo_runner
+            if repo_runner is not None
+            else self._preflight_repo_runner(workspace_repo, env, agent_name)
+        )
         if isinstance(self._k8s, DockerSandboxClient):
             pool = config.warm_pool
+        elif runner is not None:
+            pool = runner.pool
         else:
             pool = claim_warm_pool(
                 config.warm_pool,
@@ -1380,6 +1650,13 @@ class SandboxSubstrate:
         if env is not None and self._boot_credential_minter is not None:
             env = self._boot_credential_minter(env)
         self._remember_claim_credential(name, env)
+        # Passed only for an executor claim, so a client that predates the
+        # keyword keeps serving ordinary claims unchanged.
+        executor_kwargs: dict[str, Any] = (
+            {"executor_secret_names": executor_secret_names}
+            if executor_secret_names is not None
+            else {}
+        )
         self._k8s.create_claim(
             name,
             pool=pool,
@@ -1387,6 +1664,7 @@ class SandboxSubstrate:
             labels=labels,
             runner_resources=runner_resources,
             agent_name=agent_name,
+            **executor_kwargs,
         )
         deadline = time.monotonic() + config.claim_timeout_seconds
         try:
@@ -1428,6 +1706,9 @@ class SandboxSubstrate:
             state_credential_agent=credential_agent,
             state_credential_id=credential_id,
             state_token_exp=credential_exp,
+            bundle_ref=(env or {}).get(BUNDLE_REF_ENV),
+            runner_digests=None if runner is None else runner.digests,
+            runner_docker=False if runner is None else runner.docker,
         )
         if not publish:
             return handle
@@ -1452,7 +1733,27 @@ class SandboxSubstrate:
                 winner.handle.sandbox_name,
                 request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
             )
-            if sandbox is not None and sandbox.operating_mode == "Running":
+            # A winner running an image this repository's policy does not
+            # name is evicted like a dead one (ADR 0216).
+            try:
+                adoptable = (
+                    sandbox is not None
+                    and sandbox.operating_mode == "Running"
+                    and self._route_matches_runner(
+                        winner.handle,
+                        workspace_repo,
+                        agent_name=agent_name,
+                        desired=runner,
+                    )
+                )
+            except Exception:
+                self._retire_claim(
+                    name,
+                    request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                    handle=handle,
+                )
+                raise
+            if adoptable:
                 self._retire_claim(
                     name,
                     request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,

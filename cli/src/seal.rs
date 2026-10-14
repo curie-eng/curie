@@ -68,11 +68,12 @@ impl crate::ui::CliOutput for SealOutput {
 }
 
 /// Exact connector names Curie keeps for its own platform MCP servers: `curie`
-/// is the approval server and `curie-state` the durable state server.
+/// is the approval server, `curie-state` the durable state server, and
+/// `curie-slack` the granted Slack capability server.
 ///
-/// Mirrors `_RESERVED_CONNECTOR_DISPLACES` in
-/// `packages/plugin-format/src/plugin_format/connectors.py`; a test pins the two.
-const RESERVED_CONNECTOR_NAMES: [&str; 2] = ["curie", "curie-state"];
+/// Shared connector-name cases exercise both the plugin-format validator and
+/// this CLI validator through their production boundaries.
+const RESERVED_CONNECTOR_NAMES: [&str; 3] = ["curie", "curie-state", "curie-slack"];
 
 /// A connector name becomes a Kubernetes resource name component.
 fn validate_connector(name: &str) -> Result<()> {
@@ -210,73 +211,36 @@ mod tests {
     use crate::sealing;
 
     #[test]
-    fn the_reserved_connector_names_match_the_plugin_format_set() {
-        let source = include_str!("../../packages/plugin-format/src/plugin_format/connectors.py");
-        let mut lines = source.lines();
-        assert!(
-            lines
-                .by_ref()
-                .any(|line| line.trim_end() == "_RESERVED_CONNECTOR_DISPLACES: dict[str, str] = {"),
-            "_RESERVED_CONNECTOR_DISPLACES block not found in connectors.py; \
-             update RESERVED_CONNECTOR_NAMES after the upstream rename"
-        );
-        let mut parsed: Vec<&str> = Vec::new();
-        let mut closed = false;
-        for line in lines {
-            let line = line.trim();
-            if line == "}" {
-                closed = true;
-                break;
+    fn connector_name_vectors_match_the_plugin_format_behavior() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/vectors/connector-fields.json"))
+                .expect("connector parity vectors must be valid JSON");
+        let cases = vectors["connector_names"]
+            .as_array()
+            .expect("connector name cases must be present");
+        assert!(!cases.is_empty(), "connector name cases must not be empty");
+        for case in cases {
+            assert_eq!(case.as_object().expect("case must be an object").len(), 2);
+            let name = case["name"]
+                .as_str()
+                .expect("connector name must be a string");
+            let allowed = case["allowed"]
+                .as_bool()
+                .expect("expected outcome must be boolean");
+            let result = validate_connector(name);
+            assert_eq!(result.is_ok(), allowed, "connector {name}: {result:?}");
+            if let Err(error) = result {
+                assert!(
+                    format!("{error:#}").contains(name),
+                    "refusal must name {name}"
+                );
             }
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let unreadable = || {
-                format!(
-                    "unrecognized line in _RESERVED_CONNECTOR_DISPLACES: {line:?}; \
-                     update the parser in this test to read it"
-                )
-            };
-            // Split a leading quoted string into (contents, text after the closing quote).
-            fn split_quoted(text: &str) -> Option<(&str, &str)> {
-                let quote = text.chars().next().filter(|c| matches!(c, '"' | '\''))?;
-                text[1..].split_once(quote)
-            }
-            let (key, after_key) = split_quoted(line).unwrap_or_else(|| panic!("{}", unreadable()));
-            let value = after_key
-                .trim_start()
-                .strip_prefix(':')
-                .unwrap_or_else(|| panic!("{}", unreadable()))
-                .trim();
-            let (_, tail) = split_quoted(value).unwrap_or_else(|| panic!("{}", unreadable()));
-            let tail = tail.trim();
-            let entry_ends_cleanly = tail.is_empty()
-                || tail.strip_prefix(',').is_some_and(|rest| {
-                    let rest = rest.trim();
-                    rest.is_empty() || rest.starts_with('#')
-                });
-            if !entry_ends_cleanly {
-                panic!("{}", unreadable());
-            }
-            parsed.push(key);
         }
-        assert!(
-            closed,
-            "closing `}}` of _RESERVED_CONNECTOR_DISPLACES not found"
-        );
-        assert!(!parsed.is_empty(), "no reserved connector keys were parsed");
-        parsed.sort_unstable();
-        let mut expected = RESERVED_CONNECTOR_NAMES.to_vec();
-        expected.sort_unstable();
-        assert_eq!(
-            parsed, expected,
-            "RESERVED_CONNECTOR_NAMES drifted from the plugin-format reserved set"
-        );
     }
 
     #[test]
     fn validate_connector_refuses_reserved_names_and_keeps_prefixed_names_legal() {
-        for name in ["curie", "curie-state"] {
+        for name in RESERVED_CONNECTOR_NAMES {
             let err = validate_connector(name).expect_err("reserved name must be refused");
             assert!(
                 format!("{err:#}").contains(name),

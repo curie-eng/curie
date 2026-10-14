@@ -225,7 +225,7 @@ with no public key refuses hosted rendering rather than relying only on network
 policy. A runner booted by a worker that held no key carries no
 token, and every proxied connector refuses its calls until the next turn on its
 thread that a worker holding the key takes, which claims a fresh one
-(`apps/worker/src/curie_worker/kernel.py::_boots_differently`). The minting
+(`apps/worker/src/curie_worker/kernel/claim.py::_boots_differently`). The minting
 worker and the proxy ship in the same release, so during the upgrade that gives
 an install its key this covers every runner from before it and any runner a
 worker pod the roll has not replaced yet boots; `charts/curie/README.md` says
@@ -297,7 +297,7 @@ The port is a real `Protocol`, and the values crossing it are Kubernetes:
   (`ConnectorStartSpec` in `cli/src/docker.rs`), tags it with its own
   `CONNECTOR_COMPONENT_LABEL` and reaps undesired ones by that label, then
   blocks on its own readiness wait, `wait_for_connectors_ready`, called from
-  `bring_up_local` and `start_skill_connectors` in `cli/src/commands.rs`. That
+  `bring_up_local` and `start_skill_connectors` in `cli/src/commands/connector_images.rs`. That
   path goes around both `render` and `ConnectorClient`: it neither consumes the
   rendered Kubernetes objects nor implements the port, so it is leakage, not a
   second implementation. Of the two cluster appliers, the CLI applies the same

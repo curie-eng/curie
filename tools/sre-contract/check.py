@@ -228,7 +228,7 @@ def main():
             )
         )
         return 0
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         # Endpoint URLs, response bodies and credentials never enter diagnostics.
         print(f"SRE contract failed: {type(exc).__name__}", file=sys.stderr)
         return 1

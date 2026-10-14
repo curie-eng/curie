@@ -1,0 +1,95 @@
+# @spec SRE-CW-8. Opt in after creating the code/config ConfigMaps and the
+# operator-owned cloudwatch-alarms ServiceAccount described in INSTALL.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudwatch-alarms
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloudwatch-alarms
+  template:
+    metadata:
+      labels:
+        app: cloudwatch-alarms
+    spec:
+      serviceAccountName: cloudwatch-alarms
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: reader
+          image: python:3.12-alpine@sha256:d09d15e60962ca365d1cd544a48773bac9d33f2fb1b00f2aa0deec78ade7dc31
+          imagePullPolicy: IfNotPresent
+          command: [python3, -B, /app/cloudwatch_alarms.py]
+          ports:
+            - name: metrics
+              containerPort: 9108
+          env:
+            - name: TOPIC_ARN
+              valueFrom:
+                configMapKeyRef:
+                  name: cloudwatch-alarms-config
+                  key: TOPIC_ARN
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: cloudwatch-alarms-config
+                  key: AWS_REGION
+            - name: METRIC_PREFIX
+              valueFrom:
+                configMapKeyRef:
+                  name: cloudwatch-alarms-config
+                  key: METRIC_PREFIX
+                  optional: true
+          readinessProbe:
+            tcpSocket:
+              port: metrics
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: metrics
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: code
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: code
+          configMap:
+            name: cloudwatch-alarms-code
+            defaultMode: 0444
+---
+# @spec SRE-CW-6 SRE-CW-8. Only the Service is annotated to avoid double scrape.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloudwatch-alarms
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9108"
+    prometheus.io/path: /metrics
+spec:
+  selector:
+    app: cloudwatch-alarms
+  ports:
+    - name: metrics
+      port: 9108
+      targetPort: metrics

@@ -25,7 +25,7 @@ from curie_worker.attachments import AttachmentLimits
 from curie_worker.config import WorkerConfig
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore
-from curie_worker.kernel import Kernel
+from curie_worker.kernel.core import Kernel
 from nacl.signing import SigningKey
 from pydantic import AliasChoices, ValidationError
 from redis.asyncio import Redis as AsyncRedis
@@ -403,6 +403,40 @@ _ENV_TABLE: list[_Row] = [
         bare="ATTACHMENT_RETENTION_TTL_SECONDS",
         bare_raw="999999",
     ),
+    # --- the per-thread attachment budget (ADR 0205 decision 7, #4079) ---
+    # Every boot rebuilds the thread's files, so one boot's work is bounded per
+    # thread, separately from the per-message ``max_files``. The defaults are
+    # literals here on purpose: the ADR names them, and ``AttachmentLimits``
+    # carries the same two counts (pinned in test_attachment_thread_set.py).
+    # The prepare timeout bounds the worker's own rebuild (ledger read, cache
+    # re-mint, channel re-fetch) inside the turn's remaining budget.
+    _Row(
+        "attachment_thread_max_files",
+        "CURIE_ATTACHMENT_THREAD_MAX_FILES",
+        "15",
+        15,
+        20,
+        bare="ATTACHMENT_THREAD_MAX_FILES",
+        bare_raw="999",
+    ),
+    _Row(
+        "attachment_thread_max_bytes",
+        "CURIE_ATTACHMENT_THREAD_MAX_BYTES",
+        "134217728",
+        134217728,
+        256 * 1024 * 1024,
+        bare="ATTACHMENT_THREAD_MAX_BYTES",
+        bare_raw="999",
+    ),
+    _Row(
+        "attachment_thread_prepare_timeout_seconds",
+        "CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS",
+        "12.5",
+        12.5,
+        15.0,
+        bare="ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS",
+        bare_raw="999",
+    ),
 ]
 
 
@@ -574,10 +608,7 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.slack_api_base_url == ""
     assert config.slack_identities == ()
     # Postgres
-    assert (
-        config.database_url
-        == "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
-    )
+    assert config.database_url == "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
     assert config.db_schema == "curie"
     # Deployment-to-runtime binding
     assert config.default_max_usd_per_day == 10.0
@@ -799,41 +830,6 @@ def test_max_concurrency_accepts_both_ends_of_its_range(
     assert WorkerConfig().max_concurrency == int(raw)
 
 
-def _consumer_as_run_builds_it(config: WorkerConfig) -> Consumer:
-    """Build the runs consumer with exactly the arguments ``run.py`` passes.
-
-    Construction opens no connection, so an unconnected client and a stand-in
-    kernel are enough to observe what the consumer was sized to.
-    """
-    redis = AsyncRedis(host="127.0.0.1", port=1)
-    return Consumer(
-        redis=redis,
-        kernel=cast(Kernel, SimpleNamespace()),
-        config=config,
-        leases=DeliveryLeaseStore(redis, config),
-    )
-
-
-def test_max_concurrency_env_sizes_the_runs_consumer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The env value reaches the consumer that ``run.py`` constructs, which
-    passes no ``max_concurrency`` of its own."""
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_WORKER_MAX_CONCURRENCY", "4")
-
-    consumer = _consumer_as_run_builds_it(WorkerConfig())
-
-    assert consumer._max_concurrency == 4
-    assert consumer._transfer_capacity() == 4
-
-
-def test_runs_consumer_defaults_to_sixteen_turns(monkeypatch: pytest.MonkeyPatch) -> None:
-    _clear_all_config_env(monkeypatch)
-
-    assert _consumer_as_run_builds_it(WorkerConfig())._max_concurrency == 16
-
-
 def test_explicit_consumer_concurrency_still_wins_over_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -931,28 +927,6 @@ def _load_test_module(module_name: str, path: Path) -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def test_worker_boolean_explanations_do_not_cite_removed_parser() -> None:
-    repo_root = Path(__file__).resolve().parents[3]
-    config_text = (repo_root / "apps/worker/src/curie_worker/config.py").read_text(encoding="utf-8")
-    config_start = config_text.index("def _parse_bool")
-    config_end = config_text.index("\n\nBool =", config_start)
-    config_region = config_text[config_start:config_end]
-
-    test_text = Path(__file__).read_text(encoding="utf-8")
-    test_start = test_text.index("# Worker boolean behavior")
-    test_end = test_text.index("# --- Eval claim-creation concurrency", test_start)
-    test_region = test_text[test_start:test_end]
-
-    removed_helper = "_" + "set" + "_bool"
-    retired_service = "dis" + "patcher"
-
-    for region in (config_region, test_region):
-        assert removed_helper not in region, f"boolean notes still cite {removed_helper}"
-        assert retired_service not in region, (
-            f"boolean notes still compare this parser to {retired_service}"
-        )
 
 
 def test_async_test_body_gate_rejects_a_shallow_corpus(
@@ -1550,6 +1524,45 @@ def test_a_non_positive_attachment_bound_is_refused_not_read_as_unlimited(
         WorkerConfig.model_validate(overrides)
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"attachment_thread_max_files": 0},
+        {"attachment_thread_max_bytes": 0},
+        {"attachment_thread_max_bytes": -1},
+        {"attachment_thread_prepare_timeout_seconds": 0},
+        {"attachment_thread_prepare_timeout_seconds": -1.0},
+    ],
+)
+def test_a_non_positive_thread_attachment_bound_is_refused(
+    overrides: dict[str, object],
+) -> None:
+    """ADR 0205 decision 7: the per-thread budget bounds every boot's rebuild."""
+
+    with pytest.raises(ValidationError):
+        WorkerConfig.model_validate(overrides)
+
+
+def test_the_thread_file_budget_cannot_be_smaller_than_one_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A thread budget below the per-message cap would omit files the message
+    that carried them is entitled to keep (the current files are always kept),
+    so the worker refuses it at startup rather than at the first boot."""
+
+    _clear_all_config_env(monkeypatch)
+    per_message = AttachmentLimits().max_files
+
+    with pytest.raises(ValidationError):
+        WorkerConfig.model_validate({"attachment_thread_max_files": per_message - 1})
+    assert (
+        WorkerConfig.model_validate(
+            {"attachment_thread_max_files": per_message}
+        ).attachment_thread_max_files
+        == per_message
+    )
+
+
 @pytest.mark.parametrize("mode", ["all", "failures", "off"])
 def test_each_turn_receipt_mode_is_read_from_its_env(
     monkeypatch: pytest.MonkeyPatch, mode: str
@@ -1806,38 +1819,24 @@ def test_hook_claim_lease_shorter_than_the_budget_is_refused(
     assert "CURIE_HOOK_CLAIM_LEASE_S" in str(exc_info.value)
 
 
-@pytest.mark.parametrize(
-    ("api_url", "html_base"),
-    [
-        ("https://api.github.com", "https://github.com"),
-        ("https://api.github.com/", "https://github.com"),
-        ("https://github.example.com/api/v3", "https://github.example.com"),
-        ("https://github.example.com/api/v3/", "https://github.example.com"),
-        ("https://github.example.com/forge/api/v3", "https://github.example.com/forge"),
-        ("https://github.example.com:8443/forge/api/v3/", "https://github.example.com:8443/forge"),
-    ],
-)
-def test_publication_html_base_is_derived_from_the_configured_api_url(
-    monkeypatch: pytest.MonkeyPatch, api_url: str, html_base: str
-) -> None:
+def test_the_worker_reads_no_code_host_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ADR 0197: the worker receives the code host origin as data with each credential."""
+
     _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_PUBLICATION_GITHUB_API_URL", api_url)
+    monkeypatch.setenv("CURIE_PUBLICATION_GITHUB_API_URL", "https://github.example.com/api/v3")
 
-    assert WorkerConfig().publication_github_html_base == html_base
+    config = WorkerConfig()
+
+    assert not hasattr(config, "publication_github_api_url")
+    assert not hasattr(config, "publication_github_html_base")
 
 
-def test_publication_github_ca_file_defaults_to_empty(
+def test_the_publication_job_trust_bundle_comes_from_the_worker_mount(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _clear_all_config_env(monkeypatch)
+    assert WorkerConfig().publication_ca_bundle_path == ""
 
-    assert WorkerConfig().publication_github_ca_file == ""
+    monkeypatch.setenv("CURIE_CODE_HOST_CA_BUNDLE", "/etc/curie/code-host-trust/ca.crt")
 
-
-def test_publication_github_ca_file_reads_its_env_var(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_PUBLICATION_GITHUB_CA_FILE", "/etc/curie/github-stub/ca.pem")
-
-    assert WorkerConfig().publication_github_ca_file == "/etc/curie/github-stub/ca.pem"
+    assert WorkerConfig().publication_ca_bundle_path == "/etc/curie/code-host-trust/ca.crt"

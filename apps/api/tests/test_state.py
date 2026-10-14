@@ -23,7 +23,7 @@ from curie_api.routers.state import (
     _json_size,
     _namespace_lock_key,
 )
-from curie_api.sandbox_token import mint
+from curie_internal.sandbox_token import mint
 from curie_telemetry import build_resource, configure_meter_provider
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
@@ -1221,7 +1221,7 @@ def _hold_advisory_lock(
 
     try:
         asyncio.run(hold())
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - existing broad catch retained
         errors.append(error)
         acquired.set()
 
@@ -1229,7 +1229,7 @@ def _hold_advisory_lock(
 def _request_result_or_exception(request: Future[Any]) -> Any:
     try:
         return request.result(timeout=10)
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - existing broad catch retained
         return error
 
 
@@ -1924,7 +1924,7 @@ def _hold_row_lock_then_append(
 
     try:
         asyncio.run(hold())
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - existing broad catch retained
         errors.append(error)
         locked.set()
 

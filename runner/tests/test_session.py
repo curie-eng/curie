@@ -4,6 +4,7 @@ import asyncio
 import functools
 import json
 import logging
+from pathlib import Path
 
 import anyio
 import pytest
@@ -36,12 +37,40 @@ from curie_runner.mcp_tool_capability import (
     ConnectorCapabilityFailure,
 )
 from curie_runner.progress import ProgressActivity
+from curie_runner.sender_frame import frame_user_turn
 from curie_runner.session import SessionRunner
 from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
+
+
+def _sent(text: str, user: str = "U") -> str:
+    """The prompt a message turn queries when no channel kind is bound."""
+
+    return frame_user_turn("message", user, text, None)
+
+
+def test_fake_canned_turn_matches_the_shared_wire_vector() -> None:
+    expected = json.loads(
+        (Path(__file__).resolve().parents[2] / "tests/vectors/fake-canned-turn.json").read_text()
+    )
+
+    async def exercise() -> list[dict[str, object]]:
+        runner, _fake = _runner()
+        await runner.start()
+        try:
+            return [
+                json.loads(line)
+                async for line in runner.run_turn(
+                    Event(type="message", text="question", user="U", ts="1")
+                )
+            ]
+        finally:
+            await runner.close()
+
+    assert anyio.run(exercise) == expected
 
 
 class _ProviderStallSession:
@@ -246,7 +275,7 @@ def test_happy_turn_stream_shape() -> None:
     assert "side_effect_flag" in types
     assert types[-1] == "final"
     assert events[-1].status == SessionStatus.DONE
-    assert fake.queries == ["go"]  # the event text was pushed into the session
+    assert fake.queries == [_sent("go")]  # the framed event text was queried
     assert runner.status == SessionStatus.DONE
 
 
@@ -1336,7 +1365,10 @@ def test_next_turn_waits_for_timeout_interrupt_to_settle() -> None:
     second_events = parse_ndjson("".join(second_lines))
     assert first_events[-1].status is SessionStatus.CLASSIFIED_FAILURE
     assert second_events[-1].status is SessionStatus.DONE
-    assert session.queries == ["first", "second"]
+    assert session.queries == [
+        _sent("first", "U0EXAMPLE1"),
+        _sent("second", "U0EXAMPLE1"),
+    ]
     assert session.interrupts == 1
     assert session.interrupt_settled.is_set()
     assert not session.second_query_started_early
@@ -1474,7 +1506,7 @@ def _exercise_timeout_interrupt_failure(
             with timeout_scope:
                 try:
                     await runner.timeout(first_epoch)
-                except BaseException as exc:
+                except BaseException as exc:  # noqa: BLE001 - existing broad catch retained
                     timeout_errors.append(exc)
             timeout_done.set()
 
@@ -1546,11 +1578,11 @@ def test_timeout_cancelled_after_stop_write_cleans_up_before_next_query() -> Non
     assert len(errors) == 1
     assert isinstance(errors[0], asyncio.CancelledError)
     assert session.wire == [
-        ("query", "first"),
+        ("query", _sent("first", "U0EXAMPLE1")),
         ("interrupt", 1),
         ("interrupt", 2),
         ("drained", "first"),
-        ("query", "second"),
+        ("query", _sent("second", "U0EXAMPLE1")),
     ]
     _assert_timeout_then_healthy(first, second, spans, first_was_abandoned=True)
 
@@ -1559,9 +1591,9 @@ def test_timeout_ack_failure_releases_only_after_recorded_stop() -> None:
     session, first, second, errors, spans = _exercise_timeout_interrupt_failure("ack-failure")
     assert [type(error) for error in errors] == [RuntimeError]
     assert session.wire == [
-        ("query", "first"),
+        ("query", _sent("first", "U0EXAMPLE1")),
         ("interrupt", 1),
-        ("query", "second"),
+        ("query", _sent("second", "U0EXAMPLE1")),
     ]
     _assert_timeout_then_healthy(first, second, spans)
 
@@ -1573,10 +1605,10 @@ def test_timeout_cancelled_before_stop_write_uses_cleanup_before_next_query() ->
     assert len(errors) == 1
     assert isinstance(errors[0], asyncio.CancelledError)
     assert session.wire == [
-        ("query", "first"),
+        ("query", _sent("first", "U0EXAMPLE1")),
         ("interrupt", 2),
         ("drained", "first"),
-        ("query", "second"),
+        ("query", _sent("second", "U0EXAMPLE1")),
     ]
     _assert_timeout_then_healthy(first, second, spans, first_was_abandoned=True)
 
@@ -2361,7 +2393,7 @@ def test_steer_rejected_once_final_is_produced() -> None:
                 assert await runner.steer("too late") is False
 
     anyio.run(go)
-    assert fake.queries == ["go"]  # the late steer never reached the session
+    assert fake.queries == [_sent("go")]  # the late steer never reached the session
 
 
 def test_abandoned_stream_interrupts_the_sdk() -> None:
@@ -2420,7 +2452,7 @@ def test_cross_task_abandon_does_not_wedge_turn_lock() -> None:
         assert events[-1].status == SessionStatus.DONE
 
     anyio.run(go)
-    assert fake.queries[-1] == "second"  # the second turn actually ran
+    assert fake.queries[-1] == _sent("second")  # the second turn actually ran
 
 
 def test_build_options_carries_resume_ref() -> None:
@@ -2506,7 +2538,7 @@ def test_steer_reaches_live_session() -> None:
             pass
 
     anyio.run(go)
-    assert fake.queries == ["first", "steered follow-up"]
+    assert fake.queries == [_sent("first"), _sent("steered follow-up", "")]
 
 
 def _connector_failure() -> ConnectorCapabilityFailure:
@@ -2580,7 +2612,7 @@ def test_declared_connector_failure_runs_the_model_with_a_notice(
     with caplog.at_level(logging.ERROR, logger="curie_runner.session"):
         first, second = _two_turns(runner)
 
-    assert fake.queries == ["go", "again"]
+    assert fake.queries == [_sent("go"), _sent("again")]
     for events in (first, second):
         assert not any(isinstance(e, ErrorEvent) for e in events)
         assert "text_delta" in [e.type for e in events]
@@ -2619,7 +2651,7 @@ def test_declared_connector_failure_does_not_abandon_the_otel_span() -> None:
     root = _span_named(list(exporter.get_finished_spans()), "agent.run")[0]
     assert root.attributes["curie.terminal.cause"] == "completed"
     assert root.attributes["curie.terminal.status"] == "succeeded"
-    assert fake.queries == ["go"]
+    assert fake.queries == [_sent("go")]
 
 
 def test_reprobe_that_raises_keeps_prior_failures_and_still_queries() -> None:
@@ -2634,7 +2666,7 @@ def test_reprobe_that_raises_keeps_prior_failures_and_still_queries() -> None:
     )
     events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
 
-    assert fake.queries == ["go"]
+    assert fake.queries == [_sent("go")]
     assert availability.failures == (_connector_failure(),)
     assert not any(isinstance(e, ErrorEvent) for e in events)
     assert events[-1].status == SessionStatus.DONE
@@ -2699,7 +2731,7 @@ def test_side_probe_recovery_is_kept_when_the_session_is_not_connected() -> None
 
     first, second = _two_turns(runner)
 
-    assert session.queries == ["go", "again"]
+    assert session.queries == [_sent("go"), _sent("again")]
     assert session.ensured == ["github"]
     for events in (first, second):
         assert events[-1].status == SessionStatus.DONE
@@ -2870,7 +2902,7 @@ def test_status_reports_turn_active_during_connector_recovery() -> None:
     events = anyio.run(_during_recovery, runner, release, entered, probe_status)
 
     assert observed == [True]
-    assert fake.queries == ["go"]
+    assert fake.queries == [_sent("go")]
     assert events[-1].status == SessionStatus.DONE
 
 
@@ -2886,7 +2918,7 @@ def test_steer_during_connector_recovery_is_refused_and_original_goes_first() ->
     events = anyio.run(_during_recovery, runner, release, entered, steer)
 
     assert steered == [False]
-    assert fake.queries == ["go"]
+    assert fake.queries == [_sent("go")]
     assert events[-1].status == SessionStatus.DONE
     assert events[-1].text.startswith(_probe_failed().caller_message())
 
@@ -2925,7 +2957,7 @@ def test_slow_session_confirmation_is_not_cancelled_by_the_budget(
 
     assert completed == ["github"]
     assert availability.failures == ()
-    assert session.queries == ["go"]
+    assert session.queries == [_sent("go")]
     assert events[-1].text == "all done"
 
 
@@ -2946,7 +2978,7 @@ def test_connector_recovery_over_budget_keeps_failure_and_runs_the_turn(
     )
     events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
 
-    assert fake.queries == ["go"]
+    assert fake.queries == [_sent("go")]
     assert availability.failures == (_probe_failed(),)
     assert events[-1].status == SessionStatus.DONE
     assert events[-1].text.startswith(_probe_failed().caller_message())
@@ -2983,7 +3015,7 @@ def test_failed_model_turn_with_failed_connector_is_not_prefixed() -> None:
     )
     events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
 
-    assert fake.queries == ["go"]
+    assert fake.queries == [_sent("go")]
     final = events[-1]
     assert final.status == SessionStatus.CLASSIFIED_FAILURE
     assert not final.text.startswith(_connector_failure().caller_message())
@@ -2996,7 +3028,7 @@ def test_failed_model_turn_with_failed_connector_is_not_prefixed() -> None:
 def test_healthy_connector_still_queries_the_model() -> None:
     runner, fake = _runner()
     events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
-    assert fake.queries == ["go"]
+    assert fake.queries == [_sent("go")]
     assert events[-1].status == SessionStatus.DONE
 
 

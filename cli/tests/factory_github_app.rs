@@ -26,7 +26,98 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 
+use support::oci_registry_stub::sha256_digest;
 use support::{serve, MockServer, Request, Response};
+
+/// External registry shapes follow the OCI Distribution manifest/blob endpoints:
+/// https://github.com/opencontainers/distribution-spec/blob/v1.1.0/spec.md
+/// https://github.com/opencontainers/image-spec/blob/v1.1.0/manifest.md
+/// Inventory bytes follow docs/schemas/tool-manifest.schema.json.
+fn inventory_registry(python: Option<&str>) -> (MockServer, String) {
+    let mut archive = tar::Builder::new(Vec::new());
+    if let Some(version) = python {
+        let inventory = serde_json::to_vec(&serde_json::json!({
+            "schema_version":1, "docker_cli":false,
+            "tools":[
+                {"name":"python3", "version":version, "path":"/usr/bin/python3", "source":"probe"},
+                {"name":"node", "version":"22.23.0", "path":"/usr/bin/node", "source":"probe"},
+            ],
+        }))
+        .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(inventory.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                "etc/curie/tool-manifest.json",
+                inventory.as_slice(),
+            )
+            .unwrap();
+    }
+    let layer = archive.into_inner().unwrap();
+    let config = serde_json::to_vec(&serde_json::json!({
+        "architecture":"amd64", "os":"linux",
+        "rootfs":{"type":"layers", "diff_ids":[sha256_digest(&layer)]},
+    }))
+    .unwrap();
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion":2, "mediaType":"application/vnd.oci.image.manifest.v1+json",
+        "config":{"mediaType":"application/vnd.oci.image.config.v1+json", "digest":sha256_digest(&config), "size":config.len()},
+        "layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar", "digest":sha256_digest(&layer), "size":layer.len()}],
+    })).unwrap();
+    let index = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion":2, "mediaType":"application/vnd.oci.image.index.v1+json",
+        "manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json", "digest":sha256_digest(&manifest), "size":manifest.len(), "platform":{"os":"linux", "architecture":"amd64"}}],
+    })).unwrap();
+    let digest = sha256_digest(&index);
+    let responses = [
+        (
+            format!("/v2/acme/runner/manifests/{digest}"),
+            "application/vnd.oci.image.index.v1+json",
+            index,
+        ),
+        (
+            format!("/v2/acme/runner/manifests/{}", sha256_digest(&manifest)),
+            "application/vnd.oci.image.manifest.v1+json",
+            manifest,
+        ),
+        (
+            format!("/v2/acme/runner/blobs/{}", sha256_digest(&layer)),
+            "application/octet-stream",
+            layer,
+        ),
+        (
+            format!("/v2/acme/runner/blobs/{}", sha256_digest(&config)),
+            "application/octet-stream",
+            config,
+        ),
+    ];
+    let server = serve(move |request| {
+        assert_eq!(request.method, "GET");
+        assert!(
+            request.header("authorization").is_none(),
+            "GitHub credentials must not reach the registry"
+        );
+        match responses
+            .iter()
+            .find(|(path, _, _)| path == path_only(request))
+        {
+            Some((_, media_type, body)) => Response {
+                status: 200,
+                content_type: (*media_type).into(),
+                body: body.clone(),
+            },
+            None => Response::json(404, r#"{"errors":[{"code":"MANIFEST_UNKNOWN"}]}"#),
+        }
+    });
+    let image = format!(
+        "{}/acme/runner@{digest}",
+        server.base_url.trim_start_matches("http://")
+    );
+    (server, image)
+}
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -39,8 +130,10 @@ const INSTALL_TOKEN: &str = "ghs_fake";
 const WEBHOOK_SECRET: &str = "whsec-factory-test-3746-value";
 /// Exit code for usage errors (cli/src/exit.rs `ExitCode::Usage`).
 const USAGE_EXIT: i32 = 2;
+const SCOPE_ERROR: &str = "--app-id needs a repository scope: pass --repo OWNER/REPO (repeatable) or --all-installed-repos; nothing was applied";
+const SCOPE_FIX: &str = "rerun with --repo <owner>/<name> once per repository the factory may serve, or with --all-installed-repos to allow every repository the GitHub App is installed on";
 
-/// Logs every helm/kubectl invocation to `$SHIM_LOG`.
+/// Logs every helm/kubectl/docker invocation to `$SHIM_LOG`.
 /// helm: `get values` prints `$FAKE_VALUES`, `get hooks` prints nothing,
 /// `upgrade` copies its `-f` values file to `$SHIM_LOG.values`.
 /// kubectl: `get secret` prints `$FAKE_SECRET_JSON` or, when that is empty,
@@ -49,6 +142,35 @@ const USAGE_EXIT: i32 = 2;
 const TOOL_SHIM: &str = r#"#!/usr/bin/env bash
 tool=$(basename "$0")
 echo "$tool $*" >> "$SHIM_LOG"
+if [ "$tool" = "docker" ]; then
+  if [ "$FAKE_RUNNER_BUILD" = "1" ]; then
+    if [ "$1 $2" = "buildx bake" ]; then
+      prev=""
+      for a in "$@"; do
+        if [ "$prev" = "--metadata-file" ]; then
+          echo "$FAKE_BUILD_METADATA" > "$a"
+        fi
+        if [ "$prev" = "-f" ]; then
+          cat "$a" >> "$SHIM_LOG.bake"
+        fi
+        prev="$a"
+      done
+      exit 0
+    fi
+    if [ "$1 $2 $3" = "buildx imagetools inspect" ]; then
+      if [ "$5" = "--raw" ]; then
+        echo "$FAKE_BUILD_INDEX"
+      elif [[ "$4" = */platform/runner@* ]]; then
+        echo "$FAKE_BASE_CONFIG"
+      else
+        echo "$FAKE_IMAGE_CONFIG"
+      fi
+      exit 0
+    fi
+  fi
+  echo 'shim: Docker must not be called in this scenario' >&2
+  exit 1
+fi
 if [ "$tool" = "helm" ]; then
   if [ "$1" = "get" ] && [ "$2" = "values" ]; then
     echo "$FAKE_VALUES"
@@ -181,6 +303,8 @@ struct Fixture {
     secret_json: String,
     values: String,
     api_prefix: &'static str,
+    runner_build: bool,
+    inventory: Option<MockServer>,
 }
 
 fn path_only(req: &Request) -> &str {
@@ -217,7 +341,7 @@ impl Fixture {
         let dir = tempfile::tempdir().expect("tempdir");
         let shim_dir = dir.path().join("bin");
         std::fs::create_dir(&shim_dir).expect("create shim dir");
-        for tool in ["helm", "kubectl"] {
+        for tool in ["helm", "kubectl", "docker"] {
             let path = shim_dir.join(tool);
             std::fs::write(&path, TOOL_SHIM).expect("write shim");
             let mut perms = std::fs::metadata(&path).expect("stat shim").permissions();
@@ -354,17 +478,55 @@ impl Fixture {
                 _ => Response::json(404, r#"{"message":"Not Found (fake)"}"#),
             }
         });
-        Self {
+        let mut fixture = Self {
             dir,
             github,
             secret_json: String::new(),
             values: r#"{"api":{"environment":"dev"}}"#.to_string(),
             api_prefix,
+            runner_build: false,
+            inventory: None,
+        };
+        if matches!(
+            toolchain,
+            ToolchainFixture::Python
+                | ToolchainFixture::Go
+                | ToolchainFixture::WorkflowPython
+                | ToolchainFixture::WorkflowGo
+                | ToolchainFixture::Java
+                | ToolchainFixture::VersionFile
+                | ToolchainFixture::MissingVersionFile
+        ) {
+            fixture.record_inventory(Some("3.13.2"));
         }
+        fixture
     }
 
     fn installed() -> Self {
         Self::new(GithubConfig { installed: true })
+    }
+
+    fn record_inventory(&mut self, python: Option<&str>) {
+        let (server, image) = inventory_registry(python);
+        let mut values: serde_json::Value = serde_json::from_str(&self.values).unwrap();
+        values["factory"] = serde_json::json!({"sandboxEgress":{"acme-bot":true}});
+        values["agentSandbox"] = serde_json::json!({
+            "deploy":true, "runnerImages":{"acme-bot":image},
+        });
+        self.values = values.to_string();
+        self.inventory = Some(server);
+    }
+
+    fn assert_inventory_read(&self) {
+        let requests = self.inventory.as_ref().expect("owned registry").recorded();
+        assert!(
+            requests.iter().any(|r| r.path.contains("/manifests/")),
+            "{requests:?}"
+        );
+        assert!(
+            requests.iter().any(|r| r.path.contains("/blobs/")),
+            "{requests:?}"
+        );
     }
 
     fn record_existing_app(&mut self) {
@@ -373,13 +535,68 @@ impl Fixture {
                 "environment":"dev",
                 "githubAppId":APP_ID,
                 "githubAppExistingSecret":"curie-github-app",
-                "githubFactoryIntake":"poll",
-                "githubFactoryMention":SLUG,
-                "githubFactoryLabel":"curie-factory",
                 "githubRepoAllowlist":["acme/bot"],
+            },
+            "factory": {
+                "intake":"poll",
+                "trackers":[{
+                    "name":"github",
+                    "kind":"github",
+                    "mention":SLUG,
+                    "label":"curie-factory",
+                }],
             }
         })
         .to_string();
+    }
+
+    fn record_repository_bindings(&mut self, tools: &[&str]) {
+        self.record_existing_app();
+        let mut values: serde_json::Value = serde_json::from_str(&self.values).unwrap();
+        let runner = serde_json::json!({
+            "tools": tools,
+            "image": format!("registry.example.com/acme/runner@sha256:{}", "a".repeat(64)),
+            "base": format!("sha256:{}", "b".repeat(64)),
+            "platformDigests": {
+                "linux/amd64": format!("sha256:{}", "c".repeat(64)),
+                "linux/arm64": format!("sha256:{}", "d".repeat(64)),
+            },
+            "dockerfile": "Dockerfile.runner",
+            "probes": [{"name":"custom", "command":["custom", "--version"]}],
+        });
+        values["factory"]["bindings"] = serde_json::json!([
+            {
+                "name":"primary", "tracker":"github", "trackerScopeId":"1",
+                "agent":"acme-bot", "issuePrefix":"ACME", "operatorMetadata":{"keep":true},
+                "repos":[
+                    {
+                        "alias":"bot", "codeHost":"github", "projectId":"1", "path":"acme/bot",
+                        "base":"main", "runner":runner.clone(),
+                        "ci":{"required":{"key":"checks", "paths":[".github/workflows/checks.yml"]}},
+                        "docker":{"enabled":false, "egressAllowlist":[{"cidr":"192.0.2.0/24", "ports":[{"port":443}]}]},
+                        "operatorMetadata":{"repository":"keep"},
+                    },
+                    {"alias":"web", "codeHost":"github", "projectId":"2", "path":"acme/web", "base":"next", "runner":runner},
+                ],
+            },
+            {"name":"peer", "tracker":"jira", "trackerScopeId":"3", "agent":"acme-peer", "repos":[{"alias":"peer", "codeHost":"bitbucket", "path":"acme/peer", "base":"release"}]},
+        ]);
+        values["factory"]["docker"] = serde_json::json!({
+            "daemonImage":format!("registry.example.com/acme/daemon@sha256:{}", "f".repeat(64)),
+        });
+        values["worker"] = serde_json::json!({"deploy":true});
+        values["factory"]["sandboxEgress"] = serde_json::json!({"acme-bot":true});
+        values["agentSandbox"] = serde_json::json!({
+            "deploy":true,
+            "runner":{"image":"registry.example.com/platform/runner", "digest":format!("sha256:{}", "b".repeat(64))},
+            "runnerImages":{"acme-bot":format!("registry.example.com/agent/runner@sha256:{}", "e".repeat(64))},
+        });
+        self.values = values.to_string();
+    }
+
+    fn spec(&self, name: &str, contents: &str) -> String {
+        std::fs::write(self.dir.path().join(name), contents).expect("write runner spec");
+        self.path(name)
     }
 
     fn path(&self, name: &str) -> String {
@@ -430,12 +647,27 @@ impl Fixture {
             .env("FAKE_VALUES", &self.values)
             .env("FAKE_SECRET_JSON", &self.secret_json)
             .env("SHIM_LOG", self.log_path())
+            .env("FAKE_RUNNER_BUILD", if self.runner_build { "1" } else { "0" })
+            // Docker buildx metadata/config shape follows
+            // https://docs.docker.com/reference/cli/docker/buildx/bake/#metadata-file
+            // and https://docs.docker.com/reference/cli/docker/buildx/imagetools/inspect/#format.
+            .env("FAKE_BUILD_METADATA", serde_json::json!({"curie-runner":{"containerimage.digest":format!("sha256:{}", "6".repeat(64))}}).to_string())
+            .env("FAKE_BUILD_INDEX", serde_json::json!({"schemaVersion":2,"manifests":[
+                {"digest":format!("sha256:{}", "7".repeat(64)),"platform":{"os":"linux","architecture":"amd64"}},
+                {"digest":format!("sha256:{}", "8".repeat(64)),"platform":{"os":"linux","architecture":"arm64"}},
+            ]}).to_string())
+            .env("FAKE_BASE_CONFIG", image_config(false))
+            .env("FAKE_IMAGE_CONFIG", image_config(true))
             .output()
             .unwrap_or_else(|e| panic!("run curie {}: {e}", argv.join(" ")))
     }
 
     fn assert_no_mutation(&self) {
         let log = self.log();
+        assert!(
+            !log.lines().any(|line| line.starts_with("docker ")),
+            "no image build may start: {log}"
+        );
         assert!(
             !log.lines().any(|l| l.starts_with("helm upgrade")),
             "nothing may be upgraded: {log}"
@@ -456,6 +688,18 @@ impl Fixture {
     }
 }
 
+fn image_config(built: bool) -> String {
+    let mut layers = vec![format!("sha256:{}", "1".repeat(64))];
+    if built {
+        layers.push(format!("sha256:{}", "2".repeat(64)));
+    }
+    serde_json::json!({
+        "linux/amd64":{"os":"linux", "architecture":"amd64", "rootfs":{"diff_ids":layers}},
+        "linux/arm64":{"os":"linux", "architecture":"arm64", "rootfs":{"diff_ids":layers}},
+    })
+    .to_string()
+}
+
 fn combined(output: &Output) -> String {
     format!(
         "{}{}",
@@ -471,6 +715,18 @@ fn stdout_json(output: &Output) -> serde_json::Value {
 }
 
 /// Pull the first registration URL out of human output.
+/// The `factory.trackers` entry named `github` in a helm values document.
+fn github_tracker(values: &serde_json::Value) -> &serde_json::Value {
+    values
+        .pointer("/factory/trackers")
+        .and_then(|v| v.as_array())
+        .and_then(|list| {
+            list.iter()
+                .find(|t| t.get("name") == Some(&serde_json::json!("github")))
+        })
+        .unwrap_or_else(|| panic!("no github tracker in factory.trackers: {values}"))
+}
+
 fn find_url(text: &str, prefix: &str) -> String {
     let start = text
         .find(prefix)
@@ -522,6 +778,7 @@ fn happy_argv(fx: &Fixture) -> Vec<String> {
         APP_ID.into(),
         "--private-key-file".into(),
         fx.path("app.pem"),
+        "--all-installed-repos".into(),
         "--webhook-secret-file".into(),
         fx.path("webhook-secret"),
         "--chart".into(),
@@ -531,6 +788,545 @@ fn happy_argv(fx: &Fixture) -> Vec<String> {
 
 fn strs(v: &[String]) -> Vec<&str> {
     v.iter().map(String::as_str).collect()
+}
+
+#[test]
+fn app_credentials_without_repository_scope_are_refused_before_any_external_call() {
+    for (dry_run, json) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut fx = Fixture::installed();
+        fx.record_existing_app();
+        let mut argv = happy_argv(&fx);
+        argv.retain(|arg| arg != "--all-installed-repos");
+        if dry_run {
+            argv.push("--dry-run".into());
+        }
+        if json {
+            argv.push("--json".into());
+        }
+        let output = fx.run(&strs(&argv));
+        let text = combined(&output);
+        assert_eq!(output.status.code(), Some(USAGE_EXIT), "{text}");
+        if json {
+            assert_eq!(
+                stdout_json(&output),
+                serde_json::json!({"error": SCOPE_ERROR, "fix": SCOPE_FIX})
+            );
+        } else {
+            assert!(text.contains(SCOPE_ERROR), "{text}");
+            assert!(text.contains(SCOPE_FIX), "{text}");
+        }
+        assert!(fx.github.recorded().is_empty(), "GitHub must not be called");
+        assert!(fx.log().is_empty(), "no external tool call: {}", fx.log());
+        fx.assert_no_mutation();
+    }
+}
+
+#[test]
+fn all_installed_repos_conflicts_with_repo_and_requires_an_app_id() {
+    for with_app in [true, false] {
+        let fx = Fixture::installed();
+        let argv = if with_app {
+            let mut argv = happy_argv(&fx);
+            argv.extend(["--repo".into(), "acme/bot".into()]);
+            argv
+        } else {
+            vec![
+                "cluster".into(),
+                "factory".into(),
+                "--all-installed-repos".into(),
+            ]
+        };
+        let output = fx.run(&strs(&argv));
+        let text = combined(&output);
+        assert_eq!(output.status.code(), Some(USAGE_EXIT), "{text}");
+        assert!(text.contains("--all-installed-repos"), "{text}");
+        assert!(
+            text.contains(if with_app { "--repo" } else { "--app-id" }),
+            "{text}"
+        );
+        assert!(!text.contains("unexpected argument"), "{text}");
+        assert!(fx.github.recorded().is_empty());
+        assert!(fx.log().is_empty(), "{}", fx.log());
+        fx.assert_no_mutation();
+    }
+}
+
+#[test]
+fn explicit_repository_scope_only_allowlists_and_labels_the_named_repository() {
+    let mut fx = Fixture::installed();
+    fx.record_existing_app();
+    let mut argv = happy_argv(&fx);
+    argv.retain(|arg| arg != "--all-installed-repos");
+    argv.extend(["--repo".into(), "acme/bot".into(), "--json".into()]);
+    let output = fx.run(&strs(&argv));
+    assert!(output.status.success(), "{}", combined(&output));
+    let value = stdout_json(&output);
+    assert_eq!(
+        value["github_app"]["repos"],
+        serde_json::json!(["acme/bot"])
+    );
+    assert_eq!(value["github_app"]["repos_inferred"], false);
+    assert_eq!(
+        value["github_app"]["labels_created"],
+        serde_json::json!(["acme/bot"])
+    );
+    let values: serde_json::Value = serde_json::from_str(&fx.values_file()).expect("helm values");
+    assert_eq!(
+        values["api"]["githubRepoAllowlist"],
+        serde_json::json!(["acme/bot"])
+    );
+    let requests = fx.github.recorded();
+    assert!(requests.iter().any(|request| {
+        request.method == "POST" && path_only(request) == "/repos/acme/bot/labels"
+    }));
+    assert!(
+        requests
+            .iter()
+            .all(|request| { !path_only(request).starts_with("/repos/acme/web/") }),
+        "the unselected repository must not be read or labelled: {requests:?}"
+    );
+}
+
+#[test]
+fn app_dry_run_previews_each_explicit_repository_scope_without_external_calls() {
+    for (scope, expected) in [
+        (
+            vec!["--repo", "acme/bot", "--repo", "acme/web"],
+            "# allowlist: acme/bot, acme/web (--repo)",
+        ),
+        (
+            vec!["--all-installed-repos"],
+            "# allowlist: every repository the App is installed on (--all-installed-repos)",
+        ),
+    ] {
+        for json in [false, true] {
+            let fx = Fixture::installed();
+            let mut argv = happy_argv(&fx);
+            argv.retain(|arg| arg != "--all-installed-repos");
+            argv.extend(scope.iter().map(|arg| (*arg).to_string()));
+            argv.push("--dry-run".into());
+            if json {
+                argv.push("--json".into());
+            }
+            let output = fx.run(&strs(&argv));
+            assert!(output.status.success(), "{}", combined(&output));
+            let lines: Vec<String> = if json {
+                stdout_json(&output)["plan"]
+                    .as_array()
+                    .expect("dry-run plan")
+                    .iter()
+                    .map(|line| line.as_str().expect("plan line").to_string())
+                    .collect()
+            } else {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            };
+            let labels = lines
+                .iter()
+                .position(|line| {
+                    line.starts_with("# GET/POST ")
+                        && line.ends_with("/labels for each allowlisted repo")
+                })
+                .expect("labels plan line");
+            assert_eq!(lines.get(labels + 1).map(String::as_str), Some(expected));
+            assert!(fx.github.recorded().is_empty());
+            assert!(fx.log().is_empty(), "{}", fx.log());
+            fx.assert_no_mutation();
+        }
+    }
+}
+
+fn repository_argv() -> Vec<String> {
+    ["cluster", "factory", "--chart", "charts/curie", "--json"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn factory_repository_runner_dry_run_previews_builds_bindings_and_complete_receipts() {
+    for json in [false, true] {
+        let fx = Fixture::installed();
+        let bot = fx.spec(
+            "bot.yaml",
+            "tools: [uv, docker-cli]\ndockerfile: Dockerfile.runner\nprobes:\n  - name: custom\n    command: [custom, --version]\n",
+        );
+        fx.spec(
+            "Dockerfile.runner",
+            "ARG CURIE_RUNNER_IMAGE\nFROM ${CURIE_RUNNER_IMAGE}\n",
+        );
+        let web = fx.spec("web.yaml", "tools: [pnpm]\n");
+        let mut argv = repository_argv();
+        if !json {
+            argv.retain(|arg| arg != "--json");
+        }
+        argv.extend([
+            "--repo-runner".into(),
+            format!("acme/bot={bot}"),
+            "--repo-runner".into(),
+            format!("acme/web={web}"),
+            "--registry".into(),
+            "registry.example.com/acme".into(),
+            "--repo-docker".into(),
+            "acme/bot".into(),
+            "--dry-run".into(),
+        ]);
+        let output = fx.run(&strs(&argv));
+        assert!(output.status.success(), "{}", combined(&output));
+        let plan = if json {
+            stdout_json(&output)["plan"]
+                .as_array()
+                .expect("dry-run plan")
+                .iter()
+                .map(|line| line.as_str().expect("plan line"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        for expected in [
+            "acme/bot",
+            "acme/web",
+            &bot,
+            &web,
+            "registry.example.com/acme",
+            "base",
+            "platformDigests",
+            "docker",
+        ] {
+            assert!(plan.contains(expected), "missing {expected:?}: {plan}");
+        }
+        assert!(plan.contains("build"), "{plan}");
+        assert!(fx.github.recorded().is_empty());
+        assert!(fx.log().is_empty(), "dry-run external call: {}", fx.log());
+        fx.assert_no_mutation();
+    }
+}
+
+#[test]
+fn factory_repository_runner_local_input_errors_are_precise_and_offline() {
+    for case in [
+        "malformed",
+        "wildcard",
+        "empty-spec",
+        "duplicate",
+        "unknown-tool",
+    ] {
+        let fx = Fixture::installed();
+        let valid = fx.spec("valid.yaml", "tools: [uv]\n");
+        let invalid = fx.spec("invalid.yaml", "tools: [not-a-catalog-tool]\n");
+        let request = match case {
+            "malformed" => "acme/bot".into(),
+            "wildcard" => format!("acme/*={valid}"),
+            "empty-spec" => "acme/bot=".into(),
+            "unknown-tool" => format!("acme/bot={invalid}"),
+            _ => format!("acme/bot={valid}"),
+        };
+        let mut argv = repository_argv();
+        argv.extend([
+            "--repo-runner".into(),
+            request.clone(),
+            "--registry".into(),
+            "registry.example.com/acme".into(),
+            "--dry-run".into(),
+        ]);
+        if case == "duplicate" {
+            argv.extend(["--repo-runner".into(), request]);
+        }
+        let output = fx.run(&strs(&argv));
+        let text = combined(&output);
+        assert_eq!(output.status.code(), Some(USAGE_EXIT), "{case}: {text}");
+        assert!(!text.contains("unexpected argument"), "{case}: {text}");
+        match case {
+            "unknown-tool" => assert!(
+                text.contains("unknown tool") && text.contains("not-a-catalog-tool"),
+                "{text}"
+            ),
+            "duplicate" => assert!(
+                text.contains("acme/bot")
+                    && (text.contains("more than once") || text.contains("duplicate")),
+                "{text}"
+            ),
+            _ => assert!(text.contains("OWNER/REPO"), "{case}: {text}"),
+        }
+        assert!(fx.github.recorded().is_empty());
+        assert!(fx.log().is_empty(), "{case}: {}", fx.log());
+        fx.assert_no_mutation();
+    }
+}
+
+#[test]
+fn factory_repository_targets_must_resolve_one_recorded_binding_before_builds() {
+    for case in ["unknown", "unbound", "ambiguous"] {
+        let mut fx = Fixture::installed();
+        fx.record_repository_bindings(&["uv", "docker-cli"]);
+        let mut values: serde_json::Value = serde_json::from_str(&fx.values).unwrap();
+        let target = if case == "unknown" {
+            "acme/missing"
+        } else {
+            "acme/bot"
+        };
+        if case == "unbound" {
+            values["factory"]["bindings"] = serde_json::json!([]);
+        } else if case == "ambiguous" {
+            values["factory"]["bindings"][1]["repos"] =
+                serde_json::json!([values["factory"]["bindings"][0]["repos"][0].clone()]);
+        }
+        fx.values = values.to_string();
+        let spec = fx.spec("runner.yaml", "tools: [uv]\n");
+        let mut argv = repository_argv();
+        argv.extend([
+            "--repo-runner".into(),
+            format!("{target}={spec}"),
+            "--registry".into(),
+            "registry.example.com/acme".into(),
+        ]);
+        let output = fx.run(&strs(&argv));
+        let text = combined(&output);
+        assert_eq!(output.status.code(), Some(USAGE_EXIT), "{case}: {text}");
+        assert!(!text.contains("unexpected argument"), "{text}");
+        assert!(text.contains(target), "{case}: {text}");
+        assert!(
+            if case == "ambiguous" {
+                text.contains("ambiguous") || text.contains("more than one")
+            } else {
+                text.contains("bound") || text.contains("binding")
+            },
+            "{case}: {text}"
+        );
+        fx.assert_no_mutation();
+    }
+}
+
+#[test]
+fn factory_invalid_second_repository_spec_never_starts_the_first_build() {
+    let mut fx = Fixture::installed();
+    fx.record_repository_bindings(&["uv", "docker-cli"]);
+    let valid = fx.spec("valid.yaml", "tools: [uv]\n");
+    let invalid = fx.spec("invalid.yaml", "tools: [not-a-catalog-tool]\n");
+    let mut argv = repository_argv();
+    argv.extend([
+        "--repo-runner".into(),
+        format!("acme/bot={valid}"),
+        "--repo-runner".into(),
+        format!("acme/web={invalid}"),
+        "--registry".into(),
+        "registry.example.com/acme".into(),
+    ]);
+    let output = fx.run(&strs(&argv));
+    let text = combined(&output);
+    assert_eq!(output.status.code(), Some(USAGE_EXIT), "{text}");
+    assert!(text.contains("not-a-catalog-tool"), "{text}");
+    fx.assert_no_mutation();
+}
+
+#[test]
+fn factory_repository_docker_requires_catalog_cli_and_replacement_keeps_it() {
+    for replacement in [false, true] {
+        let mut fx = Fixture::installed();
+        fx.record_repository_bindings(if replacement {
+            &["docker-cli"]
+        } else {
+            &["uv"]
+        });
+        let mut values: serde_json::Value = serde_json::from_str(&fx.values).unwrap();
+        // A repository probe named docker does not select the catalog CLI.
+        values["factory"]["bindings"][0]["repos"][0]["runner"]["probes"] =
+            serde_json::json!([{"name":"docker", "command":["docker", "--version"]}]);
+        values["factory"]["bindings"][0]["repos"][0]["docker"]["enabled"] =
+            serde_json::json!(replacement);
+        fx.values = values.to_string();
+        let mut argv = repository_argv();
+        if replacement {
+            let spec = fx.spec("runner.yaml", "tools: [uv]\n");
+            argv.extend([
+                "--repo-runner".into(),
+                format!("acme/bot={spec}"),
+                "--registry".into(),
+                "registry.example.com/acme".into(),
+            ]);
+        } else {
+            argv.extend(["--repo-docker".into(), "acme/bot".into()]);
+        }
+        let output = fx.run(&strs(&argv));
+        let text = combined(&output);
+        assert_eq!(output.status.code(), Some(USAGE_EXIT), "{text}");
+        assert!(
+            text.contains("acme/bot") && text.contains("docker-cli"),
+            "{text}"
+        );
+        fx.assert_no_mutation();
+    }
+}
+
+#[test]
+fn factory_docker_only_preserves_complete_runner_receipt_binding_metadata_and_peers() {
+    let mut fx = Fixture::installed();
+    fx.record_repository_bindings(&["uv", "docker-cli"]);
+    let before: serde_json::Value = serde_json::from_str(&fx.values).unwrap();
+    let mut expected = before["factory"]["bindings"].clone();
+    expected[0]["repos"][0]["docker"]["enabled"] = serde_json::json!(true);
+    let mut argv = repository_argv();
+    argv.extend(["--repo-docker".into(), "acme/bot".into()]);
+    let output = fx.run(&strs(&argv));
+    assert!(output.status.success(), "{}", combined(&output));
+    let applied: serde_json::Value = serde_json::from_str(&fx.values_file()).expect("Helm values");
+    assert_eq!(applied["factory"]["bindings"], expected);
+    let log = fx.log();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.starts_with("helm upgrade"))
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(
+        !log.lines().any(|line| line.starts_with("docker ")),
+        "{log}"
+    );
+    assert!(
+        log.contains("rollout restart deployment/curie-worker"),
+        "{log}"
+    );
+}
+
+#[test]
+fn factory_runner_only_uses_installed_base_and_preserves_disabled_mixed_tracker_configuration() {
+    let mut fx = Fixture::installed();
+    fx.record_repository_bindings(&["uv", "docker-cli"]);
+    fx.runner_build = true;
+    let mut before: serde_json::Value = serde_json::from_str(&fx.values).unwrap();
+    before["factory"]["enabled"] = serde_json::json!(false);
+    before["factory"]["bindings"][0]["repos"][0]["path"] = serde_json::json!("acme/projects/bot");
+    before["factory"]["trackers"].as_array_mut().unwrap().push(serde_json::json!({
+        "name":"jira", "kind":"jira_cloud", "baseUrl":"https://tracker.example.com", "credential":{"existingSecret":"jira-key"},
+    }));
+    before["factory"]["codeHosts"] = serde_json::json!([{"name":"bitbucket", "kind":"bitbucket_cloud", "baseUrl":"https://api.bitbucket.org"}]);
+    fx.values = before.to_string();
+    let spec = fx.spec("runner.yaml", "tools: [uv]\n");
+    let mut argv = repository_argv();
+    argv.extend([
+        "--repo-runner".into(),
+        format!("acme/projects/bot={spec}"),
+        "--registry".into(),
+        "registry.example.com/acme".into(),
+    ]);
+    let output = fx.run(&strs(&argv));
+    assert!(output.status.success(), "{}", combined(&output));
+    let applied: serde_json::Value = serde_json::from_str(&fx.values_file()).expect("Helm values");
+    assert!(
+        applied
+            .pointer("/factory/enabled")
+            .is_none_or(|enabled| enabled == false),
+        "{applied}"
+    );
+    for key in ["trackers", "codeHosts"] {
+        if let Some(updated) = applied["factory"].get(key) {
+            assert_eq!(updated, &before["factory"][key]);
+        }
+    }
+    let mut expected = before["factory"]["bindings"].clone();
+    let runner = &applied["factory"]["bindings"][0]["repos"][0]["runner"];
+    assert_eq!(runner["tools"], serde_json::json!(["uv"]));
+    assert_eq!(runner["base"], format!("sha256:{}", "b".repeat(64)));
+    assert!(runner["image"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("@sha256:{}", "6".repeat(64))));
+    assert_eq!(
+        runner["platformDigests"]["linux/amd64"],
+        format!("sha256:{}", "7".repeat(64))
+    );
+    assert_eq!(
+        runner["platformDigests"]["linux/arm64"],
+        format!("sha256:{}", "8".repeat(64))
+    );
+    expected[0]["repos"][0]["runner"] = runner.clone();
+    assert_eq!(applied["factory"]["bindings"], expected);
+    let bake: serde_json::Value =
+        serde_json::from_str(&fx.read("invocations.log.bake")).expect("buildx bake definition");
+    assert!(bake.to_string().contains(&format!(
+        "registry.example.com/platform/runner@sha256:{}",
+        "b".repeat(64)
+    )));
+    let log = fx.log();
+    assert!(log.contains("--revision 1"), "{log}");
+    assert!(
+        log.contains("rollout restart deployment/curie-worker"),
+        "{log}"
+    );
+    assert!(fx.github.recorded().is_empty());
+}
+
+#[test]
+fn factory_unbound_repository_without_an_app_is_a_refusal_not_registration_success() {
+    let fx = Fixture::installed();
+    let mut argv = repository_argv();
+    argv.extend(["--repo-docker".into(), "acme/bot".into()]);
+    let output = fx.run(&strs(&argv));
+    let text = combined(&output);
+    assert_eq!(output.status.code(), Some(USAGE_EXIT), "{text}");
+    assert!(
+        text.contains("acme/bot") && (text.contains("binding") || text.contains("bound")),
+        "{text}"
+    );
+    assert!(!text.contains("settings/apps/new"), "{text}");
+    fx.assert_no_mutation();
+}
+
+#[test]
+fn factory_docker_opt_in_needs_a_pinned_daemon_and_deployed_worker() {
+    for case in ["missing-daemon", "mutable-daemon", "disabled-worker"] {
+        let mut fx = Fixture::installed();
+        fx.record_repository_bindings(&["docker-cli"]);
+        let mut values: serde_json::Value = serde_json::from_str(&fx.values).unwrap();
+        if case == "disabled-worker" {
+            values["worker"]["deploy"] = serde_json::json!(false);
+        } else {
+            values["factory"]["docker"]["daemonImage"] =
+                serde_json::json!(if case == "missing-daemon" {
+                    ""
+                } else {
+                    "registry.example.com/acme/daemon:latest"
+                });
+        }
+        fx.values = values.to_string();
+        let mut argv = repository_argv();
+        argv.extend(["--repo-docker".into(), "acme/bot".into()]);
+        let output = fx.run(&strs(&argv));
+        let text = combined(&output);
+        assert_eq!(output.status.code(), Some(USAGE_EXIT), "{case}: {text}");
+        assert!(
+            text.contains(if case == "disabled-worker" {
+                "worker.deploy"
+            } else {
+                "daemonImage"
+            }),
+            "{text}"
+        );
+        fx.assert_no_mutation();
+    }
+}
+
+#[test]
+fn disabling_factory_without_app_credentials_keeps_working_without_a_repository_scope() {
+    let fx = Fixture::installed();
+    let output = fx.run(&[
+        "cluster",
+        "factory",
+        "--disable",
+        "--chart",
+        "charts/curie",
+        "--json",
+    ]);
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_eq!(stdout_json(&output)["factory_intake_enabled"], false);
+    let values: serde_json::Value = serde_json::from_str(&fx.values_file()).expect("helm values");
+    assert_eq!(values["factory"], serde_json::json!({"enabled": false}));
+    assert!(values["api"].get("githubRepoAllowlist").is_none());
+    assert!(fx.github.recorded().is_empty());
 }
 
 #[test]
@@ -803,7 +1599,7 @@ fn without_an_app_the_registration_link_is_printed_and_nothing_applied() {
         .unwrap_or_else(|| panic!("steps must give the rerun command: {text}"));
     assert_eq!(
         rerun,
-        "curie cluster factory --intake poll --app-id <APP_ID> --private-key-file <PATH.pem>"
+        "curie cluster factory --intake poll --app-id <APP_ID> --private-key-file <PATH.pem> --repo <OWNER/REPO>"
     );
     fx.assert_no_mutation();
 
@@ -852,6 +1648,19 @@ fn factory_toolchain_preflight_reads_the_app_repository_before_any_helm_call() {
             contents < helm,
             "repository inference must precede Helm: {log}"
         );
+        if fx.inventory.is_some() {
+            fx.assert_inventory_read();
+            assert!(!combined(&output).contains("tool inventory unknown"));
+        } else {
+            assert!(
+                !log.contains("helm history"),
+                "no requirements need no installed runner read: {log}"
+            );
+            assert!(
+                !log.contains("--all"),
+                "no requirements need no computed values read: {log}"
+            );
+        }
         assert!(
             fx.github
                 .recorded()
@@ -917,10 +1726,16 @@ fn factory_toolchain_contents_api_reads_workflows_java_and_declared_version_file
             "{stderr}"
         );
         assert_eq!(
-            stderr.contains("fixed factory runner lacks"),
+            stderr.contains("not in selected image manifest"),
             warning,
             "{stderr}"
         );
+        assert!(!stderr.contains("tool inventory unknown"), "{stderr}");
+        assert!(
+            !stderr.contains("selected image manifest observed"),
+            "{stderr}"
+        );
+        fx.assert_inventory_read();
         let log = fx.log();
         let read = log
             .find(&format!("contents/{source}"))
@@ -954,9 +1769,11 @@ fn missing_declared_version_file_warns_with_tool_and_path_then_continues() {
     );
     assert!(
         stderr.contains(".github/workflows/checks.yml")
-            && stderr.contains("fixed factory runner lacks"),
+            && stderr.contains("selected image manifest observed python3 3.13.2"),
         "{stderr}"
     );
+    assert!(!stderr.contains("tool inventory unknown"), "{stderr}");
+    fx.assert_inventory_read();
     assert!(!stderr.contains("no toolchain signals"), "{stderr}");
     let log = fx.log();
     let missing_read = log
@@ -966,6 +1783,84 @@ fn missing_declared_version_file_warns_with_tool_and_path_then_continues() {
         .find("helm ")
         .expect("missing version file must still allow Helm");
     assert!(missing_read < helm, "{log}");
+}
+
+#[test]
+fn factory_toolchain_warns_with_observed_selected_image_version() {
+    let mut fx =
+        Fixture::with_toolchain(GithubConfig { installed: true }, ToolchainFixture::Python);
+    fx.record_inventory(Some("3.12.9"));
+    let output = fx.run(&strs(&happy_argv(&fx)));
+    assert!(output.status.success(), "{}", combined(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("required Python 3.13.2 from pyproject.toml: selected image manifest observed python3 3.12.9"), "{stderr}");
+    assert!(!stderr.contains("tool inventory unknown"), "{stderr}");
+    assert!(
+        !stderr.contains("not in selected image manifest"),
+        "{stderr}"
+    );
+    fx.assert_inventory_read();
+}
+
+#[test]
+fn factory_toolchain_missing_image_inventory_warns_and_continues() {
+    let mut fx =
+        Fixture::with_toolchain(GithubConfig { installed: true }, ToolchainFixture::Python);
+    fx.record_inventory(None);
+    let output = fx.run(&strs(&happy_argv(&fx)));
+    assert!(output.status.success(), "{}", combined(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("selected image has no readable tool manifest"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "required Python 3.13.2 from pyproject.toml: selected image tool inventory is unknown"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("not in selected image manifest"),
+        "{stderr}"
+    );
+    fx.assert_inventory_read();
+    assert!(fx.log().contains("helm upgrade"), "{}", fx.log());
+}
+
+#[test]
+fn factory_toolchain_uses_installed_platform_image_without_a_sole_factory_agent() {
+    let mut fx =
+        Fixture::with_toolchain(GithubConfig { installed: true }, ToolchainFixture::Python);
+    let mut values: serde_json::Value = serde_json::from_str(&fx.values).unwrap();
+    let image = values["agentSandbox"]["runnerImages"]["acme-bot"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (repository, digest) = image.split_once('@').unwrap();
+    values["factory"] = serde_json::json!({});
+    values["agentSandbox"] = serde_json::json!({
+        "deploy":true, "runner":{"image":repository, "digest":digest},
+    });
+    fx.values = values.to_string();
+    let output = fx.run(&strs(&happy_argv(&fx)));
+    assert!(output.status.success(), "{}", combined(&output));
+    assert!(
+        !combined(&output).contains("tool inventory unknown"),
+        "{}",
+        combined(&output)
+    );
+    assert!(
+        !combined(&output).contains("selected image manifest observed"),
+        "{}",
+        combined(&output)
+    );
+    fx.assert_inventory_read();
+    let log = fx.log();
+    assert!(
+        log.contains("helm history") && log.contains("--revision 1"),
+        "{log}"
+    );
 }
 
 #[test]
@@ -1089,6 +1984,10 @@ fn app_id_and_key_infer_mention_allowlist_label_and_store_the_key_in_a_secret() 
         "output must announce the allowlist: {text}"
     );
     assert!(
+        text.contains(" (the App's installed repositories)"),
+        "{text}"
+    );
+    assert!(
         text.contains("curie-factory"),
         "output must announce the label: {text}"
     );
@@ -1170,12 +2069,10 @@ fn app_id_and_key_infer_mention_allowlist_label_and_store_the_key_in_a_secret() 
     let api = values
         .get("api")
         .unwrap_or_else(|| panic!("no api in {values}"));
+    let tracker = github_tracker(&values);
+    assert_eq!(tracker.get("mention"), Some(&serde_json::json!(SLUG)));
     assert_eq!(
-        api.get("githubFactoryMention"),
-        Some(&serde_json::json!(SLUG))
-    );
-    assert_eq!(
-        api.get("githubFactoryLabel"),
+        tracker.get("label"),
         Some(&serde_json::json!("curie-factory"))
     );
     let mut allow: Vec<String> = api
@@ -1207,6 +2104,22 @@ fn app_id_and_key_infer_mention_allowlist_label_and_store_the_key_in_a_secret() 
         !log.contains(WEBHOOK_SECRET),
         "webhook secret leaked into argv: {log}"
     );
+
+    let fx = Fixture::installed();
+    let mut argv = happy_argv(&fx);
+    argv.push("--json".into());
+    let output = fx.run(&strs(&argv));
+    assert!(output.status.success(), "{}", combined(&output));
+    let value = stdout_json(&output);
+    assert_eq!(value["github_app"]["repos_inferred"], true);
+    assert_eq!(
+        value["github_app"]["repos"],
+        serde_json::json!(["acme/bot", "acme/web"])
+    );
+    assert_eq!(
+        value["github_app"]["labels_created"],
+        serde_json::json!(["acme/bot", "acme/web"])
+    );
 }
 
 #[test]
@@ -1221,6 +2134,8 @@ fn printed_poll_completion_configures_intake_without_a_webhook_secret() {
         APP_ID,
         "--private-key-file",
         &fx.path("app.pem"),
+        "--repo",
+        "acme/bot",
         "--chart",
         "charts/curie",
     ]);
@@ -1232,7 +2147,7 @@ fn printed_poll_completion_configures_intake_without_a_webhook_secret() {
     );
     let values: serde_json::Value = serde_json::from_str(&fx.values_file()).expect("helm values");
     assert_eq!(
-        values.pointer("/api/githubFactoryIntake"),
+        values.pointer("/factory/intake"),
         Some(&serde_json::json!("poll"))
     );
     assert!(values.pointer("/api/githubWebhookSecret").is_none());
@@ -1252,6 +2167,8 @@ fn webhook_completion_without_a_secret_is_refused_before_any_mutation() {
         APP_ID,
         "--private-key-file",
         &fx.path("app.pem"),
+        "--repo",
+        "acme/bot",
         "--chart",
         "charts/curie",
     ]);
@@ -1297,6 +2214,7 @@ fn an_app_that_is_not_installed_is_refused_before_any_mutation() {
 fn a_repo_the_app_is_not_installed_on_is_refused_naming_installed_repos() {
     let fx = Fixture::installed();
     let mut argv = happy_argv(&fx);
+    argv.retain(|arg| arg != "--all-installed-repos");
     argv.extend(["--repo".to_string(), "acme/other".to_string()]);
     let output = fx.run(&strs(&argv));
     let text = combined(&output);
@@ -1346,6 +2264,8 @@ fn app_id_without_a_private_key_file_is_a_usage_error() {
         "factory",
         "--app-id",
         "1",
+        "--repo",
+        "acme/bot",
         "--chart",
         "charts/curie",
     ]);

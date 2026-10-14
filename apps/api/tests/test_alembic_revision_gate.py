@@ -1,3 +1,4 @@
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -259,10 +260,37 @@ def test_python_ci_runs_released_upgrade_after_stack_ready_and_before_fresh_inst
     assert stack_index < readiness_index < released_upgrade_index < fresh_install_index
 
 
-def test_baseline_main_fetch_uses_a_fully_qualified_refspec() -> None:
-    instructions = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
-    safe_command = "git fetch --force --tags origin refs/heads/main:refs/remotes/origin/main"
-    unsafe_command = "git fetch --force --tags origin main:refs/remotes/origin/main"
+def test_baseline_fetch_selects_the_branch_when_a_tag_has_the_same_name(tmp_path: Path) -> None:
+    """Execute the documented fetch against conflicting local branch and tag refs."""
+    def git(directory: Path, *arguments: str) -> str:
+        result = subprocess.run(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", *arguments],
+            cwd=directory,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
 
-    assert safe_command in instructions
-    assert unsafe_command not in instructions
+    remote, seed, consumer = (tmp_path / name for name in ("remote", "seed", "consumer"))
+    for directory in (remote, seed, consumer):
+        directory.mkdir()
+    git(remote, "init", "--bare")
+    git(seed, "init", "--initial-branch=main")
+    git(seed, "commit", "--allow-empty", "-m", "tag target")
+    tag_sha = git(seed, "rev-parse", "HEAD")
+    git(seed, "tag", "main")
+    git(seed, "commit", "--allow-empty", "-m", "branch target")
+    branch_sha = git(seed, "rev-parse", "HEAD")
+    git(seed, "push", str(remote), "refs/heads/main", "refs/tags/main")
+    git(consumer, "init")
+    git(consumer, "remote", "add", "origin", str(remote))
+    command = next(
+        line.strip()
+        for line in (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8").splitlines()
+        if line.strip().startswith("git fetch") and "refs/remotes/origin/main" in line
+    )
+    git(consumer, *shlex.split(command)[1:])
+    fetched = git(consumer, "rev-parse", "refs/remotes/origin/main")
+    assert fetched == branch_sha
+    assert fetched != tag_sha

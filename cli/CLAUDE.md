@@ -161,9 +161,9 @@ Helm and the deployed release with `up`, `upgrade`, `status`, `down`, `comms`, `
   `CURIE_MODEL_CREDENTIALS`) flows through this path.
   `curie cluster comms --slack` uses the same `SecretSet` masking for
   `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN`, while `--disconnect --dry-run`
-  prints only the empty clears. After the helm upgrade it also rolls the
-  worker (and, on connect, the dispatcher) via `kubectl rollout restart` +
-  `rollout status` so the Secret-backed tokens go live.
+  prints only the empty clears. After the Helm upgrade it rolls every Slack
+  token consumer, the worker and API plus the dispatcher on connect, via
+  `kubectl rollout restart` + `rollout status` so the Secret-backed tokens go live.
 - **`local comms` shares the same Slack flag surface, but tokens travel through
   compose env, not argv.** `curie local comms --slack` reads
   `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN`, passes them through a masked
@@ -179,7 +179,7 @@ Helm and the deployed release with `up`, `upgrade`, `status`, `down`, `comms`, `
   `cli/api-mirrors.json`** (as a `mirrors` entry with its allowlisted field
   omissions, or a `non_mirrors` entry with a one-line reason). `curie dev
   field-parity` is the check (#691).
-- **A new `Deserialize` struct in `cli/src/commands.rs` or `cli/src/spec.rs`
+- **A new `Deserialize` struct in `cli/src/commands/` or `cli/src/spec.rs`
   that hand-mirrors the frozen `packages/plugin-format` manifest shape must be
   declared in `cli/plugin-format-mirrors.json`** the same way (`mirrors` with
   omissions, or `non_mirrors` with a reason) -- this is a SIBLING gate to the

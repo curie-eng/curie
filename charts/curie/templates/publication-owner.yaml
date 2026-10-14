@@ -75,8 +75,7 @@ subjects:
     namespace: {{ .Release.Namespace }}
 ---
 # Publication jobs accept no ingress and are isolated from all other egress.
-# The tokenless job may resolve DNS and connect over HTTPS only to the
-# operator-declared GitHub ranges.
+# The tokenless job may resolve DNS and reach only code host egress.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -99,14 +98,26 @@ spec:
       ports:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
+    {{- $egress := include "curie.factory.egress" (dict "root" .) | fromJsonArray }}
+    {{- if not $egress }}
+    {{- fail "worker.publication.enabled: a non-github factory code host needs egress; publication egress fails closed" }}
+    {{- end }}
+    {{- $byPorts := dict }}
+    {{- range $egress }}
+    {{- $block := dict "cidr" .cidr "except" (include "curie.egress.ipBlockExcept" (dict "entry" . "root" $) | fromJsonArray) }}
+    {{- $_ := set $byPorts (toJson .ports) (append (get $byPorts (toJson .ports) | default list) $block) }}
+    {{- end }}
+    {{- range $ports, $blocks := $byPorts }}
     - to:
-      {{- if not .Values.worker.publication.githubHttpsCidrs }}
-      {{- fail "worker.publication.enabled is true: set at least one worker.publication.githubHttpsCidrs entry; publication HTTPS egress fails closed" }}
-      {{- end }}
-      {{- range .Values.worker.publication.githubHttpsCidrs }}
+      {{- range $blocks }}
         - ipBlock:
-            cidr: {{ . | quote }}
+            cidr: {{ .cidr | quote }}
+            {{- with .except }}
+            except:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
       {{- end }}
       ports:
-        - { protocol: TCP, port: 443 }
+        {{- toYaml (fromJsonArray $ports) | nindent 8 }}
+    {{- end }}
 {{- end }}

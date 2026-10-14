@@ -51,8 +51,14 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 CONTRACT = "0041"
-# @spec PROTECTED-HOOK-SOURCE-2: ledger-dependent candidate requires schema0076.
-APP_SCHEMA_MIN = "0076"
+# @spec PROTECTED-HOOK-SOURCE-2 and DEPLOY-NOTICE-RELEASE-1.
+# Agent reads require deploy notifications after the published source-control ledger,
+# the Agent ORM and resolver read the tenant-scope columns of 0101 (#2911), and
+# factory status replies read the typed reply target columns of 0102, and
+# WorkItems are keyed by their tracker issue (0103 contract, #3831), and
+# channel and WorkItem reads carry the trigger label of 0105 (#4361).
+# The 0108 join requires both stable reply selectors (0106) and identity links (0107).
+APP_SCHEMA_MIN = "0108"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -87,13 +93,93 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     assert window.schema_head == HEAD
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
-    assert kinds[APP_SCHEMA_MIN] == KIND_EXPAND
+    # 0103 drops the GitHub identity columns (ADR 0197): a contract below the floor.
+    assert kinds["0103"] == KIND_CONTRACT
+    assert kinds["0102"] == KIND_EXPAND
     assert kinds["0070"] == KIND_CONTRACT
     assert kinds[REVIEW_SCHEMA_MIN] == KIND_CONTRACT
     if HEAD != APP_SCHEMA_MIN:
         assert kinds[HEAD] == KIND_EXPAND
     assert kinds[PREV] == KIND_EXPAND
     assert kinds["0016"] == KIND_IRREVERSIBLE
+
+
+@pytest.mark.parametrize("branch_head", ["0093", "0098"])
+def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_rows(
+    isolated_migration_db: IsolatedMigrationDb, branch_head: str
+) -> None:
+    """A released stable database and a feature database converge at the merge."""
+    isolated_migration_db.at(branch_head)
+    agent_id = uuid.uuid4()
+    _exec(
+        "INSERT INTO curie.agents(id,name) VALUES (:id,'merge-example')",
+        {"id": agent_id},
+    )
+    # The tracker identity contract (0103, #3831) is pending, so a rollback-safe
+    # upgrade is refused and only a forward-only one converges.
+    refused = apply_upgrade(
+        forward_only=False, before_apply=lambda: None, alembic_config=alembic_config()
+    )
+    assert refused.outcome == "refused"
+    assert current_revision() == branch_head
+    result = apply_upgrade(
+        forward_only=True, before_apply=lambda: None, alembic_config=alembic_config()
+    )
+    assert result.action == "apply"
+    assert result.outcome == "applied"
+    assert result.rollback_compatible is False
+    pending = {step.revision for step in result.pending}
+    if branch_head == "0093":
+        assert {
+            "0082",
+            "0091a",
+            "0092a",
+            "0093a",
+            "0098",
+            "0099",
+            "0100",
+            "0101",
+            "0102",
+            "0103",
+            "0105",
+            "0106",
+            "0107",
+            "0108",
+        } <= pending
+        assert not pending & {"0091", "0092", "0093"}
+    else:
+        assert pending == {
+            "0091",
+            "0092",
+            "0093",
+            "0099",
+            "0100",
+            "0101",
+            "0102",
+            "0103",
+            "0105",
+            "0106",
+            "0107",
+            "0108",
+        }
+    assert current_revision() == "0108"
+    assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
+        ("merge-example",)
+    ]
+    columns = {
+        (table, column)
+        for table, column in sql_rows(
+            "SELECT table_name,column_name FROM information_schema.columns "
+            "WHERE table_schema='curie'"
+        )
+    }
+    assert {
+        ("execution_requests", "owner_lost_retry"),
+        ("execution_requests", "start_deferrals"),
+        ("factory_terminal_notices", "sync_owner"),
+        ("remediation_nominations", "execution_code"),
+        ("remediation_nominations", "approval_reason"),
+    } <= columns
 
 
 def test_planner_refuses_0041_contract_without_forward_only() -> None:
@@ -130,6 +216,40 @@ def test_the_route_identity_contract_raises_the_floor_and_needs_forward_only() -
     )
     assert decision.action == "refuse"
     assert "0070" in decision.reason
+
+
+def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> None:
+    """@spec DEPLOY-NOTICE-RELEASE-1."""
+    window = load_window()
+    known = set(load_kinds())
+    for released in (
+        "0070",
+        "0071",
+        "0072",
+        "0073",
+        "0075",
+        "0076",
+        "0079",
+        "0080",
+        "0081",
+        "0082",
+        "0083",
+        "0084",
+        "0085",
+        "0086",
+        "0087",
+        "0088",
+        "0089",
+    ):
+        assert can_serve(released, window, known) is False
+    # #2911: the Agent ORM and the resolver read 0101's tenant-scope columns, and
+    # factory status replies read 0102's typed reply target and 0103 keys
+    # WorkItems by their tracker issue (#3831), and 0105 adds the trigger
+    # label (#4361). The 0108 join also requires stable reply selectors and
+    # identity links, so every earlier schema is refused.
+    for below_tenant_scope in sorted(known - {"0108"}):
+        assert can_serve(below_tenant_scope, window, known) is False
+    assert can_serve("0108", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

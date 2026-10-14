@@ -117,6 +117,8 @@ impl RunnerClient {
             tool_access: None,
             // `skill` turns carry no memory write credential.
             memory_token: None,
+            // The kernel alone issues channel read capabilities.
+            channel_read: None,
         };
         let resp = self
             .http

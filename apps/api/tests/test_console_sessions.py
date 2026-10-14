@@ -31,8 +31,8 @@ from typing import Any
 import httpx
 import pytest
 import uvicorn
-from curie_api import crud
 from curie_api.config import get_settings
+from curie_api.crud import console as crud_console
 from curie_api.main import create_app
 from curie_api.models import ConsoleSession
 from curie_api.routers.console import SESSION_COOKIE
@@ -440,31 +440,31 @@ def test_no_plaintext_credential_is_ever_stored(
     # Hashes, not values: hex SHA-256 is 64 characters.
     assert len(row.login_code_hash) == 64
     assert row.session_token_hash is not None and len(row.session_token_hash) == 64
-    assert row.login_code_hash == crud.hash_console_credential(code)
+    assert row.login_code_hash == crud_console.hash_console_credential(code)
 
 
 def test_an_expired_code_cannot_be_exchanged(clean_db: None) -> None:
     async def body(session: AsyncSession) -> None:
         # Injected clock rather than sleeping: expiry is arithmetic, not a race.
-        code, row = await crud.create_console_login_code(session, subject=SUBJECT)
+        code, row = await crud_console.create_console_login_code(session, subject=SUBJECT)
         past = row.login_code_expires_at + timedelta(seconds=1)
-        assert await crud.exchange_console_login_code(session, code, now=past) is None
+        assert await crud_console.exchange_console_login_code(session, code, now=past) is None
 
     with_session(body)
 
 
 def test_a_live_session_is_recognized_and_expiry_ends_it(clean_db: None) -> None:
     async def body(session: AsyncSession) -> None:
-        code, _ = await crud.create_console_login_code(session, subject=SUBJECT)
-        exchanged = await crud.exchange_console_login_code(session, code)
+        code, _ = await crud_console.create_console_login_code(session, subject=SUBJECT)
+        exchanged = await crud_console.exchange_console_login_code(session, code)
         assert exchanged is not None
         token, row = exchanged
 
-        assert await crud.live_console_session(session, token) is not None
+        assert await crud_console.live_console_session(session, token) is not None
         assert row.subject == SUBJECT
         assert row.session_expires_at is not None
         after = row.session_expires_at + timedelta(seconds=1)
-        assert await crud.live_console_session(session, token, now=after) is None
+        assert await crud_console.live_console_session(session, token, now=after) is None
 
     with_session(body)
 
@@ -475,23 +475,23 @@ def test_revocation_kills_a_live_session_without_waiting_for_expiry(
     """The reason this is a table and not a signed stateless token (ADR-0083)."""
 
     async def body(session: AsyncSession) -> None:
-        code, _ = await crud.create_console_login_code(session, subject=SUBJECT)
-        exchanged = await crud.exchange_console_login_code(session, code)
+        code, _ = await crud_console.create_console_login_code(session, subject=SUBJECT)
+        exchanged = await crud_console.exchange_console_login_code(session, code)
         assert exchanged is not None
         token, row = exchanged
-        assert await crud.live_console_session(session, token) is not None
+        assert await crud_console.live_console_session(session, token) is not None
 
-        await crud.revoke_console_session(session, row)
+        await crud_console.revoke_console_session(session, row)
         # Still well inside its expiry window, and no longer valid.
-        assert await crud.live_console_session(session, token) is None
+        assert await crud_console.live_console_session(session, token) is None
 
     with_session(body)
 
 
 def test_a_revoked_row_cannot_still_have_its_code_exchanged(clean_db: None) -> None:
     async def body(session: AsyncSession) -> None:
-        code, row = await crud.create_console_login_code(session, subject=SUBJECT)
-        await crud.revoke_console_session(session, row)
-        assert await crud.exchange_console_login_code(session, code) is None
+        code, row = await crud_console.create_console_login_code(session, subject=SUBJECT)
+        await crud_console.revoke_console_session(session, row)
+        assert await crud_console.exchange_console_login_code(session, code) is None
 
     with_session(body)

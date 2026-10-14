@@ -70,7 +70,7 @@ _BLOCKED_PREFIX = (
     "implementation, so no model round ran."
 )
 _ISSUE_TEXT = "Add a kilometres-to-miles conversion to unitconv."
-# Literal copy of ``_EARLY_STOP_PROMPT`` in apps/worker/src/curie_worker/kernel.py:
+# Literal copy of ``_EARLY_STOP_PROMPT`` in apps/worker/src/curie_worker/kernel/constants.py:
 # the one continuation the worker kernel sends after a factory turn that ended
 # without reported or published work (#3128). Copied, not imported, so the
 # runner tests never depend on the worker package.

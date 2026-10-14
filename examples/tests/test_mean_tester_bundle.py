@@ -231,14 +231,8 @@ def test_every_platform_text_the_skill_judges_by_still_exists_in_the_platform():
             "apps/worker/src/curie_worker/config.py",
         )
     )
-    # The release trains carry either the monolithic kernel or its package
-    # decomposition. Both are authoritative platform sources; an empty glob
-    # must not silently omit the worker's actual failure replies.
-    kernel_path = REPO / "apps/worker/src/curie_worker/kernel.py"
-    kernel_dir = kernel_path.with_suffix("")
-    kernel_sources = (
-        [kernel_path] if kernel_path.is_file() else sorted(kernel_dir.glob("*.py"))
-    )
+    kernel_dir = REPO / "apps/worker/src/curie_worker/kernel"
+    kernel_sources = sorted(kernel_dir.glob("*.py"))
     assert kernel_sources, "worker kernel sources must exist"
     sources += "\n" + "\n".join(path.read_text() for path in kernel_sources)
     joined = re.sub(r'"\s*\n\s*"', "", sources)  # join implicitly concatenated literals

@@ -30,6 +30,7 @@ from nacl.signing import VerifyKey
 from yarl import URL
 
 from . import caller
+from .canonical import canonical_arguments
 
 LISTEN_PORT_ENV = "CURIE_CALLER_PROXY_PORT"
 UPSTREAM_PORT_ENV = "CURIE_CALLER_PROXY_UPSTREAM_PORT"
@@ -190,7 +191,7 @@ class _ValkeyGrantStore:
     def spend(self, jti: str, ttl: int) -> bool:
         try:
             return _set_nx_ex(self._url, f"connector-grant:{jti}", max(ttl, 1))
-        except Exception:
+        except Exception:  # noqa: BLE001 - existing broad catch retained
             logger.warning("connector grant spend failed")
             return False
 
@@ -349,10 +350,10 @@ def _is_gated(config: ProxyConfig, name: str) -> bool:
 
 
 def _canonical_arguments(arguments: object) -> str | None:
-    if not isinstance(arguments, dict):
-        return None
+    """The shared canonical text, or None when it has none. @spec ACTION-EXECUTOR-7."""
+
     try:
-        return json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return canonical_arguments(arguments)
     except (TypeError, ValueError):
         return None
 
@@ -365,7 +366,7 @@ def _grant_spent(config: ProxyConfig, grant: caller.Grant, now: int) -> bool:
         return False
     try:
         return bool(store.spend(grant.jti, max(grant.exp - now, 1)))
-    except Exception:
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         logger.warning("connector grant spend failed")
         return False
 

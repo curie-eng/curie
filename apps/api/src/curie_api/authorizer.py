@@ -47,7 +47,7 @@ from typing import Any, Literal
 from .approvers import ApproverSet
 from .models import Approval
 
-PrincipalKind = Literal["chat", "console", "operator", "adapter"]
+PrincipalKind = Literal["chat", "console", "operator", "adapter", "test_driver"]
 
 
 @dataclass(frozen=True)
@@ -65,6 +65,10 @@ class AuthzDecision:
 # reason rendered to the resolver and the evidence flag the audit row keeps.
 # The three pre-ADR-0177 shapes are append-only audit vocabulary; keep them.
 _INELIGIBLE_DEFAULTS: dict[PrincipalKind, tuple[str, str]] = {
+    "test_driver": (
+        "test driver approval principals can resolve only routes bound to an explicit user list",
+        "explicit_users_required",
+    ),
     "operator": (
         "operator approval principals can resolve only routes bound to an explicit user list",
         "explicit_users_required",
@@ -110,6 +114,7 @@ async def authorize_approval(
     name = approver_set.audit_name
 
     eligible = {
+        "test_driver": approver_set.test_driver_eligible,
         "chat": approver_set.chat_eligible,
         "console": approver_set.console_eligible,
         "operator": approver_set.operator_eligible,

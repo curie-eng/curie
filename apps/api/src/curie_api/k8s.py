@@ -152,12 +152,12 @@ def build_pod_log_reader(kube_config_path: str | None) -> PodLogReader:
         else:
             try:
                 config.load_incluster_config()
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 # Not in a cluster: honor the standard KUBECONFIG / ~/.kube/config
                 # so local runs against a real cluster work without extra config.
                 config.load_kube_config()
         return KubernetesPodLogReader(client.CoreV1Api())
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         logger.warning(
             "runner-logs proxy: no usable kubernetes cluster (%s); "
             "pod-log reads will return 503",
@@ -249,10 +249,10 @@ def build_pod_lister(kube_config_path: str | None) -> PodLister:
         else:
             try:
                 config.load_incluster_config()
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 config.load_kube_config()
         return KubernetesPodLister(client.CoreV1Api())
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         logger.warning(
             "runner-pods list: no usable kubernetes cluster (%s); "
             "pod listing will return 503",

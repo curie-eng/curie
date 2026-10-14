@@ -33,11 +33,11 @@ from aci_protocol import QueuedTurn, TurnSource
 from aci_protocol.turn import CLUSTER_MESSAGE_ADAPTER
 from channel_protocol.progress import ProgressCommand
 from channel_protocol.reply import ReplyTarget
+from curie_internal import sandbox_token
 from pydantic import ValidationError
 from redis.exceptions import ConnectionError as ValkeyConnectionError
 from redis.exceptions import TimeoutError as ValkeyTimeoutError
 
-from . import sandbox_token
 from .binding import SANDBOX_TOKEN_TTL_SECONDS
 from .config import WorkerConfig
 from .progress import ProgressStore, progress_id_for
@@ -271,7 +271,7 @@ async def deactivate_turn_progress(store: ProgressStore, plan: TurnProgressPlan)
             await asyncio.shield(close)
         except asyncio.CancelledError as exc:
             cancellation = cancellation or exc
-        except Exception:  # handled from task.result() below
+        except Exception:  # noqa: BLE001 - handled from task.result() below
             break
     try:
         close.result()

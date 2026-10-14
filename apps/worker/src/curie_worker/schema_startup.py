@@ -49,12 +49,14 @@ async def assert_worker_schema(config: WorkerConfig) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
     try:
         engine = create_async_engine(config.database_url)
-    except Exception:
+    # sanitize every engine construction fault before it reaches diagnostics.
+    except Exception:  # noqa: BLE001
         raise SchemaServingUnavailable("schema_probe_unavailable") from None
     primary: BaseException | None = None
     try:
         await assert_servable(engine, metadata_schema=config.db_schema)
-    except BaseException as error:
+    # retain cancellation and primary failures while the probe is disposed.
+    except BaseException as error:  # noqa: BLE001
         primary = error
     cleanup = asyncio.create_task(_dispose_probe(engine, lambda: _primary_code(primary)))
     while not cleanup.done():
@@ -63,11 +65,13 @@ async def assert_worker_schema(config: WorkerConfig) -> None:
         except asyncio.CancelledError as error:
             if primary is None:
                 primary = error
-        except Exception:
+        # defer cleanup faults to the sanitized result path.
+        except Exception:  # noqa: BLE001
             break
     try:
         cleanup.result()
-    except (Exception, asyncio.CancelledError):
+    # report cleanup failure without exposing database diagnostics.
+    except (Exception, asyncio.CancelledError):  # noqa: BLE001
         if primary is None:
             raise SchemaServingUnavailable("schema_cleanup_unavailable") from None
     if primary is not None:

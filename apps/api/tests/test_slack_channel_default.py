@@ -32,11 +32,11 @@ def test_cli_default_channel_passes_api_validation() -> None:
     # kind-dispatched validator lands, and a module-level import would turn that
     # into a COLLECTION error, taking the rest of this module's signal with it
     # and reading like a broken test file rather than an absent feature.
-    from curie_api.schemas import _validate_channel_binding
+    from curie_api.schemas.channels import validate_channel_binding
 
     value = _cli_default_channel()
     # Validator raises on a bad shape and echoes the address back on success.
-    assert _validate_channel_binding("slack", value) == value
+    assert validate_channel_binding("slack", value) == value
 
 
 def test_an_unregistered_kind_does_not_borrow_the_slack_shape_rule() -> None:
@@ -49,7 +49,7 @@ def test_an_unregistered_kind_does_not_borrow_the_slack_shape_rule() -> None:
     exactly the coupling ADR-0096 removes.
     """
 
-    from curie_api.schemas import _validate_channel_binding
+    from curie_api.schemas.channels import validate_channel_binding
 
     # Rejected as a Slack address, accepted as a webhook one.
-    assert _validate_channel_binding("webhook", "acme-room-7") == "acme-room-7"
+    assert validate_channel_binding("webhook", "acme-room-7") == "acme-room-7"

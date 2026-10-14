@@ -5,11 +5,11 @@ from __future__ import annotations
 import time
 import uuid
 
+from curie_internal.sandbox_token import mint
 from curie_worker.binding import HISTORY_TOKEN_ENV
 from curie_worker.sandbox.affinity import AffinityStore
 from curie_worker.sandbox.substrate import SandboxSubstrate
 from curie_worker.sandbox.types import SandboxHandle, SubstrateConfig
-from curie_worker.sandbox_token import mint
 
 from .conftest import FakeSandboxClient
 

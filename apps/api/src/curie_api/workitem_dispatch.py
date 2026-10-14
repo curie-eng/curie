@@ -6,16 +6,36 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
-from . import crud, workitems
+from curie_api.crud import channels as crud_channels
+from curie_api.workitems import lifecycle
+from curie_api.workitems.lifecycle import (
+    ExecutionRequestSnapshot,
+    WorkItemConflict,
+    WorkItemOutcome,
+    WorkItemSnapshot,
+    database_now,
+    lock_request,
+    lock_request_by_id,
+    lock_work_item,
+    outcome,
+    record_runtime_termination_where,
+    reload_request,
+    reload_work_item,
+    start_execution_where,
+    terminalize_execution,
+)
+
 from .config import Settings, get_settings
 from .factory_notices import start_failed_sentence
+from .factory_reply_target import reply_columns
+from .forges.types import ReplyTarget, RepositoryRef, TrackerIssueRef
 from .models import Agent, AgentChannel, ExecutionRequest, Publication, WorkItem
 from .threadkeys import (
     legacy_route_adapter_of,
@@ -24,25 +44,7 @@ from .threadkeys import (
     route_thread_key,
     route_thread_key_matches,
 )
-from .workitems import (
-    _AWAITING_PUBLICATION,
-    ExecutionRequestSnapshot,
-    WorkItemConflict,
-    WorkItemOutcome,
-    WorkItemSnapshot,
-    _database_now,
-    _lock_request,
-    _lock_request_by_id,
-    _lock_work_item,
-    _not_awaiting_publication,
-    _outcome,
-    _record_runtime_termination,
-    _reload_request,
-    _reload_work_item,
-    _start_execution,
-    _terminalize_execution,
-)
-from .workspace_policy import repository_is_allowed
+from .workspace_policy import repository_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +76,41 @@ RefusalCode = Literal[
 DispatchResult = WorkItemOutcome | WorkItemConflict
 
 
+if TYPE_CHECKING:
+    from .factory_base import ResolvedBase
+
+
+@dataclass(frozen=True)
+class Admission:
+    """Trusted, normalized facts that admit or revise one WorkItem (ADR 0162).
+
+    ``issue`` keys the WorkItem and ``repository`` is the binding frozen on it
+    (ADR 0197). ``code_host_installation_id`` is the GitHub installation that
+    verified the work; other code hosts leave it None.
+    """
+
+    agent_id: uuid.UUID
+    kind: str
+    address: str
+    reply_conversation_id: str
+    issue: TrackerIssueRef
+    repository: RepositoryRef
+    code_host_installation_id: int | None
+    objective: str
+    requester: str
+    request_id: uuid.UUID
+    # The base a fresh admission resolved (ADR 0186), written on a new WorkItem.
+    base: ResolvedBase | None = None
+    # Where the request's status reply lands, and the feedback URL it answers.
+    # None is the tracker issue; review feedback sets its pull request target.
+    reply_target: ReplyTarget | None = None
+    reply_url: str | None = None
+    # The trigger label that admitted this run (#4361 decision 10), stored on
+    # the WorkItem at admission and readmission. None for an admission no label
+    # started (a revision, review feedback, the work-items API).
+    trigger_label: str | None = None
+
+
 @dataclass(frozen=True)
 class DispatchConflict:
     code: RefusalCode
@@ -88,7 +125,7 @@ class AcquireGrant:
     work_item_id: uuid.UUID
     conversation_id: str
     wait_deadline: datetime
-    repo_full_name: str
+    repository_path: str
 
 
 @dataclass(frozen=True)
@@ -167,38 +204,34 @@ async def _refuse(
 
 
 def _facts_conversation(facts: Any, adapter: str | None) -> str:
-    return route_thread_key(
-        facts.kind, adapter, facts.address, facts.reply_conversation_id
-    )
+    return route_thread_key(facts.kind, adapter, facts.address, facts.reply_conversation_id)
 
 
-def _snapshot_values(facts: Any) -> dict[str, str]:
+def _snapshot_values(facts: Any) -> dict[str, str | None]:
+    # Only factory review feedback names a pull request reply target; every
+    # other admission (an issue label or mention, the work-items API) answers
+    # on the tracker issue.
+    reply = reply_columns(getattr(facts, "reply_target", None), getattr(facts, "reply_url", None))
     return {
         "objective": facts.objective,
         "requester": facts.requester,
         "reply_kind": facts.kind,
         "reply_address": facts.address,
         "reply_conversation_id": facts.reply_conversation_id,
+        **reply,
     }
 
 
 def _snapshot_matches(row: ExecutionRequest, facts: Any) -> bool:
-    return bool(
-        row.objective == facts.objective
-        and row.requester == facts.requester
-        and row.reply_kind == facts.kind
-        and row.reply_address == facts.address
-        and row.reply_conversation_id == facts.reply_conversation_id
-    )
+    return all(getattr(row, column) == value for column, value in _snapshot_values(facts).items())
 
 
 def _work_item_matches(item: WorkItem, facts: Any, adapter: str | None) -> bool:
     return (
         item.agent_id == facts.agent_id
-        and item.repo_full_name == facts.repo_full_name
-        and item.github_repository_id == facts.github_repository_id
-        and item.github_issue_number == facts.github_issue_number
-        and item.github_installation_id == facts.github_installation_id
+        and item.tracker_issue == facts.issue
+        and lifecycle.same_repository(item.repository, facts.repository)
+        and item.code_host_installation_id == facts.code_host_installation_id
         and route_thread_key_matches(
             facts.kind,
             adapter,
@@ -223,27 +256,21 @@ async def _write_snapshot(
             updated_at=func.clock_timestamp(),
         )
     )
-    row = await _reload_request(session, request_id)
+    row = await reload_request(session, request_id)
     if not _snapshot_matches(row, facts):
-        return await _refuse(
-            session, "identity_mismatch", request_id=request_id
-        )
+        return await _refuse(session, "identity_mismatch", request_id=request_id)
     return row
 
 
 async def _replay_existing(
     session: AsyncSession, request: ExecutionRequest, facts: Any, adapter: str | None
 ) -> WorkItemOutcome | DispatchConflict:
-    work_item = await _lock_work_item(session, request.work_item_id)
+    work_item = await lock_work_item(session, request.work_item_id)
     if work_item is None:
         return await _refuse(session, "not_found", request_id=request.id)
-    locked = await _lock_request(
-        session, work_item_id=work_item.id, request_id=request.id
-    )
+    locked = await lock_request(session, work_item_id=work_item.id, request_id=request.id)
     if locked is None:
-        return await _refuse(
-            session, "not_found", work_item_id=work_item.id, request_id=request.id
-        )
+        return await _refuse(session, "not_found", work_item_id=work_item.id, request_id=request.id)
     if not _work_item_matches(work_item, facts, adapter):
         return await _refuse(
             session,
@@ -263,16 +290,14 @@ async def _replay_existing(
             work_item_id=work_item.id,
             request_id=locked.id,
         )
-    return await _outcome(session, work_item, locked, replayed=True)
+    return await outcome(session, work_item, locked, replayed=True)
 
 
-async def _admission_refusal(
-    session: AsyncSession, facts: Any
-) -> DispatchConflict | AgentChannel:
+async def _admission_refusal(session: AsyncSession, facts: Any) -> DispatchConflict | AgentChannel:
     """The binding that authorizes this admission, or the refusal.
 
     Every caller below reuses THIS binding for the rest of its own
-    transaction rather than re-resolving `crud.binding_for_route`: under
+    transaction rather than re-resolving `crud.channels.binding_for_route`: under
     Postgres's default READ COMMITTED isolation, a second read in the same
     transaction sees any rebind already committed since the first, so
     re-resolving could key the work item by a binding other than the one
@@ -289,17 +314,15 @@ async def _admission_refusal(
     # on the pair is not this work item's; two of this agent's routes on one
     # pair are ambiguous, which admission refuses rather than picking one.
     try:
-        binding = await crud.binding_for_route(
+        binding = await crud_channels.binding_for_route(
             session, facts.kind, None, facts.address, agent_id=facts.agent_id
         )
-    except crud.AmbiguousRoute:
+    except crud_channels.AmbiguousRoute:
         logger.warning("work item admission for agent %s is ambiguous", facts.agent_id)
         binding = None
     if binding is None or binding.agent_id != facts.agent_id:
         return await _refuse(session, "binding_missing")
-    if not repository_is_allowed(
-        facts.repo_full_name, get_settings().github_repo_allowlist
-    ):
+    if not repository_allowed(get_settings(), facts.repository):
         return await _refuse(session, "repository_not_allowed")
     objective = facts.objective
     requester = facts.requester
@@ -342,26 +365,21 @@ async def admit_revision(
     if existing is not None:
         return await _replay_existing(session, existing, facts, resolved.adapter)
     work_item = await session.scalar(
-        select(WorkItem).where(
-            WorkItem.github_repository_id == facts.github_repository_id,
-            WorkItem.github_issue_number == facts.github_issue_number,
-        )
+        select(WorkItem)
+        .where(*lifecycle.for_tracker_issue(facts.issue))
         .with_for_update()
         .execution_options(populate_existing=True)
     )
     if work_item is None:
         return await _refuse(session, "not_found")
     if not _work_item_matches(work_item, facts, resolved.adapter):
-        return await _refuse(
-            session, "identity_mismatch", work_item_id=work_item.id
-        )
-    now = await _database_now(session)
-    requested = await workitems.create_revision_request(
+        return await _refuse(session, "identity_mismatch", work_item_id=work_item.id)
+    now = await database_now(session)
+    requested = await lifecycle.create_revision_request(
         session,
         work_item_id=work_item.id,
         request_id=facts.request_id,
-        wait_deadline=now
-        + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
+        wait_deadline=now + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
         expected_work_item_version=work_item.version,
         snapshot=_snapshot_values(facts),
     )
@@ -373,8 +391,8 @@ async def admit_revision(
     written = await _write_snapshot(session, facts.request_id, facts)
     if isinstance(written, DispatchConflict):
         return written
-    reloaded = await _reload_work_item(session, work_item.id)
-    return await _outcome(session, reloaded, written, replayed=requested.replayed)
+    reloaded = await reload_work_item(session, work_item.id)
+    return await outcome(session, reloaded, written, replayed=requested.replayed)
 
 
 async def readmit(
@@ -395,27 +413,22 @@ async def readmit(
     if existing is not None:
         return await _replay_existing(session, existing, facts, resolved.adapter)
     work_item = await session.scalar(
-        select(WorkItem).where(
-            WorkItem.github_repository_id == facts.github_repository_id,
-            WorkItem.github_issue_number == facts.github_issue_number,
-        )
+        select(WorkItem).where(*lifecycle.for_tracker_issue(facts.issue))
     )
     if work_item is None:
         return await _admit_new(session, facts, resolved.adapter)
     if not _work_item_matches(work_item, facts, resolved.adapter):
-        return await _refuse(
-            session, "identity_mismatch", work_item_id=work_item.id
-        )
-    now = await _database_now(session)
-    readmitted = await workitems.readmit(
+        return await _refuse(session, "identity_mismatch", work_item_id=work_item.id)
+    now = await database_now(session)
+    readmitted = await lifecycle.readmit(
         session,
         work_item_id=work_item.id,
         request_id=facts.request_id,
-        wait_deadline=now
-        + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
+        wait_deadline=now + timedelta(seconds=get_settings().work_item_wait_budget_seconds),
         objective=facts.objective,
         requester=facts.requester,
         base=getattr(facts, "base", None),
+        trigger_label=facts.trigger_label,
     )
     if isinstance(readmitted, WorkItemConflict):
         return readmitted
@@ -425,31 +438,30 @@ async def readmit(
     written = await _write_snapshot(session, facts.request_id, facts)
     if isinstance(written, DispatchConflict):
         return written
-    reloaded = await _reload_work_item(session, work_item.id)
-    return await _outcome(session, reloaded, written)
+    reloaded = await reload_work_item(session, work_item.id)
+    return await outcome(session, reloaded, written)
 
 
 async def _admit_new(
     session: AsyncSession, facts: Any, adapter: str | None
 ) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
-    created = await workitems.create_or_get_work_item(
+    created = await lifecycle.create_or_get_work_item(
         session,
-        github_repository_id=facts.github_repository_id,
-        github_issue_number=facts.github_issue_number,
-        github_installation_id=facts.github_installation_id,
+        issue=facts.issue,
+        repository=facts.repository,
+        code_host_installation_id=facts.code_host_installation_id,
         agent_id=facts.agent_id,
-        repo_full_name=facts.repo_full_name,
         conversation_id=_facts_conversation(facts, adapter),
-        # Factory admission resolves a base (ADR 0186); other callers do not.
+        # Factory admission resolves a base (ADR 0186) and names the label
+        # that admitted it (#4361); other callers do neither.
         base=getattr(facts, "base", None),
+        trigger_label=facts.trigger_label,
     )
     if isinstance(created, WorkItemConflict):
         return created
-    now = await _database_now(session)
-    wait_deadline = now + timedelta(
-        seconds=get_settings().work_item_wait_budget_seconds
-    )
-    requested = await workitems.create_execution_request(
+    now = await database_now(session)
+    wait_deadline = now + timedelta(seconds=get_settings().work_item_wait_budget_seconds)
+    requested = await lifecycle.create_execution_request(
         session,
         work_item_id=created.work_item.id,
         request_id=facts.request_id,
@@ -459,9 +471,7 @@ async def _admit_new(
     if isinstance(requested, WorkItemConflict):
         if requested.code == "identity_mismatch":
             existing = await session.scalar(
-                select(ExecutionRequest).where(
-                    ExecutionRequest.id == facts.request_id
-                )
+                select(ExecutionRequest).where(ExecutionRequest.id == facts.request_id)
             )
             if existing is not None:
                 return await _replay_existing(session, existing, facts, adapter)
@@ -470,10 +480,8 @@ async def _admit_new(
     written = await _write_snapshot(session, requested.request.id, facts)
     if isinstance(written, DispatchConflict):
         return written
-    work_item = await _reload_work_item(session, created.work_item.id)
-    return await _outcome(
-        session, work_item, written, replayed=requested.replayed
-    )
+    work_item = await reload_work_item(session, created.work_item.id)
+    return await outcome(session, work_item, written, replayed=requested.replayed)
 
 
 async def claim_due(
@@ -491,8 +499,7 @@ async def claim_due(
             ),
             or_(
                 ExecutionRequest.dispatch_lease_expires_at.is_(None),
-                ExecutionRequest.dispatch_lease_expires_at
-                <= func.clock_timestamp(),
+                ExecutionRequest.dispatch_lease_expires_at <= func.clock_timestamp(),
             ),
         )
         .order_by(ExecutionRequest.dispatch_not_before)
@@ -506,8 +513,7 @@ async def claim_due(
             .values(
                 dispatch_owner=owner,
                 dispatch_epoch=ExecutionRequest.dispatch_epoch + 1,
-                dispatch_lease_expires_at=func.clock_timestamp()
-                + timedelta(seconds=lease_s),
+                dispatch_lease_expires_at=func.clock_timestamp() + timedelta(seconds=lease_s),
                 updated_at=func.clock_timestamp(),
             )
             .returning(
@@ -558,21 +564,15 @@ def _generation_refusal(generation: int, dispatch_generation: int) -> RefusalCod
 async def _lock_pair(
     session: AsyncSession, request_id: uuid.UUID
 ) -> tuple[WorkItem, ExecutionRequest] | DispatchConflict:
-    found = await session.scalar(
-        select(ExecutionRequest).where(ExecutionRequest.id == request_id)
-    )
+    found = await session.scalar(select(ExecutionRequest).where(ExecutionRequest.id == request_id))
     if found is None:
         return await _refuse(session, "not_found", request_id=request_id)
-    work_item = await _lock_work_item(session, found.work_item_id)
+    work_item = await lock_work_item(session, found.work_item_id)
     if work_item is None:
         return await _refuse(session, "not_found", request_id=request_id)
-    request = await _lock_request(
-        session, work_item_id=work_item.id, request_id=request_id
-    )
+    request = await lock_request(session, work_item_id=work_item.id, request_id=request_id)
     if request is None:
-        return await _refuse(
-            session, "not_found", work_item_id=work_item.id, request_id=request_id
-        )
+        return await _refuse(session, "not_found", work_item_id=work_item.id, request_id=request_id)
     return work_item, request
 
 
@@ -618,7 +618,7 @@ async def acquire(
             work_item_id=work_item.id,
             request_id=request.id,
         )
-    now = await _database_now(session)
+    now = await database_now(session)
     if now >= deadline:
         return await _refuse(
             session,
@@ -646,7 +646,7 @@ async def acquire(
             work_item_id=work_item.id,
             conversation_id=work_item.conversation_id,
             wait_deadline=deadline,
-            repo_full_name=work_item.repo_full_name,
+            repository_path=work_item.repository_path,
         )
         await session.execute(
             update(ExecutionRequest)
@@ -689,7 +689,7 @@ async def acquire(
         work_item_id=work_item.id,
         conversation_id=work_item.conversation_id,
         wait_deadline=deadline,
-        repo_full_name=work_item.repo_full_name,
+        repository_path=work_item.repository_path,
     )
     await session.commit()
     return grant
@@ -715,7 +715,7 @@ async def defer(
     if not counts_as_start:
         # Capacity defers and other waits never settle the request, so the
         # request lock alone suffices.
-        request = await _lock_request_by_id(session, request_id)
+        request = await lock_request_by_id(session, request_id)
         if request is None:
             return await _refuse(session, "not_found", request_id=request_id)
         work_item = None
@@ -739,16 +739,14 @@ async def defer(
             _generation_refusal(generation, request.dispatch_generation),
             request_id=request.id,
         )
-    now = await _database_now(session)
+    now = await database_now(session)
     if (
         request.acquire_owner != owner
         or request.acquired_generation != generation
         or request.acquire_expires_at is None
         or request.acquire_expires_at <= now
     ):
-        return await _refuse(
-            session, "not_dispatchable", request_id=request.id
-        )
+        return await _refuse(session, "not_dispatchable", request_id=request.id)
     settings = get_settings()
     values: dict[str, Any] = {}
     if capacity:
@@ -760,8 +758,7 @@ async def defer(
         delay = _backoff_seconds(settings, request.start_deferrals)
         values["start_deferrals"] = ExecutionRequest.start_deferrals + 1
     fails_start = (
-        counts_as_start
-        and request.start_deferrals + 1 >= settings.work_item_start_deferral_limit
+        counts_as_start and request.start_deferrals + 1 >= settings.work_item_start_deferral_limit
     )
     if fails_start:
         # #4170: the sandbox never started within the limit, so the request
@@ -795,7 +792,7 @@ async def defer(
     )
     if changed_id is None:
         return await _refuse(session, "not_dispatchable", request_id=request.id)
-    request = await _reload_request(session, request.id)
+    request = await reload_request(session, request.id)
     if not fails_start:
         result = DeferResult(
             dispatch_generation=request.dispatch_generation,
@@ -805,7 +802,7 @@ async def defer(
         return result
     assert work_item is not None
     attempts = request.start_deferrals
-    await workitems._settle_terminal(
+    await lifecycle.settle_terminal(
         session,
         work_item,
         request,
@@ -839,7 +836,7 @@ async def start(
     if isinstance(locked, DispatchConflict):
         return locked
     work_item, request = locked
-    now = await _database_now(session)
+    now = await database_now(session)
     if (
         request.acquire_owner != owner
         or request.acquired_generation != generation
@@ -854,7 +851,7 @@ async def start(
         )
     settings = get_settings()
     ttl = timedelta(seconds=settings.work_item_runtime_ttl_seconds)
-    result = await _start_execution(
+    result = await start_execution_where(
         session,
         work_item_id=work_item.id,
         request_id=request.id,
@@ -885,9 +882,9 @@ async def start(
             request_id=result.request_id,
         )
     assert result.request is not None
-    row = await _reload_request(session, result.request.id)
+    row = await reload_request(session, result.request.id)
     assert row.execution_deadline is not None
-    remaining = (row.execution_deadline - await _database_now(session)).total_seconds()
+    remaining = (row.execution_deadline - await database_now(session)).total_seconds()
     return StartResult(
         runtime_epoch=row.runtime_epoch,
         execution_deadline=row.execution_deadline,
@@ -909,7 +906,7 @@ def _map_start_conflict(result: WorkItemConflict) -> RefusalCode:
 async def heartbeat(
     session: AsyncSession, request_id: uuid.UUID, *, runtime_epoch: int
 ) -> HeartbeatResult | DispatchConflict:
-    request = await _lock_request_by_id(session, request_id)
+    request = await lock_request_by_id(session, request_id)
     if request is None:
         return await _refuse(session, "not_found", request_id=request_id)
     if request.status not in {"running", "cancellation_requested"}:
@@ -926,14 +923,12 @@ async def heartbeat(
             request_id=request.id,
             status=request.status,
         )
-    now = await _database_now(session)
+    now = await database_now(session)
     late = (
         request.runtime_heartbeat_expires_at is not None
         and now >= request.runtime_heartbeat_expires_at
     )
-    past_deadline = (
-        request.execution_deadline is not None and now >= request.execution_deadline
-    )
+    past_deadline = request.execution_deadline is not None and now >= request.execution_deadline
     # The matching epoch still owns a running request, so a late heartbeat
     # can renew its lease before the execution deadline.
     if late and (request.status != "running" or past_deadline):
@@ -958,10 +953,8 @@ async def heartbeat(
                 updated_at=func.clock_timestamp(),
             )
         )
-        request = await _reload_request(session, request.id)
-    work_item = await session.scalar(
-        select(WorkItem).where(WorkItem.id == request.work_item_id)
-    )
+        request = await reload_request(session, request.id)
+    work_item = await session.scalar(select(WorkItem).where(WorkItem.id == request.work_item_id))
     cancelled = work_item is not None and work_item.cancelled_at is not None
     result = HeartbeatResult(
         status=request.status,
@@ -981,7 +974,7 @@ async def hold_for_approval(
     This sets that lease to the execution deadline. It does not finish the request.
     """
 
-    request = await _lock_request_by_id(session, request_id)
+    request = await lock_request_by_id(session, request_id)
     if request is None:
         return await _refuse(session, "not_found", request_id=request_id)
     if request.status != "running" or request.runtime_epoch != runtime_epoch:
@@ -991,7 +984,7 @@ async def hold_for_approval(
             request_id=request.id,
             status=request.status,
         )
-    now = await _database_now(session)
+    now = await database_now(session)
     if request.execution_deadline is None or now >= request.execution_deadline:
         return await _refuse(
             session,
@@ -1020,7 +1013,7 @@ async def hold_for_approval(
             request_id=request.id,
             status=request.status,
         )
-    request = await _reload_request(session, request.id)
+    request = await reload_request(session, request.id)
     work_item = await session.scalar(select(WorkItem).where(WorkItem.id == request.work_item_id))
     result = HeartbeatResult(
         status=request.status,
@@ -1040,6 +1033,15 @@ def _not_approval_hold() -> ColumnElement[bool]:
             ExecutionRequest.execution_deadline
         ),
         ExecutionRequest.execution_deadline <= func.clock_timestamp(),
+    )
+
+
+def _not_awaiting_publication() -> ColumnElement[bool]:
+    # A publication in flight or succeeded hands the request's terminus to the
+    # publication loop and the CI gate, not to runtime owner loss.
+    return ~exists().where(
+        Publication.execution_request_id == ExecutionRequest.id,
+        Publication.status.in_((*lifecycle.IN_FLIGHT_PUBLICATION, "succeeded")),
     )
 
 
@@ -1105,7 +1107,7 @@ async def declare_owner_lost(
             request_id=request.id,
             status=request.status,
         )
-    now = await _database_now(session)
+    now = await database_now(session)
     held = (
         request.runtime_heartbeat_expires_at is not None
         and request.runtime_heartbeat_expires_at == request.execution_deadline
@@ -1115,7 +1117,7 @@ async def declare_owner_lost(
         select(Publication.id)
         .where(
             Publication.execution_request_id == request.id,
-            Publication.status.in_(_AWAITING_PUBLICATION),
+            Publication.status.in_((*lifecycle.IN_FLIGHT_PUBLICATION, "succeeded")),
         )
         .limit(1)
     )
@@ -1161,15 +1163,13 @@ async def declare_owner_lost(
             request_id=request.id,
             status=request.status,
         )
-    request = await _reload_request(session, request.id)
+    request = await reload_request(session, request.id)
     result = OwnerLostResult(status=request.status, terminal_cause=request.terminal_cause)
     await session.commit()
     return result
 
 
-def _map_finish_conflict(
-    result: WorkItemConflict, request: ExecutionRequest | None
-) -> RefusalCode:
+def _map_finish_conflict(result: WorkItemConflict, request: ExecutionRequest | None) -> RefusalCode:
     if result.code == "not_found":
         return "not_found"
     if result.code == "work_item_cancelled":
@@ -1207,7 +1207,7 @@ async def finish(
             request_id=request.id,
             status=request.status,
         )
-    now = await _database_now(session)
+    now = await database_now(session)
     if (
         request.runtime_heartbeat_expires_at is not None
         and now >= request.runtime_heartbeat_expires_at
@@ -1219,7 +1219,7 @@ async def finish(
             request_id=request.id,
             status=request.status,
         )
-    result = await _terminalize_execution(
+    result = await terminalize_execution(
         session,
         work_item_id=work_item.id,
         request_id=request.id,
@@ -1270,12 +1270,10 @@ def _unconfirmed_settle_teardown() -> ColumnElement[bool]:
 async def claim_termination(
     session: AsyncSession, request_id: uuid.UUID, *, owner: str
 ) -> TerminationClaim | DispatchConflict:
-    request = await _lock_request_by_id(session, request_id)
+    request = await lock_request_by_id(session, request_id)
     if request is None:
         return await _refuse(session, "not_found", request_id=request_id)
-    settled_teardown = (
-        request.status == "cancelled" and request.teardown_unconfirmed_at is not None
-    )
+    settled_teardown = request.status == "cancelled" and request.teardown_unconfirmed_at is not None
     # A settled teardown is re-checked against active siblings in the
     # guarded update below.
     if not settled_teardown and request.status != "cancellation_requested":
@@ -1285,16 +1283,12 @@ async def claim_termination(
             request_id=request.id,
             status=request.status,
         )
-    now = await _database_now(session)
+    now = await database_now(session)
     heartbeat_live = (
         request.runtime_heartbeat_expires_at is not None
         and request.runtime_heartbeat_expires_at > now
     )
-    allowed = (
-        request.runtime_owner is None
-        or not heartbeat_live
-        or request.runtime_owner == owner
-    )
+    allowed = request.runtime_owner is None or not heartbeat_live or request.runtime_owner == owner
     if not allowed:
         return await _refuse(session, "duplicate", request_id=request.id)
     settings = get_settings()
@@ -1325,7 +1319,7 @@ async def claim_termination(
                 status=request.status,
             )
         return await _refuse(session, "duplicate", request_id=request.id)
-    request = await _reload_request(session, request.id)
+    request = await reload_request(session, request.id)
     claimed = TerminationClaim(runtime_epoch=request.runtime_epoch)
     await session.commit()
     return claimed
@@ -1350,7 +1344,7 @@ async def record_termination(
             request_id=request.id,
             status=request.status,
         )
-    result = await _record_runtime_termination(
+    result = await record_runtime_termination_where(
         session,
         work_item_id=work_item.id,
         request_id=request.id,
@@ -1377,7 +1371,7 @@ async def cancel(
     work_item_id: uuid.UUID,
     expected_version: int,
 ) -> WorkItemOutcome | WorkItemConflict:
-    return await workitems.request_cancellation(
+    return await lifecycle.request_cancellation(
         session,
         work_item_id=work_item_id,
         expected_work_item_version=expected_version,
@@ -1401,12 +1395,9 @@ async def running_for_conversation(
     if old is not None:
         # This endpoint names no agent, so the owner of the old-key row must
         # prove the old key is its route's (ADR-0168 decision 4).
-        candidate = await session.scalar(
-            select(WorkItem).where(WorkItem.conversation_id == old)
-        )
+        candidate = await session.scalar(select(WorkItem).where(WorkItem.conversation_id == old))
         if candidate is not None and (
-            await pre_identity_thread_key_for(session, candidate.agent_id, conversation_id)
-            == old
+            await pre_identity_thread_key_for(session, candidate.agent_id, conversation_id) == old
         ):
             work_item = candidate
     if work_item is None:
@@ -1427,28 +1418,21 @@ async def running_for_conversation(
     return "running", running
 
 
-async def get_request(
-    session: AsyncSession, request_id: uuid.UUID
-) -> ExecutionRequest | None:
+async def get_request(session: AsyncSession, request_id: uuid.UUID) -> ExecutionRequest | None:
     return cast(
         ExecutionRequest | None,
-        await session.scalar(
-            select(ExecutionRequest).where(ExecutionRequest.id == request_id)
-        ),
+        await session.scalar(select(ExecutionRequest).where(ExecutionRequest.id == request_id)),
     )
 
 
 async def redispatch_lapsed_acquisitions(session: AsyncSession) -> int:
     settings = get_settings()
-    not_before = func.clock_timestamp() + timedelta(
-        seconds=settings.work_item_backoff_base_seconds
-    )
+    not_before = func.clock_timestamp() + timedelta(seconds=settings.work_item_backoff_base_seconds)
     changed = await session.scalars(
         update(ExecutionRequest)
         .where(
             ExecutionRequest.status == "waiting",
-            ExecutionRequest.acquired_generation
-            == ExecutionRequest.dispatch_generation,
+            ExecutionRequest.acquired_generation == ExecutionRequest.dispatch_generation,
             ExecutionRequest.acquire_expires_at.is_not(None),
             ExecutionRequest.acquire_expires_at <= func.clock_timestamp(),
         )
@@ -1483,8 +1467,7 @@ async def claim_terminate_publishes(
                         ExecutionRequest.terminal_cause == "issue_cancelled",
                         ExecutionRequest.runtime_owner.is_(None),
                         ExecutionRequest.runtime_heartbeat_expires_at.is_(None),
-                        ExecutionRequest.runtime_heartbeat_expires_at
-                        <= func.clock_timestamp(),
+                        ExecutionRequest.runtime_heartbeat_expires_at <= func.clock_timestamp(),
                     ),
                 ),
                 # A forced settle still owes the sandbox a teardown.
@@ -1531,9 +1514,7 @@ async def claim_terminate_publishes(
         work_items = {
             found.id: found
             for found in await session.scalars(
-                select(WorkItem).where(
-                    WorkItem.id.in_({row.work_item_id for row in rows})
-                )
+                select(WorkItem).where(WorkItem.id.in_({row.work_item_id for row in rows}))
             )
         }
     published: list[TerminatePublish] = []
@@ -1570,9 +1551,7 @@ async def load_execute_wake(
     )
     if request is None:
         return None
-    work_item = await session.scalar(
-        select(WorkItem).where(WorkItem.id == request.work_item_id)
-    )
+    work_item = await session.scalar(select(WorkItem).where(WorkItem.id == request.work_item_id))
     if work_item is None:
         return None
     binding = None
@@ -1586,17 +1565,15 @@ async def load_execute_wake(
             session, work_item.agent_id, work_item.conversation_id
         )
         try:
-            binding = await crud.binding_for_route(
+            binding = await crud_channels.binding_for_route(
                 session,
                 request.reply_kind,
                 adapter,
                 request.reply_address,
                 agent_id=work_item.agent_id,
             )
-        except crud.AmbiguousRoute:
-            logger.warning(
-                "execute wake for request %s names an ambiguous route", request.id
-            )
+        except crud_channels.AmbiguousRoute:
+            logger.warning("execute wake for request %s names an ambiguous route", request.id)
             binding = None
     return request, work_item, binding
 
@@ -1633,14 +1610,32 @@ def request_view(row: ExecutionRequest) -> dict[str, Any]:
     }
 
 
+def tracker_view(issue: TrackerIssueRef) -> dict[str, Any]:
+    return {
+        "kind": issue.kind,
+        "host": issue.host,
+        "scope_id": issue.scope_id,
+        "issue_id": issue.issue_id,
+        "display_key": issue.display_key,
+    }
+
+
+def repository_view(repository: RepositoryRef) -> dict[str, Any]:
+    return {
+        "code_host_kind": repository.kind,
+        "host": repository.host,
+        "project_id": repository.project_id,
+        "path": repository.path,
+    }
+
+
 def work_item_view(row: WorkItemSnapshot) -> dict[str, Any]:
     return {
         "id": row.id,
-        "github_repository_id": row.github_repository_id,
-        "github_issue_number": row.github_issue_number,
-        "github_installation_id": row.github_installation_id,
+        "tracker": tracker_view(row.tracker_issue),
+        "repository": repository_view(row.repository),
+        "code_host_installation_id": row.code_host_installation_id,
         "agent_id": row.agent_id,
-        "repo_full_name": row.repo_full_name,
         "conversation_id": row.conversation_id,
         "publication_lineage_id": row.publication_lineage_id,
         "cancelled_at": row.cancelled_at,

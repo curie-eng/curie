@@ -24,19 +24,17 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from curie_api import sandbox_token
 from curie_api.config import get_settings
 from curie_api.factory_progress import phase_view, pill_for
 from curie_api.models import ExecutionRequestPhaseReport
-from test_factory_terminus import (  # noqa: F401  (fixtures)
-    _label,
-    _request,
+from curie_internal import sandbox_token
+from forge_fakes.github import LABEL, _issue_event, _post
+from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     _rows,
-    _start_running,
     admitted,
     comments,
 )
-from test_github_factory_ingress import LABEL, _issue_event, _post
+from test_factory_terminus import _label, _request, _start_running  # noqa: F401  (fixtures)
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -170,8 +168,8 @@ def _all_requests(number: int) -> list[dict[str, Any]]:
     return _rows(
         "SELECT r.id, r.status FROM curie.execution_requests r "
         "JOIN curie.work_items w ON w.id = r.work_item_id "
-        "WHERE w.github_issue_number = :number ORDER BY r.sequence",
-        {"number": number},
+        "WHERE w.tracker_issue_id = :number ORDER BY r.sequence",
+        {"number": str(number)},
     )
 
 

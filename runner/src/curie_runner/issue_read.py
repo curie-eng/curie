@@ -1,11 +1,12 @@
-"""The platform ``get_issue`` tool for the GitHub factory (ADR 0187).
+"""The platform ``get_issue`` tool for the factory (ADR 0187, #4358).
 
-The sandbox holds no GitHub credential. For an execution with a WorkItem the
+The sandbox holds no tracker credential. For an execution with a WorkItem the
 worker injects the API's issue read route and an execution scoped capability
-naming that WorkItem's issue. When both are present the runner mounts
-``get_issue`` on the ``curie`` server; the tool presents the capability and the
-API reads the issue with its own App credential. The capability never reaches
-model text, tool results or logs.
+naming that WorkItem's issue, on whichever tracker holds it. When both are
+present the runner mounts ``get_issue`` on the ``curie`` server; the tool takes
+no arguments, presents the capability, and the API reads the ticket with its
+own tracker credential and answers it as markdown. The capability never
+reaches model text, tool results or logs.
 """
 
 from __future__ import annotations
@@ -29,20 +30,11 @@ _TIMEOUT_SECONDS = 30
 _MAX_RESPONSE_BYTES = 4_194_304
 
 _DESCRIPTION = (
-    "Read the GitHub issue this factory run was started for: its title, body, "
-    "state, author and every comment, verbatim. The platform reads it for you; "
-    "only this run's own issue can be read. Pass the owner, repository and "
-    "issue number from the issue link in your message."
+    "Read the issue this factory run was started for, from whichever tracker "
+    "holds it, as markdown with its comments, plus this execution's deadline. "
+    "Takes no arguments: only this run's own issue can be read."
 )
-_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "owner": {"type": "string", "minLength": 1},
-        "repo": {"type": "string", "minLength": 1},
-        "issue_number": {"type": "integer", "minimum": 1},
-    },
-    "required": ["owner", "repo", "issue_number"],
-}
+_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}
 
 
 def _error(text: str) -> dict[str, Any]:
@@ -84,34 +76,20 @@ def build_issue_tool(url: str, token: str) -> SdkMcpTool[Any]:
 
     @tool(ISSUE_TOOL, _DESCRIPTION, _SCHEMA)
     async def get_issue(args: dict[str, Any]) -> dict[str, Any]:
-        owner, repo, number = args.get("owner"), args.get("repo"), args.get("issue_number")
-        if (
-            not isinstance(owner, str)
-            or not owner.strip()
-            or not isinstance(repo, str)
-            or not repo.strip()
-            or isinstance(number, bool)
-            or not isinstance(number, int)
-            or number < 1
-        ):
-            return _error("Pass owner, repo and a positive integer issue_number.")
-        request = {"repo_full_name": f"{owner.strip()}/{repo.strip()}", "issue_number": number}
+        # The capability names the one issue; nothing the model passes is sent.
+        del args
         try:
-            status, payload = await _read(url, token, request)
+            status, payload = await _read(url, token, {})
         except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
             # Never render a transport diagnostic: it can name the endpoint.
             logger.warning("issue read transport failure: %s", type(exc).__name__)
             return _error("The issue could not be read right now. Retry shortly.")
         if status == 200 and isinstance(payload, dict):
             return {"content": [{"type": "text", "text": json.dumps(payload, indent=2)}]}
-        detail = payload.get("detail") if isinstance(payload, dict) else None
-        message = detail.get("message") if isinstance(detail, dict) else None
-        if status == 403 and isinstance(message, str):
-            return _error(f"Refused: {message}.")
         if status == 409:
             return _error("This execution has ended; its issue can no longer be read.")
         if status == 503:
-            return _error("GitHub could not answer the issue read. Retry shortly.")
+            return _error("The tracker could not answer the issue read. Retry shortly.")
         return _error(f"The issue read was refused (status {status}).")
 
     return get_issue

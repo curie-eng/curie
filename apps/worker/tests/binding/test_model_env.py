@@ -10,6 +10,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from curie_internal.sandbox_token import verify
 from curie_worker.binding import (
     APPROVAL_REQUIRED_ENV,
     BASE_URL_ENV,
@@ -23,7 +24,6 @@ from curie_worker.binding import (
 )
 from curie_worker.config import WorkerConfig
 from curie_worker.eval.stream import EvalJob, EvalStreamConsumer
-from curie_worker.sandbox_token import verify
 
 
 def _resolved(

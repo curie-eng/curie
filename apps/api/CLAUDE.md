@@ -48,7 +48,7 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   `POST /channels/token` (only for a binding it serves; else 403),
   `GET /approvals` (filtered to approvals it serves) and
   `/approvals/{id}/resolve` (with `X-Curie-Approval-Actor`; unserved is 404).
-  Served is ONE predicate, `crud._approval_served`, for both. Presenting it
+  Served is ONE predicate, `crud.approvals._approval_served`, for both. Presenting it
   with the platform key or another resolver credential is 401, never a
   precedence choice. The resolver kinds are `chat`, `console`, `operator` and
   `adapter`; `operator` resolves only explicit-user routes, and no Slack approver
@@ -81,15 +81,51 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
 - **The factory issue read is a scoped credential exception (ADR 0187).**
   `POST /work-items/issue-read` accepts only the API issued `wir` capability
   in `X-Curie-Issue-Read`. Its sole scope is `work_item.issue_read`, and it
-  names one execution request and its WorkItem's repository and issue. The
-  worker mints it at sandbox boot through
-  `POST /v1/internal/work-items/issue-read/context` using its internal worker
-  credential. The read refuses any other repository or issue, re-checks that
-  the request is still running before its deadline and that its WorkItem is
-  not cancelled, then reads the issue and its comments with a freshly minted
-  App installation token and returns them verbatim. It stores nothing.
+  names one execution request, its WorkItem, and that WorkItem's tracker
+  issue (tracker kind, host, scope id and issue id). The worker mints it at
+  sandbox boot through `POST /v1/internal/work-items/issue-read/context` using
+  its internal worker credential. The read takes no body: it refuses a
+  capability whose issue is not the durable WorkItem's, re-checks that the
+  request is still running before its deadline and that its WorkItem is not
+  cancelled, then reads the ticket through the WorkItem's tracker
+  (`Tracker.read_ticket`; a GitHub issue with an App installation token
+  freshly minted only for the recorded installation) and returns it as
+  markdown with its link. It stores nothing.
   State and other scoped credentials do not authorize it, and `wir`
   authorizes no other route.
+- **Channel read is a scoped credential exception (ADR 0100, #2877).**
+  `POST /channel-read` accepts only the API issued `chr` capability in
+  `X-Curie-Channel-Read`. Its sole audience is `channel.read`, and it names
+  one agent, deployment, grant digest, logical turn and generation. The worker
+  mints it through `POST /v1/internal/channel-read/context` using its internal
+  worker credential. The active ledger key is a 90 second lease that the worker
+  renews every 30 seconds with an owner checked refresh; the worker ends the
+  turn with an owner tombstone (a late committed open is refused) and an owner
+  checked revoke in the shared Valkey ledger
+  (`curie_internal.channel_read_ledger`), so revocation holds while the API is
+  down and a dead worker's capability lapses within one lease. Every read
+  repeats the generation, the grant (read locally from the agent's active
+  stored bundle manifest, cached by digest), the binding and provider membership.
+  Authorization is surface neutral; a kind is readable only through a
+  `channel_read/readers.py` reader that advertises `history-read`, and Slack
+  reads live only in `channel_read/slack_reads.py`. A turn may spend
+  8 pages, a window is at most 7 days, and `limit` defaults to 50 with a 100
+  maximum. Refusals are named `channel_read.*` codes; a 429 carries
+  `Retry-After`. It stores no message body. State, issue read
+  and other scoped credentials do not authorize it, and `chr` authorizes only
+  `/channel-read` and its canvas sibling `/channel-canvas` (ADR 0200). The
+  history read also requires the `channelRead` grant carried in the claims, so
+  a canvas only bundle never reads history. `/channel-canvas` repeats the same
+  generation and digest checks, requires the operation's own grant carried in
+  the claims (`canvasList`, `canvasRead`, `canvasEdit`), checks that the canvas
+  is shared into one of the agent's bindings with the bot a member before any
+  download or edit, charges one page per successful operation, and edits only
+  a table cell a read recorded in the same logical turn
+  (`channel_read/canvas_sections.py`). Slack canvas calls live only in
+  `channel_read/slack_canvas.py`. Each edit is written to
+  `channel_canvas_edits` (attempted, then applied or failed; an unconfirmed
+  outcome stays attempted) before and after the Slack call. Retrieved canvas
+  content is not stored.
 - **Git-flow never calls the GitHub API.** `gitflow.py` builds the bundle by
   archiving the pushed sha directly from the repo over the git protocol (bare
   repos in tests, the real remote in production). This keeps the flow

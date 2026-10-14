@@ -4,6 +4,31 @@ Date: 2026-10-01
 
 Status: Accepted
 
+**Partially amended by [ADR 0197](0197-the-factory-reaches-code-hosts-and-trackers-through-two-ports.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+the clause that reading the ticket is the bundle's job for the GitHub
+factory only, and consequence 6: the platform reads the ticket for every
+tracker. Everything else in this ADR stands.
+
+**Partially amended by [ADR 0199](0199-the-factory-admits-only-tickets-it-can-start-and-finish.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+"The platform reads the issue for the bundle", item 3. The platform reads and
+classifies the ticket once at admission and stores only a verdict and a
+digest, never ticket content. The sandbox read stays verbatim and unparsed.
+
+**Partially amended by [ADR 0214](0214-one-factory-agent-serves-every-github-repository-bound-to-it.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+"Polling is the default intake", item 1. The API polls the distinct addresses
+of GitHub channel bindings that the allowlist admits, not every repository the
+App is installed on.
+
+**Partially amended by [ADR 0215](0215-each-tracker-surface-starts-factory-work-under-its-own-trigger-label.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+"Polling is the default intake", item 1.1, where the poller reads open issues
+carrying "the configured label". It lists once per effective trigger label
+bound on the repository, under the ETag key `issues:<label>`. Everything else
+in this ADR stands.
+
 Accepted with explicit maintainer approval on 2026-10-01 (Brian Conn),
 alongside implementation under ADR 0102.
 

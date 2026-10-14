@@ -30,6 +30,9 @@ pub enum State {
     Ok,
     /// Genuinely missing, and something the user is trying to do needs it.
     Missing,
+    /// Usable now, but needs attention soon (a credential near expiry).
+    /// Does not make the install unready.
+    Warn,
     /// Not needed at the rung this install is on.
     NotApplicable,
 }
@@ -39,6 +42,7 @@ impl State {
         match self {
             State::Ok => "ok  ",
             State::Missing => "MISS",
+            State::Warn => "WARN",
             State::NotApplicable => "--  ",
         }
     }
@@ -1269,6 +1273,25 @@ fn evaluate_with_worker_claims(
     });
 
     out
+}
+
+/// One `forge-credentials` check per recorded forge credential (#4397): `warn`
+/// when a known expiry is past or near, else `ok`. None without a factory.
+pub fn forge_credential_checks(lines: &[crate::forge_expiry::ExpiryLine]) -> Vec<Check> {
+    lines
+        .iter()
+        .map(|line| Check {
+            id: "forge-credentials",
+            title: "Forge credential",
+            state: if line.warning.is_some() {
+                State::Warn
+            } else {
+                State::Ok
+            },
+            detail: line.detail(),
+            fix: None,
+        })
+        .collect()
 }
 
 /// Point at the guided path when there is more than one thing to fix.
@@ -5085,14 +5108,18 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
     gather_with_worker_claims(namespace, release, api).await.0
 }
 
-/// Gather the existing public facts plus the release-scoped claim observation
-/// used only by the assembled doctor report. Keeping the observation beside
-/// the facts avoids widening `Facts`, which is a public fixture surface.
+/// Gather the existing public facts plus the release-scoped claim and forge
+/// credential observations used only by the assembled doctor report. Keeping
+/// them beside the facts avoids widening `Facts`, a public fixture surface.
 async fn gather_with_worker_claims(
     namespace: &str,
     release: &str,
     api: Option<(&str, &str)>,
-) -> (Facts, Option<crate::worker_claims::ClaimsState>) {
+) -> (
+    Facts,
+    Option<crate::worker_claims::ClaimsState>,
+    Vec<crate::forge_expiry::ExpiryLine>,
+) {
     // Four independent probes, issued as ONE stage: none reads another's
     // output, and every one of them is a subprocess plus a round trip that
     // doctor used to pay for in series. The RESULTS are consumed below in
@@ -5178,7 +5205,7 @@ async fn gather_with_worker_claims(
 
     let (ok, ctx, _) = context_probe;
     if !ok || ctx.trim().is_empty() {
-        return (f, None);
+        return (f, None, Vec::new());
     }
     f.kube_context = Some(ctx.trim().to_string());
 
@@ -5201,7 +5228,7 @@ async fn gather_with_worker_claims(
     f.release = classify_release_probe(helm_present, listed, &stdout, release);
     f.release_status = release_list_status(&stdout, release);
     if !matches!(f.release, ReleaseProbe::Installed { .. }) {
-        return (f, None);
+        return (f, None, Vec::new());
     }
 
     let common = crate::ops::CommonOpts {
@@ -5296,6 +5323,7 @@ async fn gather_with_worker_claims(
             Some("could not read this release's computed Helm values".to_string());
     }
 
+    let mut forge_credentials = Vec::new();
     if let Ok(Some(values)) = values {
         // Presence only, both of them: socket mode needs the pair, and reading
         // one while reporting both is what made a half-wired release read as Ok.
@@ -5308,6 +5336,7 @@ async fn gather_with_worker_claims(
         // reproduction of this release's policy.
         (f.sandbox_egress_cidrs, f.sandbox_egress_is_reproducible) =
             sandbox_egress_from_values(&values);
+        forge_credentials = crate::forge_expiry::report(&values, time::OffsetDateTime::now_utc());
     }
 
     // These reads consume the preceding stage: mail observation needs the
@@ -5349,7 +5378,7 @@ async fn gather_with_worker_claims(
     if let Some(values) = api_values_needing_nodeport.as_ref() {
         f.api_exposure = api_exposure_from_values(values, nodeport);
     }
-    (f, Some(worker_claims.state))
+    (f, Some(worker_claims.state), forge_credentials)
 }
 
 /// The kubectl read behind `api_nodeport`, extracted pure so the Service NAME
@@ -5562,10 +5591,12 @@ pub async fn doctor(
     let api = resolved
         .as_ref()
         .map(|(url, key)| (url.as_str(), key.as_str()));
-    let (mut facts, worker_claims) = gather_with_worker_claims(namespace, release, api).await;
+    let (mut facts, worker_claims, forge_credentials) =
+        gather_with_worker_claims(namespace, release, api).await;
     facts.declared_installation = declared_installation;
     facts.apply_context = apply_context.map(str::to_string);
-    let checks = evaluate_with_worker_claims(&facts, worker_claims.as_ref());
+    let mut checks = evaluate_with_worker_claims(&facts, worker_claims.as_ref());
+    checks.extend(forge_credential_checks(&forge_credentials));
     let summary = summary(&checks);
     DoctorOutput { checks, summary }
 }

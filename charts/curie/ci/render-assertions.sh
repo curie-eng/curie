@@ -92,9 +92,9 @@
 # region as bundle fetches, with static credentials or web identity. Removing
 # either service's region must fail the same rendered-manifest assertion.
 #
-# Issue #4394, Assertion 25. With api.githubStubCaConfigMap set, the worker
-# points CURIE_PUBLICATION_GITHUB_CA_FILE at the CA it already mounts so the
-# publication Job trusts the same GitHub stub. Unset renders no variable, and
+# Issue #4394, Assertion 25. With codeHostTrust.caBundle configured, the worker
+# passes its ConfigMap name and key to publication Jobs so they trust the same
+# code host as workspace preparation. Unset renders no variable, and
 # removing it while the value is set must fail the same assertion.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
@@ -702,18 +702,11 @@ import sys
 
 import yaml
 
-# Env names in these namespaces must be declared boot-env keys unless explicitly
-# classified as install-owned configuration below.
+# Env names in these namespaces must be declared boot-env keys.
 # Anything else the runner container carries (HOME, and operator free-form
 # extraEnv on a non-default render) is out of scope by design: extraEnv is
 # operator-supplied and the contract does not govern it (issue #488, edge case 6).
 CONTRACT_PREFIXES = ("CURIE_", "OTEL_EXPORTER_OTLP_", "ANTHROPIC_")
-
-# Non-secret GitHub origin policy from api.githubApiUrl, read by workspace-init
-# and runner workspace_snapshot.py, not an ACI session payload. The chart
-# reserves it against agent extraEnv, and the worker declaration gate classifies
-# the same exact name as install-owned configuration outside frozen BootEnv.
-INSTALL_OWNED_ENV = {"CURIE_GITHUB_API_URL"}
 
 rendered, key_src = sys.argv[1], sys.argv[2]
 
@@ -759,7 +752,7 @@ if not found:
 # template that dropped its whole env block would sail through the subset check.
 contract_names = {
     n for n in found
-    if n.startswith(CONTRACT_PREFIXES) and n not in INSTALL_OWNED_ENV
+    if n.startswith(CONTRACT_PREFIXES)
 }
 if "CURIE_SESSION_ID" not in contract_names or len(contract_names) < 4:
     sys.stderr.write(
@@ -3257,8 +3250,9 @@ PYEOF
   echo "  ok: $case_name worker pods/log rule is rejected"
 done
 
-echo "=== Assertion 21: API metadata CI policy renders from its chart value (#4162) ==="
+echo "=== Assertion 21: per-repository CI policy renders from factory.bindings[].repos[].ci (#4162, #4397) ==="
 python3 - "$CHART" "$TMP/reuse-render/curie/templates/api.yaml" <<'PYEOF'
+import copy
 import json
 import pathlib
 import subprocess
@@ -3267,11 +3261,45 @@ import sys
 import yaml
 
 chart = sys.argv[1]
-env_name = "GITHUB_FACTORY_METADATA_CI"
-value_key = "api.githubFactoryMetadataCi"
+env_name = "CURIE_FORGES"
+ci_path = "factory.bindings.0.repos.0.ci"
+
+CREDENTIAL = {
+    "type": "github_app",
+    "appId": "42",
+    "existingSecret": "factory-app",
+    "existingSecretKey": "privateKey",
+}
+GOOD_CI = {
+    "required": {"key": "python", "paths": ["src/", "tests/"], "pendingKeyPrefix": "python/"},
+    "metadataRerunKeys": ["check:pr-body", "status:lint"],
+}
 
 
-def metadata_ci(documents):
+def factory(ci):
+    repo = {"alias": "repo", "codeHost": "github", "projectId": "101", "path": "acme/repo"}
+    if ci is not None:
+        repo["ci"] = ci
+    entry = {
+        "name": "github",
+        "kind": "github",
+        "host": "github.com",
+        "apiUrl": "https://api.github.com",
+        "credential": dict(CREDENTIAL),
+    }
+    tracker = dict(entry, label="curie-factory", mention="example-factory", pollIntervalSeconds=45)
+    return {
+        "enabled": True,
+        "intake": "poll",
+        "codeHosts": [entry],
+        "trackers": [tracker],
+        "bindings": [
+            {"name": "acme", "tracker": "github", "trackerScopeId": "acme/repo", "repos": [repo]}
+        ],
+    }
+
+
+def forges(documents):
     apis = [
         doc for doc in documents
         if isinstance(doc, dict)
@@ -3286,56 +3314,79 @@ def metadata_ci(documents):
     assert len(entries) == 1, f"expected exactly one {env_name}, found {entries!r}"
     assert set(entries[0]) == {"name", "value"}, entries[0]
     assert isinstance(entries[0]["value"], str), entries[0]
-    return entries[0]["value"]
+    return json.loads(entries[0]["value"] or "{}")
 
 
-def render(*args):
+def render(ci):
     return subprocess.run(
-        ["helm", "template", "acme", chart, *args],
+        ["helm", "template", "acme", chart, "--set-json", f"factory={json.dumps(factory(ci))}"],
         text=True, capture_output=True,
     )
 
 
-for policy in (
-    None,
-    {"acme/repo": {"checks": ["pr-body"], "statuses": []}},
-    {"acme/repo": {"checks": ["pr-body"]}, "acme/other": {"statuses": ["lint"]}},
-):
-    args = [] if policy is None else ["--set-json", f"{value_key}={json.dumps(policy)}"]
-    result = render(*args)
-    assert result.returncode == 0, result.stderr
-    value = metadata_ci(yaml.safe_load_all(result.stdout))
-    expected = {} if policy is None else policy
-    assert json.loads(value) == expected, f"{env_name} rendered {value!r}, expected {expected!r}"
-    if policy is None:
-        assert value == "{}", f"default {env_name} must render {{}}"
+def rendered_ci(ci):
+    result = render(ci)
+    assert result.returncode == 0, f"valid ci {ci!r} refused: {result.stderr}"
+    config = forges(yaml.safe_load_all(result.stdout))
+    repos = config["bindings"][0]["repos"]
+    assert len(repos) == 1, repos
+    return repos[0].get("ci")
 
-retained = pathlib.Path(sys.argv[2]).read_text()
-assert metadata_ci(yaml.safe_load_all(retained)) == "{}", "retained values lost the empty metadata CI default"
 
-for policy, diagnostics in (
-    ([], ("githubFactoryMetadataCi",)),
-    ({"repo": {"checks": ["pr-body"]}}, ("repo", "^[^/]+/[^/]+$")),
-    ({"acme/repo/extra": {"checks": ["pr-body"]}}, ("acme/repo/extra", "^[^/]+/[^/]+$")),
-    ({"acme/repo": []}, ("githubFactoryMetadataCi",)),
-    ({"acme/repo": {"unknown": ["pr-body"]}}, ("githubFactoryMetadataCi", "unknown")),
-    ({"acme/repo": {"checks": "pr-body"}}, ("githubFactoryMetadataCi", "checks")),
-    ({"acme/repo": {"statuses": [1]}}, ("githubFactoryMetadataCi", "statuses")),
-    ({"acme/repo": {"checks": [""]}}, ("githubFactoryMetadataCi", "checks")),
-    ({"acme/repo": {"statuses": [""]}}, ("githubFactoryMetadataCi", "statuses")),
+assert rendered_ci(GOOD_CI) == {
+    "required": {"key": "python", "paths": ["src/", "tests/"], "pending_key_prefix": "python/"},
+    "metadata_rerun_keys": ["check:pr-body", "status:lint"],
+}, "factory repo ci must render as the snake_case CiPolicyConfig"
+
+retained = forges(yaml.safe_load_all(pathlib.Path(sys.argv[2]).read_text()))
+assert not retained.get("bindings"), f"retained values without a factory block rendered bindings: {retained!r}"
+
+
+def with_required(**changes):
+    ci = copy.deepcopy(GOOD_CI)
+    for key, value in changes.items():
+        if value is None:
+            ci["required"].pop(key)
+        else:
+            ci["required"][key] = value
+    return ci
+
+
+# Each malformed ci is paired with the nearest valid ci, which must render:
+# the refusal is the mutation's, not a broken base document.
+for bad, good, diagnostics in (
+    ([], {}, ("ci",)),
+    ({"unknown": []}, {"metadataRerunKeys": []}, ("unknown",)),
+    (with_required(extra=1), GOOD_CI, ("extra",)),
+    (with_required(key=None), GOOD_CI, ("key",)),
+    (with_required(key=""), GOOD_CI, ("key",)),
+    (with_required(paths=None), GOOD_CI, ("paths",)),
+    (with_required(paths="src/"), GOOD_CI, ("paths",)),
+    (with_required(paths=[1]), GOOD_CI, ("paths",)),
+    (with_required(pendingKeyPrefix=""), GOOD_CI, ("pendingKeyPrefix",)),
+    (dict(GOOD_CI, metadataRerunKeys="check:pr-body"), GOOD_CI, ("metadataRerunKeys",)),
+    (dict(GOOD_CI, metadataRerunKeys=[1]), GOOD_CI, ("metadataRerunKeys",)),
 ):
-    result = render("--set-json", f"{value_key}={json.dumps(policy)}")
-    assert result.returncode != 0, f"accepted malformed {value_key}: {policy!r}"
+    rendered_ci(good)
+    result = render(bad)
+    assert result.returncode != 0, f"accepted malformed {ci_path}: {bad!r}"
     assert "schema(s)" in result.stderr, result.stderr
+    # Helm 3.16 prints dotted paths, newer releases JSON pointers.
+    normalized = result.stderr.replace("/", ".")
+    assert ci_path in normalized, result.stderr
     assert all(diagnostic in result.stderr for diagnostic in diagnostics), result.stderr
 
-result = render(
-    "--set", f"api.extraEnv[0].name={env_name}",
-    "--set-string", "api.extraEnv[0].value={}",
+result = subprocess.run(
+    [
+        "helm", "template", "acme", chart,
+        "--set", f"api.extraEnv[0].name={env_name}",
+        "--set-string", "api.extraEnv[0].value={}",
+    ],
+    text=True, capture_output=True,
 )
 assert result.returncode != 0, f"accepted reserved api.extraEnv {env_name}"
-assert "api.extraEnv" in result.stderr and value_key in result.stderr, result.stderr
-print("  ok: default, configured and retained metadata CI render; schema and extraEnv refuse invalid inputs")
+assert "api.extraEnv" in result.stderr and "factory.bindings" in result.stderr, result.stderr
+print("  ok: factory repo ci renders and is retained empty; schema and extraEnv refuse invalid inputs")
 PYEOF
 
 echo "=== Assertion 22: API rollouts retain availability and drain before shutdown (#4174) ==="
@@ -3632,18 +3683,17 @@ for component in ("api", "worker"):
     print(f"  ok: missing {component} S3_REGION is rejected")
 PYEOF
 
-echo "=== Assertion 25: worker hands the GitHub stub CA to publication Jobs (#4394) ==="
+echo "=== Assertion 25: worker hands its mounted code-host CA bundle to publication Jobs (#4394) ==="
 python3 - "$CHART" <<'PYEOF'
 import copy
-import posixpath
 import subprocess
 import sys
 
 import yaml
 
 chart = sys.argv[1]
-env_name = "CURIE_PUBLICATION_GITHUB_CA_FILE"
-ca_path = "/etc/curie/github-stub/ca.pem"
+env_name = "CURIE_CODE_HOST_CA_BUNDLE"
+ca_path = "/etc/curie/code-host-trust/ca.crt"
 
 
 def worker_container(documents):
@@ -3671,12 +3721,16 @@ def assert_ca_file(documents):
     assert entries == [{"name": env_name, "value": ca_path}], (
         f"worker {env_name} must equal {ca_path!r} exactly once, found {entries!r}"
     )
+    workers = [doc for doc in documents if isinstance(doc, dict) and doc.get("kind") == "Deployment" and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "worker"]
+    volumes = [volume for volume in workers[0]["spec"]["template"]["spec"]["volumes"] if volume["name"] == "code-host-trust"]
+    assert len(volumes) == 1
+    assert volumes[0]["configMap"] == {"name": "github-stub-ca", "items": [{"key": "ca.pem", "path": "ca.crt"}]}
     mounts = [
         mount for mount in worker_container(documents).get("volumeMounts", [])
-        if mount["name"] == "github-stub-ca"
+        if mount["name"] == "code-host-trust"
     ]
     assert len(mounts) == 1, f"expected one worker github-stub-ca mount, found {mounts!r}"
-    assert posixpath.dirname(ca_path) == mounts[0]["mountPath"], (
+    assert mounts[0]["mountPath"] == ca_path.rsplit("/", 1)[0], (
         f"{env_name} directory must equal the github-stub-ca mountPath {mounts[0]['mountPath']!r}"
     )
 
@@ -3694,9 +3748,9 @@ default = render()
 assert ca_entries(default) == [], f"default render must not set {env_name}"
 print(f"  ok: default render gives the worker no {env_name}")
 
-configured = render("--set", "api.githubStubCaConfigMap=github-stub-ca")
+configured = render("--set", "codeHostTrust.caBundle.configMapRef.name=github-stub-ca", "--set", "codeHostTrust.caBundle.configMapRef.key=ca.pem")
 assert_ca_file(configured)
-print(f"  ok: api.githubStubCaConfigMap renders {env_name}={ca_path} inside the worker's mounted CA directory")
+print(f"  ok: codeHostTrust.caBundle.configMapRef renders {env_name}={ca_path}, the worker's own mounted copy of the bundle")
 
 mutant = copy.deepcopy(configured)
 container = worker_container(mutant)
@@ -3711,4 +3765,4 @@ print(f"  ok: negative control, a configured render without {env_name} is reject
 PYEOF
 
 echo
-echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate, the API uses RollingUpdate with maxUnavailable 0 and maxSurge 1 plus a preStop sleep 5, proven by both removed-block negative controls, and other workloads keep their strategies; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays; every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from the chart-owned runner token Secret and none renders the tokenless dev flag, proven by three failing negative controls; and api.githubStubCaConfigMap points the worker's CURIE_PUBLICATION_GITHUB_CA_FILE at its mounted stub CA and is absent by default, proven by a failing negative control."
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate, the API uses RollingUpdate with maxUnavailable 0 and maxSurge 1 plus a preStop sleep 5, proven by both removed-block negative controls, and other workloads keep their strategies; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays; every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from the chart-owned runner token Secret and none renders the tokenless dev flag, proven by three failing negative controls; and codeHostTrust.caBundle.configMapRef hands the worker the path of its own mounted code-host CA bundle for publication Jobs and is absent by default, proven by a failing negative control."

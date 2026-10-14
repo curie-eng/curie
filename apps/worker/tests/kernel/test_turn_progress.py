@@ -24,10 +24,11 @@ from typing import Any
 
 import pytest
 from aci_protocol import Final, SessionStatus, TextDelta, TurnSource
-from curie_worker import sandbox_token
+from curie_internal import sandbox_token
 from curie_worker.approvals import ApprovalRequest, CreatedApproval
 from curie_worker.config import WorkerConfig
-from curie_worker.kernel import _boots_differently, _thread_key_for
+from curie_worker.kernel.claim import _boots_differently
+from curie_worker.kernel.routing import _thread_key_for
 from curie_worker.progress import ProgressStore, progress_id_for, sweep_pending_progress
 from curie_worker.sandbox.types import SandboxHandle
 from pydantic import ValidationError
@@ -619,8 +620,8 @@ def test_a_runner_booted_for_another_run_is_replaced() -> None:
 def test_an_expired_boot_token_replaces_the_warm_sandbox() -> None:
     """#3823: a follow-up replaces a sandbox whose token cannot cover that turn."""
 
+    from curie_internal.sandbox_token import mint
     from curie_worker.binding import HISTORY_TOKEN_ENV
-    from curie_worker.sandbox_token import mint
 
     base = dict(
         thread_key="slack:C0EXAMPLE1:t",

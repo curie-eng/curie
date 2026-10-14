@@ -42,10 +42,9 @@ from aci_protocol import BootEnv
 from claude_agent_sdk import create_sdk_mcp_server, tool
 from claude_agent_sdk.types import McpSdkServerConfig
 
-logger = logging.getLogger(__name__)
+from .tool_names import STATE_SERVER_NAME, STATE_TOOL_SHORT_NAMES
 
-# The SDK server key; the SDK prefixes tool names as mcp__<server>__<tool>.
-STATE_SERVER_NAME = "curie-state"
+logger = logging.getLogger(__name__)
 
 # Runner-local env carrying the state namespace base URL and the bearer the
 # state API expects (X-API-Key). Both are declared BootEnv fields (#249, #488),
@@ -337,44 +336,23 @@ async def op_delete(client: StateApiClient, args: dict[str, Any]) -> dict[str, A
     return _ok({"deleted": True})
 
 
-# Every tool this server publishes, declared ONCE (#2286 adversarial round).
-#
-# One list, three consumers: ``build_state_server`` registers exactly these with
-# the SDK, ``STATE_TOOL_NAMES`` below renders their live ``mcp__curie-state__*``
-# names, and ``approval.py`` exempts those live names from a bundle ``toolPolicy``.
-# Hand-maintaining the exemption set beside the registration is what the first
-# #2286 fix was written to avoid -- publication exempted two literal names and
-# every channel-memory tool added afterwards was denied on arrival -- and a
-# second copy here would reopen it at the next tool. Adding a sixth tool means
-# adding one row, and the exemption follows for free.
-_STATE_TOOL_SPECS: tuple[tuple[str, str, dict[str, Any], _StateOp], ...] = (
-    ("get", "Read a durable state value by namespace and key.", _GET_SCHEMA, op_get),
+# Metadata follows the one ordered tool name declaration in tool_names.py.
+# Registration and approval exemptions consume those same names (#2286).
+# strict zip refuses an incomplete metadata or name declaration.
+_STATE_TOOL_SPECS: tuple[tuple[str, dict[str, Any], _StateOp], ...] = (
+    ("Read a durable state value by namespace and key.", _GET_SCHEMA, op_get),
     (
-        "set",
         "Write a durable state value, optionally with a compare-and-set version.",
         _SET_SCHEMA,
         op_set,
     ),
     (
-        "append",
         "Append an item to a durable JSON-array state value.",
         _APPEND_SCHEMA,
         op_append,
     ),
-    ("list", "List every key and value in a state namespace.", _LIST_SCHEMA, op_list),
-    ("delete", "Delete a durable state value by namespace and key.", _DELETE_SCHEMA, op_delete),
-)
-
-# The live SDK names the tools above are published under, which is the ONLY form
-# an authorization decision ever sees: the SDK prefixes an in-process server's
-# tools as ``mcp__<server>__<tool>``. ``approval.py`` compares a candidate call
-# against this set by EXACT equality rather than by the ``mcp__curie-state__``
-# prefix, because a prefix match also accepts every tool of an ambient MCP server
-# whose key merely BEGINS ``curie-state__`` (``mcp__curie-state__extra__bar``),
-# an ambient project/user server could once load beside the ones the runner
-# mounts. ``strict_mcp_config`` (#2899) now stops that; exactness is the second line.
-STATE_TOOL_NAMES: frozenset[str] = frozenset(
-    f"mcp__{STATE_SERVER_NAME}__{tool_name}" for tool_name, _, _, _ in _STATE_TOOL_SPECS
+    ("List every key and value in a state namespace.", _LIST_SCHEMA, op_list),
+    ("Delete a durable state value by namespace and key.", _DELETE_SCHEMA, op_delete),
 )
 
 
@@ -405,8 +383,8 @@ def build_state_server(client: StateApiClient) -> McpSdkServerConfig:
     transport/store failure into an ``is_error`` result the model can recover
     from, rather than crashing the turn.
 
-    The tool list comes from ``_STATE_TOOL_SPECS`` so the names this server
-    actually publishes and the names ``approval.py`` exempts cannot drift.
+    The tool list uses ``tool_names.STATE_TOOL_SHORT_NAMES`` so registration
+    and approval exemption share the same declaration.
     """
 
     return create_sdk_mcp_server(
@@ -414,7 +392,9 @@ def build_state_server(client: StateApiClient) -> McpSdkServerConfig:
         version="1.0.0",
         tools=[
             _bind_state_tool(tool_name, description, schema, op, client)
-            for tool_name, description, schema, op in _STATE_TOOL_SPECS
+            for tool_name, (description, schema, op) in zip(
+                STATE_TOOL_SHORT_NAMES, _STATE_TOOL_SPECS, strict=True
+            )
         ],
     )
 

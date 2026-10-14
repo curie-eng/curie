@@ -160,7 +160,7 @@ class SlackSenderIdentities:
             response = await asyncio.wait_for(client.auth_test(), timeout=self._timeout_s)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception:  # noqa: BLE001 - existing broad catch retained
             return None
         user_id = response.get("user_id") if response.get("ok") is True else None
         return user_id if isinstance(user_id, str) and user_id else None

@@ -20,6 +20,7 @@ from typing import Any, Literal, Union, get_args, get_origin
 from pydantic import BaseModel
 
 from .events import (
+    ChannelReadCapability,
     ErrorEvent,
     Event,
     Final,
@@ -199,7 +200,12 @@ def _struct(model: type[BaseModel]) -> str:
     # fields (strict producers, tolerant consumers). A Rust producer stays strict
     # by construction -- a struct cannot serialize a field it does not have -- so
     # dropping it only loosens the read path we mean to loosen.
-    lines = [_STRUCT_DERIVES, f"pub struct {model.__name__} {{"]
+    derives = (
+        "#[derive(Clone, PartialEq, Default, Serialize, Deserialize)]"
+        if model is ChannelReadCapability
+        else _STRUCT_DERIVES
+    )
+    lines = [derives, f"pub struct {model.__name__} {{"]
     lines.extend(_struct_fields(model, skip=set(), public=True))
     lines.append("}")
     return "\n".join(lines)
@@ -300,6 +306,17 @@ where
 }"""
 
 
+_CHANNEL_READ_DEBUG = """impl std::fmt::Debug for ChannelReadCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChannelReadCapability")
+            .field("url", &self.url)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}"""
+
+
 _TESTS = """#[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +374,7 @@ mod tests {
             // TOOL-ACCESS-1: the enum's wire spelling round-trips too.
             tool_access: Some(ToolAccess::ReadOnly),
             memory_token: None,
+            channel_read: None,
         };
         let encoded = serde_json::to_string(&message).unwrap();
         assert!(encoded.contains(r#""tool_access":"read-only""#));
@@ -365,6 +383,106 @@ mod tests {
         assert!(serde_json::from_str::<InboundMessage>(&unknown).is_err());
         let decoded: InboundMessage = serde_json::from_str(&encoded).unwrap();
         assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn channel_read_roundtrips_without_debug_disclosure() {
+        let token = "channel.read.example.signature-sentinel";
+        let capability = ChannelReadCapability {
+            url: "https://api.example.com/channel-read".to_string(),
+            token: token.to_string(),
+        };
+        for rendered in [format!("{:?}", capability), format!("{:#?}", capability)] {
+            assert!(!rendered.contains(token));
+            assert!(rendered.contains("[REDACTED]"));
+        }
+        let message = InboundMessage::Event {
+            r#type: EventType::Message,
+            text: "hello".to_string(),
+            user: "U0EXAMPLE1".to_string(),
+            ts: "1.0".to_string(),
+            session_id: None,
+            history_ref: None,
+            publication_context: None,
+            tool_access: None,
+            memory_token: None,
+            channel_read: Some(capability),
+        };
+        for rendered in [format!("{:?}", message), format!("{:#?}", message)] {
+            assert!(!rendered.contains(token));
+            assert!(rendered.contains("[REDACTED]"));
+        }
+        let encoded = serde_json::to_string(&message).unwrap();
+        assert!(encoded.contains(token));
+        let decoded: InboundMessage = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn channel_read_requires_both_children() {
+        for capability in [
+            serde_json::json!({"url": "https://api.example.com/channel-read"}),
+            serde_json::json!({"token": "channel.read.example.signature-sentinel"}),
+            serde_json::json!({"url": null, "token": "example-token"}),
+            serde_json::json!({"url": "https://api.example.com/channel-read", "token": null}),
+        ] {
+            let frame = serde_json::json!({
+                "kind": "event", "type": "message", "text": "hello",
+                "user": "U0EXAMPLE1", "ts": "1.0", "channel_read": capability,
+            });
+            assert!(serde_json::from_value::<InboundMessage>(frame).is_err());
+        }
+    }
+
+    #[test]
+    fn channel_read_remains_optional_for_existing_events() {
+        let mut frame = serde_json::json!({
+            "kind": "event", "type": "message", "text": "hello",
+            "user": "U0EXAMPLE1", "ts": "1.0",
+        });
+        let omitted: InboundMessage = serde_json::from_value(frame.clone()).unwrap();
+        assert!(matches!(omitted, InboundMessage::Event { channel_read: None, .. }));
+        frame["channel_read"] = serde_json::Value::Null;
+        let explicit_null: InboundMessage = serde_json::from_value(frame).unwrap();
+        assert_eq!(omitted, explicit_null);
+    }
+
+    #[test]
+    fn previous_event_reader_ignores_the_new_channel_read_object() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct PreviousEvent {
+            kind: String,
+            r#type: EventType,
+            text: String,
+            user: String,
+            ts: String,
+            #[serde(default)]
+            session_id: Option<String>,
+            #[serde(default)]
+            history_ref: Option<String>,
+            #[serde(default)]
+            publication_context: Option<PublicationContext>,
+            #[serde(default)]
+            tool_access: Option<ToolAccess>,
+            #[serde(default)]
+            memory_token: Option<String>,
+        }
+        let mut frame = serde_json::json!({
+            "kind": "event", "type": "message", "text": "hello",
+            "user": "U0EXAMPLE1", "ts": "1.0", "session_id": "example-session",
+            "history_ref": "https://api.example.com/history",
+            "tool_access": "read-only",
+        });
+        let before: PreviousEvent = serde_json::from_value(frame.clone()).unwrap();
+        frame["channel_read"] = serde_json::json!({
+            "url": "https://api.example.com/channel-read",
+            "token": "channel.read.example.signature-sentinel",
+            "future_nested_field": true,
+        });
+        let after: PreviousEvent = serde_json::from_value(frame.clone()).unwrap();
+        assert_eq!(before, after);
+        let current: InboundMessage = serde_json::from_value(frame).unwrap();
+        assert!(matches!(current, InboundMessage::Event { channel_read: Some(_), .. }));
     }
 
     #[test]
@@ -495,6 +613,8 @@ def render_rust() -> str:
         _struct(EvalReport),
         _struct(ApprovalRequest),
         _struct(PublicationContext),
+        _struct(ChannelReadCapability),
+        _CHANNEL_READ_DEBUG,
         _tagged_enum("InboundMessage", "kind", (Event, Interrupt)),
         _tagged_enum(
             "OutboundEvent",

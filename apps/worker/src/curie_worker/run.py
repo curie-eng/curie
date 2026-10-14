@@ -14,12 +14,12 @@ import math
 import os
 import signal
 import socket
-import ssl
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, NoReturn, TypedDict
 
 import httpx
 import redis
@@ -34,7 +34,8 @@ from redis.maint_notifications import MaintNotificationsConfig
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from . import __version__
-from .actions import ActionClient
+from .action_executor_loop import ActionExecutorLoop
+from .actions import ActionClient, ActionRecorder
 from .approval_cards import ApprovalCardStore
 from .approvals import ApprovalClient
 from .attachments import (
@@ -47,21 +48,27 @@ from .binding import BindingResolver
 from .bundle_store import BundleStore
 from .config import WorkerConfig
 from .connector_loop import ConnectorReconcileLoop, HttpManifestSource
+from .connector_probe import DbCapabilityRows, HttpProbeRequester, ProbeTrigger
 from .consumer import Consumer
 from .consumer_liveness import ConsumerLivenessStore, ThreadLockOwnerLiveness
-from .cron_loop import BundleTriggerSource, CronSchedulerLoop
+from .cron_loop import BundleTriggerSource, CronSchedulerLoop, TriggerSource
 from .dead_letter_alert import install_dead_letter_alerting
 from .delivery_lease import DeliveryLeaseStore
+from .deploy_notice import DeployNoticeConsumer
+from .e2e_reaper import E2EReaperLoop
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
 from .hook_source_guard import CronHookSourceGuard
-from .kernel import Kernel, drain_pending_memory_closes
+from .kernel.channel_read import drain_pending_channel_read_closes
+from .kernel.core import Kernel
+from .kernel.memory import drain_pending_memory_closes
 from .killswitch import KillSwitch
+from .ledger_client import ThreadAttachmentLedgerClient
 from .markers import Markers
 from .progress import ProgressStore
 from .publication_clients import (
-    GitHubPublicationLookup,
+    PublicationCodeHostClient,
     PublicationCredentialClient,
     PublicationLineageClient,
     PublicationTranscriptClient,
@@ -72,7 +79,14 @@ from .publication_loop import (
     PublicationReconciler,
 )
 from .publication_store import PostgresPublicationStore
+from .remediation_cards import PostgresRemediationCardStore, RemediationCardLoop
+from .remediation_receipts import PostgresRemediationReceiptStore, RemediationReceiptLoop
 from .reply_sink import ObservedReplySink, ReplySinkRouter, build_reply_sink
+from .repo_runner_pools import (
+    REPO_RUNNER_POOLS_ENV,
+    parse_repo_runner_pools,
+    platform_runner_digest,
+)
 from .runner_client import RunnerClient
 from .sandbox import (
     AffinityStore,
@@ -88,6 +102,7 @@ from .schema_startup import assert_worker_schema
 from .sibling_turns import build_sibling_limit
 from .slack_tokens import slack_bot_tokens
 from .stream_retention import StreamRetention, build_stream_retention
+from .sweep import SweepCoverage
 from .threadlock import ThreadLock
 from .upgrade_drain import UpgradeDrainGate
 from .worker_lifecycle import WorkerResources
@@ -134,8 +149,23 @@ class Runtime:
     # Runtime constructed elsewhere need not name it.
     cron_loop: CronSchedulerLoop | None = None
     publication_loop: PublicationReconcileLoop | None = None
+    # None unless automated remediation is on (AUTOMATED-REMEDIATION-15): posts
+    # remediation approval cards beside the publication loop, outside the
+    # consumer and the stream path.
+    remediation_cards: RemediationCardLoop | None = None
+    # None unless automated remediation is on (AUTOMATED-REMEDIATION-20): posts
+    # one thread message per remediation stage, beside the card loop and outside
+    # the consumer, the thread lock and the markers.
+    remediation_receipts: RemediationReceiptLoop | None = None
+    # None unless the action executor is enabled (ACTION-EXECUTOR-1). Launched
+    # beside the connector reconcile loop, never inside the consumer.
+    action_executor: ActionExecutorLoop | None = None
     # None when the worker has no internal token and so no WorkItem client.
     orphan_sweeper: WorkItemOrphanSweeper | None = None
+    # None unless the end to end connector and the connector reconciler are
+    # both on (#3245).
+    e2e_reaper: E2EReaperLoop | None = None
+    deploy_notice_consumer: DeployNoticeConsumer | None = None
     # Trims settled entries off the runs and eval streams (ADR 0184). Optional
     # only so a Runtime constructed elsewhere need not name it.
     stream_retention: StreamRetention | None = None
@@ -255,6 +285,10 @@ def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
         warm_pool=env.get("CURIE_WARM_POOL", "curie-runner-pool"),
         agent_pools=_agent_names(env, "CURIE_AGENT_SANDBOX_POOLS"),
         connector_secret_pools=_agent_names(env, "CURIE_AGENT_CONNECTOR_SECRET_POOLS"),
+        # ADR 0216: malformed input fails worker startup rather than routing a
+        # bound repository to the generic pool.
+        repo_runner_pools=parse_repo_runner_pools(env.get(REPO_RUNNER_POOLS_ENV)).root,
+        platform_runner_digest=platform_runner_digest(env.get("CURIE_RUNNER_IMAGE")),
         runner_port=int(env.get("CURIE_RUNNER_PORT", "8080")),
         **overrides,
     )
@@ -282,6 +316,25 @@ def _workspace_limits(config: WorkerConfig) -> WorkspaceLimits:
     )
 
 
+def build_sweep_coverage(
+    config: WorkerConfig,
+    *,
+    engine: AsyncEngine,
+    trigger_source: TriggerSource,
+    client: httpx.AsyncClient,
+) -> SweepCoverage:
+    """The kernel's sweep coverage reader (ADR-0160, #2878), on the platform key."""
+
+    return SweepCoverage(
+        engine=engine,
+        db_schema=config.db_schema,
+        trigger_source=trigger_source,
+        client=client,
+        api_base_url=config.api_base_url,
+        api_key=config.api_key,
+    )
+
+
 def _attachment_limits(config: WorkerConfig) -> AttachmentLimits:
     """The operator-configured envelope for the inbound-attachment lane."""
 
@@ -289,6 +342,8 @@ def _attachment_limits(config: WorkerConfig) -> AttachmentLimits:
         max_file_bytes=config.attachment_max_file_bytes,
         reference_ttl_seconds=config.attachment_reference_ttl_seconds,
         retention_ttl_seconds=config.attachment_retention_ttl_seconds,
+        thread_max_files=config.attachment_thread_max_files,
+        thread_max_bytes=config.attachment_thread_max_bytes,
     )
 
 
@@ -335,7 +390,6 @@ def _sandbox_client(
         client = DockerSandboxClient(
             image=env.get("CURIE_RUNNER_IMAGE", "curie-runner"),
             bundle_store=bundle_store,
-            github_api_url=config.publication_github_api_url,
             network=env.get("CURIE_DOCKER_NETWORK") or None,
             otel_endpoint=runner_otel_endpoint or None,
             default_plugin_dir=config.bundle_plugin_dir,
@@ -380,6 +434,9 @@ def build(
     """@spec PROTECTED-HOOK-SOURCE-2."""
     owner = resources if resources is not None else WorkerResources()
     owner.register_close("memory-drain", drain_pending_memory_closes, order=0)
+    # Channel read revocations likewise (ADR 0100): one not finished leaves the
+    # capability to expire at its stream deadline.
+    owner.register_close("channel-read-drain", drain_pending_channel_read_closes, order=1)
     gate_engine = create_source_gate_engine(config)
     owner.register_close("source-gate", gate_engine.dispose, order=100)
     source_gate = SourceGate(gate_engine)
@@ -434,7 +491,6 @@ def build(
             preparer=WorkspacePreparer(
                 credentials=WorkspaceCredentialClient(
                     api_url=config.api_base_url,
-                    github_api_url=config.publication_github_api_url,
                     worker_token=config.internal_worker_token,
                 ),
                 commands=SubprocessCommands(),
@@ -529,10 +585,15 @@ def build(
         # defers card settlement without changing creation or shared clients.
         read_timeout_s=2.0,
     )
-    action_client = ActionClient(
-        api_base_url=config.api_base_url,
-        api_key=config.api_key,
-        client=eval_http,
+    action_client = _build_action_recorder(
+        config,
+        engine,
+        ActionClient(
+            api_base_url=config.api_base_url,
+            api_key=config.api_key,
+            client=eval_http,
+            worker_token=config.internal_worker_token,
+        ),
     )
     sink = build_reply_sink(config, slack_tokens=slack_tokens)
     owner.register_close("reply-sink", sink.aclose, order=20)
@@ -551,6 +612,18 @@ def build(
         )
         if config.internal_worker_token
         else None
+    )
+    # One bundle trigger source, shared: the cron loop fires slots from it, and
+    # a sweep's coverage read dates the slot in the same trigger's zone (#2878).
+    cron_bundle_store = BundleStore(config)
+    owner.register_close(
+        "cron-bundle-s3", lambda: _close_sync(cron_bundle_store._client.close), order=71
+    )
+    trigger_source = BundleTriggerSource(
+        cron_bundle_store,
+        max_uncompressed_bytes=config.bundle_max_uncompressed_bytes,
+        max_compression_ratio=config.bundle_max_compression_ratio,
+        max_members=config.bundle_max_members,
     )
     kernel = Kernel(
         substrate=substrate,
@@ -581,14 +654,25 @@ def build(
         binding=binding,
         workspace=workspace,
         attachments=attachments,
+        # ADR 0205: the thread attachment ledger, behind the internal worker
+        # token and nothing else. Without the token (or without the lane) no
+        # ledger is wired and every turn's attachments behave as before.
+        attachment_ledger=(
+            ThreadAttachmentLedgerClient(
+                api_base_url=config.api_base_url,
+                worker_token=config.internal_worker_token,
+                client=eval_http,
+            )
+            if attachments is not None and config.internal_worker_token
+            else None
+        ),
         approvals=approval_client,
         # Publication is cluster-only in v1. A local request sees an actionable
         # refusal in the kernel before either durable row is created.
         publication_creator=(
             approval_client
             if config.publication_enabled
-            and env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower()
-            == "kubernetes"
+            and env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower() == "kubernetes"
             else None
         ),
         # The same client, handed in twice under the two roles the kernel needs
@@ -598,6 +682,9 @@ def build(
         actions=action_client,
         card_store=card_store,
         hook_runs=HookRunRecorder(engine, config.db_schema),
+        sweep=build_sweep_coverage(
+            config, engine=engine, trigger_source=trigger_source, client=eval_http
+        ),
         route_ttl_seconds=sub_config.route_ttl_seconds,
         suspended_route_ttl_seconds=sub_config.suspended_route_ttl_seconds,
         work_items=work_items,
@@ -605,6 +692,9 @@ def build(
         # Deliberate progress (ADR 0130): the durable record a person's turn
         # reports on, the one the maintenance tick sweeps.
         progress=ProgressStore(async_redis, config),
+        # ADR 0100: the stored bundle is where a turn's channel read grant is
+        # read from, so the kernel knows it without asking the API.
+        bundles=BundleStore(config),
     )
     owner.register_close("work-item-settlement", kernel.close, order=5)
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
@@ -658,6 +748,13 @@ def build(
         ),
         repo_lookup=binding,
     )
+    deploy_notice_consumer = DeployNoticeConsumer(
+        redis=eval_redis,
+        sink=sink,
+        config=config,
+        leases=DeliveryLeaseStore(eval_redis, config),
+        drain=drain_gate,
+    )
     publication_loop = _build_publication_loop(
         config,
         env,
@@ -666,14 +763,11 @@ def build(
         eval_http,
         card_store,
     )
-    cron_bundle_store = BundleStore(config)
-    owner.register_close(
-        "cron-bundle-s3", lambda: _close_sync(cron_bundle_store._client.close), order=71
-    )
     return Runtime(
         consumer=consumer,
         killswitch=killswitch,
         eval_consumer=eval_consumer,
+        deploy_notice_consumer=deploy_notice_consumer,
         runner=runner,
         sink=sink,
         async_redis=async_redis,
@@ -700,17 +794,23 @@ def build(
             if work_items is not None
             else None
         ),
-        connector_loop=_build_connector_loop(config, engine),
+        connector_loop=_build_connector_loop(config, engine, client=eval_http),
+        action_executor=_build_action_executor(
+            config,
+            engine,
+            substrate=substrate,
+            runner=runner,
+            killswitch=killswitch,
+            binding=binding,
+            client=eval_http,
+            bundles=cron_bundle_store,
+        ),
+        e2e_reaper=_build_e2e_reaper(config, work_items),
         cron_loop=CronSchedulerLoop(
             source_guard=CronHookSourceGuard(source_gate, engine),
             engine=engine,
             redis=async_redis,
-            source=BundleTriggerSource(
-                cron_bundle_store,
-                max_uncompressed_bytes=config.bundle_max_uncompressed_bytes,
-                max_compression_ratio=config.bundle_max_compression_ratio,
-                max_members=config.bundle_max_members,
-            ),
+            source=trigger_source,
             is_killed=killswitch.is_killed,
             db_schema=config.db_schema,
             stream=config.stream,
@@ -720,6 +820,8 @@ def build(
             default_max_output_tokens_per_run=config.default_max_output_tokens_per_run,
         ),
         publication_loop=publication_loop,
+        remediation_cards=_build_remediation_cards(config, engine, sink, card_store),
+        remediation_receipts=_build_remediation_receipts(config, engine, sink),
         stream_retention=build_stream_retention(config, async_redis),
     )
 
@@ -733,13 +835,12 @@ _SUPERVISED_OPERATIONS = frozenset(
         "connectors",
         "cron",
         "publications",
+        "e2e-reaper",
     }
 )
 
 
-def _restart_delay_s(
-    consecutive_failures: int, *, base_s: float, max_s: float
-) -> float:
+def _restart_delay_s(consecutive_failures: int, *, base_s: float, max_s: float) -> float:
     """Delay before restart number ``consecutive_failures`` (1-based).
 
     Doubles from ``base_s`` per consecutive crash and never exceeds ``max_s``
@@ -932,8 +1033,144 @@ def _supervise_policy(config: WorkerConfig) -> _SupervisePolicy:
     }
 
 
+def _build_action_recorder(
+    config: WorkerConfig, engine: AsyncEngine, client: ActionClient
+) -> ActionRecorder:
+    """The ledger client, wrapped to attribute connector digests where it can.
+
+    @spec ACTION-EXECUTOR-12: only on the cluster tier with the connector
+    reconciler (which owns the Deployments read) and the executor (whose chart
+    gate is what grants the worker ``get`` on Deployments) both enabled, and an
+    internal worker token to send attribution under. With either flag off the
+    worker Role has no such ``get``, so the wrapper is not composed and every
+    action records a null digest, as on the local tier.
+    """
+
+    if not (config.connector_reconcile_enabled and config.action_executor_enabled):
+        return client
+    if not config.internal_worker_token:
+        # The API takes attribution only under the worker token; without one
+        # every attributed completion would be refused and fail its turn.
+        logger.warning("no internal worker token; actions record no connector digest")
+        return client
+    from .action_digest import DigestAttributingRecorder, agent_deployment_resolver
+    from .connector_k8s import connector_deployments_api
+
+    return DigestAttributingRecorder(
+        client,
+        deployments=connector_deployments_api(),
+        namespace=config.connector_namespace,
+        deployment_name=agent_deployment_resolver(
+            engine, db_schema=config.db_schema, release=config.connector_release
+        ),
+    )
+
+
+# The executor loop's timing (ACTION-EXECUTOR-17). The dispatch deadline bounds
+# the one ``call`` and the grant's expiry. The lease is sized for the sandbox
+# claim budget, the runner phases and the deadline, with headroom; the loop
+# bounds each phase by what is left of it and refuses before dispatch when the
+# rest cannot carry the call.
+_ACTION_EXECUTOR_DISPATCH_DEADLINE_S = 60.0
+_ACTION_EXECUTOR_INTERVAL_S = 5.0
+_ACTION_EXECUTOR_LEASE_HEADROOM_S = 240
+_ACTION_EXECUTOR_LEASE_MAX_S = 3600
+
+
+def _build_action_executor(
+    config: WorkerConfig,
+    engine: AsyncEngine,
+    *,
+    substrate: SandboxSubstrate,
+    runner: RunnerClient,
+    killswitch: KillSwitch,
+    binding: BindingResolver,
+    client: httpx.AsyncClient,
+    bundles: BundleStore,
+) -> ActionExecutorLoop | None:
+    """The connector action executor loop, or None when it is switched off.
+
+    @spec ACTION-EXECUTOR-1: off by default; with it off the worker claims
+    nothing. The executor routes take only the internal worker token, so a
+    worker without one cannot run it.
+
+    Tiers. With the connector reconciler on (the cluster tier) the loop reads
+    the connector Deployment, which the chart lets the worker ``get`` only with
+    the executor enabled, and the in-force digest from the same API render the
+    reconciler applies. Without it (the local tier) there is no Deployment and
+    no caller proxy: every restore refuses ``tool_not_grant_bound`` and every
+    probe ``connector_digest_unavailable``, which is what the local tier proves
+    (ACTION-EXECUTOR-7). No consumer, stream, thread lock or marker is touched.
+    """
+
+    if not config.action_executor_enabled:
+        return None
+    if not config.internal_worker_token:
+        logger.warning("action executor enabled without an internal worker token; not started")
+        return None
+    from .action_digest import agent_deployment_resolver
+    from .action_executor_binding import ExecutorBindings
+    from .action_executor_loop import ExecutionApi
+
+    deployments = None
+    manifests = None
+    if config.connector_reconcile_enabled:
+        from .connector_k8s import connector_deployments_api
+
+        deployments = connector_deployments_api()
+        manifests = HttpManifestSource(
+            api_base_url=config.api_base_url,
+            api_key=config.api_key,
+            release=config.connector_release,
+            namespace=config.connector_namespace,
+            app_name=config.connector_app_name,
+        )
+    bindings = ExecutorBindings(
+        binding=binding,
+        bundles=bundles,
+        manifests=manifests,
+        release=config.connector_release,
+        namespace=config.connector_namespace,
+        max_uncompressed_bytes=config.bundle_max_uncompressed_bytes,
+        max_compression_ratio=config.bundle_max_compression_ratio,
+        max_members=config.bundle_max_members,
+    )
+    lease_seconds = min(
+        _ACTION_EXECUTOR_LEASE_MAX_S,
+        int(substrate.claim_timeout_seconds) + _ACTION_EXECUTOR_LEASE_HEADROOM_S,
+    )
+    return ActionExecutorLoop(
+        api=ExecutionApi(
+            api_base_url=config.api_base_url,
+            api_key=config.api_key,
+            worker_token=config.internal_worker_token,
+            client=client,
+        ),
+        substrate=substrate,
+        runner=runner,
+        killswitch=killswitch,
+        deployments=deployments,
+        namespace=config.connector_namespace,
+        deployment_name=agent_deployment_resolver(
+            engine, db_schema=config.db_schema, release=config.connector_release
+        ),
+        in_force_digest=bindings.in_force_digest,
+        executor_boot=bindings.executor_boot,
+        grant_signing_key=config.connector_caller_signing_key,
+        lease_owner=config.consumer_name,
+        lease_seconds=lease_seconds,
+        dispatch_deadline_s=_ACTION_EXECUTOR_DISPATCH_DEADLINE_S,
+        interval_seconds=_ACTION_EXECUTOR_INTERVAL_S,
+        # @spec AUTOMATED-REMEDIATION-12 (E9): the chart's cap, also the API's.
+        max_concurrent_sandboxes=config.action_executor_max_concurrent_sandboxes,
+    )
+
+
 def _build_connector_loop(
-    config: WorkerConfig, engine: AsyncEngine
+    config: WorkerConfig,
+    engine: AsyncEngine,
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> ConnectorReconcileLoop | None:
     """The connector reconcile loop, or None when it is switched off.
 
@@ -959,37 +1196,161 @@ def _build_connector_loop(
         namespace=config.connector_namespace,
         db_schema=config.db_schema,
         interval_seconds=config.connector_reconcile_interval_s,
+        probe_trigger=_build_probe_trigger(config, engine, client=client),
     )
 
 
-_PUBLICATION_GITHUB_CA_SETTING = "CURIE_PUBLICATION_GITHUB_CA_FILE"
+def _build_probe_trigger(
+    config: WorkerConfig,
+    engine: AsyncEngine,
+    *,
+    client: httpx.AsyncClient | None,
+) -> ProbeTrigger | None:
+    """The capability probe trigger, or None when no executor could run a probe.
 
+    @spec ACTION-EXECUTOR-13. The probe route takes only the internal worker
+    token, and only an enabled executor claims what it creates, so without
+    both the reconcile runs exactly as before.
+    """
 
-def _publication_github_ca_pem(config: WorkerConfig) -> str | None:
-    """Read the configured GitHub CA once; a set but unusable path stops startup."""
-
-    path = config.publication_github_ca_file
-    if not path:
+    if not (config.action_executor_enabled and config.internal_worker_token):
         return None
-    try:
-        pem = Path(path).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise RuntimeError(
-            f"{_PUBLICATION_GITHUB_CA_SETTING} points at {path!r}, which cannot be read: {exc}"
-        ) from exc
-    if "-----BEGIN CERTIFICATE-----" not in pem:
-        raise RuntimeError(
-            f"{_PUBLICATION_GITHUB_CA_SETTING} points at {path!r}, "
-            "which contains no PEM certificate"
+    return ProbeTrigger(
+        requester=HttpProbeRequester(
+            api_base_url=config.api_base_url,
+            api_key=config.api_key,
+            worker_token=config.internal_worker_token,
+            client=client if client is not None else httpx.AsyncClient(),
+        ),
+        capabilities=DbCapabilityRows(engine, db_schema=config.db_schema),
+        release=config.connector_release,
+    )
+
+
+def _build_e2e_reaper(
+    config: WorkerConfig, work_items: WorkItemDispatchClient | None
+) -> E2EReaperLoop | None:
+    """The end to end namespace reaper (#3245), or None when it is disabled.
+
+    It reads each agent's test cluster kubeconfig from the connector Secret,
+    which only the reconciler's Role lets the worker list, and it reads run
+    status through the WorkItem client, which needs the internal worker token.
+    The chart refuses to render the first misconfiguration. Either one is
+    logged rather than failing boot, because the rest of the worker is
+    unaffected, and the loop still runs with a cluster source that raises the
+    reason, without loading a kube config. Every pass then fails and
+    ``curie.e2e.reaper.last_success`` stays 0, so CurieE2EReaperStalled fires
+    instead of the reaper going silently missing.
+    """
+
+    if not config.e2e_reaper_enabled:
+        return None
+    from curie_e2e_connector.reaper import Scope
+
+    scope = Scope(
+        namespace_prefix=config.e2e_namespace_prefix,
+        owner_label_key=config.e2e_owner_label_key,
+        owner_label_value=config.e2e_owner_label_value,
+    )
+    if not config.connector_reconcile_enabled or work_items is None:
+        reason = (
+            "CURIE_E2E_CONNECTOR_ENABLED needs CURIE_CONNECTOR_RECONCILE for the "
+            "connector Secret list grant"
+            if not config.connector_reconcile_enabled
+            else "it reads run status with the internal worker token, and none is configured"
         )
+        logger.error(
+            "e2e reaper cannot work: %s; end to end namespaces are left to their TTL "
+            "with nothing deleting them, and every pass fails",
+            reason,
+        )
+
+        def refuse_clusters() -> NoReturn:
+            raise RuntimeError(f"e2e reaper is misconfigured: {reason}")
+
+        async def refuse_status(_request_id: uuid.UUID) -> NoReturn:
+            raise RuntimeError(f"e2e reaper is misconfigured: {reason}")
+
+        return E2EReaperLoop(
+            clusters=refuse_clusters,
+            request_status=refuse_status,
+            scope=scope,
+            interval_s=config.e2e_reaper_interval_s,
+        )
+    from curie_e2e_connector.registry import RegistrySettings
+    from kubernetes import client as k8s_client
+    from kubernetes import config as k8s_config
+
+    from .e2e_reaper import connector_secret_clusters, request_status_lookup
+
+    # The same credential the connector reconciler loads (connector_k8s.py).
     try:
-        ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=pem)
-    except (ssl.SSLError, ValueError) as exc:
-        raise RuntimeError(
-            f"{_PUBLICATION_GITHUB_CA_SETTING} points at {path!r}, "
-            f"which contains no usable PEM certificate: {exc}"
-        ) from exc
-    return pem
+        k8s_config.load_incluster_config()
+    except k8s_config.ConfigException:
+        k8s_config.load_kube_config()
+    core = k8s_client.CoreV1Api()
+    return E2EReaperLoop(
+        clusters=lambda: connector_secret_clusters(
+            core,
+            namespace=config.connector_namespace,
+            release=config.connector_release,
+            timeout=30,
+            registry=RegistrySettings(
+                prefix=config.e2e_registry,
+                insecure=config.e2e_registry_insecure,
+                token_hosts=tuple(
+                    host.strip()
+                    for host in config.e2e_registry_token_hosts.split(",")
+                    if host.strip()
+                ),
+            ),
+        ),
+        request_status=request_status_lookup(work_items),
+        scope=scope,
+        interval_s=config.e2e_reaper_interval_s,
+    )
+
+
+def _build_remediation_cards(
+    config: WorkerConfig,
+    engine: AsyncEngine,
+    sink: ReplySinkRouter,
+    card_store: ApprovalCardStore,
+) -> RemediationCardLoop | None:
+    """The remediation approval card loop, behind the remediation switch.
+
+    @spec AUTOMATED-REMEDIATION-15. Its own observed reply sink and the shared
+    ``ApprovalCardStore``, as the publication loop delivers its cards.
+    """
+
+    if not config.remediation_enabled:
+        return None
+    return RemediationCardLoop(
+        store=PostgresRemediationCardStore(
+            engine, schema=config.db_schema, lease_owner=config.consumer_name
+        ),
+        replies=ObservedReplySink(sink),
+        card_store=card_store,
+    )
+
+
+def _build_remediation_receipts(
+    config: WorkerConfig, engine: AsyncEngine, sink: ReplySinkRouter
+) -> RemediationReceiptLoop | None:
+    """The remediation receipt loop, behind the remediation switch.
+
+    @spec AUTOMATED-REMEDIATION-20. Its own observed reply sink, as the card
+    loop has; it needs no card store, since a receipt carries no buttons.
+    """
+
+    if not config.remediation_enabled:
+        return None
+    return RemediationReceiptLoop(
+        store=PostgresRemediationReceiptStore(
+            engine, schema=config.db_schema, lease_owner=config.consumer_name
+        ),
+        replies=ObservedReplySink(sink),
+    )
 
 
 def _build_publication_loop(
@@ -1002,11 +1363,11 @@ def _build_publication_loop(
 ) -> PublicationReconcileLoop | None:
     """Build the worker-owned Kubernetes publication lane, never a local twin."""
 
-    if not config.publication_enabled or env.get(
-        "CURIE_SANDBOX_SUBSTRATE", "kubernetes"
-    ).lower() != "kubernetes":
+    if (
+        not config.publication_enabled
+        or env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower() != "kubernetes"
+    ):
         return None
-    github_ca_pem = _publication_github_ca_pem(config)
     namespace = config.publication_namespace
     cluster = KubernetesPublicationCluster(namespace)
     store = PostgresPublicationStore(
@@ -1021,12 +1382,15 @@ def _build_publication_loop(
         store=store,
         credentials=PublicationCredentialClient(
             api_base_url=config.api_base_url,
-            github_html_base=config.publication_github_html_base,
             worker_token=config.internal_worker_token,
             client=http,
         ),
         cluster=cluster,
-        github=GitHubPublicationLookup(http, api_base_url=config.publication_github_api_url),
+        code_host=PublicationCodeHostClient(
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
+            client=http,
+        ),
         lineage=PublicationLineageClient(
             api_base_url=config.api_base_url,
             worker_token=config.internal_worker_token,
@@ -1057,10 +1421,8 @@ def _build_publication_loop(
             owner_name=config.publication_owner_name,
             git_user_name=config.publication_git_user_name,
             git_user_email=config.publication_git_user_email,
-            github_api_url=config.publication_github_api_url,
-            active_deadline_seconds=(
-                config.publication_job_active_deadline_seconds
-            ),
+            ca_bundle_path=config.publication_ca_bundle_path,
+            active_deadline_seconds=(config.publication_job_active_deadline_seconds),
             git_timeout_seconds=config.publication_git_command_timeout_seconds,
             cpu_request=config.publication_cpu_request,
             cpu_limit=config.publication_cpu_limit,
@@ -1068,7 +1430,6 @@ def _build_publication_loop(
             memory_limit=config.publication_memory_limit,
             ephemeral_request=config.publication_ephemeral_request,
             ephemeral_limit=config.publication_ephemeral_limit,
-            github_ca_pem=github_ca_pem,
         ),
     )
     return PublicationReconcileLoop(
@@ -1086,7 +1447,8 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
     try:
         rt = build(config, env, resources=resources)
         await _run_runtime(rt, config, resources)
-    except BaseException as error:
+    # retain the primary fault while guaranteed resource cleanup runs.
+    except BaseException as error:  # noqa: BLE001
         primary = error
     finally:
         await resources.aclose(primary=primary)
@@ -1109,6 +1471,8 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
         rt.consumer.request_stop()
         rt.killswitch.request_stop()
         rt.eval_consumer.request_stop()
+        if rt.deploy_notice_consumer is not None:
+            rt.deploy_notice_consumer.request_stop()
         shutdown.set()
 
     def _remove_signals() -> None:
@@ -1191,12 +1555,26 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
             lambda: run_heartbeat(config.heartbeat_file, config.heartbeat_interval_s, shutdown),
         ),
     ]
+    if rt.deploy_notice_consumer is not None:
+        tasks.append(launch("deploy-notices", rt.deploy_notice_consumer.run))
     if rt.connector_loop is not None:
         tasks.append(launch("connectors", lambda: rt.connector_loop.run_forever(shutdown)))  # type: ignore[union-attr]
+    if getattr(rt, "action_executor", None) is not None:
+        tasks.append(launch("action-executor", lambda: rt.action_executor.run_forever(shutdown)))  # type: ignore[union-attr]
+    if getattr(rt, "e2e_reaper", None) is not None:
+        tasks.append(launch("e2e-reaper", lambda: rt.e2e_reaper.run_forever(shutdown)))  # type: ignore[union-attr]
     if rt.cron_loop is not None:
         tasks.append(launch("cron", lambda: rt.cron_loop.run_forever(shutdown)))  # type: ignore[union-attr]
     if getattr(rt, "publication_loop", None) is not None:
         tasks.append(launch("publications", lambda: rt.publication_loop.run_forever(shutdown)))  # type: ignore[union-attr]
+    if getattr(rt, "remediation_cards", None) is not None:
+        tasks.append(
+            launch("remediation-cards", lambda: rt.remediation_cards.run_forever(shutdown))  # type: ignore[union-attr]
+        )
+    if getattr(rt, "remediation_receipts", None) is not None:
+        tasks.append(
+            launch("remediation-receipts", lambda: rt.remediation_receipts.run_forever(shutdown))  # type: ignore[union-attr]
+        )
     if sweeper is not None:
         tasks.append(launch("work-item-orphans", lambda: sweeper.run_forever(shutdown)))
     if retention is not None:

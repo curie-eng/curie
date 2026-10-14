@@ -11,6 +11,7 @@ import asyncio
 import importlib.util
 import json
 import logging
+import signal
 import socket
 import subprocess
 from collections.abc import Mapping
@@ -410,10 +411,24 @@ def test_docker_runner_uses_its_network_specific_otlp_endpoint(
     )
 
 
-@pytest.mark.parametrize("prefix", ["", "/forge"])
-def test_docker_runner_snapshot_uses_the_workers_configured_github_url(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, prefix: str
+@pytest.mark.parametrize(
+    ("origin", "repo_name"),
+    [
+        ("https://github.example.com", "acme-corp/acme-bot"),
+        ("https://github.example.com/forge", "acme-corp/acme-bot"),
+        ("https://gitlab.example.com", "group/sub/project"),
+    ],
+)
+def test_docker_runner_snapshot_checks_the_claims_code_host_origin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, origin: str, repo_name: str
 ) -> None:
+    """ADR 0197: the docker runner takes the origin and path from the boot env.
+
+    The worker reads no GitHub URL. The workspace claim carries the origin and
+    path from the API's credential, the docker substrate forwards them as boot
+    env, and the runner's snapshot accepts exactly that path under that origin.
+    """
+
     from curie_runner.workspace_snapshot import capture_workspace_snapshot
 
     calls: list[list[str]] = []
@@ -428,16 +443,11 @@ def test_docker_runner_snapshot_uses_the_workers_configured_github_url(
         calls.append(args)
         return ""
 
-    html_base = f"https://github.example.com{prefix}"
-    github_api_url = f"{html_base}/api/v3"
     monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
     monkeypatch.setattr(DockerSandboxClient, "_docker", capture_docker)
     client = _sandbox_client(
-        WorkerConfig(fake_model=True, publication_github_api_url=github_api_url),
-        {
-            "CURIE_SANDBOX_SUBSTRATE": "docker",
-            "CURIE_GITHUB_API_URL": "https://other.example.com/api/v3",
-        },
+        WorkerConfig(fake_model=True),
+        {"CURIE_SANDBOX_SUBSTRATE": "docker"},
         _SUB,
     )
     assert isinstance(client, DockerSandboxClient)
@@ -446,36 +456,48 @@ def test_docker_runner_snapshot_uses_the_workers_configured_github_url(
         pool="pool",
         env={
             "CURIE_FAKE_MODEL": "1",
-            "CURIE_GITHUB_API_URL": "https://other.example.com/api/v3",
+            "CURIE_REPO_ORIGIN": origin,
+            "CURIE_REPO_PATH": repo_name,
         },
     )
-    assignments = [arg for arg in calls[0] if arg.startswith("CURIE_GITHUB_API_URL=")]
-    assert assignments == [f"CURIE_GITHUB_API_URL={github_api_url}"]
-    # Feed the emitted container setting into the actual runner snapshot
-    # boundary, proving a managed GHES checkout remains publishable locally.
-    monkeypatch.setenv("CURIE_GITHUB_API_URL", assignments[0].partition("=")[2])
-    repo_name = "acme-corp/acme-bot"
+    assert not any(arg.startswith("CURIE_GITHUB_API_URL=") for arg in calls[0])
+    forwarded = dict(arg.partition("=")[::2] for arg in calls[0] if arg.startswith("CURIE_REPO_"))
+    assert forwarded == {"CURIE_REPO_ORIGIN": origin, "CURIE_REPO_PATH": repo_name}
     for args in (
         ("init", "--quiet"),
-        ("remote", "add", "origin", f"{html_base}/{repo_name}.git"),
+        ("remote", "add", "origin", f"{origin}/{repo_name}.git"),
     ):
         subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
     (tmp_path / "README.md").write_text("base\n")
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
         [
-            "git", "-c", "user.name=Curie Test", "-c", "user.email=curie@example.com",
-            "commit", "--quiet", "-m", "Initial fixture",
+            "git",
+            "-c",
+            "user.name=Curie Test",
+            "-c",
+            "user.email=curie@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "Initial fixture",
         ],
-        cwd=tmp_path, check=True, capture_output=True,
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
     )
-    (tmp_path / "README.md").write_text("GHES change\n")
+    (tmp_path / "README.md").write_text("Code host change\n")
 
-    captured = capture_workspace_snapshot(tmp_path, expected_repo=repo_name)
+    captured = capture_workspace_snapshot(
+        tmp_path,
+        expected_repo=repo_name,
+        trusted_origin=forwarded["CURIE_REPO_ORIGIN"],
+        repository_path=forwarded["CURIE_REPO_PATH"],
+    )
 
     assert captured.repo_full_name == repo_name
     assert captured.changed_paths == ("README.md",)
-    assert b"GHES change" in captured.patch
+    assert b"Code host change" in captured.patch
 
 
 def test_sandbox_client_docker_prepulls_image(monkeypatch) -> None:
@@ -1064,6 +1086,7 @@ class _FakeRuntime:
         self.consumer = _FakeSupervisedTask(events, "runs")
         self.killswitch = _FakeSupervisedTask(events, "killswitch")
         self.eval_consumer = _FakeSupervisedTask(events, "evals")
+        self.deploy_notice_consumer = _FakeSupervisedTask(events, "deploy-notices")
         self.connector_loop = None
         self.cron_loop = _FakeCronLoop(events)
         self.runner = _FakeTransport()
@@ -1159,6 +1182,54 @@ def test_run_supervises_the_cron_loop_until_shutdown(
 
     assert events.count("cron") == 1
     assert "cron-stopped" in events
+
+
+def test_sigterm_stops_the_deploy_notice_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    runtime = _FakeRuntime(_FakeCardStore(events), events)
+
+    class StopGatedNotice:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.stopped = asyncio.Event()
+
+        async def run(self) -> None:
+            self.started.set()
+            await self.stopped.wait()
+
+        def request_stop(self) -> None:
+            self.stopped.set()
+
+    notice = StopGatedNotice()
+    runtime.deploy_notice_consumer = notice  # type: ignore[assignment]
+
+    async def stopping_heartbeat(_file: Any, _interval: Any, shutdown: asyncio.Event) -> None:
+        await notice.started.wait()
+        handlers[signal.SIGTERM]()
+        await shutdown.wait()
+
+    handlers: dict[signal.Signals, Any] = {}
+
+    async def exercise() -> None:
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(
+            loop,
+            "add_signal_handler",
+            lambda sig, handler: handlers.__setitem__(sig, handler),
+        )
+        await asyncio.wait_for(run._run(WorkerConfig(), {}), timeout=1)
+
+    def fake_build(config: WorkerConfig, env: Any, *, resources: Any) -> _FakeRuntime:
+        _register_legacy_fake_transports(runtime, resources)
+        return runtime
+
+    monkeypatch.setattr(run, "build", fake_build)
+    monkeypatch.setattr(run, "run_heartbeat", stopping_heartbeat)
+    asyncio.run(exercise())
+    assert notice.started.is_set()
+    assert notice.stopped.is_set()
 
 
 def test_cron_tick_interval_reads_its_env_knob(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1349,8 +1420,92 @@ def test_build_wires_dedicated_single_attempt_pressure_clients(
     asyncio.run(exercise())
 
 
-# --- VALKEY_TLS env -> WorkerConfig.valkey_tls (the seam the chart actually
-# drives; a field that only works via kwargs is not wired) ------------------
+def test_build_wires_the_sweep_coverage_into_the_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+    sync_redis: redis.Redis,
+) -> None:
+    """ADR-0160 (#2878): the kernel reads sweep coverage through the SAME trigger
+    source the cron scheduler fires from, so the sweep date is computed in the
+    zone the slot was scheduled in. Driving a budget cut through ``build()``
+    itself needs a live runner image and API; the production factory ``build()``
+    calls is exercised end to end in ``kernel/test_sweep_continuation.py``."""
+    from curie_worker.sweep import SweepCoverage
+
+    endpoint = sync_redis.connection_pool.connection_kwargs
+    config = WorkerConfig(
+        fake_model=True,
+        valkey_host=str(endpoint["host"]),
+        valkey_port=int(endpoint["port"]),
+        valkey_password=str(endpoint.get("password") or ""),
+        valkey_db=int(endpoint.get("db", 0)),
+        s3_access_key="PLACEHOLDER",
+        s3_secret_key="PLACEHOLDER",
+    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
+
+    async def exercise() -> None:
+        runtime = run.build(config, {"CURIE_SANDBOX_SUBSTRATE": "docker"})
+        affinity_redis = runtime.consumer._kernel._substrate._affinity._redis
+        try:
+            sweep = runtime.consumer._kernel._sweep
+            assert isinstance(sweep, SweepCoverage)
+            assert runtime.cron_loop is not None
+            assert sweep._trigger_source is runtime.cron_loop._source
+        finally:
+            affinity_redis.close()
+            await runtime.runner.close()
+            await runtime.sink.aclose()
+            await runtime.eval_http.aclose()
+            await runtime.async_redis.aclose()
+            await runtime.pressure_async_redis.aclose()
+            await runtime.eval_redis.aclose()
+            await runtime.engine.dispose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(("raw", "expected"), [(None, 16), ("4", 4)])
+def test_max_concurrency_environment_sizes_the_production_runs_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+    sync_redis: redis.Redis,
+    raw: str | None,
+    expected: int,
+) -> None:
+    if raw is None:
+        monkeypatch.delenv("CURIE_WORKER_MAX_CONCURRENCY", raising=False)
+    else:
+        monkeypatch.setenv("CURIE_WORKER_MAX_CONCURRENCY", raw)
+    endpoint = sync_redis.connection_pool.connection_kwargs
+    config = WorkerConfig(
+        fake_model=True,
+        valkey_host=str(endpoint["host"]),
+        valkey_port=int(endpoint["port"]),
+        valkey_password=str(endpoint.get("password") or ""),
+        valkey_db=int(endpoint.get("db", 0)),
+        s3_access_key="PLACEHOLDER",
+        s3_secret_key="PLACEHOLDER",
+    )
+    monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
+
+    async def exercise() -> None:
+        runtime = run.build(config, {"CURIE_SANDBOX_SUBSTRATE": "docker"})
+        try:
+            assert runtime.consumer._max_concurrency == expected
+            assert runtime.consumer._transfer_capacity() == expected
+        finally:
+            runtime.consumer._kernel._substrate._affinity._redis.close()
+            await runtime.runner.close()
+            await runtime.sink.aclose()
+            await runtime.eval_http.aclose()
+            await runtime.async_redis.aclose()
+            await runtime.pressure_async_redis.aclose()
+            await runtime.eval_redis.aclose()
+            await runtime.engine.dispose()
+
+    asyncio.run(exercise())
+
+
+# VALKEY_TLS environment reaches WorkerConfig through the chart's configuration.
 
 
 def test_valkey_tls_env_reaches_the_worker_config(
@@ -1380,6 +1535,53 @@ def test_substrate_config_reads_connector_secret_pools() -> None:
     assert _substrate_config({}).connector_secret_pools == frozenset()
     config = _substrate_config({"CURIE_AGENT_CONNECTOR_SECRET_POOLS": "acme-a, acme-b,"})
     assert config.connector_secret_pools == frozenset({"acme-a", "acme-b"})
+
+
+_RUNNER_DIGEST = "sha256:" + "d" * 64
+_REPO_POOL_ENTRY = {
+    "pool": "acme-api-runner",
+    "digests": ["sha256:" + c * 64 for c in "abc"],
+    "base": _RUNNER_DIGEST,
+    "docker": False,
+}
+
+
+def test_substrate_config_reads_repo_runner_pools() -> None:
+    from curie_worker.repo_runner_pools import RepoRunnerPool
+
+    assert dict(_substrate_config({}).repo_runner_pools) == {}
+    config = _substrate_config(
+        {"CURIE_REPO_RUNNER_POOLS": json.dumps({"acme-corp/api": _REPO_POOL_ENTRY})}
+    )
+    assert dict(config.repo_runner_pools) == {
+        "acme-corp/api": RepoRunnerPool.model_validate(_REPO_POOL_ENTRY)
+    }
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ['{"acme-corp/api":', json.dumps({"acme-corp/api": {**_REPO_POOL_ENTRY, "pool": "Bad_Pool"}})],
+    ids=["malformed-json", "bad-entry"],
+)
+def test_substrate_config_refuses_invalid_repo_runner_pools(raw: str) -> None:
+    with pytest.raises(ValueError, match="CURIE_REPO_RUNNER_POOLS"):
+        _substrate_config({"CURIE_REPO_RUNNER_POOLS": raw})
+
+
+@pytest.mark.parametrize(
+    ("image", "expected"),
+    [
+        (f"ghcr.io/x/curie-runner:v1@{_RUNNER_DIGEST}", _RUNNER_DIGEST),
+        ("ghcr.io/x/curie-runner:v1", None),
+    ],
+    ids=["pinned", "tag-only"],
+)
+def test_substrate_config_reads_the_platform_runner_digest(
+    image: str, expected: str | None
+) -> None:
+    assert _substrate_config({}).platform_runner_digest is None
+    config = _substrate_config({"CURIE_RUNNER_IMAGE": image})
+    assert config.platform_runner_digest == expected
 
 
 # -- _supervise: quiet boot while dependencies come up (#3079) ---------------

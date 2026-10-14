@@ -449,6 +449,16 @@ class Row:
 
 
 MATRIX: tuple[Row, ...] = (
+    Row(
+        name="marked_test_action_on_normal_installation",
+        expected=DropReason.TEST_ACTION_REFUSED,
+        why="ADR 0202 refuses marked bot actions after the caller check, before routing.",
+        request=_events_api_request(
+            "env-test-action",
+            "EvTestAction",
+            _mention(text="<@U0BOT> [test action] act", bot_id="B0EXAMPLE1"),
+        ),
+    ),
     # -- AC 1: bodies that are empty at the top level but carry real content ---
     Row(
         name="mention_block_kit_body_only",
@@ -990,9 +1000,7 @@ MATRIX: tuple[Row, ...] = (
             "carries no list. The distinct reason keeps an operator from hunting "
             "for a list typo during an outage."
         ),
-        request=_events_api_request(
-            "env-api-down", "Ev-api-down", _mention(text="<@U0BOT> hello")
-        ),
+        request=_events_api_request("env-api-down", "Ev-api-down", _mention(text="<@U0BOT> hello")),
         api_down=True,
         dedupe_id="Ev-api-down",
     ),

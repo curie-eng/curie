@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from curie_protected_hooks.source_policy_records import (
     SourcePolicyRecordInvalid,
-    canonical_decimal,
     canonical_hook,
     canonical_uuid,
-    target_intent_sha256,
 )
 from curie_protected_hooks.source_policy_sql import (
     SourceAgentNotFound,
@@ -22,11 +21,16 @@ from curie_protected_hooks.source_policy_sql import (
     SourceSnapshotUnavailable,
     read_source_snapshot,
 )
-from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from .hook_source_policy_schemas import HookSourcePolicyOut
+
+GATE_WAIT_SECONDS = 5.0
+"""Administrative requests give up on the agent gate after this long.
+
+@spec PROTECTED-HOOK-SOURCE-2 @spec PROTECTED-HOOK-SOURCE-10.
+"""
 
 
 class SourceAdminError(RuntimeError):
@@ -50,33 +54,34 @@ def _identity(agent_id: str, hook: str) -> uuid.UUID:
     return uuid.UUID(agent_id)
 
 
-def _mutation_identity(expected_generation: str, operation_id: str) -> uuid.UUID:
-    """@spec PROTECTED-HOOK-SOURCE-3."""
-    try:
-        canonical_decimal(expected_generation)
-        canonical_uuid(operation_id)
-    except SourcePolicyRecordInvalid:
-        raise SourceAdminError("invalid_source_request", 422) from None
-    return uuid.UUID(operation_id)
+SourceActivation = tuple[Literal["closed", "active"], str | None]
+"""(activation, refusal_reason) of a committed tombstone, @spec PROTECTED-HOOK-SOURCE-3."""
 
 
-def _intent(target: Mapping[str, object]) -> str:
-    """@spec PROTECTED-HOOK-SOURCE-3/10."""
-    try:
-        return target_intent_sha256(target)
-    except SourcePolicyRecordInvalid:
-        raise SourceAdminError("invalid_source_request", 422) from None
-
-
-def _policy_target(policy: SourcePolicySnapshot) -> dict[str, object]:
-    """@spec PROTECTED-HOOK-SOURCE-3/10."""
-    return {
-        "mode": policy.mode,
-        "tool_access": policy.tool_access,
-        "runtime_id": policy.runtime_id,
-        "qualification_id": policy.qualification_id,
-        "bundle_digest": policy.bundle_digest,
-    }
+def policy_out(
+    snapshot_agent: uuid.UUID,
+    hook: str,
+    policy: SourcePolicySnapshot | None,
+    *,
+    legacy_generation: int,
+    activation: Literal["closed", "active"],
+    refusal_reason: str | None,
+) -> HookSourcePolicyOut:
+    """The SOURCE-3 DTO for one committed row or its absence, @spec PROTECTED-HOOK-SOURCE-3/5."""
+    return HookSourcePolicyOut(
+        agent_id=str(snapshot_agent),
+        hook=hook,
+        generation="0" if policy is None else str(policy.generation),
+        mode="ordinary" if policy is None or policy.mode == "ordinary" else "protected",
+        tool_access=None if policy is None or policy.tool_access is None else "read-only",
+        runtime_id=None if policy is None else policy.runtime_id,
+        qualification_id=None if policy is None else policy.qualification_id,
+        bundle_digest=None if policy is None else policy.bundle_digest,
+        legacy_generation=str(legacy_generation),
+        activation=activation,
+        updated_at=None if policy is None else policy.updated_at,
+        refusal_reason=refusal_reason,
+    )
 
 
 class SourceAdminService:
@@ -96,7 +101,7 @@ class SourceAdminService:
         """@spec PROTECTED-HOOK-SOURCE-2/3/10."""
         agent = _identity(agent_id, hook)
         try:
-            async with self._gate.hold(agent) as context:
+            async with self._gate.hold(agent, wait_seconds=GATE_WAIT_SECONDS) as context:
                 async with self._work_engine.connect() as connection:
                     await connection.execution_options(isolation_level="READ COMMITTED")
                     async with connection.begin():
@@ -107,116 +112,65 @@ class SourceAdminService:
         except (SourceGateInvalid, SourceSnapshotUnavailable, SQLAlchemyError):
             raise SourceAdminError("source_state_unavailable", 503) from None
 
-    async def get_policy(self, agent_id: str, hook: str) -> HookSourcePolicyOut:
-        """@spec PROTECTED-HOOK-SOURCE-3/5/6/10."""
-        async with self._locked(agent_id, hook) as (_, snapshot):
-            policy = snapshot.policy
-            return HookSourcePolicyOut(
-                agent_id=str(snapshot.agent_id),
-                hook=hook,
-                generation="0" if policy is None else str(policy.generation),
-                mode="ordinary" if policy is None or policy.mode == "ordinary" else "protected",
-                tool_access=None if policy is None or policy.tool_access is None else "read-only",
-                runtime_id=None if policy is None else policy.runtime_id,
-                qualification_id=None if policy is None else policy.qualification_id,
-                bundle_digest=None if policy is None else policy.bundle_digest,
-                legacy_generation=str(snapshot.legacy_generation),
-                activation="closed",
-                updated_at=None if policy is None else policy.updated_at,
-                refusal_reason=(
-                    snapshot.refusal_reason if policy is None else "authority_unavailable"
-                ),
-            )
-
-    async def _refuse_mutation(
-        self,
-        connection: AsyncConnection,
-        snapshot: SourceSnapshot,
-        expected_generation: str,
-        operation: uuid.UUID,
-        target: Mapping[str, object],
-    ) -> None:
-        """@spec PROTECTED-HOOK-SOURCE-3/5/6/10."""
-        intent = _intent(target)
-        policy = snapshot.policy
-        if policy is not None and policy.operation_id == operation:
-            if target_intent_sha256(_policy_target(policy)) != intent:
-                raise SourceAdminError("source_operation_conflict", 409)
-            raise SourceAdminError("source_authority_unavailable", 503)
-        existing = await connection.scalar(
-            text(
-                "SELECT 1 FROM curie.hook_source_operations "
-                "WHERE agent_id=:agent AND hook=:hook AND operation_id=:operation"
-            ),
-            {"agent": snapshot.agent_id, "hook": snapshot.hook, "operation": operation},
-        )
-        if existing is not None:
-            raise SourceAdminError("source_operation_conflict", 409)
-        current_generation = 0 if policy is None else policy.generation
-        if int(expected_generation) != current_generation:
-            raise SourceAdminError("stale_source_generation", 409)
-        if max(current_generation, snapshot.attempt_generation_highwater) == 2**63 - 1:
-            raise SourceAdminError("source_generation_exhausted", 409)
-        if (
-            target["mode"] == "protected"
-            and (policy is None or policy.mode == "ordinary")
-            and snapshot.legacy_generation == 2147483647
-        ):
-            raise SourceAdminError("legacy_generation_exhausted", 409)
-        # No qualified authority resolver is composed into this unwired slice.
-        raise SourceAdminError("source_authority_unavailable", 503)
-
-    async def mutate(
+    async def read_policy(
         self,
         agent_id: str,
         hook: str,
-        expected_generation: str,
-        operation_id: str,
-        desired_target: Mapping[str, object],
-    ) -> None:
-        """@spec PROTECTED-HOOK-SOURCE-3/5/6/10."""
-        operation = _mutation_identity(expected_generation, operation_id)
-        if not isinstance(desired_target, Mapping):
-            raise SourceAdminError("invalid_source_request", 422)
-        target = dict(desired_target)
-        _intent(target)
-        async with self._locked(agent_id, hook) as (connection, snapshot):
-            await self._refuse_mutation(
-                connection, snapshot, expected_generation, operation, target
-            )
+        source_activation: Callable[[SourcePolicySnapshot], Awaitable[SourceActivation]],
+    ) -> HookSourcePolicyOut:
+        """GET with source publication activation, evaluated after the gate is released.
 
-    async def remove(
-        self, agent_id: str, hook: str, expected_generation: str, operation_id: str
-    ) -> None:
-        """@spec PROTECTED-HOOK-SOURCE-3/6/10."""
-        await self.mutate(
-            agent_id,
+        No row reports closed with a null or ``pending_history`` reason,
+        touching no broker. A tombstone and a protected row are evaluated once
+        by the caller supplied reader evaluation, after the gate and the
+        transaction ended; a protected row answers on the tombstone's rule with
+        mode ``protected``, attesting publication rather than current readiness.
+        ``legacy_generation`` is the locked agent counter.
+        @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-5/6/10.
+        """
+        async with self._locked(agent_id, hook) as (_, snapshot):
+            pass
+        policy = snapshot.policy
+        activation: Literal["closed", "active"] = "closed"
+        if policy is None:
+            reason = snapshot.refusal_reason
+        else:
+            activation, reason = await source_activation(policy)
+        return policy_out(
+            snapshot.agent_id,
             hook,
-            expected_generation,
-            operation_id,
-            {
-                "mode": "ordinary",
-                "tool_access": None,
-                "runtime_id": None,
-                "qualification_id": None,
-                "bundle_digest": None,
-            },
+            policy,
+            legacy_generation=snapshot.legacy_generation,
+            activation=activation,
+            refusal_reason=reason,
         )
 
-    async def rotate(
-        self, agent_id: str, hook: str, expected_generation: str, operation_id: str
-    ) -> None:
-        """@spec PROTECTED-HOOK-SOURCE-3/6/10."""
-        operation = _mutation_identity(expected_generation, operation_id)
-        async with self._locked(agent_id, hook) as (connection, snapshot):
-            policy = snapshot.policy
-            if policy is None or policy.mode != "protected":
-                raise SourceAdminError("source_rotation_conflict", 409)
-            await self._refuse_mutation(
-                connection, snapshot, expected_generation, operation, _policy_target(policy)
-            )
+    async def refuse_secret(
+        self,
+        agent_id: str,
+        hook: str,
+        source_activation: (
+            Callable[[SourcePolicySnapshot], Awaitable[SourceActivation]] | None
+        ) = None,
+    ) -> SourcePolicySnapshot:
+        """Refuse every state whose secret may not be served; else the active protected row.
 
-    async def read_secret(self, agent_id: str, hook: str) -> None:
-        """@spec PROTECTED-HOOK-SOURCE-3/6."""
-        async with self._locked(agent_id, hook):
-            raise SourceAdminError("source_authority_unavailable", 503)
+        Absent, history only and tombstone rows are 409 ``source_not_protected``.
+        A protected row is evaluated by the caller supplied reader evaluation
+        after the gate and the transaction ended; anything but ``active`` is 503
+        with its closed reason (``source_closed``, ``runtime_unavailable`` or
+        ``broker_unavailable``) and a null committed generation. With no
+        evaluation composed it is ``runtime_unavailable``. Never a key.
+        @spec PROTECTED-HOOK-SOURCE-3/6.
+        """
+        async with self._locked(agent_id, hook) as (_, snapshot):
+            pass
+        policy = snapshot.policy
+        if policy is None or policy.mode == "ordinary":
+            raise SourceAdminError("source_not_protected", 409)
+        if source_activation is None:
+            raise SourceAdminError("runtime_unavailable", 503)
+        activation, reason = await source_activation(policy)
+        if activation != "active":
+            raise SourceAdminError(reason or "source_closed", 503)
+        return policy

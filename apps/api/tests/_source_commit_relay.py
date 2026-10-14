@@ -87,7 +87,7 @@ class CommitResponseLossRelay:
             pass
         except asyncio.CancelledError:
             raise
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - report the class only to withhold transport credentials
             self.errors.append(type(error).__name__)
         finally:
             for task in children:

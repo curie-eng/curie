@@ -158,6 +158,11 @@ jobs:
       - name: Reject chart-owned extraEnv duplicates
         run: bash charts/curie/ci/reserved-env-assertions.sh
 
+      # Prove the factory.* block renders CURIE_FORGES with mounted credential
+      # files and that a removed api.* factory key is refused (#4397).
+      - name: helm render assertions (factory forges)
+        run: bash charts/curie/ci/factory-forges-assertions.sh
+
       # Prove worker.streamRetention.minAgeSeconds reaches the worker, is
       # bounded by the schema, and defaults on a release with no such block.
       - name: helm render assertions (stream retention window)
@@ -408,6 +413,16 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/gvisor-runtime-class-assertions.sh
 
+      # Prove the worker's runner template writes are admitted only in the
+      # chart's shape: one admission rule per host escape, token mount, SA swap
+      # and image swap, an image allowlist equal to the rendered templates,
+      # label-scoped cleanup and Secret policies, and no runner role ARN shared
+      # with a read/write chart identity (#3842).
+      - name: helm render assertions (runner template admission)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/runner-template-admission-assertions.sh
+
       # Keep the chart ClickHouse default and Langfuse pin as one supported
       # pair. ClickHouse 24.8 cannot apply Langfuse 3.225.x migration 39, so
       # the default must stay on 25.12 and AVX-required (#2210).
@@ -467,6 +482,7 @@ jobs:
           # below). It ships on ubuntu-latest, but ensure it explicitly so this
           # job is not coupled to the runner image.
           python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
+          python3 -m pip install --quiet jsonschema==4.26.0
 
       # Prove Langfuse startup is gated on ClickHouse being up (issue #2009). A
       # Helm upgrade that recreates the ClickHouse Service otherwise lets the new
@@ -605,6 +621,33 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/connector-reconciler-rbac-assertions.sh
 
+      # Prove the action executor switch (ACTION-EXECUTOR-1, -12, -14): one
+      # value renders CURIE_ACTION_EXECUTOR_ENABLED identically into the API and
+      # the worker, default off, and the worker Role gains only a single-object
+      # `get` on Deployments, and only with the executor and the reconciler on.
+      - name: helm render assertions (action executor config)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/action-executor-config-assertions.sh
+
+      # Prove the automated remediation switch (AUTOMATED-REMEDIATION-1): one
+      # value renders CURIE_REMEDIATION_ENABLED identically into the API and the
+      # worker, default off, typed boolean, and a render with remediation on and
+      # the executor off fails naming actionExecutor.enabled.
+      - name: helm render assertions (remediation config)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/remediation-config-assertions.sh
+
+      # Prove the installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+      # executor amendment E9): one value renders
+      # CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES identically into the API
+      # and the worker, default 2, typed integer with minimum 1, chart-owned.
+      - name: helm render assertions (executor sandbox cap)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/executor-sandbox-cap-assertions.sh
+
       # Pin the end to end connector's test cluster identity (ADR 0176
       # decision 4, #3243): off by default, no cluster scoped write beyond
       # namespace create and delete, the per namespace role never bound cluster
@@ -711,6 +754,7 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/runner-images-assertions.sh
+          bash charts/curie/ci/docker-daemon-assertions.sh
 
       # Prove the dispatcher is told where the platform API is and how to
       # authenticate to it (issue #442), and that the UI's CURIE_API_TARGET
@@ -866,6 +910,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/worker-object-store-assertions.sh
 
+      # Prove the optional code host CA bundle mounts at one path in the api,
+      # worker, sandbox runner and publication Job, and renders nothing unset.
+      - name: helm render assertions (code host CA bundle)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/code-host-trust-assertions.sh
+
       # A default worker missing these values runs eval suites that cannot
       # record or report results.
       - name: helm render assertions (worker eval wiring)
@@ -934,6 +985,17 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/threaded-bot-allowlist-assertions.sh
 
+      # The test installation declaration (ADR 0202 decision 1, #4133): off by
+      # default, one value rendered identically into the API and the
+      # dispatcher, render refusals on a prod environment, a published default
+      # secret and a driver with no channel (also with the schema removed), and
+      # the exact rendered value parsed by both services' real settings. Needs
+      # the uv workspace above.
+      - name: helm render assertions (test installation)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/test-installation-assertions.sh
+
       # dispatcher.slack.identities (ADR-0168 decision 1): a stock install
       # renders today's objects, a list renders by Secret reference only, and the
       # EXACT rendered declaration parses through the real Settings of the
@@ -971,10 +1033,10 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/byo-endpoint-egress-assertions.sh
 
-      # Prove a nil worker.publication.githubHttpsCidrs cannot collapse the
-      # tokenless publication job's GitHub egress rule to an empty to: (allow-all
-      # on 443). Also rejects that empty-to shape on every rendered
-      # NetworkPolicy, not just this one template (#2321).
+      # Prove an empty factory code host egress list cannot collapse the
+      # tokenless publication job's egress rule to an empty to: (allow-all).
+      # Also rejects that empty-to shape on every rendered NetworkPolicy, not
+      # just this one template (#2321, #4397).
       - name: helm render assertions (NetworkPolicy empty egress to)
         run: |
           set -euo pipefail

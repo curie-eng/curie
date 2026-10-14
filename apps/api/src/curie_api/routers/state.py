@@ -24,19 +24,18 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, NoReturn
+from urllib.parse import unquote
 
 import redis.asyncio as redis
+from curie_internal import sandbox_token
 from curie_telemetry import record_metric
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from sqlalchemy import Text, cast, delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import crud, sandbox_token, state_mutation, threadkeys, transcripts
-from ..auth import require_internal_worker_token, verify_platform_key
-from ..config import get_settings
-from ..deps import SessionDep
-from ..models import ThreadTranscript, WorkflowStateEntry
-from ..schemas import (
+from curie_api.crud import agents as crud_agents
+from curie_api.crud import channels as crud_channels
+from curie_api.schemas.state import (
     MemoryTurnClosedIn,
     SandboxCredentialReleasedIn,
     StateAppendIn,
@@ -44,6 +43,12 @@ from ..schemas import (
     StateEntryPut,
     StateNamespaceOut,
 )
+
+from .. import state_mutation, threadkeys, transcripts
+from ..auth import require_internal_worker_token, verify_platform_key
+from ..config import get_settings
+from ..deps import SessionDep
+from ..models import ThreadTranscript, WorkflowStateEntry
 from ..transcripts import TRANSCRIPT_NAMESPACE
 from ..transcripts import json_size as _json_size
 
@@ -70,7 +75,7 @@ STATE_APP_SCOPE = "state.app"
 
 # Namespaces owned by the memory (#264) and history (#20) ports; the narrow
 # app-scoped (bundle) token may not touch them. Literals rather than an import
-# because ``routers.memory`` imports ``_enforce_caps`` from THIS module (a real
+# because ``routers.memory`` imports ``enforce_caps`` from THIS module (a real
 # import cycle otherwise). Mirrors the runner client's ``RESERVED_NAMESPACES``
 # (``runner/src/curie_runner/state.py``) and ``memory.MEMORY_NAMESPACE`` /
 # the history transcript key -- a bundle wanting durable memory uses the remember
@@ -167,13 +172,17 @@ async def _check_credential_current(request: Request, agent_id: uuid.UUID, cred:
     try:
         released = await client.exists(_released_credential_key(agent_id, cred))
     except (redis.RedisError, OSError) as exc:
-        logger.warning("state: could not check sandbox credential %s: %r", cred, exc)
+        logger.warning(
+            "state: could not check sandbox credential for agent %s (%s)",
+            agent_id,
+            type(exc).__name__,
+        )
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "could not check this sandbox credential",
         ) from exc
     if released:
-        logger.warning("state: refused released sandbox credential %s for agent %s", cred, agent_id)
+        logger.warning("state: refused released sandbox credential for agent %s", agent_id)
         raise HTTPException(status.HTTP_403_FORBIDDEN, CREDENTIAL_RELEASED)
 
 
@@ -307,6 +316,17 @@ def _transcript_key_admitted(principal: StatePrincipal, agent_id: uuid.UUID, key
     return key_binding == principal.binding
 
 
+def _protected_transcript_key(key: str) -> bool:
+    """Reserve protected history from legacy compatibility, @spec PROTECTED-HOOK-LANE-7.
+
+    Decode the kind component independently of canonical parsing. A malformed
+    protected-shaped key must not regain the legacy token's unscoped reach.
+    Canonical protected credentials still use the existing binding predicate.
+    """
+    kind = unquote(key.partition(":")[0])
+    return kind == "@protected" or kind.startswith("@protected:")
+
+
 # Agents already warned about a legacy token in this process, oldest first.
 _LEGACY_WARNED_LIMIT = 1024
 _legacy_warned: OrderedDict[uuid.UUID, None] = OrderedDict()
@@ -353,14 +373,19 @@ def _check_transcript_reach(
     On a binding path, the path's binding must be the credential's; with a key,
     the key's binding must be too (``_transcript_key_admitted``), so neither
     can launder the other. A listing (``key`` None) is filtered afterwards by
-    ``_visible_transcripts``. A legacy token keeps its reach, with a warning and
-    a metric. The platform key is unaffected and the app token is already
-    fenced off by ``forbid_reserved_namespace``. Runs before any database read,
+    ``_visible_transcripts``. A legacy token keeps its ordinary reach, with a
+    warning and a metric; protected history is excluded. The platform key is
+    unaffected and the app token is already fenced off by ``forbid_reserved_namespace``.
+    Runs before any database read,
     so a refused read cannot trigger pre-identity adoption either."""
 
     if principal.caller is not StateCaller.STATE or namespace != TRANSCRIPT_NAMESPACE:
         return
     if principal.legacy:
+        if (key is not None and _protected_transcript_key(key)) or (
+            requested_binding is not None and requested_binding.startswith("@protected:")
+        ):
+            _refuse(principal, agent_id, path, "protected transcript requires a scoped credential")
         _note_legacy_transcript_use(agent_id, path)
         return
     if requested_binding is not None and principal.binding != requested_binding:
@@ -374,12 +399,10 @@ def _visible_transcripts(
 ) -> list[StateEntryOut]:
     """A transcript listing narrowed to the threads a sandbox credential reaches."""
 
-    if (
-        principal.caller is not StateCaller.STATE
-        or principal.legacy
-        or namespace != TRANSCRIPT_NAMESPACE
-    ):
+    if principal.caller is not StateCaller.STATE or namespace != TRANSCRIPT_NAMESPACE:
         return rows
+    if principal.legacy:
+        return [row for row in rows if not _protected_transcript_key(row.key)]
     return [row for row in rows if _transcript_key_admitted(principal, agent_id, row.key)]
 
 
@@ -473,12 +496,12 @@ async def _binding_scope(
     No caller here NAMES an adapter -- the state API has no such parameter --
     and an agent's rows on one pair share this one scope whichever identity
     holds them, so this checks for any row of THIS agent on the pair rather
-    than resolving the default identity's route the way `crud.binding_for_route`
+    than resolving the default identity's route the way `crud.channels.binding_for_route`
     does for a turn (an identity-narrowed read would 404 every named-identity
     binding's own state).
     """
 
-    if not await crud.agent_holds_channel_pair(session, agent_id, kind, address):
+    if not await crud_channels.agent_holds_channel_pair(session, agent_id, kind, address):
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, f"this agent has no {kind}:{address} binding"
         )
@@ -560,7 +583,7 @@ async def _namespace_exists(
     return found is not None
 
 
-async def _enforce_caps(
+async def enforce_caps(
     session: AsyncSession,
     agent_id: uuid.UUID,
     scope: str | None,
@@ -781,14 +804,14 @@ async def _put_state(
 ) -> StateEntryOut:
     # Unknown agent is a 404 (the FK would also reject, but this is the clear
     # signal). expected_version opts into compare-and-set.
-    if await crud.get_agent(session, agent_id) is None:
+    if await crud_agents.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     if namespace == TRANSCRIPT_NAMESPACE:
         row = await transcripts.put(
             session, agent_id, scope, key, data.value, data.expected_version
         )
         return _transcript_out(row)
-    await _enforce_caps(session, agent_id, scope, namespace, key, data.value)
+    await enforce_caps(session, agent_id, scope, namespace, key, data.value)
     entry = await _get_entry_locked(session, agent_id, scope, namespace, key)
     if entry is None:
         if data.expected_version is not None:
@@ -899,7 +922,7 @@ async def _append_state(
     value must already be an array, else the append is a 409. Subject to the
     same per-value and per-namespace size caps as a put.
     """
-    if await crud.get_agent(session, agent_id) is None:
+    if await crud_agents.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     if namespace == TRANSCRIPT_NAMESPACE:
         row = await transcripts.append(session, agent_id, scope, key, data.item, data.reserve_bytes)
@@ -907,7 +930,7 @@ async def _append_state(
     entry = await _get_entry_locked(session, agent_id, scope, namespace, key)
     if entry is None:
         new_value = [data.item]
-        await _enforce_caps(
+        await enforce_caps(
             session, agent_id, scope, namespace, key, new_value, reserve_bytes=data.reserve_bytes
         )
         entry = WorkflowStateEntry(
@@ -921,7 +944,7 @@ async def _append_state(
                 "cannot append: stored value is not a JSON array",
             )
         new_value = [*entry.value, data.item]
-        await _enforce_caps(
+        await enforce_caps(
             session, agent_id, scope, namespace, key, new_value, reserve_bytes=data.reserve_bytes
         )
         entry.value = new_value

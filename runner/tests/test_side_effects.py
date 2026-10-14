@@ -103,3 +103,15 @@ def test_default_is_the_claude_declaration_plus_platform_tools() -> None:
     for tool in CLAUDE_READONLY_TOOLS:
         assert not default_classifier.is_side_effecting(tool)
         assert not claude_classifier.is_side_effecting(tool)
+
+
+def test_canvas_list_and_read_are_idempotent_and_the_cell_edit_is_not() -> None:
+    """ADR 0200: listing and reading a canvas act on nothing, so a retry repeats
+    no real-world action; replacing a cell writes to Slack and must stay a side
+    effect (deny-by-default), so a failed turn that edited is never blindly retried."""
+
+    assert {
+        "mcp__curie-slack__list_channel_canvases",
+        "mcp__curie-slack__read_canvas",
+    } <= PLATFORM_IDEMPOTENT_TOOLS
+    assert "mcp__curie-slack__edit_canvas_cell" not in PLATFORM_IDEMPOTENT_TOOLS

@@ -40,7 +40,7 @@ from curie_worker.approvals import (
 )
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.config import WorkerConfig
-from curie_worker.kernel import ThreadBusyError
+from curie_worker.kernel.failures import ThreadBusyError
 from curie_worker.reply_sink import ReplySink, TargetRoute, build_reply_sink
 from curie_worker.runner_client import RunnerWorkspaceSnapshot
 from curie_worker.workitem_dispatch import (
@@ -136,7 +136,7 @@ class _WorkItems:
             work_item_id=request_id,
             conversation_id=f"work-item-{request_id}",
             wait_deadline=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
-            repo_full_name=WORK_ITEM_REPO,
+            repository_path=WORK_ITEM_REPO,
         )
 
     async def start(self, request_id: uuid.UUID, **_: object) -> WorkItemStartGrant:
@@ -1144,7 +1144,7 @@ def _patch_publication_snapshot(h: object, monkeypatch: pytest.MonkeyPatch) -> N
 
     monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)  # type: ignore[attr-defined]
     monkeypatch.setattr(
-        "curie_worker.kernel.validate_snapshot_against_base",
+        "curie_worker.kernel.attempt.validate_snapshot_against_base",
         lambda *_args, **_kwargs: None,
     )
 

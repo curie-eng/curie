@@ -155,7 +155,7 @@ There are two sandbox credentials, both `scope="state"` tokens:
   not eval-isolated, with claims `{binding, memory: "write", sender, turn}`.
   `sender` is the turn's `event.user`, or `<no person>`; `turn` is the queued
   event id plus a random suffix unique to each mint
-  (`apps/worker/src/curie_worker/kernel.py::Kernel._with_memory_token`), so a retry or
+  (`apps/worker/src/curie_worker/kernel/memory.py::_with_memory_token`), so a retry or
   continuation carries its own claim. It expires at the turn's stream deadline,
   capped at 24 hours, with no grace. When the attempt ends the worker reports
   the turn closed (`BindingResolver.close_turn_memory`), and the API then
@@ -233,7 +233,7 @@ change.
   runner's `runner/src/curie_runner/memory.py::MEMORY_LOG_KEY`), re-declares the
   `{content, provenance}` item shape in
   `apps/api/src/curie_api/routers/memory.py::_records_of`, and borrows the state
-  router's size caps (`apps/api/src/curie_api/routers/state.py::_enforce_caps`).
+  router's size caps (`apps/api/src/curie_api/routers/state.py::enforce_caps`).
   Its consumers are the CLI (`cli/src/api.rs`, behind `curie local memory` /
   `curie local memory --add` and `curie cluster memory` /
   `curie cluster memory --add`) and the console (`apps/ui/src/api/client.ts`). Unlike

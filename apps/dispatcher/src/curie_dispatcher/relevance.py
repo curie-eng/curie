@@ -59,6 +59,7 @@ class DropReason(StrEnum):
     MALFORMED_ENVELOPE = "malformed_envelope"
     UNSUBSCRIBED_LANE = "unsubscribed_lane"
     BOT_AUTHORED_THREAD_REPLY = "bot_authored_thread_reply"
+    TEST_ACTION_REFUSED = "test_action_refused"
     NON_CONTENT_SUBTYPE = "non_content_subtype"
     DUPLICATE_DELIVERY = "duplicate_delivery"
     NO_ACTION_IN_PAYLOAD = "no_action_in_payload"
@@ -100,6 +101,12 @@ DROP_RATIONALES: Mapping[DropReason, str] = MappingProxyType(
             "The subtype marks something other than new user content: an edit, a "
             "delete, a tombstone, a body redacted by Enterprise Key Management, or "
             "an assistant thread-start marker."
+        ),
+        DropReason.TEST_ACTION_REFUSED: (
+            "A bot's marked test action lacks an enabled installation declaration, "
+            "an exact listed driver/channel pair, or remaining per-thread budget; a ping "
+            "must also be a root mention. "
+            "It is refused after the caller check and before routing (ADR 0202)."
         ),
         DropReason.DUPLICATE_DELIVERY: (
             "Slack redelivered a delivery whose idempotency key was already claimed, "
@@ -221,6 +228,7 @@ def classify(
     lane: Lane,
     threaded_bot_allowlist: tuple[ThreadedBotAdmission, ...] = (),
     identity_bot_ids: Collection[str] = (),
+    marked_test_action: bool = False,
 ) -> DropReason | None:
     """The reason this event must not become a turn, or None to admit it.
 
@@ -240,6 +248,8 @@ def classify(
     if isinstance(subtype, str) and subtype in NON_CONTENT_SUBTYPES:
         return DropReason.NON_CONTENT_SUBTYPE
 
+    # Marked actions defer this one filter to ingress after the caller check
+    # (ADR 0202); structural subtype refusals above still apply.
     # Bot authorship is a refusal on the mention lane ONLY, and only in a
     # thread. A bot-authored mention at root is the case #2006 is about (an
     # alert app @-mentioning Curie) and must reach routing. On the DM lane bot
@@ -253,7 +263,12 @@ def classify(
     # field. Bolt's self-event middleware has already run and remains mandatory.
     # A sibling identity's bot (ADR-0168 decision 6) is admitted too; its id
     # comes from preflight's auth.test, never the event.
-    if lane == "mention" and event.get("bot_id") and event.get("thread_ts"):
+    if (
+        lane == "mention"
+        and event.get("bot_id")
+        and event.get("thread_ts")
+        and not marked_test_action
+    ):
         if event.get("bot_id") not in identity_bot_ids and not any(
             pair.channel_id == event.get("channel") and pair.bot_id == event.get("bot_id")
             for pair in threaded_bot_allowlist

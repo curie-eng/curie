@@ -1,0 +1,11 @@
+{
+  "errors": [
+    {
+      "context": null,
+      "message": "You are attempting to modify a comment based on out-of-date information.",
+      "exceptionName": "com.atlassian.bitbucket.comment.CommentOutOfDateException",
+      "currentVersion": 1,
+      "expectedVersion": 0
+    }
+  ]
+}

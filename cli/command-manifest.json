@@ -1990,7 +1990,7 @@
           ]
         },
         {
-          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
+          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -2042,6 +2042,22 @@
             },
             {
               "global": false,
+              "help": "Delete this fact from agent memory, or the selected channel",
+              "id": "delete",
+              "long": "delete",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Select the facts of this exact bound channel pair",
+              "id": "channel",
+              "long": "channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Show the guidance the agent gets beside its memory tools, and whether it is the platform default or operator-set (`GET /agents/{id}/memory/guidance`)",
               "id": "guidance",
               "long": "guidance",
@@ -2075,6 +2091,903 @@
           ],
           "hidden": false,
           "name": "memory"
+        },
+        {
+          "about": "The action ledger and its undo: list and read an agent's recorded actions, ask for an undo, and read an execution's receipt",
+          "hidden": false,
+          "name": "actions",
+          "subcommands": [
+            {
+              "about": "List recorded actions (`GET /actions`), each with whether it can be undone",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Scope to one agent (name or id)",
+                  "id": "agent",
+                  "long": "agent",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Scope to one conversation (thread) id",
+                  "id": "conversation",
+                  "long": "conversation",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "list"
+            },
+            {
+              "about": "Read one recorded action (`GET /actions/{id}`). Snapshot material is never shown",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Action id",
+                  "id": "id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "show"
+            },
+            {
+              "about": "Ask for an undo of one action (`POST /actions/{id}/undo`) and print the execution it created. Authentication comes from CURIE_APPROVAL_PRINCIPAL_TOKEN",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Action id",
+                  "id": "id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "undo"
+            },
+            {
+              "about": "Read an execution's receipt (`GET /action-executions/{id}`): its state and its refusal or failure code",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Execution id",
+                  "id": "id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "execution"
+            }
+          ]
+        },
+        {
+          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN",
+          "hidden": false,
+          "name": "remediation-policy",
+          "subcommands": [
+            {
+              "about": "Read a hook's current remediation policy generation (`GET /agents/{id}/hooks/{hook}/remediation-policy`)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "show"
+            },
+            {
+              "about": "Bind or replace a hook's policy from a JSON document (`PUT`). The document is validated with the platform's rules before any request",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The policy document: route, limits and actions",
+                  "id": "file",
+                  "long": "file",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The generation this write replaces, as `show` prints it (`0` binds a hook with no policy). A stale generation is refused",
+                  "id": "expected_generation",
+                  "long": "expected-generation",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Idempotency key (a UUID): a retry with the same id is the same intent. Omitted, a fresh one is minted",
+                  "id": "operation_id",
+                  "long": "operation-id",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "apply"
+            },
+            {
+              "about": "Arm the current policy so its automatic actions may run (`POST .../arm`)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The generation this write replaces, as `show` prints it (`0` binds a hook with no policy). A stale generation is refused",
+                  "id": "expected_generation",
+                  "long": "expected-generation",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Idempotency key (a UUID): a retry with the same id is the same intent. Omitted, a fresh one is minted",
+                  "id": "operation_id",
+                  "long": "operation-id",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "arm"
+            },
+            {
+              "about": "Disarm the current policy (`POST .../disarm`)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The generation this write replaces, as `show` prints it (`0` binds a hook with no policy). A stale generation is refused",
+                  "id": "expected_generation",
+                  "long": "expected-generation",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Idempotency key (a UUID): a retry with the same id is the same intent. Omitted, a fresh one is minted",
+                  "id": "operation_id",
+                  "long": "operation-id",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "disarm"
+            },
+            {
+              "about": "Remove the policy (`DELETE`): a new generation, inactive and disarmed",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The generation this write replaces, as `show` prints it (`0` binds a hook with no policy). A stale generation is refused",
+                  "id": "expected_generation",
+                  "long": "expected-generation",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Idempotency key (a UUID): a retry with the same id is the same intent. Omitted, a fresh one is minted",
+                  "id": "operation_id",
+                  "long": "operation-id",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "remove"
+            },
+            {
+              "about": "List a hook's circuit breakers, newest first, so the id `close-breaker` needs can be found (`GET .../remediation-policy/breakers`). Read only",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "`open` (the default), `closed` or `all`; checked by the verb so a bad value is one ADR-0021 error object",
+                  "id": "state",
+                  "long": "state",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "breakers"
+            },
+            {
+              "about": "Close an open circuit breaker so automatic remediation of its target may resume (`POST .../remediation-policy/breakers/{id}/close`)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The breaker's id (a UUID)",
+                  "id": "breaker_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Why the breaker may close, recorded with the closing operator. Required and never blank; checked by the verb so its absence is one ADR-0021 error object like every other input refusal",
+                  "id": "reason",
+                  "long": "reason",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "close-breaker"
+            }
+          ]
+        },
+        {
+          "about": "The operator receipt of each remediation nomination: list them, or show one with its stage, authority and code. Read only",
+          "hidden": false,
+          "name": "remediation",
+          "subcommands": [
+            {
+              "about": "List nominations, newest first (`GET /remediation-nominations`): the operator receipt of each decision and verification outcome",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id; omitted, every agent's nominations are listed",
+                  "id": "agent",
+                  "positional": true,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Only this nomination state (for example `refused` or `finished`)",
+                  "id": "state",
+                  "long": "state",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "The most nominations to list, 1 to 200 (default 50)",
+                  "id": "limit",
+                  "long": "limit",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "list"
+            },
+            {
+              "about": "Show one nomination's receipt (`GET /remediation-nominations/{id}`)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "The nomination id (a UUID)",
+                  "id": "nomination_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "show"
+            }
+          ]
+        },
+        {
+          "about": "Record a remediation qualification and run its verifier against an allowed target. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN",
+          "hidden": false,
+          "name": "remediation-qualification",
+          "subcommands": [
+            {
+              "about": "Record a qualification of an action declaration (`PUT /agents/{id}/remediation-qualifications/{qualification id}`)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The qualification's id (a UUID you choose)",
+                  "id": "qualification_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "long": "hook",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The action the policy declares",
+                  "id": "action",
+                  "long": "action",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The policy generation whose declaration was qualified",
+                  "id": "generation",
+                  "long": "generation",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "A JSON object of the execution and run ids that are the evidence",
+                  "id": "evidence_file",
+                  "long": "evidence-file",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The worst case of the action, in a sentence",
+                  "id": "worst_case",
+                  "long": "worst-case",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "record"
+            },
+            {
+              "about": "Start a run of the action's declared verifier against one allowed target (`POST .../verifier-runs`)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The qualification's id (a UUID)",
+                  "id": "qualification_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "long": "hook",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The action the policy declares",
+                  "id": "action",
+                  "long": "action",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "A literal member of the action's allowed targets; a number or boolean literal is sent as that type",
+                  "id": "target",
+                  "long": "target",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "start-run"
+            },
+            {
+              "about": "Read a verifier run and its outcome (`GET .../verifier-runs/{run id}`). Read only",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The qualification's id (a UUID)",
+                  "id": "qualification_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The run's id (a UUID)",
+                  "id": "run_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "show-run"
+            }
+          ]
         },
         {
           "about": "The human-in-the-loop plane: list and resolve pending approval records, and view or set the tools whose calls require approval. Which channel an approval posts to, and who may resolve it, come from the agent's approval route bindings; `curie guide` explains the whole plane",
@@ -2515,7 +3428,7 @@
             },
             {
               "global": false,
-              "help": "Pin the reviewer model (forwarded as CURIE_REVIEWER_MODEL at boot)",
+              "help": "Pin the reviewer model used at boot",
               "id": "reviewer_model",
               "long": "reviewer-model",
               "positional": false,
@@ -2523,7 +3436,7 @@
             },
             {
               "global": false,
-              "help": "Clear the reviewer model override back to the credential default",
+              "help": "Clear the reviewer model override",
               "id": "clear_reviewer_model",
               "long": "clear-reviewer-model",
               "positional": false,
@@ -2811,6 +3724,14 @@
               "help": "Identity for a Slack surface (default: default), or the worker credential selector for a non-Slack adapter",
               "id": "adapter",
               "long": "adapter",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The label that starts factory work through the added tracker surface (github, gitlab or jira), so two agents can share one location. Without it the surface serves the configured tracker label. Set only when a surface is added",
+              "id": "label",
+              "long": "label",
               "positional": false,
               "required": false
             },
@@ -4591,7 +5512,7 @@
           "name": "github-app"
         },
         {
-          "about": "Turn on the GitHub factory intake (label or mention triggers, repo allowlist, GitHub API egress) on an existing release",
+          "about": "Configure GitHub factory intake or update already bound repository runners and Docker access on an existing release",
           "args": [
             {
               "global": false,
@@ -4607,10 +5528,22 @@
             },
             {
               "global": false,
-              "help": "Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable. Sets `api.githubRepoAllowlist`",
+              "help": "Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable. Sets `api.githubRepoAllowlist`. With --app-id, pass at least one --repo or use --all-installed-repos to allow the whole installation. With --repo-runner/--repo-docker, selects advisory discovery only; the recorded intake allowlist stays unchanged",
               "id": "repos",
               "long": "repo",
               "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Allow every repository the GitHub App is installed on. Requires --app-id and cannot be combined with --repo",
+              "id": "all_installed_repos",
+              "long": "all-installed-repos",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
               "required": false
             },
             {
@@ -4647,9 +5580,9 @@
             },
             {
               "global": false,
-              "help": "Give this agent egress to the GitHub API ranges published at <api>/meta (port 443). Repeatable",
-              "id": "github_api_egress",
-              "long": "github-api-egress",
+              "help": "Give this agent's sandboxes egress to the configured code hosts and trackers (factory.sandboxEgress.<AGENT>). Repeatable",
+              "id": "forge_egress",
+              "long": "forge-egress",
               "positional": false,
               "required": false
             },
@@ -4667,7 +5600,7 @@
             },
             {
               "global": false,
-              "help": "The factory GitHub App's numeric App ID. Pair with --private-key-file. Without both, and with no App recorded on the release, the command prints the App registration link and applies nothing. Mention, allowlist, and label default from the App",
+              "help": "The factory GitHub App's numeric App ID. Pair with --private-key-file. Without both, and with no App recorded on the release, the command prints the App registration link and applies nothing. Mention and label default from the App. Choose the allowlist with --repo (repeatable) or --all-installed-repos. Repository updates accept this only for optional advisory discovery",
               "id": "app_id",
               "long": "app-id",
               "positional": false,
@@ -4675,7 +5608,7 @@
             },
             {
               "global": false,
-              "help": "File holding the App's PEM private key. Stored in a Kubernetes Secret through kubectl stdin; the key never enters argv",
+              "help": "File holding the App's PEM private key. Stored in a Kubernetes Secret through kubectl stdin; the key never enters argv. Repository updates use it for discovery and do not store it",
               "id": "private_key_file",
               "long": "private-key-file",
               "positional": false,
@@ -4702,6 +5635,30 @@
               "help": "Bind this digest-pinned runner image in the same helm upgrade as the intake settings (`AGENT=ghcr.io/example/runner@sha256:<digest>`). The chart is still `--chart`. The values mode stays `--reuse-values`",
               "id": "runner_image",
               "long": "runner-image",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Build and replace an already bound repository's runner from SPEC. Repeatable; repository updates preserve the intake allowlist",
+              "id": "repo_runners",
+              "long": "repo-runner",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Registry for repository runner builds, such as ghcr.io/acme-corp",
+              "id": "registry",
+              "long": "registry",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Enable Docker for an already bound repository. Repeatable; requires the catalog docker-cli in its replacement or recorded runner",
+              "id": "repo_docker",
+              "long": "repo-docker",
               "positional": false,
               "required": false
             },
@@ -5515,7 +6472,7 @@
             },
             {
               "global": false,
-              "help": "Pin the reviewer model (forwarded as CURIE_REVIEWER_MODEL at boot)",
+              "help": "Pin the reviewer model used at boot",
               "id": "reviewer_model",
               "long": "reviewer-model",
               "positional": false,
@@ -5523,7 +6480,7 @@
             },
             {
               "global": false,
-              "help": "Clear the reviewer model override back to the credential default",
+              "help": "Clear the reviewer model override",
               "id": "clear_reviewer_model",
               "long": "clear-reviewer-model",
               "positional": false,
@@ -5818,6 +6775,14 @@
               "help": "Identity for a Slack surface (default: default), or the worker credential selector for a non-Slack adapter",
               "id": "adapter",
               "long": "adapter",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The label that starts factory work through the added tracker surface (github, gitlab or jira), so two agents can share one location. Without it the surface serves the configured tracker label. Set only when a surface is added",
+              "id": "label",
+              "long": "label",
               "positional": false,
               "required": false
             },
@@ -6919,7 +7884,7 @@
           ]
         },
         {
-          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
+          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -6990,6 +7955,22 @@
             },
             {
               "global": false,
+              "help": "Delete this fact from agent memory, or the selected channel",
+              "id": "delete",
+              "long": "delete",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Select the facts of this exact bound channel pair",
+              "id": "channel",
+              "long": "channel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Show the guidance the agent gets beside its memory tools, and whether it is the platform default or operator-set (`GET /agents/{id}/memory/guidance`)",
               "id": "guidance",
               "long": "guidance",
@@ -7023,6 +8004,1175 @@
           ],
           "hidden": false,
           "name": "memory"
+        },
+        {
+          "about": "The action ledger and its undo: list and read an agent's recorded actions, ask for an undo, and read an execution's receipt",
+          "hidden": false,
+          "name": "actions",
+          "subcommands": [
+            {
+              "about": "List recorded actions (`GET /actions`), each with whether it can be undone",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Scope to one agent (name or id)",
+                  "id": "agent",
+                  "long": "agent",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Scope to one conversation (thread) id",
+                  "id": "conversation",
+                  "long": "conversation",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "list"
+            },
+            {
+              "about": "Read one recorded action (`GET /actions/{id}`). Snapshot material is never shown",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Action id",
+                  "id": "id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "show"
+            },
+            {
+              "about": "Ask for an undo of one action (`POST /actions/{id}/undo`) and print the execution it created. Authentication comes from CURIE_APPROVAL_PRINCIPAL_TOKEN",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Action id",
+                  "id": "id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "undo"
+            },
+            {
+              "about": "Read an execution's receipt (`GET /action-executions/{id}`): its state and its refusal or failure code",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Execution id",
+                  "id": "id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "execution"
+            }
+          ]
+        },
+        {
+          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN",
+          "hidden": false,
+          "name": "remediation-policy",
+          "subcommands": [
+            {
+              "about": "Read a hook's current remediation policy generation (`GET /agents/{id}/hooks/{hook}/remediation-policy`)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "show"
+            },
+            {
+              "about": "Bind or replace a hook's policy from a JSON document (`PUT`). The document is validated with the platform's rules before any request",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The policy document: route, limits and actions",
+                  "id": "file",
+                  "long": "file",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The generation this write replaces, as `show` prints it (`0` binds a hook with no policy). A stale generation is refused",
+                  "id": "expected_generation",
+                  "long": "expected-generation",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Idempotency key (a UUID): a retry with the same id is the same intent. Omitted, a fresh one is minted",
+                  "id": "operation_id",
+                  "long": "operation-id",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "apply"
+            },
+            {
+              "about": "Arm the current policy so its automatic actions may run (`POST .../arm`)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The generation this write replaces, as `show` prints it (`0` binds a hook with no policy). A stale generation is refused",
+                  "id": "expected_generation",
+                  "long": "expected-generation",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Idempotency key (a UUID): a retry with the same id is the same intent. Omitted, a fresh one is minted",
+                  "id": "operation_id",
+                  "long": "operation-id",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "arm"
+            },
+            {
+              "about": "Disarm the current policy (`POST .../disarm`)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The generation this write replaces, as `show` prints it (`0` binds a hook with no policy). A stale generation is refused",
+                  "id": "expected_generation",
+                  "long": "expected-generation",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Idempotency key (a UUID): a retry with the same id is the same intent. Omitted, a fresh one is minted",
+                  "id": "operation_id",
+                  "long": "operation-id",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "disarm"
+            },
+            {
+              "about": "Remove the policy (`DELETE`): a new generation, inactive and disarmed",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The generation this write replaces, as `show` prints it (`0` binds a hook with no policy). A stale generation is refused",
+                  "id": "expected_generation",
+                  "long": "expected-generation",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Idempotency key (a UUID): a retry with the same id is the same intent. Omitted, a fresh one is minted",
+                  "id": "operation_id",
+                  "long": "operation-id",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "remove"
+            },
+            {
+              "about": "List a hook's circuit breakers, newest first, so the id `close-breaker` needs can be found (`GET .../remediation-policy/breakers`). Read only",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "`open` (the default), `closed` or `all`; checked by the verb so a bad value is one ADR-0021 error object",
+                  "id": "state",
+                  "long": "state",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "breakers"
+            },
+            {
+              "about": "Close an open circuit breaker so automatic remediation of its target may resume (`POST .../remediation-policy/breakers/{id}/close`)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The breaker's id (a UUID)",
+                  "id": "breaker_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Why the breaker may close, recorded with the closing operator. Required and never blank; checked by the verb so its absence is one ADR-0021 error object like every other input refusal",
+                  "id": "reason",
+                  "long": "reason",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "close-breaker"
+            }
+          ]
+        },
+        {
+          "about": "The operator receipt of each remediation nomination: list them, or show one with its stage, authority and code. Read only",
+          "hidden": false,
+          "name": "remediation",
+          "subcommands": [
+            {
+              "about": "List nominations, newest first (`GET /remediation-nominations`): the operator receipt of each decision and verification outcome",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id; omitted, every agent's nominations are listed",
+                  "id": "agent",
+                  "positional": true,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Only this nomination state (for example `refused` or `finished`)",
+                  "id": "state",
+                  "long": "state",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "The most nominations to list, 1 to 200 (default 50)",
+                  "id": "limit",
+                  "long": "limit",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "list"
+            },
+            {
+              "about": "Show one nomination's receipt (`GET /remediation-nominations/{id}`)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "The nomination id (a UUID)",
+                  "id": "nomination_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "show"
+            }
+          ]
+        },
+        {
+          "about": "Record a remediation qualification and run its verifier against an allowed target. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN",
+          "hidden": false,
+          "name": "remediation-qualification",
+          "subcommands": [
+            {
+              "about": "Record a qualification of an action declaration (`PUT /agents/{id}/remediation-qualifications/{qualification id}`)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The qualification's id (a UUID you choose)",
+                  "id": "qualification_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "long": "hook",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The action the policy declares",
+                  "id": "action",
+                  "long": "action",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The policy generation whose declaration was qualified",
+                  "id": "generation",
+                  "long": "generation",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "A JSON object of the execution and run ids that are the evidence",
+                  "id": "evidence_file",
+                  "long": "evidence-file",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The worst case of the action, in a sentence",
+                  "id": "worst_case",
+                  "long": "worst-case",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "record"
+            },
+            {
+              "about": "Start a run of the action's declared verifier against one allowed target (`POST .../verifier-runs`)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The qualification's id (a UUID)",
+                  "id": "qualification_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "long": "hook",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The action the policy declares",
+                  "id": "action",
+                  "long": "action",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "A literal member of the action's allowed targets; a number or boolean literal is sent as that type",
+                  "id": "target",
+                  "long": "target",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "start-run"
+            },
+            {
+              "about": "Read a verifier run and its outcome (`GET .../verifier-runs/{run id}`). Read only",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The qualification's id (a UUID)",
+                  "id": "qualification_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The run's id (a UUID)",
+                  "id": "run_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "show-run"
+            }
+          ]
         },
         {
           "about": "The human-in-the-loop plane: list and resolve pending approval records, and view or set the tools whose calls require approval. Which channel an approval posts to, and who may resolve it, come from the agent's approval route bindings; `curie guide` explains the whole plane",
@@ -7262,7 +9412,7 @@
           "args": [
             {
               "global": false,
-              "help": "GitHub repository the factory may work in, as owner/name",
+              "help": "GitHub repositories the factory serves, as a comma separated owner/name list (repeatable). The first is the agent's git-flow repository, and each is bound to the one agent",
               "id": "repo",
               "long": "repo",
               "positional": false,
@@ -7365,10 +9515,45 @@
               "required": false
             },
             {
+              "default_values": [
+                "dark-factory"
+              ],
+              "global": false,
+              "help": "Agent to deploy. On a release that already records factory intake and with no App flags, the agent is added to that install: no cluster up, App registration, or intake",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Trigger label for this agent's GitHub bindings. Default: none, so the install label serves them",
+              "id": "label",
+              "long": "label",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Operator bundle to deploy as given, with its locked runner image or the platform runner. Default: the published dark factory bundle",
+              "id": "plugin_dir",
+              "long": "plugin-dir",
+              "positional": false,
+              "required": false
+            },
+            {
               "global": false,
               "help": "Helm chart. Default: the version pinned chart on release builds; local charts/curie on dev builds",
               "id": "chart",
               "long": "chart",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Install published sha images for a full 40 character lowercase hex commit, including an unreleased commit from next. Only full commit tags are published. Example: --candidate 0123456789abcdef0123456789abcdef01234567",
+              "id": "candidate",
+              "long": "candidate",
               "positional": false,
               "required": false
             },
@@ -7382,6 +9567,95 @@
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "github"
+              ],
+              "global": false,
+              "help": "Code host the factory publishes to. Only github is installed in this build",
+              "id": "code_host",
+              "long": "code-host",
+              "positional": false,
+              "possible_values": [
+                "github",
+                "gitlab",
+                "bitbucket-cloud",
+                "bitbucket-dc"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "github"
+              ],
+              "global": false,
+              "help": "Tracker the factory takes issues from: github, or jira-cloud with --code-host github",
+              "id": "tracker",
+              "long": "tracker",
+              "positional": false,
+              "possible_values": [
+                "github",
+                "gitlab",
+                "jira-cloud"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Base URL of a non-GitHub forge. Refused for github",
+              "id": "forge_url",
+              "long": "forge-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "File holding a non-GitHub forge's access token. The path is passed through; the token never enters argv. Refused for github",
+              "id": "token_file",
+              "long": "token-file",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "CA bundle for a non-GitHub forge with a private certificate. Refused for github",
+              "id": "ca_file",
+              "long": "ca-file",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Account whose reviews a non-GitHub forge counts (repeatable). Refused for github",
+              "id": "review_accounts",
+              "long": "review-account",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Email of the account a Jira token authenticates as. Refused for github",
+              "id": "forge_username",
+              "long": "forge-username",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Jira accountId allowed to start work (repeatable). Refused for github",
+              "id": "start_accounts",
+              "long": "start-account",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Jira groupId whose members may start work. Refused for github",
+              "id": "start_group",
+              "long": "start-group",
+              "positional": false,
               "required": false
             }
           ],
@@ -7782,7 +10056,15 @@
         },
         {
           "global": false,
-          "help": "Push every declared platform (or the `--platform` subset) to this registry (e.g. ghcr.io/acme-corp)",
+          "help": "Build a repository runner image from this input file (YAML or JSON; requires `--registry`). Needs a docker-container builder (`docker buildx use` or `BUILDX_BUILDER`) for the two-platform push",
+          "id": "repo_runner",
+          "long": "repo-runner",
+          "positional": false,
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "Push every declared platform (or the `--platform` subset) to this registry (e.g. ghcr.io/acme-corp). With `--repo-runner`, the registry the repository runner image is pushed to",
           "id": "registry",
           "long": "registry",
           "positional": false,
@@ -7790,7 +10072,7 @@
         },
         {
           "global": false,
-          "help": "The platform runner a declared runner layer builds on (default: the runner `curie skill up` uses). Resolved to a digest before building",
+          "help": "The platform runner a declared runner layer or a repository runner builds on (default: the runner `curie skill up` uses). Resolved to a digest before building",
           "id": "runner_image",
           "long": "runner-image",
           "positional": false,
@@ -7818,7 +10100,7 @@
         }
       ],
       "hidden": false,
-      "long_about": "Build the runner image, or an agent bundle's declared connectors.\n\nWith no flags it runs `docker build -f runner/Dockerfile -t <tag> .` from the repo root (source checkout only; a release binary pulls the pinned runner image from GHCR automatically and never needs this).\n\nWith `--plugin-dir <PATH>` it builds every connector that bundle's `connectors.yaml` declares from source and writes `connectors.lock.yaml` beside it. With `--registry <REF>` it builds every declared platform, pushes, and records the registry manifest digest, which is what a cluster deploy requires. Without `--registry` it builds the host platform only into the local Docker daemon and records the local image id, which is usable at the skill and local tiers and refused at cluster.",
+      "long_about": "Build the runner image, or an agent bundle's declared connectors.\n\nWith no flags it runs `docker build -f runner/Dockerfile -t <tag> .` from the repo root (source checkout only; a release binary pulls the pinned runner image from GHCR automatically and never needs this).\n\nWith `--plugin-dir <PATH>` it builds every connector that bundle's `connectors.yaml` declares from source and writes `connectors.lock.yaml` beside it. With `--registry <REF>` it builds every declared platform, pushes, and records the registry manifest digest, which is what a cluster deploy requires. Without `--registry` it builds the host platform only into the local Docker daemon and records the local image id, which is usable at the skill and local tiers and refused at cluster.\n\nWith `--repo-runner <PATH> --registry <REF>` it builds a repository runner image (ADR 0216) from a YAML or JSON input file naming catalog `tools`, an optional `dockerfile` beside the file built on `${CURIE_RUNNER_IMAGE}`, and extra `probes`. Both linux/amd64 and linux/arm64 are built in one buildx bake, every tool is probed inside the image (a failing probe fails the build), the probe manifest lands at /etc/curie/tool-manifest.json, and the image is pushed to `<REF>/curie-repo-runner`. It prints the `runner` block to paste under `factory.bindings[].repos[].runner`. The multi-platform push needs a docker-container builder: select one with `docker buildx use` or `BUILDX_BUILDER`.",
       "name": "build"
     },
     {
@@ -8112,6 +10394,60 @@
           "name": "factory-e2e"
         },
         {
+          "about": "Start, self-test, or stop a local forge fixture (#4398, `bash cli/scripts/forge-fixture.sh`). Each fixture is `tools/forge-fixtures/<kind>/fixture.py` and keeps its state under `--state-dir`. A kind whose fixture is not installed fails with a \"not installed\" message and creates no state",
+          "args": [
+            {
+              "global": false,
+              "help": "Forge to run: `gitlab` or `bitbucket-dc`",
+              "id": "kind",
+              "positional": true,
+              "possible_values": [
+                "gitlab",
+                "bitbucket-dc"
+              ],
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "`up` starts the fixture, `self-test` checks a running one, `down` stops it and removes its state",
+              "id": "action",
+              "positional": true,
+              "possible_values": [
+                "up",
+                "self-test",
+                "down"
+              ],
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Directory that holds the fixture's state and connection details",
+              "id": "state_dir",
+              "long": "state-dir",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Host name or address the fixture advertises to clients, such as cluster pods that reach it over the network",
+              "id": "advertise_host",
+              "long": "advertise-host",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Port the fixture listens on; the fixture picks one when omitted",
+              "id": "port",
+              "long": "port",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "forge-fixture"
+        },
+        {
           "about": "Serve or record a scripted Anthropic Messages endpoint (#3814). `serve` replays a transcript and fails on an unexpected request. `record` proxies to a provider and writes the transcript",
           "args": [
             {
@@ -8133,6 +10469,24 @@
           "about": "Check the OpenRouter credit on CURIE_CREDENTIALS before a graded ladder spends a build",
           "hidden": false,
           "name": "model-credit"
+        },
+        {
+          "about": "Drive generic OIDC console login end to end against a real Dex IdP (#2908, #3800, `python3 tools/oidc-e2e/oidc_e2e.py`). Boots this checkout's API and console UI as an isolated compose project beside Dex, logs in through the console's /api proxy, and asserts PKCE and cookie flags, callback binding and replay, logout's Origin check, required claims, issuer binding, the rate limit, and that the login-code console login still resolves an approval with OIDC off. Removes everything on exit and writes JSON evidence. Needs Docker; no credentials",
+          "args": [
+            {
+              "global": false,
+              "help": "Driver flags (`--build`, `--keep`, `--evidence <path>`); see `curie dev oidc-e2e -- --help`",
+              "id": "args",
+              "num_args": {
+                "max": 18446744073709551615,
+                "min": 1
+              },
+              "positional": true,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "oidc-e2e"
         },
         {
           "about": "Serve a TLS GitHub fixture or capture public check lifecycle recordings",

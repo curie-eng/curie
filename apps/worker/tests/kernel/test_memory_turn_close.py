@@ -30,7 +30,7 @@ from typing import Any
 
 import pytest
 from aci_protocol import Final, OutboundEvent, SessionStatus, TextDelta
-from curie_worker import kernel as kernel_mod
+from curie_worker.kernel import memory as kernel_memory
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -394,7 +394,7 @@ def test_a_hung_close_does_not_hold_up_the_attempt(
 ) -> None:
     # L3: the attempt ends without waiting on the close; the close runs in the
     # background, times out there, and the timeout is logged.
-    monkeypatch.setattr(kernel_mod, "_MEMORY_CLOSE_TIMEOUT_S", 1.0, raising=False)
+    monkeypatch.setattr(kernel_memory, "_MEMORY_CLOSE_TIMEOUT_S", 1.0, raising=False)
     caplog.set_level(logging.WARNING, logger="curie_worker.kernel")
 
     async def go() -> None:

@@ -145,7 +145,7 @@ class _WorkItems:
             work_item_id=request_id,
             conversation_id=f"work-item-{request_id}",
             wait_deadline=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
-            repo_full_name=WORK_ITEM_REPO,
+            repository_path=WORK_ITEM_REPO,
         )
 
     async def start(self, request_id: uuid.UUID, **_: object) -> WorkItemStartGrant:
@@ -407,7 +407,7 @@ def test_only_context_reads_end_as_early_stop(make_harness) -> None:
     ],
 )
 def test_the_unpublished_cause_follows_the_work_evidence(tools: frozenset[str], cause: str) -> None:
-    from curie_worker.kernel import _unpublished_cause
+    from curie_worker.kernel.failures import _unpublished_cause
 
     assert _unpublished_cause(tools) == cause
 
@@ -448,7 +448,7 @@ def _patch_snapshot(h: object, monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)  # type: ignore[attr-defined]
     monkeypatch.setattr(
-        "curie_worker.kernel.validate_snapshot_against_base",
+        "curie_worker.kernel.attempt.validate_snapshot_against_base",
         lambda *_args, **_kwargs: None,
     )
 
@@ -820,7 +820,7 @@ def _patch_snapshot_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
             return await real_sleep(0, result)
         return await real_sleep(delay, result)
 
-    monkeypatch.setattr("curie_worker.kernel.asyncio.sleep", without_backoff)
+    monkeypatch.setattr("curie_worker.kernel.attempt.asyncio.sleep", without_backoff)
     return delays
 
 
@@ -862,7 +862,7 @@ def test_snapshot_read_retries_then_creates_exactly_one_publication_approval(
 
             monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
             monkeypatch.setattr(
-                "curie_worker.kernel.validate_snapshot_against_base",
+                "curie_worker.kernel.attempt.validate_snapshot_against_base",
                 lambda *_args, **kwargs: validations.append(kwargs["snapshot"]),
             )
             h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
@@ -938,7 +938,7 @@ def test_snapshot_read_failure_finishes_with_a_named_cause_and_bounded_retries(
 
             monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
             monkeypatch.setattr(
-                "curie_worker.kernel.validate_snapshot_against_base",
+                "curie_worker.kernel.attempt.validate_snapshot_against_base",
                 lambda *_args, **kwargs: validations.append(kwargs["snapshot"]),
             )
             h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
@@ -976,8 +976,8 @@ def test_snapshot_read_failure_finishes_with_a_named_cause_and_bounded_retries(
 def test_snapshot_read_starts_no_retry_with_five_seconds_or_less_remaining(
     make_harness, monkeypatch: pytest.MonkeyPatch, remaining_after_failure: float
 ) -> None:
-    from curie_worker import kernel as kernel_module
     from curie_worker.delivery_lease import DeliveryBudget, unfenced_lease
+    from curie_worker.kernel import clock as kernel_clock
     from curie_worker.runner_client import RunnerSnapshotReadError
 
     _patch_snapshot_backoff(monkeypatch)
@@ -993,7 +993,7 @@ def test_snapshot_read_starts_no_retry_with_five_seconds_or_less_remaining(
         # Move only the kernel's elapsed-time view. The event loop's clock and
         # the real Valkey transport keep running normally.
         monkeypatch.setattr(
-            kernel_module,
+            kernel_clock,
             "time",
             SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed, time=time.time),
         )
@@ -1043,8 +1043,8 @@ def test_snapshot_read_starts_no_retry_with_five_seconds_or_less_remaining(
 def test_snapshot_read_starts_no_attempt_after_the_turn_spends_its_delivery_budget(
     make_harness, monkeypatch: pytest.MonkeyPatch, remaining_before_snapshot: float
 ) -> None:
-    from curie_worker import kernel as kernel_module
     from curie_worker.delivery_lease import DeliveryBudget, unfenced_lease
+    from curie_worker.kernel import clock as kernel_clock
 
     delays = _patch_snapshot_backoff(monkeypatch)
 
@@ -1057,7 +1057,7 @@ def test_snapshot_read_starts_no_attempt_after_the_turn_spends_its_delivery_budg
         )
         elapsed = 0.0
         monkeypatch.setattr(
-            kernel_module,
+            kernel_clock,
             "time",
             SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed, time=time.time),
         )
@@ -1127,8 +1127,8 @@ def test_snapshot_read_skips_backoff_that_would_spend_its_five_second_reserve(
     remaining_after_failures: tuple[float, ...],
     expected_delays: list[float],
 ) -> None:
-    from curie_worker import kernel as kernel_module
     from curie_worker.delivery_lease import DeliveryBudget, unfenced_lease
+    from curie_worker.kernel import clock as kernel_clock
     from curie_worker.runner_client import RunnerSnapshotReadError
 
     delays = _patch_snapshot_backoff(monkeypatch)
@@ -1142,7 +1142,7 @@ def test_snapshot_read_skips_backoff_that_would_spend_its_five_second_reserve(
         )
         elapsed = 0.0
         monkeypatch.setattr(
-            kernel_module,
+            kernel_clock,
             "time",
             SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed, time=time.time),
         )
@@ -1226,7 +1226,9 @@ def test_snapshot_validation_refusal_is_not_retried_and_keeps_its_prefix(
                 raise WorkspacePreparationError("publication-validation", "protected path blocked")
 
             monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
-            monkeypatch.setattr("curie_worker.kernel.validate_snapshot_against_base", refuse)
+            monkeypatch.setattr(
+                "curie_worker.kernel.attempt.validate_snapshot_against_base", refuse
+            )
             h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
             await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
 
@@ -1266,7 +1268,7 @@ def test_the_continuation_is_bounded_to_one(make_harness) -> None:
 # --- W-T1 (#3873): a preflight-blocked runner answers every turn offline -----------------
 
 # Replays the runner's PreflightBlockedSession shape (runner/src/curie_runner/
-# preflight_blocked.py, #3873) as seen through SessionRunner translation: a text
+# harness/claude/preflight_blocked.py, #3873) as seen through SessionRunner translation: a text
 # delta and a DONE final carrying the same explanation, and no ToolNote, on EVERY
 # turn, including the kernel's continuation. The kernel already ends this shape as
 # early_stop; this pins the terminus the runner change relies on.
@@ -1280,7 +1282,7 @@ BLOCKED_EXPLANATION = (
 def test_a_preflight_blocked_runner_ends_as_early_stop_and_releases_the_claim(
     make_harness,
 ) -> None:
-    from curie_worker.kernel import _EARLY_STOP_PROMPT
+    from curie_worker.kernel.constants import _EARLY_STOP_PROMPT
 
     def blocked_turn() -> list[OutboundEvent]:
         return [TextDelta(text=BLOCKED_EXPLANATION), _done(BLOCKED_EXPLANATION)]
@@ -1631,21 +1633,34 @@ def test_a_cancelled_request_is_not_continued(
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("first_read", ["running", "unreachable", "timeout"])
 def test_a_cancel_landing_during_the_continuation_precheck_stops_quietly(
-    make_harness, caplog: pytest.LogCaptureFixture
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    first_read: str,
 ) -> None:
-    """#4191 AC4: the request was running at the first read, the cancel landed
-    before the precheck, and the precheck was refused. The continuation stops
-    without a traceback or a flag."""
+    """#4191 AC4: a cancelled request cannot pass the authoritative precheck.
+
+    The advisory status read may be running or unreadable. Fresh publication
+    authority still refuses before the continuation starts, without a traceback
+    or a flag.
+    """
 
     caplog.set_level("INFO", logger="curie_worker.kernel")
+    initial_read: str | float | BaseException = "running"
+    if first_read == "unreachable":
+        initial_read = WorkItemTransportError("work-item status read unavailable")
+    elif first_read == "timeout":
+        monkeypatch.setattr("curie_worker.kernel.constants._REQUEST_STATUS_READ_TIMEOUT_S", 0.05)
+        initial_read = 30.0
 
     async def exercise() -> None:
         publications = _CountingPrecheckApi(fail_from=2)
         opened, items, _ = await _run_execute(
             make_harness,
             [WORKED_TURN, [_done("a continuation must not open")]],
-            work_items=_WorkItems(request_reads=["running", "cancellation_requested"]),
+            work_items=_WorkItems(request_reads=[initial_read, "cancellation_requested"]),
             publication_creator=publications,
         )
 
@@ -1674,14 +1689,14 @@ def test_a_running_or_unreadable_request_continues_as_before(
     """#4191 AC5: an unreadable or running request continues exactly as before;
     a running request whose precheck fails is still today's runner failure."""
 
-    from curie_worker.kernel import _UNPUBLISHED_PROMPT
+    from curie_worker.kernel.constants import _UNPUBLISHED_PROMPT
 
     caplog.set_level("INFO", logger="curie_worker.kernel")
     reads: list[str | float | BaseException] = []
     if case == "read_unreachable":
         reads = [WorkItemTransportError("work-item dispatch endpoint is unreachable")]
     elif case == "read_hangs":
-        monkeypatch.setattr("curie_worker.kernel._REQUEST_STATUS_READ_TIMEOUT_S", 0.05)
+        monkeypatch.setattr("curie_worker.kernel.constants._REQUEST_STATUS_READ_TIMEOUT_S", 0.05)
         reads = [30.0]
 
     async def exercise() -> None:

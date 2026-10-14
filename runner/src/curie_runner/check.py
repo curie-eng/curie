@@ -588,7 +588,7 @@ async def run_check(plugin_dir: str) -> dict[str, Any]:
         registered = await asyncio.wait_for(_connect_and_poll(plugins, plugin_dir), timeout_s)
     except TimeoutError:
         return _red_result(plugin_dir, declared, f"MCP init did not complete within {timeout_s}s")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         # A non-timeout failure while setting up the MCP client (Claude CLI
         # subprocess fails to start, an incompatible --image, an SDK error)
         # would otherwise escape main() before any JSON is printed, and the CLI

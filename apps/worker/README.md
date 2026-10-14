@@ -16,10 +16,14 @@ env built from the resolution: `CURIE_BUDGET` (the agent's
 `max_usd_per_day`/`max_output_tokens_per_run`, platform defaults when NULL),
 `CURIE_SESSION_ID`, `CURIE_PLUGIN_DIR`, and
 `CURIE_BUNDLE_REF` (the RustFS key). An unmapped channel is a polite placeholder
-edit and drop, never a crash. The claim env also carries a per-sandbox
+edit and drop, never a crash. The boot env also carries a per-sandbox
 `CURIE_RUNNER_TOKEN` (minted with `secrets.token_urlsafe`) that the `RunnerClient`
 sends as an `Authorization: Bearer` header on every ACI call to that sandbox
-(issue #63).
+(issue #63). On Kubernetes this token and the other scoped tokens never ride the
+`SandboxClaim`: the worker writes them to a per-claim Secret that a per-claim
+SandboxTemplate copy reads by `secretKeyRef`, all garbage-collected with the
+claim and swept by the reaper if orphaned. The Docker substrate still passes them
+in the container env.
 
 > Handoff: `CURIE_BUNDLE_REF` is a RustFS object key; the runner reads
 > `CURIE_PLUGIN_DIR` as a local mounted path and does not fetch. Fetching the
@@ -98,6 +102,39 @@ queued turn whose `tool_access` is set (a canary sets `read-only`):
   turn, `tool-access-unenforced` and `tool-access-refused`, are platform error
   classes: a turn the runner refuses escalates under its class, never as
   `unclassified`.
+
+The worker's half of channel read (ADR 0100, ADR 0200, `kernel/channel_read.py`),
+for a bundle whose manifest grants any of `channelRead`, `canvasList`,
+`canvasRead` or `canvasEdit`. The worker is the only issuer
+of the capability the runner's `curie-slack` tools use:
+
+- **WORKER-CHANNEL-READ-1:** At turn open, on every path that opens a turn (a
+  fresh claim, a replacement, an attachment handoff, a work-item continuation),
+  the worker reads the grant from the manifest of the bundle the sandbox booted
+  with, cached by bundle ref, and mints a `chr` capability through the API's
+  internal context route. An ungranted bundle makes no mint call and the event
+  carries a null `channel_read`. A retained sandbox keeps the deployment it
+  first booted with: a pin names the claim and deployment, and when the pin is
+  missing the claim's own bundle ref must equal the resolved one to recover it,
+  otherwise the turn gets no capability.
+- **WORKER-CHANNEL-READ-2:** A granted turn on a runner whose status does not
+  carry `channel_read` as literal `true` is refused once, escalated with the
+  class `channel-read-unenforced`, and not retried, whatever the mint outcome.
+  When the grant cannot be read from the bundle and the mint also fails, the
+  worker cannot tell whether enforcement is owed, so the turn is not run and is
+  retried like any turn the runner did not accept (`runner-error`).
+- **WORKER-CHANNEL-READ-3:** The capability is a lease. The API's active key
+  lives 90 seconds, and a heartbeat child of the attempt renews it every 30
+  seconds with an owner-checked refresh until the attempt ends, so a worker
+  that dies or loses Valkey lets it lapse within one lease. A steer renews
+  the live logical turn (same deployment, event and default channel, no owner)
+  only when the retained runner reports a live turn and advertises channel
+  read; any failure sends null, which clears the runner's credential.
+- **WORKER-CHANNEL-READ-4:** Every attempt end, including cancellation,
+  deletes the live record, tombstones the attempt's owner (so a mint the API
+  commits late is refused), and revokes by owner directly in the shared Valkey,
+  covering a mint whose answer was lost. A failed revoke is retried with
+  bounded backoff until the token's expiry and attempted again at shutdown.
 
 ## The eval lane (`curie_worker.eval`)
 
@@ -585,14 +622,14 @@ user-visible effect.
 
 | Verb | Where | What fences it |
 |---|---|---|
-| Execute or retry a turn | `kernel.py` (the attempt loop; `start_turn` / `steer`) | The lease is checked before every attempt, and attempts consume the one overall deadline. A loss mid-turn fires the base's lease-lost handler, which interrupts the live turn. |
-| Re-execute a *reclaimed* delivery | `kernel.py` reclaim preflight (generation > 1) | A side-effect marker forbids replay and escalates; a runner still reporting an active turn is interrupted and waited out; an unreadable runner fails closed. |
+| Execute or retry a turn | `kernel/` (the attempt loop; `start_turn` / `steer`) | The lease is checked before every attempt, and attempts consume the one overall deadline. A loss mid-turn fires the base's lease-lost handler, which interrupts the live turn. |
+| Re-execute a *reclaimed* delivery | `kernel/` reclaim preflight (generation > 1) | A side-effect marker forbids replay and escalates; a runner still reporting an active turn is interrupted and waited out; an unreadable runner fails closed. |
 | ACK (runs lane) | `consumer.py`, immediately before `XACK` | `lease.raise_if_lost()`. A refusal leaves the entry pending for the current owner. |
 | ACK (eval lane) | `eval/stream.py`, immediately before `XACK` | The same pre-ACK `raise_if_lost()`. |
 | ACK **via dead-letter**, handler path | `stream_consumer.py` `_dead_letter` → `_dead_letter_refusal` | Dead-letter is a terminal settlement (it ACKs, then deletes the lease and delivery state). A handler holds a registered lease, so the question is whether that lease is still ours. The one exception is a broker entry that a fresh read shows is gone and whose lease token is still ours or already absent (`broker-entry-vanished`): there is no successor to leave it for. |
 | ACK **via dead-letter**, over-cap scan | `stream_consumer.py` `_dead_letter_over_cap` | A live-lease check runs *before* cap evaluation, so a healthy long turn cannot be dead-lettered, and `_dead_letter_refusal` re-reads the lease before writing. Both fail closed on an unreadable answer. |
-| Write the done marker + the completion-outbox record | `markers.py` `settle_fenced`, whose only caller is `kernel.py` `_complete` — the only `mark_done` call site | One Lua script verifies the lease token and the fencing generation and then performs the terminal write. A loser writes nothing and returns `None`. |
-| Emit the terminal reply (`turn.completed`) | `kernel.py` `_complete` → `_deliver_completion` | Only reachable past `settle_fenced`; the fenced-out owner returns having emitted nothing. |
+| Write the done marker + the completion-outbox record | `markers.py` `settle_fenced`, whose only caller is `kernel/` `_complete` — the only `mark_done` call site | One Lua script verifies the lease token and the fencing generation and then performs the terminal write. A loser writes nothing and returns `None`. |
+| Emit the terminal reply (`turn.completed`) | `kernel/` `_complete` → `_deliver_completion` | Only reachable past `settle_fenced`; the fenced-out owner returns having emitted nothing. |
 | Clear an outbox record | `markers.py` `clear_completion`, via `_deliver_completion` | The same fence, plus the record-generation compare-and-check, so a stale pass cannot delete a fresh record. |
 | Write platform progress, terminal states included | `progress.py` `ProgressStore.apply_platform_update` (no caller yet; ADR 0130) | One Lua script checks the lease token and the fencing generation, the same two checks `settle_fenced` makes, before it writes anything. A loser writes no state and enqueues no delivery, and is refused `lease-lost`. |
 | Publish an eval report | `eval/stream.py` `_report` → `POST /evals/report` | The lease is resolved from the entry's stream id (never from a field that is `None` on the failure paths) and checked immediately before the send. A fenced lane whose lease cannot be resolved refuses to publish. |
@@ -604,13 +641,13 @@ new attempt.
 Three verbs are **deliberately not lease-fenced**, and none is an oversight:
 
 - **The side-effect marker** (`markers.mark_side_effect`, written from
-  `kernel.py` the instant a `side_effect_flag` is seen). A side effect that
+  `kernel/` the instant a `side_effect_flag` is seen). A side effect that
   happened must be recorded even by an owner that has since lost its fence. The
   marker is itself a hard no-replay fence, and it is what stops the
   *replacement* from re-running a non-idempotent action; fencing the write would
   let a lost lease erase the evidence. This is the one place where fail-closed
   means "write anyway".
-- **The completion-outbox sweeper** (`kernel.py` `sweep_pending_completions`).
+- **The completion-outbox sweeper** (`kernel/` `sweep_pending_completions`).
   The sweeper is not an owner: it drains records for entries that may already be
   acked off the group, where no lease exists or ever will. Its guard is the
   record's done flag plus the compare-and-checked `clear_completion`, not a
@@ -677,6 +714,32 @@ an approval pause, or `failed` for a bad exit or deadline, with `ended_at`
 before writing the done marker. A prestart deferral leaves the row open for
 scheduler reconciliation. A cron failure is not retried within its fire.
 Slack and webhook turns perform no hook run writes.
+
+A long scheduled sweep is the one cron turn that continues past its delivery
+budget (ADR-0160, #2878). A targeted cron delivery cut by the budget
+(`runner-timeout` or `runner-timeout-unconfirmed` with no budget left) whose
+newest checkpoint fact still lists uncovered sources renews the hook lease and
+publishes a continuation `<base>:sweep:<n>:<covered>:<stalled>` on the runs
+stream inside the same fenced script that settles the slice
+(`Markers.settle_fenced_and_publish`), leaving the row open. `covered` is the
+count of distinct covered names, ignoring case, and `stalled` counts the
+slices in a row that added none: a source may span up to two cut slices, and
+the sweep stops after `sweep.MAX_STALLED_SLICES` (3) stalled slices in a row or
+past `sweep.MAX_SWEEP_SLICES` (48) slices. The script publishes before it
+writes the record and the done marker, so a failed publish settles nothing. It
+also sets a per-event published marker beside the publish, and a retried
+script that finds the marker holding its own generation writes nothing again,
+even after the outbox record was cleared.
+`curie_worker.sweep.SweepCoverage` reads the checkpoint from agent and channel
+memory with the platform key, keeping only facts the API stamped with the cron
+sender for this hook, sweep date and run. A continuation only adopts the live
+route and never claims, resumes or hands off a sandbox (`SweepClaimGone`). It
+waits out a winding-down turn inside its own budget and closes `blocked` on a
+paused hook. Every stop that closes `failed`, `skipped` or `blocked` with a
+checkpoint, or on a continuation, posts one coverage notice as a new message
+after the settle is won. The hook lease renewed at a cron delivery's start
+carries `sweep.HOOK_LEASE_START_MARGIN_S` on top, so the interrupt and the
+coverage read at a budget cut cannot let the next fire reclaim the run first.
 
 If persistence fails before durable closure, the delivery stays pending and
 may run again on redelivery. The close and the done marker use PostgreSQL and
@@ -1154,6 +1217,66 @@ selection refusal and the same recovery. When repository workspaces are
 disabled, the existing workspaces disabled refusal takes precedence before the
 file is resolved. Fresh workspace claims and suspended workspace resumes still
 receive attachments. Retained workspace replacement is tracked in #2728.
+
+### Every boot rebuilds the thread's files (ADR 0205)
+
+With the attachment lane on and `CURIE_INTERNAL_WORKER_TOKEN` set, the worker
+wires the API's thread attachment ledger
+(`curie_worker.ledger_client.ThreadAttachmentLedgerClient`, the
+`/v1/internal/thread-attachments` routes behind `X-Curie-Worker-Token`). Without
+the token no ledger is wired and attachments behave exactly as above: a file
+turn resolves only its own files and a text turn reads nothing.
+
+- **A file turn** reads the ledger outside the route lock, then
+  `AttachmentCoordinator.prepare_thread_set` fetches the message's files all or
+  nothing and the thread's earlier files best effort. A failed ledger read
+  refuses the turn before any claim (`stage=ledger`). Once the files are
+  installed and the turn has opened, the worker appends the message's refs to
+  the ledger, outside the lock and idempotent per event and file. A failed append is
+  logged at WARNING and the turn goes on. A turn refused after preparing
+  appends nothing and discards what it wrote.
+- **A text turn that boots** (fresh claim, suspended resume, turn budget or
+  workspace handoff) reads the ledger and prepares the earlier files under the
+  route lock. The ledger read is bounded by
+  `CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS` (default 15) and the
+  delivery's remaining budget. The prepare has the same deadline plus a short
+  grace. A failed read boots with `ledger_unavailable` in the manifest. An
+  adopt, a steer and a sweep continuation read nothing. A route that the
+  locked snapshot saw live is read once more just before the claim, with a
+  ledger wired, using the readiness test the claim itself will use (a
+  workspace claim's `substrate.adopt`, which also needs the claim and sandbox
+  ready): if it fails, the claim cold-creates, so that boot carries the set
+  too.
+- **The rebuild is charged to the turn.** On the text-boot and the file paths,
+  the time spent preparing the thread's files comes off the delivery's
+  remaining budget before the claim and the turn start.
+- **An API without the ledger routes** (query answered a bare 404, a mixed
+  rollout) is treated as no ledger. A 404 carrying the ledger's own
+  `detail.code` (such as `thread_attachment.agent_not_found`) is an ordinary
+  ledger failure. No ledger means: a file turn resolves its own files and appends
+  nothing, and a text boot carries no attachment env.
+- **Names are fixed when recorded.** A current file's disk name is cleaned with
+  the init container's rules (a leading `.` becomes `_`) and disambiguated
+  against every name the ledger holds, ignoring case, and cut to fit 255
+  bytes. It is then stored on its ref and never recomputed. A redelivery is
+  the same (event, file id), and it keeps its stored name.
+- **Bytes stay short lived.** An earlier file whose parked copy outlives the
+  capability by a margin is re-minted, and a new owner record (still
+  `"version": 1`, with optional `agent` and `shas` fields), written before any
+  re-fetch starts, keeps it from the reaper. Otherwise it is fetched again through the agent's current bindings
+  (`BindingResolver.routes_for_agent`), never a recorded endpoint, and its
+  digest must match. The prepare deadline is checked as each chunk arrives,
+  so a slow earlier file is cut and named `deadline`. One that cannot be had is named unavailable (`no_route`,
+  `no_credential`, `not_found`, `forbidden`, `rate_limited`, `timeout`,
+  `digest_changed`, `deadline`, `fetch_failed`) and never fails the boot.
+- **The per-thread budget** (`CURIE_ATTACHMENT_THREAD_MAX_FILES`, default 20,
+  never below the per-message cap; `CURIE_ATTACHMENT_THREAD_MAX_BYTES`, default
+  256 MiB) keeps the current files and then the newest earlier files. The rest
+  are named as omitted.
+- Capabilities are presigned only after every fetch. The claim env carries
+  `CURIE_ATTACHMENTS_REF` (each entry with its exact name `n` and `c` 1 for
+  current, 0 for earlier) and `CURIE_ATTACHMENTS_MANIFEST` for the runner
+  (names and reasons only, no URL).
 
 Approval metadata references follow the same sentence boundary rules across API,
 worker, runner and the UI fallback for older API responses. A tool identifier

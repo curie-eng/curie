@@ -2,44 +2,74 @@
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from pydantic import ValidationError
 from sqlalchemy import select
-from starlette.concurrency import run_in_threadpool
 
-from .. import crud
-from ..auth import require_internal_worker_token
-from ..config import get_settings
-from ..deps import SessionDep
-from ..models import Deployment, WorkItem
-from ..repository_auth import resolve_repository_credential
-from ..schemas import (
+from curie_api.crud import deployments as crud_deployments
+from curie_api.crud import publications as crud_publications
+from curie_api.crud import workspaces as crud_workspaces
+from curie_api.schemas.workspaces import (
     WorkspaceCredentialOut,
     WorkspaceCredentialRequest,
+    WorkspaceSelectionIn,
     WorkspaceSelectionOut,
     WorkspaceSelectionRequest,
 )
-from ..workspace_policy import credential_mode, repository_is_allowed
+
+from ..auth import require_internal_worker_token
+from ..config import Settings, get_settings
+from ..deps import SessionDep
+from ..forges.types import GITHUB, CredentialScope, RepositoryRef
+from ..models import Deployment, WorkItem
+from ..repository_access import issue_stored_credential, thread_repository
+from ..workspace_policy import credential_mode, repository_allowed
 
 router = APIRouter(prefix="/v1/internal/workspaces", tags=["internal-workspaces"])
 
 
-async def _workspace_deployment(
-    session: SessionDep, deployment_id: uuid.UUID
-) -> Deployment:
-    deployment = await crud.get_deployment(session, deployment_id)
+async def _workspace_deployment(session: SessionDep, deployment_id: uuid.UUID) -> Deployment:
+    deployment = await crud_deployments.get_deployment(session, deployment_id)
     if deployment is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "deployment not found")
     return deployment
 
 
-def _require_allowed(repo_full_name: str) -> None:
-    if not repository_is_allowed(
-        repo_full_name, get_settings().github_repo_allowlist
-    ):
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "repository is not allowed for runtime workspaces",
+_NOT_ALLOWED = "repository is not allowed for runtime workspaces"
+
+
+async def _allowed_repository(
+    session: SessionDep, deployment: Deployment, data: WorkspaceSelectionIn, repo_full_name: str
+) -> RepositoryRef:
+    """The thread's repository under its own code host's rule and authority.
+
+    The kind comes from the thread's factory WorkItem (`thread_repository`),
+    never from the worker, so a GitHub owner/* entry cannot admit a path on
+    another code host and a GitLab path is admitted only by its binding.
+    """
+
+    settings = get_settings()
+    repository = await thread_repository(
+        session,
+        settings,
+        agent_id=deployment.agent_id,
+        conversation_id=data.conversation_id,
+        repo_full_name=repo_full_name,
+    )
+    try:
+        WorkspaceSelectionRequest.model_validate(
+            {
+                "conversation_id": data.conversation_id,
+                "author": data.author,
+                "repository_kind": repository.kind,
+                "repo_full_name": repo_full_name,
+            }
         )
+    except ValidationError:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, _NOT_ALLOWED) from None
+    if not repository_allowed(settings, repository):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, _NOT_ALLOWED)
+    return repository
 
 
 @router.post(
@@ -49,13 +79,13 @@ def _require_allowed(repo_full_name: str) -> None:
 )
 async def select_workspace_repository(
     deployment_id: uuid.UUID,
-    data: WorkspaceSelectionRequest,
+    data: WorkspaceSelectionIn,
     session: SessionDep,
 ) -> WorkspaceSelectionOut:
     """Select once per agent/thread, or validate and reuse the winner."""
 
     deployment = await _workspace_deployment(session, deployment_id)
-    selected = await crud.get_thread_workspace(
+    selected = await crud_workspaces.get_thread_workspace(
         session,
         agent_id=deployment.agent_id,
         conversation_id=data.conversation_id,
@@ -63,8 +93,8 @@ async def select_workspace_repository(
     if selected is None:
         if data.repo_full_name is None:
             return WorkspaceSelectionOut(repo_full_name=None)
-        _require_allowed(data.repo_full_name)
-        selected, _ = await crud.select_thread_workspace(
+        await _allowed_repository(session, deployment, data, data.repo_full_name)
+        selected, _ = await crud_workspaces.select_thread_workspace(
             session,
             agent_id=deployment.agent_id,
             deployment_id=deployment.id,
@@ -83,10 +113,22 @@ async def select_workspace_repository(
                 "message": "This conversation already selected a different repository.",
             },
         )
-    _require_allowed(selected.repo_full_name)
+    await _allowed_repository(session, deployment, data, selected.repo_full_name)
     return WorkspaceSelectionOut(
         repo_full_name=selected.repo_full_name,
         revision=selected.revision,
+    )
+
+
+def _credential_source(settings: Settings, repository: RepositoryRef) -> str:
+    """The audit's credential source: GitHub's credential mode, else the kind."""
+
+    if repository.kind != GITHUB:
+        return f"{repository.kind}_code_host"
+    return credential_mode(
+        app_id=settings.github_app_id,
+        app_private_key=settings.github_app_private_key,
+        token=settings.github_token,
     )
 
 
@@ -98,13 +140,14 @@ async def select_workspace_repository(
 async def redeem_workspace_credential(
     deployment_id: uuid.UUID,
     data: WorkspaceCredentialRequest,
+    request: Request,
     session: SessionDep,
     response: Response,
 ) -> WorkspaceCredentialOut:
     response.headers["Cache-Control"] = "no-store"
-    deployment = await crud.get_deployment(session, deployment_id)
+    deployment = await crud_deployments.get_deployment(session, deployment_id)
     if deployment is None:
-        await crud.append_credential_redemption_audit(
+        await crud_publications.append_credential_redemption_audit(
             session,
             purpose="workspace_clone",
             outcome="refused",
@@ -118,7 +161,7 @@ async def redeem_workspace_credential(
             "deployment not found",
             headers={"Cache-Control": "no-store"},
         )
-    selected = await crud.get_thread_workspace(
+    selected = await crud_workspaces.get_thread_workspace(
         session,
         agent_id=deployment.agent_id,
         conversation_id=data.conversation_id,
@@ -128,7 +171,7 @@ async def redeem_workspace_credential(
     else:
         repo = selected.repo_full_name
     if repo is None or selected is None:
-        await crud.append_credential_redemption_audit(
+        await crud_publications.append_credential_redemption_audit(
             session,
             purpose="workspace_clone",
             outcome="refused",
@@ -143,8 +186,15 @@ async def redeem_workspace_credential(
             headers={"Cache-Control": "no-store"},
         )
     settings = get_settings()
-    if not repository_is_allowed(repo, settings.github_repo_allowlist):
-        await crud.append_credential_redemption_audit(
+    repository = await thread_repository(
+        session,
+        settings,
+        agent_id=deployment.agent_id,
+        conversation_id=data.conversation_id,
+        repo_full_name=repo,
+    )
+    if not repository_allowed(settings, repository):
+        await crud_publications.append_credential_redemption_audit(
             session,
             purpose="workspace_clone",
             outcome="refused",
@@ -168,18 +218,21 @@ async def redeem_workspace_credential(
             .where(
                 WorkItem.agent_id == deployment.agent_id,
                 WorkItem.conversation_id == data.conversation_id,
-                WorkItem.repo_full_name == repo,
+                WorkItem.repository_path == repo,
             )
             .limit(2)
         )
     ).all()
     base_branch, base_commit = factory_items[0] if len(factory_items) == 1 else (None, None)
     try:
-        clone_url, authorization_header = await run_in_threadpool(
-            resolve_repository_credential, repo, settings
+        issued = await issue_stored_credential(
+            settings,
+            request.app.state.http_client,
+            repository=repository,
+            scope=CredentialScope.CLONE,
         )
     except Exception as exc:
-        await crud.append_credential_redemption_audit(
+        await crud_publications.append_credential_redemption_audit(
             session,
             purpose="workspace_clone",
             outcome="refused",
@@ -193,26 +246,23 @@ async def redeem_workspace_credential(
             "operator repository credential could not be resolved",
             headers={"Cache-Control": "no-store"},
         ) from exc
-    await crud.append_credential_redemption_audit(
+    await crud_publications.append_credential_redemption_audit(
         session,
         purpose="workspace_clone",
         outcome="issued",
         deployment_id=deployment.id,
         publication_id=None,
         repo_full_name=repo,
-        detail=(
-            "server-derived repository credential issued via "
-            + credential_mode(
-                app_id=settings.github_app_id,
-                app_private_key=settings.github_app_private_key,
-                token=settings.github_token,
-            )
-        ),
+        detail="server-derived repository credential issued via "
+        + _credential_source(settings, repository),
     )
     return WorkspaceCredentialOut(
         repo_full_name=repo,
-        clone_url=clone_url,
-        authorization_header=authorization_header,
+        clone_url=issued.clone_url,
+        authorization_header=issued.authorization_header,
+        origin=issued.origin,
+        header_form=issued.header_form,
+        ca_bundle_ref=issued.ca_bundle_ref,
         revision=selected.revision,
         base_branch=base_branch,
         base_commit=base_commit,

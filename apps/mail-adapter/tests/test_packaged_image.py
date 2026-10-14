@@ -206,7 +206,7 @@ def external_apis(request: pytest.FixtureRequest, tmp_path: Path) -> ExternalApi
                     thread.join(timeout=5)
                 if thread.is_alive():
                     errors.append("packaged mail proof left an external API fixture running")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - teardown must attempt every owned server
                 errors.append(str(exc))
         if errors:
             raise RuntimeError("; ".join(errors))

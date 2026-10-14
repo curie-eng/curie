@@ -69,7 +69,8 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Mapping, Sequence
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Literal
 from urllib.parse import quote
 
 import aiohttp
@@ -82,12 +83,15 @@ from aci_protocol.turn import (
     ReplyHandle,
     matching_routes,
 )
+from curie_internal import sandbox_token
+from curie_internal.sealing_key import is_sealing_key_name
 from plugin_format import is_reserved_boot_env_name
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from . import caller_token, sandbox_token
+from . import caller_token
+from .attachments import AgentRoute
 from .behaviorpacks import BehaviorPacks
 from .config import WorkerConfig
 
@@ -201,6 +205,14 @@ _CLOSE_TURN_TIMEOUT = aiohttp.ClientTimeout(total=5)
 # #3823: the worker reports a sandbox claim's boot credential released.
 RELEASED_CREDENTIALS_PATH = "/v1/internal/state/released-credentials"
 _RELEASE_CREDENTIAL_TIMEOUT_S = 5
+# ADR 0100 (#2877): the API route that mints a turn's channel read capability,
+# and how long that call may take. Short: an open mint runs before the runner
+# call and a steer mint runs under the per-thread lock, and a failed mint only
+# runs the turn without the capability.
+CHANNEL_READ_CONTEXT_PATH = "/v1/internal/channel-read/context"
+_CHANNEL_READ_CONTEXT_TIMEOUT = aiohttp.ClientTimeout(total=3)
+_CHANNEL_READ_GRANT_ABSENT = "channel_read.grant_absent"
+_CHANNEL_READ_CODE = re.compile(r"^channel_read\.[a-z_]{1,64}$")
 # ADR-0188: the ``sender`` claim of a turn with no person behind it (a job, an
 # eval). The runner renders the same string as "no author"
 # (``memory_facts.NO_PERSON``); ``tests/test_memory_fact_key_parity.py`` pins
@@ -294,6 +306,10 @@ def _parse_resume_event_id(event_id: str) -> uuid.UUID | None:
         return None
 
 
+# Migration 0051's auto-provisioned tenant, the one every row belongs to until
+# a second tenant exists. A frozen copy: this package does not import the API's.
+DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
 # The trailing `d.id DESC` carries no meaning of its own -- id order is not a
 # precedence rule and nothing may start reading one into it. It exists only to
 # make the order TOTAL: two active deployments in the same environment with an
@@ -331,6 +347,7 @@ JOIN {schema}.agent_channels c ON c.agent_id = a.id
 JOIN {schema}.deployments d ON d.agent_id = a.id AND d.status = 'active'
 JOIN {schema}.agent_versions v ON v.id = d.version_id AND v.agent_id = a.id
 WHERE c.kind = :kind AND c.address = :address
+  AND a.tenant_id = :tenant_id AND c.tenant_id = :tenant_id
 ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
 """
 
@@ -362,7 +379,7 @@ SELECT a.id AS agent_id,
 FROM {schema}.agents a
 JOIN {schema}.deployments d ON d.agent_id = a.id AND d.status = 'active'
 JOIN {schema}.agent_versions v ON v.id = d.version_id AND v.agent_id = a.id
-WHERE a.id = :agent_id
+WHERE a.id = :agent_id AND a.tenant_id = :tenant_id
 ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
 LIMIT 1
 """
@@ -381,6 +398,7 @@ SELECT a.id AS agent_id,
 FROM {schema}.agents a
 JOIN {schema}.agent_channels c ON c.agent_id = a.id
 WHERE c.kind = :kind AND c.address = :address
+  AND a.tenant_id = :tenant_id AND c.tenant_id = :tenant_id
 """
 
 # ADR-0168 decision 6: the identity bound at an address, if any. A channel-port
@@ -391,6 +409,7 @@ _ADDRESS_IDENTITY_SQL = """
 SELECT c.adapter AS adapter
 FROM {schema}.agent_channels c
 WHERE c.kind = :kind AND lower(c.address) = lower(:address) AND c.adapter IS NOT NULL
+  AND c.tenant_id = :tenant_id
 ORDER BY c.adapter
 LIMIT 1
 """
@@ -589,12 +608,53 @@ def _deployment_from_row(data: dict[str, Any]) -> ResolvedDeployment:
     return ResolvedDeployment.model_validate(data)
 
 
-class BindingResolver:
-    """Resolves a channel address to its active agent deployment (read-only)."""
+@dataclass(frozen=True)
+class ChannelReadMint:
+    """One minted channel read capability (ADR 0100, #2877).
 
-    def __init__(self, engine: AsyncEngine, config: WorkerConfig) -> None:
+    ``turn_key`` is the logical turn digest the API resolved, approval chain
+    hops included, so the kernel addresses the shared Valkey ledger keys for
+    revocation without resolving the chain itself. The token never appears in
+    ``repr``."""
+
+    token: str = field(repr=False)
+    generation: int
+    expires_at: int
+    turn_key: str
+
+
+class ChannelReadGrantAbsent(Exception):
+    """The deployment's bundle does not grant channel read (409 ``grant_absent``).
+
+    Raised, not returned as None, so the kernel can remember the deployment
+    and stop asking; every other refusal or failure is None."""
+
+
+class BindingResolver:
+    """Resolves a channel address to its active agent deployment (read-only).
+
+    Scoped to one tenant (ADR 0166 decision 3). Every read matches only agents
+    whose ``tenant_id`` is the resolver's, and a route also requires the
+    binding row to carry it, so a binding out of step with its agent fails
+    closed. Another tenant's agent answers exactly as an unknown one does.
+    ``deployments`` and ``agent_versions`` are row scoped by the column only and
+    follow their agent (``v.agent_id = a.id``); predicates on them would have to
+    land in ``connector_loop._TARGETS_SQL`` too, or the two rankings diverge
+    (#3049). The tenant is the default one until the queued turn carries its
+    own (#2914); it is deliberately not an operator setting, since a mistyped
+    tenant would drop every event.
+    """
+
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        config: WorkerConfig,
+        *,
+        tenant_id: uuid.UUID = DEFAULT_TENANT_ID,
+    ) -> None:
         self._engine = engine
         self._config = config
+        self._tenant_id = tenant_id
         # Table identifiers are not user input; the schema comes from config.
         self._sql = text(_RESOLVE_SQL.format(schema=config.db_schema))
         self._undeployed_binding_sql = text(_UNDEPLOYED_BINDING_SQL.format(schema=config.db_schema))
@@ -626,7 +686,7 @@ class BindingResolver:
         # @spec WORKER-CANARY-2: direct resolver callers also fail closed.
         if not _valid_slack_selector(kind, adapter):
             return None
-        params = {"kind": kind, "address": address}
+        params = {"kind": kind, "address": address, "tenant_id": self._tenant_id}
         async with self._engine.connect() as conn:
             if adapter is None and kind != SLACK_KIND:
                 bound = (await conn.execute(self._undeployed_binding_sql, params)).all()
@@ -647,7 +707,9 @@ class BindingResolver:
         row's validated id. Never a fallback for a binding miss.
         """
         async with self._engine.connect() as conn:
-            result = await conn.execute(self._resolve_agent_sql, {"agent_id": agent_id})
+            result = await conn.execute(
+                self._resolve_agent_sql, {"agent_id": agent_id, "tenant_id": self._tenant_id}
+            )
             row = result.mappings().first()
         return None if row is None else _deployment_from_row(dict(row))
 
@@ -669,7 +731,8 @@ class BindingResolver:
             return None
         async with self._engine.connect() as conn:
             result = await conn.execute(
-                self._undeployed_binding_sql, {"kind": kind, "address": address}
+                self._undeployed_binding_sql,
+                {"kind": kind, "address": address, "tenant_id": self._tenant_id},
             )
             rows = result.all()
         matches = matching_routes(rows, kind, address, adapter)
@@ -685,16 +748,42 @@ class BindingResolver:
         """The identity bound at ``address`` on ``kind``, or None (ADR-0168 decision 6)."""
         async with self._engine.connect() as conn:
             result = await conn.execute(
-                self._address_identity_sql, {"kind": kind, "address": address}
+                self._address_identity_sql,
+                {"kind": kind, "address": address, "tenant_id": self._tenant_id},
             )
             value = result.scalar()
         return value if isinstance(value, str) and value else None
 
+    async def routes_for_agent(self, agent_id: uuid.UUID) -> list[AgentRoute]:
+        """The agent's bindings as they are NOW (ADR 0205 decision 5).
+
+        A re-fetch of an earlier attachment resolves its route from these and
+        never from anything recorded with the file, so a removed binding makes
+        the file unavailable and a moved adapter endpoint is followed. Read
+        only; the address is not returned because no re-fetch needs it.
+        """
+
+        sql = text(
+            f"SELECT kind, adapter, endpoint FROM {self._config.db_schema}.agent_channels "
+            "WHERE agent_id = :id AND tenant_id = :tenant_id "
+            "ORDER BY kind, adapter NULLS FIRST, endpoint NULLS FIRST"
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
+            rows = result.all()
+        return [
+            AgentRoute(kind=str(row.kind), adapter=row.adapter, endpoint=row.endpoint)
+            for row in rows
+        ]
+
     async def repo_full_name(self, agent_id: uuid.UUID) -> str | None:
         """The agent's GitHub repo (owner/name), for the eval PR-check report."""
-        sql = text(f"SELECT repo_full_name FROM {self._config.db_schema}.agents WHERE id = :id")
+        sql = text(
+            f"SELECT repo_full_name FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             row = result.first()
         if row is None:
             return None
@@ -898,9 +987,12 @@ class BindingResolver:
         """The agent's connector secrets (#429), for lanes that boot by agent_id
         rather than by channel (the eval consumer). Decodes the JSONB the same
         way ``resolve`` does; None when the agent is unknown or has no secrets."""
-        sql = text(f"SELECT secrets FROM {self._config.db_schema}.agents WHERE id = :id")
+        sql = text(
+            f"SELECT secrets FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             row = result.first()
         if row is None or row[0] is None:
             return None
@@ -911,9 +1003,12 @@ class BindingResolver:
 
     async def name_for(self, agent_id: uuid.UUID) -> str | None:
         """The agent's NAME for eval pool routing (#1488). None if unknown."""
-        sql = text(f"SELECT name FROM {self._config.db_schema}.agents WHERE id = :id")
+        sql = text(
+            f"SELECT name FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             row = result.first()
         if row is None:
             return None
@@ -926,9 +1021,12 @@ class BindingResolver:
         This is a separate read from deployment resolution. Resolution runs in
         migration tests against schemas that predate the column.
         """
-        sql = text(f"SELECT runner_resources FROM {self._config.db_schema}.agents WHERE id = :id")
+        sql = text(
+            f"SELECT runner_resources FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             row = result.first()
         if row is None:
             return None
@@ -945,9 +1043,12 @@ class BindingResolver:
         schemas that predate the column (migration 0068). A missing agent row or
         a null value reads as off.
         """
-        sql = text(f"SELECT memory_writes FROM {self._config.db_schema}.agents WHERE id = :id")
+        sql = text(
+            f"SELECT memory_writes FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             row = result.first()
         return bool(row is not None and row[0])
 
@@ -960,11 +1061,12 @@ class BindingResolver:
         """
 
         sql = text(
-            f"SELECT execution_deadline_seconds FROM {self._config.db_schema}.agents WHERE id = :id"
+            f"SELECT execution_deadline_seconds FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
         )
         try:
             async with self._engine.connect() as conn:
-                result = await conn.execute(sql, {"id": agent_id})
+                result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
                 row = result.first()
         except Exception:  # noqa: BLE001 - a missing column still boots
             logger.warning(
@@ -982,10 +1084,11 @@ class BindingResolver:
         """Model, reviewer model, thinking, and resources for eval boots."""
         sql = text(
             "SELECT model, reviewer_model, thinking, runner_resources "
-            f"FROM {self._config.db_schema}.agents WHERE id = :id"
+            f"FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
         )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             row = result.first()
         if row is None:
             return None, None, None, None
@@ -1239,6 +1342,7 @@ class BindingResolver:
             state_url=state_url,
             state_token=app_state_token,
             channel_bound=True if kind and address else None,
+            channel_kind=kind if kind else None,
         )
         # #517/#669 opt-in false-completion check: NOT a BootEnv.render_worker
         # kwarg (it is deliberately kept out of the frozen ACI contract, see
@@ -1401,6 +1505,90 @@ class BindingResolver:
             return False
         return True
 
+    async def channel_read_context(
+        self,
+        *,
+        agent_id: uuid.UUID,
+        deployment_id: uuid.UUID,
+        event_id: str,
+        mode: Literal["open", "steer"],
+        owner: str | None = None,
+        default: tuple[str, str] | None,
+        ttl_s: int,
+    ) -> ChannelReadMint | None:
+        """Mint a turn's channel read capability on the API (ADR 0100, #2877).
+
+        ``mode="open"`` opens the logical turn under ``owner`` (the attempt's
+        id); ``mode="steer"`` renews the live one and sends no owner, since the
+        API keeps the opener's. Uses the worker token every other
+        ``/v1/internal`` call uses, never the platform key.
+
+        Raises ``ChannelReadGrantAbsent`` on 409 ``channel_read.grant_absent``.
+        Every other refusal, error, malformed body or unreachable API returns
+        None, so the turn runs without the capability (fail closed). An older
+        API without the route answers 404, logged once. Neither the token nor
+        any response text reaches a log line.
+        """
+
+        body: dict[str, Any] = {
+            "agent_id": str(agent_id),
+            "deployment_id": str(deployment_id),
+            "event_id": event_id,
+            "mode": mode,
+            "default_channel": (
+                None if default is None else {"kind": default[0], "address": default[1]}
+            ),
+            "ttl_s": ttl_s,
+        }
+        if owner is not None:
+            body["owner"] = owner
+        url = f"{self._config.api_base_url.rstrip('/')}{CHANNEL_READ_CONTEXT_PATH}"
+        try:
+            async with (
+                aiohttp.ClientSession(timeout=_CHANNEL_READ_CONTEXT_TIMEOUT) as session,
+                session.post(
+                    url,
+                    json=body,
+                    headers={"X-Curie-Worker-Token": self._config.internal_worker_token},
+                ) as response,
+            ):
+                status = response.status
+                try:
+                    payload: Any = await response.json(content_type=None)
+                except (ValueError, aiohttp.ClientError):
+                    payload = None
+        except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+            logger.warning(
+                "could not mint a channel read capability (%s): %s", mode, type(exc).__name__
+            )
+            return None
+        if status == 404:
+            if not getattr(self, "_channel_read_route_missing", False):
+                self._channel_read_route_missing = True
+                logger.info(
+                    "the API has no channel read context route (404); turns run "
+                    "without a channel read capability"
+                )
+            return None
+        if status == 409:
+            code = _refusal_code(payload)
+            if code == _CHANNEL_READ_GRANT_ABSENT:
+                raise ChannelReadGrantAbsent(code)
+            logger.info("the API refused a channel read %s mint: %s", mode, code)
+            return None
+        if status != 200:
+            logger.warning(
+                "the API refused a channel read %s mint: HTTP %s %s",
+                mode,
+                status,
+                _refusal_code(payload),
+            )
+            return None
+        mint = _channel_read_mint(payload)
+        if mint is None:
+            logger.warning("the API answered a channel read %s mint with a malformed body", mode)
+        return mint
+
     def fresh_boot_credential(self, env: Mapping[str, str]) -> dict[str, str]:
         """A copy of ``env`` whose boot state tokens carry a new credential id (#3823).
 
@@ -1498,6 +1686,38 @@ def _boot_state_token_exp(token_ttl_s: float | None) -> int:
     return int(time.time()) + bounded
 
 
+def _refusal_code(payload: object) -> str | None:
+    """The ``channel_read.*`` code of a refusal body, or None; never its message."""
+
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    code = detail.get("code") if isinstance(detail, dict) else None
+    return code if isinstance(code, str) and _CHANNEL_READ_CODE.fullmatch(code) else None
+
+
+def _channel_read_mint(payload: object) -> ChannelReadMint | None:
+    if not isinstance(payload, dict):
+        return None
+    token = payload.get("token")
+    generation = payload.get("generation")
+    expires_at = payload.get("expires_at")
+    turn_key = payload.get("turn_key")
+    if (
+        not isinstance(token, str)
+        or not token
+        or not isinstance(turn_key, str)
+        or not turn_key
+        or isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation <= 0
+        or isinstance(expires_at, bool)
+        or not isinstance(expires_at, int)
+    ):
+        return None
+    return ChannelReadMint(
+        token=token, generation=generation, expires_at=expires_at, turn_key=turn_key
+    )
+
+
 def _binding_claim(kind: str | None, address: str | None) -> str | None:
     """The ADR-0188 ``binding`` claim: ``"<kind>:<address>"``, unquoted, the same
     string as the API's ``_binding_scope`` and
@@ -1565,10 +1785,12 @@ def apply_model_env(
         env[FALSE_COMPLETION_CHECK_ENV] = "1"
 
 
-# ADR 0176 decision 2. The test cluster kubeconfig is a connector secret the
-# sandbox must not receive. Frozen with the CLI and the chart in
-# tests/vectors/e2e-connector-sandbox.json.
-SANDBOX_WITHHELD_CONNECTOR_SECRETS = frozenset({"E2E_CLUSTER_KUBECONFIG"})
+# ADR 0176 decision 2. The test cluster kubeconfig and the registry push and
+# cache configs are connector secrets the sandbox must not receive. Frozen with
+# the CLI and the chart in tests/vectors/e2e-connector-sandbox.json.
+SANDBOX_WITHHELD_CONNECTOR_SECRETS = frozenset(
+    {"E2E_CLUSTER_KUBECONFIG", "E2E_REGISTRY_PUSH_CONFIG", "E2E_BUILD_CACHE_CONFIG"}
+)
 
 
 def inject_connector_secrets(
@@ -1599,6 +1821,15 @@ def inject_connector_secrets(
             # k8s substrate would look for a sandbox secretKeyRef.
             logger.warning(
                 "Dropping connector secret withheld from the sandbox (never injected, never marked)"
+            )
+            continue
+        if is_sealing_key_name(name):
+            # @spec ACTION-EXECUTOR-16: the snapshot sealing key reaches only
+            # the hosted connector. Withheld from every sandbox and kept out of
+            # the marker, so the k8s substrate wires no secretKeyRef for it.
+            logger.warning(
+                "Dropping connector secret reserved for the sealing key "
+                "(never injected, never marked)"
             )
             continue
         if is_reserved_boot_env_name(name):

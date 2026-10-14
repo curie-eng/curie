@@ -4,6 +4,7 @@
        agent-sandbox.yaml renders only for the chart's own base name, and only
        while agentSandbox.deploy renders pools at all (#2943). */}}
 {{- $perAgentPools := and .Values.agentSandbox.deploy (eq $warmPool (printf "%s-runner-pool" (include "curie.fullname" .))) }}
+{{- $repoRunners := include "curie.factory.repoRunnerDescriptors" . | fromJsonArray }}
 {{- $workspaceStageBudget := add .Values.worker.workspace.cloneTimeoutSeconds .Values.worker.workspace.archiveTimeoutSeconds .Values.worker.workspace.uploadTimeoutSeconds }}
 {{- $publicationPullSecrets := list }}
 {{- range .Values.agentSandbox.runner.imagePullSecrets }}
@@ -81,15 +82,32 @@ rules:
     resources: ["resourcequotas"]
     verbs: ["get"]
   {{- if .Values.agentSandbox.deploy }}
-  # Per-agent runner resources (#3209). get reads the chart template. create
-  # and patch write only the worker-owned copy. list and delete stay absent.
-  # The ValidatingAdmissionPolicy in runner-resources-admission.yaml is rendered
-  # on the same condition and refuses any name that is not that copy, so this
-  # grant cannot rewrite the shared template. Kubernetes older than 1.30 fails
-  # that template, which fails this render before the grant is installed.
+  # Per-agent runner resources (#3209) and per-claim token templates (#3842).
+  # get reads the chart template and the source warm pool. create and patch
+  # write only worker-owned copies. Templates also need delete (rollback of a
+  # half-built per-claim set) and list (the reaper sweep of per-claim templates
+  # whose claim is gone); warm pools are never listed or deleted by the worker,
+  # because Kubernetes GC removes a per-claim pool with its template.
+  # The ValidatingAdmissionPolicies in runner-resources-admission.yaml render on
+  # the same condition: they refuse any name that is not a worker-owned copy,
+  # any template shape the chart does not render, and any delete of a template
+  # without the curietech.ai/sandbox-claim label, so this grant cannot rewrite
+  # or remove the shared template. Kubernetes older than 1.30 fails that
+  # template, which fails this render before the grant is installed.
   - apiGroups: ["extensions.agents.x-k8s.io"]
-    resources: ["sandboxtemplates", "sandboxwarmpools"]
+    resources: ["sandboxtemplates"]
+    verbs: ["get", "create", "patch", "list", "delete"]
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxwarmpools"]
     verbs: ["get", "create", "patch"]
+  # Per-claim token Secret (#3842): the claim's scoped tokens reach the runner
+  # by secretKeyRef instead of riding the SandboxClaim spec. create only; no
+  # get, list, or watch, so this grant cannot read any Secret back. The
+  # worker-secrets admission policy admits only an Opaque `*-tokens` Secret
+  # carrying curietech.ai/sandbox-claim in this namespace.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
   {{- end }}
   # The worker reads the exact sandbox pod for capacity and stream failure
   # diagnosis. It lists only events for that named pod after a stream drop.
@@ -117,7 +135,8 @@ that does not exist yet is authorized as a create, so a Role with only `patch`
 lets the reconciler update existing connectors while failing to create any --
 the first-run path, and the one most likely to be exercised. Verified with
 `kubectl apply --server-side --as=<the worker SA>`, which is forbidden without
-it. No `get` (nothing reads a single object), no cluster scope, no other kinds.
+it. No `get` unless the action executor is enabled, when one separate rule adds
+only `get` on Deployments for digest attribution; no cluster scope, no other kinds.
 
 This is a genuine privilege increase over the CRD-only rules above -- it
 includes delete on Secrets -- which is why it renders only when the reconciler
@@ -126,6 +145,19 @@ is actually enabled.
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["create", "list", "patch", "delete"]
+{{- if eq (include "curie.actionExecutorEnabled" .) "true" }}
+{{/*
+ACTION-EXECUTOR-12/-14: the action executor reads the connector's owned
+Deployment by name to record the digest it ran at and to check a pinned digest.
+A single-object `get` on Deployments only, in its own rule so it cannot spill
+onto another kind; granted only with the executor and this reconciler both
+enabled. With the executor off this Role is unchanged and actions record no
+digest. No `watch`, no other kind.
+*/}}
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+{{- end }}
   - apiGroups: [""]
     resources: ["services", "secrets"]
     verbs: ["create", "list", "patch", "delete"]
@@ -300,6 +332,28 @@ spec:
               value: {{ .Values.worker.attachments.referenceTtlSeconds | quote }}
             - name: CURIE_ATTACHMENT_RETENTION_TTL_SECONDS
               value: {{ .Values.worker.attachments.retentionTtlSeconds | quote }}
+            {{- /*
+            ADR 0205 decision 7: the per-thread file count and byte budget one
+            boot materializes. The byte budget has to fit the attachments
+            emptyDir the init container writes into, or the thread's files
+            overflow it and the pod is evicted mid-boot; the chart refuses the
+            values instead. Defaulted here as well as in values.yaml: under
+            `helm upgrade --reuse-values` from a release that predates the keys
+            they are nil, and a nil budget would render "0".
+            */}}
+            {{- $threadMaxFiles := .Values.worker.attachments.threadMaxFiles | default 20 | int64 }}
+            {{- $threadMaxBytes := .Values.worker.attachments.threadMaxBytes | default 268435456 | int64 }}
+            {{- $runnerAttachments := .Values.agentSandbox.runner.attachments | default dict }}
+            {{- if and .Values.worker.attachments.enabled $runnerAttachments.enabled }}
+            {{- $volumeBytes := include "curie.capacity.memBytes" $runnerAttachments.sizeLimit | int64 }}
+            {{- if gt $threadMaxBytes $volumeBytes }}
+            {{- fail (printf "worker.attachments.threadMaxBytes (%d) exceeds agentSandbox.runner.attachments.sizeLimit (%s, %d bytes): one boot of a thread's files would overflow the sandbox's attachments volume. Lower threadMaxBytes or raise sizeLimit (ADR 0205 decision 7)." $threadMaxBytes (toString $runnerAttachments.sizeLimit) $volumeBytes) }}
+            {{- end }}
+            {{- end }}
+            - name: CURIE_ATTACHMENT_THREAD_MAX_FILES
+              value: {{ $threadMaxFiles | quote }}
+            - name: CURIE_ATTACHMENT_THREAD_MAX_BYTES
+              value: {{ $threadMaxBytes | quote }}
             - name: CURIE_PUBLICATION_ENABLED
               value: {{ .Values.worker.publication.enabled | quote }}
             - name: CURIE_PUBLICATION_NAMESPACE
@@ -318,11 +372,11 @@ spec:
               value: {{ .Values.worker.publication.jobActiveDeadlineSeconds | quote }}
             - name: CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS
               value: {{ .Values.worker.publication.gitCommandTimeoutSeconds | quote }}
-            - name: CURIE_PUBLICATION_GITHUB_API_URL
-              value: {{ .Values.api.githubApiUrl | quote }}
-            {{- if .Values.api.githubStubCaConfigMap }}
-            - name: CURIE_PUBLICATION_GITHUB_CA_FILE
-              value: /etc/curie/github-stub/ca.pem
+            {{- if include "curie.codeHostTrust.name" . }}
+            # Copied into each publication Job's own ConfigMap (ADR 0197): the
+            # Job runs in the publication namespace, where this ConfigMap is absent.
+            - name: CURIE_CODE_HOST_CA_BUNDLE
+              value: {{ include "curie.codeHostTrust.path" . | quote }}
             {{- end }}
             - name: CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS
               value: {{ .Values.worker.publication.reconcileIntervalSeconds | quote }}
@@ -379,6 +433,19 @@ spec:
               valueFrom:
                 secretKeyRef:
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" (get (.Values.connectorCaller | default dict) "existingSecret") "existingSecretKey" ((get (.Values.connectorCaller | default dict) "signingKeyKey") | default "signingKey") "defaultKey" "connectorCallerSigningKey") | nindent 18 }}
+            # The action executor switch (ACTION-EXECUTOR-1). The API renders
+            # the same value from the same helper; the two must never differ.
+            - name: CURIE_ACTION_EXECUTOR_ENABLED
+              value: {{ include "curie.actionExecutorEnabled" . | quote }}
+            # The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+            # executor amendment E9): the executor loop runs up to this many at
+            # once. The API renders the same value from the same helper.
+            - name: CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES
+              value: {{ include "curie.actionExecutorMaxConcurrentSandboxes" . | quote }}
+            # The automated remediation switch (AUTOMATED-REMEDIATION-1). The API
+            # renders the same value from the same helper; the two must never differ.
+            - name: CURIE_REMEDIATION_ENABLED
+              value: {{ include "curie.remediationEnabled" . | quote }}
             # Substrate wiring: which namespace to claim sandboxes in, the warm
             # pool to claim from, and the ACI port on each claimed sandbox.
             - name: CURIE_NAMESPACE
@@ -414,6 +481,33 @@ spec:
             - name: CURIE_CONNECTOR_RECONCILE_INTERVAL_S
               value: {{ .Values.worker.connectorReconciler.intervalSeconds | quote }}
 {{- end }}
+{{- $e2e := .Values.e2eConnector }}
+{{- if $e2e.enabled }}
+{{- if not .Values.worker.connectorReconciler.enabled }}
+{{- fail "e2eConnector.enabled requires worker.connectorReconciler.enabled: the end to end namespace reaper reads the test cluster kubeconfig from the connector Secret through the reconciler's Secret list grant" }}
+{{- end }}
+            # End to end namespace reaper (#3245, ADR 0176 decision 4). The same
+            # scope the API hands env_create, so the worker deletes only what
+            # the connector creates. It reads the test cluster kubeconfig from
+            # each agent's connector Secret through the reconciler's Secret
+            # list grant; nothing new is mounted.
+            - name: CURIE_E2E_CONNECTOR_ENABLED
+              value: "true"
+            - name: CURIE_E2E_NAMESPACE_PREFIX
+              value: {{ $e2e.namespacePrefix | quote }}
+            - name: CURIE_E2E_OWNER_LABEL_KEY
+              value: {{ $e2e.ownerLabel.key | quote }}
+            - name: CURIE_E2E_OWNER_LABEL_VALUE
+              value: {{ $e2e.ownerLabel.value | quote }}
+            - name: CURIE_E2E_REAPER_INTERVAL_S
+              value: {{ $e2e.reaperIntervalSeconds | quote }}
+            - name: CURIE_E2E_REGISTRY
+              value: {{ $e2e.registry | default "" | quote }}
+            - name: CURIE_E2E_REGISTRY_INSECURE
+              value: {{ $e2e.registryInsecure | default false | quote }}
+            - name: CURIE_E2E_REGISTRY_TOKEN_HOSTS
+              value: {{ join "," ($e2e.registryTokenHosts | default list) | quote }}
+{{- end }}
             - name: LANGFUSE_HOST
               value: {{ include "curie.langfuse.url" . }}
             - name: LANGFUSE_PUBLIC_KEY
@@ -433,6 +527,10 @@ spec:
             # pool nothing rendered (#2943).
             - name: CURIE_AGENT_SANDBOX_POOLS
               value: {{ ternary (include "curie.agentSandboxPoolAgents" . | fromJsonArray | join ",") "" $perAgentPools | quote }}
+            {{- if $repoRunners }}
+            - name: CURIE_REPO_RUNNER_POOLS
+              value: {{ include "curie.factory.repoRunnerPoolsJson" $repoRunners | quote }}
+            {{- end }}
             # The subset whose pool template carries connector secretKeyRefs; a
             # claim whose bundle declares connector secrets needs one (#2943).
             - name: CURIE_AGENT_CONNECTOR_SECRET_POOLS
@@ -588,14 +686,6 @@ spec:
             {{- end }}
             - name: BUNDLE_BUCKET
               value: {{ .Values.agentSandbox.runner.bundleFetch.bucket | quote }}
-            {{- if .Values.api.githubStubCaConfigMap }}
-            - name: SSL_CERT_FILE
-              value: /etc/curie/github-stub/ca.pem
-            - name: GIT_SSL_CAINFO
-              value: /etc/curie/github-stub/ca.pem
-            - name: REQUESTS_CA_BUNDLE
-              value: /etc/curie/github-stub/ca.pem
-            {{- end }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.worker.extraEnv) | nindent 12 }}
             {{- $checksumExtraEnv | nindent 12 }}
           # No HTTP port on the worker, so an exec probe checks a heartbeat file
@@ -607,18 +697,10 @@ spec:
           volumeMounts:
             - name: workspace-clone
               mountPath: {{ .Values.worker.workspace.mountPath | quote }}
-            {{- if .Values.api.githubStubCaConfigMap }}
-            - name: github-stub-ca
-              mountPath: /etc/curie/github-stub
-              readOnly: true
-            {{- end }}
+            {{- include "curie.codeHostTrust.volumeMount" . | nindent 12 }}
       volumes:
         - name: workspace-clone
           emptyDir:
             sizeLimit: {{ .Values.worker.workspace.cloneVolumeSize | quote }}
-        {{- if .Values.api.githubStubCaConfigMap }}
-        - name: github-stub-ca
-          configMap:
-            name: {{ .Values.api.githubStubCaConfigMap }}
-        {{- end }}
+        {{- include "curie.codeHostTrust.volume" . | nindent 8 }}
 {{- end }}

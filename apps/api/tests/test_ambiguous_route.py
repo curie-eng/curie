@@ -15,8 +15,9 @@ import uuid
 from typing import Any
 
 import redis
-from curie_api import adapter_principal, crud, hook_signing
+from curie_api import adapter_principal, hook_signing
 from curie_api.config import get_settings
+from curie_api.crud import channels as crud_channels
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -206,7 +207,7 @@ def test_an_agent_scoped_lookup_is_not_ambiguous(
         engine = create_async_engine(get_settings().database_url)
         try:
             async with async_sessionmaker(engine)() as session:
-                row = await crud.binding_for_route(
+                row = await crud_channels.binding_for_route(
                     session, "email", None, ADDRESS, agent_id=uuid.UUID(first)
                 )
                 return None if row is None else row.adapter

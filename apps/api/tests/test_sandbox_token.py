@@ -1,23 +1,16 @@
-"""Wire-format contract for the scoped sandbox token (#410, api copy).
+"""Wire contract for the shared scoped sandbox token (#410, #3833).
 
-The token is a minimal HMAC-signed capability minted by the worker and verified
-by the api, so a sandboxed agent gets a token that authorizes ONLY its own state
-namespace and nothing else. The module lives byte-identical in both apps; the
-token-module test bodies below are identical to
-apps/worker/tests/binding/test_sandbox_token.py except the import line.
-
-Pure stdlib, nothing mocked. An independent reference reimplementation of the
-wire format pins the exact encoding so the two copies cannot silently drift into
-a shape that still round-trips against itself but not against the other app.
+The worker mints and the API verifies one shared HMAC signed capability.
+An independent reference implementation pins its encoding and malformed claim
+refusals without relying on a round trip through the same implementation.
 """
 
 import base64
 import hashlib
 import hmac
 import json
-from pathlib import Path
 
-from curie_api.sandbox_token import mint, verify
+from curie_internal.sandbox_token import mint, verify
 
 KEY = "curie-dev-key"
 AGENT = "00000000-0000-0000-0000-000000000001"
@@ -58,7 +51,7 @@ def _reference_token(
 
 
 def _decode():  # noqa: ANN202 - resolved lazily so the older tests still collect
-    from curie_api.sandbox_token import decode
+    from curie_internal.sandbox_token import decode
 
     return decode
 
@@ -74,9 +67,8 @@ def test_roundtrip_false_when_exp_is_in_the_past() -> None:
 
 
 def test_three_claim_token_wire_format_unchanged() -> None:
-    # Golden known-answer: pins the exact deterministic encoding, so the two
-    # byte-identical copies cannot drift into a self-consistent-but-incompatible
-    # shape. mint takes no clock; the caller passes the absolute exp.
+    # The independent known answer pins the deterministic encoding. The caller
+    # supplies the absolute expiration rather than relying on a clock.
     token = mint(KEY, agent=AGENT, scope="state", exp=EXP)
     assert token == _reference_token(KEY, AGENT, "state", EXP)
     assert token.startswith("sbx.")
@@ -258,15 +250,3 @@ def test_verify_rejection_matrix_returns_false_and_never_raises() -> None:
     ]
     for token in malformed:
         assert verify(token, KEY, agent=AGENT, scope="state") is False
-
-
-def test_the_two_module_copies_are_byte_identical() -> None:
-    # Anti-drift gate: the worker mints and the api verifies, so the two copies
-    # MUST agree on the wire format to the byte. Resolve both paths relative to
-    # this test file (parents[3] is the worktree root) rather than hardcoding.
-    root = Path(__file__).resolve().parents[3]
-    api_src = root / "apps" / "api" / "src" / "curie_api" / "sandbox_token.py"
-    worker_src = (
-        root / "apps" / "worker" / "src" / "curie_worker" / "sandbox_token.py"
-    )
-    assert api_src.read_bytes() == worker_src.read_bytes()

@@ -30,7 +30,7 @@ from curie_worker import binding as binding_module
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import BindingResolver, ResolvedDeployment
 from curie_worker.config import WorkerConfig
-from curie_worker.kernel import ThreadBusyError
+from curie_worker.kernel.failures import ThreadBusyError
 
 # importlib import mode does not add the test root to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))

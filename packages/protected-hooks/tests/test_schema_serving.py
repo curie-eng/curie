@@ -43,7 +43,23 @@ def graph_payload() -> dict[str, Any]:
 
 @pytest.mark.parametrize(
     "current,expected",
-    [(None, False), ("0075", False), ("0076", True), ("0000", True), ("future-expand", True)],
+    [
+        (None, False),
+        ("0075", False),
+        ("0076", False),
+        ("0077", True),
+        # #2911: 0101 tenant-scopes the core tables the app reads, so the
+        # revisions below it are refused. #4397's trigger label expand (0105)
+        # is the minimum: this image reads its columns, so 0103 is refused.
+        ("0082", False),
+        ("0100", False),
+        ("0101", False),
+        ("0102", False),
+        ("0103", False),
+        ("0108", True),
+        ("0000", True),
+        ("future-expand", True),
+    ],
 )
 def test_installed_candidate_decision_preserves_unknown_revision_policy(
     current: str | None, expected: bool

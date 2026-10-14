@@ -47,6 +47,8 @@ for i=1,8 do
     local kind=redis.call('TYPE',KEYS[i]).ok
     if kind~='none' and kind~=expected[i] then error('invalid admission type') end
 end
+local eventkind=redis.call('TYPE',KEYS[p.event_key]).ok
+if eventkind~='none' and eventkind~='string' then error('invalid event index type') end
 local info=redis.call('INFO','server')
 local run=string.match(info,'run_id:([0-9a-f]+)')
 if run~=p.run_id then return answer('refused','broker_identity_mismatch') end
@@ -60,7 +62,14 @@ for _,v in ipairs(p.snapshots) do
     if expectedraw==cjson.null then expectedraw=false end
     if raw~=expectedraw then return 'retry' end
 end
+local function establish_index()
+    local raw=redis.call('GET',KEYS[p.event_key])
+    if raw and raw~=p.event_index then error('event index collision') end
+    if not raw and not redis.call('SET',KEYS[p.event_key],p.event_index,'NX') then
+        error('event index collision') end
+end
 if p.mode=='read' then
+    if p.checked_commit then establish_index() end
     return cjson.encode(p.result)
 end
 local function authority()
@@ -83,6 +92,7 @@ local function commit(intent,attempts)
     end
     receipt.stream_id=intent.reserved_stream_id
     receipt.acceptance_status='accepted';receipt.tool_access='read-only'
+    establish_index()
     redis.call('DEL',KEYS[4])
     local state={schema_version=1,status='committed',recovery_attempts=attempts,
                  reason=cjson.null,receipt=receipt}
@@ -161,4 +171,38 @@ if #entries==0 then
     redis.call('XADD',KEYS[8],intent.reserved_stream_id,'payload',ARGV[2],'protected_envelope',ARGV[3])
 end
 return commit(intent,attempts)
+"""
+
+# @spec PROTECTED-HOOK-LANE-6
+RETAINED_TRANSACTION = r"""
+local p=cjson.decode(ARGV[1])
+for i,kind in ipairs(p.types) do
+    local actual=redis.call('TYPE',KEYS[i]).ok
+    if actual~='none' and actual~=kind then error('invalid retained proof type') end
+end
+local run=string.match(redis.call('INFO','server'),'run_id:([0-9a-f]+)')
+if run~=p.run_id then error('invalid retained broker epoch') end
+for _,v in ipairs(p.snapshots) do
+    local raw=redis.call('GET',KEYS[v.index])
+    local expected=v.raw
+    if expected==cjson.null then expected=false end
+    if raw~=expected then return 'retry' end
+end
+if p.repair_index and redis.call('SISMEMBER',KEYS[p.repair_index],p.event_id)~=p.repair_member then
+    return 'retry' end
+if p.mode=='backfill' then
+    local raw=redis.call('GET',KEYS[p.index_key])
+    if raw and raw~=p.index_raw then error('invalid event index collision') end
+    if not raw then redis.call('SET',KEYS[p.index_key],p.index_raw,'NX') end
+    return 'indexed'
+end
+if redis.call('ZREM',KEYS[p.quota_key],p.digest)==1 then return 'released' end
+return 'already_released'
+"""
+
+# @spec PROTECTED-HOOK-LANE-6
+QUOTA_CENSUS = r"""
+local maximum=tonumber(ARGV[1])
+if redis.call('ZCARD',KEYS[1])>maximum then error('invalid quota census overflow') end
+return redis.call('ZRANGE',KEYS[1],0,maximum-1)
 """

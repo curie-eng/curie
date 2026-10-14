@@ -11,7 +11,8 @@ import httpx
 from starlette.concurrency import run_in_threadpool
 
 from .config import Settings
-from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
+from .forges.github.transport import get_github_json, repository_identity_matches
+from .github_app import GitHubAppError, GitHubCredentials, GitHubInstallationRefused
 from .github_review_events import (
     FeedbackIgnored,
     FeedbackUnavailable,
@@ -33,57 +34,6 @@ class BoundReviewLineage:
     installation_id: int
     pr_node_id: str
     base_ref: str
-
-
-def github_headers(token: str) -> dict[str, str]:
-    return {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-
-
-async def get_github_json(
-    client: httpx.AsyncClient,
-    *,
-    api: str,
-    token: str,
-    path: str,
-    refusal: str,
-) -> dict[str, Any]:
-    """Read one GitHub JSON object. Claimed webhook URLs are never fetched."""
-
-    try:
-        response = await client.get(
-            f"{api}{path}",
-            headers=github_headers(token),
-            follow_redirects=False,
-        )
-    except httpx.HTTPError:
-        raise FeedbackUnavailable(refusal) from None
-    # A 404 can conceal missing App permissions; it cannot distinguish a
-    # deleted resource from a temporary inability to prove current authority.
-    if response.status_code in {401, 403, 404, 429} or response.status_code >= 500:
-        raise FeedbackUnavailable(refusal)
-    if response.status_code != 200:
-        raise FeedbackIgnored(refusal)
-    try:
-        result = response.json()
-    except ValueError:
-        raise FeedbackIgnored(refusal) from None
-    if not isinstance(result, dict):
-        raise FeedbackIgnored(refusal)
-    return result
-
-
-def repository_identity_matches(value: Any, *, repository_id: int, repo_full_name: str) -> bool:
-    return (
-        isinstance(value, dict)
-        and type(value.get("id")) is int
-        and value["id"] == repository_id
-        and isinstance(value.get("full_name"), str)
-        and value["full_name"].casefold() == repo_full_name.casefold()
-    )
 
 
 async def verify_sender_write_permission(
@@ -116,19 +66,21 @@ async def verify_sender_write_permission(
         raise FeedbackIgnored("sender_permission_refused")
 
 
-async def verify_feedback_truth(
-    feedback: UnverifiedFeedback,
-    lineage: BoundReviewLineage,
-    *,
-    settings: Settings,
-    client: httpx.AsyncClient,
-) -> str:
-    """Return the exact current bound PR head, or a payload-free refusal.
+@dataclass(frozen=True)
+class VerifiedRepository:
+    """A repository read with a token for its freshly rediscovered installation.
 
-    Resource URLs are derived from persisted identity. No claimed webhook or
-    REST response URL is fetched, and redirects cannot carry the App token to
-    another endpoint. All credential-bearing requests stay inside the API.
+    The poll pass builds one per repository and reuses it for every piece of
+    feedback it admits there; webhook ingress builds one per delivery.
     """
+
+    api: str
+    token: str
+    installation_id: int
+    repository: dict[str, Any]
+
+
+def _check_feedback_lineage(feedback: UnverifiedFeedback, lineage: BoundReviewLineage) -> None:
     if (
         feedback.repo_full_name.casefold() != lineage.repo_full_name.casefold()
         or feedback.pr_number != lineage.pr_number
@@ -136,9 +88,20 @@ async def verify_feedback_truth(
         or feedback.installation_id != lineage.installation_id
     ):
         raise FeedbackIgnored("lineage_mismatch")
+
+
+async def verify_repository(
+    lineage: BoundReviewLineage,
+    *,
+    client: httpx.AsyncClient,
+    credentials: GitHubCredentials,
+    api_url: str,
+) -> VerifiedRepository:
+    """Rediscover the lineage's installation and read its repository."""
+
     try:
         token = await run_in_threadpool(
-            credentials_for(settings).token_for_verified_installation,
+            credentials.token_for_verified_installation,
             lineage.repo_full_name,
             lineage.installation_id,
         )
@@ -146,17 +109,63 @@ async def verify_feedback_truth(
         raise FeedbackIgnored("installation_unverified") from None
     except GitHubAppError:
         raise FeedbackUnavailable("installation_unavailable") from None
-
-    api = settings.github_api_url.rstrip("/")
-    repo_path = f"/repos/{repo_url_path(lineage.repo_full_name)}"
-
+    api = api_url.rstrip("/")
     repository = await get_github_json(
         client,
         api=api,
         token=token,
-        path=repo_path,
+        path=f"/repos/{repo_url_path(lineage.repo_full_name)}",
         refusal="repository_unavailable",
     )
+    return VerifiedRepository(api, token, lineage.installation_id, repository)
+
+
+async def verify_feedback_truth(
+    feedback: UnverifiedFeedback,
+    lineage: BoundReviewLineage,
+    *,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    credentials: GitHubCredentials,
+    api_url: str,
+) -> str:
+    """Return the exact current bound PR head, or a payload-free refusal.
+
+    ``credentials`` and ``api_url`` name the GitHub identity the reads use: the
+    install's own for review ingress, the factory code host's for factory
+    review feedback (#4397).
+
+    Resource URLs are derived from persisted identity. No claimed webhook or
+    REST response URL is fetched, and redirects cannot carry the App token to
+    another endpoint. All credential-bearing requests stay inside the API.
+    """
+    _check_feedback_lineage(feedback, lineage)
+    verified = await verify_repository(
+        lineage, client=client, credentials=credentials, api_url=api_url
+    )
+    return await verify_feedback_in_repository(
+        feedback, lineage, verified, settings=settings, client=client
+    )
+
+
+async def verify_feedback_in_repository(
+    feedback: UnverifiedFeedback,
+    lineage: BoundReviewLineage,
+    verified: VerifiedRepository,
+    *,
+    settings: Settings,
+    client: httpx.AsyncClient,
+) -> str:
+    """`verify_feedback_truth` against an already verified repository read.
+
+    The pull request, the feedback object and the sender's write permission
+    (ADR 0197 authority 3) are still read fresh for this one piece of feedback.
+    """
+    _check_feedback_lineage(feedback, lineage)
+    if verified.installation_id != lineage.installation_id:
+        raise FeedbackIgnored("installation_unverified")
+    api, token, repository = verified.api, verified.token, verified.repository
+    repo_path = f"/repos/{repo_url_path(lineage.repo_full_name)}"
     if not repository_identity_matches(
         repository,
         repository_id=lineage.repository_id,

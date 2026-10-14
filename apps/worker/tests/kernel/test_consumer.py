@@ -36,7 +36,6 @@ from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker import capacity_wait as capacity_wait_module
 from curie_worker import consumer as consumer_module
 from curie_worker import delivery_lease as delivery_lease_module
-from curie_worker import kernel as kernel_module
 from curie_worker import stream_consumer as stream_consumer_module
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.capacity_wait import (
@@ -53,6 +52,8 @@ from curie_worker.consumer_liveness import (
 from curie_worker.cron_loop import CronSchedulerLoop, _Target
 from curie_worker.delivery_lease import DeliveryBudget, DeliveryLeaseStore, LeaseLostError
 from curie_worker.hook_source_guard import CronHookSourceGuard
+from curie_worker.kernel import constants as kernel_constants
+from curie_worker.kernel import routing as kernel_routing
 from curie_worker.runner_client import TurnStream
 from curie_worker.sandbox import QuotaRejection
 from curie_worker.stream_consumer import ConsumerLivenessExpired
@@ -1516,7 +1517,7 @@ def test_failed_capacity_grant_cannot_start_after_original_deadline(make_harness
                 await owner._handle(wake_id, wake_fields)
             finally:
                 h.kernel._runner.admit_turn = real_admit  # type: ignore[method-assign]
-            progress_id = progress_id_for(kernel_module._thread_key_for(event), event.event_id)
+            progress_id = progress_id_for(kernel_routing._thread_key_for(event), event.event_id)
             progress = await ProgressStore(h.async_redis, h.config).read(progress_id)
             assert progress is not None
             assert progress.active_generation == 0
@@ -4444,7 +4445,7 @@ def test_sadd_of_bare_eval_conversation_id_does_not_release_scoped_sandbox(
             h.runner.default_script = [Final(text="hi", status=DONE)]
             event = _qevent("eval-case-1", thread="eval:1720000000.000100")
             await h.kernel.process_event(event)
-            scoped = kernel_module._thread_key_for(event)
+            scoped = kernel_routing._thread_key_for(event)
             assert h.substrate.lookup(scoped) is not None
             assert scoped == "slack:C1:eval%3A1720000000.000100"
 
@@ -4481,7 +4482,7 @@ def test_sadd_of_scoped_eval_isolate_key_releases_the_sandbox(
             h.runner.default_script = [Final(text="hi", status=DONE)]
             event = _qevent("eval-case-1", thread="eval:1720000000.000100")
             await h.kernel.process_event(event)
-            scoped = kernel_module._thread_key_for(event)
+            scoped = kernel_routing._thread_key_for(event)
             assert h.substrate.lookup(scoped) is not None
 
             await h.async_redis.sadd(thread_reset_keys.requests, scoped)
@@ -4740,7 +4741,7 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_wedged_runner(
             thread_key = _thread_key("tWedgedDrain")
             assert h.substrate.lookup(thread_key) is not None
 
-            monkeypatch.setattr(kernel_module, "_RESET_INTERRUPT_TIMEOUT_S", 0.2)
+            monkeypatch.setattr(kernel_constants, "_RESET_INTERRUPT_TIMEOUT_S", 0.2)
 
             wedged = asyncio.Event()  # never set
 
@@ -4913,7 +4914,7 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_hanging_substrate_rel
             thread_key = _thread_key("tHangRelease")
             assert h.substrate.lookup(thread_key) is not None
 
-            monkeypatch.setattr(kernel_module, "_RESET_RELEASE_TIMEOUT_S", 0.2)
+            monkeypatch.setattr(kernel_constants, "_RESET_RELEASE_TIMEOUT_S", 0.2)
 
             def hanging_release(thread_key: str) -> bool:
                 time.sleep(5.0)  # never returns within the test's window
@@ -5200,7 +5201,7 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(
                         )
                         if not in_requests and not in_flight:
                             violations.append(name)
-                    except Exception as exc:  # never raise inside the spy
+                    except Exception as exc:  # noqa: BLE001 - never raise inside the spy
                         observer_errors.append(f"{name}: {exc!r}")
                 return result
 

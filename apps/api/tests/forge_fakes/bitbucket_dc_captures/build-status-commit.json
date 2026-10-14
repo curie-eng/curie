@@ -1,0 +1,16 @@
+{
+  "size": 1,
+  "limit": 25,
+  "isLastPage": true,
+  "values": [
+    {
+      "state": "FAILED",
+      "key": "unit-tests",
+      "name": "Unit tests",
+      "url": "https://ci.example.invalid/builds/1",
+      "description": "1 test failed",
+      "dateAdded": 1760000004000
+    }
+  ],
+  "start": 0
+}

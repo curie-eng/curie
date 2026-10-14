@@ -15,6 +15,8 @@ import uuid
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
+from curie_api.schemas.deployments import WebhookResult
+
 from ..config import get_settings
 from ..deps import EvalQueueDep, SessionDep, StoreDep
 from ..gitflow import log_push_outcome, process_push, verify_signature
@@ -39,7 +41,6 @@ from ..github_review_events import (
 )
 from ..github_review_store import admit_feedback, hold_feedback
 from ..models import GitHubReviewFeedback
-from ..schemas import WebhookResult
 from ..wirebody import read_bounded_body
 
 logger = logging.getLogger(__name__)
@@ -82,7 +83,7 @@ async def github_webhook(
         "pull_request_review_comment",
         "pull_request_review",
     }
-    factory_enabled = settings.github_factory_ingress_enabled
+    factory_enabled = settings.factory_enabled
     # Disabled factory intake must keep ignoring issue events before JSON parsing.
     # test_unrelated_event_remains_ignored_without_parsing posts a non-JSON body.
     if x_github_event == "issues" and not factory_enabled:
@@ -114,7 +115,7 @@ async def github_webhook(
         # it disabled, actionable PR feedback reaches the factory's unbound guard.
         review_enabled = settings.github_review_ingress_enabled
         if factory_enabled and (
-            await factory_owns(session, x_github_event, payload)
+            await factory_owns(session, settings, x_github_event, payload)
             or (
                 not review_enabled
                 and is_actionable_feedback(
@@ -193,7 +194,7 @@ async def github_webhook(
                     traceparent=request.headers.get("traceparent"),
                     settings=settings,
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 # Without Valkey the hold cannot be durable; degrade to the
                 # pre-#2962 refusal rather than acknowledge a lost review.
                 logger.warning("GitHub review hold unavailable; refusing held feedback")
@@ -279,6 +280,15 @@ async def github_webhook(
     # deploys that commit instead.
     result = await process_push(session, store, settings, eval_queue, payload)
     log_push_outcome(result, payload, source="github webhook")
+    notice_error: Exception | None = None
+    try:
+        await request.app.state.deploy_notice_queue.publish(session, result, payload, settings)
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
+        # A Valkey failure is retained in the SQL outbox and returns normally.
+        # A persistence failure still settles the known push outcome before
+        # returning the notice error, so a rejected delivery stays retryable.
+        logger.exception("could not persist git-flow deploy notice")
+        notice_error = exc
     # Return the request session's connection to the pool before settling.
     # `process_push` can leave a transaction open (the refresh after a
     # deployment commits, or the reads of an ignored or rejected push), and the
@@ -301,4 +311,12 @@ async def github_webhook(
     await settle_push_delivery(
         sessionmaker, delivery_id=delivery_id, status=disposition, reason=reason
     )
+    if notice_error is not None:
+        raise HTTPException(
+            503,
+            {
+                "code": "git.notice_outbox_unavailable",
+                "result": result.model_dump(mode="json"),
+            },
+        ) from notice_error
     return result

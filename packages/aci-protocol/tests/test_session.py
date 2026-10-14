@@ -87,6 +87,12 @@ _SESSION_ID = f"agent-{_AGENT_ID}-thread-{_THREAD_KEY}"
 _MEMORY_REF = f"{_API_BASE}/agents/{_AGENT_ID}/state/memory"
 _HISTORY_REF = f"{_API_BASE}/agents/{_AGENT_ID}/state/transcript/{_THREAD_SEGMENT}"
 _CHANNEL_MEMORY_REF = f"http://api:8000/agents/{_AGENT_ID}/state/bindings/slack/C0ABC/memory"
+# ADR 0205's manifest shape: names only, no URLs or ids.
+_ATTACHMENTS_MANIFEST = (
+    '{"v":1,"files":[{"name":"report.pdf","current":true}],'
+    '"unavailable":[{"name":"old.csv","reason":"expired"}],'
+    '"omitted":["big.zip"],"ledger_unavailable":false}'
+)
 
 # binding.budget_for builds a Budget with no task_budget_hint, rendered with
 # Budget.model_dump_json().
@@ -182,6 +188,7 @@ def _full_boot_env() -> BootEnv:
         progress_token="sbx-progress-token",
         issue_read_url="http://api:8000/work-items/issue-read",
         issue_read_token="wir-issue-read-capability",
+        attachments_manifest=_ATTACHMENTS_MANIFEST,
         approval_required_tools=["Bash", "mcp__github__create_pr"],
         approval_grant_tool="Bash",
         approval_grant_arguments={"command": "printf ok"},
@@ -198,6 +205,10 @@ def _full_boot_env() -> BootEnv:
         thinking="disabled",
         deployment_environment="prod",
         channel_bound=True,
+        channel_kind="slack",
+        repo_origin="https://gitlab.example.com",
+        repo_path="platform/team/infra",
+        repo_ca_bundle="/etc/curie/ca/forge.pem",
         model_env_key="MY_PROVIDER_KEY",
         metrics_temporality_preference="delta",
         max_turns=50,
@@ -568,6 +579,10 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         channel_memory_ref=_CHANNEL_MEMORY_REF,
         memory_writes=True,
         channel_bound=True,
+        channel_kind="slack",
+        repo_origin="https://gitlab.example.com",
+        repo_path="platform/team/infra",
+        repo_ca_bundle="/etc/curie/ca/forge.pem",
     )
     worker_owned = set(BootEnv.env_keys(producer="worker"))
     assert set(maximal) <= worker_owned
@@ -585,7 +600,8 @@ def test_the_kernel_owns_exactly_these_resume_overlay_keys() -> None:
     producer map is what pins the overlay's exact extent. ADR-0076/#889 added
     ``CURIE_APPROVAL_DECISION`` alongside the original two, and #3077 added the
     request-bound progress URL/token the resume overlay mints per work item.
-    ADR 0187 added the issue read URL/capability the API mints at boot.
+    ADR 0187 added the issue read URL/capability the API mints at boot, and
+    ADR 0205 added the attachment manifest the kernel builds per turn.
     """
     assert set(BootEnv.env_keys(producer="kernel")) == {
         "CURIE_APPROVAL_GRANT_TOOL",
@@ -596,6 +612,7 @@ def test_the_kernel_owns_exactly_these_resume_overlay_keys() -> None:
         "CURIE_PROGRESS_TOKEN",
         "CURIE_ISSUE_READ_URL",
         "CURIE_ISSUE_READ_TOKEN",
+        "CURIE_ATTACHMENTS_MANIFEST",
     }
 
 
@@ -843,6 +860,7 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_PROGRESS_TOKEN",
         "CURIE_ISSUE_READ_URL",
         "CURIE_ISSUE_READ_TOKEN",
+        "CURIE_ATTACHMENTS_MANIFEST",
         "CURIE_APPROVAL_REQUIRED_TOOLS",
         "CURIE_APPROVAL_GRANT_TOOL",
         "CURIE_APPROVAL_GRANT_ARGUMENTS",
@@ -859,6 +877,10 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_THINKING",
         "CURIE_DEPLOYMENT_ENVIRONMENT",
         "CURIE_CHANNEL_BOUND",
+        "CURIE_CHANNEL_KIND",
+        "CURIE_REPO_ORIGIN",
+        "CURIE_REPO_PATH",
+        "CURIE_REPO_CA_BUNDLE",
         "CURIE_MODEL_ENV_KEY",
         "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
         "CURIE_MAX_TURNS",
@@ -956,6 +978,9 @@ def test_the_substrate_writes_identity_otel_and_the_warm_pool_defaults() -> None
         "CURIE_PLUGIN_DIR",  # agent-sandbox.yaml:416
         "CURIE_SESSION_ID",  # agent-sandbox.yaml:420 ("warm-unbound")
         "CURIE_BUDGET",  # agent-sandbox.yaml:428
+        # Kernel-authoritative with an empty substrate declaration (ADR 0205):
+        # the runner template declares it so the per-claim value can land.
+        "CURIE_ATTACHMENTS_MANIFEST",
     }
 
 
@@ -1222,6 +1247,40 @@ def test_from_env_reads_channel_bound_with_the_fake_model_truthy_set(raw: str) -
 
 def test_channel_bound_is_not_a_session_config_field() -> None:
     assert "channel_bound" not in SessionConfig.model_fields
+
+
+# --- ADR 0205: the attachment manifest. ---------------------------------------
+
+
+def test_attachments_manifest_is_kernel_written_with_a_substrate_declaration() -> None:
+    assert BootEnv.env_key("attachments_manifest") == "CURIE_ATTACHMENTS_MANIFEST"
+    assert _producers_of("CURIE_ATTACHMENTS_MANIFEST") == {"kernel", "substrate"}
+
+
+def test_attachments_manifest_is_not_a_session_config_field() -> None:
+    assert "attachments_manifest" not in SessionConfig.model_fields
+    assert "CURIE_ATTACHMENTS_MANIFEST" not in BootEnv(session=_boot_session()).session.to_env()
+
+
+def test_render_worker_never_emits_the_attachments_manifest() -> None:
+    assert "CURIE_ATTACHMENTS_MANIFEST" not in _worker_env()
+
+
+def test_attachments_manifest_round_trips_verbatim() -> None:
+    boot = BootEnv(session=_boot_session(), attachments_manifest=_ATTACHMENTS_MANIFEST)
+    env = boot.to_env()
+    assert env["CURIE_ATTACHMENTS_MANIFEST"] == _ATTACHMENTS_MANIFEST
+    assert BootEnv.from_env(env).attachments_manifest == _ATTACHMENTS_MANIFEST
+
+
+def test_from_env_reads_an_absent_or_blank_attachments_manifest_as_unset() -> None:
+    """The substrate declares the key empty; empty means no manifest was sent."""
+    env = _worker_env() | _SUBSTRATE_ENV
+    assert "CURIE_ATTACHMENTS_MANIFEST" not in env
+    assert BootEnv.from_env(env).attachments_manifest is None
+    for blank in ("", " "):
+        parsed = BootEnv.from_env(env | {"CURIE_ATTACHMENTS_MANIFEST": blank})
+        assert parsed.attachments_manifest is None
 
 
 @pytest.mark.parametrize("reviewer_model", [None, "claude-opus-5-5", "acme-reviewer-model"])

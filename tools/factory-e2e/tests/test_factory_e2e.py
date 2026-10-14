@@ -282,6 +282,14 @@ def test_namespace_is_owned_and_rfc1123() -> None:
     assert fe.validate_namespace("test-factory-x1") == "test-factory-x1"
 
 
+def _github_entry(values: dict[str, Any], section: str) -> dict[str, Any]:
+    """The one ``factory.<section>`` entry named ``github``."""
+
+    entries = [entry for entry in values["factory"][section] if entry["name"] == "github"]
+    assert len(entries) == 1, values["factory"][section]
+    return entries[0]
+
+
 def test_install_values_pin_every_image_and_enable_factory_ingress(tmp_path: Path) -> None:
     config = fe.load_config(_env(_app_dir(tmp_path)), context=None, gh_token=_no_gh)
     values = fe.install_values(
@@ -295,10 +303,26 @@ def test_install_values_pin_every_image_and_enable_factory_ingress(tmp_path: Pat
         assert values[component]["image"]["tag"] == tag
     assert values["agentSandbox"]["runner"]["tag"] == tag
     assert values["agentSandbox"]["controller"]["deploy"] is False
+    factory = values["factory"]
+    assert factory["enabled"] is True
+    assert factory["intake"] == "poll"
+    credential = {
+        "type": "github_app",
+        "appId": "42",
+        "existingSecret": "factory-app",
+        "existingSecretKey": "privateKey",
+    }
+    code_host = _github_entry(values, "codeHosts")
+    assert code_host["kind"] == "github"
+    assert code_host["host"] == "github.com"
+    assert code_host["credential"] == credential
+    tracker = _github_entry(values, "trackers")
+    assert tracker["kind"] == "github"
+    assert tracker["host"] == "github.com"
+    assert tracker["credential"] == credential
+    assert tracker["label"] == "curie-factory"
+    assert tracker["mention"] == "example-factory"
     api = values["api"]
-    assert api["githubFactoryIngressEnabled"] is True
-    assert api["githubFactoryLabel"] == "curie-factory"
-    assert api["githubFactoryMention"] == "example-factory"
     assert api["githubAppId"] == "42"
     assert api["githubAppExistingSecret"] == "factory-app"
     assert api["githubRepoAllowlist"] == ["acme/fixture"]
@@ -317,12 +341,12 @@ def test_install_values_point_the_status_card_at_the_public_webhook_base(
         consumer_controller=True,
         card_base_url=base,
     )
-    assert values["api"]["githubFactoryCardBaseUrl"] == base
+    assert values["factory"]["cardBaseUrl"] == base
     # Before the tunnel exists there is no public base, so the value stays unset.
     unset = fe.install_values(
         config, candidate="c" * 40, app_key_secret="factory-app", consumer_controller=True
     )
-    assert "githubFactoryCardBaseUrl" not in unset["api"]
+    assert "cardBaseUrl" not in unset["factory"]
 
 
 def test_namespace_undo_is_registered_before_the_create_call(
@@ -599,8 +623,8 @@ def test_install_values_with_a_model_key_run_the_real_model(tmp_path: Path) -> N
     for component in ("api", "worker", "dispatcher", "mailAdapter", "ui"):
         assert values[component]["image"]["tag"] == tag
     assert values["agentSandbox"]["runner"]["tag"] == tag
+    assert values["factory"]["enabled"] is True
     api = values["api"]
-    assert api["githubFactoryIngressEnabled"] is True
     assert api["githubAppId"] == "42"
     assert api["githubAppExistingSecret"] == "factory-app"
     assert api["githubRepoAllowlist"] == ["acme/fixture"]
@@ -3101,6 +3125,23 @@ def test_locked_layer_needs_no_registry(tmp_path: Path) -> None:
     assert config.layer_registry is None
 
 
+def test_a_kind_candidate_build_refuses_a_locked_layer_without_a_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "bundle"
+    shutil.copytree(fe.DEFAULT_BUNDLE, bundle)
+    (bundle / "connectors.lock.yaml").write_text("version: 1\n")
+    env = _env(_app_dir(tmp_path))
+    del env["CURIE_FACTORY_LAYER_REGISTRY"]
+    env["CURIE_FACTORY_BUNDLE_DIR"] = str(bundle)
+    preflight = _preflight(tmp_path, env)
+    preflight.kind_cluster = "candidate"
+    monkeypatch.setenv("BUILDX_BUILDER", "candidate-builder")
+    monkeypatch.setattr(fe.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    with pytest.raises(fe.ConfigError, match="CURIE_FACTORY_LAYER_REGISTRY"):
+        preflight.check_build_tools()
+
+
 def test_layer_is_built_into_a_private_copy_on_the_candidate_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3140,3 +3181,46 @@ def test_failed_layer_build_fails_the_preflight(
     )
     with pytest.raises(fe.PreflightFailed, match="push denied"):
         preflight.build_runner_layer(fe.DEFAULT_BUNDLE)
+
+
+# #4397 AC 6: egress has one source. The sandbox reaches GitHub through
+# factory.sandboxEgress.<agent> (the chart's built-in GitHub set on the github
+# code host and tracker); only model egress stays in allowedEgress.
+def test_install_values_enroll_the_factory_agent_for_forge_egress(tmp_path: Path) -> None:
+    values = _values(_config(tmp_path))
+    assert values["factory"]["sandboxEgress"] == {fe.FACTORY_AGENT: True}
+    for section in ("codeHosts", "trackers"):
+        (entry,) = values["factory"][section]
+        assert entry["kind"] == "github"
+        assert "egress" not in entry, f"a github {section} entry uses the built-in set"
+    assert "connectorEgress" not in values["agentSandbox"]
+
+
+def test_egress_cidrs_reads_no_github_meta(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_http(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(f"egress_cidrs must not call the GitHub API: {args}")
+
+    monkeypatch.setattr(fe, "http_json", no_http)
+    preflight = _preflight(tmp_path)
+    assert preflight.egress_cidrs() == []
+
+
+def test_egress_cidrs_keeps_only_model_egress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_http(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(f"egress_cidrs must not call the GitHub API: {args}")
+
+    def resolve(host: str, port: int, *args: Any) -> list[Any]:
+        assert (host, port) == (fe.OPENROUTER_HOST, 443)
+        return [
+            (None, None, None, "", ("104.18.2.9", 443)),
+            (None, None, None, "", ("104.18.3.9", 443)),
+        ]
+
+    monkeypatch.setattr(fe, "http_json", no_http)
+    monkeypatch.setattr(fe.socket, "getaddrinfo", resolve)
+    env = _env(_app_dir(tmp_path))
+    env["CURIE_FACTORY_MODEL_API_KEY"] = "model-key-value"
+    preflight = _preflight(tmp_path, env)
+    assert preflight.egress_cidrs() == ["104.18.2.9/32", "104.18.3.9/32"]

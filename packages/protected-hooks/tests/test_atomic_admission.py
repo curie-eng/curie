@@ -110,7 +110,7 @@ def proxied(broker, atomic, proxy):
     """Same trusted tuple as facade over the wrapped client, @spec PROTECTED-HOOK-ADMISSION-1."""
     return atomic.AtomicAdmission(
         proxy,
-        broker_identity=broker.manifest().as_dict()["broker_identity"],
+        trusted_manifest=broker.manifest(),
         trusted_max_readiness_ms=60000,
         backlog_limit=1,
     )
@@ -436,15 +436,26 @@ def test_every_nested_authority_identity_component_compared(admission_broker, ki
     "raw", [b"{}", b"\xff", b"null", b'{"schema_version":1,"schema_version":1}', b"x" * 16385]
 )
 def test_malformed_authority_is_safe_unavailable_no_effect(admission_broker, kind, raw):
-    """@spec PROTECTED-HOOK-ADMISSION-1/2/4 PROTECTED-HOOK-SOURCE-6."""
+    """A malformed source or oversize record is unavailable; a malformed control record
+    within bounds counts as absent at its own step and refuses with its mapped reason.
+    @spec PROTECTED-HOOK-ADMISSION-1/2/4 PROTECTED-HOOK-SOURCE-6/9."""
     b = admission_broker
     r, f, values = setup_product(b)
     key = SOURCE if kind == "source" else next(k for k in values if ":" + kind + ":" in k)
     b.command("SET", key, raw)
     before = snapshot(b)
-    with pytest.raises(r.AdmissionUnavailable) as caught:
-        f.admit(request(r))
-    safe_error(caught.value, b)
+    if kind == "source" or len(raw) > 16384:
+        with pytest.raises(r.AdmissionUnavailable) as caught:
+            f.admit(request(r))
+        safe_error(caught.value, b)
+    else:
+        reason = {
+            "selection": "runtime_unavailable",
+            "manifest": "runtime_unavailable",
+            "qualification": "qualification_unavailable",
+            "readiness": "evidence_unavailable",
+        }[kind]
+        assert f.admit(request(r)).as_dict() == dict(status="refused", reason=reason, receipt=None)
     assert snapshot(b) == before
 
 

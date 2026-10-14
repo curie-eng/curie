@@ -170,7 +170,7 @@ def can_serve(
         try:
             record = script.get_revision(revision)
             down = record.down_revision
-        except Exception:
+        except Exception:  # noqa: BLE001 - unreadable revisions cannot prove compatibility
             break
         links = tuple(str(parent) for parent in down) if isinstance(down, (tuple, list)) else (
             (str(down),) if down is not None else ()
@@ -293,8 +293,10 @@ def _pending_from_script(
         return ()
     lower = current or "base"
     try:
-        revisions = list(script.iterate_revisions(target_head, lower))
-    except Exception:
+        # Match Alembic's upgrade traversal: include missing sibling ancestors
+        # at a merge even when they are not descendants of the live branch.
+        revisions = list(script.iterate_revisions(target_head, lower, implicit_base=True))
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         if current is None:
             return (target_head,)
         return (target_head,)
@@ -360,7 +362,7 @@ async def wait_for_postgres() -> int:
             connection = await asyncpg.connect(database_url, **connect_kwargs)
             await connection.close()
             return 0
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - readiness reports only the error class
             probe_error_class = type(error).__name__
         if attempt == 1:
             print(
@@ -456,7 +458,7 @@ async def _renew_upgrade_pause(
         retry_delay: float = PAUSE_RENEW_INTERVAL_S
         try:
             result = await renew_pause(redis, keys, revision, int(PAUSE_LEASE_S * 1000))
-        except Exception:
+        except Exception:  # noqa: BLE001 - renewal failures retry within the lease
             # Retry inside the confirmation window, rather than at its deadline.
             # The transport does not perform hidden retries of its own.
             retry_delay = PAUSE_RENEW_INTERVAL_S / 5
@@ -519,7 +521,7 @@ async def upgrade_with_pause(*, forward_only: bool) -> int:
             socket_timeout=2,
             retry=Retry(NoBackoff(), 0),
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 - configuration refusal is deliberately redacted
         print("Upgrade pause configuration invalid", file=sys.stderr, flush=True)
         return 1
 
@@ -572,7 +574,7 @@ async def upgrade_with_pause(*, forward_only: bool) -> int:
         try:
             async with asyncio.timeout(2):
                 await redis.aclose()
-        except Exception:
+        except Exception:  # noqa: BLE001 - bounded best effort cleanup
             print("Upgrade pause cleanup unavailable", file=sys.stderr, flush=True)
 
 
@@ -586,12 +588,12 @@ async def assert_servable() -> None:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
     try:
         engine = create_async_engine(get_settings().database_url)
-    except Exception:
+    except Exception:  # noqa: BLE001 - driver setup errors may contain database credentials
         raise SchemaServingUnavailable("schema_probe_unavailable") from None
     primary: BaseException | None = None
     try:
         await shared_assert_servable(engine, metadata_schema=SCHEMA)
-    except BaseException as error:
+    except BaseException as error:  # noqa: BLE001 - preserve cancellation through disposal
         primary = error
     cleanup = asyncio.create_task(_dispose_startup_engine(engine))
     while not cleanup.done():
@@ -600,11 +602,11 @@ async def assert_servable() -> None:
         except asyncio.CancelledError as error:
             if primary is None:
                 primary = error
-        except Exception:
+        except Exception:  # noqa: BLE001 - inspect completed cleanup errors below
             break
     try:
         cleanup.result()
-    except (Exception, asyncio.CancelledError):
+    except (Exception, asyncio.CancelledError):  # noqa: BLE001 - redact cleanup driver details
         if primary is None:
             raise SchemaServingUnavailable("schema_cleanup_unavailable") from None
         logger.warning("schema_cleanup_unavailable")
@@ -619,7 +621,7 @@ def wait_for_schema(*, attempts: int = 60, interval_s: float = 2.0) -> int:
     for attempt in range(1, attempts + 1):
         try:
             last = asyncio.run(current_revision_async())
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - existing broad catch retained
             last = None
             probe = type(exc).__name__
             if attempt == 1:

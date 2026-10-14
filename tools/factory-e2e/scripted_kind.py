@@ -12,6 +12,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import signal
 import socket
@@ -25,6 +26,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 import factory_e2e as fe
@@ -104,12 +106,15 @@ def scripted_values(
         consumer_controller=False,
         local_images=True,
     )
-    values["api"].update(
-        githubApiUrl=github_api,
-        githubCloneBase=clone_base,
-        githubStubCaConfigMap=ca_configmap,
-        githubFactoryPollIntervalSeconds=5,
-    )
+    values["api"].update(githubApiUrl=github_api, githubCloneBase=clone_base)
+    # The factory reads the stub through its own code host and tracker entries.
+    for entry in (*values["factory"]["codeHosts"], *values["factory"]["trackers"]):
+        entry["apiUrl"] = github_api
+        entry["host"] = urlsplit(github_api).netloc
+    values["factory"]["trackers"][0]["pollIntervalSeconds"] = 5
+    values["codeHostTrust"] = {
+        "caBundle": {"configMapRef": {"name": ca_configmap, "key": "ca.pem"}}
+    }
     values["dispatcher"]["deploy"] = False
     values["mailAdapter"]["deploy"] = False
     # Match the documented minimal backing posture in upgrade-drill: factory
@@ -333,7 +338,7 @@ class ScriptedRun:
             if not math.isfinite(remaining) or remaining < 0:
                 raise ValueError("invalid remaining limit")
             return remaining
-        except Exception:
+        except (OSError, ValueError, KeyError, TypeError):
             raise fe.ConfigError("provider credit could not be verified") from None
 
     def prepare_recording(self) -> None:
@@ -687,6 +692,7 @@ class ScriptedRun:
                 f"deployment/{deployment}",
                 "--timeout=300s",
             )
+        self.provision_publication_trust()
         # kind enforces NetworkPolicy, and the chart lets publication Jobs
         # reach only TCP 443 on GitHub's ranges. The stub listens on an
         # ephemeral port on the kind gateway, so a Job that pushes after
@@ -717,6 +723,32 @@ class ScriptedRun:
         self.stub._label_event(3815, "factory", "labeled", github.HUMAN)
         self.wait_for_final()
         self.observe()
+
+    def publication_namespace(self) -> str:
+        namespace = self.kubectl(
+            "-n",
+            self.namespace,
+            "get",
+            "deployment/curie-worker",
+            "-o",
+            'jsonpath={.spec.template.spec.containers[?(@.name=="worker")].env[?(@.name=="CURIE_PUBLICATION_NAMESPACE")].value}',
+            timeout=10,
+        ).strip()
+        if not namespace:
+            raise ScriptedScenarioError("worker publication namespace is absent")
+        return namespace
+
+    def provision_publication_trust(self) -> None:
+        # ConfigMap volume references resolve in the Pod's namespace. Helm
+        # creates the publication namespace separately from the platform.
+        self.kubectl(
+            "-n",
+            self.publication_namespace(),
+            "create",
+            "configmap",
+            "github-stub-ca",
+            f"--from-file=ca.pem={self.stub.ca_file}",
+        )
 
     def start_registry(self) -> tuple[int, str]:
         """Publish the run registry on the engine loopback and name it localhost."""
@@ -893,13 +925,15 @@ class ScriptedRun:
             if request_ids:
                 request_id = next(iter(request_ids))
                 self.evidence["execution_request_id"] = request_id
-                if not advanced and time.monotonic() >= next_publication_probe:
+                if time.monotonic() >= next_publication_probe:
                     exists = self.sql(
                         "SELECT to_json(EXISTS(SELECT 1 FROM curie.publications "
                         f"WHERE execution_request_id='{request_id}'::uuid))"
                     )
                     next_publication_probe = time.monotonic() + 10
                     if exists:
+                        self.capture_publication_runtime()
+                    if exists and not advanced:
                         self.stub.advance(1800)
                         advanced = True
             final = [row for row in comments if fe._NOTICE_FINAL in row["body"]]
@@ -912,6 +946,94 @@ class ScriptedRun:
                 self.assert_record_budget(self.provider_remaining())
             time.sleep(2)
         raise ScriptedScenarioError("final issue comment timed out after 2400 seconds")
+
+    def capture_publication_runtime(self) -> None:
+        """Preserve bounded status/log evidence while publication pods still exist."""
+
+        def safe(value: str) -> str:
+            redacted = fe.record_agent_text(value, self.secrets)[0] or ""
+            return re.sub(r"https?://[^\s\"<>]+", "https://example.com", redacted)
+
+        try:
+            publication_namespace = self.publication_namespace()
+            resources = json.loads(
+                self.kubectl(
+                    "-n",
+                    publication_namespace,
+                    "get",
+                    "jobs,pods",
+                    "-l",
+                    "curietech.ai/component=publication",
+                    "-o",
+                    "json",
+                    timeout=10,
+                )
+            )
+            self.evidence["publication_runtime_resource_count"] = len(resources.get("items", []))
+            snapshots = []
+            for item in resources.get("items", [])[:8]:
+                status = item.get("status", {})
+                snapshot: dict[str, Any] = {
+                    "kind": item["kind"],
+                    "phase": status.get("phase"),
+                    "active": status.get("active"),
+                    "failed": status.get("failed"),
+                    "succeeded": status.get("succeeded"),
+                    "conditions": [
+                        {
+                            key: safe(str(condition[key]))
+                            for key in ("type", "status", "reason", "message")
+                            if key in condition
+                        }
+                        for condition in status.get("conditions", [])[:8]
+                    ],
+                }
+                if item["kind"] == "Pod":
+                    snapshot["containers"] = [
+                        {
+                            "restart_count": container.get("restartCount"),
+                            "state": {
+                                state: {
+                                    key: safe(str(value))
+                                    for key, value in detail.items()
+                                    if key in ("reason", "message", "exitCode", "signal")
+                                }
+                                for state, detail in container.get("state", {}).items()
+                            },
+                        }
+                        for container in (
+                            status.get("initContainerStatuses", [])
+                            + status.get("containerStatuses", [])
+                        )[:8]
+                    ]
+                    try:
+                        snapshot["logs"] = safe(
+                            self.kubectl(
+                                "-n",
+                                publication_namespace,
+                                "logs",
+                                item["metadata"]["name"],
+                                "--all-containers=true",
+                                "--tail=40",
+                                "--limit-bytes=4096",
+                                "--pod-running-timeout=2s",
+                                timeout=5,
+                            )
+                        )
+                    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                        snapshot["logs_error"] = type(exc).__name__
+                snapshots.append(snapshot)
+            # An empty list after worker cleanup must not erase the last observation.
+            if snapshots:
+                if not any(item["kind"] == "Pod" for item in snapshots):
+                    snapshots.extend(
+                        item
+                        for item in self.evidence.get("publication_runtime", [])
+                        if item["kind"] == "Pod"
+                    )
+                self.evidence["publication_runtime"] = snapshots
+        except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            self.evidence["publication_runtime_error"] = type(exc).__name__
 
     def sql(self, query: str) -> Any:
         output = self.kubectl(
@@ -950,9 +1072,29 @@ class ScriptedRun:
             f"WHERE r.execution_request_id='{request_id}'::uuid "
             "AND r.phase='verification_preflight'), 'publications', "
             "(SELECT json_agg(json_build_object('changed_paths', changed_paths, "
-            "'execution_request_id', execution_request_id)) FROM curie.publications "
+            "'execution_request_id', execution_request_id, 'status', status, "
+            "'error', error, 'result_delivery_error', result_delivery_error, "
+            "'resource_cleanup_error', resource_cleanup_error)) FROM curie.publications "
             f"WHERE execution_request_id='{request_id}'::uuid))"
         )
+        # Keep only durable outcome metadata, never patch bytes, credentials,
+        # repository transport URLs or raw runner logs. Capture before verdicts
+        # so a failed publication survives the owned cluster teardown.
+        self.evidence["publication_outcomes"] = [
+            {
+                key: re.sub(r"https?://[^\s\"<>]+", "https://example.com", value)
+                if isinstance(value, str)
+                else value
+                for key, value in {
+                    "status": row["status"],
+                    **{
+                        key: fe.record_agent_text(row.get(key), self.secrets)[0]
+                        for key in ("error", "result_delivery_error", "resource_cleanup_error")
+                    },
+                }.items()
+            }
+            for row in observed["publications"] or []
+        ]
         preflights = observed["preflights"] or []
         publications = observed["publications"] or []
         if len(preflights) != 1 or len(publications) != 1:
@@ -981,6 +1123,104 @@ class ScriptedRun:
         if self.evidence["elapsed_seconds"] > BOUND_SECONDS:
             raise ScriptedScenarioError("factory scenario exceeded 2400 seconds")
 
+    def capture_failure_diagnostics(self) -> None:
+        """Write bounded pod diagnostics only to stderr, before owned teardown."""
+
+        previous_deadline = self.deadline
+        diagnostic_deadline = time.monotonic() + 30
+        self.deadline = diagnostic_deadline
+
+        def emit(operation: str, value: str) -> None:
+            sanitized = re.sub(
+                r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----.*?(?:-----END \1-----|\Z)",
+                "[REDACTED PRIVATE KEY]",
+                f"factory-e2e pod diagnostics: {operation}\n{value}",
+                flags=re.DOTALL,
+            )
+            sanitized = re.sub(
+                r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"<>]+", "https://example.com", sanitized
+            )
+            recorded, _ = fe.record_agent_text(sanitized, self.secrets)
+            print(
+                (recorded or "").encode("utf-8")[:4096].decode("utf-8", errors="ignore"),
+                file=sys.stderr,
+                flush=True,
+            )
+
+        def capture(namespace: str, operation: str, *argv: str) -> str:
+            remaining = diagnostic_deadline - time.monotonic()
+            if remaining <= 0:
+                return ""
+            try:
+                output = self.kubectl("-n", namespace, *argv, timeout=min(5, remaining))
+                value = output
+                if argv[0] == "describe":
+                    # Keep state and events only. Environment, command arguments,
+                    # annotations and other arbitrary pod inputs can hold secrets.
+                    lines = []
+                    state = False
+                    events = False
+                    for line in value.splitlines():
+                        if not line.startswith("      "):
+                            state = line.startswith(("    State:", "    Last State:"))
+                        events = events or line.startswith("Events:")
+                        if (
+                            state
+                            or events
+                            or line.startswith(("Status:", "    Ready:", "    Restart Count:"))
+                        ):
+                            lines.append(line)
+                    value = "\n".join(lines)
+                emit(f"{namespace} {operation}", value)
+                return output
+            except Exception as exc:  # noqa: BLE001 - diagnostics must never block teardown
+                emit(f"{namespace} {operation}", f"unavailable ({type(exc).__name__})")
+                return ""
+
+        try:
+            namespaces = [self.namespace]
+            try:
+                publication_namespace = self.publication_namespace()
+                if publication_namespace != self.namespace:
+                    namespaces.insert(0, publication_namespace)
+            except Exception as exc:  # noqa: BLE001 - the release can have failed before install
+                emit("publication namespace", f"unavailable ({type(exc).__name__})")
+            # List both namespaces before collecting details, with publication
+            # pods first because the worker can remove them after a failed clone.
+            snapshots = [
+                (
+                    namespace,
+                    capture(
+                        namespace,
+                        "get pods",
+                        "get",
+                        "pods",
+                        "-o",
+                        "jsonpath={range .items[:4]}{.metadata.name}"
+                        '{"\\t"}{.status.phase}{"\\n"}{end}',
+                    ),
+                )
+                for namespace in namespaces
+            ]
+            for namespace, pods in snapshots:
+                for row in pods.splitlines()[:4]:
+                    pod = row.split("\t", 1)[0]
+                    capture(namespace, f"describe pod/{pod}", "describe", "pod", pod)
+                    for previous in (True, False):
+                        capture(
+                            namespace,
+                            f"logs pod/{pod}" + (" --previous" if previous else ""),
+                            "logs",
+                            pod,
+                            "--all-containers=true",
+                            "--tail=40",
+                            "--limit-bytes=4096",
+                            "--pod-running-timeout=2s",
+                            *(("--previous",) if previous else ()),
+                        )
+        finally:
+            self.deadline = previous_deadline
+
     def cleanup(self) -> list[str]:
         """Attempt every owned teardown and verify deletion even after failures."""
 
@@ -998,7 +1238,15 @@ class ScriptedRun:
                     self.forward.wait(timeout=10)
                 if self.forward.stdout is not None:
                     self.forward.stdout.close()
-            except Exception as exc:
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+                TypeError,
+                subprocess.SubprocessError,
+                sqlite3.Error,
+            ) as exc:
                 errors.append(str(exc))
         for service, field in (
             (self.model, "unexpected_model_requests"),
@@ -1008,7 +1256,15 @@ class ScriptedRun:
                 continue
             try:
                 service.close()
-            except Exception as exc:
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+                TypeError,
+                subprocess.SubprocessError,
+                sqlite3.Error,
+            ) as exc:
                 # close() re-raises the request audit after shutting down. Those
                 # requests are already the recorded scenario failure; the probe
                 # below still proves the endpoint stopped.
@@ -1025,7 +1281,15 @@ class ScriptedRun:
                     sock.settimeout(1)
                     if sock.connect_ex((host, port)) == 0:
                         errors.append(f"owned endpoint still listens on port {port}")
-            except Exception as exc:
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+                TypeError,
+                subprocess.SubprocessError,
+                sqlite3.Error,
+            ) as exc:
                 errors.append(str(exc))
         if self.cluster_attempted:
             try:
@@ -1037,12 +1301,28 @@ class ScriptedRun:
                 )
                 if nodes.strip():
                     errors.append("owned kind node container remains after teardown")
-            except Exception as exc:
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+                TypeError,
+                subprocess.SubprocessError,
+                sqlite3.Error,
+            ) as exc:
                 errors.append(str(exc))
         if self.registry_attempted:
             try:
                 self.command("docker", "rm", "-f", self.registry, timeout=60)
-            except Exception as exc:
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+                TypeError,
+                subprocess.SubprocessError,
+                sqlite3.Error,
+            ) as exc:
                 # A failed docker run can have created no registry at all.
                 try:
                     remaining = self.command(
@@ -1050,14 +1330,30 @@ class ScriptedRun:
                     )
                     if remaining.strip():
                         errors.append(str(exc))
-                except Exception as probe_exc:
+                except (
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    KeyError,
+                    TypeError,
+                    subprocess.SubprocessError,
+                    sqlite3.Error,
+                ) as probe_exc:
                     errors.extend((str(exc), str(probe_exc)))
             try:
                 if self.command(
                     "docker", "ps", "-aq", "--filter", f"name=^/{self.registry}$"
                 ).strip():
                     errors.append("owned registry remains after teardown")
-            except Exception as exc:
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+                TypeError,
+                subprocess.SubprocessError,
+                sqlite3.Error,
+            ) as exc:
                 errors.append(str(exc))
         if self.registry_ref is not None:
             # The pushed runner base and curie build's layer leave local tags
@@ -1073,7 +1369,15 @@ class ScriptedRun:
                 ).split()
                 if tags:
                     self.command("docker", "image", "rm", *tags)
-            except Exception as exc:
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+                TypeError,
+                subprocess.SubprocessError,
+                sqlite3.Error,
+            ) as exc:
                 errors.append(str(exc))
         # A killed key-generation docker client can leave its --rm container
         # running. Select only this execution's remaining labelled resources.
@@ -1088,7 +1392,15 @@ class ScriptedRun:
                     "docker", "ps", "-aq", "--filter", f"label=curie.factory-scripted={self.run_id}"
                 ).strip():
                     errors.append("owned labelled containers remain after teardown")
-            except Exception as exc:
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+                TypeError,
+                subprocess.SubprocessError,
+                sqlite3.Error,
+            ) as exc:
                 errors.append(str(exc))
         if self.record_ledger is not None:
             try:
@@ -1104,7 +1416,15 @@ class ScriptedRun:
                 self.evidence["recording_total_usd"] = cost
                 if cost > RECORD_BUDGET_USD:
                     errors.append("recording exceeded its total 20 USD provider budget")
-            except Exception as exc:
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+                TypeError,
+                subprocess.SubprocessError,
+                sqlite3.Error,
+            ) as exc:
                 errors.append(str(exc))
         if self.workdir is not None:
             try:
@@ -1128,8 +1448,11 @@ def main(args: argparse.Namespace) -> int:
     run.evidence.update(curie_bin=curie_bin, curie_version=curie_version)
     result = fe.EXIT_FAILED
     previous_handlers: dict[int, Any] = {}
+    was_interrupted = False
 
     def interrupted(signum: int, _frame: Any) -> None:
+        nonlocal was_interrupted
+        was_interrupted = True
         raise ScriptedScenarioError(f"scripted scenario interrupted by signal {signum}")
 
     try:
@@ -1140,16 +1463,37 @@ def main(args: argparse.Namespace) -> int:
     except fe.ConfigError as exc:
         result = fe.EXIT_CONFIG
         run.evidence["error"] = str(exc)
-    except Exception as exc:
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        KeyError,
+        TypeError,
+        subprocess.SubprocessError,
+        sqlite3.Error,
+    ) as exc:
         detail, _ = fe.redact_agent_text(str(exc), run.secrets)
         run.evidence["error"] = detail
     finally:
         for restored_signum, handler in previous_handlers.items():
             signal.signal(restored_signum, handler)
+        if result != 0 and run.cluster_attempted and not was_interrupted:
+            try:
+                run.capture_failure_diagnostics()
+            except BaseException:  # noqa: BLE001 - diagnostics cannot prevent cleanup
+                pass
         try:
             if run.cleanup():
                 result = fe.EXIT_FAILED
-        except Exception as exc:
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            KeyError,
+            TypeError,
+            subprocess.SubprocessError,
+            sqlite3.Error,
+        ) as exc:
             run.evidence["cleanup_errors"] = [str(exc)]
             run.evidence["cleanup_verified"] = False
             result = fe.EXIT_FAILED

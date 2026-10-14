@@ -1,0 +1,30 @@
+[
+  {
+    "author": {
+      "avatar_url": "https://gitlab.example/uploads/-/system/user/avatar/placeholder/avatar.png",
+      "id": 2,
+      "locked": false,
+      "name": "Developer",
+      "public_email": null,
+      "state": "active",
+      "username": "developer",
+      "web_url": "https://gitlab.example/developer"
+    },
+    "body": "@factory-bot please look",
+    "commands_changes": {},
+    "confidential": false,
+    "created_at": "2026-10-13T11:49:30.115Z",
+    "id": 41,
+    "imported": false,
+    "imported_from": "none",
+    "internal": false,
+    "noteable_id": 18,
+    "noteable_iid": 18,
+    "noteable_type": "Issue",
+    "project_id": 1,
+    "resolvable": false,
+    "system": false,
+    "type": null,
+    "updated_at": "2026-10-13T11:49:30.115Z"
+  }
+]

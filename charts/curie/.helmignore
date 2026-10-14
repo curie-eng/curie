@@ -12,3 +12,9 @@
 # release Secret is what blew the 1MiB Kubernetes Secret cap on
 # `curie cluster up` once the BYO egress assertions grew (#2367).
 ci/
+
+# Operator documentation is published in the repository, not read by installed templates.
+README.md
+
+# Agent notes; no installed release reads them.
+CLAUDE.md
