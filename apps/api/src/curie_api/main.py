@@ -94,6 +94,7 @@ from .routers import (
     runs,
     schedules,
     state,
+    teams,
     thread_attachments,
     turn_progress,
     work_item_issue,
@@ -598,6 +599,7 @@ def create_app() -> FastAPI:
     app.include_router(provider_installations.router)
     app.include_router(channel_identities.router)
     app.include_router(identity.router)
+    app.include_router(teams.router)
     app.include_router(hooks.router)
 
     @app.middleware("http")

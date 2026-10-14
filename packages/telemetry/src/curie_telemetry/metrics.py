@@ -405,6 +405,8 @@ _HTTP_OPERATIONS = [
     # Principal resolution and Slack identity reports (#2910, #3039, ADR 0198).
     "/identity/resolve",
     "/identity/slack-reports",
+    # Team directory sync status (#4584, ADR 0220).
+    "/teams",
     "/publications",
     "/publications/precheck",
     "/publications/{publication_id}",

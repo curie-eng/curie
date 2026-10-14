@@ -2632,6 +2632,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/teams": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Team Sync Status */
+        get: operations["list_team_sync_status_teams_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/factory/cards/{token}.svg": {
         parameters: {
             query?: never;
@@ -8371,6 +8388,46 @@ export interface components {
             last_updated: string;
             /** Namespace */
             namespace: string;
+        };
+        /** TeamSyncOut */
+        TeamSyncOut: {
+            /** Digest */
+            digest: string | null;
+            /** Epoch */
+            epoch: number;
+            /** External Id */
+            external_id: string | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Last Attempt At */
+            last_attempt_at: string | null;
+            /** Last Error */
+            last_error: string | null;
+            /** Last Synced At */
+            last_synced_at: string | null;
+            /** Managed By */
+            managed_by: string | null;
+            /** Member Count */
+            member_count: number;
+            /** Name */
+            name: string;
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "idp_group" | "curie_managed";
+            /** Sync Age Seconds */
+            sync_age_seconds: number | null;
+            /** Synced */
+            synced: boolean;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
         };
         /** TerminationBody */
         TerminationBody: {
@@ -14628,6 +14685,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ScheduleControlOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_team_sync_status_teams_get: {
+        parameters: {
+            query?: {
+                tenant_id?: string | null;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TeamSyncOut"][];
                 };
             };
             /** @description Validation Error */

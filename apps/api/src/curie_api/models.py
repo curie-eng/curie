@@ -2915,6 +2915,13 @@ class Team(Base):
 
     An ``idp_group`` team carries the IdP's group id in ``external_id``; the
     IdP stays the system of record for its membership.
+
+    The sync columns (migration 0120, ADR 0220 sections 5 and 6) say which
+    complete snapshot the team holds and how the last attempt went. Epoch 0
+    means no snapshot was ever applied, so the team admits nobody once
+    enforcement lands; an applied snapshot always carries its digest and time.
+    A failed attempt sets ``last_attempt_at`` and ``last_error`` only, so the
+    last snapshot stays authoritative. This state is reported, never enforced.
     """
 
     __tablename__ = "teams"
@@ -2925,6 +2932,21 @@ class Team(Base):
         CheckConstraint(
             "source <> 'idp_group' OR external_id IS NOT NULL",
             name="teams_idp_group_external_id_ck",
+        ),
+        CheckConstraint("epoch >= 0", name="teams_epoch_ck"),
+        CheckConstraint("member_count >= 0", name="teams_member_count_ck"),
+        CheckConstraint(
+            "(epoch = 0 AND member_count = 0 AND digest IS NULL AND last_synced_at IS NULL)"
+            " OR (epoch > 0 AND digest IS NOT NULL AND last_synced_at IS NOT NULL)",
+            name="teams_sync_state_ck",
+        ),
+        CheckConstraint(
+            "managed_by IS NULL OR (source = 'idp_group' AND length(managed_by) > 0)",
+            name="teams_managed_by_ck",
+        ),
+        CheckConstraint(
+            "last_error IS NULL OR length(last_error) BETWEEN 1 AND 200",
+            name="teams_last_error_ck",
         ),
         UniqueConstraint(
             "tenant_id",
@@ -2941,6 +2963,17 @@ class Team(Base):
     source: Mapped[str] = mapped_column(String)
     external_id: Mapped[str | None] = mapped_column(default=None)
     name: Mapped[str] = mapped_column(String)
+    epoch: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    member_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    digest: Mapped[str | None] = mapped_column(default=None)
+    last_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    last_error: Mapped[str | None] = mapped_column(default=None)
+    managed_by: Mapped[str | None] = mapped_column(default=None)
 
 
 class PrincipalTeam(Base):
