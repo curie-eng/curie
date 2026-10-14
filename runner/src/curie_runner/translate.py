@@ -40,11 +40,17 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
+from claude_agent_sdk.types import ServerToolResultBlock, ServerToolUseBlock
 from curie_telemetry.redact import redact_text
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 from .approval import APPROVAL_TOOL_NAME, guard_reserved_summary
-from .final_answer import FINAL_ANSWER_CLASSIFICATION, FinalAnswerValidation
+from .final_answer import (
+    FINAL_ANSWER_CLASSIFICATION,
+    FinalAnswerValidation,
+    ValidationCall,
+    ValidationResult,
+)
 from .history import ConversationMessage
 from .otel import _GenerationSpan
 from .progress import ProgressActivity
@@ -325,6 +331,45 @@ class TurnState:
     channel_read_call_ids: set[str] = field(default_factory=set)
 
 
+def _observe_final_answer(message: object, validation: FinalAnswerValidation) -> None:
+    """Extract SDK shapes at the existing harness boundary, not in policy code."""
+    if isinstance(message, AssistantMessage):
+        nested = message.parent_tool_use_id is not None
+        validation.observe_calls(
+            [
+                ValidationCall(
+                    id=block.id,
+                    name=block.name,
+                    input=block.input,
+                    hosted=isinstance(block, ServerToolUseBlock),
+                )
+                for block in message.content
+                if isinstance(block, (ToolUseBlock, ServerToolUseBlock))
+            ],
+            nested=nested,
+        )
+        # SDK 0.2.163 places hosted results on assistant messages.
+        validation.observe_results(
+            [
+                ValidationResult(call_id=block.tool_use_id, content=block.content, hosted=True)
+                for block in message.content
+                if isinstance(block, ServerToolResultBlock)
+            ],
+            nested=nested,
+        )
+    elif isinstance(message, UserMessage) and isinstance(message.content, list):
+        validation.observe_results(
+            [
+                ValidationResult(
+                    call_id=block.tool_use_id, content=block.content, is_error=block.is_error
+                )
+                for block in message.content
+                if isinstance(block, ToolResultBlock)
+            ],
+            nested=message.parent_tool_use_id is not None,
+        )
+
+
 def translate_message(
     message: object,
     state: TurnState,
@@ -340,7 +385,7 @@ def translate_message(
     """
 
     if state.final_answer is not None:
-        state.final_answer.observe(message)
+        _observe_final_answer(message, state.final_answer)
     if isinstance(message, AssistantMessage):
         return _translate_assistant(message, state, classifier, gen, activity)
     if isinstance(message, ResultMessage):

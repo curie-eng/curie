@@ -1,6 +1,6 @@
 """Bounded, turn-local publication authorization (ADR 0227).
 
-This observes SDK messages; it neither executes tools nor grants tool permission.
+This observes provider-neutral tool records; it neither executes tools nor grants permission.
 The validator owns semantics. Only exact call/result provenance authorizes text.
 """
 
@@ -9,11 +9,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
-
-from claude_agent_sdk import AssistantMessage, ToolResultBlock, ToolUseBlock, UserMessage
-from claude_agent_sdk.types import ServerToolResultBlock, ServerToolUseBlock
 
 FINAL_ANSWER_HEADER = "X-Curie-Final-Answer"
 FINAL_ANSWER_CLASSIFICATION = "final-answer-validation"
@@ -91,6 +89,26 @@ def _envelope(content: object) -> dict[str, Any]:
     return content
 
 
+@dataclass(frozen=True)
+class ValidationCall:
+    """One observed tool invocation; hosted tools cannot validate bundle text."""
+
+    id: str
+    name: str
+    input: object
+    hosted: bool = False
+
+
+@dataclass(frozen=True)
+class ValidationResult:
+    """One correlated tool result, already extracted by the harness boundary."""
+
+    call_id: str
+    content: object
+    is_error: bool | None = None
+    hosted: bool = False
+
+
 @dataclass
 class FinalAnswerValidation:
     policy: FinalAnswerPolicy
@@ -110,74 +128,64 @@ class FinalAnswerValidation:
     def accepts(self, text: str) -> bool:
         return self._approved is not None and text == self._approved
 
-    def observe(self, message: object) -> None:
-        if isinstance(message, AssistantMessage):
-            calls = [
-                block
-                for block in message.content
-                if isinstance(block, (ToolUseBlock, ServerToolUseBlock))
-            ]
-            if message.parent_tool_use_id is not None:
-                for call in calls:
-                    if call.id == self._candidate:
-                        self.invalidate()
-                    self._seen.add(call.id)
-                return
-            eligible = len(calls) == 1 and not self._outstanding
-            if calls:
-                self.invalidate()
+    def observe_calls(self, calls: Sequence[ValidationCall], *, nested: bool) -> None:
+        """Observe all calls from one assistant message as an atomic group."""
+        if nested:
             for call in calls:
-                fresh = call.id not in self._seen
+                if call.id == self._candidate:
+                    self.invalidate()
                 self._seen.add(call.id)
-                self._outstanding.add(call.id)
-                if (
-                    eligible
-                    and fresh
-                    and isinstance(call, ToolUseBlock)
-                    and call.name == self.policy.tool
-                ):
-                    try:
-                        if not isinstance(call.input, dict):
-                            continue
-                        _json_bytes(call.input)
-                        draft = call.input.get("draft")
-                        if not isinstance(draft, str) or not draft:
-                            continue
-                        digest = hashlib.sha256(draft.encode("utf-8")).hexdigest()
-                    except (ValueError, TypeError, UnicodeError, RecursionError):
-                        continue
-                    self._candidate, self._digest = call.id, digest
-            # Hosted tool results are assistant blocks in SDK 0.2.163. They
-            # retire outstanding provider work, never authorize bundle text.
-            for block in message.content:
-                if isinstance(block, ServerToolResultBlock):
-                    if block.tool_use_id == self._candidate:
-                        self.invalidate()
-                    self._outstanding.discard(block.tool_use_id)
-        elif isinstance(message, UserMessage) and isinstance(message.content, list):
-            for block in message.content:
-                if not isinstance(block, ToolResultBlock):
-                    continue
-                if message.parent_tool_use_id is not None:
-                    if block.tool_use_id == self._candidate:
-                        self.invalidate()
-                    continue
-                if block.tool_use_id not in self._outstanding:
-                    self.invalidate()
-                    continue
-                self._outstanding.remove(block.tool_use_id)
-                if block.tool_use_id != self._candidate:
-                    continue
-                if self._resolved or block.is_error is True:
-                    self.invalidate()
-                    continue
-                self._resolved = True
+            return
+        eligible = len(calls) == 1 and not self._outstanding
+        if calls:
+            self.invalidate()
+        for call in calls:
+            fresh = call.id not in self._seen
+            self._seen.add(call.id)
+            self._outstanding.add(call.id)
+            if eligible and fresh and not call.hosted and call.name == self.policy.tool:
                 try:
-                    value = _envelope(block.content)
+                    if not isinstance(call.input, dict):
+                        continue
+                    _json_bytes(call.input)
+                    draft = call.input.get("draft")
+                    if not isinstance(draft, str) or not draft:
+                        continue
+                    digest = hashlib.sha256(draft.encode("utf-8")).hexdigest()
                 except (ValueError, TypeError, UnicodeError, RecursionError):
-                    self.invalidate()
                     continue
-                if value["draftSha256"] != self._digest:
+                self._candidate, self._digest = call.id, digest
+
+    def observe_results(self, results: Sequence[ValidationResult], *, nested: bool) -> None:
+        for result in results:
+            if result.hosted:
+                # Hosted results retire provider work, never authorize bundle
+                # text. Nested hosted work cannot retire top-level calls.
+                if not nested:
+                    if result.call_id == self._candidate:
+                        self.invalidate()
+                    self._outstanding.discard(result.call_id)
+                continue
+            if nested:
+                if result.call_id == self._candidate:
                     self.invalidate()
-                    continue
-                self._approved = value["text"]
+                continue
+            if result.call_id not in self._outstanding:
+                self.invalidate()
+                continue
+            self._outstanding.remove(result.call_id)
+            if result.call_id != self._candidate:
+                continue
+            if self._resolved or result.is_error is True:
+                self.invalidate()
+                continue
+            self._resolved = True
+            try:
+                value = _envelope(result.content)
+            except (ValueError, TypeError, UnicodeError, RecursionError):
+                self.invalidate()
+                continue
+            if value["draftSha256"] != self._digest:
+                self.invalidate()
+                continue
+            self._approved = value["text"]
