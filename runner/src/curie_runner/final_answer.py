@@ -25,19 +25,36 @@ _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 @dataclass(frozen=True)
 class FinalAnswerPolicy:
     tool: str
+    # None: every turn is constrained. Otherwise a turn is constrained once it
+    # observes a call to one of these exact tools; this enforces the declared
+    # flow and does not detect an analysis request that called none of them.
+    triggers: frozenset[str] | None = None
 
     @classmethod
     def parse(cls, value: object) -> FinalAnswerPolicy:
         if (
             not isinstance(value, dict)
-            or set(value) != {"version", "tool"}
+            or not {"version", "tool"} <= set(value) <= {"version", "tool", "triggers"}
             or type(value.get("version")) is not int
             or value["version"] != 1
             or not isinstance(value.get("tool"), str)
             or not _TOOL_NAME.fullmatch(value["tool"])
         ):
             raise ValueError("finalAnswer requires version 1 and an exact SDK tool name")
-        return cls(tool=value["tool"])
+        if "triggers" not in value:
+            return cls(tool=value["tool"])
+        triggers = value["triggers"]
+        if (
+            not isinstance(triggers, list)
+            or not triggers
+            or not all(isinstance(name, str) and _TOOL_NAME.fullmatch(name) for name in triggers)
+            or len(set(triggers)) != len(triggers)
+            or value["tool"] in triggers
+        ):
+            raise ValueError(
+                "finalAnswer triggers must be distinct exact SDK tool names other than tool"
+            )
+        return cls(tool=value["tool"], triggers=frozenset(triggers))
 
 
 def _json_bytes(value: object) -> bytes:
@@ -120,6 +137,12 @@ class FinalAnswerValidation:
     _approved: str | None = field(default=None, repr=False)
     _resolved: bool = field(default=False, repr=False)
     _suspended: int = field(default=0, repr=False)
+    _active: bool = field(default=False, repr=False)
+
+    @property
+    def required(self) -> bool:
+        """Whether this turn must publish only validated text (sticky per turn)."""
+        return self.policy.triggers is None or self._active
 
     @contextmanager
     def suspended(self) -> Iterator[None]:
@@ -147,6 +170,10 @@ class FinalAnswerValidation:
 
     def observe_calls(self, calls: Sequence[ValidationCall], *, nested: bool) -> None:
         """Observe all calls from one assistant message as an atomic group."""
+        triggers = self.policy.triggers
+        if triggers is not None and any(call.name in triggers for call in calls):
+            # Activation survives invalidation, suspension and steering.
+            self._active = True
         if nested:
             for call in calls:
                 if call.id == self._candidate:

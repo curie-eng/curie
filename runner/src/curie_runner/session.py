@@ -2507,7 +2507,7 @@ class SessionRunner:
     def _validate_publication(self, state: TurnState, final: Final) -> tuple[Final, bool]:
         """Last candidate check, after lifecycle overrides and before persistence."""
         validation = state.final_answer
-        if validation is None:
+        if validation is None or not validation.required:
             return final, False
         if self._timeout_requested:
             return Final(text="run timed out", status=SessionStatus.CLASSIFIED_FAILURE), False
@@ -2524,7 +2524,7 @@ class SessionRunner:
             clean = parse_ndjson_line(scrubbed[0])
             accepted = isinstance(clean, Final) and clean.text == final.text
         if accepted:
-            return final, False
+            return final.model_copy(update={"text_mode": "verbatim"}), False
         return Final(
             text=FINAL_ANSWER_DIAGNOSTIC, status=SessionStatus.CLASSIFIED_FAILURE
         ), True
@@ -2541,7 +2541,7 @@ class SessionRunner:
         if (
             notice is None
             or final.status is not SessionStatus.DONE
-            or self._final_answer is not None
+            or final.text_mode == "verbatim"
         ):
             return final
         text = f"{notice}\n\n{final.text}" if final.text else notice
