@@ -75,7 +75,10 @@ REQUIRED_VARS = (
 )
 
 LOOP_GATE_KEY = "factory-e2e-loop-gate"
-LOOP_GATE_NAME = "factory-e2e loop gate"
+# Bitbucket declares no CI diagnostics (ADR 0197 consequence 5), so the factory
+# shows the agent a failing build's name, state and link only, never its
+# description: the name carries the instruction the red gate asks for.
+LOOP_GATE_NAME = "factory-e2e loop gate: add a one line CHANGELOG.md entry for this change"
 LOOP_GATE_DESCRIPTION = (
     "Loop gate: add a one line entry for this change to CHANGELOG.md and push it to this branch."
 )
