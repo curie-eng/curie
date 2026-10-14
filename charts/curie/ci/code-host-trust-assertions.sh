@@ -2,9 +2,10 @@
 #
 # Render-assertion test for issue #3831 (ADR 0197). One optional CA bundle,
 # codeHostTrust.caBundle.configMapRef, is mounted read-only at one path
-# wherever a code host is reached: the api, the worker (which hands the same
-# ConfigMap to every publication Job it builds) and every sandbox runner. The
-# runner's git and HTTP clients point at it. Unset, nothing renders.
+# wherever a code host is reached: the api, the worker (which copies the
+# mounted PEM into each publication Job's own ConfigMap, since the Job runs in
+# another namespace) and every sandbox runner. The runner's git and HTTP
+# clients point at it. Unset, nothing renders.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly.
 set -euo pipefail
@@ -66,7 +67,7 @@ for name, (spec, container) in targets.items():
     if mode == "unset":
         if vols or mounts:
             fail(f"{name}: unset codeHostTrust still renders the trust volume")
-        leaked = [k for k in (*CLIENT_ENV, "CURIE_CODE_HOST_CA_BUNDLE", "CURIE_CODE_HOST_CA_CONFIGMAP") if k in e]
+        leaked = [k for k in (*CLIENT_ENV, "CURIE_CODE_HOST_CA_BUNDLE") if k in e]
         if leaked:
             fail(f"{name}: unset codeHostTrust still renders {leaked}")
         continue
@@ -88,10 +89,10 @@ if mode == "set":
     if api_env.get("CURIE_CODE_HOST_CA_BUNDLE") != PATH_:
         fail("api: CURIE_CODE_HOST_CA_BUNDLE must name the mounted bundle")
     worker_env = env(targets["worker"][1])
-    if worker_env.get("CURIE_CODE_HOST_CA_CONFIGMAP") != "corp-ca":
-        fail("worker: CURIE_CODE_HOST_CA_CONFIGMAP must name the ConfigMap for publication Jobs")
-    if worker_env.get("CURIE_CODE_HOST_CA_CONFIGMAP_KEY") != "bundle.pem":
-        fail("worker: CURIE_CODE_HOST_CA_CONFIGMAP_KEY must carry the configured key")
+    if worker_env.get("CURIE_CODE_HOST_CA_BUNDLE") != PATH_:
+        fail("worker: CURIE_CODE_HOST_CA_BUNDLE must name its mounted bundle for publication Jobs")
+    if any(k.startswith("CURIE_CODE_HOST_CA_CONFIGMAP") for k in worker_env):
+        fail("worker: publication Jobs must not reference the release ConfigMap by name")
     init = next(c for c in sandbox["initContainers"] if c["name"] == "workspace-init")
     if any(k in env(init) for k in CLIENT_ENV):
         fail("workspace-init reaches no code host and must not carry the trust env")
@@ -100,6 +101,11 @@ print(f"  ok: codeHostTrust {mode}")
 }
 
 render | check unset
+# A retained pre-forge value must not recreate env pointing at a removed mount.
+render --set api.githubStubCaConfigMap=old-stub-ca | check unset
+render --set api.githubStubCaConfigMap=old-stub-ca \
+  --set codeHostTrust.caBundle.configMapRef.name=corp-ca \
+  --set codeHostTrust.caBundle.configMapRef.key=bundle.pem | check set
 render --set codeHostTrust.caBundle.configMapRef.name=corp-ca \
   --set codeHostTrust.caBundle.configMapRef.key=bundle.pem | check set
 

@@ -371,6 +371,9 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             org,
             timeout,
             runner_image,
+            repo_runners,
+            registry,
+            repo_docker,
             namespace,
             release,
             chart,
@@ -380,7 +383,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 .as_deref()
                 .map(parse_runner_image_binding)
                 .transpose()?;
-            let webhook_secret = if disable {
+            let webhook_secret = if disable || !repo_runners.is_empty() || !repo_docker.is_empty() {
                 None
             } else {
                 curie::factory_intake::resolve_webhook_secret(webhook_secret_file.as_deref())?
@@ -415,6 +418,9 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     org,
                     intake,
                     runner_binding,
+                    repo_runners,
+                    registry,
+                    repo_docker,
                 })
                 .await?,
             )

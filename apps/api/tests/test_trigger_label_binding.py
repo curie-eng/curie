@@ -162,12 +162,13 @@ def _gitlab_and_jira_document() -> dict[str, Any]:
 def tracker_kinds_install(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clean_db: None
 ) -> Iterator[TestClient]:
-    """An install where ``gitlab`` and ``jira_cloud`` are registered installed
-    for this test only, with a configured GitLab project and Jira binding.
+    """An install with a configured GitLab project and Jira binding, where
+    ``gitlab`` and ``jira_cloud`` are registered with connections that make no
+    request, for this test only.
 
-    The shipped build registers both kinds not installed, so this is the only
-    way to prove the surface resolution itself (plan Open question 8): the
-    refusal for a shipped build is about installation, not the surface."""
+    Surface resolution reads only config, so the shipped adapters (#4358, #4399)
+    are replaced by stand-ins that fail if a binding write ever builds a
+    tracker (plan Open question 8)."""
 
     from curie_api.forges import registry
 
@@ -571,11 +572,12 @@ def test_trigger_label_binding_move_onto_another_agents_effective_label_is_409(
     ("kind", "address"),
     [("gitlab", GITLAB_PATH), ("jira", JIRA_BINDING)],
 )
-def test_trigger_label_binding_tracker_surface_of_a_not_installed_kind_is_422_unconfigured(
+def test_trigger_label_binding_tracker_surface_with_no_configured_location_is_422_unconfigured(
     github_install: tuple[TestClient, TestClient], kind: str, address: str
 ) -> None:
-    """The shipped build installs only GitHub, so no GitLab project or Jira
-    binding can be configured, and every such surface is unconfigured."""
+    """A GitHub-only install configures no GitLab project or Jira binding, so
+    every such surface is unconfigured. (Both kinds are installed since #4358
+    and #4399; the refusal is about configuration, not installation.)"""
 
     client, _rival = github_install
     agent = _slack_agent(client)

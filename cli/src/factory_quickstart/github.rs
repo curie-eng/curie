@@ -93,6 +93,9 @@ pub(super) fn finish_intake_opts(input: &PlanInput, _context: &str) -> FactoryIn
         private_key_file: input.private_key_file.as_ref().map(PathBuf::from),
         org: input.org.clone(),
         intake: Some(POLL_INTAKE.into()),
+        repo_runners: Vec::new(),
+        registry: None,
+        repo_docker: Vec::new(),
         // #4362 decision 7: the published layer, an operator bundle's locked
         // image, or nothing for the platform runner.
         runner_binding: match (&input.plugin_dir, &input.runner_image) {
@@ -112,7 +115,7 @@ pub(super) fn finish_intake_opts(input: &PlanInput, _context: &str) -> FactoryIn
 /// #4362 decision 5.3: the operator bundle exists, has a readable manifest,
 /// and passes the lock preflight `cluster deploy` runs. Returns its locked
 /// runner image, or `None` when it declares no runner layer.
-fn check_plugin_dir(dir: &Path) -> Result<Option<String>> {
+pub(super) fn check_plugin_dir(dir: &Path) -> Result<Option<String>> {
     if !dir.is_dir() {
         return Err(CliError::usage(format!(
             "--plugin-dir {} is not a directory",
@@ -232,15 +235,58 @@ async fn recorded_app(
     crate::factory_toolchain::preflight_with_pem(&recorded.app_id, pem, repos, false).await
 }
 
+/// Full commit tags must exist for the entire platform before quickstart
+/// reaches Kubernetes, Helm, or the forge, including on a dry run.
+pub(super) async fn resolve_candidate_runner(
+    commit: &str,
+) -> Result<crate::examples::PublishedStockRunner> {
+    let tag = format!("sha-{commit}");
+    let mut missing = Vec::new();
+    let mut published = crate::examples::PublishedStockRunner {
+        layer_image: String::new(),
+        base_image: String::new(),
+    };
+    for component in [
+        "api",
+        "dispatcher",
+        "mail-adapter",
+        "worker",
+        "ui",
+        "runner",
+        "dark-factory-runner",
+    ] {
+        let repository = format!("ghcr.io/curie-eng/curie-{component}");
+        match crate::examples::published_index_digest(&repository, &tag).await? {
+            Some(digest) => match component {
+                "runner" => published.base_image = format!("{repository}@{digest}"),
+                "dark-factory-runner" => {
+                    published.layer_image = format!("{repository}@{digest}");
+                }
+                _ => {}
+            },
+            None => missing.push(format!("{repository}:{tag}")),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(CliError::failure(format!(
+            "candidate {commit} is missing published images: {}",
+            missing.join(", ")
+        ))
+        .into());
+    }
+    Ok(published)
+}
+
 pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     // Reject a bad repository list, agent, label, or bundle before any
-    // prerequisite check, network preflight, or kube context pin.
+    // prerequisite check, App preflight, or kube context pin.
     validate_repos(&opts.repos)?;
     validate_agent_flags(&opts.agent, opts.label.as_deref())?;
     let runner_image = match &opts.plugin_dir {
         Some(dir) => check_plugin_dir(dir)?,
         None => None,
     };
+    let published_candidate = opts.candidate.as_ref().map(|candidate| &candidate.runner);
     let current = if opts.context.is_some() {
         None
     } else {
@@ -390,7 +436,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         jira = Some(jira_cloud::preflight(&opts.forge, &opts.repos, &recorded_app).await?);
         app = Some(recorded_app);
     }
-    let planned = quickstart_plan(&PlanInput {
+    let mut planned = quickstart_plan(&PlanInput {
         repos: opts.repos.clone(),
         app_id: opts.app_id.clone(),
         private_key_file: opts
@@ -423,6 +469,22 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         runner_image,
         jira,
     })?;
+    if let Some(candidate) = &opts.candidate {
+        let commit = &candidate.commit;
+        for action in &mut planned.actions {
+            match action {
+                Action::Cluster { args } => {
+                    for setting in candidate_install_settings(commit) {
+                        args.extend(["--set".into(), setting]);
+                    }
+                }
+                Action::Register { rerun_flags, .. } => {
+                    rerun_flags.extend(["--candidate".into(), commit.clone()]);
+                }
+                _ => {}
+            }
+        }
+    }
     if opts.dry_run {
         let mut planned = planned;
         if planned.path != QuickstartPath::AddAgent {
@@ -443,6 +505,21 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
             _ => None,
         }) {
             lines.splice(at..at, jira_reads);
+        }
+        if let (Some(candidate), Some(published)) = (&opts.candidate, published_candidate) {
+            lines.insert(
+                0,
+                format!("candidate {}: all seven images resolved", candidate.commit),
+            );
+            if opts.plugin_dir.is_none() {
+                lines.insert(
+                    1,
+                    format!(
+                        "runner layer lock: {} built on {}",
+                        published.layer_image, published.base_image
+                    ),
+                );
+            }
         }
         return Ok(QuickstartOutput::DryRun(DryRunPlan { lines }));
     }
@@ -466,7 +543,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
     // path renders inside intake, ahead of that path's first release write.
     let mut rendered_image = None;
     if let (QuickstartPath::AddAgent, None) = (planned.path, &opts.plugin_dir) {
-        rendered_image = Some(render_and_check(&common, &opts.agent).await?);
+        rendered_image = Some(render_and_check(&common, &opts.agent, published_candidate).await?);
     }
     if let (QuickstartPath::AddAgent, Some(recorded), None) = (planned.path, &recorded, &app) {
         app = Some(recorded_app(&common, recorded, &opts.repos).await?);
@@ -478,16 +555,21 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         app.as_ref(),
         install_label,
         rendered_image,
+        published_candidate,
     )
     .await
 }
 
 /// Render the published bundle for `agent` and refuse a layer built on
 /// another runner before anything binds it (ADR 0173 decision 5).
-async fn render_and_check(common: &CommonOpts, agent: &str) -> Result<String> {
+pub(super) async fn render_and_check(
+    common: &CommonOpts,
+    agent: &str,
+    published: Option<&crate::examples::PublishedStockRunner>,
+) -> Result<String> {
     crate::ui::ui().note("Rendering factory bundle");
     let bundle = bundle_dir(&common.namespace, &common.release, agent);
-    let image = render_published_bundle(&common.namespace, &common.release, agent)
+    let image = render_published_bundle(&common.namespace, &common.release, agent, published)
         .await
         .map_err(|error| {
             let (_, fix) = crate::exit::classify(&error);
@@ -532,6 +614,7 @@ async fn execute(
     app: Option<&crate::factory_toolchain::AppPreflight>,
     install_label: Option<String>,
     mut rendered_image: Option<String>,
+    published_candidate: Option<&crate::examples::PublishedStockRunner>,
 ) -> Result<QuickstartOutput> {
     crate::ui::ui().note(&format!("Kubernetes context: {}", planned.context));
     if planned.skipped_cluster_up {
@@ -566,26 +649,8 @@ async fn execute(
             }
         }
         match action {
-            Action::External { program, args } => {
-                let step = if program == "kind" {
-                    "Creating kind cluster"
-                } else {
-                    "Scaling CoreDNS"
-                };
-                run_program(program, args, step).await?;
-            }
-            Action::Cluster { args } => {
-                // Prompted credentials become available only immediately before
-                // this action. Resolve again so an omitted model follows that key.
-                let mut args = args.clone();
-                if let Some(model) = &prompted_model {
-                    let model_index = args
-                        .iter()
-                        .position(|arg| arg == "--model")
-                        .expect("quickstart cluster up always specifies its model");
-                    args[model_index + 1] = model.clone();
-                }
-                run_self(&args, "Installing Curie").await?;
+            Action::External { .. } | Action::Cluster { .. } => {
+                run_install_action(action, prompted_model.as_ref()).await?;
             }
             Action::Register {
                 org,
@@ -618,7 +683,9 @@ async fn execute(
             Action::Intake(intake) => {
                 let image = match &intake.runner_binding {
                     Some(binding) if binding.image == PUBLISHED_RUNNER_PENDING => {
-                        let image = render_and_check(&intake.common, &binding.agent).await?;
+                        let image =
+                            render_and_check(&intake.common, &binding.agent, published_candidate)
+                                .await?;
                         rendered_image = Some(image.clone());
                         image
                     }
@@ -655,6 +722,22 @@ async fn execute(
                     async move { Ok(chart) },
                 )
                 .await?;
+            }
+            Action::RunnerEnv { agent } => {
+                let step = "Configuring factory runner environment";
+                crate::ui::ui().note(step);
+                let chart = opts.chart.clone();
+                crate::cluster_secrets::bind_factory_runner_env(
+                    CommonOpts {
+                        namespace: opts.namespace.clone(),
+                        release: opts.release.clone(),
+                        dry_run: false,
+                    },
+                    agent.clone(),
+                    async move { Ok(chart) },
+                )
+                .await
+                .map_err(|error| step_error(Path::new("helm"), &[], step, error, None))?;
             }
             Action::TriggerLabel { label, repos } => {
                 let app = app.ok_or_else(|| {
@@ -695,6 +778,7 @@ async fn execute(
                                         dry_run: false,
                                     },
                                     agent,
+                                    published_candidate,
                                 )
                                 .await?
                             }
@@ -733,42 +817,16 @@ async fn execute(
                 for repo in bound {
                     crate::ui::ui().note(&skip_bound_line(agent, repo));
                 }
-                run_self(
-                    &cluster_agent(
-                        "overrides",
-                        agent,
-                        context,
-                        namespace,
-                        release,
-                        &["--execution-deadline".into(), deadline_seconds.to_string()],
-                    ),
-                    "Setting execution deadline",
-                )
-                .await?;
-                run_self(
-                    &cluster_agent(
-                        "publication-policy",
-                        agent,
-                        context,
-                        namespace,
-                        release,
-                        &["--policy".into(), "auto".into()],
-                    ),
-                    "Setting publication policy",
-                )
-                .await?;
-                run_self(
-                    &cluster_agent(
-                        "budget",
-                        agent,
-                        context,
-                        namespace,
-                        release,
-                        &["--limit".into(), budget_display(*budget_usd)],
-                    ),
-                    "Setting factory budget",
-                )
-                .await?;
+                for (args, step) in agent_settings(
+                    agent,
+                    context,
+                    namespace,
+                    release,
+                    *deadline_seconds,
+                    *budget_usd,
+                ) {
+                    run_self(&args, step).await?;
+                }
                 if planned.path == QuickstartPath::AddAgent {
                     return Ok(QuickstartOutput::AgentAdded {
                         context: context.clone(),
@@ -942,31 +1000,28 @@ async fn apply_jira_tracker(opts: &QuickstartOpts, jira: &JiraPlan) -> Result<()
         release: opts.release.clone(),
         dry_run: false,
     };
-    crate::ui::ui().note(&format!("Writing Secret {}", jira.secret_name));
     let token = jira_cloud::read_token(&jira.token_file)?;
-    let manifest = jira_cloud::secret_manifest(&common.namespace, &token);
-    let body = serde_json::to_vec(&manifest)?;
-    // kubectl's output is dropped: a failed apply can echo the manifest.
-    let (ok, _, _) = crate::ops::run_capture_with_stdin(
-        &crate::factory_app::secret_apply_command(&common.namespace),
-        &body,
+    apply_manifest(
+        &common.namespace,
+        &jira_cloud::secret_manifest(&common.namespace, &token),
+        &format!("Secret {}", jira.secret_name),
     )
     .await?;
-    if !ok {
-        return Err(CliError::failure(format!(
-            "writing the Jira token to Secret {} in namespace {} failed; the tracker was not written",
-            jira.secret_name, common.namespace
-        ))
-        .with_fix(format!(
-            "check access with `kubectl -n {} auth can-i create secrets` and rerun",
-            common.namespace
-        ))
-        .into());
-    }
-    crate::factory_intake::apply_forge_entries(&common, &opts.chart, jira).await
+    crate::factory_intake::apply_forge_entries(
+        &common,
+        &opts.chart,
+        &format!("the Jira tracker and binding `{}`", jira.binding_name),
+        |recorded| crate::factory_intake::forge_entries_values(recorded, jira),
+    )
+    .await
 }
 
-async fn render_published_bundle(namespace: &str, release: &str, agent: &str) -> Result<String> {
+async fn render_published_bundle(
+    namespace: &str,
+    release: &str,
+    agent: &str,
+    published: Option<&crate::examples::PublishedStockRunner>,
+) -> Result<String> {
     let dir = bundle_dir(namespace, release, agent);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).map_err(|err| {
@@ -981,9 +1036,17 @@ async fn render_published_bundle(namespace: &str, release: &str, agent: &str) ->
             CliError::failure(format!("could not create {}: {err}", parent.display()))
         })?;
     }
-    let rendered =
-        crate::examples::render_dark_factory(crate::examples::DarkFactoryRenderOpts { out: dir })
-            .await?;
+    let rendered = match published {
+        Some(published) => {
+            crate::examples::render_dark_factory_with_published_runner(dir, published)?
+        }
+        None => {
+            crate::examples::render_dark_factory(crate::examples::DarkFactoryRenderOpts {
+                out: dir,
+            })
+            .await?
+        }
+    };
     match rendered.runner_image {
         Some(image) => Ok(image),
         None => Err(CliError::failure(

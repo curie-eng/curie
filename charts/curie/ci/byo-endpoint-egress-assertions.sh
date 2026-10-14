@@ -147,6 +147,8 @@ API_BASE_URL=https://api.example.net
 declare -a DEPLOY_GATE_EXEMPTIONS=(
   "security-networkpolicy.yaml:inference=an external inference endpoint is the model API, already governed by the operator's security.networkPolicy.allowedEgress model allowlist, which is the intended mechanism there"
   "mail-adapter.yaml:mailAdapter=this is the whole-template deploy gate for the mail adapter itself, not an egress carve-out: with mailAdapter.deploy false there is no adapter pod, no policy, and no destination to bring your own"
+  "docker-daemon.yaml:agentSandbox=the sandbox-to-daemon allow exists only for chart-managed repository runner sandboxes, which refuse to render without agentSandbox.deploy, so there is no external sandbox whose egress this branch could own"
+  "docker-daemon.yaml:worker=this is the whole-template deploy gate for per-run daemons, not an egress carve-out: only this release's worker creates daemon pods, so with worker.deploy false there is no daemon and no destination to bring your own"
 )
 
 fail() {

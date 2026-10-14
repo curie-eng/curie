@@ -1,5 +1,6 @@
-"""GitLab as a code host and tracker: reserved, not installed in this build (#4397)."""
+"""GitLab (gitlab.com and self-managed) as the factory's code host and tracker (ADR 0197, #4399)."""
 
-from curie_api.forges.registry import register_not_installed
+from curie_api.forges.gitlab.connection import GitLabCodeHostConnection, GitLabTrackerConnection
+from curie_api.forges.registry import register
 
-register_not_installed("gitlab")
+register("gitlab", tracker=GitLabTrackerConnection, code_host=GitLabCodeHostConnection)

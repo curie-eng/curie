@@ -345,7 +345,7 @@ CHART_VALUES=(
   --set-string postgres.image="$POSTGRES_IMAGE"
   --set global.imagePullPolicy=IfNotPresent
   --set security.allowDevDefaults=true
-  --set postgres.persistence.enabled=false
+  --set postgres.persistence.enabled=true
   --set valkey.persistence.enabled=false
   --set clickhouse.persistence.enabled=false
   --set rustfs.persistence.enabled=false
@@ -591,10 +591,42 @@ actual = base64.b64decode(secret["data"]["postgresPassword"]).decode()
 if actual != os.environ["EXPECTED_SECRET"]:
     print("rotated Postgres Secret did not contain the intentional invalid credential", file=sys.stderr)
     sys.exit(1)
-print("negative armed: Postgres Secret changed (value redacted), running database retained its original credential")
+print("negative armed: Postgres Secret changed (value redacted)")
 PY
 
-kubectl delete pod "$WEB_POD" -n "$NAMESPACE" --wait=true >/dev/null
+# The StatefulSet also rolls on credential changes. Its namespace-owned PVC
+# preserves the initialized database password across that replacement.
+NEGATIVE_POSTGRES_REF="$(wait_for_component_pod postgres "${POSTGRES_REF#*|}" 300)" || \
+  fail "replacement Postgres pod was not created"
+NEGATIVE_POSTGRES_POD="${NEGATIVE_POSTGRES_REF%%|*}"
+kubectl wait pod "$NEGATIVE_POSTGRES_POD" -n "$NAMESPACE" \
+  --for=condition=Ready --timeout=300s
+
+# Supply the intentional invalid password over stdin into PGPASSWORD, never
+# through argv or diagnostics. The pod IP avoids local and loopback trust auth.
+NEGATIVE_POSTGRES_IP="$(kubectl get pod "$NEGATIVE_POSTGRES_POD" -n "$NAMESPACE" \
+  -o jsonpath='{.status.podIP}')" || fail "could not read replacement Postgres pod IP"
+[[ -n "$NEGATIVE_POSTGRES_IP" ]] || fail "replacement Postgres pod has no IP"
+POSTGRES_AUTH_LOG="$TMP_DIR/postgres-invalid-credential.log"
+# shellcheck disable=SC2016  # Variables expand in the container shell, not locally.
+if printf '%s\n' "$INVALID_PASSWORD" |
+    kubectl exec -i "$NEGATIVE_POSTGRES_POD" -n "$NAMESPACE" -c postgres -- \
+      sh -ec '
+        IFS= read -r PGPASSWORD
+        export PGPASSWORD
+        exec psql --host="$1" --username="$POSTGRES_USER" \
+          --dbname="$POSTGRES_DB" --no-password \
+          --command="SELECT 1"
+      ' postgres-auth-probe "$NEGATIVE_POSTGRES_IP" >"$POSTGRES_AUTH_LOG" 2>&1; then
+  fail "persisted Postgres accepted the intentional invalid credential"
+fi
+if ! grep -Eq '(^|[^[:alnum:]])28P01([^[:alnum:]]|$)|password authentication failed for user' "$POSTGRES_AUTH_LOG"; then
+  fail "invalid Postgres credential probe failed without a password authentication rejection"
+fi
+echo "negative armed: replacement Postgres is Ready, invalid TCP credential rejected, persisted database retained its original credential"
+
+# The credential checksum upgrade replaces the pod automatically. Require a
+# different UID before inspecting the invalid-credential startup.
 NEGATIVE_REF="$(wait_for_component_pod langfuse-web "$WEB_UID" 180)" || fail "replacement Langfuse web pod was not created"
 NEGATIVE_POD="${NEGATIVE_REF%%|*}"
 

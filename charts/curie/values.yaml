@@ -917,7 +917,11 @@ rustfs:
     fsGroup: 10001
   persistence:
     enabled: true
-    size: 3Gi
+    # 10Gi on ext4 is 655,360 inodes; each Langfuse event upload costs about
+    # three (#4408). An existing install keeps its claim size: the chart reads
+    # it back from the live StatefulSet with `lookup`. Renderers with no
+    # cluster access (helm template, Argo CD) must pin this to the current size.
+    size: 10Gi
   # Measured rustfs/rustfs:1.0.0-beta.12 under ordinary Langfuse traffic
   # (issue #2706): 1120Mi working set, 425m CPU. The shipped 512Mi / 500m
   # ceiling OOMKilled every in-chart install in a silent loop: kubelet
@@ -1286,6 +1290,52 @@ factory:
   trackers: []
   bindings: []
   sandboxEgress: {}
+  # Per-run Docker daemons (ADR 0217). Read only when a bindings[].repos[]
+  # entry with a runner block sets docker.enabled: true and worker.deploy is
+  # true; otherwise templates/docker-daemon.yaml renders nothing. See the
+  # README's "Factory Docker daemons" section.
+  docker:
+    # Required when a repository enables docker: a digest-pinned reference
+    # (name@sha256:<64 hex>). The Curie authorization plugin ships inside this
+    # image, so this one digest pins both (decisions 4 and 5). Admission
+    # refuses a daemon pod running any other image.
+    daemonImage: ""
+    # The daemon namespace. Empty means <release-namespace>-<fullname>-docker,
+    # truncated to 63 characters.
+    namespace: ""
+    # Create the namespace with the privileged Pod Security label. Set false
+    # when the operator creates it; it must then carry
+    # pod-security.kubernetes.io/enforce: privileged.
+    createNamespace: true
+    # The daemon's mutual TLS port. The Rail 1 sandbox allow opens only this
+    # port toward the daemon namespace.
+    port: 2376
+    # ResourceQuota spec.hard for the daemon namespace, the ceiling on every
+    # concurrent run's daemon. Required when docker is enabled. Persistent
+    # volumes, LoadBalancers and NodePorts stay at zero.
+    quota:
+      hard:
+        pods: "8"
+        requests.cpu: "8"
+        requests.memory: 16Gi
+        requests.ephemeral-storage: 160Gi
+        limits.cpu: "16"
+        limits.memory: 32Gi
+        limits.ephemeral-storage: 160Gi
+        services: "8"
+        secrets: "16"
+        persistentvolumeclaims: "0"
+        services.loadbalancers: "0"
+        services.nodeports: "0"
+    # One Container LimitRange item in the daemon namespace: per-container
+    # max, min, default limits and default requests. All four are required
+    # when docker is enabled. Admission separately refuses a zero request or
+    # limit.
+    limitRange:
+      max: { cpu: "4", memory: 8Gi, ephemeral-storage: 40Gi }
+      min: { cpu: 100m, memory: 256Mi, ephemeral-storage: 1Gi }
+      default: { cpu: "2", memory: 4Gi, ephemeral-storage: 20Gi }
+      defaultRequest: { cpu: 500m, memory: 1Gi, ephemeral-storage: 10Gi }
 # ---------------------------------------------------------------------------
 api:
   deploy: true
@@ -2595,6 +2645,21 @@ agentSandbox:
   #   runnerImages:
   #     factory: ghcr.io/acme/factory-runner@sha256:<64 hex>
   runnerImages: {}
+  # Per-agent non-secret runner environment: agent name -> NAME: string map.
+  # Each listed agent gets its own SandboxTemplate and warm pool, including
+  # agents using the platform image. Repository runner templates inherit the
+  # same agent values. Entries are appended to runner.extraEnv; duplicate names
+  # and collisions with chart-owned env or connector secrets are refused.
+  # Environment names use uppercase letters, digits and underscores, starting
+  # with a letter or underscore. Agent names remain lowercase DNS labels.
+  # Quote every value, including empty strings, numbers and booleans.
+  # CURIE_ names, runner credential/proxy names and snapshot sealing keys are
+  # reserved. OTEL_ names are refused here because telemetry egress follows the
+  # global endpoint: configure otelCollector or runner.extraEnv instead.
+  #   runnerEnv:
+  #     dark-factory:
+  #       CLAUDE_CODE_MAX_OUTPUT_TOKENS: "16000"
+  runnerEnv: {}
   # Per-agent workspace ceiling (#3523): agent name -> the sizeLimit of that
   # agent's `workspace` emptyDir, replacing agentSandbox.runner.workspace.sizeLimit
   # (default 1Gi) for that agent only. Each listed agent gets its own
@@ -2611,7 +2676,7 @@ agentSandbox:
   # Agents that get a labeled sandbox template and warm pool so connector
   # ingress can select curietech.ai/agent=<name>. A list of agent name strings.
   # Empty by default. Agents already covered by connectorSecrets, registryEgress,
-  # runnerImages, or workspaceSizeLimits are unchanged.
+  # runnerImages, runnerEnv, or workspaceSizeLimits are unchanged.
   poolAgents: []
   controller:
     # Installs the vendored kubernetes-sigs/agent-sandbox v0.5.0 controller

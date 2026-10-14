@@ -1,16 +1,23 @@
-//! Read-only toolchain discovery before Helm. This reports the fixed runner's
-//! limits; repository declarations never change its image or install tools.
+//! Read-only repository toolchain discovery and observed image inventories.
 
 use std::collections::BTreeMap;
+use std::io::{Cursor, Read};
+use std::sync::OnceLock;
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
+use serde::Deserialize;
 
 use crate::exit::CliError;
 use crate::factory_app::{GithubApi, InstalledApp, RepositoryContent};
 
 pub const SKIPPED_NOTE: &str = "toolchain inference skipped: no --app-id";
-pub const PLAN_NOTE: &str = "infer repository toolchains before Helm from App-authenticated workflows and manifests; warn about tools or versions absent from the fixed runner";
+pub const PLAN_NOTE: &str = "infer repository toolchains before Helm from App-authenticated workflows and manifests; compare requirements with observed tools after selecting the runner image";
+const MAX_BLOB_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LAYER_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LAYERS: usize = 16;
+const MAX_INVENTORY_BYTES: usize = 64 * 1024;
 const MANIFESTS: &[&str] = &[
     "pyproject.toml",
     "package.json",
@@ -27,6 +34,39 @@ const MANIFESTS: &[&str] = &[
     "rust-toolchain.toml",
 ];
 
+#[derive(Clone, Deserialize, Debug)]
+pub struct ManifestTool {
+    pub name: String,
+    pub version: String,
+    pub path: String,
+    pub source: String,
+}
+
+#[derive(Clone, Deserialize, Debug)]
+pub struct ToolManifest {
+    pub schema_version: u32,
+    pub tools: Vec<ManifestTool>,
+    pub docker_cli: bool,
+}
+
+impl ToolManifest {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        static VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
+        let validator = VALIDATOR.get_or_init(|| {
+            let schema: serde_json::Value =
+                serde_json::from_str(include_str!("../../docs/schemas/tool-manifest.schema.json"))
+                    .expect("committed tool manifest schema is valid JSON");
+            jsonschema::validator_for(&schema).expect("committed tool manifest schema compiles")
+        });
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).context("parsing selected image tool manifest")?;
+        if let Some(error) = validator.iter_errors(&value).next() {
+            bail!("selected image tool manifest violates its schema: {error}");
+        }
+        serde_json::from_value(value).context("reading validated tool manifest")
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Requirement {
     tool: &'static str,
@@ -35,7 +75,7 @@ struct Requirement {
     minimum: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Report {
     requirements: Vec<Requirement>,
 }
@@ -81,12 +121,63 @@ impl Report {
             .collect()
     }
 
-    pub fn warnings(&self) -> Vec<String> {
-        self.requirements.iter().filter(|r| !supported(r)).map(|r| format!(
-            "fixed factory runner lacks the required {} {} from {}; runner toolchains are Python 3.13, Node 22.23, and Rust 1.95",
-            r.tool, r.version, r.file
-        )).collect()
+    pub fn warnings(&self, manifest: Option<&ToolManifest>) -> Vec<String> {
+        self.requirements
+            .iter()
+            .filter_map(|r| {
+                let required = format!("required {} {} from {}", r.tool, r.version, r.file);
+                let Some(manifest) = manifest else {
+                    return Some(format!(
+                        "{required}: selected image tool inventory is unknown"
+                    ));
+                };
+                let observed: Vec<_> = manifest
+                    .tools
+                    .iter()
+                    .filter(|tool| matches_tool(r.tool, tool))
+                    .collect();
+                if observed.iter().any(|tool| supported(r, &tool.version)) {
+                    return None;
+                }
+                if observed.is_empty() {
+                    return Some(format!("{required}: not in selected image manifest"));
+                }
+                let versions = observed
+                    .iter()
+                    .map(|tool| format!("{} {}", tool.name, tool.version))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(format!(
+                    "{required}: selected image manifest observed {versions}"
+                ))
+            })
+            .collect()
     }
+}
+
+fn matches_tool(required: &str, tool: &ManifestTool) -> bool {
+    let matches = |name: &str| {
+        let name = name.to_ascii_lowercase();
+        match required {
+            "Python" => {
+                name == "python"
+                    || name.strip_prefix("python").is_some_and(|version| {
+                        version.split('.').all(|part| {
+                            !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())
+                        })
+                    })
+            }
+            "Node" => matches!(name.as_str(), "node" | "nodejs"),
+            "Rust" => matches!(name.as_str(), "rust" | "rustc" | "cargo"),
+            "Go" => name == "go",
+            "Java" => matches!(name.as_str(), "java" | "javac"),
+            "Ruby" => name == "ruby",
+            ".NET" => name == "dotnet",
+            "Gradle" => name == "gradle",
+            _ => false,
+        }
+    };
+    matches(&tool.name) || matches(tool.path.rsplit('/').next().unwrap_or(&tool.path))
 }
 
 fn number_parts(raw: &str) -> Option<Vec<u32>> {
@@ -111,21 +202,19 @@ fn number_parts(raw: &str) -> Option<Vec<u32>> {
     (!out.is_empty()).then_some(out)
 }
 
-fn supported(r: &Requirement) -> bool {
-    let runner = match r.tool {
-        "Python" => [3, 13],
-        "Node" => [22, 23],
-        "Rust" => [1, 95],
-        _ => return false,
-    };
+fn supported(r: &Requirement, observed: &str) -> bool {
     if r.version == "unspecified" {
         return true;
     }
+    let Some(parts) = number_parts(observed) else {
+        return false;
+    };
+    let runner = [parts[0], *parts.get(1).unwrap_or(&0)];
     if r.minimum {
         return number_parts(&r.version).is_some_and(|v| [v[0], *v.get(1).unwrap_or(&0)] <= runner);
     }
-    // An exact toolchain pin must match the runner's minor. Patches do not
-    // change support. Node's conventional bare major or 22.x admits that minor.
+    // Exact pins match the observed minor; patch differences do not change
+    // support. Bare majors and wildcard minors admit any observed minor.
     if let Some(v) = number_parts(&r.version) {
         return v[0] == runner[0] && v.get(1).is_none_or(|minor| *minor == runner[1]);
     }
@@ -180,6 +269,196 @@ fn supported(r: &Requirement) -> bool {
             .chars()
             .all(|ch| ch.is_whitespace() || ch == ',')
     })
+}
+
+fn image_document(raw: &[u8]) -> Result<serde_json::Value> {
+    let document: serde_json::Value =
+        serde_json::from_slice(raw).context("parsing selected image OCI manifest")?;
+    if document["schemaVersion"].as_u64() != Some(2) {
+        bail!("selected image OCI manifest has an unsupported schema version");
+    }
+    Ok(document)
+}
+
+fn descriptor(descriptor: &serde_json::Value) -> Result<(&str, &str, usize)> {
+    let digest = descriptor["digest"]
+        .as_str()
+        .filter(|digest| {
+            digest.strip_prefix("sha256:").is_some_and(|hex| {
+                hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        })
+        .ok_or_else(|| anyhow!("selected image descriptor has no valid sha256 digest"))?;
+    let size = descriptor["size"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("selected image descriptor has no valid byte size"))?;
+    if size > MAX_BLOB_BYTES as u64 {
+        bail!("selected image descriptor exceeds the {MAX_BLOB_BYTES} byte limit");
+    }
+    let media_type = descriptor["mediaType"]
+        .as_str()
+        .ok_or_else(|| anyhow!("selected image descriptor has no media type"))?;
+    Ok((digest, media_type, size as usize))
+}
+
+/// Read the selected immutable image's inventory without pulling or unpacking
+/// the image. An unreadable newer layer never falls back to older inventory.
+pub async fn read_tool_manifest(image: &str) -> Result<Option<ToolManifest>> {
+    let parsed = crate::oci_registry::parse(image)?;
+    if !parsed.reference.starts_with("sha256:") {
+        bail!("selected image tool inventory requires a digest-pinned image");
+    }
+    let root = crate::oci_registry::fetch_manifest(image).await?;
+    let mut document = image_document(&root.raw)?;
+    if matches!(
+        document["mediaType"].as_str(),
+        Some("application/vnd.oci.image.index.v1+json")
+            | Some("application/vnd.docker.distribution.manifest.list.v2+json")
+    ) {
+        let children = document["manifests"]
+            .as_array()
+            .ok_or_else(|| anyhow!("selected image index has no manifest descriptors"))?;
+        let child = ["amd64", "arm64"]
+            .into_iter()
+            .find_map(|arch| {
+                children
+                    .iter()
+                    .filter(|child| {
+                        child["platform"]["os"].as_str() == Some("linux")
+                            && child["platform"]["architecture"].as_str() == Some(arch)
+                            && child["annotations"]["vnd.docker.reference.type"].as_str()
+                                != Some("attestation-manifest")
+                            && child.get("artifactType").is_none()
+                    })
+                    .min_by(|left, right| left["digest"].as_str().cmp(&right["digest"].as_str()))
+            })
+            .ok_or_else(|| anyhow!("selected image index has no Linux amd64 or arm64 image"))?;
+        let (digest, media_type, size) = descriptor(child)?;
+        if !matches!(
+            media_type,
+            "application/vnd.oci.image.manifest.v1+json"
+                | "application/vnd.docker.distribution.manifest.v2+json"
+        ) {
+            bail!("selected image index child has an unsupported media type");
+        }
+        let child_image = format!("{}/{}@{digest}", parsed.registry, parsed.repository);
+        let child = crate::oci_registry::fetch_manifest(&child_image).await?;
+        if child.raw.len() != size {
+            bail!("selected image index child does not match its descriptor size");
+        }
+        document = image_document(&child.raw)?;
+    }
+    if !matches!(
+        document["mediaType"].as_str(),
+        Some("application/vnd.oci.image.manifest.v1+json")
+            | Some("application/vnd.docker.distribution.manifest.v2+json")
+    ) {
+        bail!("selected image has an unsupported manifest media type");
+    }
+    let layers = document["layers"]
+        .as_array()
+        .ok_or_else(|| anyhow!("selected image manifest has no layer descriptors"))?;
+    let mut total = 0;
+    for (searched, layer) in layers.iter().rev().enumerate() {
+        if searched >= MAX_LAYERS {
+            bail!("selected image inventory exceeds the {MAX_LAYERS} searched layer limit");
+        }
+        let (digest, media_type, size) = descriptor(layer)?;
+        let gzip = match media_type {
+            "application/vnd.oci.image.layer.v1.tar"
+            | "application/vnd.oci.image.layer.nondistributable.v1.tar"
+            | "application/vnd.docker.image.rootfs.diff.tar" => false,
+            "application/vnd.oci.image.layer.v1.tar+gzip"
+            | "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip"
+            | "application/vnd.docker.image.rootfs.diff.tar.gzip"
+            | "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip" => true,
+            _ => bail!("selected image layer has unsupported media type {media_type}"),
+        };
+        let blob = crate::oci_registry::fetch_blob(image, digest).await?;
+        if blob.len() > MAX_BLOB_BYTES || blob.len() != size {
+            bail!("selected image layer exceeds its byte limit or descriptor size");
+        }
+        let reader: Box<dyn Read + '_> = if gzip {
+            Box::new(flate2::read::MultiGzDecoder::new(Cursor::new(&blob)))
+        } else {
+            Box::new(Cursor::new(&blob))
+        };
+        let limit = MAX_LAYER_BYTES.min(MAX_TOTAL_BYTES - total);
+        let mut bytes = Vec::new();
+        reader
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .context("decompressing selected image layer")?;
+        if bytes.len() > limit {
+            bail!("selected image inventory exceeds its decompressed byte limit");
+        }
+        total += bytes.len();
+        let (manifest, removed) = layer_inventory(&bytes)?;
+        if manifest.is_some() || removed {
+            return Ok(manifest);
+        }
+    }
+    Ok(None)
+}
+
+fn layer_inventory(bytes: &[u8]) -> Result<(Option<ToolManifest>, bool)> {
+    if bytes.len() < 1024 || !bytes.len().is_multiple_of(512) {
+        bail!("selected image layer has malformed tar block contents");
+    }
+    let mut archive = tar::Archive::new(bytes);
+    let mut manifest = None;
+    let mut removed = false;
+    for entry in archive
+        .entries()
+        .context("reading selected image layer tar")?
+    {
+        let mut entry = entry.context("reading selected image layer tar entry")?;
+        let path = entry.path().context("reading selected image layer path")?;
+        let path = path.to_string_lossy();
+        let path = path.trim_start_matches("./").trim_end_matches('/');
+        let size = entry.size();
+        if size > bytes.len() as u64 {
+            bail!("selected image layer entry exceeds the available tar bytes");
+        }
+        if path == "etc/curie/tool-manifest.json" {
+            if !entry.header().entry_type().is_file() {
+                bail!("selected image tool manifest is not a regular file");
+            }
+            if size > MAX_INVENTORY_BYTES as u64 {
+                bail!("selected image tool manifest exceeds the {MAX_INVENTORY_BYTES} byte limit");
+            }
+            let mut raw = Vec::new();
+            entry.read_to_end(&mut raw)?;
+            if raw.len() as u64 != size {
+                bail!("selected image tool manifest has truncated tar contents");
+            }
+            manifest = Some(ToolManifest::parse(&raw)?);
+        } else {
+            if matches!(
+                path,
+                "etc/curie/.wh.tool-manifest.json"
+                    | "etc/.wh.curie"
+                    | ".wh.etc"
+                    | "etc/curie/.wh..wh..opq"
+                    | "etc/.wh..wh..opq"
+                    | ".wh..wh..opq"
+            ) {
+                if !entry.header().entry_type().is_file() || size != 0 {
+                    bail!("selected image inventory whiteout is malformed");
+                }
+                removed = true;
+            } else if matches!(path, "etc" | "etc/curie") && !entry.header().entry_type().is_dir() {
+                bail!("selected image tool manifest ancestor is not a directory");
+            }
+            if std::io::copy(&mut entry, &mut std::io::sink())? != size {
+                bail!("selected image layer has truncated tar contents");
+            }
+        }
+    }
+    Ok((manifest, removed))
 }
 
 fn quoted_assignment(text: &str, key: &str) -> Option<String> {
@@ -526,17 +805,22 @@ pub async fn infer_repository(api: &GithubApi, app: &InstalledApp, repo: &str) -
 
 /// Expand wildcard allowlists to the installed repositories, then report only
 /// selected repositories. No content is printed, and diagnostics use stderr.
-pub async fn announce(api: &GithubApi, app: &InstalledApp, allowlist: &[String]) -> Result<()> {
+pub async fn announce(
+    api: &GithubApi,
+    app: &InstalledApp,
+    allowlist: &[String],
+) -> Result<BTreeMap<String, Report>> {
+    let mut reports = BTreeMap::new();
     for repo in crate::factory_app::label_targets(allowlist, &app.repos) {
         let report = infer_repository(api, app, &repo).await?;
         for note in report.notes() {
             crate::ui::ui().note(&format!("{repo}: {note}"));
         }
-        for warning in report.warnings() {
-            crate::ui::ui().warn(&format!("{repo}: {warning}"));
+        if !report.requirements.is_empty() {
+            reports.insert(repo, report);
         }
     }
-    Ok(())
+    Ok(reports)
 }
 
 pub struct AppPreflight {
@@ -544,6 +828,7 @@ pub struct AppPreflight {
     pub app: InstalledApp,
     pub pem: String,
     pub publication: crate::factory_app::PublicationIdentity,
+    pub reports: BTreeMap<String, Report>,
 }
 
 pub async fn preflight(
@@ -567,12 +852,13 @@ pub async fn preflight_with_pem(
     let api = GithubApi::new()?;
     let app = crate::factory_app::inspect_app(&api, app_id, &pem).await?;
     let repos = crate::factory_app::resolve_allowlist(requested, &app, all_installed)?;
-    announce(&api, &app, &repos).await?;
+    let reports = announce(&api, &app, &repos).await?;
     let publication = api.bot_publication_identity(&app.slug).await?;
     Ok(AppPreflight {
         api,
         app,
         pem,
         publication,
+        reports,
     })
 }

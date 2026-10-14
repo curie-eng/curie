@@ -1127,20 +1127,44 @@ pub(crate) enum Command {
     /// deploy requires. Without `--registry` it builds the host platform only
     /// into the local Docker daemon and records the local image id, which is
     /// usable at the skill and local tiers and refused at cluster.
+    ///
+    /// With `--repo-runner <PATH> --registry <REF>` it builds a repository runner
+    /// image (ADR 0216) from a YAML or JSON input file naming catalog `tools`, an
+    /// optional `dockerfile` beside the file built on `${CURIE_RUNNER_IMAGE}`, and
+    /// extra `probes`. Both linux/amd64 and linux/arm64 are built in one buildx
+    /// bake, every tool is probed inside the image (a failing probe fails the
+    /// build), the probe manifest lands at /etc/curie/tool-manifest.json, and the
+    /// image is pushed to `<REF>/curie-repo-runner`. It prints the `runner` block
+    /// to paste under `factory.bindings[].repos[].runner`. The multi-platform push
+    /// needs a docker-container builder: select one with `docker buildx use` or
+    /// `BUILDX_BUILDER`.
     Build {
         /// Image tag to build.
         #[arg(long, default_value = docker::RUNNER_IMAGE, conflicts_with = "plugin_dir")]
         tag: String,
         /// Build the connectors this agent bundle declares.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", group = "build_input")]
         plugin_dir: Option<PathBuf>,
+        /// Build a repository runner image from this input file (YAML or JSON;
+        /// requires `--registry`). Needs a docker-container builder
+        /// (`docker buildx use` or `BUILDX_BUILDER`) for the two-platform push.
+        #[arg(
+            long,
+            value_name = "PATH",
+            group = "build_input",
+            requires = "registry",
+            conflicts_with_all = ["tag", "force", "platform"]
+        )]
+        repo_runner: Option<PathBuf>,
         /// Push every declared platform (or the `--platform` subset) to this
-        /// registry (e.g. ghcr.io/acme-corp).
-        #[arg(long, value_name = "REF", requires = "plugin_dir")]
+        /// registry (e.g. ghcr.io/acme-corp). With `--repo-runner`, the registry
+        /// the repository runner image is pushed to.
+        #[arg(long, value_name = "REF", requires = "build_input")]
         registry: Option<String>,
-        /// The platform runner a declared runner layer builds on (default: the
-        /// runner `curie skill up` uses). Resolved to a digest before building.
-        #[arg(long, value_name = "REF", requires = "plugin_dir")]
+        /// The platform runner a declared runner layer or a repository runner
+        /// builds on (default: the runner `curie skill up` uses). Resolved to a
+        /// digest before building.
+        #[arg(long, value_name = "REF", requires = "build_input")]
         runner_image: Option<String>,
         /// Replace a registry lock with a local-daemon one deliberately.
         #[arg(long, requires = "plugin_dir")]
@@ -1432,6 +1456,12 @@ pub(crate) enum FactoryAction {
         /// local charts/curie on dev builds.
         #[arg(long)]
         chart: Option<String>,
+        /// Install published sha images for a full 40 character lowercase hex
+        /// commit, including an unreleased commit from next. Only full commit
+        /// tags are published. Example: --candidate
+        /// 0123456789abcdef0123456789abcdef01234567.
+        #[arg(long, value_name = "COMMIT", value_parser = curie::factory_quickstart::parse_candidate_commit)]
+        candidate: Option<String>,
         /// Print the steps and exit without creating a cluster or applying anything.
         #[arg(long)]
         dry_run: bool,

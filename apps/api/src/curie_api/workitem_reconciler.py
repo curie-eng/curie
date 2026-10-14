@@ -38,6 +38,7 @@ from . import (
     factory_label_reconcile,
     factory_notices,
     factory_poll_intake,
+    factory_review_feedback,
     factory_tracker_intake,
 )
 from .code_host_trust import code_host_verify
@@ -92,6 +93,8 @@ class WorkItemReconciler:
         self._labels_due = 0.0
         # Monotonic due time per tracker poll and refusal sweep (#4358 plan D2).
         self._trackers_due: dict[str, float] = {}
+        # Monotonic due time per non-GitHub lineage's review feedback read (#4399).
+        self._review_feedback_due: dict[str, float] = {}
         self._step_consecutive_failures: dict[str, int] = {}
 
     def _stream(self) -> str:
@@ -168,9 +171,7 @@ class WorkItemReconciler:
                 self._step_consecutive_failures[name] = (
                     self._step_consecutive_failures.get(name, 0) + 1
                 )
-                record_metric(
-                    "curie.work_item.reconciler.step.failure", attributes=attributes
-                )
+                record_metric("curie.work_item.reconciler.step.failure", attributes=attributes)
             else:
                 self._step_consecutive_failures[name] = 0
             record_metric(
@@ -286,13 +287,8 @@ class WorkItemReconciler:
                         lifecycle.not_awaiting_publication(),
                         (
                             (
-                                ExecutionRequest.runtime_heartbeat_expires_at.is_not(
-                                    None
-                                )
-                                & (
-                                    ExecutionRequest.runtime_heartbeat_expires_at
-                                    <= now - ttl
-                                )
+                                ExecutionRequest.runtime_heartbeat_expires_at.is_not(None)
+                                & (ExecutionRequest.runtime_heartbeat_expires_at <= now - ttl)
                             )
                             | (
                                 ExecutionRequest.runtime_owner.is_(None)
@@ -373,9 +369,7 @@ class WorkItemReconciler:
                     session,
                     work_item_id=work_item_id,
                     wait_deadline=now
-                    + timedelta(
-                        seconds=self._settings.work_item_wait_budget_seconds
-                    ),
+                    + timedelta(seconds=self._settings.work_item_wait_budget_seconds),
                 )
         async with self._sessionmaker() as session:
             active = aliased(ExecutionRequest)
@@ -391,9 +385,7 @@ class WorkItemReconciler:
                         WorkItem.readmit_request_id.is_(None),
                         ~exists().where(
                             active.work_item_id == WorkItem.id,
-                            active.status.in_(
-                                ("waiting", "running", "cancellation_requested")
-                            ),
+                            active.status.in_(("waiting", "running", "cancellation_requested")),
                         ),
                     )
                     .group_by(WorkItem.id)
@@ -481,9 +473,7 @@ class WorkItemReconciler:
             if client is not None:
                 await client.aclose()
 
-    async def _dispatch_ci_turn(
-        self, request: ExecutionRequest, round_: int, text: str
-    ) -> bool:
+    async def _dispatch_ci_turn(self, request: ExecutionRequest, round_: int, text: str) -> bool:
         """Enqueue a CI fix turn for the same request, like its execute wake."""
 
         async with self._sessionmaker() as session:
@@ -555,10 +545,12 @@ class WorkItemReconciler:
                 )
 
     async def _poll_trackers(self) -> None:
-        """Poll every non-GitHub tracker binding through the ports (#4358 plan D1).
+        """Poll every non-GitHub tracker binding through the ports (#4358 plan D1),
+        then the review feedback on every non-GitHub factory pull request (#4399).
 
-        It runs whatever the GitHub intake mode is: such a tracker has no
-        webhook, so its poll is its intake.
+        Both run whatever the GitHub intake mode is: such a tracker or code host
+        has no webhook, so its poll is its intake. The review pass runs even
+        when the tracker poll failed.
         """
 
         settings = self._settings
@@ -567,13 +559,23 @@ class WorkItemReconciler:
         async with httpx.AsyncClient(
             timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
         ) as client:
-            await factory_tracker_intake.poll_trackers(
-                self._sessionmaker,
-                settings,
-                client,
-                due=self._trackers_due,
-                clock=asyncio.get_running_loop().time(),
-            )
+            try:
+                await factory_tracker_intake.poll_trackers(
+                    self._sessionmaker,
+                    settings,
+                    client,
+                    due=self._trackers_due,
+                    clock=asyncio.get_running_loop().time(),
+                )
+            finally:
+                await factory_review_feedback.poll_review_feedback(
+                    self._sessionmaker,
+                    settings,
+                    client,
+                    self._valkey,
+                    due=self._review_feedback_due,
+                    clock=asyncio.get_running_loop().time(),
+                )
 
     async def _sync_status_comments(self) -> None:
         paused_for_upgrade = False
@@ -608,13 +610,9 @@ class WorkItemReconciler:
                 continue
             await self._xadd(turn)
             async with self._sessionmaker() as session:
-                await fence_published(
-                    session, item.request_id, item.epoch, item.generation
-                )
+                await fence_published(session, item.request_id, item.epoch, item.generation)
 
-    async def _execute_turn(
-        self, request_id: uuid.UUID, generation: int
-    ) -> QueuedTurn | None:
+    async def _execute_turn(self, request_id: uuid.UUID, generation: int) -> QueuedTurn | None:
         async with self._sessionmaker() as session:
             loaded = await load_execute_wake(session, request_id)
         if loaded is None:

@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
 from ..forges import types as forge_types
 from ..forges.config import CodeHostKind
-from ..forges.paths import valid_repository_path
+from ..forges.paths import valid_code_host_path, valid_repository_path
 from ..forges.types import CredentialHeader
 
 
@@ -43,7 +43,29 @@ class WorkspaceCredentialOut(RepositoryCredentialOut):
     base_commit: str | None = None
 
 
+class WorkspaceSelectionIn(BaseModel):
+    """The worker's selection: the thread and the repository path it names.
+
+    The worker never names a code host kind. The route takes it from the
+    thread's factory WorkItem (GitHub when there is none) and validates the
+    path under that kind's rule as a `WorkspaceSelectionRequest`.
+    """
+
+    conversation_id: str = Field(min_length=1)
+    author: str = Field(min_length=1)
+    repo_full_name: str | None = None
+
+    @field_validator("repo_full_name")
+    @classmethod
+    def _repository_path(cls, value: str | None) -> str | None:
+        if value is not None and not valid_code_host_path(value):
+            raise ValueError("repo_full_name must be a repository path")
+        return value
+
+
 class WorkspaceSelectionRequest(BaseModel):
+    """A selection with its code host kind resolved (see `WorkspaceSelectionIn`)."""
+
     conversation_id: str = Field(min_length=1)
     author: str = Field(min_length=1)
     # The code host kind ``repo_full_name`` is a path on (ADR 0197). Declared

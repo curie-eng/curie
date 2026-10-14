@@ -354,6 +354,31 @@ pub fn multi_platform_driver_fix(stderr: &str, host_platform: &str) -> Option<St
     ))
 }
 
+/// Run a docker command with stdout inherited and stderr both streamed and
+/// captured, so a build log reads like a hand-run build while a driver refusal
+/// can still be answered with a fix.
+pub(super) async fn run_teeing_stderr(
+    command: &crate::ops::OpsCommand,
+) -> Result<(std::process::ExitStatus, String)> {
+    use tokio::io::AsyncBufReadExt;
+    let mut child = tokio::process::Command::new(&command.program)
+        .args(command.argv())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to invoke docker")?;
+    let mut captured = String::new();
+    if let Some(pipe) = child.stderr.take() {
+        let mut lines = tokio::io::BufReader::new(pipe).lines();
+        while let Some(line) = lines.next_line().await.unwrap_or(None) {
+            eprintln!("{line}");
+            captured.push_str(&line);
+            captured.push('\n');
+        }
+    }
+    let status = child.wait().await.context("failed to wait for docker")?;
+    Ok((status, captured))
+}
+
 pub(super) async fn run_one_connector_build(
     plan: &crate::connector_build::ConnectorBuildPlan,
     ui: &crate::ui::Ui,
@@ -365,23 +390,7 @@ pub(super) async fn run_one_connector_build(
     // Inherit stdout so the build log streams like a hand-run build. A registry
     // build tees stderr so a driver refusal can be answered with a fix.
     let (status, stderr) = if plan.delivery == cb::Delivery::Registry {
-        use tokio::io::AsyncBufReadExt;
-        let mut child = tokio::process::Command::new(&command.program)
-            .args(command.argv())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .context("failed to invoke docker")?;
-        let mut captured = String::new();
-        if let Some(pipe) = child.stderr.take() {
-            let mut lines = tokio::io::BufReader::new(pipe).lines();
-            while let Some(line) = lines.next_line().await.unwrap_or(None) {
-                eprintln!("{line}");
-                captured.push_str(&line);
-                captured.push('\n');
-            }
-        }
-        let status = child.wait().await.context("failed to wait for docker")?;
-        (status, captured)
+        run_teeing_stderr(&command).await?
     } else {
         let status = tokio::process::Command::new(&command.program)
             .args(command.argv())

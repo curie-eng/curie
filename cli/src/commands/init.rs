@@ -96,6 +96,7 @@ pub fn check_outcome(report: &CheckReport) -> std::result::Result<(), crate::exi
 
 /// Run the offline MCP load check for a plugin bundle.
 pub async fn check(plugin_dir: PathBuf, image: String, timeout_s: u64) -> Result<()> {
+    let published_host = docker::published_host_setting()?;
     let requested_dir = plugin_dir.display().to_string();
     let plugin_dir = plugin_dir.canonicalize().map_err(|err| {
         crate::exit::CliError::usage(format!("plugin dir not found: {requested_dir}: {err}"))
@@ -104,12 +105,26 @@ pub async fn check(plugin_dir: PathBuf, image: String, timeout_s: u64) -> Result
         crate::exit::CliError::usage(format!("plugin dir is not a usable bundle: {err}"))
     })?;
 
+    let snapshot = if docker::remote_mode(published_host.as_deref()) {
+        Some(crate::bundle::snapshot_ephemeral(&plugin_dir)?)
+    } else {
+        None
+    };
     let spec = CheckSpec {
         image,
-        plugin_dir: plugin_dir.display().to_string(),
+        plugin_dir: snapshot
+            .as_ref()
+            .map(|snapshot| &snapshot.dir)
+            .unwrap_or(&plugin_dir)
+            .display()
+            .to_string(),
         timeout_s,
     };
-    let (status, stdout, stderr) = docker::docker_capture(&spec.run_args()).await?;
+    let result = docker::run_check(&spec, published_host.as_deref()).await;
+    if let Some(snapshot) = snapshot {
+        crate::bundle::remove_snapshot(&snapshot.dir, &plugin_dir)?;
+    }
+    let (status, stdout, stderr) = result?;
     // A container that DID run and produced parseable JSON is data (a
     // green/red/invalid verdict) regardless of its exit code. Only when the
     // stdout is NOT a valid report is this a real docker failure -- surface the
@@ -350,6 +365,8 @@ impl crate::ui::CliOutput for InitOutput {
 pub async fn try_first_run(keep: bool, image: String) -> Result<SkillMessageOutput> {
     const DEMO_NAME: &str = "curie-demo";
     const DEMO_PROMPT: &str = "hello, are you there?";
+    let published_host = docker::published_host_setting()?;
+    let runner_url = docker::published_endpoint(published_host.as_deref(), DEFAULT_PORT);
 
     let ui = crate::ui::ui();
     let dir = if keep {
@@ -445,7 +462,7 @@ pub async fn try_first_run(keep: bool, image: String) -> Result<SkillMessageOutp
         DEMO_PROMPT,
         crate::message::DEFAULT_USER,
         EventType::Message,
-        Some(format!("http://localhost:{DEFAULT_PORT}")),
+        Some(runner_url),
         true,
     )
     .await;

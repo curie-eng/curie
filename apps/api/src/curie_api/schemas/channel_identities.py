@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ..identity.slack import AUTH_TEST_KEY
 from .common import ProviderName
 
 ChannelIdentityStatus = Literal["active", "disabled", "revoked"]
@@ -26,6 +27,14 @@ ChannelIdentityStatus = Literal["active", "disabled", "revoked"]
 def _reject_explicit_null(value: Any) -> Any:
     if value is None:
         raise ValueError("may be omitted but not null")
+    return value
+
+
+def _reject_reserved_attributes(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    # Only the Slack identity report writes this key (#3039); an administrator
+    # setting it would forge the evidence principal resolution trusts (ADR 0201).
+    if value is not None and AUTH_TEST_KEY in value:
+        raise ValueError(f"attributes.{AUTH_TEST_KEY} is reserved for Slack identity reports")
     return value
 
 
@@ -53,6 +62,8 @@ class ChannelIdentityCreate(BaseModel):
     # Omitted means unattached, same as a declared identity created at boot.
     provider_installation_id: uuid.UUID | None = None
 
+    _reserved = field_validator("attributes")(_reject_reserved_attributes)
+
 
 class ChannelIdentityUpdate(BaseModel):
     """Partial update: an omitted field is unchanged, and null clears a nullable one.
@@ -71,6 +82,7 @@ class ChannelIdentityUpdate(BaseModel):
     provider_installation_id: uuid.UUID | None = None
 
     _not_null = field_validator("name", "scopes", "attributes", "status")(_reject_explicit_null)
+    _reserved = field_validator("attributes")(_reject_reserved_attributes)
 
 
 class ChannelIdentityOut(BaseModel):

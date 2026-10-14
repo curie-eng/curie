@@ -19,7 +19,7 @@ use super::{
     BINDING_NAME, SECRET_NAME,
 };
 use crate::exit::CliError;
-use crate::factory_quickstart::{forge_egress_entries, EgressEntry, ForgeFlags};
+use crate::factory_quickstart::{forge_egress_entries, resolve_host, EgressEntry, ForgeFlags};
 use crate::factory_toolchain::AppPreflight;
 
 struct Jira {
@@ -97,11 +97,6 @@ fn authority(url: &reqwest::Url) -> String {
     }
 }
 
-fn resolve(host: &str) -> Result<Vec<std::net::IpAddr>> {
-    use std::net::ToSocketAddrs;
-    Ok((host, 0).to_socket_addrs()?.map(|addr| addr.ip()).collect())
-}
-
 /// One egress entry set per distinct host and port of `urls`.
 fn egress(urls: &[&reqwest::Url]) -> Result<Vec<EgressEntry>> {
     let mut seen = Vec::new();
@@ -117,7 +112,7 @@ fn egress(urls: &[&reqwest::Url]) -> Result<Vec<EgressEntry>> {
         if seen.contains(&(host.clone(), port)) {
             continue;
         }
-        entries.extend(forge_egress_entries(&host, &[port], resolve)?);
+        entries.extend(forge_egress_entries(&host, &[port], resolve_host)?);
         seen.push((host, port));
     }
     Ok(entries)

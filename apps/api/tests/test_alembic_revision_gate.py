@@ -203,14 +203,14 @@ def test_merge_revision_restores_one_head(tmp_path: Path) -> None:
 
 def test_python_ci_job_runs_exact_gate_before_dev_stack() -> None:
     workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yaml").read_text())
-    steps = workflow["jobs"]["python"]["steps"]
+    steps = workflow["jobs"]["python-static"]["steps"]
 
     matching_steps = [step for step in steps if step.get("run") == CHECK_COMMAND]
     assert len(matching_steps) == 1
     assert matching_steps[0]["name"] == "Alembic revision gate"
 
     # The dev stack boots only in the pytest shards, so the gate never waits on
-    # one in the required Python job.
+    # one in the static Python job.
     assert not any(step.get("name") == "Start dev stack" for step in steps)
 
 

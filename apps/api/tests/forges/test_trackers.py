@@ -141,7 +141,7 @@ def _kind_table(registry: ModuleType) -> dict[str, Any]:
 
 @pytest.fixture
 def gitlab_installed(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """``gitlab`` registered installed for this test only (the build reserves it)."""
+    """``gitlab`` registered with stand-in connections for this test only."""
 
     from curie_api.forges import registry
 

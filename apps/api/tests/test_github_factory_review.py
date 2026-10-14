@@ -27,7 +27,9 @@ import asyncio
 import copy
 import itertools
 import sys
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +39,9 @@ import pytest
 import redis.asyncio as redis
 from curie_api import github_app
 from curie_api.config import get_settings
+from curie_api.forges.github.identity import issue_lock_keys_for
+from curie_api.github_factory_review import admit_parsed_feedback
+from curie_api.github_review_events import parse_feedback
 from curie_api.main import create_app
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
@@ -61,7 +66,7 @@ from forge_fakes.github import (  # noqa: E402
     factory_env,
     fake_installation_tokens,
 )
-from test_github_factory_ingress import _code, _mark_running, _rows  # noqa: E402
+from test_github_factory_ingress import _code, _mark_running, _PermissionGate, _rows  # noqa: E402
 
 HEAD = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 BASE_REF = "main"
@@ -443,6 +448,141 @@ def test_authorized_mention_admits_the_next_request_on_the_same_work_item(
         "reply_target_comment_id": None,
         "reply_target_url": None,
     }
+
+
+def test_review_admission_retains_issue_lock_until_caller_commit(
+    factory: tuple[TestClient, ReviewGitHubAPI],
+) -> None:
+    client, api = factory
+    number, pr, _first = _owned(client, api)
+    payload, _ = _feedback_event(api, "issue_comment", pr, _mention())
+    feedback = parse_feedback(
+        "issue_comment",
+        payload,
+        str(uuid.uuid4()),
+        github_html_base=get_settings().github_html_base,
+    )
+    request_id = uuid.uuid5(uuid.NAMESPACE_URL, feedback.event_id)
+    classid, objid = issue_lock_keys_for(REPO_ID, number)
+
+    async def go() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with (
+                sessions() as session,
+                engine.connect() as observer,
+                httpx.AsyncClient(transport=httpx.MockTransport(api.handle)) as github,
+            ):
+                caller_pid = await session.scalar(text("SELECT pg_backend_pid()"))
+                admitted = await admit_parsed_feedback(
+                    session, feedback, settings=get_settings(), client=github, verified=None
+                )
+                assert admitted.status == "factory_admitted", admitted
+                issue_lock_held = text(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' "
+                    "AND granted AND pid = :caller_pid AND objsubid = 2 "
+                    "AND classid::bigint = :classid AND objid::bigint = :objid "
+                    "AND database = (SELECT oid FROM pg_database "
+                    "WHERE datname = current_database()))"
+                )
+                lock_params = {
+                    "caller_pid": caller_pid,
+                    "classid": classid & 0xFFFFFFFF,
+                    "objid": objid & 0xFFFFFFFF,
+                }
+                assert await observer.scalar(issue_lock_held, lock_params)
+                request_visible = text(
+                    "SELECT EXISTS (SELECT 1 FROM curie.execution_requests WHERE id = :request_id)"
+                )
+                assert not await observer.scalar(request_visible, {"request_id": request_id})
+                await session.commit()
+                assert await observer.scalar(request_visible, {"request_id": request_id})
+                assert not await observer.scalar(issue_lock_held, lock_params)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_unlabel_during_review_admission_waits_and_then_cancels(
+    factory: tuple[TestClient, ReviewGitHubAPI],
+) -> None:
+    client, api = factory
+    number, pr, _first = _owned(client, api)
+    payload, _ = _feedback_event(api, "issue_comment", pr, _mention())
+    review_delivery = uuid.uuid4()
+    entered = threading.Event()
+    release = asyncio.Event()
+    classid, objid = issue_lock_keys_for(REPO_ID, number)
+
+    async def observe_cancellation_blocked() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as observer, asyncio.timeout(5):
+                while not await observer.scalar(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks waiting "
+                        "JOIN pg_locks holder ON holder.locktype = waiting.locktype "
+                        "AND holder.database = waiting.database "
+                        "AND holder.classid = waiting.classid "
+                        "AND holder.objid = waiting.objid "
+                        "AND holder.objsubid = waiting.objsubid "
+                        "WHERE waiting.locktype = 'advisory' AND NOT waiting.granted "
+                        "AND holder.granted AND waiting.objsubid = 2 "
+                        "AND waiting.database = (SELECT oid FROM pg_database "
+                        "WHERE datname = current_database()) "
+                        "AND waiting.classid::bigint = :classid "
+                        "AND waiting.objid::bigint = :objid "
+                        "AND holder.pid = ANY(pg_blocking_pids(waiting.pid)))"
+                    ),
+                    {"classid": classid & 0xFFFFFFFF, "objid": objid & 0xFFFFFFFF},
+                ):
+                    await asyncio.sleep(0.01)
+        finally:
+            await engine.dispose()
+
+    previous = client.app.state.http_client
+    github = httpx.AsyncClient(transport=_PermissionGate(api, entered, release))
+    client.app.state.http_client = github
+    try:
+        with ThreadPoolExecutor(max_workers=2) as deliveries:
+            try:
+                admission = deliveries.submit(
+                    _post, client, "issue_comment", payload, delivery=str(review_delivery)
+                )
+                assert entered.wait(5)
+                api.labels = []
+                cancellation = deliveries.submit(
+                    _post,
+                    client,
+                    "issues",
+                    _issue_event("unlabeled", number, label={"name": LABEL}),
+                )
+                asyncio.run(observe_cancellation_blocked())
+                assert not cancellation.done()
+                client.portal.call(release.set)
+                admitted = admission.result(timeout=10)
+                cancelled = cancellation.result(timeout=10)
+            finally:
+                client.portal.call(release.set)
+    finally:
+        client.app.state.http_client = previous
+        client.portal.call(github.aclose)
+
+    assert admitted.status_code == 200, admitted.text
+    assert admitted.json()["status"] == "factory_admitted", admitted.text
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "factory_cancelled", cancelled.text
+    assert _rows(
+        "SELECT status FROM curie.github_review_deliveries WHERE delivery_id = :delivery",
+        {"delivery": review_delivery},
+    ) == [{"status": "accepted"}]
+    rows = _requests(number)
+    assert [row["sequence"] for row in rows] == [1, 2]
+    assert rows[0]["status"] == "completed"
+    assert rows[1]["status"] == "cancelled"
+    assert rows[1]["terminal_cause"] == "issue_cancelled"
 
 
 def test_redelivery_of_the_same_comment_is_a_duplicate(

@@ -82,6 +82,11 @@ from .publication_store import PostgresPublicationStore
 from .remediation_cards import PostgresRemediationCardStore, RemediationCardLoop
 from .remediation_receipts import PostgresRemediationReceiptStore, RemediationReceiptLoop
 from .reply_sink import ObservedReplySink, ReplySinkRouter, build_reply_sink
+from .repo_runner_pools import (
+    REPO_RUNNER_POOLS_ENV,
+    parse_repo_runner_pools,
+    platform_runner_digest,
+)
 from .runner_client import RunnerClient
 from .sandbox import (
     AffinityStore,
@@ -280,6 +285,10 @@ def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
         warm_pool=env.get("CURIE_WARM_POOL", "curie-runner-pool"),
         agent_pools=_agent_names(env, "CURIE_AGENT_SANDBOX_POOLS"),
         connector_secret_pools=_agent_names(env, "CURIE_AGENT_CONNECTOR_SECRET_POOLS"),
+        # ADR 0216: malformed input fails worker startup rather than routing a
+        # bound repository to the generic pool.
+        repo_runner_pools=parse_repo_runner_pools(env.get(REPO_RUNNER_POOLS_ENV)).root,
+        platform_runner_digest=platform_runner_digest(env.get("CURIE_RUNNER_IMAGE")),
         runner_port=int(env.get("CURIE_RUNNER_PORT", "8080")),
         **overrides,
     )
@@ -1412,8 +1421,7 @@ def _build_publication_loop(
             owner_name=config.publication_owner_name,
             git_user_name=config.publication_git_user_name,
             git_user_email=config.publication_git_user_email,
-            ca_bundle_config_map=config.publication_ca_bundle_config_map,
-            ca_bundle_key=config.publication_ca_bundle_key,
+            ca_bundle_path=config.publication_ca_bundle_path,
             active_deadline_seconds=(config.publication_job_active_deadline_seconds),
             git_timeout_seconds=config.publication_git_command_timeout_seconds,
             cpu_request=config.publication_cpu_request,

@@ -773,7 +773,7 @@ fn jira_add_agent_preserves_an_identical_recorded_tracker_and_binding() {
         .expect("an identical jira entry is served as is");
     assert_eq!(
         action_names(&planned.actions),
-        ["egress", "label", "deploy"],
+        ["egress", "label", "runner-env", "deploy"],
         "no JiraTracker write: other agents' intake is not rewritten"
     );
     assert_eq!(deploy_binding(&planned.actions).as_deref(), Some(BINDING));
@@ -788,7 +788,7 @@ fn jira_add_agent_writes_the_entry_the_release_lacks() {
     let planned = quickstart_plan(&input).unwrap();
     assert_eq!(
         action_names(&planned.actions),
-        ["jira", "egress", "label", "deploy"]
+        ["jira", "egress", "label", "runner-env", "deploy"]
     );
 }
 
@@ -858,7 +858,7 @@ fn jira_add_agent_preserves_an_equivalent_recorded_entry() {
     let planned = quickstart_plan(&input).expect("an equivalent jira entry is served as is");
     assert_eq!(
         action_names(&planned.actions),
-        ["egress", "label", "deploy"]
+        ["egress", "label", "runner-env", "deploy"]
     );
 
     // A real difference beside them is still refused.
@@ -890,7 +890,14 @@ fn jira_install_path_still_writes_over_a_recorded_jira_entry() {
     let first = quickstart_plan(&install_input()).unwrap();
     assert_eq!(
         action_names(&first.actions),
-        ["external", "cluster", "intake", "jira", "deploy"]
+        [
+            "external",
+            "cluster",
+            "intake",
+            "jira",
+            "runner-env",
+            "deploy"
+        ]
     );
 }
 
@@ -969,6 +976,7 @@ fn action_names(actions: &[Action]) -> Vec<&'static str> {
             Action::Intake(_) => "intake",
             Action::JiraTracker(_) => "jira",
             Action::ForgeEgress { .. } => "egress",
+            Action::RunnerEnv { .. } => "runner-env",
             Action::TriggerLabel { .. } => "label",
             Action::Deploy { .. } => "deploy",
         })
@@ -988,7 +996,14 @@ fn jira_tracker_action_follows_intake_on_install_and_leads_add_agent() {
     let install = quickstart_plan(&install_input()).unwrap();
     assert_eq!(
         action_names(&install.actions),
-        ["external", "cluster", "intake", "jira", "deploy"]
+        [
+            "external",
+            "cluster",
+            "intake",
+            "jira",
+            "runner-env",
+            "deploy"
+        ]
     );
     assert_eq!(deploy_binding(&install.actions).as_deref(), Some(BINDING));
     let carried = install.actions.iter().find_map(|action| match action {
@@ -1002,7 +1017,7 @@ fn jira_tracker_action_follows_intake_on_install_and_leads_add_agent() {
     let add = quickstart_plan(&add_agent_input()).unwrap();
     assert_eq!(
         action_names(&add.actions),
-        ["jira", "egress", "label", "deploy"]
+        ["jira", "egress", "label", "runner-env", "deploy"]
     );
     assert_eq!(deploy_binding(&add.actions).as_deref(), Some(BINDING));
 
@@ -1353,7 +1368,8 @@ fn dry_run(cli: &Cli, args: &[String]) -> Run {
 }
 
 #[test]
-fn factory_quickstart_jira_with_a_non_github_code_host_is_still_not_installed() {
+fn factory_quickstart_jira_with_a_gitlab_code_host_is_a_pairing_refusal() {
+    // #4399: gitlab is installed and pairs only with the gitlab tracker.
     let cli = Cli::new(0);
     let mut args = jira_args("https://jira.example.com", &cli.token_file());
     args = without(&args, "--code-host");
@@ -1361,8 +1377,10 @@ fn factory_quickstart_jira_with_a_non_github_code_host_is_still_not_installed() 
     let run = dry_run(&cli, &args);
     let text = run.all();
     assert_ne!(run.code, 0, "{text}");
-    assert!(text.contains("not installed"), "{text}");
+    assert!(text.contains("pairs only with"), "{text}");
     assert!(text.contains("gitlab"), "{text}");
+    assert!(!text.contains("not installed"), "{text}");
+    assert_no_token(&text, "the pairing refusal");
 }
 
 #[test]

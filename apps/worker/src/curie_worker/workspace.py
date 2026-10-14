@@ -578,7 +578,10 @@ class WorkspaceCredentialClient:
             ) from exc
         if selected is None:
             return None
-        if not isinstance(selected, str) or not _REPO_FULL_NAME.fullmatch(selected):
+        # The API resolves the code host kind from the thread's WorkItem and
+        # validates under that kind's rule; a GitLab path nests groups, so the
+        # worker checks only the forge-neutral shape it clones with.
+        if not isinstance(selected, str) or not _valid_repository_path(selected):
             raise WorkspacePreparationError(
                 "repository-selection", "API returned an invalid repository selection"
             )

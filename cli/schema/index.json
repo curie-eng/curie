@@ -79,7 +79,7 @@
       "result": "ClusterRollbackOutput",
       "kind": "CliOutput",
       "schema": "cluster-rollback.schema.json",
-      "version": "1.0"
+      "version": "1.1"
     },
     {
       "result": "ClusterStatusOutput",
@@ -355,6 +355,12 @@
       "result": "RemediationQualificationOutput",
       "kind": "CliOutput",
       "schema": "remediation-qualification.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "RepoRunnerBuildOutput",
+      "kind": "CliOutput",
+      "schema": "repo-runner-build.schema.json",
       "version": "1.0"
     },
     {

@@ -865,6 +865,26 @@ api/webhook keys, `worker.internalWorkerToken`, and
 (values-dev.yaml, i.e. `curie cluster up --dev`) to keep the deterministic
 published defaults for dev/CI.
 
+Each Deployment, StatefulSet and DaemonSet that consumes chart-owned Secret
+keys carries a `checksum/secret` pod-template annotation. It hashes only that
+pod's consumed keys from the same once-per-render plaintext content emitted by
+the Secret, including rendered `extraEnv` references. A `helm upgrade` that
+changes a consumed key rolls its consumers; unchanged Secret content, unrelated
+keys, replica counts and image tags leave the checksum unchanged. The first
+upgrade onto this chart adds the annotation and rolls each current consumer
+once, including all four backing StatefulSets when they use chart-owned
+credentials. Pods that consume no chart-owned keys, chart Jobs and the
+SandboxTemplate carry no such annotation. Foreign `existingSecret` contents are
+excluded, so rotating one in place still needs a manual restart; existing
+component-specific rotation mechanisms continue to apply. Restarting a store
+does not rotate the password in its persisted database; coordinate that
+database-side change separately.
+
+Dev installs derive their installation identity from the namespace and release
+name so identical inputs render identical checksums (#1135, ADR-0144). Reinstalling
+that same namespace/release in dev reuses the identity. Sealed fresh installs
+still mint unique random identities, and upgrades preserve the stored identity.
+
 The eleven non init credentials persist through `lookup`, so `helm upgrade`
 re-uses them. Their explicit `--set` overrides and per store `existingSecret`
 values take precedence for rotation or recovery. The Langfuse init project
@@ -928,6 +948,50 @@ the chart collector without setting `otelCollector.endpoint` or
 `otelCollector.telemetryDisabled=true`, so a production install cannot silently
 drop every workload's OTLP destination. It is off by default so the zero-secret
 bare install stays green.
+
+### In-chart RustFS storage
+
+The in-chart RustFS volume claim defaults to `rustfs.persistence.size: 10Gi`.
+Every Langfuse event upload costs about three inodes, and 10Gi on ext4 holds
+655,360 of them, well past the 2-day event retention window. The earlier 3Gi
+default could run out of inodes long before it ran out of bytes (#4408).
+
+A StatefulSet's volume claim template cannot change after creation, so an
+existing install keeps its claim size on upgrade: the chart reads the size back
+from the live RustFS StatefulSet's `data` claim template with Helm `lookup` and
+renders that instead of the default. To grow an existing volume on a storage
+class with `allowVolumeExpansion: true`, patch the claim directly:
+
+```bash
+kubectl patch pvc data-<release>-curie-rustfs-0 -n <namespace> \
+  -p '{"spec":{"resources":{"requests":{"storage":"10Gi"}}}}'
+```
+
+The StatefulSet's claim template keeps the old size after that, which is fine:
+it only applies to claims that do not exist yet.
+
+`lookup` is empty when the chart is rendered without cluster access (`helm
+template`, Argo CD). Those renders get the 10Gi default, which Kubernetes
+refuses on an existing StatefulSet with a different size, so pin
+`rustfs.persistence.size` to the size the StatefulSet's `data` claim template
+requests, not the size of the PVC, which is larger once patched as above:
+
+```bash
+kubectl get statefulset <release>-curie-rustfs -n <namespace> \
+  -o jsonpath='{.spec.volumeClaimTemplates[0].spec.resources.requests.storage}'
+```
+
+A `storage-guard` init container checks the volume. When free inodes or free
+bytes are under 10%, it deletes the event objects under `<rustfs.bucket>/events/`
+that have not changed within `langfuse.eventUpload.retentionDays`, the same
+objects the bucket's lifecycle rule expires, because RustFS exits on a full
+volume before its own expiry can run. It touches nothing outside that prefix, and `retentionDays: 0` disables it.
+
+Because it is an init container, the guard runs when the pod starts (install,
+an upgrade that changes the pod, a reschedule, `kubectl delete pod`), not when
+only the RustFS container restarts. A RustFS container already crash-looping on
+a full volume recovers after `kubectl delete pod <release>-curie-rustfs-0 -n
+<namespace>`, which recreates the pod and runs the guard.
 
 ### Key-free object store auth
 
@@ -1328,6 +1392,65 @@ The chart produces `CURIE_REPO_RUNNER_POOLS` only when repository runners exist.
 It maps repository paths to pool names, index and platform digests, base digest,
 Docker setting and egress. Worker `extraEnv` cannot set this reserved name.
 Worker repository routing remains deferred.
+
+**Factory Docker daemons (ADR 0217).** When a repository runner sets
+`docker.enabled: true` and `worker.deploy` is true,
+`templates/docker-daemon.yaml` renders the fixed boundary for per-run Docker
+daemons. The worker creates each run's daemon pod, Service, certificate Secret
+and ingress NetworkPolicy inside it. With no Docker repository nothing renders.
+
+1. A daemon namespace, `factory.docker.namespace` or
+   `<release-namespace>-<fullname>-docker` by default. The chart creates it
+   with `pod-security.kubernetes.io/enforce: privileged` unless
+   `factory.docker.createNamespace` is false, in which case the operator
+   creates it with that label.
+2. A Role and RoleBinding there for the worker ServiceAccount: create, get,
+   list and delete on pods, services and networkpolicies, get on pods/log,
+   create and delete on secrets.
+3. A ResourceQuota from `factory.docker.quota.hard` and a Container LimitRange
+   from `factory.docker.limitRange` (`max`, `min`, `default`,
+   `defaultRequest`). All are required.
+4. NetworkPolicies in the daemon namespace: default-deny ingress and egress,
+   DNS to `security.networkPolicy.dnsNamespace`, and one egress policy per
+   class. Pods labelled `curietech.ai/docker-egress: public` reach
+   `0.0.0.0/0` and `::/0` on TCP 80 and 443 with the metadata, private and
+   `security.networkPolicy.clusterCidrs` ranges excepted. A repository with
+   `docker.egressAllowlist` gets the class `repo-<first 16 hex of
+   sha256(path)>` and only its allowlist, validated like the other one-peer
+   egress lists.
+5. With Rail 1 on, `<fullname>-runner-allow-docker-daemon` lets the factory
+   agent's runner sandboxes (`curietech.ai/agent` set to the one factory agent
+   repository runners belong to) dial daemon pods on `factory.docker.port`
+   (2376). Other agents' sandboxes get no such allow. Daemon ingress
+   stays default-deny until the worker's per-run policy admits that run's
+   sandbox, so a sandbox reaches only its own daemon.
+6. Three ValidatingAdmissionPolicies with Deny bindings, which need
+   Kubernetes 1.30 or newer:
+   `<fullname>-docker-daemon-pods` admits only a worker-created pod with one
+   `dockerd` container on `factory.docker.daemonImage` (digest required), the
+   `--userns-remap=default` and `--authorization-plugin=curie-authz` flags
+   immediately after `dockerd`, the
+   claim, managed-by, selector and egress-class labels, no added
+   capabilities on dockerd, no init or ephemeral containers (it also matches
+   `pods/ephemeralcontainers`), no lifecycle hooks or exec probes, mounts only
+   at `/var/lib/docker` and `/certs` with no `volumeDevices`, no `env` or
+   `envFrom` (a caller environment could point the entrypoint's PATH into a
+   mounted Secret), no ServiceAccount token, only `emptyDir` volumes with a
+   positive `sizeLimit` or `secret` volumes, no host namespaces or ports,
+   positive cpu, memory and ephemeral-storage requests and limits, and
+   `activeDeadlineSeconds`.
+   `<fullname>-docker-daemon-objects` holds the worker's Services to
+   ClusterIP, its Secrets to Opaque or TLS, and its NetworkPolicies to
+   ingress-only policies selecting their own claim, whose every peer is a
+   runner sandbox of this release in the release namespace selected by a
+   label key outside the release selector keys (`name`, `instance`,
+   `component`), with no `ipBlock`, on TCP `factory.docker.port` with no
+   `endPort` range.
+   `<fullname>-docker-daemon-cleanup` lets the worker delete only
+   NetworkPolicies labelled `curietech.ai/sandbox-claim`, never the chart's.
+
+Opting a repository into Docker widens that repository's egress to what its
+class allows. Runner admission is unchanged.
 
 **Credential access.** A sandbox can inspect credentials injected into its own
 process, including any explicitly configured shared model credential. Operators
@@ -1909,12 +2032,14 @@ codeHostTrust:
 ```
 
 The chart mounts that key read-only at `/etc/curie/code-host-trust/ca.crt` in
-the api, the worker, every sandbox runner and every publication Job. The api
-adds it to the public roots for its code host HTTP clients. git
-(`GIT_SSL_CAINFO`, `http.sslCAInfo`) and the sandbox's `SSL_CERT_FILE` and
-`REQUESTS_CA_BUNDLE` use it as their whole store, so include the public roots
-if the sandbox reaches public HTTPS hosts through them. Create the ConfigMap in
-the publication namespace too when `worker.publication.namespace` differs.
+the api, the worker and every sandbox runner. The api adds it to the public
+roots for its code host HTTP clients. git (`GIT_SSL_CAINFO`, `http.sslCAInfo`)
+and the sandbox's `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` use it as their
+whole store, so include the public roots if the sandbox reaches public HTTPS
+hosts through them. Create the ConfigMap in the release namespace only. A
+publication Job runs in the publication namespace, so the worker copies the PEM
+it has mounted (`CURIE_CODE_HOST_CA_BUNDLE`) into that Job's own ConfigMap and
+mounts it read-only at the path the push credential names.
 
 The worker also refuses new third-party dependency names by default, including
 new transitive lockfile entries. It compares `pyproject.toml`, `uv.lock`,

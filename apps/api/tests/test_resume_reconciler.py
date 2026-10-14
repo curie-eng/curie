@@ -144,6 +144,7 @@ def _detached_approval(
     resolved_by: str | None = "U9",
     reply_kind: str = "slack",
     reply_adapter: str | None = None,
+    reply_identity: str | None = None,
     reply_placeholder: str | None = "p-1",
     traceparent: str | None = None,
 ) -> Approval:
@@ -169,6 +170,7 @@ def _detached_approval(
         reply_channel="C1",
         reply_placeholder=reply_placeholder,
         reply_adapter=reply_adapter,
+        reply_identity=reply_identity,
         dedupe_key=uuid.uuid4().hex,
         status=status,
         resolved_by=resolved_by,
@@ -188,6 +190,7 @@ async def _insert_approval(
     reply_kind: str = "slack",
     reply_channel: str | None = None,
     reply_adapter: str | None = None,
+    reply_identity: str | None = None,
     reply_placeholder: str | None = "p-1",
     traceparent: str | None = None,
 ) -> uuid.UUID:
@@ -200,6 +203,7 @@ async def _insert_approval(
         resolved_by=resolved_by,
         reply_kind=reply_kind,
         reply_adapter=reply_adapter,
+        reply_identity=reply_identity,
         reply_placeholder=reply_placeholder,
         traceparent=traceparent,
     )
@@ -594,6 +598,56 @@ def test_both_resume_flavors_replay_the_adapter_from_the_record(
         assert turn.reply_handle.kind == "email", event_id
         assert turn.reply_handle.adapter == "agentmail-sandbox", event_id
         assert turn.reply_handle.endpoint == "http://curie-mail-adapter:8080/", event_id
+
+
+@pytest.mark.parametrize(
+    ("reply_adapter", "reply_identity"),
+    [
+        ("curie-cluster-message", "acme-named"),
+        ("curie-cluster-message", None),
+        ("acme-named", None),
+    ],
+)
+@pytest.mark.parametrize("status", [ApprovalStatus.approved, ApprovalStatus.expired])
+def test_reconciler_replays_the_persisted_relay_binding_identity(
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    reply_adapter: str,
+    reply_identity: str | None,
+    status: str,
+) -> None:
+    async def steps(
+        sessionmaker: async_sessionmaker[AsyncSession], queue: ResumeQueue
+    ) -> uuid.UUID:
+        approval_id = await _insert_approval(
+            sessionmaker,
+            status=status,
+            resolved_at=_naive(120),
+            resumed_at=None,
+            resolved_by=None if status == ApprovalStatus.expired else "U9",
+            reply_adapter=reply_adapter,
+            reply_identity=reply_identity,
+            reply_placeholder="11111111-1111-4111-8111-111111111111",
+        )
+        reconciler = ResumeReconciler(
+            sessionmaker, queue, interval_seconds=30, grace_seconds=0, batch_limit=100
+        )
+        assert await reconciler.reconcile_once() == 1
+        assert await _resumed_at(sessionmaker, approval_id) is not None
+        assert await reconciler.reconcile_once() == 0
+        return approval_id
+
+    approval_id = _run_async(steps, runs_stream)
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    turn = QueuedTurn.model_validate(json.loads(entries[0][1]["payload"]))
+    assert turn.event_id == f"approval-{approval_id}-resolved"
+    assert turn.reply_handle.identity == reply_identity
+    assert turn.reply_handle.adapter == reply_adapter
+    assert turn.reply_handle.placeholder == "11111111-1111-4111-8111-111111111111"
+    assert turn.reply_handle.endpoint is None
+    assert turn.author == ("system" if status == ApprovalStatus.expired else "U9")
 
 
 def test_a_slack_resume_replays_no_adapter(

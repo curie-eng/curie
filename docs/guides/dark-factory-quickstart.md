@@ -1,4 +1,14 @@
-# Dark factory quickstart
+# Software Factory quickstart
+
+<a id="dark-factory-quickstart"></a>
+
+Turn a labelled GitHub issue into a pull request you can review, using the
+Software Factory co-worker. `dark-factory` remains its implementation name.
+See the [solution overview](../software-factory.md) for the delegation workflow,
+supported toolchains, review limits, and production differences.
+
+This guide uses the latest released CLI and factory runner by default. See the
+[capability reference](../capabilities.md) for supported integrations and limits.
 
 `curie factory quickstart` installs Curie on a local
 [kind](https://kind.sigs.k8s.io/) cluster or an explicitly selected existing
@@ -19,6 +29,17 @@ guarantee that the whole walkthrough finishes within the allowance.
 Polling is the intake. There is no webhook, no tunnel, and no personal access
 token. The platform reads the issue for the sandbox.
 
+Quickstart selects automatic initial PR publication and a 5 USD configured
+session ceiling. Despite the `max_usd_per_day` field name, the SDK applies this
+limit per session; it does not aggregate daily spending across runs. See
+[budget limits](../administering-co-workers.md#configure-model-roles-and-bounded-runs).
+Production agents default to human publication approval. Neither policy merges
+the PR. A trial repository can have no CI, but that outcome carries a no-CI
+note rather than evidence that tests passed. The factory cannot publish changes
+under `.github/`. Start with a bounded issue in a small repository; larger
+builds and other toolchains need the setup described in the
+[bundle reference](../../examples/dark-factory/README.md#deploy-it-as-the-factory-agent).
+
 ## What you need
 
 | Tool | Used for |
@@ -27,7 +48,7 @@ token. The platform reads the issue for the sandbox.
 | [`kind`](https://kind.sigs.k8s.io/docs/user/quick-start/#installation) v0.24 or later | the local cluster, required only when neither `--context` nor a current kubeconfig context is set. kind's network plugin enforces NetworkPolicy from v0.24. |
 | [`kubectl`](https://kubernetes.io/docs/tasks/tools/) | Kubernetes operations, required for every context |
 | [`helm`](https://helm.sh/docs/intro/install/) | Curie installation, required for every context |
-| `curie` v0.12.1 or later | install it with the command below |
+| The released `curie` CLI | install it with the command below |
 | An [Anthropic](https://console.anthropic.com/) API key (`sk-ant-`) or an [OpenRouter](https://openrouter.ai/) API key (`sk-or-`) | Anthropic defaults to `claude-sonnet-5-5` for implementation and `claude-opus-5-5` for review. OpenRouter defaults to `z-ai/glm-5.3-flash` for implementation and `openai/gpt-6.1-sol` for review. Plan on about 5 USD of available OpenRouter credit per run; actual spend varies. The command asks once, or reads `CURIE_CREDENTIALS`. |
 | A GitHub account | your own GitHub App and the trial repository |
 
@@ -43,10 +64,10 @@ version and stops before deploy, naming the release install.
 
 ## Install Curie
 
-Use **v0.12.1 or later** for the behavior in this guide. Run this in Bash:
+Install the latest release. Run this in Bash:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/curie-eng/curie/main/get-curie.sh | CURIE_VERSION=v0.12.1 bash
+curl -fsSL https://raw.githubusercontent.com/curie-eng/curie/main/get-curie.sh | bash
 if [ -w /usr/local/bin ]; then
   export PATH="/usr/local/bin:$PATH"
 else
@@ -59,9 +80,8 @@ curie --version
 The installer selects the asset for your machine, verifies its checksum, and
 installs to `/usr/local/bin` when writable, otherwise `$HOME/.local/bin`. The
 PATH block puts the selected install directory before an older binary.
-The command selects v0.12.1 explicitly. To use a later release, change
-`CURIE_VERSION` in that command to its release tag. Confirm the printed version
-is at least `curie 0.12.1` before continuing. A stale older binary can report
+By default, the installer selects the latest published release. Confirm that `curie --version`
+reports the release you installed before continuing. A stale older binary can report
 `unrecognized subcommand 'factory'`.
 
 Released assets cover Linux x86_64, Linux arm64, and macOS Apple silicon.
@@ -210,12 +230,13 @@ defaults.
 
 Before any Helm call, the second run authenticates with the GitHub App and reads
 the selected repository's workflows and standard manifests at one default-branch
-commit. It announces inferred toolchains and warns when a required tool or
-version is absent from the fixed factory runner. The runner includes Python
-3.13, Node 22.23, and Rust 1.95. Matching minor versions are supported regardless
-of patch; a bare Node 22 declaration also matches. A warning reports the tool,
-version, and declaring file without changing the runner image or installing
-tools. If a workflow names a version file that is missing, the version is
+commit. It compares inferred declarations with the tool manifest of the selected,
+digest-pinned runner image and warns about missing tools or version mismatches.
+If the selected image's inventory cannot be read, it explicitly reports the
+inventory as unknown. The operator's `--repo-runner OWNER/REPO=SPEC` option builds
+and pins an image with the tools specified for an already bound repository.
+Otherwise, inference is advisory and installs no inferred tools. If a workflow
+names a version file that is missing, the version is
 reported as unknown with a warning naming the file, and setup continues.
 Authentication failures and malformed GitHub responses remain errors.
 A repository with no declarations gets a `no toolchain signals` note.
@@ -284,8 +305,9 @@ label to try again. Credit exhaustion continues to use the add-credit remedy.
 The recommended 5 USD of available provider credit is a planning allowance,
 not a guaranteed minimum charge per run. Actual spend depends on the task,
 including the reviewers. Separately, quickstart configures the agent's
-budget to 5 USD per day; several inexpensive runs can fit within that daily
-budget. Having provider credit does not raise the configured daily budget.
+USD ceiling to 5 USD per session despite the daily-named configuration field.
+Multiple sessions can therefore exceed 5 USD in aggregate in one day.
+Having provider credit does not raise the configured session ceiling.
 
 The second run configures these values:
 
@@ -299,7 +321,7 @@ The second run configures these values:
 | GitHub surface | `github=<owner>/<name>`, one per repository |
 | Execution deadline | 10800 seconds |
 | Publication | `auto` |
-| Budget | 5 USD per day |
+| Budget | 5 USD configured session ceiling; no shared daily ledger |
 
 The card image stays a text checklist unless you later set a public
 `--card-base-url` on the cluster factory command. Polling does not need one.
@@ -310,9 +332,9 @@ Quickstart writes the factory's forge settings for you. These flags select them:
 
 1. `--code-host <kind>` and `--tracker <kind>` choose where the factory publishes
    and where it takes issues. Both default to `github`. `--tracker jira-cloud`
-   with `--code-host github` is installed; see [Jira Cloud](#jira-cloud). The
-   kind `gitlab` is named but not installed in this build, and the command
-   refuses it. `bitbucket-cloud` and `bitbucket-dc` need `--tracker
+   with `--code-host github` is installed; see [Jira Cloud](#jira-cloud).
+   `--code-host gitlab --tracker gitlab` is installed; see [GitLab](#gitlab).
+   `bitbucket-cloud` and `bitbucket-dc` need `--tracker
    jira-cloud`, and the command refuses that pairing until its quickstart
    lands; see [Bitbucket Cloud and Data Center](#bitbucket-cloud-and-data-center).
 2. `--forge-url`, `--token-file`, `--ca-file` and `--review-account` (repeatable)
@@ -474,6 +496,88 @@ tracker polls every 45 seconds by default. Removing the label, or moving the
 issue to a done status, cancels the run. The factory never changes the
 issue's workflow status.
 
+## GitLab
+
+The factory can take issues from GitLab and publish merge requests to it, on
+gitlab.com or a self-managed server. It labels the issue, opens a merge request
+whose description says `Closes #<iid>`, follows the pipeline, answers review
+discussions in the thread, and never merges or resolves a thread. The GitLab
+server must be version 17.0 or later; only 19.4.1 has been tested.
+
+### The factory account and token
+
+The token needs the `api` and `write_repository` scopes, and its user needs the
+Developer role (access level 30) or higher on the project. A Reporter cannot
+start work, and quickstart refuses a token whose user is below Developer,
+naming the level it found. The factory never needs merge rights.
+
+1. On gitlab.com Free, create a dedicated bot user and use that user's personal
+   access token.
+2. On a self-managed server you may also use a service account, a project
+   access token or a group access token.
+
+Write the token to a file. Quickstart reads it from there and stores it in a
+Secret that only the API mounts; it never prints the token or puts it in argv.
+
+### Run quickstart
+
+```bash
+curie factory quickstart --code-host gitlab --tracker gitlab \
+  --repo <group/.../project> --token-file <path> \
+  [--forge-url <web base>] [--ca-file <pem>] [--dry-run]
+```
+
+Without `--forge-url` the target is `https://gitlab.com`. `--repo` is the full
+project path including any subgroups, for example `group/subgroup/project`.
+
+Before changing the cluster, quickstart:
+
+1. Refuses a server older than 17.0.
+2. Reads the token and refuses one that is inactive or missing `api` or
+   `write_repository`, naming the missing scope.
+3. Resolves the project to its numeric id, default branch and issues setting.
+4. Refuses an access level below 30.
+5. Creates the missing labels, as described below.
+
+`--dry-run` runs these checks and prints the steps it would take, including the
+`gitlab=<path>` surface, without writing anything.
+
+### Self-managed servers
+
+1. **Sub-path installs.** `--forge-url` is the web base, for example
+   `https://host/gitlab`. Quickstart derives the API URL by appending
+   `/api/v4`, so the tracker's `apiUrl` is `https://host/gitlab/api/v4`.
+2. **Custom CA.** `--ca-file <pem>` is written to a ConfigMap and referenced
+   from `codeHostTrust.caBundle`, so the API trusts a private certificate.
+3. **Plain http.** Only `localhost` and `127.0.0.1` are accepted without TLS.
+
+### Labels
+
+Quickstart creates the trigger label `curie-factory` and the state labels
+`curie-factory:queued`, `curie-factory:running`, `curie-factory:pr-open` and
+`curie-factory:needs-human` on the project, and leaves any that already exist.
+These are plain labels. GitLab scoped labels are not used.
+
+### Surface
+
+The agent is bound with one surface per project, `gitlab=<group/subgroup/project>`,
+added with `curie cluster surfaces`. The tracker's `mention` is the token
+user's username, and the binding records the project id as both `project_id`
+and `tracker_scope_id`.
+
+### Token expiry
+
+Quickstart prints `Token expires <YYYY-MM-DD> (<n> days)`, or `Token has no
+expiry`, and records the date in the credential. The factory does not rotate
+tokens; replace the token before that date.
+
+### Polling cost
+
+Intake is polling only. Quickstart writes `factory.enabled: true` and
+`factory.intake: poll` with the GitLab entries, so a fresh install admits
+labelled issues without a separate intake step. Every poll interval (`pollIntervalSeconds`) the factory
+reads one page of the issue listing, then two reads for each issue updated since
+the last poll and one read for each issue that is running.
 ## Bitbucket Cloud and Data Center
 
 Bitbucket has no issue tracker the factory reads, so a Bitbucket code host
@@ -583,8 +687,8 @@ A cancelled run removes all four. Curie never changes your `curie-factory` label
 ## What a repository with no CI sees
 
 1. After publishing, Curie waits on the pull request's checks. With no checks
-   within 120 seconds of the push, and no required check configured, the run
-   completes and the status comment says `Note: No CI checks appeared within 120 s.`
+   within 120 seconds of the push, no required check configured, and GitHub
+   reporting the PR mergeable or already merged, the run completes and the status comment says `Note: No CI checks appeared within 120 s.`
 2. Before the model starts, the runner runs checks declared in
    `.curie/verification.json`. With no declaration it records `not_declared`. <!-- doclint:ignore-line -->
    See [Repository toolchain in the managed sandbox](repository-toolchain-in-the-managed-sandbox.md).

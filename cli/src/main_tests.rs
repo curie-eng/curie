@@ -88,6 +88,86 @@ fn cluster_factory_takes_forge_egress_and_not_the_github_api_flag() {
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
 }
 
+#[test]
+fn cluster_factory_accepts_repeated_repository_runner_and_docker_flags() {
+    assert!(
+        try_parse_from([
+            "curie",
+            "cluster",
+            "factory",
+            "--repo-runner",
+            "acme/bot=bot.yaml",
+            "--repo-runner",
+            "acme/web=web.yaml",
+            "--registry",
+            "registry.example.com/acme",
+            "--repo-docker",
+            "acme/bot",
+            "--repo-docker",
+            "acme/web",
+            "--dry-run",
+        ])
+        .is_ok(),
+        "repository runner and Docker targets must be repeatable"
+    );
+    assert!(
+        try_parse_from([
+            "curie",
+            "cluster",
+            "factory",
+            "--repo-docker",
+            "acme/bot",
+            "--dry-run",
+        ])
+        .is_ok(),
+        "Docker-only changes need no build registry"
+    );
+}
+
+#[test]
+fn cluster_factory_repository_runner_requires_a_registry() {
+    let error = match try_parse_from([
+        "curie",
+        "cluster",
+        "factory",
+        "--repo-runner",
+        "acme/bot=bot.yaml",
+        "--dry-run",
+    ]) {
+        Ok(_) => panic!("repository runner builds must require --registry"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument
+    );
+    assert!(error.to_string().contains("--registry"), "{error}");
+}
+
+#[test]
+fn cluster_factory_disable_conflicts_with_repository_changes() {
+    for extra in [
+        vec![
+            "--repo-runner",
+            "acme/bot=bot.yaml",
+            "--registry",
+            "registry.example.com/acme",
+        ],
+        vec!["--repo-docker", "acme/bot"],
+    ] {
+        let flag = extra[0];
+        let mut argv = vec!["curie", "cluster", "factory", "--disable", "--dry-run"];
+        argv.extend(extra);
+        let error = match try_parse_from(argv) {
+            Ok(_) => panic!("--disable must refuse {flag}"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let text = error.to_string();
+        assert!(text.contains("--disable") && text.contains(flag), "{text}");
+    }
+}
+
 /// clap's derived parser is deep enough that debug bin tests overflow the
 /// default thread stack once apply/diff/doctor grew `--context`. The
 /// released binary still parses on the process stack; only the test
@@ -2489,4 +2569,94 @@ fn cluster_upgrade_parses_allow_stock_layer_clear() {
         }) => assert!(allow_stock_layer_clear),
         _ => panic!("expected cluster upgrade"),
     }
+}
+
+#[test]
+fn build_repo_runner_parses_with_registry() {
+    let cli = try_parse_from([
+        "curie",
+        "build",
+        "--repo-runner",
+        "r.yaml",
+        "--registry",
+        "localhost:5000",
+    ])
+    .expect("build --repo-runner --registry should parse");
+    match cli.command {
+        Some(Command::Build {
+            repo_runner,
+            registry,
+            plugin_dir,
+            ..
+        }) => {
+            assert_eq!(repo_runner, Some(std::path::PathBuf::from("r.yaml")));
+            assert_eq!(registry.as_deref(), Some("localhost:5000"));
+            assert!(plugin_dir.is_none());
+        }
+        _ => panic!("expected build command"),
+    }
+    assert!(try_parse_from([
+        "curie",
+        "build",
+        "--repo-runner",
+        "r.yaml",
+        "--registry",
+        "localhost:5000",
+        "--runner-image",
+        "ghcr.io/curie-eng/curie-runner:dev",
+    ])
+    .is_ok());
+}
+
+#[test]
+fn build_repo_runner_requires_registry() {
+    assert!(
+        try_parse_from(["curie", "build", "--repo-runner", "r.yaml"]).is_err(),
+        "--repo-runner without --registry must be refused"
+    );
+}
+
+#[test]
+fn build_repo_runner_conflicts_with_connector_build_flags() {
+    for extra in [
+        &["--plugin-dir", "x"][..],
+        &["--tag", "my-runner:dev"][..],
+        &["--force"][..],
+        &["--platform", "linux/arm64"][..],
+    ] {
+        let mut argv = vec![
+            "curie",
+            "build",
+            "--repo-runner",
+            "r.yaml",
+            "--registry",
+            "r",
+        ];
+        argv.extend_from_slice(extra);
+        assert!(
+            try_parse_from(argv).is_err(),
+            "--repo-runner must refuse {extra:?}"
+        );
+    }
+}
+
+#[test]
+fn build_plugin_dir_registry_still_parses() {
+    let cli = try_parse_from(["curie", "build", "--plugin-dir", "x", "--registry", "r"])
+        .expect("--plugin-dir --registry is unchanged");
+    match cli.command {
+        Some(Command::Build {
+            repo_runner,
+            plugin_dir,
+            ..
+        }) => {
+            assert!(repo_runner.is_none());
+            assert_eq!(plugin_dir, Some(std::path::PathBuf::from("x")));
+        }
+        _ => panic!("expected build command"),
+    }
+    assert!(
+        try_parse_from(["curie", "build", "--registry", "r"]).is_err(),
+        "--registry alone still needs a build input"
+    );
 }

@@ -42,9 +42,9 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     stable = {"schema_min": "0076", "schema_head": "0076"}
     # Feature migrations append after the published v0.12.2 head; published
     # application windows remain fixed while the candidate advances. The
-    # minimum is #4397's trigger label expand, whose columns every channel and
-    # WorkItem read selects.
-    candidate = {"schema_min": "0105", "schema_head": "0105"}
+    # minimum is the join containing both the stable reply selector columns
+    # and the feature train schema.
+    candidate = {"schema_min": "0108", "schema_head": "0108"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -53,8 +53,8 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == candidate
     assert catalog["revisions"][-12:] == [
-        "0093a", "0094", "0095", "0096", "0097", "0098", "0099", "0100", "0101", "0102", "0103",
-        "0105",
+        "0095", "0096", "0097", "0098", "0099", "0100", "0101", "0102", "0103",
+        "0105", "0107", "0108",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(

@@ -5371,7 +5371,7 @@ export const commandManifest = {
           "name": "github-app"
         },
         {
-          "about": "Turn on the GitHub factory intake (label or mention triggers, repo allowlist, GitHub API egress) on an existing release",
+          "about": "Configure GitHub factory intake or update already bound repository runners and Docker access on an existing release",
           "args": [
             {
               "global": false,
@@ -5387,7 +5387,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable. Sets `api.githubRepoAllowlist`. With --app-id, pass at least one --repo or use --all-installed-repos to allow the whole installation",
+              "help": "Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable. Sets `api.githubRepoAllowlist`. With --app-id, pass at least one --repo or use --all-installed-repos to allow the whole installation. With --repo-runner/--repo-docker, selects advisory discovery only; the recorded intake allowlist stays unchanged",
               "id": "repos",
               "long": "repo",
               "positional": false,
@@ -5459,7 +5459,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "The factory GitHub App's numeric App ID. Pair with --private-key-file. Without both, and with no App recorded on the release, the command prints the App registration link and applies nothing. Mention and label default from the App. Choose the allowlist with --repo (repeatable) or --all-installed-repos",
+              "help": "The factory GitHub App's numeric App ID. Pair with --private-key-file. Without both, and with no App recorded on the release, the command prints the App registration link and applies nothing. Mention and label default from the App. Choose the allowlist with --repo (repeatable) or --all-installed-repos. Repository updates accept this only for optional advisory discovery",
               "id": "app_id",
               "long": "app-id",
               "positional": false,
@@ -5467,7 +5467,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "File holding the App's PEM private key. Stored in a Kubernetes Secret through kubectl stdin; the key never enters argv",
+              "help": "File holding the App's PEM private key. Stored in a Kubernetes Secret through kubectl stdin; the key never enters argv. Repository updates use it for discovery and do not store it",
               "id": "private_key_file",
               "long": "private-key-file",
               "positional": false,
@@ -5494,6 +5494,30 @@ export const commandManifest = {
               "help": "Bind this digest-pinned runner image in the same helm upgrade as the intake settings (`AGENT=ghcr.io/example/runner@sha256:<digest>`). The chart is still `--chart`. The values mode stays `--reuse-values`",
               "id": "runner_image",
               "long": "runner-image",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Build and replace an already bound repository's runner from SPEC. Repeatable; repository updates preserve the intake allowlist",
+              "id": "repo_runners",
+              "long": "repo-runner",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Registry for repository runner builds, such as ghcr.io/acme-corp",
+              "id": "registry",
+              "long": "registry",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Enable Docker for an already bound repository. Repeatable; requires the catalog docker-cli in its replacement or recorded runner",
+              "id": "repo_docker",
+              "long": "repo-docker",
               "positional": false,
               "required": false
             },
@@ -9386,6 +9410,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Install published sha images for a full 40 character lowercase hex commit, including an unreleased commit from next. Only full commit tags are published. Example: --candidate 0123456789abcdef0123456789abcdef01234567",
+              "id": "candidate",
+              "long": "candidate",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Print the steps and exit without creating a cluster or applying anything",
               "id": "dry_run",
               "long": "dry-run",
@@ -9880,7 +9912,15 @@ export const commandManifest = {
         },
         {
           "global": false,
-          "help": "Push every declared platform (or the `--platform` subset) to this registry (e.g. ghcr.io/acme-corp)",
+          "help": "Build a repository runner image from this input file (YAML or JSON; requires `--registry`). Needs a docker-container builder (`docker buildx use` or `BUILDX_BUILDER`) for the two-platform push",
+          "id": "repo_runner",
+          "long": "repo-runner",
+          "positional": false,
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "Push every declared platform (or the `--platform` subset) to this registry (e.g. ghcr.io/acme-corp). With `--repo-runner`, the registry the repository runner image is pushed to",
           "id": "registry",
           "long": "registry",
           "positional": false,
@@ -9888,7 +9928,7 @@ export const commandManifest = {
         },
         {
           "global": false,
-          "help": "The platform runner a declared runner layer builds on (default: the runner `curie skill up` uses). Resolved to a digest before building",
+          "help": "The platform runner a declared runner layer or a repository runner builds on (default: the runner `curie skill up` uses). Resolved to a digest before building",
           "id": "runner_image",
           "long": "runner-image",
           "positional": false,
@@ -9916,7 +9956,7 @@ export const commandManifest = {
         }
       ],
       "hidden": false,
-      "long_about": "Build the runner image, or an agent bundle's declared connectors.\n\nWith no flags it runs `docker build -f runner/Dockerfile -t <tag> .` from the repo root (source checkout only; a release binary pulls the pinned runner image from GHCR automatically and never needs this).\n\nWith `--plugin-dir <PATH>` it builds every connector that bundle's `connectors.yaml` declares from source and writes `connectors.lock.yaml` beside it. With `--registry <REF>` it builds every declared platform, pushes, and records the registry manifest digest, which is what a cluster deploy requires. Without `--registry` it builds the host platform only into the local Docker daemon and records the local image id, which is usable at the skill and local tiers and refused at cluster.",
+      "long_about": "Build the runner image, or an agent bundle's declared connectors.\n\nWith no flags it runs `docker build -f runner/Dockerfile -t <tag> .` from the repo root (source checkout only; a release binary pulls the pinned runner image from GHCR automatically and never needs this).\n\nWith `--plugin-dir <PATH>` it builds every connector that bundle's `connectors.yaml` declares from source and writes `connectors.lock.yaml` beside it. With `--registry <REF>` it builds every declared platform, pushes, and records the registry manifest digest, which is what a cluster deploy requires. Without `--registry` it builds the host platform only into the local Docker daemon and records the local image id, which is usable at the skill and local tiers and refused at cluster.\n\nWith `--repo-runner <PATH> --registry <REF>` it builds a repository runner image (ADR 0216) from a YAML or JSON input file naming catalog `tools`, an optional `dockerfile` beside the file built on `${CURIE_RUNNER_IMAGE}`, and extra `probes`. Both linux/amd64 and linux/arm64 are built in one buildx bake, every tool is probed inside the image (a failing probe fails the build), the probe manifest lands at /etc/curie/tool-manifest.json, and the image is pushed to `<REF>/curie-repo-runner`. It prints the `runner` block to paste under `factory.bindings[].repos[].runner`. The multi-platform push needs a docker-container builder: select one with `docker buildx use` or `BUILDX_BUILDER`.",
       "name": "build"
     },
     {

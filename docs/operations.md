@@ -10,7 +10,7 @@ installs and runs it, wrapping the umbrella Helm chart the way `linkerd` or
 
 This doc covers the `cluster` target specifically. For `skill` or `local`
 Targets, see the target comparison table in the
-[README](../README.md#which-target-do-i-want) or [`cli/README.md`](../cli/README.md).
+[CLI target guide](../cli/README.md#using-different-tiers).
 
 **Prerequisites:**
 
@@ -18,7 +18,7 @@ Targets, see the target comparison table in the
 |---|---|
 | `kubectl` and `helm` on PATH | Every `cluster` verb wraps one or both of them. |
 | A reachable cluster | Every verb talks to the cluster's Kubernetes API server directly -- there's nothing to install onto or inspect without one. The chart's own preflights additionally need the `agents.x-k8s.io` Agent Sandbox CRDs (Custom Resource Definitions) installable and a NetworkPolicy-enforcing CNI (Container Network Interface) already present; see `charts/curie/README.md`. |
-| `runsc` (gVisor) on every node for full kernel isolation | Before Helm runs, plain `cluster up` reads the rendered preflight's RuntimeClass. A `NotFound` GET infers `security.gvisor.mode=off` unless the chart creates that RuntimeClass. A `Forbidden` GET retains one retry only after admission reports `RuntimeClass "gvisor" not found`. Other read errors and admission refusals stay closed. Fake model installs do not need it. |
+| `runsc` (gVisor) on every node for full kernel isolation | Before Helm runs, plain `cluster up` reads the rendered preflight's RuntimeClass. A `NotFound` GET infers `security.gvisor.mode=off` unless the chart creates that RuntimeClass. A `Forbidden` GET retains one retry only after admission reports `RuntimeClass "gvisor" not found`. Other read errors and admission refusals stay closed. A present RuntimeClass whose nodeSelector matches no node also infers `security.gvisor.mode=off` before the first install, including fake-model auto installs with the preflight enabled; explicit `auto` is an error, while explicit `require` keeps the preflight gate for clusters that provision sandbox nodes on demand. |
 
 **For testing**, pick between **k3s**, **kind**, and **minikube** based on
 your host and how disposable the cluster needs to be. A single-node **k3s**
@@ -68,6 +68,148 @@ stale kubeconfig current-context cannot send a command at the wrong cluster:
 ```bash
 curie cluster status --context <your-production-context>
 ```
+
+### Google Kubernetes Engine (GKE)
+
+1. **Set up credentials for the child processes.** Install
+   `gke-gcloud-auth-plugin` with the Google Cloud CLI, or install your
+   distribution's package of the same name. Authenticate the service account,
+   then write the cluster's kubeconfig entry:
+
+   ```bash
+   gcloud components install gke-gcloud-auth-plugin
+   gcloud auth activate-service-account --key-file <key.json>
+   gcloud container clusters get-credentials <cluster> \
+     --location <region-or-zone> --project <project>
+   ```
+
+   Every `curie cluster` verb shells out to `kubectl` or `helm`, so the
+   kubeconfig's exec plugin must be on `PATH` for those child processes. A
+   kubeconfig built by hand around a static token from
+   `gcloud auth print-access-token` stops working after one hour, the lifetime
+   of a Google OAuth access token. An install plus first deploy can outlast
+   it. The context name written by `get-credentials` is
+   `gke_<project>_<location>_<cluster>`; pass it explicitly using the
+   [`--context` guidance below](#installing-and-inspecting-the-curie-platform-on-the-cluster).
+
+2. **Size the node pool before installing.** Start a real-model install with
+   at least **3 x e2-standard-4** nodes. **3 x e2-medium is too small**: in a
+   real install, the platform requests plus GKE's own kube-system pods filled
+   91 to 99% of each e2-medium node's allocatable CPU.
+
+   With dispatcher enabled and a real model, the defaults in
+   `charts/curie/values.yaml` request **1625m CPU and 3776Mi memory** across
+   non-hook Deployments and StatefulSets. The agent-sandbox controller has no
+   resource requests. Add **30m CPU and 48Mi memory per node** for the default
+   runner-prewarm DaemonSet, and **50m CPU and 192Mi memory per live runner
+   sandbox**, with a **1 CPU / 768Mi limit** on each runner. Each distinct
+   layered runner digest adds a prewarm container requesting another
+   10m CPU and 16Mi memory per node.
+
+   Requests are a scheduling floor, not resident use. The chart README's
+   [single-node footprint](../charts/curie/README.md#single-node-footprint-measured-on-a-disposable-single-node-k3s-cluster-4-gb--4-core)
+   records RustFS and Langfuse web near 1.1 GB and 950 MB resident and
+   recommends at least 8 vCPU / 16 to 20 GB. Three e2-standard-4 nodes leave
+   room for sandbox bursts after GKE's system reservation.
+
+   Set the node pool autoscaler minimum to its starting node count during
+   installation, and size the pool so the install does not need to scale out:
+
+   ```bash
+   gcloud container clusters update <cluster> --node-pool <pool> \
+     --enable-autoscaling --min-nodes <n> --max-nodes <m> \
+     --location <region-or-zone> --project <project>
+   ```
+
+   On a regional cluster these counts are **per zone**, so use the starting
+   node count per zone. After Helm completes, `cluster up` waits for exact
+   target workload convergence for **300 seconds**, checking every
+   Deployment, StatefulSet and DaemonSet in the release manifest
+   (`cli/src/ops/convergence.rs`). Nodes added or removed during that window
+   change the pods that must pull images and become ready before it ends.
+
+3. **Check whether the GKE gVisor RuntimeClass can schedule.** GKE
+   preinstalls a `gvisor` RuntimeClass, but its presence does not mean a
+   matching GKE Sandbox node pool exists. Read its node selector, then check
+   for nodes matching every selector entry:
+
+   ```bash
+   kubectl get runtimeclass gvisor -o jsonpath='{.scheduling.nodeSelector}' \
+     --context <gke-context>
+   kubectl get nodes -l <key=value,key=value> --context <gke-context>
+   ```
+
+   Convert each printed selector entry to `key=value` and pass the
+   comma-separated list to the second command. No matching node means no pod
+   can run under that class. When the gVisor preflight runs, its pod must
+   schedule under the class within the Job's **120 second deadline** or the
+   install fails (`charts/curie/templates/preflight-gvisor.yaml`).
+
+   Either add a GKE Sandbox node pool, following Google's
+   [GKE Sandbox node pool requirements](https://cloud.google.com/kubernetes-engine/docs/how-to/sandbox-pods):
+
+   ```bash
+   gcloud container node-pools create <pool> --cluster <cluster> \
+     --sandbox type=gvisor --machine-type <supported-machine-type> \
+     --location <region-or-zone> --project <project>
+   ```
+
+   Or install with gVisor explicitly off:
+
+   ```bash
+   curie cluster up --context <gke-context> --set security.gvisor.mode=off
+   ```
+
+   Explicit `off` is accepted in every case, including when the CLI would
+   infer the same setting, so an operator without a sandbox pool can always
+   pass it. As specified in `charts/curie/values.yaml`, `off` never stamps a
+   `runtimeClassName`: runner pods share the node kernel. Default-deny egress,
+   the metadata endpoint block, read-only root filesystem, non-root execution
+   and per-agent secret isolation stay on. With fake-model `auto`, the chart
+   still stamps the class on runner pods when lookup finds it; without a GKE
+   Sandbox node pool those pods cannot schedule either. The same two choices
+   apply to a fake-model install.
+
+4. **Bind a bundle's runner image during the first install.** A bundle with
+   its own runner image normally binds it on the first `cluster deploy`
+   through a full Helm upgrade, which fires upgrade hooks. Adding that image
+   also changes `CURIE_AGENT_SANDBOX_POOLS` on the worker and rolls the worker.
+   To avoid that upgrade, pass the exact string recorded as `runner.image` in
+   the bundle's connectors.lock.yaml file when installing:
+
+   ```bash
+   curie cluster up --context <gke-context> \
+     --set agentSandbox.runnerImages.<agent>=<locked-runner-image>
+   ```
+
+   The `bind_need` check in `cli/src/cluster_secrets.rs` skips the deploy's
+   Helm upgrade only when the release's supplied values already contain
+   that exact string under `agentSandbox.runnerImages.<agent>` and every
+   connector secret being bound already matches
+   `agentSandbox.connectorSecrets.<agent>`. A bundle with no connector
+   secrets satisfies the secret condition. A bundle with connector secrets
+   still upgrades on its first deploy. When both bindings are current, the
+   deploy prints that the connector secrets and runner image are already
+   current and the platform release was not upgraded; it only replaces the
+   agent's sandboxes.
+
+   There are two limits. `cluster up` does not carry
+   `agentSandbox.runnerImages` forward: it is absent from
+   `RETAINED_RUNNER_FAMILIES` in `cli/src/ops/up.rs`. Pass the same `--set` on
+   **every later `cluster up`** or that run drops the binding. Also, the lock's
+   `runner.base` must be the installation's runner digest;
+   `check_layered_runner_base` in `cli/src/cluster_secrets.rs` refuses a
+   bundle with a different base.
+
+5. **Allow capacity and time for prewarm convergence.** The
+   runner-prewarm DaemonSet is part of the 300 second convergence wait, so
+   every node must pull the runner image, about 380 MB, and each layered
+   runner digest within that window. The DaemonSet's desired, updated, ready
+   and current counts must agree, with zero unavailable pods. Its pods are
+   unclassed at priority 0 (`charts/curie/templates/priorityclass.yaml`), so
+   higher-priority pods can preempt them on a crowded node and hold
+   convergence back. Keep the capacity and autoscaler settings above through
+   installation so image pulls and prewarm readiness fit inside the gate.
 
 ## Installing and inspecting the Curie platform on the cluster
 
@@ -395,6 +537,19 @@ rollout reasons. `--json` retains the same report object with `healthy: false`.
 The check compares the installed Helm target with live workload generations,
 replica counts and serving pod images; an `Available` condition alone is insufficient.
 
+Terminal pods do not count as replicas. A kubelet-initiated termination, such
+as a node-pressure eviction or a graceful node shutdown, leaves the pod object
+behind in phase `Succeeded` or `Failed`, and its ReplicaSet does not delete it.
+`cluster upgrade` converge, `cluster up` and `cluster status` treat an install
+whose only extra pods are terminal and not terminating as converged.
+`cluster status` still lists those pods in its pod table but no longer counts
+them, so it exits 0 with `healthy: true` where it used to exit 1, and
+`cluster up` completes its convergence wait instead of failing it. A terminal
+pod that is terminating, or an active surplus pod, still fails the check. The
+CLI does not delete terminal pods; remove them with `kubectl delete pod -n <namespace> <name>`,
+or `kubectl delete pods -n <namespace> --field-selector=status.phase==Failed`
+for the failed ones.
+
 A diagnosis the command could not MAKE is a warning, not a failure. When the
 mail adapter is deployed but its `/statusz` cannot be read -- the pod proxy is
 unreachable, the pod is restarting, the adapter predates that endpoint -- the
@@ -517,7 +672,9 @@ up` observes it, not assumed.
 `--json` reports the current phase, the last known-good version, whether
 the previous version is still serving, and at most one fail-forward
 command. Success is refused unless convergence is exact and the canary
-passed. After a normal command failure, run the same command to resume only
+passed. Every failed phase exits 1, and `--json` preserves the full upgrade
+report, including convergence and the fail-forward command. After a normal
+command failure, run the same command to resume only
 when cleanup successfully released ownership.
 
 This composes configuration migration (issue 2299) with a `drain_preflight`
@@ -621,7 +778,11 @@ revision and version, and the rollback command. With `--take-over`, an orphaned
 before the CLI reads retained snapshots or resumes the lifecycle. A failed
 rollback fails the command and releases ownership without changing the durable
 record. `pending-install`, `pending-rollback`, and a pending history with no
-deployed revision refuse without automated recovery.
+deployed revision refuse without automated recovery. When the newest row is
+`pending-rollback` with a parsable `Rollback to <N>` description, the refusal
+adds ``it is an interrupted rollback to revision <N>; run curie cluster rollback
+--yes to finish it, or run `helm rollback <release> <serving-revision> -n
+<namespace> --wait --timeout 15m`, then rerun cluster upgrade``.
 
 The conditional manual patch remains a fallback. After verifying that the
 holder and Helm action have stopped and no release hook Job is running, recover
@@ -699,9 +860,26 @@ curie cluster rollback
 
 `curie cluster rollback` selects the newest `deployed` revision as the serving
 revision. When the newest history row is above it and is not `deployed` or
-`superseded`, the rollback targets the serving revision. For example, deployed
+`superseded` (except `pending-rollback`, below), the rollback targets the serving revision. For example, deployed
 revision 4 followed by pending revision 5 rolls back to revision 4, clearing
 the unfinished upgrade while retaining known good state.
+
+When the newest row is `pending-rollback`, its description `Rollback to <N>`
+is read. If revision N is in history below the pending row, is `deployed` or
+`superseded`, and has the same chart as the pending row, the command finishes
+the interrupted rollback toward N. For example, superseded 9, deployed 10, and
+pending-rollback 11 described `Rollback to 9` resumes to revision 9. The dry run
+prints `revision 11 is an interrupted rollback to revision 9; resuming it`, the
+same note appears before the prompt, and `--json` reports
+`resumed_interrupted_rollback: true` (`false` otherwise). If N cannot be
+confirmed, the command exits 1 with `revision 11 is an interrupted rollback
+whose target cannot be confirmed`, naming `curie cluster rollback --revision <N>
+--yes` to finish it and `curie cluster rollback --revision <serving> --yes` to
+restore the serving revision; the first choice is omitted when N does not parse
+or is not in history. Any other ineligible newest status (`pending-install`,
+`pending-upgrade`, `failed`, `unknown`, `uninstalling`, `uninstalled`) still
+restores the serving revision. `--revision` and `--allow-failed-revision` are
+unchanged, and the schema gate still applies to N.
 
 Otherwise, it selects the newest `deployed` or `superseded` revision below
 the serving revision. If no revision is deployed, it selects below the highest
@@ -727,8 +905,16 @@ so you can see exactly what a bare
 status refusals. It prints the resolved revision number, status and chart,
 the revision it rolls back from, and any skipped revisions. `--json` carries
 these same lines in the plan. A failed history read or refused selection exits
-nonzero. The plan lists the live-schema probe, but neither that probe nor
-`helm rollback` runs during a dry run.
+nonzero. With the schema gate enabled, a dry run also performs the offline
+catalog check on the selected revision: it must carry an application version
+whose schema range this CLI declares. Otherwise the dry run refuses with the
+same message as the real rollback, exits nonzero, and prints no plan. For an
+application version with no declared schema range, the refusal names the
+newest safe fail-forward version only when you pass `--live-schema-revision`,
+because the dry run does not read the live database revision; without it, the
+refusal tells you to pass one. The live window
+check stays with the real rollback. The plan lists the live-schema probe, but
+neither that probe nor `helm rollback` runs during a dry run.
 
 Status is not the whole story. Every API pod still runs `alembic upgrade head`
 at startup, so an older image refuses a live database revision it does not
@@ -1414,7 +1600,8 @@ A last `Cause:` line names the platform cause code
 (`capacity_wait_expired`, `start_failed`, `execution_deadline`, `issue_cancelled`,
 `owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
 `no_pull_request`,
-`early_stop`, `publication_denied`, `publication_expired`, `publication_failed`, or a
+`early_stop`, `publication_denied`, `publication_expired`, `publication_failed`,
+`publication_unrecorded`, or a
 classified run failure: `model_credit_exhausted`, `model_usage_limited`,
 `model_credential_rejected`, `model_rate_limited`, `model_error`, `model_unreachable`, `budget_exceeded`, `runner_timeout`,
 `sandbox_terminated`, `workspace_error`, or `history_capacity`). A sandbox
@@ -1427,7 +1614,8 @@ Other escalations use that same first line with their own token
 (`delivery-deadline`, `prior-side-effect`, `approval-route-unbound`,
 `approval-approvers-unverifiable`, `approval-no-email-approvers`, `approval-backend-missing`,
 `publication-unavailable`, or `approval-create-failed`). A failed run whose cause is `runner_escalated`,
-`sandbox_terminated`, `unclassified`, `max_turns`, or `ci_failed` still shows as needing a person.
+`sandbox_terminated`, `publication_unrecorded`, `unclassified`, `max_turns`, or `ci_failed`
+still shows as needing a person.
 A history capacity result tells the
 operator to inspect work already done and retry. A model provider that answers
 HTTP 402 or reports exhausted
@@ -1521,6 +1709,16 @@ source checkout, `kubectl`, `helm`, `openssl` and `cloudflared`.
    got HTTP 200 and `factory_admitted`, and
    `GET /v1/internal/work-items/requests/{id}` returns the admitted WorkItem.
 
+`curie dev factory-e2e scripted` runs the factory on its own disposable kind
+cluster with a GitHub stub and recorded model responses. Scripted mode honors
+`CURIE_BIN`, including when `--build-images` builds the runner with that CLI.
+Every factory mode defaults to `curie` on PATH when `CURIE_BIN` is unset,
+resolves the executable to an absolute path before any cluster or GitHub
+action, and prints that path with the first line of its `--version` output.
+The evidence JSON records these as `curie_bin` and `curie_version`. An
+unresolvable binary or a failed version probe refuses the run and names
+`CURIE_BIN`.
+
 Before it creates its namespace, the driver removes what a crashed run on this
 machine left behind. Each namespace it creates carries its run id and a
 `curie.dev/factory-e2e-holder` annotation of `<hostname>:<pid>`. A harness
@@ -1574,10 +1772,10 @@ Every identity is an operator input. Nothing names a specific App or account:
 | `CURIE_FACTORY_ACTOR_TOKEN` or `CURIE_FACTORY_ACTOR_GH_USER` | A dedicated test GitHub account with write access that opens issues, comments and moves the fixture branch (a `gh` login for the second). It must not be the operator's own account |
 | `CURIE_FACTORY_OPERATOR_LOGIN` | The operator's GitHub login, compared with the actor's (default: the login of the default `gh` account). The run is refused when they match, and refused too when neither is known, naming this variable to set |
 | `CURIE_FACTORY_LABEL`, `CURIE_FACTORY_MENTION` | Intake label (default `curie-factory`) and mention login (default the App slug) |
-| `CURIE_FACTORY_PRIORITY_CLASSES` | `<platform>,<sandbox>`: reuse existing PriorityClasses instead of creating them |
+| `CURIE_FACTORY_PRIORITY_CLASSES` | `<platform>,<sandbox>`: reuse existing PriorityClasses. Unset, the run's release (`curie-` plus 4 hex characters derived from the namespace, so it installs beside another release named `curie`) creates `<release>-platform` and `<release>-sandbox` and removes them on uninstall |
 | `CURIE_FACTORY_WEBHOOK_RESTORE_URL` | URL to leave on the App webhook (default: the URL found at start, or the parked URL when that was a dead quick tunnel) |
 | `CURIE_FACTORY_CLOUDFLARED` | cloudflared binary (default `cloudflared` on PATH) |
-| `CURIE_FACTORY_CURIE_BIN` | `curie` binary that deploys the bundle (default `curie` on PATH) |
+| `CURIE_BIN` | `curie` binary used by every factory mode (default `curie` on PATH) |
 | `CURIE_FACTORY_BUNDLE_DIR` | Bundle to deploy (default `examples/dark-factory`) |
 | `CURIE_FACTORY_MODEL_API_KEY` | Model credential. Set, the install runs a real model with the worker budget raised to the execution bound; unset, the model is fake |
 | `CURIE_FACTORY_MODEL_BASE_URL` or `--model-base-url` | Anthropic-compatible base URL. The worker receives it as `CURIE_MODEL_BASE_URL` through `worker.extraEnv`. The host must be the model proxy pod IP; sandbox egress allows that `/32` and port. `curie dev model-script record` is the proxy that writes a transcript while it forwards to `https://openrouter.ai/api`. `curie dev model-script serve` replays that transcript and fails if a request, including a plan or diff reviewer call, was not recorded |

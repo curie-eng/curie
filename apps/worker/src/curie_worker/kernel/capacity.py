@@ -231,9 +231,13 @@ async def _reclaim_idle_route_before_deadline(
         return _PressureResult(False, inventory.outcome)
 
     saw_race = False
-    # Idle eval routes go first, so a liveness probe's sandboxes are freed
-    # before a person's. The sort is stable: each group keeps the
-    # inventory's (expiry, thread key) order.
+    # Idle eval routes go first within each selection cycle. The sort is
+    # stable: each group keeps the inventory's (expiry, thread key) order.
+    # Keep selected identities across expiry changes, and forget routes
+    # absent from this complete, bounded inventory.
+    self._pressure_selected_threads.intersection_update(
+        candidate.thread_key for candidate in inventory.candidates
+    )
     candidates = tuple(
         sorted(
             (
@@ -243,7 +247,20 @@ async def _reclaim_idle_route_before_deadline(
             ),
             key=lambda candidate: not routing._is_eval_thread_key(candidate.thread_key),
         )
-    )[: constants._PRESSURE_CANDIDATES]
+    )
+    unselected = tuple(
+        candidate
+        for candidate in candidates
+        if candidate.thread_key not in self._pressure_selected_threads
+    )
+    if not unselected:
+        self._pressure_selected_threads.clear()
+        unselected = candidates
+    candidates = unselected[: constants._PRESSURE_CANDIDATES]
+    # Reserve the whole window before any await, including windows that
+    # later time out or reclaim early. Concurrent passes on this kernel
+    # therefore advance rather than repeatedly probing the same prefix.
+    self._pressure_selected_threads.update(candidate.thread_key for candidate in candidates)
     for candidate in candidates:
         if clock.time.monotonic() >= pressure_deadline:
             return _PressureResult(False, "timeout")

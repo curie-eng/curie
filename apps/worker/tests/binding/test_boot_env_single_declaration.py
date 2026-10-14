@@ -218,10 +218,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_PUBLICATION_OWNER_NAME",
         "CURIE_PUBLICATION_GIT_USER_NAME",
         "CURIE_PUBLICATION_GIT_USER_EMAIL",
-        # The code host CA bundle ConfigMap (chart codeHostTrust, ADR 0197)
-        # the publication Job builder mounts. Worker config, not a boot key.
-        "CURIE_CODE_HOST_CA_CONFIGMAP",
-        "CURIE_CODE_HOST_CA_CONFIGMAP_KEY",
+        # The worker's mounted code host CA bundle (chart codeHostTrust, ADR
+        # 0197), copied into each publication Job's own ConfigMap. Worker
+        # config, not a boot key.
+        "CURIE_CODE_HOST_CA_BUNDLE",
         "CURIE_PUBLICATION_CPU_REQUEST",
         "CURIE_PUBLICATION_CPU_LIMIT",
         "CURIE_PUBLICATION_MEMORY_REQUEST",
@@ -337,6 +337,8 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_AGENT_SANDBOX_POOLS",
         # Agents whose per-agent pool carries connector secrets (#2943), substrate only.
         "CURIE_AGENT_CONNECTOR_SECRET_POOLS",
+        # Repository runner pools (ADR 0216): run.py parses it for the substrate only.
+        "CURIE_REPO_RUNNER_POOLS",
         # The runner-facing API base (#678): WorkerConfig reads it from the
         # WORKER's env to MINT CURIE_MEMORY_REF/CURIE_HISTORY_REF (which ARE
         # declared boot keys, rendered from the declaration). It is a worker-side

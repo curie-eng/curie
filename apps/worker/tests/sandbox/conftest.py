@@ -239,9 +239,7 @@ class FakeSandboxClient:
         )
         self.created.append(name)
 
-    def get_claim(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> ClaimView | None:
+    def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
         assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None:
@@ -281,9 +279,7 @@ class FakeSandboxClient:
             raise self.template_reap_error
         return []
 
-    def get_sandbox(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> SandboxView | None:
+    def get_sandbox(self, name: str, *, request_timeout_seconds: float) -> SandboxView | None:
         assert request_timeout_seconds > 0
         sandbox = self.sandboxes.get(name)
         if sandbox is None:
@@ -330,3 +326,30 @@ class FakeSandboxClient:
 @pytest.fixture
 def fake_k8s() -> FakeSandboxClient:
     return FakeSandboxClient()
+
+
+@dataclass
+class PoolProbingFakeSandboxClient(FakeSandboxClient):
+    """A ``FakeSandboxClient`` that also answers ``warm_pool_exists``.
+
+    A separate class, because the substrate already probes for a derived
+    per-agent pool whenever the client can answer: adding the probe to the base
+    fake would move every existing agent-pool test onto the derived pool.
+    ``warm_pools`` None means every pool exists; a set names the pools that do.
+    ``warm_pool_error`` makes the probe raise, as an apiserver outage would.
+    """
+
+    warm_pools: frozenset[str] | None = None
+    warm_pool_error: BaseException | None = None
+    warm_pool_probes: list[str] = field(default_factory=list)
+
+    def warm_pool_exists(self, name: str) -> bool:
+        self.warm_pool_probes.append(name)
+        if self.warm_pool_error is not None:
+            raise self.warm_pool_error
+        return self.warm_pools is None or name in self.warm_pools
+
+
+@pytest.fixture
+def probing_k8s() -> PoolProbingFakeSandboxClient:
+    return PoolProbingFakeSandboxClient()

@@ -2218,6 +2218,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/identity/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Resolve */
+        post: operations["resolve_identity_resolve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/slack-reports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Slack Report */
+        post: operations["slack_report_identity_slack_reports_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/langfuse/traces": {
         parameters: {
             query?: never;
@@ -4359,6 +4393,8 @@ export interface components {
             reply_channel: string;
             /** Reply Endpoint */
             reply_endpoint?: string | null;
+            /** Reply Identity */
+            reply_identity?: string | null;
             /** Reply Kind */
             reply_kind: string;
             /** Reply Placeholder */
@@ -6533,6 +6569,38 @@ export interface components {
              */
             tenant_id: string;
         };
+        /** PrincipalResolutionOut */
+        PrincipalResolutionOut: {
+            /** Channel Identity Id */
+            channel_identity_id: string | null;
+            /** Namespace Id */
+            namespace_id: string | null;
+            /** Principal Id */
+            principal_id: string | null;
+            /** Reason */
+            reason: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "resolved" | "unresolved";
+        };
+        /**
+         * PrincipalResolveIn
+         * @description Which principal sent this event, as seen by one receiving channel identity.
+         */
+        PrincipalResolveIn: {
+            /** Channel Identity */
+            channel_identity: string;
+            /**
+             * Provider
+             * @enum {string}
+             */
+            provider: "slack" | "m365" | "github" | "jira" | "linear" | "confluence" | "quickbooks" | "other";
+            slack?: components["schemas"]["SlackEvidence"] | null;
+            /** Tenant Id */
+            tenant_id?: string | null;
+        };
         /**
          * ProbeCreate
          * @description @spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13: exactly these three keys.
@@ -6785,6 +6853,8 @@ export interface components {
             reply_conversation_id?: string | null;
             /** Reply Endpoint */
             reply_endpoint?: string | null;
+            /** Reply Identity */
+            reply_identity?: string | null;
             /** Reply Kind */
             reply_kind: string;
             /** Reply Placeholder */
@@ -7974,6 +8044,68 @@ export interface components {
             settings?: components["schemas"]["SettingConfig"][];
         };
         /**
+         * SlackEvidence
+         * @description The identity-bearing fields of one Slack delivery, as the dispatcher read them.
+         *
+         *     Strict, so a string ``"false"`` is never taken as the positive statement
+         *     ``is_ext_shared_channel: false``; extra fields are refused, so a field this
+         *     mapping does not use cannot be sent as if it were evidence.
+         */
+        SlackEvidence: {
+            /** Delivery */
+            delivery: string;
+            /** Enterprise Ids */
+            enterprise_ids?: string[];
+            /** Event Team */
+            event_team?: string | null;
+            /** Event User Team */
+            event_user_team?: string | null;
+            /** Interaction User Team Id */
+            interaction_user_team_id?: string | null;
+            /** Is Ext Shared Channel */
+            is_ext_shared_channel?: boolean | null;
+            /** User Id */
+            user_id?: string | null;
+        };
+        /**
+         * SlackReportIn
+         * @description What ``auth.test`` returned for one Slack identity's own token.
+         */
+        SlackReportIn: {
+            /** Enterprise Id */
+            enterprise_id: string | null;
+            /** Enterprise Id Present */
+            enterprise_id_present: boolean;
+            /** Is Enterprise Install */
+            is_enterprise_install: boolean | null;
+            /** Name */
+            name: string;
+            /** Team Id */
+            team_id: string;
+            /** Tenant Id */
+            tenant_id?: string | null;
+        };
+        /** SlackReportOut */
+        SlackReportOut: {
+            /**
+             * Identity Id
+             * Format: uuid
+             */
+            identity_id: string;
+            /** Installation Mismatch */
+            installation_mismatch: boolean;
+            /**
+             * Namespace Id
+             * Format: uuid
+             */
+            namespace_id: string;
+            /**
+             * Provider Installation Id
+             * Format: uuid
+             */
+            provider_installation_id: string;
+        };
+        /**
          * SourceBindingConfig
          * @description How one hook maps a workload identity onto a coding target (#2572).
          */
@@ -8815,27 +8947,28 @@ export interface components {
             /** Conversation Id */
             conversation_id: string;
         };
-        /** WorkspaceSelectionOut */
-        WorkspaceSelectionOut: {
-            /** Repo Full Name */
-            repo_full_name: string | null;
-            /** Revision */
-            revision?: string | null;
-        };
-        /** WorkspaceSelectionRequest */
-        WorkspaceSelectionRequest: {
+        /**
+         * WorkspaceSelectionIn
+         * @description The worker's selection: the thread and the repository path it names.
+         *
+         *     The worker never names a code host kind. The route takes it from the
+         *     thread's factory WorkItem (GitHub when there is none) and validates the
+         *     path under that kind's rule as a `WorkspaceSelectionRequest`.
+         */
+        WorkspaceSelectionIn: {
             /** Author */
             author: string;
             /** Conversation Id */
             conversation_id: string;
             /** Repo Full Name */
             repo_full_name?: string | null;
-            /**
-             * Repository Kind
-             * @default github
-             * @enum {string}
-             */
-            repository_kind?: "github" | "gitlab" | "bitbucket_cloud" | "bitbucket_dc";
+        };
+        /** WorkspaceSelectionOut */
+        WorkspaceSelectionOut: {
+            /** Repo Full Name */
+            repo_full_name: string | null;
+            /** Revision */
+            revision?: string | null;
         };
     };
     responses: never;
@@ -13498,6 +13631,76 @@ export interface operations {
             };
         };
     };
+    resolve_identity_resolve_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrincipalResolveIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrincipalResolutionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    slack_report_identity_slack_reports_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SlackReportIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SlackReportOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_traces_langfuse_traces_get: {
         parameters: {
             query?: {
@@ -15661,7 +15864,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["WorkspaceSelectionRequest"];
+                "application/json": components["schemas"]["WorkspaceSelectionIn"];
             };
         };
         responses: {

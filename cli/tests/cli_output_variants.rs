@@ -795,6 +795,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         samples![
             "DryRun" => FactoryIntakeOutput::DryRun(plan()),
             "Done" => FactoryIntakeOutput::Done { enabled: true },
+            "RepositoriesUpdated" => FactoryIntakeOutput::RepositoriesUpdated { enabled: false, repos: vec!["acme/bot".into()] },
         ],
     );
     m.insert(
@@ -948,6 +949,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 to_revision: 19,
                 skipped: vec![20],
                 forced: false,
+                resumed_interrupted_rollback: false,
             },
         ],
     );

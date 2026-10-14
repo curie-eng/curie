@@ -40,3 +40,13 @@ def valid_repository_path(kind: str, path: str) -> bool:
     return len(segments) >= 2 and all(
         _SEGMENT.fullmatch(segment) and segment not in {".", ".."} for segment in segments
     )
+
+
+def valid_code_host_path(path: str) -> bool:
+    """Whether ``path`` is a repository path some code host kind can have.
+
+    For a request whose repository kind is not yet known (the thread's
+    WorkItem decides it); the kind's own rule is applied once it is.
+    """
+
+    return valid_repository_path(types.GITHUB, path) or valid_repository_path(types.GITLAB, path)

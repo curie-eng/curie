@@ -15,15 +15,13 @@ one of `up`, `self-test`, or `down`, followed by `--state-dir <dir>` and the
 optional `--advertise-host <host>` and `--port <port>`. `cli/scripts/forge-fixture.sh`
 runs it with `python3`. All fixture state lives under the state directory.
 
-The reserved kinds are `gitlab` and `bitbucket-dc`. `bitbucket-dc` is
-installed: it runs Bitbucket Data Center 9.4.24 behind an nginx TLS front end
-on `--port` (default 27443), seeds project `FAC`, repository `demo`, users
-`reviewer` and `outsider` and a repository access token, and writes
-`state.json` into the state directory, which must be outside the repository.
-Test code drives a running fixture through `bitbucket-dc/helpers.py`.
-`gitlab` is not installed yet: until its `fixture.py` exists,
-`curie dev forge-fixture gitlab` exits nonzero with a "not installed" message
-and creates no state.
+Both reserved kinds are installed. `bitbucket-dc` runs Bitbucket Data Center
+9.4.24 behind an nginx TLS front end on `--port` (default 27443), seeds project
+`FAC`, repository `demo`, users `reviewer` and `outsider` and a repository
+access token, and writes `state.json` into the state directory, which must be
+outside the repository. Test code drives a running fixture through
+`bitbucket-dc/helpers.py`. `gitlab` runs GitLab CE with a shell runner; see
+`gitlab/README.md`.
 
 ## Adding a fixture
 

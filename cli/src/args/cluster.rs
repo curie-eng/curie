@@ -484,8 +484,8 @@ pub(crate) enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Turn on the GitHub factory intake (label or mention triggers, repo
-    /// allowlist, GitHub API egress) on an existing release.
+    /// Configure GitHub factory intake or update already bound repository
+    /// runners and Docker access on an existing release.
     Factory {
         /// Select polling or webhook intake. Omit to keep the recorded mode.
         #[arg(long, value_parser = ["poll", "webhook"])]
@@ -493,6 +493,8 @@ pub(crate) enum ClusterAction {
         /// Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable.
         /// Sets `api.githubRepoAllowlist`. With --app-id, pass at least one
         /// --repo or use --all-installed-repos to allow the whole installation.
+        /// With --repo-runner/--repo-docker, selects advisory discovery only;
+        /// the recorded intake allowlist stays unchanged.
         #[arg(long = "repo", value_name = "OWNER/REPO")]
         repos: Vec<String>,
         /// Allow every repository the GitHub App is installed on. Requires
@@ -527,10 +529,12 @@ pub(crate) enum ClusterAction {
         /// release, the command prints the App registration link and applies
         /// nothing. Mention and label default from the App. Choose the
         /// allowlist with --repo (repeatable) or --all-installed-repos.
+        /// Repository updates accept this only for optional advisory discovery.
         #[arg(long, value_name = "ID", requires = "private_key_file")]
         app_id: Option<String>,
         /// File holding the App's PEM private key. Stored in a Kubernetes
         /// Secret through kubectl stdin; the key never enters argv.
+        /// Repository updates use it for discovery and do not store it.
         #[arg(long, value_name = "PATH", requires = "app_id")]
         private_key_file: Option<PathBuf>,
         /// Print the registration link for this GitHub organization instead
@@ -549,6 +553,17 @@ pub(crate) enum ClusterAction {
         /// The chart is still `--chart`. The values mode stays `--reuse-values`.
         #[arg(long, value_name = "AGENT=IMAGE")]
         runner_image: Option<String>,
+        /// Build and replace an already bound repository's runner from SPEC.
+        /// Repeatable; repository updates preserve the intake allowlist.
+        #[arg(long = "repo-runner", value_name = "OWNER/REPO=SPEC", requires = "registry", conflicts_with_all = ["disable", "intake", "label", "mention", "card_base_url", "webhook_secret_file", "forge_egress", "org", "runner_image"])]
+        repo_runners: Vec<String>,
+        /// Registry for repository runner builds, such as ghcr.io/acme-corp.
+        #[arg(long, value_name = "REGISTRY", requires = "repo_runners")]
+        registry: Option<String>,
+        /// Enable Docker for an already bound repository. Repeatable; requires
+        /// the catalog docker-cli in its replacement or recorded runner.
+        #[arg(long = "repo-docker", value_name = "OWNER/REPO", conflicts_with_all = ["disable", "intake", "label", "mention", "card_base_url", "webhook_secret_file", "forge_egress", "org", "runner_image"])]
+        repo_docker: Vec<String>,
         /// Kubernetes namespace.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,

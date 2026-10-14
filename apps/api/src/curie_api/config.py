@@ -106,9 +106,7 @@ class Settings(BaseSettings):
     # the claim route hands out no work.
     action_executor_enabled: bool = Field(
         default=False,
-        validation_alias=AliasChoices(
-            "CURIE_ACTION_EXECUTOR_ENABLED", "action_executor_enabled"
-        ),
+        validation_alias=AliasChoices("CURIE_ACTION_EXECUTOR_ENABLED", "action_executor_enabled"),
     )
     # @spec AUTOMATED-REMEDIATION-12 (executor amendment E9): the most executions
     # live (claimed or dispatched) across the installation at once, so ordinary
@@ -1065,9 +1063,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_factory(self) -> "Settings":
-        """The factory's boot contract: a GitHub tracker and code host in
-        CURIE_FORGES, a repository allowlist, and a webhook secret fit for the
-        intake. Label and mention validity belong to the tracker entry."""
+        """The factory's boot contract: a tracker and a code host of any
+        installed kind in CURIE_FORGES, a webhook secret fit for the intake,
+        and, when a GitHub tracker or code host is configured, a repository
+        allowlist. Label and mention validity belong to the tracker entry."""
 
         if not self.factory_enabled:
             return self
@@ -1075,17 +1074,18 @@ class Settings(BaseSettings):
             "tracker": {tracker.kind for tracker in self.forges.trackers},
             "code host": {host.kind for host in self.forges.code_hosts},
         }
-        missing = [what for what, found in kinds.items() if forge_types.GITHUB not in found]
+        missing = [what for what, found in kinds.items() if not found]
         offenders = []
         if missing:
-            offenders.append(f"CURIE_FORGES (no github {' or '.join(missing)})")
+            offenders.append(f"CURIE_FORGES (no {' or '.join(missing)})")
         # Polling may disable signed deliveries with a blank secret, but a
         # published signing key must never authenticate factory deliveries.
         if self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET or (
             self.factory_intake == "webhook" and not self.github_webhook_secret.strip()
         ):
             offenders.append("GITHUB_WEBHOOK_SECRET")
-        if not self.github_repo_allowlist:
+        github = any(forge_types.GITHUB in found for found in kinds.values())
+        if github and not self.github_repo_allowlist:
             offenders.append("GITHUB_REPO_ALLOWLIST")
         if offenders:
             raise ValueError(
@@ -1206,8 +1206,7 @@ class Settings(BaseSettings):
         parts = urlsplit(self.forges.card_base_url)
         if parts.scheme == "http" and self.environment.strip().lower() != "dev":
             raise ValueError(
-                "CURIE_FORGES factory.cardBaseUrl must be an https:// URL outside "
-                "ENVIRONMENT=dev"
+                "CURIE_FORGES factory.cardBaseUrl must be an https:// URL outside ENVIRONMENT=dev"
             )
         return self
 

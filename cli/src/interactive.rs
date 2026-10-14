@@ -670,6 +670,7 @@ fn explore_examples(
         return Ok(());
     };
 
+    let published_host = crate::docker::published_host_setting()?;
     crate::secrets::sync_secret_file()?;
     ensure_model_credential_available(terminal, app)?;
     for name in example.secrets {
@@ -689,7 +690,7 @@ fn explore_examples(
 
     let container_name = format!("curie-example-{}", example.id);
     let port = "7247";
-    let url = format!("http://localhost:{port}");
+    let url = crate::docker::published_endpoint(published_host.as_deref(), 7247);
     let mut setup = RunView::new(&format!("Starting {}", example.name));
     let mut started = false;
     let run_result = (|| -> Result<()> {

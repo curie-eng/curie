@@ -45,7 +45,8 @@ import pytest
 EXPECTED_PAIRINGS = {
     "github+github",
     "jira_cloud+github",
-    "gitlab+gitlab",
+    "gitlab+gitlab@fixture",
+    "gitlab+gitlab@saas",
     "jira_cloud+gitlab",
     "jira_cloud+bitbucket_cloud",
     "jira_cloud+bitbucket_dc",
@@ -53,11 +54,26 @@ EXPECTED_PAIRINGS = {
 INSTALLED = {
     "github+github",
     "jira_cloud+github",
+    "gitlab+gitlab@fixture",
+    "gitlab+gitlab@saas",
 }
 # Installed drivers, refused pairing: the combined quickstart is #4400.
 REFUSED_4400 = {"jira_cloud+bitbucket_cloud", "jira_cloud+bitbucket_dc"}
 NOT_INSTALLED = sorted(EXPECTED_PAIRINGS - INSTALLED)
 NAMESPACE = "test-factory-acceptance"
+# The steps every forge-loop entry tears down, whatever its driver adds.
+GENERIC_TEARDOWN = {
+    "reset fixture repository",
+    "restore fixture default branch",
+    "delete namespaces",
+}
+
+
+def _forges(key: str) -> tuple[str, str]:
+    """(tracker, code host) of an acceptance key; a GitLab key ends in @<target>."""
+
+    tracker, code_host = key.split("@", 1)[0].split("+")
+    return tracker, code_host
 
 
 # --- the pairing table ---------------------------------------------------------------
@@ -70,7 +86,7 @@ def test_every_pairing_is_an_entry() -> None:
 @pytest.mark.parametrize("key", sorted(EXPECTED_PAIRINGS))
 def test_each_entry_names_its_tracker_code_host_and_install_state(key: str) -> None:
     pairing = acceptance.PAIRINGS[key]
-    tracker, code_host = key.split("+")
+    tracker, code_host = _forges(key)
     assert (pairing.tracker, pairing.code_host) == (tracker, code_host)
     assert pairing.installed is (key in INSTALLED)
     assert (pairing.refused is not None) is (key in REFUSED_4400)
@@ -172,13 +188,15 @@ def test_dry_run_fails_on_an_unset_step_field(monkeypatch: pytest.MonkeyPatch) -
 def test_acceptance_mode_takes_a_known_pairing() -> None:
     args = fe.parse_args(["acceptance", "--pairing", "github+github", "--dry-run"])
     assert (args.mode, args.pairing, args.dry_run) == ("acceptance", "github+github", True)
-    args = fe.parse_args(["acceptance", "--pairing", "gitlab+gitlab"])
+    args = fe.parse_args(["acceptance", "--pairing", "gitlab+gitlab@saas"])
     assert args.dry_run is False
 
 
 def test_acceptance_refuses_an_unknown_pairing() -> None:
     with pytest.raises(SystemExit):
         fe.parse_args(["acceptance", "--pairing", "github+gitlab"])
+    with pytest.raises(SystemExit):
+        fe.parse_args(["acceptance", "--pairing", "gitlab+gitlab"])
     with pytest.raises(SystemExit):
         fe.parse_args(["acceptance"])
 
@@ -685,7 +703,7 @@ def test_every_entry_asserts_its_pairing_and_a_jira_tracker_its_tracker_evidence
     key: str,
 ) -> None:
     persisted = _persisted_map(key)
-    tracker, code_host = key.split("+")
+    tracker, code_host = _forges(key)
     assert persisted["scenario.pairing"] == key
     if tracker == "jira_cloud" and code_host.startswith("bitbucket"):
         # The Bitbucket driver delegates the ticket and its teardown to the
@@ -698,6 +716,11 @@ def test_every_entry_asserts_its_pairing_and_a_jira_tracker_its_tracker_evidence
         for field, expected in TRACKER_ASSERTIONS.items():
             assert persisted[field] == expected, field
         assert CLOSE_JIRA in _teardown_names(key)
+    elif tracker == "gitlab":
+        # GitLab is its own tracker; its evidence is pinned in test_gitlab_acceptance.py.
+        assert persisted["forge"] == persisted["scenario.forge"] == "gitlab"
+        assert persisted["scenario.tracker.closes_issue"] is True
+        assert CLOSE_JIRA not in _teardown_names(key)
     else:
         assert persisted["forge"] == persisted["scenario.forge"] == code_host
         assert not [f for f in persisted if f.startswith("scenario.tracker.")]
@@ -710,9 +733,8 @@ def test_jira_entry_teardown_names_match_the_driver_teardowns() -> None:
     # test_jira_driver.py::test_teardowns_is_exactly_the_close_step and
     # test_close_jira_test_issues_is_a_separate_teardown_step).
     names = _teardown_names(JIRA)
-    generic = _teardown_names("gitlab+gitlab")
-    assert names - generic == {CLOSE_JIRA}
-    assert generic <= names
+    assert names - GENERIC_TEARDOWN == {CLOSE_JIRA}
+    assert GENERIC_TEARDOWN <= names
     assert "restore App webhook" not in names
 
 
