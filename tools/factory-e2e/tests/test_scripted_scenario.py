@@ -610,7 +610,8 @@ def test_failure_pod_diagnostics_are_bounded_redacted_and_stderr_only(
     assert "CrashLoopBackOff" in captured.err
     assert "Exit Code: 124" in captured.err
     assert "[REDACTED]" in captured.err
-    assert "https://example.com" in captured.err
+    assert captured.err.splitlines().count("database: https://example.com") == 16
+    assert captured.err.splitlines().count("cache: https://example.com") == 16
     for private_value in (
         known_secret,
         shaped_secret,
