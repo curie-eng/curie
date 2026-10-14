@@ -1,10 +1,19 @@
 # Curie Architecture (as built)
 
-Curie (codename **Relay**) turns a Slack thread into a conversation with a
-versioned, sandboxed AI agent, and turns a git push into a deployment of that
-agent. Slack, Discord, and email are the three wired channels today; all sit behind a
-channel-agnostic message port ([ADR 0020](docs/adr/0020-message-port-rendering-free-channel-interface.md)),
-so additional channels are additive, not a rewrite. This document is the as-built map. It covers:
+Curie (codename **Relay**) turns supported agents into co-workers, with
+Software Factory as the primary developer adoption path. Its shared platform
+connects a workspace conversation to a versioned, sandboxed agent and a git
+push to an agent deployment. Slack is the primary conversation path. Discord
+has a separate adapter with manual deployment and interaction limits. The email
+adapter ships, but currently refuses every inbound AgentMail message because
+sender authentication cannot be verified; it is not a usable inbound co-worker
+path. See [capabilities and release status](docs/capabilities.md) and the
+[canonical email gate](apps/mail-adapter/README.md#inbound-security).
+
+These adapters use a channel-agnostic message port
+([ADR 0020](docs/adr/0020-message-port-rendering-free-channel-interface.md)).
+That extension point does not mean every channel is supported. This document
+is the as-built map. It covers:
 
 - the components
 - the two runtime modes and what is identical between them
@@ -265,8 +274,8 @@ work added the [mail adapter](apps/mail-adapter), the
 chart is a built thing, not a packaging afterthought. The security rails are
 chart defaults, so the chart is where a rail either ships or does not.
 
-The per-package directory listing — path, language, and what each package owns
-— lives in the [AGENTS.md directory map](AGENTS.md#directory-map), not duplicated
+The per-package directory listing, with each path, language, and ownership,
+lives in the [repository directory map](AGENTS.md#directory-map), not duplicated
 here so the two cannot drift apart. The Python packages are one **uv workspace**
 (root [`pyproject.toml`](pyproject.toml)); see [`CLAUDE.md`](CLAUDE.md) for
 verify commands.
@@ -1357,7 +1366,10 @@ The following are built and verified:
 **Deferred:**
 
 - **running** the sandbox-substrate resilience E2E at N1 scale (the scenario is real Python, env-gated on `CURIE_SANDBOX_E2E` — what is deferred is the run, not the code)
-- the **live cluster run** of the email channel (the adapter itself ships: [`apps/mail-adapter`](apps/mail-adapter) with its test suite, its `mail-adapter-image-smoke` gate and its chart wiring behind `mailAdapter.deploy`; what is deferred is the on-cluster send-and-reply rehearsal, so email is not yet in the live-verified list above)
+- usable **email ingress**: the adapter ships with tests and opt-in chart wiring,
+  but its authentication gate refuses every inbound AgentMail message. A trusted
+  authentication source and a live send/reply rehearsal are still needed; see
+  [`apps/mail-adapter/README.md`](apps/mail-adapter/README.md#inbound-security).
 - the Interview-Me onboarding compiler
 - automatic memory generation
 - the **native OpenAI wire format**
