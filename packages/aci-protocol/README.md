@@ -24,9 +24,9 @@ string rather than a `const`. Artifact sync is enforced by the
 schema-compat gate (`tests/test_schema_compat.py`); an unbumped wire change is
 caught by the wire-lock gate (`tests/test_wire_lock.py`).
 
-## Contract surface (v0.5.22)
+## Contract surface (v0.5.23)
 
-`PROTOCOL_VERSION = "0.5.22"` is embedded in the schema and in every outbound
+`PROTOCOL_VERSION = "0.5.23"` is embedded in the schema and in every outbound
 event.
 
 `QueuedTurn.reply_handle` may be absent only when `source` is `cron` and
@@ -131,7 +131,9 @@ implements no Slack read operation or runtime lifecycle.
 
 - `text_delta` = `{version, text}`
 - `tool_note` = `{version, text, tool?}`
-- `final` = `{version, text, status}` where `status` is `SessionStatus`
+- `final` = `{version, text, status}` where `status` is `SessionStatus`;
+  optional `text_mode: "verbatim"` marks a validated answer for literal
+  delivery (ADR 0227)
 - `error` = `{version, message, classification?}`
 - `side_effect_flag` = `{version, tool?, detail?}`
 
