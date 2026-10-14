@@ -65,7 +65,9 @@ async def test_clone_and_push_over_tls_with_bearer_env(
 ) -> None:
     credential = await adapter.credential(repository, CredentialScope.PUSH)
     assert credential.header is CredentialHeader.AUTHORIZATION_BEARER
-    assert credential.origin == live.state["base_url"]
+    assert credential.origin == f"{live.state['base_url']}/scm"
+    # The clone URL every platform consumer derives from the credential.
+    clone_url = f"{credential.origin}/{repository.path}.git"
     base = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     base["GIT_TERMINAL_PROMPT"] = "0"
     trust = {"GIT_CONFIG_KEY_0": "http.sslCAInfo", "GIT_CONFIG_VALUE_0": live.state["ca_file"]}
@@ -85,12 +87,10 @@ async def test_clone_and_push_over_tls_with_bearer_env(
         return subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, check=False)
 
     # Without the credential the private repository is refused.
-    anonymous = git(
-        "clone", live.clone_url(), "anon", env={**base, **trust, "GIT_CONFIG_COUNT": "1"}
-    )
+    anonymous = git("clone", clone_url, "anon", env={**base, **trust, "GIT_CONFIG_COUNT": "1"})
     assert anonymous.returncode != 0
 
-    cloned = git("clone", live.clone_url(), "work", env=authorized)
+    cloned = git("clone", clone_url, "work", env=authorized)
     assert cloned.returncode == 0, cloned.stderr
     work = tmp_path / "work"
     (work / "tls-push.txt").write_text("pushed over TLS\n")
