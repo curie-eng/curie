@@ -4,6 +4,17 @@ Date: 2026-10-05
 
 Status: Accepted
 
+**Partially amended by [ADR 0222](0222-coworker-bundles-own-workflow-policy-and-curie-enforces-execution.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+decisions 2.5, 4.2 and 7 become the factory bundle's versioned input contract
+and evaluator. Decision 1.4 permits separately bounded isolated preflight,
+without an implementation WorkItem, ExecutionRequest or execution budget;
+environment failures stop before preflight allocation. Decisions 4.1 and 4.3
+retain deterministic checks before bounded classification. Decision 4.6's
+classification identity additionally binds policy and execution context,
+preserving unchanged rejection and explicit edit/relabel readmission rules.
+Curie retains admission enforcement and decision 6's internal unknown handling.
+
 **Partially amended by [ADR 0204](0204-the-factory-checks-its-environment-before-it-admits-a-ticket.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 decision 2's "can it start" gains an environment half (model credit, base
