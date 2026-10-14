@@ -1,8 +1,8 @@
 # Documentation
 
 Curie turns supported agents into co-workers in team workspaces. Start with
-Software Factory to delegate GitHub issues, or bring your existing skills and
-tools onto the same platform. [Capabilities and release status](capabilities.md)
+Software Factory to delegate GitHub, GitLab or Jira Cloud issues, or bring your
+existing skills and tools onto the same platform. [Capabilities and release status](capabilities.md)
 separates what you can deploy from what is planned.
 
 ## Living documentation
@@ -14,9 +14,12 @@ they are not substitutes for a supported quickstart.
 ## Get started
 
 - [Software Factory](software-factory.md): the primary engineering-team path,
-  from assigned issue to reviewed PR or a clear failure reason.
-- [Factory quickstart](guides/dark-factory-quickstart.md): install the released
-  factory, create/install your GitHub App, label an issue, and inspect the result.
+  from assigned issue to reviewed PR or merge request, or a clear failure reason.
+- [Factory quickstart](guides/dark-factory-quickstart.md): choose an issue tracker
+  and code host, install the released factory, and inspect a delegated ticket's result.
+  Start with [GitHub](guides/dark-factory-quickstart.md#what-you-need),
+  [GitLab](guides/factory-gitlab-quickstart.md), or
+  [Jira Cloud with GitHub](guides/factory-jira-github-quickstart.md).
 - [Bring your agent](bring-your-agent.md): compatibility and reuse of supported
   skills and tools.
 - [SRE co-worker](../examples/sre-bot/README.md): investigate Kubernetes workloads

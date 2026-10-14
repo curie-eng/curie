@@ -12,13 +12,13 @@ follow progress, approve restricted actions, and inspect the result. The platfor
 is Apache-2.0 and runs in your infrastructure, with shared memory facilities,
 model configuration, and cost visibility.
 
-Start with a **Software Factory co-worker** that turns assigned GitHub issues into reviewed
-pull requests, or an **SRE co-worker** that investigates Kubernetes workloads from
-Slack. Then convert your existing agents into a co-worker with supported skills and tools onto the same platform.
+Start with a **Software Factory co-worker** that turns delegated GitHub, GitLab or
+Jira Cloud issues into reviewed pull requests or merge requests, or an **SRE
+co-worker** that investigates Kubernetes workloads from Slack. Then convert your existing agents into a co-worker with supported skills and tools onto the same platform.
 
 | Start here | First outcome |
 | --- | --- |
-| [Software Factory](#software-factory-on-your-laptop) | Label an issue and get a reviewed PR or a clear failure reason. |
+| [Software Factory](#software-factory-on-your-laptop) | Label an issue and get a reviewed PR or merge request, or a clear failure reason. |
 | [SRE co-worker](#sre-co-worker-on-your-laptop) | Ask about your local cluster in Slack; approve configured mutations. |
 | [Bring your existing agent](#make-your-existing-agent-a-co-worker) | Reuse its instructions and tools, then connect it to a workspace. |
 
@@ -58,6 +58,17 @@ export CURIE_MODEL
 ```
 
 ### Software Factory on your laptop
+
+Choose where your issues and code live:
+
+| Issues | Code and result | Start here |
+| --- | --- | --- |
+| GitHub | GitHub pull request | Follow the GitHub steps below |
+| GitLab | GitLab merge request | [GitLab quickstart](docs/guides/factory-gitlab-quickstart.md), for gitlab.com or self-managed GitLab |
+| Jira Cloud | GitHub pull request | [Jira Cloud with GitHub quickstart](docs/guides/factory-jira-github-quickstart.md) |
+| Jira Cloud | Bitbucket Cloud or Data Center pull request | Adapters ship, but the combined quickstart is unavailable; see [current limits](docs/capabilities.md) |
+
+#### GitHub
 
 Create a GitHub repository with an initial commit, or use a small existing
 repository. Write a bounded issue with clear acceptance criteria.
