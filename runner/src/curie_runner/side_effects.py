@@ -28,6 +28,8 @@ reads as an escape hatch that silently does nothing (#488).
 
 from collections.abc import Iterable
 
+from .state import STATE_READ_TOOL_NAMES
+
 # The platform's in-process approval-request tool (ADR-0010) is idempotent under
 # EVERY harness: it executes no real-world action (it only marks the turn
 # awaiting-approval), and when applicable it is injected by the platform rather
@@ -40,13 +42,20 @@ from collections.abc import Iterable
 # deliberate ``progress`` tool (ADR 0130): it reports task state to the
 # platform and acts on nothing, so it is never a side effect and never on the
 # turn's receipt. The factory ``get_issue`` (ADR 0187) only reads its own issue.
-PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = frozenset(
-    {
-        "mcp__curie__request_approval",
-        "mcp__curie__report_progress",
-        "mcp__curie__progress",
-        "mcp__curie__get_issue",
-    }
+# The ``curie-state`` reads (``get`` and ``list``) only read the durable store;
+# their names come from the server's own tool list (``state.STATE_READ_TOOL_NAMES``)
+# so they cannot drift from what it registers. Its writes (``set``, ``append``,
+# ``delete``) change the store and stay side-effecting.
+PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = (
+    frozenset(
+        {
+            "mcp__curie__request_approval",
+            "mcp__curie__report_progress",
+            "mcp__curie__progress",
+            "mcp__curie__get_issue",
+        }
+    )
+    | STATE_READ_TOOL_NAMES
 )
 
 # The Claude Code harness adapter's declared read-only tool set. Names match the
