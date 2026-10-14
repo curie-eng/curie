@@ -386,7 +386,7 @@ class WorkerConfig(BaseSettings):
     # Any other value refuses boot rather than falling back to a mode nobody
     # chose. It changes only what the person is shown, never what the action
     # ledger records or what the no-retry rule reads.
-    turn_receipt: TurnReceiptMode = Field(default="all", validation_alias="CURIE_TURN_RECEIPT")
+    turn_receipt: TurnReceiptMode = Field(default="off", validation_alias="CURIE_TURN_RECEIPT")
 
     # Whether deliberate progress (ADR 0130) reaches an adapter. Temporary: it
     # exists until the rendering change lands, and the chart does not set it.

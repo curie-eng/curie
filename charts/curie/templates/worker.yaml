@@ -607,7 +607,7 @@ spec:
             # values omit this key, so an absent or coalesced null value uses
             # the same default as a fresh install.
             - name: CURIE_TURN_RECEIPT
-              value: {{ (.Values.worker.turnReceipt | default "all") | quote }}
+              value: {{ (.Values.worker.turnReceipt | default "off") | quote }}
             # Runner model passthrough: the worker injects these into every claim
             # (fake model needs no credential; a real credential comes from the
             # chart Secret and is only wired when one is configured and the

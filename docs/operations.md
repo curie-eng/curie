@@ -2011,9 +2011,10 @@ workspace with no Slack access. Full flag reference is in
 
 ### What a reply says the agent changed
 
-A turn that ran a tool outside the read-only allowlist ends its reply with a
-`_What I changed:_` receipt, one line per action, each saying whether the
-platform recorded what a restore would need or why the action cannot be undone
+A turn with receipts enabled that ran a tool outside the read-only allowlist
+ends its reply with a `_What I changed:_` receipt, one line per action. Each
+line says whether the platform recorded what a restore would need or why the
+action cannot be undone
 ([ADR-0117](adr/0117-a-tool-that-changes-the-world-reports-what-it-changed.md)).
 No restore runs from the receipt yet; it says "restore information recorded",
 not "can be undone".
@@ -2023,9 +2024,9 @@ How much of it the people using the install see is the chart value
 
 | Value | The reply ends with |
 |---|---|
-| `all` (default) | every action, each saying whether restore information was recorded |
+| `all` | every action, each saying whether restore information was recorded |
 | `failures` | only the actions that reported failure, which a person should check before asking again; nothing when none failed |
-| `off` | no receipt, even when an action failed |
+| `off` (default) | no receipt, even when an action failed |
 
 The value changes only the reply. Every action is still recorded and readable
 through the API's `GET /actions`, and a turn that touched anything is still

@@ -355,7 +355,7 @@
         "turnReceipt": {
           "type": "string",
           "enum": ["all", "failures", "off"],
-          "description": "What the receipt beneath a turn's reply shows (ADR-0180), rendered as CURIE_TURN_RECEIPT: all (every action, the default), failures (only actions that reported failure) or off (none). The worker refuses any other value at startup, so the schema admits only these three."
+          "description": "What the receipt beneath a turn's reply shows (ADR-0180), rendered as CURIE_TURN_RECEIPT: all (every action), failures (only actions that reported failure) or off (none, the default). The worker refuses any other value at startup, so the schema admits only these three."
         },
         "deliveryShutdownReserveSeconds": {
           "type": "integer",
