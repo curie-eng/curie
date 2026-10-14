@@ -531,3 +531,84 @@ def test_duplicate_support_headers_are_refused_before_model(tmp_path, second):
             await response.read()
 
     anyio.run(exercise)
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_steer_injection_in_flight_cannot_publish_old_context_answer(tmp_path, cancel):
+    """Old-context validation that lands while a steer is still being injected."""
+
+    async def exercise():
+        entered = anyio.Event()
+        release = anyio.Event()
+        steered: list[bool] = []
+
+        class BlockingSteerSession(FakeModelSession):
+            steer_queries = 0
+
+            async def query(self, text: str) -> None:
+                self.steer_queries += 1
+                if self.steer_queries > 1:
+                    entered.set()
+                    await release.wait()
+                await super().query(text)
+
+            async def receive_turn(self):
+                tg.start_soon(steer)
+                await entered.wait()
+                async for message in super().receive_turn():
+                    yield message
+
+        async def steer():
+            with anyio.CancelScope() as scope:
+                steer_scope.append(scope)
+                steered.append(await runner.steer("changed request"))
+
+        steer_scope: list[anyio.CancelScope] = []
+        fake = BlockingSteerSession(
+            lambda: [call(), result(), _result(text=APPROVED)], truncate_on_interrupt=False
+        )
+        runner = SessionRunner(
+            session_factory=lambda: fake,
+            ceiling=0,
+            max_usd_per_day=None,
+            tracer=RunTracer(None),
+            classifier=SideEffectClassifier(),
+            trace_name="final-answer-test",
+            held_secrets=frozenset(),
+            final_answer=policy(tmp_path),
+        )
+        await runner.start()
+        try:
+            async with anyio.create_task_group() as tg:
+                frames = [json.loads(line) async for line in runner.run_turn(EVENT)]
+                # The old answer settled while the steer was still injecting.
+                assert_refused(frames)
+                if cancel:
+                    steer_scope[0].cancel()
+                release.set()
+            assert steered == ([] if cancel else [True])
+        finally:
+            await runner.close()
+
+    anyio.run(exercise)
+
+
+def test_validation_suspension_blocks_and_then_invalidates(tmp_path):
+    from curie_runner.final_answer import FinalAnswerValidation, ValidationCall, ValidationResult
+
+    validation = FinalAnswerValidation(policy(tmp_path))
+    digest_ok = json.dumps(envelope())
+    validation.observe_calls([ValidationCall("a", TOOL, {"draft": DRAFT})], nested=False)
+    with validation.suspended():
+        with validation.suspended():  # concurrent steers nest
+            validation.observe_results([ValidationResult("a", digest_ok)], nested=False)
+            assert not validation.accepts(APPROVED)
+            validation.observe_calls([ValidationCall("b", TOOL, {"draft": DRAFT})], nested=False)
+            validation.observe_results([ValidationResult("b", digest_ok)], nested=False)
+            assert not validation.accepts(APPROVED)
+        assert not validation.accepts(APPROVED)
+    # Settling invalidates anything observed during injection.
+    assert not validation.accepts(APPROVED)
+    validation.observe_calls([ValidationCall("c", TOOL, {"draft": DRAFT})], nested=False)
+    validation.observe_results([ValidationResult("c", digest_ok)], nested=False)
+    assert validation.accepts(APPROVED)
