@@ -87,9 +87,9 @@ def _refusal(body: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _refused_by_rule(body: dict[str, Any], error_type: str, fragment: str = "") -> None:
     errors = _refusal(body)
-    assert any(
-        error["type"] == error_type and fragment in str(error["msg"]) for error in errors
-    ), errors
+    assert any(error["type"] == error_type and fragment in str(error["msg"]) for error in errors), (
+        errors
+    )
     # An adapter that answers 422 with these errors (the Discord adapter does)
     # must be able to encode them.
     json.dumps(errors)
@@ -98,10 +98,11 @@ def _refused_by_rule(body: dict[str, Any], error_type: str, fragment: str = "") 
 # --- versions -------------------------------------------------------------------
 
 
-def test_the_wire_has_two_versions_and_1_0_stays_the_default() -> None:
-    assert get_args(reply_wire.ReplyWireVersion) == ("1.0", "1.1")
+def test_the_wire_has_three_versions_and_1_0_stays_the_default() -> None:
+    assert get_args(reply_wire.ReplyWireVersion) == ("1.0", "1.1", "1.2")
     assert REPLY_WIRE_VERSION == "1.0"
     assert reply_wire.PROGRESS_REPLY_WIRE_VERSION == "1.1"
+    assert reply_wire.VERBATIM_REPLY_WIRE_VERSION == "1.2"
 
 
 @pytest.mark.parametrize(
@@ -134,7 +135,8 @@ def test_the_schema_says_which_events_have_a_1_1_form() -> None:
     for name in ("TurnStatus", "TurnCompleted"):
         assert defs[name]["properties"]["version"]["const"] == "1.0", name
     for name in ("ReplyUpdate", "ReplyPost"):
-        assert defs[name]["properties"]["version"]["enum"] == ["1.0", "1.1"], name
+        versions = ["1.0", "1.1", "1.2"] if name == "ReplyUpdate" else ["1.0", "1.1"]
+        assert defs[name]["properties"]["version"]["enum"] == versions, name
         assert {"delivery_id", "progress"} <= set(defs[name]["properties"]), name
         assert "delivery_id" not in defs[name].get("required", []), name
 
@@ -147,9 +149,7 @@ def test_the_schema_says_which_events_have_a_1_1_form() -> None:
     [
         pytest.param(_update(version="1.0", text="hi", delivery_id=_ID), id="update-delivery-id"),
         pytest.param(_post(version="1.0", delivery_id=_ID), id="post-delivery-id"),
-        pytest.param(
-            _update(version="1.0", delivery_id=_ID, progress=_CARD), id="update-progress"
-        ),
+        pytest.param(_update(version="1.0", delivery_id=_ID, progress=_CARD), id="update-progress"),
         pytest.param(
             _post(version="1.0", delivery_id=_ID, progress=_MILESTONE), id="post-progress"
         ),

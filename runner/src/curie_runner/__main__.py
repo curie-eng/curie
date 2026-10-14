@@ -116,6 +116,7 @@ from .platform_slack.capability import ChannelReadTurn, url_origin
 from .plugin import (
     bundle_mcp_servers,
     bundle_skill_names,
+    load_bundle_final_answer,
     load_bundle_platform_slack_grants,
     load_bundle_web_search_enabled,
 )
@@ -692,6 +693,7 @@ def build_runner(
     compiled = harness.compile_bundle(config.session.plugin_dir)
     system_prompt = compiled.system_prompt
     web_search_enabled = load_bundle_web_search_enabled(config.session.plugin_dir)
+    final_answer = load_bundle_final_answer(config.session.plugin_dir)
     mounted_workspace = (
         workspace_path
         if workspace_path is not None
@@ -1259,6 +1261,7 @@ def build_runner(
     return bind_status_attestation(
         SessionRunner(
             session_factory=factory,
+            final_answer=final_answer,
             ceiling=config.ceiling,
             max_usd_per_day=config.max_usd_per_day,
             tracer=RunTracer(provider),

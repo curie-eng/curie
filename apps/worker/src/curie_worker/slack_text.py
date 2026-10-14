@@ -8,6 +8,9 @@ from dataclasses import dataclass
 
 # Pinned from the measured edit rejection recorded in test_slack_sink.py.
 SLACK_ANSWER_MAX_BYTES = 4000
+# Slack section plain_text is limited to 3,000 characters. This smaller UTF-8
+# byte budget also leaves room for provider-side encoding differences.
+SLACK_VERBATIM_MAX_BYTES = 2800
 _ATOM = re.compile(r"```|`[^`\n]*`|<[^>\n]*>|\*[^*\n]+\*|_[^_\n]+_|~[^~\n]+~")
 
 
@@ -20,6 +23,29 @@ class AnswerPart:
     @property
     def text(self) -> str:
         return self.prefix + self.content + self.suffix
+
+
+def split_verbatim_answer(text: str) -> list[AnswerPart]:
+    """Partition literal text without adding, removing or normalizing characters.
+
+    Slack documents a 3,000-character limit on a section's plain_text object:
+    https://docs.slack.dev/reference/block-kit/composition-objects/text-object/
+    Count UTF-8 bytes more conservatively, without splitting a code point.
+    """
+    if not text:
+        return []
+    parts: list[AnswerPart] = []
+    start = 0
+    size = 0
+    for index, char in enumerate(text):
+        encoded_size = len(char.encode("utf-8"))
+        if size + encoded_size > SLACK_VERBATIM_MAX_BYTES:
+            parts.append(AnswerPart(text[start:index]))
+            start = index
+            size = 0
+        size += encoded_size
+    parts.append(AnswerPart(text[start:]))
+    return parts
 
 
 def split_answer(text: str) -> list[AnswerPart]:

@@ -65,7 +65,7 @@ from .blocks import (
     resolved_approval_card,
     to_blocks,
 )
-from .slack_text import split_answer
+from .slack_text import split_answer, split_verbatim_answer
 from .slack_tokens import token_identity
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle: reply_sink builds this adapter
@@ -304,6 +304,7 @@ async def _post_with_block_fallback(
     blocks: list[dict[str, Any]] | None,
     thread_ts: str | None,
     client_msg_id: str | None = None,
+    allow_block_fallback: bool = True,
 ) -> AsyncSlackResponse:
     try:
         if blocks is not None:
@@ -323,7 +324,7 @@ async def _post_with_block_fallback(
     except SlackApiError as exc:
         if _slack_retry_class(exc) == "rate-limit":
             raise
-        if blocks is None:
+        if blocks is None or not allow_block_fallback:
             raise
         logger.warning("chat_postMessage with blocks rejected; retrying text-only")
         return await client.chat_postMessage(
@@ -665,9 +666,16 @@ class SlackReplyAdapter:
     ) -> str | None:
         """Ack only after sequential delivery; retries keep the same create keys."""
         target = event.target
-        rendered, blocks = render(event.text or "", _nav_pack(event.nav))
-        parts = split_answer(rendered)
-        structured = parse_reply(event.text or "")
+        verbatim = event.text_mode == "verbatim"
+        if verbatim:
+            rendered = event.text or ""
+            blocks = None
+            parts = split_verbatim_answer(rendered)
+            structured = None
+        else:
+            rendered, blocks = render(event.text or "", _nav_pack(event.nav))
+            parts = split_answer(rendered)
+            structured = parse_reply(event.text or "")
         ref = target.reply_ref
         thread = _thread_ts(target.conversation_id) or ref
         digest = hashlib.sha256(rendered.encode()).hexdigest()
@@ -676,6 +684,16 @@ class SlackReplyAdapter:
         seed = event.delivery_id or ref
         for index, part in enumerate(parts):
             payload = (part.text, blocks if len(parts) == 1 else None)
+            if verbatim:
+                payload = (
+                    part.content,
+                    [
+                        {
+                            "type": "section",
+                            "text": {"type": "plain_text", "text": part.content, "emoji": False},
+                        }
+                    ],
+                )
             if structured is not None and len(parts) > 1:
                 last = index == len(parts) - 1
                 payload = (
@@ -704,6 +722,7 @@ class SlackReplyAdapter:
                     endpoint=endpoint,
                     identity=identity,
                     best_effort_unreachable=best_effort_unreachable,
+                    allow_block_fallback=not verbatim,
                 )
                 continue
             key = (
@@ -732,6 +751,7 @@ class SlackReplyAdapter:
                 identity=identity,
                 best_effort_unreachable=best_effort_unreachable,
                 client_msg_id=key,
+                allow_block_fallback=not verbatim,
             )
             if posted is None:
                 return ref  # The existing approval-resume best-effort exception.
@@ -752,6 +772,7 @@ class SlackReplyAdapter:
         best_effort_unreachable: bool = False,
         identity: str = DEFAULT_IDENTITY,
         payload: tuple[str, list[dict[str, Any]] | None] | None = None,
+        allow_block_fallback: bool = True,
     ) -> None:
         # The runner emits Markdown; Slack renders mrkdwn. ``render`` converts to
         # mrkdwn and, if the reply carries a complete ``curie-reply`` block,
@@ -764,6 +785,11 @@ class SlackReplyAdapter:
 
         async def op(client: AsyncWebClient) -> None:
             if blocks is not None:
+                if not allow_block_fallback:
+                    await client.chat_update(
+                        channel=channel, ts=ts, text=rendered_text, blocks=blocks
+                    )
+                    return
                 # Slack rejects the whole message if a block exceeds a limit we did
                 # not clamp; fall back to a text-only update (on the SAME reachable
                 # client) so the turn still completes and the stream entry is acked
@@ -804,6 +830,7 @@ class SlackReplyAdapter:
         identity: str = DEFAULT_IDENTITY,
         client_msg_id: str | None = None,
         payload: tuple[str, list[dict[str, Any]] | None] | None = None,
+        allow_block_fallback: bool = True,
     ) -> str | None:
         """Post this turn's reply as a NEW message and return its ts.
 
@@ -843,6 +870,7 @@ class SlackReplyAdapter:
                 blocks=blocks,
                 thread_ts=thread_ts,
                 client_msg_id=client_msg_id,
+                allow_block_fallback=allow_block_fallback,
             ),
             describe="chat_postMessage",
             operation="post",

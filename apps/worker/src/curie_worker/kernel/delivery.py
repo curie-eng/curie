@@ -13,6 +13,7 @@ from aci_protocol import (
 from channel_protocol.reply import (
     PROGRESS_REPLY_WIRE_VERSION,
     REPLY_WIRE_VERSION,
+    VERBATIM_REPLY_WIRE_VERSION,
     NavAffordance,
     ReplyTarget,
     ReplyUpdate,
@@ -85,6 +86,8 @@ class _StreamAccumulator:
     # The repository this turn attached from its own message (#2659), announced
     # at finalize only. Intermediate streaming edits show `rendered()` alone.
     workspace_inferred_repo: str | None = None
+    # Bound to the actual turn response, never inherited from a sandbox.
+    verbatim_answer: bool = False
 
     def rendered(self) -> str:
         return self.final_text if self.final_text is not None else "".join(self.text_parts)
@@ -103,6 +106,8 @@ class _StreamAccumulator:
         sits directly after the answer so the receipt stays the last block.
         """
 
+        if self.verbatim_answer and self.status is SessionStatus.DONE:
+            return self.rendered()
         return _join_reply_blocks(
             self.rendered(),
             workspace._workspace_inference_notice(self.workspace_inferred_repo),
@@ -204,20 +209,21 @@ class _ThrottledReply:
         except Exception as exc:  # noqa: BLE001 - cosmetic progress is best effort
             logger.warning("context reply update failed: %s", type(exc).__name__)
 
-    def prepare_final(self, text: str) -> ReplyUpdate | None:
+    def prepare_final(self, text: str, *, verbatim: bool = False) -> ReplyUpdate | None:
         """Freeze the final reply for the completion outbox, before any send."""
         if self._target is None:
             return None
         return ReplyUpdate(
-            version=PROGRESS_REPLY_WIRE_VERSION,
+            version=VERBATIM_REPLY_WIRE_VERSION if verbatim else PROGRESS_REPLY_WIRE_VERSION,
             event="reply.update",
             target=self._target,
-            text=text or "(no response)",
-            nav=self._nav,
+            text=text if verbatim else (text or "(no response)"),
+            nav=None if verbatim else self._nav,
             delivery_id=self._delivery_id,
+            text_mode="verbatim" if verbatim else None,
         )
 
-    async def finalize(self, text: str) -> None:
+    async def finalize(self, text: str, *, verbatim: bool = False) -> None:
         # First statement, BEFORE the early return: an identical final means the
         # last streamed edit already IS the answer, so it is delivered and must
         # mark. Before the emit for the same reason ``_reply_for`` marks first.
@@ -226,20 +232,22 @@ class _ThrottledReply:
         if text == self._last_text:
             return
         self._last_text = text
-        await self._emit(text or "(no response)")
+        await self._emit(text if verbatim else (text or "(no response)"), verbatim=verbatim)
 
-    async def _emit(self, text: str) -> None:
+    async def _emit(self, text: str, *, verbatim: bool = False) -> None:
         if self._target is None:
             # A targetless turn (#2963) or factory execution (#2991): the stream
             # is consumed, never sent to the requesting chat.
             return
         ack = await self._sink.emit(
             ReplyUpdate(
-                version=REPLY_WIRE_VERSION,
+                version=VERBATIM_REPLY_WIRE_VERSION if verbatim else REPLY_WIRE_VERSION,
                 event="reply.update",
                 target=self._target,
                 text=text,
-                nav=self._nav,
+                nav=None if verbatim else self._nav,
+                delivery_id=self._delivery_id if verbatim else None,
+                text_mode="verbatim" if verbatim else None,
             ),
             route=self._route,
             best_effort_unreachable=self._best_effort,

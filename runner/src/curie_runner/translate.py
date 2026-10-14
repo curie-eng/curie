@@ -44,6 +44,7 @@ from curie_telemetry.redact import redact_text
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 from .approval import APPROVAL_TOOL_NAME, guard_reserved_summary
+from .final_answer import FINAL_ANSWER_CLASSIFICATION, FinalAnswerValidation
 from .history import ConversationMessage
 from .otel import _GenerationSpan
 from .progress import ProgressActivity
@@ -62,6 +63,7 @@ RESULT_MAX_BYTES = 64_000
 # make a currently non-retryable token retryable.
 PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
     {
+        FINAL_ANSWER_CLASSIFICATION,
         "rate-limit",
         "runner-error",
         "runner-timeout",
@@ -212,6 +214,7 @@ class TurnState:
     # approval and publication requests below are never captured: the calls
     # are refused before they execute, so there is no request to report.
     tool_access: ToolAccess | None = None
+    final_answer: FinalAnswerValidation | None = None
     side_effect_emitted: bool = False
     error_classification: str | None = None
     # Runner-internal latch, not a wire field (#3935): set once credit
@@ -336,6 +339,8 @@ def translate_message(
     ``report_progress`` tool carries; None when no progress tool is mounted.
     """
 
+    if state.final_answer is not None:
+        state.final_answer.observe(message)
     if isinstance(message, AssistantMessage):
         return _translate_assistant(message, state, classifier, gen, activity)
     if isinstance(message, ResultMessage):
@@ -418,7 +423,8 @@ def _translate_assistant(
             if block.text and not nested:
                 if not collecting:
                     state.assistant_text += block.text
-                events.append(TextDelta(text=block.text))
+                if state.final_answer is None:
+                    events.append(TextDelta(text=block.text))
         elif isinstance(block, ToolUseBlock):
             events.append(ToolNote(text=f"running tool {block.name}", tool=block.name))
             if activity is not None:

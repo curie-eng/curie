@@ -161,6 +161,15 @@ _DONE_FIELD = "done"
 _GENERATION_FIELD = "gen"
 _CAUSE_FIELD = "cause"
 _ANSWER_GENERATION_PREFIX = "answer-v1:"
+_VERBATIM_GENERATION_PREFIX = "answer-v2:"
+CompletionNamespace = bool | Literal["verbatim"]
+
+
+def _generation_namespace(generation: str) -> CompletionNamespace:
+    if generation.startswith(_VERBATIM_GENERATION_PREFIX):
+        return "verbatim"
+    return generation.startswith(_ANSWER_GENERATION_PREFIX)
+
 
 # Set the done marker and flag the completion record done in ONE round trip.
 # The record is only touched when it still exists, so a sweeper that cleared it
@@ -329,7 +338,7 @@ class CompletionRecord(BaseModel):
 
 
 class MalformedCompletionError(RuntimeError):
-    answer_namespace: bool = False
+    answer_namespace: CompletionNamespace = False
 
     """A stored completion record is missing a field every writer sets.
 
@@ -358,14 +367,26 @@ class StoredCompletion:
     cause: str | None
 
 
-@dataclass(frozen=True, order=True)
+@dataclass(frozen=True)
 class CompletionIndexEntry:
     event_id: str
-    answer_namespace: bool = False
+    answer_namespace: CompletionNamespace = False
+
+    def __lt__(self, other: CompletionIndexEntry) -> bool:
+        return (self.event_id, str(self.answer_namespace)) < (
+            other.event_id,
+            str(other.answer_namespace),
+        )
 
 
 def completion_generation(record: CompletionRecord) -> str:
-    prefix = _ANSWER_GENERATION_PREFIX if record.answer is not None else ""
+    prefix = (
+        _VERBATIM_GENERATION_PREFIX
+        if record.answer is not None and record.answer.text_mode == "verbatim"
+        else _ANSWER_GENERATION_PREFIX
+        if record.answer is not None
+        else ""
+    )
     return prefix + uuid.uuid4().hex
 
 
@@ -377,23 +398,28 @@ class Markers:
     def __init__(self, redis: Redis, config: WorkerConfig) -> None:
         self._redis = redis
         self._config = config
-        self._answer_index_first = False
+        self._completion_sample_offset = 0
 
-    def _completion_storage_key(self, event_id: str, *, answer: bool = False) -> str:
+    def _completion_storage_key(self, event_id: str, *, answer: CompletionNamespace = False) -> str:
         key = self._config.completion_key(event_id)
+        if answer == "verbatim":
+            return f"{self._config.key_prefix}:answer-completion-v2:{event_id}"
         return f"{self._config.key_prefix}:answer-completion-v1:{event_id}" if answer else key
 
-    def _completion_pending_key(self, *, answer: bool = False) -> str:
+    def _completion_pending_key(self, *, answer: CompletionNamespace = False) -> str:
         key = self._config.completions_pending_key()
+        if answer == "verbatim":
+            return key + ":answer-v2"
         return key + ":answer-v1" if answer else key
 
     def _generation_storage_key(self, event_id: str, generation: str) -> str:
-        return self._completion_storage_key(
-            event_id, answer=generation.startswith(_ANSWER_GENERATION_PREFIX)
-        )
+        return self._completion_storage_key(event_id, answer=_generation_namespace(generation))
 
     def _generation_pending_key(self, generation: str) -> str:
-        return self._completion_pending_key(answer=generation.startswith(_ANSWER_GENERATION_PREFIX))
+        return self._completion_pending_key(answer=_generation_namespace(generation))
+
+    def _completion_namespaces(self) -> tuple[CompletionNamespace, ...]:
+        return (False, True, "verbatim") if self.supports_answer_outbox else (False,)
 
     async def push_steer_memory_turns(
         self, agent_id: uuid.UUID, live_turn: str, turns: Sequence[tuple[uuid.UUID, str]]
@@ -566,7 +592,8 @@ class Markers:
             pipe.exists(self._config.done_key(event_id))
             pipe.hget(self._config.completion_key(event_id), _DONE_FIELD)
             if self.supports_answer_outbox:
-                pipe.hget(self._completion_storage_key(event_id, answer=True), _DONE_FIELD)
+                for namespace in (True, "verbatim"):
+                    pipe.hget(self._completion_storage_key(event_id, answer=namespace), _DONE_FIELD)
             marker, *flags = await pipe.execute()
         if marker:
             return True
@@ -833,7 +860,7 @@ class Markers:
         return bool(updated)
 
     async def read_completion(self, event_id: str) -> StoredCompletion | None:
-        namespaces = (True, False) if self.supports_answer_outbox else (False,)
+        namespaces = tuple(reversed(self._completion_namespaces()))
         async with self._redis.pipeline(transaction=False) as pipe:
             for answer in namespaces:
                 pipe.hgetall(self._completion_storage_key(event_id, answer=answer))
@@ -870,7 +897,7 @@ class Markers:
     async def read_completions(
         self, event_ids: Sequence[str]
     ) -> dict[str, StoredCompletion | MalformedCompletionError | None]:
-        namespaces = (True, False) if self.supports_answer_outbox else (False,)
+        namespaces = tuple(reversed(self._completion_namespaces()))
         if not event_ids:
             return {}
         async with self._redis.pipeline(transaction=False) as pipe:
@@ -943,7 +970,9 @@ class Markers:
             )
         )
 
-    async def drop_pending_member(self, event_id: str, *, answer_namespace: bool = False) -> None:
+    async def drop_pending_member(
+        self, event_id: str, *, answer_namespace: CompletionNamespace = False
+    ) -> None:
         """Drop ONLY the set membership, leaving whatever key state exists.
 
         For the member whose payload is already gone: some emitter confirmed
@@ -962,7 +991,7 @@ class Markers:
         return {entry.event_id for entry in await self.pending_completion_entries(limit)}
 
     async def pending_completion_count(self) -> int:
-        namespaces = (False, True) if self.supports_answer_outbox else (False,)
+        namespaces = self._completion_namespaces()
         async with self._redis.pipeline(transaction=False) as pipe:
             for answer in namespaces:
                 pipe.scard(self._completion_pending_key(answer=answer))
@@ -972,17 +1001,17 @@ class Markers:
     async def pending_completion_entries(self, limit: int) -> set[CompletionIndexEntry]:
         if limit <= 0:
             return set()
-        namespaces = [False, True] if self.supports_answer_outbox else [False]
-        if getattr(self, "_answer_index_first", False):
-            namespaces.reverse()
-        self._answer_index_first = not getattr(self, "_answer_index_first", False)
+        families = self._completion_namespaces()
+        offset = getattr(self, "_completion_sample_offset", 0) % len(families)
+        namespaces = families[offset:] + families[:offset]
+        self._completion_sample_offset = (offset + 1) % len(families)
         async with self._redis.pipeline(transaction=False) as pipe:
             for answer in namespaces:
                 pipe.srandmember(self._completion_pending_key(answer=answer), limit)
             batches = await pipe.execute()
         entries: set[CompletionIndexEntry] = set()
-        # Alternate namespaces, including limit=1 across passes; neither an old
-        # backlog nor a new answer backlog can starve the other storage version.
+        # Rotate every family, including limit=1, so no supported storage
+        # version can starve either a legacy or a verbatim answer backlog.
         for index in range(limit):
             for answer, batch in zip(namespaces, batches, strict=True):
                 if batch and index < len(batch):
@@ -1001,7 +1030,14 @@ def _parse_stored(event_id: str, stored: dict[Any, Any]) -> StoredCompletion | N
     raw = _as_str(stored.get(_RECORD_FIELD))
     if not raw:
         return None
-    record = CompletionRecord.model_validate(json.loads(raw))
+    try:
+        record = CompletionRecord.model_validate(json.loads(raw))
+    except ValueError as exc:
+        # Keep corrupt or unsupported payloads local to their sampled entry;
+        # never abort unrelated completions or log candidate answer contents.
+        raise MalformedCompletionError(
+            f"completion record {event_id} has an invalid payload"
+        ) from exc
     flag = _as_str(stored.get(_DONE_FIELD))
     generation = _as_str(stored.get(_GENERATION_FIELD))
     if flag is None or generation is None:
