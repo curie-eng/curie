@@ -281,7 +281,7 @@ def test_a_turn_that_already_settled_keeps_its_answer(make_harness) -> None:
     The answer here is delivered with ``terminal=False`` on purpose, so the
     in-process ``_terminal_reply_attempted`` mark is NOT taken and this test
     isolates the ``Markers.is_terminal`` read. Its twin
-    ``test_an_answer_delivered_before_a_failed_settle_is_not_overwritten``
+    ``test_an_answer_delivered_before_a_failed_clear_is_not_overwritten``
     isolates the other half, where ``is_terminal`` is False and only the mark
     can save the answer.
 
@@ -473,136 +473,6 @@ def test_the_not_started_text_names_no_tool_and_no_id(
 # --- F3: the notice never overwrites a delivered answer -----------------------
 
 
-def test_an_answer_delivered_before_a_failed_settle_is_not_overwritten(
-    make_harness,
-) -> None:
-    """F3, the ``finalize`` half. The REAL ``process_event`` unwind, deliberately.
-
-    ``is_terminal`` protects a settlement that succeeded and lost its response.
-    It does NOT protect one that failed BEFORE writing: the answer reaches the
-    person at ``reply.finalize``, and only afterwards does ``_complete`` make its
-    first fenced write. With ``settle_fenced`` raising, the exception unwinds
-    with the answer on screen and ``is_terminal`` reading False.
-
-    A substituted ``process_event`` would pass against a broken implementation,
-    because ``_process_event``'s ``finally`` runs BEFORE the exception reaches
-    the consumer and ``process_event``'s ``finally`` is what decides whether the
-    mark survives. So the real one runs here, the runner is scripted with a
-    Final, and only the fenced write fails.
-
-    Red without EB-12b: the notice overwrites a delivered answer. Twin:
-    ``test_a_turn_that_already_settled_keeps_its_answer`` (the durable half).
-    """
-
-    async def go() -> None:
-        async with make_harness(**_LEASE_KNOBS) as h:
-            store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
-            await consumer.ensure_group()
-            h.runner.default_script = [Final(text="the answer", status=DONE)]
-
-            async def refuse(*args: Any, **kwargs: Any) -> str | None:
-                raise ConnectionError("the fenced write never landed")
-
-            h.kernel._markers.settle_fenced = refuse  # type: ignore[method-assign,assignment]
-
-            entry_id = await _deliver_one(
-                h, consumer, _qevent("hello", thread="nts-7", event_id="nts-7")
-            )
-
-            assert _updates_for(h, "nts-7")[-1] == "the answer", (
-                "the notice overwrote an answer the person had already read"
-            )
-            assert h.config.turn_not_started_text not in _updates_for(h, "nts-7")
-            assert await h.kernel._markers.is_terminal("nts-7") is False, (
-                "the settle wrote a marker, so this test no longer exercises the "
-                "in-process mark it exists to pin"
-            )
-            assert entry_id in await _pending_rows(h)
-
-    asyncio.run(go())
-
-
-def test_a_terminal_send_that_lands_then_raises_is_treated_as_delivered(
-    make_harness, caplog: pytest.LogCaptureFixture
-) -> None:
-    """AC1's AMBIGUOUS terminal send: the edit landed, the await did not.
-
-    An HTTP edit that applies on the platform and then loses its response is
-    indistinguishable, locally, from one that never applied. The answer is on the
-    person's screen and the local call raised, so the delivery still unwinds into
-    the consumer's except branch. ``is_terminal`` cannot save it (the settle is
-    downstream of the send and never ran) and neither can a mark taken on
-    SUCCESS, because there was no success to take it on. Only marking BEFORE the
-    send covers this shape, and the fail-safe direction is to treat the person as
-    already answered: a duplicate notice costs them an answer they can read,
-    while a skipped one costs them the seconds until the redelivery.
-
-    The REAL ``process_event`` runs, for the reason the module docstring gives:
-    the mark's survival is decided by ``process_event``'s own ``finally``, which a
-    substituted one would not have. The sink's ``fail_events`` cannot arm this
-    shape because it raises BEFORE recording, which is the unambiguous
-    never-landed case, so ``emit`` is wrapped HERE to record first and raise
-    after.
-
-    Red if the terminal mark moves from before the send to after a successful
-    send, and red if it moves to the top of ``_complete``: both leave this
-    delivery unmarked, and the notice replaces a delivered answer with an
-    invitation to resend it.
-    """
-
-    async def go() -> None:
-        async with make_harness(**_LEASE_KNOBS) as h:
-            store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
-            await consumer.ensure_group()
-            h.runner.default_script = [Final(text="the answer", status=DONE)]
-
-            landed = h.sink.emit
-
-            async def lands_then_raises(
-                event: ReplyEvent,
-                *,
-                route: TargetRoute,
-                best_effort_unreachable: bool = False,
-            ) -> ReplyAck:
-                ack = await landed(
-                    event, route=route, best_effort_unreachable=best_effort_unreachable
-                )
-                if isinstance(event, ReplyUpdate) and event.text == "the answer":
-                    raise ConnectionError("the edit applied and lost its response")
-                return ack
-
-            h.sink.emit = lands_then_raises  # type: ignore[method-assign]
-
-            with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
-                entry_id = await _deliver_one(
-                    h, consumer, _qevent("hello", thread="nts-13", event_id="nts-13")
-                )
-
-            assert any("nts-13" in message for message in caplog.messages), (
-                "the delivery never reached the notice branch, so a green result "
-                "here would prove nothing about the mark"
-            )
-            texts = _updates_for(h, "nts-13")
-            assert texts[-1] == "the answer", (
-                "the notice overwrote an answer that had already reached the "
-                "person, because the send raised after it landed"
-            )
-            assert h.config.turn_not_started_text not in texts
-            assert await h.kernel._markers.is_terminal("nts-13") is False, (
-                "the turn settled, so this test no longer exercises the "
-                "before-the-send mark it exists to pin"
-            )
-            assert entry_id in await _pending_rows(h)
-
-    asyncio.run(go())
-
-
 def test_a_polite_drop_is_not_overwritten_by_the_notice(make_harness) -> None:
     """F3, the ``_drop_with_message`` half: the second delivery path before ``_complete``.
 
@@ -647,58 +517,6 @@ def test_a_polite_drop_is_not_overwritten_by_the_notice(make_harness) -> None:
                 "the notice overwrote the polite drop"
             )
             assert h.config.turn_not_started_text not in drop_texts
-            assert entry_id in await _pending_rows(h)
-
-    asyncio.run(go())
-
-
-def test_a_partially_streamed_turn_still_gets_the_notice(make_harness) -> None:
-    """F3's mandatory NEGATIVE, and one of #2433's three named shapes.
-
-    "The turn that streamed partial text and then raised" must still be told
-    about. Streaming previews are not a terminal result: the person has a
-    fragment, not an answer, and suppressing the notice here would silently
-    delete a third of AC1's coverage while the two tests above stayed green.
-
-    The failure is induced at ``_finish``, which is downstream of every streamed
-    edit and upstream of ``reply.finalize``, so ``stream`` provably fired and
-    ``finalize`` provably did not. ``process_event`` itself is untouched, so the
-    whole real lifecycle still runs.
-
-    Red on calling the mark from ``_ThrottledReply.stream`` or
-    ``stream_context``. Twin:
-    ``test_an_answer_delivered_before_a_failed_settle_is_not_overwritten``.
-    """
-
-    async def go() -> None:
-        async with make_harness(**_LEASE_KNOBS) as h:
-            store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
-            await consumer.ensure_group()
-            h.runner.default_script = [
-                TextDelta(text="partial "),
-                TextDelta(text="thought"),
-            ]
-
-            async def never_finishes(*args: Any, **kwargs: Any) -> Any:
-                raise RuntimeError("the turn raised before it could finalize")
-
-            h.kernel._finish = never_finishes  # type: ignore[method-assign,assignment]
-
-            entry_id = await _deliver_one(
-                h, consumer, _qevent("hello", thread="nts-9", event_id="nts-9")
-            )
-
-            texts = _updates_for(h, "nts-9")
-            assert any(text.startswith("partial") for text in texts), (
-                "nothing streamed, so this test does not exercise the negative"
-            )
-            assert texts[-1] == h.config.turn_not_started_text, (
-                "a partially streamed turn was treated as delivered and the "
-                "person was never told it failed"
-            )
             assert entry_id in await _pending_rows(h)
 
     asyncio.run(go())
@@ -805,5 +623,181 @@ def test_a_notice_is_skipped_when_the_lease_is_lost_during_the_terminality_read(
             assert h.sink.updates == []
             assert entry_id in await _pending_rows(h)
             assert any("nts-11" in message for message in caplog.messages)
+
+    asyncio.run(go())
+
+
+def test_a_settle_that_fails_before_writing_gets_the_notice(make_harness) -> None:
+    """F3 under ADR 0226: the answer is stored by the fenced settle before any send.
+
+    A settle that fails before writing means nothing reached the person and
+    nothing is owed, so the not-started notice is true and redelivery reruns.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+            h.runner.default_script = [Final(text="the answer", status=DONE)]
+
+            async def refuse(*args: Any, **kwargs: Any) -> str | None:
+                raise ConnectionError("the fenced write never landed")
+
+            h.kernel._markers.settle_fenced = refuse  # type: ignore[method-assign,assignment]
+
+            entry_id = await _deliver_one(
+                h, consumer, _qevent("hello", thread="nts-7", event_id="nts-7")
+            )
+
+            texts = _updates_for(h, "nts-7")
+            assert "the answer" not in texts, "an answer was sent before it was stored"
+            assert texts[-1] == h.config.turn_not_started_text
+            assert await h.kernel._markers.is_terminal("nts-7") is False
+            assert await h.kernel._markers.read_completion("nts-7") is None
+            assert entry_id in await _pending_rows(h)
+
+    asyncio.run(go())
+
+
+def test_an_answer_delivered_before_a_failed_clear_is_not_overwritten(
+    make_harness,
+) -> None:
+    """F3, the in-process mark: an answer sent before a later failure keeps it.
+
+    The answer now leaves in ``_deliver_completion``, which marks the turn as
+    answered before the send. A failed clear after it must not let the notice
+    overwrite the answer; ``is_terminal`` is blinded to isolate that mark.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+            h.runner.default_script = [Final(text="the answer", status=DONE)]
+
+            async def refuse(*args: Any, **kwargs: Any) -> None:
+                raise ConnectionError("the clear never landed")
+
+            async def unreadable(*args: Any, **kwargs: Any) -> bool:
+                # Isolate the in-process half: the durable half would also
+                # suppress the notice here, because the settle already wrote.
+                return False
+
+            h.kernel._markers.clear_completion = refuse  # type: ignore[method-assign,assignment]
+            h.kernel._markers.is_terminal = unreadable  # type: ignore[method-assign,assignment]
+
+            entry_id = await _deliver_one(
+                h, consumer, _qevent("hello", thread="nts-7b", event_id="nts-7b")
+            )
+
+            texts = _updates_for(h, "nts-7b")
+            assert texts[-1] == "the answer", (
+                "the notice overwrote an answer the person had already read"
+            )
+            assert h.config.turn_not_started_text not in texts
+            assert entry_id in await _pending_rows(h)
+
+    asyncio.run(go())
+
+
+def test_a_terminal_send_that_lands_then_raises_stays_owed_and_replays(
+    make_harness,
+) -> None:
+    """AC1's ambiguous terminal send under ADR 0226.
+
+    The settle precedes the send, so a send that lands and then raises leaves
+    the answer on screen, the turn terminal and the stored answer owed. The
+    replay delivers that stored answer without running the model again.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+            h.runner.default_script = [Final(text="the answer", status=DONE)]
+
+            landed = h.sink.emit
+
+            async def lands_then_raises(
+                event: ReplyEvent,
+                *,
+                route: TargetRoute,
+                best_effort_unreachable: bool = False,
+            ) -> ReplyAck:
+                ack = await landed(
+                    event, route=route, best_effort_unreachable=best_effort_unreachable
+                )
+                if isinstance(event, ReplyUpdate) and event.text == "the answer":
+                    raise ConnectionError("the edit applied and lost its response")
+                return ack
+
+            h.sink.emit = lands_then_raises  # type: ignore[method-assign]
+            await _deliver_one(
+                h, consumer, _qevent("hello", thread="nts-13", event_id="nts-13")
+            )
+
+            texts = _updates_for(h, "nts-13")
+            assert texts[-1] == "the answer"
+            assert h.config.turn_not_started_text not in texts
+            assert await h.kernel._markers.is_terminal("nts-13") is True
+            owed = await h.kernel._markers.read_completion("nts-13")
+            assert owed is not None and owed.record.answer is not None
+            assert owed.record.answer.text == "the answer"
+
+            h.sink.emit = landed  # type: ignore[method-assign]
+            await h.kernel._reemit_pending_completion("nts-13")
+
+            assert h.runner.opened == ["hello"], "the replay re-ran the model"
+            assert _updates_for(h, "nts-13")[-1] == "the answer"
+            assert await h.kernel._markers.read_completion("nts-13") is None
+
+    asyncio.run(go())
+
+
+def test_a_turn_that_raised_before_its_answer_still_gets_the_notice(
+    make_harness,
+) -> None:
+    """F3's negative: a turn that raised before its answer still gets the notice.
+
+    Provisional text is internal (ADR 0226 decision 1), so nothing streamed
+    stands in for an answer.
+    """
+
+    async def go() -> None:
+        async with make_harness(**_LEASE_KNOBS) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
+            )
+            await consumer.ensure_group()
+            h.runner.default_script = [
+                TextDelta(text="partial "),
+                TextDelta(text="thought"),
+            ]
+
+            async def never_finishes(*args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("the turn raised before it could finalize")
+
+            h.kernel._finish = never_finishes  # type: ignore[method-assign,assignment]
+
+            entry_id = await _deliver_one(
+                h, consumer, _qevent("hello", thread="nts-9", event_id="nts-9")
+            )
+
+            texts = _updates_for(h, "nts-9")
+            assert not any("partial" in text for text in texts), (
+                "provisional text reached the channel (ADR 0226 decision 1)"
+            )
+            assert texts[-1] == h.config.turn_not_started_text
+            assert entry_id in await _pending_rows(h)
 
     asyncio.run(go())

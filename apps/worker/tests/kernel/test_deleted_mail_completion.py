@@ -28,6 +28,28 @@ from .test_completion_outbox import (
     _record,
 )
 
+_NAMESPACE_INDEX_SUFFIXES = ("", ":answer-v1", ":answer-v2")
+
+
+async def _owed(h) -> set[str]:
+    """Every completion owed, across every storage namespace (ADR 0226)."""
+    owed: set[str] = set()
+    for suffix in _NAMESPACE_INDEX_SUFFIXES:
+        owed |= set(await h.async_redis.smembers(h.config.completions_pending_key() + suffix))
+    return owed
+
+
+async def _owed_answer(h, event_id: str):
+    """The owed record, asserting it is answer-bearing and indexed in its own namespace."""
+    stored = await Markers(h.async_redis, h.config).read_completion(event_id)
+    assert stored is not None
+    assert stored.record.answer is not None
+    assert stored.generation.startswith(("answer-v1:", "answer-v2:"))
+    suffix = ":answer-v2" if stored.generation.startswith("answer-v2:") else ":answer-v1"
+    assert await h.async_redis.smembers(h.config.completions_pending_key() + suffix) == {event_id}
+    assert await h.async_redis.smembers(h.config.completions_pending_key()) == set()
+    return stored
+
 # Reuse the package's documented HTTP provider simulator. Nothing in the
 # adapter, sink, kernel, or Valkey is mocked.
 _SUPPORT_PATH = Path(__file__).resolve().parents[3] / "mail-adapter/tests/_support.py"
@@ -126,7 +148,7 @@ def test_admitted_mail_completion_dead_letters_deleted_thread_only(
                     assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
                         "pending"
                     ] == 0
-                    pending = await h.async_redis.smembers(h.config.completions_pending_key())
+                    pending = await _owed(h)
                     rows = await h.async_redis.xrange(h.config.dead_letter_stream_name())
                     if deleted:
                         assert pending == set()
@@ -134,12 +156,16 @@ def test_admitted_mail_completion_dead_letters_deleted_thread_only(
                         assert rows[0][1]["dl_reason"] == "thread deleted at provider"
                         assert rows[0][1]["event_id"] == qe.event_id
                         assert rows[0][1]["dl_delivery_count"] == "1"
+                        assert await Markers(h.async_redis, h.config).read_completion(
+                            qe.event_id
+                        ) is None
                     else:
                         assert pending == {qe.event_id}
+                        await _owed_answer(h, qe.event_id)
                         assert rows == []
                     await h.kernel.sweep_pending_completions()
                     await h.kernel.sweep_pending_completions()
-                    assert await h.async_redis.smembers(h.config.completions_pending_key()) == set()
+                    assert await _owed(h) == set()
                     assert mail.thread_calls == (1 if deleted else 2)
                     assert len(mail.replies) == (0 if deleted else 1)
                     assert len(await h.async_redis.xrange(h.config.dead_letter_stream_name())) == (
@@ -206,14 +232,9 @@ def test_refused_provider_connection_persists_completion_cause(
                         assert (
                             await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
                         )["pending"] == 0
-                        assert await h.async_redis.smembers(h.config.completions_pending_key()) == {
-                            qe.event_id
-                        }
-                        assert (
-                            await h.async_redis.hget(h.config.completion_key(qe.event_id), "cause")
-                            == "provider egress refused"
-                        )
-                        assert await Markers(h.async_redis, h.config).read_completion(qe.event_id)
+                        assert await _owed(h) == {qe.event_id}
+                        stored = await _owed_answer(h, qe.event_id)
+                        assert stored.cause == "provider egress refused"
                         assert await h.async_redis.xrange(h.config.dead_letter_stream_name()) == []
                         assert mail.replies == []
                 finally:
@@ -411,9 +432,8 @@ def test_generic_retry_failure_clears_refusal_cause_without_clearing_completion(
                 assert after is not None
                 assert after.generation == before.generation
                 assert after.cause is None
-                assert await h.async_redis.smembers(h.config.completions_pending_key()) == {
-                    qe.event_id
-                }
+                assert await _owed(h) == {qe.event_id}
+                await _owed_answer(h, qe.event_id)
                 assert await h.async_redis.xrange(h.config.dead_letter_stream_name()) == []
                 assert completion_calls == 2
         finally:
