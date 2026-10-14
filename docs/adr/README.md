@@ -233,10 +233,14 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0208 | [A factory PR opened after its request was cancelled is adopted by the next run](0208-a-factory-pr-opened-after-its-request-was-cancelled-is-adopted-by-the-next-run.md) | Accepted |
 | 0209 | [Pause authority after a drain is a lease held by a live upgrade step](0209-pause-authority-after-a-drain-is-a-lease-held-by-a-live-upgrade-step.md) | Accepted |
 | 0210 | [A bundle may declare a secret optional](0210-a-bundle-may-declare-a-secret-optional.md) | Accepted |
+| 0211 | [A factory run that loses its sandbox is re-admitted like one that loses its worker](0211-a-factory-run-that-loses-its-sandbox-is-re-admitted-like-one-that-loses-its-worker.md) | Draft |
 | 0212 | [A work item owner rides through a store outage and stops its turn when it cannot](0212-a-work-item-owner-rides-through-a-store-outage-and-stops-its-turn-when-it-cannot.md) | Draft |
 | 0214 | [One factory agent serves every GitHub repository bound to it](0214-one-factory-agent-serves-every-github-repository-bound-to-it.md) | Accepted |
 | 0215 | [Each tracker surface starts factory work under its own trigger label](0215-each-tracker-surface-starts-factory-work-under-its-own-trigger-label.md) | Accepted |
 | 0216 | [A factory repository binding selects its own runner image, built from a tool catalog](0216-a-factory-repository-binding-selects-its-own-runner-image-built-from-a-tool-catalog.md) | Accepted |
 | 0217 | [A factory run that opts into Docker gets its own daemon outside the sandbox](0217-a-factory-run-that-opts-into-docker-gets-its-own-daemon-outside-the-sandbox.md) | Accepted |
+| 0218 | [Cluster up infers gVisor off when the RuntimeClass matches no node](0218-cluster-up-infers-gvisor-off-when-the-runtimeclass-matches-no-node.md) | Accepted |
 | 0219 | [A deploy binds an agent's runner image at runtime, outside the Helm release](0219-a-deploy-binds-an-agents-runner-image-at-runtime-outside-the-helm-release.md) | Draft |
+| 0221 | [Cluster up reads the gVisor RuntimeClass for a fake-model install](0221-cluster-up-reads-the-gvisor-runtimeclass-for-a-fake-model-install.md) | Accepted |
+| 0224 | [Protected runtime commissioning precedes installation acceptance](0224-protected-runtime-commissioning-precedes-installation-acceptance.md) | Accepted |
 <!-- END GENERATED: adr-index -->

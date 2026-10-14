@@ -360,7 +360,7 @@ path and Python symbol resolves, that each graded seam's `grade:` agrees with th
 `docs/adr/` claim the same number prefix, and that every `curie ...` command named in
 `docs/agents.md` resolves against `cli/command-manifest.json`. Run it after editing any interface-catalog doc
 and commit the regenerated files; CI runs the same check (`scripts/check-docs.sh`) in the
-`python` job. To exempt a genuinely illustrative example path, put
+`python-static` job. To exempt a genuinely illustrative example path, put
 `<!-- doclint:ignore-line -->` on that line (or the line before it).
 
 Test discipline: test-first for behavior-bearing code; mock ONLY external

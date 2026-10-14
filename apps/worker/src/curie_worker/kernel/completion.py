@@ -293,16 +293,14 @@ async def _complete(
         if fenced is None:
             # The single most diagnostic line in this feature: it is the
             # only record that a turn ran to a terminal outcome and then
-            # discovered it no longer owned the delivery. Name what we held,
-            # so an operator can line it up against the replacement's
-            # acquisition rather than guessing which side was stale.
+            # discovered it no longer owned the delivery. Correlate by event
+            # and generation without exposing the bearer ownership token.
             logger.warning(
                 "fenced out of terminal settlement for event %s "
-                "(owner=%s generation=%d outcome=%s): another owner holds "
+                "(generation=%d outcome=%s): another owner holds "
                 "this delivery; writing no marker, clearing nothing and "
                 "emitting nothing",
                 event_id,
-                lease.owner,
                 lease.generation,
                 outcome,
             )

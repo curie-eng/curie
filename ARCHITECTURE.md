@@ -611,8 +611,8 @@ admitted: envelope carries
 remediation_generation  -----------------> (read under the source gate)
 read-only turn; final text may
 carry one curie-remediation block
-                          capture seam (planned: the protected worker's runner client wrapper
-                          withholds the fence from every reply and submits the block) ---------+
+                          capture seam: the protected worker's runner client wrapper
+                          withholds the fence from every reply and submits the block ---------+
 POST /v1/internal/remediation/nominations (worker token, event_id + block)  <-------------------+
   binding by event_id -> agent, hook, generation, reply surface; parse; one row per entry
   admission, checks 2..12 in order, under a per-agent advisory lock

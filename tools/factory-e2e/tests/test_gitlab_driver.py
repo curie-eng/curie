@@ -101,6 +101,16 @@ FIXTURE_PID = 4101
 FIXTURE_PATH = "factory-fixture/nested/widgets"
 FIXTURE_HOST = "gitlab-fixture.test"
 FIXTURE_PORT = 28443
+FIXTURE_BRIDGE = "172.18.0.0/24"
+_HOST_EGRESS = {"cidr": "192.0.2.10/32", "ports": [{"protocol": "TCP", "port": FIXTURE_PORT}]}
+# The factory block `curie factory quickstart --code-host gitlab` leaves on the release.
+QUICKSTART_VALUES: dict[str, Any] = {
+    "factory": {
+        "enabled": True,
+        "codeHosts": [{"kind": "gitlab", "name": "gitlab", "egress": [_HOST_EGRESS]}],
+        "trackers": [{"kind": "gitlab", "name": "gitlab", "egress": [_HOST_EGRESS]}],
+    }
+}
 SAAS_PID = 58123
 SAAS_PROJECT = "curie-test-group/factory/widgets"
 MR_IID = 7
@@ -691,6 +701,7 @@ def _state_file(tmp_path: Path, ca: Path) -> Path:
         "ca_path": str(ca),
         "advertise_host": FIXTURE_HOST,
         "port": FIXTURE_PORT,
+        "docker_subnets": [FIXTURE_BRIDGE],
         "version": "19.4.1",
         "server_version": "19.4.1",
         "root_token_file": tokens["root"],
@@ -1386,13 +1397,16 @@ class _Processes:
 
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], Mapping[str, str] | None]] = []
+        self.upgrades: list[dict[str, Any]] = []
 
     def __call__(self, argv: Any, *_a: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         argv = [str(a) for a in argv]
         self.calls.append((argv, kwargs.get("env")))
         name = Path(argv[0]).name
         if name == "helm" and "get" in argv and "values" in argv:
-            return subprocess.CompletedProcess(argv, 0, "{}", "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(QUICKSTART_VALUES), "")
+        if name == "helm" and "upgrade" in argv:
+            self.upgrades.append(json.loads(Path(_flag(argv, "-f")[0]).read_text()))
         if name == "kubectl" and "config" in argv:
             return subprocess.CompletedProcess(argv, 0, "apiVersion: v1\nkind: Config\n", "")
         return subprocess.CompletedProcess(argv, 0, "", "")
@@ -1423,6 +1437,7 @@ def _install_rig(
         raise AssertionError("install_gitlab started a background process")
 
     monkeypatch.setattr(subprocess, "Popen", no_popen)
+    monkeypatch.setattr(rig.p, "ensure_api", lambda: None)
     return rig, processes
 
 
@@ -1461,6 +1476,51 @@ def test_install_gitlab_runs_the_gitlab_quickstart_with_token_files_only(
         _no_secret(str(value), "the quickstart environment")
 
 
+def test_install_gitlab_on_the_fixture_also_allows_its_docker_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture_ca: Path
+) -> None:
+    # A pod on the fixture's own node is DNATed to the container's bridge
+    # address, so the publication policy must allow that subnet as well
+    # (refused live: the push failed to connect with only the host /32).
+    rig, processes = _install_rig("fixture", tmp_path, monkeypatch, fixture_ca)
+    _gitlab_module().install_gitlab(rig.p)
+
+    (upgrade,) = processes.upgrades
+    bridge = {"cidr": FIXTURE_BRIDGE, "ports": [{"protocol": "TCP", "port": FIXTURE_PORT}]}
+    host = QUICKSTART_VALUES["factory"]["codeHosts"][0]["egress"][0]
+    for key in ("codeHosts", "trackers"):
+        (entry,) = upgrade["factory"][key]
+        assert entry["kind"] == "gitlab"
+        assert entry["egress"] == [host, bridge]
+    (upgrade_argv,) = [a for a, _ in processes.calls if a[0] == "helm" and "upgrade" in a]
+    assert "--reuse-values" in upgrade_argv
+    assert _flag(upgrade_argv, "--kube-context") == [rig.p.config.kube_context]
+
+
+def test_install_gitlab_on_saas_does_not_touch_the_egress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture_ca: Path
+) -> None:
+    rig, processes = _install_rig("saas", tmp_path, monkeypatch, fixture_ca)
+    _gitlab_module().install_gitlab(rig.p)
+    assert processes.upgrades == []
+
+
+def test_fixture_bridge_egress_keeps_other_kinds_and_refuses_a_missing_gitlab_host() -> None:
+    gl = _gitlab_module()
+    github = {"kind": "github", "egress": [{"cidr": "192.0.2.1/32", "ports": []}]}
+    values = {"factory": {"codeHosts": [github, *QUICKSTART_VALUES["factory"]["codeHosts"]]}}
+    out = gl.fixture_bridge_egress(values, [FIXTURE_BRIDGE], FIXTURE_PORT)
+    assert out["factory"]["codeHosts"][0] == github
+    assert len(out["factory"]["codeHosts"][1]["egress"]) == 2
+    assert out["factory"]["trackers"] == []
+    again = gl.fixture_bridge_egress(out, [FIXTURE_BRIDGE], FIXTURE_PORT)
+    assert again["factory"]["codeHosts"] == out["factory"]["codeHosts"]
+    with pytest.raises(fe.PreflightFailed, match="no gitlab code host"):
+        gl.fixture_bridge_egress({"factory": {"codeHosts": [github]}}, ["10.0.0.0/24"], 1)
+    with pytest.raises(fe.PreflightFailed, match="no factory values"):
+        gl.fixture_bridge_egress({}, ["10.0.0.0/24"], 1)
+
+
 def test_install_values_for_the_gitlab_forge_write_no_github_app(tmp_path: Path) -> None:
     config = _preflight(tmp_path).config
     values = fe.install_values(
@@ -1496,3 +1556,110 @@ def test_install_values_default_still_write_the_github_app(tmp_path: Path) -> No
     assert values["api"]["githubAppExistingSecret"] == "factory-app"
     kinds = {entry["kind"] for entry in values["factory"]["codeHosts"]}
     assert kinds == {"github"}
+
+
+# --- restore_fixture_base: GitLab keeps the default branch's protection -----------------
+
+
+class _ProtectingGitLab:
+    """The branch and protection calls restore_fixture_base makes, answered as the
+    GitLab 19.4.1 fixture answered them in a replay: a DELETE of the default
+    branch's protection answers 204 but the rule stays, the recreated branch is
+    protected again, and the parking branch is protected once it is the
+    default. A POST for an existing rule answers 409 "already exists"."""
+
+    RULE = {
+        "name": "main",
+        "push_access_levels": [{"access_level": 40}],
+        "merge_access_levels": [{"access_level": 40}],
+        "allow_force_push": False,
+    }
+
+    def __init__(self, kept: dict[str, Any] | None = None) -> None:
+        self.branches = {"main": HEAD_FIX}
+        self.default = "main"
+        self.protected: dict[str, dict[str, Any]] = {"main": dict(kept or self.RULE)}
+        self.writes: list[tuple[str, str]] = []
+
+    def __call__(self, _actor: str, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        tail = path.split(f"/projects/{FIXTURE_PID}", 1)[1]
+        if method != "GET":
+            self.writes.append((method, tail))
+        name = urllib.parse.unquote(tail.rsplit("/", 1)[-1])
+        if tail.startswith("/repository/branches"):
+            if method == "GET":
+                sha = self.branches.get(name)
+                return (200, {"name": name, "commit": {"id": sha}}) if sha else (404, None)
+            if method == "POST":
+                self.branches[body["branch"]] = body["ref"]
+                if body["branch"] == "main":
+                    self.protected.setdefault("main", dict(self.RULE))
+                return 201, {"name": body["branch"]}
+            if name == self.default:
+                return 400, {"message": "Cannot remove HEAD branch"}
+            self.branches.pop(name, None)
+            return 204, None
+        if tail.startswith("/protected_branches"):
+            if method == "GET":
+                rule = self.protected.get(name)
+                return (200, rule) if rule else (404, None)
+            if method == "DELETE":
+                return 204, None  # the rule stays
+            if body["name"] in self.protected:
+                return 409, {"message": f"Protected branch '{body['name']}' already exists"}
+            self.protected[body["name"]] = dict(self.RULE)
+            return 201, self.protected[body["name"]]
+        if method == "PUT" and tail == "":
+            self.default = body["default_branch"]
+            self.protected.setdefault(self.default, dict(self.RULE))
+            return 200, {"default_branch": self.default}
+        raise AssertionError(f"unexpected {method} {tail}")
+
+
+def _restoring_driver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ca: Path, gitlab: _ProtectingGitLab
+) -> Any:
+    rig = _target_rig("fixture", tmp_path, monkeypatch, ca)
+    driver = rig.driver()
+    monkeypatch.setattr(driver, "_json", gitlab)
+    driver._base_sha = BASE_SHA
+    return driver
+
+
+def test_restore_accepts_the_protection_gitlab_kept_and_moves_the_default_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture_ca: Path
+) -> None:
+    # Live run 10: re-protecting answered 409, the default stayed on the
+    # parking branch, and the reset then failed deleting it with 400.
+    gitlab = _ProtectingGitLab()
+    driver = _restoring_driver(tmp_path, monkeypatch, fixture_ca, gitlab)
+
+    assert driver.restore_fixture_base() == {"restored": True, "moved": True}
+
+    assert gitlab.default == "main"
+    assert gitlab.branches == {"main": BASE_SHA}
+    assert ("PUT", "") in gitlab.writes and gitlab.writes[-1][0] == "DELETE"
+
+
+def test_restore_refuses_a_kept_protection_that_differs_but_still_unparks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fixture_ca: Path
+) -> None:
+    weaker = {**_ProtectingGitLab.RULE, "push_access_levels": [{"access_level": 30}]}
+    gitlab = _ProtectingGitLab()
+    driver = _restoring_driver(tmp_path, monkeypatch, fixture_ca, gitlab)
+    # The original rule is Maintainer-only; the one GitLab keeps is weaker.
+    real = gitlab.__call__
+
+    def weaken(actor: str, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        result = real(actor, method, path, body)
+        if method == "POST" and path.endswith("/repository/branches") and body["branch"] == "main":
+            gitlab.protected["main"] = dict(weaker)
+        return result
+
+    monkeypatch.setattr(driver, "_json", weaken)
+
+    with pytest.raises(fe.PreflightFailed, match="differs from the original"):
+        driver.restore_fixture_base()
+
+    assert gitlab.default == "main"
+    assert "factory-e2e-park-" not in " ".join(gitlab.branches)

@@ -886,7 +886,10 @@ def test_declared_check_reports_missing_uv_without_network_fallback(
     assert "in-sandbox verification is unavailable" in prompt
     line = _instruction_line(prompt, "python")
     assert "delegat" in line.casefold()
-    assert "CI is pending proof" in line
+    assert (
+        "had not reported when this pull request was opened; "
+        "the issue status comment reports its result."
+    ) in line
     assert "do not publish and the work item cannot succeed" not in prompt
     fenced, outside = _split_fence(prompt)
     assert '"delegated_to":"unit-tests"' in fenced

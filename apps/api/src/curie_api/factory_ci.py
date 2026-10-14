@@ -352,6 +352,7 @@ class MetadataCiPolicy:
 
     checks: tuple[str, ...]
     statuses: tuple[str, ...]
+    recorded: bool = False
 
     @property
     def keys(self) -> frozenset[str]:
@@ -419,6 +420,27 @@ def ci_capabilities(capabilities: Mapping[Operation, Support]) -> CiCapabilities
     )
 
 
+def _recorded_metadata_ci_policy(raw: str | bytes | None) -> MetadataCiPolicy | None:
+    """Read a round's failing names; invalid or empty records cannot prove a revision."""
+
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    checks, statuses = value.get("checks"), value.get("statuses")
+    if not isinstance(checks, list) or not isinstance(statuses, list):
+        return None
+    if not checks and not statuses:
+        return None
+    if not all(isinstance(name, str) and name.strip() for name in [*checks, *statuses]):
+        return None
+    return MetadataCiPolicy(checks=tuple(checks), statuses=tuple(statuses), recorded=True)
+
+
 VerdictKind = Literal[
     "green", "no_ci", "failing", "pending", "timed_out", "unverified", "merge_conflict"
 ]
@@ -429,6 +451,7 @@ GateResult = Literal["settled", "waiting", "fixing", "continued"]
 class Verdict:
     kind: VerdictKind
     failing: list[dict[str, Any]] = field(default_factory=list)
+    failing_keys: tuple[str, ...] = ()
     pending: list[dict[str, Any]] = field(default_factory=list)
     reason: str | None = None
     note: str | None = None
@@ -500,7 +523,11 @@ def _metadata_revision_detail(
     fresh = _fresh_view(view, fresh_after)
     rerun = metadata_ci.keys
     fresh_keys = {check.key for check in fresh.checks}
-    kept = [check for check in view.checks if check.key not in fresh_keys | rerun]
+    kept = [
+        check
+        for check in view.checks
+        if check.key not in fresh_keys and (metadata_ci.recorded or check.key not in rerun)
+    ]
     return replace(
         view,
         checks=(
@@ -576,6 +603,7 @@ def decide(
         rerun_keys = metadata_ci.keys
         fresh_keys = {check.key for check in fresh.checks}
         missing_rerun = any(key not in fresh_keys for key in rerun_keys)
+        recorded_rerun = metadata_ci.recorded and bool(rerun_keys & fresh_keys)
         effective = _metadata_revision_detail(view, fresh_after, metadata_ci)
         # Only caused failures may end the wait for the metadata rerun.
         fresh_failure = any(
@@ -591,6 +619,9 @@ def decide(
             not fresh_failure
             and not unchanged_failure
             and (missing_rerun or not fresh_runs and not fresh_statuses)
+            # A partial recorded rerun leaves the other failures to be judged
+            # at the deadline. No recorded rerun still means no proof.
+            and not (expired and recorded_rerun)
         ):
             return Verdict(
                 kind="unverified" if expired else "pending",
@@ -623,6 +654,7 @@ def decide(
         return Verdict(kind="unverified", reason=f"delegated_ci_{delegated_unproven}")
 
     failing: list[dict[str, Any]] = []
+    failing_keys: list[str] = []
     pending: list[dict[str, Any]] = []
     preexisting: list[dict[str, Any]] = []
     for run in check_runs:
@@ -632,6 +664,7 @@ def decide(
             preexisting.append({"name": run.name, "conclusion": run.reported_state})
         elif run.state in _FAILING:
             failing.append({"name": run.name, "conclusion": run.reported_state})
+            failing_keys.append(run.key)
         elif run.state not in _PASSING:
             pending.append({"name": run.name, "status": run.reported_state})
     for status_item in statuses:
@@ -639,6 +672,7 @@ def decide(
             preexisting.append({"context": status_item.name, "state": status_item.reported_state})
         elif status_item.state in _FAILING:
             failing.append({"context": status_item.name, "state": status_item.reported_state})
+            failing_keys.append(status_item.key)
         elif status_item.state is not CheckState.SUCCESS:
             pending.append({"context": status_item.name, "state": status_item.reported_state})
     if failing:
@@ -649,6 +683,7 @@ def decide(
         return Verdict(
             kind="failing",
             failing=failing,
+            failing_keys=tuple(failing_keys),
             pending=pending,
             reason="required_python_ci_failed" if required_python_failed else None,
         )
@@ -1160,6 +1195,10 @@ async def gate(
         )
         metadata_only = not latest.changed_paths and latest.base_sha == observed_sha
         fresh_after = latest.metadata_updated_at if metadata_only else None
+        if metadata_only and metadata_ci is None:
+            metadata_ci = _recorded_metadata_ci_policy(
+                await valkey.get(f"{ci_key(request.id, round_)}:failing")
+            )
         async with sessionmaker() as session:
             now = await lifecycle.database_now(session)
             await session.rollback()
@@ -1239,6 +1278,7 @@ async def gate(
             owner=owner,
             now=now,
             dispatch=dispatch,
+            failing_keys=verdict.failing_keys,
         )
     if verdict.kind in ("green", "no_ci"):
         status: Literal["completed", "failed"] = "completed"
@@ -1647,6 +1687,7 @@ async def _continue(
     owner: str,
     now: datetime,
     dispatch: Dispatch,
+    failing_keys: Sequence[str],
 ) -> GateResult:
     """Claim the round, hold the lease, publish the turn, then confirm the claim.
 
@@ -1678,6 +1719,19 @@ async def _continue(
             # Another reconciler already enqueued this round.
             await valkey.set(key, "published", ex=ttl)
             return "fixing"
+        record = {
+            "checks": list(
+                dict.fromkeys(key for key in failing_keys if not key.startswith(STATUS_KEY_PREFIX))
+            ),
+            "statuses": list(
+                dict.fromkeys(
+                    key.removeprefix(STATUS_KEY_PREFIX)
+                    for key in failing_keys
+                    if key.startswith(STATUS_KEY_PREFIX)
+                )
+            ),
+        }
+        await valkey.set(f"{key}:failing", json.dumps(record), ex=ttl)
         # ``dispatch`` sets the marker and appends the turn atomically.
         published = await dispatch(request, round_, text)
     except Exception:

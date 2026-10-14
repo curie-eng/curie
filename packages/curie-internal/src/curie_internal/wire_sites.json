@@ -68,6 +68,18 @@
       "language": "lua",
       "purpose": "Worker progress stream publication"
     },
+    "apps/worker/src/curie_worker/protected_dispatch.py:module:1": {
+      "language": "lua",
+      "purpose": "Bounded original protected delivery diagnostic publication before fenced transport acknowledgement"
+    },
+    "apps/worker/src/curie_worker/protected_lane.py:module:1": {
+      "language": "lua",
+      "purpose": "Bounded protected transport refusal diagnostic publication after exact row and ownership checks"
+    },
+    "apps/worker/src/curie_worker/protected_markers.py:module:1": {
+      "language": "lua",
+      "purpose": "Bounded protected completion graveyard publication before exact generation outbox resolution"
+    },
     "apps/worker/src/curie_worker/stream_consumer.py:StreamConsumer._dead_letter:1": {
       "language": "python",
       "purpose": "Bounded stream graveyard publication before acknowledgement"
@@ -125,6 +137,14 @@
     "apps/worker/src/curie_worker/deploy_notice.py:DeployNoticeConsumer._handle:2": {
       "value": "f'curie:deploy-notice:{self._stream}:{entry_id}'",
       "reason": "Worker deployment notice synthetic thread identity namespace"
+    },
+    "apps/worker/src/curie_worker/protected_execution.py:protected_execution_scope:1": {
+      "value": "curie:runs",
+      "reason": "Execution scope validates the original runs stream on its private protected broker"
+    },
+    "apps/worker/src/curie_worker/protected_lane.py:module:1": {
+      "value": "curie:runs",
+      "reason": "Protected intake retains the original runs stream on its private broker"
     },
     "apps/worker/src/curie_worker/publication_k8s.py:build_publication_resources:1": {
       "value": "f'curie:{settings.namespace}:{settings.owner_name}'",
@@ -277,6 +297,10 @@
     "packages/protected-hooks/src/curie_protected_hooks/atomic_admission.py:AtomicAdmission._prepare:1": {
       "value": "curie:runs",
       "reason": "Protected admission recovery verifies the reserved runs stream entry and envelope with an exact XRANGE"
+    },
+    "packages/protected-hooks/src/curie_protected_hooks/execution_namespace.py:derive_lane_namespace:1": {
+      "value": "curie:runs",
+      "reason": "Manifest-derived private lane retains the original runs stream with separate execution key and group namespaces"
     }
   }
 }

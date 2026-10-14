@@ -4,9 +4,10 @@ Every added or changed script under charts/curie/ci/runtime/ must be invoked,
 through tools/runtime-assertion-gate/run.sh, by a step of a CI job that:
 
 * is a dependency of the required `E2E required` job,
-* is selected by the cluster tier (its `if` reads needs.changes.outputs.cluster),
+* is selected by the cluster tier or its registered chart scenarios,
 * installs Calico before the invoking step, so NetworkPolicy is enforced, and
-* runs the invoking step unconditionally, with no continue-on-error.
+* runs the invoking step unconditionally or with its canonical chart scenario
+  condition, with no continue-on-error.
 
 `E2E required` then refuses the verdict unless each such script left a pass
 receipt for its exact blob. The general cluster parity ladder is never taken as
@@ -22,10 +23,12 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import shlex
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,6 +39,8 @@ RUNTIME_DIR = "charts/curie/ci/runtime"
 RUNNER = "tools/runtime-assertion-gate/run.sh"
 REQUIRED_JOB = "e2e-required"
 CLUSTER_SELECTOR = "${{ needs.changes.outputs.cluster == 'true' }}"
+CHART_JOB = "e2e-cluster-chart-regressions"
+CHART_SELECTOR = "${{ needs.changes.outputs.chart_scenarios != '[]' }}"
 CALICO_MARKERS = ("projectcalico/calico", "rollout status daemonset/calico-node")
 
 
@@ -64,6 +69,43 @@ def _load_jobs(workflow: Path) -> dict[str, Any]:
     if not isinstance(jobs, dict):
         raise GateError(f"{workflow}: no jobs mapping")
     return jobs
+
+
+def _load_chart_registry(workflow: Path) -> dict[str, Any]:
+    path = workflow.parent.parent / "e2e-selection.yaml"
+    try:
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise GateError(f"{path}: cannot load the chart scenario registry") from exc
+    section = document.get("chart_scenarios") if isinstance(document, dict) else None
+    if (
+        not isinstance(section, dict)
+        or section.get("job") != CHART_JOB
+        or not isinstance(section.get("scenarios"), dict)
+    ):
+        raise GateError(f"{path}: no chart scenario registry for {CHART_JOB}")
+    return section
+
+
+def _registered_chart_step(
+    registry: dict[str, Any], step: dict[str, Any], script: str
+) -> bool:
+    for scenario_id, entry in registry.get("scenarios", {}).items():
+        if not isinstance(scenario_id, str) or not isinstance(entry, dict):
+            continue
+        condition = (
+            "${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), '"
+            + scenario_id
+            + "') }}"
+        )
+        if (
+            entry.get("step") == step.get("name")
+            and isinstance(entry.get("inputs"), list)
+            and script in entry["inputs"]
+            and step.get("if") == condition
+        ):
+            return True
+    return False
 
 
 def _needs(job: dict[str, Any]) -> list[str]:
@@ -115,7 +157,9 @@ class Invocation:
     problems: tuple[str, ...]
 
 
-def invocations(jobs: dict[str, Any], script: str) -> list[Invocation]:
+def invocations(
+    jobs: dict[str, Any], script: str, chart_registry: dict[str, Any]
+) -> list[Invocation]:
     """Every step that passes `script` to the runner, with its disqualifiers."""
     required = jobs.get(REQUIRED_JOB)
     required_needs = set(_needs(required)) if isinstance(required, dict) else set()
@@ -133,14 +177,26 @@ def invocations(jobs: dict[str, Any], script: str) -> list[Invocation]:
                 problems: list[str] = []
                 if job_id not in required_needs:
                     problems.append(f"job {job_id} is not a dependency of {REQUIRED_JOB}")
-                if str(job.get("if", "")).strip() != CLUSTER_SELECTOR:
-                    problems.append(f"job {job_id} is not selected by {CLUSTER_SELECTOR}")
+                selector = CHART_SELECTOR if job_id == CHART_JOB else CLUSTER_SELECTOR
+                selected = (
+                    job.get("if") == selector
+                    if job_id == CHART_JOB
+                    else str(job.get("if", "")).strip() == selector
+                )
+                if not selected:
+                    problems.append(f"job {job_id} is not selected by {selector}")
                 if not calico_seen:
                     problems.append(
                         f"job {job_id} does not install Calico before the step, "
                         "so NetworkPolicy is not enforced"
                     )
-                if "if" in step:
+                if job_id == CHART_JOB:
+                    if not _registered_chart_step(chart_registry, step, script):
+                        problems.append(
+                            "the step does not have its canonical chart scenario condition "
+                            "and own script input in the registry"
+                        )
+                elif "if" in step:
                     problems.append("the step has an `if` and can be skipped")
                 if _runs_other_commands(run):
                     problems.append(
@@ -155,11 +211,12 @@ def invocations(jobs: dict[str, Any], script: str) -> list[Invocation]:
     return found
 
 
-def check_registration(workflow: Path, scripts: list[str]) -> None:
-    jobs = _load_jobs(workflow)
+def _check_registration(
+    workflow: Path, jobs: dict[str, Any], scripts: list[str], chart_registry: dict[str, Any]
+) -> None:
     errors: list[str] = []
     for script in scripts:
-        found = invocations(jobs, script)
+        found = invocations(jobs, script, chart_registry)
         if any(not item.problems for item in found):
             print(f"registered: {script}")
             continue
@@ -177,6 +234,12 @@ def check_registration(workflow: Path, scripts: list[str]) -> None:
             )
     if errors:
         raise GateError("\n".join(errors))
+
+
+def check_registration(workflow: Path, scripts: list[str]) -> None:
+    jobs = _load_jobs(workflow)
+    chart_registry = _load_chart_registry(workflow) if CHART_JOB in jobs else {}
+    _check_registration(workflow, jobs, scripts, chart_registry)
 
 
 def check_receipts(receipts: Path, scripts: list[str]) -> None:
@@ -207,14 +270,39 @@ def self_test(workflow: Path, registered: str) -> None:
     """Prove the gate fails closed against the real workflow.
 
     An unregistered script must fail registration, and a registered script with
-    no receipt must fail the execution check. The registered script must pass
-    registration, or the controls would prove nothing.
+    no receipt must fail the execution check. A chart registry copy that omits
+    an invoked script from its own inputs must fail registration too. The
+    registered scripts must pass registration, or the controls prove nothing.
     """
     check_registration(workflow, [registered])
-    for label, attempt in (
+    jobs = _load_jobs(workflow)
+    chart_registry = _load_chart_registry(workflow)
+    chart_script = next(
+        (
+            script
+            for entry in chart_registry["scenarios"].values()
+            if isinstance(entry, dict)
+            for script in entry.get("inputs", [])
+            if isinstance(script, str) and is_runtime_assertion(script)
+        ),
+        None,
+    )
+    if chart_script is None:
+        raise GateError("the chart registry has no runtime assertion for its negative control")
+    _check_registration(workflow, jobs, [chart_script], chart_registry)
+    omitted_registry = copy.deepcopy(chart_registry)
+    for entry in omitted_registry["scenarios"].values():
+        if isinstance(entry, dict) and isinstance(entry.get("inputs"), list):
+            entry["inputs"] = [script for script in entry["inputs"] if script != chart_script]
+    controls: tuple[tuple[str, Callable[[], None]], ...] = (
         ("unregistered script", lambda: check_registration(workflow, [NEGATIVE_UNREGISTERED])),
         ("unexecuted script", lambda: check_receipts(Path("/nonexistent-receipts"), [registered])),
-    ):
+        (
+            "chart registry script omission",
+            lambda: _check_registration(workflow, jobs, [chart_script], omitted_registry),
+        ),
+    )
+    for label, attempt in controls:
         try:
             attempt()
         except GateError as exc:

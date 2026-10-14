@@ -151,6 +151,7 @@ import base64
 import dataclasses
 import datetime as dt
 import fcntl
+import hashlib
 import http.client
 import importlib.util
 import ipaddress
@@ -173,7 +174,7 @@ import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 if __name__ == "__main__":
     # Forge entry modules import this module by name; run as a script it must
@@ -223,16 +224,15 @@ CHART_COMPONENTS = {
     "ui": "curie-ui",
 }
 RUNNER_IMAGE = "curie-runner"
-RELEASE = "curie"
 # The chart's DB_SCHEMA; the in-chart role's search_path does not include it.
 DB_SCHEMA = "curie"
 DEFAULT_LABEL = "curie-factory"
 NAMESPACE_PREFIX = "test-factory-"
 APP_KEY_REF = "factory-e2e-github-app"
-SANDBOX_CRD = "sandboxes.agents.x-k8s.io"
-# The pod label of the vendored agent-sandbox controller Deployment the chart
-# renders (charts/curie/templates/agent-sandbox.yaml).
-SANDBOX_CONTROLLER_SELECTOR = "app=agent-sandbox-controller"
+# The shared agent-sandbox controller, read the same way `curie cluster up`
+# reads it (cli/src/ops/up.rs) to decide whether this install deploys one.
+SANDBOX_CONTROLLER_NAMESPACE = "agent-sandbox-system"
+SANDBOX_CONTROLLER_DEPLOYMENT = "agent-sandbox-controller"
 OWNER_LABEL = "app.kubernetes.io/managed-by=curie-factory-e2e"
 RUN_ANNOTATION = "curie.dev/factory-e2e-run"
 # "<hostname>:<pid>" of the process that created the namespace, so a later run
@@ -1051,7 +1051,7 @@ def load_config(
         model=model,
         model_context_tokens=model_context_tokens,
         bundle_dir=bundle_dir,
-        curie_bin=env.get("CURIE_FACTORY_CURIE_BIN") or "curie",
+        curie_bin=env.get("CURIE_BIN") or "curie",
         layer_registry=layer_registry,
         operator_login=env.get("CURIE_FACTORY_OPERATOR_LOGIN") or None,
         model_base_url=env.get("CURIE_FACTORY_MODEL_BASE_URL") or None,
@@ -1250,18 +1250,6 @@ def model_proxy_egress(url: str) -> dict[str, Any]:
     return {"cidr": f"{host}/32", "ports": [{"protocol": "TCP", "port": port}]}
 
 
-def sandbox_controller_serves(*, crd: str, controller_pods: str) -> bool:
-    """True when the install should consume an existing sandbox controller. Pure.
-
-    The sandbox CRDs outlive the release that created them (helm never deletes
-    `crds/`), so a CRD alone does not mean a controller serves it. Only a
-    running controller pod does; without one this install deploys its own,
-    or every sandbox claim waits unbound.
-    """
-
-    return bool(crd.strip()) and bool(controller_pods.strip())
-
-
 def install_values(
     config: FactoryConfig,
     *,
@@ -1409,13 +1397,38 @@ def install_values(
         values["security"].setdefault("networkPolicy", {})["allowedEgress"] = allowed
     if sandbox_pod_quota is not None:
         values["resourceQuota"] = {"hard": {"sandboxPodCount": str(sandbox_pod_quota)}}
-    if config.priority_classes is not None:
-        platform, sandbox = config.priority_classes
-        values["priorityClasses"] = {
-            "platform": {"create": False, "name": platform},
-            "sandbox": {"create": False, "name": sandbox},
-        }
     return values
+
+
+def release_name(namespace: str) -> str:
+    """The Helm release for a run in ``namespace``.
+
+    Per run, not "curie": the chart names its cluster-scoped objects (the
+    ValidatingAdmissionPolicy ``<release>-runner-resources``, ClusterRoles,
+    PriorityClasses) from the release, so a fixed name collides with another
+    release named curie on the same cluster.
+    """
+
+    return "curie-" + hashlib.sha256(namespace.encode()).hexdigest()[:4]
+
+
+def priority_class_values(priority_classes: tuple[str, str] | None, release: str) -> dict[str, Any]:
+    """The chart's priorityClasses block for one run.
+
+    Configured names are reused as they are. Otherwise the release creates its
+    own per-release classes, which ``helm uninstall`` removes again.
+    """
+
+    if priority_classes is None:
+        return {
+            "platform": {"create": True, "name": f"{release}-platform"},
+            "sandbox": {"create": True, "name": f"{release}-sandbox"},
+        }
+    platform, sandbox = priority_classes
+    return {
+        "platform": {"create": False, "name": platform},
+        "sandbox": {"create": False, "name": sandbox},
+    }
 
 
 def helm_upgrade_command(
@@ -1467,8 +1480,8 @@ def quota_hard_pods(listing: Mapping[str, Any]) -> str | None:
     for item in items:
         if not isinstance(item, dict):
             continue
-        spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
-        hard = spec.get("hard") if isinstance(spec.get("hard"), dict) else {}
+        spec = item["spec"] if isinstance(item.get("spec"), dict) else {}
+        hard = spec["hard"] if isinstance(spec.get("hard"), dict) else {}
         pods = hard.get("pods")
         if isinstance(pods, str) and pods.strip():
             return pods.strip()
@@ -1886,6 +1899,40 @@ def run(argv: list[str], *, check: bool = True, input_text: str | None = None) -
     return result.stdout
 
 
+def resolve_curie_binary(binary: str) -> tuple[str, str]:
+    try:
+        if os.path.dirname(binary):
+            path = Path(binary)
+            resolved = str(path) if path.is_file() and os.access(path, os.X_OK) else None
+        else:
+            resolved = shutil.which(binary)
+        if resolved is None:
+            raise ConfigError(f"CURIE_BIN {binary!r} cannot be resolved to an executable")
+        curie_bin = str(Path(resolved).resolve())
+    except (OSError, RuntimeError):
+        raise ConfigError(f"CURIE_BIN {binary!r} cannot be resolved to an executable") from None
+    try:
+        result = subprocess.run(
+            [curie_bin, "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
+        raise ConfigError(f"CURIE_BIN {curie_bin!r} could not run --version") from None
+    if result.returncode:
+        raise ConfigError(
+            f"CURIE_BIN {curie_bin!r} failed --version (exit {result.returncode})"
+        )
+    lines = result.stdout.splitlines()
+    version = lines[0] if lines else ""
+    if not version.strip():
+        raise ConfigError(f"CURIE_BIN {curie_bin!r} did not report a version")
+    print(f"factory-e2e: curie binary {curie_bin} ({version})", file=sys.stderr, flush=True)
+    return curie_bin, version
+
+
 def http_json(
     method: str,
     url: str,
@@ -2074,11 +2121,11 @@ class Preflight:
         self.repo_root = repo_root
         self.candidate = candidate
         self.namespace = namespace
-        self.release = RELEASE
         self.evidence_path = evidence_path
         self.admission_timeout = admission_timeout
         self.teardown = Teardown()
         self.run_id = uuid.uuid4().hex[:12]
+        self.release = release_name(namespace)
         self.created_crds: list[str] = []
         self.evidence: dict[str, Any] = {
             "schema": "curie.factory-e2e.evidence/v1",
@@ -2197,7 +2244,6 @@ class Preflight:
             "git",
             "openssl",
             self.config.cloudflared,
-            self.config.curie_bin,
         ]
         absent = [tool for tool in wanted if shutil.which(tool) is None]
         if absent:
@@ -2578,7 +2624,7 @@ class Preflight:
                 "--kube-context",
                 self.config.kube_context,
                 "uninstall",
-                self.release,
+                release_name(name),
                 "-n",
                 name,
                 "--no-hooks",
@@ -2596,7 +2642,7 @@ class Preflight:
                 f"{uninstall.stderr.strip()[-500:]}"
             )
         names = [name]
-        publication = f"{name}-{self.release}-publication"
+        publication = f"{name}-{release_name(name)}-publication"
         raw = self.kubectl("get", "namespace", publication, "--ignore-not-found", "-o", "json")
         if raw.strip():
             annotations = json.loads(raw)["metadata"].get("annotations") or {}
@@ -2673,33 +2719,75 @@ class Preflight:
             "verified_absent": True,
         }
 
+    def existing_sandbox_controller(self) -> bool:
+        """Whether the shared agent-sandbox controller Deployment already runs.
+
+        Same rule as `curie cluster up`: an existing controller is reused, a
+        NotFound means this release deploys its own, and any other read failure
+        stops the run before Helm touches the cluster.
+        """
+
+        try:
+            out = self.kubectl(
+                "-n",
+                SANDBOX_CONTROLLER_NAMESPACE,
+                "get",
+                "deployment",
+                SANDBOX_CONTROLLER_DEPLOYMENT,
+                "--ignore-not-found",
+                "-o",
+                "name",
+            )
+        except PreflightFailed as exc:
+            raise PreflightFailed(
+                f"cannot read deployment {SANDBOX_CONTROLLER_NAMESPACE}/"
+                f"{SANDBOX_CONTROLLER_DEPLOYMENT} to decide sandbox controller reuse: {exc}"
+            ) from exc
+        return bool(out.strip())
+
+    def release_values(
+        self,
+        config: FactoryConfig,
+        *,
+        sandbox_pod_quota: int | None,
+        card_base_url: str = "",
+    ) -> dict[str, Any]:
+        """install_values plus this run's per-release PriorityClasses.
+
+        The one builder for install() and helm_upgrade(), so the two agree.
+        """
+
+        values = install_values(
+            config,
+            candidate=self.candidate,
+            app_key_secret=APP_KEY_REF,
+            consumer_controller=self._consumer_controller,
+            egress_cidrs=self._egress_cidrs,
+            sandbox_pod_quota=sandbox_pod_quota,
+            card_base_url=card_base_url,
+            candidate_images=self.candidate_images,
+            kind=self.kind_cluster is not None,
+            forge=self.install_forge,
+        )
+        values["priorityClasses"] = priority_class_values(config.priority_classes, self.release)
+        return values
+
     def install(
         self,
         *,
         egress_cidrs: Sequence[str] | None = None,
         extra_values: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
-        """Install the candidate release.
-
-        ``egress_cidrs`` replaces the GitHub-plus-model sandbox egress (no
-        GitHub /meta read happens then), and ``extra_values`` layers a
-        scenario's own values on top (the tls-code-host stub code host).
-        """
-
+        # Read before any CRD, Secret or Helm call: a failed read must leave
+        # the cluster untouched.
+        consumer = self.existing_sandbox_controller()
+        if consumer:
+            self.step(
+                "sandbox controller reused",
+                namespace=SANDBOX_CONTROLLER_NAMESPACE,
+                deployment=SANDBOX_CONTROLLER_DEPLOYMENT,
+            )
         chart = self.extract_chart()
-        consumer = sandbox_controller_serves(
-            crd=self.kubectl("get", "crd", SANDBOX_CRD, "--ignore-not-found", "-o", "name"),
-            controller_pods=self.kubectl(
-                "get",
-                "pods",
-                "--all-namespaces",
-                "-l",
-                SANDBOX_CONTROLLER_SELECTOR,
-                "--field-selector=status.phase=Running",
-                "-o",
-                "name",
-            ),
-        )
         for manifest in sorted((chart / "crds").glob("*.yaml")):
             match = re.search(r"^  name:\s*(\S+)", manifest.read_text(), re.MULTILINE)
             if (
@@ -2744,17 +2832,7 @@ class Preflight:
         self._consumer_controller = consumer
         self._egress_cidrs = list(egress_cidrs)
         self._sandbox_quota = quota
-        values = install_values(
-            self.config,
-            candidate=self.candidate,
-            app_key_secret=APP_KEY_REF,
-            consumer_controller=consumer,
-            egress_cidrs=egress_cidrs,
-            sandbox_pod_quota=quota,
-            candidate_images=self.candidate_images,
-            kind=self.kind_cluster is not None,
-            forge=self.install_forge,
-        )
+        values = self.release_values(self.config, sandbox_pod_quota=quota)
         if extra_values is not None:
             values = extra_values(values)
         values_file = self.workdir / "values.json"
@@ -3351,18 +3429,7 @@ class Preflight:
 
         assert self.chart_dir is not None, "install() extracts the chart first"
         config = self.config if model is None else dataclasses.replace(self.config, model=model)
-        values = install_values(
-            config,
-            candidate=self.candidate,
-            app_key_secret=APP_KEY_REF,
-            consumer_controller=self._consumer_controller,
-            egress_cidrs=self._egress_cidrs,
-            sandbox_pod_quota=quota,
-            card_base_url=self.tunnel_url,
-            candidate_images=self.candidate_images,
-            kind=self.kind_cluster is not None,
-            forge=self.install_forge,
-        )
+        values = self.release_values(config, sandbox_pod_quota=quota, card_base_url=self.tunnel_url)
         values_file = self.workdir / "values.json"
         fd = os.open(str(values_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as handle:
@@ -3514,7 +3581,7 @@ class Preflight:
         for pod in listing.get("items") or []:
             if not isinstance(pod, dict):
                 continue
-            status = pod.get("status") if isinstance(pod.get("status"), dict) else {}
+            status = pod["status"] if isinstance(pod.get("status"), dict) else {}
             phase = status.get("phase")
             if phase not in ("Running", "Succeeded"):
                 continue
@@ -3523,7 +3590,7 @@ class Preflight:
                 parsed = dt.datetime.fromisoformat(started.replace("Z", "+00:00"))
                 if parsed.timestamp() + 1 < since:
                     continue
-            spec = pod.get("spec") if isinstance(pod.get("spec"), dict) else {}
+            spec = pod["spec"] if isinstance(pod.get("spec"), dict) else {}
             for container in spec.get("containers") or []:
                 if not isinstance(container, dict):
                     continue
@@ -4620,10 +4687,7 @@ def revision(p: Preflight) -> dict[str, Any]:
         comment["body"], hit = record_agent_text(comment["body"], known)
         disclosed = disclosed or hit
     ended_at = min(
-        (
-            str(comment.get("updated_at") or comment.get("created_at") or "")
-            for comment in comments
-        ),
+        (str(comment.get("updated_at") or comment.get("created_at") or "") for comment in comments),
         default=None,
     )
     elapsed, _execution = ending_times(latest, labelled_at=p.labelled_at, ended_at=ended_at)
@@ -4993,7 +5057,7 @@ def _open_case(p: Preflight, title: str, body: str) -> None:
 
 
 def _hidden_for_case(p: Preflight, case_id: str, result: Mapping[str, Any]) -> dict[str, Any]:
-    prs = result.get("pull_requests") if isinstance(result.get("pull_requests"), list) else []
+    prs = result["pull_requests"] if isinstance(result.get("pull_requests"), list) else []
     if case_id in _PR_CASE_IDS:
         if len(prs) != 1 or not isinstance(prs[0], dict) or not prs[0].get("number"):
             return {"status": "failed", "failures": ["no single pull request to test"]}
@@ -5250,6 +5314,7 @@ def evaluation(p: Preflight) -> dict[str, Any]:
         p.helm_upgrade(quota=CODING_SANDBOX_POD_QUOTA)
     except PreflightFailed as exc:
         quota_error = str(exc)
+    revision_record: dict[str, Any] | None
     if quota_error:
         configured_cases = _failed_pass(configured_model, quota_error)
         revision_record = _blank_revision(quota_error, configured_model)
@@ -5623,7 +5688,7 @@ def _sigkill_drain(p: Preflight, obs: dict[str, Any]) -> str:
     host = os.environ.get("CURIE_FACTORY_NODE_SSH_HOST") or node
     script = (
         f"pid=$(sudo -n crictl inspect {container_id} | "
-        "python3 -c 'import json,sys;print(json.load(sys.stdin)[\"info\"][\"pid\"])') "
+        'python3 -c \'import json,sys;print(json.load(sys.stdin)["info"]["pid"])\') '
         '&& sudo -n kill -KILL "$pid" && echo "$pid"'
     )
     try:
@@ -6745,6 +6810,7 @@ def evaluation_report_failures(report: Mapping[str, Any]) -> list[str]:
     if roles != ["configured", "reference"]:
         failures.append("passes must contain the configured run and then the reference run")
         return failures
+    passes = cast(list[Any], passes)
     models: list[str] = []
     for index, item in enumerate(passes):
         assert isinstance(item, dict)
@@ -6917,7 +6983,12 @@ def main(argv: list[str] | None = None) -> int:
                     if args.issue_file is not None
                     else DEFAULT_CANCEL_RUNNING_ISSUE
                 )
-        if args.mode == "run" and args.scenario in WHOLE_FLOW_SCENARIOS:
+        whole_flow = args.mode == "run" and args.scenario in WHOLE_FLOW_SCENARIOS
+        # Whole-flow input refusal must precede even a local binary command.
+        # Ordinary preflight checks its binary before loading factory actions.
+        if not whole_flow:
+            curie_bin, curie_version = resolve_curie_binary(os.environ.get("CURIE_BIN") or "curie")
+        if whole_flow:
             if args.scenario == "repo-runner" and args.model_base_url:
                 raise ConfigError("repo-runner refuses an external model endpoint")
             loaders = {
@@ -6945,6 +7016,9 @@ def main(argv: list[str] | None = None) -> int:
                     "CURIE_FACTORY_REFERENCE_MODEL must name a different model than "
                     "CURIE_FACTORY_MODEL"
                 )
+        if whole_flow:
+            curie_bin, curie_version = resolve_curie_binary(os.environ.get("CURIE_BIN") or "curie")
+        config = dataclasses.replace(config, curie_bin=curie_bin)
         repo_root = _repo_root()
         candidate = (
             _resolve_candidate(repo_root, args.candidate, published=lambda _commit: True)
@@ -6978,6 +7052,7 @@ def main(argv: list[str] | None = None) -> int:
         candidate_images=args.candidate_images,
         kind_cluster=args.kind_cluster,
     )
+    preflight.evidence.update(curie_bin=curie_bin, curie_version=curie_version)
     if args.mode == "run":
         preflight.evidence["mode"] = f"run:{args.scenario}"
     if forge is not None:

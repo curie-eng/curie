@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.5.20";
+pub const PROTOCOL_VERSION: &str = "0.5.22";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -393,6 +393,8 @@ pub struct ApprovalRequest {
     pub reply_endpoint: Option<String>,
     #[serde(default)]
     pub reply_adapter: Option<String>,
+    #[serde(default)]
+    pub reply_identity: Option<String>,
     pub dedupe_key: String,
     #[serde(default)]
     pub route: Option<String>,
@@ -741,13 +743,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.5.21","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.23","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.5.20","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.22","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

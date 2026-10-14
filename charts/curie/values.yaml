@@ -917,7 +917,11 @@ rustfs:
     fsGroup: 10001
   persistence:
     enabled: true
-    size: 3Gi
+    # 10Gi on ext4 is 655,360 inodes; each Langfuse event upload costs about
+    # three (#4408). An existing install keeps its claim size: the chart reads
+    # it back from the live StatefulSet with `lookup`. Renderers with no
+    # cluster access (helm template, Argo CD) must pin this to the current size.
+    size: 10Gi
   # Measured rustfs/rustfs:1.0.0-beta.12 under ordinary Langfuse traffic
   # (issue #2706): 1120Mi working set, 425m CPU. The shipped 512Mi / 500m
   # ceiling OOMKilled every in-chart install in a silent loop: kubelet

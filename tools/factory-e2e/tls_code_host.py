@@ -375,7 +375,7 @@ def load_tls_config(env: Mapping[str, str], *, context: str | None) -> fe.Factor
         model=model,
         model_context_tokens=context_tokens,
         bundle_dir=bundle_dir,
-        curie_bin=env.get("CURIE_FACTORY_CURIE_BIN") or "curie",
+        curie_bin=env.get("CURIE_BIN") or "curie",
         layer_registry=env.get("CURIE_FACTORY_LAYER_REGISTRY") or None,
         operator_login=None,
         model_base_url=None,

@@ -107,6 +107,10 @@ class Kernel:
         self._sink = ObservedReplySink(sink)
         self._lock = lock
         self._pressure_lock = pressure_lock
+        # Scheduling only: remember each bounded window so unreadable retained
+        # routes cannot occupy every pass. Deletion still requires the locked
+        # status and ownership checks, never this process-local set.
+        self._pressure_selected_threads: set[str] = set()
         self._markers = markers
         self._config = config
         # Deployment-to-runtime binding and the kill switch are optional: when

@@ -722,6 +722,34 @@ def test_ci_only_docs_change_has_no_tiers(repository: Path) -> None:
     assert load_tool().select_ci_only(repository, [path], "main", head) == []
 
 
+@pytest.mark.parametrize(
+    ("path", "base", "cluster_selected", "chart_selected"),
+    [
+        ("apps/api/src/curie_api/main.py", "main", True, True),
+        ("charts/curie/templates/agent-sandbox.yaml", "main", True, True),
+        ("charts/curie/ci/runtime/connector-readiness-runtime.sh", "main", True, True),
+        ("charts/curie/ci/scenarios/controller-preflight-kind.sh", "main", True, True),
+        ("scripts/check-runner-byo-egress.sh", "main", True, True),
+        ("charts/curie/ci/runtime/metrics-alerts-runtime.sh", "main", True, False),
+        ("examples/weather/evals/cases.json", "main", True, False),
+        ("scripts/check-netpol-enforcement.sh", "main", True, False),
+        ("docs/example.md", "main", False, False),
+        ("apps/api/src/curie_api/main.py", "next", False, False),
+        ("charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh", "next", True, True),
+    ],
+)
+def test_ci_only_chart_job_listing_follows_chart_scenarios(
+    repository: Path, path: str, base: str, cluster_selected: bool, chart_selected: bool,
+) -> None:
+    if base == "next":
+        git(repository, "update-ref", "refs/remotes/origin/next", "origin/main")
+    head = commit_paths(repository, [path])
+    selected = load_tool().select_ci_only(repository, [path], base, head)
+    assert ("cluster" in selected) is cluster_selected
+    assert ("e2e-ladder-cluster" in selected) is cluster_selected
+    assert ("e2e-cluster-chart-regressions" in selected) is chart_selected
+
+
 def test_private_services_shared_worktree_lock_refuses_detached_checkout(
     tmp_path: Path,
 ) -> None:
@@ -770,37 +798,97 @@ def test_private_services_unavailable_daemon_is_transient_error(
 
 def test_private_config_accepts_loopback_binding_and_owned_network() -> None:
     project = "curie-preflight-example"
+    subnets = ("10.240.0.0/24", "10.240.1.0/24")
     configuration = {
         "services": {
             "postgres": {"ports": [{"host_ip": "127.0.0.1", "target": 5432, "published": "35432"}]}
         },
-        "networks": {"curie_runner": {"name": f"{project}_runner"}},
+        "networks": {
+            "default": {
+                "name": f"{project}_default",
+                "ipam": {"config": [{"subnet": subnets[0]}]},
+            },
+            "curie_runner": {
+                "name": f"{project}_runner",
+                "ipam": {"config": [{"subnet": subnets[1]}]},
+            },
+        },
     }
-    assert load_tool().validate_private_config(configuration, project, {"postgres": [5432]}) is None
+    assert (
+        load_tool().validate_private_config(
+            configuration, project, {"postgres": [5432]}, subnets
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("host_ip", ["0.0.0.0", "::", None])
 def test_private_config_shared_binding_is_gate_failure(host_ip: str | None) -> None:
     project = "curie-preflight-example"
+    subnets = ("10.240.0.0/24", "10.240.1.0/24")
     port = {"target": 5432, "published": "35432"}
     if host_ip is not None:
         port["host_ip"] = host_ip
     configuration = {
         "services": {"postgres": {"ports": [port]}},
-        "networks": {"curie_runner": {"name": f"{project}_runner"}},
+        "networks": {
+            "default": {
+                "name": f"{project}_default",
+                "ipam": {"config": [{"subnet": subnets[0]}]},
+            },
+            "curie_runner": {
+                "name": f"{project}_runner",
+                "ipam": {"config": [{"subnet": subnets[1]}]},
+            },
+        },
     }
     module = load_tool()
     with pytest.raises(module.GateFailure, match="shared binding"):
-        module.validate_private_config(configuration, project, {"postgres": [5432]})
+        module.validate_private_config(configuration, project, {"postgres": [5432]}, subnets)
 
 
 def test_private_config_shared_network_is_gate_failure() -> None:
+    subnets = ("10.240.0.0/24", "10.240.1.0/24")
     configuration = {
         "services": {"postgres": {"ports": [{"host_ip": "127.0.0.1", "target": 5432}]}},
-        "networks": {"curie_runner": {"name": "shared_runner"}},
+        "networks": {
+            "default": {
+                "name": "curie-preflight-example_default",
+                "ipam": {"config": [{"subnet": subnets[0]}]},
+            },
+            "curie_runner": {
+                "name": "shared_runner",
+                "ipam": {"config": [{"subnet": subnets[1]}]},
+            },
+        },
     }
     module = load_tool()
     with pytest.raises(module.GateFailure, match="incorrect owner"):
         module.validate_private_config(
-            configuration, "curie-preflight-example", {"postgres": [5432]}
+            configuration, "curie-preflight-example", {"postgres": [5432]}, subnets
         )
+
+
+def test_private_preflight_networks_skip_occupied_subnets() -> None:
+    module = load_tool()
+    occupied = [
+        f"10.240.{octet}.0/24" for octet in range(16) if octet not in {0, 1}
+    ]
+    occupied.extend(f"172.31.{octet}.0/24" for octet in range(240, 256))
+    occupied.extend(f"192.168.{octet}.0/24" for octet in range(240, 256))
+
+    default_subnet, runner_subnet = module.private_network_subnets(
+        "curie-preflight-example", occupied
+    )
+
+    assert {default_subnet, runner_subnet} == {"10.240.0.0/24", "10.240.1.0/24"}
+
+
+def test_private_preflight_networks_fail_when_reserved_pool_is_full() -> None:
+    module = load_tool()
+    occupied = [f"10.240.{octet}.0/24" for octet in range(16)]
+    occupied.extend(f"172.31.{octet}.0/24" for octet in range(240, 256))
+    occupied.extend(f"192.168.{octet}.0/24" for octet in range(240, 256))
+
+    with pytest.raises(module.TransientError, match="No free private preflight subnets"):
+        module.private_network_subnets("curie-preflight-example", occupied)

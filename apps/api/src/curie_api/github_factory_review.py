@@ -287,8 +287,15 @@ async def admit_parsed_feedback(
         reply_target=_reply_target(feedback, work_item),
         reply_url=url,
     )
-    result = await workitem_dispatch.admit_revision(session, facts)
-    return admission_result(result, facts.request_id)
+    # Keep dispatch commits inside savepoints so the caller's issue lock remains
+    # held until admission and delivery settlement commit together.
+    async with AsyncSession(
+        bind=await session.connection(),
+        join_transaction_mode="create_savepoint",
+        expire_on_commit=False,
+    ) as admission:
+        result = await workitem_dispatch.admit_revision(admission, facts)
+        return admission_result(result, facts.request_id)
 
 
 async def handle_factory_review_delivery(

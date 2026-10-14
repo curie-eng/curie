@@ -177,6 +177,35 @@ def compose(
     return run(cmd + list(args), **kw)
 
 
+def network_subnets(project: str) -> list[str]:
+    """The IPv4 subnets of the project's compose network.
+
+    A pod on the Docker host's own Kubernetes node reaches the published port
+    through Docker's DNAT, so a NetworkPolicy sees the container's bridge
+    address, not the advertised host. A consumer that runs on that node needs
+    these subnets as well as the advertised host to pass an egress policy.
+    """
+
+    out = run(
+        [
+            "docker",
+            "network",
+            "inspect",
+            f"{project}_default",
+            "--format",
+            "{{json .IPAM.Config}}",
+        ]
+    ).stdout
+    subnets = []
+    for entry in json.loads(out or "null") or []:
+        subnet = str(entry.get("Subnet") or "")
+        if subnet and ipaddress.ip_network(subnet).version == 4:
+            subnets.append(subnet)
+    if not subnets:
+        raise FixtureError(f"the {project}_default network has no IPv4 subnet")
+    return subnets
+
+
 # --------------------------------------------------------------------------
 # HTTP helpers
 
@@ -819,6 +848,8 @@ def cmd_up(args: argparse.Namespace) -> int:
 
         log("creating containers")
         compose(state, state_dir, "create")
+        state["docker_subnets"] = network_subnets(project)
+        save_state(state_dir, state)
         compose(
             state,
             state_dir,

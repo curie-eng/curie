@@ -59,30 +59,103 @@ jobs:
         run: gh run watch "$CI_RUN_ID" --exit-status
 
   report:
-    name: Report failed nightly kind CI
+    name: Report nightly kind CI result
     needs: [dispatch, verify]
-    if: ${{ always() && (needs.dispatch.result != 'success' || needs.verify.result != 'success') }}
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       issues: write
+      actions: read
     steps:
-      - name: Open a tracking issue for the failed nightly
+      - name: Update the nightly tracking issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          CI_RUN_ID: ${{ needs.dispatch.outputs.run_id }}
           CI_RUN_URL: ${{ needs.dispatch.outputs.run_url }}
           DISPATCH_RESULT: ${{ needs.dispatch.result }}
           VERIFY_RESULT: ${{ needs.verify.result }}
-          NIGHTLY_RUN_ID: ${{ github.run_id }}
           NIGHTLY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          body=$(printf 'Nightly kind CI on next did not succeed.\n\nNightly workflow: %s\nDispatch result: %s\nVerification result: %s\n' \
-            "$NIGHTLY_RUN_URL" "$DISPATCH_RESULT" "$VERIFY_RESULT")
-          if [[ -n "$CI_RUN_URL" ]]; then
-            body+=$'\n\nDispatched CI run: '"$CI_RUN_URL"
-          else
-            body+=$'\n\nNo CI run was confirmed. Inspect the nightly workflow logs for the dispatch failure.'
-          fi
-          gh issue create --repo "$GH_REPO" \
-            --title "Nightly kind CI on next failed for run $NIGHTLY_RUN_ID" --body "$body"
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          repo = os.environ["GH_REPO"]
+          title = "Nightly kind CI on next is failing"
+          failed_conclusions = {"failure", "timed_out", "cancelled"}
+
+          def gh(*arguments, capture_output=False):
+              return subprocess.run(
+                  ["gh", *arguments], check=True, capture_output=capture_output, text=True)
+
+          def read_pages(endpoint):
+              result = gh("api", "--paginate", "--slurp", endpoint, capture_output=True)
+              return json.loads(result.stdout)
+
+          issue_number = min(
+              (issue["number"]
+                  for page in read_pages(f"repos/{repo}/issues?state=open&per_page=100")
+                  for issue in page
+                  if "pull_request" not in issue
+                  and issue.get("title") == title
+                  and (issue.get("user") or {}).get("login") == "github-actions[bot]"),
+              default=None)
+          nightly_url = os.environ["NIGHTLY_RUN_URL"]
+          run_url = os.environ["CI_RUN_URL"]
+          dispatch_result = os.environ["DISPATCH_RESULT"]
+          verify_result = os.environ["VERIFY_RESULT"]
+
+          green = dispatch_result == "success" and verify_result == "success"
+          if green:
+              if issue_number is None:
+                  raise SystemExit(0)
+              body = (
+                  "Nightly kind CI on next passed.\n\n"
+                  f"Nightly workflow: {nightly_url}\n"
+                  f"Dispatched CI run: {run_url}")
+          else:
+              lines = [
+                  "Nightly kind CI on next did not succeed.",
+                  "",
+                  f"Nightly workflow: {nightly_url}",
+                  f"Dispatch result: {dispatch_result}",
+                  f"Verification result: {verify_result}", "",
+              ]
+              if run_url:
+                  lines.append(f"Dispatched CI run: {run_url}")
+                  try:
+                      pages = read_pages(
+                          f"repos/{repo}/actions/runs/{os.environ['CI_RUN_ID']}/jobs?filter=latest&per_page=100")
+                  except (subprocess.CalledProcessError, json.JSONDecodeError):
+                      lines.extend(["", "Failed jobs: could not be listed"])
+                  else:  # The complete job listing supplies failure details.
+                      lines.extend(["", "Failed jobs:"])
+                      jobs = [
+                          job
+                          for page in pages
+                          for job in page["jobs"]
+                          if job.get("conclusion") in failed_conclusions]
+                      for index, job in enumerate(jobs, 1):
+                          steps = [
+                              step["name"]
+                              for step in job.get("steps", [])
+                              if step.get("conclusion") in failed_conclusions]
+                          detail = ", ".join(steps) if steps else (
+                              f"no failed step recorded ({job['conclusion']})")
+                          lines.append(f"{index}. {job['name']}: {detail}")
+                      if not jobs:
+                          lines.append("No failed jobs recorded.")
+              else:  # Dispatch did not confirm a CI run.
+                  lines.append(
+                      "No CI run was confirmed. Inspect the nightly workflow logs for the dispatch failure.")
+              body = "\n".join(lines)
+          if issue_number is None:
+              gh("issue", "create", "--repo", repo, "--title", title, "--body", body)
+          else:  # Reuse the existing bot tracking issue.
+              gh("issue", "comment", str(issue_number), "--repo", repo, "--body", body)
+              if green:
+                  gh("issue", "close", str(issue_number), "--repo", repo, "--reason", "completed")
+          PY

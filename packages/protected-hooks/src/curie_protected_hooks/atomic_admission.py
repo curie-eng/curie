@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any
+from typing import Any, NoReturn
 
 from aci_protocol.ndjson import parse_queued_turn
 from redis import Redis
@@ -33,7 +33,7 @@ from .admission_records import (
     parse_selection,
     parse_state,
 )
-from .admission_scripts import TRANSACTION
+from .admission_scripts import QUOTA_CENSUS, TRANSACTION
 from .authority_evaluation import (
     ADMISSION_REASONS,
     AuthorityReads,
@@ -42,12 +42,22 @@ from .authority_evaluation import (
 )
 from .authority_records import Manifest, parse_readiness
 from .broker_metadata import AuthorityMetadataReader
+from .settlement_records import EventIndex
 from .source_fence import SourceState, _decode_source
 from .source_policy_records import policy_fingerprint
 
 # @spec PROTECTED-HOOK-ADMISSION-5
 _ABSENT = object()
 _DIGEST = re.compile(rb"[0-9a-f]{64}", re.ASCII)
+
+
+def _unavailable() -> NoReturn:
+    error = AdmissionUnavailable()
+    try:
+        raise error from None
+    finally:
+        error.__context__ = None
+        error.__cause__ = None
 
 
 class AtomicAdmission:
@@ -88,7 +98,7 @@ class AtomicAdmission:
         try:
             return self._operate(request.identity, request)
         except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
-            raise AdmissionUnavailable() from None
+            _unavailable()
 
     def recover(self, identity: DeliveryIdentity) -> AdmissionResult:
         """@spec PROTECTED-HOOK-ADMISSION-2/5."""
@@ -97,7 +107,49 @@ class AtomicAdmission:
         try:
             return self._operate(identity, None)
         except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
-            raise AdmissionUnavailable() from None
+            _unavailable()
+
+    def backfill_accepted(self, identity: DeliveryIdentity) -> bool:
+        """Owner checked immutable index backfill, @spec PROTECTED-HOOK-LANE-6."""
+        from .settlement_owner import backfill_accepted
+        try:
+            return backfill_accepted(self, identity)
+        except Exception:  # noqa: BLE001
+            _unavailable()
+
+    def release_accepted(self, identity: DeliveryIdentity) -> str:
+        """Owner-only capacity refund; no retained proof deletion."""
+        from .settlement_owner import release_accepted
+        try:
+            return release_accepted(self, identity)
+        except Exception:  # noqa: BLE001
+            _unavailable()
+
+    def committed(self, limit: int) -> tuple[DeliveryIdentity, ...]:
+        """Bounded owner census; overflow refuses instead of truncating."""
+        if type(limit) is not int or not 0 < limit <= min(self._limit,64):
+            raise ValueError("invalid protected admission listing limit")
+        try:
+            prefix = "protected:admission:"
+            members = self._client.eval(QUOTA_CENSUS, 1, prefix+"quota", limit)
+            if type(members) is not list or len(members)>limit:
+                _unavailable()
+            found = []
+            for member in members:
+                if type(member) is not bytes or _DIGEST.fullmatch(member) is None:
+                    continue
+                raw = self._get(prefix+"intent:"+member.decode())
+                if raw is None or self._get(prefix+"commit:"+member.decode()) is None:
+                    continue
+                try:
+                    identity = DeliveryIdentity(**parse_intent(raw).as_dict()["identity"])
+                except (ValueError, TypeError):
+                    continue
+                if delivery_digest(identity)==member.decode():
+                    found.append(identity)
+            return tuple(found)
+        except Exception:  # noqa: BLE001
+            _unavailable()
 
     def preparing(self, limit: int) -> tuple[DeliveryIdentity, ...]:
         """Outstanding intents holding capacity, in quota score order.
@@ -115,7 +167,7 @@ class AtomicAdmission:
         try:
             return self._preparing(limit)
         except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
-            raise AdmissionUnavailable() from None
+            _unavailable()
 
     def _preparing(self, limit: int) -> tuple[DeliveryIdentity, ...]:
         """@spec PROTECTED-HOOK-ADMISSION-5."""
@@ -537,6 +589,28 @@ class AtomicAdmission:
                 envelope_raw = self._envelope(original, manifest).canonical_bytes
                 original["envelope_sha256"] = hashlib.sha256(envelope_raw).hexdigest()
                 params.update(mode="new", intent=original)
+        if original is not None:
+            event_id = original["event_id"]
+        else:
+            if request is None:
+                raise AdmissionUnavailable()
+            event_id = parse_queued_turn(request.queued_payload).event_id
+        event_key = prefix + "event:" + event_id
+        index_raw = self._get(event_key)
+        index = EventIndex(_encode(dict(
+            schema_version=1, event_id=event_id, intent_digest=delivery_digest(identity)
+        )))
+        if index_raw is not None and index_raw != index.canonical_bytes:
+            raise AdmissionUnavailable()
+        keys.append(event_key)
+        params.update(
+            event_key=len(keys), event_index=index.canonical_bytes.decode(),
+            checked_commit=commit is not None,
+        )
+        observed.append((event_key, 16384, index_raw))
+        params["snapshots"].append(dict(
+            index=len(keys), raw=index_raw.decode() if index_raw is not None else None
+        ))
         return payload, envelope_raw
 
     def _target(
@@ -611,9 +685,11 @@ def quota_census(admission: AtomicAdmission) -> tuple[int, int]:
         raise ValueError("invalid protected admission facade")
     try:
         prefix = "protected:admission:"
-        members: Any = admission._client.zrange(prefix + "quota", 0, admission._limit - 1)
-        if type(members) is not list:
-            raise AdmissionUnavailable()
+        members: Any = admission._client.eval(
+            QUOTA_CENSUS, 1, prefix + "quota", min(admission._limit, 64)
+        )
+        if type(members) is not list or len(members)>min(admission._limit,64):
+            _unavailable()
         parked = 0
         for member in members:
             if type(member) is not bytes or _DIGEST.fullmatch(member) is None:
@@ -626,4 +702,4 @@ def quota_census(admission: AtomicAdmission) -> tuple[int, int]:
                 parked += 1
         return len(members), parked
     except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
-        raise AdmissionUnavailable() from None
+        _unavailable()
