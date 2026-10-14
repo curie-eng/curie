@@ -11,6 +11,7 @@ from aci_protocol import (
     SessionStatus,
 )
 from channel_protocol.reply import (
+    PROGRESS_REPLY_WIRE_VERSION,
     REPLY_WIRE_VERSION,
     NavAffordance,
     ReplyTarget,
@@ -80,7 +81,7 @@ class _StreamAccumulator:
     receipt_rows: list[dict[str, Any]] = field(default_factory=list)
     # The install's receipt mode (ADR-0180). Read only by rendered_with_receipt:
     # the ledger rows above and saw_side_effect are the same in every mode.
-    receipt_mode: TurnReceiptMode = "all"
+    receipt_mode: TurnReceiptMode = "off"
     # The repository this turn attached from its own message (#2659), announced
     # at finalize only. Intermediate streaming edits show `rendered()` alone.
     workspace_inferred_repo: str | None = None
@@ -126,6 +127,7 @@ class _ThrottledReply:
         best_effort: bool = False,
         on_ref: Callable[[str], None] | None = None,
         on_final: Callable[[], None] | None = None,
+        delivery_id: str | None = None,
     ) -> None:
         self._sink = ObservedReplySink(sink)
         self._target = target
@@ -138,6 +140,7 @@ class _ThrottledReply:
         # fragment is a preview, not the answer, and one of #2433's three named
         # shapes is the turn that streamed partial text and then raised.
         self._on_final = on_final
+        self._delivery_id = delivery_id
         self._min_interval_s = min_interval_s
         self._no_edit = no_edit
         self._last = 0.0
@@ -200,6 +203,19 @@ class _ThrottledReply:
             self._last_text = text
         except Exception as exc:  # noqa: BLE001 - cosmetic progress is best effort
             logger.warning("context reply update failed: %s", type(exc).__name__)
+
+    def prepare_final(self, text: str) -> ReplyUpdate | None:
+        """Freeze the final reply for the completion outbox, before any send."""
+        if self._target is None:
+            return None
+        return ReplyUpdate(
+            version=PROGRESS_REPLY_WIRE_VERSION,
+            event="reply.update",
+            target=self._target,
+            text=text or "(no response)",
+            nav=self._nav,
+            delivery_id=self._delivery_id,
+        )
 
     async def finalize(self, text: str) -> None:
         # First statement, BEFORE the early return: an identical final means the

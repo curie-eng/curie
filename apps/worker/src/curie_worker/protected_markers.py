@@ -156,6 +156,8 @@ class OwedCompletion:
 class ProtectedMarkers(Markers):
     """Kernel-injected retention wrapper bound to one authenticated runtime."""
 
+    supports_answer_outbox = False
+
     def __init__(
         self,
         redis: Redis,

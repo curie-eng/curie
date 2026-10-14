@@ -534,7 +534,7 @@ def test_a_transient_ledger_outage_delivers_with_a_durable_receipt(
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
             actions = ActionClient(api_base_url="http://api", api_key="example", client=http)
-            async with make_harness(actions=actions) as h:
+            async with make_harness(actions=actions, turn_receipt="all") as h:
                 h.runner.default_script = [*_call("tool-1"), Final(text="done", status=DONE)]
                 event = _qevent("scale it")
                 await h.kernel.process_event(event)

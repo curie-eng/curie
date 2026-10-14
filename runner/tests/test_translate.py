@@ -1157,3 +1157,64 @@ def test_finance_text_without_existing_credit_match_is_not_a_subscription_limit(
         if isinstance(event, ErrorEvent)
     ]
     assert [event.classification for event in errors] == ["unclassified"]
+
+def test_empty_result_delivers_only_answer_after_tool_activity() -> None:
+    state = TurnState()
+    _translate(
+        AssistantMessage(
+            content=[
+                TextBlock(text="Collecting evidence."),
+                ToolUseBlock(id="r1", name="Read", input={}),
+            ],
+            model="m",
+        ),
+        state,
+    )
+    _translate(
+        AssistantMessage(
+            content=[TextBlock(text="Nested diagnostic.")], model="m", parent_tool_use_id="r1"
+        ),
+        state,
+    )
+    _translate(
+        UserMessage(content=[ToolResultBlock(tool_use_id="r1", content="synthetic evidence")]),
+        state,
+    )
+    _translate(
+        AssistantMessage(content=[TextBlock(text="The requested answer.")], model="m"), state
+    )
+    result = ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=2,
+        session_id="s",
+        result="",
+    )
+    final = _translate(result, state)[0]
+    assert final.text == "The requested answer."
+
+
+def test_empty_result_after_a_tool_does_not_deliver_its_preamble() -> None:
+    state = TurnState()
+    _translate(
+        AssistantMessage(
+            content=[
+                TextBlock(text="I will inspect it."),
+                ToolUseBlock(id="r1", name="Read", input={}),
+            ],
+            model="m",
+        ),
+        state,
+    )
+    result = ResultMessage(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=False,
+        num_turns=1,
+        session_id="s",
+        result="",
+    )
+    assert _translate(result, state)[0].text == ""

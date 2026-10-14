@@ -877,6 +877,7 @@ async def _consume(
     silent_requesting_chat = self._is_factory_work_item_turn(qevent.event_id)
     reply = delivery._ThrottledReply(
         self._sink,
+        delivery_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"curie-answer:{qevent.event_id}")),
         target=(
             None
             if routing._is_targetless(qevent) or silent_requesting_chat
@@ -1047,7 +1048,8 @@ async def _apply_frame(
 ) -> None:
     if isinstance(frame, TextDelta):
         acc.text_parts.append(frame.text)
-        await reply.stream(acc.rendered())
+        # Provisional assistant text can precede tool calls. Keep it for
+        # diagnostics, but only the terminal Final is an end-user answer.
     elif isinstance(frame, ToolNote):
         # Tool notes remain available on the ACI stream for internal
         # consumers, but they are not part of the user-facing reply. The
@@ -1164,9 +1166,14 @@ async def _finish(
 ) -> failures.TurnOutcome:
     if acc.status in (SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT):
         text = acc.rendered_with_receipt()
-        await reply.finalize(text)
+        durable_answer = self._markers.supports_answer_outbox
+        if not durable_answer:
+            # The protected lane has a witnessed settlement contract. Preserve
+            # its existing send/ref adoption before witnessing completion.
+            await reply.finalize(text)
         return failures.TurnOutcome(
             terminal_ok=True,
+            answer=reply.prepare_final(text) if durable_answer else None,
             saw_side_effect=acc.saw_side_effect,
             text=text,
             status=acc.status,

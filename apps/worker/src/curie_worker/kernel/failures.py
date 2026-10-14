@@ -9,6 +9,7 @@ from aci_protocol import (
     SessionStatus,
     ToolAccess,
 )
+from channel_protocol.reply import ReplyUpdate
 from curie_telemetry.redact import redact_text
 
 from ..runner_client import (
@@ -189,6 +190,7 @@ class TurnOutcome:
     """The result of streaming one turn, feeding the retry/escalate decision."""
 
     terminal_ok: bool
+    answer: ReplyUpdate | None = None
     saw_side_effect: bool = False
     classification: str | None = None
     error_message: str | None = None
