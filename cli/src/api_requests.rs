@@ -105,6 +105,16 @@ pub struct ChannelCallersWrite {
     pub allowed_callers: Option<Vec<String>>,
 }
 
+/// `PUT /agents/{id}/access-policy` (`AgentAccessPolicyWrite`, ADR 0220).
+/// Both team keys are required; `null` clears that role. `expected_version`
+/// is the version last read, 0 when the agent has no policy yet.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentAccessPolicyWrite {
+    pub invocation_team_id: Option<String>,
+    pub approver_team_id: Option<String>,
+    pub expected_version: u64,
+}
+
 /// `POST /channels/token` (`ChannelTokenRequest`).
 #[derive(Debug, Clone, Serialize)]
 pub struct ChannelTokenRequest {

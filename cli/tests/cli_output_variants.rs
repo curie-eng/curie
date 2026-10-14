@@ -35,15 +35,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use curie::api::{
-    ApprovalRecord, ChannelBinding, HookFireRecord, MemoryEntry, MetricPoint, MetricSeries,
-    MetricsSummary, ScheduleList, Version,
+    AgentAccessPolicy, ApprovalRecord, ChannelBinding, HookFireRecord, MemoryEntry, MetricPoint,
+    MetricSeries, MetricsSummary, ScheduleList, Version,
 };
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
-    ActionsOutput, ApprovalsOutput, BudgetOutput, CallersOutput, ChannelsOutput, DeleteOutput,
-    HookFireOutput, HookOutput, KillOutput, MemoryChannel, MemoryOutput, OverridesOutput,
-    PublicationPolicyOutput, ResetThreadOutput, ResumeOutput, SchedulesOutput,
-    SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
+    AccessPolicyOutput, ActionsOutput, ApprovalsOutput, BudgetOutput, CallersOutput,
+    ChannelsOutput, DeleteOutput, HookFireOutput, HookOutput, KillOutput, MemoryChannel,
+    MemoryOutput, OverridesOutput, PublicationPolicyOutput, ResetThreadOutput, ResumeOutput,
+    SchedulesOutput, SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::factory_intake::FactoryIntakeOutput;
@@ -398,6 +398,24 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 publication_draft: false,
                 publication_branch_prefix: None,
                 changed: false,
+            },
+        ],
+    );
+    m.insert(
+        "AccessPolicyOutput",
+        samples![
+            "DryRun" => AccessPolicyOutput::DryRun(plan()),
+            "Done" => AccessPolicyOutput::Done {
+                agent: "a".to_string(),
+                policy: AgentAccessPolicy {
+                    agent_id: "00000000-0000-0000-0000-0000000000a1".to_string(),
+                    tenant_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                    invocation_team_id: Some("00000000-0000-0000-0000-0000000000b1".to_string()),
+                    approver_team_id: None,
+                    version: 1,
+                    updated_at: Some("2026-10-14T00:00:00Z".to_string()),
+                },
+                changed: true,
             },
         ],
     );

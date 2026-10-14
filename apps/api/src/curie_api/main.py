@@ -58,6 +58,7 @@ from .resumereconciler import ResumeReconciler
 from .routers import (
     action_executions,
     actions,
+    agent_access,
     agents,
     approval_recovery,
     approvals,
@@ -600,6 +601,7 @@ def create_app() -> FastAPI:
     app.include_router(channel_identities.router)
     app.include_router(identity.router)
     app.include_router(teams.router)
+    app.include_router(agent_access.router)
     app.include_router(hooks.router)
 
     @app.middleware("http")

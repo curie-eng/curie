@@ -1028,6 +1028,35 @@ pub(crate) enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show or change which IdP teams may invoke the agent and approve for it
+    /// (`GET`/`PUT /agents/{id}/access-policy`, ADR 0220).
+    ///
+    /// With no team flag this shows the policy. A team is named by its id, as
+    /// `GET /teams` lists it, and must be an IdP group team of the agent's
+    /// tenant. A role left unmentioned keeps its team. The write sends back
+    /// the version it read, so a concurrent change is refused rather than
+    /// overwritten. Nothing enforces the policy yet.
+    AccessPolicy {
+        /// Agent name or id.
+        agent: String,
+        /// The team whose members may start a turn with the agent.
+        #[arg(long, value_name = "TEAM_ID", conflicts_with = "clear_invocation_team")]
+        invocation_team: Option<String>,
+        /// The team whose members may resolve the agent's approvals.
+        #[arg(long, value_name = "TEAM_ID", conflicts_with = "clear_approver_team")]
+        approver_team: Option<String>,
+        /// Remove the invocation team, so today's caller rules apply.
+        #[arg(long)]
+        clear_invocation_team: bool,
+        /// Remove the approver team, so each route's approvers apply.
+        #[arg(long)]
+        clear_approver_team: bool,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Mint or inspect the mail adapter's channel token
     /// (`POST /channels/token`).
     ///

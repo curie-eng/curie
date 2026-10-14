@@ -128,6 +128,10 @@ fn cluster_cases() -> Vec<ClusterCase> {
             ],
         },
         ClusterCase {
+            name: "access-policy",
+            args: &["access-policy", "acme-bot", "--dry-run"],
+        },
+        ClusterCase {
             name: "channel-token",
             args: &["channel-token", "acme-bot", "--show-exp", "--dry-run"],
         },
@@ -316,7 +320,7 @@ fn coverage_inventory_names_every_cluster_verb() {
     let covered_names: BTreeSet<&str> = cluster_cases().iter().map(|case| case.name).collect();
 
     assert_eq!(covered_names, manifest_names);
-    assert_eq!(covered_names.len(), 36);
+    assert_eq!(covered_names.len(), 37);
 }
 
 #[test]
@@ -489,6 +493,7 @@ fn connection_backed_verbs_discover_the_file_target() {
                 "slack=C0EXAMPLE1",
             ],
         ),
+        ("access-policy", &["cluster", "access-policy", "acme-bot"]),
         (
             "channel-token",
             &["cluster", "channel-token", "acme-bot", "--show-exp"],

@@ -140,6 +140,11 @@
       "omissions": []
     },
     {
+      "struct": "AgentAccessPolicy",
+      "schema": "AgentAccessPolicyOut",
+      "omissions": []
+    },
+    {
       "struct": "ChannelBinding",
       "schema": "ChannelBindingOut",
       "omissions": []
@@ -618,6 +623,11 @@
       ]
     },
     {
+      "struct": "AgentAccessPolicyWrite",
+      "schema": "AgentAccessPolicyWrite",
+      "omissions": []
+    },
+    {
       "struct": "ChannelCallersWrite",
       "schema": "ChannelCallersWrite",
       "omissions": []
@@ -760,6 +770,12 @@
       "struct": "ChannelBindingWrite",
       "method": "post",
       "path": "/agents/{agent_id}/channels"
+    },
+    {
+      "function": "put_agent_access_policy",
+      "struct": "AgentAccessPolicyWrite",
+      "method": "put",
+      "path": "/agents/{agent_id}/access-policy"
     },
     {
       "function": "set_channel_callers",
@@ -945,6 +961,14 @@
         {"field": "publication_policy_version", "why": "Publication policy has its own operator command."},
         {"field": "publication_draft", "why": "Publication policy has its own operator command."},
         {"field": "publication_branch_prefix", "why": "Publication policy has its own operator command."}
+      ]
+    },
+    {
+      "output": "AccessPolicyOutput",
+      "struct": "AgentAccessPolicy",
+      "omissions": [
+        {"field": "tenant_id", "why": "An agent belongs to one tenant; the policy result names the agent, and the tenant is read from the agent."},
+        {"field": "updated_at", "why": "The version is the change signal operators act on; the timestamp stays in the API read."}
       ]
     },
     {

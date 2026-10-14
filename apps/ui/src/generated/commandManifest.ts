@@ -6824,6 +6824,114 @@ export const commandManifest = {
           "name": "callers"
         },
         {
+          "about": "Show or change which IdP teams may invoke the agent and approve for it (`GET`/`PUT /agents/{id}/access-policy`, ADR 0220)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "The team whose members may start a turn with the agent",
+              "id": "invocation_team",
+              "long": "invocation-team",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The team whose members may resolve the agent's approvals",
+              "id": "approver_team",
+              "long": "approver-team",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove the invocation team, so today's caller rules apply",
+              "id": "clear_invocation_team",
+              "long": "clear-invocation-team",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove the approver team, so each route's approvers apply",
+              "id": "clear_approver_team",
+              "long": "clear-approver-team",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be done and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Show or change which IdP teams may invoke the agent and approve for it (`GET`/`PUT /agents/{id}/access-policy`, ADR 0220).\n\nWith no team flag this shows the policy. A team is named by its id, as `GET /teams` lists it, and must be an IdP group team of the agent's tenant. A role left unmentioned keeps its team. The write sends back the version it read, so a concurrent change is refused rather than overwritten. Nothing enforces the policy yet.",
+          "name": "access-policy"
+        },
+        {
           "about": "Mint or inspect the mail adapter's channel token (`POST /channels/token`)",
           "args": [
             {

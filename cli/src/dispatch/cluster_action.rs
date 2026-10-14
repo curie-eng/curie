@@ -1236,6 +1236,44 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 .await?,
             )
         }
+        ClusterAction::AccessPolicy {
+            agent,
+            invocation_team,
+            approver_team,
+            clear_invocation_team,
+            clear_approver_team,
+            conn,
+            dry_run,
+        } => {
+            // Resolved before the connection, like `Callers`: a malformed team
+            // id is a usage error, not a cluster lookup that fails elsewhere.
+            let change = commands::AccessPolicyChange::resolve(
+                invocation_team,
+                approver_team,
+                clear_invocation_team,
+                clear_approver_team,
+            )?;
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
+            emit(
+                commands::agent_access_policy(
+                    AgentActionOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        dry_run,
+                    },
+                    change,
+                )
+                .await?,
+            )
+        }
         ClusterAction::Callers {
             agent,
             surface,

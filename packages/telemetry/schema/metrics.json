@@ -528,6 +528,7 @@
           "/identity/resolve",
           "/identity/slack-reports",
           "/teams",
+          "/agents/{agent_id}/access-policy",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -602,7 +603,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1304,
+      "cardinality_bound": 1312,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -718,6 +719,7 @@
           "/identity/resolve",
           "/identity/slack-reports",
           "/teams",
+          "/agents/{agent_id}/access-policy",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -799,7 +801,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 6520,
+      "cardinality_bound": 6560,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -915,6 +917,7 @@
           "/identity/resolve",
           "/identity/slack-reports",
           "/teams",
+          "/agents/{agent_id}/access-policy",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -996,7 +999,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 6520,
+      "cardinality_bound": 6560,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

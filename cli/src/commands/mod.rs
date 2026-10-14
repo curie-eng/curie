@@ -29,6 +29,7 @@ use crate::scaffold::{
 };
 use crate::state::{self, RunnerState};
 
+mod access_policy;
 mod actions;
 mod agent_actions;
 mod agents;
@@ -51,6 +52,7 @@ mod skill_approvals;
 mod skill_unavailable;
 mod work;
 
+pub use access_policy::*;
 pub use actions::*;
 pub use agent_actions::*;
 pub use agents::*;

@@ -407,6 +407,8 @@ _HTTP_OPERATIONS = [
     "/identity/slack-reports",
     # Team directory sync status (#4584, ADR 0220).
     "/teams",
+    # An agent's invocation and approver teams (#4585, ADR 0220).
+    "/agents/{agent_id}/access-policy",
     "/publications",
     "/publications/precheck",
     "/publications/{publication_id}",

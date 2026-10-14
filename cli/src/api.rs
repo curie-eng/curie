@@ -9,12 +9,12 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::api_requests::{
-    ActionUndo, AgentCreate, AgentUpdate, ApprovalPrincipalMint, ApprovalRecover, ApprovalResolve,
-    ChannelBindingWrite, ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint,
-    DeploymentCreate, EvalTriggerRequest, MemoryEntryCreate, MemoryGuidanceIn,
-    RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
-    RemediationQualificationWrite, RemediationVerifierRunStart, ResolveTargetRequest,
-    RoutingCheckRequest, VersionCreate,
+    ActionUndo, AgentAccessPolicyWrite, AgentCreate, AgentUpdate, ApprovalPrincipalMint,
+    ApprovalRecover, ApprovalResolve, ChannelBindingWrite, ChannelCallersWrite,
+    ChannelTokenRequest, ConsoleLoginCodeMint, DeploymentCreate, EvalTriggerRequest,
+    MemoryEntryCreate, MemoryGuidanceIn, RemediationBreakerClose, RemediationPolicyMutation,
+    RemediationPolicyWrite, RemediationQualificationWrite, RemediationVerifierRunStart,
+    ResolveTargetRequest, RoutingCheckRequest, VersionCreate,
 };
 
 pub struct ApiClient {
@@ -277,6 +277,18 @@ impl ChannelBinding {
             .as_deref()
             .filter(|adapter| !(self.kind == "slack" && *adapter == DEFAULT_SLACK_IDENTITY))
     }
+}
+
+/// An agent's invocation and approver teams (`AgentAccessPolicyOut`, ADR 0220).
+/// Version 0 with no `updated_at` means no policy was ever set.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentAccessPolicy {
+    pub agent_id: String,
+    pub tenant_id: String,
+    pub invocation_team_id: Option<String>,
+    pub approver_team_id: Option<String>,
+    pub version: u64,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2828,6 +2840,47 @@ impl ApiClient {
             .json()
             .await
             .context("decoding the agent after the caller list write")
+    }
+
+    /// Read an agent's access policy: `GET /agents/{id}/access-policy`
+    /// (ADR 0220). An agent with no policy answers version 0.
+    pub async fn get_agent_access_policy(&self, agent_id: &str) -> Result<AgentAccessPolicy> {
+        let resp = self
+            .http
+            .get(format!("{}/agents/{agent_id}/access-policy", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .context("GET /agents/{id}/access-policy")?;
+        Self::expect_ok(resp, "reading the agent's access policy")
+            .await?
+            .json()
+            .await
+            .context("decoding the agent's access policy")
+    }
+
+    /// Replace an agent's access policy: `PUT /agents/{id}/access-policy`
+    /// (ADR 0220). The API refuses with 409 when `expected_version` is not the
+    /// stored version, and with 422 when a team is not an IdP group team of
+    /// the agent's tenant; it answers the policy as stored.
+    pub async fn put_agent_access_policy(
+        &self,
+        agent_id: &str,
+        body: &AgentAccessPolicyWrite,
+    ) -> Result<AgentAccessPolicy> {
+        let resp = self
+            .http
+            .put(format!("{}/agents/{agent_id}/access-policy", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json::<AgentAccessPolicyWrite>(body)
+            .send()
+            .await
+            .context("PUT /agents/{id}/access-policy")?;
+        Self::expect_ok(resp, "setting the agent's access policy")
+            .await?
+            .json()
+            .await
+            .context("decoding the agent's access policy")
     }
 
     /// Mint a scoped `chn` token for one binding (`POST /channels/token`).

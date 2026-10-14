@@ -35,8 +35,8 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     )
     # The next-only migrations follow the immutable published 0.12.2 chain.
     # The minimum tracks the newest schema the app reads (#2911's tenant scope);
-    # the head is team sync state (0120, #4584), an expand above the join.
-    assert window == {"schema_min": "0108", "schema_head": "0120"}
+    # the head is agent access policies (0121, #4585), an expand above the join.
+    assert window == {"schema_min": "0108", "schema_head": "0121"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -61,7 +61,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.12.5") == {"schema_min": "0076", "schema_head": "0106"}
     assert data["windows"].get("0.13.0") == {"schema_min": "0108", "schema_head": "0108"}
     assert data["windows"].get("0.13.1") == {"schema_min": "0108", "schema_head": "0108"}
-    assert data["revisions"][-13:] == [
+    assert data["revisions"][-14:] == [
         "0095",
         "0096",
         "0097",
@@ -75,6 +75,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0107",
         "0108",
         "0120",
+        "0121",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -84,6 +85,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0107"] == "expand"
     assert kinds["0108"] == "expand"
     assert kinds["0120"] == "expand"
+    assert kinds["0121"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -157,7 +159,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0120"
+    assert current_revision() == "0121"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]

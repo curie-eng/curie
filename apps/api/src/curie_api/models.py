@@ -3017,6 +3017,52 @@ class PrincipalTeam(Base):
     )
 
 
+class AgentAccessPolicy(Base):
+    """Which teams may invoke an agent and approve for it (#4585, ADR 0220 s.8).
+
+    One row per agent, absent until an operator sets one; a missing row and a
+    NULL role both mean today's behavior for that role. Each team reference
+    carries ``tenant_id``, so a policy cannot name another tenant's team, and a
+    team a policy names cannot be deleted from under it. Deleting the agent
+    deletes its policy. ``version`` is the optimistic concurrency token a write
+    must name.
+    """
+
+    __tablename__ = "agent_access_policies"
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="agent_access_policies_version_ck"),
+        ForeignKeyConstraint(
+            ["tenant_id", "agent_id"],
+            [f"{SCHEMA}.agents.tenant_id", f"{SCHEMA}.agents.id"],
+            ondelete="CASCADE",
+            name="agent_access_policies_agent_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "invocation_team_id"],
+            [f"{SCHEMA}.teams.tenant_id", f"{SCHEMA}.teams.id"],
+            name="agent_access_policies_invocation_team_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "approver_team_id"],
+            [f"{SCHEMA}.teams.tenant_id", f"{SCHEMA}.teams.id"],
+            name="agent_access_policies_approver_team_fkey",
+        ),
+    )
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    invocation_team_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    approver_team_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class FactoryPollCursor(Base):
     """One tracker scope's factory poll cursors and conditional-request tags (#3745).
 

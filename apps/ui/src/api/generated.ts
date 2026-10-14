@@ -394,6 +394,24 @@ export interface paths {
         patch: operations["update_agent_agents__agent_id__patch"];
         trace?: never;
     };
+    "/agents/{agent_id}/access-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Agent Access Policy */
+        get: operations["get_agent_access_policy_agents__agent_id__access_policy_get"];
+        /** Put Agent Access Policy */
+        put: operations["put_agent_access_policy_agents__agent_id__access_policy_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/{agent_id}/behavior-packs": {
         parameters: {
             query?: never;
@@ -3838,6 +3856,46 @@ export interface components {
             install_restricted: boolean;
             /** Restricted */
             restricted: boolean;
+        };
+        /**
+         * AgentAccessPolicyOut
+         * @description An agent's policy; version 0 and no ``updated_at`` mean none was set.
+         */
+        AgentAccessPolicyOut: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Approver Team Id */
+            approver_team_id: string | null;
+            /** Invocation Team Id */
+            invocation_team_id: string | null;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+            /** Updated At */
+            updated_at: string | null;
+            /** Version */
+            version: number;
+        };
+        /**
+         * AgentAccessPolicyWrite
+         * @description Replace an agent's policy.
+         *
+         *     Both team keys are required so a write states the whole policy; ``null``
+         *     clears that role back to today's behavior. ``expected_version`` is the
+         *     version the writer last read: 0 when the agent has no policy yet.
+         */
+        AgentAccessPolicyWrite: {
+            /** Approver Team Id */
+            approver_team_id: string | null;
+            /** Expected Version */
+            expected_version: number;
+            /** Invocation Team Id */
+            invocation_team_id: string | null;
         };
         /** AgentCreate */
         AgentCreate: {
@@ -9814,6 +9872,76 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AgentOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_agent_access_policy_agents__agent_id__access_policy_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentAccessPolicyOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_agent_access_policy_agents__agent_id__access_policy_put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AgentAccessPolicyWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentAccessPolicyOut"];
                 };
             };
             /** @description Validation Error */

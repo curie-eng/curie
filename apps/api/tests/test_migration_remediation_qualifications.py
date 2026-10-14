@@ -72,12 +72,12 @@ def test_one_hand_written_revision_on_the_assumed_parent() -> None:
     """@spec AUTOMATED-REMEDIATION-22: one revision, ``HEAD`` on ``BELOW``; task 12's
     ``0095`` (remediation escalations) and task 16's ``0096`` (the tune
     refusal) are above it; ``0097`` (receipts) and ``0098`` (driver audit) follow it.
-    Team sync state (``0120``), above the train merge, is the single head.
+    Agent access policies (``0121``), above the train merge, are the single head.
     """
 
     revision, down = _revision()
     assert (revision, down) == (HEAD, BELOW)
-    assert ScriptDirectory.from_config(alembic_config()).get_heads() == ["0120"]
+    assert ScriptDirectory.from_config(alembic_config()).get_heads() == ["0121"]
 
 
 def test_the_record_is_keyed_by_what_it_qualifies(
