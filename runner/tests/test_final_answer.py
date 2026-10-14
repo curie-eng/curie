@@ -612,3 +612,222 @@ def test_validation_suspension_blocks_and_then_invalidates(tmp_path):
     validation.observe_calls([ValidationCall("c", TOOL, {"draft": DRAFT})], nested=False)
     validation.observe_results([ValidationResult("c", digest_ok)], nested=False)
     assert validation.accepts(APPROVED)
+
+
+# --- Workflow-scoped activation: one bundle, a validated flow and a lookup ------
+
+TRIGGER = "mcp__deck_review__inspect_deck"
+LOOKUP = "mcp__library__find_template"
+LOOKUP_ANSWER = "Here is the *template*: <https://example.com/t|Template>"
+
+
+def triggered_policy(tmp_path: Path):
+    (tmp_path / "curie.bundle.json").write_text(
+        json.dumps({"finalAnswer": {"version": 1, "tool": TOOL, "triggers": [TRIGGER]}})
+    )
+    return plugin.load_bundle_final_answer(str(tmp_path))
+
+
+def tool(call_id, name, *, parent=None, text=None):
+    content = ([TextBlock(text=text)] if text else []) + [
+        ToolUseBlock(id=call_id, name=name, input={})
+    ]
+    return AssistantMessage(content=content, model="synthetic", parent_tool_use_id=parent)
+
+
+def tool_result(call_id, *, parent=None):
+    return UserMessage(
+        content=[ToolResultBlock(tool_use_id=call_id, content="ok", is_error=False)],
+        parent_tool_use_id=parent,
+    )
+
+
+def test_always_required_validated_answer_is_marked_verbatim(tmp_path):
+    frames = run([call(), result(), _result(text=APPROVED)], policy(tmp_path))
+    assert frames[-1]["status"] == "done"
+    assert frames[-1]["text_mode"] == "verbatim"
+
+
+def test_unrelated_lookup_is_preserved_without_verbatim_mode(tmp_path):
+    frames = run(
+        [tool("find", LOOKUP), tool_result("find"), _result(text=LOOKUP_ANSWER)],
+        triggered_policy(tmp_path),
+    )
+    assert frames[-1]["status"] == "done"
+    assert frames[-1]["text"] == LOOKUP_ANSWER
+    assert frames[-1]["text_mode"] is None
+    assert not any(f.get("classification") == "final-answer-validation" for f in frames)
+
+
+def test_unrelated_lookup_keeps_connector_notice(tmp_path):
+    async def exercise():
+        runner, _ = runner_for(
+            [_result(text=LOOKUP_ANSWER)],
+            final_answer=triggered_policy(tmp_path),
+            connector_failures=(
+                ConnectorCapabilityFailure(
+                    connector="github", credential_names=(), reason="empty_expansion"
+                ),
+            ),
+        )
+        await runner.start()
+        try:
+            frames = [json.loads(line) async for line in runner.run_turn(EVENT)]
+            assert frames[-1]["text"] != LOOKUP_ANSWER
+            assert frames[-1]["text"].endswith(LOOKUP_ANSWER)
+            assert frames[-1]["text_mode"] is None
+        finally:
+            await runner.close()
+
+    anyio.run(exercise)
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        # The declared flow ran and skipped finalization.
+        [tool("inspect", TRIGGER), tool_result("inspect"), _result(text=APPROVED)],
+        # A subagent ran the declared flow.
+        [
+            tool("inspect", TRIGGER, parent="agent"),
+            tool_result("inspect", parent="agent"),
+            _result(text=APPROVED),
+        ],
+        # Early provisional text cannot become the answer of a later declared flow.
+        [
+            AssistantMessage(content=[TextBlock(text=APPROVED)], model="synthetic"),
+            tool("inspect", TRIGGER),
+            tool_result("inspect"),
+            _result(text=APPROVED),
+        ],
+        # Validation before the declared flow is superseded by it.
+        [
+            call(),
+            result(),
+            tool("inspect", TRIGGER),
+            tool_result("inspect"),
+            _result(text=APPROVED),
+        ],
+        # Later tool activity after validation still invalidates it.
+        [
+            tool("inspect", TRIGGER),
+            tool_result("inspect"),
+            call(),
+            result(),
+            tool("find", LOOKUP),
+            tool_result("find"),
+            _result(text=APPROVED),
+        ],
+    ],
+)
+def test_declared_flow_cannot_skip_validation(tmp_path, script):
+    assert_refused(run(script, triggered_policy(tmp_path)))
+
+
+def test_declared_flow_with_validation_publishes_verbatim(tmp_path):
+    frames = run(
+        [
+            tool("inspect", TRIGGER),
+            tool_result("inspect"),
+            call(),
+            result(),
+            _result(text=APPROVED),
+        ],
+        triggered_policy(tmp_path),
+    )
+    assert frames[-1]["status"] == "done"
+    assert frames[-1]["text"] == APPROVED
+    assert frames[-1]["text_mode"] == "verbatim"
+    assert not any(f["type"] == "text_delta" for f in frames)
+
+
+def test_steering_does_not_clear_activation(tmp_path):
+    async def exercise():
+        class SteeredSession(FakeModelSession):
+            async def receive_turn(self):
+                async for message in super().receive_turn():
+                    yield message
+                    if isinstance(message, UserMessage):
+                        assert await runner.steer("never mind, just the template")
+
+        fake = SteeredSession(
+            lambda: [tool("inspect", TRIGGER), tool_result("inspect"), _result(text=LOOKUP_ANSWER)],
+            truncate_on_interrupt=False,
+        )
+        runner = SessionRunner(
+            session_factory=lambda: fake,
+            ceiling=0,
+            max_usd_per_day=None,
+            tracer=RunTracer(None),
+            classifier=SideEffectClassifier(),
+            trace_name="final-answer-test",
+            held_secrets=frozenset(),
+            final_answer=triggered_policy(tmp_path),
+        )
+        await runner.start()
+        try:
+            frames = [json.loads(line) async for line in runner.run_turn(EVENT)]
+            assert frames[-1]["status"] == "classified-failure"
+        finally:
+            await runner.close()
+
+    anyio.run(exercise)
+
+
+def test_activation_does_not_leak_into_the_next_turn(tmp_path):
+    async def exercise():
+        turns = iter(
+            [
+                [tool("inspect", TRIGGER), tool_result("inspect"), _result(text=APPROVED)],
+                [_result(text=LOOKUP_ANSWER)],
+            ]
+        )
+        fake = FakeModelSession(lambda: next(turns), truncate_on_interrupt=False)
+        runner = SessionRunner(
+            session_factory=lambda: fake,
+            ceiling=0,
+            max_usd_per_day=None,
+            tracer=RunTracer(None),
+            classifier=SideEffectClassifier(),
+            trace_name="final-answer-test",
+            held_secrets=frozenset(),
+            final_answer=triggered_policy(tmp_path),
+        )
+        await runner.start()
+        try:
+            first = [json.loads(line) async for line in runner.run_turn(EVENT)]
+            second = [json.loads(line) async for line in runner.run_turn(EVENT)]
+        finally:
+            await runner.close()
+        assert first[-1]["status"] == "classified-failure"
+        assert second[-1]["status"] == "done"
+        assert second[-1]["text"] == LOOKUP_ANSWER
+
+    anyio.run(exercise)
+
+
+@pytest.mark.parametrize(
+    "triggers",
+    [[], "x", [""], ["*"], [TRIGGER, TRIGGER], [TOOL], [1], None],
+)
+def test_invalid_triggers_are_refused_at_sidecar_load(tmp_path, triggers):
+    (tmp_path / "curie.bundle.json").write_text(
+        json.dumps({"finalAnswer": {"version": 1, "tool": TOOL, "triggers": triggers}})
+    )
+    with pytest.raises(plugin.PluginBundleError):
+        plugin.load_bundle_final_answer(str(tmp_path))
+
+
+def test_triggered_bundle_still_requires_exact_output_support(tmp_path):
+    async def exercise():
+        runner, fake = runner_for(
+            [_result(text=LOOKUP_ANSWER)], final_answer=triggered_policy(tmp_path)
+        )
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner))) as client:
+            response = await client.post("/v1/event", json=EVENT.model_dump())
+            assert response.status == 400
+            await response.read()
+            assert not fake.queries
+
+    anyio.run(exercise)
