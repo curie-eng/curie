@@ -14,7 +14,7 @@ The entry's setup, ``install_bitbucket_dc``, installs the factory with `curie
 factory quickstart --tracker jira-cloud --code-host bitbucket-dc` against the
 fixture's advertised URL and CA, with the reviewer's user id as the review
 account, then admits the fixture's Docker bridge subnets as the GitLab
-fixture entry does.
+fixture entry does, on the container port the bridge traffic is rewritten to.
 
 The change is the pull request the WorkItem records, CI is the
 repository-scoped build statuses on its head, the review is a top-level
@@ -55,6 +55,10 @@ import factory_e2e as fe
 FIXTURE_VAR = "CURIE_BITBUCKET_DC_FIXTURE"
 FIXTURE_DOWN_STEP = "remove Bitbucket Data Center fixture"
 FIXTURE_UP_TIMEOUT_SECONDS = 20 * 60
+# The fixture's nginx listens on 443 inside its container and is published on
+# the fixture port. Docker's DNAT rewrites a pod's connection to that container
+# port, so the bridge subnets are allowed on 443, not on the published port.
+FIXTURE_CONTAINER_PORT = 443
 FIXTURE_DOWN_TIMEOUT_SECONDS = 10 * 60
 STATE_SCHEMA = "curie.forge-fixture.bitbucket-dc/v1"
 LOOP_GATE_KEY = "factory-e2e-loop-gate"
@@ -159,7 +163,6 @@ class BitbucketDcDriver:
             self.reviewer_id = str(state["users"][REVIEWER]["user_id"])
             self.repo_path = f"{project}/{slug}"
             self.compose_project = str(state["project"])
-            self.port = int(state["port"])
         except (KeyError, TypeError) as exc:
             raise fe.ConfigError(f"{FIXTURE_VAR}: the fixture state lacks {exc}") from None
         self.p = p
@@ -677,7 +680,7 @@ def install_bitbucket_dc(p: fe.Preflight) -> None:
     )
     p.evidence["bitbucket_dc"] = {"repo": driver.repo_path}
     _gitlab().allow_fixture_bridge(
-        p, _bridge_subnets(driver.compose_project), driver.port, kind="bitbucket_dc"
+        p, _bridge_subnets(driver.compose_project), FIXTURE_CONTAINER_PORT, kind="bitbucket_dc"
     )
 
 
