@@ -506,6 +506,25 @@ def test_awaiting_approval_display_is_optional_and_round_trips() -> None:
     assert Final.model_validate(wire) == final
 
 
+
+def test_final_text_mode_is_optional_and_only_verbatim() -> None:
+    """ADR 0227: a runner marks a validated answer for literal delivery.
+
+    Older producers omit it, so a tolerant consumer sees None and renders as
+    before. The only value is ``verbatim``; anything else is a producer error.
+    """
+
+    final = Final(text="  exact *text*\n", text_mode="verbatim")
+    wire = final.model_dump(mode="json")
+    assert wire["text_mode"] == "verbatim"
+    assert Final.model_validate(wire) == final
+    assert Final(text="ok").text_mode is None
+    legacy = Final.model_validate({"type": "final", "text": "ok", "status": "done"})
+    assert legacy.text_mode is None
+    with pytest.raises(ValidationError):
+        Final(text="ok", text_mode="markdown")  # type: ignore[arg-type]
+
+
 # --- What a side-effecting call reports (ADR-0117) -----------------------------
 
 
