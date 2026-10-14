@@ -2,7 +2,7 @@
 
 Date: 2026-10-13
 
-Status: Draft
+Status: Accepted
 
 Tracked in [#4557](https://github.com/curie-eng/curie/issues/4557).
 This proposes an additional commissioning boundary under
