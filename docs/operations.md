@@ -10,7 +10,7 @@ installs and runs it, wrapping the umbrella Helm chart the way `linkerd` or
 
 This doc covers the `cluster` target specifically. For `skill` or `local`
 Targets, see the target comparison table in the
-[README](../README.md#which-target-do-i-want) or [`cli/README.md`](../cli/README.md).
+[CLI target guide](../cli/README.md#using-different-tiers).
 
 **Prerequisites:**
 
