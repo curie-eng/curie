@@ -239,4 +239,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0216 | [A factory repository binding selects its own runner image, built from a tool catalog](0216-a-factory-repository-binding-selects-its-own-runner-image-built-from-a-tool-catalog.md) | Accepted |
 | 0217 | [A factory run that opts into Docker gets its own daemon outside the sandbox](0217-a-factory-run-that-opts-into-docker-gets-its-own-daemon-outside-the-sandbox.md) | Accepted |
 | 0219 | [A deploy binds an agent's runner image at runtime, outside the Helm release](0219-a-deploy-binds-an-agents-runner-image-at-runtime-outside-the-helm-release.md) | Draft |
+| 0223 | [Curie Manager ships with the platform and holds a scoped credential](0223-curie-manager-ships-with-the-platform-and-holds-a-scoped-credential.md) | Draft |
 <!-- END GENERATED: adr-index -->
