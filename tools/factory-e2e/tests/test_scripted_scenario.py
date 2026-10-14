@@ -506,7 +506,11 @@ def test_successful_scenario_skips_pod_diagnostics(
     assert "failure_diagnostics" not in evidence
 
 
+@pytest.mark.parametrize(
+    "truncate_key", [False, True], ids=["complete-key", "kubectl-truncated-key"]
+)
 def test_failure_pod_diagnostics_are_bounded_redacted_and_stderr_only(
+    truncate_key: bool,
     tmp_path: Path,
     candidate_curie: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -528,6 +532,22 @@ def test_failure_pod_diagnostics_are_bounded_redacted_and_stderr_only(
     private_key_lines = private_key.splitlines()
     # Place the key across the recorder boundary to exercise redaction before truncation.
     key_prefix = "example diagnostic context " * 120 + "\n"
+    log_output = (
+        f"pod diagnostic marker {known_secret} {shaped_secret} {credential_url}\n"
+        f"database: {postgresql_url}\ncache: {redis_url}\n"
+        + key_prefix + private_key
+        + "é" * 6000
+    )
+    captured_key_body_lines = private_key_lines[1:-1]
+    if truncate_key:
+        # Model kubectl cutting the subprocess output before the PEM footer,
+        # including a partial final body line that must also be redacted.
+        log_output = log_output.encode("utf-8")[:4096].decode("utf-8")
+        assert private_key_lines[0] in log_output
+        assert private_key_lines[-1] not in log_output
+        captured_key_body_lines = log_output.split(private_key_lines[0] + "\n", 1)[1].splitlines()
+        assert len(captured_key_body_lines) >= 2
+        assert captured_key_body_lines[-1] not in private_key_lines
 
     def execute(run: Any) -> None:
         run.cluster_attempted = True
@@ -567,12 +587,7 @@ def test_failure_pod_diagnostics_are_bounded_redacted_and_stderr_only(
                 assert "--tail=40" in operation
                 assert "--limit-bytes=4096" in operation
                 assert "--pod-running-timeout=2s" in operation
-                output = (
-                    f"pod diagnostic marker {known_secret} {shaped_secret} {credential_url}\n"
-                    f"database: {postgresql_url}\ncache: {redis_url}\n"
-                    + key_prefix + private_key
-                    + "é" * 6000
-                )
+                output = log_output
             else:
                 raise AssertionError(f"unexpected diagnostic command: {argv}")
         else:
@@ -605,6 +620,7 @@ def test_failure_pod_diagnostics_are_bounded_redacted_and_stderr_only(
         "user:password@",
         ":password@",
         *private_key_lines,
+        *captured_key_body_lines,
         "example-query-secret",
         "arbitrary-annotation-input",
         "arbitrary-command-input",
@@ -640,8 +656,12 @@ def test_failure_pod_diagnostics_are_bounded_redacted_and_stderr_only(
             ]
             assert len(log_calls) == 4
     unicode_lines = [line for line in captured.err.splitlines() if line.startswith("é")]
-    assert len(unicode_lines) == 16
-    assert all(len(line.encode("utf-8")) < 4096 for line in unicode_lines)
+    if truncate_key:
+        assert unicode_lines == []
+        assert captured.err.count("[REDACTED PRIVATE KEY]") == 16
+    else:
+        assert len(unicode_lines) == 16
+        assert all(len(line.encode("utf-8")) < 4096 for line in unicode_lines)
 
 
 def test_failure_diagnostics_stop_at_budget_and_restore_scenario_deadline(

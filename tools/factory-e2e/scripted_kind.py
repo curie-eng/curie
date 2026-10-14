@@ -1132,7 +1132,7 @@ class ScriptedRun:
 
         def emit(operation: str, value: str) -> None:
             sanitized = re.sub(
-                r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----.*?-----END \1-----",
+                r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----.*?(?:-----END \1-----|\Z)",
                 "[REDACTED PRIVATE KEY]",
                 f"factory-e2e pod diagnostics: {operation}\n{value}",
                 flags=re.DOTALL,
