@@ -241,6 +241,8 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0217 | [A factory run that opts into Docker gets its own daemon outside the sandbox](0217-a-factory-run-that-opts-into-docker-gets-its-own-daemon-outside-the-sandbox.md) | Accepted |
 | 0218 | [Cluster up infers gVisor off when the RuntimeClass matches no node](0218-cluster-up-infers-gvisor-off-when-the-runtimeclass-matches-no-node.md) | Accepted |
 | 0219 | [A deploy binds an agent's runner image at runtime, outside the Helm release](0219-a-deploy-binds-an-agents-runner-image-at-runtime-outside-the-helm-release.md) | Draft |
+| 0220 | [One identity provider decides who may invoke and approve, on every channel](0220-one-identity-provider-decides-who-may-invoke-and-approve-on-every-channel.md) | Accepted |
 | 0221 | [Cluster up reads the gVisor RuntimeClass for a fake-model install](0221-cluster-up-reads-the-gvisor-runtimeclass-for-a-fake-model-install.md) | Accepted |
 | 0222 | [Coworker bundles own workflow policy and Curie enforces execution](0222-coworker-bundles-own-workflow-policy-and-curie-enforces-execution.md) | Accepted |
+| 0224 | [Protected runtime commissioning precedes installation acceptance](0224-protected-runtime-commissioning-precedes-installation-acceptance.md) | Accepted |
 <!-- END GENERATED: adr-index -->

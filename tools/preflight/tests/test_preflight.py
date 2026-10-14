@@ -169,6 +169,36 @@ def load_tool() -> ModuleType:
     return module
 
 
+def test_private_services_handoff_protected_source_resources() -> None:
+    from urllib.parse import unquote, urlsplit
+
+    environment = {
+        "COMPOSE_PROJECT_NAME": "curie-preflight-example",
+        "COMPOSE_FILE": "/source/compose.dev.yaml:/source/.projects/private.yaml",
+        "TEST_VALKEY_PW": "owned password/@",
+        "CURIE_PRIMARY_SOURCE_RESOURCES": "0",
+        "CURIE_SETTLEMENT_TEST_REDIS_URL": "redis://unowned.example.com:1/0",
+    }
+    result = load_tool().private_service_environment(
+        environment, postgres=35432, valkey=36379, s3=39000, otel=34318
+    )
+    assert result["CURIE_PRIMARY_SOURCE_RESOURCES"] == "1"
+    endpoint = urlsplit(result["CURIE_SETTLEMENT_TEST_REDIS_URL"])
+    assert endpoint.hostname == result["TEST_VALKEY_HOST"] == "127.0.0.1"
+    assert endpoint.port == int(result["TEST_VALKEY_PORT"])
+    assert unquote(endpoint.password or "") == result["TEST_VALKEY_PW"]
+
+
+def test_ci_explicitly_hands_off_protected_source_resources() -> None:
+    environment = yaml.safe_load((ROOT / ".github/workflows/ci.yaml").read_text())["jobs"][
+        "python-pytest"
+    ]["env"]
+    assert environment["CURIE_PRIMARY_SOURCE_RESOURCES"] == "1"
+    assert environment["CURIE_SETTLEMENT_TEST_REDIS_URL"] == (
+        "redis://:valkeypass@127.0.0.1:26379/0"
+    )
+
+
 def test_drift_guard_accepts_real_workflows() -> None:
     load_tool().validate_workflows(ROOT)
 

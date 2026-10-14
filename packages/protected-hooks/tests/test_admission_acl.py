@@ -193,6 +193,9 @@ def test_facade_exports_only_closed_operations_and_owns_no_client_lifecycle(admi
         "admit",
         "recover",
         "preparing",
+        "committed",
+        "backfill_accepted",
+        "release_accepted",
     }
     assert list(inspect.signature(a.AtomicAdmission).parameters) == [
         "client",

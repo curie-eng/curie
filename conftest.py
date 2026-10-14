@@ -9,6 +9,8 @@ one group and never overlap each other on different workers:
   running consumer drains, and the default eval stream is read by exact length;
 - the shared Langfuse project: exact aggregate comparisons read ClickHouse
   while other files ingest traces into the same project.
+- the protected source runner peer: its closed projection fixes port 8080,
+  so those files share a separate scheduling group.
 
 A serial run is unaffected: without xdist the marker is inert.
 
@@ -26,6 +28,23 @@ from __future__ import annotations
 import pytest
 
 SHARED_LIVE_STATE_GROUP = "shared-live-state"
+PROTECTED_RUNNER_GROUP = "protected-source-runner-port"
+PROTECTED_RUNNER_FILES = frozenset(
+    {
+        # The closed protected projection fixes the external runner peer at 8080.
+        # These source fixtures share that host port, while owning separate brokers.
+        "apps/api/tests/test_guarded_nomination_api_integration.py",
+        "apps/worker/tests/test_protected_consumer_recovery.py",
+        "apps/worker/tests/test_protected_entry_runtime.py",
+        "apps/worker/tests/test_protected_launch_server_integration.py",
+        "apps/worker/tests/test_protected_original_cap.py",
+        "apps/worker/tests/test_protected_pending_cleanup.py",
+        "apps/worker/tests/test_protected_primary_runtime.py",
+        "apps/worker/tests/test_protected_recovery_source.py",
+        "apps/worker/tests/test_protected_retirement_server.py",
+        "apps/worker/tests/test_protected_terminal_copy_cleanup.py",
+    }
+)
 
 SHARED_LIVE_STATE_FILES = frozenset(
     {
@@ -85,6 +104,8 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         path = item.path.relative_to(config.rootpath).as_posix()
         group = SHARED_LIVE_STATE_GROUP if path in SHARED_LIVE_STATE_FILES else path
+        if path in PROTECTED_RUNNER_FILES:
+            group = PROTECTED_RUNNER_GROUP
         item.add_marker(pytest.mark.xdist_group(group))
         groups.setdefault(group, []).append(item)
 

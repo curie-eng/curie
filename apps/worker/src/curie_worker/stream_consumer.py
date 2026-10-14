@@ -57,6 +57,11 @@ StreamEntry = tuple[str, dict[str, str]]
 # An async per-message handler: (entry_id, fields) -> None.
 EntryHandler = Callable[[str, dict[str, str]], Awaitable[None]]
 
+# Optional lane-specific gate for deciding whether a pending entry may be
+# transferred. It is intentionally only a selector: the handler must verify
+# authority again immediately before processing.
+EntryEligibility = Callable[[str, dict[str, str] | None], Awaitable[bool]]
+
 # Called once when a delivery's lease is lost mid-flight: (entry_id, fields).
 LeaseLostHandler = Callable[[str, dict[str, str]], Awaitable[None]]
 
@@ -110,6 +115,10 @@ class DeliverySpec:
     # dataclass because it is the first defaulted field; both lanes construct
     # ``DeliverySpec`` with keyword arguments only, so appending is safe.
     lease_expired_idle_ms: int | None = None
+    # Protected lanes park entries while their immutable admission is still
+    # preparing. Ordinary/eval lanes leave this unset and retain the historical
+    # XAUTOCLAIM path byte-for-byte.
+    entry_eligibility: EntryEligibility | None = None
 
 
 class ConsumerLivenessExpired(RuntimeError):
@@ -721,6 +730,42 @@ class StreamConsumer:
         rows = await self._redis.xrange(self._spec.stream, min=entry_id, max=entry_id)
         return dict(rows[0][1]) if rows else None
 
+    async def _entry_may_transfer(
+        self, entry_id: str, fields: dict[str, str] | None = None
+    ) -> bool:
+        """Apply an optional lane selector before changing PEL ownership.
+
+        This hook can defer a preparing protected delivery. It cannot authorize
+        execution: the consumer handler independently verifies every entry.
+        Callback failures fail closed and leave the PEL untouched.
+        """
+        eligibility = self._spec.entry_eligibility
+        if eligibility is None:
+            return True
+        try:
+            return await eligibility(entry_id, fields)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._spec.logger.warning(
+                "pending entry eligibility check failed for %s on stream %s; leaving it pending",
+                entry_id,
+                self._spec.stream,
+                exc_info=True,
+            )
+            return False
+
+    async def _pending_row(self, entry_id: str) -> Any | None:
+        """Refresh one PEL row after a possibly slow protected eligibility read."""
+        rows = await self._redis.xpending_range(
+            self._spec.stream,
+            self._spec.group,
+            min=entry_id,
+            max=entry_id,
+            count=1,
+        )
+        return rows[0] if rows else None
+
     async def _lease_is_live(self, entry_id: str) -> bool:
         """Does some owner hold this delivery right now?
 
@@ -1321,12 +1366,48 @@ class StreamConsumer:
                 # its count must not be judged.
                 if await self._lease_is_live(entry_id):
                     continue
+                fields: dict[str, str] | None = None
+                if self._spec.entry_eligibility is not None:
+                    try:
+                        fields = await self._entry_fields(entry_id)
+                    except Exception:
+                        self._spec.logger.warning(
+                            "pending entry read failed for %s on stream %s; leaving it pending",
+                            entry_id,
+                            self._spec.stream,
+                            exc_info=True,
+                        )
+                        continue
+                    if not await self._entry_may_transfer(entry_id, fields):
+                        continue
+                    try:
+                        current = await self._pending_row(entry_id)
+                    except Exception:
+                        self._spec.logger.warning(
+                            "pending entry refresh failed for %s on stream %s; leaving it pending",
+                            entry_id,
+                            self._spec.stream,
+                            exc_info=True,
+                        )
+                        continue
+                    if current is None:
+                        continue
+                    if (
+                        str(current["consumer"]) != str(row["consumer"])
+                        or int(current["times_delivered"]) != int(row["times_delivered"])
+                        or int(current["time_since_delivered"]) < self._spec.reclaim_min_idle_ms
+                    ):
+                        continue
+                    row = current
+                    if await self._lease_is_live(entry_id):
+                        continue
                 delivered = int(row["times_delivered"])
                 if delivered < self._spec.max_delivery:
                     continue
                 over_cap.add(entry_id)
                 try:
-                    fields = await self._entry_fields(entry_id)
+                    if self._spec.entry_eligibility is None:
+                        fields = await self._entry_fields(entry_id)
                     await self._dead_letter(
                         entry_id,
                         fields,
@@ -1593,13 +1674,57 @@ class StreamConsumer:
                 continue
             if require_delivery_state and not await self._has_delivery_state(entry_id):
                 continue
+            fields: dict[str, str] | None = None
+            if self._spec.entry_eligibility is not None:
+                observed_owner = str(row["consumer"])
+                observed_deliveries = int(row["times_delivered"])
+                observed_idle = int(row["time_since_delivered"])
+                try:
+                    fields = await self._entry_fields(entry_id)
+                except Exception:
+                    self._spec.logger.warning(
+                        "pending entry read failed for %s on stream %s; leaving it pending",
+                        entry_id,
+                        self._spec.stream,
+                        exc_info=True,
+                    )
+                    continue
+                if not await self._entry_may_transfer(entry_id, fields):
+                    continue
+                # Eligibility can involve several authority reads. Refresh the
+                # PEL snapshot afterwards so a slow verifier cannot use stale
+                # delivery count or idle to overrun the retry cap or win a
+                # compare-and-claim after another owner already transferred it.
+                try:
+                    current = await self._pending_row(entry_id)
+                except Exception:
+                    self._spec.logger.warning(
+                        "pending entry refresh failed for %s on stream %s; leaving it pending",
+                        entry_id,
+                        self._spec.stream,
+                        exc_info=True,
+                    )
+                    continue
+                if current is None:
+                    continue
+                if (
+                    str(current["consumer"]) != observed_owner
+                    or int(current["times_delivered"]) != observed_deliveries
+                    or int(current["time_since_delivered"]) < observed_idle
+                ):
+                    continue
+                row = current
+                if await self._lease_is_live(entry_id):
+                    continue
             delivered = int(row["times_delivered"])
             if delivered >= self._spec.max_delivery:
                 over_cap.add(entry_id)
                 try:
+                    if self._spec.entry_eligibility is None:
+                        fields = await self._entry_fields(entry_id)
                     await self._dead_letter(
                         entry_id,
-                        await self._entry_fields(entry_id),
+                        fields,
                         reason=self._spec.over_cap_reason,
                         delivery_count=delivered,
                     )
@@ -1610,7 +1735,11 @@ class StreamConsumer:
                     )
                 continue
             idle_for_row = (
-                min_idle_ms
+                (
+                    max(min_idle_ms, int(row["time_since_delivered"]))
+                    if self._spec.entry_eligibility is not None
+                    else min_idle_ms
+                )
                 if min_idle_ms is not None
                 # Floored to 1: a just-delivered row's own
                 # ``time_since_delivered`` can read 0, and XCLAIM with min-idle
@@ -1790,26 +1919,63 @@ class StreamConsumer:
                     over_cap, already_selected=len(selected)
                 )
             )
-            cursor: str = "0-0"
-            while not self._should_stop():
-                raw = await self._redis.xautoclaim(
-                    self._spec.stream,
-                    self._spec.group,
-                    self._spec.consumer,
-                    min_idle_time=self._spec.reclaim_min_idle_ms,
-                    start_id=cursor,
-                    count=self._spec.read_count,
+            if self._spec.entry_eligibility is None:
+                cursor: str = "0-0"
+                while not self._should_stop():
+                    raw = await self._redis.xautoclaim(
+                        self._spec.stream,
+                        self._spec.group,
+                        self._spec.consumer,
+                        min_idle_time=self._spec.reclaim_min_idle_ms,
+                        start_id=cursor,
+                        count=self._spec.read_count,
+                    )
+                    cursor = str(raw[0])
+                    entries = cast("list[StreamEntry]", raw[1])
+                    for entry_id, fields in entries:
+                        if entry_id in self._inflight_ids:
+                            continue  # still being processed here; not an orphan
+                        if entry_id in over_cap:
+                            continue  # budget spent; never dispatch it again
+                        if await self._lease_is_live(entry_id):
+                            continue  # another delivery owner is still active
+                        selected.append((entry_id, fields))
+                    if cursor in ("0-0", "0"):
+                        break
+            else:
+                # XAUTOCLAIM changes owner and increments delivery count before
+                # returning fields, so it cannot be used when a protected
+                # preparing entry must remain wholly untouched. Use XPENDING as
+                # the read-only candidate scan and the shared positive-idle
+                # XCLAIM primitive only after lane eligibility succeeds.
+                capacity = self._transfer_capacity()
+                budget = (
+                    None
+                    if capacity is None
+                    else max(0, capacity - len(selected))
                 )
-                cursor = str(raw[0])
-                entries = cast("list[StreamEntry]", raw[1])
-                for entry_id, fields in entries:
-                    if entry_id in self._inflight_ids:
-                        continue  # still being processed here; not an orphan
-                    if entry_id in over_cap:
-                        continue  # budget spent; never dispatch it again
-                    if await self._lease_is_live(entry_id):
-                        continue  # another delivery owner is still active
-                    selected.append((entry_id, fields))
-                if cursor in ("0-0", "0"):
-                    break
+                cursor = "-"
+                while not self._should_stop() and (budget is None or budget > 0):
+                    rows = await self._redis.xpending_range(
+                        self._spec.stream,
+                        self._spec.group,
+                        min=cursor,
+                        max="+",
+                        count=self._spec.cap_scan_page,
+                        idle=self._spec.reclaim_min_idle_ms,
+                    )
+                    if not rows:
+                        break
+                    claimed = await self._claim_pending_page(
+                        rows,
+                        over_cap,
+                        min_idle_ms=None,
+                        budget=budget,
+                    )
+                    selected.extend(claimed)
+                    if budget is not None:
+                        budget -= len(claimed)
+                    if len(rows) < self._spec.cap_scan_page:
+                        break
+                    cursor = f"({rows[-1]['message_id']}"
         return await self._dispatch_reclaimed(selected)
