@@ -121,9 +121,14 @@ regex = '''(?i)\b[A-Za-z][A-Za-z0-9-]*/[A-Za-z0-9._-]+#[0-9]+\b'''
 tags = ["identifier", "repo"]
 
   [rules.allowlist]
-  description = "This repo's own issues, written in the qualified form"
+  description = "This repo's own issues and the Slack setup Markdown heading link"
   regexTarget = "match"
-  regexes = ['''(?i)^curie-eng/(curie|agentos)#[0-9]+$''']
+  regexes = [
+    '''(?i)^curie-eng/(curie|agentos)#[0-9]+$''',
+    # The README's local heading link is matched only through its numeric prefix.
+    # Exempt that exact match for this rule; every file and other rule stays scanned.
+    '''^docs/your-first-slack-agent\.md#2$''',
+  ]
 
 [allowlist]
 description = "Placeholder values this repo uses deliberately, plus generated artifacts"
