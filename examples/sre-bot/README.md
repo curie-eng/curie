@@ -1,5 +1,18 @@
 # SRE bot example
 
+The SRE co-worker is a second use case of the same Curie platform behind the
+[Software Factory](../../docs/software-factory.md). Ask it to investigate an
+operational problem in a connected workspace, inspect the evidence it gathers,
+and review its proposed action. Reads can run immediately; Kubernetes mutations
+require a fresh human approval. After an approved action, the agent can inspect
+the result and report back. Approval does not expand its Kubernetes permissions.
+
+Start with [Install](#install) and read [Kubernetes authority](#kubernetes-authority)
+before granting access. The default write grant is confined to the disposable
+`sre-demo` namespace. See the [capability reference](../../docs/capabilities.md)
+for release and verification status, and the
+[co-worker overview](../../docs/co-workers.md) for shared platform controls.
+
 This bundle combines Grafana, Tempo, and one pinned upstream Kubernetes MCP
 server. The Kubernetes connector runs only the `core` toolset, has config and
 multi-cluster disabled, is stateless, and reads one file-mounted kubeconfig.

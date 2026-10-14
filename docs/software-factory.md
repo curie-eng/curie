@@ -1,0 +1,134 @@
+# Software Factory
+
+Delegate a GitHub issue to a Curie co-worker and get a pull request to review,
+or a stated reason it could not complete. You can leave the work running
+asynchronously, inspect progress on the issue, and request revisions on the
+same pull request. Curie runs in your infrastructure; configured model and
+GitHub services still receive the data needed for their work.
+
+Software Factory is the first developer adoption path for the broader
+[co-worker platform](co-workers.md). `dark-factory` remains the bundle name,
+agent identifier, and CLI example name. Existing commands and paths keep working.
+
+**Start here:** [the factory quickstart](guides/dark-factory-quickstart.md).
+For a larger repository or production deployment, use the
+[bundle reference](../examples/dark-factory/README.md#deploy-it-as-the-factory-agent).
+
+## What you are trying
+
+This overview describes the default factory bundle and supported workflow.
+The [quickstart](guides/dark-factory-quickstart.md) uses the latest release by default.
+Check the [capability reference](capabilities.md) for supported integrations and
+their limits.
+
+| Before setup | What to expect |
+|---|---|
+| Host | Released CLI assets support Linux x86_64, Linux arm64, and Apple silicon macOS. The quickstart has no Intel macOS asset. |
+| Cluster | Kubernetes with `kubectl` and Helm; Docker and kind v0.24+ are needed only if quickstart must create a local cluster. Review the selected context before installing. |
+| Model | An Anthropic or OpenRouter credential, with available provider credit. Implementation and review use separately configured models. |
+| GitHub | A repository with an initial commit, and a GitHub App installed on it. Public and private repositories are supported through that installation. The delegating user needs write or admin access. |
+| Repository | Clear acceptance criteria and documented checks. A small repository is the first trial; Curie-sized builds need additional disk, memory, registry access, and CI configuration. |
+| Toolchains | The stock layer supplies Python 3.13, Node 22, uv, Rust, and pnpm 9. Locked dependency fetching is restricted to the bundle's supported uv, Cargo, and pnpm commands and operator-approved registry routes. Other toolchains require a custom layer. |
+| Result | A pull request with verification information, or a classified failure/clarification request. Model review and passing checks do not certify correctness or merge the PR. |
+| Time and cost | Quickstart reserves about 190 minutes of configured waiting windows plus variable setup time. This is neither measured latency nor a completion promise. About 5 USD of available OpenRouter credit is planning guidance; actual usage varies. |
+
+The quickstart documents precise prerequisites, models, installation, inspection,
+and cleanup in one place. It uses a released runner layer; a source-built CLI
+cannot deploy an unpublished layer through that path. Repository dependencies
+are not baked into the stock image. The
+[managed sandbox toolchain guide](guides/repository-toolchain-in-the-managed-sandbox.md)
+and bundle reference explain locked installs, absent services, and resource limits.
+
+## Delegate, inspect, and refine
+
+1. **Write a bounded issue.** Describe the behavior, acceptance criteria, and
+   how to verify it. Start with a small change. The sandbox receives the
+   repository checkout and reads the issue and comments through a scoped
+   platform tool; it holds no GitHub publication credential.
+2. **Add the configured label.** The default is `curie-factory`. A permitted
+   user adding it admits work. Polling is the quickstart default, with a
+   45-second interval; production can also use authenticated webhooks.
+3. **Follow the issue status comment.** It shows planning, implementation,
+   review, publication, and CI phases. State labels distinguish queued,
+   running, PR open, and needs human. Queueing for capacity is distinct from
+   an executing model turn.
+4. **Inspect the pull request and checks.** Read the diff, verification table,
+   and any reviewer notes or unavailable checks. An opened PR can still be
+   waiting on CI or need human intervention. The factory does not merge it.
+5. **Request a revision.** Use a new issue comment explicitly mentioning the
+   configured App login, such as `@<app-slug>`, with your requested change.
+   Ordinary comments and edits do not execute work. Authorized PR mentions
+   and review feedback are also supported when configured. Feedback
+   publication requires a new human approval even where initial factory
+   publication is automatic; see the operations reference.
+6. **Stop or retry deliberately.** Remove the factory label or close the issue
+   to cancel. Running work remains cancellation requested until termination
+   is observed; an existing PR remains open and linked. After resolving a
+   failure or answering clarification, re-add the label or send an authorized
+   mention. Relabelling replaces the current run; inspect existing work first.
+
+For operator inspection, `curie cluster work-items --agent dark-factory`
+shows work item outcomes; supply an item ID for detail. This is distinct from
+release/pod health inspection in the quickstart. See
+[reading outcomes](operations.md#reading-work-item-outcomes),
+[intake and cancellation](operations.md#admitting-a-labelled-github-issue), and
+[review feedback](operations.md#accepting-review-feedback-from-github).
+
+## What review and publication enforce
+
+The default bundle has an implementer, a plan reviewer, and a diff reviewer.
+It requires a plan verdict before source edits and a diff verdict before a
+publication request. Each review loop has at most three rounds. Blocking
+findings request changes; nonblocking notes can accompany approval. Ambiguous
+requirements, exhausted review rounds, and unavailable reviewer calls end
+with `Could not complete:` rather than an invented result.
+
+These gates belong to the installed bundle. The platform does not claim that
+all bundles ran tests or that a model's approval proves correctness. The
+factory skill instructs the implementer to run repository checks and record
+verification, with required CI delegation only where its verification contract
+allows it. See the [review protocol](../examples/dark-factory/README.md#review-loops).
+
+**Publication policy is a separate control.** New agents default to `approve`,
+requiring a human publication decision with a configured approval route.
+The quickstart deliberately sets `auto`, allowing its initial pull request
+without a human publication click. `auto` preserves patch validation, scope,
+and the trusted publisher outside the sandbox. It does not mean automatic
+merge. The [production recipe](../examples/dark-factory/README.md#deploy-it-as-the-factory-agent)
+keeps human publication approval unless the operator explicitly changes it.
+See [administering co-workers](administering-co-workers.md).
+
+The factory cannot publish changes under `.github/`, regardless of the issue's
+request. Split such work out or implement it outside the factory. Toolchain
+changes, required services, dependency routes, execution deadlines, and build
+resources also constrain which tickets can finish.
+
+## CI is part of the result
+
+After publication, the platform waits for checks within the execution deadline.
+Failures can trigger up to three repair rounds on the same PR. Failed GitHub
+Actions jobs are rerun once before repair when the App has Actions write access;
+without it, check summaries remain available but logs/reruns can be unavailable.
+
+The default CI wait is 1200 seconds from the push, bounded by the remaining
+execution deadline. Unreadable checks, missing required evidence, and a wait
+that expires produce unverified or timed-out results. A merge conflict is
+reported for human resolution. Zero checks complete only after the 120-second
+no-check grace, with no required check missing, and a mergeable or merged PR.
+That result carries a no-CI note; it is not evidence that tests passed.
+Required repository policies can impose stricter evidence. The detailed
+[factory operations reference](operations.md#admitting-a-labelled-github-issue)
+is authoritative for base-branch failures, required Python checks, and timeouts.
+
+## Operate and evaluate
+
+Use [measuring factory outcomes](guides/measuring-factory-outcomes.md) to
+compare completed work, PR acceptance, estimated costs, and human effort.
+Configure implementer and reviewer models explicitly; this is not a promise
+of automatic task-complexity routing.
+
+When upgrading, re-render the stock bundle with the upgraded release CLI so
+its toolchain layer matches that release's platform runner. A custom toolchain
+layer must be built and published to a registry the nodes can pull from.
+Use the [operations upgrade procedure](operations.md) and bundle reference;
+changing an image tag or using an unreleased commit is not the quickstart path.
