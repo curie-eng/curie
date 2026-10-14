@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "source": {
+    "kind": "existing-ticket",
+    "identity": "synthetic-source"
+  },
+  "requirements": [
+    {
+      "id": "persist",
+      "text": "Preserve the counter"
+    },
+    {
+      "id": "integrate",
+      "text": "Verify the counter integration"
+    }
+  ],
+  "children": [
+    {
+      "id": "storage",
+      "specification_fingerprint": "6b50077bb5d2d8c3561b5f2652085d7f7f3e8e1f0b0005867442a453c988d6fe"
+    },
+    {
+      "id": "integration",
+      "specification_fingerprint": "6b50077bb5d2d8c3561b5f2652085d7f7f3e8e1f0b0005867442a453c988d6fe"
+    }
+  ],
+  "coverage": [
+    {
+      "requirement": "persist",
+      "child": "storage",
+      "criterion": 1
+    },
+    {
+      "requirement": "integrate",
+      "child": "integration",
+      "criterion": 2
+    }
+  ],
+  "integration": {
+    "child": "integration",
+    "criterion": 2,
+    "check": "counter-integration"
+  },
+  "dependencies": [
+    {
+      "child": "integration",
+      "prerequisite": "storage"
+    }
+  ],
+  "scope_exclusions": []
+}

@@ -54,6 +54,9 @@ git history (`git log -- docs/`).
   `curie factory quickstart` takes a new repository from nothing to a labelled
   issue the dark factory can turn into a pull request, with polling intake and
   no webhook tunnel.
+- [`guides/factory-specification.md`](guides/factory-specification.md):
+  the versioned ticket contract, structural parser and local decomposition
+  envelope; structural validity does not establish deployment readiness.
 - [`guides/repository-toolchain-in-the-managed-sandbox.md`](guides/repository-toolchain-in-the-managed-sandbox.md):
   the supported recipe for installing a repository's dependencies and running
   its checks inside a managed sandbox, including the measured fail-closed
