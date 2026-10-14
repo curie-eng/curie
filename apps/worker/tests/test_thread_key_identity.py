@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 from aci_protocol import QueuedTurn, ReplyHandle
-from curie_worker.kernel import _thread_key_for
+from curie_worker.kernel.routing import _thread_key_for
 
 
 def _turn(

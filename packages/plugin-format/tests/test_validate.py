@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from plugin_format import (
     TOOL_POLICY_ENFORCEMENT,
+    PluginManifest,
     ValidationResult,
     validate_bundle,
     validate_pattern,
@@ -73,6 +74,86 @@ def test_mcp_server_without_command_or_url_is_reported() -> None:
 def test_inline_object_mcp_declaration_stays_valid(tmp_path: Path) -> None:
     # The fix the string-pointer error names. It must keep validating clean.
     bundle = _bundle(tmp_path, '{"name": "demo", "mcpServers": {"crm": {"command": "crm-server"}}}')
+    result = validate_bundle(bundle)
+    assert result.valid, result.errors
+
+
+@pytest.mark.parametrize("grant", [False, True])
+def test_bundle_channel_read_accepts_boolean_grants_without_operations(
+    tmp_path: Path, grant: bool
+) -> None:
+    bundle = _bundle(
+        tmp_path,
+        json.dumps({"name": "acme-bot", "channelRead": grant, "futureClaudeField": 42}),
+    )
+    result = validate_bundle(bundle)
+    assert result.valid, result.errors
+
+
+@pytest.mark.parametrize("grant", [None, 0, 1, "true", "false", [], {}, {"channels": []}])
+def test_bundle_channel_read_refuses_non_boolean_grants(tmp_path: Path, grant: object) -> None:
+    bundle = _bundle(tmp_path, json.dumps({"name": "acme-bot", "channelRead": grant}))
+    result = validate_bundle(bundle)
+    assert not result.valid
+    issue = next(issue for issue in result.errors if issue.code == "manifest.invalid")
+    assert "channelRead" in issue.message
+
+
+@pytest.mark.parametrize("grant", [None, False, True], ids=["absent", "false", "true"])
+@pytest.mark.parametrize("surface", ["inline", "inline-wrapped", "root"])
+def test_bundle_cannot_shadow_channel_read_on_any_mcp_surface(
+    tmp_path: Path, grant: bool | None, surface: str
+) -> None:
+    servers = {"curie-slack": {"command": "example-mcp-server"}}
+    manifest: dict[str, object] = {"name": "acme-bot"}
+    if grant is not None:
+        manifest["channelRead"] = grant
+    if surface == "inline":
+        manifest["mcpServers"] = servers
+    elif surface == "inline-wrapped":
+        manifest["mcpServers"] = {"mcpServers": servers}
+    bundle = _bundle(tmp_path, json.dumps(manifest))
+    if surface == "root":
+        (bundle / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+
+    result = validate_bundle(bundle)
+    assert not result.valid
+    issue = next(issue for issue in result.errors if issue.code == "mcp.reserved_name")
+    assert "curie-slack" in issue.message
+    assert "platform" in issue.message.lower()
+
+
+@pytest.mark.parametrize("grant", [False, True])
+def test_bundle_rejects_channel_read_shadowing_across_duplicate_surfaces(
+    tmp_path: Path, grant: bool
+) -> None:
+    servers = {"curie-slack": {"command": "example-mcp-server"}}
+    bundle = _bundle(
+        tmp_path,
+        json.dumps({"name": "acme-bot", "channelRead": grant, "mcpServers": servers}),
+    )
+    (bundle / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+    (bundle / "connectors.yaml").write_text(
+        "connectors:\n  curie-slack:\n    image: example/mcp:1.0.0\n", encoding="utf-8"
+    )
+    result = validate_bundle(bundle)
+    assert not result.valid
+    codes = {issue.code for issue in result.errors}
+    assert {"mcp.reserved_name", "connectors.reserved_name"} <= codes
+
+
+@pytest.mark.parametrize("name", ["curie", "curie-state", "curie-slack-archive"])
+@pytest.mark.parametrize("surface", ["inline", "root"])
+def test_channel_read_reservation_preserves_other_plugin_mcp_names(
+    tmp_path: Path, name: str, surface: str
+) -> None:
+    servers = {name: {"command": "example-mcp-server"}}
+    manifest: dict[str, object] = {"name": "acme-bot"}
+    if surface == "inline":
+        manifest["mcpServers"] = servers
+    bundle = _bundle(tmp_path, json.dumps(manifest))
+    if surface == "root":
+        (bundle / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
     result = validate_bundle(bundle)
     assert result.valid, result.errors
 
@@ -272,6 +353,125 @@ def test_unparsed_cron_schedule_is_rejected(tmp_path: Path, schedule: str) -> No
         ],
     )
     assert "triggers.cron_invalid_schedule" in _codes(bundle)
+
+
+_CRON_PREFIX = "a 'cron' trigger 'schedule'"
+_CRON_CODE = "triggers.cron_invalid_schedule"
+
+
+def _cron_schedule_issues(tmp_path: Path, schedule: str) -> list[tuple[str, str]]:
+    """(code, message) for each cron schedule error on a trigger with name and prompt set."""
+    bundle = _trigger_bundle(
+        tmp_path,
+        [
+            {
+                "type": "cron",
+                "name": "weekday-digest",
+                "schedule": schedule,
+                "prompt": "Post the daily plan.",
+            }
+        ],
+    )
+    return [
+        (issue.code, issue.message)
+        for issue in validate_bundle(bundle).errors
+        if issue.code == _CRON_CODE
+    ]
+
+
+def test_cron_minute_out_of_range_names_the_field(tmp_path: Path) -> None:
+    assert _cron_schedule_issues(tmp_path, "61 * * * *") == [
+        (_CRON_CODE, f"{_CRON_PREFIX} field minute `61` is outside 0-59")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("schedule", "count"),
+    [("*/5 * * *", 4), ("0 0 9 * * 1-5", 6)],
+    ids=["four-fields", "six-fields"],
+)
+def test_cron_wrong_field_count_reports_the_count(
+    tmp_path: Path, schedule: str, count: int
+) -> None:
+    assert _cron_schedule_issues(tmp_path, schedule) == [
+        (
+            _CRON_CODE,
+            f"{_CRON_PREFIX} must have five fields "
+            f"(minute hour day-of-month month day-of-week); got {count}",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("schedule", "field", "text", "bounds"),
+    [
+        ("60 * * * *", "minute", "60", "0-59"),
+        ("* 24 * * *", "hour", "24", "0-23"),
+        ("* 1-25 * * *", "hour", "1-25", "0-23"),
+        ("* * 0 * *", "day-of-month", "0", "1-31"),
+        ("* * 32 * *", "day-of-month", "32", "1-31"),
+        ("* * * 13 *", "month", "13", "1-12"),
+        ("* * * * 8", "day-of-week", "8", "0-7"),
+    ],
+    ids=["minute", "hour", "hour-range", "dom-low", "dom-high", "month", "dow"],
+)
+def test_cron_out_of_range_field_is_named_with_its_range(
+    tmp_path: Path, schedule: str, field: str, text: str, bounds: str
+) -> None:
+    assert _cron_schedule_issues(tmp_path, schedule) == [
+        (_CRON_CODE, f"{_CRON_PREFIX} field {field} `{text}` is outside {bounds}")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("schedule", "field", "text"),
+    [
+        ("abc * * * *", "minute", "abc"),
+        ("* * * foo *", "month", "foo"),
+        ("* * * * 1,,2", "day-of-week", "1,,2"),
+        ("* 5-1 * * *", "hour", "5-1"),
+        ("*/0 * * * *", "minute", "*/0"),
+        ("* * * * 99999", "day-of-week", "99999"),
+        ("* * abc * *", "day-of-month", "abc"),
+        ("* * jan * *", "day-of-month", "jan"),
+    ],
+    ids=[
+        "unknown-text",
+        "unknown-month",
+        "empty-part",
+        "reversed",
+        "zero-step",
+        "oversized",
+        "dom-unknown-text",
+        "dom-month-name",
+    ],
+)
+def test_cron_malformed_field_is_named(
+    tmp_path: Path, schedule: str, field: str, text: str
+) -> None:
+    assert _cron_schedule_issues(tmp_path, schedule) == [
+        (_CRON_CODE, f"{_CRON_PREFIX} field {field} `{text}` is not a valid cron field")
+    ]
+
+
+def test_cron_reports_the_first_failing_field(tmp_path: Path) -> None:
+    assert _cron_schedule_issues(tmp_path, "abc 99 * * *") == [
+        (_CRON_CODE, f"{_CRON_PREFIX} field minute `abc` is not a valid cron field")
+    ]
+
+
+def test_cron_malformed_part_beats_out_of_range_part_in_one_field(tmp_path: Path) -> None:
+    assert _cron_schedule_issues(tmp_path, "70,abc * * * *") == [
+        (_CRON_CODE, f"{_CRON_PREFIX} field minute `70,abc` is not a valid cron field")
+    ]
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    ["*/5 * * * *", "0 9 * * mon-fri", "0 0 1 jan,jul 7"],
+)
+def test_valid_cron_schedules_raise_no_schedule_error(tmp_path: Path, schedule: str) -> None:
+    assert _cron_schedule_issues(tmp_path, schedule) == []
 
 
 @pytest.mark.parametrize(
@@ -501,6 +701,59 @@ def test_legitimate_connector_secret_name_is_not_reserved(tmp_path: Path) -> Non
 def test_malformed_secrets_shape_is_rejected(tmp_path: Path) -> None:
     # A non-list secrets value is rejected.
     bundle = _bundle(tmp_path, '{"name": "demo", "secrets": "nope"}')
+    assert not validate_bundle(bundle).valid
+
+
+# ADR 0210: `optionalSecrets` names secrets a bundle can use but does not need.
+def test_valid_optional_secrets_pass(tmp_path: Path) -> None:
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "secrets": ["API_KEY"], '
+        '"optionalSecrets": ["GITHUB_PERSONAL_ACCESS_TOKEN"]}',
+    )
+    assert validate_bundle(bundle).valid
+
+
+def test_optional_secrets_parse_onto_the_manifest() -> None:
+    manifest = PluginManifest.model_validate(
+        {"name": "demo", "optionalSecrets": ["GITHUB_PERSONAL_ACCESS_TOKEN"]}
+    )
+    assert manifest.optionalSecrets == ["GITHUB_PERSONAL_ACCESS_TOKEN"]
+    assert PluginManifest.model_validate({"name": "demo"}).optionalSecrets is None
+
+
+def test_non_env_var_optional_secret_name_is_rejected(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, '{"name": "demo", "optionalSecrets": ["github-token"]}')
+    result = validate_bundle(bundle)
+    assert not result.valid
+    assert "secrets.name_invalid" in _codes(bundle)
+    assert any("optionalSecrets[0]" in e.location for e in result.errors)
+
+
+@pytest.mark.parametrize(
+    "name", ["CURIE_BUDGET", *_RESERVED_CREDENTIAL_KEYS, *_REDIRECT_CAPTURE_KEYS]
+)
+def test_reserved_optional_secret_name_is_rejected(tmp_path: Path, name: str) -> None:
+    bundle = _bundle(tmp_path, f'{{"name": "demo", "optionalSecrets": ["{name}"]}}')
+    assert "secrets.name_reserved" in _codes(bundle)
+
+
+def test_a_name_in_both_secret_lists_is_rejected(tmp_path: Path) -> None:
+    # Required or optional, never both: the deploy gate could not tell which.
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "secrets": ["API_KEY"], "optionalSecrets": ["API_KEY"]}',
+    )
+    assert "secrets.optional_overlap" in _codes(bundle)
+
+
+def test_malformed_optional_secrets_shape_is_rejected(tmp_path: Path) -> None:
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    bundle = _bundle(tmp_path / "a", '{"name": "demo", "optionalSecrets": "nope"}')
+    assert not validate_bundle(bundle).valid
+    # The object form ADR 0210 rejected is not accepted either.
+    bundle = _bundle(tmp_path / "b", '{"name": "demo", "optionalSecrets": [{"name": "X"}]}')
     assert not validate_bundle(bundle).valid
 
 
@@ -2067,6 +2320,200 @@ def test_a_bundle_that_declares_its_own_curie_server_keeps_the_pattern_valid(
     assert "tool_policy.platform_server" not in codes
     assert "tool_policy.unknown_server" not in codes
     assert result.valid, [(i.code, i.message) for i in result.errors]
+
+
+@pytest.mark.parametrize("collection", ["allow", "approvalRequired", "deny"])
+def test_granted_channel_read_is_a_recognized_policy_server(
+    tmp_path: Path, collection: str
+) -> None:
+    bundle = _bundle(
+        tmp_path,
+        json.dumps(
+            {
+                "name": "acme-bot",
+                "channelRead": True,
+                "toolPolicy": {
+                    "enforcement": TOOL_POLICY_ENFORCEMENT,
+                    collection: ["curie-slack/history"],
+                },
+            }
+        ),
+    )
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert result.valid, result.errors
+    assert not (bundle / ".mcp.json").exists()
+    assert not (bundle / "connectors.yaml").exists()
+
+
+@pytest.mark.parametrize("grant", [None, False], ids=["absent", "false"])
+@pytest.mark.parametrize("collection", ["allow", "approvalRequired", "deny"])
+def test_channel_read_policy_without_grant_reports_capability_requirement(
+    tmp_path: Path, grant: bool | None, collection: str
+) -> None:
+    manifest: dict[str, object] = {
+        "name": "acme-bot",
+        "toolPolicy": {
+            "enforcement": TOOL_POLICY_ENFORCEMENT,
+            collection: ["curie-slack/history"],
+        },
+    }
+    if grant is not None:
+        manifest["channelRead"] = grant
+    bundle = _bundle(tmp_path, json.dumps(manifest))
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    codes = {issue.code for issue in result.errors}
+    assert "channel_read.grant_required" in codes
+    assert "tool_policy.platform_server" not in codes
+    assert "tool_policy.unknown_server" not in codes
+    issue = next(issue for issue in result.errors if issue.code == "channel_read.grant_required")
+    assert "channelRead" in issue.message
+    assert "curie-slack" in issue.message
+    assert "declare the server" not in issue.message
+
+
+_SLACK_GRANTS = ("channelRead", "canvasList", "canvasRead", "canvasEdit")
+
+
+@pytest.mark.parametrize("collection", ["allow", "approvalRequired", "deny"])
+@pytest.mark.parametrize("grant", _SLACK_GRANTS)
+def test_each_single_platform_slack_grant_is_a_recognized_policy_server(
+    tmp_path: Path, grant: str, collection: str
+) -> None:
+    bundle = _bundle(
+        tmp_path,
+        json.dumps(
+            {
+                "name": "acme-bot",
+                grant: True,
+                "toolPolicy": {
+                    "enforcement": TOOL_POLICY_ENFORCEMENT,
+                    collection: ["curie-slack/read_canvas"],
+                },
+            }
+        ),
+    )
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert result.valid, result.errors
+    assert not (bundle / ".mcp.json").exists()
+    assert not (bundle / "connectors.yaml").exists()
+
+
+def test_all_platform_slack_grants_true_validates_cleanly(tmp_path: Path) -> None:
+    bundle = _bundle(
+        tmp_path,
+        json.dumps(
+            {
+                "name": "acme-bot",
+                **{grant: True for grant in _SLACK_GRANTS},
+                "toolPolicy": {
+                    "enforcement": TOOL_POLICY_ENFORCEMENT,
+                    "allow": [
+                        "curie-slack/history",
+                        "curie-slack/list_channel_canvases",
+                        "curie-slack/read_canvas",
+                        "curie-slack/edit_canvas_cell",
+                    ],
+                },
+            }
+        ),
+    )
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert result.valid, result.errors
+
+
+@pytest.mark.parametrize("grant", ["canvasList", "canvasRead", "canvasEdit"])
+@pytest.mark.parametrize("value", [False, True])
+def test_bundle_canvas_grants_accept_boolean_values(
+    tmp_path: Path, grant: str, value: bool
+) -> None:
+    bundle = _bundle(tmp_path, json.dumps({"name": "acme-bot", grant: value}))
+    result = validate_bundle(bundle)
+    assert result.valid, result.errors
+
+
+@pytest.mark.parametrize("grant", ["canvasList", "canvasRead", "canvasEdit"])
+@pytest.mark.parametrize("value", [None, 0, 1, "true", "false", [], {}, {"channels": []}])
+def test_bundle_canvas_grants_refuse_non_boolean_values(
+    tmp_path: Path, grant: str, value: object
+) -> None:
+    bundle = _bundle(tmp_path, json.dumps({"name": "acme-bot", grant: value}))
+    result = validate_bundle(bundle)
+    assert not result.valid
+    issue = next(issue for issue in result.errors if issue.code == "manifest.invalid")
+    assert grant in issue.message
+
+
+@pytest.mark.parametrize("grant", [None, False], ids=["absent", "false"])
+def test_slack_policy_with_only_non_literal_canvas_grants_requires_a_real_grant(
+    tmp_path: Path, grant: object
+) -> None:
+    manifest: dict[str, object] = {
+        "name": "acme-bot",
+        "toolPolicy": {
+            "enforcement": TOOL_POLICY_ENFORCEMENT,
+            "allow": ["curie-slack/read_canvas"],
+        },
+    }
+    if grant is not None:
+        manifest["canvasRead"] = grant
+    bundle = _bundle(tmp_path, json.dumps(manifest))
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    assert not result.valid
+    assert "channel_read.grant_required" in {issue.code for issue in result.errors}
+
+
+def test_grant_required_message_names_all_four_grants(tmp_path: Path) -> None:
+    bundle = _bundle(
+        tmp_path,
+        json.dumps(
+            {
+                "name": "acme-bot",
+                "toolPolicy": {
+                    "enforcement": TOOL_POLICY_ENFORCEMENT,
+                    "allow": ["curie-slack/edit_canvas_cell"],
+                },
+            }
+        ),
+    )
+    result = validate_bundle(bundle, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    issue = next(issue for issue in result.errors if issue.code == "channel_read.grant_required")
+    for grant in _SLACK_GRANTS:
+        assert grant in issue.message
+    assert "curie-slack" in issue.message
+
+
+@pytest.mark.parametrize("grant", _SLACK_GRANTS)
+def test_reserved_name_error_names_all_four_grants(tmp_path: Path, grant: str) -> None:
+    servers = {"curie-slack": {"command": "example-mcp-server"}}
+    bundle = _bundle(
+        tmp_path,
+        json.dumps({"name": "acme-bot", grant: True, "mcpServers": servers}),
+    )
+    result = validate_bundle(bundle)
+    assert not result.valid
+    issue = next(issue for issue in result.errors if issue.code == "mcp.reserved_name")
+    for name in _SLACK_GRANTS:
+        assert name in issue.message
+
+
+def test_granted_channel_read_policy_still_requires_policy_enforcement(tmp_path: Path) -> None:
+    bundle = _bundle(
+        tmp_path,
+        json.dumps(
+            {
+                "name": "acme-bot",
+                "channelRead": True,
+                "toolPolicy": {
+                    "enforcement": TOOL_POLICY_ENFORCEMENT,
+                    "allow": ["curie-slack/history"],
+                },
+            }
+        ),
+    )
+    result = validate_bundle(bundle)
+    assert not result.valid
+    assert "tool_policy.unenforced" in {issue.code for issue in result.errors}
 
 
 def test_a_misspelled_undeclared_server_still_reports_unknown_server(

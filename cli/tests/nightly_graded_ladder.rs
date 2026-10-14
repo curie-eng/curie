@@ -27,8 +27,7 @@
 //! existing `ci.yaml` and only breaks if someone arms `ci.yaml`'s fake seal
 //! off, proving the two workflows are pinned to opposite sides of the seam.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::io::{Read, Write};
@@ -40,15 +39,18 @@ use std::thread;
 
 use sha2::{Digest, Sha256};
 
-/// Read a workflow file's raw text, or an empty string when it does not exist
-/// yet. Assertions on an empty string fail with their own readable messages
-/// rather than panicking on a missing file, so a missing nightly workflow
-/// surfaces as a normal test failure naming the violated contract.
+/// Read a repository file these text contracts inspect. A missing or
+/// unreadable file panics naming its path: an empty-string fallback would let
+/// every negative assertion on it pass vacuously (#3826).
+fn repo_text(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+}
+
 fn workflow_text(name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../.github/workflows")
         .join(name);
-    fs::read_to_string(path).unwrap_or_default()
+    repo_text(&path)
 }
 
 fn nightly() -> String {
@@ -59,9 +61,24 @@ fn ci() -> String {
     workflow_text("ci.yaml")
 }
 
+#[test]
+fn repo_text_panics_naming_a_missing_file() {
+    let missing = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../.github/workflows/renamed-away-3826.yaml");
+    let panic = std::panic::catch_unwind(|| repo_text(&missing))
+        .expect_err("a missing repository file must not read as empty text");
+    let message = panic
+        .downcast_ref::<String>()
+        .expect("the read panic must carry a formatted message");
+    assert!(
+        message.contains(&missing.display().to_string()),
+        "the read panic must name the missing path: {message}"
+    );
+}
+
 fn ladder() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/e2e-ladder.sh");
-    fs::read_to_string(path).unwrap_or_default()
+    repo_text(&path)
 }
 
 fn ladder_function(name: &str) -> String {
@@ -302,6 +319,155 @@ fn write_otlp_fixture(root: &Path, name: &str, documents: &[serde_json::Value]) 
         rendered.push('\n');
     }
     fs::write(root.join(format!("{name}.json")), rendered).expect("write OTLP fixture");
+}
+
+// Collector v0.119.0's exportMessageAsLine writes the JSON buffer and its
+// terminating newline separately, so a concurrent query can see either a
+// partial JSON buffer or valid JSON whose newline has not been written yet.
+// https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.119.0/exporter/fileexporter/file_writer.go
+#[test]
+fn local_otel_query_reads_terminated_records_before_a_partial_export() {
+    use serde_json::json;
+
+    let harness = tempfile::tempdir().expect("create local OTel fixture directory");
+    let root = harness.path();
+    write_otlp_fixture(
+        root,
+        "traces",
+        &[
+            json!({"resourceSpans": [{"scopeSpans": [{"spans": [{"traceId": "committed-trace"}]}]}]}),
+        ],
+    );
+    write_otlp_fixture(root, "logs", &[json!({"resourceLogs": []})]);
+    write_otlp_fixture(
+        root,
+        "metrics",
+        &[
+            json!({"resourceMetrics": [{"scopeMetrics": [{"metrics": [{"name": "committed.metric", "sum": {"dataPoints": [{"asInt": 2}]}}]}]}]}),
+        ],
+    );
+    for name in ["traces", "logs", "metrics"] {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(format!("{name}.json")))
+            .expect("open live OTLP fixture")
+            .write_all(b"{\"resource")
+            .expect("append in-progress export");
+    }
+
+    let result = run_local_otel_query(
+        &local_otel_query_python(),
+        "snapshot",
+        root,
+        &root.join("unused-baseline.json"),
+    );
+    assert!(
+        result.status.success(),
+        "terminated records must remain readable while the next export is partial: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&result.stdout).expect("parse committed snapshot");
+    assert_eq!(snapshot["trace_ids"], json!(["committed-trace"]));
+    assert_eq!(snapshot["metrics"].as_array().expect("metrics").len(), 1);
+    assert_eq!(snapshot["metrics"][0]["name"], "committed.metric");
+    assert_eq!(snapshot["metrics"][0]["value"], 2.0);
+}
+
+#[test]
+fn local_otel_query_defers_valid_exports_until_their_newline() {
+    use serde_json::json;
+
+    let harness = tempfile::tempdir().expect("create local OTel fixture directory");
+    let root = harness.path();
+    let script = local_otel_query_python();
+    for (name, document) in [
+        (
+            "traces",
+            json!({"resourceSpans": [{"scopeSpans": [{"spans": [{"traceId": "pending-trace"}]}]}]}),
+        ),
+        ("logs", json!({"resourceLogs": []})),
+        (
+            "metrics",
+            json!({"resourceMetrics": [{"scopeMetrics": [{"metrics": [{"name": "pending.metric", "sum": {"dataPoints": [{"asInt": 7}]}}]}]}]}),
+        ),
+    ] {
+        fs::write(
+            root.join(format!("{name}.json")),
+            serde_json::to_vec(&document).expect("serialize pending export"),
+        )
+        .expect("write export before its newline");
+    }
+
+    let before = run_local_otel_query(
+        &script,
+        "snapshot",
+        root,
+        &root.join("unused-baseline.json"),
+    );
+    assert!(
+        before.status.success(),
+        "a pending newline must not fail the query: {}",
+        String::from_utf8_lossy(&before.stderr)
+    );
+    let before_snapshot: serde_json::Value =
+        serde_json::from_slice(&before.stdout).expect("parse snapshot before commit");
+    assert_eq!(before_snapshot, json!({"trace_ids": [], "metrics": []}));
+
+    for name in ["traces", "logs", "metrics"] {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(format!("{name}.json")))
+            .expect("open pending export")
+            .write_all(b"\n")
+            .expect("commit export newline");
+    }
+    let after = run_local_otel_query(
+        &script,
+        "snapshot",
+        root,
+        &root.join("unused-baseline.json"),
+    );
+    assert!(
+        after.status.success(),
+        "the newline must make the export readable: {}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    let after_snapshot: serde_json::Value =
+        serde_json::from_slice(&after.stdout).expect("parse snapshot after commit");
+    assert_eq!(after_snapshot["trace_ids"], json!(["pending-trace"]));
+    assert_eq!(
+        after_snapshot["metrics"].as_array().expect("metrics").len(),
+        1
+    );
+    assert_eq!(after_snapshot["metrics"][0]["name"], "pending.metric");
+    assert_eq!(after_snapshot["metrics"][0]["value"], 7.0);
+}
+
+#[test]
+fn local_otel_query_rejects_malformed_terminated_exports() {
+    let script = local_otel_query_python();
+    for name in ["traces", "logs", "metrics"] {
+        let harness = tempfile::tempdir().expect("create local OTel fixture directory");
+        let root = harness.path();
+        fs::write(root.join(format!("{name}.json")), b"{\"resource\":}\n")
+            .expect("write malformed terminated export");
+        let result = run_local_otel_query(
+            &script,
+            "snapshot",
+            root,
+            &root.join("unused-baseline.json"),
+        );
+        assert!(
+            !result.status.success(),
+            "malformed terminated {name} records must fail the query"
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("JSONDecodeError"),
+            "{name} corruption must remain a JSON decoding error: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
 }
 
 #[test]
@@ -556,7 +722,7 @@ fn local_otel_failure_recovery_scopes_classified_metrics_to_the_traces_worker_in
 
 fn chart_runtime_e2e() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/chart-runtime-e2e.sh");
-    fs::read_to_string(path).unwrap_or_default()
+    repo_text(&path)
 }
 
 fn count_lines_containing(text: &str, needle: &str) -> usize {
@@ -815,6 +981,114 @@ printf '1'
     );
 }
 
+fn run_cluster_approval_inline_failure_guard(log: &str, previous: bool, log_status: i32) -> Output {
+    let source = repo_text(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts/e2e-cluster-approval-resume-restarts.sh"),
+    );
+    let (_, guard_tail) = source
+        .split_once("\ninline_failed=0\n")
+        .expect("approval resume script must check the inline enqueue failure");
+    let (guard, _) = guard_tail
+        .split_once("\necho \"API logged the failed inline resume enqueue")
+        .expect("inline failure guard must precede its success announcement");
+    let function = |name: &str| {
+        let marker = format!("{name}() {{");
+        let (_, tail) = source
+            .split_once(&marker)
+            .unwrap_or_else(|| panic!("approval resume script must define {name}"));
+        let (body, _) = tail
+            .split_once("\n}\n")
+            .unwrap_or_else(|| panic!("approval resume function {name} must close"));
+        format!("{marker}{body}\n}}\n")
+    };
+    let harness = tempfile::tempdir().expect("create inline failure guard harness");
+    let log_path = harness.path().join("api.log");
+    fs::write(&log_path, log).expect("write API log fixture");
+    let script = format!(
+        r#"set -euo pipefail
+APPROVAL_ID=acme-approval
+API_DEPLOYMENT=acme-api
+SCRIPT_STARTED_RFC3339=2026-01-01T00:00:00Z
+LISTENER_ERR=/dev/null
+LISTENER_OUT=/dev/null
+pods_by_selector_of() {{
+    [[ "$1 $2" == 'deployment acme-api' ]] || return 97
+    printf 'acme-api-pod\tacme-uid\tready\n'
+}}
+kube() {{
+    [[ "$1 $2 $3 $4 $5" == 'logs acme-api-pod -c api --since-time=2026-01-01T00:00:00Z' ]] || return 97
+    local previous=0
+    [[ "${{6:-}}" != --previous ]] || previous=1
+    if [[ "$previous" == "$TEST_LOG_PREVIOUS" ]]; then
+        cat "$TEST_API_LOG"
+        return "$TEST_LOG_STATUS"
+    fi
+}}
+{}
+{}
+inline_failed=0
+{}
+"#,
+        function("fail"),
+        function("dump_diagnostics"),
+        guard,
+    );
+    Command::new("bash")
+        .args(["-c", &script])
+        .env("TEST_API_LOG", &log_path)
+        .env("TEST_LOG_PREVIOUS", if previous { "1" } else { "0" })
+        .env("TEST_LOG_STATUS", log_status.to_string())
+        .output()
+        .expect("run the extracted inline failure guard")
+}
+
+#[test]
+fn cluster_approval_inline_failure_guard_drains_logs_and_preserves_pipefail() {
+    let marker = "approval acme-approval approved by operator; resume enqueue failed, reconciler will retry\n";
+    let trailing = format!("approval acme-approval observed {}\n", "x".repeat(128)).repeat(12_000);
+    assert!(trailing.len() > 1_000_000);
+    let large_log = format!("{marker}{trailing}");
+
+    for previous in [false, true] {
+        let lane = if previous { "previous" } else { "current" };
+        for (label, log, status) in [
+            ("missing marker", "approval acme-approval approved\n", 0),
+            (
+                "different approval",
+                "approval acme-other approved; resume enqueue failed\n",
+                0,
+            ),
+            ("log command exited 37", marker, 37),
+        ] {
+            let output = run_cluster_approval_inline_failure_guard(log, previous, status);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "the {lane} log lane must reject {label}: {}",
+                transcript(&output)
+            );
+            assert!(
+                transcript(&output).contains("scenario did not exercise the failed inline enqueue"),
+                "the {lane} log lane must reject {label} through the actual guard: {}",
+                transcript(&output)
+            );
+        }
+
+        let output = run_cluster_approval_inline_failure_guard(&large_log, previous, 0);
+        assert!(
+            output.status.success(),
+            "the {lane} log lane must consume all matching approval lines after the early failure marker without a broken pipe: {}",
+            transcript(&output)
+        );
+        assert!(
+            !transcript(&output).contains("Broken pipe"),
+            "the {lane} log lane must leave its upstream grep able to drain: {}",
+            transcript(&output)
+        );
+    }
+}
+
 // --- Assertion group 1: arms the GRADED path -------------------------------
 
 /// The nightly workflow must arm live grading with the exact double-quoted
@@ -992,6 +1266,11 @@ fn nightly_pairs_every_checkout_with_persist_credentials_false() {
 #[test]
 fn nightly_never_echoes_the_openrouter_secret_on_a_run_line() {
     let text = nightly();
+    assert!(
+        text.contains("secrets.OPENROUTER_API_KEY"),
+        "the nightly workflow must reference secrets.OPENROUTER_API_KEY, or \
+         the run-line check below inspects nothing; file contents:\n{text}"
+    );
     for line in text.lines() {
         if line.contains("secrets.OPENROUTER_API_KEY") {
             assert!(
@@ -1001,6 +1280,236 @@ fn nightly_never_echoes_the_openrouter_secret_on_a_run_line() {
             );
         }
     }
+}
+
+fn workflow_jobs(text: &str) -> Vec<&str> {
+    let rest = text
+        .split_once("\njobs:\n")
+        .map(|(_, rest)| rest)
+        .expect("workflow must declare a jobs block");
+    let mut ranges = Vec::new();
+    let mut offset = 0usize;
+    for line in rest.split_inclusive('\n') {
+        let bare = line.trim_end_matches(['\r', '\n']);
+        if let Some(key) = bare.strip_prefix("  ") {
+            let name = key.strip_suffix(':').unwrap_or("");
+            if !key.starts_with(' ')
+                && !key.starts_with('#')
+                && key.ends_with(':')
+                && !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                ranges.push(offset);
+            }
+        }
+        offset += line.len();
+    }
+    assert!(
+        !ranges.is_empty(),
+        "workflow jobs block must name at least one job"
+    );
+    ranges
+        .iter()
+        .enumerate()
+        .map(|(index, start)| {
+            let end = ranges.get(index + 1).copied().unwrap_or(rest.len());
+            &rest[*start..end]
+        })
+        .collect()
+}
+
+fn graded_parity_jobs(text: &str) -> Vec<&str> {
+    let jobs: Vec<&str> = workflow_jobs(text)
+        .into_iter()
+        .filter(|job| {
+            job.lines()
+                .any(|line| line.contains("name:") && line.contains("Graded parity ladder"))
+        })
+        .collect();
+    assert_eq!(
+        jobs.len(),
+        3,
+        "expected three Graded parity ladder jobs, found {}",
+        jobs.len()
+    );
+    jobs
+}
+
+fn assert_openrouter_secret_lines(text: &str, label: &str) {
+    let mut saw = false;
+    for line in text.lines() {
+        if line.contains("secrets.OPENROUTER_API_KEY") {
+            saw = true;
+            assert!(
+                line.contains("CURIE_CREDENTIALS:"),
+                "{label}: every secrets.OPENROUTER_API_KEY line must also \
+                 assign CURIE_CREDENTIALS: on that same line: {line}"
+            );
+            assert!(
+                !line.contains("run:"),
+                "{label}: secrets.OPENROUTER_API_KEY must not appear on a run: \
+                 line: {line}"
+            );
+        }
+    }
+    assert!(
+        saw,
+        "{label} must reference secrets.OPENROUTER_API_KEY at least once"
+    );
+}
+
+fn assert_model_credit_between(job: &str, earlier: &str, first_later: &str, label: &str) {
+    let credit = job
+        .find("curie dev model-credit")
+        .unwrap_or_else(|| panic!("{label} must run `curie dev model-credit`\n{job}"));
+    let earlier_at = job
+        .find(earlier)
+        .unwrap_or_else(|| panic!("{label} must contain `{earlier}`"));
+    let later_at = job
+        .find(first_later)
+        .unwrap_or_else(|| panic!("{label} must contain `{first_later}`"));
+    let ladder_at = job
+        .find("bash cli/scripts/e2e-ladder.sh")
+        .unwrap_or_else(|| panic!("{label} must run the ladder script"));
+    assert!(
+        earlier_at < credit,
+        "{label}: `curie dev model-credit` must follow `{earlier}`"
+    );
+    assert!(
+        credit < later_at,
+        "{label}: `curie dev model-credit` must precede the first `{first_later}`"
+    );
+    assert!(
+        credit < ladder_at,
+        "{label}: `curie dev model-credit` must precede the ladder script"
+    );
+}
+
+fn assert_ladder_failure_markers(job: &str, label: &str) {
+    let build_failed = "echo build-failed >> \"$GITHUB_STEP_SUMMARY\"";
+    let test_failed = "echo test-failed >> \"$GITHUB_STEP_SUMMARY\"";
+    let ladder_script = "bash cli/scripts/e2e-ladder.sh";
+    let ladder_at = job
+        .find(ladder_script)
+        .unwrap_or_else(|| panic!("{label} must run the ladder script"));
+    let build_at = job
+        .find(build_failed)
+        .unwrap_or_else(|| panic!("{label} must echo build-failed before the ladder"));
+    assert!(
+        build_at < ladder_at,
+        "{label}: build-failed must be written before the ladder script"
+    );
+    let ladder_steps: Vec<&str> = job
+        .split("\n      - ")
+        .skip(1)
+        .filter(|step| step.contains(ladder_script))
+        .collect();
+    assert_eq!(
+        ladder_steps.len(),
+        1,
+        "{label}: expected one ladder script step"
+    );
+    assert!(
+        ladder_steps[0]
+            .lines()
+            .any(|line| line.trim() == "id: ladder"),
+        "{label}: the ladder script step must contain `id: ladder`:\n{}",
+        ladder_steps[0]
+    );
+    let id_at = line_offset(job, "id: ladder")
+        .unwrap_or_else(|| panic!("{label} must contain a line `id: ladder`"));
+    let test_at = job
+        .find(test_failed)
+        .unwrap_or_else(|| panic!("{label} must echo test-failed after id: ladder"));
+    assert!(
+        id_at < test_at,
+        "{label}: test-failed must follow the ladder step id"
+    );
+    // GitHub Actions treats an `if` without failure(), always(), or
+    // success() as success(). After a failed build or ladder that default
+    // skips the summary step, so the class line never lands.
+    for marker in [build_failed, test_failed] {
+        let at = job
+            .find(marker)
+            .unwrap_or_else(|| panic!("{label} must contain {marker}"));
+        let step_start = job[..at].rfind("\n      - ").unwrap_or(0);
+        let step = &job[step_start..at];
+        assert!(
+            step.contains("failure()"),
+            "{label}: the step that writes {marker} must be conditioned on \
+             failure() so it still runs after the failed step:\n{step}"
+        );
+    }
+}
+
+fn line_offset(text: &str, trimmed: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']).trim() == trimmed {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+#[test]
+fn graded_workflows_run_model_credit_before_image_builds_and_the_ladder() {
+    let nightly = nightly();
+    let sdk = workflow_text("sdk-approval-gate.yaml");
+    assert!(
+        nightly.contains("curie dev model-credit"),
+        "nightly-graded-ladder.yaml must run curie dev model-credit"
+    );
+    assert!(
+        sdk.contains("curie dev model-credit"),
+        "sdk-approval-gate.yaml must run curie dev model-credit"
+    );
+    for job in graded_parity_jobs(&nightly) {
+        assert_model_credit_between(
+            job,
+            "chmod +x cli/target/release/curie",
+            "docker/build-push-action",
+            "nightly graded ladder job",
+        );
+    }
+    let live_jobs: Vec<&str> = workflow_jobs(&sdk)
+        .into_iter()
+        .filter(|job| job.contains("bash cli/scripts/e2e-ladder.sh"))
+        .collect();
+    assert_eq!(live_jobs.len(), 1, "sdk-approval-gate has one ladder job");
+    assert_model_credit_between(
+        live_jobs[0],
+        "cargo build --release --locked",
+        "docker/setup-buildx-action",
+        "sdk approval live job",
+    );
+}
+
+#[test]
+fn openrouter_secret_lines_are_curie_credentials_env_mappings() {
+    assert_openrouter_secret_lines(&nightly(), "nightly-graded-ladder.yaml");
+    assert_openrouter_secret_lines(
+        &workflow_text("sdk-approval-gate.yaml"),
+        "sdk-approval-gate.yaml",
+    );
+}
+
+#[test]
+fn ladder_jobs_record_build_failed_and_test_failed_around_the_ladder_step() {
+    let nightly = nightly();
+    for job in graded_parity_jobs(&nightly) {
+        assert_ladder_failure_markers(job, "nightly graded ladder job");
+    }
+    let sdk = workflow_text("sdk-approval-gate.yaml");
+    let live_jobs: Vec<&str> = workflow_jobs(&sdk)
+        .into_iter()
+        .filter(|job| job.contains("bash cli/scripts/e2e-ladder.sh"))
+        .collect();
+    assert_eq!(live_jobs.len(), 1, "sdk-approval-gate has one ladder job");
+    assert_ladder_failure_markers(live_jobs[0], "sdk approval live job");
 }
 
 // --- Assertion group 5: the eval-block TEXT contracts ----------------------
@@ -1171,6 +1680,10 @@ fn connector_local_rungs_bind_routes_immediately_before_captured_deploy() {
 fn local_rung_sandbox_sweep_is_project_scoped() {
     let teardown = ladder();
     assert!(
+        teardown.contains("orphans=\"$(docker ps -aq --filter \"label=$SANDBOX_LABEL\""),
+        "the ladder teardown must still sweep orphaned sandbox containers by label"
+    );
+    assert!(
         !teardown
             .contains("orphans=\"$(docker ps -aq --filter \"label=$SANDBOX_LABEL\" 2>/dev/null)\""),
         "sandbox sweep must not select every host-wide sandbox label"
@@ -1273,7 +1786,7 @@ fn product_observability_requires_four_valid_seeds_and_count_only_mcp_receipt() 
 
     let receipt_fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/fixtures/mcp-receipt/server.py");
-    let receipt_source = fs::read_to_string(&receipt_fixture).unwrap_or_default();
+    let receipt_source = repo_text(&receipt_fixture);
     assert!(
         receipt_source.contains(r#""tools/call""#),
         "the hosted MCP fixture must log exactly one private receipt per tools/call"
@@ -1297,6 +1810,183 @@ fn product_observability_requires_four_valid_seeds_and_count_only_mcp_receipt() 
         !approval.contains("curie.approval.wait"),
         "the oracle must not invent a wait span that no current emitter produces"
     );
+}
+
+fn run_plain_reply_seed(
+    function_name: &str,
+    finalized: bool,
+) -> (Output, Vec<Vec<String>>, String) {
+    let harness = tempfile::tempdir().expect("create plain reply seed harness");
+    let argv_log = harness.path().join("message-argv.log");
+    let phase_log = harness.path().join("seed-phases.log");
+    fs::write(&argv_log, b"").expect("initialize message argv log");
+    fs::write(&phase_log, b"").expect("initialize seed phase log");
+    let script = format!(
+        r#"set -euo pipefail
+WORKDIR="$TEST_WORKDIR"
+BIN=capture_message
+LIVE=1
+FAKE_SENTINEL=fake-reply
+LAST_ORDINARY_TRACE_ID=22222222222222222222222222222222
+capture_message() {{
+    printf '%s\0' "$@" >> "$TEST_MESSAGE_ARGV"
+    printf '\0' >> "$TEST_MESSAGE_ARGV"
+    printf '%s\n' "$TEST_MESSAGE_REPLY"
+    return "$TEST_MESSAGE_EXIT"
+}}
+capture_stream_cursor() {{ printf '%s-0\n' "$(wc -c < "$TEST_MESSAGE_ARGV" | tr -d ' ')"; }}
+assert_product_runner_endpoints() {{ echo endpoints >> "$TEST_PHASE_LOG"; }}
+discover_trace_id_for_seed() {{
+    printf 'discover %s\n' "$*" >> "$TEST_PHASE_LOG"
+    if [[ "$2" == curie-seed-invalid-auth-* ]]; then
+        echo 11111111111111111111111111111111
+    else
+        echo 22222222222222222222222222222222
+    fi
+}}
+query_exact_seed_trace() {{
+    printf 'query %s\n' "$*" >> "$TEST_PHASE_LOG"
+    LAST_QUERY_MEMBERSHIP=true
+}}
+ladder_compose() {{
+    case "$*" in
+        '--profile full ps -q langfuse-web') echo fixture-langfuse ;;
+        '--profile full ps -q otel-collector') echo fixture-collector ;;
+        *) return 97 ;;
+    esac
+}}
+restart_local_product_collector() {{ echo restart >> "$TEST_PHASE_LOG"; }}
+wait_product_collector_ready() {{ :; }}
+product_collector_metric_value() {{
+    if [[ "$1" == otelcol_exporter_queue_size || ! -s "$TEST_MESSAGE_ARGV" ]]; then
+        echo 0
+    else
+        echo 1
+    fi
+}}
+docker() {{
+    [[ "$*" == 'logs fixture-collector' ]] || return 97
+    echo 'HTTP Status Code 401 Permanent error not retryable error'
+}}
+restore_local_langfuse_auth() {{ echo restored >> "$TEST_PHASE_LOG"; }}
+{}
+{}
+{}
+{}
+if [[ "$TEST_SEED_FUNCTION" == seed_ordinary_turn ]]; then
+    seed_ordinary_turn local fixture-agent present
+else
+    case_local_langfuse_invalid_auth fixture-agent
+fi
+"#,
+        ladder_function("assert_finalized_reply"),
+        ladder_function("assert_product_collector_permanent_auth_rejection"),
+        ladder_function("seed_ordinary_turn"),
+        ladder_function("case_local_langfuse_invalid_auth"),
+    );
+    let output = Command::new("bash")
+        .args(["-c", &script])
+        .env("TEST_WORKDIR", harness.path())
+        .env("TEST_MESSAGE_ARGV", &argv_log)
+        .env("TEST_PHASE_LOG", &phase_log)
+        .env("TEST_SEED_FUNCTION", function_name)
+        .env(
+            "TEST_MESSAGE_REPLY",
+            serde_json::json!({"finalized": finalized, "reply": "seed complete"}).to_string(),
+        )
+        .env("TEST_MESSAGE_EXIT", if finalized { "0" } else { "7" })
+        .env_remove("STUB_STATE")
+        .env_remove("LANGFUSE_OTLP_AUTH_HEADER")
+        .output()
+        .expect("run extracted plain reply seed functions");
+    let invocations = fs::read_to_string(argv_log)
+        .expect("read captured message argv")
+        .split("\0\0")
+        .filter(|invocation| !invocation.is_empty())
+        .map(|invocation| invocation.split('\0').map(str::to_owned).collect())
+        .collect();
+    let phases = fs::read_to_string(phase_log).expect("read seed phases");
+    (output, invocations, phases)
+}
+
+#[test]
+fn plain_reply_observability_seeds_send_an_exact_marker_task() {
+    for function_name in ["seed_ordinary_turn", "case_local_langfuse_invalid_auth"] {
+        let (output, invocations, phases) = run_plain_reply_seed(function_name, true);
+        assert!(
+            output.status.success(),
+            "{function_name} must complete with a finalized reply: {}",
+            transcript(&output)
+        );
+        assert_eq!(
+            invocations.len(),
+            if function_name == "seed_ordinary_turn" {
+                1
+            } else {
+                2
+            },
+            "invalid-auth recovery must send a fresh ordinary seed"
+        );
+        for (index, argv) in invocations.iter().enumerate() {
+            assert_eq!(argv.len(), 6, "the prompt must be one argument: {argv:?}");
+            assert_eq!(
+                &argv[..5],
+                ["--json", "local", "message", "--channel", "C0LOCALDEV"]
+            );
+            let marker = argv[5]
+                .strip_prefix("Reply with exactly: ")
+                .and_then(|prompt| {
+                    prompt.strip_suffix(". Do not call tools or investigate anything.")
+                })
+                .unwrap_or_else(|| {
+                    panic!("{function_name} must send a bounded reply task: {argv:?}")
+                });
+            let prefix = if function_name == "case_local_langfuse_invalid_auth" && index == 0 {
+                "curie-seed-invalid-auth-"
+            } else {
+                "curie-seed-ordinary-"
+            };
+            assert!(
+                marker.starts_with(prefix),
+                "retain the seed marker: {marker}"
+            );
+            assert!(
+                phases.contains(marker),
+                "the exact trace receipt must use the same marker as the task: {phases}"
+            );
+        }
+    }
+}
+
+#[test]
+fn plain_reply_observability_seeds_reject_nonfinal_replies_and_restore_auth() {
+    for function_name in ["seed_ordinary_turn", "case_local_langfuse_invalid_auth"] {
+        let (output, invocations, phases) = run_plain_reply_seed(function_name, false);
+        assert!(
+            !output.status.success(),
+            "{function_name} must propagate a nonfinal CLI refusal: {}",
+            transcript(&output)
+        );
+        assert!(transcript(&output).contains("status=not_finalized"));
+        assert_eq!(
+            invocations.len(),
+            1,
+            "a refused seed must not start recovery"
+        );
+        assert!(
+            !phases.contains("discover "),
+            "a refused seed has no receipt: {phases}"
+        );
+        assert!(
+            !phases.contains("endpoints"),
+            "a refused seed must stop: {phases}"
+        );
+        assert_eq!(
+            phases.lines().filter(|line| *line == "restored").count(),
+            usize::from(function_name == "case_local_langfuse_invalid_auth"),
+            "invalid-auth failure must restore auth exactly once: {phases}"
+        );
+    }
 }
 
 #[test]
@@ -2373,9 +3063,25 @@ json.dump(d, open(p, "w"))' "$(cat "$STUB_STATE/last_plugin_dir")/evals/cases.js
             echo "bundle changed: replacing the recorded runner 'curie-e2e-runner' first"
         fi
         printf '%s' "$(sha_of_bundle "$PWD")" > "$STUB_STATE/skill_digest"
+        rm -rf .curie/snapshots
+        snapshot_dir="$PWD/.curie/snapshots/$(cat "$STUB_STATE/skill_digest")"
+        mkdir -p "$snapshot_dir"
+        python3 - "$snapshot_dir" <<'PYSTATE'
+import json, sys
+with open(".curie/runner.json", "w", encoding="utf-8") as handle:
+    json.dump({
+        "runner": "stub",
+        "bundle_snapshot_dir": sys.argv[1],
+        "port": 7245,
+        "base_url": "http://localhost:7245",
+    }, handle)
+PYSTATE
         skill=$(find "$PWD/skills" -mindepth 2 -maxdepth 2 -name SKILL.md | sort | head -1)
         if [ -n "$skill" ]; then
             cp "$skill" "$STUB_STATE/mounted_skill.md"
+            snapshot_skill="$snapshot_dir/${skill#"$PWD"/}"
+            mkdir -p "$(dirname "$snapshot_skill")"
+            cp "$skill" "$snapshot_skill"
         fi
         echo "stub: runner up"
         # e2e.sh asserts the boot panel NAMES the model path it resolved, and
@@ -2439,6 +3145,7 @@ print(json.dumps({
         ;;
     "skill down")
         rm -f .curie/runner.json
+        rm -rf .curie/snapshots
         echo "stub: runner down"
         ;;
     "skill down --name "*)
@@ -2620,11 +3327,32 @@ case "$*" in
             printf '%s\n' "${STUB_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}"
         fi
         ;;
-    "inspect curie-runner-local")
+    "inspect --type container curie-runner-local")
         # e2e.sh's ownership precondition: the standard interactive runner is
         # absent in this isolated harness unless a control explicitly says
         # otherwise.
         exit 1
+        ;;
+    "inspect --type container --format {{if eq (index .Config.Labels \"curietech.ai/managed-by\") \"curie-cli\"}}{{with index .Config.Labels \"curietech.ai/snapshot-volume\"}}{{.}}{{end}}{{end}} curie-e2e-runner")
+        # This harness's runner uses a local snapshot bind mount, so its
+        # cleanup read must not invent a remote snapshot volume from worker env.
+        ;;
+    "inspect --type container --format {{json .Mounts}} curie-e2e-runner")
+        # Report the actual snapshot directory staged by the skill-up arm.
+        python3 - "$STUB_STATE/skill_digest" <<'PYMOUNTS'
+import json, os, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    digest = handle.read()
+print(json.dumps([{
+    "Type": "bind",
+    "Source": os.path.join(os.getcwd(), ".curie", "snapshots", digest),
+    "Destination": "/plugin",
+    "RW": False,
+}]))
+PYMOUNTS
+        ;;
+    "inspect --type container --format {{range .Mounts}}{{if eq .Destination \"/plugin\"}}{{if eq .Type \"volume\"}}{{.Name}}{{end}}{{end}}{{end}} curie-e2e-runner")
+        # A local bind mount has no Docker volume name at either boot.
         ;;
     "inspect curie-ladder-hermetic-"*)
         # Keep the connector-free negative non-vacuous by giving its runner the
@@ -2811,7 +3539,7 @@ esac
 /// and return its base URL for `CURIE_API_URL`.
 ///
 /// `CURIE_API_URL` is not a test-only knob: it is the documented env fallback of
-/// every local verb's `--api-url` (`cli/src/main.rs:1193`), with the same
+/// every local verb's `--api-url` (`cli/src/args/local.rs`), with the same
 /// default the CLI itself applies, so pointing the ladder's deployments read at
 /// a different API is production behavior that happens to also be the seam this
 /// control needs.
@@ -2936,6 +3664,7 @@ fn run_ladder_script(script: &Path, harness: &Path, envs: &[(&str, &str)]) -> Ou
         .env_remove("CURIE_E2E_PORT")
         .env_remove("CURIE_E2E_NETWORK")
         .env_remove("CURIE_E2E_OTEL")
+        .env_remove("DOCKER_PUBLISHED_HOST")
         .env_remove("CURIE_FAKE_MODEL")
         .env_remove("CURIE_API_KEY")
         .env_remove("CURIE_API_URL")
@@ -3701,6 +4430,7 @@ fn parity_passes_when_every_rung_reports_the_same_identity() {
     write_ladder_stubs(harness.path());
     let api_url = spawn_deployments_stub(&one_active_deployment());
     let digest = weather_bundle_sha256();
+    let docker_log = harness.path().join("docker-invocations.log");
 
     let output = run_ladder(
         harness.path(),
@@ -3708,6 +4438,7 @@ fn parity_passes_when_every_rung_reports_the_same_identity() {
             ("CURIE_E2E_TIERS", "skill,local,cluster"),
             ("CURIE_API_URL", &api_url),
             ("STUB_FAKE_MODEL", "1"),
+            ("STUB_DOCKER_INVOCATION_LOG", docker_log.to_str().unwrap()),
         ],
     );
 
@@ -3731,6 +4462,26 @@ fn parity_passes_when_every_rung_reports_the_same_identity() {
         "the ladder must name the common suite's case ids, so a reader can see \
          WHICH case set every rung shared rather than taking `parity` on \
          trust; transcript:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("confirmed: readonly bind snapshot and recorded published endpoint"),
+        "the skill rung must validate its immutable mount and saved endpoint; transcript:\n{transcript}"
+    );
+    let docker_invocations = fs::read_to_string(docker_log).expect("read Docker invocations");
+    assert!(
+        docker_invocations.lines().any(|command| {
+            command == "inspect --type container --format {{json .Mounts}} curie-e2e-runner"
+        }),
+        "the mount proof must inspect the owned runner's actual Mounts; invocations:\n{docker_invocations}"
+    );
+    let volume_name_read = r#"inspect --type container --format {{range .Mounts}}{{if eq .Destination "/plugin"}}{{if eq .Type "volume"}}{{.Name}}{{end}}{{end}}{{end}} curie-e2e-runner"#;
+    assert_eq!(
+        docker_invocations
+            .lines()
+            .filter(|command| *command == volume_name_read)
+            .count(),
+        2,
+        "the skill rung must capture both original and replacement snapshot mounts; invocations:\n{docker_invocations}"
     );
 }
 
@@ -3777,11 +4528,24 @@ fn skill_up_failure_surfaces_diagnostic_preserves_exit_and_cleans_up() {
         "no subsequent skill, eval, or local action may follow the refused boot; invocations:\n{invocations}"
     );
     let docker_invocations = fs::read_to_string(docker_log).expect("read Docker invocations");
+    let cleanup_inspect = r#"inspect --type container --format {{if eq (index .Config.Labels "curietech.ai/managed-by") "curie-cli"}}{{with index .Config.Labels "curietech.ai/snapshot-volume"}}{{.}}{{end}}{{end}} curie-e2e-runner"#;
+    assert!(
+        docker_invocations
+            .lines()
+            .any(|command| command == cleanup_inspect),
+        "cleanup must read the owned container's snapshot-volume label; invocations:\n{docker_invocations}"
+    );
     assert!(
         docker_invocations
             .lines()
             .any(|command| command == "rm -f curie-e2e-runner"),
         "the failure must still invoke cleanup for the owned runner; invocations:\n{docker_invocations}"
+    );
+    assert!(
+        !docker_invocations.lines().any(|command| {
+            command.starts_with("volume inspect ") || command.starts_with("volume rm ")
+        }),
+        "a bind-mounted runner must not trigger snapshot volume operations; invocations:\n{docker_invocations}"
     );
 }
 
@@ -5517,4 +6281,155 @@ stop_local_otel_sink
             assert!(!calls.contains("network rm acme-other_runner"), "{calls}");
         }
     }
+}
+
+fn exact_trace_names(workdir: &Path) -> Vec<String> {
+    fs::read_dir(workdir)
+        .expect("read oracle workdir")
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name();
+            let name = name.to_string_lossy().into_owned();
+            if name.starts_with("exact-trace.") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Run the extracted `query_exact_seed_trace`. The success path calls
+/// `sanitize_exact_trace_read`, so that sibling is defined too.
+fn run_query_exact_seed_trace(
+    bin_body: &str,
+    trace_id: &str,
+    expected_span: &str,
+) -> (Output, String, Vec<String>) {
+    let harness = tempfile::tempdir().expect("oracle harness");
+    let workdir = harness.path().join("work");
+    fs::create_dir(&workdir).expect("oracle workdir");
+    let summary_path = harness.path().join("github-step-summary.txt");
+    fs::write(&summary_path, "").expect("create step summary");
+    let bin_path = harness.path().join("observability-bin");
+    test_executable::install(&bin_path, bin_body);
+    let mut script = format!(
+        "set -u\n\
+         export WORKDIR={workdir}\n\
+         export OBSERVABILITY_POLL_ATTEMPTS=1\n\
+         export OBSERVABILITY_POLL_INTERVAL_SECONDS=0\n\
+         export GITHUB_STEP_SUMMARY={summary}\n\
+         export BIN={bin}\n",
+        workdir = sh_single_quote(&workdir),
+        summary = sh_single_quote(&summary_path),
+        bin = sh_single_quote(&bin_path),
+    );
+    script.push_str(&ladder_function("sanitize_exact_trace_read"));
+    script.push_str(&ladder_function("query_exact_seed_trace"));
+    script.push_str(&format!(
+        "query_exact_seed_trace local {trace_id} {expected_span} '' present\nexit $?\n",
+        trace_id = sh_single_quote(Path::new(trace_id)),
+        expected_span = sh_single_quote(Path::new(expected_span)),
+    ));
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("run query_exact_seed_trace");
+    let summary = fs::read_to_string(&summary_path).expect("read step summary");
+    let leftover = exact_trace_names(&workdir);
+    (output, summary, leftover)
+}
+
+#[test]
+fn oracle_writes_expected_span_and_query_before_teardown() {
+    let trace_id = "0123456789abcdef0123456789abcdef";
+    let (output, summary, leftover) =
+        run_query_exact_seed_trace("#!/bin/sh\nexit 1\n", trace_id, "curie.turn.process");
+    assert!(
+        !output.status.success(),
+        "a failing exact-trace query must return non-zero: {}",
+        transcript(&output)
+    );
+    assert!(
+        summary
+            .lines()
+            .any(|line| line == "expected span: curie.turn.process"),
+        "summary must name the expected span:\n{summary}"
+    );
+    assert!(
+        summary.lines().any(|line| {
+            line == format!("query: curie --json local observability run {trace_id}")
+        }),
+        "summary must name the observability query:\n{summary}"
+    );
+    assert!(
+        leftover.is_empty(),
+        "exact-trace temp files must be gone: {leftover:?}"
+    );
+}
+
+#[test]
+fn oracle_cluster_query_includes_the_selected_namespace_and_release() {
+    let trace_id = "abcdef0123456789abcdef0123456789";
+    let harness = tempfile::tempdir().expect("cluster oracle harness");
+    let workdir = harness.path().join("work");
+    fs::create_dir(&workdir).expect("oracle workdir");
+    let summary_path = harness.path().join("github-step-summary.txt");
+    fs::write(&summary_path, "").expect("create step summary");
+    let bin_path = harness.path().join("observability-bin");
+    test_executable::install(&bin_path, "#!/bin/sh\nexit 1\n");
+    let mut script = format!(
+        "set -u\n\
+         export WORKDIR={workdir}\n\
+         export OBSERVABILITY_POLL_ATTEMPTS=1\n\
+         export OBSERVABILITY_POLL_INTERVAL_SECONDS=0\n\
+         export GITHUB_STEP_SUMMARY={summary}\n\
+         export BIN={bin}\n\
+         ns_rel=(--namespace acme --release acme-dev)\n",
+        workdir = sh_single_quote(&workdir),
+        summary = sh_single_quote(&summary_path),
+        bin = sh_single_quote(&bin_path),
+    );
+    script.push_str(&ladder_function("query_exact_seed_trace"));
+    script.push_str(&format!(
+        "query_exact_seed_trace cluster {trace_id} curie.turn.process '' present\nexit $?\n",
+        trace_id = sh_single_quote(Path::new(trace_id)),
+    ));
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("run the cluster oracle");
+    let summary = fs::read_to_string(&summary_path).expect("read step summary");
+    assert!(!output.status.success(), "{}", transcript(&output));
+    assert!(
+        summary.lines().any(|line| {
+            line == format!(
+                "query: curie --json cluster observability --namespace acme --release acme-dev run {trace_id}"
+            )
+        }),
+        "summary must name the cluster query that was actually issued:\n{summary}"
+    );
+}
+
+#[test]
+fn oracle_success_does_not_write_a_failure_summary() {
+    let trace_id = "fedcba9876543210fedcba9876543210";
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' '{{\"trace\":{{\"id\":\"{trace_id}\"}},\"tree\":[{{\"name\":\"agent.run\",\"type\":\"SPAN\",\"children\":[]}}]}}'\nexit 0\n"
+    );
+    let (output, summary, leftover) = run_query_exact_seed_trace(&body, trace_id, "agent.run");
+    assert!(
+        output.status.success(),
+        "a matching agent.run span must exit 0: {}",
+        transcript(&output)
+    );
+    assert!(
+        summary.is_empty(),
+        "a successful query must leave the summary empty:\n{summary}"
+    );
+    assert!(
+        leftover.is_empty(),
+        "exact-trace temp files must be gone: {leftover:?}"
+    );
 }

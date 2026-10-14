@@ -27,6 +27,8 @@ from .progress import (
     ProgressCommand,
     ProgressMilestone,
     ProgressState,
+    progress_heading,
+    progress_text,
 )
 from .reply import (
     PROGRESS_REPLY_WIRE_VERSION,
@@ -75,5 +77,7 @@ __all__ = [
     "TurnStatus",
     "hook_conversation_id",
     "parse_scoped_conversation_id",
+    "progress_heading",
+    "progress_text",
     "scoped_conversation_id",
 ]

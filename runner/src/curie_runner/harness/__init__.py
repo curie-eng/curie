@@ -1,7 +1,7 @@
 """The harness contribution manifest and its entry-point registry (ADR-0060)."""
 
 from .claude import CLAUDE_CONTRIBUTION, get_contribution
-from .contribution import AuthSpec, BundleCompileResult, HarnessContribution, InstallSpec
+from .contribution import BundleCompileResult, HarnessContribution
 from .registry import (
     BUILTIN_HARNESS_CANONICAL_PATHS,
     ENTRY_POINT_GROUP,
@@ -9,14 +9,13 @@ from .registry import (
     HarnessNameCollisionError,
     MalformedHarnessContributionError,
     UnknownHarnessError,
+    UnsupportedHarnessError,
     discover_contributions,
     resolve_harness,
 )
 
 __all__ = [
     "HarnessContribution",
-    "InstallSpec",
-    "AuthSpec",
     "BundleCompileResult",
     "CLAUDE_CONTRIBUTION",
     "get_contribution",
@@ -26,6 +25,7 @@ __all__ = [
     "HarnessNameCollisionError",
     "MalformedHarnessContributionError",
     "UnknownHarnessError",
+    "UnsupportedHarnessError",
     "discover_contributions",
     "resolve_harness",
 ]

@@ -1,0 +1,5 @@
+# pip bootstrap for the runner image venv (#3843).
+# The base image is digest pinned and already bundles this pip, so pinning it
+# with hashes keeps the bootstrap reproducible and makes pip refuse a tampered
+# or substituted wheel. Bump together with the base image.
+pip==26.2.1 --hash=sha256:71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e --hash=sha256:f6ad667e89a1fe78046c8f13232b247200f5258d7828f3f7883d660878e0813f

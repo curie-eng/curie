@@ -14,7 +14,7 @@ from typing import Any
 
 import asyncpg
 from curie_api.config import get_settings
-from curie_api.sandbox_token import mint
+from curie_internal.sandbox_token import mint
 from sqlalchemy import make_url
 
 
@@ -138,7 +138,7 @@ def _hold_memory_update_gate(
 
     try:
         asyncio.run(hold())
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - existing broad catch retained
         errors.append(error)
         acquired.set()
 

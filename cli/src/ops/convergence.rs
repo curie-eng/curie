@@ -40,15 +40,17 @@ pub(super) enum Facet {
     Rollout,
 }
 
-/// The Drain facet is the worker drain Job, its post-upgrade release, and the
-/// attest Job (`charts/curie/templates/worker-upgrade-drain.yaml`). A refusal
-/// there means accepted work had not settled, or no successful drain is
-/// recorded for this revision, which `cluster upgrade` reports separately from
-/// every other hook. Schema-migrate stays [`Facet::Hook`].
+/// The Drain facet covers the worker drain, attest, hold, and post-upgrade
+/// release Jobs (`charts/curie/templates/worker-upgrade-drain.yaml`). A refusal
+/// means accepted work had not settled, no successful drain is recorded, or
+/// this revision's pause authority could not be renewed. `cluster upgrade`
+/// reports these failures separately from every other hook. Schema-migrate
+/// stays [`Facet::Hook`].
 fn hook_facet(name: &str) -> Facet {
     if name.ends_with("-upgrade-drain")
         || name.ends_with("-upgrade-drain-release")
         || name.ends_with("-upgrade-drain-attest")
+        || name.ends_with("-upgrade-drain-hold")
     {
         Facet::Drain
     } else {
@@ -450,6 +452,26 @@ fn selected(workload: &Value, pod: &Value) -> bool {
     })
 }
 
+/// A terminal pod (`Succeeded` or `Failed`) that is not being deleted. A
+/// kubelet-initiated termination (node-pressure eviction, graceful node
+/// shutdown) leaves that pod object behind and its ReplicaSet never deletes it,
+/// while the controller's own counts already cover active pods only (#4496).
+/// A terminal pod with a deletionTimestamp is still terminating and still counts.
+fn left_terminal(pod: &Value) -> bool {
+    matches!(text(pod, "/status/phase"), "Succeeded" | "Failed")
+        && pod
+            .pointer("/metadata/deletionTimestamp")
+            .is_none_or(Value::is_null)
+}
+
+/// A Pod the workload selects and that counts as a replica: terminal pods
+/// dropped by `left_terminal` are excluded. Node discovery and `workload()`
+/// share this one predicate so a pod that is not counted never triggers a Node
+/// read (an evicted pod's Node may be gone or unreadable).
+fn counted_pod(expected: &Value, item: &Value) -> bool {
+    text(item, "/kind") == "Pod" && selected(expected, item) && !left_terminal(item)
+}
+
 fn pod_reasons(pod: &Value, result: &mut Observation) {
     let name = text(pod, "/metadata/name");
     let pod_reason = text(pod, "/status/reason");
@@ -677,7 +699,7 @@ fn workload(
     compare_containers(expected, actual, false, nodes, result);
     let pods: Vec<_> = items
         .iter()
-        .filter(|item| text(item, "/kind") == "Pod" && selected(expected, item))
+        .filter(|item| counted_pod(expected, item))
         .collect();
     if pods.len() as u64 != desired {
         result.issue(
@@ -792,7 +814,7 @@ async fn observe_inner(opts: &CommonOpts) -> Result<Observation> {
     for object in &expected {
         for pod in namespaces[namespace(object, opts)]
             .iter()
-            .filter(|item| text(item, "/kind") == "Pod" && selected(object, item))
+            .filter(|item| counted_pod(object, item))
         {
             for (field, statuses) in [
                 ("containers", "containerStatuses"),
@@ -1021,6 +1043,29 @@ pub(super) async fn wait_for_observation(opts: &CommonOpts) -> Observation {
 mod timestamp_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn hook_facet_reports_a_failed_hold_as_a_drain_failure() {
+        let name = "acme-curie-upgrade-drain-hold";
+        let mut observation = Observation::default();
+        observation.issue(hook_facet(name), name, "Helm hook failed");
+        assert!(!observation.holds(Facet::Drain));
+        assert!(observation.holds(Facet::Hook));
+        assert_eq!(observation.issues, [format!("{name}: Helm hook failed")]);
+
+        for suffix in [
+            "upgrade-drain",
+            "upgrade-drain-attest",
+            "upgrade-drain-release",
+        ] {
+            assert_eq!(hook_facet(&format!("acme-curie-{suffix}")), Facet::Drain);
+        }
+        assert_eq!(hook_facet("acme-curie-schema-migrate"), Facet::Hook);
+        assert_eq!(
+            hook_facet("acme-curie-upgrade-drain-hold-other"),
+            Facet::Hook
+        );
+    }
 
     #[test]
     fn rfc3339_parses_helm_and_kubernetes_stamps() {

@@ -1,9 +1,15 @@
 import { test, expect, type Page } from "@playwright/test";
+import { stubConsoleSession } from "./support/consoleSession";
 
 // Pins the landing Overview split: the initial document must not download the
 // non-landing views or jszip, and navigating to Agents / Observability must
 // then request their deferred chunks. Chunk hashes change per build; identity
 // is "referenced by index.html" vs "requested only after navigation".
+
+// The console sits behind the login gate (#1047): sign this spec in.
+test.beforeEach(async ({ page }) => {
+  await stubConsoleSession(page);
+});
 
 const JS_ASSET = /\/assets\/([^/?]+\.js)(?:\?|$)/;
 

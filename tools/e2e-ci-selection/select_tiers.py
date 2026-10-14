@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import json
 import os
 import re
+import shlex
 import subprocess
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Any, cast
 
 import yaml
@@ -24,6 +29,32 @@ OUTPUT_KEYS = {
 # Jobs behind these tiers each boot a kind cluster. Callers omit them when
 # the run should not pay for that.
 KIND_TIERS = frozenset({"cluster", "released-upgrade"})
+# The kind-rung factory scenario runs only when one of these paths changes.
+FACTORY_PREFIXES = (
+    "apps/api/src/curie_api/factory_",
+    "apps/api/src/curie_api/routers/publications",
+    "apps/worker/src/curie_worker/factory",
+    "runner/src/curie_runner/verification.py",
+    "runner/src/curie_runner/preflight",
+    "examples/dark-factory",
+    "tools/factory-e2e",
+    "tools/model-script",
+    "tools/github-stub",
+)
+# The kind approval resume scenario (#4016) runs only when a worker or approval
+# path changes. Prefixes without a .py suffix match by raw string prefix, so
+# "curie_api/approval" covers every approval*.py module.
+APPROVAL_RESUME_PREFIXES = (
+    "apps/worker/src/curie_worker",
+    "apps/api/src/curie_api/resumequeue.py",
+    "apps/api/src/curie_api/resumereconciler.py",
+    "apps/api/src/curie_api/sweeper.py",
+    "apps/api/src/curie_api/routers/approvals.py",
+    "apps/api/src/curie_api/routers/approval_recovery.py",
+    "apps/api/src/curie_api/approval",
+    "runner/src/curie_runner/approval.py",
+    "cli/scripts/e2e-cluster-approval-resume-restarts.sh",
+)
 UPGRADE_WORKFLOW_JOBS = frozenset(
     {
         "e2e-released-upgrade",
@@ -33,6 +64,13 @@ UPGRADE_WORKFLOW_JOBS = frozenset(
     }
 )
 WORKFLOW_PATH = ".github/workflows/ci.yaml"
+CHART_JOB = "e2e-cluster-chart-regressions"
+SCENARIO_SCRIPT = re.compile(r"^(?:charts/curie/ci|scripts)/[^\s]+\.sh(?:$|[;|&])")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CARGO_MANIFEST = "cli/Cargo.toml"
+# A version-only diff (#3858) still runs this rung: it proves the new version
+# identity end to end on the new commit.
+VERSION_ONLY_TIERS = frozenset({"local-release"})
 HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
@@ -70,12 +108,27 @@ UniqueKeyLoader.add_constructor(
 
 
 @dataclass(frozen=True)
+class ChartScenario:
+    step: str
+    inputs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ChartScenarios:
+    job: str
+    shared_inputs: tuple[str, ...]
+    scenarios: dict[str, ChartScenario]
+
+
+@dataclass(frozen=True)
 class Registry:
     fallback: tuple[str, ...]
     exact: dict[str, tuple[str, ...]]
     prefixes: dict[str, tuple[str, ...]]
     ignored_exact: tuple[str, ...]
     ignored_prefixes: tuple[str, ...]
+    chart_scenarios: ChartScenarios
+    conditional_pytest_files: dict[str, tuple[str, ...]]
 
 
 def _mapping(value: object, label: str) -> dict[str, object]:
@@ -113,6 +166,44 @@ def _tier_rules(value: object, label: str) -> dict[str, tuple[str, ...]]:
 
 def _matches_prefix(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(f"{prefix}/")
+
+
+def _inputs(value: object, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value or any(
+        not isinstance(path, str) or not path or path.startswith("/") or path.endswith("/")
+        for path in value
+    ):
+        raise RegistryError(f"{label} must be a nonempty list of valid paths")
+    return tuple(value)
+
+
+def _chart_registry(value: object) -> ChartScenarios:
+    section = _mapping(value, "chart_scenarios")
+    if set(section) != {"job", "shared_inputs", "scenarios"}:
+        raise RegistryError("chart_scenarios must define job, shared_inputs, and scenarios")
+    if section["job"] != CHART_JOB:
+        raise RegistryError(f"chart_scenarios.job must be {CHART_JOB}")
+    shared_inputs = _inputs(section["shared_inputs"], "chart_scenarios.shared_inputs")
+    entries = _mapping(section["scenarios"], "chart_scenarios.scenarios")
+    if not entries:
+        raise RegistryError("chart_scenarios.scenarios must not be empty")
+    scenarios: dict[str, ChartScenario] = {}
+    step_names: set[str] = set()
+    for scenario_id, value in entries.items():
+        if not re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", scenario_id):
+            raise RegistryError("chart_scenarios contains an invalid scenario id")
+        label = f"chart_scenarios.scenarios.{scenario_id}"
+        entry = _mapping(value, label)
+        if set(entry) != {"step", "inputs"}:
+            raise RegistryError(f"{label} must define step and inputs")
+        step = entry["step"]
+        if not isinstance(step, str) or not step:
+            raise RegistryError(f"{label}.step must be a nonempty string")
+        if step in step_names:
+            raise RegistryError(f"duplicate chart scenario step: {step}")
+        step_names.add(step)
+        scenarios[scenario_id] = ChartScenario(step, _inputs(entry["inputs"], f"{label}.inputs"))
+    return ChartScenarios(CHART_JOB, shared_inputs, scenarios)
 
 
 # Fail-closed pytest set. Ignore rules may skip compose+pytest, but never
@@ -176,6 +267,27 @@ def _is_runtime_assertion(path: str) -> bool:
     return parent == RUNTIME_ASSERTION_DIR and name.endswith(".sh")
 
 
+def _matches_scenario(path: str, prefixes: tuple[str, ...]) -> bool:
+    for prefix in prefixes:
+        if path == prefix or path.startswith(f"{prefix}/"):
+            return True
+        if not prefix.endswith((".py", ".sh")) and path.startswith(prefix):
+            return True
+    return False
+
+
+def _needs_factory(paths: list[str]) -> bool:
+    if not paths:
+        return True
+    return any(_matches_scenario(path, FACTORY_PREFIXES) for path in paths)
+
+
+def _needs_approval_resume(paths: list[str]) -> bool:
+    if not paths:
+        return True
+    return any(_matches_scenario(path, APPROVAL_RESUME_PREFIXES) for path in paths)
+
+
 def _needs_cli_release(paths: list[str]) -> bool:
     if not paths:
         return True
@@ -222,17 +334,38 @@ def _load_registry(path: Path) -> Registry:
         ignored_prefixes.append(ignored)
 
     for ignored in ignored_prefixes:
-        # Reject only when this ignore would hide a selected exact path or prefix.
+        # Exact paths can opt back in, but selected prefixes cannot be hidden.
         # A more-specific ignored child of a selected prefix is a hole, not an overlap.
-        if any(_matches_prefix(path, ignored) for path in exact):
-            raise RegistryError(f"ignored prefix overlaps a selected rule: {ignored}")
         if any(_matches_prefix(prefix, ignored) for prefix in prefixes):
             raise RegistryError(f"ignored prefix overlaps a selected rule: {ignored}")
 
-    return Registry(fallback, exact, prefixes, tuple(ignored_exact), tuple(ignored_prefixes))
+    chart_scenarios = _chart_registry(root.get("chart_scenarios"))
+    conditional_entries = _mapping(
+        root.get("conditional_pytest_files"), "conditional_pytest_files"
+    )
+    conditional_pytest_files: dict[str, tuple[str, ...]] = {}
+    for test_file, value in conditional_entries.items():
+        if not test_file or test_file.startswith("/") or test_file.endswith("/"):
+            raise RegistryError("conditional_pytest_files contains an invalid path")
+        label = f"conditional_pytest_files.{test_file}"
+        inputs = _inputs(value, label)
+        if len(set(inputs)) != len(inputs):
+            raise RegistryError(f"{label} contains duplicate inputs")
+        conditional_pytest_files[test_file] = inputs
+    return Registry(
+        fallback,
+        exact,
+        prefixes,
+        tuple(ignored_exact),
+        tuple(ignored_prefixes),
+        chart_scenarios,
+        conditional_pytest_files,
+    )
 
 
 def _is_ignored(registry: Registry, path: str) -> bool:
+    if path in registry.exact:
+        return False
     return path in registry.ignored_exact or any(
         _matches_prefix(path, prefix) for prefix in registry.ignored_prefixes
     )
@@ -252,6 +385,80 @@ def _select_path(registry: Registry, path: str) -> set[str]:
             matched = True
             selected.update(tiers)
     return selected if matched else set(registry.fallback)
+
+
+def _chart_steps(job: str, head: str | None) -> list[dict[str, object]]:
+    if head is None:
+        content = Path(WORKFLOW_PATH).read_text(encoding="utf-8")
+    else:
+        content = subprocess.run(
+            ["git", "show", f"{head}:{WORKFLOW_PATH}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    try:
+        document = yaml.load(content, Loader=UniqueKeyLoader)
+    except yaml.YAMLError as exc:
+        raise RegistryError("workflow YAML is malformed") from exc
+    if not isinstance(document, dict):
+        raise RegistryError("workflow root must be a mapping")
+    jobs = _mapping(document.get("jobs"), "workflow jobs")
+    selected_job = _mapping(jobs.get(job), f"workflow job {job}")
+    steps = selected_job.get("steps")
+    if not isinstance(steps, list):
+        raise RegistryError(f"workflow job {job} must define a steps list")
+    return [_mapping(step, f"workflow job {job} step") for step in steps]
+
+
+def _is_scenario_step(step: dict[str, object]) -> bool:
+    run = step.get("run")
+    if not isinstance(run, str):
+        return False
+    for line in run.replace("\\\n", " ").splitlines():
+        try:
+            words = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        if any(SCENARIO_SCRIPT.match(word) for word in words):
+            return True
+    return False
+
+
+def _select_chart_scenarios(
+    registry: Registry,
+    paths: list[str],
+    selected_tiers: set[str],
+    push: bool,
+    head: str | None,
+) -> list[str]:
+    if "cluster" not in selected_tiers:
+        return []
+    chart = registry.chart_scenarios
+    fallback = any(
+        not _is_ignored(registry, path)
+        and path not in registry.exact
+        and not any(_matches_prefix(path, prefix) for prefix in registry.prefixes)
+        for path in paths
+    )
+    if push or fallback:
+        selected = set(chart.scenarios)
+    else:
+        selected = {
+            scenario_id
+            for scenario_id, scenario in chart.scenarios.items()
+            if any(
+                _matches_scenario(path, (*chart.shared_inputs, *scenario.inputs))
+                for path in paths
+            )
+        }
+    registered_steps = {scenario.step for scenario in chart.scenarios.values()}
+    if any(
+        _is_scenario_step(step) and step.get("name") not in registered_steps
+        for step in _chart_steps(chart.job, head)
+    ):
+        selected.add("unregistered")
+    return sorted(selected)
 
 
 def _changed_paths(base: str, head: str) -> list[str]:
@@ -321,7 +528,7 @@ def _workflow_job_spans(content: str) -> dict[str, tuple[int, int]]:
         alias_lines = (
             event.start_mark.line + 1
             for event in yaml.parse(content)
-            if isinstance(event, yaml.events.AliasEvent)
+            if isinstance(event, yaml.events.AliasEvent) and event.start_mark is not None
         )
         if any(
             beginning <= line < end
@@ -384,22 +591,85 @@ def _changes_upgrade_workflow_jobs(base: str, head: str) -> bool:
     return False
 
 
+def _load_atlas() -> ModuleType:
+    """Load release/atlas.py by path; it owns the version-only path set."""
+    path = REPO_ROOT / "release" / "atlas.py"
+    spec = importlib.util.spec_from_file_location("release_atlas", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_atlas = _load_atlas()
+
+
+def _head_version(head: str | None) -> str | None:
+    """The CLI version at `head` (revision mode) or in this checkout (path mode).
+
+    None when the manifest cannot be read, which keeps today's selection.
+    """
+    if head is None:
+        try:
+            manifest = (REPO_ROOT / CARGO_MANIFEST).read_text(encoding="utf-8")
+        except OSError:
+            return None
+    else:
+        completed = subprocess.run(
+            ["git", "show", f"{head}:{CARGO_MANIFEST}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return None
+        manifest = completed.stdout
+    try:
+        version = tomllib.loads(manifest)["package"]["version"]
+    except (tomllib.TOMLDecodeError, KeyError, TypeError):
+        return None
+    return version if isinstance(version, str) and version else None
+
+
+def _is_version_only(paths: list[str], head: str | None) -> bool:
+    """Does the diff change only version identity for the head's release (#3858)?"""
+    if not paths:
+        return False
+    version = _head_version(head)
+    if version is None:
+        return False
+    allowed: frozenset[str] = _atlas.version_only_paths(f"v{version}")
+    return set(paths) <= allowed
+
+
 def _render(
     selected: set[str],
     pytest_needed: bool,
+    pytest_deselect: list[str],
     images_needed: bool,
     cli_release_needed: bool,
     released_upgrade_full: bool,
+    version_only: bool,
+    factory_needed: bool,
+    approval_resume_needed: bool,
+    chart_scenarios: list[str],
 ) -> str:
     lines = [f"{OUTPUT_KEYS[tier]}={'true' if tier in selected else 'false'}" for tier in TIERS]
     skill_local = ",".join(tier for tier in TIERS[:2] if tier in selected)
     lines.append(f"skill_local_tiers={skill_local}")
     lines.append(f"pytest={'true' if pytest_needed else 'false'}")
+    lines.append("pytest_deselect=" + ",".join(pytest_deselect))
     lines.append(f"images={'true' if images_needed else 'false'}")
     lines.append(f"cli_release={'true' if cli_release_needed else 'false'}")
     lines.append(
         f"released_upgrade_full={'true' if released_upgrade_full else 'false'}"
     )
+    lines.append(f"version_only={'true' if version_only else 'false'}")
+    lines.append(f"factory={'true' if factory_needed else 'false'}")
+    lines.append(
+        f"approval_resume={'true' if approval_resume_needed else 'false'}"
+    )
+    lines.append("chart_scenarios=" + json.dumps(chart_scenarios, separators=(",", ":")))
     return "\n".join(lines) + "\n"
 
 
@@ -424,6 +694,9 @@ def _run() -> None:
 
     paths: list[str] = []
     workflow_upgrade_changed = False
+    version_only = False
+    factory_needed = False
+    approval_resume_needed = False
     if args.push:
         if args.path or args.base or args.head:
             raise RegistryError("push cannot be combined with paths or revisions")
@@ -431,6 +704,8 @@ def _run() -> None:
         pytest_needed = True
         images_needed = True
         cli_release_needed = True
+        factory_needed = True
+        approval_resume_needed = True
     else:
         if args.path and (args.base or args.head):
             raise RegistryError("paths cannot be combined with revisions")
@@ -448,6 +723,13 @@ def _run() -> None:
         pytest_needed = _needs_pytest(registry, paths)
         images_needed = _needs_images(paths)
         cli_release_needed = _needs_cli_release(paths)
+        version_only = _is_version_only(paths, args.head if not args.path else None)
+        factory_needed = _needs_factory(paths)
+        if factory_needed:
+            selected.add("cluster")
+        approval_resume_needed = _needs_approval_resume(paths)
+        if approval_resume_needed:
+            selected.add("cluster")
 
     if args.omit_kind:
         selected.difference_update(KIND_TIERS)
@@ -456,8 +738,34 @@ def _run() -> None:
         # never drops the tier that proves it.
         if any(_is_runtime_assertion(path) for path in paths):
             selected.add("cluster")
+        factory_needed = False
+        approval_resume_needed = False
     if workflow_upgrade_changed:
         selected.add("released-upgrade")
+    if version_only:
+        # A release bump changes only version identity, so the proof the base
+        # already has still holds (#3858). Run the rung that exercises the new
+        # version, and leave pytest to the required job's release tests.
+        selected = set(VERSION_ONLY_TIERS)
+        pytest_needed = False
+
+    pytest_deselect = []
+    if not args.push and paths and pytest_needed and all(
+        path in registry.exact
+        or path in registry.ignored_exact
+        or any(
+            _matches_prefix(path, prefix)
+            for prefix in (*registry.prefixes, *registry.ignored_prefixes)
+        )
+        for path in paths
+    ):
+        pytest_deselect = sorted(
+            test_file
+            for test_file, inputs in registry.conditional_pytest_files.items()
+            if not any(
+                _matches_prefix(path, prefix) for path in paths for prefix in inputs
+            )
+        )
 
     # Ordinary pull requests run one upgrade matrix smoke shard. A change to
     # the upgrade jobs themselves runs the full matrix and released chart jobs
@@ -465,6 +773,10 @@ def _run() -> None:
     released_upgrade_full = (
         args.push or workflow_upgrade_changed
     ) and "released-upgrade" in selected
+    chart_scenarios = _select_chart_scenarios(
+        registry, paths, selected, args.push, args.head if not args.path else None
+    )
+    print("chart_scenarios=" + json.dumps(chart_scenarios, separators=(",", ":")))
 
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
@@ -474,9 +786,14 @@ def _run() -> None:
             _render(
                 selected,
                 pytest_needed,
+                pytest_deselect,
                 images_needed,
                 cli_release_needed,
                 released_upgrade_full,
+                version_only,
+                factory_needed,
+                approval_resume_needed,
+                chart_scenarios,
             )
         )
 

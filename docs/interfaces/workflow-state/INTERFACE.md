@@ -29,8 +29,9 @@ the same shared function. The swap
 axis here is the state backend, and it is a SOFT seam: the store is reached over the HTTP
 state API, not a typed in-process port, so a second backend is a persistence change behind
 that API rather than a `Protocol` swap. A separate concrete route store, `AffinityStore`,
-records one narrow thing (the `thread_key -> sandbox route` binding on Valkey, with atomic
-acquire and TTL expiry) and is not the general store. The typed in-process port the kernel
+records the `thread_key -> sandbox route` binding on Valkey, with atomic acquire and
+TTL expiry, plus claim credential ids retained for release reporting. It is not the
+general store. The typed in-process port the kernel
 would write arbitrary run state through (#23) is still unextracted, per "the second
 implementation teaches the interface."
 
@@ -87,17 +88,46 @@ Neither path uses the platform key, and neither carries the same reach as the
 runner's own loaders: there are two scoped-token scopes (ADR-0033), minted
 side by side at `apps/worker/src/curie_worker/binding.py::BindingResolver.boot_env`.
 The broad `state` scope backs `CURIE_MEMORY_TOKEN` / `CURIE_HISTORY_TOKEN` and
-reaches every namespace, because the memory and history loaders must read and
-write the reserved ones to rehydrate the agent across a suspend/resume. The narrow
+reaches every namespace, because the memory and history loaders must read the
+reserved ones (and write transcripts) to rehydrate the agent across a
+suspend/resume. On the `memory` namespace its claims narrow it (ADR-0188,
+`apps/api/src/curie_api/routers/state.py::_check_memory_reach`): the `binding`
+claim names the one channel whose memory it reaches, the boot-env token is
+`memory: "read"` and carries a `cred` id, and only the per-turn write credential on `Event.memory_token`
+may write, only fact keys, with the API stamping its `sender` claim as the
+author. A token with no `memory` claim (a pre-ADR-0188 worker's) fails closed
+there. On `transcript` the `binding` claim holds it to its own channel's threads
+(#3767, `apps/api/src/curie_api/routers/state.py::_check_transcript_reach`):
+the API maps a transcript key back to its binding with
+`apps/api/src/curie_api/threadkeys.py::transcript_binding`, ignoring the
+identity segment, and the key's binding (and a binding path's) must be the
+claim's. The unbound credential of a targetless cron reaches only its own
+agent's `@cron` threads, a key no producer builds is refused, and a transcript
+listing is filtered to the reachable threads. A pre-ADR-0188 token keeps its
+transcript reach until it expires, with a "legacy sandbox token" warning and a
+`curie.state.legacy_token` count. General state keeps the broad reach. The narrow
 `state.app` scope backs the bundle-facing `CURIE_STATE_TOKEN` and is refused on
 the reserved namespaces server-side by
 `apps/api/src/curie_api/routers/state.py::forbid_reserved_namespace`, so a skill
 cannot bypass the MCP tool's own client-side refusal by composing
 `CURIE_STATE_URL` itself. `list_namespaces` has no `namespace` path param and so
 cannot be gated that way; it filters the reserved namespaces out of the response
-for an app-scoped caller instead (#856). Which scope authenticated is carried
-through as `apps/api/src/curie_api/routers/state.py::StateCaller`, resolved by
+for an app-scoped caller instead (#856), and drops the `memory` row for a `state`
+caller listing a binding whose memory it may not reach. The `transcript`
+summary row, which counts every channel's threads, is returned to the platform
+key only. Which scope
+authenticated, with its verified claims, is carried through as
+`apps/api/src/curie_api/routers/state.py::StatePrincipal` (its
+`apps/api/src/curie_api/routers/state.py::StateCaller`), resolved by
 `apps/api/src/curie_api/routers/state.py::require_state_access`.
+
+Both boot scopes carry the same `cred` id. Before accepting either one,
+`apps/api/src/curie_api/routers/state.py::_check_credential_current` checks Valkey
+for a release record: a released id is refused with 403, and an unavailable check
+returns 503. A token without `cred` retains its expiry-based lifetime. The worker reports
+release through `apps/api/src/curie_api/routers/state.py::release_sandbox_credential`,
+which keeps the refusal record for 24 hours. Thus sandbox state access depends on
+Valkey authorization state as well as the Postgres data backend.
 
 Every completed state delete, shared or binding scoped and including a
 transcript, and every operator memory edit or delete, leaves one INFO line on
@@ -120,6 +150,7 @@ route-state contract:
 - `replace(thread_key, record, ttl_seconds) -> None` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.replace`)
 - `replace_if_generation(...) -> bool`: the CAS primitive, replacing a route only while its claim and generation match (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.replace_if_generation`)
 - `touch(thread_key, ttl_seconds) -> bool` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.touch`)
+- `touch_if_live_claim(thread_key, claim_name, ttl_seconds) -> bool`: extend the TTL only while the route still names that claim; the substrate calls it in production (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.touch_if_live_claim`)
 - `delete_if_claim(thread_key, claim_name) -> bool` — guarded delete via a Lua script (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.delete_if_claim`, script at `apps/worker/src/curie_worker/sandbox/affinity.py::_DELETE_IF_CLAIM`)
 - `pressure_get(thread_key) -> RouteRecord | None` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.pressure_get`)
 - `pressure_candidates(...) -> PressureScanResult` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.pressure_candidates`)
@@ -129,6 +160,17 @@ route-state contract:
 - `mark_suspended(thread_key, history_ref, ttl_seconds) -> RouteRecord` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.mark_suspended`)
 
 The stored value is a `RouteRecord` (`apps/worker/src/curie_worker/sandbox/types.py::RouteRecord`) JSON-serialized. This is route affinity, not general workflow state.
+
+The same concrete store also retains `(agent, credential id)` by claim name for up to
+24 hours through `AffinityStore.remember_claim_credential`, looks it up through
+`AffinityStore.claim_credential`, removes it through `AffinityStore.forget_claim_credential`,
+and scans retained records through `AffinityStore.iter_claim_credentials`
+(`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore`). These are ids,
+not bearer tokens. `SandboxSubstrate._report_boot_credential` reports the release
+before claim deletion and removes the retained record only after the API accepts it.
+A failed or unwired report remains for reaping to retry after confirming the claim is
+gone (`apps/worker/src/curie_worker/sandbox/substrate.py::SandboxSubstrate._retry_unreported_credentials`).
+Its TTL backstops those pending reports; it is not proof that the API recorded a release.
 
 ## Implementations today
 
@@ -158,8 +200,8 @@ and `edit_memory`
 `apps/api/src/curie_api/routers/memory.py::create_memory`,
 `apps/api/src/curie_api/routers/memory.py::edit_memory`) and
 `apps/api/src/curie_api/routers/memory.py::delete_memory` all `select(WorkflowStateEntry)`
-against the `memory` namespace, and the router imports the state module's private
-`apps/api/src/curie_api/routers/state.py::_enforce_caps` to reuse the size caps rather
+against the `memory` namespace, and the router imports the state module's public
+`apps/api/src/curie_api/routers/state.py::enforce_caps` to reuse the size caps rather
 than inheriting them from a route. That import is deliberate (the state module documents
 it as the reason `RESERVED_NAMESPACES` is a literal there and not an import back from
 `routers.memory`), but the consequence for this seam is concrete: a second state backend

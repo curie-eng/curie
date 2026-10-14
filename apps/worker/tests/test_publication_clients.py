@@ -1,4 +1,4 @@
-"""GitHub lineage recovery uses stored PR identity and marked commit ancestry."""
+"""The worker's publication clients: credentials, API code host routes, lineage, transcript."""
 
 from __future__ import annotations
 
@@ -10,12 +10,13 @@ import httpx
 import pytest
 from channel_protocol import scoped_conversation_id
 from curie_worker.publication_clients import (
-    GitHubPublicationLookup,
+    PublicationCodeHostClient,
     PublicationCredentialClient,
     PublicationLineageClient,
     PublicationTranscriptClient,
 )
 from curie_worker.publication_loop import (
+    PublicationCredential,
     PublicationIdentityUnavailable,
     PublicationLineageRefused,
     PublicationReconcileError,
@@ -43,70 +44,314 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
-async def test_stored_pull_number_is_the_only_identity_used_for_lineage_truth() -> None:
+CODE_HOST_PREFIX = f"/v1/internal/publications/{PUBLICATION_ID}"
+
+
+def _pull_out(**overrides: object) -> dict[str, object]:
+    pull: dict[str, object] = {
+        "number": 123,
+        "url": PR_URL,
+        "state": "open",
+        "head_sha": REVISION_HEAD,
+        "head_ref": BRANCH,
+    }
+    pull.update(overrides)
+    return pull
+
+
+def _code_host(_handler: object, client: httpx.AsyncClient) -> PublicationCodeHostClient:
+    return PublicationCodeHostClient(
+        api_base_url=f"{LINEAGE_API_BASE}/", worker_token=WORKER_TOKEN, client=client
+    )
+
+
+async def test_stored_pull_request_is_read_by_number_through_the_api() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        assert request.url.path == f"/repos/{REPO}/pulls/123"
+        return httpx.Response(200, json=_pull_out(state="merged"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        observed = await _code_host(handler, client).read_pull_request(PUBLICATION_ID, 123)
+
+    assert [(r.method, r.url.path, dict(r.url.params)) for r in requests] == [
+        ("GET", f"{CODE_HOST_PREFIX}/pull-request", {"pr_number": "123"})
+    ]
+    assert requests[0].headers["X-Curie-Worker-Token"] == WORKER_TOKEN
+    assert "authorization" not in requests[0].headers
+    assert (observed.number, observed.url, observed.state, observed.head_sha) == (
+        123,
+        PR_URL,
+        "merged",
+        REVISION_HEAD,
+    )
+    assert observed.head_ref == BRANCH
+
+
+async def test_a_different_pull_request_from_the_api_is_refused() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_pull_out(number=124))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PublicationReconcileError, match="wrong stored pull request"):
+            await _code_host(handler, client).read_pull_request(PUBLICATION_ID, 123)
+
+
+@pytest.mark.parametrize("pr_number", [0, -1])
+async def test_an_invalid_stored_number_is_refused_before_network_access(pr_number: int) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PublicationReconcileError, match="lookup is invalid"):
+            await _code_host(handler, client).read_pull_request(PUBLICATION_ID, pr_number)
+
+
+@pytest.mark.parametrize(
+    ("status", "detail", "message"),
+    [
+        (
+            409,
+            {"code": "publication.lineage_stale", "message": "the stored number differs"},
+            "stored pull request lookup returned HTTP 409: the stored number differs",
+        ),
+        (
+            503,
+            {
+                "code": "publication.code_host_unavailable",
+                "message": "the code host answered timeout",
+            },
+            "stored pull request lookup returned HTTP 503: the code host answered timeout",
+        ),
+        (401, "invalid internal worker token", "returned HTTP 401: invalid internal worker"),
+    ],
+)
+async def test_api_refusals_surface_their_fixed_message(
+    status: int, detail: object, message: str
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"detail": detail})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PublicationReconcileError, match=message):
+            await _code_host(handler, client).read_pull_request(PUBLICATION_ID, 123)
+
+
+async def test_an_unreachable_api_is_a_reconcile_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PublicationReconcileError, match="branch lookup was unreachable"):
+            await _code_host(handler, client).read_branch_head(PUBLICATION_ID)
+
+
+@pytest.mark.parametrize("head", [REVISION_HEAD, None])
+async def test_branch_head_is_read_for_the_publication(head: str | None) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"head_sha": head})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        observed = await _code_host(handler, client).read_branch_head(PUBLICATION_ID)
+
+    assert observed == head
+    assert [(r.method, r.url.path) for r in requests] == [
+        ("GET", f"{CODE_HOST_PREFIX}/branch-head")
+    ]
+
+
+async def test_an_invalid_branch_head_is_refused() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"head_sha": "not-a-sha"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PublicationReconcileError, match="invalid branch head"):
+            await _code_host(handler, client).read_branch_head(PUBLICATION_ID)
+
+
+async def test_revision_commit_is_verified_by_the_api_with_the_revision_marker() -> None:
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert (request.method, request.url.path) == (
+            "POST",
+            f"{CODE_HOST_PREFIX}/revision-commit",
+        )
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"commit_sha": REVISION_HEAD})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        verified = await _code_host(handler, client).verify_revision_commit(
+            PUBLICATION_ID, REVISION_HEAD, revision_id=REVISION_ID, expected_parent=PRIOR_HEAD
+        )
+
+    assert verified == REVISION_HEAD
+    assert bodies == [
+        {
+            "commit_sha": REVISION_HEAD,
+            "revision_id": str(REVISION_ID),
+            "expected_parent": PRIOR_HEAD,
+        }
+    ]
+
+
+async def test_a_refused_revision_commit_carries_the_api_reason() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            200,
+            409,
             json={
-                "number": 123,
-                "html_url": PR_URL,
-                "state": "open",
-                "merged_at": None,
-                "title": "A human may edit this without changing identity",
-                "body": "Mutable prose is not a recovery key.",
-                "head": {"ref": BRANCH, "sha": REVISION_HEAD},
-                "base": {"ref": "main"},
+                "detail": {
+                    "code": "publication.revision_mismatch",
+                    "message": "remote revision has the wrong expected parent",
+                }
             },
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        observed = await GitHubPublicationLookup(client).read_pr_by_number(
-            REPO,
-            123,
-            "Bearer operator-token",
-        )
-
-    assert len(requests) == 1
-    assert observed.number == 123
-    assert observed.url == PR_URL
-    assert observed.state == "open"
-    assert observed.head_sha == REVISION_HEAD
-    assert observed.head_ref == BRANCH
+        with pytest.raises(PublicationReconcileError, match="wrong expected parent"):
+            await _code_host(handler, client).verify_revision_commit(
+                PUBLICATION_ID, REVISION_HEAD, revision_id=REVISION_ID, expected_parent=PRIOR_HEAD
+            )
 
 
-@pytest.mark.parametrize("html_base", ["https://github.com", "https://github.example.com/forge"])
-async def test_publication_credential_accepts_only_the_configured_clone_origin(
-    html_base: str,
-) -> None:
-    clone_url = f"{html_base}/{REPO}.git"
-    requests: list[httpx.Request] = []
+async def test_a_different_verified_commit_is_refused() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"commit_sha": PRIOR_HEAD})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PublicationReconcileError, match="different commit"):
+            await _code_host(handler, client).verify_revision_commit(
+                PUBLICATION_ID, REVISION_HEAD, revision_id=REVISION_ID, expected_parent=PRIOR_HEAD
+            )
+
+
+@pytest.mark.parametrize("state", ["open", "closed", "merged"])
+async def test_recovery_adopts_the_api_answer_for_the_expected_head(state: str) -> None:
+    bodies: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(
-            200,
-            headers={"Cache-Control": "no-store"},
-            json={
-                "repo_full_name": REPO,
-                "clone_url": clone_url,
-                "authorization_header": "Bearer fixture-publication-token",
-            },
+        assert (request.method, request.url.path) == ("POST", f"{CODE_HOST_PREFIX}/pull-request")
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json=_pull_out(state=state))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        recovered = await _code_host(handler, client).recover_pull_request(
+            PUBLICATION_ID, expected_head_sha=REVISION_HEAD
         )
 
+    assert recovered is not None
+    assert (recovered.number, recovered.state, recovered.head_sha) == (123, state, REVISION_HEAD)
+    assert bodies == [{"expected_head_sha": REVISION_HEAD}]
+
+
+async def test_recovery_of_an_absent_branch_is_none() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        recovered = await _code_host(handler, client).recover_pull_request(
+            PUBLICATION_ID, expected_head_sha=REVISION_HEAD
+        )
+
+    assert recovered is None
+
+
+async def test_recovery_refuses_a_pull_request_on_another_head() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_pull_out(head_sha="c" * 40))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PublicationReconcileError, match="does not match the expected commit"):
+            await _code_host(handler, client).recover_pull_request(
+                PUBLICATION_ID, expected_head_sha=REVISION_HEAD
+            )
+
+
+async def test_recovery_refuses_an_invalid_expected_head_before_network_access() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PublicationReconcileError, match="expected commit is invalid"):
+            await _code_host(handler, client).recover_pull_request(
+                PUBLICATION_ID, expected_head_sha="HEAD"
+            )
+
+
+async def test_code_host_client_refuses_construction_without_internal_worker_auth() -> None:
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(ValueError, match="internal worker auth"):
+            PublicationCodeHostClient(api_base_url=LINEAGE_API_BASE, worker_token="", client=client)
+
+
+def _credential_body(**overrides: object) -> dict[str, object]:
+    body: dict[str, object] = {
+        "repo_full_name": REPO,
+        "clone_url": f"https://github.example.com/forge/{REPO}.git",
+        "authorization_header": "Basic eC1hY2Nlc3MtdG9rZW46Zml4dHVyZQ==",
+        "origin": "https://github.example.com/forge",
+        "header_form": "authorization_basic",
+        "ca_bundle_ref": None,
+    }
+    body.update(overrides)
+    return body
+
+
+async def _redeem(body: dict[str, object], requests: list[httpx.Request] | None = None) -> object:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if requests is not None:
+            requests.append(request)
+        return httpx.Response(200, headers={"Cache-Control": "no-store"}, json=body)
+
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        credential = await PublicationCredentialClient(
-            api_base_url=LINEAGE_API_BASE,
-            worker_token=WORKER_TOKEN,
-            github_html_base=html_base,
-            client=http,
+        return await PublicationCredentialClient(
+            api_base_url=LINEAGE_API_BASE, worker_token=WORKER_TOKEN, client=http
         ).redeem(PUBLICATION_ID)
 
-    assert credential.clean_clone_url == clone_url
-    assert credential.authorization_header == "Bearer fixture-publication-token"
+
+@pytest.mark.parametrize(
+    ("origin", "repo", "header_form", "ca_bundle_ref"),
+    [
+        ("https://github.com", REPO, "authorization_basic", None),
+        ("https://github.example.com/forge", REPO, "authorization_basic", None),
+        # Any code host the API names (ADR 0197): a nested path, another
+        # header form and a mounted trust bundle are data, not GitHub rules.
+        (
+            "https://gitlab.example.com",
+            "group/sub/project",
+            "private_token",
+            "/etc/curie/code-host-trust/ca.crt",
+        ),
+    ],
+)
+async def test_publication_credential_takes_origin_header_form_and_ca_as_data(
+    origin: str, repo: str, header_form: str, ca_bundle_ref: str | None
+) -> None:
+    clone_url = f"{origin}/{repo}.git"
+    requests: list[httpx.Request] = []
+
+    credential = await _redeem(
+        _credential_body(
+            repo_full_name=repo,
+            clone_url=clone_url,
+            origin=origin,
+            header_form=header_form,
+            ca_bundle_ref=ca_bundle_ref,
+        ),
+        requests,
+    )
+
+    assert credential == PublicationCredential(
+        clean_clone_url=clone_url,
+        authorization_header="Basic eC1hY2Nlc3MtdG9rZW46Zml4dHVyZQ==",
+        origin=origin,
+        header_form=header_form,  # type: ignore[arg-type]
+        ca_bundle_ref=ca_bundle_ref,
+    )
     assert len(requests) == 1
     assert requests[0].method == "POST"
     assert requests[0].url.path == f"/v1/internal/publications/{PUBLICATION_ID}/credential"
@@ -114,496 +359,52 @@ async def test_publication_credential_accepts_only_the_configured_clone_origin(
 
 
 @pytest.mark.parametrize(
-    "clone_url",
+    ("overrides", "message"),
     [
-        f"https://github.com/{REPO}.git",
-        f"https://other.example.com/forge/{REPO}.git",
-        f"https://github.example.com/{REPO}.git",
-        f"https://user@github.example.com/forge/{REPO}.git",
-        f"https://github.example.com/forge/{REPO}.git?token=example",
-        f"https://github.example.com/forge/{REPO}.git#example",
+        ({"clone_url": f"https://github.com/{REPO}.git"}, "clone URL"),
+        ({"clone_url": f"https://other.example.com/forge/{REPO}.git"}, "clone URL"),
+        ({"clone_url": f"https://github.example.com/{REPO}.git"}, "clone URL"),
+        ({"clone_url": f"https://user@github.example.com/forge/{REPO}.git"}, "clone URL"),
+        ({"clone_url": f"https://github.example.com/forge/{REPO}.git?token=example"}, "clone URL"),
+        ({"clone_url": f"https://github.example.com/forge/{REPO}.git#example"}, "clone URL"),
+        ({"origin": "https://user@github.example.com/forge"}, "clone URL"),
+        ({"origin": "http://github.example.com/forge"}, "clone URL"),
+        ({"header_form": "cookie"}, "header form"),
+        ({"ca_bundle_ref": "relative/ca.crt"}, "CA bundle"),
+        ({"authorization_header": "Basic a\nb"}, "authorization"),
     ],
 )
-async def test_enterprise_publication_credential_refuses_foreign_clone_origins(
-    clone_url: str,
+async def test_publication_credential_refuses_an_unclean_transport(
+    overrides: dict[str, object], message: str
 ) -> None:
+    with pytest.raises(PublicationReconcileError, match=message):
+        await _redeem(_credential_body(**overrides))
+
+
+async def test_metadata_update_is_asked_of_the_api_and_carries_its_update_time() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_pull_out(updated_at="2026-10-05T12:00:00Z"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        pull = await _code_host(handler, client).update_pull_request_metadata(PUBLICATION_ID)
+
+    [request] = requests
+    assert request.method == "POST"
+    assert request.url.path == f"/v1/internal/publications/{PUBLICATION_ID}/pull-request/metadata"
+    assert request.headers["X-Curie-Worker-Token"] == WORKER_TOKEN
+    assert pull.updated_at is not None and pull.updated_at.tzinfo is not None
+
+
+async def test_a_naive_update_time_from_the_api_is_refused() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            headers={"Cache-Control": "no-store"},
-            json={
-                "repo_full_name": REPO,
-                "clone_url": clone_url,
-                "authorization_header": "Bearer fixture-publication-token",
-            },
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        credential_client = PublicationCredentialClient(
-            api_base_url=LINEAGE_API_BASE,
-            worker_token=WORKER_TOKEN,
-            github_html_base="https://github.example.com/forge",
-            client=http,
-        )
-        with pytest.raises(PublicationReconcileError, match="clone URL"):
-            await credential_client.redeem(PUBLICATION_ID)
-
-
-@pytest.mark.parametrize("returned_base", ["https://github.example.com/forge", "https://github.com"])
-async def test_enterprise_lineage_lookup_validates_the_configured_html_origin(
-    returned_base: str,
-) -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(
-            200,
-            json={
-                "number": 123,
-                "html_url": f"{returned_base}/{REPO}/pull/123",
-                "state": "open",
-                "merged_at": None,
-                "head": {"ref": BRANCH, "sha": REVISION_HEAD},
-                "base": {"ref": "main"},
-            },
-        )
+        return httpx.Response(200, json=_pull_out(updated_at="2026-10-05T12:00:00"))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        lookup = GitHubPublicationLookup(
-            client, api_base_url="https://github.example.com/forge/api/v3"
-        )
-        if returned_base == "https://github.com":
-            with pytest.raises(PublicationReconcileError, match="wrong stored pull request"):
-                await lookup.read_pr_by_number(REPO, 123, "Bearer fixture-publication-token")
-        else:
-            pull = await lookup.read_pr_by_number(REPO, 123, "Bearer fixture-publication-token")
-            assert pull.url == f"{returned_base}/{REPO}/pull/123"
-
-    assert [str(request.url) for request in requests] == [
-        f"https://github.example.com/forge/api/v3/repos/{REPO}/pulls/123"
-    ]
-
-
-async def test_github_lineage_reads_refuse_empty_auth_before_network_access() -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        raise AssertionError("unauthenticated GitHub request escaped")
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        lookup = GitHubPublicationLookup(client)
-        with pytest.raises(PublicationReconcileError, match="requires authorization"):
-            await lookup.read_pr_by_number(REPO, 123, "")
-        with pytest.raises(PublicationReconcileError, match="requires authorization"):
-            await lookup.verify_revision_commit(
-                REPO,
-                REVISION_HEAD,
-                revision_id=REVISION_ID,
-                expected_parent=PRIOR_HEAD,
-                authorization_header="",
-            )
-
-    assert requests == []
-
-
-@pytest.mark.parametrize(
-    ("state", "merged_at", "expected"),
-    [("closed", None, "closed"), ("closed", "2026-09-03T00:00:00Z", "merged")],
-)
-async def test_stored_pull_number_reports_terminal_state_without_title_matching(
-    state: str,
-    merged_at: str | None,
-    expected: str,
-) -> None:
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "number": 123,
-                "html_url": PR_URL,
-                "state": state,
-                "merged_at": merged_at,
-                "title": "Edited title",
-                "body": "Edited body",
-                "head": {"ref": BRANCH, "sha": REVISION_HEAD},
-                "base": {"ref": "main"},
-            },
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        observed = await GitHubPublicationLookup(client).read_pr_by_number(
-            REPO, 123, "Bearer operator-token"
-        )
-
-    assert observed.state == expected
-
-
-@pytest.mark.parametrize(
-    ("message", "parent", "error"),
-    [
-        ("Approved revision without a trailer", PRIOR_HEAD, "revision marker"),
-        (
-            f"Approved revision\n\nCurie-Revision: {REVISION_ID}",
-            "c" * 40,
-            "expected parent",
-        ),
-    ],
-    ids=("missing-marker", "wrong-parent"),
-)
-async def test_lost_response_adopts_only_the_marked_revision_with_expected_parent(
-    message: str,
-    parent: str,
-    error: str,
-) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == f"/repos/{REPO}/git/commits/{REVISION_HEAD}"
-        return httpx.Response(
-            200,
-            json={
-                "sha": REVISION_HEAD,
-                "message": message,
-                "parents": [{"sha": parent}],
-            },
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(PublicationReconcileError, match=error):
-            await GitHubPublicationLookup(client).verify_revision_commit(
-                REPO,
-                REVISION_HEAD,
-                revision_id=REVISION_ID,
-                expected_parent=PRIOR_HEAD,
-                authorization_header="Bearer operator-token",
-            )
-
-
-async def test_lost_response_adopts_the_exact_marked_revision_commit() -> None:
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "sha": REVISION_HEAD,
-                "message": f"Approved revision\n\nCurie-Revision: {REVISION_ID}",
-                "parents": [{"sha": PRIOR_HEAD}],
-            },
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        verified = await GitHubPublicationLookup(client).verify_revision_commit(
-            REPO,
-            REVISION_HEAD,
-            revision_id=REVISION_ID,
-            expected_parent=PRIOR_HEAD,
-            authorization_header="Bearer operator-token",
-        )
-
-    assert verified == REVISION_HEAD
-
-
-async def test_missing_job_recovery_reads_the_exact_lineage_branch_head() -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(200, json={"object": {"sha": REVISION_HEAD}})
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        head = await GitHubPublicationLookup(client).read_branch_head(
-            REPO,
-            BRANCH,
-            "Bearer rotated-installation-token",
-        )
-
-    assert head == REVISION_HEAD
-    assert len(requests) == 1
-    assert requests[0].url.raw_path.decode() == (
-        f"/repos/{REPO}/git/ref/heads/curie%2Fthread-lineage-example"
-    )
-    assert requests[0].headers["Authorization"] == "Bearer rotated-installation-token"
-
-
-@pytest.mark.parametrize(
-    ("state", "merged_at", "terminal"),
-    [
-        ("closed", None, "closed"),
-        ("closed", "2026-09-03T00:00:00Z", "merged"),
-    ],
-)
-async def test_first_pr_recovery_recognizes_exact_terminal_pull_without_posting(
-    state: str,
-    merged_at: str | None,
-    terminal: str,
-) -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if request.url.path == f"/repos/{REPO}":
-            return httpx.Response(200, json={"default_branch": "main"})
-        assert request.url.path == f"/repos/{REPO}/pulls"
-        assert request.url.params["state"] == "all"
-        assert request.url.params["head"] == f"acme-corp:{BRANCH}"
-        return httpx.Response(
-            200,
-            json=[
-                {
-                    "number": 123,
-                    "html_url": PR_URL,
-                    "state": state,
-                    "merged_at": merged_at,
-                    "title": "Update repository",
-                    "body": "Approved platform publication.",
-                    "head": {
-                        "ref": BRANCH,
-                        "sha": REVISION_HEAD,
-                        "repo": {"full_name": REPO},
-                    },
-                    "base": {"ref": "main", "repo": {"full_name": REPO}},
-                }
-            ],
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        recovered = await GitHubPublicationLookup(client).recover_pr_by_head(
-            REPO,
-            BRANCH,
-            "Update repository",
-            "Approved platform publication.",
-            expected_head_sha=REVISION_HEAD,
-            authorization_header="Bearer rotated-installation-token",
-        )
-
-    assert recovered is not None
-    assert (
-        recovered.number,
-        recovered.url,
-        recovered.state,
-        recovered.head_sha,
-        recovered.head_ref,
-    ) == (
-        123,
-        PR_URL,
-        terminal,
-        REVISION_HEAD,
-        BRANCH,
-    )
-    assert [request.method for request in requests] == ["GET", "GET"]
-
-
-async def test_first_pr_recovery_rejects_pull_whose_head_was_replaced() -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if request.url.path == f"/repos/{REPO}":
-            return httpx.Response(200, json={"default_branch": "main"})
-        assert request.url.path == f"/repos/{REPO}/pulls"
-        return httpx.Response(
-            200,
-            json=[
-                {
-                    "number": 123,
-                    "html_url": PR_URL,
-                    "state": "open",
-                    "merged_at": None,
-                    "title": "Update repository",
-                    "body": "Approved platform publication.",
-                    "head": {
-                        "ref": BRANCH,
-                        "sha": "c" * 40,
-                        "repo": {"full_name": REPO},
-                    },
-                    "base": {"ref": "main", "repo": {"full_name": REPO}},
-                }
-            ],
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(PublicationReconcileError, match="expected commit"):
-            await GitHubPublicationLookup(client).recover_pr_by_head(
-                REPO,
-                BRANCH,
-                "Update repository",
-                "Approved platform publication.",
-                expected_head_sha=REVISION_HEAD,
-                authorization_header="Bearer rotated-installation-token",
-            )
-
-    assert [request.method for request in requests] == ["GET", "GET"]
-
-
-async def test_lost_create_response_recognizes_terminal_pull_without_second_post() -> None:
-    requests: list[httpx.Request] = []
-    pull_queries = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal pull_queries
-        requests.append(request)
-        if request.url.path == f"/repos/{REPO}":
-            return httpx.Response(200, json={"default_branch": "main"})
-        if request.url.raw_path.decode().endswith("/git/ref/heads/curie%2Fthread-lineage-example"):
-            return httpx.Response(200, json={"object": {"sha": REVISION_HEAD}})
-        if request.method == "POST":
-            raise httpx.ReadError("create response was lost", request=request)
-        assert request.url.path == f"/repos/{REPO}/pulls"
-        pull_queries += 1
-        if pull_queries == 1:
-            return httpx.Response(200, json=[])
-        return httpx.Response(
-            200,
-            json=[
-                {
-                    "number": 123,
-                    "html_url": PR_URL,
-                    "state": "closed",
-                    "merged_at": None,
-                    "title": "Update repository",
-                    "body": "Approved platform publication.",
-                    "head": {
-                        "ref": BRANCH,
-                        "sha": REVISION_HEAD,
-                        "repo": {"full_name": REPO},
-                    },
-                    "base": {"ref": "main", "repo": {"full_name": REPO}},
-                }
-            ],
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        recovered = await GitHubPublicationLookup(client).recover_pr_by_head(
-            REPO,
-            BRANCH,
-            "Update repository",
-            "Approved platform publication.",
-            expected_head_sha=REVISION_HEAD,
-            authorization_header="Bearer rotated-installation-token",
-        )
-
-    assert recovered is not None
-    assert recovered.state == "closed"
-    assert recovered.head_sha == REVISION_HEAD
-    assert [request.method for request in requests].count("POST") == 1
-    assert pull_queries == 2
-
-
-async def test_lost_create_response_adopts_exact_open_pull_once() -> None:
-    requests: list[httpx.Request] = []
-    pull_queries = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal pull_queries
-        requests.append(request)
-        if request.url.path == f"/repos/{REPO}":
-            return httpx.Response(200, json={"default_branch": "main"})
-        if request.url.raw_path.decode().endswith("/git/ref/heads/curie%2Fthread-lineage-example"):
-            return httpx.Response(200, json={"object": {"sha": REVISION_HEAD}})
-        if request.method == "POST":
-            raise httpx.ReadError("create response was lost", request=request)
-        assert request.url.path == f"/repos/{REPO}/pulls"
-        assert request.url.params["state"] == "all"
-        pull_queries += 1
-        if pull_queries == 1:
-            return httpx.Response(200, json=[])
-        return httpx.Response(
-            200,
-            json=[
-                {
-                    "number": 123,
-                    "html_url": PR_URL,
-                    "state": "open",
-                    "merged_at": None,
-                    "title": "Update repository",
-                    "body": "Approved platform publication.",
-                    "head": {
-                        "ref": BRANCH,
-                        "sha": REVISION_HEAD,
-                        "repo": {"full_name": REPO},
-                    },
-                    "base": {"ref": "main", "repo": {"full_name": REPO}},
-                }
-            ],
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        recovered = await GitHubPublicationLookup(client).recover_pr_by_head(
-            REPO,
-            BRANCH,
-            "Update repository",
-            "Approved platform publication.",
-            expected_head_sha=REVISION_HEAD,
-            authorization_header="Bearer rotated-installation-token",
-        )
-
-    assert recovered is not None
-    assert (
-        recovered.number,
-        recovered.url,
-        recovered.state,
-        recovered.head_sha,
-        recovered.head_ref,
-    ) == (
-        123,
-        PR_URL,
-        "open",
-        REVISION_HEAD,
-        BRANCH,
-    )
-    assert [request.method for request in requests].count("POST") == 1
-    assert pull_queries == 2
-
-
-async def test_draft_recovery_posts_draft_and_refuses_a_non_draft_pull() -> None:
-    posts: list[dict[str, object]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == f"/repos/{REPO}":
-            return httpx.Response(200, json={"default_branch": "main"})
-        if request.url.raw_path.decode().endswith("/git/ref/heads/curie%2Fthread-lineage-example"):
-            return httpx.Response(200, json={"object": {"sha": REVISION_HEAD}})
-        if request.method == "POST":
-            posts.append(json.loads(request.content))
-            return httpx.Response(
-                201,
-                json={
-                    "number": 123,
-                    "html_url": PR_URL,
-                    "state": "open",
-                    "draft": False,
-                    "title": "Update repository",
-                    "body": "Approved platform publication.",
-                    "head": {
-                        "ref": BRANCH,
-                        "sha": REVISION_HEAD,
-                        "repo": {"full_name": REPO},
-                    },
-                    "base": {"ref": "main", "repo": {"full_name": REPO}},
-                },
-            )
-        return httpx.Response(200, json=[])
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(PublicationReconcileError, match="required draft"):
-            await GitHubPublicationLookup(client).recover_pr_by_head(
-                REPO,
-                BRANCH,
-                "Update repository",
-                "Approved platform publication.",
-                expected_head_sha=REVISION_HEAD,
-                authorization_header="Bearer rotated-installation-token",
-                draft=True,
-            )
-
-    assert posts == [
-        {
-            "title": "Update repository",
-            "head": BRANCH,
-            "base": "main",
-            "body": "Approved platform publication.",
-            "draft": True,
-        }
-    ]
+        with pytest.raises(PublicationReconcileError, match="invalid pull request"):
+            await _code_host(handler, client).update_pull_request_metadata(PUBLICATION_ID)
 
 
 async def test_publication_result_is_appended_once_to_the_durable_transcript() -> None:

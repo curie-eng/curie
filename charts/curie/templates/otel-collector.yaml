@@ -1,4 +1,5 @@
 {{- if .Values.otelCollector.deploy }}
+{{- $checksumExtraEnv := include "curie.extraEnv" (dict "root" . "workload" "otelCollector" "env" .Values.otelCollector.extraEnv) -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -107,6 +108,13 @@ spec:
   template:
     metadata:
       annotations:
+        {{- with (include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list )
+        "refs" (list (dict "name" (include "curie.otlpAuthHeaderSecretName" $) "key" "otlpAuthHeader"))
+        "env" $checksumExtraEnv)) }}
+        checksum/secret: {{ . }}
+        {{- end }}
         {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}
@@ -159,7 +167,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.otlpAuthHeaderSecretName" . }}
                   key: otlpAuthHeader
-            {{- include "curie.extraEnv" (dict "root" . "workload" "otelCollector" "env" .Values.otelCollector.extraEnv) | nindent 12 }}
+            {{- $checksumExtraEnv | nindent 12 }}
           ports:
             - name: otlp-grpc
               containerPort: 4317

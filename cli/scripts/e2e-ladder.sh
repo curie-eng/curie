@@ -1196,8 +1196,26 @@ PY
 # Query one exact ID only. Raw CLI output remains in a mode-0600 file and only
 # sanitize_exact_trace_read reaches stdout.
 query_exact_seed_trace() {
+    # Defined inside the function so a harness that extracts only this function
+    # still records a miss. A failure writes the expected span and the query
+    # before the temp files are removed.
+    record_exact_trace_oracle_miss() {
+        local expected_csv="$1" tier="$2" trace_id="$3"
+        local query="curie --json ${tier} observability run ${trace_id}"
+        # A cluster read also carries the selected namespace and release.
+        # ${ns_rel[*]+x} stays unset-safe under `set -u` when this function
+        # is sourced alone for a local query.
+        if [[ "$tier" == "cluster" && -n "${ns_rel[*]+x}" ]]; then
+            query="curie --json cluster observability ${ns_rel[*]} run ${trace_id}"
+        fi
+        [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
+        {
+            printf 'expected span: %s\n' "$expected_csv"
+            printf 'query: %s\n' "$query"
+        } >> "$GITHUB_STEP_SUMMARY"
+    }
     local tier="$1" trace_id="$2" expected_csv="${3:-}" expected_decision="${4:-}" expected_state="${5:-present}" expected_tool="${6:-}"
-    local attempt code=0 private_read safe_read membership observation_count saw_valid=0
+    local attempt code=0 private_read safe_read membership observation_count saw_valid=0 saw_query_error=0
     local last_query_state="query-error"
     LAST_QUERY_MEMBERSHIP=""
     LAST_QUERY_OBSERVATION_COUNT="0"
@@ -1205,6 +1223,7 @@ query_exact_seed_trace() {
     private_read="$(mktemp "$WORKDIR/exact-trace.XXXXXX")"
     safe_read="$(mktemp "$WORKDIR/safe-trace.XXXXXX")"
     [[ "$trace_id" =~ ^[0-9a-f]{32}$ ]] || {
+        record_exact_trace_oracle_miss "$expected_csv" "$tier" "$trace_id"
         rm -f "$private_read" "$safe_read"
         echo "seed-invalid: exact trace id is not 32 lowercase hex characters" >&2
         return 1
@@ -1217,12 +1236,14 @@ query_exact_seed_trace() {
             "$BIN" --json cluster observability "${ns_rel[@]}" \
                 run "$trace_id" > "$private_read" 2>/dev/null || code=$?
         else
+            record_exact_trace_oracle_miss "$expected_csv" "$tier" "$trace_id"
             rm -f "$private_read" "$safe_read"
             echo "seed-invalid: exact trace query tier is unknown" >&2
             return 1
         fi
         if [[ "$expected_state" == "absent" ]]; then
             if (( code == 0 )); then
+                record_exact_trace_oracle_miss "$expected_csv" "$tier" "$trace_id"
                 rm -f "$private_read" "$safe_read"
                 echo "exact trace was queryable while the exporter was required to be failing" >&2
                 return 1
@@ -1247,6 +1268,7 @@ if not stable_not_found or not isinstance(fix, str) or not fix.strip():
     raise SystemExit(1)
 PY
             then
+                record_exact_trace_oracle_miss "$expected_csv" "$tier" "$trace_id"
                 rm -f "$private_read" "$safe_read"
                 echo "exact trace absence query returned an unexpected failure" >&2
                 return 1
@@ -1257,12 +1279,12 @@ PY
             continue
         fi
         if [[ "$expected_state" == "observe" && "$code" -ne 0 ]]; then
-            if (( code != 1 )) || ! python3 - "$private_read" "$trace_id" <<'PY'
+            if (( code != 1 && code != 3 )) || ! python3 - "$private_read" "$trace_id" "$code" <<'PY'
 import json
 import pathlib
 import sys
 
-source, trace_id = sys.argv[1:3]
+source, trace_id, code = sys.argv[1:4]
 try:
     value = json.loads(pathlib.Path(source).read_text())
 except (OSError, json.JSONDecodeError):
@@ -1270,15 +1292,24 @@ except (OSError, json.JSONDecodeError):
 expected = f'observability trace "{trace_id}" was not found'
 if not isinstance(value, dict) or set(value) != {"error", "fix"}:
     raise SystemExit(1)
-if value.get("error") not in {"exact trace not found", expected}:
+if code == "1" and value.get("error") not in {"exact trace not found", expected}:
+    raise SystemExit(1)
+if not isinstance(value.get("error"), str) or not value["error"].strip():
     raise SystemExit(1)
 if not isinstance(value.get("fix"), str) or not value["fix"].strip():
     raise SystemExit(1)
 PY
             then
+                record_exact_trace_oracle_miss "$expected_csv" "$tier" "$trace_id"
                 rm -f "$private_read" "$safe_read"
                 echo "exact trace observation returned an unexpected query failure" >&2
                 return 1
+            fi
+            if (( code == 3 )); then
+                saw_query_error=1
+                last_query_state="query-error"
+            else
+                last_query_state="not-found"
             fi
             if (( attempt < OBSERVABILITY_POLL_ATTEMPTS )); then
                 sleep "$OBSERVABILITY_POLL_INTERVAL_SECONDS"
@@ -1290,6 +1321,7 @@ PY
             if ! sanitize_exact_trace_read "$trace_id" "$private_read" "$expected_csv" "$expected_decision" > "$safe_read"; then
                 last_query_state="malformed-response"
                 if [[ "$expected_state" == "observe" ]]; then
+                    record_exact_trace_oracle_miss "$expected_csv" "$tier" "$trace_id"
                     rm -f "$private_read" "$safe_read"
                     echo "exact trace response was malformed rather than selectively incomplete" >&2
                     return 1
@@ -1337,7 +1369,7 @@ PY
         rm -f "$private_read" "$safe_read"
         return 0
     fi
-    if [[ "$expected_state" == "observe" ]]; then
+    if [[ "$expected_state" == "observe" && "$saw_valid" == "0" && "$saw_query_error" == "0" && "$last_query_state" == "not-found" ]]; then
         LAST_QUERY_MEMBERSHIP="false"
         LAST_QUERY_OBSERVATION_COUNT="0"
         python3 - "$trace_id" <<'PY'
@@ -1351,11 +1383,15 @@ PY
         rm -f "$private_read" "$safe_read"
         return 0
     fi
+    if [[ "$expected_state" == "observe" && "$saw_query_error" == "1" && "$last_query_state" == "not-found" ]]; then
+        last_query_state="query-error"
+    fi
     echo "exact trace failed the bounded ingestion poll: $last_query_state (cli exit $code)" >&2
     if [[ "$last_query_state" == "incomplete-membership" ]]; then
         # Only the allowlisted projection, never the original trace response.
         cat "$safe_read" >&2
     fi
+    record_exact_trace_oracle_miss "$expected_csv" "$tier" "$trace_id"
     rm -f "$private_read" "$safe_read"
     return 1
 }
@@ -1380,7 +1416,7 @@ seed_ordinary_turn() {
             return 1
         fi
         stream_start="$(capture_stream_cursor "$tier")" || return 1
-        out="$("$BIN" --json local message --channel C0LOCALDEV "ordinary correlation $marker" || true)"
+        out="$("$BIN" --json local message --channel C0LOCALDEV "Reply with exactly: $marker. Do not call tools or investigate anything." || true)"
         assert_finalized_reply "$tier ordinary correlation" "$out" || return 1
         assert_product_runner_endpoints || return 1
         stream_end="$(capture_stream_cursor "$tier")" || return 1
@@ -1995,7 +2031,7 @@ assert_model_mode() {
 
 # A deploy receipt proves what was UPLOADED. It does NOT prove the following
 # `message` and `eval` turns ran that deployment: `deploy` defaults the
-# environment to dev (cli/src/commands.rs) while the worker's runtime binding
+# environment to dev (cli/src/commands/deploy.rs) while the worker's runtime binding
 # prefers prod over recency (apps/worker/src/curie_worker/binding.py's
 # `ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC`) over the ACTIVE
 # set only. So one stale active prod row for this agent serves the turn while the
@@ -2029,7 +2065,7 @@ assert_model_mode() {
 # stack rather than fighting a foreign one.
 assert_sole_active_deployment() {
     local label="$1" agent_id="$2" deployment_id="$3" api_base verdict listed
-    # The CLI's own public inputs, with the CLI's own defaults (cli/src/main.rs's
+    # The CLI's own public inputs, with the CLI's own defaults (cli/src/args/'s
     # --api-url/--api-key clap declarations, defaulting to the crate constants
     # DEFAULT_LOCAL_API_URL and DEFAULT_API_KEY in cli/src/message.rs). Reading
     # the same two variables means this queries whatever API the deploy above
@@ -2054,7 +2090,7 @@ if not isinstance(rows, list):
     print(repr(rows)[:400])
     sys.exit(0)
 # Validate EVERY row before filtering, and fail on any that is not a
-# DeploymentOut (apps/api/src/curie_api/schemas.py). Skipping malformed rows
+# DeploymentOut (apps/api/src/curie_api/schemas/deployments.py). Skipping malformed rows
 # inside the filter instead would be fail-open on an unexpected shape: a
 # response carrying the expected active row PLUS a null or a truncated object
 # would be silently reduced to the one good row and pass as proof that exactly
@@ -2515,7 +2551,7 @@ connector_mode() {
 # provisioned into THIS RUN's process environment and the scratch bundle copies
 # only. Nothing of the operator's is read, written or restored: the CLI resolves
 # a connector credential from the environment first and the host vault second
-# (cli/src/commands.rs resolve_connector_secret), so exporting is sufficient and
+# (cli/src/commands/connector_images.rs resolve_connector_secret), so exporting is sufficient and
 # `curie secrets set` -- which writes the operator's real store -- is never run.
 #
 # The kubeconfigs need no cluster. These rungs assert HOSTING, not live
@@ -3450,7 +3486,7 @@ case_connector_changed_source_skill() {
         echo "=== curie build --plugin-dir (changed source, registry delivery: $CONNECTOR_REGISTRY) ==="
         "$BIN" build --plugin-dir "$dir" --registry "$CONNECTOR_REGISTRY"
     else
-        echo "the rebuild below is skill up's OWN (cli/src/commands.rs, ADR 0113 Decision 3), not a hand-run build: the production consumer of a stale lock is the tier's bring-up, so that is what this case exercises."
+        echo "the rebuild below is skill up's OWN (cli/src/commands/skill.rs, ADR 0113 Decision 3), not a hand-run build: the production consumer of a stale lock is the tier's bring-up, so that is what this case exercises."
     fi
 
     "$BIN" skill up --fake-model --plugin-dir "$dir" --name "$CHANGED_RUNNER_NAME"
@@ -3503,7 +3539,7 @@ assert_connector_source_change() {
 }
 
 # A cluster deploy whose locked image the REGISTRY cannot resolve must refuse,
-# and must refuse before it has touched the cluster (ADR 0113, cli/src/commands.rs
+# and must refuse before it has touched the cluster (ADR 0113, cli/src/commands/connector_images.rs
 # registry_preflight). The failure this guards against is not theoretical: the
 # lock is what a node pulls from, so an image that is gone from the registry
 # surfaces after apply as a pod stuck on ImagePullBackOff, with a healthy
@@ -3732,7 +3768,9 @@ def documents(name):
     if not path.exists():
         return []
     result = []
-    for line in path.read_text(errors="replace").splitlines():
+    # The fileexporter writes JSON and its newline separately. Only the newline
+    # commits a record; leave any trailing export fragment for the next query.
+    for line in path.read_text(errors="replace").split("\n")[:-1]:
         if line.strip():
             result.append(json.loads(line))
     return result
@@ -4526,7 +4564,7 @@ case_local_langfuse_invalid_auth() {
         marker="curie-seed-invalid-auth-$$-$RANDOM"
         stream_start="$(capture_stream_cursor local)" || exit 1
         out="$("$BIN" --json local message --channel C0LOCALDEV \
-            "observable exporter rejection $marker" || true)"
+            "Reply with exactly: $marker. Do not call tools or investigate anything." || true)"
         assert_finalized_reply "local invalid-auth seed" "$out" || exit 1
         stream_end="$(capture_stream_cursor local)" || exit 1
         failed_trace_id="$(discover_trace_id_for_seed local "$marker" "$stream_start" "$stream_end")" || exit 1
@@ -5700,7 +5738,7 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
 
     # The full runtime-binding assertion is CONDITIONAL here, and only here,
     # because the cluster API key has no default -- it is resolved from the
-    # installed release (cli/src/main.rs's --api-key value_parser) -- and CI's
+    # installed release (cli/src/args/mod.rs's --api-key value_parser) -- and CI's
     # cluster ladder job supplies none, so requiring it would red a job this
     # change cannot touch.
     #

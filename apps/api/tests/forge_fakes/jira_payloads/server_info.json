@@ -1,0 +1,19 @@
+{
+  "baseUrl": "https://acme.atlassian.example",
+  "version": "1001.0.0-SNAPSHOT",
+  "versionNumbers": [
+    1001,
+    0,
+    0
+  ],
+  "deploymentType": "Cloud",
+  "buildNumber": 100274,
+  "buildDate": "2026-03-01T00:00:00.000+0000",
+  "serverTime": "2026-03-08T01:59:30.000-0500",
+  "scmInfo": "0000000000000000000000000000000000000000",
+  "serverTitle": "Jira",
+  "defaultLocale": {
+    "locale": "en_US"
+  },
+  "serverTimeZone": "Etc/UTC"
+}

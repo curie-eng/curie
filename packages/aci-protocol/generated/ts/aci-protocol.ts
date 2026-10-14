@@ -20,7 +20,7 @@ export type ExpiresInSeconds = number | null;
  * authority-bearing per #544/ADR-0046, so the value domain is a named, exported
  * part of the contract rather than an inline annotation.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "GateKind".
  */
 export type GateKind = "permission" | "policy";
@@ -31,6 +31,7 @@ export type GrantedTool = string | null;
 export type ReplyAdapter = string | null;
 export type ReplyChannel = string;
 export type ReplyEndpoint = string | null;
+export type ReplyIdentity = string | null;
 export type ReplyKind = string;
 export type ReplyPlaceholder = string | null;
 export type Route = string | null;
@@ -47,10 +48,13 @@ export type ApprovalGrantArguments = {
 export type ApprovalGrantTool = string | null;
 export type ApprovalRequiredTools = string[] | null;
 export type ApprovalResumedKind = string | null;
+export type AttachmentsManifest = string | null;
 export type BaseUrl = string | null;
 export type BundleRef = string | null;
 export type BundleVersion = string | null;
 export type ChannelBound = boolean | null;
+export type ChannelKind = string | null;
+export type ChannelMemoryRef = string | null;
 export type ConnectorAgent = string | null;
 export type ConnectorCallerToken = string | null;
 export type ConnectorNamespace = string | null;
@@ -65,13 +69,19 @@ export type HistoryToken = string | null;
 export type IssueReadToken = string | null;
 export type IssueReadUrl = string | null;
 export type MaxTurns = number | null;
+export type MemoryMaxFacts = number | null;
 export type MemoryToken = string | null;
+export type MemoryWrites = boolean | null;
 export type MetricsTemporalityPreference = string | null;
 export type Model = string | null;
 export type ModelEnvKey = string | null;
 export type Port = number | null;
 export type ProgressToken = string | null;
 export type ProgressUrl = string | null;
+export type RepoCaBundle = string | null;
+export type RepoOrigin = string | null;
+export type RepoPath = string | null;
+export type ReviewerModel = string | null;
 export type RunnerToken = string | null;
 export type MaxOutputTokensPerRun = number;
 export type MaxUsdPerDay = number;
@@ -87,6 +97,8 @@ export type SessionId = string;
 export type StateToken = string | null;
 export type StateUrl = string | null;
 export type Thinking = string | null;
+export type Token = string;
+export type Url = string;
 export type Classification = string | null;
 export type Message = string;
 export type Type = "error";
@@ -106,6 +118,7 @@ export type TargetUrl1 = string | null;
 export type Total = number;
 export type HistoryRef1 = string | null;
 export type Kind = "event";
+export type MemoryToken1 = string | null;
 export type AgentId2 = string;
 export type Capability = string;
 export type ConversationId1 = string;
@@ -138,7 +151,7 @@ export type Text = string;
  * wire, never read as null, because reading it as null would run a restricted
  * turn unrestricted. A second value is a breaking change, decided on its own.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "ToolAccess".
  */
 export type ToolAccess = "read-only";
@@ -169,14 +182,14 @@ export type AgentId3 = string;
 export type Name1 = string;
 export type SlotUtc = string;
 /**
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "InboundMessage".
  */
 export type InboundMessage = Event | Interrupt;
 export type Kind1 = "interrupt";
 export type Reason = string;
 /**
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "OutboundEvent".
  */
 export type OutboundEvent = TextDelta | ToolNote | Final | ErrorEvent | SideEffectFlag;
@@ -243,7 +256,7 @@ export type Text4 = string;
  * Wire tokens follow the section 0 spelling; ``classified failure`` in prose
  * becomes the token ``classified-failure`` on the wire.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "SessionStatus".
  */
 export type SessionStatus1 = "done" | "idle-awaiting-input" | "classified-failure" | "awaiting-approval";
@@ -271,12 +284,12 @@ export type SessionStatus1 = "done" | "idle-awaiting-input" | "classified-failur
  * ENUM VALUE -- breaking under this package's rules, so it is a deliberate,
  * separately-decided bump rather than something this change assumes.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "TurnSource".
  */
 export type TurnSource1 = "slack" | "webhook" | "cron";
 
-export interface ACIProtocolV0511 {
+export interface ACIProtocolV0522 {
   [k: string]: unknown;
 }
 /**
@@ -304,7 +317,7 @@ export interface ACIProtocolV0511 {
  * nullable because ``slack`` legitimately has no adapter -- its route is the
  * worker's configured Slack origin.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "ApprovalRequest".
  */
 export interface ApprovalRequest {
@@ -320,6 +333,7 @@ export interface ApprovalRequest {
   reply_adapter?: ReplyAdapter;
   reply_channel: ReplyChannel;
   reply_endpoint?: ReplyEndpoint;
+  reply_identity?: ReplyIdentity;
   reply_kind: ReplyKind;
   reply_placeholder: ReplyPlaceholder;
   route?: Route;
@@ -360,7 +374,7 @@ export interface ApprovalRequest {
  * found the field would reasonably assume it worked. Resolution is the producing
  * adapter's job, through ``id``, when a resolve path is actually built.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "Attachment".
  */
 export interface Attachment {
@@ -396,7 +410,7 @@ export interface Attachment {
  * baked template default, the worker's value is per-agent model routing. Do not
  * collapse either producer list to a single value.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "BootEnv".
  */
 export interface BootEnv {
@@ -406,10 +420,13 @@ export interface BootEnv {
   approval_grant_tool?: ApprovalGrantTool;
   approval_required_tools?: ApprovalRequiredTools;
   approval_resumed_kind?: ApprovalResumedKind;
+  attachments_manifest?: AttachmentsManifest;
   base_url?: BaseUrl;
   bundle_ref?: BundleRef;
   bundle_version?: BundleVersion;
   channel_bound?: ChannelBound;
+  channel_kind?: ChannelKind;
+  channel_memory_ref?: ChannelMemoryRef;
   connector_agent?: ConnectorAgent;
   connector_caller_token?: ConnectorCallerToken;
   connector_namespace?: ConnectorNamespace;
@@ -424,13 +441,19 @@ export interface BootEnv {
   issue_read_token?: IssueReadToken;
   issue_read_url?: IssueReadUrl;
   max_turns?: MaxTurns;
+  memory_max_facts?: MemoryMaxFacts;
   memory_token?: MemoryToken;
+  memory_writes?: MemoryWrites;
   metrics_temporality_preference?: MetricsTemporalityPreference;
   model?: Model;
   model_env_key?: ModelEnvKey;
   port?: Port;
   progress_token?: ProgressToken;
   progress_url?: ProgressUrl;
+  repo_ca_bundle?: RepoCaBundle;
+  repo_origin?: RepoOrigin;
+  repo_path?: RepoPath;
+  reviewer_model?: ReviewerModel;
   runner_token?: RunnerToken;
   session: SessionConfig;
   state_token?: StateToken;
@@ -445,7 +468,7 @@ export interface BootEnv {
  * section 0 describes these as per-tool secrets via K8s Secret refs, so the
  * contract carries the reference, not the secret material itself.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "SessionConfig".
  */
 export interface SessionConfig {
@@ -464,7 +487,7 @@ export interface SessionConfig {
  * ``task_budget_hint`` is the optional hint passed through to the model so it
  * self paces (section 6b); it is not a hard ceiling.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "Budget".
  */
 export interface Budget {
@@ -480,7 +503,7 @@ export interface Budget {
  * fields the prototype used (endpoint, headers, protocol); any others pass
  * through as raw env vars untouched and are out of scope for this typed view.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "OtelConfig".
  */
 export interface OtelConfig {
@@ -490,9 +513,39 @@ export interface OtelConfig {
   [k: string]: unknown;
 }
 /**
+ * Dedicated proxy authority for one admitted logical turn under ADR 0100.
+ *
+ * Only the kernel may issue and send it, over authenticated event or steer
+ * control requests to a server advertising enforcement. The configured URL
+ * identifies the trusted platform proxy, not a provider endpoint. HTTP URL
+ * syntax alone establishes no trust; the implementing lanes must verify the
+ * trusted configuration. The provider credential remains in the platform.
+ *
+ * The signed token binds audience ``channel.read``, agent, deployment, bundle
+ * grant, logical turn, credential generation and finite expiry. Every read
+ * requires a live matching turn, current binding and adapter membership, and
+ * atomic successful page accounting. Renewal preserves the logical turn and
+ * its budget, revokes the old generation, and never extends channel scope.
+ * A steer cannot change the original inbound binding or authenticated scope.
+ * Terminal paths revoke and clear the capability; null on a steer clears it.
+ *
+ * Tokens must stay out of environment variables, hooks, subprocesses, model
+ * arguments, logs, telemetry, transcripts, checkpoints and persisted state.
+ * This model declares the transport contract. It issues no token and supplies
+ * no read operation, authorization, renewal or runtime revocation behavior.
+ *
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
+ * via the `definition` "ChannelReadCapability".
+ */
+export interface ChannelReadCapability {
+  token: Token;
+  url: Url;
+  [k: string]: unknown;
+}
+/**
  * A classified failure surfaced to the platform.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "ErrorEvent".
  */
 export interface ErrorEvent {
@@ -509,7 +562,7 @@ export interface ErrorEvent {
  * worker consumes off it (formerly the API's ``EvalJobRequest`` and the
  * worker's ``EvalWorkItem``, which had drifted on ``bundle_ref``).
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "EvalJob".
  */
 export interface EvalJob {
@@ -529,7 +582,7 @@ export interface EvalJob {
  * Byte-identical across both lanes before this promotion, so it carries no
  * semantic decisions.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "EvalReport".
  */
 export interface EvalReport {
@@ -553,12 +606,31 @@ export interface EvalReport {
  * ``TOOL_ACCESS_STATUS_FIELD`` (TOOL-ACCESS-4), because a server that does
  * not enforce it ignores it.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * ``memory_token`` is the per-turn signed state credential the runner's
+ * memory tools present for writes (MEMORY-TOKEN-1). Null means the turn
+ * carries no write credential. It is never a BootEnv key or an env var, and
+ * it is sent only on the runner POST (``/v1/event``, ``/v1/steer``;
+ * MEMORY-TOKEN-2). ``repr=False`` keeps the value out of ``repr(event)`` and
+ * log ``%r``; a consumer must not place it in env, logs, hook or subprocess
+ * input, or persisted state (MEMORY-TOKEN-3).
+ *
+ * ``channel_read`` pairs a trusted platform proxy URL with a dedicated
+ * ephemeral signed credential for one logical turn. Only the kernel sends it
+ * on authenticated ``/v1/event`` and ``/v1/steer`` requests after the server
+ * advertises actual enforcement under ``CHANNEL_READ_STATUS_FIELD``. Missing
+ * or null means no capability, and a steer clears any previous capability.
+ * It is not a BootEnv or SessionConfig field and reuses no other credential.
+ * The nested type defines the required scope and lifecycle; these models do
+ * not advertise enforcement or implement that lifecycle.
+ *
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "Event".
  */
 export interface Event {
+  channel_read?: ChannelReadCapability | null;
   history_ref?: HistoryRef1;
   kind: Kind;
+  memory_token?: MemoryToken1;
   publication_context?: PublicationContext | null;
   session_id?: SessionId1;
   text: Text;
@@ -577,7 +649,7 @@ export interface Event {
  * Observation metadata records the API read at dispatch; consumers must make
  * a fresh comparison before handling an empty publication proposal.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "PublicationContext".
  */
 export interface PublicationContext {
@@ -646,7 +718,7 @@ export interface PublicationContext {
  * scalars: a tolerant consumer decoding an older producer's ``final`` simply
  * sees them absent.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "Final".
  */
 export interface Final {
@@ -669,7 +741,7 @@ export interface Final {
  *
  * ``slot_utc`` is an ISO 8601 timestamp with an explicit UTC offset.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "HookRunRef".
  */
 export interface HookRunRef {
@@ -681,7 +753,7 @@ export interface HookRunRef {
 /**
  * A hard stop delivered on the control channel, distinct from a steer.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "Interrupt".
  */
 export interface Interrupt {
@@ -692,7 +764,7 @@ export interface Interrupt {
 /**
  * A streamed chunk of assistant text.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "TextDelta".
  */
 export interface TextDelta {
@@ -704,7 +776,7 @@ export interface TextDelta {
 /**
  * A human readable note about a tool call the harness is making.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "ToolNote".
  */
 export interface ToolNote {
@@ -733,7 +805,7 @@ export interface ToolNote {
  * turn that calls the same tool twice is otherwise indistinguishable from one
  * that called it once.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "SideEffectFlag".
  */
 export interface SideEffectFlag {
@@ -791,7 +863,7 @@ export interface SideEffectFlag {
  * unrestricted turn, so a pre-upgrade producer keeps decoding unchanged. No
  * first-party ingress sets it.
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "QueuedTurn".
  */
 export interface QueuedTurn {
@@ -850,7 +922,7 @@ export interface QueuedTurn {
  * value retains the default identity. Ordinary Slack turns continue to name
  * their identity in ``adapter`` (INGRESS-CANARY-1).
  *
- * This interface was referenced by `ACIProtocolV0511`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV0522`'s JSON-Schema
  * via the `definition` "ReplyHandle".
  */
 export interface ReplyHandle {

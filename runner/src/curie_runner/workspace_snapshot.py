@@ -16,13 +16,17 @@ import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from .subprocess_env import shell_and_hook_env
 
 MAX_PATCH_BYTES = 900_000
 _GIT_TIMEOUT_SECONDS = 30
 _SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
+# One segment of a declared repository path (ADR 0197): GitLab nests groups, so
+# a code host other than GitHub has any number of these. Dot segments are
+# refused separately, since a URL would resolve them away.
+_PATH_SEGMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._~-]*")
 
 
 class WorkspaceSnapshotError(RuntimeError):
@@ -169,27 +173,75 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
         raise WorkspaceSnapshotError(f"git snapshot failed: {diagnostic}") from exc
 
 
-def _canonical_repo(origin: str) -> str:
-    parsed = urlsplit(origin.strip())
+def _trusted_base(trusted_origin: str) -> str:
+    """The boot env's code host origin (ADR 0197) as a URL base, or refuse it.
+
+    The same credential-free HTTPS rule the workspace origin meets: a trusted
+    origin carrying userinfo, a query or a fragment is a broken boot, so the
+    snapshot fails closed rather than trusting any part of it.
+    """
+
+    trusted = urlsplit(trusted_origin)
+    _ = trusted.port
+    if (
+        trusted.scheme != "https"
+        or not trusted.hostname
+        or trusted.username is not None
+        or trusted.password is not None
+        or trusted.query
+        or trusted.fragment
+    ):
+        raise ValueError("trusted repository origin is not credential-free HTTPS")
+    return urlunsplit((trusted.scheme, trusted.netloc, trusted.path.rstrip("/"), "", ""))
+
+
+def _valid_repository_path(path: str) -> bool:
+    """A repository path of two or more segments, as the boot env declared it."""
+
+    segments = path.split("/")
+    return len(segments) >= 2 and all(
+        _PATH_SEGMENT.fullmatch(segment) and segment not in {".", ".."} for segment in segments
+    )
+
+
+def _canonical_repo(
+    origin: str, *, trusted_origin: str | None, repository_path: str | None
+) -> str:
+    if trusted_origin is None or repository_path is None:
+        # The worker sets both on every workspace claim (ADR 0197); without
+        # them the runner has no trusted origin to check against.
+        raise WorkspaceSnapshotError(
+            "the boot env names no trusted repository origin and path for the workspace"
+        )
+    try:
+        html_base = _trusted_base(trusted_origin)
+        parsed = urlsplit(origin)
+        _ = parsed.port
+    except ValueError as exc:
+        raise WorkspaceSnapshotError("workspace repository origin is invalid") from exc
     if (
         parsed.scheme != "https"
-        or parsed.hostname != "github.com"
+        or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
+        or not origin.startswith(f"{html_base}/")
     ):
         raise WorkspaceSnapshotError(
-            "workspace repository origin is not credential-free GitHub HTTPS"
+            "workspace repository origin is not credential-free trusted code host HTTPS"
         )
-    parts = [part for part in parsed.path.strip("/").split("/") if part]
-    if len(parts) != 2:
-        raise WorkspaceSnapshotError("workspace repository origin is not an owner/repository URL")
-    owner, name = parts
-    name = name.removesuffix(".git")
-    if not owner or not name:
-        raise WorkspaceSnapshotError("workspace repository origin is incomplete")
-    return f"{owner}/{name}"
+    repo = origin[len(html_base) + 1 :].removesuffix(".git")
+    if (
+        not _valid_repository_path(repository_path)
+        or repo.casefold() != repository_path.casefold()
+        or origin != f"{html_base}/{repo}.git"
+    ):
+        # A declared path of any depth is accepted, but only that one.
+        raise WorkspaceSnapshotError(
+            "workspace repository origin is not the declared repository path"
+        )
+    return repo
 
 
 def _changed_paths(repo: Path) -> tuple[str, ...]:
@@ -248,9 +300,20 @@ def capture_workspace_snapshot(
     workspace: str | Path = "/workspace",
     *,
     expected_repo: str | None = None,
+    trusted_origin: str | None = None,
+    repository_path: str | None = None,
     publication_title: str | None = None,
     publication_body: str | None = None,
 ) -> WorkspaceSnapshot:
+    """Capture the workspace as a publication patch, refusing an untrusted origin.
+
+    ``trusted_origin`` and ``repository_path`` are the boot env's
+    ``CURIE_REPO_ORIGIN`` and ``CURIE_REPO_PATH`` (ADR 0197), which the worker
+    sets on every workspace claim. Without them the snapshot is refused. The
+    path is accepted at any depth, but the workspace origin must be exactly
+    that path under the trusted origin.
+    """
+
     repo = Path(workspace)
     if not repo.is_dir():
         raise WorkspaceSnapshotError("managed workspace directory is missing")
@@ -259,7 +322,9 @@ def capture_workspace_snapshot(
         raise WorkspaceSnapshotError("managed workspace is not a git checkout")
 
     origin = _git(repo, "remote", "get-url", "origin").stdout.decode().strip()
-    actual_repo = _canonical_repo(origin)
+    actual_repo = _canonical_repo(
+        origin, trusted_origin=trusted_origin, repository_path=repository_path
+    )
     if expected_repo is not None and (
         actual_repo.casefold() != expected_repo.strip().removesuffix(".git").casefold()
     ):

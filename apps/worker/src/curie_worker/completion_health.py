@@ -209,7 +209,7 @@ async def observe_completion_outbox(
 
     try:
         snapshot = await snapshot_completion_outbox(markers, redis, config)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         logger.warning(
             "completion outbox telemetry observation failed (%s)",
             type(exc).__name__,
@@ -227,7 +227,7 @@ async def observe_completion_outbox(
         )
     try:
         publish_snapshot(snapshot)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - existing broad catch retained
         logger.warning(
             "completion outbox metric publish failed (%s)",
             type(exc).__name__,

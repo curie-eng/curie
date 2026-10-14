@@ -2,7 +2,7 @@
 
 The worker mints a request-bound ``work_item.progress`` token and the progress
 URL into the claim env of a work-item execution, and into no other turn. The
-api verifies the token with the same byte-identical ``sandbox_token`` module.
+API verifies the token with the same shared ``sandbox_token`` module.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from curie_worker import sandbox_token  # noqa: E402
+from curie_internal import sandbox_token  # noqa: E402
 from test_work_item_workspace import (  # noqa: E402
     ISSUE_URL,
     _Binding,

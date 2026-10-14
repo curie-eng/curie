@@ -32,18 +32,42 @@ redefine them.
 
 ## Current contract
 
-A second implementation is an **ACI server**, an HTTP process serving eight authenticated
-control routes. The seven POST endpoints (`runner/src/curie_runner/server.py`): `POST /v1/event` opens a
+A second implementation is an **ACI server**, an HTTP process serving eight required authenticated
+control routes (seven POSTs and `GET /v1/status`) plus one optional executor route. The eight POST endpoints (`runner/src/curie_runner/server.py`, seven every
+server serves plus one optional executor route): `POST /v1/event` opens a
 turn, `POST /v1/steer` injects into the live turn (409 if none running),
 `POST /v1/interrupt` hard-stops it, `POST /v1/reset` discards the conversation so the
 next turn starts fresh (409 while a turn is active), `POST /v1/snapshot` captures a
 bounded managed-workspace snapshot for publication, `POST /v1/timeout` stops the
 exact open turn named by the event response epoch, and `POST /v1/turn-admit` grants or denies
-the exact waiting turn epoch. Two GETs sit alongside them and stay
+the exact waiting turn epoch; only in executor mode, the optional `POST /v1/execute` runs one
+connector action for the worker's executor. Two GETs sit alongside them and stay
 unauthenticated, `GET /healthz` and `GET /status`, because the chart's readiness probe
 sends no auth header. The eighth authenticated control route, `GET /v1/status`, returns
 the credential-free boot attestation (`session_id`, `sandbox_id`, `managed_workspace`,
-`cwd`) plus `history_durable` for the worker's replacement-authority check. The timeout
+`cwd`) plus `history_durable` for the worker's replacement-authority check. `POST /v1/execute` is an optional, runner-private,
+bearer-authenticated route served only by a runner booted with `CURIE_RUNNER_MODE=execute`
+(ACTION-EXECUTOR-6, -24): it runs one connector action's `list`, `observe`, `call` and `read` phases
+for the worker's executor, carries no ACI frame (like `/v1/turn-admit`) and changes no frozen
+contract (ACTION-EXECUTOR-25, AUTOMATED-REMEDIATION-27). The `read` phase
+(AUTOMATED-REMEDIATION-12, executor amendments E3 and E4;
+[`runner/src/curie_runner/executor.py::sample_of`](../../../runner/src/curie_runner/executor.py))
+is one sample for an automated-remediation precondition or verifier: after `list`, exactly one
+`tools/call` of a declared read tool with no grant, whose request adds an RFC 6901 `pointer` that
+no other phase carries. The runner answers only `{phase, sample, value}`: the scalar at the pointer
+(of at most 256 characters) in the structured content, or in the strict JSON of the result's one
+and only text block, never the result itself. Any other shape is an unsuccessful `sample`
+(`result_unstructured`, `pointer_absent`, `not_scalar`, `value_too_long`, `tool_error`). A tool the
+sandbox's own `list` did not advertise with `readOnlyHint: true` is refused `tool_not_read_only`
+before any dial; the hint is a fail-closed refusal on top of the policy that declares the read,
+never an authorization. In one sandbox the accepted orders are `list`; `list`, `observe`, then a
+restore `call`; `list` then a forward `call`; `list` then one `read`; and `list` then one
+`observe` with no `call`, which an automated-remediation verifier uses to see whether another
+change superseded its action. The request shape and refusal codes are frozen in `tests/vectors/runner-execute.json`, and
+the sample kinds and the predicate they feed in `tests/vectors/remediation-predicate.json`. In that mode the runner serves only `/healthz`, `/status`,
+`/v1/status` and `/v1/execute`, and answers every other control route `409` naming the mode.
+`run_conformance` does not cover it, and a server without it answers `404`, which the worker
+maps to `runner_unavailable`. The timeout
 and `/v1/status` are runner-private, bearer-authenticated control routes. A server that
 omits the epoch response header is simply not notified, and worker timeout classification
 remains unaffected. `/v1/reset` carries no ACI wire frame (it is a runner control route,
@@ -120,6 +144,23 @@ ordinary turns on the same install are untouched.
   same turn decoded after it. The comparison covers only the fields the
   comparing consumer models, so a field that grants authority must be modelled
   by that consumer before any worker acts on it.
+
+### Per-turn memory credential (MEMORY-TOKEN)
+
+The worker mints a short-lived write credential for each turn and carries it to
+the runner on the `Event`, so the runner's memory tools can present it. The
+credential stays out of the sandbox env, `BootEnv`, and hook or subprocess
+input, but the ACI server that receives the `Event` runs inside the sandbox, so
+it does reach the in-sandbox runner process (ADR-0188 decision 5).
+
+- **MEMORY-TOKEN-1:** `Event` carries an optional `memory_token`, a string or
+  null, defaulting to null. Null means the turn carries no memory write
+  credential. It is never a `BootEnv` key or an env var.
+- **MEMORY-TOKEN-2:** A producer sends `memory_token` only on the runner POST,
+  `POST /v1/event` and `POST /v1/steer`.
+- **MEMORY-TOKEN-3:** A consumer must not place `memory_token` in env, logs,
+  hook or subprocess input, or persisted state. The reference model declares it
+  with `repr=False`, so `repr(event)` and a log's `%r` never show it.
 
 ## Implementations today
 

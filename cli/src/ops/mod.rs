@@ -11,6 +11,7 @@
 
 #![deny(clippy::let_underscore_must_use, clippy::let_underscore_untyped)]
 
+pub(crate) mod capacity;
 mod command;
 mod convergence;
 mod lint_values;
@@ -156,10 +157,14 @@ mod testsupport {
     /// assertion below reads exactly one variable.
     pub(super) fn up_with_github_token(plan: GithubTokenPlan) -> Vec<OpsCommand> {
         up_commands(&UpOpts {
+            file_values: None,
             retained_mail_values: None,
+            retained_runner_values: None,
+            saved_credentials: None,
             common: common(),
             github_token: plan,
             set_string: vec![],
+            set_json: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),

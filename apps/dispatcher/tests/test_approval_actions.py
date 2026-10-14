@@ -1188,3 +1188,20 @@ def test_a_verdict_with_no_decision_time_keeps_the_bare_attribution() -> None:
     line = settled_verdict_line(decision="approved", resolver="U1", note=None, resolved_at=None)
 
     assert line == "Approved by <@U1>"
+
+
+def test_dispatcher_mints_shared_test_driver_wire_vector() -> None:
+    from curie_dispatcher.approval_principal import mint_test_driver_principal
+
+    vector = json.loads(
+        (Path(__file__).parents[3] / "tests/vectors/approval-principal.json").read_text()
+    )
+    claims = vector["test_driver"]["claims"]
+    token = mint_test_driver_principal(
+        vector["secret"],
+        subject=claims["sub"],
+        actor_channel=claims["actor_channel"],
+        approval_id=claims["approval_id"],
+        now=vector["issued_at"],
+    )
+    assert token == vector["test_driver"]["token"]

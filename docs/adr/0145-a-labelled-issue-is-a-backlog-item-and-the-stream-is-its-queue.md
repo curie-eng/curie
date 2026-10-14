@@ -13,6 +13,13 @@ Partially amended by
 [ADR 0161](0161-signed-github-issue-events-admit-one-work-item.md)
 for the intake clause that routed labelled issues through hook partitions.
 
+Partially amended by
+[ADR 0199](0199-the-factory-admits-only-tickets-it-can-start-and-finish.md)
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+the selection label requests admission, and only a passing viability verdict
+permits it. A rejected ticket stays in the tracker with the reason. The tracker
+remains the backlog and Curie still does not copy tracker content.
+
 Proposed as part of the dark-factory decision set, discussed in
 [discussion #2551](https://github.com/curie-eng/curie/discussions/2551).
 

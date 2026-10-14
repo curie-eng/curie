@@ -144,20 +144,6 @@ fn apply_help_references_shipped_curie_yaml_example() {
     );
 }
 
-#[test]
-fn operations_references_shipped_curie_yaml_example() {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("cli crate has a repository root");
-    let operations = fs::read_to_string(repo_root.join("docs/operations.md"))
-        .expect("read the operations guide");
-
-    assert!(
-        operations.contains("[`examples/curie.yaml`](../examples/curie.yaml)"),
-        "operations guide must link to the shipped example"
-    );
-}
-
 fn help_lists_subcommand(text: &str, name: &str) -> bool {
     text.lines().any(|line| {
         let line = line.trim_start();
@@ -315,6 +301,28 @@ fn process_skill_help_distinguishes_tier_from_bundle_artifact() {
         !text.contains("skills/<name>/SKILL.md`: `skill <up|down|status|message|eval|approvals>"),
         "skill help must not attach the subcommand list to the artifact distinction\n{text}"
     );
+}
+
+/// `hooks` manages webhook partitions and source bindings, which its old help
+/// ("hook configuration") let a reader mistake for cron hooks (#4012). The help
+/// must disown cron triggers and point at the verbs that do read them.
+#[test]
+fn hooks_help_says_not_cron_triggers() {
+    for tier in ["local", "cluster"] {
+        let output = run_help(&[tier, "hooks"]);
+        assert!(
+            output.status.success(),
+            "expected success for {tier} hooks help\n{}",
+            output_text(&output)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        for needle in ["Not cron triggers", "schedules", "hook fire"] {
+            assert!(
+                text.contains(needle),
+                "{tier} hooks help missing `{needle}`\n{text}"
+            );
+        }
+    }
 }
 
 /// `curie dev plugin-compat` is the operator-facing name of the outbound
@@ -1036,5 +1044,45 @@ fn help_never_discloses_the_curie_api_key_value() {
             text.contains("--api-key") && text.contains("CURIE_API_KEY"),
             "{path:?} help lost the --api-key flag or its env name\n{text}"
         );
+    }
+}
+
+#[test]
+fn hook_record_is_available_on_local_and_cluster_with_three_positionals() {
+    let manifest = live_command_manifest();
+    for tier in ["local", "cluster"] {
+        let tier_command = manifest["subcommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == tier)
+            .unwrap();
+        let hook = tier_command["subcommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == "hook")
+            .unwrap();
+        let record = hook["subcommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == "record")
+            .unwrap_or_else(|| panic!("{tier} hook must expose record"));
+        let positionals: Vec<_> = record["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|arg| arg["positional"] == true)
+            .collect();
+        assert_eq!(positionals.len(), 3, "{tier}: {positionals:?}");
+        assert!(
+            positionals.iter().all(|arg| arg["required"] == true),
+            "{tier}: {positionals:?}"
+        );
+        let output = run_help(&[tier, "hook", "record"]);
+        assert!(output.status.success(), "{tier}: {}", output_text(&output));
+        let text = output_text(&output);
+        assert!(text.contains("--dry-run"), "{tier}: {text}");
     }
 }

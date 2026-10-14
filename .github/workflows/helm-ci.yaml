@@ -5,60 +5,14 @@ name: Helm CI
 # job gives the chart the CI it otherwise lacks -- lint, render every shipped
 # values overlay, and schema-validate the rendered manifests.
 on:
-  # Push runs for every releasable commit because release authorization
-  # requires this check. Pull requests remain filtered to chart changes.
+  # Pull requests to main and next always start this workflow so the chart
+  # aggregator can report. chart-changes decides whether the shards run,
+  # using the historical path list in tools/helm-ci-gate/decide.py. Pushes
+  # stay unfiltered in effect because select treats push as chart-relevant.
   push:
     branches: [main, next]
   pull_request:
     branches: [main, next]
-    paths:
-      - "charts/curie/**"
-      - "examples/sre-bot/**"
-      - ".github/workflows/helm-ci.yaml"
-      - ".github/workflows/ci.yaml"
-      - ".github/workflows/release.yaml"
-      # The Chart job below is the only CI run of the chart assertion
-      # scripts, and several read or EXECUTE repository code outside charts/: the object-store web-identity and threaded bot allowlist gates
-      # import the real api, worker, and dispatcher config through `uv run`;
-      # upgrade-retained-scalar builds and runs the CLI with cargo against a
-      # Python driver under cli/tests/data; observability-stack and
-      # worker-ttl-bounds cross-check cli/src and cli/scripts; render reads the
-      # generated aci-protocol bindings; security-probe runs scripts/; and the
-      # image-pin gates read the compose files; and mail-adapter-wiring reads
-      # the ci.yaml and release.yaml image build matrices. A PR that breaks one of those
-      # without touching charts/ must still run this workflow, or the gate
-      # that exists to catch it is skipped. Whole trees are listed rather than
-      # single files so a new script reading a new file cannot silently fall
-      # outside the filter.
-      - "cli/**"
-      - "apps/api/**"
-      - "apps/worker/**"
-      - "apps/dispatcher/**"
-      - "packages/**"
-      - "scripts/**"
-      - "uv.lock"
-      - "pyproject.toml"
-      - "compose.yaml"
-      - "compose.dev.yaml"
-      # Third obligation, and the one this gate exists for (#2741): the
-      # retained-values scalar gate below BUILDS AND EXECUTES the real CLI
-      # against the recorded upgrade boundary, so its subject is Rust and its
-      # driver is a Python stub -- neither of them under charts/. Without these
-      # entries, a PR that reverts the JSON re-serializer and puts the YAML 1.2
-      # emitter back matches nothing in this filter, the helm job is skipped,
-      # and the gate that exists to catch exactly that revert never runs.
-      - "cli/src/ops/upgrade.rs"
-      - "cli/tests/data/upgrade-driver.py"
-      # Fourth obligation, the first gate's shape: the Slack identities gate
-      # (ADR-0168 decision 1) feeds the rendered declaration through this
-      # parser, which the API, worker and dispatcher config all import, and
-      # the worker's env through the sandbox filter. The parser reads the
-      # default identity's name and the reserved delivery selector from
-      # turn.py. A PR that loosens any of them must still run it.
-      - "packages/aci-protocol/src/aci_protocol/slack_identities.py"
-      - "packages/aci-protocol/src/aci_protocol/turn.py"
-      - "apps/worker/src/curie_worker/sandbox/types.py"
-      - "compose/**"
 
 permissions:
   contents: read
@@ -71,6 +25,22 @@ env:
   KUBECONFORM_VERSION: v0.6.7
 
 jobs:
+  chart-changes:
+    name: Detect chart-relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      chart: ${{ steps.filter.outputs.chart }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: python3 tools/helm-ci-gate/decide.py select
+
   # The chart gate runs as parallel shards. The render assertions used to be
   # one serial job of roughly nine minutes, dominated by the retained-values
   # step that builds the CLI; each shard now repeats the cheap tool setup and
@@ -79,12 +49,27 @@ jobs:
   chart-lint-and-assertions-1:
     name: Chart lint, kubeconform, and render assertions (1 of 3)
     runs-on: ubuntu-latest
+    needs: [chart-changes]
+    if: ${{ needs.chart-changes.outputs.chart == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -92,8 +77,12 @@ jobs:
       - name: Install kubeconform
         run: |
           set -euo pipefail
-          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin kubeconform
+          kubeconform_archive="$RUNNER_TEMP/kubeconform.tar.gz"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -o "$kubeconform_archive" \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          sudo tar -xz -C /usr/local/bin -f "$kubeconform_archive" kubeconform
+          rm -f "$kubeconform_archive"
           kubeconform -v
           # The validate steps normalize rendered manifests through PyYAML (see
           # below). It ships on ubuntu-latest, but ensure it explicitly so this
@@ -163,8 +152,21 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/render-assertions.sh
 
+      - name: Per-workload Secret checksum assertions
+        run: bash charts/curie/ci/secret-checksum-assertions.sh
+
       - name: Reject chart-owned extraEnv duplicates
         run: bash charts/curie/ci/reserved-env-assertions.sh
+
+      # Prove the factory.* block renders CURIE_FORGES with mounted credential
+      # files and that a removed api.* factory key is refused (#4397).
+      - name: helm render assertions (factory forges)
+        run: bash charts/curie/ci/factory-forges-assertions.sh
+
+      # Prove worker.streamRetention.minAgeSeconds reaches the worker, is
+      # bounded by the schema, and defaults on a release with no such block.
+      - name: helm render assertions (stream retention window)
+        run: bash charts/curie/ci/stream-retention-assertions.sh
 
       # Prove the API Service keeps a stable NodePort when enabled, allows an
       # override, and omits the field for ClusterIP or explicit auto allocation.
@@ -175,6 +177,9 @@ jobs:
 
       - name: helm render assertions (NetworkPolicy warning)
         run: bash charts/curie/ci/networkpolicy-notes-assertions.sh
+
+      - name: helm render assertions (MCP connector Valkey ingress opt-out)
+        run: bash charts/curie/ci/mcp-valkey-ingress-optout-assertions.sh
 
       # Prove the api reads runner pods for the Logs tab from the release
       # namespace, the same namespace the worker claims sandboxes in.
@@ -290,10 +295,25 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/statefulset-metadata-rollout-assertions.sh
 
+      # Prove the compute-plane PodDisruptionBudgets (issue #1574): off by
+      # default, each enabled budget selects exactly its own Deployment's pods
+      # (a selector mutated onto another component fails the checker), an
+      # unacknowledged blocking budget refuses the render, and the dispatcher
+      # accepts only an acknowledged blocking budget.
+      - name: helm render assertions (compute-plane PodDisruptionBudgets)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/compute-pdb-assertions.sh
+
       - name: helm render assertions (otel collector durable delivery)
         run: |
           set -euo pipefail
           bash charts/curie/ci/otel-collector-durability-assertions.sh
+
+      - name: helm render assertions (otel collector trace processors)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/otel-collector-processors-assertions.sh
 
       - name: helm render assertions (exporters without exporterhelper)
         run: |
@@ -393,6 +413,16 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/gvisor-runtime-class-assertions.sh
 
+      # Prove the worker's runner template writes are admitted only in the
+      # chart's shape: one admission rule per host escape, token mount, SA swap
+      # and image swap, an image allowlist equal to the rendered templates,
+      # label-scoped cleanup and Secret policies, and no runner role ARN shared
+      # with a read/write chart identity (#3842).
+      - name: helm render assertions (runner template admission)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/runner-template-admission-assertions.sh
+
       # Keep the chart ClickHouse default and Langfuse pin as one supported
       # pair. ClickHouse 24.8 cannot apply Langfuse 3.225.x migration 39, so
       # the default must stay on 25.12 and AVX-required (#2210).
@@ -411,12 +441,29 @@ jobs:
   chart-assertions-2:
     name: Chart render assertions (2 of 3)
     runs-on: ubuntu-latest
+    needs: [chart-changes]
+    if: ${{ needs.chart-changes.outputs.chart == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          # The mail-adapter retained-values proof reads the v0.12.0 tag.
+          fetch-depth: 0
 
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -424,13 +471,18 @@ jobs:
       - name: Install kubeconform
         run: |
           set -euo pipefail
-          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin kubeconform
+          kubeconform_archive="$RUNNER_TEMP/kubeconform.tar.gz"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -o "$kubeconform_archive" \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          sudo tar -xz -C /usr/local/bin -f "$kubeconform_archive" kubeconform
+          rm -f "$kubeconform_archive"
           kubeconform -v
           # The validate steps normalize rendered manifests through PyYAML (see
           # below). It ships on ubuntu-latest, but ensure it explicitly so this
           # job is not coupled to the runner image.
           python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
+          python3 -m pip install --quiet jsonschema==4.26.0
 
       # Prove Langfuse startup is gated on ClickHouse being up (issue #2009). A
       # Helm upgrade that recreates the ClickHouse Service otherwise lets the new
@@ -569,6 +621,33 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/connector-reconciler-rbac-assertions.sh
 
+      # Prove the action executor switch (ACTION-EXECUTOR-1, -12, -14): one
+      # value renders CURIE_ACTION_EXECUTOR_ENABLED identically into the API and
+      # the worker, default off, and the worker Role gains only a single-object
+      # `get` on Deployments, and only with the executor and the reconciler on.
+      - name: helm render assertions (action executor config)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/action-executor-config-assertions.sh
+
+      # Prove the automated remediation switch (AUTOMATED-REMEDIATION-1): one
+      # value renders CURIE_REMEDIATION_ENABLED identically into the API and the
+      # worker, default off, typed boolean, and a render with remediation on and
+      # the executor off fails naming actionExecutor.enabled.
+      - name: helm render assertions (remediation config)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/remediation-config-assertions.sh
+
+      # Prove the installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+      # executor amendment E9): one value renders
+      # CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES identically into the API
+      # and the worker, default 2, typed integer with minimum 1, chart-owned.
+      - name: helm render assertions (executor sandbox cap)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/executor-sandbox-cap-assertions.sh
+
       # Pin the end to end connector's test cluster identity (ADR 0176
       # decision 4, #3243): off by default, no cluster scoped write beyond
       # namespace create and delete, the per namespace role never bound cluster
@@ -675,6 +754,7 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/runner-images-assertions.sh
+          bash charts/curie/ci/docker-daemon-assertions.sh
 
       # Prove the dispatcher is told where the platform API is and how to
       # authenticate to it (issue #442), and that the UI's CURIE_API_TARGET
@@ -753,6 +833,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/sandbox-capacity-fit-assertions.sh
 
+      # Prove worker.maxConcurrency (issue #760): it reaches the worker env as
+      # CURIE_WORKER_MAX_CONCURRENCY exactly once, the schema holds it to 1
+      # through 256, and NOTES prints replicas x maxConcurrency beside the
+      # sandbox quota ceiling (lookup stubbed to a fixture node).
+      - name: helm render assertions (worker maxConcurrency)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/worker-max-concurrency-assertions.sh
+
       # Prove the in-chart rustfs resource floors (issue #2706). Presence is
       # not the defect; the 512Mi memory ceiling is. The shipped default sat
       # under a measured 1120Mi working set, so every install OOMKilled in a
@@ -761,6 +850,24 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/rustfs-resource-floor-assertions.sh
+
+      # Prove the in-chart RustFS claim defaults to 10Gi while an existing
+      # StatefulSet keeps its claim size, and that the storage-guard init
+      # container is wired with the RustFS image and only when persistence is
+      # on (issue #4408). A full inode table crash-looped RustFS for hours.
+      - name: helm render assertions (rustfs storage guard)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/rustfs-storage-guard-assertions.sh
+
+      # Run the storage guard against the real RustFS image on an
+      # inode-limited tmpfs (issue #4408): RustFS crashes on the full volume
+      # without it, and after it frees only expired event objects RustFS
+      # answers /health.
+      - name: docker behavior (rustfs storage guard)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/rustfs-storage-guard-behavior.sh
 
       # Prove the runner and both bundle init containers declare an
       # ephemeral-storage request AND limit (ADR-0059 decision 1, issue #755),
@@ -803,6 +910,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/worker-object-store-assertions.sh
 
+      # Prove the optional code host CA bundle mounts at one path in the api,
+      # worker, sandbox runner and publication Job, and renders nothing unset.
+      - name: helm render assertions (code host CA bundle)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/code-host-trust-assertions.sh
+
       # A default worker missing these values runs eval suites that cannot
       # record or report results.
       - name: helm render assertions (worker eval wiring)
@@ -826,7 +940,19 @@ jobs:
       # provider won. Reading the manifests alone cannot tell an omitted
       # credential apart from one the SDK signs as an empty identity.
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Sync workspace
@@ -858,6 +984,17 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/threaded-bot-allowlist-assertions.sh
+
+      # The test installation declaration (ADR 0202 decision 1, #4133): off by
+      # default, one value rendered identically into the API and the
+      # dispatcher, render refusals on a prod environment, a published default
+      # secret and a driver with no channel (also with the schema removed), and
+      # the exact rendered value parsed by both services' real settings. Needs
+      # the uv workspace above.
+      - name: helm render assertions (test installation)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/test-installation-assertions.sh
 
       # dispatcher.slack.identities (ADR-0168 decision 1): a stock install
       # renders today's objects, a list renders by Secret reference only, and the
@@ -896,10 +1033,10 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/byo-endpoint-egress-assertions.sh
 
-      # Prove a nil worker.publication.githubHttpsCidrs cannot collapse the
-      # tokenless publication job's GitHub egress rule to an empty to: (allow-all
-      # on 443). Also rejects that empty-to shape on every rendered
-      # NetworkPolicy, not just this one template (#2321).
+      # Prove an empty factory code host egress list cannot collapse the
+      # tokenless publication job's egress rule to an empty to: (allow-all).
+      # Also rejects that empty-to shape on every rendered NetworkPolicy, not
+      # just this one template (#2321, #4397).
       - name: helm render assertions (NetworkPolicy empty egress to)
         run: |
           set -euo pipefail
@@ -914,15 +1051,45 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/release-record-size-assertions.sh
 
+      # Prove the candidate templates render on a PREVIOUS release's values,
+      # the way `helm upgrade --reuse-values` hands them over (#3813). Every
+      # other render here uses the candidate's own values.yaml, where every
+      # key exists, so a template dereferencing a key an older release never
+      # had (`placement` #2008, `langfuse.eventUpload`, `connectorCaller`
+      # #3505) passed them all and broke the upgrade. The step downloads the
+      # newest stable chart artifact and a pinned v0.10.3, and carries a
+      # negative control that reverts #3544's connectorCaller guard.
+      - name: helm render assertions (previous release reuse-values render)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/reuse-values-render-assertions.sh
+
   chart-assertions-retained-values:
     name: Chart render assertions (3 of 3, retained values through the real CLI)
     runs-on: ubuntu-latest
+    needs: [chart-changes]
+    if: ${{ needs.chart-changes.outputs.chart == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -930,8 +1097,12 @@ jobs:
       - name: Install kubeconform
         run: |
           set -euo pipefail
-          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin kubeconform
+          kubeconform_archive="$RUNNER_TEMP/kubeconform.tar.gz"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            -o "$kubeconform_archive" \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          sudo tar -xz -C /usr/local/bin -f "$kubeconform_archive" kubeconform
+          rm -f "$kubeconform_archive"
           kubeconform -v
           # The validate steps normalize rendered manifests through PyYAML (see
           # below). It ships on ubuntu-latest, but ensure it explicitly so this
@@ -952,33 +1123,72 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/upgrade-retained-scalar-assertions.sh
 
-  # The required check name the release gate reads (release/authorize.py).
-  # It carries no job-level `if:` (#1470): when any shard fails this job is
-  # skipped, and the release gate refuses a skipped required check, so a
-  # failing shard still blocks a release exactly as a failing step did when
-  # the shards were one job.
   helm:
     name: Chart (lint + template + kubeconform)
     runs-on: ubuntu-latest
-    needs: [chart-lint-and-assertions-1, chart-assertions-2, chart-assertions-retained-values]
+    needs: [chart-changes, chart-lint-and-assertions-1, chart-assertions-2, chart-assertions-retained-values]
+    # A completed run must record this check as success or failure. A
+    # condition that can be false would mark it skipped and block release
+    # authorization (#1470). Cancellation is the only skip.
+    if: ${{ !cancelled() }}
     steps:
-      - name: Every chart shard passed
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Require shard outcomes
         env:
-          NEEDS: ${{ toJSON(needs) }}
-        run: |
-          set -euo pipefail
-          echo "$NEEDS" | jq -e '[.[].result] | all(. == "success")'
+          CHANGES_RESULT: ${{ needs.chart-changes.result }}
+          CHART: ${{ needs.chart-changes.outputs.chart }}
+          SHARD_LINT: ${{ needs.chart-lint-and-assertions-1.result }}
+          SHARD_RENDER: ${{ needs.chart-assertions-2.result }}
+          SHARD_RETAINED: ${{ needs.chart-assertions-retained-values.result }}
+        run: python3 tools/helm-ci-gate/decide.py aggregate
 
   reserved-env-upgrade:
     name: Reject legacy extraEnv before upgrade mutation
     runs-on: ubuntu-latest
+    needs: [chart-changes]
+    if: ${{ needs.chart-changes.outputs.chart == 'true' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
+      - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.17.3
-      - uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.17.3
+      - name: Ensure kind-registry exists
+        run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Create the kind cluster
+        id: create_the_kind_cluster
+        continue-on-error: true
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          cluster_name: curie-reserved-env
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+      - name: Back off before retrying Create the kind cluster
+        if: steps.create_the_kind_cluster.outcome == 'failure'
+        run: |
+          echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          bash cli/scripts/ensure-kind-registry.sh
+          kind delete cluster --name curie-reserved-env 2>/dev/null || true
+          sleep 15
+      - name: Create the kind cluster (retry)
+        if: steps.create_the_kind_cluster.outcome == 'failure'
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           cluster_name: curie-reserved-env
           node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
@@ -1002,3 +1212,42 @@ jobs:
       - name: Remove owned cluster
         if: always()
         run: kind delete cluster --name curie-reserved-env
+
+  # #4311: three overlapping `curie cluster message` processes without --thread
+  # must land in three conversations. The script owns its whole lifecycle: it
+  # builds the CLI and the api, worker and runner images from this checkout,
+  # creates and deletes its own kind cluster, deploys those candidate images,
+  # and verifies its teardown.
+  # Fix pin verification runs the same script red-on-revert; this job keeps
+  # the regression running on chart changes, and gives chart-check's root
+  # inventory the helm-ci step every root script needs.
+  automatic-thread-isolation:
+    name: Automatic thread isolation (kind)
+    runs-on: ubuntu-latest
+    needs: [chart-changes]
+    if: ${{ needs.chart-changes.outputs.chart == 'true' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
+      - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.17.3
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.17.3
+      - name: Concurrent automatic threads stay isolated
+        run: bash charts/curie/ci/automatic-thread-isolation.sh

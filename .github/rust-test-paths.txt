@@ -24,7 +24,7 @@
 ^\.github/rust-test-paths\.txt$
 ^tools/
 ^scripts/
-^hooks/
+^\.githooks/
 ^pyproject\.toml$
 ^uv\.lock$
 ^uv\.toml$

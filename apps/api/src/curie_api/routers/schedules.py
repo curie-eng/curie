@@ -1,8 +1,8 @@
-"""List each in-force cron hook and the newest slot recorded for it (#2933).
+"""List each in-force cron hook and its scheduled and manual histories (#4010).
 
 The ranking matches the worker cron loop: prod outranks dev, then the newest
 active deployment. Declarations are read from that version's bundle. ``hook_runs``
-only supplies the newest slot for a name the bundle still declares.
+supplies the newest slot of each source for a name the bundle still declares.
 """
 
 from __future__ import annotations
@@ -11,25 +11,28 @@ import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast, get_args
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from .. import bundles, crud
-from ..auth import require_api_key
-from ..config import get_settings
-from ..db import SCHEMA
-from ..deps import SessionDep, StoreDep
-from ..schemas import (
+from curie_api.crud import agents as crud_agents
+from curie_api.schemas.schedules import (
     AgentSchedulesOut,
+    HookRunReason,
     ScheduleControlOut,
     ScheduleHookOut,
     ScheduleListOut,
     ScheduleOutcome,
 )
+
+from .. import bundles
+from ..auth import require_api_key
+from ..config import get_settings
+from ..db import SCHEMA
+from ..deps import SessionDep, StoreDep
 from ..storage import ObjectStore
 
 _OUTCOMES: dict[str, ScheduleOutcome] = {
@@ -62,11 +65,11 @@ ORDER BY a.id, (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
 """
 
 _LATEST_SQL = """
-SELECT DISTINCT ON (name)
-       name, slot_utc, outcome
+SELECT DISTINCT ON (name, source)
+       name, source, slot_utc, outcome, reason
 FROM {schema}.hook_runs
 WHERE agent_id = :agent_id
-ORDER BY name, slot_utc DESC
+ORDER BY name, source, slot_utc DESC
 """
 
 _PAUSED_SQL = """
@@ -119,7 +122,7 @@ def _cron_hooks(raw: list[Any]) -> list[tuple[str, str, str]]:
     return found
 
 
-def _read_triggers(data: bytes) -> list[Any]:
+def read_triggers(data: bytes) -> list[Any]:
     settings = get_settings()
     with tempfile.TemporaryDirectory() as tmp:
         bundles.extract_and_validate(
@@ -133,15 +136,15 @@ def _read_triggers(data: bytes) -> list[Any]:
     return declared if isinstance(declared, list) else []
 
 
-async def _resolve_agent(session: AsyncSession, raw: str) -> Any:
+async def resolve_agent(session: AsyncSession, raw: str) -> Any:
     parsed: uuid.UUID | None
     try:
         parsed = uuid.UUID(raw)
     except ValueError:
         parsed = None
-    agent = await crud.get_agent(session, parsed) if parsed is not None else None
+    agent = await crud_agents.get_agent(session, parsed) if parsed is not None else None
     if agent is None:
-        agent = await crud.get_agent_by_name(session, raw)
+        agent = await crud_agents.get_agent_by_name(session, raw)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     return agent
@@ -157,14 +160,14 @@ async def _in_force(session: AsyncSession, agent_id: uuid.UUID | None) -> list[d
 
 async def _latest(
     session: AsyncSession, agent_id: uuid.UUID
-) -> dict[str, tuple[datetime, str | None]]:
+) -> dict[tuple[str, str], tuple[datetime, str | None, str | None]]:
     statement = text(_LATEST_SQL.format(schema=SCHEMA))
     rows = (await session.execute(statement, {"agent_id": agent_id})).mappings().all()
-    latest: dict[str, tuple[datetime, str | None]] = {}
+    latest: dict[tuple[str, str], tuple[datetime, str | None, str | None]] = {}
     for row in rows:
         name = row["name"]
         if isinstance(name, str):
-            latest[name] = (row["slot_utc"], row["outcome"])
+            latest[name, row["source"]] = (row["slot_utc"], row["outcome"], row["reason"])
     return latest
 
 
@@ -184,16 +187,27 @@ async def _hooks_for(
         return [], None
     try:
         data = await store.get(bundle_ref)
-        declared = await run_in_threadpool(_read_triggers, data)
-    except Exception:
+        declared = await run_in_threadpool(read_triggers, data)
+    except Exception:  # noqa: BLE001 - existing broad catch retained
         return [], _UNREADABLE
     latest = await _latest(session, agent_id)
     paused = await _paused(session, agent_id)
     hooks: list[ScheduleHookOut] = []
     for name, schedule, zone in _cron_hooks(declared):
-        slot = latest.get(name)
+        slot = latest.get((name, "schedule"))
         last_fire_at = None if slot is None else slot[0]
         last_outcome = None if slot is None else _OUTCOMES.get(slot[1] or "")
+        raw_reason = None if slot is None else slot[2]
+        if raw_reason is not None and raw_reason not in get_args(HookRunReason):
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "hook run reason is unknown")
+        last_reason = cast(HookRunReason | None, raw_reason)
+        manual = latest.get((name, "manual"))
+        last_manual_fire_at = None if manual is None else manual[0]
+        last_manual_outcome = None if manual is None else _OUTCOMES.get(manual[1] or "")
+        raw_manual_reason = None if manual is None else manual[2]
+        if raw_manual_reason is not None and raw_manual_reason not in get_args(HookRunReason):
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "hook run reason is unknown")
+        last_manual_reason = cast(HookRunReason | None, raw_manual_reason)
         hooks.append(
             ScheduleHookOut(
                 name=name,
@@ -202,6 +216,10 @@ async def _hooks_for(
                 zone=zone,
                 last_fire_at=last_fire_at,
                 last_outcome=last_outcome,
+                last_reason=last_reason,
+                last_manual_fire_at=last_manual_fire_at,
+                last_manual_outcome=last_manual_outcome,
+                last_manual_reason=last_manual_reason,
                 paused=name in paused,
             )
         )
@@ -214,9 +232,9 @@ async def list_schedules(
     store: StoreDep,
     agent: str | None = None,
 ) -> ScheduleListOut:
-    """Cron hooks on each in-force deployment, newest slot first in the record."""
+    """Cron hooks on each in-force deployment, with separate latest run histories."""
 
-    selected = None if agent is None else await _resolve_agent(session, agent)
+    selected = None if agent is None else await resolve_agent(session, agent)
     rows = await _in_force(session, None if selected is None else selected.id)
     if selected is not None and not rows:
         return ScheduleListOut(
@@ -245,13 +263,13 @@ async def list_schedules(
 
 
 async def _named_hook(session: AsyncSession, store: ObjectStore, raw_agent: str, name: str) -> Any:
-    agent = await _resolve_agent(session, raw_agent)
+    agent = await resolve_agent(session, raw_agent)
     rows = await _in_force(session, agent.id)
     if not rows or rows[0]["bundle_ref"] is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "schedule not found")
     try:
         data = await store.get(rows[0]["bundle_ref"])
-        declared = await run_in_threadpool(_read_triggers, data)
+        declared = await run_in_threadpool(read_triggers, data)
     except Exception as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, _UNREADABLE) from exc
     if name not in {hook_name for hook_name, _, _ in _cron_hooks(declared)}:

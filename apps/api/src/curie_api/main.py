@@ -9,10 +9,12 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
+from functools import partial
 
 import httpx
 import redis.asyncio as redis
+from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     bootstrap_service_telemetry,
@@ -26,11 +28,21 @@ from fastapi import FastAPI, HTTPException, Request
 from opentelemetry.trace import SpanKind, StatusCode
 from starlette.routing import Match
 
-from . import __version__, crud
+from curie_api.crud import agents as crud_agents
+
+from . import __version__, oidc
+from .channel_identities import start_static_slack_bootstrap
+from .code_host_trust import code_host_verify
 from .commitpoller import CommitPoller, GitHubBranchTip
 from .config import get_settings
-from .db import create_engine, create_sessionmaker
+from .db import (
+    create_engine,
+    create_liveness_engine,
+    create_sessionmaker,
+    create_source_gate_engine,
+)
 from .evalqueue import EvalQueue
+from .forges.registry import forges_registry
 from .github_app import credentials_for, log_credential_path
 from .github_checks import GitHubStatusReporter
 from .github_review_store import GitHubReviewReconciler
@@ -38,14 +50,20 @@ from .graveyardwatcher import GraveyardWatcher
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
 from .langfuse import LangfuseClient
+from .lineage_reconciler import start_lineage_reconciler
+from .protected_reconciler import ProtectedAdmissionReconciler
+from .remediation_admission import reconcile_admissions
 from .resumequeue import ResumeQueue
 from .resumereconciler import ResumeReconciler
 from .routers import (
+    action_executions,
     actions,
     agents,
     approval_recovery,
     approvals,
     bundles,
+    channel_identities,
+    channel_read,
     channels,
     cluster_message_replies,
     config,
@@ -59,14 +77,24 @@ from .routers import (
     github,
     github_reviews,
     hook_fire,
+    hook_source_policy,
     hooks,
+    identity,
     memory,
     observability,
+    provider_installations,
+    publication_code_host,
     publication_precheck,
     publications,
+    remediation_nominations,
+    remediation_policy,
+    remediation_qualifications,
+    remediation_receipts,
     runs,
     schedules,
     state,
+    thread_attachments,
+    turn_progress,
     work_item_issue,
     work_item_outcomes,
     work_items,
@@ -90,6 +118,7 @@ def _validate_forwarded_allow_ips() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """@spec PROTECTED-HOOK-SOURCE-2/10."""
     _validate_forwarded_allow_ips()
     settings = get_settings()
     # Fail closed when this image cannot serve the live schema. Migrations are
@@ -98,7 +127,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = create_engine()
     app.state.engine = engine
     app.state.sessionmaker = create_sessionmaker(engine)
-    http_client = httpx.AsyncClient(timeout=10.0)
+    # The factory's forge registry, built once from CURIE_FORGES (#4397), so a
+    # config the registry refuses fails boot rather than the first factory pass.
+    app.state.forges = forges_registry(settings)
+    # The shared client reaches the code host, so it trusts the operator's
+    # code host CA bundle as well as the public roots (#3831).
+    http_client = httpx.AsyncClient(timeout=10.0, verify=code_host_verify(settings))
     app.state.http_client = http_client
     app.state.langfuse = LangfuseClient(settings, http_client)
     store = BundleStore(settings)
@@ -114,6 +148,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.kill_switch = KillSwitch(valkey)
     app.state.thread_reset_requests = ThreadResetRequests(valkey)
     app.state.eval_queue = EvalQueue(valkey)
+    from .deploy_notice import DeployNoticeQueue
+
+    app.state.deploy_notice_queue = DeployNoticeQueue(
+        valkey, settings.deploy_notice_stream_name(), app.state.sessionmaker
+    )
+    app.state.deploy_notice_reconciler_task = (
+        asyncio.create_task(
+            app.state.deploy_notice_queue.run_forever(
+                settings.deploy_notice_reconciler_interval_s
+            )
+        )
+        if settings.deploy_notice_reconciler_enabled
+        else None
+    )
     # resume_dead_letter_stream stays the narrower override that wins when set;
     # its fallback is now the unified graveyard name (which honors
     # CURIE_DEAD_LETTER_STREAM / CURIE_STREAM via the shared derivation, #668)
@@ -144,6 +192,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # deployment, and a route that declares an approvers group then fails
     # closed at resolve time rather than silently widening.
     app.state.approver_sets = build_approver_set_selector(http_client, settings)
+    # Every configured Slack identity as one unattached channel identity
+    # (#2909, ADR 0168 decision 1, as scoped by ADR 0193 decision 4): the
+    # legacy default plus every CURIE_SLACK_IDENTITIES entry with a non-blank
+    # bot token, each behind its own token gate, so a Slack-free install gets
+    # no row. Attaching it to a provider_installations row is #3039's job, not
+    # boot's -- only the identity's own credential can later report which
+    # installation it belongs to. Never fails boot; if this image started
+    # below this migration it keeps retrying in the background. identities.py
+    # still reads CURIE_SLACK_IDENTITIES directly to validate a binding's
+    # declared name, not from this table, pending #2911.
+    app.state.static_slack_bootstrap_task = await start_static_slack_bootstrap(
+        app.state.sessionmaker, settings
+    )
     app.state.github_reporter = GitHubStatusReporter(
         http_client,
         api_url=settings.github_api_url,
@@ -173,10 +234,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.work_item_reconciler_enabled
         else None
     )
+    app.state.work_item_status_comments_task = (
+        asyncio.create_task(work_item_reconciler.run_status_comments_forever())
+        if settings.work_item_reconciler_enabled
+        else None
+    )
     app.state.resume_reconciler_task = (
         asyncio.create_task(reconciler.run_forever())
         if settings.resume_reconciler_enabled
         else None
+    )
+    app.state.lineage_reconciler_task = start_lineage_reconciler(
+        app.state.sessionmaker, settings, http_client
     )
     # The expiry sweeper (#412) flips lapsed pending approvals and resumes their
     # stranded sessions. It shares this lifecycle's resources (sessionmaker,
@@ -191,6 +260,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 settings.approval_sweep_interval_s,
                 sweeper_stop,
                 publication_patch_retention_seconds=(settings.publication_patch_retention_seconds),
+                remediation_admissions=(
+                    partial(
+                        reconcile_admissions,
+                        store=app.state.bundle_store,
+                        kill_switch=app.state.kill_switch,
+                    )
+                    if settings.remediation_enabled and settings.action_executor_enabled
+                    else None
+                ),
             )
         )
     else:
@@ -221,6 +299,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             store=app.state.bundle_store,
             settings=settings,
             eval_queue=app.state.eval_queue,
+            notice_queue=app.state.deploy_notice_queue,
             tips=GitHubBranchTip(settings, credentials_for(settings)),
             interval_seconds=settings.commit_poll_interval_s,
         )
@@ -235,6 +314,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         environ=os.environ,
         level=settings.log_level.upper(),
     )
+    # Keep access and error records at INFO on the shared telemetry handlers.
+    configure_service_logging(
+        logging.getLogger("uvicorn"),
+        service_name="curie-api",
+        logger_provider=telemetry.logger_provider,
+        level=logging.INFO,
+    )
     app.state.telemetry = telemetry
     for limit in ("value", "namespace"):
         record_metric(
@@ -247,67 +333,111 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "limit": limit,
             },
         )
-    try:
-        yield
-    finally:
-        review_task = getattr(app.state, "github_review_reconciler_task", None)
-        if review_task is not None:
-            review_task.cancel()
-            try:
-                await review_task
-            except asyncio.CancelledError:
-                pass
-        # Both background loops enqueue via resume_queue (which uses the valkey
-        # client) and read via the sessionmaker, so both are stopped BEFORE
-        # valkey.aclose()/engine.dispose() below.
-        work_item_task = getattr(app.state, "work_item_reconciler_task", None)
-        if work_item_task is not None:
-            work_item_task.cancel()
-            try:
-                await work_item_task
-            except asyncio.CancelledError:
-                pass
-        task = getattr(app.state, "resume_reconciler_task", None)
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        # Stop the sweeper BEFORE closing valkey/engine so an in-flight pass does
-        # not race the closed clients. The wait-first loop wakes immediately on
-        # stop.set(); wait_for already cancels on timeout, so suppressing
-        # TimeoutError/CancelledError is the whole teardown.
-        if sweeper_stop is not None:
-            sweeper_stop.set()
-            try:
-                await asyncio.wait_for(app.state.sweeper_task, 5.0)
-            except (TimeoutError, asyncio.CancelledError):
-                pass
-        # Read-only, so simply cancel it before closing valkey.
-        watcher_task = getattr(app.state, "graveyard_watcher_task", None)
-        if watcher_task is not None:
-            watcher_task.cancel()
-            try:
-                await watcher_task
-            except asyncio.CancelledError:
-                pass
-        # Cancelled before engine.dispose(): a poll pass mid-deploy holds a
-        # session, and disposing the engine underneath it would raise on the
-        # way out rather than shutting down cleanly.
-        poller_task = getattr(app.state, "commit_poller_task", None)
-        if poller_task is not None:
-            poller_task.cancel()
-            try:
-                await poller_task
-            except asyncio.CancelledError:
-                pass
+    async with AsyncExitStack() as source_resources:
+        liveness_engine = create_liveness_engine()
+        source_resources.push_async_callback(liveness_engine.dispose)
+        app.state.liveness_engine = liveness_engine
+        app.state.liveness_sessionmaker = create_sessionmaker(liveness_engine)
+        source_gate_engine = create_source_gate_engine()
+        source_resources.push_async_callback(source_gate_engine.dispose)
+        app.state.source_gate = SourceGate(source_gate_engine)
+        # @spec PROTECTED-HOOK-LANE-4: one admission reconciler per process, inside
+        # the source resource scope, stopped before Valkey and the engines close.
+        protected_reconciler = ProtectedAdmissionReconciler(
+            lambda: get_settings().protected_runtime_dir
+        )
+        app.state.protected_admission_reconciler = protected_reconciler
+        protected_reconciler.start()
         try:
-            await valkey.aclose()
-            await http_client.aclose()
-            await engine.dispose()
+            yield
         finally:
-            telemetry.shutdown()
+            await protected_reconciler.stop()
+            notice_task = app.state.deploy_notice_reconciler_task
+            if notice_task is not None:
+                notice_task.cancel()
+                try:
+                    await notice_task
+                except asyncio.CancelledError:
+                    pass
+            # Holds a session while it retries, so it stops before engine.dispose().
+            bootstrap_task = getattr(app.state, "static_slack_bootstrap_task", None)
+            if bootstrap_task is not None:
+                bootstrap_task.cancel()
+                try:
+                    await bootstrap_task
+                except asyncio.CancelledError:
+                    pass
+            review_task = getattr(app.state, "github_review_reconciler_task", None)
+            if review_task is not None:
+                review_task.cancel()
+                try:
+                    await review_task
+                except asyncio.CancelledError:
+                    pass
+            # These background loops use Valkey and the database, so stop them
+            # before closing either resource.
+            status_task = getattr(app.state, "work_item_status_comments_task", None)
+            if status_task is not None:
+                status_task.cancel()
+                try:
+                    await status_task
+                except asyncio.CancelledError:
+                    pass
+            work_item_task = getattr(app.state, "work_item_reconciler_task", None)
+            if work_item_task is not None:
+                work_item_task.cancel()
+                try:
+                    await work_item_task
+                except asyncio.CancelledError:
+                    pass
+            lineage_task = getattr(app.state, "lineage_reconciler_task", None)
+            if lineage_task is not None:
+                lineage_task.cancel()
+                try:
+                    await lineage_task
+                except asyncio.CancelledError:
+                    pass
+            task = getattr(app.state, "resume_reconciler_task", None)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            # Stop the sweeper BEFORE closing valkey/engine so an in-flight pass does
+            # not race the closed clients. The wait-first loop wakes immediately on
+            # stop.set(); wait_for already cancels on timeout, so suppressing
+            # TimeoutError/CancelledError is the whole teardown.
+            if sweeper_stop is not None:
+                sweeper_stop.set()
+                try:
+                    await asyncio.wait_for(app.state.sweeper_task, 5.0)
+                except (TimeoutError, asyncio.CancelledError):
+                    pass
+            # Read-only, so simply cancel it before closing valkey.
+            watcher_task = getattr(app.state, "graveyard_watcher_task", None)
+            if watcher_task is not None:
+                watcher_task.cancel()
+                try:
+                    await watcher_task
+                except asyncio.CancelledError:
+                    pass
+            # Cancelled before engine.dispose(): a poll pass mid-deploy holds a
+            # session, and disposing the engine underneath it would raise on the
+            # way out rather than shutting down cleanly.
+            poller_task = getattr(app.state, "commit_poller_task", None)
+            if poller_task is not None:
+                poller_task.cancel()
+                try:
+                    await poller_task
+                except asyncio.CancelledError:
+                    pass
+            try:
+                await valkey.aclose()
+                await http_client.aclose()
+                await engine.dispose()
+            finally:
+                telemetry.shutdown()
 
 
 def configure_logging(level: str | None = None) -> logging.Logger:
@@ -376,7 +506,23 @@ def create_app() -> FastAPI:
     # Which credential the platform will clone with (ADR-0092, #1262). One
     # line, no secret, and a warning when the App is set up only halfway.
     log_credential_path(get_settings())
-    app = FastAPI(title="Curie API", version="0.1.0", lifespan=lifespan)
+    # And whether an enabled OIDC login admits everyone its IdP signs in.
+    oidc.log_admission_policy(get_settings())
+    # Curie owns the redacted, closed-vocabulary HTTP telemetry below. FastAPI's
+    # native telemetry otherwise inserts a second server/operation span and
+    # configures independent exporters around that boundary (#4410).
+    app = FastAPI(
+        title="Curie API",
+        version="0.1.0",
+        lifespan=lifespan,
+        telemetry={
+            "tracing": False,
+            "metrics": False,
+            "logs": False,
+            "operation_spans": False,
+            "auto_configure": False,
+        },
+    )
 
     @app.get("/health", tags=["health"])
     async def health() -> dict[str, str]:
@@ -390,9 +536,9 @@ def create_app() -> FastAPI:
     async def ready(request: Request) -> dict[str, str]:
         try:
             async with asyncio.timeout(2):
-                async with request.app.state.sessionmaker() as session:
-                    await crud.list_agents(session)
-        except Exception:
+                async with request.app.state.liveness_sessionmaker() as session:
+                    await crud_agents.list_agents(session)
+        except Exception:  # noqa: BLE001 - existing broad catch retained
             raise HTTPException(
                 status_code=503,
                 detail="Database is unavailable",
@@ -402,6 +548,11 @@ def create_app() -> FastAPI:
     app.include_router(config.router)
     app.include_router(console.router)
     app.include_router(agents.router)
+    app.include_router(hook_source_policy.router)
+    app.include_router(remediation_policy.router)
+    app.include_router(remediation_nominations.router)
+    app.include_router(remediation_qualifications.router)
+    app.include_router(remediation_receipts.router)
     app.include_router(deployments.router)
     app.include_router(bundles.router)
     app.include_router(deploy_targets.router)
@@ -415,24 +566,38 @@ def create_app() -> FastAPI:
     app.include_router(schedules.router)
     app.include_router(hook_fire.router)
     app.include_router(state.router)
+    app.include_router(state.internal_router)
+    app.include_router(state.released_router)
+    app.include_router(thread_attachments.internal_router)
     app.include_router(memory.router)
     # BEFORE approvals.router: GET /approvals/identity-report would otherwise
     # be matched by GET /approvals/{approval_id} and fail as a bad uuid.
     app.include_router(approval_recovery.router)
     app.include_router(approvals.router)
     app.include_router(actions.router)
+    app.include_router(actions.undo_router)
+    app.include_router(action_executions.probe_router)
+    app.include_router(action_executions.router)
+    app.include_router(action_executions.receipt_router)
     app.include_router(publication_precheck.router)
     app.include_router(publications.router)
     app.include_router(publications.internal_router)
+    app.include_router(publication_code_host.router)
     app.include_router(work_item_issue.router)
     app.include_router(work_item_issue.internal_router)
+    app.include_router(channel_read.router)
+    app.include_router(channel_read.internal_router)
     app.include_router(work_items.router)
     app.include_router(factory_status.router)
+    app.include_router(turn_progress.router)
     app.include_router(work_item_outcomes.router)
     app.include_router(cluster_message_replies.router)
     app.include_router(cluster_message_replies.internal_router)
     app.include_router(workspaces.router)
     app.include_router(channels.router)
+    app.include_router(provider_installations.router)
+    app.include_router(channel_identities.router)
+    app.include_router(identity.router)
     app.include_router(hooks.router)
 
     @app.middleware("http")

@@ -61,9 +61,7 @@ def test_a_redirected_ingress_post_never_replays_the_channel_token(
     origin that captures it can drive the agent directly.
     """
     adapter = make_adapter(api_base_url=redirect.url)
-    mail.add_inbound("msg-1", "thr-1")
-
-    adapter.poll_once()
+    adapter.post_turn({"delivery_id": "msg-1", "conversation_id": "thr-1"})
 
     assert sink.credentials_seen() == [], "the channel token was replayed at the redirect target"
     # The name-independent form of the same claim: nothing at all arrived, so

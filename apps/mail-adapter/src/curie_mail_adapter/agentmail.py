@@ -244,9 +244,20 @@ class AgentMailClient:
     def get_thread(self, thread_id: str) -> tuple[int, Any]:
         return self._call("GET", f"/inboxes/{self._inbox}/threads/{_quoted(thread_id)}")
 
-    def reply(self, message_id: str, text: str) -> tuple[int, Any]:
+    def reply(self, message_id: str, text: str, *, reply_all: bool = False) -> tuple[int, Any]:
+        """Reply to one message: to its sender, or with ``reply_all`` to everyone on it.
+
+        Reply To Message takes "reply_all (boolean, optional): Reply to all
+        recipients of the original message"; without it the reply goes to the
+        sender alone, which is every reply this adapter sends except the
+        approval request and its outcome (ADR-0177 amendment A5).
+        https://docs.agentmail.to/api-reference/inboxes/messages/reply
+        """
+        body: dict[str, Any] = {"text": text}
+        if reply_all:
+            body["reply_all"] = True
         return self._call(
             "POST",
             f"/inboxes/{self._inbox}/messages/{_quoted(message_id)}/reply",
-            {"text": text},
+            body,
         )

@@ -5,6 +5,20 @@ on:
     branches: [main, next]
   pull_request:
     branches: [main, next, "task/**"]
+    paths:
+      - cli/Cargo.lock
+      - cli/Cargo.toml
+      - packages/aci-protocol/generated/rust/Cargo.lock
+      - packages/aci-protocol/generated/rust/Cargo.toml
+      - apps/docker-daemon/Cargo.lock
+      - apps/docker-daemon/Cargo.toml
+      - uv.lock
+      - "**/pyproject.toml"
+      - apps/ui/pnpm-lock.yaml
+      - apps/ui/package.json
+      - tools/contract-codegen/pnpm-lock.yaml
+      - tools/contract-codegen/package.json
+      - .github/workflows/dependency-audit.yaml
   schedule:
     # Advisory databases change independently of the code, so re-run weekly to
     # catch newly-published CVEs against dependencies that never changed.
@@ -30,13 +44,16 @@ jobs:
           persist-credentials: false
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
-      # Both committed Cargo.lock files are audited. cargo-audit reads the
+      # Every committed Cargo.lock file is audited. cargo-audit reads the
       # Cargo.lock in the working directory and fails the job on any advisory.
       - name: Audit cli crate
         working-directory: cli
         run: cargo audit
       - name: Audit generated ACI protocol crate
         working-directory: packages/aci-protocol/generated/rust
+        run: cargo audit
+      - name: Audit Docker authorization plugin crate
+        working-directory: apps/docker-daemon
         run: cargo audit
 
   python-audit:
@@ -56,7 +73,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -66,7 +83,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       # Export the fully-resolved third-party dependency set from the frozen
@@ -103,4 +120,27 @@ jobs:
       # advisory, matching cargo-audit/pip-audit's fail-the-job behavior above.
       - name: pnpm audit
         working-directory: apps/ui
+        run: pnpm audit
+
+  contract-codegen-audit:
+    name: pnpm audit (tools/contract-codegen)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: tools/contract-codegen/pnpm-lock.yaml
+      - name: Install dependencies
+        working-directory: tools/contract-codegen
+        run: pnpm install --frozen-lockfile
+      - name: pnpm audit
+        working-directory: tools/contract-codegen
         run: pnpm audit

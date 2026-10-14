@@ -17,6 +17,7 @@ from _support import (
     free_port,
     get,
     post_event,
+    seed_historical_reply,
     spawn_adapter,
     stop,
     update,
@@ -34,6 +35,16 @@ def _env(mail: MailState, ingress: IngressState, port: int, state_path: Path) ->
         port=port,
         CURIE_MAIL_STATE_PATH=str(state_path),
     )
+
+
+def _seed_history(mail: MailState, state_path: Path, message_id: str, thread_id: str) -> None:
+    """Write state accepted before upgrade before the real adapter process opens it."""
+    state = DurableMailState(str(state_path), max_pending=1000, max_bytes=268435456)
+    try:
+        seed_historical_reply(mail, state, message_id, thread_id)
+        state.finish_prime()
+    finally:
+        state.close()
 
 
 def _sigkill(proc: subprocess.Popen[str]) -> str:
@@ -85,18 +96,12 @@ with state.transaction() as connection:
             writer.kill()
             writer.communicate(timeout=15)
 
-    reopened = DurableMailState(
-        str(state_path), max_pending=20, max_bytes=8 * 1024 * 1024
-    )
+    reopened = DurableMailState(str(state_path), max_pending=20, max_bytes=8 * 1024 * 1024)
     try:
         with reopened.lock:
-            assert reopened.connection.execute("PRAGMA journal_mode").fetchone() == (
-                "wal",
-            )
+            assert reopened.connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
             assert reopened.connection.execute("PRAGMA synchronous").fetchone() == (2,)
-            assert reopened.connection.execute("PRAGMA integrity_check").fetchone() == (
-                "ok",
-            )
+            assert reopened.connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert reopened.delivery("msg-uncommitted") is None
 
         summary = {
@@ -120,18 +125,14 @@ with state.transaction() as connection:
             },
         )
         assert (
-            reopened.claim_event(
-                "ev-after-crash", "thr-crash", "msg-after-crash", "owner-1"
-            )
+            reopened.claim_event("ev-after-crash", "thr-crash", "msg-after-crash", "owner-1")
             == "claimed"
         )
         reopened.finish_event("ev-after-crash")
         reopened.finish_reply("thr-crash", "msg-after-crash")
 
         assert (
-            reopened.claim_event(
-                "ev-after-crash", "thr-crash", "msg-after-crash", "owner-2"
-            )
+            reopened.claim_event("ev-after-crash", "thr-crash", "msg-after-crash", "owner-2")
             == "done"
         )
         with reopened.lock:
@@ -149,20 +150,22 @@ def test_sigterm_drains_an_in_flight_egress_handler_before_sqlite_close(
     """Shutdown joins a provider-blocked completion before closing durable state."""
     state_path = tmp_path / "mail-state.sqlite3"
     first_port = free_port()
+    _seed_history(mail, state_path, "msg-shutdown", "thr-shutdown")
     first = spawn_adapter(_env(mail, ingress, first_port, state_path))
     completion_result: list[tuple[int, object]] = []
     try:
         wait_for_readyz(first_port, first)
-        mail.add_inbound("msg-shutdown", "thr-shutdown")
-        assert wait_until(lambda: ingress.delivery_ids() == ["msg-shutdown"])
-        assert post_event(
-            f"http://127.0.0.1:{first_port}/",
-            update(
-                "reply survives shutdown",
-                conversation_id="thr-shutdown",
-                reply_ref="msg-shutdown",
-            ),
-        )[0] == 200
+        assert (
+            post_event(
+                f"http://127.0.0.1:{first_port}/",
+                update(
+                    "reply survives shutdown",
+                    conversation_id="thr-shutdown",
+                    reply_ref="msg-shutdown",
+                ),
+            )[0]
+            == 200
+        )
 
         mail.hold_replies()
         completion = threading.Thread(
@@ -178,9 +181,9 @@ def test_sigterm_drains_an_in_flight_egress_handler_before_sqlite_close(
         assert mail.reply_entered.wait(20), "completion never reached the provider"
 
         first.terminate()
-        assert not wait_until(
-            lambda: first.poll() is not None, timeout=0.2
-        ), "SIGTERM exited before the in-flight handler drained"
+        assert not wait_until(lambda: first.poll() is not None, timeout=0.2), (
+            "SIGTERM exited before the in-flight handler drained"
+        )
         mail.release_replies()
         completion.join(20)
         assert not completion.is_alive()
@@ -199,19 +202,22 @@ def test_sigterm_drains_an_in_flight_egress_handler_before_sqlite_close(
     second = spawn_adapter(_env(mail, ingress, second_port, state_path))
     try:
         wait_for_readyz(second_port, second)
-        assert post_event(
-            f"http://127.0.0.1:{second_port}/",
-            completed("ev-shutdown", "thr-shutdown", "msg-shutdown"),
-        )[0] == 200
+        assert (
+            post_event(
+                f"http://127.0.0.1:{second_port}/",
+                completed("ev-shutdown", "thr-shutdown", "msg-shutdown"),
+            )[0]
+            == 200
+        )
         assert len(mail.replies_to("msg-shutdown")) == 1
     finally:
         stop(second)
 
 
-def test_restart_confirmation_delivers_downtime_mail_without_repriming(
+def test_restart_confirmation_rejects_unverifiable_downtime_mail(
     mail: MailState, ingress: IngressState, tmp_path: Path
 ) -> None:
-    """First boot primes once; a replacement resumes rather than burning downtime mail."""
+    """First boot primes once; restart discovery still applies authentication."""
     state_path = tmp_path / "mail-state.sqlite3"
     first_port = free_port()
     first = spawn_adapter(_env(mail, ingress, first_port, state_path))
@@ -225,9 +231,16 @@ def test_restart_confirmation_delivers_downtime_mail_without_repriming(
     second = spawn_adapter(_env(mail, ingress, second_port, state_path))
     try:
         wait_for_readyz(second_port, second)
-        assert wait_until(lambda: ingress.delivery_ids() == ["msg-downtime"])
+        assert ingress.delivery_ids() == []
+        assert mail.body_calls == {}
     finally:
         stop(second)
+
+    state = DurableMailState(str(state_path), max_pending=1000, max_bytes=268435456)
+    try:
+        assert state.delivery("msg-downtime") == {"state": "rejected", "turn": None}
+    finally:
+        state.close()
 
 
 def test_readyz_after_startup_makes_no_agentmail_call(
@@ -250,37 +263,40 @@ def test_readyz_after_startup_makes_no_agentmail_call(
         stop(proc)
 
 
-def test_scoped_token_401_stays_pending_across_recreate(
+def test_historical_pending_mail_is_quarantined_before_platform_token_retries(
     mail: MailState, ingress: IngressState, tmp_path: Path
 ) -> None:
-    """A token rotation may restart the only replica without losing its delivery."""
+    """A delivery pending before upgrade cannot resume without authentication."""
     state_path = tmp_path / "mail-state.sqlite3"
+    state = DurableMailState(str(state_path), max_pending=1000, max_bytes=268435456)
+    summary = mail.add_inbound("msg-rotate", "thr-rotate")
+    assert state.admit(summary) == "admitted"
+    state.finish_prime()
+    state.close()
+    ingress.response = (401, {"detail": "expired scoped token"})
     first_port = free_port()
     first = spawn_adapter(_env(mail, ingress, first_port, state_path))
     try:
         wait_for_readyz(first_port, first)
-        ingress.response = (401, {"detail": "expired scoped token"})
-        mail.add_inbound("msg-rotate", "thr-rotate")
-        assert wait_until(lambda: ingress.attempts > 0)
+        assert ingress.attempts == 0
+        assert mail.body_calls == {}
         _sigkill(first)
     finally:
         if first.poll() is None:
             stop(first)
-
-    ingress.requests.clear()
-    ingress.attempts = 0
-    ingress.attempt_times.clear()
-    ingress.response = (
-        200,
-        {"event_id": "chn-rotate", "stream_id": "1-0", "duplicate": False},
-    )
     second_port = free_port()
     second = spawn_adapter(_env(mail, ingress, second_port, state_path))
     try:
         wait_for_readyz(second_port, second)
-        assert wait_until(lambda: ingress.delivery_ids() == ["msg-rotate"])
+        assert ingress.attempts == 0
     finally:
         stop(second)
+    reopened = DurableMailState(str(state_path), max_pending=1000, max_bytes=268435456)
+    try:
+        assert reopened.delivery("msg-rotate") == {"state": "rejected", "turn": None}
+        assert reopened.pending() == []
+    finally:
+        reopened.close()
 
 
 def test_expired_completion_lease_is_reclaimed_after_sigkill_reopen(
@@ -289,11 +305,10 @@ def test_expired_completion_lease_is_reclaimed_after_sigkill_reopen(
     """Admitted reply text survives SIGKILL and completion never 503s forever."""
     state_path = tmp_path / "mail-state.sqlite3"
     first_port = free_port()
+    _seed_history(mail, state_path, "msg-lease", "thr-lease")
     first = spawn_adapter(_env(mail, ingress, first_port, state_path))
     try:
         wait_for_readyz(first_port, first)
-        mail.add_inbound("msg-lease", "thr-lease")
-        assert wait_until(lambda: ingress.delivery_ids() == ["msg-lease"])
         status, _ = post_event(
             f"http://127.0.0.1:{first_port}/",
             update("durable answer", conversation_id="thr-lease", reply_ref=None),
@@ -341,20 +356,25 @@ def test_crash_after_provider_accept_uses_thread_witness_before_resend(
     """An accepted-but-unacked reply converges to 200 with zero extra sends."""
     state_path = tmp_path / "mail-state.sqlite3"
     first_port = free_port()
+    _seed_history(mail, state_path, "msg-ambiguous", "thr-ambiguous")
     first = spawn_adapter(_env(mail, ingress, first_port, state_path))
     try:
         wait_for_readyz(first_port, first)
-        mail.add_inbound("msg-ambiguous", "thr-ambiguous")
-        assert wait_until(lambda: ingress.delivery_ids() == ["msg-ambiguous"])
-        assert post_event(
-            f"http://127.0.0.1:{first_port}/",
-            update("one answer", conversation_id="thr-ambiguous", reply_ref=None),
-        )[0] == 200
+        assert (
+            post_event(
+                f"http://127.0.0.1:{first_port}/",
+                update("one answer", conversation_id="thr-ambiguous", reply_ref=None),
+            )[0]
+            == 200
+        )
         mail.accept_then_drop_next_reply = True
-        assert post_event(
-            f"http://127.0.0.1:{first_port}/",
-            completed("ev-ambiguous", "thr-ambiguous", "msg-ambiguous"),
-        )[0] == 502
+        assert (
+            post_event(
+                f"http://127.0.0.1:{first_port}/",
+                completed("ev-ambiguous", "thr-ambiguous", "msg-ambiguous"),
+            )[0]
+            == 502
+        )
         assert len(mail.replies_to("msg-ambiguous")) == 1
         _sigkill(first)
     finally:
@@ -385,9 +405,9 @@ def test_serialized_sqlite_writer_handles_poll_and_concurrent_egress(
     url = serve_egress(adapter) + "/"
     message_ids = [f"msg-{index}" for index in range(8)]
     for index, message_id in enumerate(message_ids):
-        mail.add_inbound(message_id, f"thr-{index}")
+        seed_historical_reply(mail, adapter.state, message_id, f"thr-{index}")
     adapter.poll_once()
-    assert set(ingress.delivery_ids()) == set(message_ids)
+    assert ingress.delivery_ids() == []
 
     barrier = threading.Barrier(len(message_ids) + 1)
     statuses: list[int] = []
@@ -400,9 +420,7 @@ def test_serialized_sqlite_writer_handles_poll_and_concurrent_egress(
                 update(f"answer {index}", f"thr-{index}", reply_ref=message_id),
             )[0]
         )
-        statuses.append(
-            post_event(url, completed(f"ev-{index}", f"thr-{index}", message_id))[0]
-        )
+        statuses.append(post_event(url, completed(f"ev-{index}", f"thr-{index}", message_id))[0])
 
     threads = [
         threading.Thread(target=complete, args=(index, message_id), daemon=True)
@@ -418,4 +436,5 @@ def test_serialized_sqlite_writer_handles_poll_and_concurrent_egress(
 
     assert statuses == [200] * (len(message_ids) * 2)
     assert {message_id for message_id, _text in mail.replies} == set(message_ids)
-    assert "msg-poll-race" in ingress.delivery_ids()
+    assert ingress.delivery_ids() == []
+    assert adapter.state.delivery("msg-poll-race") == {"state": "rejected", "turn": None}

@@ -35,6 +35,8 @@
 #   9  CURIE_MAIL_ALLOWED_SENDERS renders from mailAdapter.allowedSenders, and an
 #      EMPTY list renders an empty value rather than being omitted, so the
 #      adapter's boot gate fires instead of the variable silently defaulting.
+#      The candidate also renders CURIE_MAIL_ALLOW_ALL_SENDERS=false against
+#      retained v0.12.0 defaults, which have no allowAllSenders key.
 #   10 Every configured knob arrives under the exact name MailAdapterConfig
 #      reads. A typo in an env NAME renders green and is then ignored at runtime.
 #   11 replicas is 1, --set mailAdapter.replicas=3 does not change it (the knob
@@ -490,11 +492,40 @@ actual="$(field "$on_dir" Deployment "$DEPLOY_NAME" spec.template.spec.priorityC
 #    VALUE rather than being omitted, so the adapter's boot gate fires instead of
 #    the variable silently defaulting.
 # ---------------------------------------------------------------------------
+assert_env_value "$on_dir" CURIE_MAIL_ALLOW_ALL_SENDERS "false" \
+  "The wildcard sender filter must require explicit opt in by default."
 assert_env_value "$on_dir" CURIE_MAIL_ALLOWED_SENDERS "" \
   "An empty mailAdapter.allowedSenders must render the variable with an empty value, not omit it."
 senders_dir="$(render senders "${ON[@]}" "${CREDS[@]}" --set 'mailAdapter.allowedSenders={ops@example.com,dev@example.com}')"
 assert_env_value "$senders_dir" CURIE_MAIL_ALLOWED_SENDERS "ops@example.com,dev@example.com" \
   "The configured allow-list must reach the process comma-joined."
+
+# Helm --reuse-values replaces the candidate's defaults with the released
+# defaults; an old values overlay would silently retain the new key. Use the
+# actual locally tracked release values, without a network or provider call.
+retained_chart="$TMP/retained-v0.12.0"
+cp -R "$CHART" "$retained_chart"
+git -C "$REPO_ROOT" show v0.12.0:charts/curie/values.yaml > "$retained_chart/values.yaml" \
+  || fail "the tracked v0.12.0 values.yaml is required for the retained-values proof"
+python3 - "$retained_chart/values.yaml" <<'PY' \
+  || fail "v0.12.0 must contain mailAdapter defaults without allowAllSenders"
+import sys
+
+import yaml
+
+values = yaml.safe_load(open(sys.argv[1]))
+mail = values.get("mailAdapter")
+if not isinstance(mail, dict) or "allowAllSenders" in mail:
+    raise SystemExit("retained values must predate mailAdapter.allowAllSenders")
+PY
+retained_dir="$TMP/render-retained-v0.12.0"
+mkdir -p "$retained_dir"
+helm template "$RELEASE" "$retained_chart" --namespace default --is-upgrade \
+  --output-dir "$retained_dir" "${ON[@]}" "${CREDS[@]}" \
+  --set 'mailAdapter.allowedSenders={ops@example.com}' >/dev/null \
+  || fail "candidate templates must render against retained v0.12.0 defaults"
+assert_env_value "$retained_dir" CURIE_MAIL_ALLOW_ALL_SENDERS "false" \
+  "Retained release values without allowAllSenders must keep wildcard consent false."
 
 # ---------------------------------------------------------------------------
 # 10: every configured knob arrives under the exact name MailAdapterConfig reads.
@@ -509,11 +540,14 @@ knobs_dir="$(render knobs "${ON[@]}" "${CREDS[@]}" \
   --set mailAdapter.maxReplyBytes=8192 \
   --set mailAdapter.maxStateBytes=1048576 \
   --set mailAdapter.ingressEnabled=false \
+  --set mailAdapter.allowAllSenders=true \
   --set mailAdapter.discoveryUnreadyAfterSeconds=45)"
 assert_env_value "$knobs_dir" AGENTMAIL_INBOX "assert-inbox@example.com" \
   "mailAdapter.inbox must reach the process; a name typo renders green and is ignored at runtime."
 assert_env_value "$knobs_dir" CURIE_MAIL_POLL_INTERVAL_SECONDS "37" \
   "mailAdapter.pollIntervalSeconds must reach the process as a quoted string."
+assert_env_value "$knobs_dir" CURIE_MAIL_ALLOW_ALL_SENDERS "true" \
+  "mailAdapter.allowAllSenders must explicitly reach the boot gate without bypassing authentication."
 assert_env_value "$knobs_dir" ADAPTER_INGRESS_ENABLED "false" \
   "mailAdapter.ingressEnabled must reach the process as a quoted string; an unquoted YAML bool is rejected by the API server."
 assert_env_value "$knobs_dir" CURIE_MAIL_MAX_PENDING_DELIVERIES "17" \

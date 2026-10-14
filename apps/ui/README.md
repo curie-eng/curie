@@ -20,6 +20,50 @@ pnpm exec playwright test   # E2E, headless; builds + previews automatically
 `pnpm dev` serves the app on http://localhost:5173. `pnpm preview` serves the
 production build on http://localhost:4173 (what Playwright drives).
 
+### Console credential proof
+
+Choose an unused loopback `PW_PORT` and leave `PW_BASE_URL` unset so Playwright
+builds and serves the candidate's production assets. From `apps/ui`, run:
+
+```bash
+CI=1 pnpm exec playwright test e2e/console-assets.spec.ts --project=chromium
+```
+
+The spec reads every built file under `dist/`, including deferred chunks and any
+source maps. It rejects platform key values and the removed browser key resolver
+signatures. The generated browser command manifest omits credential argument
+defaults; command IDs, flags, environment names, help text, secret references,
+and ordinary defaults remain available for CLI hints. The host CLI manifest is
+unchanged.
+
+For the wired proof, start a task-owned full backing stack and the candidate API
+with its schema applied. Follow the repository's
+[concurrent verification instructions](../../AGENTS.md#concurrent-local-verification)
+for isolated ports, endpoints, and cleanup. Export `CURIE_API_TARGET` for that API,
+an unused loopback `PW_PORT`, and `CURIE_API_KEY` matching the API's `API_KEY`
+setting. The platform key is used only by the Node harness to mint a login code;
+the browser signs in through the login screen with that code.
+
+```bash
+PW_INTEGRATION=1 pnpm exec playwright test e2e/integration/console-secret-proof.spec.ts --project=integration
+```
+
+This proof records real traffic while signing in, navigating, and traversing
+browser history. It checks browser URLs, request URLs, and Referer headers for
+credential parameters and tested credential values, rejects a platform-key
+request header, and checks request bodies and completed API response bodies for
+platform key values. It verifies the session cookie and requires successful
+protected API calls. The login exchange must post only the code and return only
+identity and expiry fields. An unauthenticated request from the fresh Playwright
+context through the preview's `/api/agents` proxy must receive 401. It uses the
+real API without route interception and does not need the existing wiring spec's
+OTLP trace seed.
+
+Verify the assertions with a local negative control: temporarily reintroduce a
+platform-key query path, rebuild, and run the same proof. The run must fail on a
+credential assertion. Restore the candidate source, rebuild, and confirm both
+proof specs pass before retaining the change.
+
 ## Container build inputs
 
 Build from the repository root with `docker build -f apps/ui/Dockerfile .`.
@@ -99,7 +143,7 @@ honest `ComingSoon` stub (Usage, Settings).
   and an optional note. Resolver identity is the immutable subject of a live,
   HttpOnly same-origin Console session: the UI has no free-text identity or
   actor-channel field. A CLI-minted, single-use login code is exchanged for that
-  session; missing, revoked, or expired sessions return to the login-code prompt.
+  session; missing, revoked, or expired sessions return to the console login screen.
   Console principals carry no Slack channel evidence. They can resolve an
   explicit-user route containing their subject or a Slack user-group route when
   the server verifies that subject's membership; they cannot satisfy the default
@@ -124,12 +168,19 @@ filter, not exact matching.
 render a `ComingSoon` placeholder (`src/views/wired/WiredStubs.tsx`). These state
 plainly what is not wired yet rather than showing fictional data.
 
-**API access.** `src/api/config.ts` resolves the API key and prefix:
-- The API key is `?api_key=` else `VITE_API_KEY` else the dev default; sent as
-  `X-API-Key` for administrative/read surfaces. Approval resolution is the
-  exception: it sends the same-origin Console cookie, no platform key, and a body
-  containing only `decision` plus optional `note`. A platform key alone cannot
-  resolve an approval.
+**API access.** The console never holds the platform key (ADR-0083).
+- A login screen exchanges a code from `curie local console login` or
+  `curie cluster console login` for an HttpOnly `__Host-curie_console_session`
+  cookie, and every call sends only that cookie. Approval resolution sends a body
+  of `decision` plus optional `note`.
+- A 401 re-checks the session and returns to the login screen only if the session
+  is gone.
+- Limitation: the cookie is `__Host-` prefixed and `Secure`, so the browser stores
+  it only over HTTPS or from `http://localhost` / a loopback host. A plain-HTTP
+  console reached by a non-loopback address accepts the code and then fails every
+  call. Reach a cluster console at `http://localhost` through
+  `kubectl port-forward` or a kind `extraPortMappings` entry, or serve it over
+  HTTPS. Tracked in https://github.com/curie-eng/curie/issues/3968.
 - All calls go to the same-origin `/api` prefix. `vite.config.ts` proxies `/api`
   to `CURIE_API_TARGET` (default `http://localhost:8000`), stripping the
   prefix. This avoids CORS (Cross-Origin Resource Sharing) issues: apps/api
@@ -141,7 +192,7 @@ and the cost calls `getCost`/`getBudget`/`putBudget`/`getKillState`/`killAgent`/
 `resumeAgent`/`getAgents`, and the behavior-packs calls
 `getBehaviorPacks`/`putBehaviorPacks`), `bundle.ts` (jszip packaging + the testable
 `bundleFileTree`), `hooks.ts` (`useTraces`/`useTrace`/`useMetricsSummary`/
-`useMetricSeries`/`useAgents`/`useCost`), `config.ts` (API key + prefix). Deploy
+`useMetricSeries`/`useAgents`/`useCost`), `config.ts` (same-origin API prefix). Deploy
 failures flow through the store reducer actions `deployFailedValidation` /
 `deployFailed`. Observability lives in `src/views/obs/Real*.tsx`
 (`RealTraces`, `RealMetrics`, `RealLogs`, `RealCost`, `RealApprovals`),

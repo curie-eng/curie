@@ -35,7 +35,7 @@ from curie_api.admission import AdmissionReason, admit
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.models import AgentChannel
-from curie_api.schemas import MAX_ALLOWED_CALLERS, validate_allowed_callers
+from curie_api.schemas.channels import MAX_ALLOWED_CALLERS, validate_allowed_callers
 from curie_telemetry import build_resource, configure_meter_provider
 from fastapi.testclient import TestClient
 from opentelemetry.sdk.metrics import MeterProvider

@@ -38,7 +38,7 @@ from curie_worker.approvals import (
     PublicationLineage,
 )
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.kernel import ThreadBusyError
+from curie_worker.kernel.failures import ThreadBusyError
 from curie_worker.runner_client import RunnerWorkspaceSnapshot, TurnStream
 from curie_worker.workspace import WorkspaceSelectionRefused
 
@@ -135,6 +135,7 @@ class ReviewBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+        **_: object,
     ) -> dict[str, str]:
         assert (kind, address) == ("slack", CHANNEL)
         return {
@@ -260,7 +261,7 @@ class ReviewPublicationApi:
         )
 
     async def create_publication(
-        self, request: PublicationCreateRequest
+        self, request: PublicationCreateRequest, *, budget_s: float = 120
     ) -> CreatedPublication:
         self.operations.append("create")
         self.creates.append(request)
@@ -432,8 +433,7 @@ def test_final_reserve_refusal_stops_before_steer_or_model(make_harness) -> None
     async def exercise() -> None:
         turn = _review_turn()
         refusal = (
-            "The pull request changed after GitHub feedback verification; "
-            "no model turn started."
+            "The pull request changed after GitHub feedback verification; no model turn started."
         )
         api = ReviewPublicationApi(
             turn,
@@ -672,7 +672,7 @@ def test_review_publication_carries_origin_into_a_fresh_same_pr_approval(
 
             monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
             monkeypatch.setattr(
-                "curie_worker.kernel.validate_snapshot_against_base",
+                'curie_worker.kernel.attempt.validate_snapshot_against_base',
                 lambda *_args, **_kwargs: None,
             )
 

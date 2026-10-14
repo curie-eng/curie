@@ -1,8 +1,14 @@
 import { test, expect, type Page, type Route } from "@playwright/test";
+import { stubConsoleSession } from "./support/consoleSession";
 
 // FX2 items 3 & 4: the wired trace drill-in. A trace with no observations is a
 // legitimate empty state (honest empty view, not an error toast); a trace whose
 // resource/metadata carries curie.sandbox_id shows which sandbox served it.
+
+// The console sits behind the login gate (#1047): sign this spec in.
+test.beforeEach(async ({ page }) => {
+  await stubConsoleSession(page);
+});
 
 const TRACES = [{ id: "tr1", name: "deal-desk run", timestamp: "2026-07-05T14:02:07Z" }];
 

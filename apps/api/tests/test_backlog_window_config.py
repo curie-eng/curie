@@ -8,7 +8,7 @@ so retries see the delivery as pending until ``channel_delivery_lease_s``
 expires. A negative window is no better: the quota script's ``EXPIRE`` goes
 negative, which deletes the counter immediately, so the per-agent backlog quota
 is silently never enforced. Both windows are therefore bounded at ``Settings``
-construction, the same posture as ``GITHUB_FACTORY_RECONCILE_INTERVAL_S``
+construction, the same posture as ``FACTORY_RECONCILE_INTERVAL_S``
 (#3709): a bad value is refused at boot rather than surfacing mid-delivery.
 
 Pure unit tests: no fixtures, no Postgres/Valkey/network. ``_env_file=None``

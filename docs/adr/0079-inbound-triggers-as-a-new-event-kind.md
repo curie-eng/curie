@@ -3,6 +3,9 @@
 Date: 2026-07-10
 Status: Accepted
 
+Amended by [ADR 0190](0190-automated-hook-sources-cannot-widen-their-tool-access.md)
+for credentials used by operator-restricted hook sources.
+
 Proposes how "triggers beyond chat" (issue
 [#29](https://github.com/curie-eng/curie/issues/29)) enter the system: which
 service accepts a non-Slack trigger, and how a triggered turn produces output

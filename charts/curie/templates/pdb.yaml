@@ -23,3 +23,62 @@ spec:
       {{- include "curie.selectorLabels" (dict "root" $ "component" $store) | nindent 6 }}
 {{- end }}
 {{- end }}
+{{/*
+  Optional PodDisruptionBudgets for the compute-plane Deployments (#1574).
+  Off by default, because every shipped replica count is 1: there a
+  `maxUnavailable: 1` budget permits the only pod's eviction and protects
+  nothing, and a `minAvailable: 1` budget permits none and blocks every drain
+  of that node. The second is a legitimate choice only when made on purpose,
+  so a budget that allows zero voluntary disruptions at the configured replica
+  count refuses the render unless `allowBlockingDrain: true` acknowledges it.
+  The dispatcher is one replica with strategy Recreate by design (#2944), so
+  more replicas is never the way out and a non-blocking budget can only ever
+  protect nothing: it accepts an acknowledged blocking budget or nothing.
+  `minAvailable`, when set, replaces the default `maxUnavailable`: a policy/v1
+  budget carries exactly one of the two. See README "High availability and
+  PodDisruptionBudgets".
+*/}}
+{{- range $component := (list "api" "worker" "ui" "dispatcher") }}
+{{- $cfg := index $.Values $component }}
+{{- $pdb := (get $cfg "podDisruptionBudget") | default dict }}
+{{- $deployed := $cfg.deploy }}
+{{- if eq $component "dispatcher" }}
+{{- $deployed = include "curie.dispatcher.enabled" $ }}
+{{- end }}
+{{- if and $deployed $pdb.enabled }}
+{{- $key := printf "%s.podDisruptionBudget" $component }}
+{{- $replicas := int $cfg.replicas }}
+{{- $field := "" }}
+{{- $value := 0 }}
+{{- $blocking := false }}
+{{- if hasKey $pdb "minAvailable" }}
+{{- $field = "minAvailable" }}
+{{- $value = int $pdb.minAvailable }}
+{{- $blocking = ge $value $replicas }}
+{{- else if hasKey $pdb "maxUnavailable" }}
+{{- $field = "maxUnavailable" }}
+{{- $value = int $pdb.maxUnavailable }}
+{{- $blocking = le $value 0 }}
+{{- else }}
+{{- fail (printf "%s.enabled is true but neither %s.maxUnavailable nor %s.minAvailable is set. Set one of them." $key $key $key) }}
+{{- end }}
+{{- if and (eq $component "dispatcher") (not $blocking) }}
+{{- fail (printf "%s.%s=%d at dispatcher.replicas=%d permits a voluntary disruption, so it protects nothing. The dispatcher runs one replica with strategy Recreate by design (a second Socket Mode client splits Slack events, #2944), so raising replicas is not an option either. Leave %s.enabled false, or set %s.minAvailable to 1 with %s.allowBlockingDrain: true so every node drain waits for an operator." $key $field $value $replicas $key $key $key) }}
+{{- end }}
+{{- if and $blocking (not $pdb.allowBlockingDrain) }}
+{{- fail (printf "%s.%s=%d at %s.replicas=%d allows zero voluntary disruptions, so every kubectl drain of a node running it blocks until an operator intervenes. Set %s.allowBlockingDrain: true to accept that, or raise %s.replicas, or permit a disruption with %s.maxUnavailable." $key $field $value $component $replicas $key $component $key) }}
+{{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "curie.fullname" $ }}-{{ $component }}
+  labels:
+    {{- include "curie.labels" $ | nindent 4 }}
+spec:
+  {{ $field }}: {{ $value }}
+  selector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" $ "component" $component) | nindent 6 }}
+{{- end }}
+{{- end }}

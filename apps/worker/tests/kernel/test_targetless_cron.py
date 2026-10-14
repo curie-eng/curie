@@ -31,6 +31,7 @@ from aci_protocol import (
     SessionStatus,
     TurnSource,
 )
+from curie_internal.keyspace import kill_key
 from curie_worker.approvals import ApprovalRequest, CreatedApproval
 from curie_worker.binding import (
     BUNDLE_REF_ENV,
@@ -41,7 +42,6 @@ from curie_worker.binding import (
     BindingResolver,
 )
 from curie_worker.delivery_lease import DeliveryLeaseStore
-from curie_worker.killswitch import kill_key
 from curie_worker.sandbox import QuotaRejection
 from curie_worker.workitem_dispatch import WorkItemAcquireGrant, WorkItemRun
 from sqlalchemy import text
@@ -428,7 +428,9 @@ def test_targetless_approval_gate_is_not_bypassed_and_fails_the_hook_run(
         def __init__(self) -> None:
             self.requests: list[ApprovalRequest] = []
 
-        async def create(self, request: ApprovalRequest) -> CreatedApproval:
+        async def create(
+            self, request: ApprovalRequest, *, budget_s: float = 120
+        ) -> CreatedApproval:
             self.requests.append(request)
             return CreatedApproval(id=f"appr-{uuid.uuid4().hex}", status="pending")
 
@@ -597,7 +599,7 @@ def test_targetless_turn_does_not_touch_an_active_matching_work_item_run(
                     work_item_id=request_id,
                     conversation_id=thread_key,
                     wait_deadline="",
-                    repo_full_name="acme/widgets",
+                    repository_path="acme/widgets",
                 ),
                 event_id=execute_id,
                 thread_key=thread_key,
@@ -819,5 +821,30 @@ def test_targetless_turn_refused_before_runner_start_fails_the_hook_run(
             assert ended_at is not None
             assert await h.async_redis.exists(h.config.done_key(event.event_id))
             assert not await _has_outbox_record(h, event.event_id)
+
+    asyncio.run(go())
+
+
+def test_hook_run_reason_approval_gate_targetless(make_harness, make_hook_run) -> None:
+    async def go() -> None:
+        async with (
+            make_hook_run() as run,
+            _seed_deployments(run.engine, run.agent_id),
+            make_harness(
+                hook_runs=run.recorder(),
+                binding_factory=_resolver_factory(run.engine),
+            ) as h,
+        ):
+            h.runner.default_script = [
+                Final(
+                    text="Requesting sign off",
+                    status=SessionStatus.AWAITING_APPROVAL,
+                    approval_summary="Tool call awaiting approval: deploy",
+                )
+            ]
+            await h.kernel.process_event(_targetless(run.ref))
+            outcome, _ended = await run.state() or (None, None)
+            assert outcome == "failed"
+            assert await run.reason() == "approval_gate_targetless"
 
     asyncio.run(go())

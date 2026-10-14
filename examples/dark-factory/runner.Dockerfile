@@ -22,4 +22,5 @@ ENV CARGO_HOME=${HOME}/.cargo
 ENV UV_CACHE_DIR=${HOME}/.cache/uv
 ENV PNPM_HOME=${HOME}/.local/share/pnpm
 ENV PATH="/usr/local/cargo/bin:${PATH}"
+RUN rustup component add rustfmt clippy
 USER 1000:1000

@@ -74,8 +74,7 @@
 //! and would make the stage count depend on socket timing rather than on the
 //! CLI's own await structure. The API leg is covered by `doctor_api.rs`.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

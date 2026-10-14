@@ -31,7 +31,7 @@ class _DeadLetterAlertHandler(logging.Handler):
                 f"dead_stream={dead_stream}"
             )
             logging.getLogger(_ALERT_LOGGER).critical(alert)
-        except Exception:
+        except Exception:  # noqa: BLE001 - existing broad catch retained
             return
 
 

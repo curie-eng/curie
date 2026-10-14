@@ -60,23 +60,28 @@ RESULT_MAX_BYTES = 64_000
 # Platform ErrorEvent.classification vocabulary. Allowlist-constrain only: do
 # not synonym-map SDK ``rate_limit`` onto platform ``rate-limit``, which would
 # make a currently non-retryable token retryable.
-PLATFORM_ERROR_CLASSIFICATIONS = frozenset({
-    "rate-limit",
-    "runner-error",
-    "runner-timeout",
-    "workspace-error",
-    "budget-exceeded",
-    "server-error",
-    "ledger-error",
-    "model-credential-rejected",
-    "model-credit-exhausted",
-    "approval-not-acted",
-    "false-completion",
-    "publication-unrecorded",
-    "history-persistence-error",
-    # #3071: the turn budget ran out (SDK result subtype ``error_max_turns``).
-    "max-turns",
-})
+PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
+    {
+        "rate-limit",
+        "runner-error",
+        "runner-timeout",
+        "workspace-error",
+        "budget-exceeded",
+        "server-error",
+        "ledger-error",
+        "model-credential-rejected",
+        "model-credit-exhausted",
+        "model-usage-limited",
+        "approval-not-acted",
+        "false-completion",
+        "publication-unrecorded",
+        "history-persistence-error",
+        # #3071: the turn budget ran out (SDK result subtype ``error_max_turns``).
+        "max-turns",
+        # #4333: the model endpoint was unreachable at the transport layer.
+        "model-unreachable",
+    }
+)
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
 
 # SDK ResultMessage subtypes that name a known platform failure (#3071). Only
@@ -97,13 +102,36 @@ def map_error_classification(raw: str | None) -> str:
 # A provider refusing a request for lack of credits (#3073). The SDK names an
 # Anthropic billing refusal ``billing_error``; an OpenAI-compatible provider
 # such as OpenRouter answers HTTP 402, which the SDK reports only as
-# ``unknown`` with the provider's message as the assistant text. Terminal and
-# not retryable: more attempts cannot add credits.
+# ``unknown`` with the provider's message as the assistant text. A key at its
+# own OpenRouter spend limit answers HTTP 403 "Key limit exceeded", which the SDK
+# reports as ``authentication_failed`` (#4104). Terminal and not retryable: more
+# attempts cannot add credits.
 CREDIT_EXHAUSTED_CLASSIFICATION = "model-credit-exhausted"
 _BILLING_SDK_CODE = "billing_error"
 _CREDIT_EXHAUSTED_TEXT = re.compile(
     r"\b402\b|payment required|insufficient (?:credits?|balance|funds)"
-    r"|(?:credit|spend|usage) limit|(?:more|out of|no) credits",
+    r"|(?:credit|spend|usage) limit|key limit exceeded|(?:more|out of|no) credits",
+    re.IGNORECASE,
+)
+# SDK 0.2.159 bundles Claude Code 2.1.281. Its nFn/oFn/_h formatters emit
+# these terminal subscription refusals, optionally with reset/progress text.
+# Match the emitted phrase, not advisory usage percentages or financial limits.
+USAGE_LIMITED_CLASSIFICATION = "model-usage-limited"
+_USAGE_LIMITED_TEXT = re.compile(
+    r"\b(?:You've hit your (?:(?:session|weekly|Opus|Sonnet|Fable|usage) )?limit"
+    r"|You've reached your Fable limit\."
+    r"|Usage limit reached)"
+    r"(?: · resets [^\n·]+)?(?: · progress saved)?\s*$",
+    re.IGNORECASE,
+)
+# #4333: the SDK reports a transport failure reaching the model endpoint as
+# ``server_error`` with the socket error in the assistant text. Only that exact
+# SDK code qualifies, so an HTTP 5xx from a provider that did answer stays
+# ``server-error``.
+MODEL_UNREACHABLE_CLASSIFICATION = "model-unreachable"
+_MODEL_UNREACHABLE_TEXT = re.compile(
+    r"ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN"
+    r"|Connection refused|Connection error",
     re.IGNORECASE,
 )
 # Longest provider message carried on the error event.
@@ -121,14 +149,59 @@ def _provider_error_text(message: AssistantMessage) -> str:
         for block in message.content
         if isinstance(block, TextBlock) and block.text.strip()
     )
+    return _redact_and_clip(text)
+
+
+def _redact_and_clip(text: str) -> str:
     text = redact_text(text)
     if len(text) > _PROVIDER_TEXT_MAX:
         text = text[: _PROVIDER_TEXT_MAX - 3].rstrip() + "..."
     return text
 
 
+# Tools that run a subagent. Provider refusals can surface as either a forwarded
+# errored AssistantMessage or this call's error result (#3935/#3937).
+_SUBAGENT_TOOLS = frozenset({"Agent", "Task"})
+
+
+def _result_text(content: object) -> str:
+    """The text of a tool result: a string, or the text parts of a block list."""
+
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return " ".join(
+            part["text"].strip()
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"].strip()
+        )
+    return ""
+
+
 def _is_credit_exhausted(error: str, provider_text: str) -> bool:
     return error == _BILLING_SDK_CODE or bool(_CREDIT_EXHAUSTED_TEXT.search(provider_text))
+
+
+def _is_usage_limited(error: str, provider_text: str) -> bool:
+    return error == "rate_limit" or bool(_USAGE_LIMITED_TEXT.search(provider_text))
+
+
+def _is_model_unreachable(error: str, provider_text: str) -> bool:
+    return error == "server_error" and bool(_MODEL_UNREACHABLE_TEXT.search(provider_text))
+
+
+def is_usage_refusal(message: AssistantMessage) -> bool:
+    """True when an errored assistant message reports a terminal usage limit."""
+
+    return bool(message.error) and _is_usage_limited(
+        message.error or "", _provider_error_text(message)
+    )
+
+
+def is_credit_refusal(message: AssistantMessage) -> bool:
+    """True when an errored assistant message reports exhausted provider credit."""
+
+    return _is_credit_exhausted(message.error or "", _provider_error_text(message))
 
 
 @dataclass
@@ -141,6 +214,12 @@ class TurnState:
     tool_access: ToolAccess | None = None
     side_effect_emitted: bool = False
     error_classification: str | None = None
+    # Runner-internal latch, not a wire field (#3935): set once credit
+    # exhaustion is classified so a later recoverable error cannot mask it.
+    credit_exhausted: bool = False
+    # Subscription windows cannot be fixed by retrying. This latch outranks
+    # credit and recoverable failures until the terminal result (#4120).
+    usage_limited: bool = False
     # The summary passed to the approval-request tool (ADR-0010), captured off
     # the ToolUseBlock so the session can end the turn awaiting-approval. None
     # when no approval was requested this turn.
@@ -238,6 +317,9 @@ class TurnState:
     tool_results: list[tuple[str, str, bool, bool]] = field(default_factory=list)
     # How many of ``tool_results`` the session has already counted.
     tool_results_observed: int = 0
+    # Call ids of the curie-slack read tools seen this turn (ADR 0100), so the
+    # session stubs their results in the portable record. History only.
+    channel_read_call_ids: set[str] = field(default_factory=set)
 
 
 def translate_message(
@@ -282,6 +364,7 @@ def _translate_assistant(
     activity: ProgressActivity | None = None,
 ) -> list[OutboundEvent]:
     events: list[OutboundEvent] = []
+    nested = message.parent_tool_use_id is not None
 
     # Assistant usage is per-message. ResultMessage usage is a turn total and
     # must never be copied onto the last generation, where it would double-count
@@ -295,8 +378,16 @@ def _translate_assistant(
     error = getattr(message, "error", None)
     if error:
         provider_text = _provider_error_text(message)
-        if _is_credit_exhausted(error, provider_text):
+        if _is_usage_limited(error, provider_text):
+            mapped = USAGE_LIMITED_CLASSIFICATION
+            state.usage_limited = True
+        elif _is_credit_exhausted(error, provider_text):
             mapped = CREDIT_EXHAUSTED_CLASSIFICATION
+            state.credit_exhausted = True
+        elif _is_model_unreachable(error, provider_text):
+            mapped = MODEL_UNREACHABLE_CLASSIFICATION
+        elif error == "server_error":
+            mapped = "server-error"
         else:
             mapped = map_error_classification(error)
         state.error_classification = mapped
@@ -312,13 +403,13 @@ def _translate_assistant(
         # below closes the generation, so a later block in a parallel tool
         # response would otherwise be dropped. Tool names only, never arguments.
         for block in message.content:
-            if isinstance(block, TextBlock) and block.text:
+            if isinstance(block, TextBlock) and block.text and not nested:
                 gen.observe_output(block.text)
             elif isinstance(block, ToolUseBlock):
                 gen.observe_output(f"[tool_use {block.name}]")
     for block in message.content:
         if isinstance(block, TextBlock):
-            if block.text:
+            if block.text and not nested:
                 state.assistant_text += block.text
                 events.append(TextDelta(text=block.text))
         elif isinstance(block, ToolUseBlock):
@@ -430,6 +521,34 @@ def _translate_user(
             state.tool_results.append(
                 (block.tool_use_id, called, block.is_error is True, unknown_marker)
             )
+            if called in _SUBAGENT_TOOLS and block.is_error is True:
+                # A reviewer refusal is terminal even if the parent recovers.
+                # Subscription limits take precedence over financial limits,
+                # and repeat results do not emit duplicate refusal events.
+                sub_text = _result_text(block.content)
+                if _is_usage_limited("", sub_text):
+                    state.usage_limited = True
+                    if state.error_classification != USAGE_LIMITED_CLASSIFICATION:
+                        state.error_classification = USAGE_LIMITED_CLASSIFICATION
+                        events.append(
+                            ErrorEvent(
+                                message=f"subagent model error: {_redact_and_clip(sub_text)}",
+                                classification=USAGE_LIMITED_CLASSIFICATION,
+                            )
+                        )
+                elif _CREDIT_EXHAUSTED_TEXT.search(sub_text):
+                    state.credit_exhausted = True
+                    if (
+                        not state.usage_limited
+                        and state.error_classification != CREDIT_EXHAUSTED_CLASSIFICATION
+                    ):
+                        state.error_classification = CREDIT_EXHAUSTED_CLASSIFICATION
+                        events.append(
+                            ErrorEvent(
+                                message=f"subagent model error: {_redact_and_clip(sub_text)}",
+                                classification=CREDIT_EXHAUSTED_CLASSIFICATION,
+                            )
+                        )
         tool = state.pending_actions.pop(block.tool_use_id, None)
         if tool is None:
             # Read-only, or a result for a call this turn never saw, or a second
@@ -490,6 +609,32 @@ def _loads_object(raw: object) -> tuple[dict[str, object] | None, bool]:
     return (parsed if isinstance(parsed, dict) else None), False
 
 
+def _restore_provider_error(state: TurnState) -> list[OutboundEvent]:
+    """Re-emit a latched provider refusal when a later error replaced it.
+
+    The worker keeps the classification of the last ErrorEvent, so a latched
+    refusal must be the last one before the Final. Usage outranks credit.
+    """
+
+    if state.usage_limited:
+        classification = USAGE_LIMITED_CLASSIFICATION
+        message = "model usage limit reached earlier in the turn"
+    elif state.credit_exhausted:
+        classification = CREDIT_EXHAUSTED_CLASSIFICATION
+        message = "model credit exhausted earlier in the turn"
+    else:
+        return []
+    if state.error_classification == classification:
+        return []
+    state.error_classification = classification
+    return [
+        ErrorEvent(
+            message=message,
+            classification=classification,
+        )
+    ]
+
+
 def _translate_result(
     message: ResultMessage,
     state: TurnState,
@@ -498,7 +643,17 @@ def _translate_result(
     if message.is_error or subtype.startswith("error"):
         text = message.result or "run failed"
         events: list[OutboundEvent] = []
-        if state.error_classification is None:
+        if _is_usage_limited(subtype, text):
+            state.usage_limited = True
+            if state.error_classification != USAGE_LIMITED_CLASSIFICATION:
+                state.error_classification = USAGE_LIMITED_CLASSIFICATION
+                events.append(
+                    ErrorEvent(
+                        message=_redact_and_clip(text),
+                        classification=USAGE_LIMITED_CLASSIFICATION,
+                    )
+                )
+        elif state.error_classification is None:
             raw = subtype or "server-error"
             known = _RESULT_SUBTYPE_CLASSIFICATIONS.get(raw)
             mapped = known or map_error_classification(raw)
@@ -510,8 +665,20 @@ def _translate_result(
                     classification=mapped,
                 )
             )
+        events.extend(_restore_provider_error(state))
         events.append(Final(text=text, status=SessionStatus.CLASSIFIED_FAILURE))
         return events
+
+    if state.usage_limited or state.credit_exhausted:
+        # A provider refusal anywhere in the turn, including a reviewer the
+        # parent recovered from, is terminal. Keep its last ErrorEvent truthful.
+        return [
+            *_restore_provider_error(state),
+            Final(
+                text=message.result or state.assistant_text,
+                status=SessionStatus.CLASSIFIED_FAILURE,
+            ),
+        ]
 
     # The SDK's ``result`` is authoritative when present. When it is empty on an
     # otherwise-successful turn, fall back to the assistant text streamed this turn

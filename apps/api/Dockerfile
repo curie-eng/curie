@@ -28,15 +28,20 @@ ENV UV_COMPILE_BYTECODE=1 \
 # dependencies without building any workspace member.
 COPY pyproject.toml uv.lock ./
 COPY packages/aci-protocol/pyproject.toml packages/aci-protocol/
+COPY packages/curie-internal/pyproject.toml packages/curie-internal/
 COPY packages/channel-protocol/pyproject.toml packages/channel-protocol/
+# @spec PROTECTED-HOOK-LANE-1: resolve the complete internal workspace.
+COPY packages/protected-hooks/pyproject.toml packages/protected-hooks/
 COPY packages/plugin-format/pyproject.toml packages/plugin-format/
 COPY packages/telemetry-schema/pyproject.toml packages/telemetry-schema/
+COPY packages/upgrade-pause/pyproject.toml packages/upgrade-pause/
 COPY packages/test-support/pyproject.toml packages/test-support/
 COPY packages/telemetry/pyproject.toml packages/telemetry/
 COPY apps/api/pyproject.toml apps/api/
 COPY apps/dispatcher/pyproject.toml apps/dispatcher/
 COPY adapters/discord/pyproject.toml adapters/discord/
 COPY apps/mail-adapter/pyproject.toml apps/mail-adapter/
+COPY apps/e2e-connector/pyproject.toml apps/e2e-connector/
 COPY apps/worker/pyproject.toml apps/worker/
 COPY runner/pyproject.toml runner/
 COPY tools/doclint/pyproject.toml tools/doclint/
@@ -67,4 +72,4 @@ ENV PATH="/app/.venv/bin:$PATH"
 ENV FORWARDED_ALLOW_IPS=""
 USER 1000
 EXPOSE 8000
-CMD ["uvicorn", "curie_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "curie_api"]

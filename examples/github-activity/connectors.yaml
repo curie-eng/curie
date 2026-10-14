@@ -1,0 +1,35 @@
+# What this bundle needs running. Curie derives the Deployment, Service,
+# container hardening, sandbox-to-connector NetworkPolicy, secret wiring, and
+# the URL the agent dials (ADR-0086).
+#
+# One connector, read only. Build and publish it before a cluster deploy:
+#   curie build --plugin-dir <this directory> --registry <ref>
+connectors:
+  github:
+    build:
+      context: connectors/github
+      platforms: [linux/amd64, linux/arm64]
+    # Skill and local tiers have no Curie-hosted Service to derive a URL from;
+    # point this at a server.py you run yourself (see the README).
+    unhosted_url: ${GITHUB_ACTIVITY_MCP_URL}
+    env:
+      # Comma separated owner/name list. When set, it is both the default set a
+      # call reads and the allowlist: a repository outside it is refused. Empty
+      # means each call names its repositories.
+      GITHUB_REPOSITORIES: ""
+    # A Secret reference, not a plain string, on purpose. A hosted connector
+    # with one plain string secret derives an `Authorization: Bearer ${NAME}`
+    # header for the agent's MCP client (connector_render `_derived_headers`),
+    # which stages the token into the sandbox. A `from_secret` reference derives
+    # no header, so the token stays in the connector pod and the sandbox learns
+    # only a URL.
+    #
+    # The token must be read only: a fine-grained personal access token with
+    # Issues: read, Pull requests: read, and Metadata: read on the target
+    # repositories, or a GitHub App installation token minted with exactly
+    # those permissions. GitHub then refuses any write with a 403 no matter
+    # what the connector sends.
+    secrets:
+      - name: GITHUB_TOKEN
+        from_secret: github-activity-token
+        key: GITHUB_TOKEN

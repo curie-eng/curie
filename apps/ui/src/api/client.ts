@@ -1,14 +1,15 @@
 // Typed client for the B1/B2 API, reached through the same-origin /api proxy.
-// Administrative and read calls carry X-API-Key unless a function explicitly
-// documents its narrower credential (for example, console-session approval
-// resolution). Shapes mirror apps/api/openapi.json.
+// Every call authenticates with the same-origin HttpOnly console session cookie
+// (ADR-0083). API wire shapes are aliases generated from apps/api/openapi.json
+// by `pnpm gen:api-types`; UI helpers and undeclared error shapes stay local.
 
-import { API_PREFIX, apiKey } from "./config";
+import { API_PREFIX } from "./config";
+import type { components } from "./generated";
+
+type Schemas = components["schemas"];
 
 // Open (unauthenticated) app config: the configurable org/workspace name.
-export interface AppConfig {
-  org_name: string;
-}
+export type AppConfig = Schemas["AppConfig"];
 
 // A channel-neutral binding: an agent binds one or more channels (ADR-0118),
 // so the wire carries a list, ordered `(kind, address)` server-side. `kind`
@@ -17,55 +18,28 @@ export interface AppConfig {
 // route answers as (ADR-0168 decision 3) -- a Slack binding with no stored
 // identity reads back "default", and a non-Slack binding reads its adapter,
 // or null. Non-Slack reply routing is supplied only on the write shape below.
-export interface ChannelBinding {
-  kind: string;
-  address: string;
-  adapter?: string | null;
-}
+export type ChannelBinding = Schemas["ChannelBindingOut"];
 
 // Reply routing is accepted on writes but deliberately never returned by the
 // API. Keeping the write shape separate prevents a refetch from being mistaken
 // for a source of adapter credentials: the identity (`adapter`) comes back on
 // every read; the endpoint never does.
-export interface ChannelBindingWrite extends ChannelBinding {
-  endpoint?: string;
-  adapter?: string;
-}
+export type ChannelBindingWrite = Schemas["ChannelBindingWrite"];
 
 // The worker resolves an agent's binding against `channel.address`, not a
 // bare `slack_channel` column. This is the console's fast local check for the
 // Slack kind; it is a soft check (warns, never blocks) because
-// the authoritative gate lives server-side (apps/api schemas.py).
+// the authoritative gate lives in apps/api/src/curie_api/schemas/channels.py.
 export const SLACK_ADDRESS_RE = /^[CDG][A-Z0-9]+$/;
 
-export interface AgentOut {
-  id: string;
-  name: string;
-  // One or more channel bindings (ADR-0118), ordered `(kind, address)`
-  // server-side.
-  channels: ChannelBinding[];
-  // Per-agent model id, forwarded as CURIE_MODEL at boot (#254). null uses the
-  // platform default model.
-  model: string | null;
-  created_at: string;
-}
+export type AgentOut = Schemas["AgentOut"];
+export type AgentCreate = Schemas["AgentCreate"];
+export type AgentUpdate = Schemas["AgentUpdate"];
 
-export interface VersionOut {
-  id: string;
-  agent_id: string;
-  version_label: string;
-  bundle_ref: string | null;
-  bundle_sha256: string | null;
-  created_by: string;
-  created_at: string;
-}
+export type VersionOut = Schemas["VersionOut"];
+export type VersionCreate = Schemas["VersionCreate"];
 
-export interface BundleOut {
-  version_id: string;
-  bundle_ref: string;
-  bundle_sha256: string;
-  size_bytes: number;
-}
+export type BundleOut = Schemas["BundleOut"];
 
 // One issue from the frozen plugin_format validator, surfaced on a 422.
 export interface BundleIssue {
@@ -74,39 +48,17 @@ export interface BundleIssue {
   location: string;
 }
 
-export interface ObservationNode {
-  id: string;
-  type: string;
-  name: string | null;
-  model: string | null;
-  startTime: string | null;
-  usageDetails: Record<string, unknown> | null;
-  children: ObservationNode[];
-}
+export type ObservationNode = Schemas["ObservationNode"];
 
-export interface TraceTree {
-  trace: Record<string, unknown>;
-  tree: ObservationNode[];
-  // The serving sandbox id (curie.sandbox_id), hoisted server-side from the
-  // trace/observation resource attributes; null when the trace predates it.
-  sandbox_id: string | null;
-}
+export type TraceTree = Schemas["TraceTree"];
 
 // A raw Langfuse trace row (opaque; we read a few well-known fields defensively).
 export type RawTrace = Record<string, unknown>;
 
 // An eval case in the frozen eval-case format (#8/#259): an input prompt plus a
 // deterministic grader. Returned by promoteTraceToEvalCase.
-export interface GraderOut {
-  kind: "exact" | "contains" | "regex" | "tool_called";
-  expected: string;
-  case_sensitive: boolean;
-}
-export interface EvalCaseOut {
-  id: string;
-  input: string;
-  grader: GraderOut;
-}
+export type GraderOut = Schemas["GraderOut"];
+export type EvalCaseOut = Schemas["EvalCaseOut"];
 
 /** Thrown when the bundle validator rejects the archive (HTTP 422). */
 export class BundleValidationError extends Error {
@@ -128,12 +80,37 @@ export class ApiError extends Error {
   }
 }
 
+/** True for a 401 from the API: no credential the route accepts. */
+export function isUnauthorized(e: unknown): boolean {
+  return e instanceof ApiError && e.status === 401;
+}
+
 function url(path: string): string {
   return `${API_PREFIX}${path}`;
 }
 
-function headers(extra?: Record<string, string>): Record<string, string> {
-  return { "X-API-Key": apiKey(), ...extra };
+type UnauthorizedListener = () => void;
+
+const unauthorizedListeners = new Set<UnauthorizedListener>();
+
+// Subscribe to 401s from any protected call. The console session gate uses this
+// to re-check the session; returns the unsubscribe.
+export function onUnauthorized(listener: UnauthorizedListener): () => void {
+  unauthorizedListeners.add(listener);
+  return () => {
+    unauthorizedListeners.delete(listener);
+  };
+}
+
+// The one wrapper every protected call goes through: the session cookie is the
+// only credential, and a 401 notifies the listeners above. It neither throws on
+// a status nor reads the body; callers keep their own error mapping.
+async function request(path: string, init: RequestInit = {}): Promise<Response> {
+  const resp = await fetch(url(path), { ...init, credentials: "same-origin" });
+  if (resp.status === 401) {
+    for (const listener of [...unauthorizedListeners]) listener();
+  }
+  return resp;
 }
 
 async function jsonOrThrow<T>(resp: Response): Promise<T> {
@@ -161,15 +138,11 @@ function describeError(body: unknown): string | null {
   return null;
 }
 
-export async function createAgent(input: {
-  name: string;
-  channel: ChannelBinding;
-  // Optional per-agent model id (#254). Omit for the platform default.
-  model?: string;
-}): Promise<AgentOut> {
-  const resp = await fetch(url("/agents"), {
+// `model` is optional (#254); omit it for the platform default.
+export async function createAgent(input: AgentCreate): Promise<AgentOut> {
+  const resp = await request("/agents", {
     method: "POST",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
   });
   return jsonOrThrow<AgentOut>(resp);
@@ -177,11 +150,11 @@ export async function createAgent(input: {
 
 export async function createVersion(
   agentId: string,
-  input: { version_label: string; created_by: string },
+  input: VersionCreate,
 ): Promise<VersionOut> {
-  const resp = await fetch(url(`/agents/${agentId}/versions`), {
+  const resp = await request(`/agents/${agentId}/versions`, {
     method: "POST",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
   });
   return jsonOrThrow<VersionOut>(resp);
@@ -199,9 +172,8 @@ export async function uploadBundle(
 ): Promise<BundleOut> {
   const form = new FormData();
   form.append("file", archive, "bundle.zip");
-  const resp = await fetch(url(`/agents/${agentId}/versions/${versionId}/bundle`), {
+  const resp = await request(`/agents/${agentId}/versions/${versionId}/bundle`, {
     method: "PUT",
-    headers: headers(),
     body: form,
   });
   if (resp.ok) return (await resp.json()) as BundleOut;
@@ -231,25 +203,20 @@ function extractIssues(body: unknown): BundleIssue[] | null {
 // List recent traces. With agentId, the API filters to that agent's runs (its
 // traces carry the `agent-<id>` name token); without it, all recent traces.
 export async function listTraces(limit = 20, agentId?: string): Promise<RawTrace[]> {
-  const resp = await fetch(url(`/langfuse/traces${query({ limit, agent_id: agentId })}`), {
-    headers: headers(),
-  });
+  const resp = await request(`/langfuse/traces${query({ limit, agent_id: agentId })}`);
   return jsonOrThrow<RawTrace[]>(resp);
 }
 
 export async function getTrace(traceId: string): Promise<TraceTree> {
-  const resp = await fetch(url(`/langfuse/traces/${encodeURIComponent(traceId)}`), {
-    headers: headers(),
-  });
+  const resp = await request(`/langfuse/traces/${encodeURIComponent(traceId)}`);
   return jsonOrThrow<TraceTree>(resp);
 }
 
 // Promote a trace into an anonymized, runnable eval case (#259). The API reads
 // the trace, scrubs PII, and returns a case in the frozen eval-case format.
 export async function promoteTraceToEvalCase(traceId: string): Promise<EvalCaseOut> {
-  const resp = await fetch(url(`/langfuse/traces/${encodeURIComponent(traceId)}/eval-case`), {
+  const resp = await request(`/langfuse/traces/${encodeURIComponent(traceId)}/eval-case`, {
     method: "POST",
-    headers: headers(),
   });
   return jsonOrThrow<EvalCaseOut>(resp);
 }
@@ -259,49 +226,24 @@ export async function promoteTraceToEvalCase(traceId: string): Promise<EvalCaseO
 // One cell of the eval matrix: a case's outcome on a version column.
 // `plumbing_ok` means the case ran to completion but no grader judged it (the
 // fake-model tier); it is neither a pass nor a fail and must never read green.
-export type EvalStatus = "pass" | "fail" | "plumbing_ok" | "missing";
+export type EvalStatus = Schemas["EvalCell"]["status"];
 
-export interface EvalCell {
-  version: string;
-  status: EvalStatus;
-  // The model the result was produced under, or null when the run was unlabelled.
-  model: string | null;
-}
+export type EvalCell = Schemas["EvalCell"];
 
-export interface EvalMatrixRow {
-  case_id: string;
-  cells: EvalCell[];
-}
+export type EvalMatrixRow = Schemas["EvalMatrixRow"];
 
 // A per-model rollup across the suite. `passed`/`total` exclude non-graded
 // (plumbing) rows, counted separately in `plumbing`; `completed` (⊆ `total`) is
 // the graded rows whose turn actually reached a verdict, so `total > 0` with
 // `completed === 0` is a model that never answered — distinct from a real 0%.
-export interface EvalModelSummary {
-  model: string | null;
-  passed: number;
-  total: number;
-  cost_usd: number | null;
-  plumbing: number;
-  completed: number;
-}
+export type EvalModelSummary = Schemas["EvalModelSummary"];
 
-export interface EvalMatrix {
-  suite: string;
-  // Version columns, most-recently-exercised first, capped at the requested N.
-  versions: string[];
-  cases: string[];
-  rows: EvalMatrixRow[];
-  models: (string | null)[];
-  model_summaries: EvalModelSummary[];
-}
+export type EvalMatrix = Schemas["EvalMatrix"];
 
 // Read the eval matrix for a suite. The matrix is filtered by suite (the real
 // dimension on eval traces); `versions` caps the number of version columns.
 export async function getEvalMatrix(suite: string, versions = 5): Promise<EvalMatrix> {
-  const resp = await fetch(url(`/evals/matrix${query({ suite, versions })}`), {
-    headers: headers(),
-  });
+  const resp = await request(`/evals/matrix${query({ suite, versions })}`);
   return jsonOrThrow<EvalMatrix>(resp);
 }
 
@@ -310,50 +252,20 @@ export async function getEvalMatrix(suite: string, versions = 5): Promise<EvalMa
 export type MetricKey = "runs" | "latency_p95_ms" | "tokens" | "cost_usd" | "error_rate";
 export type Granularity = "hour" | "day" | "week";
 
-export interface MetricsSummary {
-  start: string;
-  end: string;
-  runs: number;
-  latency_p95_ms: number;
-  tokens: number;
-  cost_usd: number;
-  error_rate: number;
-  // False when a run used a model with no Langfuse price row: cost_usd is then
-  // 0 because the cost is unknown, not because the run was free.
-  cost_known?: boolean;
-}
+export type MetricsSummary = Schemas["MetricsSummary"];
 
-export interface MetricPoint {
-  ts: string;
-  value: number;
-}
+export type MetricPoint = Schemas["MetricPoint"];
 
-export interface MetricSeries {
-  metric: string;
-  granularity: string;
-  start: string;
-  end: string;
-  points: MetricPoint[];
-}
+export type MetricSeries = Schemas["MetricSeries"];
 
-export interface PodLogs {
-  namespace: string;
-  pod: string;
-  container: string | null;
-  logs: string;
-}
+export type PodLogs = Schemas["PodLogs"];
 
-export interface RunnerPods {
-  namespace: string;
-  pods: string[];
-}
+export type RunnerPods = Schemas["RunnerPods"];
 
 // List the runner sandbox pods in a namespace (populates the Logs dropdown).
 // Non-2xx throws ApiError carrying the status: 503 (no cluster), 502 (other).
 export async function listRunnerPods(namespace?: string): Promise<RunnerPods> {
-  const resp = await fetch(url(`/observability/runners${query({ namespace })}`), {
-    headers: headers(),
-  });
+  const resp = await request(`/observability/runners${query({ namespace })}`);
   return jsonOrThrow<RunnerPods>(resp);
 }
 
@@ -374,9 +286,7 @@ function query(params: Record<string, string | number | boolean | undefined>): s
 }
 
 export async function getMetricsSummary(filter: MetricFilter = {}): Promise<MetricsSummary> {
-  const resp = await fetch(url(`/observability/metrics/summary${query({ ...filter })}`), {
-    headers: headers(),
-  });
+  const resp = await request(`/observability/metrics/summary${query({ ...filter })}`);
   return jsonOrThrow<MetricsSummary>(resp);
 }
 
@@ -385,9 +295,8 @@ export async function getMetricSeries(
   granularity: Granularity,
   filter: MetricFilter = {},
 ): Promise<MetricSeries> {
-  const resp = await fetch(
-    url(`/observability/metrics/series${query({ metric, granularity, ...filter })}`),
-    { headers: headers() },
+  const resp = await request(
+    `/observability/metrics/series${query({ metric, granularity, ...filter })}`,
   );
   return jsonOrThrow<MetricSeries>(resp);
 }
@@ -405,33 +314,21 @@ export async function getRunnerLogs(
   pod: string,
   opts: RunnerLogsQuery = {},
 ): Promise<PodLogs> {
-  const resp = await fetch(
-    url(
-      `/observability/runners/${encodeURIComponent(namespace)}/${encodeURIComponent(pod)}/logs${query({ ...opts })}`,
-    ),
-    { headers: headers() },
+  const resp = await request(
+    `/observability/runners/${encodeURIComponent(namespace)}/${encodeURIComponent(pod)}/logs${query({ ...opts })}`,
   );
   return jsonOrThrow<PodLogs>(resp);
 }
 
 // ---- L1: per-agent cost, budget, and the kill switch ----
 
-export interface CostReport {
-  start: string;
-  end: string;
-  total_usd: number;
-  points: MetricPoint[];
-}
+export type CostReport = Schemas["CostReport"];
 
-// Both fields nullable; null means platform defaults. Values must be > 0.
-export interface BudgetConfig {
-  max_usd_per_day: number | null;
-  max_output_tokens_per_run: number | null;
-}
+// Both fields optional and nullable; absent or null means platform defaults.
+// Values must be > 0.
+export type BudgetConfig = Schemas["BudgetConfig"];
 
-export interface KillState {
-  killed: boolean;
-}
+export type KillState = Schemas["KillState"];
 
 // The forced-thread-reset state (#737/#735). `requested` is true from the moment
 // the POST enqueues a reset until the worker's maintenance tick has actually
@@ -441,114 +338,61 @@ export interface KillState {
 // false when the key matched no route, so nothing was released; true when a
 // route existed and was released; null/absent while pending, when the outcome
 // expired, or against an API that predates the field.
-export interface ThreadResetState {
-  requested: boolean;
-  route_existed?: boolean | null;
-}
+export type ThreadResetState = Schemas["ThreadResetState"];
 
 export async function getAgents(): Promise<AgentOut[]> {
-  const resp = await fetch(url("/agents"), { headers: headers() });
+  const resp = await request("/agents");
   return jsonOrThrow<AgentOut[]>(resp);
 }
 
 // ---- Work items (#2577): factory outcomes for a GitHub-issue-driven agent ----
 
-export type WorkItemState =
-  | "queued"
-  | "waiting"
-  | "running"
-  | "cancellation_requested"
-  | "cancelled"
-  | "awaiting_approval"
-  | "publishing"
-  | "published"
-  | "failed"
-  | "expired"
-  | "completed_unpublished";
+export type WorkItemState = Schemas["WorkItemOutcomeOut"]["state"];
 
-export interface WorkItemPr {
-  number: number;
-  url: string;
-  status: string;
-}
+export type WorkItemPr = Schemas["WorkItemPrOut"];
 
-export interface WorkItemPublication {
-  status: string;
-  revision_number: number | null;
-  approval_status: string | null;
-}
+export type WorkItemPublication = Schemas["WorkItemPublicationOut"];
 
 // The console never re-derives correctness from the diff; it renders exactly
 // what the API asserts (currently always unasserted, owned by the bundle).
-export interface WorkItemCorrectness {
-  asserted: boolean;
-  owner: string;
-}
+export type WorkItemCorrectness = Schemas["WorkItemCorrectnessOut"];
 
-export interface WorkItemCi {
-  state: string;
-  reason: string | null;
-  head_sha: string | null;
-  observed_at: string | null;
-}
+export type WorkItemCi = Schemas["WorkItemCiOut"];
 
-export interface WorkItemRequest {
-  sequence: number;
-  status: string;
-  created_at: string;
-  wait_deadline: string | null;
-  started_at: string | null;
-  execution_deadline: string | null;
-  terminal_at: string | null;
-  terminal_cause: string | null;
-  termination_observation: string | null;
-  capacity_deferrals: number;
-  last_deferral_reason: string | null;
-}
+export type WorkItemRequest = Schemas["WorkItemRequestOut"];
 
-export interface WorkItemOutcome {
-  id: string;
-  agent_id: string;
-  repo_full_name: string;
-  github_issue_number: number;
-  issue_url: string;
-  cancelled_at: string | null;
-  created_at: string;
-  updated_at: string;
-  objective: string | null;
-  objective_truncated: boolean;
-  requester: string | null;
-  state: WorkItemState;
-  actionable_cause: string;
-  pr: WorkItemPr | null;
-  publication: WorkItemPublication | null;
-  correctness: WorkItemCorrectness;
-  // null on the list response; present (possibly null-fielded) on the detail
-  // fetch, since CI status is a per-item lookup the list endpoint skips.
-  ci: WorkItemCi | null;
-  requests: WorkItemRequest[];
-}
+export type WorkItemOutcome = Schemas["WorkItemOutcomeOut"];
 
-export interface WorkItemsList {
-  items: WorkItemOutcome[];
-  limit: number;
-  truncated: boolean;
-}
+export type WorkItemsList = Schemas["WorkItemOutcomeList"];
+
+// Stage progress (#4102): the same phase_view derivation the GitHub status
+// card draws, so the console and the card always agree.
+export type WorkItemProgress = Schemas["WorkItemProgressOut"];
+
+export type WorkItemStage = Schemas["WorkItemStageOut"];
+
+// Token usage and estimated cost summed over every request of a work item (#3223).
+export type WorkItemUsage = Schemas["WorkItemUsageOut"];
 
 export async function listWorkItems(params: { agentId?: string } = {}): Promise<WorkItemsList> {
-  const resp = await fetch(url(`/work-items${query({ agent_id: params.agentId })}`), { headers: headers() });
+  const resp = await request(`/work-items${query({ agent_id: params.agentId })}`);
   return jsonOrThrow<WorkItemsList>(resp);
 }
 
 export async function getWorkItem(id: string): Promise<WorkItemOutcome> {
-  const resp = await fetch(url(`/work-items/${encodeURIComponent(id)}`), { headers: headers() });
+  const resp = await request(`/work-items/${encodeURIComponent(id)}`);
   return jsonOrThrow<WorkItemOutcome>(resp);
 }
 
-// The open /config endpoint (no API key required) carries the configurable
+export async function getWorkItemUsage(id: string): Promise<WorkItemUsage> {
+  const resp = await request(`/work-items/${encodeURIComponent(id)}/usage`);
+  return jsonOrThrow<WorkItemUsage>(resp);
+}
+
+// The open /config endpoint (no credential required) carries the configurable
 // org/workspace name the shared chrome renders.
 export async function getConfig(): Promise<AppConfig> {
-  const resp = await fetch(url("/config"));
+  const resp = await request("/config");
   return jsonOrThrow<AppConfig>(resp);
 }
 
@@ -565,11 +409,11 @@ export async function getConfig(): Promise<AppConfig> {
 // platform default that clearing is supposed to restore.
 export async function updateAgent(
   agentId: string,
-  patch: { model?: string | null },
+  patch: AgentUpdate,
 ): Promise<AgentOut> {
-  const resp = await fetch(url(`/agents/${agentId}`), {
+  const resp = await request(`/agents/${agentId}`, {
     method: "PATCH",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(patch),
   });
   return jsonOrThrow<AgentOut>(resp);
@@ -590,17 +434,15 @@ export async function patchAgentChannel(
   selector: ChannelBinding,
   next: ChannelBinding,
 ): Promise<AgentOut> {
-  const resp = await fetch(
-    url(
-      `/agents/${agentId}/channels${query({
-        kind: selector.kind,
-        address: selector.address,
-        adapter: selector.adapter ?? undefined,
-      })}`,
-    ),
+  const resp = await request(
+    `/agents/${agentId}/channels${query({
+      kind: selector.kind,
+      address: selector.address,
+      adapter: selector.adapter ?? undefined,
+    })}`,
     {
       method: "PATCH",
-      headers: headers({ "Content-Type": "application/json" }),
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(next),
     },
   );
@@ -611,9 +453,9 @@ export async function addAgentSurface(
   agentId: string,
   surface: ChannelBindingWrite,
 ): Promise<AgentOut> {
-  const resp = await fetch(url(`/agents/${agentId}/channels`), {
+  const resp = await request(`/agents/${agentId}/channels`, {
     method: "POST",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(surface),
   });
   return jsonOrThrow<AgentOut>(resp);
@@ -627,15 +469,13 @@ export async function removeAgentSurface(
   agentId: string,
   surface: ChannelBinding,
 ): Promise<void> {
-  const resp = await fetch(
-    url(
-      `/agents/${agentId}/channels${query({
-        kind: surface.kind,
-        address: surface.address,
-        adapter: surface.adapter ?? undefined,
-      })}`,
-    ),
-    { method: "DELETE", headers: headers() },
+  const resp = await request(
+    `/agents/${agentId}/channels${query({
+      kind: surface.kind,
+      address: surface.address,
+      adapter: surface.adapter ?? undefined,
+    })}`,
+    { method: "DELETE" },
   );
   if (resp.ok) return;
   const body = await resp.json().catch(() => null);
@@ -645,70 +485,57 @@ export async function removeAgentSurface(
 // Delete an agent (cascades its versions/deployments server-side; 204 No Content
 // on success). A 409 (active deployment) surfaces via the thrown ApiError.
 export async function deleteAgent(agentId: string): Promise<void> {
-  const resp = await fetch(url(`/agents/${agentId}`), { method: "DELETE", headers: headers() });
+  const resp = await request(`/agents/${agentId}`, { method: "DELETE" });
   if (resp.ok) return;
   const body = await resp.json().catch(() => null);
   throw new ApiError(resp.status, describeError(body) ?? resp.statusText);
 }
 
 export async function getCost(agentId: string, range: { start?: string; end?: string } = {}): Promise<CostReport> {
-  const resp = await fetch(url(`/agents/${agentId}/cost${query({ ...range })}`), { headers: headers() });
+  const resp = await request(`/agents/${agentId}/cost${query({ ...range })}`);
   return jsonOrThrow<CostReport>(resp);
 }
 
 export async function getBudget(agentId: string): Promise<BudgetConfig> {
-  const resp = await fetch(url(`/agents/${agentId}/budget`), { headers: headers() });
+  const resp = await request(`/agents/${agentId}/budget`);
   return jsonOrThrow<BudgetConfig>(resp);
 }
 
 // PUT the budget. A non-positive value 422s server-side (Field(gt=0)); the
 // ApiError message carries the field-level reason for inline display.
 export async function putBudget(agentId: string, budget: BudgetConfig): Promise<BudgetConfig> {
-  const resp = await fetch(url(`/agents/${agentId}/budget`), {
+  const resp = await request(`/agents/${agentId}/budget`, {
     method: "PUT",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(budget),
   });
   return jsonOrThrow<BudgetConfig>(resp);
 }
 
 export async function getKillState(agentId: string): Promise<KillState> {
-  const resp = await fetch(url(`/agents/${agentId}/kill`), { headers: headers() });
+  const resp = await request(`/agents/${agentId}/kill`);
   return jsonOrThrow<KillState>(resp);
 }
 
 // ---- FX2: agent detail — versions, bundle files, and version activation ----
 
-export type Environment = "prod" | "dev";
+export type Environment = Schemas["Environment"];
 
-export interface DeploymentOut {
-  id: string;
-  agent_id: string;
-  version_id: string;
-  environment: Environment;
-  commit_sha: string | null;
-  status: string;
-  deployed_at: string;
-}
+export type DeploymentOut = Schemas["DeploymentOut"];
 
 // One unwrapped file from a stored bundle. `path` is bundle-root-relative, e.g.
 // "skills/deal-desk/SKILL.md" or ".claude-plugin/plugin.json".
-export interface BundleFile {
-  path: string;
-  content: string;
-}
+export type BundleFile = Schemas["BundleFile"];
 
-export interface BundleFiles {
-  files: BundleFile[];
-}
+export type BundleFiles = Schemas["BundleFiles"];
 
 export async function listVersions(agentId: string): Promise<VersionOut[]> {
-  const resp = await fetch(url(`/agents/${agentId}/versions`), { headers: headers() });
+  const resp = await request(`/agents/${agentId}/versions`);
   return jsonOrThrow<VersionOut[]>(resp);
 }
 
 export async function listDeployments(agentId: string): Promise<DeploymentOut[]> {
-  const resp = await fetch(url(`/deployments${query({ agent_id: agentId })}`), { headers: headers() });
+  const resp = await request(`/deployments${query({ agent_id: agentId })}`);
   return jsonOrThrow<DeploymentOut[]>(resp);
 }
 
@@ -716,7 +543,7 @@ export async function listDeployments(agentId: string): Promise<DeploymentOut[]>
 // by the env-scoped Agents/Overview views to decide which agents are live in the
 // selected environment.
 export async function listAllDeployments(): Promise<DeploymentOut[]> {
-  const resp = await fetch(url("/deployments"), { headers: headers() });
+  const resp = await request("/deployments");
   return jsonOrThrow<DeploymentOut[]>(resp);
 }
 
@@ -726,28 +553,19 @@ export async function listAllDeployments(): Promise<DeploymentOut[]> {
  * the version yet; callers distinguish it via the thrown ApiError's status.
  */
 export async function getVersionFiles(agentId: string, versionId: string): Promise<BundleFiles> {
-  const resp = await fetch(url(`/agents/${agentId}/versions/${versionId}/files`), { headers: headers() });
+  const resp = await request(`/agents/${agentId}/versions/${versionId}/files`);
   return jsonOrThrow<BundleFiles>(resp);
 }
 
-export type DeploymentStatus = "active" | "inactive";
-
-export interface DeploymentCreate {
-  agent_id: string;
-  version_id: string;
-  environment: Environment;
-  // Optional; the API's DeploymentCreate defaults to "active" server-side. The
-  // rollback path sets it explicitly to redeploy an old version as active.
-  status?: DeploymentStatus;
-}
+export type DeploymentCreate = Schemas["DeploymentCreate"];
 
 // Activate a version by creating a deployment for it (status defaults to active
 // server-side). This is the third step of the redeploy sequence, after POST
 // version + PUT bundle.
 export async function createDeployment(input: DeploymentCreate): Promise<DeploymentOut> {
-  const resp = await fetch(url("/deployments"), {
+  const resp = await request("/deployments", {
     method: "POST",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
   });
   return jsonOrThrow<DeploymentOut>(resp);
@@ -757,26 +575,15 @@ export async function createDeployment(input: DeploymentCreate): Promise<Deploym
 
 // Where a memory entry was learned from (#264 Provenance shape). Provenance is
 // the differentiator: an operator can see which session/traces taught a lesson.
-export interface MemoryProvenance {
-  learned_from_session_id: string | null;
-  source_trace_ids: string[];
-  recorded_at: string;
-  /** `operator` for CLI/API-seeded records; absent/null for learned ones. */
-  source?: string | null;
-}
+export type MemoryProvenance = Schemas["MemoryProvenanceOut"];
 
 // One learned memory entry. `index` is its position in the append only memory
 // log. It is valid only with the accompanying parent log version.
-export interface MemoryEntry {
-  index: number;
-  version: number;
-  content: string;
-  provenance: MemoryProvenance;
-}
+export type MemoryEntry = Schemas["MemoryEntryOut"];
 
 // List an agent's learned memory, oldest first (empty for a fresh agent).
 export async function listMemory(agentId: string): Promise<MemoryEntry[]> {
-  const resp = await fetch(url(`/agents/${agentId}/memory`), { headers: headers() });
+  const resp = await request(`/agents/${agentId}/memory`);
   return jsonOrThrow<MemoryEntry[]>(resp);
 }
 
@@ -788,9 +595,9 @@ export async function editMemory(
   content: string,
   expectedVersion: number,
 ): Promise<MemoryEntry> {
-  const resp = await fetch(url(`/agents/${agentId}/memory/${index}`), {
+  const resp = await request(`/agents/${agentId}/memory/${index}`, {
     method: "PUT",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content, expected_version: expectedVersion }),
   });
   return jsonOrThrow<MemoryEntry>(resp);
@@ -802,12 +609,9 @@ export async function deleteMemory(
   index: number,
   expectedVersion: number,
 ): Promise<void> {
-  const resp = await fetch(
-    url(`/agents/${agentId}/memory/${index}${query({ expected_version: expectedVersion })}`),
-    {
-      method: "DELETE",
-      headers: headers(),
-    },
+  const resp = await request(
+    `/agents/${agentId}/memory/${index}${query({ expected_version: expectedVersion })}`,
+    { method: "DELETE" },
   );
   if (resp.ok) return;
   const body = await resp.json().catch(() => null);
@@ -818,45 +622,33 @@ export async function deleteMemory(
 
 // One namespace in an agent's durable state store, summarized for the inspector:
 // how many keys it holds and when it was last written.
-export interface StateNamespace {
-  namespace: string;
-  key_count: number;
-  last_updated: string;
-}
+export type StateNamespace = Schemas["StateNamespaceOut"];
 
 // A single durable state entry (a namespace+key holding arbitrary JSON), with the
 // compare-and-set version and the last write time.
-export interface StateEntry {
-  namespace: string;
-  key: string;
-  value: unknown;
-  version: number;
-  updated_at: string;
-}
+export type StateEntry = Schemas["StateEntryOut"];
 
 // List the namespaces an agent has stored, most-recently-written first (empty
 // for an agent that has stored nothing).
 export async function listStateNamespaces(agentId: string): Promise<StateNamespace[]> {
-  const resp = await fetch(url(`/agents/${agentId}/state`), { headers: headers() });
+  const resp = await request(`/agents/${agentId}/state`);
   return jsonOrThrow<StateNamespace[]>(resp);
 }
 
 // List every key stored under one namespace (get-by-key is not needed for the
 // read surface: the list carries each entry's value, version, and write time).
 export async function listStateEntries(agentId: string, namespace: string): Promise<StateEntry[]> {
-  const resp = await fetch(url(`/agents/${agentId}/state/${encodeURIComponent(namespace)}`), {
-    headers: headers(),
-  });
+  const resp = await request(`/agents/${agentId}/state/${encodeURIComponent(namespace)}`);
   return jsonOrThrow<StateEntry[]>(resp);
 }
 
 export async function killAgent(agentId: string): Promise<KillState> {
-  const resp = await fetch(url(`/agents/${agentId}/kill`), { method: "POST", headers: headers() });
+  const resp = await request(`/agents/${agentId}/kill`, { method: "POST" });
   return jsonOrThrow<KillState>(resp);
 }
 
 export async function resumeAgent(agentId: string): Promise<KillState> {
-  const resp = await fetch(url(`/agents/${agentId}/resume`), { method: "POST", headers: headers() });
+  const resp = await request(`/agents/${agentId}/resume`, { method: "POST" });
   return jsonOrThrow<KillState>(resp);
 }
 
@@ -868,9 +660,9 @@ export async function resumeAgent(agentId: string): Promise<KillState> {
 // confirm it landed. The thread key is arbitrary (e.g. a Slack thread ts), so it
 // is URL-encoded into the path.
 export async function resetThread(agentId: string, threadKey: string): Promise<ThreadResetState> {
-  const resp = await fetch(
-    url(`/agents/${agentId}/threads/${encodeURIComponent(threadKey)}/reset`),
-    { method: "POST", headers: headers() },
+  const resp = await request(
+    `/agents/${agentId}/threads/${encodeURIComponent(threadKey)}/reset`,
+    { method: "POST" },
   );
   return jsonOrThrow<ThreadResetState>(resp);
 }
@@ -882,9 +674,8 @@ export async function getThreadResetState(
   agentId: string,
   threadKey: string,
 ): Promise<ThreadResetState> {
-  const resp = await fetch(
-    url(`/agents/${agentId}/threads/${encodeURIComponent(threadKey)}/reset`),
-    { headers: headers() },
+  const resp = await request(
+    `/agents/${agentId}/threads/${encodeURIComponent(threadKey)}/reset`,
   );
   return jsonOrThrow<ThreadResetState>(resp);
 }
@@ -895,51 +686,11 @@ export async function getThreadResetState(
 // run pauses on a permission/policy gate and suspends the session; an operator
 // resolves it here or from the Slack card. `status` is one of
 // pending/approved/rejected/expired.
-export interface ApprovalOut {
-  id: string;
-  agent_id: string | null;
-  conversation_id: string;
-  author: string;
-  summary: string;
-  display_summary?: string | null;
-  reply_channel: string;
-  reply_placeholder: string | null;
-  reply_endpoint: string | null;
-  dedupe_key: string;
-  route: string | null;
-  card_channel: string | null;
-  // Gate provenance (#544): which gate fired, and the tool a grant is bound to.
-  gate_kind: string | null;
-  granted_tool: string | null;
-  status: string;
-  expires_at: string | null;
-  resolved_by: string | null;
-  resolution_note: string | null;
-  created_at: string;
-  resolved_at: string | null;
-}
+export type ApprovalOut = Schemas["ApprovalOut"];
 
 // One audit-trail entry for an approval (mirrors ApprovalAuditOut, #247): each
 // resolution attempt with the authorizer snapshot that counted or refused it.
-export interface ApprovalAudit {
-  id: string;
-  approval_id: string;
-  action: string;
-  actor: string;
-  actor_channel: string | null;
-  // Proof attached to the derived actor (ADR-0106). Historical rows retain a
-  // null kind and authenticated=false rather than being retroactively trusted.
-  principal_kind: "chat" | "console" | "operator" | "adapter" | "platform" | null;
-  // The adapter that carried the decision (ADR-0154); null for other kinds.
-  principal_subject: string | null;
-  authenticated: boolean;
-  decision: string;
-  authorizer: string;
-  authorized: boolean;
-  reason: string | null;
-  evidence: Record<string, unknown> | null;
-  created_at: string;
-}
+export type ApprovalAudit = Schemas["ApprovalAuditOut"];
 
 export interface ApprovalListQuery {
   // Passed as the `status_filter` query param; omit for all statuses.
@@ -952,46 +703,37 @@ export interface ApprovalListQuery {
 // List approvals, newest first (server clamps limit to 1..200). Without a status
 // filter, every status is returned; the operator surface defaults to pending.
 export async function listApprovals(opts: ApprovalListQuery = {}): Promise<ApprovalOut[]> {
-  const resp = await fetch(
-    url(
-      `/approvals${query({
-        status_filter: opts.status,
-        agent_id: opts.agentId,
-        conversation_id: opts.conversationId,
-        limit: opts.limit,
-      })}`,
-    ),
-    { headers: headers() },
+  const resp = await request(
+    `/approvals${query({
+      status_filter: opts.status,
+      agent_id: opts.agentId,
+      conversation_id: opts.conversationId,
+      limit: opts.limit,
+    })}`,
   );
   return jsonOrThrow<ApprovalOut[]>(resp);
 }
 
 export async function getApproval(approvalId: string): Promise<ApprovalOut> {
-  const resp = await fetch(url(`/approvals/${encodeURIComponent(approvalId)}`), { headers: headers() });
+  const resp = await request(`/approvals/${encodeURIComponent(approvalId)}`);
   return jsonOrThrow<ApprovalOut>(resp);
 }
 
 // The approval's audit trail, oldest first (empty until the first resolution
 // attempt). A 404 (approval gone) surfaces via the thrown ApiError.
 export async function getApprovalAudit(approvalId: string): Promise<ApprovalAudit[]> {
-  const resp = await fetch(url(`/approvals/${encodeURIComponent(approvalId)}/audit`), { headers: headers() });
+  const resp = await request(`/approvals/${encodeURIComponent(approvalId)}/audit`);
   return jsonOrThrow<ApprovalAudit[]>(resp);
 }
 
-export interface ApprovalResolveInput {
-  decision: "approved" | "rejected";
-  note?: string;
-}
+export type ApprovalResolveInput = Schemas["ApprovalResolve"];
 
-export interface ConsoleSession {
-  // The server rejects subject-less sessions on the current-session route, but
-  // the response schema remains nullable for pre-ADR-0106 historical rows.
-  subject: string | null;
-  expires_at: string;
-}
+export type ConsoleSession = Schemas["ConsoleSessionOut"];
 
 // Inspect the HttpOnly same-origin console session. No platform key is sent:
 // the ambient cookie is the only credential on this identity boundary.
+// Bypasses request() on purpose: a 401 here means signed out, not an expired
+// session, so it must not fire the unauthorized listeners.
 export async function getConsoleSession(): Promise<ConsoleSession> {
   const resp = await fetch(url("/console/session"), {
     credentials: "same-origin",
@@ -1001,6 +743,8 @@ export async function getConsoleSession(): Promise<ConsoleSession> {
 
 // Exchange a single-use CLI-minted login code. The response never exposes the
 // session token; the API installs it as an HttpOnly cookie.
+// Bypasses request() on purpose: a 401 here means a bad code, not an expired
+// session, so it must not fire the unauthorized listeners.
 export async function exchangeConsoleLoginCode(code: string): Promise<ConsoleSession> {
   const resp = await fetch(url("/console/session"), {
     method: "POST",
@@ -1012,14 +756,13 @@ export async function exchangeConsoleLoginCode(code: string): Promise<ConsoleSes
 }
 
 // Resolve an approval (resolve-once compare-and-set) as the immutable subject
-// in the HttpOnly console session. The request deliberately omits X-API-Key and
-// carries no caller-asserted identity/channel fields. Designed failures are 401
+// in the HttpOnly console session. Like every call, it carries only the console
+// cookie and no caller-asserted identity/channel fields. Designed failures are 401
 // (session missing/revoked/expired), 403 (not authorized), 409 (already
 // resolved), and 410 (expired).
 export async function resolveApproval(approvalId: string, input: ApprovalResolveInput): Promise<ApprovalOut> {
-  const resp = await fetch(url(`/approvals/${encodeURIComponent(approvalId)}/resolve`), {
+  const resp = await request(`/approvals/${encodeURIComponent(approvalId)}/resolve`, {
     method: "POST",
-    credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
   });
@@ -1028,73 +771,31 @@ export async function resolveApproval(approvalId: string, input: ApprovalResolve
 
 // ---- Behavior packs: per-agent opt-in deterministic behaviors (#870) ----
 //
-// Shapes mirror apps/api schemas.BehaviorPacksConfig verbatim. The packs ride on
-// the agent's stored config (like BudgetConfig mirrors the ACI Budget), so the
-// shape is duplicated here rather than shared. A NULL agent row reads back as the
-// all-off default; the API always returns the fully-defaulted object.
+// The packs ride on the agent's stored config. A NULL agent row reads back as
+// the all-off default, but the schema declares every pack and every pack field
+// optional, so consumers fill absent fields from the same all-off defaults.
 
-export interface LoadPack {
-  enabled: boolean;
-  // Rotating "working…" load lines shown while the agent is thinking.
-  lines: string[];
-}
+export type LoadPack = Schemas["LoadPackConfig"];
 
-export interface TipsPack {
-  enabled: boolean;
-  // Rotating capability tips (what the agent CAN do, vs. what it is doing now).
-  tips: string[];
-}
+export type TipsPack = Schemas["TipsPackConfig"];
 
-export interface GreetingPack {
-  enabled: boolean;
-  // Trigger phrases that short-circuit to the deterministic reply below.
-  phrases: string[];
-  reply: string;
-}
+export type GreetingPack = Schemas["GreetingPackConfig"];
 
-export interface HelpPack {
-  enabled: boolean;
-  // Trigger phrases (e.g. "what can you do") that short-circuit to the reply.
-  phrases: string[];
-  reply: string;
-}
+export type HelpPack = Schemas["HelpPackConfig"];
 
 // One declared user-editable runtime knob. The settings pack is schema-only today
 // (the override store + per-user edit UI are a deferred runtime), so the console
 // surfaces the declared knobs read-only and round-trips them unchanged.
-export interface SettingConfig {
-  key: string;
-  label: string;
-  kind: string;
-  default: string;
-  help: string;
-  choices: string[];
-  applies_live: boolean;
-}
+export type SettingConfig = Schemas["SettingConfig"];
 
-export interface SettingsPack {
-  enabled: boolean;
-  settings: SettingConfig[];
-}
+export type SettingsPack = Schemas["SettingsPackConfig"];
 
-export interface NavPack {
-  enabled: boolean;
-  // The no-dead-ends hub button label + command for this agent.
-  hub_label: string;
-  hub_command: string;
-}
+export type NavPack = Schemas["NavPackConfig"];
 
-export interface BehaviorPacksConfig {
-  load: LoadPack;
-  tips: TipsPack;
-  greeting: GreetingPack;
-  help: HelpPack;
-  settings: SettingsPack;
-  nav: NavPack;
-}
+export type BehaviorPacksConfig = Schemas["BehaviorPacksConfig"];
 
 export async function getBehaviorPacks(agentId: string): Promise<BehaviorPacksConfig> {
-  const resp = await fetch(url(`/agents/${agentId}/behavior-packs`), { headers: headers() });
+  const resp = await request(`/agents/${agentId}/behavior-packs`);
   return jsonOrThrow<BehaviorPacksConfig>(resp);
 }
 
@@ -1106,9 +807,9 @@ export async function putBehaviorPacks(
   agentId: string,
   config: BehaviorPacksConfig,
 ): Promise<BehaviorPacksConfig> {
-  const resp = await fetch(url(`/agents/${agentId}/behavior-packs`), {
+  const resp = await request(`/agents/${agentId}/behavior-packs`, {
     method: "PUT",
-    headers: headers({ "Content-Type": "application/json" }),
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(config),
   });
   return jsonOrThrow<BehaviorPacksConfig>(resp);

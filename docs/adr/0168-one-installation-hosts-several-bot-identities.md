@@ -4,6 +4,23 @@ Date: 2026-09-22
 
 Status: Accepted
 
+**Superseded in part by [ADR 0198](0198-identity-links-live-in-provider-identity-namespaces.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+decision 1's choice to make a channel identity a row in
+`provider_installations` (identities are rows in `channel_identities`); in
+decision 3, the binding's installation reference named by `adapter` now
+references a channel identity; and the Tracking clause that has #2909 create
+one bootstrap row per declared identity in that table. Everything else in this
+ADR stands.
+
+**Superseded in part by [ADR 0215](0215-each-tracker-surface-starts-factory-work-under-its-own-trigger-label.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+in decision 3, the route key widens to `(kind, address, adapter,
+trigger_label)`, and tracker surfaces (`github`, `gitlab`, `jira`) are exempt
+from the route-less pair exclusivity; their overlap is refused by effective
+trigger label instead. Every other kind keeps that exclusivity. Everything
+else in this ADR stands.
+
 This ADR builds on [ADR-0096](0096-port-adapters-are-deployed-services.md),
 [ADR-0118](0118-binding-cardinality-is-the-multi-surface-opt-in.md),
 [ADR-0155](0155-tenant-boundary-and-principal-identity-land-together.md),

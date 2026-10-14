@@ -12,6 +12,9 @@ from typing import Any
 
 _RUNNER_POOL_SUFFIX = "-runner-pool"
 _POOL_SUFFIX = "-pool"
+# Suffixes of the worker-owned resources template and its warm pool.
+RESOURCES_TEMPLATE_SUFFIX = "-resources"
+RESOURCES_POOL_SUFFIX = "-resources-pool"
 _DIMENSIONS = ("cpu", "memory", "ephemeral-storage")
 
 
@@ -23,9 +26,9 @@ def resources_object_name(kind: str, name: str) -> str:
     before a write, including the shared chart template.
     """
 
-    if kind == "template" and name.endswith("-resources"):
+    if kind == "template" and name.endswith(RESOURCES_TEMPLATE_SUFFIX):
         return name
-    if kind == "warmpool" and name.endswith("-resources-pool"):
+    if kind == "warmpool" and name.endswith(RESOURCES_POOL_SUFFIX):
         return name
     raise ValueError(f"{kind} name {name!r} is not a worker-owned resources object")
 
@@ -80,9 +83,7 @@ def prepare_resources_claim(
     owned_template, owned_pool = _owned_names(pool, agent_name)
     resources_object_name("template", owned_template)
     resources_object_name("warmpool", owned_pool)
-    copied = copy.deepcopy(templates[source_name])
-    _replace_resources(copied, resources)
-    templates[owned_template] = copied
+    templates[owned_template] = claim_resources_spec(templates[source_name], resources)
     warm_pools[owned_pool] = {
         "replicas": 0,
         "sandboxTemplateRef": {"name": owned_template},
@@ -90,12 +91,25 @@ def prepare_resources_claim(
     return owned_pool
 
 
+def claim_resources_spec(spec: dict[str, Any], resources: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``spec`` with ``resources`` on every container.
+
+    The shape is validated before the copy, so a refused override writes
+    nothing. ``spec`` itself is not changed.
+    """
+
+    _validate_resources(resources)
+    copied = copy.deepcopy(spec)
+    _replace_resources(copied, resources)
+    return copied
+
+
 def _owned_names(pool: str, agent_name: str) -> tuple[str, str]:
     stem = pool[: -len(_RUNNER_POOL_SUFFIX)]
     agent_suffix = f"-agent-{agent_name}"
     prefix = stem[: -len(agent_suffix)] if stem.endswith(agent_suffix) else stem
-    template = f"{prefix}-agent-{agent_name}-resources"
-    return template, f"{template}-pool"
+    template = f"{prefix}-agent-{agent_name}{RESOURCES_TEMPLATE_SUFFIX}"
+    return template, f"{template}{_POOL_SUFFIX}"
 
 
 def _validate_resources(resources: dict[str, Any]) -> None:

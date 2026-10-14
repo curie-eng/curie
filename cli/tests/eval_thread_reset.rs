@@ -3,7 +3,7 @@
 
 use curie::queue::{queue_thread_reset, THREAD_RESET_SET};
 
-mod support;
+use crate::support;
 use support::{unique_stream, valkey_or_skip};
 
 #[tokio::test]

@@ -96,6 +96,17 @@ workspace and preserves the shell arguments, exit status and signals. Missing or
 nonexecutable launchers reject session startup instead of selecting another shell.
 Declared connector secrets remain available to bundle tools.
 
+SDK initialization writes a start record and a finish record to the runner log
+under the fixed phase `sdk_initialize`. The finish record carries the outcome
+(`success`, `failure` or `cancelled`), monotonic elapsed milliseconds, the SDK
+version and, on failure only, the exception class. It never carries options,
+environment, prompts or exception text. Every Claude CLI stderr line still reaches
+the runner's stderr for the whole session. While connect runs, the runner also
+keeps a copy of those lines, redacted before it is kept and bounded to the newest
+8192 UTF-8 bytes. A failed initialization emits that tail as one WARNING; success
+and cancellation discard it, and nothing is kept after connect ends. The original
+exception propagates unchanged, with no retry or timeout change.
+
 Each `text_delta` the runner emits is one whole assistant text block, and a
 consumer joins deltas as they come. The same boundary therefore starts a later
 block of the turn on its own paragraph (a blank line), unless the model already
@@ -111,11 +122,69 @@ The control routes (`/v1/event`, `/v1/steer`, `/v1/interrupt`, `/v1/reset`,
 header matching `CURIE_RUNNER_TOKEN` when that env var is set, returning 401
 otherwise. This is per-sandbox transport auth (defense-in-depth on the ACI
 ingress alongside the NetworkPolicy), not part of the frozen ACI wire contract.
-Enforcement is only-when-configured: with the var unset the app is pass-through
-(CLI, fake-model CI, and pre-token sandboxes stay unauthenticated). `GET
+A runner with the var unset or blank refuses to boot with
+`RunnerTokenRequiredError` unless `CURIE_RUNNER_ALLOW_TOKENLESS=1` is set, which
+only `curie skill up` and the eval sweep set; the chart always supplies a token
+from the `<release>-runner-token` Secret (#3821). `GET
 /healthz` and probe-only `GET /status` are never gated (the chart readinessProbe
 hits `/healthz`); replacement authority comes only from authenticated
 `GET /v1/status`.
+
+## Deliberate progress (ADR 0130)
+
+The runner mounts a `progress` tool on its platform `curie` MCP server, so the
+model sees it as `mcp__curie__progress`. It is ADR 0130's `curie_progress`
+operation. Its input schema is the committed `ProgressCommand` schema
+(`packages/channel-protocol/schema/channel-protocol.schema.json`) without
+`version`, which the runner fills in: `update_id`, `state`, `summary` and an
+optional `milestone`. A factory execution mounts `report_progress` instead and
+never both. When the tool is mounted the system prompt carries a short progress
+block beside the memory and workspace blocks: call it only on long,
+multi-step tasks, at material transitions, and never for a quick answer; a
+milestone (`evidence`, `scope` or `verification`) only when the step is
+material, at most three per task; and never reasoning, raw tool output, secrets
+or a draft answer in the summary. The tool description repeats the rules.
+
+The tool and its progress prompt are mounted only when the worker booted this
+sandbox with `CURIE_TURN_PROGRESS_ENABLED=1`. The worker sets that direct
+runner boot fact only for a human Slack thread and includes it in sandbox reuse
+comparison; jobs, cron, email, relay, targetless and factory sessions retain
+their pre-progress model surface. This leaves the frozen ACI unchanged.
+
+The capability is per turn. The worker first allocates a durable, monotonically
+increasing generation on the chain and marks it active. It sends the capability
+on `POST /v1/event` in three runner control headers, `X-Curie-Progress-Url`,
+`X-Curie-Progress-Token`, and `X-Curie-Progress-Generation`,
+next to `X-Curie-Capacity-Admission`; like the turn epoch they are not ACI
+fields. The token is signed for `progress_id:generation`, and the API also
+checks that the same generation is still active and before its bounded
+server-time lease before it appends anything. The worker renews that five-second
+lease while the stream is open, and cannot revive a missed lease, so a failed
+turn-end clear loses authority promptly rather than leaving a 24-hour token
+usable.
+The runner holds the three values only while that turn is open, sets them when
+the turn starts and clears them when it ends, so a steer uses the turn's
+capability and a closed or superseded turn cannot enqueue. The names are frozen
+with the worker and the API in `tests/vectors/turn-progress-capability.json`.
+
+Each call POSTs the command to the capability URL with the token in
+`X-API-Key`, adding the worker-issued `generation` and a `seq` that counts this
+turn's posts from 1. The generation remains monotonic across runner restarts,
+clock skew, retries, and cold approval resumes; the worker applies a turn's
+commands in order and refuses an older generation after a newer one. HTTP 202
+means `Progress queued.`, because durable application can still refuse it. A call
+without a capability returns "Progress is not shown for this turn." and makes
+no network call. A refusal, a rate limit, a 5xx or a transport failure is a
+soft tool result that tells the model to continue; it never fails the turn. An
+input the schema refuses (an unknown field, a bad state or summary) is an error
+result the model can correct, still without failing the turn. The call is
+platform-owned and idempotent (`PLATFORM_IDEMPOTENT_TOOLS`), so it raises no
+`side_effect_flag` and never lands on the turn's receipt.
+
+The fake model is unconditionally network-free, including when progress headers
+are present. `[fake:progress-demo]` remains a deterministic long-running turn
+for steering tests, but it does not call the ingress. API/worker integration
+tests and live-provider tests exercise the real progress handler instead.
 
 ## Per-turn tool access
 
@@ -208,6 +277,61 @@ turn whose `Event.tool_access` is `read-only`:
   recorded in the thread's durable history, so a later boot of that thread
   replays them.
 
+## Channel read and canvases (ADR 0100, ADR 0200)
+
+A bundle granting `channelRead: true` lets its agent read its own bound
+channels through the platform; `canvasList`, `canvasRead` and `canvasEdit`
+let it list, read and edit table cells of canvases shared into those
+channels. The runner side has four rules.
+
+1. **RUNNER-CHANNEL-READ-1:** Only a real-model boot whose bundle grants at
+   least one of `channelRead`, `canvasList`, `canvasRead`, `canvasEdit` (each a
+   literal `true`) mounts the platform `curie-slack` server, and each tool on
+   it is present only with its own grant: `channelRead` brings
+   `read_channel_history`, `read_thread_replies` and `read_channel_message`;
+   `canvasList` brings `list_channel_canvases`; `canvasRead` brings
+   `read_canvas`; `canvasEdit` brings `edit_canvas_cell`. No grant implies
+   another, and no canvas grant brings the history tools. No grant, or the
+   fake model, mounts nothing. The tools are governed by `toolPolicy` like a
+   connector's (the gate counts `curie-slack` as a connector server) and are
+   never platform exempt. Policy denials hide them from the model's
+   catalogue. The history tools, `list_channel_canvases` and `read_canvas`
+   are idempotent for `side_effect_flag`; `edit_canvas_cell` writes to the
+   provider and is not.
+2. **RUNNER-CHANNEL-READ-2:** `GET /status` and `GET /v1/status` carry
+   `"channel_read": true` only when the server is mounted, and omit the key
+   otherwise, so the kernel refuses a granted turn on a runner that cannot
+   enforce it.
+3. **RUNNER-CHANNEL-READ-3:** The capability arrives on `/v1/event` and
+   `/v1/steer` only and lives in one per-turn holder
+   (`platform_slack/capability.py`). Turn open admits its scope (agent,
+   deployment, logical turn, default channel) and generation. A steer with null
+   or no capability clears the credential and keeps the scope; a steer naming
+   another scope, an unreadable token or a capability with no admitted scope is
+   rejected and clears it; a steer at or below the highest accepted generation
+   is stale and changes nothing. A capability is accepted only when its URL has
+   the boot `CURIE_STATE_URL` origin and a path ending `/channel-read`. The
+   canvas tools post to the sibling `/channel-canvas` route derived from that
+   admitted URL; no second URL is accepted.
+   Completion, interrupt, an accepted timeout (after its epoch check), reset
+   and abandonment clear it before any await. The token never reaches the
+   environment, tool arguments, results, logs, telemetry or the transcript; a
+   tool with no credential refuses `channel_read.no_capability` without a
+   request.
+4. **RUNNER-CHANNEL-READ-4:** A successful result is JSON labelled
+   `content_trust: "untrusted"`, `source: "channel"` (history) or
+   `source: "canvas"` (canvas tools). The persisted turn record keeps a
+   provenance stub (ids, timestamps, permalinks, `bodies_retained: false`) in
+   place of each successful read result; a canvas stub keeps only canvas ids,
+   section ids and creation times, never titles or cell or paragraph text. Once
+   a read or canvas tool has returned a result, the session exports no native
+   replay checkpoint until a new SDK session replaces it. A platform refusal comes back to the model as a
+   named `channel_read.*` code with its message (and, when the platform sends
+   one, `Retry after N seconds`), `channel_read.refused` for an unnamed one;
+   an unreachable platform returns `channel_read.unavailable`. The runner keeps
+   no retry or page counter of its own: the 8 page per turn budget, the 7 day
+   window and the 100 message page ceiling are enforced by the API.
+
 ## Portable assistant message groups
 
 Structured history preserves the logical assistant message that produced each
@@ -237,24 +361,28 @@ marker. This grouping is replay metadata, never approval or tool authority.
   inference from adjacency, result arrival, tool name, or prose may combine
   independent messages or move a dependent call before the result it consumes.
 - **RUNNER-HISTORY-GROUP-4:** Old role/content-only records remain readable.
-  Unambiguous sequential call/result history works without a native checkpoint.
-  A legacy checkpoint can supply missing group identity only when its assistant
-  and user conversation rows match the authoritative portable prefix exactly
-  and unambiguously, with valid IDs and causal boundaries. Its prompt snapshots,
+  Unambiguous sequential call/result history works without a native checkpoint. A
+  legacy checkpoint can supply missing group identity only when its assistant and
+  user conversation rows match the authoritative portable prefix exactly and
+  unambiguously, with valid IDs and causal boundaries. Its prompt snapshots,
   attachment availability, other envelope fields, and extra content are never
   imported by this recovery. If an overlapping tool-call sequence needs grouping
-  that neither portable metadata nor validated native mapping proves, never
-  submit that known corrupt replay or manufacture a result. Replay that one turn
-  as its visible text instead: the turn runs from a genuine user message to the
-  next one, and it becomes that user message followed by one assistant message
-  carrying the turn's assistant text blocks in order (or, if it had none, a text
-  saying its tool activity could not be replayed). Every other turn keeps its
-  rows unchanged, a native checkpoint is set aside, and the runner logs a WARNING
-  naming the session and the number of turns reduced, never their content.
-  Refusing the whole history instead strands the thread: the runner exits
-  before it is ready, every retry and every later message in that thread fails
-  the same way, and a thread whose key is fixed, such as an inbound hook's, can
-  never start fresh.
+  that neither portable metadata nor validated native mapping proves, never submit
+  that known corrupt replay or manufacture a result. Replay that one turn as its
+  visible text instead: the turn runs from a genuine user message (a user row
+  carrying no tool result) to the next one, and it becomes that user message
+  followed by one assistant message carrying the turn's assistant text blocks in
+  order (or, if it had none, a text saying its tool activity could not be
+  replayed). Subagent messages (those with a parent tool call) are not portable
+  history; only the parent's `Agent` call and its result are. Overlap that spans
+  turns is reduced the same way, both the turn that adds the overlapping call and
+  each earlier turn still holding an unanswered call, plus any later turn holding
+  a result for a reduced call. Every other turn keeps its rows unchanged, a native
+  checkpoint is set aside, and the runner logs a WARNING naming the session and
+  the number of turns reduced, never their content. Refusing the whole history
+  instead strands the thread: the runner exits before it is ready, every retry and
+  every later message in that thread fails the same way, and a thread whose key is
+  fixed, such as an inbound hook's, can never start fresh.
 - **RUNNER-HISTORY-GROUP-5:** Reject malformed persisted group metadata and
   inconsistent provenance, including attribution on user rows and reuse across
   genuine user or distinct assistant-group boundaries. Preserve group identity
@@ -285,8 +413,13 @@ resources and fake provider credentials, with no real model or approval action.
   `CURIE_HISTORY_MAX_TURNS` / `CURIE_HISTORY_MAX_BYTES` (bound the rehydrated
   structured prefix with stable summary boundaries; defaults 40 turns / 16000
   bytes, a nonpositive value falls back to the default),
+  `CURIE_MEMORY_MAX_FACTS` (how many facts each memory may hold and boot
+  loads into the prompt, one number for both; default 200, a nonpositive or
+  unparseable value falls back to the default),
   `CURIE_RUNNER_PORT`, `CURIE_RUNNER_TOKEN` (per-sandbox bearer token gating
-  the three ACI POST routes; enforced only when set), `CURIE_FAKE_MODEL`
+  the control routes; required: the runner refuses to boot without it),
+  `CURIE_RUNNER_ALLOW_TOKENLESS` (local development only, `1` or `true`: serve
+  without a bearer token; a set token is still enforced), `CURIE_FAKE_MODEL`
   (offline smoke; no model call), `CURIE_DISALLOWED_TOOLS` (optional
   comma-separated tool names removed from the session and refused even under
   bypassPermissions; unset keeps every tool available). This stops the named
@@ -296,6 +429,10 @@ resources and fake provider credentials, with no real model or approval action.
   still-permitted shell tool (e.g. `Bash`) can reach the same HTTP state API
   directly. Naming `Bash` alongside the state tools closes that path today;
   removing the token itself needs a code change, not a config knob.
+  `CURIE_CHANNEL_BOUND` (optional, set by the worker when the turn has a
+  channel kind and address) adds the `SendMessage` and `PushNotification`
+  built-ins to that same removed list (#3336): neither reaches anyone from a
+  channel agent. Unset or false leaves the list exactly as configured.
   Hosted-connector Bearer secrets are a different class (#2559): the runner
   expands `Authorization: Bearer ${NAME}` into the in-memory MCP catalog at
   boot and drops `NAME` from the process environment (and from
@@ -320,6 +457,7 @@ curie build
 # Offline round-trip (fake model, no credential), OTel to the dev collector:
 docker run -d --name runner-smoke --network curie_default \
   -e CURIE_FAKE_MODEL=1 -e CURIE_PLUGIN_DIR=/unused \
+  -e CURIE_RUNNER_ALLOW_TOKENLESS=1 \
   -e CURIE_SESSION_ID=smoke -e CURIE_SANDBOX_ID=sbx \
   -e 'CURIE_BUDGET={"max_output_tokens_per_run":100000,"max_usd_per_day":5.0}' \
   -e OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \

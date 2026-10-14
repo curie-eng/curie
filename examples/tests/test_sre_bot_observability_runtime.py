@@ -185,7 +185,7 @@ def _run(
     *,
     input_text: str | None = None,
     environment: dict[str, str] | None = None,
-    timeout: int = 180,
+    timeout: float = 180,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
@@ -466,6 +466,38 @@ def _container_name(prefix: str, suffix: str) -> str:
     return f"curie-obs-{prefix}-{suffix}"
 
 
+class _QueryNotReady(AssertionError):
+    """A connector reached its backend but the bounded query is not ready."""
+
+
+def _require_query_success(response: dict[str, Any]) -> str:
+    # The shipped Tempo connector's _proxy raises ToolError for HTTP statuses
+    # and transport failures; MCP places that error in CallToolResult.isError.
+    # examples/sre-bot/connectors/tempo/server.py::_proxy
+    # https://modelcontextprotocol.io/specification/2025-06-18/server/tools
+    text = _candidate_response_text(response)
+    if response.get("isError") is True:
+        normalized = text.lower()
+        refused = re.search(r"\b(?:401|403)\b", normalized) or any(
+            marker in normalized
+            for marker in (
+                "authorization", "credential", "forbidden", "permission",
+                "refused the request", "refused datasource discovery",
+            )
+        )
+        temporary = re.search(r"\b(?:404|429|500|502|503|504)\b", normalized) or any(
+            marker in normalized
+            for marker in (
+                "query error", "query unavailable", "backend unavailable", "could not reach",
+                "did not respond within", "timed out", "timeout", "context deadline exceeded",
+            )
+        )
+        if temporary and not refused:
+            raise _QueryNotReady(text)
+        raise AssertionError(response)
+    return text
+
+
 @dataclass
 class RuntimeStack:
     suffix: str
@@ -491,7 +523,9 @@ class RuntimeStack:
     def connector_url(self, connector: str) -> str:
         return f"http://{service_dns(RELEASE, AGENT, connector, NAMESPACE)}:{CONNECTOR_PORT}/mcp"
 
-    def call(self, connector: str, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def call(
+        self, connector: str, tool: str, arguments: dict[str, Any], *, timeout: float,
+    ) -> dict[str, Any]:
         result = _docker(
             "exec",
             "-i",
@@ -502,18 +536,16 @@ class RuntimeStack:
             tool,
             json.dumps(arguments),
             input_text=MCP_PROBE,
-            timeout=90,
+            timeout=timeout,
         )
         return json.loads(result.stdout.strip().splitlines()[-1])
 
-    def call_text(self, connector: str, tool: str, arguments: dict[str, Any]) -> str:
-        response = self.call(connector, tool, arguments)
+    def call_text(
+        self, connector: str, tool: str, arguments: dict[str, Any], *, timeout: float,
+    ) -> str:
+        response = self.call(connector, tool, arguments, timeout=timeout)
         assert "error" not in response, response
-        result = response["result"]
-        assert result.get("isError") is not True, response
-        return "\n".join(
-            item["text"] for item in result.get("content", []) if item.get("type") == "text"
-        )
+        return _require_query_success(response["result"])
 
     def eventually_call_text(
         self,
@@ -525,11 +557,19 @@ class RuntimeStack:
     ) -> str:
         deadline = time.monotonic() + timeout
         last = ""
-        while time.monotonic() < deadline:
-            last = self.call_text(connector, tool, arguments)
-            if marker in last:
-                return last
-            time.sleep(1)
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                last = self.call_text(connector, tool, arguments, timeout=remaining)
+            except _QueryNotReady as error:
+                last = str(error)
+            except subprocess.TimeoutExpired:
+                last = "query timed out"
+            else:
+                if marker in last:
+                    return last
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(1, remaining))
         raise AssertionError(
             f"{connector}.{tool} never returned marker {marker!r}; last response: {last}"
         )
@@ -539,6 +579,7 @@ class RuntimeStack:
         calls: list[dict[str, Any]],
         *,
         invalid: bool = False,
+        timeout: float,
     ) -> dict[str, Any]:
         container = (
             self.invalid_candidate_runner_container if invalid else self.candidate_runner_container
@@ -552,7 +593,7 @@ class RuntimeStack:
             "/bundle",
             json.dumps(calls),
             input_text=CANDIDATE_RUNNER_PROBE,
-            timeout=120,
+            timeout=timeout,
         )
         return json.loads(result.stdout.strip().splitlines()[-1])
 
@@ -561,17 +602,18 @@ class RuntimeStack:
         connector: str,
         tool: str,
         arguments: dict[str, Any],
+        *,
+        timeout: float,
     ) -> str:
         evidence = self.candidate_evidence(
-            [{"connector": connector, "tool": tool, "arguments": arguments}]
+            [{"connector": connector, "tool": tool, "arguments": arguments}], timeout=timeout,
         )
         assert _evidence_contains_a_token_value(self, evidence) is False
         capability = evidence["capability"]
         assert capability["complete"], capability
         assert capability["failures"] == [], capability
         response = evidence["calls"][0]
-        assert response.get("isError") is not True, response
-        return _candidate_response_text(response)
+        return _require_query_success(response)
 
     def eventually_candidate_call_text(
         self,
@@ -583,11 +625,19 @@ class RuntimeStack:
     ) -> str:
         deadline = time.monotonic() + timeout
         last = ""
-        while time.monotonic() < deadline:
-            last = self.candidate_call_text(connector, tool, arguments)
-            if marker in last:
-                return last
-            time.sleep(1)
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                last = self.candidate_call_text(connector, tool, arguments, timeout=remaining)
+            except _QueryNotReady as error:
+                last = str(error)
+            except subprocess.TimeoutExpired:
+                last = "query timed out"
+            else:
+                if marker in last:
+                    return last
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(1, remaining))
         raise AssertionError(
             f"{connector}.{tool} never returned marker {marker!r}; last response: {last}"
         )
@@ -908,8 +958,8 @@ def _populate_runtime_stack(stack: RuntimeStack, root: Path, images: dict[str, s
     last_error = "connectors were not probed"
     while time.monotonic() < deadline:
         try:
-            stack.call("grafana", "list_datasources", {})
-            stack.call("tempo", "list_trace_tags", {})
+            stack.call("grafana", "list_datasources", {}, timeout=90)
+            stack.call("tempo", "list_trace_tags", {}, timeout=90)
             break
         except Exception as error:  # noqa: BLE001
             last_error = str(error)
@@ -964,7 +1014,7 @@ def _populate_runtime_stack(stack: RuntimeStack, root: Path, images: dict[str, s
     invalid_last_error = "invalid connectors were not probed"
     while time.monotonic() < invalid_deadline:
         try:
-            evidence = stack.candidate_evidence([], invalid=True)
+            evidence = stack.candidate_evidence([], invalid=True, timeout=120)
         except Exception as error:  # noqa: BLE001
             invalid_last_error = str(error)
         else:
@@ -1062,7 +1112,7 @@ def _trace_query_for_session(session_id: str) -> str:
 def test_candidate_runner_derives_and_probes_both_pod_credential_connectors(
     observability_runtime: RuntimeStack,
 ) -> None:
-    evidence = observability_runtime.candidate_evidence([])
+    evidence = observability_runtime.candidate_evidence([], timeout=120)
     catalog = evidence["catalog"]
     capability = evidence["capability"]
     environment_contains_token = _candidate_environment_contains_a_token_value(
@@ -1185,6 +1235,7 @@ def test_logql_through_the_bots_real_grafana_connector_returns_a_curie_log(
             **query,
             "logql": '{namespace="curie", container="api"} |= "absent-runtime-marker"',
         },
+        timeout=90,
     )
     assert marker not in missing
     assert '"data":[]' in missing.replace(" ", "")
@@ -1249,6 +1300,7 @@ def test_tempo_connector_returns_a_real_curie_span_through_grafanas_uid_proxy(
         "tempo",
         "search_traces",
         {"query": '{ resource.service.name = "curie-runtime-absent" }', "limit": 20},
+        timeout=90,
     )
     assert json.loads(missing).get("traces") == []
 
@@ -1290,6 +1342,7 @@ def test_invalid_connector_token_fails_a_real_read_after_successful_tool_discove
     evidence = observability_runtime.candidate_evidence(
         [{"connector": connector, "tool": tool, "arguments": arguments}],
         invalid=True,
+        timeout=120,
     )
 
     capability = evidence["capability"]
@@ -1425,7 +1478,7 @@ def _read_json(stack: RuntimeStack, tool: str, arguments: dict[str, Any]) -> Any
     silently treating a sentence as a successful answer.
     """
 
-    text = stack.call_text("tempo", tool, arguments)
+    text = stack.call_text("tempo", tool, arguments, timeout=90)
     try:
         return json.loads(text)
     except json.JSONDecodeError as error:

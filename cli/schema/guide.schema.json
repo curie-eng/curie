@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/guide/v1.1.json",
+  "$id": "https://schemas.curietech.ai/cli/guide/v1.2.json",
   "title": "curie guide --json",
   "description": "The agent-facing payload of `curie guide`: the self-describing harness primer as structured data (the same content the default Markdown render is built from).",
   "type": "object",
@@ -74,6 +74,45 @@
       }
     },
     "approvals": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "summary": {
+          "type": "string"
+        },
+        "facts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "detail": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "title",
+              "detail"
+            ]
+          }
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "summary",
+        "facts",
+        "commands"
+      ]
+    },
+    "cron": {
       "type": "object",
       "additionalProperties": false,
       "properties": {

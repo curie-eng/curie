@@ -8,8 +8,7 @@
 //! Hook Jobs use Helm's documented `helm.sh/hook` annotation:
 //! https://helm.sh/docs/topics/charts_hooks/
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::path::PathBuf;
@@ -254,6 +253,11 @@ if args and args[0] == "delete" and len(args) > 2 and args[1] in ("job", "jobs",
         else: kept.append(job)
     state["jobs"][namespace] = kept; save(); raise SystemExit(0)
 
+if args[:2] == ["get", "runtimeclass"]:
+    sys.stderr.write(
+        'Error from server (Forbidden): runtimeclasses.node.k8s.io "gvisor" is forbidden: User "system:serviceaccount:example:example" cannot get resource "runtimeclasses" in API group "node.k8s.io" at the cluster scope\n'
+    )
+    raise SystemExit(1)
 fail("unexpected kubectl invocation: " + " ".join(args), 64)
 "###;
 
@@ -654,8 +658,12 @@ fn failed_install_cleanup_and_empty_namespace_adoption() {
     );
     assert_eq!(
         state["labels_at_upgrade"],
+        // The created namespace also carries the Pod Security labels (#3842).
         json!({
-            "curietech.ai/created-by": RELEASE, "curietech.ai/created-in": NS
+            "curietech.ai/created-by": RELEASE, "curietech.ai/created-in": NS,
+            "pod-security.kubernetes.io/enforce": "baseline",
+            "pod-security.kubernetes.io/warn": "restricted",
+            "pod-security.kubernetes.io/audit": "restricted"
         }),
         "Helm ran before ownership was established"
     );

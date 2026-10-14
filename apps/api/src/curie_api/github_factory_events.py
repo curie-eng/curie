@@ -6,6 +6,7 @@ repository names. A parsed notice is not authorization.
 
 import re
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +19,8 @@ from .github_review_events import (
 from .repo_full_name import InvalidRepoFullName, normalize_repo_full_name
 
 _MAX_COMMENT_LENGTH = 65536
+# The label prefix a ticket declares its base with (ADR 0186).
+BASE_LABEL_PREFIX = "base:"
 
 
 class FactoryRefused(FeedbackIgnored):
@@ -41,11 +44,19 @@ class FactoryNotice:
     label: str | None = None
     comment_id: int | None = None
     comment_body: str | None = None
+    label_event_id: int | None = None
 
     @property
     def request_id(self) -> uuid.UUID:
         if self.disposition == "mention":
             identity = f"https://github.com/factory/mention/{self.repository_id}/{self.comment_id}"
+        elif self.disposition == "admit" and self.label_event_id is not None:
+            # The timeline event is the admission identity, shared by poll and
+            # webhook. The webhook receipt stays the delivery header.
+            identity = (
+                f"https://github.com/factory/label/{self.repository_id}/"
+                f"{self.issue_number}/{self.label_event_id}"
+            )
         else:
             # Each labeled delivery is its own request, so a relabel starts a
             # new run. Redelivery of the same delivery is deduped upstream.
@@ -104,15 +115,34 @@ def _repository(data: dict[str, Any]) -> tuple[int, str, int]:
     return installation_id, repo, repository_id
 
 
+def event_repository(payload: Any) -> str | None:
+    """The normalized repository a factory event names, or None when it names
+    none readable. The trigger labels bound on it are what `parse_factory_event`
+    judges a label event against; a malformed payload is refused there."""
+
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return _repository(payload)[1]
+    except FeedbackIgnored:
+        return None
+
+
 def parse_factory_event(
     event: str,
     payload: Any,
     delivery_id: str,
     *,
-    label: str,
+    labels: Collection[str],
     mention: str,
 ) -> FactoryNotice:
     """Keep an admission, cancellation, or explicit mention. Refuse everything else.
+
+    ``labels`` are the effective trigger labels bound on the event's repository
+    (#4361 decision 15). Adding one of them is an admission. Removing any label
+    that is not a ``base:`` label is a cancellation candidate, whether or not a
+    surface still binds it: whether it admitted the issue's WorkItem is the
+    WorkItem's stored label to decide (decision 10, ADR 0161), never a binding.
 
     Actions and fields follow GitHub's webhook catalog:
     https://docs.github.com/en/webhooks/webhook-events-and-payloads
@@ -134,13 +164,22 @@ def parse_factory_event(
         if action in {"labeled", "unlabeled"}:
             label_obj = payload_object(data.get("label"), "invalid_label")
             name = label_obj.get("name")
-            if not isinstance(name, str) or name != label:
+            if not isinstance(name, str):
+                raise FactoryRefused("unrelated_label")
+            if name.startswith(BASE_LABEL_PREFIX):
+                # A base label change only records disagreement (ADR 0186).
+                disposition = "base_label"
+            elif action == "unlabeled":
+                disposition = "cancel"
+            elif name in labels:
+                disposition = "admit"
+            else:
                 raise FactoryRefused("unrelated_label")
             return FactoryNotice(
                 delivery,
                 event,
                 action,
-                "admit" if action == "labeled" else "cancel",
+                disposition,
                 installation_id,
                 repository_id,
                 repo,

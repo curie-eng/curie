@@ -266,6 +266,9 @@ spec:
      fixture data, then execute its normal module entrypoint. */}}
 {{- $probeBootstrap := "        - name: runner\n          command: [\"/bin/sh\", \"-c\"]\n          args:\n            - |\n              set -eu\n              mkdir -p \"$CURIE_PLUGIN_DIR/.claude-plugin\"\n              printf '%s\\n' '{\"name\":\"acme-security-probe\"}' > \"$CURIE_PLUGIN_DIR/.claude-plugin/plugin.json\"\n              exec python3 -m curie_runner\n" -}}
 {{- $probeLabels := printf "  podTemplate:\n    metadata:\n      labels:\n        curie.io/security-probe: %s\n" (include "curie.fullname" . | quote) -}}
+{{- $probeRunner := $probeRoot.Values.agentSandbox.runner -}}
+{{- $probeImage := include "curie.image" (dict "repository" $probeRunner.image "tag" $probeRunner.tag "digest" $probeRunner.digest "defaultTag" $probeRoot.Chart.AppVersion) -}}
+{{- $probeFullname := include "curie.fullname" $probeRoot -}}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -316,6 +319,11 @@ spec:
               {{- $runnerTemplates := list (printf "%s-runner" (include "curie.fullname" .)) }}
               {{- range $agent := include "curie.agentSandboxPoolAgents" . | fromJsonArray }}
               {{- $runnerTemplates = append $runnerTemplates (printf "%s-agent-%s-runner" (include "curie.fullname" $) $agent) }}
+              {{- end }}
+              {{- range include "curie.factory.repoRunnerDescriptors" . | fromJsonArray }}
+              {{- if not (has .template $runnerTemplates) }}
+              {{- $runnerTemplates = append $runnerTemplates .template }}
+              {{- end }}
               {{- end }}
               value: {{ join " " $runnerTemplates | quote }}
             - name: EGRESS_POD
@@ -480,7 +488,12 @@ spec:
               # carve-out: a broad allow (the realistic model-API 0.0.0.0/0 case) must
               # reach the internet yet keep the metadata endpoint blocked via `except`.
               # Mirrors exactly what the chart renders for allowedEgress:[{cidr:0.0.0.0/0}]
-              # (issue #70: a broad allow must not silently re-open IMDS).
+              # (issue #70: a broad allow must not silently re-open IMDS), including the
+              # private-range excepts curie.privateExcept appends (#3842; any
+              # security.networkPolicy.clusterCidrs entries are not mirrored here). No
+              # private-range leg: NetworkPolicy permits pod-to-own-node traffic, so a
+              # node or API address proves nothing; scripts/check-runner-byo-egress.sh
+              # proves the private except against a controlled pod peer instead.
               echo ""
               echo "== Claim 1b: metadata blocked under a broad 0.0.0.0/0 allowlist =="
               kubectl run "$EGRESS_POD" -n "$NS" --image="$NETSHOOT" --restart=Never \
@@ -504,6 +517,10 @@ spec:
                           cidr: 0.0.0.0/0
                           except:
                             - 169.254.0.0/16
+                            - 10.0.0.0/8
+                            - 100.64.0.0/10
+                            - 172.16.0.0/12
+                            - 192.168.0.0/16
               EOF
               sleep 5
               broad_ext=$(classify "$(probe_rc "https://${BLOCKED}/")")
@@ -607,8 +624,8 @@ spec:
                 sp_secrets+=("$secret_b")
                 create_rc=0
                 created=$(kubectl create -n "$NS" -f - -o name <<'PROBE_SANDBOXES'
-              {{- include "curie.sandboxTemplate" (dict "root" $probeRoot "agent" "sp-a" "secrets" (dict "CURIE_SECURITY_PROBE_SECRET" "AAA")) | replace "        - name: runner\n" $probeBootstrap | replace "  podTemplate:\n    metadata:\n      labels:\n" $probeLabels | nindent 14 }}
-              {{- include "curie.sandboxTemplate" (dict "root" $probeRoot "agent" "sp-b" "secrets" (dict "CURIE_SECURITY_PROBE_SECRET" "BBB" "CURIE_SECURITY_PROBE_B_ONLY" "BBB")) | replace "        - name: runner\n" $probeBootstrap | replace "  podTemplate:\n    metadata:\n      labels:\n" $probeLabels | nindent 14 }}
+              {{- include "curie.sandboxTemplate" (dict "root" $probeRoot "agent" "sp-a" "secrets" (dict "CURIE_SECURITY_PROBE_SECRET" "AAA") "image" (index ($probeRoot.Values.agentSandbox.runnerImages | default dict) "sp-a" | default $probeImage) "templateName" (printf "%s-agent-sp-a-runner" $probeFullname) "poolName" (printf "%s-agent-sp-a-runner-pool" $probeFullname)) | replace "        - name: runner\n" $probeBootstrap | replace "  podTemplate:\n    metadata:\n      labels:\n" $probeLabels | nindent 14 }}
+              {{- include "curie.sandboxTemplate" (dict "root" $probeRoot "agent" "sp-b" "secrets" (dict "CURIE_SECURITY_PROBE_SECRET" "BBB" "CURIE_SECURITY_PROBE_B_ONLY" "BBB") "image" (index ($probeRoot.Values.agentSandbox.runnerImages | default dict) "sp-b" | default $probeImage) "templateName" (printf "%s-agent-sp-b-runner" $probeFullname) "poolName" (printf "%s-agent-sp-b-runner-pool" $probeFullname)) | replace "        - name: runner\n" $probeBootstrap | replace "  podTemplate:\n    metadata:\n      labels:\n" $probeLabels | nindent 14 }}
               PROBE_SANDBOXES
                 ) || create_rc=$?
                 for object in $created; do
@@ -756,7 +773,7 @@ spec:
               # Namespaced checks (no cluster RBAC). Read each runner SandboxTemplate
               # class first; an empty class is a mismatch, not a skip. Then schedule
               # a throwaway pod under the runtimeclass: admission tells us if it
-              # exists, and the kernel string tells us if it is enforced.
+              # exists, and the sentry kernel version tells us if it is enforced.
               check_runner_sandbox_template_class() {
                 if [ -z "${REQUIRED_RUNTIME_CLASS:-}" ]; then
                   return 0
@@ -781,7 +798,7 @@ spec:
                 kubectl delete pod "$gpod" -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
                 admit=$(kubectl run "$gpod" -n "$NS" --image="$BUSYBOX" --restart=Never \
                   --overrides="{\"spec\":{\"runtimeClassName\":\"${RC}\"}}" \
-                  --command -- sh -c 'uname -a; sleep 3' 2>&1 || true)
+                  --command -- sh -c 'uname -v; sleep 3' 2>&1 || true)
                 if echo "$admit" | grep -qi 'not found'; then
                   echo "NOT-TESTABLE: RuntimeClass '${RC}' absent on this cluster (admission: RuntimeClass"
                   echo "  not found). Reported, not faked (PT-3 discipline). gVisor kernel isolation was"
@@ -790,8 +807,9 @@ spec:
                   kubectl wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$gpod" -n "$NS" --timeout=30s >/dev/null 2>&1 || \
                     kubectl wait --for=condition=Ready "pod/$gpod" -n "$NS" --timeout=30s >/dev/null 2>&1 || true
                   gkernel=$(kubectl logs "$gpod" -n "$NS" 2>/dev/null || true)
+                  gkernel="${gkernel%"${gkernel##*[![:space:]]}"}"
                   kubectl delete pod "$gpod" -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
-                  if echo "$gkernel" | grep -qi gvisor; then
+                  if [ "$gkernel" = {{ include "curie.gvisor.sentryKernelVersion" . | quote }} ]; then
                     echo "PASS: pod under RuntimeClass '${RC}' reports a gVisor kernel: ${gkernel}"
                   else
                     echo "FAIL: RuntimeClass '${RC}' exists but the pod kernel is NOT gVisor (downgraded"

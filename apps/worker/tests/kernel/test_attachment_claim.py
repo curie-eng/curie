@@ -52,7 +52,7 @@ from aci_protocol import (
 )
 from curie_worker.attachments import AttachmentResolutionError
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.kernel import Kernel
+from curie_worker.kernel.core import Kernel
 from curie_worker.sandbox import SuspendedThreadError
 from curie_worker.workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
 
@@ -234,6 +234,7 @@ class _WorkspaceBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+    **_: object,
     ) -> dict[str, str]:
         return {
             "CURIE_SESSION_ID": f"session:{thread_key}",
@@ -252,6 +253,7 @@ class _HistoryBinding(_WorkspaceBinding):
         *,
         kind: str | None = None,
         address: str | None = None,
+    **_: object,
     ) -> dict[str, str]:
         return {
             **super().boot_env(

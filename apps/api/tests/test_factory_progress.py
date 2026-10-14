@@ -12,6 +12,7 @@ test_factory_terminus.py. Machine fixtures drive the events.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sys
 import time
@@ -23,19 +24,17 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from curie_api import sandbox_token
 from curie_api.config import get_settings
 from curie_api.factory_progress import phase_view, pill_for
 from curie_api.models import ExecutionRequestPhaseReport
-from test_factory_terminus import (  # noqa: F401  (fixtures)
-    _label,
-    _request,
+from curie_internal import sandbox_token
+from forge_fakes.github import LABEL, _issue_event, _post
+from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     _rows,
-    _start_running,
     admitted,
     comments,
 )
-from test_github_factory_ingress import LABEL, _issue_event, _post
+from test_factory_terminus import _label, _request, _start_running  # noqa: F401  (fixtures)
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -80,7 +79,7 @@ ACTIVITY: dict[str, Any] = {
     "tool_calls": 37,
     "last_tool": "Bash",
 }
-PYTHON_COMMAND = "uv run pytest runner/tests -q"
+PYTHON_COMMAND = "uv run pytest unitconv/tests -q"
 NOT_DECLARED: dict[str, Any] = {
     "check": None,
     "command": None,
@@ -169,8 +168,8 @@ def _all_requests(number: int) -> list[dict[str, Any]]:
     return _rows(
         "SELECT r.id, r.status FROM curie.execution_requests r "
         "JOIN curie.work_items w ON w.id = r.work_item_id "
-        "WHERE w.github_issue_number = :number ORDER BY r.sequence",
-        {"number": number},
+        "WHERE w.tracker_issue_id = :number ORDER BY r.sequence",
+        {"number": str(number)},
     )
 
 
@@ -401,6 +400,7 @@ def test_a_failed_requests_token_cannot_write_onto_the_run_that_replaced_it(
     first = _request(number)["id"]
     _fail(client, first)
     github.labels = [LABEL]
+    github.advance_label_event(number)
     again = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
     assert again.json()["status"] == "factory_admitted", again.text
     rows = _all_requests(number)
@@ -726,8 +726,9 @@ def test_malformed_verification_is_rejected_without_persisting_evidence(
     assert _reports(request_id) == []
 
 
-def test_duplicate_verification_does_not_replace_the_first_observation(
+def test_changed_verification_replay_keeps_the_first_observation_and_logs_both_outcomes(
     admitted: Any,  # noqa: F811
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     client, github, _sink = admitted
     number = 9715
@@ -751,10 +752,16 @@ def test_duplicate_verification_does_not_replace_the_first_observation(
     }
 
     first = verification(client, request_id, first_observation)
-    duplicate = verification(client, request_id, second_observation)
+    with caplog.at_level(logging.INFO, logger="curie_api.factory_progress"):
+        replay = verification(client, request_id, second_observation)
 
     assert first.status_code == 201, first.text
-    assert duplicate.status_code == 409, duplicate.text
+    assert replay.status_code == 201, replay.text
+    assert replay.json() == {
+        "recorded": True,
+        "request_id": str(request_id),
+        "replayed": True,
+    }
     assert _reports(request_id) == [
         {
             "phase": "verification_preflight",
@@ -762,6 +769,13 @@ def test_duplicate_verification_does_not_replace_the_first_observation(
             "loop_round": None,
         }
     ]
+    (record,) = [record for record in caplog.records if record.name == "curie_api.factory_progress"]
+    assert record.levelno == logging.INFO
+    message = record.getMessage()
+    assert str(request_id) in message
+    assert "check=python" in message
+    assert "stored_outcome=unavailable" in message
+    assert "replayed_outcome=passed" in message
 
 
 def _declared(check: str, command: str) -> dict[str, Any]:
@@ -777,6 +791,178 @@ def _declared(check: str, command: str) -> dict[str, Any]:
 
 def _note(observation: dict[str, Any]) -> str:
     return json.dumps(observation, sort_keys=True, separators=(",", ":"))
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [_declared("python", PYTHON_COMMAND), NOT_DECLARED],
+    ids=["declared-check", "not-declared"],
+)
+def test_identical_verification_replay_returns_success_and_stores_one_observation(
+    admitted: Any,  # noqa: F811
+    observation: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client, github, _sink = admitted
+    number = 9741
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+
+    first = verification(client, request_id, observation)
+    with caplog.at_level(logging.INFO, logger="curie_api.factory_progress"):
+        replay = verification(client, request_id, observation)
+
+    assert first.status_code == 201, first.text
+    assert first.json() == {"recorded": True, "request_id": str(request_id)}
+    assert replay.status_code == 201, replay.text
+    assert replay.json() == {
+        "recorded": True,
+        "request_id": str(request_id),
+        "replayed": True,
+    }
+    assert _reports(request_id) == [
+        {"phase": "verification_preflight", "note": _note(observation), "loop_round": None}
+    ]
+    assert not [record for record in caplog.records if record.name == "curie_api.factory_progress"]
+
+
+@pytest.mark.parametrize(
+    ("first_observation", "changes"),
+    [
+        (
+            {**_declared("python", PYTHON_COMMAND), "outcome": "failed", "exit_status": 1},
+            {"exit_status": 2},
+        ),
+        (
+            {
+                **_declared("python", PYTHON_COMMAND),
+                "outcome": "unavailable",
+                "exit_status": None,
+                "missing_binaries": ["uv"],
+            },
+            {"missing_binaries": ["git"]},
+        ),
+        (
+            {
+                **_declared("python", PYTHON_COMMAND),
+                "outcome": "unavailable",
+                "exit_status": None,
+                "missing_binaries": ["uv"],
+            },
+            {"blocked_services": ["postgres"]},
+        ),
+        (
+            {
+                **_declared("python", PYTHON_COMMAND),
+                "outcome": "unavailable",
+                "exit_status": None,
+                "missing_binaries": ["uv"],
+            },
+            {"delegated_to": "python-ci"},
+        ),
+    ],
+    ids=["exit-status", "missing-binary", "blocked-service", "delegated-to"],
+)
+def test_verification_replay_preserves_first_result_fields_and_logs_at_info(
+    admitted: Any,  # noqa: F811
+    first_observation: dict[str, Any],
+    changes: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client, github, _sink = admitted
+    number = 9742
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+    assert verification(client, request_id, first_observation).status_code == 201
+
+    with caplog.at_level(logging.INFO, logger="curie_api.factory_progress"):
+        replay = verification(client, request_id, {**first_observation, **changes})
+
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["recorded"] is True
+    assert replay.json()["replayed"] is True
+    assert _reports(request_id) == [
+        {
+            "phase": "verification_preflight",
+            "note": _note(first_observation),
+            "loop_round": None,
+        }
+    ]
+    (record,) = [record for record in caplog.records if record.name == "curie_api.factory_progress"]
+    assert record.levelno == logging.INFO
+    message = record.getMessage()
+    assert str(request_id) in message
+    assert "check=python" in message
+    assert f"stored_outcome={first_observation['outcome']}" in message
+    assert f"replayed_outcome={first_observation['outcome']}" in message
+
+
+def test_all_four_checks_can_replay_at_the_limit_but_a_fifth_check_conflicts(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, _sink = admitted
+    number = 9743
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+    checks = [
+        _declared("python", PYTHON_COMMAND),
+        _declared("rust", "cargo test --locked"),
+        _declared("ui", "pnpm test"),
+        _declared("helm", "helm lint charts/curie"),
+    ]
+    for observation in checks:
+        response = verification(client, request_id, observation)
+        assert response.status_code == 201, response.text
+    for observation in checks:
+        replay = verification(client, request_id, observation)
+        assert replay.status_code == 201, replay.text
+        assert replay.json()["recorded"] is True
+        assert replay.json()["replayed"] is True
+
+    fifth = verification(client, request_id, _declared("docs", "bash scripts/check-docs.sh"))
+
+    assert fifth.status_code == 409, fifth.text
+    assert fifth.json()["code"] == "verification_exists"
+    assert _reports(request_id) == [
+        {"phase": "verification_preflight", "note": _note(observation), "loop_round": None}
+        for observation in checks
+    ]
+
+
+@pytest.mark.parametrize(
+    "notes",
+    [
+        ["unreadable"],
+        [json.dumps(_declared("python", PYTHON_COMMAND))],
+        [_note(_declared("python", PYTHON_COMMAND))] * 2,
+        [_note(NOT_DECLARED), _note(_declared("python", PYTHON_COMMAND))],
+        [_note(_declared(f"check_{index}", "make check")) for index in range(5)],
+    ],
+    ids=["malformed", "noncanonical", "duplicate-check", "mixed-not-declared", "over-limit"],
+)
+def test_unreadable_stored_verification_is_never_acknowledged_as_a_replay(
+    admitted: Any,  # noqa: F811
+    notes: list[str],
+) -> None:
+    from test_factory_status_comment import _execute
+
+    client, github, _sink = admitted
+    number = 9744
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+    for note in notes:
+        _execute(
+            "INSERT INTO curie.execution_request_phase_reports "
+            "(execution_request_id, phase, note) VALUES (:id, 'verification_preflight', :note)",
+            {"id": request_id, "note": note},
+        )
+    stored = _reports(request_id)
+
+    response = verification(client, request_id, _declared("python", PYTHON_COMMAND))
+
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "verification_exists"
+    assert _reports(request_id) == stored
 
 
 def test_python_check_id_is_the_api_python_gate_key() -> None:
@@ -815,16 +1001,14 @@ def test_two_declared_checks_are_recorded_on_one_request(
         ),
         (_declared("python", PYTHON_COMMAND), NOT_DECLARED),
         (NOT_DECLARED, _declared("python", PYTHON_COMMAND)),
-        (NOT_DECLARED, NOT_DECLARED),
     ],
     ids=[
-        "duplicate-check-id",
+        "changed-command",
         "not-declared-after-a-check",
         "check-after-not-declared",
-        "second-not-declared",
     ],
 )
-def test_conflicting_second_verification_is_rejected_like_a_duplicate(
+def test_conflicting_second_verification_is_rejected_without_changing_the_first(
     admitted: Any,  # noqa: F811
     first_observation: dict[str, Any],
     second_observation: dict[str, Any],
@@ -858,6 +1042,7 @@ def test_a_stale_request_cannot_record_verification_for_its_replacement(
     first = _request(number)["id"]
     _fail(client, first)
     github.labels = [LABEL]
+    github.advance_label_event(number)
     again = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
     assert again.json()["status"] == "factory_admitted", again.text
     rows = _all_requests(number)
@@ -901,6 +1086,170 @@ def test_model_progress_cannot_spoof_the_reserved_verification_phase(
 
     assert response.status_code == 422, response.text
     assert _reports(request_id) == []
+
+
+# --- 5b: delegated_to and the verification route (#3873) -----------------------------------
+
+DELEGATED: dict[str, Any] = {
+    "check": "integration",
+    "command": "make integration",
+    "outcome": "unavailable",
+    "exit_status": None,
+    "missing_binaries": [],
+    "blocked_services": ["postgres"],
+    "delegated_to": "integration-tests",
+}
+UNDELEGATED: dict[str, Any] = {k: v for k, v in DELEGATED.items() if k != "delegated_to"}
+
+
+def _read_observations(request_id: uuid.UUID) -> Any:
+    """Run the real reader in a fresh session; returns its list or raises its error."""
+
+    import asyncio
+
+    from curie_api.factory_progress import read_verification_observations
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+    async def go() -> Any:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                return await read_verification_observations(session, request_id)
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(go())
+
+
+def test_a_delegated_unavailable_check_is_stored_canonically_and_routes_to_required_ci(
+    admitted: Any,  # noqa: F811
+) -> None:
+    from curie_api.factory_progress import verification_route
+
+    client, github, _sink = admitted
+    number = 9731
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+
+    response = verification(client, request_id, DELEGATED)
+
+    assert response.status_code == 201, response.text
+    expected_note = json.dumps(DELEGATED, sort_keys=True, separators=(",", ":"))
+    assert '"delegated_to":"integration-tests"' in expected_note
+    assert len(expected_note.encode("utf-8")) <= 280
+    assert _reports(request_id) == [
+        {"phase": "verification_preflight", "note": expected_note, "loop_round": None}
+    ]
+    (observation,) = _read_observations(request_id)
+    assert observation.delegated_to == "integration-tests"
+    assert verification_route(observation) == "required_ci"
+
+
+def test_an_undelegated_note_omits_the_key_and_a_null_key_is_not_canonical(
+    admitted: Any,  # noqa: F811
+) -> None:
+    from curie_api.factory_progress import verification_route
+
+    client, github, _sink = admitted
+    number = 9732
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+
+    response = verification(client, request_id, UNDELEGATED)
+
+    assert response.status_code == 201, response.text
+    (stored,) = _reports(request_id)
+    assert stored["note"] == json.dumps(UNDELEGATED, sort_keys=True, separators=(",", ":"))
+    assert "delegated_to" not in stored["note"]
+    (observation,) = _read_observations(request_id)
+    assert observation.delegated_to is None
+    assert verification_route(observation) == "blocked"
+
+    # A local import: test_factory_status_comment imports this module at load time.
+    from test_factory_status_comment import _execute
+
+    noncanonical = json.dumps(
+        {**UNDELEGATED, "delegated_to": None}, sort_keys=True, separators=(",", ":")
+    )
+    _execute(
+        "DELETE FROM curie.execution_request_phase_reports WHERE execution_request_id = :id",
+        {"id": request_id},
+    )
+    _execute(
+        "INSERT INTO curie.execution_request_phase_reports "
+        "(execution_request_id, phase, note) VALUES (:id, 'verification_preflight', :note)",
+        {"id": request_id, "note": noncanonical},
+    )
+    with pytest.raises(ValueError, match="not canonical"):
+        _read_observations(request_id)
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        {**NOT_DECLARED, "delegated_to": "integration-tests"},
+        {**DELEGATED, "delegated_to": "x" * 65},
+        {**DELEGATED, "delegated_to": "integration`tests"},
+        {**DELEGATED, "delegated_to": " integration-tests"},
+        {**DELEGATED, "delegated_to": "integration-tests "},
+        {**DELEGATED, "delegated_to": ""},
+        {**DELEGATED, "delegated_to": "integration\ntests"},
+    ],
+    ids=[
+        "not-declared",
+        "65-characters",
+        "backtick",
+        "leading-space",
+        "trailing-space",
+        "empty",
+        "control-character",
+    ],
+)
+def test_a_bad_delegated_to_is_422_and_stores_nothing(
+    admitted: Any, observation: dict[str, Any]  # noqa: F811
+) -> None:
+    client, github, _sink = admitted
+    number = 9734
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+
+    response = verification(client, request_id, observation)
+
+    assert response.status_code == 422, response.text
+    assert _reports(request_id) == []
+
+
+def test_a_64_character_delegated_to_is_accepted(admitted: Any) -> None:  # noqa: F811
+    client, github, _sink = admitted
+    number = 9735
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+
+    response = verification(client, request_id, {**DELEGATED, "delegated_to": "x" * 64})
+
+    assert response.status_code == 201, response.text
+    (observation,) = _read_observations(request_id)
+    assert observation.delegated_to == "x" * 64
+
+
+@pytest.mark.parametrize(
+    ("observation", "route"),
+    [
+        (_declared("python", PYTHON_COMMAND), "sandbox"),
+        (
+            {**_declared("python", PYTHON_COMMAND), "outcome": "failed", "exit_status": 1},
+            "sandbox",
+        ),
+        (DELEGATED, "required_ci"),
+        (UNDELEGATED, "blocked"),
+        (NOT_DECLARED, None),
+    ],
+    ids=["passed", "failed", "unavailable-delegated", "unavailable-undelegated", "not-declared"],
+)
+def test_verification_route_table(observation: dict[str, Any], route: str | None) -> None:
+    from curie_api.factory_progress import VerificationObservation, verification_route
+
+    assert verification_route(VerificationObservation.model_validate(observation)) == route
 
 
 # --- 6 and 7: declaration pinning and the report limit -----------------------------------
@@ -1093,7 +1442,7 @@ def test_a_failed_request_keeps_its_current_phase_and_adds_no_ticks() -> None:
     assert [states[p] for p in ("review_diff", "publish", "wait_ci")] == ["pending"] * 3
 
 
-def test_an_out_of_order_report_takes_the_latest_as_current() -> None:
+def test_an_out_of_order_report_keeps_the_furthest_phase_current() -> None:
     view = phase_view(
         DECLARATION,
         _reports_of(("implement", 1), ("plan", 1)),
@@ -1101,8 +1450,75 @@ def test_an_out_of_order_report_takes_the_latest_as_current() -> None:
         None,
     )
     states = _states(view)
-    assert states["plan"] == "current"
-    assert states["implement"] == "pending"
+    assert view.current == "implement"
+    assert states["plan"] == "done"
+    assert states["implement"] == "current"
+
+
+@pytest.mark.parametrize("declaration", [DECLARATION, STAGED_DECLARATION])
+@pytest.mark.parametrize("status", ["running", "failed"])
+def test_renewed_plan_review_preserves_completed_plan_and_diff_review_progress(
+    declaration: dict[str, Any], status: str
+) -> None:
+    view = phase_view(
+        declaration,
+        _reports_of(
+            ("plan", 1),
+            ("plan_review", 1),
+            ("failing_test", None),
+            ("implement", 1),
+            ("review_diff", 1),
+            ("plan_review", 2),
+        ),
+        status,
+        "runner_escalated" if status == "failed" else None,
+    )
+
+    assert view.current == "review_diff"
+    states = _states(view)
+    assert all(
+        states[phase] == "done"
+        for phase in (
+            "read_issue", "pin_criteria", "plan", "plan_review", "failing_test", "implement"
+        )
+    )
+    assert states["review_diff"] == "current"
+    assert states["publish"] == states["wait_ci"] == "pending"
+    assert _loop(view, "plan").approved
+    assert not _loop(view, "plan").active
+    stages = _stage_states(view)
+    assert stages["plan"] == stages["plan_review"] == stages["implement"] == "done"
+    assert stages["review_diff"] == ("blocked" if status == "failed" else "current")
+
+
+@pytest.mark.parametrize("status", ["failed", "expired", "cancelled"])
+@pytest.mark.parametrize(
+    ("entries", "returned_phase"),
+    [
+        ((("plan", 1), ("plan_review", 1), ("plan", 2)), "plan"),
+        ((("implement", 1), ("review_diff", 1), ("implement", 2)), "implement"),
+        (
+            (
+                ("implement", 1),
+                ("review_diff", 1),
+                ("publish", None),
+                ("wait_ci", None),
+                ("implement", 2),
+            ),
+            "implement",
+        ),
+    ],
+)
+def test_terminal_loop_return_keeps_the_returned_phase_selected(
+    status: str, entries: tuple[tuple[str, int | None], ...], returned_phase: str
+) -> None:
+    view = phase_view(STAGED_DECLARATION, _reports_of(*entries), status, None)
+
+    assert view.current == returned_phase
+    assert _states(view)[returned_phase] == "current"
+    assert _stage_states(view)[returned_phase] == (
+        "blocked" if status in {"failed", "expired"} else "current"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1301,8 +1717,8 @@ PILLS = {
     "running": ("RUNNING", "#2f81f7", True),
     "cancellation_requested": ("STOPPING", "#bc4c00", True),
     "completed": ("SUCCEEDED", "#1a7f37", False),
-    "failed": ("FAILED", "#cf222e", False),
-    "expired": ("EXPIRED", "#953800", False),
+    "failed": ("NEEDS HUMAN", "#bf8700", False),
+    "expired": ("NEEDS HUMAN", "#bf8700", False),
     "cancelled": ("CANCELLED", "#6e7781", False),
 }
 
@@ -1315,6 +1731,11 @@ def test_every_constraint_status_has_its_pill(status: str) -> None:
 
 def test_a_running_request_that_is_publishing_shows_publishing() -> None:
     assert pill_for("running", True) == ("PUBLISHING", "#8250df", True)
+
+
+def test_a_retrying_failed_request_has_a_blue_non_live_pill() -> None:
+    assert pill_for("failed", False, retrying=True) == ("RETRYING", "#2f81f7", False)
+    assert pill_for("failed", False) == ("NEEDS HUMAN", "#bf8700", False)
 
 
 def test_an_unknown_status_shows_its_raw_value_in_grey() -> None:

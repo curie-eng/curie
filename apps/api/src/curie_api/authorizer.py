@@ -24,10 +24,10 @@ but neither kind may manufacture Slack channel evidence. An ``adapter``
 (ADR-0154) vouches for a sender it authenticated on its own channel, and every
 Slack set, the explicit user list included, names Slack IDs that only the Slack
 dispatcher vouches for (ADR-0106), so no Slack set admits an adapter at all
-(ADR-0177, "A separate finding"). The reverse holds for a card shown on a
-non-Slack channel (ADR-0177 decision 3): its requester-only set admits only the
-adapter that serves that channel, so no ``chat``, ``console`` or ``operator``
-principal is eligible there.
+(ADR-0177, "A separate finding"). The reverse holds for a card shown in an
+email thread (ADR-0177 amendment): its approver email list admits only the adapter that
+serves that channel, so no ``chat``, ``console`` or ``operator`` principal is
+eligible there.
 
 Fail closed: a set that could not determine membership (a lookup that failed, a
 binding the platform cannot read) denies. That is the set reporting
@@ -47,7 +47,7 @@ from typing import Any, Literal
 from .approvers import ApproverSet
 from .models import Approval
 
-PrincipalKind = Literal["chat", "console", "operator", "adapter"]
+PrincipalKind = Literal["chat", "console", "operator", "adapter", "test_driver"]
 
 
 @dataclass(frozen=True)
@@ -65,6 +65,10 @@ class AuthzDecision:
 # reason rendered to the resolver and the evidence flag the audit row keeps.
 # The three pre-ADR-0177 shapes are append-only audit vocabulary; keep them.
 _INELIGIBLE_DEFAULTS: dict[PrincipalKind, tuple[str, str]] = {
+    "test_driver": (
+        "test driver approval principals can resolve only routes bound to an explicit user list",
+        "explicit_users_required",
+    ),
     "operator": (
         "operator approval principals can resolve only routes bound to an explicit user list",
         "explicit_users_required",
@@ -110,6 +114,7 @@ async def authorize_approval(
     name = approver_set.audit_name
 
     eligible = {
+        "test_driver": approver_set.test_driver_eligible,
         "chat": approver_set.chat_eligible,
         "console": approver_set.console_eligible,
         "operator": approver_set.operator_eligible,
@@ -119,7 +124,7 @@ async def authorize_approval(
         set_reason = approver_set.ineligible_reason
         if set_reason is not None:
             # The set's eligibility is about something other than Slack
-            # evidence (``RequesterOnly``), so it says why in its own words.
+            # evidence (``EmailApprovers``), so it says why in its own words.
             return name, AuthzDecision(
                 allowed=False,
                 reason=set_reason,

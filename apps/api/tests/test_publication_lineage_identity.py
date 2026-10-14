@@ -43,7 +43,8 @@ GITHUB_UNAVAILABLE_CODE = "publication.github_unavailable"
 
 _LINEAGE_COLUMNS = (
     "id, version, status, pr_number, pr_url, head_sha, latest_revision, binding_id, "
-    "github_repository_id, github_installation_id, github_pr_node_id, base_ref, updated_at"
+    "code_host_kind, code_host_host, repository_project_id, code_host_installation_id, "
+    "code_host_pr_id, base_ref, updated_at"
 )
 
 
@@ -355,11 +356,13 @@ def _lineage_row(lineage_id: str) -> dict[str, Any]:
     return rows[0]
 
 
-def _identity_columns(row: Mapping[str, Any]) -> tuple[Any, Any, Any, Any]:
+def _identity_columns(row: Mapping[str, Any]) -> tuple[Any, Any, Any, Any, Any, Any]:
     return (
-        row["github_repository_id"],
-        row["github_installation_id"],
-        row["github_pr_node_id"],
+        row["code_host_kind"],
+        row["code_host_host"],
+        row["repository_project_id"],
+        row["code_host_installation_id"],
+        row["code_host_pr_id"],
         row["base_ref"],
     )
 
@@ -442,7 +445,14 @@ def test_patch_captures_provider_identity_with_the_first_pr_facts(
     assert ("GET", f"/repos/{REPO}") in truth["calls"]
     assert ("GET", f"/repos/{REPO}/pulls/{PR_NUMBER}") in truth["calls"]
     row = _lineage_row(publication["lineage_id"])
-    assert _identity_columns(row) == (9001, 41, "PR_example_123", "main")
+    assert _identity_columns(row) == (
+        "github",
+        "github.com",
+        "9001",
+        41,
+        "PR_example_123",
+        "main",
+    )
     assert (row["pr_number"], row["pr_url"], row["head_sha"], row["version"]) == (
         PR_NUMBER,
         PR_URL,
@@ -484,7 +494,14 @@ def test_patch_preserves_captured_identity_on_a_later_revision(
 
     assert advanced.status_code == 200, advanced.text
     row = _lineage_row(first["lineage_id"])
-    assert _identity_columns(row) == (9001, 41, "PR_example_123", "main")
+    assert _identity_columns(row) == (
+        "github",
+        "github.com",
+        "9001",
+        41,
+        "PR_example_123",
+        "main",
+    )
     assert (row["pr_number"], row["head_sha"], row["version"]) == (
         PR_NUMBER,
         SECOND_REVISION_SHA,
@@ -507,7 +524,9 @@ def test_case_only_pr_url_spelling_is_accepted_by_the_patch(
 
     assert response.status_code == 200, response.text
     assert _identity_columns(_lineage_row(publication["lineage_id"])) == (
-        9001,
+        "github",
+        "github.com",
+        "9001",
         41,
         "PR_example_123",
         "main",
@@ -528,6 +547,8 @@ def test_token_mode_patch_settles_without_provider_identity(
     assert response.status_code == 200, response.text
     assert calls == []
     assert _identity_columns(_lineage_row(publication["lineage_id"])) == (
+        None,
+        None,
         None,
         None,
         None,

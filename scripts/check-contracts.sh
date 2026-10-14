@@ -34,14 +34,15 @@ echo "== regenerating the ACI wire lock =="
 uv run python -m aci_protocol.wire_lock
 
 echo "== regenerating TypeScript types =="
-npx --yes json-schema-to-typescript@15 "$aci_schema" \
-  --unreachableDefinitions -o "$ts_out"
+pnpm --dir tools/contract-codegen exec json2ts "$repo_root/$aci_schema" \
+  --unreachableDefinitions -o "$repo_root/$ts_out"
 
 echo "== compiling generated Rust =="
 cargo check --manifest-path "$rust_crate/Cargo.toml"
 
 echo "== compiling generated TypeScript =="
-npx --yes -p typescript@5 tsc --noEmit -p packages/aci-protocol/generated/ts/tsconfig.json
+pnpm --dir tools/contract-codegen exec tsc --noEmit \
+  -p "$repo_root/packages/aci-protocol/generated/ts/tsconfig.json"
 
 echo "== checking for drift =="
 if ! git diff --exit-code -- \

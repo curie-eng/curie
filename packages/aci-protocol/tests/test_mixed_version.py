@@ -24,9 +24,11 @@ minus the routing half.
 
 import json
 from pathlib import Path
+from typing import Literal
 
-from aci_protocol import ReplyHandle
-from aci_protocol.events import READER_CONTEXT, _AciModel
+from aci_protocol import PROTOCOL_VERSION, Event, ReplyHandle, is_compatible, parse_inbound
+from aci_protocol.events import READER_CONTEXT, PublicationContext, ToolAccess, _AciModel
+from pydantic import Field
 
 _FIXTURE = Path(__file__).resolve().parent / "fixtures" / "reply_handle_0_2_9.json"
 
@@ -130,3 +132,133 @@ def test_an_old_consumer_cannot_distinguish_two_kinds_at_one_address() -> None:
         "an old consumer sees the two turns as the same routing key; only the "
         "cutover ordering (no old worker before 0023) prevents the misroute"
     )
+
+
+# --- Event.memory_token (0.5.12) ----------------------------------------------
+#
+# The other direction from the 0.2.9 hazard above: here dropping the field is the
+# intended behaviour. A 0.5.11 runner must ignore the credential (and fall back to
+# its env token), and a 0.5.11 worker's event, which never carries it, must
+# decode on a 0.5.12 runner as a turn with no write credential.
+
+
+class _Event_0_5_11(_AciModel):  # noqa: N801 - the version IS the name
+    """The `Event` shape as of PROTOCOL_VERSION 0.5.11, pinned (no `memory_token`)."""
+
+    kind: Literal["event"] = "event"
+    type: Literal["message", "job", "eval_case"]
+    text: str
+    user: str
+    ts: str
+    session_id: str | None = None
+    history_ref: str | None = None
+    publication_context: PublicationContext | None = None
+    tool_access: ToolAccess | None = None
+
+
+def _event_0_5_11() -> dict[str, object]:
+    """A 0.5.11 worker's event: every 0.5.11 field, and no `memory_token` key."""
+
+    return {
+        "kind": "event",
+        "type": "message",
+        "text": "Remember that the standup moved to 10am",
+        "user": "U0EXAMPLE1",
+        "ts": "1720000000.000100",
+        "session_id": None,
+        "history_ref": None,
+        "publication_context": None,
+        "tool_access": None,
+    }
+
+
+def test_the_pinned_0_5_11_event_matches_the_live_model_minus_memory_token() -> None:
+    """The pinned reader predates the two optional credential fields."""
+
+    assert set(Event.model_fields) - set(_Event_0_5_11.model_fields) == {
+        "memory_token",
+        "channel_read",
+    }
+    assert set(_Event_0_5_11.model_fields) <= set(Event.model_fields)
+
+
+def test_a_0_5_11_event_without_memory_token_decodes_with_null() -> None:
+    payload = _event_0_5_11()
+    assert "memory_token" not in payload
+
+    consumed = parse_inbound(json.dumps(payload))
+
+    assert isinstance(consumed, Event)
+    assert consumed.memory_token is None
+    assert consumed.text == payload["text"]
+
+
+def test_an_event_carrying_memory_token_decodes_under_the_0_5_gate() -> None:
+    # 0.5.11 and 0.5.12 share major.minor, so neither side refuses the other.
+    assert is_compatible("0.5.11", PROTOCOL_VERSION) is True
+    assert is_compatible(PROTOCOL_VERSION, "0.5.11") is True
+
+    new_payload = json.loads(
+        Event(
+            type="message",
+            text="Remember that the standup moved to 10am",
+            user="U0EXAMPLE1",
+            ts="1720000000.000100",
+            memory_token="sbx.eyJhZ2VudCI6ImFjbWUtYm90In0.not-a-real-signature",
+        ).model_dump_json()
+    )
+    assert new_payload["memory_token"] is not None
+
+    # The new runner reads it.
+    consumed = parse_inbound(json.dumps(new_payload))
+    assert isinstance(consumed, Event)
+    assert consumed.memory_token == new_payload["memory_token"]
+
+    # An old runner parses the same payload and simply has no credential.
+    old = _Event_0_5_11.model_validate(new_payload, context=READER_CONTEXT)
+    assert old.text == new_payload["text"]
+    assert "memory_token" not in old.model_dump()
+
+
+class _Event_0_5_15(_Event_0_5_11):  # noqa: N801
+    """The previous event shape contains memory credentials but no channel read."""
+
+    memory_token: str | None = Field(default=None, repr=False)
+
+
+def test_pinned_0_5_15_event_has_exactly_the_previous_patch_fields() -> None:
+    assert set(Event.model_fields) - set(_Event_0_5_15.model_fields) == {"channel_read"}
+    assert set(_Event_0_5_15.model_fields) <= set(Event.model_fields)
+    assert is_compatible("0.5.15", PROTOCOL_VERSION)
+    assert is_compatible(PROTOCOL_VERSION, "0.5.15")
+
+
+def test_previous_patch_event_without_channel_read_decodes_without_capability() -> None:
+    previous = _Event_0_5_15.model_validate(_event_0_5_11())
+    payload = previous.model_dump_json()
+    assert "channel_read" not in previous.model_dump()
+    current = parse_inbound(payload)
+    assert isinstance(current, Event)
+    assert current.channel_read is None
+    assert current.text == previous.text
+    assert current.user == previous.user
+
+
+def test_previous_patch_reader_accepts_and_drops_optional_channel_read_object() -> None:
+    current = Event.model_validate(
+        {
+            **_event_0_5_11(),
+            "memory_token": "memory.example.signature",
+            "channel_read": {
+                "url": "https://api.example.com/channel-read",
+                "token": "channel.read.example.signature",
+            },
+        }
+    )
+    payload = json.loads(current.model_dump_json())
+    assert payload["channel_read"]["token"] == "channel.read.example.signature"
+    previous = _Event_0_5_15.model_validate(payload, context=READER_CONTEXT)
+    assert previous.text == current.text
+    assert previous.memory_token == "memory.example.signature"
+    assert "channel_read" not in previous.model_dump()
+    assert not hasattr(previous, "channel_read")

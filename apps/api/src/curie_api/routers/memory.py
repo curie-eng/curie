@@ -18,20 +18,25 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 
-from .. import crud, state_mutation
-from ..auth import require_api_key
-from ..config import get_settings
-from ..deps import SessionDep
-from ..models import WorkflowStateEntry
-from ..schemas import (
+from curie_api.crud import agents as crud_agents
+from curie_api.routers.state import enforce_caps
+from curie_api.schemas.state import (
     MemoryEntryCreate,
     MemoryEntryEdit,
     MemoryEntryOut,
+    MemoryGuidanceIn,
+    MemoryGuidanceOut,
     MemoryProvenanceOut,
     MemoryTraceBackOut,
     SourceTraceOut,
 )
-from .state import _enforce_caps
+
+from .. import state_mutation
+from ..auth import require_api_key
+from ..config import get_settings
+from ..deps import SessionDep
+from ..memory_guidance import DEFAULT_MEMORY_GUIDANCE
+from ..models import WorkflowStateEntry
 
 router = APIRouter(
     prefix="/agents", tags=["memory"], dependencies=[Depends(require_api_key)]
@@ -41,13 +46,16 @@ router = APIRouter(
 # single log-shaped key inside the reserved ``memory`` namespace).
 MEMORY_NAMESPACE = "memory"
 MEMORY_LOG_KEY = "log"
+# Operator guidance for the runner's memory tools (#1461): ``{"text": ...}`` at
+# the agent-wide scope, next to the log. Never a memory entry itself.
+MEMORY_GUIDANCE_KEY = "guidance"
 # Provenance ``source`` stamped on operator-seeded records (#1904). Distinct from
 # session-learned entries, which omit the field or leave it null.
 OPERATOR_MEMORY_SOURCE = "operator"
 
 
 async def _require_agent(session: SessionDep, agent_id: uuid.UUID) -> None:
-    if await crud.get_agent(session, agent_id) is None:
+    if await crud_agents.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
 
 
@@ -174,7 +182,7 @@ async def create_memory(
     )
     if entry is None:
         new_value = [record]
-        await _enforce_caps(
+        await enforce_caps(
             session, agent_id, None, MEMORY_NAMESPACE, MEMORY_LOG_KEY, new_value
         )
         entry = WorkflowStateEntry(
@@ -191,7 +199,7 @@ async def create_memory(
                 "cannot append: stored value is not a JSON array",
             )
         new_value = [*entry.value, record]
-        await _enforce_caps(
+        await enforce_caps(
             session, agent_id, None, MEMORY_NAMESPACE, MEMORY_LOG_KEY, new_value
         )
         entry.value = new_value
@@ -200,6 +208,101 @@ async def create_memory(
     await session.refresh(entry)
     index = len(_records_from_value(entry.value)) - 1
     return _to_out(index, record, entry.version)
+
+
+async def _get_guidance_entry(
+    session: SessionDep, agent_id: uuid.UUID
+) -> WorkflowStateEntry | None:
+    entry: WorkflowStateEntry | None = await session.scalar(
+        select(WorkflowStateEntry).where(
+            WorkflowStateEntry.agent_id == agent_id,
+            WorkflowStateEntry.binding_scope.is_(None),
+            WorkflowStateEntry.namespace == MEMORY_NAMESPACE,
+            WorkflowStateEntry.key == MEMORY_GUIDANCE_KEY,
+        )
+    )
+    return entry
+
+
+def _guidance_out(entry: WorkflowStateEntry | None) -> MemoryGuidanceOut:
+    """The effective guidance: the stored text, else the platform default.
+
+    A stored value that is not ``{"text": <non-blank str>}`` reads as the
+    default, which is also what the runner does with it.
+    """
+    value = entry.value if entry is not None else None
+    if isinstance(value, dict):
+        text = value.get("text")
+        if isinstance(text, str) and text.strip():
+            return MemoryGuidanceOut(text=text, source="operator")
+    return MemoryGuidanceOut(text=DEFAULT_MEMORY_GUIDANCE, source="default")
+
+
+# The guidance routes are registered before ``/memory/{index}`` so the literal
+# ``guidance`` segment is never parsed as an int index (a 422).
+@router.get("/{agent_id}/memory/guidance", response_model=MemoryGuidanceOut)
+async def get_memory_guidance(
+    agent_id: uuid.UUID, session: SessionDep
+) -> MemoryGuidanceOut:
+    """The agent's effective memory guidance and its source (#1461)."""
+    await _require_agent(session, agent_id)
+    return _guidance_out(await _get_guidance_entry(session, agent_id))
+
+
+@router.put("/{agent_id}/memory/guidance", response_model=MemoryGuidanceOut)
+async def put_memory_guidance(
+    agent_id: uuid.UUID, data: MemoryGuidanceIn, session: SessionDep
+) -> MemoryGuidanceOut:
+    """Store operator guidance, replacing any earlier one (#1461).
+
+    The runner reads it at the next session boot; a live thread keeps the
+    guidance it booted with.
+    """
+    await _require_agent(session, agent_id)
+    value = {"text": data.text}
+    await enforce_caps(
+        session, agent_id, None, MEMORY_NAMESPACE, MEMORY_GUIDANCE_KEY, value
+    )
+    entry: WorkflowStateEntry | None = await session.scalar(
+        select(WorkflowStateEntry)
+        .where(
+            WorkflowStateEntry.agent_id == agent_id,
+            WorkflowStateEntry.binding_scope.is_(None),
+            WorkflowStateEntry.namespace == MEMORY_NAMESPACE,
+            WorkflowStateEntry.key == MEMORY_GUIDANCE_KEY,
+        )
+        .with_for_update()
+    )
+    if entry is None:
+        entry = WorkflowStateEntry(
+            agent_id=agent_id,
+            namespace=MEMORY_NAMESPACE,
+            key=MEMORY_GUIDANCE_KEY,
+            value=value,
+        )
+        session.add(entry)
+    else:
+        entry.value = value
+        entry.version += 1
+    await session.commit()
+    await session.refresh(entry)
+    return _guidance_out(entry)
+
+
+@router.delete(
+    "/{agent_id}/memory/guidance", status_code=status.HTTP_204_NO_CONTENT
+)
+async def delete_memory_guidance(agent_id: uuid.UUID, session: SessionDep) -> Response:
+    """Remove operator guidance, so the platform default applies again (#1461).
+
+    Removing guidance that is not stored is a no-op, still 204.
+    """
+    await _require_agent(session, agent_id)
+    entry = await _get_guidance_entry(session, agent_id)
+    if entry is not None:
+        await session.delete(entry)
+        await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get(
@@ -251,7 +354,7 @@ async def edit_memory(
     # None: the memory port stays agent-wide regardless of `agents.memory`
     # (#1525 follow-up) -- it is a different reserved namespace with no
     # per-binding story, same as every row this port has ever written.
-    await _enforce_caps(
+    await enforce_caps(
         session, agent_id, None, MEMORY_NAMESPACE, MEMORY_LOG_KEY, replacement
     )
     entry.value = replacement

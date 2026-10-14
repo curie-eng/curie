@@ -19,6 +19,7 @@ import base64
 import gzip
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -38,9 +39,30 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
+from aci_protocol import BootEnv
+
+logger = logging.getLogger(__name__)
+
 WORKSPACE_REF_ENV = "CURIE_WORKSPACE_REF"
 WORKSPACE_SHA256_ENV = "CURIE_WORKSPACE_SHA256"
 WORKSPACE_MOUNT_PATH = "/workspace"
+# The workspace's code host facts in the boot contract (ADR 0197): the trusted
+# clone origin, the repository path under it, and the mounted CA bundle path.
+# Named from the one BootEnv declaration so a rename cannot drift.
+REPO_ORIGIN_ENV = BootEnv.env_key("repo_origin")
+REPO_PATH_ENV = BootEnv.env_key("repo_path")
+REPO_CA_BUNDLE_ENV = BootEnv.env_key("repo_ca_bundle")
+# How git presents each credential header form the API names (ADR 0197).
+# GitHub is Basic with x-access-token, exactly as before.
+_HEADER_NAMES = {
+    "authorization_basic": ("Authorization", "Basic "),
+    "authorization_bearer": ("Authorization", "Bearer "),
+    "private_token": ("PRIVATE-TOKEN", ""),
+}
+_PATH_SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
+# Encoded argument bytes per `git update-index` call, kept well under ARG_MAX
+# so a repository with thousands of dropped links still prepares.
+_UPDATE_INDEX_ARG_BUDGET = 64 * 1024
 _GITHUB_URL = re.compile(r"https://github\.com/[^\s<>|]+", re.IGNORECASE)
 _REPO_FULL_NAME = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
@@ -140,9 +162,7 @@ WORKSPACES_DISABLED_REFUSAL = (
 # Pinned by `test_selection_refusal_codes_match_the_apis_emissions` in
 # `apps/worker/tests/test_workspace.py`.
 _SELECTION_REFUSAL_MESSAGES = {
-    "workspace.selection_conflict": (
-        "This thread is already bound to a different repository."
-    ),
+    "workspace.selection_conflict": ("This thread is already bound to a different repository."),
 }
 
 
@@ -245,27 +265,80 @@ class WorkspaceLimits:
             raise ValueError("workspace stage budgets exceed total_timeout_seconds")
 
 
+def _valid_repository_path(path: str) -> bool:
+    """A repository path of two or more plain segments, as the API named it."""
+
+    segments = path.split("/")
+    return len(segments) >= 2 and all(
+        _PATH_SEGMENT.fullmatch(segment) and segment not in {".", ".."} for segment in segments
+    )
+
+
 @dataclass(frozen=True)
 class WorkspaceCredential:
-    """One deployment-derived clone credential returned by the API."""
+    """One deployment-derived clone credential returned by the API.
+
+    ``origin``, ``header_form`` and ``ca_bundle_ref`` are the code host's
+    transport facts as the API issued them (ADR 0197); the worker derives no
+    forge URL itself.
+    """
 
     repo_full_name: str
     clone_url: str
     authorization_header: str
+    origin: str
+    header_form: str
+    ca_bundle_ref: str | None = None
     revision: str | None = None
+    base_branch: str | None = None
+    base_commit: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.repo_full_name or not self.clone_url or not self.authorization_header:
+        if (
+            not self.repo_full_name
+            or not self.clone_url
+            or not self.authorization_header
+            or not self.origin
+        ):
             raise ValueError("workspace credential response is incomplete")
-        if not self.clone_url.startswith("https://github.com/"):
-            raise ValueError("workspace clone URL must be a clean GitHub HTTPS URL")
-        if self.clone_url != f"https://github.com/{self.repo_full_name}.git":
+        base = urlsplit(self.origin)
+        clone = urlsplit(self.clone_url)
+        # Accessing port also refuses malformed ports before Git receives auth.
+        _ = base.port, clone.port
+        if (
+            base.scheme != "https"
+            or not base.hostname
+            or base.username is not None
+            or base.password is not None
+            or base.query
+            or base.fragment
+            or self.origin.endswith("/")
+            or clone.scheme != "https"
+            or clone.username is not None
+            or clone.password is not None
+            or clone.query
+            or clone.fragment
+        ):
+            raise ValueError("workspace clone URL must be a clean HTTPS URL")
+        if (
+            not _valid_repository_path(self.repo_full_name)
+            or self.clone_url != f"{self.origin}/{self.repo_full_name}.git"
+        ):
             raise ValueError("workspace clone URL does not match the server-derived repository")
-        authority = self.clone_url.removeprefix("https://").split("/", 1)[0]
-        if "@" in authority:
-            raise ValueError("workspace clone URL must not contain userinfo")
         if any(character in self.authorization_header for character in ("\r", "\n", "\0")):
             raise ValueError("workspace authorization header contains control characters")
+        form = _HEADER_NAMES.get(self.header_form)
+        if form is None or not self.authorization_header.startswith(form[1]):
+            raise ValueError("workspace credential header form does not match its header")
+        if self.ca_bundle_ref is not None and not self.ca_bundle_ref.startswith("/"):
+            raise ValueError("workspace CA bundle reference is not an absolute path")
+
+    @property
+    def git_header(self) -> str:
+        """The one ``http.extraHeader`` line git sends to ``origin``."""
+
+        name, _ = _HEADER_NAMES[self.header_form]
+        return f"{name}: {self.authorization_header}"
 
 
 def parse_github_repo_fact(message: str) -> RepoFact | None:
@@ -505,15 +578,16 @@ class WorkspaceCredentialClient:
             ) from exc
         if selected is None:
             return None
-        if not isinstance(selected, str) or not _REPO_FULL_NAME.fullmatch(selected):
+        # The API resolves the code host kind from the thread's WorkItem and
+        # validates under that kind's rule; a GitLab path nests groups, so the
+        # worker checks only the forge-neutral shape it clones with.
+        if not isinstance(selected, str) or not _valid_repository_path(selected):
             raise WorkspacePreparationError(
                 "repository-selection", "API returned an invalid repository selection"
             )
         return selected
 
-    def redeem(
-        self, deployment_id: uuid.UUID, conversation_id: str
-    ) -> WorkspaceCredential:
+    def redeem(self, deployment_id: uuid.UUID, conversation_id: str) -> WorkspaceCredential:
         body = json.dumps({"conversation_id": conversation_id}).encode()
         try:
             response = self._transport(
@@ -548,19 +622,42 @@ class WorkspaceCredentialClient:
             )
         try:
             payload = json.loads(response.body)
-            revision = payload.get("revision")
-            if revision is not None and not isinstance(revision, str):
-                raise TypeError("revision is not a string")
+            revision = _opt_str(payload, "revision")
+            base_branch = _opt_str(payload, "base_branch")
+            base_commit = _opt_str(payload, "base_commit")
             return WorkspaceCredential(
                 repo_full_name=str(payload["repo_full_name"]),
                 clone_url=str(payload["clone_url"]),
                 authorization_header=str(payload["authorization_header"]),
+                origin=str(payload["origin"]),
+                header_form=str(payload["header_form"]),
+                ca_bundle_ref=_opt_str(payload, "ca_bundle_ref"),
                 revision=revision,
+                base_branch=base_branch,
+                base_commit=base_commit,
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise WorkspacePreparationError(
                 "credential-redemption", "API returned an invalid credential response"
             ) from exc
+
+
+def _opt_str(payload: dict[str, Any], key: str) -> str | None:
+    """An optional string field of an API payload; any other type is invalid."""
+
+    value = payload.get(key)
+    if value is not None and not isinstance(value, str):
+        raise TypeError(f"{key} is not a string")
+    return value
+
+
+_FULL_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def _is_full_sha(value: str | None) -> bool:
+    """Whether ``value`` is a full lowercase 40-hex commit id."""
+
+    return value is not None and _FULL_SHA.fullmatch(value) is not None
 
 
 @dataclass(frozen=True)
@@ -812,12 +909,37 @@ class PreparedWorkspace:
     materialized_head: str
     checkout_mode: int
     reference: WorkspaceRef
+    # The code host CA bundle the clone trusted, mounted at this path in the
+    # sandbox too; None for the public trust store.
+    ca_bundle_ref: str | None = None
+
+    @property
+    def repo_origin(self) -> str:
+        """The trusted clone origin: the clean clone URL less the repository path."""
+
+        suffix = f"/{self.repo_full_name}.git"
+        if not self.clean_clone_url.endswith(suffix):
+            raise WorkspacePreparationError(
+                "reference", "workspace clone URL does not end in its repository path"
+            )
+        return self.clean_clone_url.removesuffix(suffix)
 
     def claim_env(self) -> dict[str, str]:
-        return {
+        """The workspace capability plus the code host facts the boot contract carries.
+
+        The sandbox checks the checkout's origin against ``CURIE_REPO_ORIGIN``
+        and ``CURIE_REPO_PATH`` rather than deriving a host itself (ADR 0197).
+        """
+
+        env = {
             WORKSPACE_REF_ENV: self.reference.encode(),
             WORKSPACE_SHA256_ENV: self.sha256,
+            REPO_ORIGIN_ENV: self.repo_origin,
+            REPO_PATH_ENV: self.repo_full_name,
         }
+        if self.ca_bundle_ref is not None:
+            env[REPO_CA_BUNDLE_ENV] = self.ca_bundle_ref
+        return env
 
 
 _OWNERSHIP_PREFIX = "_ownership"
@@ -849,6 +971,7 @@ class _WorkspaceOwnership:
                     "materialized_head": prepared.materialized_head,
                     "checkout_mode": prepared.checkout_mode,
                     "reference": prepared.reference.encode(),
+                    "ca_bundle_ref": prepared.ca_bundle_ref,
                 },
             },
             separators=(",", ":"),
@@ -881,6 +1004,7 @@ class _WorkspaceOwnership:
                 ),
                 checkout_mode=int(prepared_raw["checkout_mode"]),
                 reference=WorkspaceRef.decode(str(prepared_raw["reference"])),
+                ca_bundle_ref=_opt_str(prepared_raw, "ca_bundle_ref"),
             )
             expires_at_epoch = int(raw["expires_at_epoch"])
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1106,9 +1230,17 @@ class WorkspacePreparer:
                     "GIT_CONFIG_COUNT": "2",
                     "GIT_CONFIG_KEY_0": "http.followRedirects",
                     "GIT_CONFIG_VALUE_0": "false",
-                    "GIT_CONFIG_KEY_1": "http.https://github.com/.extraHeader",
-                    "GIT_CONFIG_VALUE_1": f"Authorization: {credential.authorization_header}",
+                    # The header is scoped to the origin the API named, in the
+                    # form it named (ADR 0197).
+                    "GIT_CONFIG_KEY_1": f"http.{credential.origin}/.extraHeader",
+                    "GIT_CONFIG_VALUE_1": credential.git_header,
                 }
+                if credential.ca_bundle_ref is not None:
+                    # The operator's code host trust bundle, mounted here at
+                    # the path the credential named.
+                    clone_env["GIT_CONFIG_COUNT"] = "3"
+                    clone_env["GIT_CONFIG_KEY_2"] = "http.sslCAInfo"
+                    clone_env["GIT_CONFIG_VALUE_2"] = credential.ca_bundle_ref
                 try:
                     clone_argv = [
                         "git",
@@ -1119,6 +1251,8 @@ class WorkspacePreparer:
                     ]
                     if branch is not None:
                         clone_argv.extend(["--branch", branch])
+                    elif detached_head is None and credential.base_branch:
+                        clone_argv.extend(["--branch", credential.base_branch])
                     clone_argv.extend([credential.clone_url, str(checkout)])
                     self.commands.run(
                         clone_argv,
@@ -1129,9 +1263,9 @@ class WorkspacePreparer:
                         ),
                     )
                     pin = detached_head
-                    if pin is None and credential.revision and re.fullmatch(
-                        r"[0-9a-f]{40}", credential.revision
-                    ):
+                    if pin is None and branch is None and _is_full_sha(credential.base_commit):
+                        pin = credential.base_commit
+                    if pin is None and _is_full_sha(credential.revision):
                         pin = credential.revision
                     if pin is not None:
                         self.commands.run(
@@ -1192,6 +1326,7 @@ class WorkspacePreparer:
                         "checkout does not match the expected lineage head",
                     )
 
+                self._drop_escaping_links(checkout)
                 checkout_bytes = self._checkout_size(checkout)
                 if checkout_bytes > self.limits.max_checkout_bytes:
                     raise WorkspacePreparationError(
@@ -1261,12 +1396,13 @@ class WorkspacePreparer:
                 materialized_head=base_sha,
                 checkout_mode=checkout.stat().st_mode,
                 reference=reference,
+                ca_bundle_ref=credential.ca_bundle_ref,
             )
         except Exception:
             if object_key is not None:
                 try:
                     self.objects.delete(object_key)
-                except Exception:
+                except Exception:  # noqa: BLE001 - existing broad catch retained
                     pass
             raise
         finally:
@@ -1306,9 +1442,7 @@ class WorkspacePreparer:
         """Materialize a headless lineage at its proposal base without a branch."""
 
         if re.fullmatch(r"[0-9a-f]{40}", expected_base) is None:
-            raise WorkspacePreparationError(
-                "lineage-checkout", "lineage base is invalid"
-            )
+            raise WorkspacePreparationError("lineage-checkout", "lineage base is invalid")
         return self.prepare(
             deployment_id=deployment_id,
             thread_key=thread_key,
@@ -1342,7 +1476,10 @@ class WorkspacePreparer:
             raise WorkspacePreparationError(
                 "origin-sanitization", ".git/config could not be inspected"
             ) from exc
-        forbidden = (credential.authorization_header, "@github.com")
+        forbidden = (
+            credential.authorization_header,
+            f"@{urlsplit(credential.origin).netloc}",
+        )
         if any(value and value in config for value in forbidden):
             raise WorkspacePreparationError(
                 "origin-sanitization", ".git/config still contains credential material"
@@ -1351,6 +1488,55 @@ class WorkspacePreparer:
             raise WorkspacePreparationError(
                 "origin-sanitization", ".git/config does not contain exactly one clean origin"
             )
+
+    def _drop_escaping_links(self, checkout: Path) -> None:
+        """Remove committed links that point outside the checkout.
+
+        A repository may commit convenience links (Bazel output links, for
+        example) whose targets live outside the tree. They cannot be shipped,
+        so they are unlinked and marked skip-worktree, which keeps the
+        deletion out of `git status` and out of anything `git add -A` stages.
+        """
+
+        dropped: list[str] = []
+        for root, dirnames, filenames in os.walk(checkout, followlinks=False):
+            root_path = Path(root)
+            if root_path == checkout and ".git" in dirnames:
+                dirnames.remove(".git")
+            for name in (*dirnames, *filenames):
+                path = root_path / name
+                if not path.is_symlink():
+                    continue
+                relative = path.relative_to(checkout).as_posix()
+                if _link_escapes(relative, os.readlink(path)):
+                    dropped.append(relative)
+        if not dropped:
+            return
+        dropped.sort()
+        for relative in dropped:
+            (checkout / relative).unlink()
+        batch: list[str] = []
+        batch_bytes = 0
+        for relative in dropped:
+            cost = len(os.fsencode(relative)) + 1
+            if batch and batch_bytes + cost > _UPDATE_INDEX_ARG_BUDGET:
+                self._skip_worktree(checkout, batch)
+                batch, batch_bytes = [], 0
+            batch.append(relative)
+            batch_bytes += cost
+        self._skip_worktree(checkout, batch)
+        logger.warning(
+            "workspace checkout dropped %d escaping link(s) outside the checkout: %s",
+            len(dropped),
+            ", ".join(dropped),
+        )
+
+    def _skip_worktree(self, checkout: Path, paths: list[str]) -> None:
+        self.commands.run(
+            ["git", "update-index", "--skip-worktree", "--", *paths],
+            cwd=checkout,
+            timeout_seconds=self.limits.archive_timeout_seconds,
+        )
 
     def _checkout_size(self, checkout: Path) -> int:
         total = 0
@@ -1500,6 +1686,7 @@ class WorkspaceClaimCoordinator:
         lineage_base_sha: str | None = None,
         publication_visible_outcome_revision: int = 0,
         fresh_only: bool = False,
+        caller_run: str | None = None,
     ) -> WorkspaceClaimResult:
         """Prepare once, then cold-claim or resume a suspended route.
 
@@ -1576,11 +1763,10 @@ class WorkspaceClaimCoordinator:
                     env=claim_env,
                     workspace_repo=repo_full_name,
                     workspace_materialized_head=prepared.materialized_head,
-                    publication_visible_outcome_revision=(
-                        publication_visible_outcome_revision
-                    ),
+                    publication_visible_outcome_revision=(publication_visible_outcome_revision),
                     agent_name=agent_name,
                     runner_resources=runner_resources,
+                    caller_run=caller_run,
                     **candidate_guard,
                 )
             else:
@@ -1592,10 +1778,9 @@ class WorkspaceClaimCoordinator:
                         runner_resources=runner_resources,
                         workspace_repo=repo_full_name,
                         workspace_materialized_head=prepared.materialized_head,
-                        publication_visible_outcome_revision=(
-                            publication_visible_outcome_revision
-                        ),
+                        publication_visible_outcome_revision=(publication_visible_outcome_revision),
                         fresh_only=fresh_only,
+                        caller_run=caller_run,
                     )
                 except Exception as exc:
                     # The substrate signal is injected to keep this worker-local
@@ -1609,9 +1794,8 @@ class WorkspaceClaimCoordinator:
                         runner_resources=runner_resources,
                         workspace_repo=repo_full_name,
                         workspace_materialized_head=prepared.materialized_head,
-                        publication_visible_outcome_revision=(
-                            publication_visible_outcome_revision
-                        ),
+                        publication_visible_outcome_revision=(publication_visible_outcome_revision),
+                        caller_run=caller_run,
                     )
             sandbox_exposed = True
             self._commit_ownership(thread_key, prepared)
@@ -1639,9 +1823,7 @@ class WorkspaceClaimCoordinator:
 
         return cast(
             "str | None",
-            self.preparer.credentials.select(
-                deployment_id, thread_key, author, repo_full_name
-            ),
+            self.preparer.credentials.select(deployment_id, thread_key, author, repo_full_name),
         )
 
     def _stage_ownership(
@@ -1812,7 +1994,7 @@ class WorkspaceClaimCoordinator:
                     key,
                     expected_thread_key=ownership.thread_key,
                 )
-            except Exception as read_exc:
+            except Exception as read_exc:  # noqa: BLE001 - existing broad catch retained
                 if self._is_missing_object(read_exc):
                     raise write_exc from None
                 raise _OwnershipWriteUncertain() from write_exc
@@ -1844,7 +2026,7 @@ class WorkspaceClaimCoordinator:
         for key in ownership.stale_object_keys:
             try:
                 self.preparer.objects.delete(key)
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 remaining.append(key)
         if tuple(remaining) != ownership.stale_object_keys:
             self._store_ownership(

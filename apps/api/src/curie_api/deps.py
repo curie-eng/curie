@@ -23,6 +23,12 @@ async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
         yield session
 
 
+async def get_liveness_session(request: Request) -> AsyncIterator[AsyncSession]:
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.liveness_sessionmaker
+    async with sessionmaker() as session:
+        yield session
+
+
 def get_langfuse(request: Request) -> LangfuseClient:
     client: LangfuseClient = request.app.state.langfuse
     return client
@@ -80,6 +86,7 @@ def get_approver_sets(request: Request) -> ApproverSetSelector:
 
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+LivenessSessionDep = Annotated[AsyncSession, Depends(get_liveness_session)]
 LangfuseDep = Annotated[LangfuseClient, Depends(get_langfuse)]
 StoreDep = Annotated[ObjectStore, Depends(get_store)]
 PodLogReaderDep = Annotated[PodLogReader, Depends(get_pod_log_reader)]

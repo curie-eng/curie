@@ -39,6 +39,10 @@ PYPROJECT = REPO_ROOT / "pyproject.toml"
 VERIFY_FIX_PIN = REPO_ROOT / "cli" / "scripts" / "verify-fix-pin.sh"
 
 VALID_SELECTOR = "apps/api/tests/test_fix_pin_ci_gate.py::test_exact_declaration"
+FACTORY_SELECTOR = (
+    "tools/factory-e2e/tests/test_scripted_driver.py::"
+    "test_scripted_driver_records_the_curie_bin_it_used"
+)
 LOCAL_SELECTOR = "cli/tests/local/test_deploy.py::test_deploy"
 LOCAL_LIVE_SELECTOR = "cli/tests/local/test_live.py::test_live"
 LIVE_SELECTOR = "runner/tests/test_live.py::test_example"
@@ -111,8 +115,7 @@ def _write_fake_binary(
                 "import os",
                 "from pathlib import Path",
                 "import sys",
-                f"Path(os.environ['{call_log_environment}']).write_text("
-                "json.dumps(sys.argv[1:]))",
+                f"Path(os.environ['{call_log_environment}']).write_text(json.dumps(sys.argv[1:]))",
                 f"print(os.environ.get('{output_environment}', {default_output!r}), "
                 f"end={print_end!r})",
                 f"raise SystemExit(int(os.environ.get('{exit_environment}', '0')))",
@@ -143,9 +146,7 @@ def _gh_issue_payload(
     """Return issue data, including milestone state that the gate must ignore."""
     parsed = json.loads(gh_labels)
     if isinstance(parsed, list):
-        return json.dumps(
-            {"labels": parsed, "body": gh_body, "milestone": gh_milestone}
-        )
+        return json.dumps({"labels": parsed, "body": gh_body, "milestone": gh_milestone})
     return gh_labels
 
 
@@ -259,8 +260,7 @@ def _gh_calls(tmp_path: Path) -> list[list[str]]:
     if not _gh_call_log(tmp_path).exists():
         return []
     return [
-        json.loads(line)
-        for line in _gh_call_log(tmp_path).read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in _gh_call_log(tmp_path).read_text(encoding="utf-8").splitlines()
     ]
 
 
@@ -390,6 +390,18 @@ def test_exact_declaration_calls_the_verifier_with_one_argv_selector(tmp_path: P
     ]
 
 
+def test_factory_python_selector_calls_the_verifier_at_the_ci_boundary(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(tmp_path, f"Fix pin: {FACTORY_SELECTOR}\n")
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(call_log.read_text(encoding="utf-8")) == [
+        "dev",
+        "verify-fix-pin",
+        "HEAD",
+        FACTORY_SELECTOR,
+    ]
+
+
 @pytest.mark.parametrize(
     "selector",
     [
@@ -407,9 +419,7 @@ def test_exact_declaration_calls_the_verifier_with_one_argv_selector(tmp_path: P
         ),
     ],
 )
-def test_supported_nested_python_selectors_call_the_verifier(
-    tmp_path: Path, selector: str
-) -> None:
+def test_supported_nested_python_selectors_call_the_verifier(tmp_path: Path, selector: str) -> None:
     completed, call_log = _run_checker(tmp_path, f"Fix pin: {selector}")
 
     assert completed.returncode == 0, completed.stderr
@@ -437,9 +447,7 @@ def test_local_python_selector_calls_the_verifier_at_the_ci_boundary(
 
 
 def test_ordinary_fix_pin_prose_skips_without_calling_the_verifier(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(
-        tmp_path, "This closes the fix pin-related enforcement gap"
-    )
+    completed, call_log = _run_checker(tmp_path, "This closes the fix pin-related enforcement gap")
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "SKIPPED: no Fix pin declaration"
@@ -486,12 +494,19 @@ def test_invalid_or_duplicate_declarations_fail_closed_without_calling_curie(
         "-h",
         "cli/tests/verify_fix_pin.rs::--no-run",
         "tools/fix-pin-ci/tests/test_fix_pin_ci.py::test_not_supported",
+        "tools/other-tool/tests/test_pin.py::test_pin",
+        "tools/factory-e2e/test_pin.py::test_pin",
+        "tools/factory-e2e/tests/../test_pin.py::test_pin",
+        "tools/factory-e2e/tests/test_pin.py::helper",
         "apps/api/tests/test_fix_pin_ci_gate.py",
         "cli/tests/test_pin.py::test_pin",
         "cli/tests/local/nested/test_pin.py::test_pin",
         "cli/tests/local/../test_pin.py::test_pin",
         "cli/tests/local/pin.py::test_pin",
         "cli/tests/local/test_pin.py::helper",
+        "charts/curie/ci/../render-assertions.sh",
+        "charts/curie/ci/runtime/",
+        "charts/curie/ci/runtime/name.py",
     ],
 )
 def test_unsupported_selectors_fail_closed_without_calling_curie(
@@ -1045,12 +1060,18 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
 
     job, required_steps = _python_job(document)
     assert job.get("name") == "Python (ruff + mypy + pytest)"
-    # The suite runs in the python-pytest shards; the required job only waits
-    # for them to aggregate their results, and always() keeps it from skipping.
-    assert job.get("needs") == "python-pytest"
+    # The suite runs in the python-pytest shards and the static gates in
+    # python-static; the required job only waits for them to aggregate their
+    # results, and always() keeps it from skipping.
+    assert job.get("needs") == ["changes", "python-pytest", "python-static"]
     assert job.get("if") == "always()", "the required Python check must not be skippable"
     shard_job, steps = _python_job(document, "python-pytest")
-    assert "needs" not in shard_job and "if" not in shard_job
+    # #3858: the shards wait for the `changes` selection and run only when it
+    # selected pytest; the required job above still reports either way.
+    shard_needs = shard_job.get("needs")
+    shard_needs = [shard_needs] if isinstance(shard_needs, str) else list(shard_needs or [])
+    assert "changes" in shard_needs
+    assert shard_job.get("if") == "${{ needs.changes.outputs.pytest == 'true' }}"
 
     permissions = job.get("permissions")
     assert isinstance(permissions, dict), "the Python job must declare job level permissions"
@@ -1074,7 +1095,10 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
 
     stack_index = _single_step_index(
         steps,
-        lambda step: "docker compose -f compose.dev.yaml up -d" in _string(step, "run"),
+        lambda step: (
+            _string(step, "run").strip()
+            == "python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480"
+        ),
         "dev stack startup",
     )
     migration_index = _single_step_index(
@@ -1088,42 +1112,67 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     # a contract change.
     pytest_index = _single_step_index(
         steps,
-        lambda step: _string(step, "run").strip().startswith("uv run pytest -q"),
+        lambda step: step.get("id") == "pytest",
         "normal Python suite",
     )
-    pytest_command = shlex.split(_string(steps[pytest_index], "run").strip())
-    assert pytest_command[:4] == ["uv", "run", "pytest", "-q"]
-    # xdist distribution flags change where tests run, not which tests run, so
-    # they are allowed alongside reporting flags. Anything else could filter.
-    extra = pytest_command[4:]
-    # The shard flag and the one rerun are also allowed: the shards partition
-    # the unfiltered collection along xdist groups (asserted in
-    # tools/e2e-ci-selection/tests/test_python_pytest_selection.py), and a rerun
-    # changes how often a failing test runs, never which tests run.
-    distribution = [
-        "-n",
-        "4",
-        "--dist",
-        "loadgroup",
-        "--ci-shard",
-        # shlex splits the matrix expression `${{ matrix.shard }}/3`
-        "${{",
-        "matrix.shard",
-        "}}/3",
-        "--reruns",
-        "1",
-    ]
-    if extra[: len(distribution)] == distribution:
-        extra = extra[len(distribution) :]
-    report_chars = set("fEsxXpPaAR")
-    assert all(
-        argument.startswith("--durations")
-        or (argument.startswith("-r") and len(argument) > 2 and set(argument[2:]) <= report_chars)
-        for argument in extra
-    ), (
-        "the Python suite must run unfiltered: only reporting, sharding, rerun, and "
-        f"xdist distribution flags may be added to `uv run pytest -q`, got {pytest_command!r}"
-    )
+    pytest_step = steps[pytest_index]
+    pytest_script = _string(pytest_step, "run")
+    assert "${{" not in pytest_script
+    pytest_env = pytest_step.get("env")
+    assert isinstance(pytest_env, dict)
+    bindings = {}
+    for meaning, expression in {
+        "shard": "${{ matrix.shard }}",
+        "deselect": "${{ steps.python-runtime.outputs.pytest_deselect }}",
+    }.items():
+        names = [name for name, value in pytest_env.items() if value == expression]
+        assert len(names) == 1, expression
+        bindings[meaning] = names[0]
+    # Run the unmodified Bash with a recording uv function at its command boundary.
+    # Keep reporting flags flexible; only the declared file may be added by
+    # conditional selection, after the unfiltered suite's distribution flags.
+    for shard in (1, 2, 3):
+        for deselect in ("", "examples/tests/test_sre_bot_observability_runtime.py"):
+            environment = {
+                **os.environ,
+                "BASH_FUNC_uv%%": "() { printf '%s\\0' \"$@\"; }",
+                bindings["shard"]: str(shard),
+                bindings["deselect"]: deselect,
+            }
+            result = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", pytest_script],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            pytest_command = result.stdout.split("\0")
+            assert pytest_command.pop() == ""
+            assert pytest_command[:3] == ["run", "pytest", "-q"]
+            if deselect:
+                assert pytest_command.count("--deselect") == 1
+                assert pytest_command[-2:] == ["--deselect", deselect]
+                pytest_command = pytest_command[:-2]
+            distribution = [
+                "-n", "4", "--dist", "loadgroup", "--ci-shard", f"{shard}/3", "--reruns", "1",
+            ]
+            extra = pytest_command[3:]
+            assert extra[: len(distribution)] == distribution
+            extra = extra[len(distribution) :]
+            report_chars = set("fEsxXpPaAR")
+            assert all(
+                argument.startswith("--durations")
+                or (
+                    argument.startswith("-r")
+                    and len(argument) > 2
+                    and set(argument[2:]) <= report_chars
+                )
+                for argument in extra
+            ), (
+                "the Python suite permits only reporting flags after its distribution block, "
+                f"plus the selected trailing deselect pair, got {pytest_command!r}"
+            )
     assert stack_index < migration_index < pytest_index
 
     # The half that keeps the win. Nothing about the gate may drift back into
@@ -1135,9 +1184,9 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     assert not any(_is_fix_pin_probe(step) for step in steps), (
         "the fix pin probe must not run inside the Python job again"
     )
-    assert not any(
-        "cargo" in _string(step, "run") for step in steps
-    ), "the Python job must not build Rust behind the suite"
+    assert not any("cargo" in _string(step, "run") for step in steps), (
+        "the Python job must not build Rust behind the suite"
+    )
 
     diagnostic_index = _single_step_index(
         steps,
@@ -1217,32 +1266,55 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
 
     release_build_index = _single_step_index(
         steps,
-        lambda step: _string(step, "run").strip()
-        == "cargo build --release --locked --manifest-path cli/Cargo.toml",
+        lambda step: (
+            _string(step, "run").strip()
+            == "cargo build --release --locked --manifest-path cli/Cargo.toml"
+        ),
         "direct current release build",
     )
     helm_index = _single_step_index(
         steps,
-        lambda step: _string(step, "uses")
-        == "azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310"
-        and (step.get("with") or {}).get("version") == "v3.16.4",
+        lambda step: (
+            _string(step, "uses") == "azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310"
+            and (step.get("with") or {}).get("version") == "v3.16.4"
+        ),
         "pinned Helm setup",
     )
-    assert probe_index < release_build_index < helm_index < gate_index
+    cache_index = _single_step_index(
+        steps,
+        lambda step: _string(step, "uses").startswith("Swatinem/rust-cache@"),
+        "fix pin Cargo cache",
+    )
+    cache = steps[cache_index]
+    cache_action = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
+    assert cache.get("name") == "Cargo cache"
+    assert cache.get("uses") == cache_action
+    assert _string(cache, "if") == CARGO_NEEDED_GUARD
+    assert cache.get("with") == {
+        "workspaces": "cli",
+        "shared-key": "curie-cli-release",
+        "cache-on-failure": True,
+    }
+    assert probe_index < cache_index < release_build_index < helm_index < gate_index
 
-    # The build stays direct. A `rust` selector makes verify-fix-pin.sh run
-    # `cargo test` out of CARGO_TARGET_DIR, so this build warms the directory
-    # the verification then compiles in; swapping it for rust-build's artifact
-    # would leave that selector to compile from cold.
-    assert not any(
-        _string(step, "uses") == "Swatinem/rust-cache@v2" for step in steps
-    ), "the fix pin job must build directly without a Cargo cache dependency"
+    # Both jobs restore the same dependency cache and still build curie directly.
+    rust_build_steps = _load_ci()["jobs"]["rust-build"]["steps"]
+    assert isinstance(rust_build_steps, list)
+    rust_build_cache = rust_build_steps[
+        _single_step_index(
+            rust_build_steps,
+            lambda step: _string(step, "uses").startswith("Swatinem/rust-cache@"),
+            "rust-build Cargo cache",
+        )
+    ]
+    assert rust_build_cache.get("uses") == cache_action
+    assert rust_build_cache.get("with", {}).get("shared-key") == "curie-cli-release"
     assert not any(
         _string(step, "uses").startswith("actions/download-artifact") for step in steps
     ), "the fix pin job must not download its curie binary"
-    assert not any(
-        "chmod +x cli/target/release/curie" in _string(step, "run") for step in steps
-    ), "the direct Cargo build creates the executable"
+    assert not any("chmod +x cli/target/release/curie" in _string(step, "run") for step in steps), (
+        "the direct Cargo build creates the executable"
+    )
 
     # Inside the Python job the gate inherited a booted stack. A `python`
     # selector naming an integration test dials Postgres and Valkey through
@@ -1255,7 +1327,10 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
     )
     stack_index = _single_step_index(
         steps,
-        lambda step: "docker compose -f compose.dev.yaml up -d" in _string(step, "run"),
+        lambda step: (
+            _string(step, "run").strip()
+            == "python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480"
+        ),
         "dev stack startup",
     )
     migration_index = _single_step_index(
@@ -1309,13 +1384,16 @@ def test_selector_tooling_builds_only_when_the_parser_would_invoke_curie() -> No
     for description, predicate in (
         (
             "direct current release build",
-            lambda step: _string(step, "run").strip()
-            == "cargo build --release --locked --manifest-path cli/Cargo.toml",
+            lambda step: (
+                _string(step, "run").strip()
+                == "cargo build --release --locked --manifest-path cli/Cargo.toml"
+            ),
         ),
         (
             "pinned Helm setup",
-            lambda step: _string(step, "uses")
-            == "azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310",
+            lambda step: (
+                _string(step, "uses") == "azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310"
+            ),
         ),
     ):
         step = steps[_single_step_index(steps, predicate, description)]
@@ -1508,9 +1586,7 @@ def test_not_applicable_without_a_reason_fails_closed_without_calling_curie(
 
 def test_bug_label_is_found_anywhere_in_the_label_list(tmp_path: Path) -> None:
     """The gate tests membership, not the first or only label."""
-    completed, call_log = _run_checker(
-        tmp_path, "Closes #12\n", gh_labels='["priority", "bug"]'
-    )
+    completed, call_log = _run_checker(tmp_path, "Closes #12\n", gh_labels='["priority", "bug"]')
 
     assert completed.returncode != 0, f"{completed.stdout}\n{completed.stderr}"
     assert "#12" in completed.stderr
@@ -1534,9 +1610,7 @@ def test_not_applicable_reason_without_a_dash_fails_closed_without_calling_curie
 def test_closing_a_non_bug_issue_without_a_declaration_keeps_the_existing_skip(
     tmp_path: Path,
 ) -> None:
-    completed, call_log = _run_checker(
-        tmp_path, "Closes #12\n", gh_labels='["enhancement"]'
-    )
+    completed, call_log = _run_checker(tmp_path, "Closes #12\n", gh_labels='["enhancement"]')
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "SKIPPED: no Fix pin declaration"
@@ -1580,9 +1654,7 @@ def test_closing_keyword_variants_all_require_a_declaration(tmp_path: Path, body
         "Closes #",
     ],
 )
-def test_non_closing_references_are_not_looked_up_and_still_skip(
-    tmp_path: Path, body: str
-) -> None:
+def test_non_closing_references_are_not_looked_up_and_still_skip(tmp_path: Path, body: str) -> None:
     completed, call_log = _run_checker(tmp_path, body, gh_labels=BUG_LABELS)
 
     assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
@@ -1760,6 +1832,24 @@ def test_helm_render_pin_for_a_found_cluster_issue_passes_without_a_waiver(
     ]
 
 
+def test_nested_chart_runtime_selector_meets_the_cluster_floor(tmp_path: Path) -> None:
+    """charts/curie/ci/runtime/ scripts are cluster pins like top-level ones (#4367)."""
+    selector = "charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh"
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {selector}\n",
+        gh_labels=FOUND_CLUSTER_LABELS,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(call_log.read_text(encoding="utf-8")) == [
+        "dev",
+        "verify-fix-pin",
+        "HEAD",
+        selector,
+    ]
+
+
 def test_unlabeled_bug_with_a_unit_pin_keeps_no_tier_floor(tmp_path: Path) -> None:
     """Existing bugs without a found:* label keep the pre-#2243 behaviour."""
     completed, call_log = _run_checker(
@@ -1803,10 +1893,7 @@ def test_duplicate_waiver_lines_fail_closed_without_calling_curie(tmp_path: Path
 def test_pin_tier_comes_from_selector_location_not_from_prose(tmp_path: Path) -> None:
     completed, call_log = _run_checker(
         tmp_path,
-        (
-            f"Closes #12\n\nThis pin is a live Slack test.\n"
-            f"Fix pin: {VALID_SELECTOR}\n"
-        ),
+        (f"Closes #12\n\nThis pin is a live Slack test.\nFix pin: {VALID_SELECTOR}\n"),
         gh_labels=FOUND_LIVE_LABELS,
     )
     shown = f"{completed.stdout}\n{completed.stderr}"
@@ -2003,9 +2090,7 @@ def _invalid_prerequisite_payload(case: str) -> str:
         "invalid json",
     ],
 )
-def test_invalid_direct_prerequisite_refuses_before_curie(
-    tmp_path: Path, case: str
-) -> None:
+def test_invalid_direct_prerequisite_refuses_before_curie(tmp_path: Path, case: str) -> None:
     completed, call_log = _run_checker(
         tmp_path,
         f"Closes #12\n\nFix pin: {LOCAL_SELECTOR}\n",

@@ -4,8 +4,7 @@
 //! product change is reversed. Docker is the boundary outside the changed CLI
 //! component and returns the runner report that `skill check` consumes.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use serde_json::{json, Value};
 use std::ffi::OsString;

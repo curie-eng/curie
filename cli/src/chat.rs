@@ -22,7 +22,8 @@
 //! channel, or real Slack HTTP on the CLI side.
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::extract::{Path, State};
@@ -107,6 +108,21 @@ pub(crate) fn capped(budget: Duration, deadline: Instant) -> Duration {
 /// therefore red rather than a silently blind detection (#1079).
 pub const APPROVE_ACTION_ID_PREFIX: &str = "curie-approval-approve";
 
+/// The `block_id` prefix on every block of the worker's Slack progress card
+/// (`apps/worker/src/curie_worker/blocks.py::progress_card`, ADR-0130).
+///
+/// A progress card is posted and edited like any message, and it can be the
+/// first post of a turn, which is exactly what [`observe_reply`] follows as a
+/// resumed answer. These prefixes are how the stub tells it apart, so they are
+/// frozen with the worker in `tests/vectors/progress-blocks.json` and checked
+/// in `tests::progress_block_ids_match_the_frozen_vector` below.
+pub const PROGRESS_CARD_BLOCK_ID_PREFIX: &str = "curie-progress-card:";
+
+/// The `block_id` prefix on every block of a progress milestone
+/// (`apps/worker/src/curie_worker/blocks.py::progress_milestone`); see
+/// [`PROGRESS_CARD_BLOCK_ID_PREFIX`].
+pub const PROGRESS_MILESTONE_BLOCK_ID_PREFIX: &str = "curie-progress-milestone:";
+
 /// One captured Slack Web API call at the stub.
 #[derive(Debug, Clone)]
 pub struct SlackCall {
@@ -125,11 +141,19 @@ pub struct SlackCall {
     /// a reply the worker posted as a new message (ADR-0179). `None` for every
     /// other method.
     pub posted_ts: Option<String>,
+    /// True when a block of the call carries a progress `block_id` prefix: the
+    /// worker posted or edited a progress card or milestone (ADR-0130). Such a
+    /// call is a status line at most and never the turn's reply.
+    pub progress: bool,
 }
 
 /// If this call is a `chat.update` editing `placeholder_ts`, its new text.
+///
+/// A progress edit is never that text, even of the placeholder's own ts: a
+/// progress body is not an answer (ADR-0130 decision 5).
 pub fn placeholder_update_text<'a>(call: &'a SlackCall, placeholder_ts: &str) -> Option<&'a str> {
-    if call.method == "chat.update" && call.ts.as_deref() == Some(placeholder_ts) {
+    if call.method == "chat.update" && call.ts.as_deref() == Some(placeholder_ts) && !call.progress
+    {
         call.text.as_deref()
     } else {
         None
@@ -149,6 +173,14 @@ fn observe_reply(
     latest: &mut Option<String>,
     observer: &mut impl FnMut(&str),
 ) -> bool {
+    if call.progress {
+        // A status line at most (ADR-0130). Not consumed, so a call the
+        // approval wait defers still reaches the resume wait in order.
+        if let Some(text) = call.text.as_deref() {
+            observer(text);
+        }
+        return false;
+    }
     if latest.is_none() && call.method == "chat.postMessage" && !call.approval_card {
         if let Some(posted) = call.posted_ts.as_deref() {
             *tracked_ts = posted.to_string();
@@ -213,13 +245,48 @@ pub fn extract_fields(
     (find("channel"), find("ts"), find("text"))
 }
 
+/// Whether a Slack call body carries a worker progress block (ADR-0130).
+///
+/// Structured, never a raw-body substring: the prefix must be the start of a
+/// block's `block_id`, so answer text that mentions it is not progress. The
+/// blocks ride the JSON body, or a JSON string in the `blocks` form field.
+pub fn is_progress_call(content_type: &str, body: &str) -> bool {
+    fn is_progress_block(block: &serde_json::Value) -> bool {
+        block
+            .get("block_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| {
+                id.starts_with(PROGRESS_CARD_BLOCK_ID_PREFIX)
+                    || id.starts_with(PROGRESS_MILESTONE_BLOCK_ID_PREFIX)
+            })
+    }
+
+    let blocks = if content_type.contains("application/json") {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|root| root.get("blocks").cloned())
+    } else {
+        let pairs: Vec<(String, String)> = serde_urlencoded::from_str(body).unwrap_or_default();
+        pairs
+            .iter()
+            .find(|(key, _)| key == "blocks")
+            .and_then(|(_, value)| serde_json::from_str::<serde_json::Value>(value).ok())
+    };
+    blocks
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|blocks| blocks.iter().any(is_progress_block))
+}
+
 /// Extract a validated durable approval id from a structured approval card.
 ///
-/// The worker puts the same UUID in the card's `client_msg_id` and approval
-/// action `value`. Neither copy is authoritative alone: both must be valid UUIDs
-/// and equal, and the action id must start with [`APPROVE_ACTION_ID_PREFIX`].
-/// This keeps incomplete, inconsistent, or ordinary Slack posts from being
-/// mistaken for approval control data.
+/// The approval action `value` is authoritative: reply-wire 1.1 uses its
+/// distinct `delivery_id` as `client_msg_id`, while 1.0 historically reuses the
+/// approval UUID there. The action must be structured, carry an action id that
+/// starts with [`APPROVE_ACTION_ID_PREFIX`], and hold a valid UUID value. The
+/// `client_msg_id` must also be present and UUID-valid, but need not equal the
+/// action value. This keeps incomplete, malformed, or ordinary Slack posts from
+/// becoming approval control data.
 pub fn approval_card_id(content_type: &str, body: &str) -> Option<String> {
     fn valid_uuid(value: &str) -> Option<String> {
         uuid::Uuid::parse_str(value).ok().map(|_| value.to_string())
@@ -290,9 +357,7 @@ pub fn approval_card_id(content_type: &str, body: &str) -> Option<String> {
     };
 
     match (card_seen, action_id, client_msg_id) {
-        (true, Some(action_id), Some(client_msg_id)) if action_id == client_msg_id => {
-            Some(action_id)
-        }
+        (true, Some(action_id), Some(_client_msg_id)) => Some(action_id),
         _ => None,
     }
 }
@@ -406,6 +471,7 @@ async fn handle_call(
     // awaiting-approval turn is detectable regardless of encoding (#529).
     let approval_card = body.contains(APPROVE_ACTION_ID_PREFIX);
     let approval_id = approval_card_id(content_type, &body);
+    let progress = is_progress_call(content_type, &body);
     // chat.update echoes the existing ts; a hypothetical new-message call has no
     // ts, so synthesize one so the response still looks like Slack.
     let ts_out = ts
@@ -420,6 +486,7 @@ async fn handle_call(
         approval_card,
         approval_id,
         posted_ts,
+        progress,
     });
     Json(json!({ "ok": true, "ts": ts_out, "channel": channel, "text": text }))
 }
@@ -804,21 +871,147 @@ pub fn continue_hint_long_line(verb: &str, channel: &str, thread_ts: &str) -> St
 
 /// Resolve the channel and timestamps for a turn: an explicit `--channel` is
 /// carried verbatim (so the worker's exact-equality binding can route to a
-/// deployed agent) and an explicit `--thread` continues that thread; each falls
+/// deployed agent) and an explicit `--thread` is continued verbatim; each falls
 /// back to a fresh synthetic value when absent. The placeholder ts is always
-/// synthetic (the CLI owns the placeholder message). Returns
+/// synthetic (the CLI owns the placeholder message). Automatic allocation mixes
+/// a per-process identity into the clock read, so independent processes reading
+/// the same clock value get distinct conversations (#4311). The ts keeps
+/// Slack's `<secs>.<6 digit>` shape, and successive calls in one process stay
+/// distinct because the micros advance. Returns
 /// `(channel, thread_ts, placeholder_ts)`.
 pub fn resolve_targets(channel: Option<&str>, thread: Option<&str>) -> (String, String, String) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after the epoch");
+    resolve_targets_at(channel, thread, now, process_thread_identity())
+}
+
+/// The pure core of [`resolve_targets`], with the clock read and the process
+/// identity passed in so a test can pin both. The thread ts is
+/// `<secs>.<frac>` where `frac` is the clock's micros plus `identity`, modulo a
+/// million and zero padded to six digits; the placeholder ts is the next
+/// micro after it. Returns `(channel, thread_ts, placeholder_ts)`.
+fn resolve_targets_at(
+    channel: Option<&str>,
+    thread: Option<&str>,
+    now: Duration,
+    identity: u32,
+) -> (String, String, String) {
     let channel = channel.map_or_else(synthetic_channel, str::to_string);
-    let (synthetic_thread_ts, placeholder_ts) = synthetic_thread_and_placeholder();
-    let thread_ts = thread.map_or(synthetic_thread_ts, str::to_string);
+    let secs = now.as_secs();
+    let frac = (u64::from(now.subsec_micros()) + u64::from(identity)) % 1_000_000;
+    let thread_ts = thread.map_or_else(|| format!("{secs}.{frac:06}"), str::to_string);
+    let placeholder_ts = format!("{secs}.{:06}", (frac + 1) % 1_000_000);
     (channel, thread_ts, placeholder_ts)
+}
+
+/// A value drawn once per process and mixed into automatic thread allocation,
+/// so two processes that read the same clock value still land on different
+/// thread timestamps (#4311). It is below one million so it fits the six digit
+/// fraction of a Slack ts.
+fn process_thread_identity() -> u32 {
+    static IDENTITY: OnceLock<u32> = OnceLock::new();
+    *IDENTITY.get_or_init(|| (uuid::Uuid::new_v4().as_u128() % 1_000_000) as u32)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde::Deserialize;
+
+    /// Split a Slack-shaped `<secs>.<micros>` ts into its two fields.
+    fn ts_fields(ts: &str) -> (u64, &str) {
+        let (secs, micros) = ts.split_once('.').expect("dot separator");
+        assert_eq!(micros.len(), 6, "micros width: {ts}");
+        assert!(
+            micros.bytes().all(|b| b.is_ascii_digit()),
+            "micros digits: {ts}"
+        );
+        (secs.parse().expect("integer seconds"), micros)
+    }
+
+    /// #4311: three processes that omit `--thread` and read the SAME wall-clock
+    /// value must still land in three conversations. Before the fix the thread
+    /// ts was a pure function of the clock, so identical reads shared one
+    /// conversation. The clock is injected so the collision is reproduced
+    /// exactly instead of hoped for; only the process identity differs.
+    #[test]
+    fn automatic_thread_identity_is_distinct_per_process_at_one_clock_value() {
+        let now = Duration::new(1_760_000_000, 123_456_000);
+        let identities = [7_u32, 424_242, 999_999];
+        let allocated: Vec<(String, String, String)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = identities
+                .iter()
+                .map(|&identity| {
+                    scope.spawn(move || resolve_targets_at(Some("C0EXAMPLE1"), None, now, identity))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("allocation thread"))
+                .collect()
+        });
+
+        let threads: std::collections::BTreeSet<&str> = allocated
+            .iter()
+            .map(|(_, thread, _)| thread.as_str())
+            .collect();
+        assert_eq!(
+            threads.len(),
+            identities.len(),
+            "one clock value must still yield one conversation per process: {allocated:?}"
+        );
+        for (channel, thread, placeholder) in &allocated {
+            assert_eq!(
+                channel, "C0EXAMPLE1",
+                "an explicit channel is carried verbatim"
+            );
+            assert_ne!(
+                thread, placeholder,
+                "the placeholder never names the thread"
+            );
+            let (secs, _) = ts_fields(thread);
+            assert_eq!(
+                secs,
+                now.as_secs(),
+                "the thread keeps the clock's seconds: {thread}"
+            );
+            ts_fields(placeholder);
+        }
+    }
+
+    /// The neighbouring behaviour the fix must keep: an explicit `--thread`
+    /// continues exactly that conversation whatever the clock or process
+    /// identity, and one process allocating twice at two clock reads still
+    /// gets two conversations (the `skill eval` per-sample threads, #550).
+    #[test]
+    fn automatic_thread_identity_keeps_explicit_threads_and_in_process_order() {
+        let now = Duration::new(1_760_000_000, 123_456_000);
+        for identity in [0_u32, 7, 999_999] {
+            let (_, thread, placeholder) =
+                resolve_targets_at(Some("C0EXAMPLE1"), Some("1720000000.000100"), now, identity);
+            assert_eq!(
+                thread, "1720000000.000100",
+                "explicit --thread is continued verbatim"
+            );
+            assert_ne!(placeholder, thread);
+        }
+
+        let later = now + Duration::from_micros(1);
+        let (_, first, _) = resolve_targets_at(Some("C0EXAMPLE1"), None, now, 7);
+        let (_, second, _) = resolve_targets_at(Some("C0EXAMPLE1"), None, later, 7);
+        assert_ne!(
+            first, second,
+            "successive reads in one process stay distinct"
+        );
+
+        // With no channel the synthetic channel is still minted.
+        let (channel, _, _) = resolve_targets_at(None, None, now, 7);
+        assert!(
+            channel.starts_with("C-SIM-"),
+            "synthetic channel: {channel}"
+        );
+    }
 
     /// The frozen action-id vector, parsed strictly. `deny_unknown_fields` is
     /// the whole point: a key this lane cannot see would pass vacuously, which
@@ -873,6 +1066,165 @@ mod tests {
         );
     }
 
+    /// The frozen progress block-id vector, parsed strictly for the same reason
+    /// as [`ActionIdVector`]. The Python lane rejects unknown keys via
+    /// `_EXPECTED_PROGRESS_VECTOR_KEYS` in `apps/worker/tests/test_blocks_progress.py`.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ProgressBlockVector {
+        #[serde(rename = "comment")]
+        _comment: String,
+        card_block_id_prefix: String,
+        milestone_block_id_prefix: String,
+    }
+
+    /// The Rust half of the worker vs CLI progress-block gate (ADR-0130). The
+    /// worker's constants and builders are checked against the same file by
+    /// `test_progress_block_ids_match_the_frozen_vector` in
+    /// `apps/worker/tests/test_blocks_progress.py`. The rule lives in the file.
+    #[test]
+    fn progress_block_ids_match_the_frozen_vector() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/vectors/progress-blocks.json"
+        ))
+        .expect("read tests/vectors/progress-blocks.json");
+        let parsed: ProgressBlockVector = serde_json::from_str(&raw).unwrap_or_else(|err| {
+            panic!(
+                "parse tests/vectors/progress-blocks.json: {err}\n\
+                 An unknown field is rejected on purpose. Teach a new key to \
+                 ProgressBlockVector here, to _EXPECTED_PROGRESS_VECTOR_KEYS in \
+                 apps/worker/tests/test_blocks_progress.py, and to both lanes' assertions."
+            )
+        });
+
+        assert_eq!(
+            parsed.card_block_id_prefix, PROGRESS_CARD_BLOCK_ID_PREFIX,
+            "the stub would read a progress card as the turn's answer"
+        );
+        assert_eq!(
+            parsed.milestone_block_id_prefix, PROGRESS_MILESTONE_BLOCK_ID_PREFIX,
+            "the stub would read a milestone as the turn's answer"
+        );
+    }
+
+    fn card_blocks(block_id: &str) -> String {
+        format!(
+            r#"[{{"type":"section","block_id":"{block_id}","text":{{"type":"plain_text","text":"Task status: Testing","emoji":false}}}}]"#
+        )
+    }
+
+    /// ADR-0130: a progress call is told apart by the block ids the worker
+    /// stamps, in either encoding slack_sdk may send, and by nothing else.
+    #[test]
+    fn progress_blocks_are_detected_by_block_id_in_either_encoding() {
+        let card = format!(
+            r#"{{"channel":"C0EXAMPLE1","text":"Task status: Testing. x","blocks":{}}}"#,
+            card_blocks(&format!("{PROGRESS_CARD_BLOCK_ID_PREFIX}r2:state"))
+        );
+        assert!(is_progress_call("application/json; charset=utf-8", &card));
+
+        let milestone_blocks = card_blocks(&format!("{PROGRESS_MILESTONE_BLOCK_ID_PREFIX}1:class"));
+        let form = serde_urlencoded::to_string([
+            ("channel", "C0EXAMPLE1"),
+            ("text", "Milestone: Scope changed. y"),
+            ("blocks", milestone_blocks.as_str()),
+        ])
+        .expect("encode a form body");
+        assert!(is_progress_call("application/x-www-form-urlencoded", &form));
+
+        // The negatives: the prefix in answer text, an ordinary structured
+        // reply, an approval card, and a body that is not JSON at all.
+        let in_text = format!(
+            r#"{{"text":"see {PROGRESS_CARD_BLOCK_ID_PREFIX}r2:state","blocks":{}}}"#,
+            card_blocks("reply-1")
+        );
+        assert!(!is_progress_call("application/json", &in_text));
+        let answer = r#"{"text":"the answer","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"the answer"}}]}"#;
+        assert!(!is_progress_call("application/json", answer));
+        let approval = format!(
+            r#"{{"blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"x"}}]}}]}}"#
+        );
+        assert!(!is_progress_call("application/json", &approval));
+        assert!(!is_progress_call("application/json", "not json"));
+    }
+
+    /// A progress card posted before the placeholder is edited is not the reply
+    /// the way a resumed answer post is: it is a status line, and its later
+    /// edits are status lines too.
+    #[test]
+    fn a_progress_post_and_its_edits_are_never_the_reply() {
+        let (latest, seen) = replay(&[
+            progress_call(
+                "chat.postMessage",
+                None,
+                Some("card"),
+                "Task status: Queued. x",
+            ),
+            progress_call("chat.update", Some("card"), None, "Task status: Testing. y"),
+            stub_call("chat.update", Some("ph"), None, "the answer"),
+            progress_call(
+                "chat.postMessage",
+                None,
+                Some("m1"),
+                "Milestone: Scope changed. z",
+            ),
+        ]);
+
+        assert_eq!(latest.as_deref(), Some("the answer"));
+        assert_eq!(
+            seen,
+            vec![
+                "Task status: Queued. x",
+                "Task status: Testing. y",
+                "the answer",
+                "Milestone: Scope changed. z",
+            ]
+        );
+    }
+
+    /// The negative for the tracked message itself: a progress edit of the ts
+    /// the wait follows still does not replace the answer.
+    #[test]
+    fn a_progress_edit_of_the_tracked_message_is_not_the_answer() {
+        let edit = progress_call("chat.update", Some("ph"), None, "Task complete. done");
+        assert_eq!(placeholder_update_text(&edit, "ph"), None);
+
+        let (latest, _seen) = replay(&[
+            stub_call("chat.update", Some("ph"), None, "the answer"),
+            edit,
+        ]);
+        assert_eq!(latest.as_deref(), Some("the answer"));
+    }
+
+    /// The stub marks what it captured, so the wait never has to re-parse.
+    #[tokio::test]
+    async fn the_stub_marks_a_captured_progress_call() {
+        let mut stub = SlackStub::start("127.0.0.1", 0, "127.0.0.1")
+            .await
+            .expect("binding an ephemeral port must succeed");
+        let client = reqwest::Client::new();
+        client
+            .post(format!("{}chat.postMessage", stub.base_api_url()))
+            .header("Content-Type", "application/json")
+            .body(format!(
+                r#"{{"channel":"C0EXAMPLE1","text":"Task status: Queued. x","blocks":{}}}"#,
+                card_blocks(&format!("{PROGRESS_CARD_BLOCK_ID_PREFIX}r1:state"))
+            ))
+            .send()
+            .await
+            .expect("the stub answers");
+        client
+            .post(format!("{}chat.postMessage", stub.base_api_url()))
+            .form(&[("channel", "C0EXAMPLE1"), ("text", "the answer")])
+            .send()
+            .await
+            .expect("the stub answers");
+
+        assert!(stub.recv().await.expect("the progress post").progress);
+        assert!(!stub.recv().await.expect("the answer post").progress);
+    }
+
     #[test]
     fn extract_fields_reads_form_and_json_bodies() {
         let (channel, ts, text) = extract_fields(
@@ -908,13 +1260,13 @@ mod tests {
     }
 
     #[test]
-    fn approval_card_id_requires_equal_structured_uuid_copies() {
-        let id = "00000000-0000-4000-8000-000000000220";
+    fn approval_card_id_reads_the_structured_action_value() {
+        let approval_id = "00000000-0000-4000-8000-000000000220";
         let body = format!(
-            r#"{{"channel":"C0EXAMPLE1","client_msg_id":"{id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{id}"}}]}}]}}"#
+            r#"{{"channel":"C0EXAMPLE1","client_msg_id":"{approval_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{approval_id}"}}]}}]}}"#
         );
         let captured = approval_card_id("application/json", &body);
-        assert_eq!(captured.as_deref(), Some(id));
+        assert_eq!(captured.as_deref(), Some(approval_id));
 
         // The card can win the Slack-call race while the latest placeholder is
         // still ordinary text. Preserve that text for output, but carry the
@@ -922,7 +1274,10 @@ mod tests {
         match completed_turn_outcome(Some("working".into()), true, captured) {
             Outcome::AwaitingApproval { reply, approval_id } => {
                 assert_eq!(reply.as_deref(), Some("working"));
-                assert_eq!(approval_id.as_deref(), Some(id));
+                assert_eq!(
+                    approval_id.as_deref(),
+                    Some("00000000-0000-4000-8000-000000000220")
+                );
             }
             outcome => panic!("approval card was not classified as awaiting: {outcome:?}"),
         }
@@ -949,27 +1304,86 @@ mod tests {
         }
     }
 
+    fn approval_card_body(
+        content_type: &str,
+        client_msg_id: Option<&str>,
+        approval_id: &str,
+    ) -> String {
+        let blocks = serde_json::json!([{
+            "type": "actions",
+            "elements": [{
+                "type": "button",
+                "action_id": APPROVE_ACTION_ID_PREFIX,
+                "value": approval_id,
+            }],
+        }]);
+        if content_type.contains("application/json") {
+            let mut body = serde_json::json!({"blocks": blocks});
+            if let Some(client_msg_id) = client_msg_id {
+                body["client_msg_id"] = serde_json::json!(client_msg_id);
+            }
+            return serde_json::to_string(&body).expect("encode approval card JSON");
+        }
+
+        let blocks = serde_json::to_string(&blocks).expect("encode approval card blocks");
+        let mut pairs = vec![("blocks", blocks.as_str())];
+        if let Some(client_msg_id) = client_msg_id {
+            pairs.push(("client_msg_id", client_msg_id));
+        }
+        serde_urlencoded::to_string(pairs).expect("encode approval card form")
+    }
+
     #[test]
-    fn approval_card_id_rejects_mismatched_or_missing_uuid_copies() {
-        let client_id = "00000000-0000-4000-8000-000000000220";
-        let action_id = "00000000-0000-4000-8000-000000000221";
-        let mismatched = format!(
-            r#"{{"client_msg_id":"{client_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{action_id}"}}]}}]}}"#
-        );
-        let missing_client = format!(
-            r#"{{"blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}","value":"{action_id}"}}]}}]}}"#
-        );
+    fn approval_card_id_accepts_equal_or_distinct_valid_client_keys() {
+        let delivery_id = "00000000-0000-4000-8000-000000000220";
+        let approval_id = "00000000-0000-4000-8000-000000000221";
+
+        for content_type in ["application/json", "application/x-www-form-urlencoded"] {
+            for client_msg_id in [approval_id, delivery_id] {
+                let body = approval_card_body(content_type, Some(client_msg_id), approval_id);
+                assert_eq!(
+                    approval_card_id(content_type, &body).as_deref(),
+                    Some(approval_id)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn approval_card_id_rejects_missing_or_invalid_client_keys() {
+        let approval_id = "00000000-0000-4000-8000-000000000221";
+
+        for content_type in ["application/json", "application/x-www-form-urlencoded"] {
+            for client_msg_id in [None, Some("not-a-uuid")] {
+                let body = approval_card_body(content_type, client_msg_id, approval_id);
+                assert_eq!(
+                    approval_card_id(content_type, &body),
+                    None,
+                    "{content_type} accepted client_msg_id={client_msg_id:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn approval_card_id_rejects_a_missing_action_value() {
+        let delivery_id = "00000000-0000-4000-8000-000000000220";
         let missing_action_value = format!(
-            r#"{{"client_msg_id":"{client_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}"}}]}}]}}"#
+            r#"{{"client_msg_id":"{delivery_id}","blocks":[{{"type":"actions","elements":[{{"type":"button","action_id":"{APPROVE_ACTION_ID_PREFIX}"}}]}}]}}"#
         );
 
-        for body in [&mismatched, &missing_client, &missing_action_value] {
-            assert!(body.contains(APPROVE_ACTION_ID_PREFIX));
-            assert_eq!(approval_card_id("application/json", body), None);
-            match completed_turn_outcome(None, true, approval_card_id("application/json", body)) {
-                Outcome::AwaitingApproval { approval_id, .. } => assert_eq!(approval_id, None),
-                outcome => panic!("untrusted card lost its awaiting status: {outcome:?}"),
-            }
+        assert!(missing_action_value.contains(APPROVE_ACTION_ID_PREFIX));
+        assert_eq!(
+            approval_card_id("application/json", &missing_action_value),
+            None
+        );
+        match completed_turn_outcome(
+            None,
+            true,
+            approval_card_id("application/json", &missing_action_value),
+        ) {
+            Outcome::AwaitingApproval { approval_id, .. } => assert_eq!(approval_id, None),
+            outcome => panic!("untrusted card lost its awaiting status: {outcome:?}"),
         }
     }
 
@@ -983,6 +1397,7 @@ mod tests {
             approval_card: false,
             approval_id: None,
             posted_ts: None,
+            progress: false,
         };
         assert_eq!(placeholder_update_text(&update, "1.2"), Some("the answer"));
         // Wrong ts (a different message).
@@ -1004,6 +1419,19 @@ mod tests {
             approval_card: false,
             approval_id: None,
             posted_ts: posted.map(str::to_string),
+            progress: false,
+        }
+    }
+
+    fn progress_call(
+        method: &str,
+        ts: Option<&str>,
+        posted: Option<&str>,
+        text: &str,
+    ) -> SlackCall {
+        SlackCall {
+            progress: true,
+            ..stub_call(method, ts, posted, text)
         }
     }
 

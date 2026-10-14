@@ -21,11 +21,14 @@ from __future__ import annotations
 from typing import Any
 
 import anyio
+import pytest
 from aci_protocol import Event, parse_ndjson
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from claude_agent_sdk import ResultMessage
 from curie_runner import RunTracer, SideEffectClassifier
+from curie_runner.fake import FakeModelSession
+from curie_runner.sender_frame import frame_user_turn
 from curie_runner.session import SessionRunner
 from curie_runner.usage_report import UsageReporter, build_usage_body
 
@@ -216,6 +219,10 @@ def test_the_report_is_awaited_before_the_final_event_is_yielded() -> None:
         async def report(self, got: Any, primary_model: str | None) -> None:
             calls.append((got, primary_model, len(lines)))
 
+        async def report_unfinished(self, primary_model: str | None) -> None: ...
+
+        def absorb(self, message: Any) -> None: ...
+
     runner = SessionRunner(
         max_usd_per_day=None,
         held_secrets=frozenset(),
@@ -277,6 +284,7 @@ def _assistant(
     *,
     parent: str | None = None,
     message_id: str | None = None,
+    session_id: str | None = None,
 ) -> AssistantMessage:
     return AssistantMessage(
         content=[TextBlock(text="x")],
@@ -284,6 +292,7 @@ def _assistant(
         parent_tool_use_id=parent,
         usage=usage,
         message_id=message_id,
+        session_id=session_id,
     )
 
 
@@ -359,11 +368,246 @@ def test_a_model_seen_only_on_subagent_messages_is_wholly_reviewer() -> None:
     assert got[("reviewer", REVIEWER)]["output_tokens"] == 45
 
 
+def test_a_zero_model_usage_entry_beside_a_nonzero_one_posts_no_zero_row() -> None:
+    """A cumulative entry at zero means the model gained nothing this turn."""
+    message = _result(
+        model_usage={PRIMARY: _model_usage(100, 10), REVIEWER: _model_usage(0, 0)},
+        uuid="t-zero-beside",
+    )
+    observed = {("implementer", PRIMARY): _wire(100, 10)}
+    body = build_usage_body(message, PRIMARY, observed=observed)
+    assert body is not None
+    assert [(e["role"], e["model"]) for e in body["models"]] == [("implementer", PRIMARY)]
+
+
+def test_model_usage_with_only_zero_entries_builds_nothing() -> None:
+    """All-zero cumulative entries are no observation, so there is no body."""
+    message = _result(
+        model_usage={PRIMARY: _model_usage(0, 0), REVIEWER: _model_usage(0, 0)},
+        uuid="t-all-zero",
+    )
+    assert build_usage_body(message, PRIMARY, observed={}) is None
+
+
+def test_an_explicit_zero_per_turn_usage_posts_one_zero_implementer_row() -> None:
+    """A blocked-preflight turn ran and spent nothing; that zero is a real row (#3977)."""
+    message = _result(
+        usage={"input_tokens": 0, "output_tokens": 0}, model_usage={}, uuid="t-zero-usage"
+    )
+    observed = {("implementer", PRIMARY): _wire(0, 0)}
+    body = build_usage_body(message, PRIMARY, observed=observed)
+    assert body is not None
+    assert body["models"] == [{"model": PRIMARY, "role": "implementer", **_wire(0, 0)}]
+
+
 def test_a_model_never_observed_is_implementer_whatever_the_primary() -> None:
     message = _result(model_usage={REVIEWER: _model_usage(9, 9)}, uuid="t-unseen")
     body = build_usage_body(message, PRIMARY, observed={})
     assert body is not None
     assert [(e["role"], e["model"]) for e in body["models"]] == [("implementer", REVIEWER)]
+
+
+@pytest.mark.parametrize("result_shape", ["model_usage", "usage"])
+def test_session_posts_observed_reviewer_missing_from_result_totals_once(
+    result_shape: str,
+) -> None:
+    """Text only nested messages carry usage even without terminal model totals.
+
+    Provider shapes are defined by installed claude_agent_sdk/types.py,
+    AssistantMessage and ClaudeAgentOptions.forward_subagent_text.
+    Repeated message IDs carry the same API response usage:
+    https://code.claude.com/docs/en/agent-sdk/cost-tracking
+    """
+    recorder = _Recorder()
+    terminal = (
+        {"model_usage": {PRIMARY: _model_usage(100, 40, cached=20, write=5)}}
+        if result_shape == "model_usage"
+        else {"usage": _sdk_usage(100, 40, cached=20, write=5)}
+    )
+    reviewer = _assistant(
+        REVIEWER,
+        _sdk_usage(30, 12, cached=7, write=3),
+        parent="toolu_example",
+        message_id="msg_reviewer_example",
+    )
+    messages = [
+        _assistant(PRIMARY, _sdk_usage(100, 40, cached=20, write=5)),
+        reviewer,
+        reviewer,
+        _result(**terminal, uuid="turn_missing_reviewer"),
+    ]
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            fake = FakeModelSession(lambda: messages)
+            runner = SessionRunner(
+                max_usd_per_day=None,
+                held_secrets=frozenset(),
+                session_factory=lambda: fake,
+                ceiling=0,
+                tracer=RunTracer(None),
+                classifier=SideEffectClassifier(),
+                trace_name="usage",
+                usage_reporter=UsageReporter(
+                    str(server.make_url("/v1/work-item-progress/example-request/usage")), TOKEN
+                ),
+                primary_model=PRIMARY,
+            )
+            await runner.start()
+            try:
+                lines = [
+                    line
+                    async for line in runner.run_turn(
+                        Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
+                    )
+                ]
+                assert parse_ndjson("".join(lines))[-1].type == "final"
+                assert len(recorder.received) == 1
+            finally:
+                await runner.close()
+
+    anyio.run(go)
+    body, token = recorder.received[0]
+    assert token == TOKEN
+    assert body["turn_id"] == "turn_missing_reviewer"
+    models = _by_role_model(body)
+    assert set(models) == {("implementer", PRIMARY), ("reviewer", REVIEWER)}
+    assert {key: models[("implementer", PRIMARY)][key] for key in _wire(0, 0)} == _wire(
+        100, 40, cached=20, write=5
+    )
+    assert {key: models[("reviewer", REVIEWER)][key] for key in _wire(0, 0)} == _wire(
+        30, 12, cached=7, write=3
+    )
+
+
+def test_zero_cumulative_delta_keeps_fresh_reviewer_usage_without_recounting() -> None:
+    """A repeated cumulative snapshot must still retain fresh observed usage.
+
+    Cumulative snapshots and response ID deduplication follow the SDK guide:
+    https://code.claude.com/docs/en/agent-sdk/cost-tracking
+    """
+    recorder = _Recorder()
+    totals = {PRIMARY: _model_usage(100, 10), REVIEWER: _model_usage(40, 4)}
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            reporter = UsageReporter(
+                str(server.make_url("/v1/work-item-progress/example-request/usage")), TOKEN
+            )
+            reporter.observe(_assistant(PRIMARY, _sdk_usage(100, 10)))
+            reporter.observe(_assistant(REVIEWER, _sdk_usage(40, 4), parent="toolu_example"))
+            await reporter.report(_result(model_usage=totals, uuid="turn_initial"), PRIMARY)
+            fresh = _assistant(
+                REVIEWER,
+                _sdk_usage(20, 2, cached=5, write=1),
+                parent="toolu_example",
+                message_id="msg_fresh_reviewer",
+            )
+            reporter.observe(fresh)
+            reporter.observe(fresh)
+            await reporter.report(_result(model_usage=totals, uuid="turn_fresh"), PRIMARY)
+            await reporter.report(_result(model_usage=totals, uuid="turn_empty"), PRIMARY)
+            reporter.observe(_assistant(PRIMARY, _sdk_usage(25, 3)))
+            await reporter.report(
+                _result(
+                    model_usage={**totals, PRIMARY: _model_usage(125, 13)},
+                    uuid="turn_followup",
+                ),
+                PRIMARY,
+            )
+
+    anyio.run(go)
+    assert [body["turn_id"] for body, _ in recorder.received] == [
+        "turn_initial",
+        "turn_fresh",
+        "turn_followup",
+    ]
+    fresh_body = _by_role_model(recorder.received[1][0])
+    assert set(fresh_body) == {("reviewer", REVIEWER)}
+    assert {key: fresh_body[("reviewer", REVIEWER)][key] for key in _wire(0, 0)} == _wire(
+        20, 2, cached=5, write=1
+    )
+    followup = _by_role_model(recorder.received[2][0])
+    assert set(followup) == {("implementer", PRIMARY)}
+    assert {key: followup[("implementer", PRIMARY)][key] for key in _wire(0, 0)} == _wire(25, 3)
+
+
+@pytest.mark.parametrize(
+    ("initial_report_fails", "fresh_usage"), [(False, True), (True, True), (True, False)]
+)
+def test_delayed_reviewer_totals_count_previously_observed_usage_once(
+    initial_report_fails: bool,
+    fresh_usage: bool,
+) -> None:
+    """A later cumulative snapshot includes reviewer usage already reported.
+
+    The SDK cost guide defines model_usage as cumulative within a session:
+    https://code.claude.com/docs/en/agent-sdk/cost-tracking
+    """
+    recorder = _Recorder(statuses=[503, 503, 201, 201] if initial_report_fails else None)
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            reporter = UsageReporter(
+                str(server.make_url("/v1/work-item-progress/example-request/usage")), TOKEN
+            )
+            reporter.observe(_assistant(PRIMARY, _sdk_usage(100, 10)))
+            reporter.observe(
+                _assistant(
+                    REVIEWER,
+                    _sdk_usage(30, 12, cached=9, write=6),
+                    parent="toolu_example",
+                    message_id="msg_reviewer_initial",
+                )
+            )
+            await reporter.report(
+                _result(model_usage={PRIMARY: _model_usage(100, 10)}, uuid="turn_observed"),
+                PRIMARY,
+            )
+            if fresh_usage:
+                reporter.observe(_assistant(PRIMARY, _sdk_usage(25, 3)))
+                reporter.observe(
+                    _assistant(
+                        REVIEWER,
+                        _sdk_usage(20, 8, cached=3, write=2),
+                        parent="toolu_example",
+                        message_id="msg_reviewer_fresh",
+                    )
+                )
+            totals = {
+                PRIMARY: _model_usage(125, 13) if fresh_usage else _model_usage(100, 10),
+                REVIEWER: (
+                    _model_usage(50, 20, cached=12, write=8)
+                    if fresh_usage
+                    else _model_usage(30, 12, cached=9, write=6)
+                ),
+            }
+            await reporter.report(_result(model_usage=totals, uuid="turn_catchup"), PRIMARY)
+            await reporter.report(_result(model_usage=totals, uuid="turn_empty"), PRIMARY)
+
+    anyio.run(go)
+    expected_turns = ["turn_observed"] * (3 if initial_report_fails else 1)
+    if fresh_usage:
+        expected_turns.append("turn_catchup")
+    assert [body["turn_id"] for body, _ in recorder.received] == expected_turns
+    if initial_report_fails:
+        assert recorder.received[0] == recorder.received[1] == recorder.received[2]
+    first = _by_role_model(recorder.received[0][0])
+    assert set(first) == {("implementer", PRIMARY), ("reviewer", REVIEWER)}
+    assert {key: first[("reviewer", REVIEWER)][key] for key in _wire(0, 0)} == _wire(
+        30, 12, cached=9, write=6
+    )
+    if not fresh_usage:
+        return
+    catchup = _by_role_model(recorder.received[-1][0])
+    assert set(catchup) == {("implementer", PRIMARY), ("reviewer", REVIEWER)}
+    assert {key: catchup[("reviewer", REVIEWER)][key] for key in _wire(0, 0)} == _wire(
+        20, 8, cached=3, write=2
+    )
+    assert {
+        key: sum(body[("reviewer", REVIEWER)][key] for body in (first, catchup))
+        for key in _wire(0, 0)
+    } == _wire(50, 20, cached=12, write=8)
 
 
 def test_observe_keys_role_on_parent_tool_use_id_and_report_resets() -> None:
@@ -427,6 +671,10 @@ def test_the_session_runner_observes_every_assistant_message_before_the_report()
 
         async def report(self, got: Any, primary_model: str | None) -> None:
             calls.append(("report", got))
+
+        async def report_unfinished(self, primary_model: str | None) -> None: ...
+
+        def absorb(self, message: Any) -> None: ...
 
     runner = SessionRunner(
         max_usd_per_day=None,
@@ -743,3 +991,831 @@ def test_a_failed_reviewer_report_is_replayed_with_its_role_before_the_next_delt
     assert set(kept) == {("implementer", PRIMARY)}
     assert kept[("implementer", PRIMARY)]["input_tokens"] == 50
     assert kept[("implementer", PRIMARY)]["output_tokens"] == 5
+
+
+# --- a context-window suffix on model_usage keys (#3992) ---------------------------
+#
+# The SDK keys ``model_usage`` with the configured id, which can carry a trailing
+# context-window token such as ``[1m]``; ``AssistantMessage.model`` carries the
+# base id. The counts below are the ones a factory run stored for one request.
+
+FAST = "z-ai/glm-5.3-flash"
+OPUS = "anthropic/claude-opus-5.5"
+OPUS_1M = f"{OPUS}[1m]"
+
+
+@pytest.mark.parametrize("primary", [FAST, OPUS_1M])
+def test_a_suffixed_model_usage_key_pairs_with_its_base_model_observations(
+    primary: str,
+) -> None:
+    observed = {
+        ("implementer", FAST): _wire(35696, 9279, cached=750720),
+        ("reviewer", OPUS): _wire(16, 64, cached=45517, write=29094),
+    }
+    if primary == FAST:
+        observed[("implementer", OPUS)] = _wire(0, 4434)
+    message = _result(
+        model_usage={
+            FAST: _model_usage(35696, 9279, cached=750720),
+            OPUS_1M: _model_usage(16, 4498, cached=45517, write=29094),
+        },
+        uuid="turn-suffixed",
+    )
+
+    body = build_usage_body(message, primary, observed=observed)
+
+    assert body is not None
+    models = _by_role_model(body)
+    assert set(models) == {
+        ("implementer", FAST),
+        ("implementer", OPUS_1M),
+        ("reviewer", OPUS_1M),
+    }
+    assert {key: models[("reviewer", OPUS_1M)][key] for key in _wire(0, 0)} == _wire(
+        16, 64, cached=45517, write=29094
+    )
+    assert {key: models[("implementer", OPUS_1M)][key] for key in _wire(0, 0)} == _wire(0, 4434)
+    assert {
+        key: sum(entry[key] for entry in body["models"] if entry["model"] == OPUS_1M)
+        for key in _wire(0, 0)
+    } == _wire(16, 4498, cached=45517, write=29094)
+
+
+def test_a_different_bracketed_model_does_not_take_another_models_observations() -> None:
+    other = "anthropic/claude-opus-5[1m]"
+    observed = {("reviewer", OPUS): _wire(16, 64)}
+    message = _result(model_usage={other: _model_usage(100, 50)}, uuid="turn-other")
+
+    body = build_usage_body(message, other, observed=observed)
+
+    assert body is not None
+    models = _by_role_model(body)
+    assert set(models) == {("implementer", other), ("reviewer", OPUS)}
+    assert {key: models[("implementer", other)][key] for key in _wire(0, 0)} == _wire(100, 50)
+
+
+def test_reviewer_usage_reported_before_its_suffixed_totals_is_not_counted_again() -> None:
+    """The SDK cost guide defines model_usage as cumulative within a session:
+    https://code.claude.com/docs/en/agent-sdk/cost-tracking
+    """
+    recorder = _Recorder()
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            reporter = UsageReporter(
+                str(server.make_url("/v1/work-item-progress/example-request/usage")), TOKEN
+            )
+            reporter.observe(_assistant(FAST, _sdk_usage(100, 10)))
+            reporter.observe(
+                _assistant(
+                    OPUS,
+                    _sdk_usage(16, 64, cached=45517, write=29094),
+                    parent="toolu_example",
+                    message_id="msg_reviewer_early",
+                )
+            )
+            await reporter.report(
+                _result(model_usage={FAST: _model_usage(100, 10)}, uuid="turn_early"), FAST
+            )
+            await reporter.report(
+                _result(
+                    model_usage={
+                        FAST: _model_usage(100, 10),
+                        OPUS_1M: _model_usage(16, 64, cached=45517, write=29094),
+                    },
+                    uuid="turn_caught_up",
+                ),
+                FAST,
+            )
+
+    anyio.run(go)
+    assert [body["turn_id"] for body, _ in recorder.received] == ["turn_early"]
+    early = _by_role_model(recorder.received[0][0])
+    assert set(early) == {("implementer", FAST), ("reviewer", OPUS)}
+
+
+# --- a turn that ends without a result (#4190) ------------------------------------
+#
+# Pinned interface:
+#
+# - ``UsageReporter.report_unfinished(primary_model) -> None``: takes the turn's
+#   observations like ``report`` and, when any ``(role, model)`` bucket is
+#   nonzero, posts one body ``{"turn_id": "unfinished:<hex>", "primary_model",
+#   "models": [{"model", "role", <four wire counts>}]}``. It never moves the
+#   ``model_usage`` baseline and never raises.
+# - ``UsageReporter.absorb(result) -> None``: advances the baseline from a result
+#   that is not reported, and posts nothing.
+# - ``SessionRunner`` calls ``report_unfinished`` for every turn ending, shielded
+#   and bounded by ``session._UNFINISHED_USAGE_BOUND_S``, and ``absorb`` on the
+#   abandoned turn's result it drains before the next prompt.
+
+import contextlib  # noqa: E402
+import time  # noqa: E402
+from collections.abc import AsyncIterator, Callable  # noqa: E402
+
+from claude_agent_sdk import ToolUseBlock  # noqa: E402
+from curie_runner import session as session_module  # noqa: E402
+
+USAGE_PATH_EXAMPLE = "/v1/work-item-progress/example-request/usage"
+# The session id ``_result`` stamps by default; queued turns share it.
+SDK_SESSION = "sdk-session-PLACEHOLDER"
+TURN_EVENT = Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
+
+
+def _tool_assistant(
+    model: str, usage: dict[str, int], message_id: str, session_id: str | None = None
+) -> AssistantMessage:
+    """A mid-tool assistant message; its tool note line passes the redactor at once."""
+
+    return AssistantMessage(
+        content=[ToolUseBlock(id="call_slow", name="Bash", input={"command": "sleep 90"})],
+        model=model,
+        usage=usage,
+        message_id=message_id,
+        session_id=session_id,
+    )
+
+
+def _wire_of(entry: dict[str, Any]) -> dict[str, int]:
+    return {key: entry[key] for key in _wire(0, 0)}
+
+
+def _unfinished(recorder: _Recorder) -> list[dict[str, Any]]:
+    return [body for body, _ in recorder.received if body["turn_id"].startswith("unfinished:")]
+
+
+def _usage_runner(session_factory: Callable[[], Any], reporter: Any) -> SessionRunner:
+    return SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
+        session_factory=session_factory,
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="usage",
+        usage_reporter=reporter,
+        primary_model=PRIMARY,
+    )
+
+
+class _StallingSession:
+    """Yields one assistant message, then waits forever or raises."""
+
+    def __init__(self, first: AssistantMessage, *, then: str = "wait") -> None:
+        self._first = first
+        self._then = then
+        self.interrupts = 0
+
+    async def connect(self) -> None: ...
+
+    async def query(self, _text: str) -> None: ...
+
+    async def receive_turn(self) -> AsyncIterator[Any]:
+        yield self._first
+        if self._then == "raise":
+            raise RuntimeError("sdk iterator failed")
+        await anyio.sleep_forever()
+
+    async def interrupt(self) -> None:
+        self.interrupts += 1
+
+    async def close(self) -> None: ...
+
+
+class _UsageQueueSession:
+    """One message queue across turns, like the SDK's streaming-input client.
+
+    A ``slow`` prompt enqueues an optional reviewer message and one mid-tool
+    implementer message, and stays there until ``interrupt`` enqueues the
+    interrupted result carrying ``interrupted_usage`` (the session total so far).
+    Any other prompt enqueues its answer, an optional fresh reviewer message,
+    and a result carrying ``answer_usage_total`` and ``answer_uuid``.
+    """
+
+    def __init__(
+        self,
+        *,
+        slow_usage: tuple[int, int] = (100, 20),
+        slow_reviewer: tuple[int, int] | None = None,
+        interrupted_usage: dict[str, dict[str, int]] | None = None,
+        answer_usage: tuple[int, int] = (200, 30),
+        answer_reviewer: tuple[int, int] | None = None,
+        answer_usage_total: dict[str, dict[str, int]] | None = None,
+        answer_uuid: str = "turn-two-uuid",
+    ) -> None:
+        self.queue: list[Any] = []
+        self.arrived = anyio.Event()
+        self._mid_tool = False
+        self._slow_usage = slow_usage
+        self._slow_reviewer = slow_reviewer
+        self._interrupted_usage = interrupted_usage or {PRIMARY: _model_usage(*slow_usage)}
+        self._answer_usage = answer_usage
+        self._answer_reviewer = answer_reviewer
+        self._answer_usage_total = answer_usage_total or {PRIMARY: _model_usage(300, 50)}
+        self._answer_uuid = answer_uuid
+
+    async def connect(self) -> None: ...
+
+    async def close(self) -> None: ...
+
+    def _put(self, message: Any) -> None:
+        self.queue.append(message)
+        self.arrived.set()
+
+    async def query(self, text: str) -> None:
+        if text == frame_user_turn("message", "U0EXAMPLE1", "slow", None):
+            self._mid_tool = True
+            if self._slow_reviewer is not None:
+                self._put(
+                    _assistant(
+                        REVIEWER,
+                        _sdk_usage(*self._slow_reviewer),
+                        parent="toolu_review",
+                        message_id="r1",
+                        session_id=SDK_SESSION,
+                    )
+                )
+            self._put(
+                _tool_assistant(
+                    PRIMARY, _sdk_usage(*self._slow_usage), "msg_slow", session_id=SDK_SESSION
+                )
+            )
+            return
+        self._put(
+            _assistant(
+                PRIMARY,
+                _sdk_usage(*self._answer_usage),
+                message_id="msg_answer",
+                session_id=SDK_SESSION,
+            )
+        )
+        if self._answer_reviewer is not None:
+            self._put(
+                _assistant(
+                    REVIEWER,
+                    _sdk_usage(*self._answer_reviewer),
+                    parent="toolu_review",
+                    message_id="r2",
+                    session_id=SDK_SESSION,
+                )
+            )
+        self._put(_result(model_usage=self._answer_usage_total, uuid=self._answer_uuid))
+
+    async def interrupt(self) -> None:
+        if self._mid_tool:
+            self._mid_tool = False
+            self._put(
+                _result(
+                    subtype="error_during_execution",
+                    is_error=True,
+                    result="",
+                    model_usage=self._interrupted_usage,
+                )
+            )
+
+    def receive_turn(self) -> AsyncIterator[Any]:
+        async def _gen() -> AsyncIterator[Any]:
+            while True:
+                while not self.queue:
+                    self.arrived = anyio.Event()
+                    await self.arrived.wait()
+                message = self.queue.pop(0)
+                yield message
+                if isinstance(message, ResultMessage):
+                    return
+
+        return _gen()
+
+
+async def _abandon_at_tool_line(runner: SessionRunner, text: str) -> None:
+    """Read the turn up to its mid-tool line, then close the stream like server.py.
+
+    Every message before the implementer tool call has been observed by then.
+    """
+
+    with anyio.fail_after(5):
+        async with contextlib.aclosing(
+            runner.run_turn(Event(type="message", text=text, user="U0EXAMPLE1", ts="1"))
+        ) as stream:
+            async for line in stream:
+                if "Bash" in line:
+                    break
+
+
+def test_report_unfinished_posts_observed_counts_once_per_role_and_model() -> None:
+    recorder = _Recorder()
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            url = str(server.make_url(USAGE_PATH_EXAMPLE))
+            reporter = UsageReporter(url, TOKEN)
+            implementer = _assistant(PRIMARY, _sdk_usage(100, 20), message_id="m1")
+            reporter.observe(implementer)
+            reporter.observe(implementer)
+            reporter.observe(
+                _assistant(REVIEWER, _sdk_usage(50, 10), parent="toolu_example", message_id="r1")
+            )
+            await reporter.report_unfinished(PRIMARY)
+            await reporter.report_unfinished(PRIMARY)
+            await UsageReporter(url, TOKEN).report_unfinished(PRIMARY)
+
+    anyio.run(go)
+    assert len(recorder.received) == 1
+    body, key = recorder.received[0]
+    assert key == TOKEN
+    assert body["turn_id"].startswith("unfinished:")
+    assert body["primary_model"] == PRIMARY
+    models = _by_role_model(body)
+    assert set(models) == {("implementer", PRIMARY), ("reviewer", REVIEWER)}
+    assert _wire_of(models[("implementer", PRIMARY)]) == _wire(100, 20)
+    assert _wire_of(models[("reviewer", REVIEWER)]) == _wire(50, 10)
+
+
+def test_a_turn_closed_mid_run_posts_its_observed_usage_before_the_close_returns() -> None:
+    recorder = _Recorder()
+    posted_at_close: list[dict[str, Any]] = []
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            session = _StallingSession(_tool_assistant(PRIMARY, _sdk_usage(100, 20), "m1"))
+            runner = _usage_runner(
+                lambda: session, UsageReporter(str(server.make_url(USAGE_PATH_EXAMPLE)), TOKEN)
+            )
+            await runner.start()
+            try:
+                await _abandon_at_tool_line(runner, "go")
+                posted_at_close.extend(_unfinished(recorder))
+                assert session.interrupts == 1
+            finally:
+                await runner.close()
+
+    anyio.run(go)
+    assert len(posted_at_close) == 1
+    assert len(recorder.received) == 1
+    models = _by_role_model(posted_at_close[0])
+    assert set(models) == {("implementer", PRIMARY)}
+    assert _wire_of(models[("implementer", PRIMARY)]) == _wire(100, 20)
+
+
+@pytest.mark.parametrize("ending", ["raise", "cancel"])
+def test_an_iterator_error_or_cancellation_posts_one_unfinished_body(ending: str) -> None:
+    recorder = _Recorder()
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            session = _StallingSession(
+                _tool_assistant(PRIMARY, _sdk_usage(100, 20), "m1"),
+                then="raise" if ending == "raise" else "wait",
+            )
+            runner = _usage_runner(
+                lambda: session, UsageReporter(str(server.make_url(USAGE_PATH_EXAMPLE)), TOKEN)
+            )
+            await runner.start()
+            try:
+                first_line = anyio.Event()
+
+                async def consume() -> None:
+                    async with contextlib.aclosing(runner.run_turn(TURN_EVENT)) as stream:
+                        async for _line in stream:
+                            first_line.set()
+
+                with anyio.fail_after(5):
+                    async with anyio.create_task_group() as tg:
+                        tg.start_soon(consume)
+                        await first_line.wait()
+                        if ending == "cancel":
+                            tg.cancel_scope.cancel()
+            finally:
+                await runner.close()
+
+    anyio.run(go)
+    unfinished = _unfinished(recorder)
+    assert len(unfinished) == 1
+    assert len(recorder.received) == 1
+    models = _by_role_model(unfinished[0])
+    assert set(models) == {("implementer", PRIMARY)}
+    assert _wire_of(models[("implementer", PRIMARY)]) == _wire(100, 20)
+
+
+def test_a_turn_that_reaches_its_result_posts_no_unfinished_body() -> None:
+    recorder = _Recorder()
+    messages = [
+        _assistant(PRIMARY, _sdk_usage(100, 20), message_id="m1"),
+        _result(model_usage={PRIMARY: _model_usage(100, 20)}, uuid="turn-finished"),
+    ]
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            fake = FakeModelSession(lambda: messages)
+            runner = _usage_runner(
+                lambda: fake, UsageReporter(str(server.make_url(USAGE_PATH_EXAMPLE)), TOKEN)
+            )
+            await runner.start()
+            try:
+                lines = [line async for line in runner.run_turn(TURN_EVENT)]
+                assert parse_ndjson("".join(lines))[-1].type == "final"
+            finally:
+                await runner.close()
+
+    anyio.run(go)
+    assert [body["turn_id"] for body, _ in recorder.received] == ["turn-finished"]
+    models = _by_role_model(recorder.received[0][0])
+    assert _wire_of(models[("implementer", PRIMARY)]) == _wire(100, 20)
+
+
+def test_a_hung_unfinished_report_is_bounded_and_the_next_turn_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_module, "_UNFINISHED_USAGE_BOUND_S", 0.2)
+    unfinished_calls: list[str | None] = []
+
+    class _HungReporter:
+        def observe(self, message: Any) -> None: ...
+
+        async def report(self, got: Any, primary_model: str | None) -> None: ...
+
+        async def report_unfinished(self, primary_model: str | None) -> None:
+            unfinished_calls.append(primary_model)
+            await anyio.sleep_forever()
+
+        def absorb(self, message: Any) -> None: ...
+
+    session = _UsageQueueSession()
+    runner = _usage_runner(lambda: session, _HungReporter())
+    elapsed: list[float] = []
+    second_lines: list[str] = []
+
+    async def go() -> None:
+        await runner.start()
+        try:
+            started = time.monotonic()
+            await _abandon_at_tool_line(runner, "slow")
+            elapsed.append(time.monotonic() - started)
+            with anyio.fail_after(5):
+                async for line in runner.run_turn(TURN_EVENT):
+                    second_lines.append(line)
+        finally:
+            await runner.close()
+
+    anyio.run(go)
+    assert unfinished_calls
+    assert elapsed[0] < 2
+    assert second_lines
+    assert parse_ndjson("".join(second_lines))[-1].type == "final"
+
+
+def test_a_drained_abandoned_result_moves_the_baseline_without_a_second_post() -> None:
+    """The abandoned turn's tokens post once, as unfinished; the next turn's
+    cumulative delta starts after them.
+
+    The SDK cost guide defines model_usage as cumulative within a session:
+    https://code.claude.com/docs/en/agent-sdk/cost-tracking
+    """
+
+    recorder = _Recorder()
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            session = _UsageQueueSession()
+            runner = _usage_runner(
+                lambda: session, UsageReporter(str(server.make_url(USAGE_PATH_EXAMPLE)), TOKEN)
+            )
+            await runner.start()
+            try:
+                await _abandon_at_tool_line(runner, "slow")
+                with anyio.fail_after(5):
+                    lines = [line async for line in runner.run_turn(TURN_EVENT)]
+                assert parse_ndjson("".join(lines))[-1].type == "final"
+                assert session.queue == []
+            finally:
+                await runner.close()
+
+    anyio.run(go)
+    assert len(recorder.received) == 2
+    first, second = (body for body, _ in recorder.received)
+    assert first["turn_id"].startswith("unfinished:")
+    first_models = _by_role_model(first)
+    assert set(first_models) == {("implementer", PRIMARY)}
+    assert _wire_of(first_models[("implementer", PRIMARY)]) == _wire(100, 20)
+    assert second["turn_id"] == "turn-two-uuid"
+    second_models = _by_role_model(second)
+    assert set(second_models) == {("implementer", PRIMARY)}
+    assert _wire_of(second_models[("implementer", PRIMARY)]) == _wire(200, 30)
+
+
+@pytest.mark.parametrize(
+    ("drained_has_reviewer", "fresh_reviewer"),
+    [(False, False), (True, False), (True, True)],
+)
+def test_unfinished_reviewer_usage_is_not_counted_again_when_totals_catch_up(
+    drained_has_reviewer: bool,
+    fresh_reviewer: bool,
+) -> None:
+    """Reviewer counts posted as unfinished are consumed when their totals arrive.
+
+    The totals can already be in the drained result or appear only in a later
+    turn's cumulative model_usage; either way they are not posted again, and a
+    fresh reviewer message in the later turn still posts its own usage.
+    https://code.claude.com/docs/en/agent-sdk/cost-tracking
+    """
+
+    recorder = _Recorder()
+    interrupted = {PRIMARY: _model_usage(100, 20)}
+    if drained_has_reviewer:
+        interrupted[REVIEWER] = _model_usage(50, 10)
+    answer_total = {
+        PRIMARY: _model_usage(300, 50),
+        REVIEWER: _model_usage(55, 11) if fresh_reviewer else _model_usage(50, 10),
+    }
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            session = _UsageQueueSession(
+                slow_reviewer=(50, 10),
+                interrupted_usage=interrupted,
+                answer_reviewer=(5, 1) if fresh_reviewer else None,
+                answer_usage_total=answer_total,
+            )
+            runner = _usage_runner(
+                lambda: session, UsageReporter(str(server.make_url(USAGE_PATH_EXAMPLE)), TOKEN)
+            )
+            await runner.start()
+            try:
+                await _abandon_at_tool_line(runner, "slow")
+                with anyio.fail_after(5):
+                    lines = [line async for line in runner.run_turn(TURN_EVENT)]
+                assert parse_ndjson("".join(lines))[-1].type == "final"
+                assert session.queue == []
+            finally:
+                await runner.close()
+
+    anyio.run(go)
+    assert len(recorder.received) == 2
+    first, second = (body for body, _ in recorder.received)
+    assert first["turn_id"].startswith("unfinished:")
+    first_models = _by_role_model(first)
+    assert set(first_models) == {("implementer", PRIMARY), ("reviewer", REVIEWER)}
+    assert _wire_of(first_models[("implementer", PRIMARY)]) == _wire(100, 20)
+    assert _wire_of(first_models[("reviewer", REVIEWER)]) == _wire(50, 10)
+    assert second["turn_id"] == "turn-two-uuid"
+    second_models = _by_role_model(second)
+    expected = {("implementer", PRIMARY)}
+    if fresh_reviewer:
+        expected.add(("reviewer", REVIEWER))
+    assert set(second_models) == expected
+    assert _wire_of(second_models[("implementer", PRIMARY)]) == _wire(200, 30)
+    if fresh_reviewer:
+        assert _wire_of(second_models[("reviewer", REVIEWER)]) == _wire(5, 1)
+
+
+def test_unfinished_reviewer_usage_from_a_replaced_session_is_not_subtracted() -> None:
+    """A replaced SDK session's unfinished reviewer counts never reduce a new session's.
+
+    The new session's first result restarts the total, so its own reviewer usage
+    posts in full.
+    """
+
+    recorder = _Recorder()
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            reporter = UsageReporter(str(server.make_url(USAGE_PATH_EXAMPLE)), TOKEN)
+            reporter.observe(
+                _assistant(
+                    REVIEWER,
+                    _sdk_usage(50, 10),
+                    parent="toolu_example",
+                    message_id="r-old",
+                    session_id="sdk-session-old",
+                )
+            )
+            await reporter.report_unfinished(PRIMARY)
+            reporter.observe(
+                _assistant(
+                    REVIEWER,
+                    _sdk_usage(100, 20),
+                    parent="toolu_example",
+                    message_id="r-new",
+                    session_id="sdk-session-new",
+                )
+            )
+            reporter.observe(
+                _assistant(
+                    PRIMARY, _sdk_usage(10, 1), message_id="m-new", session_id="sdk-session-new"
+                )
+            )
+            await reporter.report(
+                _result(
+                    session_id="sdk-session-new",
+                    model_usage={PRIMARY: _model_usage(10, 1), REVIEWER: _model_usage(100, 20)},
+                    uuid="turn-new-session",
+                ),
+                PRIMARY,
+            )
+
+    anyio.run(go)
+    assert len(recorder.received) == 2
+    first, second = (body for body, _ in recorder.received)
+    assert first["turn_id"].startswith("unfinished:")
+    assert _wire_of(_by_role_model(first)[("reviewer", REVIEWER)]) == _wire(50, 10)
+    assert second["turn_id"] == "turn-new-session"
+    models = _by_role_model(second)
+    assert set(models) == {("implementer", PRIMARY), ("reviewer", REVIEWER)}
+    assert _wire_of(models[("reviewer", REVIEWER)]) == _wire(100, 20)
+    assert _wire_of(models[("implementer", PRIMARY)]) == _wire(10, 1)
+
+
+def test_unfinished_reviewer_usage_from_two_sessions_is_not_merged() -> None:
+    """A replacement session's unfinished counts do not inherit the old session's.
+
+    Absorbing the replacement's own result consumes exactly its own reviewer
+    counts, so nothing is subtracted from its later usage.
+    """
+
+    recorder = _Recorder()
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            reporter = UsageReporter(str(server.make_url(USAGE_PATH_EXAMPLE)), TOKEN)
+            for session_id, usage in (("sdk-session-a", (50, 10)), ("sdk-session-b", (100, 20))):
+                reporter.observe(
+                    _assistant(
+                        REVIEWER,
+                        _sdk_usage(*usage),
+                        parent="toolu_example",
+                        message_id=f"r-{session_id}",
+                        session_id=session_id,
+                    )
+                )
+                await reporter.report_unfinished(PRIMARY)
+            reporter.absorb(
+                _result(session_id="sdk-session-b", model_usage={REVIEWER: _model_usage(100, 20)})
+            )
+            reporter.observe(
+                _assistant(
+                    REVIEWER, _sdk_usage(200, 40), message_id="m-b", session_id="sdk-session-b"
+                )
+            )
+            await reporter.report(
+                _result(
+                    session_id="sdk-session-b",
+                    model_usage={REVIEWER: _model_usage(300, 60)},
+                    uuid="turn-session-b",
+                ),
+                PRIMARY,
+            )
+
+    anyio.run(go)
+    assert len(recorder.received) == 3
+    last = recorder.received[-1][0]
+    assert last["turn_id"] == "turn-session-b"
+    models = _by_role_model(last)
+    assert set(models) == {("implementer", REVIEWER)}
+    assert _wire_of(models[("implementer", REVIEWER)]) == _wire(200, 40)
+
+
+def test_unfinished_reviewer_usage_of_a_session_after_a_reported_one_catches_up_once() -> None:
+    """A replacement session's pending reviewer counts survive its own first result.
+
+    Session A already reported, so B's drained result restarts the total from
+    A's. B's unfinished reviewer counts still belong to B, so when its delayed
+    reviewer totals arrive they are not posted again as implementer usage.
+    """
+
+    recorder = _Recorder()
+    a, b = "sdk-session-a", "sdk-session-b"
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            reporter = UsageReporter(str(server.make_url(USAGE_PATH_EXAMPLE)), TOKEN)
+            reporter.observe(_assistant(PRIMARY, _sdk_usage(10, 1), message_id="m-a", session_id=a))
+            await reporter.report(
+                _result(session_id=a, model_usage={PRIMARY: _model_usage(10, 1)}, uuid="turn-a"),
+                PRIMARY,
+            )
+            reporter.observe(
+                _assistant(PRIMARY, _sdk_usage(100, 20), message_id="m-b1", session_id=b)
+            )
+            reporter.observe(
+                _assistant(
+                    REVIEWER,
+                    _sdk_usage(50, 10),
+                    parent="toolu_example",
+                    message_id="r-b1",
+                    session_id=b,
+                )
+            )
+            await reporter.report_unfinished(PRIMARY)
+            reporter.absorb(_result(session_id=b, model_usage={PRIMARY: _model_usage(100, 20)}))
+            reporter.observe(
+                _assistant(PRIMARY, _sdk_usage(200, 30), message_id="m-b2", session_id=b)
+            )
+            await reporter.report(
+                _result(
+                    session_id=b,
+                    model_usage={PRIMARY: _model_usage(300, 50), REVIEWER: _model_usage(50, 10)},
+                    uuid="turn-b",
+                ),
+                PRIMARY,
+            )
+
+    anyio.run(go)
+    assert [body["turn_id"] for body, _ in recorder.received][::2] == ["turn-a", "turn-b"]
+    assert recorder.received[1][0]["turn_id"].startswith("unfinished:")
+    assert len(recorder.received) == 3
+    last = recorder.received[-1][0]
+    models = _by_role_model(last)
+    assert set(models) == {("implementer", PRIMARY)}
+    assert _wire_of(models[("implementer", PRIMARY)]) == _wire(200, 30)
+
+
+def test_unfinished_usage_on_a_shared_model_catches_up_by_model_total() -> None:
+    """An unfinished body's implementer and reviewer counts on one model both
+    catch up against that model's later cumulative totals, so the posted sum
+    equals what the session spent.
+
+    https://code.claude.com/docs/en/agent-sdk/cost-tracking
+    """
+
+    recorder = _Recorder()
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            reporter = UsageReporter(str(server.make_url(USAGE_PATH_EXAMPLE)), TOKEN)
+            reporter.observe(
+                _assistant(SHARED, _sdk_usage(100, 20), message_id="m1", session_id=SDK_SESSION)
+            )
+            reporter.observe(
+                _assistant(
+                    SHARED,
+                    _sdk_usage(50, 10),
+                    parent="toolu_example",
+                    message_id="r1",
+                    session_id=SDK_SESSION,
+                )
+            )
+            await reporter.report_unfinished(SHARED)
+            reporter.absorb(_result(model_usage={SHARED: _model_usage(100, 20)}))
+            reporter.observe(
+                _assistant(SHARED, _sdk_usage(200, 30), message_id="m2", session_id=SDK_SESSION)
+            )
+            await reporter.report(
+                _result(model_usage={SHARED: _model_usage(350, 60)}, uuid="turn-shared"),
+                SHARED,
+            )
+
+    anyio.run(go)
+    assert len(recorder.received) == 2
+    first, last = (body for body, _ in recorder.received)
+    assert first["turn_id"].startswith("unfinished:")
+    assert last["turn_id"] == "turn-shared"
+
+    def total(body: dict[str, Any]) -> dict[str, int]:
+        return {
+            key: sum(e[key] for e in body["models"] if e["model"] == SHARED) for key in _wire(0, 0)
+        }
+
+    assert total(first) == _wire(150, 30)
+    assert total(last) == _wire(200, 30)
+    assert {key: total(first)[key] + total(last)[key] for key in _wire(0, 0)} == _wire(350, 60)
+
+
+def test_unfinished_usage_carries_onto_a_reset_within_its_own_session() -> None:
+    """A cumulative drop in the same session keeps the unfinished counts.
+
+    The reset may have come before the unfinished turn, in which case the next
+    total already includes its tokens; keeping them never counts a token twice.
+    """
+
+    recorder = _Recorder()
+
+    async def go() -> None:
+        async with TestServer(recorder.app()) as server:
+            reporter = UsageReporter(str(server.make_url(USAGE_PATH_EXAMPLE)), TOKEN)
+            reporter.observe(
+                _assistant(PRIMARY, _sdk_usage(900, 90), message_id="m1", session_id=SDK_SESSION)
+            )
+            await reporter.report(
+                _result(model_usage={PRIMARY: _model_usage(900, 90)}, uuid="turn-before"),
+                PRIMARY,
+            )
+            reporter.observe(
+                _assistant(PRIMARY, _sdk_usage(100, 10), message_id="m2", session_id=SDK_SESSION)
+            )
+            await reporter.report_unfinished(PRIMARY)
+            reporter.observe(
+                _assistant(PRIMARY, _sdk_usage(200, 20), message_id="m3", session_id=SDK_SESSION)
+            )
+            await reporter.report(
+                _result(model_usage={PRIMARY: _model_usage(300, 30)}, uuid="turn-after-reset"),
+                PRIMARY,
+            )
+
+    anyio.run(go)
+    assert len(recorder.received) == 3
+    unfinished, last = recorder.received[1][0], recorder.received[2][0]
+    assert unfinished["turn_id"].startswith("unfinished:")
+    assert last["turn_id"] == "turn-after-reset"
+    models = _by_role_model(last)
+    assert set(models) == {("implementer", PRIMARY)}
+    assert _wire_of(models[("implementer", PRIMARY)]) == _wire(200, 20)

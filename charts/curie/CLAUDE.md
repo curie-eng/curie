@@ -169,6 +169,20 @@ component and rail detail in `charts/curie/README.md`.
   canonical overlay for that shape (all four stores off, Secret references,
   three buckets, narrow S3 egress). Pin it with
   `ci/external-values-profile-assertions.sh`.
+- **`attachments-init` has a docker twin, held by a shared vector.** The
+  program `templates/agent-sandbox.yaml` renders into the sandbox's
+  `attachments-init` container and the docker driver's `_prepare_attachments`
+  (`apps/worker/src/curie_worker/sandbox/docker.py`) redeem the same
+  `CURIE_ATTACHMENTS_REF` payload and must agree on every outcome: names written
+  exactly, current files first and all-or-nothing, earlier files skipped with a
+  reason in `.curie-attachments-status.json`, a digest mismatch fatal either
+  way (ADR 0205); a payload with no "c" keeps the pre-ADR rules, so a new
+  chart never regresses an old worker. Change one and you change the other in the same PR;
+  `tests/vectors/attachment-init-outcomes.json` is run through both by
+  `ci/attachment-init-behavior-assertions.sh` and
+  `test_docker_attachment_claim.py`. The worker's `threadMaxBytes` must fit the
+  attachments emptyDir's `sizeLimit`; the worker template refuses to render
+  otherwise.
 - **Values keys are camelCase, not hyphenated.** Go templates cannot
   dot-index a hyphenated key. Keep this consistent across any new values
   additions.
@@ -193,6 +207,17 @@ component and rail detail in `charts/curie/README.md`.
   that refusal into a default would silently drop every scheduling
   constraint the operator asked for. A new pod surface added to the chart
   uses the helper with its class name rather than a fresh direct index.
+- **A new top level values key is nil under `--reuse-values` from any
+  release that predates it.** Helm renders the new templates against the
+  OLD chart's values.yaml plus the stored operator values, so
+  `.Values.<newKey>.<field>` dereferences nil and the upgrade dies
+  (`connectorCaller`, #3505). Read it through
+  `(get (.Values.<newKey> | default dict) "<field>")` as #3544 did.
+  `ci/reuse-values-render-assertions.sh` renders the candidate on the
+  newest stable release's and a pinned v0.10.3's values.yaml, under no
+  operator values, the release's `values-dev.yaml`, and
+  `ci/fixtures/reuse-values-operator.yaml`, and its negative control
+  reverts the #3544 guard (#3813).
 - **Fail-closed egress, always.** `security.networkPolicy.allowedEgress` is
   empty by default; an unset allowlist must never mean allow-all. If you add
   a new egress destination the runner needs, it goes into this allowlist
@@ -259,9 +284,15 @@ component and rail detail in `charts/curie/README.md`.
   false`, and it types only four bounded values: the three worker knobs
   (`worker.claimTimeoutSeconds`, `worker.routeTtlSeconds`,
   `worker.suspendedRouteTtlSeconds`) and the approval-chat attester's explicit
-  nonblank contract (`api.approvalChatAttesterSecret`), plus the new
+  nonblank contract (`api.approvalChatAttesterSecret`), plus
+  `worker.streamRetention.minAgeSeconds` (a new key, so no existing values
+  file can disagree with it; the template reads it through `dig` for a
+  retained release without the block) and the new
   `e2eConnectorIdentity` block, whose prefix and label patterns keep its
-  values safe to embed in the admission policy's CEL (#3243). Adding a `required` or
+  values safe to embed in the admission policy's CEL (#3243), and the new
+  `worker.attachments.threadMaxFiles` / `threadMaxBytes` thread budget (ADR
+  0205; new keys, read in the template with a default so a `--reuse-values`
+  upgrade from a release without them still renders). Adding a `required` or
   `additionalProperties: false` constraint, or typing any other existing
   key, would fail every install whose values file happens not to match the
   new shape -- broaden the schema only for a key you are prepared to
@@ -291,11 +322,10 @@ component and rail detail in `charts/curie/README.md`.
     can store `placement: null`, and `--reuse-values` on upgrade replays
     it, deleting the key -- and the `curie.placement.class` helper (see
     the values-keys invariant above) is its template-level backstop
-    (#2008). `worker.publication.githubHttpsCidrs` is a third instance:
-    `minItems: 1` catches `[]`, but a coalesced nil deletes the key and a
-    `range` over it used to emit an empty `to:` (allow-all on 443 for the
-    tokenless publication job). The template `fail` in
-    `publication-owner.yaml` is the backstop (#2321).
+    (#2008). Publication egress is a third: an empty
+    `curie.factory.egress` list would emit an empty `to:` (allow-all
+    for the tokenless publication job), so `publication-owner.yaml` fails on
+    it (#2321, #4397).
 
 ## Verify
 

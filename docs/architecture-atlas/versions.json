@@ -1,6 +1,6 @@
 {
   "schemaVersion": "1.0",
-  "defaultVersion": "v0.11.2",
+  "defaultVersion": "v0.13.0",
   "versions": [
     {
       "id": "v0.7.1",
@@ -217,6 +217,78 @@
       "date": "2026-10-02",
       "branch": "main",
       "commit": "1619a0a4f220f2058591497d89b0304a962c9b4e"
+    },
+    {
+      "id": "v0.12.0-rc.1",
+      "label": "v0.12.0-rc.1",
+      "file": "snapshots/v0.12.0-rc.1.json",
+      "date": "2026-10-02",
+      "branch": "next",
+      "commit": "43a53488fca082d5749eead2ffd47abc08b8867a"
+    },
+    {
+      "id": "v0.12.0",
+      "label": "v0.12.0",
+      "file": "snapshots/v0.12.0.json",
+      "date": "2026-10-02",
+      "branch": "next",
+      "commit": "1441ec9248ee38bb0f89ce0e6b43a18f08a733f2"
+    },
+    {
+      "id": "v0.12.1",
+      "label": "v0.12.1",
+      "file": "snapshots/v0.12.1.json",
+      "date": "2026-10-04",
+      "branch": "main",
+      "commit": "30c92418c889ef634a93b621994ac3450c17de50"
+    },
+    {
+      "id": "v0.12.2",
+      "label": "v0.12.2",
+      "file": "snapshots/v0.12.2.json",
+      "date": "2026-10-06",
+      "branch": "main",
+      "commit": "e2082c288ba8624e7a551a535cdd4cae0d3acb03"
+    },
+    {
+      "id": "v0.12.3",
+      "label": "v0.12.3",
+      "file": "snapshots/v0.12.3.json",
+      "date": "2026-10-08",
+      "branch": "main",
+      "commit": "b5162bb4367fdf0d370c500cb3b4a268acd67a94"
+    },
+    {
+      "id": "audit-2026-10-10-f66c4aa5",
+      "label": "Seam audit 2026-10-10 (f66c4aa5)",
+      "file": "snapshots/audit-2026-10-10-f66c4aa5.json",
+      "date": "2026-10-10",
+      "branch": "main",
+      "commit": "f66c4aa55523f474da50dc7261a3b9373ede988a"
+    },
+    {
+      "id": "v0.12.4",
+      "label": "v0.12.4",
+      "file": "snapshots/v0.12.4.json",
+      "date": "2026-10-11",
+      "branch": "main",
+      "commit": "0da08c943d930d17f3090d24934198f3253f17ec"
+    },
+    {
+      "id": "v0.12.5",
+      "label": "v0.12.5",
+      "file": "snapshots/v0.12.5.json",
+      "date": "2026-10-13",
+      "branch": "main",
+      "commit": "4ac7f1c10af3616f3ec50e04d42125891c8be145"
+    },
+    {
+      "id": "v0.13.0",
+      "label": "v0.13.0",
+      "file": "snapshots/v0.13.0.json",
+      "date": "2026-10-14",
+      "branch": "next",
+      "commit": "e0f795e531e658c448b6039e565339ca1c68f56f"
     }
   ]
 }

@@ -10,18 +10,14 @@ import json
 
 import pytest
 from curie_runner import PluginBundleError
-from curie_runner import __main__ as boot
 from curie_runner.__main__ import DEFAULT_HARNESS, _resolve_harness, build_runner
 from curie_runner.config import RunnerConfig
-from curie_runner.harness.contribution import (
-    AuthSpec,
-    BundleCompileResult,
-    HarnessContribution,
-    InstallSpec,
-)
+from curie_runner.harness import registry
+from curie_runner.harness.contribution import BundleCompileResult, HarnessContribution
 from curie_runner.harness.registry import (
     MalformedHarnessContributionError,
     UnknownHarnessError,
+    UnsupportedHarnessError,
 )
 from curie_runner.history import ConversationMessage, ConversationReplay
 
@@ -47,11 +43,7 @@ def _harness(**overrides) -> HarnessContribution:
     boot path read from THIS manifest or fell back to hardcoded Claude values."""
     defaults: dict = dict(
         name="test-harness",
-        image="test-image",
-        install=InstallSpec(),
-        auth=AuthSpec(credential_env_keys=(), oauth_token_prefix=None),
         readonly_tools=frozenset({"CustomReadOnly"}),
-        model_override_env_keys=(),
         build_spawn_env=lambda env: None,
         compile_bundle=lambda plugin_dir: BundleCompileResult(
             plugins=[], system_prompt=None
@@ -89,10 +81,41 @@ def test_claude_runner_materializes_history_without_system_prompt_preamble(tmp_p
     runner = build_runner(config, conversation_replay=replay)
     options = runner._factory()._options
 
+    # An ineligible boot preserves the pre-progress model surface exactly.
     assert options.system_prompt is None
     assert options.resume is not None
     assert options.session_store is not None
     assert runner._history_resumed is True
+
+
+def test_only_an_eligible_boot_mounts_the_progress_tool_and_prompt(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import anyio
+    import mcp.types as mcp_types
+    from curie_runner.tool_names import TURN_PROGRESS_TOOL
+    from curie_runner.turn_progress import (
+        PROGRESS_PREAMBLE,
+        TURN_PROGRESS_ELIGIBILITY_ENV,
+    )
+
+    async def tool_names(runner: object) -> set[str]:
+        options = runner._factory()._options  # type: ignore[attr-defined]
+        server = options.mcp_servers["curie"]
+        entry = server["instance"].get_request_handler("tools/list")
+        assert entry is not None
+        result = await entry.handler(None, mcp_types.PaginatedRequestParams())
+        return {tool.name for tool in result.tools}
+
+    monkeypatch.delenv(TURN_PROGRESS_ELIGIBILITY_ENV, raising=False)
+    ineligible = build_runner(_config(tmp_path / "off"))
+    assert TURN_PROGRESS_TOOL not in anyio.run(tool_names, ineligible)
+    assert ineligible._factory()._options.system_prompt is None
+
+    monkeypatch.setenv(TURN_PROGRESS_ELIGIBILITY_ENV, "1")
+    eligible = build_runner(_config(tmp_path / "on"))
+    assert TURN_PROGRESS_TOOL in anyio.run(tool_names, eligible)
+    assert eligible._factory()._options.system_prompt == PROGRESS_PREAMBLE
 
 
 def test_claude_runner_offers_provider_web_search_by_default(tmp_path) -> None:
@@ -158,17 +181,20 @@ def test_build_runner_routes_bundle_compile_through_the_harness(tmp_path) -> Non
     assert calls == [config.session.plugin_dir]
 
 
-def test_resolve_harness_default_alias_and_unknown() -> None:
+def test_resolve_harness_default_and_builtin_names() -> None:
     assert _resolve_harness().name == "claude"
-    assert _resolve_harness("claude-sdk").name == "claude"  # an alias resolves
-    with pytest.raises(UnknownHarnessError):
-        _resolve_harness("no-such-harness")
+    for name in ("claude", "claude-sdk", "claude-code"):
+        assert _resolve_harness(name).name == "claude"
+
+
+@pytest.mark.parametrize("name", ["rival", "no-such-harness"])
+def test_resolve_harness_refuses_an_alternate_engine(name: str) -> None:
+    with pytest.raises(UnsupportedHarnessError, match=name):
+        _resolve_harness(name)
 
 
 def test_config_selected_unregistered_harness_fails_loud() -> None:
-    # End to end: a config-selected harness that isn't registered raises through
-    # the same _resolve_harness(config.harness) call main() makes -- no silent
-    # fallback for a non-built-in name, so a misconfigured harness fails visibly.
+    # The config selection reaches the same refusal that process boot uses.
     cfg = RunnerConfig.from_env(
         {
             "CURIE_PLUGIN_DIR": "/b",
@@ -179,35 +205,32 @@ def test_config_selected_unregistered_harness_fails_loud() -> None:
         }
     )
     assert cfg.harness == "no-such-harness"
-    with pytest.raises(UnknownHarnessError):
+    with pytest.raises(UnsupportedHarnessError, match="no-such-harness"):
         _resolve_harness(cfg.harness)
 
 
 def test_resolve_harness_falls_back_to_builtin_when_registry_misses(monkeypatch) -> None:
-    # If entry-point discovery somehow cannot surface the built-in, the default
-    # falls back to its direct import so the boot path never loses Claude. A
-    # non-built-in name still raises rather than silently falling back.
-    def miss(name: str, **kwargs: object) -> HarnessContribution:
-        raise UnknownHarnessError(name)
+    # The built in and its aliases remain independent of registration metadata.
+    def miss() -> dict[str, HarnessContribution]:
+        raise UnknownHarnessError("no contributions registered")
 
-    monkeypatch.setattr(boot, "resolve_harness", miss)
+    monkeypatch.setattr(registry, "discover_contributions", miss)
     assert _resolve_harness(DEFAULT_HARNESS).name == "claude"
-    with pytest.raises(UnknownHarnessError):
+    assert _resolve_harness("claude-sdk").name == "claude"
+    assert _resolve_harness("claude-code").name == "claude"
+    with pytest.raises(UnsupportedHarnessError, match="other"):
         _resolve_harness("other")
 
 
 def test_default_harness_survives_a_malformed_sibling(monkeypatch) -> None:
-    # #865: a malformed / colliding / import-crashing sibling entry point makes
-    # discover_contributions raise a GUARD error (not UnknownHarnessError), which
-    # the old code let propagate past the fallback and take the built-in down with
-    # it. The built-in must never depend on that scan, so a built-in name -- its
-    # declared name AND every alias -- still resolves to Claude. A non-built-in
-    # name still surfaces the guard error loudly rather than silently falling back.
-    def boom(name: str, **kwargs: object) -> HarnessContribution:
+    # A malformed sibling cannot take the built in or its aliases down. An
+    # alternate selection is refused before a registry error escapes discovery.
+    def boom() -> dict[str, HarnessContribution]:
         raise MalformedHarnessContributionError("a sibling entry point is broken")
 
-    monkeypatch.setattr(boot, "resolve_harness", boom)
+    monkeypatch.setattr(registry, "discover_contributions", boom)
     assert _resolve_harness(DEFAULT_HARNESS).name == "claude"
-    assert _resolve_harness("claude-sdk").name == "claude"  # aliases protected too
-    with pytest.raises(MalformedHarnessContributionError):
+    assert _resolve_harness("claude-sdk").name == "claude"
+    assert _resolve_harness("claude-code").name == "claude"
+    with pytest.raises(UnsupportedHarnessError, match="other"):
         _resolve_harness("other")

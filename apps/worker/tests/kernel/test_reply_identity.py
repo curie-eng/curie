@@ -85,6 +85,7 @@ class _TripleBinding:
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+    **_: object,
     ) -> dict[str, str]:
         env = {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',
@@ -175,7 +176,7 @@ class _RecordingApprovals:
     def __init__(self) -> None:
         self.requests: list[object] = []
 
-    async def create(self, request: object) -> CreatedApproval:
+    async def create(self, request: object, *, budget_s: float = 120) -> CreatedApproval:
         self.requests.append(request)
         return CreatedApproval(id=f"appr-{len(self.requests)}", status="pending")
 

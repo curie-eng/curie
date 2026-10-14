@@ -97,10 +97,7 @@ tests:
         exp_alerts:
           - exp_labels:
               component: curie-canary
-              outcome: accepted
-              service_name: curie-worker
               severity: page
-              source: worker
             exp_annotations:
               summary: No Curie turn has been accepted for 90 minutes
               description: >-
@@ -494,6 +491,119 @@ tests:
         alertname: CurieMailAdapterNotReady
         exp_alerts: []
 
+  - name: stale Slack Email intake scan fires
+    interval: 1m
+    input_series:
+      - series: 'sre_slack_email_intake_ready'
+        values: '0x6'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SreSlackEmailIntakeNotReady
+        exp_alerts:
+          - exp_labels:
+              component: sre-slack-email-intake
+              severity: page
+            exp_annotations:
+              summary: Slack Email alert intake is not ready
+              description: >-
+                The opt-in Slack Email intake has not completed a scan within
+                two poll intervals, has no ready replica or Prometheus scrape,
+                was scaled to zero, or disappeared after previously being
+                deployed. Alert emails may not be starting SRE turns in their
+                source threads.
+
+  - name: healthy Slack Email intake stays quiet
+    interval: 1m
+    input_series:
+      - series: 'sre_slack_email_intake_ready'
+        values: '1x6'
+      - series: 'kube_deployment_status_replicas_unavailable{deployment="sre-slack-email-intake",namespace="observability"}'
+        values: '0x6'
+      - series: 'kube_deployment_spec_replicas{deployment="sre-slack-email-intake",namespace="observability"}'
+        values: '1x6'
+      - series: 'kube_pod_container_status_restarts_total{container="intake",pod="sre-slack-email-intake-example",namespace="observability"}'
+        values: '0x6'
+      - series: 'up{job="kubernetes-pods",pod="sre-slack-email-intake-example",namespace="observability"}'
+        values: '1x6'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SreSlackEmailIntakeNotReady
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: SreSlackEmailIntakeRestarted
+        exp_alerts: []
+
+  - name: missing Slack Email intake scrape fires while deployment exists
+    interval: 1m
+    input_series:
+      - series: 'sre_slack_email_intake_ready'
+        values: '1x6'
+      - series: 'kube_deployment_status_replicas_unavailable{deployment="sre-slack-email-intake",namespace="observability"}'
+        values: '0x6'
+      - series: 'kube_deployment_spec_replicas{deployment="sre-slack-email-intake",namespace="observability"}'
+        values: '1x6'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SreSlackEmailIntakeNotReady
+        exp_alerts:
+          - exp_labels:
+              component: sre-slack-email-intake
+              deployment: sre-slack-email-intake
+              namespace: observability
+              severity: page
+            exp_annotations:
+              summary: Slack Email alert intake is not ready
+              description: >-
+                The opt-in Slack Email intake has not completed a scan within
+                two poll intervals, has no ready replica or Prometheus scrape,
+                was scaled to zero, or disappeared after previously being
+                deployed. Alert emails may not be starting SRE turns in their
+                source threads.
+
+  - name: Slack Email intake marker keeps a deleted deployment alarming
+    interval: 1m
+    input_series:
+      - series: 'kube_configmap_info{configmap="sre-slack-email-intake-code",namespace="observability"}'
+        values: '1x6'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SreSlackEmailIntakeNotReady
+        exp_alerts:
+          - exp_labels:
+              component: sre-slack-email-intake
+              configmap: sre-slack-email-intake-code
+              namespace: observability
+              severity: page
+            exp_annotations:
+              summary: Slack Email alert intake is not ready
+              description: >-
+                The opt-in Slack Email intake has not completed a scan within
+                two poll intervals, has no ready replica or Prometheus scrape,
+                was scaled to zero, or disappeared after previously being
+                deployed. Alert emails may not be starting SRE turns in their
+                source threads.
+
+  - name: first Slack Email intake restart sample fires
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_restarts_total{container="intake",pod="sre-slack-email-intake-example",namespace="observability"}'
+        values: '1x6'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: SreSlackEmailIntakeRestarted
+        exp_alerts:
+          - exp_labels:
+              component: sre-slack-email-intake
+              container: intake
+              namespace: observability
+              pod: sre-slack-email-intake-example
+              severity: page
+            exp_annotations:
+              summary: Slack Email alert intake restarted
+              description: >-
+                The intake process restarted after a configuration, Slack,
+                file-download, hook, routing, or stale-placeholder failure.
+
   - name: sustained low memory headroom fires
     interval: 5m
     input_series:
@@ -746,14 +856,13 @@ tests:
   # One installation can run several mail adapters, one per mailbox, named
   # with a suffix. PromQL label matchers are fully anchored, so
   # `deployment=~".*mail-adapter"` matches `mail-adapter` and not
-  # `mail-adapter-brand`. On the downstream cluster that measured this, two of
-  # its three adapters could never alert.
+  # `acme-mail-adapter-example`, so a suffixed adapter needs the trailing wildcard.
   - name: a suffixed mail adapter with unavailable replicas fires
     interval: 1m
     input_series:
-      - series: 'kube_deployment_spec_replicas{namespace="curie",deployment="mail-adapter-brand"}'
+      - series: 'kube_deployment_spec_replicas{namespace="curie",deployment="acme-mail-adapter-example"}'
         values: '1x15'
-      - series: 'kube_deployment_status_replicas_unavailable{namespace="curie",deployment="mail-adapter-brand"}'
+      - series: 'kube_deployment_status_replicas_unavailable{namespace="curie",deployment="acme-mail-adapter-example"}'
         values: '1x15'
     alert_rule_test:
       - eval_time: 10m
@@ -763,7 +872,7 @@ tests:
               severity: page
               component: curie-token
               namespace: curie
-              deployment: mail-adapter-brand
+              deployment: acme-mail-adapter-example
             exp_annotations:
               summary: Mail adapter replicas are unavailable
               description: The mail adapter Deployment has unavailable replicas. An expired channel token fails /readyz and surfaces here without inspecting a token value.
@@ -3026,15 +3135,17 @@ tests:
         alertname: CurieWorkerSupervisedRestartLoop
         exp_alerts: []
 
-  # CurieTurnAcceptedStale is about a label set, not a process. A restart ends
-  # the old instance's series and starts the new one's at its first turn, so a
-  # count per series pages on the old instance's flat series and cannot see the
-  # new one's first turn. The rule counts each window over every instance of a
-  # label set. The 90m count reads a series first sampled inside the window from
-  # zero, whether or not its process is still exporting, and a label set with
-  # turns in 7 days but no 90m count counts 0 there. The 7d count is increase()
-  # alone: with under seven days of history every live series would look new
-  # over 7d. The alert names no instance.
+  # CurieTurnAcceptedStale is about an installation, not a process or a label
+  # combination. A restart ends the old instance's series and starts the new
+  # one's at its first turn, so a count per series pages on the old instance's
+  # flat series and cannot see the new one's first turn; and a combination that
+  # goes quiet while others accept turns is no missed canary. The rule counts
+  # each window over every instance and combination of the installation. The
+  # 90m count reads a series first sampled inside the window from zero, whether
+  # or not its process is still exporting, and an installation with turns in 7
+  # days but no 90m count counts 0 there. The 7d count is increase() alone:
+  # with under seven days of history every live series would look new over 7d.
+  # The alert names no instance, job, service, source or outcome.
 
   # A worker restart with the canary healthy throughout, on a 30-minute
   # cadence. Worker a's last turn is first exported at 121m and its last export
@@ -3097,10 +3208,7 @@ tests:
         exp_alerts:
           - exp_labels:
               component: curie-canary
-              outcome: accepted
-              service_name: curie-worker
               severity: page
-              source: worker
             exp_annotations:
               summary: No Curie turn has been accepted for 90 minutes
               description: >-
@@ -3111,10 +3219,7 @@ tests:
         exp_alerts:
           - exp_labels:
               component: curie-canary
-              outcome: accepted
-              service_name: curie-worker
               severity: page
-              source: worker
             exp_annotations:
               summary: No Curie turn has been accepted for 90 minutes
               description: >-
@@ -3142,10 +3247,7 @@ tests:
         exp_alerts:
           - exp_labels:
               component: curie-canary
-              outcome: accepted
-              service_name: curie-worker
               severity: page
-              source: worker
             exp_annotations:
               summary: No Curie turn has been accepted for 90 minutes
               description: >-
@@ -3156,10 +3258,7 @@ tests:
         exp_alerts:
           - exp_labels:
               component: curie-canary
-              outcome: accepted
-              service_name: curie-worker
               severity: page
-              source: worker
             exp_annotations:
               summary: No Curie turn has been accepted for 90 minutes
               description: >-
@@ -3306,56 +3405,100 @@ tests:
         alertname: CurieTurnAcceptedStale
         exp_alerts: []
 
-  # Two sources, each under its own job. The worker's last turn is exported at
-  # 60m and the dispatcher's at 120m. The worker's 90m count is 0 from 149m and
-  # fires alone at 164m while the dispatcher still accepts turns; the
-  # dispatcher's is 0 from 209m and fires beside it at 224m. One alert per
-  # label set, each keeping `job` and naming no instance.
-  - name: two sources that stop accepting turns page separately without an instance
+  # Every label combination of one installation, under its own job where each
+  # process exports one. The worker's last turn is exported at 60m and it keeps
+  # exporting its flat counter. Runner sandbox a takes a turn at 1m and sandbox
+  # b at 31m; each exports for 10 minutes and exits, and each carries its own
+  # service_instance_id, as the collector copies it onto runner points. The api
+  # takes turns until 120m and exits at 130m. The dispatcher takes turns until
+  # 180m and stops exporting at 190m. Counted per label combination, the
+  # worker's and both sandboxes' combinations each page while the dispatcher
+  # still accepts turns, and the api's beside them from 225m: the shape of the
+  # issue, where dozens of combinations paged for days while turns flowed.
+  # Counted per installation, the 90m count is above 0 until the dispatcher's
+  # last turn leaves the window: 0 from 269m, pending, and one alert from 284m.
+  # By then no combination but the worker's has a series left in the range, so
+  # the zero term still holds the alert while the 7d count is above 0.
+  - name: a quiet label combination stays silent while the installation accepts turns
     interval: 1m
     input_series:
-      - series: 'curie_turn_accepted_total{job="curie-worker",instance="curie-worker-a",service_name="curie-worker",source="worker",outcome="accepted"}'
-        values: '_ 1+1x59 60x239'
-      - series: 'curie_turn_accepted_total{job="curie-dispatcher",instance="curie-dispatcher-a",service_name="curie-dispatcher",source="dispatcher",outcome="accepted"}'
-        values: '_ 1+1x119 120x179'
+      - series: 'curie_turn_accepted_total{job="curie/curie-worker",instance="curie-worker-a",service_name="curie-worker",source="worker",outcome="accepted"}'
+        values: '_ 1+1x59 60x299'
+      - series: 'curie_turn_accepted_total{job="curie/curie-runner",instance="curie-runner-a",service_instance_id="curie-runner-a",service_name="curie-runner",source="runner",outcome="accepted"}'
+        values: '_ 1x9'
+      - series: 'curie_turn_accepted_total{job="curie/curie-runner",instance="curie-runner-b",service_instance_id="curie-runner-b",service_name="curie-runner",source="runner",outcome="accepted"}'
+        values: '_x31 1x9'
+      - series: 'curie_turn_accepted_total{job="curie/curie-api",instance="curie-api-a",service_name="curie-api",source="api",outcome="accepted"}'
+        values: '_ 1+1x119 120x10'
+      - series: 'curie_turn_accepted_total{job="curie/curie-dispatcher",instance="curie-dispatcher-a",service_name="curie-dispatcher",source="dispatcher",outcome="accepted"}'
+        values: '_ 1+1x179 180x10'
     alert_rule_test:
       - eval_time: 164m
         alertname: CurieTurnAcceptedStale
-        exp_alerts:
-          - exp_labels:
-              component: curie-canary
-              job: curie-worker
-              outcome: accepted
-              service_name: curie-worker
-              severity: page
-              source: worker
-            exp_annotations:
-              summary: No Curie turn has been accepted for 90 minutes
-              description: >-
-                Turns were accepted in the last seven days, but none in the
-                last 90 minutes. On the soak cadence that is a missed canary.
-      - eval_time: 224m
+        exp_alerts: []
+      - eval_time: 240m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+      - eval_time: 283m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+      - eval_time: 284m
         alertname: CurieTurnAcceptedStale
         exp_alerts:
           - exp_labels:
               component: curie-canary
-              job: curie-dispatcher
-              outcome: accepted
-              service_name: curie-dispatcher
               severity: page
-              source: dispatcher
             exp_annotations:
               summary: No Curie turn has been accepted for 90 minutes
               description: >-
                 Turns were accepted in the last seven days, but none in the
                 last 90 minutes. On the soak cadence that is a missed canary.
+      - eval_time: 360m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts:
           - exp_labels:
               component: curie-canary
-              job: curie-worker
-              outcome: accepted
-              service_name: curie-worker
               severity: page
-              source: worker
+            exp_annotations:
+              summary: No Curie turn has been accepted for 90 minutes
+              description: >-
+                Turns were accepted in the last seven days, but none in the
+                last 90 minutes. On the soak cadence that is a missed canary.
+
+  # Every combination stops exporting, as when the whole installation stops:
+  # no series is left in the 90m range, and the turns before still count over
+  # 7d. The worker's last turn is exported at 60m and its last export is at
+  # 70m; the runner sandbox's turn is at 61m and it exits at 70m. The 90m count
+  # holds the sandbox's first sample until 150m, and is 0 from 151m: one alert
+  # from 166m, though no series of the installation is present any more.
+  - name: an installation whose every series stops pages once
+    interval: 1m
+    input_series:
+      - series: 'curie_turn_accepted_total{job="curie/curie-worker",instance="curie-worker-a",service_name="curie-worker",source="worker",outcome="accepted"}'
+        values: '_ 1+1x59 60x10'
+      - series: 'curie_turn_accepted_total{job="curie/curie-runner",instance="curie-runner-a",service_instance_id="curie-runner-a",service_name="curie-runner",source="runner",outcome="accepted"}'
+        values: '_x61 1x9'
+    alert_rule_test:
+      - eval_time: 165m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts: []
+      - eval_time: 166m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts:
+          - exp_labels:
+              component: curie-canary
+              severity: page
+            exp_annotations:
+              summary: No Curie turn has been accepted for 90 minutes
+              description: >-
+                Turns were accepted in the last seven days, but none in the
+                last 90 minutes. On the soak cadence that is a missed canary.
+      - eval_time: 300m
+        alertname: CurieTurnAcceptedStale
+        exp_alerts:
+          - exp_labels:
+              component: curie-canary
+              severity: page
             exp_annotations:
               summary: No Curie turn has been accepted for 90 minutes
               description: >-
@@ -3801,4 +3944,251 @@ tests:
     alert_rule_test:
       - eval_time: 20m
         alertname: CurieAlloyScrapeMissing
+        exp_alerts: []
+
+  # End to end namespace reaper (#3245, ADR 0176 decision 4).
+  - name: e2e reaper timestamp stuck while time advances pages
+    interval: 1m
+    input_series:
+      # Healthy for ten minutes (value tracks time()), then stuck at 600.
+      - series: 'curie_e2e_reaper_last_success_seconds{service_name="curie-worker"}'
+        values: '0+60x10 600x50'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieE2EReaperStalled
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: CurieE2EReaperStalled
+        exp_alerts:
+          - exp_labels:
+              service_name: curie-worker
+              severity: page
+              component: curie-e2e
+            exp_annotations:
+              summary: The end to end namespace reaper has not completed a sweep in 15 minutes
+              description: >-
+                curie_e2e_reaper_last_success_seconds is more than 900 seconds
+                old. Expired and finished end to end namespaces are not being
+                deleted, and their quota on the test cluster is not being
+                released.
+
+  - name: e2e reaper timestamp advancing with time stays quiet
+    interval: 5m
+    input_series:
+      - series: 'curie_e2e_reaper_last_success_seconds{service_name="curie-worker"}'
+        values: '0+300x24'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: CurieE2EReaperStalled
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: CurieE2EReaperStalled
+        exp_alerts: []
+
+  - name: e2e reaper that never succeeded pages
+    interval: 1m
+    input_series:
+      - series: 'curie_e2e_reaper_last_success_seconds{service_name="curie-worker"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieE2EReaperStalled
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: CurieE2EReaperStalled
+        exp_alerts:
+          - exp_labels:
+              service_name: curie-worker
+              severity: page
+              component: curie-e2e
+            exp_annotations:
+              summary: The end to end namespace reaper has not completed a sweep in 15 minutes
+              description: >-
+                curie_e2e_reaper_last_success_seconds is more than 900 seconds
+                old. Expired and finished end to end namespaces are not being
+                deleted, and their quota on the test cluster is not being
+                released.
+
+  - name: overdue e2e namespaces held for 15 minutes page
+    interval: 1m
+    input_series:
+      - series: 'curie_e2e_namespaces_overdue{service_name="curie-worker"}'
+        values: '2x45'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieE2EExpiredNamespacesAccumulating
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: CurieE2EExpiredNamespacesAccumulating
+        exp_alerts:
+          - exp_labels:
+              service_name: curie-worker
+              severity: page
+              component: curie-e2e
+            exp_annotations:
+              summary: End to end namespaces more than 10 minutes past their TTL are still on the test cluster
+              description: >-
+                curie_e2e_namespaces_overdue has stayed above 0 for 15 minutes.
+                Namespaces past their TTL are not being removed, so their quota
+                on the test cluster is not released.
+      - eval_time: 40m
+        alertname: CurieE2EExpiredNamespacesAccumulating
+        exp_alerts:
+          - exp_labels:
+              service_name: curie-worker
+              severity: page
+              component: curie-e2e
+            exp_annotations:
+              summary: End to end namespaces more than 10 minutes past their TTL are still on the test cluster
+              description: >-
+                curie_e2e_namespaces_overdue has stayed above 0 for 15 minutes.
+                Namespaces past their TTL are not being removed, so their quota
+                on the test cluster is not released.
+
+  # A healthy reaper always sees a few namespaces just past their TTL between
+  # sweeps. That churn is in curie_e2e_namespaces_expired and must never page.
+  - name: healthy expired churn with nothing overdue stays quiet
+    interval: 1m
+    input_series:
+      - series: 'curie_e2e_namespaces_expired{service_name="curie-worker"}'
+        values: '1 2 0 3 1 0 2 1 3 0 1 2 1 0 3 2 1 0 2 1 3 1 0 2 1 3 2 0 1 2 1 0 3 2 1 0 2 1 3 1 0 2 1 3 2 0 1 2 1 0 3 2 1 0 2 1 3 1 0 2 1'
+      - series: 'curie_e2e_namespaces_overdue{service_name="curie-worker"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CurieE2EExpiredNamespacesAccumulating
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: CurieE2EExpiredNamespacesAccumulating
+        exp_alerts: []
+
+  - name: overdue e2e namespaces drained to zero stay quiet
+    interval: 1m
+    input_series:
+      - series: 'curie_e2e_namespaces_overdue{service_name="curie-worker"}'
+        values: '2x10 0x50'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieE2EExpiredNamespacesAccumulating
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: CurieE2EExpiredNamespacesAccumulating
+        exp_alerts: []
+
+  # The reaper's timestamp stops being exported at all: the worker task died,
+  # or the worker stopped running it. CurieE2EReaperStalled sees no series and
+  # cannot fire, so this one does. max() strips every series label.
+  - name: e2e reaper signal that stops reporting pages
+    interval: 1m
+    input_series:
+      - series: 'curie_e2e_reaper_last_success_seconds{service_name="curie-worker"}'
+        values: '0+60x10'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-e2e
+            exp_annotations:
+              summary: The end to end namespace reaper stopped reporting
+              description: >-
+                curie_e2e_reaper_last_success_seconds was reported in the last
+                7 days but not in the last 15 minutes. The worker task that deletes
+                expired end to end namespaces is not running.
+
+  # An outage longer than a day still pages: the window is 7 days.
+  - name: e2e reaper signal absent for more than a day still pages
+    interval: 1h
+    input_series:
+      - series: 'curie_e2e_reaper_last_success_seconds{service_name="curie-worker"}'
+        values: '0+3600x3'
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-e2e
+            exp_annotations:
+              summary: The end to end namespace reaper stopped reporting
+              description: >-
+                curie_e2e_reaper_last_success_seconds was reported in the last
+                7 days but not in the last 15 minutes. The worker task that deletes
+                expired end to end namespaces is not running.
+
+  # A reaper task that crashed until the supervisor gave up on it.
+  - name: parked e2e reaper pages
+    interval: 1m
+    input_series:
+      - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="e2e-reaper",outcome="give_up"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CurieWorkerSupervisedTaskParked
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-worker
+              service_name: curie-worker
+              operation: e2e-reaper
+              outcome: give_up
+            exp_annotations:
+              summary: A supervised worker task was parked after repeated crashes
+              description: >-
+                curie_worker_supervised_restart_total with outcome give_up
+                is present. The named operation stopped restarting and stays
+                down until the worker pod restarts.
+
+  - name: e2e reaper signal reported continuously stays quiet
+    interval: 1m
+    input_series:
+      - series: 'curie_e2e_reaper_last_success_seconds{service_name="curie-worker"}'
+        values: '0+60x150'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts: []
+
+  # An installation without the end to end connector never exports the gauge.
+  - name: e2e reaper signal never reported stays quiet
+    interval: 1m
+    input_series:
+      - series: 'curie_worker_supervised_restart_total{service_name="curie-worker",operation="runs",outcome="restart"}'
+        values: '0x120'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts: []
+
+  - name: e2e reaper signal that resumes after a gap stops paging
+    interval: 1m
+    input_series:
+      # Reported for 10 minutes, absent for 30, then reported again.
+      - series: 'curie_e2e_reaper_last_success_seconds{service_name="curie-worker"}'
+        values: '0+60x10 _x30 2460+60x30'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: CurieE2EReaperSignalAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              component: curie-e2e
+            exp_annotations:
+              summary: The end to end namespace reaper stopped reporting
+              description: >-
+                curie_e2e_reaper_last_success_seconds was reported in the last
+                7 days but not in the last 15 minutes. The worker task that deletes
+                expired end to end namespaces is not running.
+      - eval_time: 45m
+        alertname: CurieE2EReaperSignalAbsent
         exp_alerts: []

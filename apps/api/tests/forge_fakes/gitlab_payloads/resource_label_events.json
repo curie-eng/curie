@@ -1,0 +1,28 @@
+[
+  {
+    "action": "add",
+    "created_at": "2026-10-13T11:49:30.007Z",
+    "id": 18,
+    "label": {
+      "archived": false,
+      "color": "#6699cc",
+      "description": null,
+      "description_html": "",
+      "id": 13,
+      "name": "factory",
+      "text_color": "#FFFFFF"
+    },
+    "resource_id": 18,
+    "resource_type": "Issue",
+    "user": {
+      "avatar_url": "https://gitlab.example/uploads/-/system/user/avatar/placeholder/avatar.png",
+      "id": 2,
+      "locked": false,
+      "name": "Developer",
+      "public_email": null,
+      "state": "active",
+      "username": "developer",
+      "web_url": "https://gitlab.example/developer"
+    }
+  }
+]

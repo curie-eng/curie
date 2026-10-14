@@ -85,10 +85,11 @@ fn inspected_the_bare_service_name(argv: &str) -> bool {
 }
 
 /// One test function, because PATH is process-global: the scenarios run in
-/// sequence, each pointing PATH at its own shim.
+/// sequence, each pointing PATH at its own shim, under `support::ENV_LOCK`.
 #[tokio::test]
 async fn the_probe_resolves_the_worker_by_label_and_reads_empty_base_as_connected() {
     let temp = tempfile::tempdir().expect("create temporary directory");
+    let _env = crate::support::ENV_LOCK.lock().await;
     let original_path = std::env::var_os("PATH");
 
     // ---- connected: the state `local comms --connect` leaves, on a non-default

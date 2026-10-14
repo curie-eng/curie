@@ -5,12 +5,61 @@
 //! to `docker` keeps the CLI dependency-light: the target machine is a dev
 //! laptop that already has Docker if it can run the runner at all.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use curie_aci_protocol::env_keys;
 use tokio::process::Command;
+
+/// Snapshot transport is selected explicitly, independent of Docker's transport.
+pub fn remote_mode(published: Option<&str>) -> bool {
+    published.is_some()
+}
+
+pub fn published_host(published: Option<&str>) -> &str {
+    published.unwrap_or("localhost")
+}
+
+pub fn published_endpoint(published: Option<&str>, port: u16) -> String {
+    let host = published_host(published);
+    if host.contains(':') && !host.starts_with('[') {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
+    }
+}
+
+/// Validate the published address before creating Docker resources.
+pub fn published_host_setting() -> Result<Option<String>> {
+    let host = match std::env::var("DOCKER_PUBLISHED_HOST") {
+        Ok(host) => host,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(_) => {
+            return Err(crate::exit::usage(
+                "DOCKER_PUBLISHED_HOST must be valid text",
+            ))
+        }
+    };
+    let url = reqwest::Url::parse(&published_endpoint(Some(&host), 8080));
+    if host.is_empty()
+        || host.chars().any(char::is_whitespace)
+        || !url.is_ok_and(|url| {
+            url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.port() == Some(8080)
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none()
+        })
+    {
+        return Err(crate::exit::usage(
+            "DOCKER_PUBLISHED_HOST must be a hostname or IP address without a scheme or port",
+        ));
+    }
+    Ok(Some(host))
+}
 
 /// Everything `docker run` needs to boot a local runner container.
 #[derive(Debug, Clone)]
@@ -75,6 +124,10 @@ fn runner_hardening_args() -> Vec<String> {
 impl CheckSpec {
     /// The one shot check container argv (after the `docker` executable).
     pub fn run_args(&self) -> Vec<String> {
+        self.run_args_with_snapshot_volume(None)
+    }
+
+    pub fn run_args_with_snapshot_volume(&self, volume: Option<&str>) -> Vec<String> {
         let mut args: Vec<String> = vec![
             "run".into(),
             "--rm".into(),
@@ -91,11 +144,21 @@ impl CheckSpec {
         args.extend(runner_hardening_args());
         args.extend([
             "-v".into(),
-            format!("{}:/plugin:ro", self.plugin_dir),
+            format!("{}:/plugin:ro", volume.unwrap_or(&self.plugin_dir)),
             "-e".into(),
             format!("{}=/plugin", env_keys::CURIE_PLUGIN_DIR),
             "-e".into(),
             format!("CURIE_CHECK_TIMEOUT_S={}", self.timeout_s),
+        ]);
+        if let Some(volume) = volume {
+            args.extend([
+                "--label".into(),
+                CLI_MANAGED_LABEL.into(),
+                "--label".into(),
+                format!("{SNAPSHOT_VOLUME_LABEL}={volume}"),
+            ]);
+        }
+        args.extend([
             self.image.clone(),
             "python".into(),
             "-m".into(),
@@ -105,9 +168,18 @@ impl CheckSpec {
     }
 }
 
+/// Runner-local dev flag, read by `runner/src/curie_runner/config.py`. Not a
+/// boot-env key (the ACI contract is frozen), so it is spelled here, not in
+/// `env_keys`.
+const RUNNER_ALLOW_TOKENLESS_ENV: &str = "CURIE_RUNNER_ALLOW_TOKENLESS";
+
 impl StartSpec {
     /// The `docker run` argument vector (after the `docker` executable).
     pub fn run_args(&self) -> Vec<String> {
+        self.run_args_with_snapshot_volume(None)
+    }
+
+    pub fn run_args_with_snapshot_volume(&self, volume: Option<&str>) -> Vec<String> {
         let mut args: Vec<String> = vec![
             "run".into(),
             "-d".into(),
@@ -116,7 +188,12 @@ impl StartSpec {
             "-p".into(),
             format!("{}:8080", self.host_port),
             "-v".into(),
-            format!("{}:/plugin:ro", self.plugin_dir.display()),
+            format!(
+                "{}:/plugin:ro",
+                volume
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.plugin_dir.display().to_string())
+            ),
             "-e".into(),
             format!("{}=/plugin", env_keys::CURIE_PLUGIN_DIR),
             "-e".into(),
@@ -125,6 +202,13 @@ impl StartSpec {
             format!("{}={}", env_keys::CURIE_SANDBOX_ID, self.sandbox_id),
             "-e".into(),
             format!("{}={}", env_keys::CURIE_BUDGET, self.budget_json),
+            // Runner-local dev knob (#3821), not a boot-env key: the runner
+            // refuses to boot without CURIE_RUNNER_TOKEN, but the skill-tier
+            // runner is deliberately tokenless (the CLI dials it without a
+            // bearer), so every StartSpec runner opts in. CheckSpec does not
+            // serve and does not get it.
+            "-e".into(),
+            format!("{RUNNER_ALLOW_TOKENLESS_ENV}=1"),
         ];
         // Container isolation (#631): read-only rootfs + tmpfs, cap-drop ALL,
         // no-new-privileges. Mirrors the worker Docker substrate + K8s runner.
@@ -135,6 +219,10 @@ impl StartSpec {
         args.push(CLI_MANAGED_LABEL.into());
         args.push("--label".into());
         args.push(RUNNER_COMPONENT_LABEL.into());
+        if let Some(volume) = volume {
+            args.push("--label".into());
+            args.push(format!("{SNAPSHOT_VOLUME_LABEL}={volume}"));
+        }
         if self.fake_model {
             args.push("-e".into());
             args.push(format!("{}=1", env_keys::CURIE_FAKE_MODEL));
@@ -230,6 +318,185 @@ pub async fn docker_capture_with_env(
         String::from_utf8_lossy(&output.stdout).trim().to_string(),
         String::from_utf8_lossy(&output.stderr).trim().to_string(),
     ))
+}
+
+const SNAPSHOT_COMPONENT_LABEL: &str = "curietech.ai/component=skill-snapshot";
+const SNAPSHOT_OWNER_LABEL: &str = "curietech.ai/snapshot-owner";
+const SNAPSHOT_VOLUME_LABEL: &str = "curietech.ai/snapshot-volume";
+
+/// Copy client-side snapshot bytes through Docker's API into a private volume.
+async fn prepare_snapshot_volume(image: &str, snapshot: &Path, owner: &str) -> Result<String> {
+    let volume = format!("curie-snapshot-{}", uuid::Uuid::new_v4());
+    let helper = format!("{volume}-seed");
+    let prepare = async {
+        docker(&[
+            "volume".into(),
+            "create".into(),
+            "--label".into(),
+            CLI_MANAGED_LABEL.into(),
+            "--label".into(),
+            SNAPSHOT_COMPONENT_LABEL.into(),
+            "--label".into(),
+            format!("{SNAPSHOT_OWNER_LABEL}={owner}"),
+            volume.clone(),
+        ])
+        .await?;
+        docker(&[
+            "create".into(),
+            "--name".into(),
+            helper.clone(),
+            "--network".into(),
+            "none".into(),
+            "--user".into(),
+            "0:0".into(),
+            "--entrypoint".into(),
+            "python".into(),
+            "--label".into(),
+            CLI_MANAGED_LABEL.into(),
+            "--label".into(),
+            format!("{SNAPSHOT_VOLUME_LABEL}={volume}"),
+            "-v".into(),
+            format!("{volume}:/plugin:rw"),
+            image.into(),
+            "-c".into(),
+            "pass".into(),
+        ])
+        .await?;
+        docker(&[
+            "cp".into(),
+            format!("{}/.", snapshot.display()),
+            format!("{helper}:/plugin"),
+        ])
+        .await?;
+        docker(&["rm".into(), "-f".into(), helper.clone()]).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(err) = prepare {
+        let cleanup = cleanup_snapshot_volume(&volume).await;
+        return Err(match cleanup {
+            Ok(()) => err.context("copying the bundle snapshot to Docker"),
+            Err(cleanup) => err.context(format!(
+                "copying the bundle snapshot to Docker; cleanup failed: {cleanup}"
+            )),
+        });
+    }
+    Ok(volume)
+}
+
+/// Remove only a volume carrying both CLI ownership and snapshot component labels.
+async fn remove_snapshot_volume(volume: &str) -> Result<()> {
+    let (status, labels, stderr) = docker_capture(&[
+        "volume".into(),
+        "inspect".into(),
+        "--format".into(),
+        "{{index .Labels \"curietech.ai/managed-by\"}} {{index .Labels \"curietech.ai/component\"}}".into(),
+        volume.into(),
+    ])
+    .await?;
+    if !status.success() {
+        if stderr.to_ascii_lowercase().contains("no such volume") {
+            return Ok(());
+        }
+        bail!("could not inspect snapshot volume '{volume}': {stderr}");
+    }
+    if !snapshot_volume_owned(&labels) {
+        bail!("refusing to remove volume '{volume}' without snapshot ownership labels");
+    }
+    docker(&["volume".into(), "rm".into(), volume.into()])
+        .await
+        .map(|_| ())
+}
+
+fn snapshot_volume_owned(labels: &str) -> bool {
+    labels == "curie-cli skill-snapshot"
+}
+
+/// Release partial startup containers and their uniquely owned snapshot volume.
+async fn cleanup_snapshot_volume(volume: &str) -> Result<()> {
+    let report = reap_filtered(&[
+        ("label", CLI_MANAGED_LABEL),
+        ("label", &format!("{SNAPSHOT_VOLUME_LABEL}={volume}")),
+    ])
+    .await;
+    let removal = remove_snapshot_volume(volume).await;
+    if let Some(err) = report.error {
+        bail!("snapshot container cleanup failed: {err}; volume cleanup: {removal:?}");
+    }
+    removal
+}
+
+/// Discover a stopped runner's remaining volumes from its existing session identity.
+fn session_snapshot_volumes_args(owner: &str) -> Vec<String> {
+    vec![
+        "volume".into(),
+        "ls".into(),
+        "-q".into(),
+        "--filter".into(),
+        format!("label={CLI_MANAGED_LABEL}"),
+        "--filter".into(),
+        format!("label={SNAPSHOT_COMPONENT_LABEL}"),
+        "--filter".into(),
+        format!("label={SNAPSHOT_OWNER_LABEL}={owner}"),
+    ]
+}
+
+pub async fn remove_session_snapshot_volumes(owner: &str) -> Result<()> {
+    let volumes = docker(&session_snapshot_volumes_args(owner)).await?;
+    for volume in volumes.lines().filter(|line| !line.is_empty()) {
+        remove_snapshot_volume(volume).await?;
+    }
+    Ok(())
+}
+
+/// Boot with a bind mount locally or an API-seeded volume when explicitly selected.
+pub async fn start_runner(spec: &StartSpec, published: Option<&str>) -> Result<String> {
+    if !remote_mode(published) {
+        return docker_with_env(&spec.run_args(), &spec.docker_env).await;
+    }
+    let volume = prepare_snapshot_volume(
+        &spec.image,
+        &spec.plugin_dir,
+        &format!("{}:{}", spec.container_name, spec.session_id),
+    )
+    .await?;
+    let result = docker_with_env(
+        &spec.run_args_with_snapshot_volume(Some(&volume)),
+        &spec.docker_env,
+    )
+    .await;
+    match result {
+        Ok(id) => Ok(id),
+        Err(err) => {
+            if let Err(cleanup) = cleanup_snapshot_volume(&volume).await {
+                return Err(err.context(format!("snapshot cleanup failed: {cleanup}")));
+            }
+            Err(err)
+        }
+    }
+}
+
+pub async fn run_check(
+    spec: &CheckSpec,
+    published: Option<&str>,
+) -> Result<(std::process::ExitStatus, String, String)> {
+    if !remote_mode(published) {
+        return docker_capture(&spec.run_args()).await;
+    }
+    let volume = prepare_snapshot_volume(
+        &spec.image,
+        Path::new(&spec.plugin_dir),
+        &format!("check-{}", uuid::Uuid::new_v4()),
+    )
+    .await?;
+    let result = docker_capture(&spec.run_args_with_snapshot_volume(Some(&volume))).await;
+    if let Err(cleanup) = cleanup_snapshot_volume(&volume).await {
+        return Err(match result {
+            Ok(_) => cleanup.context("releasing the check snapshot"),
+            Err(err) => err.context(format!("check snapshot cleanup failed: {cleanup}")),
+        });
+    }
+    result
 }
 
 /// The bounded window for resolving the actual Docker IDs of local Compose
@@ -1033,10 +1300,28 @@ pub async fn pull_model(container: &str, model: &str) -> Result<()> {
 }
 
 /// Best-effort container teardown (used for cleanup paths).
+async fn container_snapshot_volume(name_or_id: &str) -> Result<Option<String>> {
+    let (status, volume, stderr) = docker_capture(&[
+        "container".into(),
+        "inspect".into(),
+        "--format".into(),
+        "{{if eq (index .Config.Labels \"curietech.ai/managed-by\") \"curie-cli\"}}{{with index .Config.Labels \"curietech.ai/snapshot-volume\"}}{{.}}{{end}}{{end}}".into(),
+        name_or_id.into(),
+    ])
+    .await?;
+    if !status.success() && !stderr.contains("No such") {
+        bail!("could not inspect container '{name_or_id}' before teardown: {stderr}");
+    }
+    Ok((!volume.is_empty()).then_some(volume))
+}
+
 pub async fn remove_container(name_or_id: &str) -> Result<()> {
-    docker(&["rm".into(), "-f".into(), name_or_id.to_string()])
-        .await
-        .map(|_| ())
+    let volume = container_snapshot_volume(name_or_id).await?;
+    docker(&["rm".into(), "-f".into(), name_or_id.to_string()]).await?;
+    if let Some(volume) = volume {
+        remove_snapshot_volume(&volume).await?;
+    }
+    Ok(())
 }
 
 /// The outcome of reaping labeled containers: what was removed, what is still
@@ -1133,6 +1418,16 @@ pub async fn reap_filtered(filters: &[(&str, &str)]) -> ReapReport {
         };
     }
 
+    let mut snapshot_volumes = Vec::new();
+    let mut snapshot_problems = Vec::new();
+    for candidate in &candidates {
+        match container_snapshot_volume(candidate).await {
+            Ok(Some(volume)) => snapshot_volumes.push(volume),
+            Ok(None) => {}
+            Err(err) => snapshot_problems.push(err.to_string()),
+        }
+    }
+
     let mut rm_args: Vec<String> = vec!["rm".into(), "-f".into()];
     rm_args.extend(candidates.iter().cloned());
     // Capture (not `docker`) so a nonzero exit keeps its stdout: `docker rm -f`
@@ -1150,7 +1445,7 @@ pub async fn reap_filtered(filters: &[(&str, &str)]) -> ReapReport {
     };
 
     // Re-list for the ground truth of what is still running.
-    match labeled_container_ids_filtered(filters).await {
+    let mut report = match labeled_container_ids_filtered(filters).await {
         Ok(still_present) => reap_report(&rm_stdout, rm_error, still_present),
         Err(e) => ReapReport {
             removed: count_removed(&rm_stdout),
@@ -1160,7 +1455,20 @@ pub async fn reap_filtered(filters: &[(&str, &str)]) -> ReapReport {
                 None => format!("could not confirm teardown of containers {filters:?}: {e}"),
             }),
         },
+    };
+    for volume in snapshot_volumes {
+        if let Err(err) = remove_snapshot_volume(&volume).await {
+            snapshot_problems.push(err.to_string());
+        }
     }
+    if !snapshot_problems.is_empty() {
+        let problems = snapshot_problems.join("; ");
+        report.error = Some(match report.error {
+            Some(err) => format!("{err}; snapshot cleanup: {problems}"),
+            None => format!("snapshot cleanup: {problems}"),
+        });
+    }
+    report
 }
 
 /// The number of containers `docker rm -f` confirmed removed: it echoes one
@@ -1514,6 +1822,266 @@ mod tests {
             passthrough_env: vec!["CURIE_TEST_ENV_THAT_DOES_NOT_EXIST".into()],
             docker_env: vec![],
         }
+    }
+
+    #[test]
+    fn snapshot_volume_requires_both_exact_ownership_labels() {
+        assert!(snapshot_volume_owned("curie-cli skill-snapshot"));
+        for labels in [
+            "",
+            "curie-cli",
+            "skill-snapshot",
+            "foreign-cli skill-snapshot",
+            "curie-cli foreign-component",
+            "curie-cli skill-snapshot-extra",
+        ] {
+            assert!(
+                !snapshot_volume_owned(labels),
+                "foreign or incomplete ownership must refuse volume removal: {labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_snapshot_volume_discovery_filters_the_exact_owner() {
+        for owner in [
+            "acme-runner:session-one",
+            "acme-runner:session-one-neighbor",
+        ] {
+            assert_eq!(
+                session_snapshot_volumes_args(owner),
+                vec![
+                    "volume".to_string(),
+                    "ls".to_string(),
+                    "-q".to_string(),
+                    "--filter".to_string(),
+                    "label=curietech.ai/managed-by=curie-cli".to_string(),
+                    "--filter".to_string(),
+                    "label=curietech.ai/component=skill-snapshot".to_string(),
+                    "--filter".to_string(),
+                    format!("label=curietech.ai/snapshot-owner={owner}"),
+                ],
+                "discovery must exclude unrelated volumes and neighboring sessions"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_mode_requires_the_published_host_setting_to_be_present() {
+        assert!(!remote_mode(None));
+        for published in ["docker.example.com", "localhost", "127.0.0.1", ""] {
+            assert!(remote_mode(Some(published)), "{published:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_mode_does_not_infer_transport_from_the_docker_host_scheme() {
+        let _guard = crate::PROCESS_ENV_LOCK.lock().await;
+        let original = std::env::var_os("DOCKER_HOST");
+        let original_published = std::env::var_os("DOCKER_PUBLISHED_HOST");
+        std::env::remove_var("DOCKER_PUBLISHED_HOST");
+        let schemes = [
+            "ssh://docker.example.com",
+            "tcp://docker.example.com:2376",
+            "unix:///var/run/docker.sock",
+        ];
+        let mut results = Vec::new();
+        for docker_host in schemes {
+            std::env::set_var("DOCKER_HOST", docker_host);
+            results.push((docker_host, published_host_setting()));
+        }
+        match original {
+            Some(value) => std::env::set_var("DOCKER_HOST", value),
+            None => std::env::remove_var("DOCKER_HOST"),
+        }
+        match original_published {
+            Some(value) => std::env::set_var("DOCKER_PUBLISHED_HOST", value),
+            None => std::env::remove_var("DOCKER_PUBLISHED_HOST"),
+        }
+        for (docker_host, result) in results {
+            assert_eq!(
+                result.expect("a transport without a published host must remain local"),
+                None,
+                "DOCKER_HOST={docker_host} must not select snapshot transport"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn published_host_setting_accepts_absence_hostnames_and_ip_addresses() {
+        let _guard = crate::PROCESS_ENV_LOCK.lock().await;
+        let original = std::env::var_os("DOCKER_PUBLISHED_HOST");
+        std::env::remove_var("DOCKER_PUBLISHED_HOST");
+        let absent = published_host_setting();
+        let hosts = [
+            "localhost",
+            "docker.example.com",
+            "192.0.2.10",
+            "2001:db8::10",
+            "[2001:db8::10]",
+        ];
+        let mut results = Vec::new();
+        for host in hosts {
+            std::env::set_var("DOCKER_PUBLISHED_HOST", host);
+            results.push((host, published_host_setting()));
+        }
+        match original {
+            Some(value) => std::env::set_var("DOCKER_PUBLISHED_HOST", value),
+            None => std::env::remove_var("DOCKER_PUBLISHED_HOST"),
+        }
+
+        assert_eq!(absent.expect("an absent setting selects local mode"), None);
+        for (host, result) in results {
+            assert_eq!(
+                result.expect("a hostname or IP address must be accepted"),
+                Some(host.to_string()),
+                "{host}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn published_host_setting_rejects_invalid_addresses_as_usage_errors() {
+        let _guard = crate::PROCESS_ENV_LOCK.lock().await;
+        let original = std::env::var_os("DOCKER_PUBLISHED_HOST");
+        let hosts = [
+            "",
+            " ",
+            "docker.example.com ",
+            "http://docker.example.com",
+            "ssh://docker.example.com",
+            "docker.example.com/plugin",
+            "docker.example.com:2376",
+            "[2001:db8::10]:2376",
+            "user@docker.example.com",
+            "docker.example.com?query=1",
+            "docker.example.com#fragment",
+        ];
+        let mut results = Vec::new();
+        for host in hosts {
+            std::env::set_var("DOCKER_PUBLISHED_HOST", host);
+            results.push((host, published_host_setting()));
+        }
+        match original {
+            Some(value) => std::env::set_var("DOCKER_PUBLISHED_HOST", value),
+            None => std::env::remove_var("DOCKER_PUBLISHED_HOST"),
+        }
+
+        for (host, result) in results {
+            let err = result.expect_err("invalid addresses must fail before Docker startup");
+            assert_eq!(
+                crate::exit::classify(&err).0,
+                crate::exit::ExitClass::Usage,
+                "{host:?}"
+            );
+            assert!(
+                err.to_string().contains("DOCKER_PUBLISHED_HOST"),
+                "the usage error must identify the setting: {err}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn published_host_setting_rejects_non_unicode_as_a_usage_error() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = crate::PROCESS_ENV_LOCK.lock().await;
+        let original = std::env::var_os("DOCKER_PUBLISHED_HOST");
+        std::env::set_var(
+            "DOCKER_PUBLISHED_HOST",
+            std::ffi::OsString::from_vec(b"docker.\xff".to_vec()),
+        );
+        let result = published_host_setting();
+        match original {
+            Some(value) => std::env::set_var("DOCKER_PUBLISHED_HOST", value),
+            None => std::env::remove_var("DOCKER_PUBLISHED_HOST"),
+        }
+
+        let err = result.expect_err("a non-Unicode setting must not select local mode");
+        assert_eq!(crate::exit::classify(&err).0, crate::exit::ExitClass::Usage);
+        assert!(err.to_string().contains("DOCKER_PUBLISHED_HOST"));
+    }
+
+    #[test]
+    fn published_host_defaults_to_localhost_and_preserves_an_explicit_host() {
+        assert_eq!(published_host(None), "localhost");
+        for host in [
+            "docker.example.com",
+            "localhost",
+            "192.0.2.10",
+            "2001:db8::10",
+        ] {
+            assert_eq!(published_host(Some(host)), host);
+        }
+    }
+
+    #[test]
+    fn published_endpoint_uses_the_selected_host_and_brackets_ipv6() {
+        let cases = [
+            (None, "http://localhost:7245"),
+            (Some("docker.example.com"), "http://docker.example.com:7245"),
+            (Some("192.0.2.10"), "http://192.0.2.10:7245"),
+            (Some("2001:db8::10"), "http://[2001:db8::10]:7245"),
+            (Some("[2001:db8::10]"), "http://[2001:db8::10]:7245"),
+        ];
+        for (published, expected) in cases {
+            let endpoint = published_endpoint(published, 7245);
+            assert_eq!(endpoint, expected);
+            let url = reqwest::Url::parse(&endpoint).expect("a published endpoint must be a URL");
+            assert_eq!(url.port(), Some(7245));
+        }
+    }
+
+    #[test]
+    fn remote_runner_args_mount_only_the_readonly_snapshot_volume() {
+        let snapshot = format!("/tmp/acme-bot/.curie/snapshots/{}", "b".repeat(64));
+        let runner = StartSpec {
+            plugin_dir: PathBuf::from(&snapshot),
+            ..spec()
+        };
+        let volume = "curie-snapshot-acme-runner";
+        let args = runner.run_args_with_snapshot_volume(Some(volume));
+        let mounts: Vec<&str> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-v")
+            .map(|pair| pair[1].as_str())
+            .collect();
+
+        assert_eq!(mounts, vec!["curie-snapshot-acme-runner:/plugin:ro"]);
+        assert!(
+            !args.iter().any(|arg| arg.contains(&snapshot)),
+            "the client's snapshot path must not reach a remote daemon: {args:?}"
+        );
+        assert_eq!(args.last().map(String::as_str), Some("curie-runner"));
+        assert_eq!(
+            runner.run_args_with_snapshot_volume(None),
+            runner.run_args()
+        );
+    }
+
+    #[test]
+    fn remote_check_args_mount_only_the_readonly_snapshot_volume() {
+        let snapshot = format!("/tmp/acme-bot/.curie/snapshots/{}", "b".repeat(64));
+        let check = CheckSpec {
+            image: "curie-runner".into(),
+            plugin_dir: snapshot.clone(),
+            timeout_s: 30,
+        };
+        let args = check.run_args_with_snapshot_volume(Some("curie-snapshot-acme-check"));
+        let mounts: Vec<&str> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-v")
+            .map(|pair| pair[1].as_str())
+            .collect();
+
+        assert_eq!(mounts, vec!["curie-snapshot-acme-check:/plugin:ro"]);
+        assert!(
+            !args.iter().any(|arg| arg.contains(&snapshot)),
+            "the client's snapshot path must not reach a remote daemon: {args:?}"
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--network", "none"]));
+        assert_eq!(check.run_args_with_snapshot_volume(None), check.run_args());
     }
 
     #[test]

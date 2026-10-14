@@ -530,3 +530,89 @@ def test_repository_identifier_rules_preserve_case_and_clone_verdicts(
     assert scan.returncode == (1 if expected_rules else 0), _scan_diagnostics(scan)
     findings = json.loads((repo / "findings.json").read_text(encoding="utf-8"))
     assert {finding["RuleID"] for finding in findings} == expected_rules
+
+
+def _path_allowlist() -> list[re.Pattern[str]]:
+    paths = _gitleaks_config()["allowlist"]["paths"]
+    assert isinstance(paths, list)
+    return [re.compile(str(pattern)) for pattern in paths]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "cli/target/release/curie",
+        "cli/target-linux-arm64/x",
+        "apps/ui/node_modules/a/b.js",
+        "apps/ui/dist/index.js",
+        ".venv/lib/x.py",
+        "dist/checksums.txt",
+        "build/x",
+        "node_modules/x",
+        "packages/telemetry/build/lib/x.py",
+        "apps/api/.venv/x",
+        "runner/dist/x.whl",
+        ".pytest_cache/v/x",
+        "uv.lock",
+        "cli/Cargo.lock",
+        "apps/ui/pnpm-lock.yaml",
+        "packages/aci-protocol/generated/x.py",
+        ".gitleaks.toml",
+    ],
+)
+def test_path_allowlist_skips_known_generated_roots(path: str) -> None:
+    assert any(pattern.search(path) for pattern in _path_allowlist()), (
+        f"{path} is a known generated root and must be skipped by the scan"
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "docs/build/notes.md",
+        "examples/sre-bot/dist/config.yaml",
+        "charts/curie/target/values.yaml",
+        "apps/ui/src/build/x.ts",
+        "cli/src/target/x.rs",
+        "docs/node_modules/x",
+        "examples/x/.venv/y",
+        "packages/telemetry/src/build/x.py",
+        "deep/nested/dist/x",
+        "release/target-linux-amd64/x",
+    ],
+)
+def test_path_allowlist_does_not_skip_tracked_source_at_depth(path: str) -> None:
+    matching = [p.pattern for p in _path_allowlist() if p.search(path)]
+    assert matching == [], f"{path} is not a generated root but is skipped by {matching}"
+
+
+def _aws_account_probe() -> str:
+    # Built at runtime so this source never holds a literal the aws-account-id
+    # rule matches. The digits are random and never the 000000000000 placeholder.
+    digits = "".join(secrets.choice(string.digits[1:]) for _ in range(12))
+    return "role: " + "arn:aws:" + "iam::" + digits + ":role/probe\n"
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "expected_findings"),
+    [
+        ("docs/build/leak.txt", 1),
+        ("cli/target/leak.txt", 0),
+    ],
+)
+def test_path_allowlist_scopes_the_scanner_to_generated_roots(
+    tmp_path: Path, relative_path: str, expected_findings: int
+) -> None:
+    repo, base_sha = _new_repo(tmp_path / "repo")
+    (repo / ".gitleaks.toml").write_bytes(GITLEAKS_CONFIG_PATH.read_bytes())
+    leak = repo / relative_path
+    leak.parent.mkdir(parents=True)
+    leak.write_text(_aws_account_probe(), encoding="utf-8")
+    head_sha = _commit(repo, "add probe")
+
+    scan = _scan(repo, f"{base_sha}..{head_sha}", report_path="/repo/findings.json")
+
+    assert scan.returncode == (1 if expected_findings else 0), _scan_diagnostics(scan)
+    findings = json.loads((repo / "findings.json").read_text(encoding="utf-8"))
+    assert len(findings) == expected_findings
+    assert {finding["RuleID"] for finding in findings} <= {"aws-account-id"}

@@ -1,0 +1,17 @@
+{
+  "comment": "The per-turn deliberate progress capability (ADR-0130), frozen across the three services it crosses, which ship in different images and share no module. The worker writes `eligibility_env=1` into the sandbox boot environment only for a human Slack thread, records that boot fact on the sandbox handle, and refuses warm adoption when either direction differs, so ineligible sessions never inherit the model-visible tool or prompt. It durably allocates a monotonically increasing generation for the chain, marks that generation active with a short renewable server-time lease, and mints a sandbox token with `token_scope` whose subject is `progress_id:generation`. The live worker pump renews only its active unexpired generation; a missed lease cannot be revived. It sends the capability URL (`route` under the API base), token, and generation to the runner on POST /v1/event in `url_header`, `token_header`, and `generation_header`. The runner reads those headers, holds them for the open turn only, and POSTs each progress command to the URL with the token in `token_request_header`; it adds the worker-issued generation and its own per-turn sequence. The API verifies the token, generation, and active lease atomically before appending to the chain's inbox at `inbox_key` and indexing the chain in `inbox_pending_key`. One entry per command has exactly the fields of `inbox_entry_example`; the live pump or maintenance drainer reads it. Read by apps/worker/tests/test_turn_progress_vector.py, runner/tests/test_turn_progress_vector.py and apps/api/tests/test_turn_progress_vector.py, each of which rejects an unknown key so a key added for one reader cannot pass vacuously.",
+  "eligibility_env": "CURIE_TURN_PROGRESS_ENABLED",
+  "url_header": "X-Curie-Progress-Url",
+  "token_header": "X-Curie-Progress-Token",
+  "generation_header": "X-Curie-Progress-Generation",
+  "token_request_header": "X-API-Key",
+  "token_scope": "turn.progress",
+  "route": "/v1/turn-progress/{progress_id}",
+  "inbox_key": "{key_prefix}:progress:inbox:{progress_id}",
+  "inbox_pending_key": "{key_prefix}:progress:inbox:pending",
+  "inbox_entry_example": {
+    "command": "{\"version\":\"1.0\",\"update_id\":\"demo-1\",\"state\":\"investigating\",\"summary\":\"Reading the failing test\",\"milestone\":\"evidence\"}",
+    "generation": "7",
+    "seq": "1"
+  }
+}

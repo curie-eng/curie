@@ -17,15 +17,34 @@ from aci_protocol import (
     TurnSource,
 )
 from channel_protocol.work_item_events import execute_event_id, terminate_event_id
-from curie_telemetry import record_metric
+from curie_internal.streams import ensure_group
+from curie_telemetry import (
+    TRACEPARENT_STREAM_FIELD,
+    inject_trace_context,
+    operation_span,
+    record_metric,
+)
+from opentelemetry.trace import SpanKind
 from redis.exceptions import ResponseError
+from redis.typing import EncodableT
 from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
-from . import factory_ci, factory_label_reconcile, factory_notices, workitems
+from curie_api.workitems import lifecycle
+
+from . import (
+    factory_ci,
+    factory_label_reconcile,
+    factory_notices,
+    factory_poll_intake,
+    factory_review_feedback,
+    factory_tracker_intake,
+)
+from .code_host_trust import code_host_verify
 from .config import Settings
-from .models import ExecutionRequest, Publication, WorkItem
+from .forges.registry import forges_registry
+from .models import ExecutionRequest, WorkItem
 from .workitem_dispatch import (
     claim_due,
     claim_terminate_publishes,
@@ -41,7 +60,12 @@ logger = logging.getLogger(__name__)
 # can leave a marker without its turn.
 _MARK_AND_XADD = """
 if redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1]) then
-  redis.call('XADD', KEYS[2], '*', ARGV[2], ARGV[3])
+  local args = {KEYS[2], '*', ARGV[2], ARGV[3]}
+  if ARGV[4] ~= '' and ARGV[5] ~= '' then
+    table.insert(args, ARGV[4])
+    table.insert(args, ARGV[5])
+  end
+  redis.call('XADD', unpack(args))
   return 1
 end
 return 0
@@ -67,6 +91,10 @@ class WorkItemReconciler:
         self._ci_pass = 0
         # Monotonic time of the next missed-label listing (#3081).
         self._labels_due = 0.0
+        # Monotonic due time per tracker poll and refusal sweep (#4358 plan D2).
+        self._trackers_due: dict[str, float] = {}
+        # Monotonic due time per non-GitHub lineage's review feedback read (#4399).
+        self._review_feedback_due: dict[str, float] = {}
         self._step_consecutive_failures: dict[str, int] = {}
 
     def _stream(self) -> str:
@@ -76,45 +104,45 @@ class WorkItemReconciler:
         return self._settings.runs_consumer_group or WORKER_GROUP_DEFAULT
 
     async def _ensure_group(self) -> None:
-        try:
-            await self._valkey.xgroup_create(
-                self._stream(), self._group(), id="$", mkstream=True
-            )
-        except ResponseError as exc:
-            if "BUSYGROUP" not in str(exc):
-                raise
+        await ensure_group(self._valkey, self._stream(), self._group(), start_id="$")
 
     async def _xadd(self, turn: QueuedTurn, *, marker: tuple[str, int] | None = None) -> None:
-        if marker is not None:
-            # Set the round's marker NX and append atomically; a marker that is
-            # already set means the turn is already on the stream.
-            key, ttl = marker
-            await self._ensure_group()
-            await self._valkey.eval(
-                _MARK_AND_XADD,
-                2,
-                key,
-                self._stream(),
-                ttl,
-                STREAM_PAYLOAD_FIELD,
-                turn.model_dump_json(),
-            )
-            return
-        try:
-            await self._ensure_group()
-            await self._valkey.xadd(
-                self._stream(), {STREAM_PAYLOAD_FIELD: turn.model_dump_json()}
-            )
-        except ResponseError as exc:
-            message = str(exc)
-            if "NOGROUP" in message or "no such key" in message.lower():
+        with operation_span(
+            "curie.queue.enqueue",
+            kind=SpanKind.PRODUCER,
+            attributes={"service.name": "curie-api", "source": "api"},
+        ):
+            carrier: dict[str, str] = {STREAM_PAYLOAD_FIELD: turn.model_dump_json()}
+            inject_trace_context(carrier)
+            fields: dict[EncodableT, EncodableT] = {}
+            fields.update(carrier)
+            if marker is not None:
+                # Set the round's marker NX and append atomically; a marker that is
+                # already set means the turn is already on the stream.
+                key, ttl = marker
                 await self._ensure_group()
-                await self._valkey.xadd(
+                await self._valkey.eval(
+                    _MARK_AND_XADD,
+                    2,
+                    key,
                     self._stream(),
-                    {STREAM_PAYLOAD_FIELD: turn.model_dump_json()},
+                    ttl,
+                    STREAM_PAYLOAD_FIELD,
+                    carrier[STREAM_PAYLOAD_FIELD],
+                    TRACEPARENT_STREAM_FIELD if TRACEPARENT_STREAM_FIELD in carrier else "",
+                    carrier.get(TRACEPARENT_STREAM_FIELD, ""),
                 )
                 return
-            raise
+            try:
+                await self._ensure_group()
+                await self._valkey.xadd(self._stream(), fields)
+            except ResponseError as exc:
+                message = str(exc)
+                if "NOGROUP" in message or "no such key" in message.lower():
+                    await self._ensure_group()
+                    await self._valkey.xadd(self._stream(), fields)
+                    return
+                raise
 
     async def run_once(self) -> None:
         for name, step in (
@@ -131,7 +159,7 @@ class WorkItemReconciler:
             ("settle_overdue_cancellations", self._settle_overdue_cancellations),
             ("readmit_pending", self._readmit_pending),
             ("reconcile_missed_labels", self._reconcile_missed_labels),
-            ("sync_status_comments", self._sync_status_comments),
+            ("poll_trackers", self._poll_trackers),
             ("redispatch_lapsed_acquisitions", self._redispatch_lapsed_acquisitions),
             ("publish_execute_wakes", self._publish_execute_wakes),
         ):
@@ -143,9 +171,7 @@ class WorkItemReconciler:
                 self._step_consecutive_failures[name] = (
                     self._step_consecutive_failures.get(name, 0) + 1
                 )
-                record_metric(
-                    "curie.work_item.reconciler.step.failure", attributes=attributes
-                )
+                record_metric("curie.work_item.reconciler.step.failure", attributes=attributes)
             else:
                 self._step_consecutive_failures[name] = 0
             record_metric(
@@ -168,9 +194,20 @@ class WorkItemReconciler:
                 logger.exception("work item reconciler pass failed")
             await asyncio.sleep(self._settings.work_item_reconciler_interval_seconds)
 
+    async def run_status_comments_forever(self) -> None:
+        """Keep GitHub status I/O independent of dispatch and lease reconciliation."""
+        while True:
+            try:
+                await self._sync_status_comments()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("work item status comment pass failed")
+            await asyncio.sleep(self._settings.work_item_reconciler_interval_seconds)
+
     async def _expire_waiting(self) -> None:
         async with self._sessionmaker() as session:
-            now = await workitems._database_now(session)
+            now = await lifecycle.database_now(session)
             overdue = (
                 await session.execute(
                     select(
@@ -189,14 +226,14 @@ class WorkItemReconciler:
             ).all()
         for row in overdue:
             async with self._sessionmaker() as session:
-                result = await workitems.expire_waiting(
+                result = await lifecycle.expire_waiting(
                     session,
                     work_item_id=row.work_item_id,
                     request_id=row.id,
                     expected_work_item_version=row.work_item_version,
                     expected_request_version=row.version,
                 )
-            if isinstance(result, workitems.WorkItemOutcome):
+            if isinstance(result, lifecycle.WorkItemOutcome):
                 logger.warning(
                     "work item request %s expired waiting for capacity after %d deferrals",
                     row.id,
@@ -205,7 +242,7 @@ class WorkItemReconciler:
 
     async def _request_deadline_cancellations(self) -> None:
         async with self._sessionmaker() as session:
-            now = await workitems._database_now(session)
+            now = await lifecycle.database_now(session)
             rows = (
                 await session.execute(
                     select(
@@ -224,7 +261,7 @@ class WorkItemReconciler:
             ).all()
         for row in rows:
             async with self._sessionmaker() as session:
-                await workitems.request_execution_deadline_cancellation(
+                await lifecycle.request_execution_deadline_cancellation(
                     session,
                     work_item_id=row.work_item_id,
                     request_id=row.id,
@@ -235,7 +272,7 @@ class WorkItemReconciler:
     async def _request_owner_lost_cancellations(self) -> None:
         ttl = timedelta(seconds=self._settings.work_item_runtime_ttl_seconds)
         async with self._sessionmaker() as session:
-            now = await workitems._database_now(session)
+            now = await lifecycle.database_now(session)
             rows = (
                 await session.execute(
                     select(
@@ -247,20 +284,11 @@ class WorkItemReconciler:
                     .join(WorkItem, WorkItem.id == ExecutionRequest.work_item_id)
                     .where(
                         ExecutionRequest.status == "running",
-                        # A published request waits on CI; the CI gate owns it.
-                        ~exists().where(
-                            Publication.execution_request_id == ExecutionRequest.id,
-                            Publication.status == "succeeded",
-                        ),
+                        lifecycle.not_awaiting_publication(),
                         (
                             (
-                                ExecutionRequest.runtime_heartbeat_expires_at.is_not(
-                                    None
-                                )
-                                & (
-                                    ExecutionRequest.runtime_heartbeat_expires_at
-                                    <= now
-                                )
+                                ExecutionRequest.runtime_heartbeat_expires_at.is_not(None)
+                                & (ExecutionRequest.runtime_heartbeat_expires_at <= now - ttl)
                             )
                             | (
                                 ExecutionRequest.runtime_owner.is_(None)
@@ -273,7 +301,7 @@ class WorkItemReconciler:
             ).all()
         for row in rows:
             async with self._sessionmaker() as session:
-                await workitems.request_owner_lost_cancellation(
+                await lifecycle.request_owner_lost_cancellation(
                     session,
                     work_item_id=row.work_item_id,
                     request_id=row.id,
@@ -284,7 +312,7 @@ class WorkItemReconciler:
     async def _settle_overdue_cancellations(self) -> None:
         settle_seconds = self._settings.work_item_cancel_settle_seconds
         async with self._sessionmaker() as session:
-            now = await workitems._database_now(session)
+            now = await lifecycle.database_now(session)
             rows = (
                 await session.execute(
                     select(
@@ -310,14 +338,14 @@ class WorkItemReconciler:
             ).all()
         for row in rows:
             async with self._sessionmaker() as session:
-                result = await workitems.settle_overdue_cancellation(
+                result = await lifecycle.settle_overdue_cancellation(
                     session,
                     work_item_id=row.work_item_id,
                     request_id=row.id,
                     expected_request_version=row.version,
                     settle_seconds=settle_seconds,
                 )
-            if isinstance(result, workitems.WorkItemOutcome):
+            if isinstance(result, lifecycle.WorkItemOutcome):
                 logger.warning(
                     "work item request %s cancellation settled after %ds "
                     "without a worker teardown receipt",
@@ -336,14 +364,12 @@ class WorkItemReconciler:
             ).all()
         for work_item_id in ids:
             async with self._sessionmaker() as session:
-                now = await workitems._database_now(session)
-                await workitems.admit_pending_readmit(
+                now = await lifecycle.database_now(session)
+                await lifecycle.admit_pending_readmit(
                     session,
                     work_item_id=work_item_id,
                     wait_deadline=now
-                    + timedelta(
-                        seconds=self._settings.work_item_wait_budget_seconds
-                    ),
+                    + timedelta(seconds=self._settings.work_item_wait_budget_seconds),
                 )
         async with self._sessionmaker() as session:
             active = aliased(ExecutionRequest)
@@ -359,9 +385,7 @@ class WorkItemReconciler:
                         WorkItem.readmit_request_id.is_(None),
                         ~exists().where(
                             active.work_item_id == WorkItem.id,
-                            active.status.in_(
-                                ("waiting", "running", "cancellation_requested")
-                            ),
+                            active.status.in_(("waiting", "running", "cancellation_requested")),
                         ),
                     )
                     .group_by(WorkItem.id)
@@ -371,8 +395,8 @@ class WorkItemReconciler:
             ).all()
         for work_item_id in queued_ids:
             async with self._sessionmaker() as session:
-                now = await workitems._database_now(session)
-                await workitems.admit_next_revision(
+                now = await lifecycle.database_now(session)
+                await lifecycle.admit_next_revision(
                     session,
                     work_item_id=work_item_id,
                     wait_deadline=now
@@ -399,11 +423,11 @@ class WorkItemReconciler:
             return True
 
         client: httpx.AsyncClient | None = None
-        gated: list[workitems.PublicationSettlement] = []
+        gated: list[lifecycle.PublicationSettlement] = []
         try:
             for _ in range(self._settings.work_item_batch_limit):
                 async with self._sessionmaker() as session:
-                    settlement = await workitems.claim_publication_settlement(
+                    settlement = await lifecycle.claim_publication_settlement(
                         session, exclude=frozenset(skip)
                     )
                     if settlement is None:
@@ -411,7 +435,7 @@ class WorkItemReconciler:
                         break
                     skip.add(settlement.request_id)
                     if settlement.cause != "completed":
-                        await workitems.fail_execution(
+                        await lifecycle.fail_execution(
                             session,
                             work_item_id=settlement.work_item_id,
                             request_id=settlement.request_id,
@@ -429,7 +453,8 @@ class WorkItemReconciler:
             for settlement in gated:
                 if client is None:
                     client = httpx.AsyncClient(
-                        timeout=self._settings.github_app_timeout_seconds
+                        timeout=self._settings.github_app_timeout_seconds,
+                        verify=code_host_verify(self._settings),
                     )
                 result = await factory_ci.gate(
                     self._sessionmaker,
@@ -448,9 +473,7 @@ class WorkItemReconciler:
             if client is not None:
                 await client.aclose()
 
-    async def _dispatch_ci_turn(
-        self, request: ExecutionRequest, round_: int, text: str
-    ) -> bool:
+    async def _dispatch_ci_turn(self, request: ExecutionRequest, round_: int, text: str) -> bool:
         """Enqueue a CI fix turn for the same request, like its execute wake."""
 
         async with self._sessionmaker() as session:
@@ -498,17 +521,61 @@ class WorkItemReconciler:
         """Admit labeled issues whose delivery GitHub never retried (#3081)."""
 
         settings = self._settings
-        interval = settings.github_factory_reconcile_interval_s
-        if not settings.github_factory_ingress_enabled or interval <= 0:
+        if not settings.factory_enabled:
+            return
+        if settings.factory_intake == "poll":
+            tracker = forges_registry(settings).github_tracker()
+            interval = tracker.config.poll_interval_s if tracker is not None else 0.0
+        else:
+            interval = settings.factory_reconcile_interval_s
+        if interval <= 0:
             return
         clock = asyncio.get_running_loop().time()
         if clock < self._labels_due:
             return
         self._labels_due = clock + interval
-        async with httpx.AsyncClient(timeout=settings.github_app_timeout_seconds) as client:
-            await factory_label_reconcile.reconcile_missed_labels(
-                self._sessionmaker, settings, client, now=datetime.now(UTC)
-            )
+        async with httpx.AsyncClient(
+            timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
+        ) as client:
+            if settings.factory_intake == "poll":
+                await factory_poll_intake.poll_once(self._sessionmaker, settings, client)
+            else:
+                await factory_label_reconcile.reconcile_missed_labels(
+                    self._sessionmaker, settings, client, now=datetime.now(UTC)
+                )
+
+    async def _poll_trackers(self) -> None:
+        """Poll every non-GitHub tracker binding through the ports (#4358 plan D1),
+        then the review feedback on every non-GitHub factory pull request (#4399).
+
+        Both run whatever the GitHub intake mode is: such a tracker or code host
+        has no webhook, so its poll is its intake. The review pass runs even
+        when the tracker poll failed.
+        """
+
+        settings = self._settings
+        if not settings.factory_enabled:
+            return
+        async with httpx.AsyncClient(
+            timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
+        ) as client:
+            try:
+                await factory_tracker_intake.poll_trackers(
+                    self._sessionmaker,
+                    settings,
+                    client,
+                    due=self._trackers_due,
+                    clock=asyncio.get_running_loop().time(),
+                )
+            finally:
+                await factory_review_feedback.poll_review_feedback(
+                    self._sessionmaker,
+                    settings,
+                    client,
+                    self._valkey,
+                    due=self._review_feedback_due,
+                    clock=asyncio.get_running_loop().time(),
+                )
 
     async def _sync_status_comments(self) -> None:
         paused_for_upgrade = False
@@ -522,10 +589,12 @@ class WorkItemReconciler:
                 " treating the installation as not paused",
                 exc_info=True,
             )
-        async with self._sessionmaker() as session:
-            await factory_notices.sync_status_comments(
-                session, self._settings, paused_for_upgrade=paused_for_upgrade
-            )
+        await factory_notices.sync_status_comments(
+            self._sessionmaker,
+            self._settings,
+            owner=self._owner,
+            paused_for_upgrade=paused_for_upgrade,
+        )
 
     async def _publish_execute_wakes(self) -> None:
         async with self._sessionmaker() as session:
@@ -541,13 +610,9 @@ class WorkItemReconciler:
                 continue
             await self._xadd(turn)
             async with self._sessionmaker() as session:
-                await fence_published(
-                    session, item.request_id, item.epoch, item.generation
-                )
+                await fence_published(session, item.request_id, item.epoch, item.generation)
 
-    async def _execute_turn(
-        self, request_id: uuid.UUID, generation: int
-    ) -> QueuedTurn | None:
+    async def _execute_turn(self, request_id: uuid.UUID, generation: int) -> QueuedTurn | None:
         async with self._sessionmaker() as session:
             loaded = await load_execute_wake(session, request_id)
         if loaded is None:

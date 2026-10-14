@@ -11,12 +11,12 @@
 
 #![cfg(unix)]
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const RELEASE: &str = "acme-platform";
@@ -99,6 +99,32 @@ spec:
     name: acme-platform-runner
 "#;
 
+const REPOSITORY_PAIR_MANIFEST: &str = r#"---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: acme-platform-agent-red-img-aaaaaaaaaaaa-runner
+  labels:
+    app.kubernetes.io/component: agent-sandbox
+    app.kubernetes.io/instance: acme-platform
+    app.kubernetes.io/managed-by: Helm
+spec:
+  service: true
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: acme-platform-agent-red-img-aaaaaaaaaaaa-runner-pool
+  labels:
+    app.kubernetes.io/component: agent-sandbox
+    app.kubernetes.io/instance: acme-platform
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 0
+  sandboxTemplateRef:
+    name: acme-platform-agent-red-img-aaaaaaaaaaaa-runner
+"#;
+
 const INCOMPLETE_MANIFEST: &str = r#"---
 apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxTemplate
@@ -124,6 +150,7 @@ const TOOL_SHIM: &str = r#"#!/usr/bin/env python3
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -193,6 +220,20 @@ objects = {
     },
 }
 
+if scenario in ("repository-runner-omitted", "repository-runners-complete"):
+    for suffix in ("a" * 12, "b" * 12):
+        name = "acme-platform-agent-red-img-" + suffix + "-runner"
+        objects[name] = {
+            "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+            "kind": "SandboxTemplate", "metadata": metadata(name),
+            "spec": {"service": True},
+        }
+        objects[name + "-pool"] = {
+            "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+            "kind": "SandboxWarmPool", "metadata": metadata(name + "-pool"),
+            "spec": {"replicas": 0, "sandboxTemplateRef": {"name": name}},
+        }
+
 if scenario == "divergent-live":
     objects["acme-platform-agent-red-runner"]["metadata"]["labels"]["app.kubernetes.io/managed-by"] = "external-controller"
     objects["acme-platform-agent-red-runner"]["spec"]["service"] = False
@@ -210,6 +251,13 @@ def sandbox_list():
 if tool == "helm":
     verb = args[0] if args else ""
     if verb == "history":
+        if scenario == "helm-upgrade-hang" and (root / "hung-helm.pid").exists() and not (root / "helm-death-observed").exists():
+            pid = (root / "hung-helm.pid").read_text().strip()
+            status = subprocess.run(["ps", "-p", pid, "-o", "stat="], capture_output=True, text=True)
+            state = status.stdout.strip()
+            alive = status.returncode == 0 and state and state[0] not in ("Z", "X")
+            event("helm:child-alive" if alive else "helm:child-exited")
+            (root / "helm-death-observed").touch()
         event("helm:history")
         if scenario == "history-failure":
             print("history unavailable", file=sys.stderr)
@@ -309,6 +357,22 @@ if tool == "helm":
             print(json.dumps({"agentSandbox": {"deploy": False}}))
         elif scenario == "active-agent-omitted":
             print(json.dumps({"agentSandbox": {"deploy": True, "connectorSecrets": {"red": {"EXAMPLE_SETTING": "placeholder"}}}}))
+        elif scenario in ("repository-runner-omitted", "repository-runners-complete"):
+            def runner(digit):
+                return {
+                    "tools": ["uv"],
+                    "image": "registry.example.com/acme/runner@sha256:" + digit * 64,
+                    "base": "sha256:" + "d" * 64,
+                    "platformDigests": {"linux/amd64": "sha256:" + "e" * 64, "linux/arm64": "sha256:" + "f" * 64},
+                }
+            print(json.dumps({
+                "agentSandbox": {"deploy": True, "runnerImages": {"red": "registry.example.com/acme/agent@sha256:" + "c" * 64}},
+                "factory": {"sandboxEgress": {"red": True}, "bindings": [{"repos": [
+                    {"path": "acme-corp/api", "runner": runner("a")},
+                    {"path": "acme-corp/ui", "runner": runner("a")},
+                    {"path": "acme-corp/tools", "runner": runner("b")},
+                ]}]},
+            }))
         else:
             print("{}")
         raise SystemExit(0)
@@ -338,8 +402,9 @@ if tool == "helm":
             (root / "hung-helm.pid").write_text(str(os.getpid()))
             print("helm-hang-stdout-placeholder", flush=True)
             print("helm-hang-stderr-placeholder", file=sys.stderr, flush=True)
-            time.sleep(3)
-            raise SystemExit(124)
+            event("helm:waiting")
+            while True:
+                time.sleep(60)
         if scenario == "helm-sensitive-stderr":
             print(os.environ["FAKE_SENSITIVE_SENTINEL"], file=sys.stderr)
             raise SystemExit(1)
@@ -486,7 +551,17 @@ impl FakeCluster {
         let github = support::serve(|_req: &support::Request| {
             support::Response::json(200, r#"{"id":1234567,"name":"acme-bot"}"#)
         });
-        fs::write(dir.path().join("pre.yaml"), PRE_MANIFEST).expect("write pre manifest");
+        let pre_manifest = match scenario {
+            "repository-runner-omitted" => {
+                format!("{PRE_MANIFEST}{REPOSITORY_PAIR_MANIFEST}")
+            }
+            "repository-runners-complete" => format!(
+                "{PRE_MANIFEST}{REPOSITORY_PAIR_MANIFEST}{}",
+                REPOSITORY_PAIR_MANIFEST.replace("aaaaaaaaaaaa", "bbbbbbbbbbbb")
+            ),
+            _ => PRE_MANIFEST.to_string(),
+        };
+        fs::write(dir.path().join("pre.yaml"), pre_manifest).expect("write pre manifest");
         fs::write(dir.path().join("dropped.yaml"), DROPPED_MANIFEST)
             .expect("write dropped manifest");
         fs::write(dir.path().join("incomplete.yaml"), INCOMPLETE_MANIFEST)
@@ -508,6 +583,20 @@ impl FakeCluster {
                     || !name.contains("agent-red"))
             {
                 fs::write(dir.path().join(format!("live__{name}")), "").expect("seed live object");
+            }
+        }
+        if matches!(
+            scenario,
+            "repository-runner-omitted" | "repository-runners-complete"
+        ) {
+            for name in [
+                "acme-platform-agent-red-img-aaaaaaaaaaaa-runner",
+                "acme-platform-agent-red-img-aaaaaaaaaaaa-runner-pool",
+                "acme-platform-agent-red-img-bbbbbbbbbbbb-runner",
+                "acme-platform-agent-red-img-bbbbbbbbbbbb-runner-pool",
+            ] {
+                fs::write(dir.path().join(format!("live__{name}")), "")
+                    .expect("seed live repository object");
             }
         }
         Self { dir, github }
@@ -568,7 +657,29 @@ impl FakeCluster {
             .env("FAKE_SENSITIVE_SENTINEL", sensitive_stderr_sentinel())
             .env("CURIE_GITHUB_API_URL", &self.github.base_url);
         if scenario == "helm-upgrade-hang" {
-            command.env("CURIE_TEST_GITHUB_APP_HELM_TIMEOUT_MS", "1000");
+            // Leave ample time for the real shim process to start under load.
+            // Correctness is asserted by events, rather than elapsed wall time.
+            command.env("CURIE_TEST_GITHUB_APP_HELM_TIMEOUT_MS", "10000");
+            let mut child = command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("run curie with a hung Helm child");
+            let watchdog = Instant::now() + Duration::from_secs(60);
+            loop {
+                if child.try_wait().expect("observe curie process").is_some() {
+                    return child.wait_with_output().expect("collect curie output");
+                }
+                if Instant::now() >= watchdog {
+                    child
+                        .kill()
+                        .expect("stop curie after fixture watchdog expiry");
+                    kill_recorded_process(&self.state().join("hung-helm.pid"));
+                    child.wait().expect("reap the fixture's curie process");
+                    panic!("the hung Helm fixture exceeded its broad safety watchdog");
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
         }
         command
             .output()
@@ -605,6 +716,17 @@ fn combined(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+fn kill_recorded_process(path: &Path) {
+    if let Some(pid) = fs::read_to_string(path)
+        .ok()
+        .and_then(|recorded| recorded.trim().parse::<libc::pid_t>().ok())
+        .filter(|pid| *pid > 0)
+    {
+        // Only the private shim's recorded child can receive this cleanup signal.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
 }
 
 fn process_exited(pid: u32) -> bool {
@@ -1903,6 +2025,72 @@ fn active_connector_agent_missing_from_the_captured_manifest_refuses_before_muta
 }
 
 #[test]
+fn repository_runner_missing_from_the_captured_manifest_refuses_before_mutation() {
+    let cluster = FakeCluster::new("repository-runner-omitted");
+    let output = cluster.run("repository-runner-omitted", false);
+    let events = cluster.events();
+    assert!(
+        !output.status.success(),
+        "repository values require both distinct image pairs: {}",
+        combined(&output)
+    );
+    assert!(
+        position(&events, "helm:get-values") < position(&events, "helm:get-manifest:pre"),
+        "repository inventory must come from the captured Helm values: {events:?}"
+    );
+    assert_revisioned_pre_manifest_read(&cluster.raw());
+    assert!(
+        !events.iter().any(|event| event == "helm:upgrade"
+            || event.starts_with("helm:rollback:")
+            || event.starts_with("kubectl:create:")
+            || event == "kubectl:rollout-restart"),
+        "missing repository inventory reached a mutation: {events:?}"
+    );
+    let value = stdout_json(&output);
+    let error = value["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("inventory")
+            && error.contains("acme-platform-agent-red-img-bbbbbbbbbbbb-runner")
+            && error.contains("acme-platform-agent-red-img-bbbbbbbbbbbb-runner-pool"),
+        "the refusal must identify the missing repository pair: {value}"
+    );
+    assert!(
+        value.get("github_app_configured").is_none(),
+        "missing repository inventory emitted success: {value}"
+    );
+}
+
+#[test]
+fn complete_repository_runner_inventory_proceeds_with_the_credential_change() {
+    let cluster = FakeCluster::new("repository-runners-complete");
+    let output = cluster.run("repository-runners-complete", false);
+    let events = cluster.events();
+    assert!(
+        output.status.success(),
+        "complete repository runner inventory must be accepted: {}; events: {events:?}",
+        combined(&output)
+    );
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({"github_app_configured": true})
+    );
+    assert_revisioned_pre_manifest_read(&cluster.raw());
+    assert!(
+        position(&events, "helm:get-manifest:pre") < position(&events, "helm:upgrade")
+            && position(&events, "helm:upgrade") < position(&events, "helm:get-manifest:post")
+            && position(&events, "helm:get-manifest:post")
+                < position(&events, "kubectl:rollout-restart"),
+        "complete repository pairs must be checked before mutation and rollout: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("kubectl:create:")),
+        "already-live repository pairs must not be overwritten: {events:?}"
+    );
+}
+
+#[test]
 fn failed_helm_successor_restores_the_stable_active_revision_before_returning_error() {
     let cluster = FakeCluster::new("helm-failed-successor-with-loss");
     let output = cluster.run("helm-failed-successor-with-loss", false);
@@ -2037,21 +2225,20 @@ fn helm_failure_output_cannot_echo_sensitive_stderr_into_the_json_error() {
 
 #[test]
 fn a_hung_helm_upgrade_times_out_restores_live_pairs_and_returns_recovery() {
+    struct HungHelmCleanup(Option<PathBuf>);
+
+    impl Drop for HungHelmCleanup {
+        fn drop(&mut self) {
+            if let Some(path) = &self.0 {
+                kill_recorded_process(path);
+            }
+        }
+    }
+
     let cluster = FakeCluster::new("helm-upgrade-hang");
-    let started = Instant::now();
+    let mut cleanup = HungHelmCleanup(Some(cluster.state().join("hung-helm.pid")));
     let output = cluster.run("helm-upgrade-hang", false);
-    let elapsed = started.elapsed();
     let events = cluster.events();
-    // The one second child deadline includes delayed Python shim startup and is
-    // followed by several recovery subprocesses.
-    // Under nextest's partition-wide load those process launches can take a
-    // couple of seconds even though the hung Helm child was killed on time.
-    // Keep the wall bound far below the production Helm timeout without
-    // coupling the assertion to an otherwise idle runner.
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "debug timeout override must bound the hanging Helm child well below the production timeout; elapsed={elapsed:?}"
-    );
     assert!(
         !output.status.success(),
         "a timed-out Helm upgrade must return nonzero"
@@ -2065,6 +2252,7 @@ fn a_hung_helm_upgrade_times_out_restores_live_pairs_and_returns_recovery() {
         process_exited(pid),
         "timed-out Helm child {pid} remained alive after the CLI returned"
     );
+    cleanup.0 = None;
     assert!(
         events
             .iter()
@@ -2086,9 +2274,22 @@ fn a_hung_helm_upgrade_times_out_restores_live_pairs_and_returns_recovery() {
         .iter()
         .rposition(|event| event == "kubectl:get-sandboxes:post")
         .unwrap_or_else(|| panic!("missing post-timeout live verification: {events:?}"));
+    let waiting = position(&events, "helm:waiting");
+    let exited = position(&events, "helm:child-exited");
+    let recovery_history = events
+        .iter()
+        .enumerate()
+        .find_map(|(index, event)| (index > exited && event == "helm:history").then_some(index))
+        .unwrap_or_else(|| panic!("missing history read after child death: {events:?}"));
     assert!(
-        position(&events, "helm:upgrade") < template && template < pool && pool < verified,
-        "timeout recovery must restore template-before-pool and verify: {events:?}"
+        position(&events, "helm:upgrade") < waiting
+            && waiting < exited
+            && exited < recovery_history
+            && recovery_history < template
+            && template < pool
+            && pool < verified
+            && !events.iter().any(|event| event == "helm:child-alive"),
+        "the hung child must die before recovery history, template-before-pool restore, and verification: {events:?}"
     );
     assert_recreated_as_helm_owned(
         &cluster,
@@ -2104,6 +2305,13 @@ fn a_hung_helm_upgrade_times_out_restores_live_pairs_and_returns_recovery() {
         "the CLI must not automatically roll back an uncertain Helm attempt: {events:?}"
     );
     let value = stdout_json(&output);
+    assert!(
+        value
+            .get("error")
+            .and_then(|error| error.as_str())
+            .is_some_and(|error| error.contains("Helm mutation failed") && error.contains("sandbox")),
+        "the indefinitely waiting child must return the typed mutation and recovery failure: {value}"
+    );
     let recovery =
         format!("helm rollback {RELEASE} {REVISION} -n {NAMESPACE} --wait --timeout 180s");
     assert!(

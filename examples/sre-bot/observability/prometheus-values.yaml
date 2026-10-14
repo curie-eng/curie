@@ -349,31 +349,43 @@ serverFiles:
                 broken metrics pipeline, a dead process, or a worker or api that
                 cannot read Valkey or Postgres, never a quiet system.
           - alert: CurieTurnAcceptedStale
-            # Counted per label set, not per series: a restart leaves the old
-            # instance's series flat in the range, where a per-series count
-            # pages, and starts the new one's at its first turn. So both
-            # windows sum without `instance`, and the alert names no process.
+            # Counted per installation, not per series or label combination.
+            # Each window sums without every label that names a process or a
+            # combination: `instance` and `job` per exporting process,
+            # `service_instance_id` per runner sandbox, and `service_name`,
+            # `source` and `outcome` per combination. A combination that goes
+            # quiet while others accept turns is not a missed canary, and
+            # paging per combination pages for up to seven days on each one
+            # with a turn in the 7d range. A restart leaves the old instance's
+            # series flat in the range and starts the new one's at its first
+            # turn, which a per-series count also misreads. Any other label,
+            # such as one an operator stamps to tell installations apart, is
+            # kept, so the alert names the installation and nothing finer.
             # The 90m count adds the new-series term above, reading
             # last_over_time(X[90m]) for X, so a new instance's first turn
             # counts for the whole window: a process that took one turn and
             # exited, including the runner's one-turn sandboxes, still counts
             # after X drops it. The 7d gate adds no such term: with under
             # seven days of history every live series looks new over 7d, and
-            # a term there would page every label set with a lifetime count
-            # above zero and no turn in 90 minutes. A label set with no series left in the 90m range,
-            # such as an old instance's after a restart with no turn since,
-            # counts as zero rather than absent. The costs: a label set whose
-            # only turns in seven days are new series' first samples, such as
-            # its first turn ever and then silence, is not armed; and a label
-            # set that stops recording for good pages for up to seven days,
-            # while its turns are still in the 7d range; and after a metrics
-            # gap longer than the 1h lookback every series looks new until 90
-            # minutes after samples resume, so the 90m count reads lifetime
-            # values and a canary that stopped around the gap stays hidden
-            # until then. CurieApplicationMetricsAbsent pages the gap itself.
+            # a term there would page every installation with a lifetime count
+            # above zero and no turn in 90 minutes. An installation with no
+            # series left in the 90m range, such as one whose every process
+            # stopped exporting, counts as zero rather than absent, so it still
+            # pages while its turns are in the 7d range; one with no turn in
+            # seven days is not armed, and a dead process or pipeline behind it
+            # is CurieApplicationMetricsAbsent's page. The costs:
+            # an installation whose only turns in seven days are new series'
+            # first samples, such as its first turn ever and then silence, is
+            # not armed; and an installation that stops recording for good
+            # pages for up to seven days, while its turns are still in the 7d
+            # range; and after a metrics gap longer than the 1h lookback every
+            # series looks new until 90 minutes after samples resume, so the
+            # 90m count reads lifetime values and a canary that stopped around
+            # the gap stays hidden until then. CurieApplicationMetricsAbsent
+            # pages the gap itself.
             expr: |
               (
-                sum without (instance) (
+                sum without (instance, job, service_instance_id, service_name, source, outcome) (
                   (
                     increase(curie_turn_accepted_total[90m])
                     unless
@@ -391,12 +403,12 @@ serverFiles:
                   )
                 )
                 or
-                0 * sum without (instance) (
+                0 * sum without (instance, job, service_instance_id, service_name, source, outcome) (
                   increase(curie_turn_accepted_total[7d])
                 )
               ) == 0
               and
-              sum without (instance) (
+              sum without (instance, job, service_instance_id, service_name, source, outcome) (
                 increase(curie_turn_accepted_total[7d])
               ) > 0
             for: 15m
@@ -533,6 +545,68 @@ serverFiles:
                 curie_worker_supervised_restart_total with outcome give_up
                 is present. The named operation stopped restarting and stays
                 down until the worker pod restarts.
+          # The two reaper alerts below, and what covers each failure. The
+          # worker records curie_e2e_reaper_last_success_seconds every
+          # interval while the reaper task lives. A slow pass keeps reporting
+          # its stale timestamp and is never cancelled or overlapped, so a
+          # live worker with a stuck pass is CurieE2EReaperStalled.
+          # A crashed task is CurieWorkerSupervisedRestartLoop, then
+          # CurieWorkerSupervisedTaskParked with operation e2e-reaper, which
+          # holds while the worker lives. A dead worker is
+          # CurieCoreWorkloadNotReady and CurieApplicationMetricsAbsent,
+          # neither of which has a window. CurieE2EReaperSignalAbsent is the
+          # backstop for a series that stops with none of those firing.
+          - alert: CurieE2EReaperStalled
+            # End to end namespace reaper (#3245, ADR 0176 decision 4). The
+            # gauge is the unix time of the last clean sweep and reads 0 until
+            # one succeeds, so a reaper that never worked pages too.
+            expr: |
+              time() - max_over_time(curie_e2e_reaper_last_success_seconds[6h]) > 900
+            for: 5m
+            labels:
+              severity: page
+              component: curie-e2e
+            annotations:
+              summary: The end to end namespace reaper has not completed a sweep in 15 minutes
+              description: >-
+                curie_e2e_reaper_last_success_seconds is more than 900 seconds
+                old. Expired and finished end to end namespaces are not being
+                deleted, and their quota on the test cluster is not being
+                released.
+          - alert: CurieE2EReaperSignalAbsent
+            # The timestamp stops being exported at all: the worker task died
+            # or the worker stopped running it. CurieE2EReaperStalled then sees
+            # no series and cannot fire. An installation that never exported
+            # it has nothing in the last 7 days and stays quiet.
+            expr: |
+              max(max_over_time(curie_e2e_reaper_last_success_seconds[7d]))
+              unless
+              max(max_over_time(curie_e2e_reaper_last_success_seconds[15m]))
+            for: 5m
+            labels:
+              severity: page
+              component: curie-e2e
+            annotations:
+              summary: The end to end namespace reaper stopped reporting
+              description: >-
+                curie_e2e_reaper_last_success_seconds was reported in the last
+                7 days but not in the last 15 minutes. The worker task that deletes
+                expired end to end namespaces is not running.
+          - alert: CurieE2EExpiredNamespacesAccumulating
+            # Keys on overdue, not expired: a healthy reaper always sees a few
+            # namespaces just past their TTL between sweeps.
+            expr: |
+              curie_e2e_namespaces_overdue > 0
+            for: 15m
+            labels:
+              severity: page
+              component: curie-e2e
+            annotations:
+              summary: End to end namespaces more than 10 minutes past their TTL are still on the test cluster
+              description: >-
+                curie_e2e_namespaces_overdue has stayed above 0 for 15 minutes.
+                Namespaces past their TTL are not being removed, so their quota
+                on the test cluster is not released.
           - alert: CurieReplyDeliveryRefused
             expr: |
               increase(
@@ -737,7 +811,7 @@ serverFiles:
             # unavailable as spec minus available, which is 0 - 0 there.
             # The regex is `.*mail-adapter.*` because matchers are fully
             # anchored and an installation names one adapter per mailbox
-            # with a suffix (`mail-adapter-brand`).
+            # with a suffix (`acme-mail-adapter-example`).
             expr: |
               (
                 kube_deployment_status_replicas_unavailable{
@@ -788,6 +862,103 @@ serverFiles:
                 A connector has no available replica, or has been scaled to
                 zero. Its agent still answers, and tells the person it cannot
                 reach the systems it reads from.
+          - alert: SreSlackEmailIntakeNotReady
+            # @spec SRE-EMAIL-3. The code ConfigMap is the durable opt-in
+            # marker: default SRE installs stay quiet, while deleting only the
+            # Deployment pages for as long as the install remains opted in.
+            # The historical term bridges a missing marker scrape for up to
+            # the shipped seven-day retention.
+            expr: |
+              sre_slack_email_intake_ready == 0
+              or
+              kube_deployment_status_replicas_unavailable{
+                deployment="sre-slack-email-intake"
+              } > 0
+              or
+              kube_deployment_spec_replicas{
+                deployment="sre-slack-email-intake"
+              } == 0
+              or
+              (
+                kube_deployment_spec_replicas{
+                  deployment="sre-slack-email-intake"
+                } > 0
+                unless on (namespace)
+                max by (namespace) (
+                  up{
+                    job="kubernetes-pods",
+                    pod=~"sre-slack-email-intake-.*"
+                  }
+                )
+              )
+              or
+              (
+                kube_configmap_info{
+                  configmap="sre-slack-email-intake-code"
+                }
+                unless on (namespace)
+                kube_deployment_spec_replicas{
+                  deployment="sre-slack-email-intake"
+                }
+              )
+              or
+              (
+                max_over_time(
+                  kube_deployment_spec_replicas{
+                    deployment="sre-slack-email-intake"
+                  }[7d]
+                ) > 0
+                unless
+                kube_deployment_spec_replicas{
+                  deployment="sre-slack-email-intake"
+                }
+              )
+            for: 2m
+            labels:
+              severity: page
+              component: sre-slack-email-intake
+            annotations:
+              summary: Slack Email alert intake is not ready
+              description: >-
+                The opt-in Slack Email intake has not completed a scan within
+                two poll intervals, has no ready replica or Prometheus scrape,
+                was scaled to zero, or disappeared after previously being
+                deployed. Alert emails may not be starting SRE turns in their
+                source threads.
+          - alert: SreSlackEmailIntakeRestarted
+            # @spec SRE-EMAIL-3. One restart is enough: all scan and dispatch
+            # failures are fatal by design. The second arm sees the first
+            # sample of a newly exported container counter.
+            expr: |
+              increase(
+                kube_pod_container_status_restarts_total{
+                  container="intake",
+                  pod=~"sre-slack-email-intake-.*"
+                }[15m]
+              ) > 0
+              or
+              (
+                kube_pod_container_status_restarts_total{
+                  container="intake",
+                  pod=~"sre-slack-email-intake-.*"
+                }
+                unless
+                last_over_time(
+                  kube_pod_container_status_restarts_total{
+                    container="intake",
+                    pod=~"sre-slack-email-intake-.*"
+                  }[1h] offset 15m
+                )
+              ) > 0
+            for: 2m
+            labels:
+              severity: page
+              component: sre-slack-email-intake
+            annotations:
+              summary: Slack Email alert intake restarted
+              description: >-
+                The intake process restarted after a configuration, Slack,
+                file-download, hook, routing, or stale-placeholder failure.
           - alert: CurieConnectorToolErrors
             # A connector that is serving but answers its tool calls with
             # errors is invisible to CurieConnectorNotReady: every turn still

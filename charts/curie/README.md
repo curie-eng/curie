@@ -109,6 +109,12 @@ marker in place, so a successful release Job means release processing completed;
 confirm the actual claim state with `curie cluster status`. The marker TTL is a
 last-resort expiry, not a promise of prompt convergence for a current pause.
 
+The drain, attest and release hook Jobs share `worker.upgradeDrain.resources`.
+Worker dependency imports peaked at approximately `148Mi` in subprocess
+measurements, so the default memory request and limit are both `384Mi`, giving
+more than twice that peak. When overriding this block, size both the memory
+request and limit to at least twice the deployed worker image's measured peak.
+
 **Step 2 -- connect Slack + a real model.** When you have Slack tokens and a
 model credential, upgrade in place (the exact command is also printed in
 `NOTES.txt` after step 1):
@@ -344,6 +350,41 @@ HTTP. Logs and metrics retain explicit collector pipelines. Their destinations
 are operator-configured collector exporters; installing Grafana, Loki, Tempo,
 Prometheus, or another retained backend is deliberately separate from this
 chart's OTLP write path.
+
+### Optional trace processors
+
+`otelCollector.extraProcessors` defines additional Collector processors by
+component ID. `otelCollector.extraTracePipelineProcessors` selects their IDs in
+execution order for the traces pipeline. Selected processors run after
+`memory_limiter` and before `batch`; with both values empty, the rendered
+Collector configuration and all three pipelines retain their existing defaults.
+An upgrade using `--reuse-values` from a release whose values predate these
+keys also treats the omitted keys as empty. An explicitly supplied non-map
+`extraProcessors` or non-list `extraTracePipelineProcessors` is rejected.
+For example, an operator can suppress routine spans before batching and export
+while retaining user, state, and action spans:
+
+```yaml
+otelCollector:
+  extraProcessors:
+    filter/routine_spans:
+      error_mode: ignore
+      traces:
+        span:
+          - 'IsMatch(name, "^(health|background)")'
+  extraTracePipelineProcessors: [filter/routine_spans]
+```
+
+The chart refuses an extra processor that replaces a built-in processor, a
+malformed component ID or non-map configuration, an undefined pipeline
+reference, a duplicate selected ID, or a selected built-in ID. The selection
+affects traces only; logs and metrics keep their existing processor order.
+The operator owns the filter expression and must validate it against the
+pinned Collector image and representative spans before applying it. On
+Collector contrib 0.119.0, `otelcol-contrib validate --config=...` accepted
+the example filter; an OTLP/HTTP input with `health.check`,
+`background.poll`, `user.message`, `state.update`, and `action.execute`
+produced exactly the final three spans at a detailed debug exporter.
 
 The SRE bot Prometheus overlay includes alerts for dead lettered messages,
 slow sandbox claims, refused capacity reclamation, and transcript persistence
@@ -824,6 +865,26 @@ api/webhook keys, `worker.internalWorkerToken`, and
 (values-dev.yaml, i.e. `curie cluster up --dev`) to keep the deterministic
 published defaults for dev/CI.
 
+Each Deployment, StatefulSet and DaemonSet that consumes chart-owned Secret
+keys carries a `checksum/secret` pod-template annotation. It hashes only that
+pod's consumed keys from the same once-per-render plaintext content emitted by
+the Secret, including rendered `extraEnv` references. A `helm upgrade` that
+changes a consumed key rolls its consumers; unchanged Secret content, unrelated
+keys, replica counts and image tags leave the checksum unchanged. The first
+upgrade onto this chart adds the annotation and rolls each current consumer
+once, including all four backing StatefulSets when they use chart-owned
+credentials. Pods that consume no chart-owned keys, chart Jobs and the
+SandboxTemplate carry no such annotation. Foreign `existingSecret` contents are
+excluded, so rotating one in place still needs a manual restart; existing
+component-specific rotation mechanisms continue to apply. Restarting a store
+does not rotate the password in its persisted database; coordinate that
+database-side change separately.
+
+Dev installs derive their installation identity from the namespace and release
+name so identical inputs render identical checksums (#1135, ADR-0144). Reinstalling
+that same namespace/release in dev reuses the identity. Sealed fresh installs
+still mint unique random identities, and upgrades preserve the stored identity.
+
 The eleven non init credentials persist through `lookup`, so `helm upgrade`
 re-uses them. Their explicit `--set` overrides and per store `existingSecret`
 values take precedence for rotation or recovery. The Langfuse init project
@@ -887,6 +948,50 @@ the chart collector without setting `otelCollector.endpoint` or
 `otelCollector.telemetryDisabled=true`, so a production install cannot silently
 drop every workload's OTLP destination. It is off by default so the zero-secret
 bare install stays green.
+
+### In-chart RustFS storage
+
+The in-chart RustFS volume claim defaults to `rustfs.persistence.size: 10Gi`.
+Every Langfuse event upload costs about three inodes, and 10Gi on ext4 holds
+655,360 of them, well past the 2-day event retention window. The earlier 3Gi
+default could run out of inodes long before it ran out of bytes (#4408).
+
+A StatefulSet's volume claim template cannot change after creation, so an
+existing install keeps its claim size on upgrade: the chart reads the size back
+from the live RustFS StatefulSet's `data` claim template with Helm `lookup` and
+renders that instead of the default. To grow an existing volume on a storage
+class with `allowVolumeExpansion: true`, patch the claim directly:
+
+```bash
+kubectl patch pvc data-<release>-curie-rustfs-0 -n <namespace> \
+  -p '{"spec":{"resources":{"requests":{"storage":"10Gi"}}}}'
+```
+
+The StatefulSet's claim template keeps the old size after that, which is fine:
+it only applies to claims that do not exist yet.
+
+`lookup` is empty when the chart is rendered without cluster access (`helm
+template`, Argo CD). Those renders get the 10Gi default, which Kubernetes
+refuses on an existing StatefulSet with a different size, so pin
+`rustfs.persistence.size` to the size the StatefulSet's `data` claim template
+requests, not the size of the PVC, which is larger once patched as above:
+
+```bash
+kubectl get statefulset <release>-curie-rustfs -n <namespace> \
+  -o jsonpath='{.spec.volumeClaimTemplates[0].spec.resources.requests.storage}'
+```
+
+A `storage-guard` init container checks the volume. When free inodes or free
+bytes are under 10%, it deletes the event objects under `<rustfs.bucket>/events/`
+that have not changed within `langfuse.eventUpload.retentionDays`, the same
+objects the bucket's lifecycle rule expires, because RustFS exits on a full
+volume before its own expiry can run. It touches nothing outside that prefix, and `retentionDays: 0` disables it.
+
+Because it is an init container, the guard runs when the pod starts (install,
+an upgrade that changes the pod, a reschedule, `kubectl delete pod`), not when
+only the RustFS container restarts. A RustFS container already crash-looping on
+a full volume recovers after `kubectl delete pod <release>-curie-rustfs-0 -n
+<namespace>`, which recreates the pod and runs the guard.
 
 ### Key-free object store auth
 
@@ -960,8 +1065,8 @@ The bundle fetch uses path style addressing, so it appends
 `agentSandbox.runner.bundleFetch.bucket` to this endpoint. For another AWS
 region, change the region in `rustfs.host` and set `rustfs.region` to control
 the SigV4 signing region used by the bundle fetch init container and by
-Langfuse's event/media uploads. This setting does not configure the API or
-worker S3 clients.
+Langfuse's event/media uploads. This setting also sets `S3_REGION` for the API
+and worker S3 clients.
 
 **Runner egress is a separate required list.** Rail 1 default-denies the
 sandbox, and the in-chart `runner-allow-rustfs` policy is a pod selector on
@@ -1072,21 +1177,43 @@ egress is actually blocked, and `enforcement=false` (fails loudly) otherwise.
 post-upgrade hook Job, also re-runnable via `helm test`. Default `enabled:
 true`, gated also on `agentSandbox.controller.deploy` (also default true).
 
-- The vendored agent-sandbox controller runs a cluster-scope NetworkPolicy
-  informer. If its RBAC cannot satisfy that cluster LIST, the manager
-  crash-loops and no SandboxClaim ever binds. The Deployment has no
-  readiness probe, so `rollout status` can pass while the manager still
-  blocks on cache sync. The load-bearing signal is the "Starting workers"
-  log line.
-- The Job fails the Helm operation unless the controller becomes Available
-  and logs "Starting workers" within
-  `preflights.controllerReady.timeoutSeconds` (default 180).
-- An upgrade over a crash-looping controller may need a manual pod delete
-  plus `helm test`, because the hook waits for a healthy controller that
-  never arrives.
-- Skipped when `agentSandbox.controller.deploy: false` (BYO controller) or
-  `preflights.controllerReady.enabled: false`.
-- Read the verdict: `kubectl logs -n <ns> job/<release>-preflight-controller`.
+1. The vendored agent-sandbox controller runs a cluster-scope NetworkPolicy
+   informer. If its RBAC cannot satisfy that cluster LIST, the manager
+   crash-loops and no SandboxClaim ever binds. The Deployment has no
+   readiness probe, so `rollout status` can pass while the manager still
+   blocks on cache sync.
+2. Each poll first fails on a forbidden-NetworkPolicy line in the current
+   controller log.
+3. It then passes on a stable serving leader (issue #4197): the controller
+   Deployment has finished rolling out its current generation, the
+   leader-election Lease names a current Running, Ready, non-terminating
+   controller pod, the same holder has led for at least
+   `preflights.controllerReady.stableLeaderSeconds` (default 180, minimum 150),
+   and it renews the Lease while the hook watches. A manager whose informer
+   caches cannot sync exits after the 120s controller-runtime cache-sync
+   timeout and loses the lease, so a longer continuous term proves sync. This
+   is what lets an upgrade that does not restart the controller pass, even
+   when its startup log has rotated away, its metrics port is unreachable
+   from the control plane, or it restarted long before the upgrade. Both lease
+   timestamps come from the controller, so the hook node's clock does not
+   matter.
+4. Otherwise it checks pod restarts and previous logs. A lost leader-election
+   lease or a pod restart fails the gate with its existing cause-specific
+   diagnostic. A controller this upgrade restarted holds a fresh lease, so it
+   is judged here.
+5. The Job then passes when it observes "Starting workers" or a positive sum of
+   `controller_runtime_reconcile_total` samples with `result="success"` from
+   the current Running controller pod. It reads metrics on port 8080 through
+   the Kubernetes pod proxy. Successful reconciles require synced informer
+   caches, and their counter persists when the startup log rotates away.
+   Failed metrics requests and zero successful reconciles keep polling within
+   `preflights.controllerReady.timeoutSeconds` (default 180).
+6. An upgrade over a crash-looping controller may need a manual pod delete
+   plus `helm test`, because the hook waits for a healthy controller that
+   never arrives.
+7. Skipped when `agentSandbox.controller.deploy: false` (BYO controller) or
+   `preflights.controllerReady.enabled: false`.
+8. Read the verdict: `kubectl logs -n <ns> job/<release>-preflight-controller`.
 
 ## Single-node footprint (measured on a disposable single-node k3s cluster, 4 GB / 4 core)
 
@@ -1130,6 +1257,25 @@ this toward production HA:
   to handle drains deliberately (scale up first, or delete the PDB for planned
   maintenance). Enable it only once you run multiple replicas or explicitly want
   drains gated.
+- **Optional compute-plane PodDisruptionBudgets (#1574).** The api, worker, ui
+  and dispatcher Deployments each carry a `<component>.podDisruptionBudget`
+  block, also OFF by default because every one ships at `replicas: 1`:
+
+  | Values key | Default | When enabled |
+  |---|---|---|
+  | `api.podDisruptionBudget` | `{enabled: false, maxUnavailable: 1}` | Bounds how many API pods a drain evicts at once. Raise `api.replicas` for it to protect anything. |
+  | `worker.podDisruptionBudget` | `{enabled: false, maxUnavailable: 1}` | Bounds how many workers a drain evicts at once. Each evicted worker still drains its in-flight turns inside its termination grace (ADR-0131). |
+  | `ui.podDisruptionBudget` | `{enabled: false, maxUnavailable: 1}` | Bounds how many UI pods a drain evicts at once. Raise `ui.replicas` for it to protect anything. |
+  | `dispatcher.podDisruptionBudget` | `{enabled: false, maxUnavailable: 1}` | Accepted only as `minAvailable: 1` with `allowBlockingDrain: true`. The dispatcher is one replica with strategy `Recreate` by design (#2944), so a budget that permits a disruption protects nothing and is refused. |
+
+  Setting `minAvailable` replaces `maxUnavailable`, since a `policy/v1` budget
+  carries exactly one of the two. A budget that allows zero voluntary
+  disruptions at the configured replica count (`minAvailable` at or above
+  `replicas`, or `maxUnavailable: 0`) blocks every drain of the node running
+  that pod, so the render refuses it unless `allowBlockingDrain: true` says
+  that is intended. Each budget selects exactly its own Deployment's pods,
+  which `ci/compute-pdb-assertions.sh` checks against every rendered pod
+  template.
 
 Production sizing (raise every `resources` block and persistence size, supply
 real secrets) is covered in **Production sizing** above; PDBs and BYO stores are
@@ -1186,12 +1332,125 @@ sandbox and renders whenever an in-chart store is deployed.
 
 | Rail | What ships | Values |
 |---|---|---|
-| 1. Default-deny egress + metadata block | NetworkPolicies selecting `component: runner-sandbox`: default-deny egress, allow-DNS, an operator-declared egress allowlist, and (optional) ingress lock. Arbitrary internet AND `169.254.169.254` are denied by construction. | `security.networkPolicy.*` |
-| 2. Per agent secret isolation | Per agent SandboxTemplates inject connector credentials through `secretKeyRef` environment entries. The release runner ServiceAccount has no bound Role or mounted Kubernetes API token by default. The control plane does not create per agent Roles. | `agentSandbox.connectorSecrets`, `agentSandbox.runner.serviceAccount.*` |
+| 1. Default-deny egress + metadata block | NetworkPolicies selecting `component: runner-sandbox`: default-deny egress, allow-DNS, an operator-declared egress allowlist, and (optional) ingress lock that admits only this release's worker pods to the runner port. Arbitrary internet, `169.254.169.254`, and private ranges reached through a broad route are denied by construction. | `security.networkPolicy.*` |
+| 2. Per agent secret isolation | Per agent SandboxTemplates inject connector credentials through `secretKeyRef` environment entries, and each claim's scoped tokens ride a per-claim Secret instead of the SandboxClaim. The release runner ServiceAccount has no bound Role, and no runner pod mounts a Kubernetes API token (`automountToken` must stay `false`; the render fails otherwise). The control plane does not create per agent Roles. | `agentSandbox.connectorSecrets`, `agentSandbox.runner.serviceAccount.*` |
 | 3. Non-root / read-only rootfs | Pod + container securityContext on the runner: `runAsNonRoot`, uid 1000, `readOnlyRootFilesystem`, drop ALL caps, no privilege escalation, RuntimeDefault seccomp, plus writable emptyDir scratch (`/tmp`, `/home/runner`) and `HOME`. | `agentSandbox.runner.hardening.*` |
 | 4. gVisor kernel isolation | `runtimeClassName` on runner pods, driven by the `security.gvisor.mode` tri-state (`auto`/`require`/`off`) + a preflight that fails the install if the RuntimeClass is missing or downgraded, firing in `require` (always) and in `auto` for real-model runs + an optional RuntimeClass object. | `security.gvisor.*`, `security.gvisorPreflight.*` |
 | 5. Data-tier ingress isolation | Per deployed store (Postgres, RustFS, ClickHouse, Valkey): a default-deny-ingress NetworkPolicy plus a scoped-allow that permits ingress on the store's ports ONLY from this release's app pods (`name`+`instance` label). Blocks any co-tenant pod from opening `Postgres:5432` etc. | `security.dataTierNetworkPolicy.*` |
 | 6. Tenant capacity ceiling | A `ResourceQuota` bounding aggregate cpu/memory and sandbox pod count (scoped to the sandbox PriorityClass; a scoped quota cannot constrain ephemeral-storage, so per-pod disk is bounded by the `LimitRange`/pod limits times the pod-count cap), plus a `LimitRange` supplying per-container defaults so a sandbox pod created outside this chart's own templates still inherits a ceiling. Renders whenever `agentSandbox.deploy: true`. | `resourceQuota.*`, `limitRange.*` |
+
+**Runner template admission and per-claim tokens (#3842).** A `SandboxClaim`
+env entry is plain text in etcd, so the worker keeps the scoped tokens (runner,
+history, memory, state, progress, issue-read and connector-caller) off the claim.
+For a claim that carries them it writes a per-claim Secret, a per-claim copy of
+the pool's SandboxTemplate whose runner container reads each token by
+`secretKeyRef`, and a `replicas: 0` warm pool. The Secret and pool are owned by
+the template and the template by the claim, so Kubernetes garbage collection
+removes all three when the claim goes. The worker's reaper also deletes
+per-claim templates whose claim no longer exists. The worker's Role grants
+Secret `create` only (no read, list, or watch), and `list` and `delete` on
+SandboxTemplates. Three ValidatingAdmissionPolicies bound to the worker
+ServiceAccount enforce the shape (Kubernetes 1.30 or newer, rendered with
+`agentSandbox.deploy`):
+
+- `<fullname>-runner-resources` admits a SandboxTemplate only with no `hostPath`
+  volume, no host network, PID or IPC, no mounted ServiceAccount token (pod
+  `automountServiceAccountToken: false`, no projected token), the chart runner
+  ServiceAccount, no privileged container, added capability or host port, and
+  only images the chart renders (the runner image, each
+  `agentSandbox.runnerImages` entry, repository runner images from
+  `factory.bindings[].repos[].runner.image`, the bundle-fetch images when enabled) plus
+  `agentSandbox.runner.admission.extraImages`.
+- `<fullname>-runner-claim-cleanup` lets the worker delete only SandboxTemplates
+  labelled `curietech.ai/sandbox-claim`, never the chart's.
+- `<fullname>-worker-secrets` lets the worker create only Opaque `*-tokens`
+  Secrets labelled `curietech.ai/sandbox-claim` in the release namespace.
+
+The chart also refuses a runner `eks.amazonaws.com/role-arn` that equals the api,
+worker, or langfuse ServiceAccount's. It cannot see the role's IAM policy or an
+EKS Pod Identity association, so keep the runner role read-only on the bundle
+bucket. The Docker substrate is unchanged: it has no Secret and still passes
+tokens in the container env.
+
+**Factory repository runner resources (ADR 0216).** Repository `runner`
+declarations under `factory.bindings[].repos[]` add one SandboxTemplate and
+SandboxWarmPool per factory agent and distinct image index digest. Repositories
+sharing a digest share the pair. The runner, workspace-init and attachments-init
+containers use the repository image while preserving the agent's connector
+Secret references, label, workspace limit, placement and security settings.
+The chart prewarms these images and includes them in runner admission.
+
+When repository runners are configured, the current repository-keyed map requires
+exactly one true agent in `factory.sandboxEgress`, `agentSandbox.deploy: true`,
+and the chart-managed `worker.warmPool`. Template names are
+`<fullname>-agent-<agent>-img-<first12-indexhex>-runner`, with `-pool` appended
+for pools. Pool names must fit 63 characters. Conflicting duplicate repository
+declarations, conflicting image identities and digest-prefix or ordinary-agent
+name collisions fail rendering.
+
+The chart produces `CURIE_REPO_RUNNER_POOLS` only when repository runners exist.
+It maps repository paths to pool names, index and platform digests, base digest,
+Docker setting and egress. Worker `extraEnv` cannot set this reserved name.
+Worker repository routing remains deferred.
+
+**Factory Docker daemons (ADR 0217).** When a repository runner sets
+`docker.enabled: true` and `worker.deploy` is true,
+`templates/docker-daemon.yaml` renders the fixed boundary for per-run Docker
+daemons. The worker creates each run's daemon pod, Service, certificate Secret
+and ingress NetworkPolicy inside it. With no Docker repository nothing renders.
+
+1. A daemon namespace, `factory.docker.namespace` or
+   `<release-namespace>-<fullname>-docker` by default. The chart creates it
+   with `pod-security.kubernetes.io/enforce: privileged` unless
+   `factory.docker.createNamespace` is false, in which case the operator
+   creates it with that label.
+2. A Role and RoleBinding there for the worker ServiceAccount: create, get,
+   list and delete on pods, services and networkpolicies, get on pods/log,
+   create and delete on secrets.
+3. A ResourceQuota from `factory.docker.quota.hard` and a Container LimitRange
+   from `factory.docker.limitRange` (`max`, `min`, `default`,
+   `defaultRequest`). All are required.
+4. NetworkPolicies in the daemon namespace: default-deny ingress and egress,
+   DNS to `security.networkPolicy.dnsNamespace`, and one egress policy per
+   class. Pods labelled `curietech.ai/docker-egress: public` reach
+   `0.0.0.0/0` and `::/0` on TCP 80 and 443 with the metadata, private and
+   `security.networkPolicy.clusterCidrs` ranges excepted. A repository with
+   `docker.egressAllowlist` gets the class `repo-<first 16 hex of
+   sha256(path)>` and only its allowlist, validated like the other one-peer
+   egress lists.
+5. With Rail 1 on, `<fullname>-runner-allow-docker-daemon` lets the factory
+   agent's runner sandboxes (`curietech.ai/agent` set to the one factory agent
+   repository runners belong to) dial daemon pods on `factory.docker.port`
+   (2376). Other agents' sandboxes get no such allow. Daemon ingress
+   stays default-deny until the worker's per-run policy admits that run's
+   sandbox, so a sandbox reaches only its own daemon.
+6. Three ValidatingAdmissionPolicies with Deny bindings, which need
+   Kubernetes 1.30 or newer:
+   `<fullname>-docker-daemon-pods` admits only a worker-created pod with one
+   `dockerd` container on `factory.docker.daemonImage` (digest required), the
+   `--userns-remap=default` and `--authorization-plugin=curie-authz` flags
+   immediately after `dockerd`, the
+   claim, managed-by, selector and egress-class labels, no added
+   capabilities on dockerd, no init or ephemeral containers (it also matches
+   `pods/ephemeralcontainers`), no lifecycle hooks or exec probes, mounts only
+   at `/var/lib/docker` and `/certs` with no `volumeDevices`, no `env` or
+   `envFrom` (a caller environment could point the entrypoint's PATH into a
+   mounted Secret), no ServiceAccount token, only `emptyDir` volumes with a
+   positive `sizeLimit` or `secret` volumes, no host namespaces or ports,
+   positive cpu, memory and ephemeral-storage requests and limits, and
+   `activeDeadlineSeconds`.
+   `<fullname>-docker-daemon-objects` holds the worker's Services to
+   ClusterIP, its Secrets to Opaque or TLS, and its NetworkPolicies to
+   ingress-only policies selecting their own claim, whose every peer is a
+   runner sandbox of this release in the release namespace selected by a
+   label key outside the release selector keys (`name`, `instance`,
+   `component`), with no `ipBlock`, on TCP `factory.docker.port` with no
+   `endPort` range.
+   `<fullname>-docker-daemon-cleanup` lets the worker delete only
+   NetworkPolicies labelled `curietech.ai/sandbox-claim`, never the chart's.
+
+Opting a repository into Docker widens that repository's egress to what its
+class allows. Runner admission is unchanged.
 
 **Credential access.** A sandbox can inspect credentials injected into its own
 process, including any explicitly configured shared model credential. Operators
@@ -1242,10 +1501,29 @@ rule at index `[0]` and without weakening it; the raw helm equivalent is `--set
 because the model entry is `[0]`; use index `[0]` instead when installing sealed
 with no model credential, so the array has no gap). This is the platform enablement the weather
 example (#36) depends on -- its skill answers via a live web search, which the
-sealed default denies. `--allow-web-egress 0.0.0.0/0` opens the open internet
-(still minus the `169.254.169.254` metadata endpoint the chart carves out of
-`0.0.0.0/0`); narrow the CIDR to a specific provider for a tighter posture. Omit
-the flag and the install stays fully sealed.
+sealed default denies. `--allow-web-egress 0.0.0.0/0` opens the public internet
+(minus the `169.254.169.254` metadata endpoint and the private ranges below, all
+carved out of the broad route); narrow the CIDR to a specific provider for a
+tighter posture. Omit the flag and the install stays fully sealed.
+
+Every egress entry also excepts each private range it strictly contains:
+`10.0.0.0/8`, `100.64.0.0/10`, `169.254.0.0/16`, `172.16.0.0/12`,
+`192.168.0.0/16`, `fc00::/7`, `fe80::/10`, and each
+`security.networkPolicy.clusterCidrs` entry (pod or Service CIDRs outside those
+ranges). A runner cannot reach a pod, Service, or VPC host through a broad route.
+To re-allow a private peer, add a narrow `allowedEgress` entry for it, such as
+`10.20.0.5/32`; an entry equal to or inside a private range gets no except.
+Upgrade note: an install that reached private endpoints through `0.0.0.0/0`
+loses that access and needs those narrow entries.
+
+**Pod Security Admission.** `curie cluster up` labels a namespace it creates with
+`pod-security.kubernetes.io/enforce=baseline` and `warn` and `audit` at
+`restricted`. Labels are not applied to a namespace that already exists, or one
+created with raw `helm --create-namespace`. Label it yourself:
+
+```bash
+kubectl label namespace <namespace> pod-security.kubernetes.io/enforce=baseline pod-security.kubernetes.io/warn=restricted pod-security.kubernetes.io/audit=restricted --overwrite
+```
 
 **Data-tier ingress isolation.** The backing stores hold every credential and all
 trace/app data, so `security.dataTierNetworkPolicy.enabled` (default `true`)
@@ -1257,6 +1535,17 @@ and exfiltrate. BYO stores (`<store>.deploy: false`) are external and get no
 policy. Claim 5 of the security probe verifies it empirically (an app-labeled pod
 reaches each store while a non-app-labeled pod is blocked), which also catches a
 non-enforcing CNI.
+
+The Valkey allow-ingress policy also admits MCP connector pods so connector
+proxies can spend one-shot grants. Set
+`security.dataTierNetworkPolicy.allowMcpConnectorValkeyIngress: false` when
+those proxies do not need this release's in-chart Valkey. The default is
+`true`, preserving the current policy for fresh installs and older release
+values reused during upgrade. This removes only the MCP connector peer and its
+Valkey port rule; the release app peer, Valkey default-deny policy, and all
+other NetworkPolicies remain. The value must be a boolean. It does not replace
+caller-proxy preflight or the chart's NetworkPolicy verification. See
+[issue #4318](https://github.com/curie-eng/curie/issues/4318).
 
 **gVisor needs runsc on the node**, and `security.gvisor.mode` is a tri-state
 (default `auto`):
@@ -1397,6 +1686,25 @@ CURIE_E2E_IDENTITY_CONTEXT=<test cluster context> \
 ```
 
 It creates only objects named from its run id and deletes them on exit.
+
+## End to end connector on the factory cluster (ADR 0176)
+
+`e2eConnector.enabled` defaults to false. A factory bundle may declare a hosted connector named `e2e` (see `apps/e2e-connector/README.md`). While the flag is false the API renders no end to end connector and deploy is refused with `e2e_connector_not_configured`.
+
+Turn it on only when a separate test cluster already has the identity above. Set `serviceAccount`, `serviceAccountNamespace`, and `workerClusterRole` to that identity, and set `ownerLabel.value` to the same value the test cluster admission policy expects. The connector process uses the factory worker image. `E2E_CLUSTER_KUBECONFIG`, plus the optional `E2E_REGISTRY_PUSH_CONFIG` and `E2E_BUILD_CACHE_CONFIG` (both docker `config.json` files), are supplied with `curie secrets`, mounted on the connector, and omitted from the sandbox template and from the per agent sandbox Secret.
+
+`e2eConnector.enabled` also turns on the worker's end to end namespace reaper (#3245). Every `e2eConnector.reaperIntervalSeconds` (default 60, minimum 10) it deletes each namespace in the `namespacePrefix` and `ownerLabel` scope whose TTL has passed or whose run has finished, whether or not the agent called `env_destroy`. It reads `E2E_CLUSTER_KUBECONFIG` from each agent's connector Secret through the connector reconciler's Secret list grant, so `e2eConnector.enabled` also requires `worker.connectorReconciler.enabled`; the chart refuses to render without it. A worker started without that grant or without the internal worker token still runs the reaper, and every pass fails, so the stalled alert fires. The worker exports three gauges, `curie_e2e_reaper_last_success_seconds`, `curie_e2e_namespaces_expired`, and `curie_e2e_namespaces_overdue`, and the SRE example pages on `CurieE2EReaperStalled`, `CurieE2EReaperSignalAbsent`, and `CurieE2EExpiredNamespacesAccumulating`. See `apps/e2e-connector/README.md` for what each one means and how a refused child delete is handled.
+
+The `image_build` tool (#3246) builds a commit that is fetchable by SHA from an allowlisted https host, with kaniko, in a Job in the run's own namespace, and pushes it with crane. These values configure it:
+
+1. `e2eConnector.registry` is the registry prefix, such as `registry.test:5000/e2e`; a trailing `/` is ignored by both the connector and the worker. Images land at `<registry>/<namespace>/<name>`. Empty makes `image_build` refuse with `e2e_registry_not_configured`. The push credential `E2E_REGISTRY_PUSH_CONFIG` exists only in the connector and in a per build Secret on the test cluster, never in the sandbox or in the container that runs Dockerfile `RUN` steps. It must hold basic `user:password` credentials; an `identitytoken` or `registrytoken` config is refused with `e2e_connector_misconfigured`.
+2. `e2eConnector.buildCacheRepo` defaults to `null`, which renders `<registry>/cache`. An explicit empty string disables the cache. The cache is used only when this value is non empty and `E2E_BUILD_CACHE_CONFIG` is stored, so an authenticated registry needs that config to cache at all.
+3. **Cache credential warning.** `E2E_BUILD_CACHE_CONFIG` is mounted in the build container, so Dockerfile `RUN` steps can read it. Scope it to the cache repository only and never give it push access to run repositories. The shared cache can also be poisoned between runs; that affects only test images, which never ship.
+4. `e2eConnector.registryInsecure` allows plain http to the registry and cache. `e2eConnector.registryTokenHosts` lists hosts besides the registry whose https token realm may receive the push credential; an entry without a port means 443.
+5. `e2eConnector.builderImage`, `gitImage` and `pushImage` override the connector's pinned defaults when empty strings are left alone. `e2eConnector.buildTimeoutSeconds` (default 1200, 60 to 3600) bounds one build. `e2eConnector.sourceHosts` (default `github.com`) lists the https hosts a build may fetch from.
+6. The worker receives `CURIE_E2E_REGISTRY`, `CURIE_E2E_REGISTRY_INSECURE` and `CURIE_E2E_REGISTRY_TOKEN_HOSTS` so teardown retention can list and delete the images a run pushed before it deletes the namespace.
+
+**Registry delete and garbage collection requirement.** Teardown deletes every image digest a run pushed, so the registry must allow manifest deletes (a 405 fails the namespace and keeps it). Deleting a manifest does not free blobs. The registry needs its own garbage collection, and `registry:2` requires an operator to run it. The same applies to the cache repository, which this chart never garbage collects. The build pod runs with baseline Pod Security (kaniko is root but not privileged), so an installation with `podSecurity: restricted` refuses `image_build`.
 
 ## Uninstalling and CRD lifecycle
 
@@ -1706,6 +2014,46 @@ not a fork, so a `push` or `pull_request` workflow in that repository runs
 the changed files with the repository's Actions secrets before a person
 reviews the pull request. Keep those secrets in GitHub environments that
 require reviewers.
+
+The publication Job only pushes, using the origin, header form and CA path in
+the API's push credential. The API opens or updates the pull request (ADR 0197).
+
+### Code host CA bundle
+
+A self-managed code host whose certificate no public root covers needs one PEM
+bundle, supplied as a ConfigMap you create:
+
+```yaml
+codeHostTrust:
+  caBundle:
+    configMapRef:
+      name: corp-code-host-ca
+      key: ca.crt
+```
+
+The chart mounts that key read-only at `/etc/curie/code-host-trust/ca.crt` in
+the api, the worker and every sandbox runner. The api adds it to the public
+roots for its code host HTTP clients. git (`GIT_SSL_CAINFO`, `http.sslCAInfo`)
+and the sandbox's `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` use it as their
+whole store, so include the public roots if the sandbox reaches public HTTPS
+hosts through them. Create the ConfigMap in the release namespace only. A
+publication Job runs in the publication namespace, so the worker copies the PEM
+it has mounted (`CURIE_CODE_HOST_CA_BUNDLE`) into that Job's own ConfigMap and
+mounts it read-only at the path the push credential names.
+
+The worker also refuses new third-party dependency names by default, including
+new transitive lockfile entries. It compares `pyproject.toml`, `uv.lock`,
+`Cargo.toml`, `Cargo.lock`, `package.json`, `pnpm-lock.yaml` and
+`package-lock.json` by basename at any repository depth after applying the patch
+to the base tree. Version changes to existing names are allowed. Path, workspace,
+editable, virtual and directory sources are ignored; Git sources count as
+third-party. A new file has an empty dependency set before the patch, and an
+in-scope file that cannot be parsed is refused. Set
+`worker.publication.allowDependencyAdditions: true` to allow additions across
+every publication in the install, including factory work and human-approved
+requests. The default is `false`, rendered as
+`CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS` on the worker. This opt-in keeps
+the `.github/` and `worker.publication.protectedPaths` refusals.
 
 One allowed root `https://github.com/owner/repository` URL in the initial
 message establishes the thread's selection and causes the worker to acquire its

@@ -25,7 +25,7 @@ assertion must kill are named alongside it.
 
 import re
 
-from curie_runner.approval import _PUBLISH_DESCRIPTION
+from curie_runner.harness.claude.approval import _PUBLISH_DESCRIPTION
 
 
 def test_publication_description_requires_a_reported_verification_first() -> None:
@@ -84,10 +84,16 @@ def test_publication_description_requires_a_reported_verification_first() -> Non
     ), "an unavailable check needs a matching declared required CI route"
     assert re.search(
         r"in-sandbox\s+verification\s+was\s+unavailable"
-        r"[^.]{0,120}CI\s+is\s+pending",
+        r"\s+and\s+the\s+required\s+CI\s+check\s+had\s+not\s+reported\s+when\s+this"
+        r"\s+pull\s+request\s+was\s+opened;\s+the\s+issue\s+status\s+comment"
+        r"\s+reports\s+its\s+result\.",
         verification_text,
         flags=re.IGNORECASE,
-    ), "the PR must state unavailable verification and pending CI"
+    ), (
+        "the PR must state unavailable verification and that the required CI check "
+        "had not reported when this pull request was opened; "
+        "the issue status comment reports its result."
+    )
     # Kills: replacing the whole failure rule with a softer one ("If the command
     # fails, note it."). Sentence-local, so the cannot-identify sentence and the
     # artifacts sentence cannot stand in for it.

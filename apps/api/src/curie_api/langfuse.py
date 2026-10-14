@@ -13,8 +13,9 @@ from typing import Any
 import httpx
 from curie_telemetry_schema import SpanAttributeKey
 
+from curie_api.schemas.observability import ObservationNode
+
 from .config import Settings
-from .schemas import ObservationNode
 
 # When filtering the trace list by an agent token, scan this many recent traces
 # and keep the matches. Langfuse's list API has no substring filter, so the

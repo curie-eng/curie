@@ -21,6 +21,8 @@ import aiohttp
 from aci_protocol import BootEnv
 from claude_agent_sdk import SdkMcpTool, tool
 
+from .tool_names import PROGRESS_TOOL
+
 logger = logging.getLogger(__name__)
 
 # Named from the one BootEnv declaration (#488, ADR-0049) rather than retyped
@@ -28,7 +30,6 @@ logger = logging.getLogger(__name__)
 PROGRESS_URL_ENV = BootEnv.env_key("progress_url")
 PROGRESS_TOKEN_ENV = BootEnv.env_key("progress_token")
 PROGRESS_FILE = Path("progress") / "phases.json"
-PROGRESS_TOOL = "report_progress"
 
 _PHASE_ID = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _MAX_PHASES = 12
@@ -44,6 +45,12 @@ _DESCRIPTION = (
     "your skill names, with round for looped phases. Reporting never changes what "
     "you are allowed to do."
 )
+
+
+def factory_progress_requested(env: Mapping[str, str]) -> bool:
+    """Whether boot carries any factory-progress signal, even an incomplete one."""
+
+    return bool(env.get(PROGRESS_URL_ENV) or env.get(PROGRESS_TOKEN_ENV))
 
 
 def _validate(raw: object) -> dict[str, Any]:

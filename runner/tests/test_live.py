@@ -12,6 +12,7 @@ A third live test covers the OpenRouter path, gated on ``OPENROUTER_API_KEY``.
 import json
 import logging
 import os
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -31,6 +32,8 @@ from curie_runner.approval import (
     APPROVAL_SERVER_NAME,
     ApprovalGate,
     build_approval_gate,
+)
+from curie_runner.harness.claude.approval import (
     build_approval_hook,
     build_approval_server,
     build_can_use_tool,
@@ -755,7 +758,8 @@ def test_live_permission_gate_pauses_awaiting_approval() -> None:
     approval-required is intercepted by can_use_tool (never executed) and the
     turn ends awaiting-approval with the blocked call in the summary."""
 
-    from curie_runner.approval import ApprovalGate, build_can_use_tool
+    from curie_runner.approval import ApprovalGate
+    from curie_runner.harness.claude.approval import build_can_use_tool
 
     gate = ApprovalGate(required=frozenset({"Bash"}))
     options = build_options(
@@ -1284,8 +1288,8 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
     """A suspended real tool call resumes once, then its one-shot grant expires."""
     from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
     from curie_runner import session as session_module
-    from curie_runner.approval import (
-        ApprovalGate,
+    from curie_runner.approval import ApprovalGate
+    from curie_runner.harness.claude.approval import (
         build_approval_hook,
         build_can_use_tool,
     )
@@ -1604,3 +1608,454 @@ def test_live_publish_without_gate_layers_still_pauses_via_the_stream(
         and "fallback" in record.getMessage().lower()
         for record in caplog.records
     ), caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# #3625: a compound "make this stick" request either saves or does not claim to
+# --------------------------------------------------------------------------- #
+#
+# Found live: with the memory tools mounted, a message asking for a reply
+# signature "in every channel" plus a private aside drew the harness ``Skill``
+# tool, no ``remember`` call, and the reply "I've noted that as a standing
+# instruction". Nothing was saved. The property pinned here holds whichever
+# choice the model makes: a reply that claims a save must be backed by a
+# ``remember`` (or ``update``) call that reached the store and left a fact there.
+
+
+class _InProcessFactsStore:
+    """A fake memory namespace with the ``MemoryFactsStore`` surface the tools use.
+
+    Only the memory tools call ``add``/``update``, so ``writes`` is the record of
+    every successful ``remember``/``update`` call this turn.
+    """
+
+    def __init__(self) -> None:
+        self.facts: dict[str, dict[str, str]] = {}
+        self.writes: list[tuple[str, str]] = []
+
+    async def list(self) -> list[Any]:
+        return []
+
+    async def add(self, *, statement: str, author: str, session_id: str) -> str:
+        fact_id = f"fact-{uuid4().hex}"
+        self.facts[fact_id] = {"statement": statement, "author": author}
+        self.writes.append(("remember", statement))
+        return fact_id
+
+    async def update(self, fact_id: str, *, statement: str, author: str, session_id: str) -> None:
+        from curie_runner.memory_facts import FactNotFound
+
+        if fact_id not in self.facts:
+            raise FactNotFound(fact_id)
+        self.facts[fact_id] = {"statement": statement, "author": author}
+        self.writes.append(("update", statement))
+
+    async def forget(self, fact_id: str) -> None:
+        from curie_runner.memory_facts import FactNotFound
+
+        if self.facts.pop(fact_id, None) is None:
+            raise FactNotFound(fact_id)
+
+
+_COMPOUND_MEMORY_REQUEST = (
+    "From now on, sign every reply you send in every channel with"
+    ' "-- Curie, on duty". Make this stick. Also, just between us, I think the'
+    " Thursday standup runs long, but don't repeat that to anyone."
+)
+
+# An affirmative claim that something was kept. Only first-person or passive
+# "it is saved" forms count, so an honest refusal ("I can't save that", "Nothing
+# was saved", "I won't remember this across channels") is not read as a claim, and
+# neither is a bare mention of the ``remember`` tool (review M3).
+_SAVE_CLAIM = re.compile(
+    r"\bi(?:'ve|’ve| have)\s+(?:saved|noted|stored|recorded|remembered)\b"
+    r"|\bi(?:'ll|’ll| will)\s+remember\b"
+    r"|\bfrom now on,?\s+i(?:'ll|’ll| will)\b"
+    r"|\b(?:saved|noted|stored|recorded)\s+(?:that|this|it)\b"
+    r"|\b(?:it|that|this)(?:'s|’s| is| has been)\s+(?:now\s+)?(?:saved|stored)\b",
+    re.IGNORECASE,
+)
+# A negation in the same clause just before a match turns it into a refusal:
+# "I haven't saved that", "I have not saved it".
+_NEGATION = re.compile(
+    r"\b(?:not|never|nothing|no|unable|cannot)\b|n't|n’t",
+    re.IGNORECASE,
+)
+_NEGATION_WINDOW = 25
+
+
+def _save_claim(reply: str) -> str | None:
+    """The first affirmative save claim in ``reply``, or None when it makes none."""
+    for match in _SAVE_CLAIM.finditer(reply):
+        before = reply[max(0, match.start() - _NEGATION_WINDOW) : match.start()]
+        # Only the clause the match sits in: a negation before a comma or a full
+        # stop belongs to something else ("No problem, I've saved it").
+        clause = re.split(r"[.,;:!?]", before)[-1]
+        if not _NEGATION.search(clause):
+            return match.group(0)
+    return None
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Noted that as a standing instruction.",
+        "I've saved that to channel memory.",
+        "I have stored this as a standing instruction.",
+        "I'll remember that from now on.",
+        "From now on, I'll sign every reply.",
+        "Done, it's saved.",
+        "No problem, I've saved it.",
+    ],
+)
+def test_save_claim_detects_an_affirmative_claim(reply: str) -> None:
+    assert _save_claim(reply) is not None, reply
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "I can't save that.",
+        "I cannot save that for every channel.",
+        "That was not saved.",
+        "Nothing was saved.",
+        "I didn't save anything.",
+        "I won't remember this across channels.",
+        "I haven't saved that yet.",
+        "I have not saved it.",
+        "I can't set a standing instruction for every channel.",
+        "Noted, but I couldn't save it.",
+        "You can ask me to call remember later.",
+    ],
+)
+def test_save_claim_ignores_refusals_and_negations(reply: str) -> None:
+    assert _save_claim(reply) is None, reply
+
+
+@pytest.mark.skipif(
+    not _HAS_CRED,
+    reason="no live credential (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY) in env",
+)
+def test_live_compound_request_saves_or_does_not_claim_to() -> None:
+    from curie_runner.__main__ import _compose_system_prompt
+    from curie_runner.harness.claude.approval import build_memory_tools
+    from curie_runner.memory_facts import DEFAULT_GUIDANCE, MemoryTurn
+
+    channel_store = _InProcessFactsStore()
+    agent_store = _InProcessFactsStore()
+    turn = MemoryTurn()
+    session_id = "live-memory-compound"
+    memory_tools = build_memory_tools(
+        agent_store=agent_store,  # type: ignore[arg-type]
+        channel_store=channel_store,  # type: ignore[arg-type]
+        turn=turn,
+        session_id=session_id,
+    )
+    # The production composition: the default memory guidance ahead of the
+    # bundle's own prompt, as a boot with the tools mounted and no operator
+    # guidance builds it.
+    system_prompt = _compose_system_prompt(
+        "You are a helpful team assistant deployed in a chat workspace.",
+        None,
+        model=None,
+        guidance_preamble=DEFAULT_GUIDANCE,
+    )
+    options = build_options(
+        plugins=[],
+        model=None,
+        system_prompt=system_prompt,
+        max_turns=6,
+        max_budget_usd=1.0,
+        resume=None,
+        mcp_servers={
+            APPROVAL_SERVER_NAME: build_approval_server(
+                None, include_request_approval=False, memory_tools=memory_tools
+            )
+        },
+    )
+    runner = SessionRunner(
+        held_secrets=frozenset(),
+        session_factory=lambda: ClaudeAgentSession(options),
+        ceiling=0,
+        max_usd_per_day=1.0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name=session_id,
+        session_id=session_id,
+        memory_turn=turn,
+    )
+
+    async def go() -> list[str]:
+        await runner.start()
+        try:
+            return [
+                line
+                async for line in runner.run_turn(
+                    Event(type="message", text=_COMPOUND_MEMORY_REQUEST, user="U-live", ts="1.0")
+                )
+            ]
+        finally:
+            await runner.close()
+
+    events = parse_ndjson("".join(anyio.run(go)))
+    final = events[-1]
+    assert final.type == "final"
+    reply = final.text or "".join(e.text for e in events if e.type == "text_delta")
+    # The guidance forbids agent-memory writes, so one is a failure on every run,
+    # whatever the reply says (review L1).
+    assert agent_store.writes == [], (
+        f"the turn wrote to agent memory, which the guidance forbids: "
+        f"{agent_store.writes!r}; reply: {reply!r}"
+    )
+    claim = _save_claim(reply)
+    if claim is None:
+        # No claim, so nothing is owed; the turn simply did not say it saved.
+        return
+    # Only a channel-memory write counts as the save.
+    assert channel_store.writes, (
+        f"the reply claims a save ({claim!r}) but no remember/update call "
+        f"reached channel memory: {reply!r}"
+    )
+    assert channel_store.facts, (
+        f"the reply claims a save but channel memory holds no fact: {reply!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# ADR 0100 channel read (#2877): the granted curie-slack tools on the real SDK
+# --------------------------------------------------------------------------- #
+
+_CHANNEL_READ_TOOL = "mcp__curie-slack__read_channel_history"
+_CHANNEL_READ_CAPABILITY_HEADER = "X-Curie-Channel-Read"
+
+
+def _require_live_channel_read_credential() -> None:
+    if not (_HAS_CRED or _OPENROUTER_KEY):
+        pytest.fail(
+            "CURIE_E2E_LIVE=1 channel read proof requires a model credential: "
+            "set CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY or OPENROUTER_API_KEY"
+        )
+
+
+class _ChannelReadStub:
+    """A local stand-in for the platform ``POST /channel-read`` route."""
+
+    def __init__(self, marker: str) -> None:
+        self.marker = marker
+        self.received: list[tuple[str | None, dict[str, Any]]] = []
+
+    def app(self) -> Any:
+        from aiohttp import web
+
+        app = web.Application()
+
+        async def read(request: web.Request) -> web.Response:
+            self.received.append(
+                (request.headers.get(_CHANNEL_READ_CAPABILITY_HEADER), await request.json())
+            )
+            return web.json_response(
+                {
+                    "messages": [
+                        {
+                            "id": "1759449600.000100",
+                            "timestamp": "2026-10-03T12:00:00Z",
+                            "author": "U0EXAMPLE1",
+                            "text": f"The deploy code word is {self.marker}.",
+                            "truncated": False,
+                            "provenance": (
+                                "https://example.slack.com/archives/C0EXAMPLE1/p1759449600000100"
+                            ),
+                        }
+                    ],
+                    "has_more": False,
+                }
+            )
+
+        app.router.add_post("/{tail:.*}", read)
+        return app
+
+
+def _channel_read_token(turn: str) -> str:
+    import base64
+    import time
+
+    now = int(time.time())
+    claims = {
+        "aud": "channel.read",
+        "agent": "00000000-0000-4000-8000-00000000a001",
+        "deployment": "00000000-0000-4000-8000-00000000d001",
+        "grant": "a" * 64,
+        "turn": turn,
+        "gen": 1,
+        "default": {"kind": "slack", "address": "C0EXAMPLE1"},
+        "iat": now,
+        "exp": now + 900,
+    }
+    payload = (
+        base64.urlsafe_b64encode(json.dumps(claims, sort_keys=True).encode())
+        .rstrip(b"=")
+        .decode()
+    )
+    return f"chr.{payload}.live-channel-read-signature"
+
+
+def _channel_read_bundle(
+    tmp_path: Path, *, grant: bool, policy: dict[str, list[str]] | None = None
+) -> Path:
+    bundle = tmp_path / "channel-read-bundle"
+    (bundle / ".claude-plugin").mkdir(parents=True)
+    manifest: dict[str, Any] = {
+        "name": "channel-reader",
+        "version": "0.1.0",
+        "description": "Reads its own channel",
+    }
+    if grant:
+        manifest["channelRead"] = True
+    if policy is not None:
+        manifest["toolPolicy"] = {"enforcement": TOOL_POLICY_ENFORCEMENT, **policy}
+    (bundle / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    return bundle
+
+
+_CHANNEL_READ_PROMPT = (
+    "Call the mcp__curie-slack__read_channel_history tool exactly once with "
+    "oldest `2026-10-03T00:00:00Z` and latest `2026-10-04T00:00:00Z` to read "
+    "yesterday's messages in this channel. Then reply with only the code word "
+    "the first message names. If the tool is unavailable or refused, reply "
+    "with only: unavailable"
+)
+
+
+def _drive_live_channel_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    grant: bool,
+    policy: dict[str, list[str]] | None,
+    marker: str,
+) -> tuple[Final, list[dict[str, Any]], _ChannelReadStub, str]:
+    from aiohttp.test_utils import TestServer
+    from curie_runner import __main__ as boot
+
+    init_messages = _install_init_observer(monkeypatch)
+    stub = _ChannelReadStub(marker)
+    session_id = f"channel-read-{uuid4()}"
+    token = _channel_read_token(session_id)
+    bundle = _channel_read_bundle(tmp_path, grant=grant, policy=policy)
+    # The OpenRouter key rides the SDK env exactly as production feeds it;
+    # with only an Anthropic credential the ambient one is used.
+    model, sdk_env = _live_model_and_env()
+    if model is not None:
+        monkeypatch.setenv("CURIE_MODEL", model)
+
+    async def go() -> Final:
+        async with TestServer(stub.app()) as server:
+            base = str(server.make_url("")).rstrip("/")
+            # The capability URL shares the boot's platform origin, which the
+            # runner pins it to.
+            monkeypatch.setenv("CURIE_STATE_URL", f"{base}/agents/a/state")
+            monkeypatch.setenv("CURIE_STATE_TOKEN", "live-state-placeholder")
+            config = _catalog_config(bundle, session_id)
+            runner = await anyio.to_thread.run_sync(
+                lambda: boot.build_runner(
+                    config, sdk_env=sdk_env, history_store=_LiveTranscriptStore()
+                )
+            )
+            await runner.start()
+            final: Final | None = None
+            try:
+                async for line in runner.run_turn(
+                    Event.model_validate(
+                        {
+                            "kind": "event",
+                            "type": "message",
+                            "text": _CHANNEL_READ_PROMPT,
+                            "user": "U0EXAMPLE1",
+                            "ts": "1",
+                            "channel_read": {"url": f"{base}/channel-read", "token": token},
+                        }
+                    )
+                ):
+                    parsed = parse_ndjson_line(line)
+                    if isinstance(parsed, Final):
+                        final = parsed
+            finally:
+                await runner.close()
+            assert final is not None, "real SDK turn emitted no terminal Final"
+            return final
+
+    return anyio.run(go), init_messages, stub, token
+
+
+def _init_tools(init_messages: list[dict[str, Any]]) -> set[str]:
+    assert init_messages, "real SDK boot emitted no init frame"
+    raw = init_messages[-1].get("tools")
+    assert isinstance(raw, list), "SDK init carried no concrete tools catalogue"
+    return {str(tool) for tool in raw}
+
+
+@pytest.mark.skipif(
+    not _LIVE_REQUESTED,
+    reason="set CURIE_E2E_LIVE=1 for real SDK channel read discovery and invocation",
+)
+def test_live_granted_read_tool_is_discoverable_and_returns_the_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_live_channel_read_credential()
+    marker = f"curie-2877-{uuid4().hex[:12]}"
+    final, init_messages, stub, token = _drive_live_channel_read(
+        tmp_path, monkeypatch, grant=True, policy=None, marker=marker
+    )
+
+    assert _CHANNEL_READ_TOOL in _init_tools(init_messages)
+    assert final.status is SessionStatus.DONE, final
+    assert len(stub.received) == 1, stub.received
+    header, body = stub.received[0]
+    assert header == token
+    assert body.get("operation") == "history"
+    assert "live-channel-read-signature" not in json.dumps(body)
+    assert marker in (final.text or ""), final.text
+
+
+@pytest.mark.skipif(
+    not _LIVE_REQUESTED,
+    reason="set CURIE_E2E_LIVE=1 for real SDK channel read catalogue control",
+)
+def test_live_ungranted_bundle_lists_no_channel_read_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_live_channel_read_credential()
+    marker = f"curie-2877-{uuid4().hex[:12]}"
+    final, init_messages, stub, _ = _drive_live_channel_read(
+        tmp_path, monkeypatch, grant=False, policy=None, marker=marker
+    )
+
+    # A provider error before any tool runs would pass a refusal vacuously.
+    assert not (final.text or "").startswith("API Error"), final.text
+    listed = _init_tools(init_messages)
+    assert not {name for name in listed if name.startswith("mcp__curie-slack__")}
+    assert stub.received == []
+    assert marker not in (final.text or "")
+
+
+@pytest.mark.skipif(
+    not _LIVE_REQUESTED,
+    reason="set CURIE_E2E_LIVE=1 for real SDK channel read policy control",
+)
+def test_live_policy_denied_read_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_live_channel_read_credential()
+    marker = f"curie-2877-{uuid4().hex[:12]}"
+    final, init_messages, stub, _ = _drive_live_channel_read(
+        tmp_path, monkeypatch, grant=True, policy={"deny": ["curie-slack/*"]}, marker=marker
+    )
+
+    # Either the catalogue hides it or the gate denies the call; both are
+    # refusals, and neither lets a request reach the platform route.
+    assert not (final.text or "").startswith("API Error"), final.text
+    assert init_messages, "real SDK boot emitted no init frame"
+    assert stub.received == []
+    assert marker not in (final.text or "")

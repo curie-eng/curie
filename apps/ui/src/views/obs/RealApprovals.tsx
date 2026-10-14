@@ -3,11 +3,10 @@ import { C } from "../../tokens";
 import { Button, Card, Chip, Dot, Modal, Notice, Table } from "../../primitives";
 import { actionLabel, approvalSummary } from "../../primitives/actionWording";
 import { useStore } from "../../state/store";
+import { useConsoleSession } from "../../state/session";
 import {
   ApiError,
-  exchangeConsoleLoginCode,
   getApprovalAudit,
-  getConsoleSession,
   listApprovals,
   resolveApproval,
   type ApprovalAudit,
@@ -22,7 +21,8 @@ import {
 // subject, so an operator has visibility and control outside Slack. Read +
 // resolve only; it never creates approvals (that is the worker's job). Backed
 // by the real API over the same-origin /api proxy (GET /approvals,
-// GET /approvals/{id}/audit, POST /approvals/{id}/resolve).
+// GET /approvals/{id}/audit, POST /approvals/{id}/resolve). The subject comes
+// from the global console session gate (#1047), which also owns a 401.
 
 // The status filter options; "all" sends no status_filter so every status
 // returns. Pending is the default — the queue an operator acts on.
@@ -167,13 +167,11 @@ function ApprovalDetail({
   session,
   onClose,
   onResolved,
-  onSessionInvalid,
 }: {
   approval: ApprovalOut;
-  session: ConsoleSession | null;
+  session: ConsoleSession;
   onClose: () => void;
   onResolved: () => void;
-  onSessionInvalid: () => void;
 }) {
   const { dispatch } = useStore();
   const [audit, setAudit] = useState<ApprovalAudit[] | null>(null);
@@ -209,10 +207,6 @@ function ApprovalDetail({
       dispatch({ type: "toast", message: `Approval ${decision}` });
       onResolved();
     } catch (e) {
-      if (e instanceof ApiError && e.status === 401) {
-        onSessionInvalid();
-        return;
-      }
       // The resolve route has designed failure statuses; surface each honestly
       // rather than a bare "failed" (403 not-authorized, 409 lost
       // the race, 410 expired past its SLA).
@@ -289,16 +283,12 @@ function ApprovalDetail({
             }}
           >
             <div style={{ fontWeight: 600, fontSize: 13, color: C.text2 }}>Resolve</div>
-            {session?.subject ? (
-              <div style={{ color: C.text2, fontSize: 12.5 }}>
-                Authenticated principal:{" "}
-                <span data-testid="approval-principal" style={{ color: C.text, fontFamily: C.mono }}>
-                  {session.subject}
-                </span>
-              </div>
-            ) : (
-              <Notice padding="12px">Sign in with a console login code before resolving this approval.</Notice>
-            )}
+            <div style={{ color: C.text2, fontSize: 12.5 }}>
+              Authenticated principal:{" "}
+              <span data-testid="approval-principal" style={{ color: C.text, fontFamily: C.mono }}>
+                {session.subject}
+              </span>
+            </div>
             <textarea
               aria-label="note"
               value={note}
@@ -317,14 +307,14 @@ function ApprovalDetail({
                 label={busy === "approved" ? "Approving…" : "Approve"}
                 variant="primary"
                 testId="approve-btn"
-                disabled={busy !== null || !session?.subject}
+                disabled={busy !== null}
                 onClick={() => void resolve("approved")}
               />
               <Button
                 label={busy === "rejected" ? "Rejecting…" : "Reject"}
                 variant="danger"
                 testId="reject-btn"
-                disabled={busy !== null || !session?.subject}
+                disabled={busy !== null}
                 onClick={() => void resolve("rejected")}
               />
             </div>
@@ -343,61 +333,7 @@ export function RealApprovals() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [openId, setOpenId] = useState<string | null>(null);
-  const [session, setSession] = useState<ConsoleSession | null>(null);
-  const [sessionLoading, setSessionLoading] = useState(true);
-  const [sessionError, setSessionError] = useState<string | null>(null);
-  const [loginCode, setLoginCode] = useState("");
-  const [loginBusy, setLoginBusy] = useState(false);
-
-  useEffect(() => {
-    let live = true;
-    getConsoleSession()
-      .then((current) => {
-        if (!live) return;
-        if (current.subject?.trim()) {
-          setSession(current);
-          setSessionError(null);
-        } else {
-          setSession(null);
-        }
-      })
-      .catch((e) => {
-        if (!live) return;
-        setSession(null);
-        if (!(e instanceof ApiError && e.status === 401)) {
-          setSessionError(e instanceof Error ? e.message : String(e));
-        }
-      })
-      .finally(() => {
-        if (live) setSessionLoading(false);
-      });
-    return () => {
-      live = false;
-    };
-  }, []);
-
-  const exchangeLoginCode = async () => {
-    const code = loginCode.trim();
-    if (!code) {
-      setSessionError("Enter a login code minted by the Curie CLI.");
-      return;
-    }
-    setLoginBusy(true);
-    setSessionError(null);
-    try {
-      const current = await exchangeConsoleLoginCode(code);
-      if (!current.subject?.trim()) {
-        throw new ApiError(401, "missing, invalid, or expired console session");
-      }
-      setSession(current);
-      setLoginCode("");
-    } catch (e) {
-      setSession(null);
-      setSessionError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLoginBusy(false);
-    }
-  };
+  const session = useConsoleSession();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -449,40 +385,12 @@ export function RealApprovals() {
         <Button label="Refresh" variant="ghost" size="sm" onClick={() => void load()} />
       </div>
 
-      {!sessionLoading ? (
-        session?.subject ? (
-          <div style={{ color: C.text2, fontSize: 12.5, marginBottom: 12 }}>
-            Authenticated principal:{" "}
-            <span data-testid="approval-principal" style={{ color: C.text, fontFamily: C.mono }}>
-              {session.subject}
-            </span>
-          </div>
-        ) : (
-          <div style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <input
-              aria-label="login code"
-              value={loginCode}
-              onChange={(e) => setLoginCode(e.target.value)}
-              placeholder="CLI-minted login code"
-              autoComplete="one-time-code"
-              style={{ ...inputStyle, minWidth: 240 }}
-            />
-            <Button
-              label={loginBusy ? "Signing in…" : "Sign in"}
-              variant="primary"
-              size="sm"
-              testId="approval-login-submit"
-              disabled={loginBusy}
-              onClick={() => void exchangeLoginCode()}
-            />
-            {sessionError ? (
-              <span data-testid="approval-login-error" style={{ color: C.destructive, fontSize: 12.5, fontFamily: C.mono }}>
-                {sessionError}
-              </span>
-            ) : null}
-          </div>
-        )
-      ) : null}
+      <div style={{ color: C.text2, fontSize: 12.5, marginBottom: 12 }}>
+        Authenticated principal:{" "}
+        <span data-testid="approval-principal" style={{ color: C.text, fontFamily: C.mono }}>
+          {session.subject}
+        </span>
+      </div>
 
       {error ? (
         <div data-testid="approvals-error" style={{ color: C.destructive, fontSize: 12.5, marginBottom: 10, fontFamily: C.mono }}>
@@ -531,13 +439,6 @@ export function RealApprovals() {
           onResolved={() => {
             setOpenId(null);
             void load();
-          }}
-          onSessionInvalid={() => {
-            setSession(null);
-            setSessionError(
-              "Your console session expired or was revoked. Enter a new login code.",
-            );
-            setOpenId(null);
           }}
         />
       ) : null}

@@ -2,11 +2,13 @@
 
 Date: 2026-09-21
 
-Status: Draft
+Status: Accepted
 
-Proposal for the architecture review. A Draft does not authorize
-implementation. If accepted, this is the design for
-[#1461](https://github.com/curie-eng/curie/issues/1461) in v0.10.0.
+Accepted by Brian on 2026-09-30. This is the design for
+[#1461](https://github.com/curie-eng/curie/issues/1461), shipping in v0.12.0
+from `next`. Memory implementation merged on `next` in
+[#3445](https://github.com/curie-eng/curie/pull/3445) and
+[#3390](https://github.com/curie-eng/curie/pull/3390).
 
 ## Context
 

@@ -66,6 +66,9 @@ from redis.asyncio import Redis as AsyncRedis
 _TTL_S = 1.0
 _HEARTBEAT_S = 0.3
 _BUDGET_S = 60.0
+# A lease TTL longer than any runner stall, for a test that must observe a
+# lease stay live across real heartbeats rather than wait for one to lapse.
+_STALL_PROOF_TTL_S = 300.0
 
 
 # ``sync_redis`` and ``names`` (the per-test-unique stream / group / key
@@ -422,10 +425,19 @@ def test_heartbeat_extends_the_lease_without_bumping_times_delivered(names) -> N
     """Two independent reverts, both caught here. Dropping the renewal expires a
     healthy long turn's lease; dropping ``JUSTID`` from the same-owner ``XCLAIM``
     burns one delivery per heartbeat and dead-letters a healthy turn in under a
-    minute. The delivery count stays PEL-backed and is never reset."""
+    minute. The delivery count stays PEL-backed and is never reset.
+
+    The renewal is read from the lease key's absolute server expiry
+    (``PEXPIRETIME``) under a TTL no runner stall can outlast (#3861). Racing
+    six 0.3s beats against a 1.0s TTL failed whenever one beat stalled 0.7s.
+    No assertion needs the un-renewed sibling to survive the loop either."""
 
     async def go() -> None:
-        async with _store(names) as (store, config, client):
+        async with _store(names, delivery_lease_ttl_s=_STALL_PROOF_TTL_S) as (
+            store,
+            config,
+            client,
+        ):
             renewed_entry, abandoned_entry = await _pending(client, config, "worker-a", count=2)
             renewed = await store.acquire(
                 config.stream, config.consumer_group, renewed_entry, consumer="worker-a"
@@ -434,10 +446,20 @@ def test_heartbeat_extends_the_lease_without_bumping_times_delivered(names) -> N
             await store.acquire(
                 config.stream, config.consumer_group, abandoned_entry, consumer="worker-a"
             )
+            renewed_key = config.delivery_lease_key(
+                config.stream, config.consumer_group, renewed_entry
+            )
+            abandoned_key = config.delivery_lease_key(
+                config.stream, config.consumer_group, abandoned_entry
+            )
+            abandoned_expiry = await client.pexpiretime(abandoned_key)
+            # A positive absolute expiry: the lease is a TTL that does lapse,
+            # not a key that silently never expires.
+            assert abandoned_expiry > 0
 
             before = await _times_delivered(client, config, renewed_entry)
+            expiry = await client.pexpiretime(renewed_key)
 
-            # Six beats spans ~1.8s, comfortably past the 1.0s lease TTL.
             for _ in range(6):
                 await asyncio.sleep(_HEARTBEAT_S)
                 anchor = await store.heartbeat(
@@ -454,17 +476,20 @@ def test_heartbeat_extends_the_lease_without_bumping_times_delivered(names) -> N
                 # a worker with a skewed clock still measures elapsed correctly.
                 assert anchor.deadline_ms == renewed.budget.deadline_ms
                 assert anchor.anchor_server_ms >= renewed.budget.anchor_server_ms
+                # The beat pushed the lease's server-side expiry forward.
+                renewed_expiry = await client.pexpiretime(renewed_key)
+                assert renewed_expiry > expiry, "the heartbeat did not renew the lease"
+                expiry = renewed_expiry
 
             assert (
                 await store.is_live(config.stream, config.consumer_group, renewed_entry) is True
             )
-            # ...and the un-renewed sibling expired over the SAME window, so the
-            # assertion above is about the heartbeat and not about a lease TTL
-            # that silently never expires.
-            assert (
-                await store.is_live(config.stream, config.consumer_group, abandoned_entry)
-                is False
-            )
+            # ...and the un-renewed sibling's expiry never moved over the SAME
+            # window, so the renewal above is the heartbeat's doing and not a
+            # side effect of acquiring under the same consumer. A renewal could
+            # only move it later; an expired key reads -2, which also passes.
+            assert await client.pexpiretime(abandoned_key) <= abandoned_expiry
+            assert expiry > abandoned_expiry
 
             after = await _times_delivered(client, config, renewed_entry)
             assert after == before, (

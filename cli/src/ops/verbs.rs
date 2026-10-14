@@ -14,8 +14,8 @@ pub struct DownOpts {
 pub struct RollbackOpts {
     pub common: CommonOpts,
     /// An operator-named revision. `None` lets [`select_rollback_revision`] pick
-    /// the newest `deployed`/`superseded` revision below the current one, which
-    /// is the whole point of the verb (#1899).
+    /// the serving revision beneath an unfinished latest revision, or the
+    /// newest prior `deployed`/`superseded` revision (#1899, #4335).
     pub revision: Option<u32>,
     /// Admit a `--revision` whose status is not `deployed`/`superseded`. Refused
     /// without this flag, since helm never finished applying such a revision.
@@ -165,6 +165,8 @@ pub(crate) fn nodes_cmd() -> OpsCommand {
 /// retention rather than deleting a namespace whose owner cannot be
 /// established; there is no fallback selector, since a fallback is exactly the
 /// cross-release delete #1654 reports.
+const OWNED_NAMESPACE_SWEEP_TIMEOUT: &str = "300s";
+
 pub fn down_commands(o: &CommonOpts) -> Vec<OpsCommand> {
     vec![
         OpsCommand::new(
@@ -187,6 +189,7 @@ pub fn down_commands(o: &CommonOpts) -> Vec<OpsCommand> {
                     o.release, o.namespace
                 )),
                 plain("--ignore-not-found"),
+                plain(format!("--timeout={OWNED_NAMESPACE_SWEEP_TIMEOUT}")),
             ],
         ),
     ]
@@ -537,6 +540,290 @@ fn teardown_result(
     Err(err.into())
 }
 
+/// True only when the namespace sweep itself failed and at least one owned
+/// namespace is still present. A successful sweep, including a zero-match
+/// sweep, is not a wait expiry.
+pub(super) fn owned_namespace_wait_expired(sweep_ok: bool, remaining: usize) -> bool {
+    !sweep_ok && remaining > 0
+}
+
+/// kubectl's own delete wait expired. This is not an immediate RBAC or
+/// validation failure, and it is not the connectivity marker `i/o timeout`.
+pub(super) fn sweep_wait_expired(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("timed out waiting")
+}
+
+fn step_is_permanent(outcome_failed: bool, stderr: &str) -> bool {
+    outcome_failed && !is_connectivity_failure(stderr)
+}
+
+/// One owned namespace still present after the bounded sweep wait.
+pub(super) struct OwnedNamespaceWait {
+    pub name: String,
+    pub phase: String,
+    pub conditions: String,
+    pub objects: String,
+}
+
+/// Operator text for a sweep wait that expired. Names each remaining namespace.
+/// It does not say that any finalizer was cleared.
+pub(super) fn format_owned_namespace_wait(rows: &[OwnedNamespaceWait], resume: &str) -> String {
+    let listed = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "namespace {} phase {} conditions {}; remaining objects: {}",
+                row.name, row.phase, row.conditions, row.objects
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "owned namespace sweep waited {OWNED_NAMESPACE_SWEEP_TIMEOUT} and these namespaces are still present: {listed}. Resume with: {resume}"
+    )
+}
+
+fn owned_namespace_list_cmd(o: &CommonOpts) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("namespace"),
+            plain("-l"),
+            plain(format!(
+                "curietech.ai/created-by={},curietech.ai/created-in={}",
+                o.release, o.namespace
+            )),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+fn format_namespace_conditions(item: &serde_json::Value) -> String {
+    let Some(conditions) = item.pointer("/status/conditions") else {
+        return "none".to_string();
+    };
+    if conditions.is_null() {
+        return "none".to_string();
+    }
+    let Some(conditions) = conditions.as_array() else {
+        return "none".to_string();
+    };
+    let parts: Vec<String> = conditions
+        .iter()
+        .filter_map(|condition| {
+            let type_name = condition.get("type")?.as_str()?;
+            let status = condition.get("status")?.as_str()?;
+            if type_name.is_empty() || status.is_empty() {
+                None
+            } else {
+                Some(format!("{type_name}={status}"))
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+struct OwnedNamespaceSnapshot {
+    name: String,
+    phase: String,
+    conditions: String,
+}
+
+/// A kind List whose items are Namespaces. Any other shape is an error so a
+/// diagnosis failure falls through to the existing sweep failure.
+fn parse_owned_namespace_list(output: &str) -> Result<Vec<OwnedNamespaceSnapshot>> {
+    let document: serde_json::Value =
+        serde_json::from_str(output).context("parsing the owned namespace list")?;
+    if document.get("kind").and_then(serde_json::Value::as_str) != Some("List") {
+        bail!("owned namespace list is not a kind List");
+    }
+    let items = document
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .context("owned namespace list has no items array")?;
+    let mut rows = Vec::new();
+    for item in items {
+        if item.get("kind").and_then(serde_json::Value::as_str) != Some("Namespace") {
+            bail!("owned namespace list contains an item that is not a Namespace");
+        }
+        let name = item
+            .pointer("/metadata/name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .context("owned namespace list contains a Namespace without a name")?
+            .to_string();
+        let phase = item
+            .pointer("/status/phase")
+            .and_then(serde_json::Value::as_str)
+            .filter(|phase| !phase.is_empty())
+            .unwrap_or("Unknown")
+            .to_string();
+        rows.push(OwnedNamespaceSnapshot {
+            name,
+            phase,
+            conditions: format_namespace_conditions(item),
+        });
+    }
+    Ok(rows)
+}
+
+fn parse_remaining_objects(output: &str) -> Result<Vec<(String, String)>> {
+    let document: serde_json::Value =
+        serde_json::from_str(output).context("parsing a namespace object inventory")?;
+    let items = document
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .context("namespace object inventory has no items array")?;
+    let mut found = Vec::new();
+    for item in items {
+        let Some(name) = item
+            .pointer("/metadata/name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let kind = item
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or("Unknown");
+        found.push((kind.to_string(), name.to_string()));
+    }
+    Ok(found)
+}
+
+fn format_remaining_objects(grouped: std::collections::BTreeMap<String, Vec<String>>) -> String {
+    if grouped.is_empty() {
+        return "none".to_string();
+    }
+    grouped
+        .into_iter()
+        .map(|(kind, mut names)| {
+            names.sort();
+            format!("{kind} ({}): {}", names.len(), names.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+const OWNED_NAMESPACE_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const OWNED_NAMESPACE_INVENTORY_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Namespaces still selected by this release's ownership pair, plus the objects
+/// left in each. One failed object list is recorded and does not abort the
+/// rest. The list and the inventory share a bounded budget so a stalled API
+/// cannot hold `cluster down` open after the sweep wait. Never finalizes,
+/// patches, or force-deletes.
+async fn diagnose_owned_namespace_wait(o: &CommonOpts) -> Result<Vec<OwnedNamespaceWait>> {
+    let listed = match tokio::time::timeout(
+        OWNED_NAMESPACE_LIST_TIMEOUT,
+        run_capture(&owned_namespace_list_cmd(o)),
+    )
+    .await
+    {
+        Ok(captured) => captured?,
+        Err(_) => bail!("timed out listing owned namespaces after the sweep wait"),
+    };
+    let (ok, output, err) = listed;
+    if !ok {
+        bail!(
+            "could not list owned namespaces after the sweep wait: {}",
+            failure_reason(&err)
+        );
+    }
+    let namespaces = parse_owned_namespace_list(&output)?;
+    if namespaces.is_empty() {
+        return Ok(Vec::new());
+    }
+    let discovered = match tokio::time::timeout(
+        OWNED_NAMESPACE_LIST_TIMEOUT,
+        run_capture(&super::namespaced_resources_cmd()),
+    )
+    .await
+    {
+        Ok(Ok((true, discovered, _err))) => discovered,
+        _ => {
+            return Ok(namespaces
+                .into_iter()
+                .map(|namespace| OwnedNamespaceWait {
+                    name: namespace.name,
+                    phase: namespace.phase,
+                    conditions: namespace.conditions,
+                    objects: "inventory timed out".to_string(),
+                })
+                .collect());
+        }
+    };
+    let resources: Vec<String> = discovered
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    let inventory_deadline = std::time::Instant::now() + OWNED_NAMESPACE_INVENTORY_BUDGET;
+    let mut rows = Vec::with_capacity(namespaces.len());
+    for namespace in namespaces {
+        let mut grouped: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let mut failures = Vec::new();
+        for resource in &resources {
+            let remaining = inventory_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                failures.push("inventory timed out".to_string());
+                break;
+            }
+            let captured = match tokio::time::timeout(
+                remaining,
+                run_capture(&super::namespace_inventory_cmd(&namespace.name, resource)),
+            )
+            .await
+            {
+                Ok(Ok(captured)) => captured,
+                Ok(Err(_)) | Err(_) => {
+                    failures.push(format!("{resource}: list failed"));
+                    continue;
+                }
+            };
+            let (listed, inventory, _err) = captured;
+            if !listed {
+                failures.push(format!("{resource}: list failed"));
+                continue;
+            }
+            match parse_remaining_objects(&inventory) {
+                Ok(items) => {
+                    for (kind, name) in items {
+                        grouped.entry(kind).or_default().push(name);
+                    }
+                }
+                Err(_) => failures.push(format!("{resource}: list failed")),
+            }
+        }
+        let mut objects = format_remaining_objects(grouped);
+        if !failures.is_empty() {
+            if objects == "none" {
+                objects = failures.join("; ");
+            } else {
+                objects.push_str("; ");
+                objects.push_str(&failures.join("; "));
+            }
+        }
+        rows.push(OwnedNamespaceWait {
+            name: namespace.name,
+            phase: namespace.phase,
+            conditions: namespace.conditions,
+            objects,
+        });
+    }
+    Ok(rows)
+}
+
 /// #707 ownership stamp. Returns the single `kubectl label namespace` step that
 /// records THIS release as the creator of the target namespace `o.namespace`
 /// (callers retarget `o` with `ns_common`, so this is the namespace being
@@ -669,6 +956,9 @@ pub struct ClusterStatus {
     pub urls: Vec<ServiceUrl>,
     pub delivery: crate::completion_outbox::Report,
     pub upgrade: super::upgrade::UpgradeStatusView,
+    /// Each recorded forge credential's expiry (#4397), from the computed
+    /// values; a warning is also in `warnings`.
+    pub credentials: Vec<crate::forge_expiry::ExpiryLine>,
 }
 
 impl crate::ui::CliOutput for ClusterStatusOutput {
@@ -696,6 +986,7 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                     "delivery": serde_json::to_value(&s.delivery).expect("delivery serializes"),
                     "healthy": healthy,
                     "upgrade": s.upgrade.to_json(),
+                    "credentials": serde_json::to_value(&s.credentials).expect("credentials serialize"),
                 })
             }
         }
@@ -721,6 +1012,9 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                 }
                 for url in &s.urls {
                     url.render(ui);
+                }
+                for line in &s.credentials {
+                    ui.payload(&line.summary());
                 }
                 ui.payload(&format!(
                     "upgrade {} · phase {} · known-good {}",
@@ -960,6 +1254,16 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
         None => crate::completion_outbox::Report::unknown(),
     };
 
+    let credentials = match &computed {
+        Ok(Some(values)) => crate::forge_expiry::report(values, time::OffsetDateTime::now_utc()),
+        _ => Vec::new(),
+    };
+    for line in &credentials {
+        if let Some(warning) = &line.warning {
+            warnings.push(format!("{}: {warning}", line.summary()));
+        }
+    }
+
     if upgrade.known_good_version.is_none() && helm_ok {
         upgrade.known_good_version =
             Some(field("CHART:", "")).filter(|version| !version.trim().is_empty());
@@ -986,6 +1290,7 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
         urls,
         delivery,
         upgrade,
+        credentials,
     }));
     let json = crate::ui::CliOutput::to_json(&output);
     if let Some(error) = context_error {
@@ -1182,6 +1487,7 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     // to do" apart from "removed it"; only the stdout content can. Distinguish
     // them into their own outcome so `teardown_result` never claims compute was
     // stopped when the sweep matched nothing.
+    let mut sweep_report = sweep_err.clone();
     let sweep_outcome = if ok {
         if out.trim().is_empty() {
             step.done("no matching namespaces");
@@ -1190,11 +1496,59 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
             step.done("removed");
             SweepOutcome::Removed
         }
+    } else if sweep_wait_expired(&sweep_err) {
+        // An immediate RBAC or validation failure is not a wait expiry, so it
+        // keeps the permanent exit class from #767. Only kubectl's own
+        // "timed out waiting" wording opens this path.
+        match diagnose_owned_namespace_wait(&opts.common).await {
+            Ok(rows) if !owned_namespace_wait_expired(false, rows.len()) => {
+                // The namespace finished deleting between the sweep error and
+                // the follow-up list. That is a completed sweep, not a failure.
+                step.done("removed");
+                SweepOutcome::Removed
+            }
+            Ok(rows)
+                if !step_is_permanent(matches!(helm_outcome, HelmOutcome::Failed), &helm_err)
+                    && !step_is_permanent(
+                        matches!(hook_outcome, HookOutcome::Failed),
+                        &hook_err,
+                    ) =>
+            {
+                step.fail("still present");
+                for line in out.lines().chain(sweep_err.lines()) {
+                    ui.plumbing(line);
+                }
+                let resume = resume_command(
+                    &outstanding_steps(helm_outcome, hook_outcome, SweepOutcome::Failed),
+                    &opts.common,
+                );
+                return Err(
+                    crate::exit::CliError::transient(format_owned_namespace_wait(&rows, &resume))
+                        .with_fix(resume)
+                        .into(),
+                );
+            }
+            Ok(rows) => {
+                // A permanent helm or hook failure still decides the exit
+                // class. The sweep report carries the objects that remain.
+                step.fail("still present");
+                let resume = resume_command(
+                    &outstanding_steps(helm_outcome, hook_outcome, SweepOutcome::Failed),
+                    &opts.common,
+                );
+                sweep_report = format_owned_namespace_wait(&rows, &resume);
+                SweepOutcome::Failed
+            }
+            Err(_) => {
+                step.fail("failed");
+                SweepOutcome::Failed
+            }
+        }
     } else {
         step.fail("failed");
         SweepOutcome::Failed
     };
-    for line in out.lines().chain(sweep_err.lines()) {
+    for line in out.lines().chain(sweep_report.lines()) {
         ui.plumbing(line);
     }
 
@@ -1206,7 +1560,7 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
         sweep_outcome,
         &helm_err,
         &hook_err,
-        &sweep_err,
+        &sweep_report,
         &opts.common,
     )
 }
@@ -1311,6 +1665,10 @@ pub struct RollbackChoice {
     /// True only when `--allow-failed-revision` admitted a revision whose status
     /// is not `deployed`/`superseded`.
     pub forced: bool,
+    /// True only when the newest revision is a `pending-rollback` whose
+    /// recorded target was confirmed, so this choice finishes that interrupted
+    /// rollback instead of restoring the serving revision (#4497).
+    pub resumes_interrupted_rollback: bool,
 }
 
 /// The outcome of the pure selection. `NoEligible` is a legitimate reading of a
@@ -1360,10 +1718,20 @@ impl RollbackTarget {
     }
 }
 
-/// Pick the rollback target: the NEWEST revision strictly below the current one
-/// whose status is `deployed` or `superseded`.
+/// Pick the serving revision when the newest revision above it is ineligible.
+/// Otherwise pick the newest eligible revision strictly below the current one.
 ///
-/// This is the whole fix for #1899. A `cluster up` against a cluster with no
+/// This preserves known good state after an interrupted or failed upgrade
+/// (#4335). A `pending-rollback` newest revision is the one exception (#4497,
+/// amending #4335 for that status only): its row records the operator's last
+/// instruction as `Rollback to <N>`, and Helm history is the only place that
+/// intent survives a kill. When N parses, is in history below the pending row,
+/// is eligible, and carries the pending row's chart, the choice finishes that
+/// rollback toward N. Otherwise selection refuses and names the explicit
+/// choices, rather than silently restoring the serving revision the operator
+/// was leaving. Every other ineligible newest status restores serving.
+///
+/// The status filter fixes #1899: a `cluster up` against a cluster with no
 /// `runsc` RuntimeClass records a FAILED revision before its successful retry,
 /// so the history alternates failed/superseded and the immediately preceding
 /// revision -- the one bare `helm rollback` targets -- is a failed one. Skipping
@@ -1372,6 +1740,27 @@ impl RollbackTarget {
 /// Pure by construction so the decision is unit-testable with no cluster.
 pub fn select_rollback_revision(history: &[HelmRevision]) -> Result<RollbackTarget> {
     let current = require_current_revision(history)?;
+
+    if let Some(newest) = history
+        .iter()
+        .max_by_key(|row| row.revision)
+        .filter(|row| row.revision > current && !is_eligible_rollback_status(&row.status))
+    {
+        if newest
+            .status
+            .trim()
+            .eq_ignore_ascii_case("pending-rollback")
+        {
+            return resume_interrupted_rollback(history, newest, current);
+        }
+        return Ok(RollbackTarget::Eligible(RollbackChoice {
+            from_revision: newest.revision,
+            to_revision: current,
+            skipped: skipped_between(history, current, newest.revision),
+            forced: false,
+            resumes_interrupted_rollback: false,
+        }));
+    }
 
     match history
         .iter()
@@ -1384,6 +1773,7 @@ pub fn select_rollback_revision(history: &[HelmRevision]) -> Result<RollbackTarg
             to_revision,
             skipped: skipped_between(history, to_revision, current),
             forced: false,
+            resumes_interrupted_rollback: false,
         })),
         None => Ok(RollbackTarget::NoEligible {
             current,
@@ -1431,7 +1821,60 @@ pub fn resolve_explicit_revision(
         to_revision: revision,
         skipped: skipped_between(history, revision, current),
         forced: !eligible,
+        resumes_interrupted_rollback: false,
     })
+}
+
+/// The target revision of an interrupted `helm rollback`, read from its
+/// pending row's description. Helm writes that description as
+/// `Rollback to %d` (helm pkg/action/rollback.go,
+/// `Description = fmt.Sprintf("Rollback to %d", r.Version)`), so only that
+/// exact shape, trimmed, with a nonempty run of ASCII digits that fits a
+/// `u32`, is read as a target. Anything else is `None`.
+pub(crate) fn interrupted_rollback_target(description: &str) -> Option<u32> {
+    let digits = description.trim().strip_prefix("Rollback to ")?;
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Finish a `pending-rollback` newest revision toward its recorded target, or
+/// refuse with both explicit choices when that target cannot be confirmed.
+fn resume_interrupted_rollback(
+    history: &[HelmRevision],
+    pending: &HelmRevision,
+    serving: u32,
+) -> Result<RollbackTarget> {
+    let target = interrupted_rollback_target(&pending.description)
+        .and_then(|n| history.iter().find(|row| row.revision == n));
+    if let Some(row) = target.filter(|row| {
+        row.revision < pending.revision
+            && is_eligible_rollback_status(&row.status)
+            && row.chart == pending.chart
+    }) {
+        return Ok(RollbackTarget::Eligible(RollbackChoice {
+            from_revision: pending.revision,
+            to_revision: row.revision,
+            skipped: skipped_between(history, row.revision, pending.revision),
+            forced: false,
+            resumes_interrupted_rollback: true,
+        }));
+    }
+    let restore = format!("curie cluster rollback --revision {serving} --yes");
+    let fix = match target {
+        Some(row) => format!(
+            "run curie cluster rollback --revision {} --yes to finish it, or {restore} to restore the serving revision",
+            row.revision
+        ),
+        None => format!("run {restore} to restore the serving revision"),
+    };
+    Err(crate::exit::CliError::failure(format!(
+        "revision {} is an interrupted rollback whose target cannot be confirmed; {fix}",
+        pending.revision
+    ))
+    .with_fix(fix)
+    .into())
 }
 
 /// Parse `helm history -o json`: an array of objects. Unknown fields are
@@ -1622,6 +2065,7 @@ pub enum ClusterRollbackOutput {
         to_revision: u32,
         skipped: Vec<u32>,
         forced: bool,
+        resumed_interrupted_rollback: bool,
     },
 }
 
@@ -1637,12 +2081,14 @@ impl crate::ui::CliOutput for ClusterRollbackOutput {
                 to_revision,
                 skipped,
                 forced,
+                resumed_interrupted_rollback,
             } => serde_json::json!({
                 "rolled_back": true,
                 "from_revision": from_revision,
                 "to_revision": to_revision,
                 "skipped": skipped,
                 "forced": forced,
+                "resumed_interrupted_rollback": resumed_interrupted_rollback,
             }),
         }
     }
@@ -1656,6 +2102,7 @@ impl crate::ui::CliOutput for ClusterRollbackOutput {
                 to_revision,
                 skipped,
                 forced,
+                ..
             } => {
                 ui.payload(&format!(
                     "curie rolled back from revision {from_revision} to revision {to_revision}"
@@ -1728,6 +2175,52 @@ fn retained_manifest_fix(common: &CommonOpts, revision: u32, published_head: &st
     )
 }
 
+/// After the catalog window refuses an unambiguous target, admit it only when
+/// its retained manifest carries the build's own ADR 0142 schema-compat
+/// metadata, that declared head is strictly later than the catalog head and no
+/// later than the next catalogued release's head, and the declared window
+/// contains the live revision. Requiring a later head keeps every published
+/// release judged by its catalog window. The upper bound admits only a build
+/// cut between its release and the next one, so a chart packaged from a newer
+/// tree under an older version keeps the catalog refusal. Any failure keeps
+/// the original refusal.
+async fn declared_window_admits_rollback(
+    common: &CommonOpts,
+    ui: &crate::ui::Ui,
+    revision: u32,
+    target_app: &str,
+    catalog_head: &str,
+    live: &str,
+    history_apps: &[String],
+) -> bool {
+    let manifest_cmd = helm_retained_manifest_cmd(common, revision);
+    ui.plumbing(&format!("+ {}", manifest_cmd.display()));
+    let Ok((true, manifest_out, _)) = run_capture(&manifest_cmd).await else {
+        return false;
+    };
+    let Ok(crate::schema_compat::RetainedManifestIdentity::Candidate(metadata)) =
+        crate::schema_compat::classify_retained_manifest(&manifest_out, target_app)
+    else {
+        return false;
+    };
+    let Ok(declared) =
+        crate::schema_window::candidate_window(&metadata.schema_min, &metadata.schema_head)
+    else {
+        return false;
+    };
+    // candidate_window refuses a min after its head, so this orders the heads.
+    let later_head = declared.schema_head != catalog_head
+        && crate::schema_window::candidate_window(catalog_head, &declared.schema_head).is_ok();
+    let before_next_release =
+        crate::schema_window::next_release_head(target_app).is_none_or(|next_head| {
+            crate::schema_window::candidate_window(&declared.schema_head, &next_head).is_ok()
+        });
+    later_head
+        && before_next_release
+        && crate::schema_window::check_target_schema(target_app, &declared, live, history_apps)
+            .is_ok()
+}
+
 async fn probe_live_schema_revision(common: &CommonOpts, ui: &crate::ui::Ui) -> Result<String> {
     require_on_path("kubectl")?;
     let probe = live_schema_revision_cmd(common);
@@ -1756,20 +2249,91 @@ async fn probe_live_schema_revision(common: &CommonOpts, ui: &crate::ui::Ui) -> 
     })
 }
 
+/// Fix a schema-gated dry run carries when no live revision was asserted: the
+/// fail-forward version depends on a revision the dry run never probes.
+const DRY_RUN_FAIL_FORWARD_FIX: &str = "the newest safe fail-forward version depends on the live database revision; pass --live-schema-revision <id> to name it";
+
+/// One shape for every rollback schema-gate refusal. The next step rides in the
+/// message as well as the fix, as in [`RollbackTarget::require_eligible`]: the
+/// human presenter shows only the message, and `--json` keeps `fix`.
+fn schema_gate_refusal(message: &str, fix: &str) -> anyhow::Error {
+    crate::exit::CliError::failure(format!("{message}; {fix}"))
+        .with_fix(fix)
+        .into()
+}
+
+/// The operator-asserted `--live-schema-revision`, or the refusal both the dry
+/// run and the real run return when it names no revision.
+fn parse_asserted_live_schema_revision(raw: &str) -> Result<String> {
+    crate::schema_window::parse_alembic_current_output(raw).ok_or_else(|| {
+        schema_gate_refusal(
+            "refusing rollback: --live-schema-revision did not contain a database revision",
+            "pass a revision id such as 0039",
+        )
+    })
+}
+
+/// The application version the selected target revision installed, or the
+/// refusal both the dry run and the real run return when it has none.
+fn require_target_application_version(
+    history: &[HelmRevision],
+    to_revision: u32,
+) -> Result<String> {
+    history
+        .iter()
+        .find(|row| row.revision == to_revision)
+        .and_then(HelmRevision::application_version)
+        .ok_or_else(|| {
+            schema_gate_refusal(
+                &format!(
+                    "refusing rollback to Helm revision {to_revision}: no application version on that revision"
+                ),
+                "inspect `helm history <release> -n <namespace> -o json` and fail forward to a revision whose app_version is catalogued",
+            )
+        })
+}
+
+/// The offline half of the rollback schema gate, run by a dry run: the target
+/// has an application version and the embedded catalog declares its range. The
+/// live window stays real-run only, so a live revision here only names the
+/// fail-forward version in the refusal.
+fn dry_run_schema_catalog_check(
+    history: &[HelmRevision],
+    to_revision: u32,
+    live_schema_revision: Option<&str>,
+) -> Result<()> {
+    let live = live_schema_revision
+        .map(parse_asserted_live_schema_revision)
+        .transpose()?;
+    let target_app = require_target_application_version(history, to_revision)?;
+    if crate::schema_window::window_for(&target_app).is_some() {
+        return Ok(());
+    }
+    let refusal = match live {
+        Some(live) => crate::schema_window::missing_target_window_refusal(
+            &target_app,
+            &live,
+            &history_application_versions(history),
+        ),
+        None => crate::schema_window::SchemaRefusal {
+            message: crate::schema_window::missing_target_window_message(&target_app),
+            fix: DRY_RUN_FAIL_FORWARD_FIX.to_string(),
+        },
+    };
+    Err(schema_gate_refusal(&refusal.message, &refusal.fix))
+}
+
+fn history_application_versions(history: &[HelmRevision]) -> Vec<String> {
+    history
+        .iter()
+        .filter_map(HelmRevision::application_version)
+        .collect()
+}
+
 pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
     let ui = crate::ui::ui();
     let history_cmd = helm_history_cmd(&opts.common);
 
-    if opts.common.dry_run {
-        // The target revision is a function of the live history, so a dry run
-        // that has not read it can only name the revision when the operator did.
-        return Ok(ClusterRollbackOutput::DryRun(crate::ui::DryRunPlan {
-            lines: rollback_commands(&opts.common, opts.revision)
-                .iter()
-                .map(plan_line)
-                .collect(),
-        }));
-    }
     require_on_path("helm")?;
 
     ui.plumbing(&format!("+ {}", history_cmd.display()));
@@ -1801,47 +2365,62 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
         None => select_rollback_revision(&history)?.require_eligible()?,
     };
 
-    if !opts.disable_schema_gate {
-        let target_row = history
+    if opts.common.dry_run {
+        if !opts.disable_schema_gate {
+            dry_run_schema_catalog_check(
+                &history,
+                choice.to_revision,
+                opts.live_schema_revision.as_deref(),
+            )?;
+        }
+        let target = history
             .iter()
-            .find(|row| row.revision == choice.to_revision);
-        let target_app = target_row.and_then(HelmRevision::application_version);
-        let history_apps: Vec<String> = history
+            .find(|row| row.revision == choice.to_revision)
+            .context("selected rollback revision is missing from Helm history")?;
+        let skipped = if choice.skipped.is_empty() {
+            "none".to_string()
+        } else {
+            choice
+                .skipped
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut lines: Vec<String> = rollback_commands(&opts.common, Some(choice.to_revision))
             .iter()
-            .filter_map(HelmRevision::application_version)
+            .map(plan_line)
             .collect();
+        if choice.resumes_interrupted_rollback {
+            lines.push(interrupted_rollback_note(&choice));
+        }
+        lines.push(format!(
+            "selected revision {} ({}, {}) from revision {}; skipped {}",
+            choice.to_revision, target.status, target.chart, choice.from_revision, skipped
+        ));
+        return Ok(ClusterRollbackOutput::DryRun(crate::ui::DryRunPlan {
+            lines,
+        }));
+    }
+
+    if !opts.disable_schema_gate {
+        let history_apps = history_application_versions(&history);
         let live = match opts.live_schema_revision.as_deref() {
-            Some(raw) => {
-                crate::schema_window::parse_alembic_current_output(raw).ok_or_else(|| {
-                    crate::exit::CliError::failure(
-                    "refusing rollback: --live-schema-revision did not contain a database revision",
-                )
-                .with_fix("pass a revision id such as 0039")
-                })?
-            }
+            Some(raw) => parse_asserted_live_schema_revision(raw)?,
             None => probe_live_schema_revision(&opts.common, ui).await?,
         };
-        let Some(target_app) = target_app else {
-            return Err(crate::exit::CliError::failure(format!(
-                "refusing rollback to Helm revision {}: no application version on that revision",
-                choice.to_revision
-            ))
-            .with_fix("inspect `helm history <release> -n <namespace> -o json` and fail forward to a revision whose app_version is catalogued")
-            .into());
-        };
+        let target_app = require_target_application_version(&history, choice.to_revision)?;
         let Some(catalog_window) = crate::schema_window::window_for(&target_app) else {
             let refusal = crate::schema_window::missing_target_window_refusal(
                 &target_app,
                 &live,
                 &history_apps,
             );
-            return Err(crate::exit::CliError::failure(refusal.message)
-                .with_fix(refusal.fix)
-                .into());
+            return Err(schema_gate_refusal(&refusal.message, &refusal.fix));
         };
-        let (resolved_window, published_identity_fix) = if catalog_window
-            .artifact_identity_ambiguous
-        {
+        let catalog_ambiguous = catalog_window.artifact_identity_ambiguous;
+        let catalog_head = catalog_window.schema_head.clone();
+        let (resolved_window, published_identity_fix) = if catalog_ambiguous {
             let manifest_cmd = helm_retained_manifest_cmd(&opts.common, choice.to_revision);
             ui.plumbing(&format!("+ {}", manifest_cmd.display()));
             let (ok, manifest_out, manifest_err) = run_capture(&manifest_cmd).await?;
@@ -1906,12 +2485,23 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
             &live,
             &history_apps,
         ) {
-            let fix = published_identity_fix
-                .map(|identity| format!("{}. {identity}", refusal.fix))
-                .unwrap_or(refusal.fix);
-            return Err(crate::exit::CliError::failure(refusal.message)
-                .with_fix(fix)
-                .into());
+            let admitted = !catalog_ambiguous
+                && declared_window_admits_rollback(
+                    &opts.common,
+                    ui,
+                    choice.to_revision,
+                    &target_app,
+                    &catalog_head,
+                    &live,
+                    &history_apps,
+                )
+                .await;
+            if !admitted {
+                let fix = published_identity_fix
+                    .map(|identity| format!("{}. {identity}", refusal.fix))
+                    .unwrap_or(refusal.fix);
+                return Err(schema_gate_refusal(&refusal.message, &fix));
+            }
         }
         if opts.live_schema_revision.is_some() {
             ui.warn(&format!(
@@ -1926,6 +2516,9 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
     // `payload` -- ADR-0021 (#474) reserves that channel for `CliOutput::render`,
     // and routing it here told an operator who then declined the prompt that the
     // release was rolling back, on stdout, while printing it twice on success.
+    if choice.resumes_interrupted_rollback {
+        ui.note(&interrupted_rollback_note(&choice));
+    }
     ui.note(&format!(
         "rolling release '{}' back from revision {} to revision {}",
         opts.common.release, choice.from_revision, choice.to_revision
@@ -1975,7 +2568,17 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
         to_revision: choice.to_revision,
         skipped: choice.skipped,
         forced: choice.forced,
+        resumed_interrupted_rollback: choice.resumes_interrupted_rollback,
     })
+}
+
+/// The sentence a dry run and the pre-prompt note share when a bare rollback
+/// finishes an interrupted one (#4497).
+fn interrupted_rollback_note(choice: &RollbackChoice) -> String {
+    format!(
+        "revision {} is an interrupted rollback to revision {}; resuming it",
+        choice.from_revision, choice.to_revision
+    )
 }
 
 /// Read a y/N confirmation from stderr/stdin for `down` when `--yes` is absent.
@@ -2036,8 +2639,9 @@ fn render_pod_table(ui: &crate::ui::Ui, pods: &[PodRow]) {
 
 /// Summarise `kubectl get pods` output into (rows, ready count, steady-state
 /// total, names of pods not Running) WITHOUT printing, so the caller can render
-/// or serialize it (#485). Terminal and terminating pods stay in the rows but are
-/// excluded from the tally.
+/// or serialize it (#485). Terminal (`Succeeded`, `Failed`, `Completed`) and
+/// terminating pods stay in the rows but are excluded from the tally; a kubelet
+/// eviction leaves a `Failed` pod its ReplicaSet never deletes (#4496).
 fn collect_pod_summary(pods: &[serde_json::Value]) -> (Vec<PodRow>, usize, usize, Vec<String>) {
     let mut ready = 0usize;
     let mut total = 0usize;
@@ -2093,7 +2697,7 @@ fn collect_pod_summary(pods: &[serde_json::Value]) -> (Vec<PodRow>, usize, usize
             status: display_status.to_string(),
             mail_channel: None,
         });
-        if phase == "Succeeded" || reason == "Completed" || terminating {
+        if phase == "Succeeded" || phase == "Failed" || reason == "Completed" || terminating {
             continue;
         }
         total += 1;
@@ -3096,12 +3700,36 @@ impl ReleaseFullname {
 /// `cli/tests/chart_fullname_parity.rs` pins both the rule and its limit
 /// against the chart's own render.
 pub fn chart_fullname(release: &str) -> ReleaseFullname {
+    ReleaseFullname(release_fullname_from_values(
+        release,
+        &serde_json::Value::Null,
+    ))
+}
+
+/// The chart's `curie.fullname` (charts/curie/templates/_helpers.tpl) for
+/// `release` under `values`, the document Apply hands Helm (#4321). A nonempty
+/// `fullnameOverride` wins; otherwise the name is `nameOverride` or `curie`,
+/// and a release already containing it is used as is. Both branches then
+/// `trunc 63 | trimSuffix "-"`, which removes exactly one trailing dash.
+pub(crate) fn release_fullname_from_values(release: &str, values: &serde_json::Value) -> String {
     const CHART_NAME: &str = "curie";
 
-    let fullname = if release.contains(CHART_NAME) {
-        release.to_string()
-    } else {
-        format!("{release}-{CHART_NAME}")
+    let nonempty = |key: &str| {
+        values
+            .get(key)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+    };
+    let fullname = match nonempty("fullnameOverride") {
+        Some(over) => over.to_string(),
+        None => {
+            let name = nonempty("nameOverride").unwrap_or(CHART_NAME);
+            if release.contains(name) {
+                release.to_string()
+            } else {
+                format!("{release}-{name}")
+            }
+        }
     };
     // `trunc 63` first, then `trimSuffix "-"`, with sprig's exact semantics:
     // `trimSuffix` removes EXACTLY ONE trailing dash where
@@ -3110,8 +3738,10 @@ pub fn chart_fullname(release: &str) -> ReleaseFullname {
     // fullnameOverride=<61 a's>--<10 z's>` renders the api Service as
     // `<61 a's>--api`, so one dash survives for the component suffix to join to.
     let truncated: String = fullname.chars().take(63).collect();
-    let trimmed = truncated.strip_suffix('-').unwrap_or(truncated.as_str());
-    ReleaseFullname(trimmed.to_string())
+    truncated
+        .strip_suffix('-')
+        .unwrap_or(truncated.as_str())
+        .to_string()
 }
 
 /// The fullname a `--dry-run` plan prints, plus the caveat that goes with it.
@@ -4034,7 +4664,11 @@ async fn read_release_secret(namespace: &str, release: &str, data_key: &str) -> 
 /// an operator-managed Secret elsewhere in the namespace. Decoded server-side by
 /// kubectl's `base64decode` so the plaintext never lands in argv (#524). `None`
 /// when the Secret, the key, or the cluster is unreachable.
-async fn read_secret_key(namespace: &str, secret_name: &str, data_key: &str) -> Option<String> {
+pub(crate) async fn read_secret_key(
+    namespace: &str,
+    secret_name: &str,
+    data_key: &str,
+) -> Option<String> {
     let cmd = OpsCommand::new(
         "kubectl",
         vec![
@@ -4733,13 +5367,72 @@ mod tests {
         // namespace, so it cannot reach another release's namespaces.
         assert_eq!(
             sweep,
-            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found"
+            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found --timeout=300s"
         );
         // Negative case: the pre-existing shared namespace is no longer an
         // unconditional delete target (that would strand pre-existing state).
         assert!(!sweep.contains("agent-sandbox-system"), "{sweep}");
         // ignore-not-found preserved so a partial teardown stays re-runnable.
         assert!(sweep.contains("--ignore-not-found"), "{sweep}");
+    }
+
+    // #4017: the owned-namespace sweep carries a bounded wait. A stuck
+    // finalizer must not hang `cluster down`, and the command must not clear
+    // finalizers or force the delete (#707, #767, #768).
+    #[test]
+    fn down_sweep_command_carries_a_300s_bound() {
+        let cmds = down_commands(&common_distinct_release());
+        let sweep = cmds[1].display();
+        assert!(sweep.contains("--timeout=300s"), "{sweep}");
+        assert!(sweep.contains("--ignore-not-found"), "{sweep}");
+        assert!(
+            sweep.contains("curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns"),
+            "{sweep}"
+        );
+        assert!(!sweep.contains("finalize"), "{sweep}");
+        assert!(!sweep.contains("--force"), "{sweep}");
+    }
+
+    // #4017: a successful sweep is not a wait expiry, and an empty remainder
+    // is not either. Only a failed sweep that left namespaces behind expires.
+    // The message names what is still there; it must not claim a finalizer
+    // was removed (#707, #767, #768).
+    #[test]
+    fn owned_namespace_wait_expires_only_for_a_failed_sweep_with_namespaces_left() {
+        assert!(
+            !owned_namespace_wait_expired(true, 3),
+            "a successful sweep is not a wait expiry"
+        );
+        assert!(!owned_namespace_wait_expired(false, 0));
+        assert!(owned_namespace_wait_expired(false, 1));
+        assert!(sweep_wait_expired(
+            "error: timed out waiting for the condition on namespaces/agent-ns"
+        ));
+        assert!(!sweep_wait_expired(
+            "Error: namespaces is forbidden: User \"x\" cannot delete resource \"namespaces\""
+        ));
+        // `i/o timeout` is a connectivity failure, not kubectl's delete wait.
+        assert!(!sweep_wait_expired("dial tcp: i/o timeout"));
+        let resume = "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found --timeout=300s";
+        let message = format_owned_namespace_wait(
+            &[OwnedNamespaceWait {
+                name: "agent-ns".into(),
+                phase: "Terminating".into(),
+                conditions: "NamespaceFinalizersRemaining=True".into(),
+                objects: "ConfigMap (1): hold".into(),
+            }],
+            resume,
+        );
+        assert!(message.contains("agent-ns"), "{message}");
+        assert!(message.contains("Terminating"), "{message}");
+        assert!(
+            message.contains("NamespaceFinalizersRemaining=True"),
+            "{message}"
+        );
+        assert!(message.contains("ConfigMap"), "{message}");
+        assert!(message.contains("hold"), "{message}");
+        assert!(message.contains("--timeout=300s"), "{message}");
+        assert!(!message.contains("finalizer removed"), "{message}");
     }
 
     // #1654 cross-release teardown scope. Two independent Curie installs on one
@@ -4882,7 +5575,7 @@ mod tests {
         let cmd = resume_command(&[TeardownStep::NamespaceSweep], &o);
         assert_eq!(
             cmd,
-            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found"
+            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found --timeout=300s"
         );
         // #707 ownership-scope invariant: the sweep stays keyed on THIS release's
         // label and is never widened to an unconditional namespace delete.
@@ -4922,7 +5615,7 @@ mod tests {
         );
         let helm_cmd = "helm uninstall prod-release -n agent-ns";
         let sweep_cmd =
-            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found";
+            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found --timeout=300s";
         assert_eq!(
             cmd,
             format!(
@@ -5659,6 +6352,33 @@ mod tests {
         let items: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
         let (_, ready, total, unhealthy) = collect_pod_summary(&items);
         assert_eq!((ready, total, unhealthy), (10, 10, vec![]));
+    }
+
+    #[test]
+    fn pod_summary_lists_but_does_not_tally_evicted_failed_pods() {
+        // Node-pressure eviction leaves a Failed pod with reason Evicted:
+        // https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/
+        let json = r#"[
+            {"metadata":{"name":"api0"},"status":{"phase":"Running","containerStatuses":[{"ready":true,"restartCount":0}]}},
+            {"metadata":{"name":"langfuse-evicted"},"status":{"phase":"Failed","reason":"Evicted","containerStatuses":[{"ready":false,"restartCount":0}]}},
+            {"metadata":{"name":"langfuse-evicted-deleting","deletionTimestamp":"2026-10-12T14:56:00Z"},"status":{"phase":"Failed","reason":"Evicted","containerStatuses":[{"ready":false,"restartCount":0}]}}
+        ]"#;
+
+        let items: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
+        let (rows, ready, total, unhealthy) = collect_pod_summary(&items);
+        assert_eq!((ready, total, unhealthy), (1, 1, vec![]));
+        let listed: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|row| (row.name.as_str(), row.status.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("api0", "Running"),
+                ("langfuse-evicted", "Evicted"),
+                ("langfuse-evicted-deleting", "Terminating"),
+            ]
+        );
     }
 
     #[test]

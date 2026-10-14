@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, cast
@@ -16,10 +16,22 @@ from opentelemetry.trace import (
     StatusCode,
     Tracer,
 )
-from opentelemetry.util.types import AttributeValue
 
 from .context import _normalize_trace_context
 from .redact import redact_span_attribute
+
+# opentelemetry-api 1.45 declares AttributeValue in a chained assignment, which
+# mypy does not accept as a type alias, so the same value shape is restated here.
+type AttributeValue = (
+    str
+    | bool
+    | int
+    | float
+    | bytes
+    | Sequence[AttributeValue]
+    | Mapping[str, AttributeValue]
+    | None
+)
 
 _tracer: Tracer = trace.NoOpTracerProvider().get_tracer("curie-telemetry")
 
@@ -91,6 +103,13 @@ PLATFORM_SPAN_ATTRIBUTE_KEYS = {
     "outcome": "curie.outcome",
     "retry_class": "curie.retry_class",
     "event_id": "curie.channel.event_id",
+    # AUTOMATED-REMEDIATION-21: the receipt span's closed attributes. The ids
+    # are admitted on spans only, as event_id is.
+    "stage": "curie.remediation.stage",
+    "kind": "curie.remediation.kind",
+    "authority": "curie.remediation.authority",
+    "code": "curie.remediation.code",
+    "nomination_id": "curie.remediation.nomination_id",
 }
 PLATFORM_EVENT_ATTRIBUTE_KEYS = {
     "outcome": "curie.outcome",

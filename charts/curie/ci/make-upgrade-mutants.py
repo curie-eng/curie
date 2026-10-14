@@ -23,12 +23,27 @@ def remove_placement_nil_guard(path: Path) -> None:
     path.write_text(text[: match.start()] + mutated + text[match.end() :])
 
 
+ACTION_RE = re.compile(r"{{-?\s*(if|range|with|define|block|end)\b[^}]*-?}}")
+
+
+def define_block_end(text: str, start: int) -> int:
+    """Return the offset just past the `end` closing the define at `start`."""
+    depth = 0
+    for match in ACTION_RE.finditer(text, start):
+        depth += -1 if match.group(1) == "end" else 1
+        if depth == 0:
+            return match.end()
+    return -1
+
+
 def restore_nil_unsafe_managed_secret(path: Path) -> None:
     text = path.read_text()
     start_marker = '{{- define "curie.managedSecret" -}}'
-    end_marker = '{{/* ---- Shared first-party-app environment fragments ---- */}}'
     start = text.find(start_marker)
-    end = text.find(end_marker, start)
+    # Replace only the managedSecret define. Later helpers in the same file
+    # (curie.secretChecksum since #4466) must survive, or every consumer fails
+    # to render and the control fails for the wrong reason.
+    end = define_block_end(text, start) if start != -1 else -1
     if start == -1 or end == -1:
         raise SystemExit("nil-unsafe negative control could not find curie.managedSecret")
 

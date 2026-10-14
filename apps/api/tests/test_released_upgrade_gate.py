@@ -48,7 +48,7 @@ from types import ModuleType
 from typing import Any
 
 import pytest
-from curie_api.schemas import _validate_channel_binding
+from curie_api.schemas.channels import validate_channel_binding
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 GATE_SCRIPT = REPO_ROOT / "scripts" / "check-released-upgrade.py"
@@ -201,14 +201,26 @@ def sibling_postgres(
     isolated_released_upgrade_resources: Any,
     tmp_path: Path,
 ) -> Any:
+    project = f"curie2751sibling{uuid.uuid4().hex[:8]}"
+    preflight = _load_script(
+        "released_upgrade_preflight_networks",
+        REPO_ROOT / "tools" / "preflight" / "preflight.py",
+    )
+    occupied = preflight.docker_network_subnets(REPO_ROOT, dict(os.environ))
+    subnet, _ = preflight.private_network_subnets(project, occupied)
     override = tmp_path / "sibling.yaml"
     override.write_text(
         "services:\n"
         "  postgres:\n"
-        "    ports: !override [\"127.0.0.1::5432\"]\n",
+        "    ports: !override [\"127.0.0.1::5432\"]\n"
+        "networks:\n"
+        "  default:\n"
+        f"    name: {project}_default\n"
+        "    ipam:\n"
+        "      config:\n"
+        f"        - subnet: {subnet}\n",
         encoding="utf-8",
     )
-    project = f"curie2751sibling{uuid.uuid4().hex[:8]}"
     scope = gate.ReleaseUpgradeResources(
         compose_project=project,
         compose_files=(gate.COMPOSE_FILE, override),
@@ -1088,7 +1100,7 @@ def test_every_legacy_fixture_address_is_rejected_by_the_live_validator(
         if not agent.legacy:
             continue
         with pytest.raises(ValueError):
-            _validate_channel_binding(agent.kind, agent.address)
+            validate_channel_binding(agent.kind, agent.address)
 
 
 def test_the_valid_fixture_address_is_accepted_by_the_live_validator(
@@ -1097,7 +1109,7 @@ def test_the_valid_fixture_address_is_accepted_by_the_live_validator(
     for agent in gate.SEED_FIXTURE:
         if agent.legacy:
             continue
-        assert _validate_channel_binding(agent.kind, agent.address) == agent.address
+        assert validate_channel_binding(agent.kind, agent.address) == agent.address
 
 
 def test_the_seeded_approval_route_reuses_a_rejected_legacy_address(

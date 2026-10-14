@@ -49,6 +49,15 @@ to know what the target is for. It takes the first of these the request gives:
 The report's first line names the source: `<owner/repo>@<commit>`,
 `request spec`, or `(no spec)`.
 
+A repository spec is the source the target was rendered from, not proof of
+what is deployed: an installer may drop connectors, gates and secrets before
+deploying. Add `, rendered` or `, deployed` after naming the spec to say which,
+for example `spec from acme-corp/acme-bot@main examples/acme-bot, rendered`.
+Without either, a repository spec counts as a source and a spec in the request
+counts as deployed. When the target says it lacks something only a source spec
+declares, the tester grades it UNCLEAR ("spec source may differ from
+deployment"), not FAIL. See [docs/VALIDATOR.md](docs/VALIDATOR.md#deployed-and-source-specs).
+
 ## A round without a spec
 
 Without a spec, the only thing to hold a reply against is ordinary use. The
@@ -63,9 +72,10 @@ tester grades only what needs no spec, and marks the report `(no spec)`:
 
 ## Prerequisites
 
-- **Its own Curie installation.** Its Slack app must **not** be the app of any
-  agent it will test. A bot's own posts never reach its own dispatcher, so a
-  shared app would make the tester invisible to itself.
+- **Its own Slack app.** It must **not** be the app of any agent it will test.
+  A bot's own posts never reach its own dispatcher, so a shared app would make
+  the tester invisible to itself. Two installations must not hold the same app
+  either: Slack hands each event to one of the connections at random (#2248).
 - **Stdio MCP servers**: this bundle's `runner.Dockerfile` installs them in a
   runner layer (ADR 0173) that `curie build` builds. The platform runner image
   does not carry them.
@@ -74,14 +84,13 @@ tester grades only what needs no spec, and marks the report `(no spec)`:
   invitation list is the allowlist: the bot can post anywhere it is invited.
   Never invite it to an externally shared channel. Nothing else stops it
   probing there.
-- **A GitHub token for the tester itself**, never a person's. It is needed
-  only for repositories listed under "Where you work". Use either a
-  fine-grained token on a machine account, or a GitHub App installation
-  token, limited to those repositories with **Contents: Read** and nothing
-  else. The token sits in the sandbox's environment, so its scope is the real
-  bound. The manifest declares the secret either way. With no repository
-  listed, give it a token that can read no private repository, such as a
-  fine-grained token limited to public repositories.
+- **An optional GitHub token for the tester itself**, never a person's. Omit
+  `GITHUB_PERSONAL_ACCESS_TOKEN` for Slack-only campaigns, request specs,
+  attached specs and recorded exchanges. Bind it only when the tester will
+  read repositories listed under "Where you work". Use a fine-grained machine
+  account token or GitHub App installation token limited to those repositories
+  with **Contents: Read**. Without it, skip authenticated GitHub reads and ask
+  for the spec in the request; never invent repository access.
 - **Enough agent steps for a campaign.** The runner ends a turn after
   `CURIE_MAX_TURNS` model steps, 20 by default. A campaign takes well over a
   hundred: every probe, read and wait is a step. Set it for the tester's
@@ -92,6 +101,43 @@ tester grades only what needs no spec, and marks the report `(no spec)`:
   and give the tester's Slack app the `files:read` scope. Without both,
   attached files are ignored, so paste the spec into the request instead.
 
+## Where to run it
+
+Run the tester beside the agents it tests: deploy it into the target's own
+Curie installation as a sibling identity
+([ADR 0168](../../docs/adr/0168-one-installation-hosts-several-bot-identities.md)),
+with its own Slack app. ADR 0169 requires a separate provider installation,
+which is the Slack app, not a separate Curie installation. In that placement:
+
+- it runs on the model credential that installation already gives its agents,
+  so it needs none of its own and the target's team pays for its runs;
+- it reads the target's bundle from the thread's repository workspace: put
+  `https://github.com/<owner>/<repo>` in the request, and the platform clones
+  it into `/workspace` with the installation's GitHub access (`api.githubToken`,
+  its existing secret, or the GitHub App). The repository must be in that
+  installation's `api.githubRepoAllowlist`; otherwise the whole request is
+  refused before the tester runs. The tester then copies the suite from disk
+  instead of retyping it;
+- its mentions inside a thread are admitted as an own identity's, so
+  conversation follow-ups need no `threadedBotAllowlist` entry.
+
+Turns between one installation's own bots are rate limited (ADR 0168
+decision 6): at most five new threads per pair of bots, and five messages per
+thread, in any ten minutes. Past that the platform ends the turn with a
+"Stopped here" notice. Set "New threads per 15 minutes" to 5 or less and
+"Follow-ups per thread" to 4 or less there.
+
+Settings under `agentSandbox.runner`, such as `extraEnv` for `CURIE_MAX_TURNS`,
+apply to every agent on the installation. Prefer the per-agent overrides
+(`curie cluster overrides <agent> --execution-deadline`) where one exists.
+
+The cost is shared fate. It takes sandboxes from the same capacity as the
+target's real users, and an outage that takes the platform down takes the
+tester down too, so it cannot report one.
+
+A tester in a separate installation still works as before, through the GitHub
+server and the listed repositories under "Where you work".
+
 ## Configure
 
 Edit "Where you work" in [`skills/mean-tester/SKILL.md`](skills/mean-tester/SKILL.md):
@@ -100,10 +146,13 @@ Edit "Where you work" in [`skills/mean-tester/SKILL.md`](skills/mean-tester/SKIL
 - how many new threads a campaign may open per 15 minutes, how many follow-ups
   a thread may carry, and the turn budget (see "A campaign").
 
-Every probe only reads or asks. The tester never asks for an action, even on a
-test installation and even when the action is approval gated. It never creates
-or resolves an approval card, and it never attaches a file (ADR 0172 decision
-5, tightened by #3043).
+Read-or-ask remains the default. On an operator-declared test installation,
+ADR 0202 permits a listed driver's marked actions after its own root ping's
+first target reply confirms admission. Every action carries `[test action]`
+immediately after the target mention. An approve/reject reply belongs only to
+the native target card in the tester's own thread. State checks use declared
+read access; the tester gains no API key or additional tool permissions.
+Attachments and non-approver button clicks remain unsupported and blocked.
 
 The sandbox needs egress to Slack's API, and to GitHub's API when a repository
 is listed. Add one `agentSandbox.connectorEgress.<agent>` entry per CIDR, for
@@ -120,12 +169,14 @@ TCP 443:
 ```bash
 export MEAN_TESTER_SLACK_BOT_TOKEN=xoxb-...   # the tester's own app
 export MEAN_TESTER_SLACK_TEAM_ID=T...         # the workspace the app is installed in
-export GITHUB_PERSONAL_ACCESS_TOKEN=...       # Contents: Read, listed repositories only
 curie build --plugin-dir examples/mean-tester --registry <registry-ref>
 curie cluster deploy --plugin-dir examples/mean-tester --target dev \
-  --secret MEAN_TESTER_SLACK_BOT_TOKEN --secret MEAN_TESTER_SLACK_TEAM_ID \
-  --secret GITHUB_PERSONAL_ACCESS_TOKEN
+  --secret MEAN_TESTER_SLACK_BOT_TOKEN --secret MEAN_TESTER_SLACK_TEAM_ID
 ```
+
+For authenticated reads of listed repositories, export
+`GITHUB_PERSONAL_ACCESS_TOKEN` and add `--secret GITHUB_PERSONAL_ACCESS_TOKEN` to
+the deploy command. Omit both for Slack-only campaigns and recorded exchanges.
 
 `curie build` builds the runner layer that carries the Slack and GitHub
 servers and records its digest in `connectors.lock.yaml`. The deploy refuses
@@ -230,23 +281,41 @@ then an invented fact, then a failure text, then a wrong answer, then UNCLEAR.
 It counts each kind of thread and carries eval cases for the worst three FAILs,
 all in one Slack reply of under 3,000 characters.
 
-## Validator slice 1
+## Validator gate
 
 <!-- @spec VALIDATOR-README-1 -->
-A validation campaign runs a target-owned `acceptance/cases.json` fixed suite
-before invented probes, reports each criterion's executed cases and gaps, and
-plans 2–4 realistic user sessions. It grades read-or-ask steps from the user's
-seat. Attachments, actions, card resolution and state checks remain
-`BLOCKED: slice 2`, even on a marked installation. A missing or malformed suite,
-UNCLEAR, incomplete repeats or blocked steps cannot become PASS or full GO.
+Run the target-owned `acceptance/cases.json` before invented probes and plan
+2–4 realistic scenario sessions. The bundled `mean-tester-gate` computes the
+verdict from each fixed repeat, scenario step and planned probe; copy its
+`Ship:`, `Coverage:` and `Ledger:` lines unchanged. Missing suites, UNCLEAR,
+unrun cases and unsupported dependencies never become PASS.
 
-See [the validator design](docs/VALIDATOR.md) for the separate suite format,
-configuration comparison, smoke, snapshot/restore and fault-injection contracts,
-and [phase 0 evidence](docs/PHASE-0.md) for approval and attachment limitations.
-The [illustrative suite](acceptance/cases.json) is sample data for a fictional
-target; the tester's own grading regressions remain in `evals/cases.json`.
-Human and campaign findings become permanent case drafts for a maintainer to
-commit. The shipped tool permissions and read-or-ask rule remain unchanged.
+Readonly campaigns retain `GO (read-only scope)`. An admitted campaign can
+receive `GO (action scope)` only with the actual marked probes, own-thread
+cards and declared read observations, verified restoration preserving base
+content, every test/production configuration difference explained, and an
+actual post-deploy readonly production smoke. Pre-deploy reports stay NO-GO.
+No installation name or caller assertion substitutes for the own-ping check.
+
+The gate only checks driver-supplied observations; it neither attests identity
+nor authorizes actions. Preserve bounded credential-free projections and
+fingerprints. Never put whole configurations, sealed snapshots or secrets in
+its ledger/report. Oversize continuation checkpoints are explicit NO-GO gaps,
+never truncated evidence. See [the validator contract](docs/VALIDATOR.md) for
+JSON inputs and [the skill](skills/mean-tester/SKILL.md) for the exact sequence.
+[Phase 0](docs/PHASE-0.md) remains historical evidence, not current authority.
+The shipped illustrative suite requires an unsupported upload and stays NO-GO;
+it is sample data, not another target's acceptance suite. The platform's frozen
+eval format and this bundle's seven-tool policy are unchanged.
+
+## Models
+
+The recorded-exchange evals in `evals/cases.json` have been graded on Claude
+only. On another model, the tester's verdicts and its use of the gate are
+unverified. In one campaign on `z-ai/glm-5.3-flash`, the tester ended with an
+empty reply after its GitHub reads failed (#4130). Pin the tester to a Claude
+model (`curie cluster overrides <agent> --model …`) unless you have run the
+evals on the model you use.
 
 ## Evals
 
@@ -256,19 +325,27 @@ good replies PASS, with a spec and without one. The recorded exchanges include
 contradictions between a claimed capability and the target's own tool inventory,
 misleading tool-call
 inventories presented as changes, replies that leave their Slack thread,
-settled approval cards that still look pending, and approval messages in the
-wrong order. Approval cases are recorded exchanges only. The tester never
-creates a card to exercise them. Run the cases with a model credential:
+settled approval cards that still look pending, approval messages in the
+wrong order, and a capability the target denies that only a source spec
+declares (UNCLEAR) against one a deployed spec declares (FAIL). These evals judge recorded exchanges. Live marked-action qualification is
+a separate run against an admitted installation; a recorded exchange is not
+proof of a live card or state change. From the bundle directory, run the cases
+with a model credential and the example runner image built above. Set
+`MEAN_TESTER_RUNNER_IMAGE` to that image's immutable reference and `CURIE_MODEL`
+to the model you want to evaluate:
 
 ```bash
-curie skill eval --plugin-dir examples/mean-tester
+cd examples/mean-tester
+curie skill up --image "$MEAN_TESTER_RUNNER_IMAGE" --model "$CURIE_MODEL"
+curie skill eval --cases evals/cases.json
+curie skill down
 ```
 
 ## What it will not do
 
-- Resolve, approve or reject any approval card.
-- Ask a target to perform an action or create an approval card.
-- Change anything about its target, or file anything.
+- Press a Slack button or resolve a card outside its admitted own-thread campaign.
+- Send unmarked actions, or actions before its own admission check.
+- Fix the target, change its configuration or file an issue.
 - Reply in any thread but the ones its own probes opened, react, or read Slack
   users: the tool policy allows exactly the seven tools listed in
   [`docs/PERMISSION-MAP.md`](docs/PERMISSION-MAP.md).

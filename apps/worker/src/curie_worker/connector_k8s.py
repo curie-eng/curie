@@ -62,14 +62,37 @@ class UnsupportedKind(ValueError):
     """A plan named an object kind connectors are not made of."""
 
 
+def _load_cluster_config(kubeconfig: str | None) -> None:
+    try:
+        k8s_config.load_incluster_config()
+    except k8s_config.ConfigException:
+        k8s_config.load_kube_config(config_file=kubeconfig)
+
+
+def connector_deployments_api(*, kubeconfig: str | None = None) -> k8s_client.AppsV1Api:
+    """The apps API the digest-attributing recorder reads one Deployment through.
+
+    Same credential as the reconciler. @spec ACTION-EXECUTOR-12: the recorder
+    uses only ``read_namespaced_deployment`` on it, the ``get`` the chart grants
+    with the executor enabled -- never this module's ``list_owned``.
+    """
+
+    _load_cluster_config(kubeconfig)
+    # One attempt per read. The recorder abandons a read at its two second
+    # bound, but the sync client keeps running in its thread; urllib3's default
+    # Retry(3) would hold that thread for several more bounds against a stalled
+    # API server. With no retries, the per-request total timeout the recorder
+    # passes ends the thread at the bound too.
+    configuration = k8s_client.Configuration.get_default_copy()
+    configuration.retries = 0
+    return k8s_client.AppsV1Api(k8s_client.ApiClient(configuration))
+
+
 class KubernetesConnectorClient:
     """ConnectorClient against a real cluster (in-cluster or kubeconfig auth)."""
 
     def __init__(self, *, kubeconfig: str | None = None) -> None:
-        try:
-            k8s_config.load_incluster_config()
-        except k8s_config.ConfigException:
-            k8s_config.load_kube_config(config_file=kubeconfig)
+        _load_cluster_config(kubeconfig)
         self._apis: dict[str, Any] = {}
 
     def _api(self, kind: str) -> tuple[Any, str]:

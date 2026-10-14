@@ -163,6 +163,16 @@ fn cluster_cases() -> Vec<ClusterCase> {
             args: &["approvals", "acme-bot", "--dry-run"],
         },
         ClusterCase {
+            name: "console",
+            args: &[
+                "console",
+                "login",
+                "--subject",
+                "operator@example.com",
+                "--dry-run",
+            ],
+        },
+        ClusterCase {
             name: "work-items",
             args: &["work-items", "--dry-run"],
         },
@@ -173,6 +183,35 @@ fn cluster_cases() -> Vec<ClusterCase> {
         ClusterCase {
             name: "hook",
             args: &["hook", "fire", "acme-bot", "nightly-cleanup", "--dry-run"],
+        },
+        // @spec ACTION-EXECUTOR-23: a read verb with no dry run; the target
+        // must still be refused before connection discovery.
+        ClusterCase {
+            name: "actions",
+            args: &["actions", "show", "11111111-1111-4111-8111-111111111111"],
+        },
+        // @spec AUTOMATED-REMEDIATION-3: the policy read has no dry run; the
+        // target must still be refused before connection discovery.
+        ClusterCase {
+            name: "remediation-policy",
+            args: &["remediation-policy", "show", "acme-bot", "alerts"],
+        },
+        // @spec AUTOMATED-REMEDIATION-20: the receipt read has no dry run.
+        ClusterCase {
+            name: "remediation",
+            args: &["remediation", "list"],
+        },
+        // @spec AUTOMATED-REMEDIATION-22: the run read needs no principal, so
+        // the target is the first thing refused.
+        ClusterCase {
+            name: "remediation-qualification",
+            args: &[
+                "remediation-qualification",
+                "show-run",
+                "acme-bot",
+                "88888888-8888-4888-8888-888888888888",
+                "99999999-9999-4999-8999-999999999999",
+            ],
         },
     ]
 }
@@ -277,7 +316,7 @@ fn coverage_inventory_names_every_cluster_verb() {
     let covered_names: BTreeSet<&str> = cluster_cases().iter().map(|case| case.name).collect();
 
     assert_eq!(covered_names, manifest_names);
-    assert_eq!(covered_names.len(), 31);
+    assert_eq!(covered_names.len(), 36);
 }
 
 #[test]
@@ -470,6 +509,16 @@ fn connection_backed_verbs_discover_the_file_target() {
         ("versions", &["cluster", "versions", "acme-bot"]),
         ("memory", &["cluster", "memory", "acme-bot"]),
         ("approvals", &["cluster", "approvals", "acme-bot"]),
+        (
+            "console",
+            &[
+                "cluster",
+                "console",
+                "login",
+                "--subject",
+                "operator@example.com",
+            ],
+        ),
     ];
     let expected = format!(
         "could not inspect Helm state for release {FILE_RELEASE} in namespace {FILE_NAMESPACE}"
@@ -524,6 +573,40 @@ fn nested_observability_uses_the_file_target() {
     write_installation(dir.path(), FILE_NAMESPACE, FILE_RELEASE);
     let output = run(dir.path(), &["cluster", "observability", "--dry-run"], &[]);
     assert_success_target(&output, FILE_NAMESPACE, FILE_RELEASE);
+}
+
+#[test]
+fn console_login_accepts_explicit_literal_target_after_the_leaf() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_installation(dir.path(), FILE_NAMESPACE, FILE_RELEASE);
+    let output = run(
+        dir.path(),
+        &[
+            "cluster",
+            "console",
+            "login",
+            "--subject",
+            "operator@example.com",
+            "--namespace",
+            "curie",
+            "--release",
+            "curie",
+        ],
+        &[("CURIE_NAMESPACE", "env-namespace")],
+    );
+    let text = combined(&output);
+    assert!(
+        !output.status.success(),
+        "empty PATH must stop discovery\n{text}"
+    );
+    assert!(
+        text.contains("could not inspect Helm state for release curie in namespace curie"),
+        "explicit literal defaults must reach release credential discovery\n{text}"
+    );
+    assert!(!text.contains(FILE_NAMESPACE), "{text}");
+    assert!(!text.contains(FILE_RELEASE), "{text}");
+    assert!(!text.contains("env-namespace"), "{text}");
+    assert!(target_diagnostics(&output).is_empty(), "{text}");
 }
 
 fn assert_observability_query_bypasses_malformed_file(args: &[&str]) {

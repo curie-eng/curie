@@ -31,6 +31,7 @@ from curie_runner.history import (
     build_conversation_replay,
     resolve_history,
 )
+from curie_runner.sender_frame import frame_user_turn
 from runner_state_fake import CappedCasState
 
 _STATE_VALUE_MAX_BYTES = 65_536
@@ -1278,7 +1279,8 @@ def test_accepted_steer_is_persisted_in_ordered_structured_history() -> None:
     steers = [
         message
         for message in messages
-        if message.role == "user" and message.content == "authorized steering state"
+        if message.role == "user"
+        and message.content == frame_user_turn("message", "", "authorized steering state", None)
     ]
     assert len(steers) == 1
 
@@ -1464,6 +1466,7 @@ def test_build_runner_forwards_configured_model_to_session_prompt(tmp_path) -> N
     assert isinstance(session, ClaudeAgentSession)
     options = session._options
 
+    # An ineligible boot preserves the pre-progress prompt surface.
     assert options.system_prompt == "Configured model: z-ai/glm-5.2"
 
 

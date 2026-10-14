@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +22,7 @@ from curie_runner.approval import APPROVAL_SERVER_NAME
 from curie_runner.connectors import build_mcp_servers, derive_mcp_servers
 from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
 from curie_runner.plugin import PluginBundleError
-from curie_runner.state import STATE_SERVER_NAME
+from curie_runner.tool_names import STATE_SERVER_NAME
 from plugin_format.connectors import RESERVED_CONNECTOR_NAMES
 
 HOSTED = "connectors:\n  grafana:\n    image: grafana/mcp-grafana:0.17.2\n    secrets: [T]\n"
@@ -569,6 +570,9 @@ BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 
 
 def _boot_env(monkeypatch, tmp_path: Path, suffix: str) -> dict[str, str]:
+    # These exact-live-tool tests model an eligible human Slack sandbox. The
+    # default-off negative is pinned independently in harness boot wiring.
+    monkeypatch.setenv("CURIE_TURN_PROGRESS_ENABLED", "1")
     monkeypatch.setenv("CURIE_STATE_URL", "http://state.invalid/agents/a/state")
     monkeypatch.setenv("CURIE_STATE_TOKEN", "t")
     return {
@@ -784,27 +788,46 @@ def test_a_name_in_both_channels_fails_the_boot_instead_of_picking_a_winner(
 
 
 def test_the_reserved_list_matches_the_runner_constants() -> None:
-    # plugin_format re-enumerates these names because runner depends on it and
-    # never the reverse. This is the pin that keeps the copy honest: rename
-    # either constant here and the deploy-time guard stops fencing it.
-    assert RESERVED_CONNECTOR_NAMES == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
+    from plugin_format.connectors import CHANNEL_READ_SERVER_NAME
+
+    assert RESERVED_CONNECTOR_NAMES == {
+        APPROVAL_SERVER_NAME,
+        STATE_SERVER_NAME,
+        CHANNEL_READ_SERVER_NAME,
+    }
 
 
-def test_the_boot_mounts_exactly_the_reserved_platform_servers(tmp_path, monkeypatch) -> None:
-    # #2286. Pinned against the boot MOUNT, not against another constant: the
-    # sibling above already pins RESERVED_CONNECTOR_NAMES against the two runner
-    # constants, and two constants can agree with each other and both be wrong
-    # about what this boot actually mounted. A platform server mounted without
-    # being reserved is denied for every policy-bearing bundle, which is exactly
-    # the #2286 defect recurring, so this reddens instead.
+@pytest.mark.parametrize("grant", [None, False, True], ids=["absent", "false", "true"])
+@pytest.mark.parametrize("wildcard_policy", [False, True], ids=["no-policy", "wildcard-policy"])
+def test_the_boot_mounts_only_active_platform_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grant: bool | None, wildcard_policy: bool
+) -> None:
+    # The grant alone mounts curie-slack on a real-model boot (#2877). Absent
+    # or false mounts nothing, and a wildcard policy never mounts it either:
+    # a pattern governs a mounted tool, it does not grant one.
     env = _boot_env(monkeypatch, tmp_path, "platform-set")
+    manifest_path = Path(env["CURIE_PLUGIN_DIR"]) / ".claude-plugin" / "plugin.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if grant is not None:
+        manifest["channelRead"] = grant
+    if wildcard_policy:
+        manifest["toolPolicy"] = {
+            "enforcement": "curie/mcp-tool-policy@1",
+            "allow": ["*/*"],
+        }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     mounted = _boot_options(
         monkeypatch,
         RunnerConfig.from_env(env),
         potential_write=True,
     ).mcp_servers
 
-    assert set(mounted) == set(RESERVED_CONNECTOR_NAMES)
+    if grant is True:
+        assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME, "curie-slack"}
+    else:
+        assert set(mounted) == {APPROVAL_SERVER_NAME, STATE_SERVER_NAME}
+        assert "curie-slack" not in mounted
+    assert set(mounted) <= RESERVED_CONNECTOR_NAMES
 
 
 def _published_live_tool_names(mcp_servers: dict[str, Any]) -> set[str]:
@@ -1134,6 +1157,48 @@ def test_build_runner_expands_the_bearer_and_drops_it_from_spawn_env(
     assert spawn["STDIO_TOKEN"] == "keep-me"
     github = session.options.mcp_servers["github"]
     assert github["headers"]["Authorization"] == "Bearer ghp_sentinel"
+
+
+def test_optional_binding_is_projected_before_hosted_secret_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CURIE_STATE_URL", raising=False)
+    monkeypatch.setenv("GITHUB_PERSONAL_ACCESS_TOKEN", "example-shared-token")
+    root = _bundle(
+        tmp_path,
+        GITHUB,
+        mcp={
+            "mcpServers": {
+                "stdio": {"command": "node", "env": {"TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"}}
+            }
+        },
+    )
+    manifest_path = root / ".claude-plugin/plugin.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["optionalSecrets"] = ["GITHUB_PERSONAL_ACCESS_TOKEN"]
+    manifest_path.write_text(json.dumps(manifest))
+    before = (root / ".mcp.json").read_bytes()
+    config = _config_for(root, release="curie", agent="acme-dev", namespace="curie")
+    spawn = {"GITHUB_PERSONAL_ACCESS_TOKEN": "example-shared-token"}
+
+    async def probe(*_args: Any, **_kwargs: Any) -> McpToolCapabilityProbe:
+        return McpToolCapabilityProbe(complete=True, has_potential_write_tool=False, tool_count=0)
+
+    monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
+    monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
+    runner = build_runner(config, fake_model=False, sdk_env=spawn)
+    session = runner._factory()
+    assert isinstance(session, _CapturedSession)
+    # Bound is judged at boot, before hosted credential custody removes the
+    # process variable. Preserve existing stdio placeholder semantics; this is
+    # not a claim that sharing hosted/stdio credentials authenticates stdio.
+    servers = session.options.mcp_servers
+    assert servers["plugin:b:stdio"]["env"]["TOKEN"] == "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    assert servers["github"]["headers"]["Authorization"] == "Bearer example-shared-token"
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in spawn
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in os.environ
+    assert "example-shared-token" in runner._held_secrets
+    assert (root / ".mcp.json").read_bytes() == before
 
 
 # --------------------------------------------------------------------------- #

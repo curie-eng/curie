@@ -327,6 +327,28 @@ fn json_equivalent(left: &Value, right: &Value) -> bool {
     }
 }
 
+/// @spec CLUSTER-VALUES-FILES c1-c3
+pub(crate) fn clear_replaced_secret_refs(retained: &mut Value, later: &Value) {
+    let mut refs = Vec::new();
+    collect_existing_secret_refs(retained, "", &mut refs);
+    for reference in refs {
+        if get_path(later, &reference).is_some() {
+            continue;
+        }
+        if inline_keys_for(&reference).iter().any(|inline| {
+            get_path(later, inline).is_some_and(|value| {
+                !value.is_null() && value.as_str().is_none_or(|s| !s.is_empty())
+            })
+        }) {
+            remove_path(retained, &reference);
+            let key = format!("{reference}Key");
+            if get_path(later, &key).is_none() {
+                remove_path(retained, &key);
+            }
+        }
+    }
+}
+
 fn strip_inline_secrets(values: &mut Value, changes: &mut Vec<String>) {
     let mut refs = Vec::new();
     collect_existing_secret_refs(values, "", &mut refs);

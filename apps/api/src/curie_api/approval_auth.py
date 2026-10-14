@@ -16,20 +16,22 @@ from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 from fastapi import Cookie, Depends, Header, HTTPException, Request, Response, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import adapter_principal, approval_principal, crud
-from .auth import require_api_key
+from curie_api.crud import console as crud_console
+
+from . import adapter_principal, approval_principal
+from .auth import CONSOLE_SESSION_COOKIE, require_api_key
 from .config import get_settings
 from .deps import SessionDep
 
 APPROVAL_PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
 ADAPTER_PRINCIPAL_HEADER = "X-Curie-Adapter-Principal"
 APPROVAL_ACTOR_HEADER = "X-Curie-Approval-Actor"
-CONSOLE_SESSION_COOKIE = "__Host-curie_console_session"
 _SAFE_ORIGIN_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _DEFAULT_ORIGIN_PORTS = {"http": 80, "https": 443}
 
-AuthenticatedPrincipalKind = Literal["chat", "console", "operator", "adapter"]
+AuthenticatedPrincipalKind = Literal["chat", "console", "operator", "adapter", "test_driver"]
 
 
 def set_console_session_cookie(response: Response, token: str) -> None:
@@ -83,7 +85,7 @@ async def authenticate_console_session(
 
     if not token:
         return None
-    row = await crud.live_console_session(session, token)
+    row = await crud_console.live_console_session(session, token)
     if row is None or row.subject is None or not row.subject.strip():
         return None
     return AuthenticatedApprovalPrincipal(
@@ -169,51 +171,76 @@ def _console_origin_rejected() -> HTTPException:
     )
 
 
-async def require_approval_principal(
-    approval_id: uuid.UUID,
-    request: Request,
-    session: SessionDep,
-    x_curie_approval_principal: Annotated[
-        str | None, Header(alias=APPROVAL_PRINCIPAL_HEADER)
-    ] = None,
-    console_session: Annotated[str | None, Cookie(alias=CONSOLE_SESSION_COOKIE)] = None,
-    x_curie_adapter_principal: Annotated[
-        str | None, Header(alias=ADAPTER_PRINCIPAL_HEADER)
-    ] = None,
-    x_curie_approval_actor: Annotated[str | None, Header(alias=APPROVAL_ACTOR_HEADER)] = None,
-) -> AuthenticatedApprovalPrincipal:
-    """Authenticate exactly one resolver credential for ``approval_id``.
+def enforce_console_cookie_origin(request: Request) -> None:
+    """Reject an unsafe cookie-authenticated method whose origin host does not match.
 
-    The platform key is intentionally absent: it administers principal
-    issuance but is not itself a human identity.  Any two of a principal
-    header, a console cookie and an adapter credential together are ambiguous
-    and fail closed rather than choosing one by precedence.
+    SameSite=Strict does not stop a same-site sibling form. Safe methods are
+    not checked. The platform-key path must not call this.
+    """
+    if request.method.upper() in _SAFE_ORIGIN_METHODS:
+        return
+    if not _same_console_host(
+        _claimed_console_origin(request), _expected_console_origin(request)
+    ):
+        raise _console_origin_rejected()
+
+
+def principal_credentials_presented(
+    x_curie_approval_principal: str | None,
+    console_session: str | None,
+    x_curie_adapter_principal: str | None,
+) -> None:
+    """Refuse no principal credential, or more than one, before any lookup.
+
+    Any two of a principal header, a console cookie and an adapter credential
+    together are ambiguous and fail closed rather than choosing one by
+    precedence.
+    """
+
+    presented = sum(
+        value is not None
+        for value in (x_curie_approval_principal, console_session, x_curie_adapter_principal)
+    )
+    if presented > 1:
+        raise _unauthorized("ambiguous approval principal credentials")
+    if presented == 0:
+        raise _unauthorized()
+
+
+async def authenticate_principal(
+    *,
+    approval_id: uuid.UUID | None,
+    request: Request,
+    session: AsyncSession,
+    x_curie_approval_principal: str | None,
+    console_session: str | None,
+    x_curie_adapter_principal: str | None,
+    x_curie_approval_actor: str | None,
+) -> AuthenticatedApprovalPrincipal:
+    """Authenticate exactly one ADR 0106 principal credential.
+
+    The one implementation behind the approval resolver and the undo ruling
+    (ACTION-EXECUTOR-3). A chat credential is bound to ``approval_id``, so with
+    none it never authenticates; an operator credential is bound to no
+    approval. The platform key is intentionally absent: it administers
+    principal issuance but is not itself a human identity.
 
     When the console cookie is the only credential on an unsafe method, the
     browser origin must match this request before the session is looked up.
     Header principals are not origin checked.
     """
 
-    has_token = x_curie_approval_principal is not None
-    has_cookie = console_session is not None
-    has_adapter = x_curie_adapter_principal is not None
-    presented = sum((has_token, has_cookie, has_adapter))
-    if presented > 1:
-        raise _unauthorized("ambiguous approval principal credentials")
-    if presented == 0:
-        raise _unauthorized()
+    principal_credentials_presented(
+        x_curie_approval_principal, console_session, x_curie_adapter_principal
+    )
 
-    if has_cookie and request.method.upper() not in _SAFE_ORIGIN_METHODS:
-        if not _same_console_host(
-            _claimed_console_origin(request), _expected_console_origin(request)
-        ):
-            raise _console_origin_rejected()
+    if console_session is not None:
+        enforce_console_cookie_origin(request)
 
-    if has_adapter:
-        assert x_curie_adapter_principal is not None
+    if x_curie_adapter_principal is not None:
         return _authenticate_adapter(x_curie_adapter_principal, x_curie_approval_actor)
 
-    if has_cookie:
+    if console_session is not None:
         principal = await authenticate_console_session(session, console_session)
         if principal is None:
             raise _unauthorized()
@@ -222,10 +249,12 @@ async def require_approval_principal(
     assert x_curie_approval_principal is not None
     settings = get_settings()
     kind = approval_principal.unverified_kind(x_curie_approval_principal)
-    if kind == "chat":
+    if kind in ("chat", "test_driver"):
         attester_secret = settings.approval_chat_attester_secret
-        if not attester_secret or hmac.compare_digest(
-            attester_secret.encode(), settings.api_key.encode()
+        if (
+            approval_id is None
+            or not attester_secret
+            or hmac.compare_digest(attester_secret.encode(), settings.api_key.encode())
         ):
             raise _unauthorized()
         claims = approval_principal.verify_claims(
@@ -244,10 +273,41 @@ async def require_approval_principal(
         claims = None
     if claims is None or claims.kind != kind:
         raise _unauthorized()
+    if (
+        kind == "test_driver"
+        and getattr(request.scope.get("route"), "name", None) != "resolve_approval"
+    ):
+        raise _unauthorized("test driver principal is limited to approval resolution")
     return AuthenticatedApprovalPrincipal(
         subject=claims.subject,
         kind=claims.kind,
         actor_channel=claims.actor_channel,
+    )
+
+
+async def require_approval_principal(
+    approval_id: uuid.UUID,
+    request: Request,
+    session: SessionDep,
+    x_curie_approval_principal: Annotated[
+        str | None, Header(alias=APPROVAL_PRINCIPAL_HEADER)
+    ] = None,
+    console_session: Annotated[str | None, Cookie(alias=CONSOLE_SESSION_COOKIE)] = None,
+    x_curie_adapter_principal: Annotated[
+        str | None, Header(alias=ADAPTER_PRINCIPAL_HEADER)
+    ] = None,
+    x_curie_approval_actor: Annotated[str | None, Header(alias=APPROVAL_ACTOR_HEADER)] = None,
+) -> AuthenticatedApprovalPrincipal:
+    """Authenticate exactly one resolver credential for ``approval_id``."""
+
+    return await authenticate_principal(
+        approval_id=approval_id,
+        request=request,
+        session=session,
+        x_curie_approval_principal=x_curie_approval_principal,
+        console_session=console_session,
+        x_curie_adapter_principal=x_curie_adapter_principal,
+        x_curie_approval_actor=x_curie_approval_actor,
     )
 
 
@@ -282,20 +342,22 @@ def platform_key_or_adapter(
     ``scope`` (ADR-0154), returning the adapter's claims or None for the key.
 
     Exactly one credential: both together are ambiguous and fail closed, as
-    the resolver's credentials do. The platform-key half is ``require_api_key``
-    unchanged, detail string included.
+    the resolver's credentials do. The platform-key half is ``require_api_key``,
+    and a live console session is that same half. An adapter plus the platform
+    key, or an adapter plus a session cookie, fails closed before verification.
     """
 
     async def dependency(
+        request: Request,
         x_api_key: Annotated[str | None, Header()] = None,
         x_curie_adapter_principal: Annotated[
             str | None, Header(alias=ADAPTER_PRINCIPAL_HEADER)
         ] = None,
     ) -> adapter_principal.AdapterClaims | None:
         if x_curie_adapter_principal is None:
-            await require_api_key(x_api_key)
+            await require_api_key(request, x_api_key)
             return None
-        if x_api_key is not None:
+        if x_api_key is not None or CONSOLE_SESSION_COOKIE in request.cookies:
             raise _unauthorized("ambiguous credentials")
         claims = adapter_principal.verify(
             x_curie_adapter_principal, get_settings().api_key, scope=scope

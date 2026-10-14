@@ -4,13 +4,16 @@ The email channel adapter: an AgentMail inbox bridged to a Curie channel binding
 
 Two halves, and neither one knows anything about Slack:
 
-- **Ingress.** It polls the inbox and POSTs each new message to the platform's
-  channel ingress (`POST /channels/turns`) under its own scoped channel token,
-  with the AgentMail `message_id` as the `delivery_id` so a retry is idempotent.
-- **Egress.** It serves the neutral reply wire (`turn.status`, `reply.update`,
-  `reply.post`, `turn.completed`), authenticating the platform on
-  `X-Curie-Adapter-Secret` before any side effect, and sends one threaded
-  AgentMail reply per `turn.completed`.
+1. **Ingress.** It polls the inbox and rejects every AgentMail message with
+   `authentication_unverifiable`. AgentMail supplies no positive sender
+   authentication verdict that Curie can verify, so no message starts a turn or
+   resolves an approval. The channel ingress transport uses the AgentMail
+   `message_id` as the `delivery_id` so retries remain idempotent if a verified
+   authentication source becomes available.
+2. **Egress.** It serves the neutral reply wire (`turn.status`, `reply.update`,
+   `reply.post`, `turn.completed`), authenticating the platform on
+   `X-Curie-Adapter-Secret` before any side effect, and sends one threaded
+   AgentMail reply per `turn.completed`.
 
 It holds no platform API key, no queue credential, and no platform database
 access. Binding is an operator action at deploy time. Delivery and reply
@@ -20,65 +23,36 @@ not multi-writer operation.
 
 ## Inbound security
 
-This section is the canonical one; the chart comment, `docs/operations.md` and
-the channel-adapter guide summarize it. Four things sit between a stranger with
-the inbox address and an agent turn, and they are not equally load-bearing.
+The inbound gate fails closed. A message may reach channel ingress or approval
+resolution only when its sender matches `CURIE_MAIL_ALLOWED_SENDERS` and Curie
+itself verifies a positive authentication verdict for that sender. A provider
+label, the absence of a rejection label, or a provider supplied header is never
+that verdict.
 
-1. **The provider filters first, and that is where the protection comes from
-   today.** AgentMail runs SPF, DKIM and DMARC checks and drops a message whose
-   authentication headers are present and explicitly fail, so a hard-fail never
-   reaches the API at all. It also excludes the `spam`, `blocked` and
-   `unauthenticated` categories from List Messages results by default
-   (<https://www.agentmail.to/docs/messages>,
-   <https://www.agentmail.to/docs/spam-virus-detection>).
-2. **The adapter states those exclusions in its request rather than inheriting
-   them.** Every list call, the priming one included, sends `include_spam=false`,
-   `include_blocked=false` and `include_unauthenticated=false`
-   (<https://docs.agentmail.to/api-reference/inboxes/messages/list>). That changes
-   nothing about what a correct provider returns today, and that is the point: a
-   provider that changes a default, or a key that carries the label-read
-   permissions, cannot silently widen what reaches the agent. They are constants
-   in the client. There is no values key and no env var that can turn them on.
-3. **The `labels` check is defense in depth.** Any message whose `labels` array
-   carries `unauthenticated`, `spam` or `blocked` is rejected before the
-   allow-list and before any state write. In a correct install this never fires,
-   and it is not what makes the install safe. It exists to catch a widened
-   provider default or an over-permissioned key.
-4. **The allow-list is a filter on the `From` header, and it authenticates
-   nobody.** An SMTP `From` is attacker-controlled. `CURIE_MAIL_ALLOWED_SENDERS`
-   keeps unwanted correspondents out; it is not sender authentication, and Curie
-   performs none.
+**Every AgentMail message is currently rejected with
+`authentication_unverifiable`.** The documented [Get Message response](https://docs.agentmail.to/api-reference/inboxes/messages/get)
+and [List Messages response](https://docs.agentmail.to/api-reference/inboxes/messages/list)
+contain labels and a generic headers map. They supply no trusted positive aligned
+authentication verdict and guarantee neither header provenance nor stripping of
+sender supplied authentication headers. AgentMail's [inbound authentication handling](https://docs.agentmail.to/knowledge-base/inbound-emails-missing)
+also permits DMARC failure when the sending domain publishes `p=none`.
+Neither an enforcing DMARC policy nor an allowlisted sender makes those API
+fields independently verifiable. There is no supported authentication source in
+this adapter, so it refuses unlabelled mail, allowlisted mail, and approval
+answers alike before either platform endpoint can be called.
 
-**A spoofed `From` from a non-enforcing domain defeats the allow-list.** AgentMail
-delivers a DMARC failure when the sender's own policy is `none`, and such a
-message carries authentication headers, so it is not labeled `unauthenticated`. An
-allow-listed domain that publishes no DMARC record, or `p=none`, is therefore
-still spoofable end to end, and no code in this adapter can close that. It closes
-at the allow-listed domain's DNS.
+Every listing still sends `include_spam=false`, `include_blocked=false` and
+`include_unauthenticated=false`, including the first listing. Those constants
+reduce unwanted provider results; they establish no sender identity and cannot
+substitute for authentication. Keep AgentMail's `label_spam_read`,
+`label_blocked_read` and `label_unauthenticated_read` permissions disabled as
+recommended in its [permissions guide](https://docs.agentmail.to/permissions).
+Permission restrictions also cannot satisfy this gate.
 
-**Enforcing DMARC does not close the gap, it narrows it.** DMARC aligns and
-validates the sending *domain*; it says nothing about the mailbox local part. With
-`alice@example.com` allow-listed, anyone who can send authenticated mail for
-`example.com` -- another employee, a compromised account, a permissive relay, any
-signer the domain authorizes -- can set `From: alice@example.com`, pass DMARC under
-`p=reject`, carry none of the labels layer 3 rejects, and trigger an agent turn. Read
-the four layers together this way: the provider's filtering, the explicit
-`include_*=false` parameters and the `labels` check bound **what** gets in; DMARC
-bounds **which domain** may claim to send; **nothing here authenticates an individual
-mailbox**. So allow-listing a domain, or an address at a domain with senders other
-than that one person, grants agent-trigger authority to everyone who can send
-authenticated mail for that domain. Size the allow-list to that blast radius.
-
-Two operator prerequisites follow, and neither is optional. Both are necessary and
-neither is sufficient:
-
-- [ ] **Every domain on the allow-list publishes `p=quarantine` or `p=reject`.**
-      Without an enforcing DMARC policy the entry buys nothing.
-- [ ] **The AgentMail key the adapter is given has `label_spam_read`,
-      `label_blocked_read` and `label_unauthenticated_read` set to `false`**, per
-      AgentMail's own guidance for agent-facing keys
-      (<https://docs.agentmail.to/permissions>). That makes the exclusion a
-      permission the provider enforces rather than a default it chooses.
+The allowlist filters the sender's claimed `From` address. It authenticates no
+sender. A wildcard changes only this filter and never bypasses the required
+verdict. This section is canonical; chart values, `docs/operations.md` and the
+channel adapter guide summarize it.
 
 ## The allow-list
 
@@ -95,34 +69,34 @@ empty segments (a trailing comma, a doubled comma) are dropped rather than read
 as a match-anything entry, and a `From` header carrying a display name is matched
 on the bare address inside it.
 
-**The binding can carry the real list instead.** The platform checks the
-binding's own caller list (ADR 0175) after this adapter's gate, for every
-channel alike, and a list there is edited through the platform without a
-redeploy. An operator who keeps the list on the binding can set
-`CURIE_MAIL_ALLOWED_SENDERS=*` here; the provider-label check above still runs,
-and so do the provider's SPF, DKIM and DMARC checks. A binding list compares exact
-addresses only, so the DMARC caveats above apply to it unchanged.
+The platform checks the binding's own caller list (ADR 0175) after this
+adapter's gate. That list can be edited through the platform without a redeploy;
+it provides another authorization check and never supplies authentication.
 
-**Empty means deny everything, and it is refused at boot rather than served as
-deny-all.** With `ADAPTER_INGRESS_ENABLED=true` and no allow-list the process
-exits non-zero naming the variable. Allow-all is reachable only by writing `*`
-explicitly, so the dangerous state is always named by an operator rather than
-produced by omission.
+**An empty allowlist fails boot while ingress is enabled.** The error names
+`CURIE_MAIL_ALLOWED_SENDERS` and asks for explicit sender addresses or domains.
+Any list containing `*` also fails boot unless
+`CURIE_MAIL_ALLOW_ALL_SENDERS=true` is explicitly set. Its default is `false`;
+the chart exposes the same opt in as `mailAdapter.allowAllSenders`. Even with
+both settings present, all AgentMail messages remain rejected with
+`authentication_unverifiable`.
 
-**Mail rejected by the allow-list is dropped permanently, and widening the
-allow-list later does not reprocess it.** The rejected `message_id` and security
+**A security rejection is permanent, and widening the allowlist later does not
+reprocess it.** The rejected `message_id` and security
 decision are already durable. A rejection is logged once at WARNING with the
 reason and a one-way correlation token, never the sender, subject, body, provider
 message/thread id, or reply text. The message is left in the mailbox unmodified:
-nothing is deleted, labeled or bounced. So after widening the list, use the
-durable state and provider mailbox under the operator's PII controls, and ask the
-correspondent to resend. There is no replay or reprocess-on-widen mechanism.
+nothing is deleted, labeled or bounced. Inspect the durable state and provider
+mailbox under the operator's PII controls. A future verifiable authentication
+source would require new messages; rejected messages are not replayed.
 
-**Another inbox of this installation is admitted like any sender.** A second
+**Another inbox of this installation must pass the same gate.** A second
 mail adapter is a second identity (ADR-0168), and one inbox answers another only
-if its address, or a domain entry that covers it, is on this list. The
-prerequisites above apply to its domain as to any other. The worker rate limits
-an exchange between two inboxes and drops the turn that passes the limit.
+if its address, or a domain entry that covers it, is on this list and its
+sender authentication can be verified by Curie. Currently every such AgentMail
+message is refused with `authentication_unverifiable`. The worker rate limits
+an exchange between two inboxes if a verified authentication source later
+permits one.
 
 **A dropped completion that recorded no text sends no mail, for any drop
 reason.** A dropped turn was never processed, so there is nothing of its own
@@ -132,6 +106,75 @@ dropped completion that did record text (an undeployed or paused agent's
 notice, say) still sends it, and a delivered completion with no text still
 sends the empty-reply notice as before; only a drop with nothing recorded is
 silent.
+
+## Approvals by email
+
+`CURIE_ADAPTER_PRINCIPAL` supplies the credential for carrying approval
+answers (ADR 0177 and its amendment). Every answer must first pass the same
+sender authentication and allowlist gate as a new turn. Currently every
+AgentMail answer is rejected with `authentication_unverifiable`, including an
+allowlisted approver quoting a live reference. No approval is resolved by email.
+The request and settlement egress behavior remains available. The reply flow
+below requires an independently verifiable sender authentication source before
+it can admit an answer. Without the principal credential, the card's text is
+mailed and email answers cannot be carried.
+
+**The request.** When the worker posts the approval card into the thread, the
+adapter adds the instructions and a random single-use reference, and keeps that
+reference with the approval id and the thread. The card's ack carries a ref, so
+the worker can settle this card later. The reference links a reply to its
+approval. It proves nothing about who sent the reply: every reply quotes it.
+
+The instructions say who can approve (ADR-0177 amendment A5). The worker sends the route's listed approver addresses with the card, as `Approver` fields, and the adapter reads the asking message's To and Cc from the provider. If a listed address is already on the thread (the requester counts), the email names the list and says who on the thread can answer. If none is, it says so, names the list, and asks the requester to reply all and add one or more of them, as many as they like. If the asking message cannot be read, it is worded to hold either way. The adapter uses the list only for wording; the platform still decides who may answer. A card from a worker that sends no `Approver` fields gets the generic instructions ("reply with APPROVE or REJECT on the first line; anything after it is your note; only an approver listed for this request can answer").
+
+**Who receives what.** The request email is sent reply all to the asking message, so a listed approver copied there receives it. Every other reply goes to its sender only, as before, including the resumed answer, which therefore reaches the requester. The adapter never mails an address that is not already on the thread: bringing an approver in is the requester's choice, made by copying them. A reply from someone not listed that copies a listed approver in and carries no decision is the requester doing what was asked, and gets nothing back.
+
+**The reply.** A message in a thread with an approval pending is never a turn.
+It is an answer only when all of these hold:
+
+1. Curie itself verified a positive sender authentication verdict, and the
+   claimed sender matched `CURIE_MAIL_ALLOWED_SENDERS`. Provider labels or
+   headers cannot supply this verdict, so every current AgentMail answer fails
+   here before any approval logic and receives no response.
+2. It names a reference issued in this thread, and that reference is still live.
+3. It was not sent automatically: no `Auto-Submitted` other than `no` (RFC 3834),
+   no `X-Autoreply` style header, no `Precedence: bulk`, `junk`, `list` or
+   `auto_reply`, not a delivery report, not from `mailer-daemon` or `postmaster`.
+   A message whose headers the provider did not return is treated as automatic.
+4. The first line of its new text (AgentMail's `extracted_text`, which has the
+   quoted history stripped) is `APPROVE` or `REJECT`. The rest of the new text is
+   the note.
+
+The adapter then calls `POST /approvals/{id}/resolve` with its credential and
+the sender's bare address (lowercased, never the display name) as
+`X-Curie-Approval-Actor`, and the platform decides: the binding's
+`allowed_callers` must admit the sender, and the address must be on the route's
+approver `emails` (ADR-0177 amendment). The person who asked is not admitted by default. A
+reply that is not an answer gets the instructions back; a sender the platform
+does not list is told they are not an approver, and who is; a sender the binding's
+`allowed_callers` refuse gets nothing back; a reply to a spent reference is told
+it was already answered. An automatic message gets no
+response at all, so nothing loops. If the platform cannot be reached, or rejects
+this adapter's credential, the message stays pending and a later pass carries
+the same answer again.
+
+**When it ends.** A sent email cannot be edited, so when the worker settles the
+card the adapter sends one short follow-up in the thread (approved or rejected,
+by whom, with the note, or expired) and spends the reference. It also reopens
+the asking message's reply, so the resumed turn's answer is mailed in the same
+thread.
+
+The follow-up is sent reply all to the message that carried the winning answer, so the approver, the requester and everyone copied on it see who decided. If the requester is not on that message, because the approver replied to the bot alone, the requester also gets it as a direct reply to the asking message. With no email answer (an expiry), it is sent reply all to the asking message. Each of these sends is counted, so a settlement that failed part way is retried without sending a part twice. The first answer the platform accepts is final: any later answer is told the approval was already answered.
+
+**A reference is not identity evidence.** It associates an answer with its
+approval and never replaces sender authentication. Provider headers claiming
+DMARC success, a copied reference, and membership in either allowlist cannot
+resolve an approval. Use another supported channel for approval answers while
+AgentMail sender authentication remains unverifiable.
+
+The adapter principal is not rotated by the adapter yet. Re-mint it with `POST
+/approvals/principals/adapter` before it expires, the same operator step as
+`CURIE_CHANNEL_TOKEN`.
 
 ## Config surface (env vars)
 
@@ -147,6 +190,7 @@ stray generic `PORT` or `POLL_INTERVAL` in the pod environment cannot reach one.
 | `CURIE_API_URL` | `http://localhost:8000` | platform API the ingress POST goes to (in-cluster: `http://curie-api:8000`). `CURIE_API_BASE_URL` is a deprecated alias |
 | `CURIE_CHANNEL_TOKEN` | "" | the scoped `chn` token, sent as `X-API-Key` on ingress. Required |
 | `CURIE_EGRESS_SECRET` | "" | shared secret the platform presents on `X-Curie-Adapter-Secret`. Required |
+| `CURIE_ADAPTER_PRINCIPAL` | "" | the adapter principal credential (ADR 0156), sent as `X-Curie-Adapter-Principal` when carrying an admitted approval answer. Every AgentMail answer currently fails sender authentication before this credential is used (see "Approvals by email") |
 | `ADAPTER_INGRESS_ENABLED` | `true` | gates the poller only, never the egress server |
 | `CURIE_MAIL_POLL_INTERVAL_SECONDS` | `5.0` | seconds between listings; must be greater than zero. A transport failure or any 4xx refusal arms bounded exponential backoff on top, up to 60s; a successful 200 listing resets it, while 5xx responses retain their existing semantics and neither arm nor clear an already armed delay |
 | `CURIE_MAIL_INGRESS_ATTEMPTS` | `3` | short in-process attempts for transport ambiguity and retryable status; durable retry continues after this budget |
@@ -157,7 +201,8 @@ stray generic `PORT` or `POLL_INTERVAL` in the pod environment cannot reach one.
 | `CURIE_MAIL_MAX_BODY_BYTES` | `1048576` | maximum provider message body read or stored, in bytes |
 | `CURIE_MAIL_MAX_REPLY_BYTES` | `1048576` | maximum accumulated outbound reply, in bytes |
 | `CURIE_MAIL_MAX_STATE_BYTES` | `268435456` | maximum SQLite page budget; size the volume above this for the WAL and filesystem overhead. Terminal `completion_events` rows (`delivered=1` or `deleted=1`, not both-required) are compacted oldest-first under the same derived ceiling as terminal receipts (at most 4096, and at most one quarter of the page budget). Unresolved and leased completion rows are never evicted to admit newer mail. A late duplicate whose row was evicted and whose provider marker is gone resends; keep the cap above the worker's 7-day completion retention if that duplicate must not fire |
-| `CURIE_MAIL_ALLOWED_SENDERS` | "" | the allow-list above. Required while ingress is enabled |
+| `CURIE_MAIL_ALLOWED_SENDERS` | "" | the claimed sender allowlist above. Required while ingress is enabled; never substitutes for sender authentication |
+| `CURIE_MAIL_ALLOW_ALL_SENDERS` | `false` | explicit opt in permitting a `*` entry at boot. Never bypasses sender authentication, so every current AgentMail message is still refused |
 | `CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS` | "" | comma-separated CIDRs the egress policy admits for AgentMail. When set, the AgentMail client dials only addresses inside them (see below). Empty dials whatever DNS returns |
 | `CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS` | `120` | how long a continuous discovery failure run lasts before `/readyz` reports 503. Must be greater than zero |
 
@@ -196,7 +241,9 @@ pod's POST handler through the outage.
 `AGENTMAIL_INBOX`, `AGENTMAIL_API_KEY`, `CURIE_CHANNEL_TOKEN` or
 `CURIE_EGRESS_SECRET` is unset, when `CURIE_MAIL_POLL_INTERVAL_SECONDS` is not
 positive (a chart typo would otherwise be a tight loop against a third-party
-API), or when ingress is enabled with an empty allow-list.
+API), or when ingress is enabled with an empty allowlist. A list containing
+`*` is refused unless `CURIE_MAIL_ALLOW_ALL_SENDERS=true` is explicitly set.
+The empty list error suggests explicit sender addresses or domains, never `*`.
 
 ### Health and readiness
 
@@ -264,6 +311,13 @@ and names that verb as the fix. No platform signing key is given to the adapter.
   ref the platform returned. Two turns in one thread cannot clear or inherit one
   another's text. A null-ref post attaches only when exactly one live ref is
   unambiguous.
+- **Deliberate progress is silent.** A `reply.update` or `reply.post` carrying
+  reply wire 1.1 `progress` (ADR-0130) is acknowledged 200 with no `ref` and
+  changes nothing: not the buffered reply text, not its ref, and no email. An
+  email turn sends one message, so a card edit has nothing to edit, and a
+  progress post appended to the buffered reply would put task-status lines
+  into the answer the correspondent reads. Silence is the conforming choice the
+  channel-adapter guide allows.
 - **Provider-visible dedupe closes the accepted-send crash window.** The local
   event receipt is the fast path. After an uncertain send, the adapter reads the
   marker carried on the provider thread before retrying: found settles without a

@@ -24,10 +24,12 @@ The frozen bundle/plugin manifest format: the **Claude Code plugin shape verbati
 distribution wedge. What is swappable is the harness that consumes a bundle; what stays fixed is
 the shape a bundle must have to be accepted. The base is the Claude Code plugin shape, and the
 models are lenient (`extra="allow"`) rather than strict so any bundle written for Claude Code
-validates unchanged. On top of that base the package **does add six Curie authoring
-extensions** — `systemPrompt`, `starterPrompts`, `secrets`, `triggers`, `approvalPolicy`,
-`toolPolicy` on `packages/plugin-format/src/plugin_format/models.py::PluginManifest`, optional
-fields Claude Code does not define. Leniency is what lets the Claude Code base and these
+validates unchanged. On top of that base the package **does add eleven Curie authoring
+extensions**: `systemPrompt`, `starterPrompts`, `secrets`, `optionalSecrets`, `triggers`, `approvalPolicy`,
+`toolPolicy`, `channelRead`, `canvasList`, `canvasRead` and `canvasEdit` on `packages/plugin-format/src/plugin_format/models.py::PluginManifest`, optional
+fields Claude Code does not define. `secrets` names the secrets a deploy must bind;
+`optionalSecrets` (ADR 0210) names the ones it may leave unbound, validated the same
+way, and a name may not appear in both (`secrets.optional_overlap`). Leniency is what lets the Claude Code base and these
 extensions coexist; the earlier "does not invent format extensions" framing was wrong.
 
 The manifest is not the whole bundle either. Three **Curie-only root files** sit beside the Claude
@@ -39,12 +41,15 @@ all three parse under `extra="forbid"` (`packages/plugin-format/src/plugin_forma
 `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTarget`), because there is no
 external producer that could legitimately carry a key the models do not know, so an unrecognised key
 is a typo rather than a future Claude Code field. The lock is the one root file no human authors --
-`curie build` writes it and the bundle carries it -- but it is part of the format all the same,
+`curie build` writes it, `curie example dark-factory render` writes a `runner:` entry into it from a
+published tag, and the bundle carries it -- but it is part of the format all the same,
 because a second consumer that ignores it deploys a different image than the one the bundle's source
 was built into. What a bundle actually is, then, is the Claude Code
 plugin shape verbatim plus a strict Curie-only overlay, not a Claude Code plugin end to end.
 
 ## Current contract
+
+The optional-secret contract follows the [accepted decision on the source release train](https://github.com/curie-eng/curie/blob/757ac40ff53af39622e0dc0fe09db4ea66dcf868/docs/adr/0209-a-bundle-may-declare-a-secret-optional.md) and #4129. This backport preserves that decision without assigning its number to a different decision on this release train.
 
 `validate_bundle(path) -> ValidationResult` is the single entry point every deploy path calls
 (`packages/plugin-format/src/plugin_format/validate.py::validate_bundle`). It returns path-qualified
@@ -68,7 +73,7 @@ which also adds the second, non-default `agent-skills-strict` validation profile
 Those are the Claude-Code-shaped surfaces. `validate_bundle` also validates three **Curie-only root
 files**, each absent from a bundle that needs none, all three invisible to Claude Code:
 
-- `connectors.yaml` (ADR-0086, `packages/plugin-format/src/plugin_format/connectors.py::ConnectorsFile`)
+1. `connectors.yaml` (ADR-0086, `packages/plugin-format/src/plugin_format/connectors.py::ConnectorsFile`)
   declares the MCP servers Curie should run or reach on the bundle's behalf, keyed by connector name.
   Each entry is a `packages/plugin-format/src/plugin_format/connectors.py::ConnectorSpec` in exactly
   one of three mutually exclusive forms: hosted by reference (`image`, plus `args`/`env`/`port`
@@ -118,7 +123,7 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   `connectors.build_no_platforms`, `connectors.ambiguous_name` (a connector name that contains
   `-mcp-` or STARTS with `mcp-`, forging the `-mcp-` join used to render the connector's object
   name, so two different (agent, connector) pairs would render byte-identical objects — checked
-  only for a hosted connector, one declaring `image:`; a remote connector, declaring `url:`,
+  only for a hosted connector, one declaring `image:` or `build:`; a remote connector, declaring `url:`,
   derives no Kubernetes object name, since `render()` emits no objects for it and its `.mcp.json`
   entry is the authored URL, so its name is not checked), `connectors.direct_service_collision` (a
   hosted connector named `x-direct` beside a hosted `x`, whose direct Service behind a caller proxy
@@ -127,8 +132,10 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   silently replaced by the last YAML value.
 - `connectors.lock.yaml` (ADR-0113,
   `packages/plugin-format/src/plugin_format/connector_lock.py::ConnectorLockFile`) records what each
-  declared `build` resolved to. It is **generated, not authored**: `curie build` writes it and it is
-  packed into the bundle like any other file, so the platform holds the exact digest a version
+  declared `build` resolved to. It is **generated, not authored**: `curie build` writes it, and so does
+  `curie example dark-factory render`, which records a `runner:` entry for the published runner image
+  without building anything locally, so that entry trusts the release pipeline for the source-to-image
+  link rather than proving it. The lock is packed into the bundle like any other file, so the platform holds the exact digest a version
   deployed rather than that fact living in local CLI state. One
   `packages/plugin-format/src/plugin_format/connector_lock.py::ConnectorLockEntry` per built
   connector carries `image`, `delivery` (`registry` or `local-daemon`), the `platforms` the build
@@ -231,7 +238,7 @@ script from `.github/workflows/plugin-compat.yaml` on two triggers, because drif
 directions: a path-filtered `pull_request` trigger catches our own drift when we touch the bundles
 or the format models, and a nightly `schedule` catches Claude Code changing the format under us,
 which no PR of ours would ever surface. The check is deliberately not `--strict`: strict mode
-promotes unknown-field warnings to errors, and the six Curie authoring extensions are
+promotes unknown-field warnings to errors, and the seven Curie authoring extensions are
 unknown-to-Claude-Code by design, so warnings are the expected steady state and only a non-zero
 exit is a failure.
 
@@ -280,9 +287,10 @@ Rust and is kept honest by `cli/plugin-format-mirrors.json` plus `curie dev fiel
 (`cli/scripts/check-field-parity.sh`). The export covers the three Curie-only root files as well
 as the Claude-Code-shaped ones, so a field change to `connectors.yaml`, `connectors.lock.yaml` or
 `deploy.yaml` fails the same drift gate, and the CLI's connector and lock structs are declared
-mirrors of those `$defs`. The TypeScript (UI)
-consumer remains a hand-written
-mirror. It also carries no `PROTOCOL_VERSION`; the
+mirrors of those `$defs`
+([ADR-0194](../../adr/0194-plugin-format-contract-is-the-frozen-schema-plus-a-parity-gate.md)
+records this as the contract). The UI's bundle writer (`apps/ui/src/api/bundle.ts`)
+is hand-written and relies on the server's plugin_format validator. It also carries no `PROTOCOL_VERSION`; the
 format is pinned to the Claude Code shape and the models are lenient by design so future Claude
 Code keys still validate.
 
@@ -290,8 +298,8 @@ Code keys still validate.
 
 By intent, the manifest, skill, and MCP surfaces are Claude-Code-shaped — that is the wedge, not a
 leak. What the wedge
-costs is asymmetric fidelity: a bundle loaded by Claude Code **validates but degrades**. All six
-Curie authoring extensions — `systemPrompt`, `starterPrompts`, `secrets`, `triggers`,
+costs is asymmetric fidelity: a bundle loaded by Claude Code **validates but degrades**. All seven
+Curie authoring extensions — `systemPrompt`, `starterPrompts`, `secrets`, `optionalSecrets`, `triggers`,
 `approvalPolicy`, `toolPolicy` — are unknown fields to Claude Code, which warns about each and then
 silently ignores it at load time. The manifest is accepted and the commands, agents, hooks, and MCP
 servers work; the agent's persona, its suggested openers, its secret declarations, its wake-up
@@ -315,7 +323,7 @@ model the key at all, and the lenient models accept and silently ignore it.
 
 The three Curie-only root files degrade **more quietly still**, and they belong on the same list. A
 manifest extension at least draws a warning: `claude plugin validate examples/compat-fixture` (the
-fixture at `examples/compat-fixture/.claude-plugin/plugin.json`, which exists to carry all six)
+fixture at `examples/compat-fixture/.claude-plugin/plugin.json`, which carries the original six)
 reports one `Unknown field ... Claude Code ignores it at load time` warning per extension.
 `connectors.yaml`, `connectors.lock.yaml`, and `deploy.yaml` are not manifest fields at all, so
 Claude Code neither loads them nor mentions them: validating `examples/weather` (which carries `examples/weather/connectors.yaml`)
@@ -410,11 +418,33 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
   takes an `enforces_tool_policy` handshake argument and REFUSES a policy-bearing bundle from any
   caller that does not name `curie/mcp-tool-policy@1`; `load_tool_policy` raises rather than
   returning a policy such a caller would not apply.
-  **Curie's own platform-owned MCP servers, `curie` and `curie-state`, are outside `toolPolicy`
-  scope entirely** (#2286, ADR-0139). A bundle cannot declare them as connectors
-  (`packages/plugin-format/src/plugin_format/connectors.py::RESERVED_CONNECTOR_NAMES`), so it
-  cannot express a policy over them, and the runtime exempts the tools those servers actually
-  published through `runner/src/curie_runner/approval.py::is_platform_owned_tool` before
+  **The existing platform servers `curie` and `curie-state` retain their `toolPolicy`
+  exemption** (#2286, ADR 0139). Their names are reserved against connectors;
+  a bundle may still plugin mount either name with the plugin infix and full
+  policy scope. Reservation does not imply mounting, publication or exemption.
+  The reserved `curie-slack` capability is fully governed by policy when the
+  manifest grants any platform Slack grant (`channelRead`, `canvasList`,
+  `canvasRead`, `canvasEdit`), and a bundle cannot declare it in any MCP
+  map or in `connectors.yaml`. Without the grant a literal policy pattern gets
+  `channel_read.grant_required`. A granted, real-model boot mounts it (#2877);
+  its tools are governed by policy like a connector's. The server carries three
+  read only tools, `read_channel_history`, `read_thread_replies` and
+  `read_channel_message`, over the agent's own bound Slack channels (a
+  `{kind, address}` selector such as `C0EXAMPLE1`, defaulting to the turn's
+  channel). Reads are bounded to a 7 day window, `limit` 50 by default and 100
+  at most, and 8 pages per logical turn. A refusal is a named code the model
+  sees, among them `channel_read.not_bound`, `channel_read.grant_revoked`,
+  `channel_read.turn_inactive`, `channel_read.window_too_wide`,
+  `channel_read.limit_invalid`, `channel_read.page_budget_exhausted` and
+  `channel_read.provider_rate_limited`. Three canvas tools share the server, each
+  present only with its own grant: `list_channel_canvases` (`canvasList`),
+  `read_canvas` (`canvasRead`) and `edit_canvas_cell` (`canvasEdit`). Each costs
+  one of the 8 pages, an edit is limited to one existing table cell whose section
+  id a read returned in the same logical turn, and every edit is audited
+  (ADR 0200). A granted turn on a runner that cannot
+  enforce the grant is refused with `channel-read-unenforced`. The runtime exempts
+  only exact platform tool names published by the existing two servers through
+  `runner/src/curie_runner/approval.py::is_platform_owned_tool` before
   `classify_tool` is ever consulted. The exemption is exact live tool names, not the
   `mcp__<server>__` prefix: `strict_mcp_config` is off, so the CLI also loads ambient project
   and user MCP servers, and a prefix match would exempt every tool of one keyed `curie__extra`
@@ -432,7 +462,7 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
   configuration may add restrictions but may not hollow out operator or platform controls, and the
   same predicate decides both directions; platform-scope patterns for an operator-level need would
   be new semantics and belong to a future `@2` enforcement id. A bundle's own plugin-mounted
-  `mcpServers` entry named `curie` is a different server, carries the `plugin_<bundle>_` infix in
+  `mcpServers` entry named `curie` or `curie-state` is a different server, carries the `plugin_<bundle>_` infix in
   its live names, and stays fully in scope.
 
 Their validators live alongside the others in `validate.py` (`triggers.*` / `approval_policy.*` /

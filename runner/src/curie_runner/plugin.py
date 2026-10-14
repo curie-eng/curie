@@ -22,8 +22,10 @@ frozen validator gets a chance to mis-attribute it.
 """
 
 import json
+import logging
 import os
-from collections.abc import Mapping
+import re
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -35,6 +37,53 @@ from plugin_format import (
     resolve_manifest,
     validate_bundle,
 )
+
+# The SDK's skill-name check is private, and the SDK is pinned only ``>=``, so a
+# later release may move or rename it. When it is gone, use the local copy below.
+_sdk_validate_skill_name: Callable[[str], None] | None
+try:
+    from claude_agent_sdk._internal.transport.subprocess_cli import (
+        _validate_skill_name as _sdk_validate_skill_name,
+    )
+except ImportError:
+    _sdk_validate_skill_name = None
+
+logger = logging.getLogger(__name__)
+
+# A copy of ``_validate_skill_name`` in claude_agent_sdk 0.2.159
+# (``claude_agent_sdk/_internal/transport/subprocess_cli.py``). It rejects the names
+# the SDK rejects; a test pins the two together while the SDK still ships its own.
+_SKILL_NAME_INVALID_CHARS = re.compile(r"[(),\x00-\x1f\x7f-\x9f\ufeff]")
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def _local_validate_skill_name(name: str) -> None:
+    """Raise ``ValueError`` if ``name`` cannot ride in a ``Skill(name)`` rule."""
+
+    if not name.strip():
+        raise ValueError("Skill names must be non-empty strings")
+    if _SURROGATE_RE.search(name):
+        raise ValueError(f"Invalid skill name {name!r}: contains a surrogate code point")
+    if name != name.strip():
+        raise ValueError(f"Invalid skill name {name!r}: leading or trailing whitespace")
+    if _SKILL_NAME_INVALID_CHARS.search(name):
+        raise ValueError(
+            f"Invalid skill name {name!r}: parentheses, commas, control characters,"
+            " and byte-order marks are not allowed"
+        )
+    if name == "*":
+        raise ValueError("Invalid skill name '*': wildcards are not allowed")
+    if name.endswith((":*", " *")):
+        raise ValueError(f"Invalid skill name {name!r}: wildcard-suffix names are not allowed")
+    if name.startswith("/"):
+        raise ValueError(f"Invalid skill name {name!r}: skill names may not start with '/'")
+    if "\\\\" in name:
+        raise ValueError(f"Invalid skill name {name!r}: consecutive backslashes are not allowed")
+    if name.endswith("\\"):
+        raise ValueError(f"Invalid skill name {name!r}: names may not end with a backslash")
+
+
+_validate_skill_name: Callable[[str], None] = _sdk_validate_skill_name or _local_validate_skill_name
 
 BUNDLE_CONFIG_NAME = "curie.bundle.json"
 
@@ -93,6 +142,28 @@ def load_bundle_web_search_enabled(plugin_dir: str | None) -> bool:
             f"invalid {config_path}: webSearch must be a JSON boolean"
         )
     return enabled
+
+
+def load_bundle_platform_slack_grants(plugin_dir: str | None) -> frozenset[str]:
+    """The platform Slack grants the bundle manifest holds (ADR 0100, ADR 0200).
+
+    The grants are ``channelRead``, ``canvasList``, ``canvasRead`` and
+    ``canvasEdit``; each is held only as a literal ``true`` and defaults off.
+    Any manifest this reader cannot parse grants nothing; ``load_plugins`` is
+    the gate that refuses such a bundle at startup.
+    """
+
+    if not plugin_dir:
+        return frozenset()
+    manifest_path = resolve_manifest(plugin_dir)
+    if manifest_path is None:
+        return frozenset()
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = PluginManifest.model_validate(data)
+    except (json.JSONDecodeError, ValueError, OSError):
+        return frozenset()
+    return manifest.platform_slack_grants()
 
 
 def load_bundle_system_prompt(plugin_dir: str | None) -> str | None:
@@ -229,7 +300,9 @@ def bundle_mcp_servers(plugin_dir: str | None) -> dict[str, Any]:
 
     ``${CLAUDE_PLUGIN_ROOT}`` is the one variable the plugin loader supplies that
     the ``--mcp-config`` path does not, so it is substituted here and exported to
-    a stdio server's env. Every other ``${VAR}`` is left for the CLI, which
+    a stdio server's env. An absent optional secret's whole-value stdio env
+    reference is omitted before mounting (#4129); the bundle stays immutable.
+    Every other ``${VAR}`` is left for the CLI, which
     expands ``--mcp-config`` entries from the session env exactly as it expands a
     plugin's. Call only after ``load_plugins`` has validated the bundle; a
     malformed declaration was already refused there.
@@ -250,6 +323,9 @@ def bundle_mcp_servers(plugin_dir: str | None) -> dict[str, Any]:
         declarations.append(json.loads(root_mcp.read_text(encoding="utf-8")))
 
     plugin_root = str(root)
+    absent_optional_refs = {
+        f"${{{name}}}" for name in manifest.optionalSecrets or [] if name not in os.environ
+    }
     servers: dict[str, Any] = {}
     for payload in declarations:
         if not isinstance(payload, dict):
@@ -263,11 +339,68 @@ def bundle_mcp_servers(plugin_dir: str | None) -> dict[str, Any]:
             entry = cast("dict[str, object]", _substitute_plugin_root(config, plugin_root))
             if isinstance(entry.get("command"), str):
                 raw_env = entry.get("env")
-                env = dict(raw_env) if isinstance(raw_env, dict) else {}
+                env = (
+                    {
+                        key: value
+                        for key, value in raw_env.items()
+                        if not (isinstance(value, str) and value in absent_optional_refs)
+                    }
+                    if isinstance(raw_env, dict)
+                    else {}
+                )
                 env.setdefault("CLAUDE_PLUGIN_ROOT", plugin_root)
                 entry["env"] = env
             servers[f"plugin:{manifest.name}:{name}"] = entry
     return servers
+
+
+def bundle_skill_names(plugin_dir: str | None) -> list[str]:
+    """The bundle's own skills, named as the CLI names plugin skills (#3766).
+
+    The runner passes this list as the SDK ``skills`` option so the model's
+    skill listing holds only the bundle's skills, not the Claude Code CLI's
+    built-in ones (ADR-0189). The CLI names a plugin skill
+    ``<manifest name>:<dir>`` after its directory, not its frontmatter
+    ``name``, and loads only ``skills/<dir>/SKILL.md`` one level down, so the
+    list follows the same rule (verified on CLI 2.1.281). Sorted, so the list
+    is deterministic. No bundle, or a bundle without skills, gives ``[]``. Call
+    only after ``load_plugins`` has validated the bundle.
+
+    The bundle validator only warns about odd folder names, but the SDK raises
+    ``ValueError`` while building the CLI command for a name it cannot carry in
+    a ``Skill(<name>)`` rule (a comma, a parenthesis, edge whitespace and so
+    on). One such folder would stop the whole session at connect, so each name
+    goes through the SDK's own check, and a rejected folder is skipped with a
+    warning that names it. Calling the SDK's check keeps the accepted set
+    exactly what the installed SDK accepts.
+    """
+
+    if not plugin_dir:
+        return []
+    root = Path(plugin_dir)
+    manifest_path = resolve_manifest(root)
+    if manifest_path is None:
+        return []
+    manifest = PluginManifest.model_validate(json.loads(manifest_path.read_text(encoding="utf-8")))
+    skills_dir = root / "skills"
+    if not skills_dir.is_dir():
+        return []
+    names: list[str] = []
+    for entry in sorted(skills_dir.iterdir(), key=lambda path: path.name):
+        if not (entry.is_dir() and (entry / "SKILL.md").is_file()):
+            continue
+        name = f"{manifest.name}:{entry.name}"
+        try:
+            _validate_skill_name(name)
+        except ValueError as exc:
+            logger.warning(
+                "skipping bundle skill folder %r: the agent SDK cannot pass its name (%s)",
+                entry.name,
+                exc,
+            )
+            continue
+        names.append(name)
+    return names
 
 
 def _substitute_plugin_root(value: object, plugin_root: str) -> object:

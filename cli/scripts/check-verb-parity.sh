@@ -6,5 +6,5 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 cargo test --manifest-path "$REPO_ROOT/cli/Cargo.toml" \
-    --test command_surface message_tiers_share_the_conversation_flag_and_default \
+    --test integration command_surface::message_tiers_share_the_conversation_flag_and_default \
     -- --exact --nocapture

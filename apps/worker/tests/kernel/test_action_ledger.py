@@ -11,14 +11,19 @@ ledger is about the signal the ledger must not disturb.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from aci_protocol import ErrorEvent, Final, SessionStatus, SideEffectFlag
-from curie_worker.actions import ActionBackendError, RecordedAction
+from curie_worker.actions import ActionBackendError, ActionClient, RecordedAction
+from curie_worker.delivery_lease import DeliveryBudget, unfenced_lease
 
 # importlib import mode does not add the test root to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -45,6 +50,7 @@ class FakeRecorder:
         conversation_id: str,
         agent_id: str | None,
         gate_approval_id: str | None = None,
+        budget_s: float = 120,
     ) -> RecordedAction:
         if self.fail_on_record:
             raise ActionBackendError("ledger down")
@@ -55,11 +61,14 @@ class FakeRecorder:
                 "conversation_id": conversation_id,
                 "agent_id": agent_id,
                 "gate_approval_id": gate_approval_id,
+                "budget_s": budget_s,
             }
         )
         return RecordedAction(id=f"a{len(self.recorded)}", status="pending")
 
-    async def complete(self, action_id: str, frame: SideEffectFlag) -> dict[str, Any]:
+    async def complete(
+        self, action_id: str, frame: SideEffectFlag, *, budget_s: float = 120
+    ) -> dict[str, Any]:
         self.completed.append((action_id, frame))
         return {
             "tool": frame.tool,
@@ -216,6 +225,36 @@ def test_a_ledger_that_refuses_the_write_fails_the_turn(make_harness) -> None:
             # exactly one attempt was made.
             assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
             assert h.runner.opened == ["scale it"]
+
+    asyncio.run(go())
+
+
+def test_ledger_empty_backend_error_is_named_in_the_log(make_harness, caplog) -> None:
+    class EmptyErrorRecorder(FakeRecorder):
+        async def record(self, *args, **kwargs) -> RecordedAction:
+            raise ActionBackendError("")
+
+    async def go() -> None:
+        async with make_harness(actions=EmptyErrorRecorder()) as h:
+            h.runner.default_script = [*_call("toolu_01"), Final(text="done", status=DONE)]
+            event = _qevent("scale it")
+            with caplog.at_level(logging.ERROR, logger="curie_worker.kernel"):
+                await h.kernel.process_event(event)
+
+            records = [
+                record
+                for record in caplog.records
+                if record.getMessage().startswith("action ledger write failed for ")
+            ]
+            assert len(records) == 1
+            assert records[0].levelno == logging.ERROR
+            assert records[0].getMessage() == (
+                f"action ledger write failed for {event.event_id}: ActionBackendError: "
+            )
+            assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
+            assert h.runner.opened == ["scale it"]
+            assert h.sink.last_text is not None
+            assert "human" in h.sink.last_text.lower()
 
     asyncio.run(go())
 
@@ -459,5 +498,113 @@ def test_a_side_effect_still_blocks_retry_in_every_receipt_mode(make_harness, mo
             assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
             assert await h.async_redis.exists(h.config.done_key(event.event_id))
             assert [r["frame"].call_id for r in recorder.recorded] == ["toolu_01"]
+
+    asyncio.run(go())
+
+
+def test_a_transient_ledger_outage_delivers_with_a_durable_receipt(
+    make_harness, monkeypatch
+) -> None:
+    from curie_worker import api_retry
+
+    async def go() -> None:
+        now = 0.0
+        records: list[dict[str, Any]] = []
+        completions: list[dict[str, Any]] = []
+
+        async def sleep(delay: float) -> None:
+            nonlocal now
+            now += delay
+            await asyncio.sleep(0)
+
+        monkeypatch.setattr(api_retry, "_clock", lambda: now)
+        monkeypatch.setattr(api_retry, "_sleep", sleep)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/actions":
+                records.append(json.loads(request.content))
+                if len(records) <= 2:
+                    raise httpx.ConnectError("API restarting", request=request)
+                return httpx.Response(201, json={"id": "action-1", "status": "pending"})
+            completions.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "action-1",
+                    "tool": "scale_deployment",
+                    "status": "succeeded",
+                    "undoable": True,
+                },
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            actions = ActionClient(api_base_url="http://api", api_key="example", client=http)
+            async with make_harness(actions=actions) as h:
+                h.runner.default_script = [*_call("tool-1"), Final(text="done", status=DONE)]
+                event = _qevent("scale it")
+                await h.kernel.process_event(event)
+                assert [completion.outcome for completion in h.sink.completions] == ["delivered"]
+                assert len(records) == 3
+                assert records[0] == records[1] == records[2]
+                assert len(completions) == 1
+                assert "What I changed" in h.sink.last_text
+                assert "restore information recorded" in h.sink.last_text
+                assert await h.kernel._markers.is_terminal(event.event_id)
+                assert h.runner.opened == ["scale it"]
+
+    asyncio.run(go())
+
+
+def test_a_422_ledger_refusal_still_escalates_without_reexecution(
+    make_harness, monkeypatch
+) -> None:
+    async def go() -> None:
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(422, json={"detail": "invalid action"})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            actions = ActionClient(api_base_url="http://api", api_key="example", client=http)
+            async with make_harness(actions=actions) as h:
+                h.runner.default_script = [*_call("tool-1"), Final(text="done", status=DONE)]
+                await h.kernel.process_event(_qevent("scale it"))
+                assert attempts == 1
+                assert [completion.outcome for completion in h.sink.completions] == ["escalated"]
+                assert "ledger-error" in h.sink.last_text
+                assert h.runner.opened == ["scale it"]
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("remaining", [None, 40.0, 200.0])
+def test_kernel_bounds_both_ledger_writes_by_the_delivery_budget(make_harness, remaining) -> None:
+    async def go() -> None:
+        class BudgetRecorder(FakeRecorder):
+            complete_budgets: list[float]
+
+            async def complete(
+                self, action_id: str, frame: SideEffectFlag, *, budget_s: float = 120
+            ) -> dict[str, Any]:
+                self.complete_budgets = [budget_s]
+                return await super().complete(action_id, frame, budget_s=budget_s)
+
+        recorder = BudgetRecorder()
+        async with make_harness(actions=recorder) as h:
+            h.runner.default_script = [*_call("tool-1"), Final(text="done", status=DONE)]
+            lease = None
+            if remaining is not None:
+                lease = unfenced_lease()
+                lease.budget = DeliveryBudget(
+                    deadline_ms=int(remaining * 1000),
+                    anchor_server_ms=0,
+                    anchor_monotonic=time.monotonic(),
+                )
+            await h.kernel.process_event(_qevent("scale it"), lease=lease)
+            expected = 120 if remaining is None else min(120, remaining)
+            assert recorder.recorded[0]["budget_s"] == pytest.approx(expected, abs=0.5)
+            assert recorder.complete_budgets == [pytest.approx(expected, abs=0.5)]
 
     asyncio.run(go())

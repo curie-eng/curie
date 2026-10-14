@@ -1,7 +1,7 @@
 //! Deployment-level repository-workspace intent across local, cluster fan-out,
 //! wire JSON, and the generated command manifests.
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -89,6 +89,9 @@ fn deploy_response(req: &support::Request, existing: ExistingAgent) -> Response 
                 })
                 .to_string(),
             )
+        }
+        ("PATCH", "/agents/agent-acme-bot") => {
+            Response::json(200, &agent_json("acme-bot", None).to_string())
         }
         ("POST", "/deployments") => {
             let body: Value = serde_json::from_slice(&req.body).expect("deployment body is JSON");
@@ -340,6 +343,19 @@ fn fanout_response(
                 response["workspace_enabled"] = value.clone();
             }
             Response::json(201, &response.to_string())
+        }
+        ("PATCH", path) if path.starts_with("/agents/") && path.matches('/').count() == 2 => {
+            let id = path.trim_start_matches("/agents/");
+            Response::json(
+                200,
+                &json!({
+                    "id": id,
+                    "name": id,
+                    "channels": [],
+                    "memory": false
+                })
+                .to_string(),
+            )
         }
         ("GET", path) if path.contains("/versions/") && path.contains("/connectors?") => {
             Response::json(

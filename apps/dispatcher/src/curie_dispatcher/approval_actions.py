@@ -30,7 +30,7 @@ import httpx
 from curie_telemetry import inject_trace_context
 from slack_sdk.web import WebClient
 
-from .approval_principal import mint_chat_principal
+from .approval_principal import mint_chat_principal, mint_test_driver_principal
 from .config import DispatcherConfig
 
 logger = logging.getLogger(__name__)
@@ -297,6 +297,7 @@ class ApprovalResolveClient:
         attested_user: str,
         attested_channel: str,
         note: str | None = None,
+        test_driver: bool = False,
     ) -> ResolveOutcome:
         body: dict[str, Any] = {"decision": decision}
         # Only send the key when the approver typed something. The field is
@@ -307,7 +308,9 @@ class ApprovalResolveClient:
             body["note"] = note
         headers = {
             **self._headers,
-            "X-Curie-Approval-Principal": mint_chat_principal(
+            "X-Curie-Approval-Principal": (
+                mint_test_driver_principal if test_driver else mint_chat_principal
+            )(
                 self._approval_chat_attester_secret,
                 subject=attested_user,
                 actor_channel=attested_channel,
@@ -1194,3 +1197,106 @@ def build_resolver(config: DispatcherConfig) -> ApprovalResolveClient:
         api_key=config.api_key,
         approval_chat_attester_secret=config.approval_chat_attester_secret,
     )
+
+
+def resolve_driver_reply(
+    *,
+    approval_id: str,
+    decision: str,
+    subject: str,
+    channel: str,
+    thread_ts: str,
+    bot_user_id: str | None,
+    bot_id: str | None,
+    web_client: WebClient,
+    resolver: ApprovalResolveClient,
+    log: logging.Logger,
+) -> bool:
+    """Resolve only a unique target-owned approval card in the delivered thread.
+
+    Slack returns the parent and replies, possibly paginated. Read at most three
+    pages and refuse incomplete/unreadable evidence. No guessed card is stamped.
+    https://docs.slack.dev/reference/methods/conversations.replies/
+    """
+    if not thread_ts or not bot_user_id or not bot_id:
+        return False
+    matches: list[dict[str, Any]] = []
+    cursor = ""
+    try:
+        for _page in range(3):
+            page = web_client.conversations_replies(
+                channel=channel, ts=thread_ts, limit=100, cursor=cursor
+            )
+            if not page.get("ok"):
+                return False
+            for message in page.get("messages") or []:
+                if not isinstance(message, dict):
+                    return False
+                if (
+                    message.get("user") != bot_user_id
+                    or message.get("bot_id") != bot_id
+                    or not message.get("ts")
+                    or message.get("thread_ts", message.get("ts")) != thread_ts
+                ):
+                    continue
+                buttons = [
+                    element
+                    for block in message.get("blocks") or []
+                    if isinstance(block, dict) and block.get("type") == "actions"
+                    for element in block.get("elements") or []
+                    if isinstance(element, dict) and element.get("type") == "button"
+                ]
+                approve = any(
+                    button.get("action_id") in (APPROVE_ACTION_ID, APPROVE_NOTE_ACTION_ID)
+                    and button.get("value") == approval_id
+                    for button in buttons
+                )
+                reject = any(
+                    button.get("action_id") in (REJECT_ACTION_ID, REJECT_NOTE_ACTION_ID)
+                    and button.get("value") == approval_id
+                    for button in buttons
+                )
+                header = any(
+                    isinstance(block, dict)
+                    and block.get("type") == "header"
+                    and isinstance(block.get("text"), dict)
+                    and block["text"].get("text") == APPROVAL_CARD_HEADER
+                    for block in message.get("blocks") or []
+                )
+                if approve and reject and header and _card_is_readable(message):
+                    matches.append(message)
+            if not page.get("has_more"):
+                break
+            cursor = (page.get("response_metadata") or {}).get("next_cursor") or ""
+            if not isinstance(cursor, str) or not cursor:
+                return False
+        else:
+            return False
+    except Exception:  # noqa: BLE001 - unreadable evidence never authorizes a reply
+        log.warning("test driver approval card could not be verified")
+        return False
+    if len(matches) != 1:
+        return False
+    message = matches[0]
+    outcome = resolver.resolve(
+        approval_id,
+        decision=decision,
+        attested_user=subject,
+        attested_channel=channel,
+        test_driver=True,
+    )
+    # Match the click ownership signal: another release's card stays unchanged.
+    if not is_release_ownership_miss(outcome):
+        _render_outcome(
+            approval_id=approval_id,
+            decision=decision,
+            user=subject,
+            channel=channel,
+            card_ts=message["ts"],
+            message=message,
+            note=None,
+            outcome=outcome,
+            web_client=web_client,
+            log=log,
+        )
+    return True

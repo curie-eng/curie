@@ -172,7 +172,7 @@ fn replacing_a_recorded_local_model_run_tears_down_its_sidecar_and_network() {
 }
 
 /// The ADR-0093 local-model asset preflight is exactly the kind of cheap abort
-/// the CLI's own ordering invariant (commands.rs, #747) describes: it never
+/// the CLI's own ordering invariant (commands/skill.rs, #747) describes: it never
 /// touches the network, only `docker image inspect` and a throwaway probe
 /// container against a volume this test guarantees cannot exist. So a refusal
 /// here must be free, the same as the `--budget` bail above, and the recorded

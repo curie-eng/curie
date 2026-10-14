@@ -1,16 +1,16 @@
 # syntax=docker/dockerfile:1
 # Curie UI image: static Vite build served by non-root nginx.
 #
-# BUILD FROM THE REPO ROOT, not from apps/ui/, because the UI resolves the frozen
-# ACI TypeScript types through a path alias (@aci -> ../../packages/aci-protocol/
-# generated/ts, in both tsconfig and vite), which lives outside apps/ui. The repo
-# layout is replicated in the build stage so that relative alias resolves:
+# BUILD FROM THE REPO ROOT, not from apps/ui/, because the UI reads the shared
+# wording vector (tests/vectors/user-action-wording.json), which lives outside
+# apps/ui. The repo layout is replicated in the build stage so that relative path
+# resolves:
 #
 #   docker build -f apps/ui/Dockerfile -t curie-ui .
 #
 # apps/ui/Dockerfile.dockerignore (BuildKit honors <dockerfile>.dockerignore over
-# the context-root one) trims the root context to the UI plus that one
-# cross-package tree and the shared wording vector.
+# the context-root one) trims the root context to the UI plus that vector. The
+# API types (src/api/generated.ts) are committed; nothing is generated here.
 FROM node:22.23.2-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS build
 WORKDIR /app
 # Pin pnpm explicitly: package.json has no packageManager field, so corepack
@@ -24,10 +24,9 @@ RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
 COPY apps/ui/package.json apps/ui/pnpm-lock.yaml ./apps/ui/
 WORKDIR /app/apps/ui
 RUN pnpm install --frozen-lockfile
-# The frozen ACI types the @aci alias points at, then the UI sources. Both land
-# at their repo-relative paths so `../../packages/...` resolves from apps/ui.
+# The shared wording vector, then the UI sources. Both land at their
+# repo-relative paths so `../../tests/...` resolves from apps/ui.
 WORKDIR /app
-COPY packages/aci-protocol/generated ./packages/aci-protocol/generated
 COPY tests/vectors/user-action-wording.json ./tests/vectors/user-action-wording.json
 COPY apps/ui ./apps/ui
 WORKDIR /app/apps/ui

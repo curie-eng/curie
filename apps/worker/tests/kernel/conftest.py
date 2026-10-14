@@ -18,8 +18,8 @@ import os
 import socket
 import threading
 import uuid
-from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -49,17 +49,18 @@ from curie_test_support.valkey import (
 from curie_test_support.valkey import (
     VALKEY_PW as _VALKEY_PW,
 )
+from curie_worker import consumer as consumer_module
 from curie_worker.approval_cards import ApprovalCardStore
 from curie_worker.config import WorkerConfig
-from curie_worker.kernel import Kernel
+from curie_worker.kernel.core import Kernel
 from curie_worker.markers import Markers
 from curie_worker.reply_sink import TargetRoute
+from curie_worker.run import _substrate_config
 from curie_worker.runner_client import RunnerClient
 from curie_worker.sandbox import (
     AffinityStore,
     QuotaRejection,
     SandboxSubstrate,
-    SubstrateConfig,
 )
 from curie_worker.sandbox.types import ClaimView, SandboxView
 from curie_worker.threadlock import ThreadLock
@@ -103,14 +104,21 @@ class HookRunSeed:
         async with self.engine.connect() as conn:
             row = (
                 await conn.execute(
-                    text(
-                        "SELECT outcome, ended_at FROM curie.hook_runs "
-                        "WHERE id = :run_id"
-                    ),
+                    text("SELECT outcome, ended_at FROM curie.hook_runs WHERE id = :run_id"),
                     {"run_id": self.run_id},
                 )
             ).one_or_none()
         return None if row is None else (row.outcome, row.ended_at)
+
+    async def reason(self) -> str | None:
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("SELECT reason FROM curie.hook_runs WHERE id = :run_id"),
+                    {"run_id": self.run_id},
+                )
+            ).one()
+        return row.reason
 
     async def lease_expires_at(self) -> datetime | None:
         async with self.engine.connect() as conn:
@@ -192,6 +200,35 @@ def make_hook_run() -> Callable[..., contextlib.AbstractAsyncContextManager[Hook
             await engine.dispose()
 
     return seed
+
+
+@dataclass(frozen=True)
+class ThreadResetKeys:
+    """Per-test thread-reset request, in-flight and result keys."""
+
+    requests: str
+    inflight: str
+    result_prefix: str
+
+
+@pytest.fixture
+def thread_reset_keys(names: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> ThreadResetKeys:
+    """Point the consumer's thread-reset keys at per-test keys (#3807).
+
+    The production keys are fixed cross-service constants, so on the shared
+    Valkey a concurrent test's consumer would drain, delete, or inject this
+    test's reset requests. The test owns its keys instead; they live under the
+    ``names`` prefix, whose teardown deletes them.
+    """
+    keys = ThreadResetKeys(
+        requests=f"{names['prefix']}:thread-reset-requests",
+        inflight=f"{names['prefix']}:thread-reset-inflight",
+        result_prefix=f"{names['prefix']}:thread-reset-result:",
+    )
+    monkeypatch.setattr(consumer_module, "THREAD_RESET_SET", keys.requests)
+    monkeypatch.setattr(consumer_module, "THREAD_RESET_INFLIGHT_SET", keys.inflight)
+    monkeypatch.setattr(consumer_module, "THREAD_RESET_RESULT_PREFIX", keys.result_prefix)
+    return keys
 
 
 def make_config(names: dict[str, str], **overrides: object) -> WorkerConfig:
@@ -277,9 +314,7 @@ class FakeSink:
         # so this double records the intent, not blocks. The endpoint is the
         # transport the post is delivered through (#451): None means the worker's
         # default Slack transport.
-        self.posts: list[
-            tuple[str, OutboundMessage, str, str | None, str | None]
-        ] = []
+        self.posts: list[tuple[str, OutboundMessage, str, str | None, str | None]] = []
         # In-place edits of an already-posted message (settling the approval
         # card: expired in #419, resolved in #1084):
         # (channel, ts, message, endpoint, settled) per update_message. Like
@@ -449,6 +484,7 @@ class FakeK8s:
     unschedulable_message: str | None = None
     termination: Any | None = None
     termination_queries: list[str] = field(default_factory=list)
+    template_reaps: list[tuple[set[str], datetime]] = field(default_factory=list)
     # OPT-IN per-sandbox runner ports, pre-started by the harness fixture (see
     # ``per_sandbox_runners``). Empty (the default) is the shared-runner world
     # every existing test lives in: every sandbox gets ``port=None`` and dials
@@ -516,9 +552,7 @@ class FakeK8s:
             name=sandbox_name, port=self._take_port(sandbox_name)
         )
 
-    def get_claim(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> ClaimView | None:
+    def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
         assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None:
@@ -551,9 +585,11 @@ class FakeK8s:
                 out.append(view)
         return out
 
-    def get_sandbox(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> SandboxView | None:
+    def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
+        self.template_reaps.append((set(keep), created_before))
+        return []
+
+    def get_sandbox(self, name: str, *, request_timeout_seconds: float) -> SandboxView | None:
         assert request_timeout_seconds > 0
         sandbox = self.sandboxes.get(name)
         if sandbox is None:
@@ -652,6 +688,10 @@ class FakeRunner:
         # The tool access values this runner advertises under ``tool_access``
         # (TOOL-ACCESS-4). None models a runner that predates the key.
         self.tool_access_enforced: list[str] | None = None
+        # The value this runner advertises under ``channel_read`` (ADR 0100).
+        # None omits the key, as a runner that predates it does; anything else
+        # is sent as is, so a test can advertise ``False`` or ``"true"``.
+        self.channel_read_enforced: object = None
         # When set, /status answers 200 with no ``turn_active`` field.
         self.status_malformed = False
         self.status_delay_seconds = 0.0
@@ -665,6 +705,8 @@ class FakeRunner:
         self.queried: list[str] = []
         self.admissions: list[tuple[str, bool]] = []
         self.steers: list[str] = []
+        # Every accepted /v1/steer body as received.
+        self.steer_bodies: list[dict[str, object]] = []
         self.interrupts: int = 0
         self.hold: object | None = None  # asyncio.Event when a turn should hang
         self.accept: asyncio.Event | None = None  # gate after opened, before prepare
@@ -705,6 +747,8 @@ class FakeRunner:
         }
         if self.tool_access_enforced is not None:
             body["tool_access"] = list(self.tool_access_enforced)
+        if self.channel_read_enforced is not None:
+            body["channel_read"] = self.channel_read_enforced
         if request.path == "/v1/status":
             body["turn_epoch"] = self.turn_epoch
             if self.supports_capacity_admission:
@@ -784,11 +828,10 @@ class FakeRunner:
     async def _steer(self, request: web.Request) -> web.Response:
         self.steer_headers.append(dict(request.headers))
         body = await request.json()
-        if not self.turn_active or (
-            self._admission_gate is not None and not self.turn_ready
-        ):
+        if not self.turn_active or (self._admission_gate is not None and not self.turn_ready):
             return web.json_response({"error": "no active turn"}, status=409)
         self.steers.append(body["text"])
+        self.steer_bodies.append(body)
         return web.json_response({"ok": True})
 
     async def _turn_admit(self, request: web.Request) -> web.Response:
@@ -976,7 +1019,11 @@ def make_harness(
     (build a real KillSwitch wired to the kernel) and ``sink`` (any ``ReplySink``
     -- a real ``ReplySinkRouter`` for the adapter-selection tests, T-B3/T-B4);
     ``sibling_limit_factory`` builds the kernel's sibling limit from the
-    harness's own Valkey client and config; the rest are config overrides.
+    harness's own Valkey client and config, and ``progress_factory`` its
+    deliberate progress store the same way, and ``sweep_factory`` its
+    ``SweepCoverage`` (ADR-0160, #2878; omitted, the kernel has no sweep
+    service and every cron turn runs exactly as before); the rest are config
+    overrides.
     ``runner_total_timeout_s`` is an ordinary
     config override: it drives BOTH the ``WorkerConfig`` and the
     ``RunnerClient``'s streaming budget (mirroring ``run.py``), so a test that
@@ -1013,9 +1060,12 @@ async def kernel_harness(
     sink: object | None = None,
     runner_app: web.Application | None = None,
     claim_timeout_seconds: float = 3.0,
+    substrate_env: Mapping[str, str] | None = None,
     per_sandbox_runners: int = 0,
     hook_runs: object | None = None,
     sibling_limit_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
+    progress_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
+    sweep_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel wired to a fake runner and real Valkey."""
@@ -1074,11 +1124,11 @@ async def kernel_harness(
             pressure_client=pressure_async_redis,
             key_prefix=names["sandbox_prefix"],
         ),
-        SubstrateConfig(
+        replace(
+            _substrate_config({"CURIE_ROUTE_TTL_SECONDS": "60", **(substrate_env or {})}),
             namespace="test-ns",
             warm_pool="test-pool",
             runner_port=fleet_port,
-            route_ttl_seconds=60,
             claim_timeout_seconds=claim_timeout_seconds,
             poll_interval_seconds=0.005,
             key_prefix=names["sandbox_prefix"],
@@ -1121,16 +1171,22 @@ async def kernel_harness(
         approval_reader=approval_reader,  # type: ignore[arg-type]
         actions=actions,  # type: ignore[arg-type]
         publication_creator=publication_creator,  # type: ignore[arg-type]
-        workspace=(
-            workspace_factory(substrate) if workspace_factory else None
-        ),  # type: ignore[arg-type]
+        workspace=(workspace_factory(substrate) if workspace_factory else None),  # type: ignore[arg-type]
         card_store=card_store,
+        route_ttl_seconds=substrate._config.route_ttl_seconds,
+        suspended_route_ttl_seconds=substrate._config.suspended_route_ttl_seconds,
         **({"hook_runs": hook_runs} if hook_runs is not None else {}),
         **(
             {"sibling_limit": sibling_limit_factory(async_redis, config)}
             if sibling_limit_factory is not None
             else {}
         ),
+        **(
+            {"progress": progress_factory(async_redis, config)}
+            if progress_factory is not None
+            else {}
+        ),
+        **({"sweep": sweep_factory(async_redis, config)} if sweep_factory is not None else {}),
     )
     killswitch = None
     if with_killswitch:

@@ -1,8 +1,14 @@
 import { test, expect, type Page } from "@playwright/test";
+import { stubConsoleSession } from "./support/consoleSession";
 
 // Wired Agents delete flow (stackless via route stubs): the agent list is
 // mutable so a successful DELETE drops the card, and a 409 (active deployment)
 // surfaces as a toast while the card stays put. No backend needed.
+
+// The console sits behind the login gate (#1047): sign this spec in.
+test.beforeEach(async ({ page }) => {
+  await stubConsoleSession(page);
+});
 
 function json(status: number, body: unknown) {
   return { status, contentType: "application/json", body: JSON.stringify(body) };

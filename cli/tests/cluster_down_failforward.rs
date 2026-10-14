@@ -11,16 +11,16 @@
 //! EVERYTHING lives in ONE test fn. `down()` resolves `helm`/`kubectl` off the
 //! process PATH, so the test mutates process-global PATH (and a SWEEP_MARKER env
 //! var the fake kubectl records into); a second parallel test in this file would
-//! race on that shared state. Each `tests/*.rs` file is its own test binary, so a
-//! single test here is race-free, and it saves and restores the original PATH.
+//! race on that shared state. The test holds `support::ENV_LOCK` for its whole
+//! body, since every integration test shares one process, and it saves and
+//! restores the original PATH.
 //!
 //! These assertions are RED until the implementer hardens `down()`: today the
 //! resume command lives only in the error `fix` (never composed into the Display
 //! message, so scenario 1's message assertion fails), and any nonzero helm exit
 //! returns Transient (so scenario 2's permanent case is mislabeled retryable).
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::ffi::OsString;
 use std::fs;
@@ -61,6 +61,7 @@ fn down_opts() -> DownOpts {
 
 #[tokio::test]
 async fn cluster_down_fails_forward_through_real_down() {
+    let _env = crate::support::ENV_LOCK.lock().await;
     let original_path = std::env::var_os("PATH");
 
     // ----- Scenario 1: unreachable API server (connectivity) -----
@@ -315,6 +316,6 @@ fn down_sweep_selector_is_scoped_by_release_and_namespace() {
     let sweep = cmds[1].display();
     assert_eq!(
         sweep,
-        "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found"
+        "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found --timeout=300s"
     );
 }

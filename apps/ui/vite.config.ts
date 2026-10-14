@@ -1,4 +1,3 @@
-import { fileURLToPath, URL } from "node:url";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -20,13 +19,6 @@ const proxy = {
 
 export default defineConfig({
   plugins: [react()],
-  resolve: {
-    alias: {
-      "@aci": fileURLToPath(
-        new URL("../../packages/aci-protocol/generated/ts", import.meta.url),
-      ),
-    },
-  },
   // allowedHosts lets the dev/preview server be reached over the tailnet
   // (e.g. via `tailscale serve`); tailnet membership is the auth boundary.
   server: { port: 5173, proxy, allowedHosts: [".ts.net"] },

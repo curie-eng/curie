@@ -1,16 +1,120 @@
 version: 1
 fallback: [skill, local, local-release, cluster]
+conditional_pytest_files:
+  examples/tests/test_sre_bot_observability_runtime.py:
+    - examples/sre-bot
+    - examples/tests/test_sre_bot_observability_runtime.py
+    - runner
+    - packages/aci-protocol
+    - packages/plugin-format
+    - packages/telemetry
+    - packages/telemetry-schema
+    - otel/collector-config.yaml
+    - charts/curie/values.yaml
+    - uv.lock
+    - pyproject.toml
+    - conftest.py
+    - cli/scripts/configure-docker-hub-mirror.sh
+    - .github/workflows/ci.yaml
+    - .github/e2e-selection.yaml
+    - tools/e2e-ci-selection
+chart_scenarios:
+  job: e2e-cluster-chart-regressions
+  shared_inputs:
+    - charts/curie/templates
+    - charts/curie/values
+    - charts/curie/Chart.yaml
+    - charts/curie/crds
+    - charts/curie/files
+    - charts/curie/.helmignore
+    - .github/workflows/ci.yaml
+    - .github/e2e-selection.yaml
+    - .github/actions/load-ci-images
+    - tools/runtime-assertion-gate/run.sh
+    - cli/scripts/configure-docker-hub-mirror.sh
+    - cli/scripts/ensure-kind-registry.sh
+  scenarios:
+    installation-identity:
+      step: Installation identity Secret lifecycle
+      inputs:
+        - charts/curie/ci/runtime/upgrade-drain-installation-runtime.sh
+    connector-identity:
+      step: End to end connector identity is denied outside its scope
+      inputs:
+        - charts/curie/ci/runtime/e2e-connector-identity-runtime.sh
+    runner-resources-render:
+      step: Per-agent runner resource override renders
+      inputs:
+        - charts/curie/ci/runtime/runner-resources-assertions.sh
+    langfuse-postgres-readiness:
+      step: Langfuse web waits for delayed Postgres without restarting
+      inputs:
+        - charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh
+        - charts/curie/ci/postgres-readiness-delay.Dockerfile
+    connector-readiness:
+      step: Connector that never listens stays not-Ready until it binds
+      inputs:
+        - charts/curie/ci/runtime/connector-readiness-runtime.sh
+        - packages/plugin-format
+        - apps/worker/src/curie_worker/connector_k8s.py
+        - pyproject.toml
+        - uv.lock
+    runner-template-admission:
+      step: Runner template admission refuses host escapes, token mounts, and unlisted images
+      inputs:
+        - charts/curie/ci/runtime/runner-template-admission-runtime.sh
+    runner-byo-egress:
+      step: Runner BYO egress enforces (not just rendered)
+      inputs:
+        - scripts/check-runner-byo-egress.sh
+    controller-preflight:
+      step: Controller preflight accepts a serving upgrade and refuses broken RBAC
+      inputs:
+        - charts/curie/ci/scenarios/controller-preflight-kind.sh
+        - pyproject.toml
+        - uv.lock
+    workspace-diagnostic:
+      step: Workspace dependency failure reaches the terminal diagnostic
+      inputs:
+        - charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh
+        - apps/api
+        - apps/worker
+        - runner
+        - cli
+        - packages
+        - pyproject.toml
+        - uv.lock
+    quota-progress:
+      step: Quota progress regression
+      inputs:
+        - charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh
+        - apps/api
+        - apps/worker
+        - runner
+        - cli
+        - packages
+        - pyproject.toml
+        - uv.lock
 rules:
   exact:
     compose.dev.yaml: [local]
     pyproject.toml: [skill, local, local-release, cluster]
     uv.lock: [skill, local, local-release, cluster]
+    # These scripts run in cluster-gated jobs despite their ignored parent trees.
+    scripts/check-netpol-enforcement.sh: [cluster]
+    scripts/check-connector-caller-enforcement.sh: [cluster]
+    scripts/check-mail-adapter-otel-egress.sh: [cluster]
+    scripts/check-runner-byo-egress.sh: [cluster]
+    tools/runtime-assertion-gate/run.sh: [cluster]
     # The upgrade matrix and the repository files it reads. A test scans the
     # script's $REPO_ROOT reads and fails on any that skips released-upgrade.
     cli/scripts/gnu-process.py: [released-upgrade]
     apps/api/src/curie_api/schema_compat.json: [released-upgrade]
     cli/src/application_schema_windows.json: [released-upgrade]
     cli/scripts/cluster-upgrade-matrix.sh: [released-upgrade]
+    # Upgrade and kind jobs run these before they pull images or create a cluster.
+    cli/scripts/configure-docker-hub-mirror.sh: [released-upgrade]
+    cli/scripts/ensure-kind-registry.sh: [released-upgrade]
     cli/tests/data/upgrade-driver.py: [released-upgrade]
     # The only charts/curie/ci files the released-upgrade jobs run.
     charts/curie/ci/live_manifest_parity.py: [released-upgrade]
@@ -67,6 +171,9 @@ rules:
     docs: []
     apps/ui: []
     apps/dispatcher: []
+    # Nothing deploys the per-run Docker daemon image yet; its own CI job
+    # (docker-daemon) builds it and runs the escape tests against it.
+    apps/docker-daemon: []
     scripts: []
     # The revision-based selector inspects ci.yaml hunks and runs the full
     # released-upgrade tier when one of its upgrade jobs changes. Other

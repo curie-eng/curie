@@ -16,7 +16,7 @@ byte-exact truncation).
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 # The classification string carried on the error event and used by consumers
@@ -45,19 +45,29 @@ class BudgetTracker:
     Two SDK usage sources report the same tokens and must not be double counted:
     ``AssistantMessage.usage`` is the per-message output as the turn streams, and
     ``ResultMessage.usage`` is the SDK's authoritative aggregate for the whole
-    turn (equal to the sum of the per-message values). So per-message usage is
-    *summed* (for mid-turn enforcement) while the terminal total *replaces* rather
-    than adds -- ``used`` is the max of the two, which is correct whether the SDK
-    reports per-message usage, only a terminal total, or both.
+    turn (equal to the sum of the per-response values). So streaming usage is
+    *summed once per message id* (for mid-turn enforcement) while the terminal
+    total *replaces* rather than adds -- ``used`` is the max of the two, which is
+    correct whether the SDK reports per-message usage, only a terminal total,
+    or both.
     """
 
     ceiling: int
     _incremental: int = 0
     _total: int = 0
+    _seen_message_ids: set[str] = field(default_factory=set, init=False, repr=False)
 
-    def add_increment(self, usage: Mapping[str, Any] | None) -> None:
-        """Add one streaming (assistant) message's output to the running sum."""
+    def add_increment(self, usage: Mapping[str, Any] | None, message_id: str | None = None) -> None:
+        """Count a response once per run; messages without a usable id still add.
 
+        The SDK may emit several assistant content blocks with the same
+        response id and usage. Each turn owns a fresh tracker and seen set.
+        """
+
+        if isinstance(message_id, str) and message_id:
+            if message_id in self._seen_message_ids:
+                return
+            self._seen_message_ids.add(message_id)
         self._incremental += output_tokens(usage)
 
     def set_total(self, usage: Mapping[str, Any] | None) -> None:

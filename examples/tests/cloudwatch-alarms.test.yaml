@@ -1,0 +1,112 @@
+# @spec SRE-CW-7. Consume the production optional rule file, never copied PromQL.
+rule_files: [cloudwatch_rules.yml]
+evaluation_interval: 1m
+tests:
+  - name: healthy reader with no alarms remains quiet
+    interval: 1m
+    input_series:
+      - series: curie_cloudwatch_alarm_poll_ok
+        values: 1x20
+    promql_expr_test:
+      - expr: ALERTS{alertname=~"CurieCloudWatchAlarm|CurieCloudWatchAlarmsUnread",alertstate="firing"}
+        eval_time: 20m
+        exp_samples: []
+
+  - name: disabled and recovered alarm absent from reader do not fire
+    interval: 1m
+    input_series:
+      - series: curie_cloudwatch_alarm_poll_ok
+        values: 1x20
+      - series: curie_cloudwatch_alarm_in_alarm{alarm="example-alarm",description="Example alarm",state_transitioned_at="2026-10-07T11:59:00Z"}
+        values: 1x2 stale
+    promql_expr_test:
+      - expr: ALERTS{alertname="CurieCloudWatchAlarm",alertstate="firing"}
+        eval_time: 7m
+        exp_samples: []
+
+  - name: duplicate readers produce one alert with stable evidence
+    interval: 1m
+    input_series:
+      - series: curie_cloudwatch_alarm_poll_ok
+        values: 1x20
+      - series: curie_cloudwatch_alarm_in_alarm{alarm="example-alarm",description="Example alarm",state_transitioned_at="2026-10-07T11:59:00Z",pod="reader-one",instance="one"}
+        values: 1x20
+      - series: curie_cloudwatch_alarm_in_alarm{alarm="example-alarm",description="Example alarm",state_transitioned_at="2026-10-07T11:59:00Z",pod="reader-two",instance="two"}
+        values: 1x20
+    promql_expr_test:
+      - expr: ALERTS{alertname="CurieCloudWatchAlarm",alertstate="firing"}
+        eval_time: 1m
+        exp_samples:
+          - labels: ALERTS{alertname="CurieCloudWatchAlarm",alertstate="firing",alarm="example-alarm",description="Example alarm",state_transitioned_at="2026-10-07T11:59:00Z",severity="page",component="cloudwatch"}
+            value: 1
+
+  - name: failed poll keeps alarm and raises unread after fifteen minutes
+    interval: 1m
+    input_series:
+      - series: curie_cloudwatch_alarm_poll_ok
+        values: 0x20
+      - series: curie_cloudwatch_alarm_in_alarm{alarm="example-alarm",description="Example alarm",state_transitioned_at="2026-10-07T11:59:00Z"}
+        values: 1x20
+    promql_expr_test:
+      - expr: ALERTS{alertname="CurieCloudWatchAlarmsUnread",alertstate="firing"}
+        eval_time: 14m
+        exp_samples: []
+      - expr: ALERTS{alertname="CurieCloudWatchAlarmsUnread",alertstate="firing"}
+        eval_time: 15m
+        exp_samples:
+          - labels: ALERTS{alertname="CurieCloudWatchAlarmsUnread",alertstate="firing",severity="warning",component="cloudwatch"}
+            value: 1
+      - expr: ALERTS{alertname="CurieCloudWatchAlarm",alertstate="firing"}
+        eval_time: 15m
+        exp_samples:
+          - labels: ALERTS{alertname="CurieCloudWatchAlarm",alertstate="firing",alarm="example-alarm",description="Example alarm",state_transitioned_at="2026-10-07T11:59:00Z",severity="page",component="cloudwatch"}
+            value: 1
+
+  - name: reader never scraped is unread rather than healthy empty
+    interval: 1m
+    input_series: []
+    promql_expr_test:
+      - expr: ALERTS{alertname="CurieCloudWatchAlarmsUnread",alertstate="firing"}
+        eval_time: 15m
+        exp_samples:
+          - labels: ALERTS{alertname="CurieCloudWatchAlarmsUnread",alertstate="firing",severity="warning",component="cloudwatch"}
+            value: 1
+
+  - name: reader recovery resolves unread
+    interval: 1m
+    input_series:
+      - series: curie_cloudwatch_alarm_poll_ok
+        values: 0x15 1x5
+    promql_expr_test:
+      - expr: ALERTS{alertname="CurieCloudWatchAlarmsUnread",alertstate="firing"}
+        eval_time: 15m
+        exp_samples:
+          - labels: ALERTS{alertname="CurieCloudWatchAlarmsUnread",alertstate="firing",severity="warning",component="cloudwatch"}
+            value: 1
+      - expr: ALERTS{alertname="CurieCloudWatchAlarmsUnread",alertstate="firing"}
+        eval_time: 16m
+        exp_samples: []
+
+  - name: short reader restart preserves alert then successful empty resolves
+    interval: 1m
+    input_series:
+      - series: curie_cloudwatch_alarm_poll_ok
+        values: 1x2 0x1 1x16
+      - series: curie_cloudwatch_alarm_in_alarm{alarm="example-alarm",description="Example alarm",state_transitioned_at="2026-10-07T11:59:00Z",pod="reader-old"}
+        values: 1x2 stale
+      - series: curie_cloudwatch_alarm_in_alarm{alarm="example-alarm",description="Example alarm",state_transitioned_at="2026-10-07T11:59:00Z",pod="reader-new"}
+        values: _x5 1x3 stale
+    promql_expr_test:
+      - expr: ALERTS{alertname="CurieCloudWatchAlarm",alertstate="firing"}
+        eval_time: 4m
+        exp_samples:
+          - labels: ALERTS{alertname="CurieCloudWatchAlarm",alertstate="firing",alarm="example-alarm",description="Example alarm",state_transitioned_at="2026-10-07T11:59:00Z",severity="page",component="cloudwatch"}
+            value: 1
+      - expr: ALERTS{alertname="CurieCloudWatchAlarm",alertstate="firing"}
+        eval_time: 6m
+        exp_samples:
+          - labels: ALERTS{alertname="CurieCloudWatchAlarm",alertstate="firing",alarm="example-alarm",description="Example alarm",state_transitioned_at="2026-10-07T11:59:00Z",severity="page",component="cloudwatch"}
+            value: 1
+      - expr: ALERTS{alertname="CurieCloudWatchAlarm",alertstate="firing"}
+        eval_time: 14m
+        exp_samples: []

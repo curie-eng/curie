@@ -35,6 +35,7 @@ _OVERRIDES: dict[str, tuple[str, str, object]] = {
     "CURIE_API_URL": ("api_base_url", "http://sentinel-api:9000", "http://sentinel-api:9000"),
     "CURIE_CHANNEL_TOKEN": ("channel_token", "chn-sentinel", "chn-sentinel"),
     "CURIE_EGRESS_SECRET": ("egress_secret", "egress-sentinel", "egress-sentinel"),
+    "CURIE_ADAPTER_PRINCIPAL": ("adapter_principal", "adp-sentinel", "adp-sentinel"),
     "ADAPTER_INGRESS_ENABLED": ("ingress_enabled", "false", False),
     "CURIE_MAIL_POLL_INTERVAL_SECONDS": ("poll_interval_seconds", "12.5", 12.5),
     "CURIE_MAIL_INGRESS_ATTEMPTS": ("ingress_attempts", "7", 7),
@@ -49,6 +50,7 @@ _OVERRIDES: dict[str, tuple[str, str, object]] = {
     "CURIE_MAIL_MAX_BODY_BYTES": ("max_body_bytes", "4096", 4096),
     "CURIE_MAIL_MAX_REPLY_BYTES": ("max_reply_bytes", "8192", 8192),
     "CURIE_MAIL_MAX_STATE_BYTES": ("max_state_bytes", "1048576", 1048576),
+    "CURIE_MAIL_ALLOW_ALL_SENDERS": ("allow_all_senders", "true", True),
     "CURIE_MAIL_ALLOWED_SENDERS": (
         "allowed_senders",
         "alice@example.com,example.org",
@@ -63,6 +65,7 @@ _DEFAULTS: dict[str, object] = {
     "api_base_url": "http://localhost:8000",
     "channel_token": "",
     "egress_secret": "",
+    "adapter_principal": "",
     "ingress_enabled": True,
     "poll_interval_seconds": 5.0,
     "ingress_attempts": 3,
@@ -74,6 +77,7 @@ _DEFAULTS: dict[str, object] = {
     "max_reply_bytes": 1048576,
     "max_state_bytes": 268435456,
     "allowed_senders": (),
+    "allow_all_senders": False,
     "agentmail_egress_cidrs": (),
     "discovery_unready_after_seconds": 120.0,
 }

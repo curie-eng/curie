@@ -1,4 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
+import { SESSION_SUBJECT, stubConsoleSession } from "./support/consoleSession";
 
 // Wired Approvals (#867) in the stackless suite: the app is served with the
 // approvals API stubbed with real-shaped responses via route interception, so
@@ -30,39 +31,14 @@ function approval(overrides: Record<string, unknown> = {}) {
   };
 }
 
-// Stub the approvals list and the same-origin console session. The audit
-// endpoint (more specific path) is stubbed first so the list matcher does not
-// swallow it. A session becomes authenticated only through POST /console/session
-// in the login-code test, matching the browser's actual contract.
-async function stubApprovals(page: Page, rows: object[], initialSubject: string | null = "U0AUTHENTICATED") {
-  let sessionSubject = initialSubject;
+// Stub the approvals list behind an authenticated console session (the global
+// login gate owns sign-in since #1047; console-login.spec.ts covers it). The
+// audit endpoint (more specific path) is stubbed first so the list matcher does
+// not swallow it.
+async function stubApprovals(page: Page, rows: object[]) {
+  await stubConsoleSession(page);
   await page.route("**/api/approvals/*/audit*", (route) =>
     route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([]) }),
-  );
-  await page.route(
-    (url) => url.pathname.endsWith("/api/console/session"),
-    (route) => {
-      if (route.request().method() === "POST") {
-        sessionSubject = "U0EXCHANGED";
-        return route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          body: JSON.stringify({ subject: sessionSubject, expires_at: "2026-07-24T12:00:00+00:00" }),
-        });
-      }
-      if (sessionSubject === null) {
-        return route.fulfill({
-          status: 401,
-          contentType: "application/json",
-          body: JSON.stringify({ detail: "missing, invalid, or expired console session" }),
-        });
-      }
-      return route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({ subject: sessionSubject, expires_at: "2026-07-24T12:00:00+00:00" }),
-      });
-    },
   );
   await page.route(
     (url) => url.pathname.endsWith("/api/approvals"),
@@ -90,32 +66,19 @@ test("lists pending approvals and opens the detail with its audit trail", async 
   await expect(detail).not.toContainText("issue_refund");
 });
 
-test("exchanges a login code before showing the immutable console principal", async ({ page }) => {
-  await stubApprovals(page, [], null);
+test("shows the immutable session principal from the global console session", async ({ page }) => {
+  await stubApprovals(page, []);
   await openApprovalsTab(page);
 
-  await expect(page.getByLabel("login code")).toBeVisible();
-  await page.getByLabel("login code").fill("one-time-example-code");
-  await page.getByTestId("approval-login-submit").click();
-  await expect(page.getByTestId("approval-principal")).toContainText("U0EXCHANGED");
+  await expect(page.getByTestId("approval-principal")).toContainText(SESSION_SUBJECT);
+  // The view no longer owns a sign-in path or an asserted resolver identity.
+  await expect(page.getByLabel("login code")).toHaveCount(0);
   await expect(page.getByLabel("resolved by")).toHaveCount(0);
   await expect(page.getByLabel("actor channel")).toHaveCount(0);
 });
 
-test("resolves with the same-origin console cookie and exactly decision/note, never the platform key", async ({ page }, testInfo) => {
+test("resolves with exactly decision/note and never the platform key", async ({ page }) => {
   await stubApprovals(page, [approval()]);
-
-  // Chromium rejects a __Host- cookie on this stackless HTTP preview
-  // (addCookies accepts it only for an https URL). The API tests own that
-  // name. Here the browser only has to attach the console cookie and omit
-  // the platform key; the stubbed API never reads the cookie.
-  await page.context().addCookies([
-    {
-      name: "curie_console_session",
-      value: "session-example",
-      url: String(testInfo.project.use.baseURL),
-    },
-  ]);
 
   let resolveBody: Record<string, unknown> | null = null;
   let resolveHeaders: Record<string, string> | null = null;
@@ -125,7 +88,7 @@ test("resolves with the same-origin console cookie and exactly decision/note, ne
     return route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify(approval({ status: "approved", resolved_by: "U0AUTHENTICATED" })),
+      body: JSON.stringify(approval({ status: "approved", resolved_by: SESSION_SUBJECT })),
     });
   });
 
@@ -136,7 +99,6 @@ test("resolves with the same-origin console cookie and exactly decision/note, ne
 
   await expect.poll(() => resolveBody).toEqual({ decision: "approved", note: "Confirmed in console" });
   await expect.poll(() => resolveHeaders).not.toBeNull();
-  expect(resolveHeaders?.cookie).toContain("curie_console_session=session-example");
   expect(resolveHeaders?.["x-api-key"]).toBeUndefined();
 });
 

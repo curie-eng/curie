@@ -11,6 +11,7 @@ the k8scratch e2e test.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from datetime import UTC, datetime
@@ -19,15 +20,30 @@ from typing import Any
 from aci_protocol import BootEnv
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
+from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
 from ..attachments import ATTACHMENTS_REF_ENV
-from ..workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
+from ..workspace import (
+    REPO_ORIGIN_ENV,
+    REPO_PATH_ENV,
+    WORKSPACE_REF_ENV,
+    WORKSPACE_SHA256_ENV,
+)
+from .claim_tokens import (
+    CLAIM_LABEL,
+    ClaimObjectNames,
+    claim_object_names,
+    claim_template_spec,
+    executor_withheld_names,
+    split_claim_tokens,
+)
 from .quota import quota_has_live_headroom, quota_rejection_is_valid
 from .resources import prepare_resources_claim
 from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     ClaimView,
+    KubeTransientError,
     OperatingMode,
     QuotaRejection,
     SandboxTermination,
@@ -35,10 +51,15 @@ from .types import (
     filter_agent_child_env,
 )
 
+logger = logging.getLogger(__name__)
+
 CORE_GROUP = "agents.x-k8s.io"
 CORE_VERSION = "v1beta1"
 EXT_GROUP = "extensions.agents.x-k8s.io"
 EXT_VERSION = "v1beta1"
+
+# Apiserver statuses a read may recover from on the next poll.
+_TRANSIENT_STATUSES = frozenset({500, 502, 503, 504})
 
 # Per-claim env with no containerName reaches only the FIRST main container (the
 # agent-sandbox Overrides policy). The bundle ref must additionally reach the
@@ -53,6 +74,10 @@ EXT_VERSION = "v1beta1"
 BUNDLE_REF_ENV = BootEnv.env_key("bundle_ref")
 BUNDLE_INIT_CONTAINERS = ("bundle-fetch", "bundle-extract")
 WORKSPACE_INIT_CONTAINERS = ("workspace-init",)
+# The claim env each workspace init container receives by name. The origin and
+# path are the trusted checkout origin (ADR 0197); the worker sets them from
+# the API's credential, never from turn text.
+WORKSPACE_INIT_ENV = (WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV, REPO_ORIGIN_ENV, REPO_PATH_ENV)
 # The attachment lane's own init container (#2567): it redeems the minted
 # one-object capabilities and materializes the files into the emptyDir the
 # runner mounts. Named here for the same reason the two above are -- the
@@ -83,6 +108,12 @@ CREDENTIALS_ENV = BootEnv.env_key("credentials_ref")
 # a local literal that drifted on a rename would stop matching the marker the
 # binding writes, and every connector secret would be persisted as plaintext.
 CONNECTOR_SECRET_KEYS_ENV = BootEnv.env_key("connector_secret_keys")
+
+# Transport bound on every call a token-bearing create_claim makes. The per-claim
+# template is a reaper candidate once it outlives the grace and has no claim, so
+# the four calls from template create to claim create must sum (20 s) to well
+# under REAP_GRACE_MARGIN_SECONDS (30 s); a stalled call fails the claim instead.
+_CLAIM_PREPARATION_TIMEOUT_S = 5.0
 
 
 def _conditions_ready(status: dict[str, Any]) -> bool:
@@ -209,7 +240,22 @@ def _claim_view(obj: dict[str, Any]) -> ClaimView:
         quota_rejection=_quota_rejection(status),
         ready_reason=ready_reason,
         ready_message=ready_message,
+        bundle_ref=_claim_bundle_ref(obj),
     )
+
+
+def _claim_bundle_ref(obj: dict[str, Any]) -> str | None:
+    """The runner's ``CURIE_BUNDLE_REF`` from the claim spec env, or None."""
+
+    for entry in (obj.get("spec") or {}).get("env") or []:
+        if (
+            isinstance(entry, dict)
+            and entry.get("name") == BUNDLE_REF_ENV
+            and not entry.get("containerName")
+            and isinstance(entry.get("value"), str)
+        ):
+            return str(entry["value"])
+    return None
 
 
 def _sandbox_view(obj: dict[str, Any]) -> SandboxView:
@@ -258,6 +304,10 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
     if phase == "Failed" and reason == "Evicted":
         return SandboxTermination("Evicted", _safe_pod_message(getattr(status, "message", None)))
 
+    # A graceful delete surfaces as a generic Error or Completed runner exit.
+    # On a deleting pod only OOMKilled outranks the deletion itself.
+    deleting = getattr(getattr(pod, "metadata", None), "deletion_timestamp", None) is not None
+    deleted_detail: str | None = None
     for container in getattr(status, "container_statuses", None) or []:
         if getattr(container, "name", None) != "runner":
             continue
@@ -266,6 +316,9 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
             continue
         exit_code = getattr(terminated, "exit_code", None)
         detail = f"exit code {exit_code}" if isinstance(exit_code, int) else None
+        if deleting and getattr(terminated, "reason", None) != "OOMKilled":
+            deleted_detail = detail
+            break
         return SandboxTermination(
             _safe_termination_reason(getattr(terminated, "reason", None)), detail
         )
@@ -284,6 +337,8 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
             detail = f"exit code {exit_code}" if isinstance(exit_code, int) else None
             return SandboxTermination("OOMKilled", detail)
 
+    if deleting:
+        return SandboxTermination("Deleted", deleted_detail)
     if phase in {"Failed", "Succeeded"}:
         return SandboxTermination(
             _safe_termination_reason(
@@ -325,6 +380,23 @@ def _event_termination(
             if match.reason == preferred:
                 return match
     return None
+
+
+def _extension_body(kind: str, metadata: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
+    """A full extensions-group object body of ``kind``."""
+
+    return {
+        "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
+        "kind": kind,
+        "metadata": metadata,
+        "spec": spec,
+    }
+
+
+def _owner_ref(api_version: str, kind: str, name: str, uid: str) -> dict[str, str]:
+    """An ownerReference with no ``controller`` or ``blockOwnerDeletion``."""
+
+    return {"apiVersion": api_version, "kind": kind, "name": name, "uid": uid}
 
 
 class KubernetesSandboxClient:
@@ -398,12 +470,7 @@ class KubernetesSandboxClient:
         return owned_pool
 
     def _put_extension(self, plural: str, name: str, kind: str, spec: dict[str, Any]) -> None:
-        body = {
-            "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
-            "kind": kind,
-            "metadata": {"name": name},
-            "spec": spec,
-        }
+        body = _extension_body(kind, {"name": name}, spec)
         try:
             self._api.get_namespaced_custom_object(
                 EXT_GROUP, EXT_VERSION, self._namespace, plural, name
@@ -419,6 +486,145 @@ class KubernetesSandboxClient:
             EXT_GROUP, EXT_VERSION, self._namespace, plural, name, body
         )
 
+    def _claim_scoped_pool(
+        self,
+        claim: str,
+        pool: str,
+        tokens: dict[str, str],
+        runner_resources: dict[str, Any] | None,
+        executor_secret_names: frozenset[str] | None = None,
+        executor_withheld: frozenset[str] = frozenset(),
+    ) -> ClaimObjectNames:
+        """Write the per-claim template, token Secret and pool; return their names.
+
+        The source template is the one ``pool``'s ``sandboxTemplateRef`` names,
+        so per-agent connector ``secretKeyRef`` entries (#1488) survive the copy.
+        Every refusal (name too long, missing pool or template, no runner
+        container, invalid resources) is raised before the first write. The
+        Secret and pool are owned by the template, so deleting the template on
+        a later failure removes all three.
+        """
+
+        names = claim_object_names(claim)
+        source_name = self._pool_template_name(pool)
+        source_spec = self._source_template_spec(
+            source_name, request_timeout_seconds=_CLAIM_PREPARATION_TIMEOUT_S
+        )
+        spec = claim_template_spec(
+            source_spec,
+            secret_name=names.secret,
+            token_names=sorted(tokens),
+            runner_resources=runner_resources,
+            claim=claim,
+            executor_secret_names=executor_secret_names,
+            executor_withheld=executor_withheld,
+        )
+        labels = {MANAGED_BY_LABEL: MANAGED_BY_VALUE, CLAIM_LABEL: claim}
+        created = self._api.create_namespaced_custom_object(
+            EXT_GROUP,
+            EXT_VERSION,
+            self._namespace,
+            "sandboxtemplates",
+            _extension_body("SandboxTemplate", {"name": names.template, "labels": labels}, spec),
+            _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
+        )
+        try:
+            # No controller or blockOwnerDeletion: either would need
+            # ``finalizers`` RBAC the worker is not granted.
+            owner = _owner_ref(
+                f"{EXT_GROUP}/{EXT_VERSION}",
+                "SandboxTemplate",
+                names.template,
+                created["metadata"]["uid"],
+            )
+            metadata = {"name": names.secret, "labels": labels, "ownerReferences": [owner]}
+            # Token values are never logged; ``stringData`` is the only place
+            # they are written.
+            self._core_api.create_namespaced_secret(
+                self._namespace,
+                {
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "type": "Opaque",
+                    "metadata": metadata,
+                    "stringData": dict(tokens),
+                },
+                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
+            )
+            self._api.create_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxwarmpools",
+                _extension_body(
+                    "SandboxWarmPool",
+                    {**metadata, "name": names.pool},
+                    {"replicas": 0, "sandboxTemplateRef": {"name": names.template}},
+                ),
+                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
+            )
+        except Exception:
+            self._rollback_delete("sandboxtemplates", names.template)
+            raise
+        return names
+
+    def _pool_template_name(self, pool: str) -> str:
+        """The template ``pool``'s ``sandboxTemplateRef`` names; a missing pool refuses."""
+
+        obj = self._get(
+            EXT_GROUP,
+            EXT_VERSION,
+            "sandboxwarmpools",
+            pool,
+            request_timeout_seconds=_CLAIM_PREPARATION_TIMEOUT_S,
+        )
+        if obj is None:
+            raise ValueError(f"source pool {pool} is missing")
+        ref = (obj.get("spec") or {}).get("sandboxTemplateRef") or {}
+        name = ref.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"source pool {pool} names no sandboxTemplateRef")
+        return name
+
+    def _source_template_spec(self, name: str, *, request_timeout_seconds: float) -> dict[str, Any]:
+        """The spec of source template ``name``; a missing template refuses."""
+
+        obj = self._get(
+            EXT_GROUP,
+            EXT_VERSION,
+            "sandboxtemplates",
+            name,
+            request_timeout_seconds=request_timeout_seconds,
+        )
+        if obj is None:
+            raise ValueError(f"source template {name} is missing")
+        spec: dict[str, Any] = obj.get("spec") or {}
+        return spec
+
+    def _rollback_delete(self, plural: str, name: str) -> None:
+        """Delete one object a failed claim created; never mask the original error.
+
+        A failed delete is logged by exception class only and left to the
+        reaper's per-claim template sweep.
+        """
+
+        try:
+            self._api.delete_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                plural,
+                name,
+                propagation_policy="Background",
+                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 - a rollback delete is best effort
+            if isinstance(exc, k8s_client.ApiException) and exc.status == 404:
+                return
+            logger.warning(
+                "rollback delete of %s %s failed (%s)", plural, name, type(exc).__name__
+            )
+
     # -- SandboxClaim (extensions group) ------------------------------------
 
     def create_claim(
@@ -430,10 +636,33 @@ class KubernetesSandboxClient:
         labels: dict[str, str] | None = None,
         runner_resources: dict[str, Any] | None = None,
         agent_name: str | None = None,
+        executor_secret_names: frozenset[str] | None = None,
     ) -> None:
-        if runner_resources is not None:
-            pool = self._resources_pool(pool, agent_name, runner_resources)
         env = filter_agent_child_env(env)
+        executor = executor_secret_names is not None
+        withheld: frozenset[str] = frozenset()
+        if executor:
+            # @spec ACTION-EXECUTOR-5: no model credential, its env-key
+            # declaration, or a name that declaration points at reaches an
+            # executor runner, by claim or template.
+            withheld = executor_withheld_names(env)
+            env = {k: v for k, v in env.items() if k not in withheld}
+        # Scoped tokens never ride the value-only claim (#3842): they go to a
+        # per-claim Secret read by a per-claim template copy, which also
+        # carries any runner resources override. A token-free claim keeps the
+        # chart pool or the per-agent resources pool. An executor claim always
+        # takes the per-claim path: claim env cannot remove what the pool
+        # template carries, so only its own stripped copy can (ACTION-EXECUTOR-5).
+        tokens, env = split_claim_tokens(env)
+        claim_template: str | None = None
+        if tokens or executor:
+            claim_names = self._claim_scoped_pool(
+                name, pool, tokens, runner_resources, executor_secret_names, withheld
+            )
+            pool = claim_names.pool
+            claim_template = claim_names.template
+        elif runner_resources is not None:
+            pool = self._resources_pool(pool, agent_name, runner_resources)
         body: dict[str, Any] = {
             "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
             "kind": "SandboxClaim",
@@ -450,7 +679,9 @@ class KubernetesSandboxClient:
             # claim: the credential reaches the runner via the template's
             # secretKeyRef, and connector secrets are delivered the same way via
             # the per-agent template (#1488). The marker var naming the
-            # connector-secret keys is stripped too.
+            # connector-secret keys is stripped too. Scoped tokens were already
+            # split off above and reach the runner through the per-claim
+            # Secret (#3842).
             marker = env.get(CONNECTOR_SECRET_KEYS_ENV, "")
             stripped = {
                 CREDENTIALS_ENV,
@@ -476,27 +707,18 @@ class KubernetesSandboxClient:
                         }
                     )
             # Workspace fetch/extract consumes only the short-lived exact-object
-            # reference and digest. It receives no worker-auth, object-store, or
-            # GitHub credential.
+            # reference and digest, plus the trusted origin and repository path
+            # it checks the checkout against (ADR 0197). It receives no
+            # worker-auth, object-store, or code host credential.
             workspace_ref = env.get(WORKSPACE_REF_ENV)
-            workspace_sha256 = env.get(WORKSPACE_SHA256_ENV)
             if workspace_ref is not None:
                 for container in WORKSPACE_INIT_CONTAINERS:
-                    entries.append(
-                        {
-                            "containerName": container,
-                            "name": WORKSPACE_REF_ENV,
-                            "value": workspace_ref,
-                        }
-                    )
-                    if workspace_sha256 is not None:
-                        entries.append(
-                            {
-                                "containerName": container,
-                                "name": WORKSPACE_SHA256_ENV,
-                                "value": workspace_sha256,
-                            }
-                        )
+                    for key in WORKSPACE_INIT_ENV:
+                        value = env.get(key)
+                        if value is not None:
+                            entries.append(
+                                {"containerName": container, "name": key, "value": value}
+                            )
             # The attachment capability reaches ONLY its own init container. An
             # unnamed entry would also hand the presigned URL to the model's own
             # process -- a capability the agent has no need for and, being a
@@ -512,13 +734,45 @@ class KubernetesSandboxClient:
                         }
                     )
             body["spec"]["env"] = entries
-        self._api.create_namespaced_custom_object(
-            EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims", body
-        )
+        if claim_template is None:
+            self._api.create_namespaced_custom_object(
+                EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims", body
+            )
+            return
+        claim_created = False
+        try:
+            created = self._api.create_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxclaims",
+                body,
+                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
+            )
+            claim_created = True
+            # Hand the template (and through it the Secret and pool) to the
+            # claim, so garbage collection removes all three when the claim
+            # goes by any path. Until this lands only the reaper's template
+            # sweep covers them.
+            owner = _owner_ref(
+                f"{EXT_GROUP}/{EXT_VERSION}", "SandboxClaim", name, created["metadata"]["uid"]
+            )
+            self._api.patch_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxtemplates",
+                claim_template,
+                {"metadata": {"ownerReferences": [owner]}},
+                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
+            )
+        except Exception:
+            if claim_created:
+                self._rollback_delete("sandboxclaims", name)
+            self._rollback_delete("sandboxtemplates", claim_template)
+            raise
 
-    def get_claim(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> ClaimView | None:
+    def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
         obj = self._get(
             EXT_GROUP,
             EXT_VERSION,
@@ -552,6 +806,67 @@ class KubernetesSandboxClient:
         )
         return [_claim_view(item) for item in result.get("items", [])]
 
+    def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
+        """Delete per-claim templates whose claim is gone; return their names.
+
+        Only templates this substrate labelled for a claim are candidates, never
+        the chart's. A template whose claim is in ``keep``, that is not older
+        than ``created_before``, or whose age is unreadable is spared, the same
+        fail-safe direction as claim reaping. Deleting one removes its token
+        Secret and pool by ownerReference; a 404 means garbage collection got
+        there first and counts as deleted.
+        """
+
+        result = self._api.list_namespaced_custom_object(
+            EXT_GROUP,
+            EXT_VERSION,
+            self._namespace,
+            "sandboxtemplates",
+            label_selector=f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE},{CLAIM_LABEL}",
+        )
+        deleted: list[str] = []
+        for item in result.get("items", []):
+            metadata = item.get("metadata") or {}
+            name = metadata.get("name")
+            claim = (metadata.get("labels") or {}).get(CLAIM_LABEL)
+            created_at = _parse_timestamp(metadata.get("creationTimestamp"))
+            if (
+                not name
+                or not claim
+                or claim in keep
+                or created_at is None
+                or created_at >= created_before
+            ):
+                continue
+            # The claim inventory behind ``keep`` predates this sweep, so a
+            # create_claim that finished since then has a live claim missing
+            # from it. Re-read that one claim; only a 404 proves it is gone.
+            try:
+                live = self.get_claim(claim, request_timeout_seconds=_CLAIM_PREPARATION_TIMEOUT_S)
+            except Exception as exc:  # noqa: BLE001 - an unreadable claim is spared
+                logger.warning(
+                    "claim recheck for template %s failed (%s); sparing it",
+                    name,
+                    type(exc).__name__,
+                )
+                continue
+            if live is not None:
+                continue
+            try:
+                self._api.delete_namespaced_custom_object(
+                    EXT_GROUP,
+                    EXT_VERSION,
+                    self._namespace,
+                    "sandboxtemplates",
+                    name,
+                    propagation_policy="Background",
+                )
+            except k8s_client.ApiException as exc:
+                if exc.status != 404:
+                    raise
+            deleted.append(name)
+        return deleted
+
     # -- Sandbox (core group) ------------------------------------------------
 
     def warm_pool_exists(self, name: str) -> bool:
@@ -576,9 +891,7 @@ class KubernetesSandboxClient:
             raise
         return True
 
-    def get_sandbox(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> SandboxView | None:
+    def get_sandbox(self, name: str, *, request_timeout_seconds: float) -> SandboxView | None:
         obj = self._get(
             CORE_GROUP,
             CORE_VERSION,
@@ -620,9 +933,7 @@ class KubernetesSandboxClient:
             status_used=getattr(status, "used", None),
         )
 
-    def pod_unschedulable(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> str | None:
+    def pod_unschedulable(self, name: str, *, request_timeout_seconds: float) -> str | None:
         try:
             pod = self._core_api.read_namespaced_pod(
                 name,
@@ -642,6 +953,46 @@ class KubernetesSandboxClient:
                 return message if isinstance(message, str) and message else "Unschedulable"
         return None
 
+    def pod_log_tail(self, name: str, *, request_timeout_seconds: float) -> str | None:
+        """Read the runner's last 8 KB, preferring its terminated instance."""
+
+        deadline = time.monotonic() + request_timeout_seconds
+        for previous in (True, False):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            response: Any = None
+            try:
+                response = self._core_api.read_namespaced_pod_log(
+                    name,
+                    self._namespace,
+                    container="runner",
+                    previous=previous,
+                    tail_lines=200,
+                    limit_bytes=8192,
+                    _preload_content=False,
+                    _request_timeout=remaining,
+                )
+                data = getattr(response, "data", response)
+                if isinstance(data, bytes):
+                    return data.decode("utf-8", errors="replace")
+                return str(data)
+            except k8s_client.ApiException as exc:
+                if previous and exc.status == 400:
+                    continue
+                return None
+            except Exception:  # noqa: BLE001 - diagnosis is best effort
+                return None
+            finally:
+                for method_name in ("close", "release_conn"):
+                    try:
+                        method = getattr(response, method_name, None)
+                        if callable(method):
+                            method()
+                    except Exception:  # noqa: BLE001 - response cleanup is best effort
+                        pass
+        return None
+
     def pod_termination(
         self, name: str, *, since: datetime, request_timeout_seconds: float
     ) -> SandboxTermination | None:
@@ -649,14 +1000,26 @@ class KubernetesSandboxClient:
 
         deadline = time.monotonic() + request_timeout_seconds
         pod: Any = None
+        # A 404 is positive evidence the pod was deleted: the stream was
+        # established against it. A 403 or a timeout proves nothing.
+        pod_missing = False
         try:
             pod = self._core_api.read_namespaced_pod(
                 name,
                 self._namespace,
                 _request_timeout=max(0.001, deadline - time.monotonic()),
             )
+        except k8s_client.ApiException as exc:
+            pod_missing = exc.status == 404
         except Exception:  # noqa: BLE001 - diagnosis is best effort
             pass
+        # since is taken after the original pod was serving, and creation
+        # timestamps truncate to the second, so a pod created at or after it is
+        # a controller replacement. Its status and events describe another pod.
+        if pod is not None and _recent(
+            getattr(getattr(pod, "metadata", None), "creation_timestamp", None), since=since
+        ):
+            return SandboxTermination("Deleted", "replaced by a new pod with the same name")
         status_termination = _pod_termination(pod, since=since) if pod is not None else None
         pod_uid = getattr(getattr(pod, "metadata", None), "uid", None)
         event_termination: SandboxTermination | None = None
@@ -680,11 +1043,11 @@ class KubernetesSandboxClient:
         }:
             return status_termination
         if event_termination is not None and (
-            event_termination.reason == "Evicted"
-            or pod is None
-            or status_termination is not None
+            event_termination.reason == "Evicted" or pod is None or status_termination is not None
         ):
             return event_termination
+        if pod_missing:
+            return SandboxTermination("Deleted")
         return status_termination
 
     def set_sandbox_mode(self, name: str, mode: OperatingMode) -> None:
@@ -720,5 +1083,13 @@ class KubernetesSandboxClient:
         except k8s_client.ApiException as exc:
             if exc.status == 404:
                 return None
+            if exc.status in _TRANSIENT_STATUSES:
+                raise KubeTransientError(f"kube API {exc.status} reading {plural}/{name}") from exc
             raise
+        except Urllib3HTTPError as exc:
+            # With retries=0 a read timeout or dropped connection surfaces as a
+            # raw urllib3 error; typed here so it is a SandboxError (#4181).
+            raise KubeTransientError(
+                f"kube API transport error reading {plural}/{name}: {type(exc).__name__}"
+            ) from exc
         return dict(obj)

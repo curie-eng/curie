@@ -1,7 +1,7 @@
 ---
 seam: Channel interaction message
 kind: CLEAN
-impls: 2 renderers (Slack, terminal)
+impls: 4 renderers (Slack, terminal, mail, Discord)
 grade: not separately graded
 epics:
   - "ADR-0020"
@@ -13,7 +13,7 @@ order: 5
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 2 renderers (Slack, terminal) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 4 renderers (Slack, terminal, mail, Discord) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -120,7 +120,7 @@ during migration but is not valid v1 authoring.
 - Render `text` even when no optional capability is supported.
 - Advertise capabilities; never infer them from the channel name. (ADR-0020's
   intent. `ChannelCapabilities` is modeled but has no producer or consumer today,
-  so both shipped adapters decide statically; see Known leakage.)
+  so the shipped adapters decide statically; see Known leakage.)
 - Render choices and confirmations using native affordances when the channel has
   them and as numbered text otherwise.
 - Preserve action values exactly when converting a selection into inbound text.
@@ -152,7 +152,7 @@ returns a new interaction.
 
 ## Implementations today
 
-Two renderers consume the same `OutboundMessage`, and neither leaks its widgets
+Four renderers consume the same `OutboundMessage`, and none leaks its widgets
 back into the contract:
 
 1. **Slack (Block Kit)** — `apps/worker/src/curie_worker/blocks.py`. The worker
@@ -201,8 +201,22 @@ back into the contract:
    (`REPLY_FENCE`) into a `TerminalMessage` of plain lines plus actions, which the
    TUI renders as a numbered selector per the TUI behavior above. It expresses
    `allow_free_text` as a typed reply alongside the numbered actions.
+3. **Mail**: `apps/mail-adapter/src/curie_mail_adapter/egress.py`. A `ReplyPost`
+   whose interaction is a `ConfirmIntent` becomes an approval-card email through
+   `apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.record_approval_card`,
+   carrying APPROVE or REJECT reply instructions (ADR-0177). The reply interpreter is
+   implemented, but the current AgentMail inbound gate refuses every message before
+   reaching it because sender authentication cannot be verified
+   (`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.handle_inbound`). Other
+   posts and updates are recorded as the turn's one reply text. A settling
+   `reply.update` closes the card through
+   `apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.settle_approval_card`.
+4. **Discord**: `adapters/discord/src/curie_discord_adapter/egress.py`. It renders
+   the message text and progress as plain text posts and edits, and appends the
+   settled decision to the text of a settling update. It builds no component
+   widgets for an interaction.
 
-The two renderers honor `allow_free_text` on different subsets. The terminal one
+The Slack and terminal renderers honor `allow_free_text` on different subsets. The terminal one
 carries it through for both intents
 (`cli/src/channel.rs`, consumed by `cli/src/interactive.rs`). The Slack one reads
 it on exactly one path, the kernel-emitted `confirm` that becomes the approval
@@ -216,23 +230,33 @@ The split is the point: Block Kit lives only in the two Slack-side modules named
 above (`blocks.py` and `approval_actions.py`), the numbered selector only in
 `channel.rs`, and the agent authors none of them.
 
-Neither renderer consumes progress yet. The progress models, their JSON Schema
-and the reply-wire corpus exist, and no code produces or renders a
-`ProgressCard` or `ProgressMilestone`.
+The Slack and Discord renderers consume progress; the terminal and mail ones do not. A card and a
+milestone become Block Kit in
+`apps/worker/src/curie_worker/blocks.py::progress_card` and
+`apps/worker/src/curie_worker/blocks.py::progress_milestone`, every text element
+`plain_text` so a model-authored summary cannot mention anyone, and
+`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.emit` routes a
+progress body to them before any answer or approval path. The channel-neutral
+text for a channel with nothing richer is
+`packages/channel-protocol/src/channel_protocol/progress.py::progress_text`, which the Discord adapter posts and edits as plain text. The mail adapter drops a progress-bearing post or update silently, because one message per turn has no card to edit. Nothing produces a progress body yet: the worker's coordinator stores what it
+owes, and no deliverer calls an adapter with it.
 
 ## Known leakage
 
-- **The terminal renderer is a hand-written mirror, not generated.** The source of
+1. **The terminal renderer is a hand-written mirror, not generated.** The source of
   truth is the Pydantic model in
   `packages/channel-protocol/src/channel_protocol/models.py` with a committed JSON
   Schema (`packages/channel-protocol/schema/channel-protocol.schema.json`), but
   `channel-protocol` ships **no Rust binding**. `cli/src/channel.rs` re-declares the
-  wire shape by hand (`#[serde(deny_unknown_fields)]` on each struct). Nothing gates
-  that mirror against the schema the way ADR-0017 gates the ACI's tri-language
-  contract, so a field added in Python is not mechanically caught here — and
-  `deny_unknown_fields` means the mirror *rejects* the new field rather than
-  ignoring it. This is the seam's real drift risk, and it is why "2 renderers" does
-  not imply "2 generated adapters".
+  wire shape by hand (`#[serde(deny_unknown_fields)]` on each struct). Both the Rust
+  renderer's `matches_the_shared_schema_corpus` and the Python model tests in
+  `packages/channel-protocol/tests/test_corpus.py` consume
+  `packages/channel-protocol/schema/channel-protocol.corpus.json`. This gates the
+  represented field bounds and explicit `allow_free_text` values, but omits the
+  defaults for an absent `allow_free_text` and does not regenerate the Rust model
+  from the schema. A Python field added without extending the corpus can therefore
+  escape that gate; `deny_unknown_fields` makes the mirror reject it. The handwritten
+  model still carries drift risk, and four renderers do not imply four generated adapters.
 - **Capability negotiation is modeled but unwired.**
   `packages/channel-protocol/src/channel_protocol/models.py::ChannelCapability`
   and
@@ -256,18 +280,31 @@ and the reply-wire corpus exist, and no code produces or renders a
   does hide its compose option. But the field is dropped at the projection rather
   than deliberately declined, so the asymmetry is invisible in the code, and the
   next Slack-side interaction that wants it will find nothing to read.
-- **Progress is modeled but unwired.** No `curie_progress` tool or progress
-  ingress exists, so no model's `ProgressCommand` reaches the platform and
-  nothing resolves a command to its turn's record. The worker coordinator's
-  durable store exists
-  (`apps/worker/src/curie_worker/progress.py::ProgressStore`): it applies the
-  idempotency, ordering, terminal, milestone-budget and delivery-identity rules
-  ADR-0130 places on the coordinator, and keeps the delivery outbox, but no
-  surface reaches it and nothing delivers from it. Its rules are in the
-  worker's [README](../../../apps/worker/README.md#deliberate-progress-adr-0130).
+- **Progress is accepted but not rendered.** The `curie_progress` operation is
+  the runner's platform `progress` tool (`mcp__curie__progress`), and a
+  person's Slack turn carries a per-turn capability for it. The tool posts each
+  `ProgressCommand` to the API's scoped ingress
+  (`apps/api/src/curie_api/routers/turn_progress.py::accept_turn_progress`),
+  which resolves it to the turn chain's record by the token's subject and
+  appends it to that chain's inbox, and a per-turn pump in the kernel applies
+  it to the worker coordinator's durable store
+  (`apps/worker/src/curie_worker/progress.py::ProgressStore`). The store
+  applies the idempotency, ordering, terminal, milestone-budget and
+  delivery-identity rules ADR-0130 places on the coordinator, but with
+  rendering off nothing delivers from it. Its rules are in the worker's
+  [README](../../../apps/worker/README.md#deliberate-progress-adr-0130).
   What the models realize on the wire is the closed shape: a command that names
   a routing, credential, delivery or budget field is refused at validation. The
   terminal mirror in `cli/src/channel.rs` does not model progress either.
+- **The mail renderer keys an approval card on a display label.**
+  `apps/mail-adapter/src/curie_mail_adapter/egress.py::EgressHandler` collects the
+  approver addresses by comparing each `MessageField.label` with
+  `APPROVER_FIELD_LABEL`, the string `"Approver"`. The constant is defined twice, in
+  `apps/worker/src/curie_worker/approvals.py` (the producer) and in
+  `apps/mail-adapter/src/curie_mail_adapter/adapter.py` (the reader), and nothing
+  gates the two against each other. Rewording the label on the worker side silently
+  leaves the email naming no approvers, because a field label is display text, not a
+  typed key. Only the platform decides who may answer; the label only words the email.
 - **The envelope is a text-channel workaround.** ACI has no native
   semantic-message event, so the message rides inside the runner's final text as a
   fenced block. Every adapter therefore carries fence-parsing and partial-envelope

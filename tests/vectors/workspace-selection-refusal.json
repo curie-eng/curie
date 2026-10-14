@@ -1,0 +1,13 @@
+{
+  "comment": "Structured selection refusals emitted by the API and rendered by the worker (#2684). The API test persists the selected repository and submits the conflicting repository through the real database route, then compares its response status and code. The worker test passes every status and code through WorkspaceCredentialClient.select and checks the resulting public detail while changing the API message prose.",
+  "vectors": [
+    {
+      "name": "selection_conflict",
+      "selected_repo_full_name": "acme-corp/acme-bot",
+      "requested_repo_full_name": "attacker/other-bot",
+      "status": 409,
+      "code": "workspace.selection_conflict",
+      "public_detail": "This thread is already bound to a different repository."
+    }
+  ]
+}

@@ -16,6 +16,15 @@ probe. It deploys only when the Slack identity `default` has both tokens
 entirely rather than crash-looping the reconnect supervisor, and
 NOTES.txt prints the `helm upgrade` command to connect Slack later.
 */}}
+{{- $threadedReserved := dict -}}
+{{- $threadedBotAllowlist := "" -}}
+{{- if $.Values.dispatcher.threadedBotAllowlist -}}
+{{- /* Validate typed entries before extraEnv rejects duplicate names, so a
+malformed allowlist still reports its invalid field first. */ -}}
+{{- $threadedBotAllowlist = include "curie.dispatcher.threadedBotAllowlist" $ -}}
+{{- $threadedReserved = dict "CURIE_SLACK_THREADED_BOT_ALLOWLIST" "dispatcher.threadedBotAllowlist" -}}
+{{- end -}}
+{{- $checksumExtraEnv := include "curie.extraEnv" (dict "root" . "workload" "dispatcher" "env" .Values.dispatcher.extraEnv "additionalReserved" (merge $threadedReserved (include "curie.slack.reservedEnv" (dict "root" . "workload" "dispatcher") | fromJson))) -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -42,9 +51,20 @@ spec:
         {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "dispatcher") | nindent 8 }}
-      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
+      {{- $placementAnnotations := include "curie.placement.annotations" (dict "root" $ "class" "platform") }}
+      {{- $secretChecksum := include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list "approvalChatAttesterSecret")
+        "refs" (list)
+        "env" (printf "%s\n%s\n%s\n%s\n%s" (include "curie.env.valkey" $) (include "curie.env.api" $) (include "curie.env.slack" (dict "root" $ "workload" "dispatcher")) (include "curie.env.otel" (dict "root" $ "extraEnv" $.Values.dispatcher.extraEnv)) $checksumExtraEnv)) }}
+      {{- if or $placementAnnotations $secretChecksum }}
       annotations:
+        {{- with $placementAnnotations }}
         {{- . | nindent 8 }}
+        {{- end }}
+        {{- with $secretChecksum }}
+        checksum/secret: {{ . }}
+        {{- end }}
       {{- end }}
     spec:
       {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}
@@ -87,7 +107,16 @@ spec:
             # app cannot drift.
             - name: CURIE_HEARTBEAT_FILE
               value: /tmp/curie-dispatcher.heartbeat
-            {{- $threadedReserved := dict -}}
+            # The test installation declaration (ADR 0202 decision 1), from the
+            # helpers api.yaml renders it with. The dispatcher refuses to boot
+            # on a published default secret while it is on, and its Slack
+            # preflight keeps each driver identity to its own agent.
+            - name: CURIE_TEST_INSTALLATION_ENABLED
+              value: {{ include "curie.testInstallation.enabled" . | quote }}
+            - name: CURIE_TEST_INSTALLATION_DRIVERS
+              value: {{ include "curie.testInstallation.drivers" . | quote }}
+            - name: CURIE_TEST_INSTALLATION_THREAD_TURN_LIMIT
+              value: {{ include "curie.testInstallation.threadTurnLimit" . | quote }}
             {{- if .Values.dispatcher.threadedBotAllowlist }}
             # First-class allowlist (#2437). Rendered ONLY when the typed value is
             # non-empty; the chart then owns the name for this render, so the
@@ -95,10 +124,9 @@ spec:
             # names it. An empty value renders nothing and reserves nothing, so a
             # pre-existing extraEnv entry keeps working unchanged.
             - name: CURIE_SLACK_THREADED_BOT_ALLOWLIST
-              value: {{ include "curie.dispatcher.threadedBotAllowlist" . | quote }}
-            {{- $threadedReserved = dict "CURIE_SLACK_THREADED_BOT_ALLOWLIST" "dispatcher.threadedBotAllowlist" -}}
+              value: {{ $threadedBotAllowlist | quote }}
             {{- end }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "dispatcher" "env" .Values.dispatcher.extraEnv "additionalReserved" (merge $threadedReserved (include "curie.slack.reservedEnv" (dict "root" . "workload" "dispatcher") | fromJson))) | nindent 12 }}
+            {{- $checksumExtraEnv | nindent 12 }}
           # No HTTP port on the dispatcher (Slack Socket Mode is outbound-only),
           # so an exec probe checks a heartbeat file a background daemon thread
           # touches each tick. The dispatcher blocks the main thread in

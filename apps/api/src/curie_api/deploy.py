@@ -16,10 +16,12 @@ import plugin_format
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from . import bundles, crud
+from curie_api.crud import versions as crud_versions
+from curie_api.schemas.versions import BundleOut
+
+from . import bundles
 from .config import Settings, get_settings
 from .models import AgentVersion
-from .schemas import BundleOut
 from .storage import ObjectStore
 
 
@@ -66,6 +68,21 @@ class BundleTooLarge(Exception):
             f"stored bundle for version {version_id} fails the current bundle "
             f"size/ratio limits and must be rebuilt and re-uploaded: {exc}"
         )
+
+
+class SealingKeyCustody(Exception):
+    """A stored bundle declares a reserved sealing key in a form other than a SecretRef.
+
+    @spec ACTION-EXECUTOR-16. Intake refuses these declarations, but a version
+    stored before it did can still be deployed, promoted or rolled back to,
+    and at the cluster tier the deploy path would then resolve a plain name
+    into the per-agent connector Secret. Raised by
+    ``check_stored_sealing_key_custody``; the message is the intake refusal's
+    own custody reason, and ``code`` is the intake issue's code, so a git push
+    rejection and a 422 detail say the same thing.
+    """
+
+    code = bundles.SEALING_KEY_CODE
 
 
 class ApprovalRoutesUnbound(Exception):
@@ -148,7 +165,7 @@ def _quoted(names: Iterable[str]) -> str:
     ``repr`` rather than bare text so a padded or oddly cased key is VISIBLE in
     the error: both runtime consumers of this map (``kernel.py``'s
     ``(approval_routes or {}).get(route_name)`` and
-    ``crud.get_approval_route_binding``) do an exact dict lookup, so `" ops "`
+    ``crud.approvals.get_approval_route_binding``) do an exact dict lookup, so `" ops "`
     binds nothing and the operator has to be able to see why.
     """
 
@@ -202,7 +219,7 @@ async def revalidate_stored_bundle(
     (unsafe entries, uncompressed-size and compression-ratio caps) via
     ``plugin_format.check_archive_bounds``, which extracts nothing -- cheap
     enough to run on every deploy/promote. Called before a version becomes
-    deployable (``crud.create_deployment_row``'s callers), so a legacy bundle
+    deployable (``crud.deployments.create_deployment_row``'s callers), so a legacy bundle
     that predates these caps, or was stored under looser ones, fails here with
     a clear ``BundleTooLarge`` instead of only surfacing once some sandbox
     substrate tries to fetch and extract it.
@@ -222,6 +239,46 @@ async def revalidate_stored_bundle(
         )
     except plugin_format.UnsupportedArchive as exc:
         raise BundleTooLarge.for_stored_bundle(version.id, exc) from exc
+
+
+def _stored_custody_reasons(data: bytes, settings: Settings) -> list[str]:
+    """Blocking half of ``check_stored_sealing_key_custody``; run in a threadpool."""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp)
+        bundles.extract_stored_bundle(
+            data,
+            dest,
+            max_uncompressed_bytes=settings.bundle_max_uncompressed_bytes,
+            max_compression_ratio=settings.bundle_max_compression_ratio,
+            max_members=settings.bundle_max_members,
+        )
+        issues = bundles.sealing_key_custody_issues(plugin_format.bundle_root(dest))
+        return [issue.message for issue in issues]
+
+
+async def check_stored_sealing_key_custody(
+    store: ObjectStore, version: AgentVersion, settings: Settings | None = None
+) -> None:
+    """Refuse a stored bundle that intake would now refuse for sealing key custody.
+
+    @spec ACTION-EXECUTOR-16: custody holds on every path that makes a version
+    the one that boots, not only on first upload. A no-op when the version
+    carries no bundle yet, like ``revalidate_stored_bundle``. Stored bytes the
+    current caps refuse report ``BundleTooLarge``, the settled answer for them
+    (ADR-0059 decision 3).
+    """
+
+    if version.bundle_ref is None:
+        return
+    settings = settings or get_settings()
+    data = await store.get(version.bundle_ref)
+    try:
+        reasons = await run_in_threadpool(_stored_custody_reasons, data, settings)
+    except plugin_format.UnsupportedArchive as exc:
+        raise BundleTooLarge.for_stored_bundle(version.id, exc) from exc
+    if reasons:
+        raise SealingKeyCustody("; ".join(reasons))
 
 
 def _declared_routes(data: bytes, settings: Settings) -> set[str] | None:
@@ -276,7 +333,7 @@ def _raise_if_routes_unbound(
     protects are exact dict lookups (see ``_quoted``). A ``declared`` of ``None``
     is the reader's poison value and refuses. A ``routes`` that is not a dict
     (a direct JSONB write) counts as no bindings, mirroring
-    ``crud.get_approval_route_binding``'s ``isinstance(..., dict)`` guard rather
+    ``crud.approvals.get_approval_route_binding``'s ``isinstance(..., dict)`` guard rather
     than raising. A bound route no bundle declares is never an error: the join is
     one directional, and pre-binding ahead of a bundle bump is supported (AC2).
     """
@@ -350,7 +407,7 @@ async def store_bundle(
     key = f"bundles/{agent_id}/{version.id}{extension}"
     digest = hashlib.sha256(data).hexdigest()
     await store.put(key, data, content_type)
-    await crud.attach_bundle(session, version, key, digest)
+    await crud_versions.attach_bundle(session, version, key, digest)
     return BundleOut(
         version_id=version.id,
         bundle_ref=key,

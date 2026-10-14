@@ -18,7 +18,6 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from curie_runner.state import (
     RESERVED_NAMESPACES,
-    STATE_SERVER_NAME,
     StateApiClient,
     build_state_server,
     op_append,
@@ -28,6 +27,7 @@ from curie_runner.state import (
     op_set,
     resolve_state_client,
 )
+from curie_runner.tool_names import STATE_SERVER_NAME
 
 
 def _fake_state_app() -> tuple[web.Application, dict]:

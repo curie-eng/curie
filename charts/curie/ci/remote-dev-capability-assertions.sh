@@ -30,13 +30,13 @@ for invalid_allowlist_entry in \
   fi
 done
 
-python3 - "$RENDERED" "$SEALED" "$CHART/values.yaml" <<'PY'
+python3 - "$RENDERED" "$SEALED" "$CHART/values.yaml" "$SCRIPT_DIR/fixtures/factory-github-builtin-egress.yaml" <<'PY'
 import sys
 from pathlib import Path
 
 import yaml
 
-rendered_path, sealed_path, values_path = map(Path, sys.argv[1:])
+rendered_path, sealed_path, values_path, builtin_egress_path = map(Path, sys.argv[1:])
 docs = [doc for doc in yaml.safe_load_all(rendered_path.read_text()) if doc]
 sealed_docs = [doc for doc in yaml.safe_load_all(sealed_path.read_text()) if doc]
 values = yaml.safe_load(values_path.read_text())
@@ -108,17 +108,28 @@ for workload in [doc for doc in docs if doc.get("kind") == "Deployment" and doc 
 
 
 # Publication authority lives only in the dedicated namespace Role. The main
-# worker Role remains free of publication resources.
+# worker Role remains free of publication resources except its read-only
+# runner boot diagnosis log grant (#4171).
 worker_role = one("Role", component="worker")
 worker_resources = {
     resource
     for rule in worker_role.get("rules") or []
     for resource in rule.get("resources") or []
 }
-if worker_resources & {"jobs", "configmaps", "secrets", "pods/log"}:
+if worker_resources & {"jobs", "configmaps"}:
     fail(f"main worker Role carries publication authority: {sorted(worker_resources)}")
+# Create-only secrets is the per-claim token grant (#3842), not publication
+# authority: publication needs get and delete, and create cannot read a Secret back.
+worker_secret_verbs = {
+    verb
+    for rule in worker_role.get("rules") or []
+    if "secrets" in (rule.get("resources") or [])
+    for verb in rule.get("verbs") or []
+}
+if worker_secret_verbs - {"create"}:
+    fail(f"main worker Role secrets must be create-only, got: {sorted(worker_secret_verbs)}")
 # The one pod grant is the exact-name read an unschedulable claim needs
-# (#3169); publication's pod authority is list plus pods/log.
+# (#3169); publication's pod discovery authority remains list.
 pod_verbs = {
     verb
     for rule in worker_role.get("rules") or []
@@ -127,6 +138,14 @@ pod_verbs = {
 }
 if pod_verbs - {"get"}:
     fail(f"main worker Role grants pods beyond get: {sorted(pod_verbs)}")
+log_rules = [
+    rule
+    for rule in worker_role.get("rules") or []
+    if set(rule.get("apiGroups") or []) & {"", "*"}
+    and set(rule.get("resources") or []) & {"pods/log", "*/log", "*"}
+]
+if log_rules != [{"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]}]:
+    fail(f"main worker Role must grant namespaced pods/log get only: {log_rules}")
 event_rules = [
     rule
     for rule in worker_role.get("rules") or []
@@ -216,7 +235,14 @@ rendered_cidrs = {
     target.get("ipBlock", {}).get("cidr")
     for target in github_rules[0]["to"]
 }
-expected_cidrs = set(values["worker"]["publication"]["githubHttpsCidrs"])
+# No factory block: publication still targets the install's GitHub through the
+# chart's built-in set (#4397 decision 6), which no values key carries.
+builtin_egress = yaml.safe_load(builtin_egress_path.read_text())
+if builtin_egress["port"] != 443:
+    fail("the built-in GitHub egress fixture must be TCP 443")
+expected_cidrs = set(builtin_egress["cidrs"])
+if "githubHttpsCidrs" in (values.get("worker", {}).get("publication") or {}):
+    fail("worker.publication.githubHttpsCidrs must be removed; egress has one source (factory code hosts)")
 if rendered_cidrs != expected_cidrs:
     fail(f"publication GitHub CIDR egress drifted: {sorted(rendered_cidrs)!r}")
 
@@ -284,12 +310,17 @@ if not any(m.get("name") == "workspace" and m.get("mountPath") == "/workspace"
            for m in runner.get("volumeMounts", [])):
     fail("runner must share workspace at /workspace")
 
-signed_workspace_facts = {"CURIE_WORKSPACE_REF", "CURIE_WORKSPACE_SHA256"}
+# The signed object facts plus the trusted origin and repository path the
+# worker's claim fills from the API credential (ADR 0197). The template only
+# declares them, empty, so the claim can target this init container.
+signed_workspace_facts = {
+    "CURIE_WORKSPACE_REF", "CURIE_WORKSPACE_SHA256", "CURIE_REPO_ORIGIN", "CURIE_REPO_PATH",
+}
 fetch_env = set(env_map(workspace_init))
 if fetch_env != signed_workspace_facts:
     fail(
-        "workspace-init must carry only the signed exact-object reference and digest; "
-        f"rendered env was {sorted(fetch_env)}"
+        "workspace-init must carry the signed object facts and the claim's repository "
+        f"origin and path; rendered env was {sorted(fetch_env)}"
     )
 
 names = set(env_map(workspace_init))
@@ -310,6 +341,12 @@ if leaked:
     )
 
 runner_env = env_map(runner)
+for name in ("CURIE_REPO_ORIGIN", "CURIE_REPO_PATH"):
+    if env_map(workspace_init)[name].get("value") != "":
+        fail(f"workspace-init must declare {name} empty; only the claim may fill it")
+for consumer in (workspace_init, runner):
+    if "CURIE_GITHUB_API_URL" in env_map(consumer):
+        fail(f"{consumer['name']} must not derive the repository origin from a GitHub API URL")
 forbidden_runner = {
     "S3_ACCESS_KEY", "S3_SECRET_KEY", "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_APP_ID",
@@ -357,4 +394,142 @@ for policy in policies:
         fail(f"runner policy selector widened: {policy['metadata']['name']}")
 
 print("remote-dev capability render assertions passed")
+PY
+
+# Run the rendered init command across real HTTP, tar and Git boundaries. The
+# signed workspace archive is the same input the sandbox consumes in a claim.
+python3 - "$CHART" "$TMP" <<'PY'
+import base64
+import functools
+import hashlib
+import http.server
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tarfile
+import threading
+import time
+
+import yaml
+
+chart, scratch = map(Path, sys.argv[1:])
+root = scratch / "workspace-root"
+fixture = scratch / "workspace-fixture"
+root.mkdir()
+fixture.mkdir()
+subprocess.run(["git", "init", "--quiet", str(fixture)], check=True)
+(fixture / "README.md").write_text("managed workspace\n")
+subprocess.run(
+    ["git", "-C", str(fixture), "remote", "add", "origin", "https://github.example.com/acme-corp/acme-bot.git"],
+    check=True,
+)
+archive_path = scratch / "workspace-fixture.tar.gz"
+
+
+class ObjectHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+
+server = http.server.ThreadingHTTPServer(
+    ("127.0.0.1", 0), functools.partial(ObjectHandler, directory=str(scratch))
+)
+thread = threading.Thread(target=server.serve_forever, daemon=True)
+thread.start()
+try:
+    rendered = subprocess.run(
+        [
+            "helm", "template", "remote-dev", str(chart),
+            "-f", str(chart / "values-dev.yaml"),
+            "--show-only", "templates/agent-sandbox.yaml",
+            "--set", "agentSandbox.deploy=true",
+            "--set", "agentSandbox.controller.deploy=false",
+        ],
+        check=True, capture_output=True, text=True,
+    )
+    for html_base, repo_path in (
+        ("https://github.example.com", "acme-corp/acme-bot"),
+        ("https://github.example.com/forge", "acme-corp/acme-bot"),
+        ("https://gitlab.example.com/scm", "platform/team/acme-bot"),
+    ):
+        sandbox = next(
+            doc for doc in yaml.safe_load_all(rendered.stdout)
+            if doc and doc.get("kind") == "SandboxTemplate"
+        )
+        pod = sandbox["spec"]["podTemplate"]["spec"]
+        init = next(c for c in pod["initContainers"] if c["name"] == "workspace-init")
+        runner = next(c for c in pod["containers"] if c["name"] == "runner")
+        # Keep the production mount schema intact. The local subprocess owns
+        # a private scratch directory in place of the container's /workspace.
+        init_script = init["command"][-1]
+        production_root = 'root = pathlib.Path("/workspace")'
+        assert init_script.count(production_root) == 1
+        init_script = init_script.replace(
+            production_root, f"root = pathlib.Path({str(root)!r})", 1
+        )
+        init_env = {entry["name"]: entry["value"] for entry in init["env"]}
+        # What the worker's claim injects from the API credential.
+        claim_env = {"CURIE_REPO_ORIGIN": html_base, "CURIE_REPO_PATH": repo_path}
+        clean_origin = f"{html_base}/{repo_path}.git"
+        cases = [
+            (clean_origin, True),
+            (f"https://github.com/{repo_path}.git", False),
+            (f"https://other.example.com/{repo_path}.git", False),
+            (f"{html_base}/acme-corp/other.git", False),
+            (clean_origin.replace("https://", "http://", 1), False),
+            (clean_origin.replace("https://", "https://token@", 1), False),
+            (f"{clean_origin}/", False),
+            (clean_origin.removesuffix(".git"), False),
+            (f"{clean_origin}?download=1", False),
+            (f"{clean_origin}#HEAD", False),
+            (f"{html_base}/{repo_path.replace('/', '//', 1)}.git", False),
+        ]
+        if html_base.endswith(("/forge", "/scm")):
+            cases.append((f"https://{html_base.split('/')[2]}/{repo_path}.git", False))
+        for origin, accepted in cases:
+            subprocess.run(
+                ["git", "-C", str(fixture), "remote", "set-url", "origin", origin],
+                check=True,
+            )
+            with tarfile.open(archive_path, "w:gz") as archive:
+                archive.add(fixture, arcname=".")
+            digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            claim = {
+                "u": f"http://127.0.0.1:{server.server_port}/{archive_path.name}",
+                "s": digest,
+                "e": int(time.time()) + 300,
+            }
+            reference = base64.urlsafe_b64encode(json.dumps(claim).encode()).decode().rstrip("=")
+            env = {
+                "PATH": os.environ["PATH"],
+                **init_env,
+                **claim_env,
+                "CURIE_WORKSPACE_REF": reference,
+                "CURIE_WORKSPACE_SHA256": digest,
+            }
+            result = subprocess.run(
+                [sys.executable, "-c", init_script],
+                env=env, capture_output=True, text=True, timeout=60,
+            )
+            if accepted:
+                assert result.returncode == 0, result.stderr
+                assert (root / "README.md").read_text() == "managed workspace\n"
+                observed = subprocess.run(
+                    ["git", "-C", str(root), "remote", "get-url", "origin"],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+                assert observed == clean_origin
+            else:
+                assert result.returncode != 0, f"workspace-init accepted {origin}"
+                assert "checkout origin" in result.stderr, result.stderr
+                assert not (root / "README.md").exists(), origin
+finally:
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=5)
+    assert not thread.is_alive(), "workspace object server did not stop"
+
+print("workspace-init claim origin and path behavior assertions passed")
 PY

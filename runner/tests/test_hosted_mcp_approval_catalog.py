@@ -30,11 +30,13 @@ from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
 from curie_runner.approval import (
     build_approval_gate,
-    build_approval_hook,
-    build_can_use_tool,
     resolve_approval_policy,
 )
 from curie_runner.connectors import derive_mcp_servers
+from curie_runner.harness.claude.approval import (
+    build_approval_hook,
+    build_can_use_tool,
+)
 from curie_runner.history import TurnRecord, build_conversation_replay
 from curie_runner.mcp_tool_capability import probe_mcp_tool_capability
 from mcp.server import MCPServer

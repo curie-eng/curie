@@ -18,18 +18,24 @@
 //! sub-flags stay true: a binding that collapses every flag onto
 //! `issues.is_empty()` fails these tests just as loudly as a hardcoded `true`.
 
+use crate::support;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use support::{serve, MockServer, Response};
 
 const HOLDER_ANNOTATION: &str = "curietech.ai/upgrade-holder";
 const ACTION_ANNOTATION: &str = "curietech.ai/upgrade-action";
 const CREATE_WINNER: &str = "00000000-0000-4000-8000-000000000701";
 const PATCH_WINNER: &str = "00000000-0000-4000-8000-000000000702";
 const RELEASE_WINNER: &str = "00000000-0000-4000-8000-000000000703";
+const STALE_HOLDER: &str = "stale-holder";
 
 /// The exact resource selector `convergence::workloads_command` issues. The
 /// recording `kubectl` serves ONLY this string, so a narrower `deploy,sts,ds`
@@ -77,6 +83,24 @@ impl Fixture {
         fs::write(
             self.0.path().join("retained.json"),
             serde_json::to_string(values).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The target chart's own values, which `helm show values` prints and the
+    /// recording `kubectl` renders SandboxTemplates over.
+    fn set_chart_values(&self, values: &Value) {
+        fs::write(
+            self.0.path().join("chart-values.json"),
+            serde_json::to_string(values).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn set_retirement_inputs(&self, inputs: &Value) {
+        fs::write(
+            self.0.path().join("retirement.json"),
+            serde_json::to_string(inputs).unwrap(),
         )
         .unwrap();
     }
@@ -277,6 +301,34 @@ exec "$UPGRADE_DRIVER_ROOT/recorder/helm" "$@"
         self.run(scenario, "0.9.0", "charts/curie")
     }
 
+    fn local_human(&self, scenario: &str) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_curie"))
+            .args([
+                "--color=never",
+                "cluster",
+                "upgrade",
+                "--to",
+                "0.9.0",
+                "--namespace",
+                "ns",
+                "--release",
+                "rel",
+                "--chart",
+                "charts/curie",
+                "--yes",
+            ])
+            .current_dir(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap(),
+            )
+            .env("PATH", format!("{}:/usr/bin:/bin", self.0.path().display()))
+            .env("UPGRADE_DRIVER_ROOT", self.0.path())
+            .env("UPGRADE_DRIVER_SCENARIO", scenario)
+            .output()
+            .unwrap()
+    }
+
     fn local_env(&self, scenario: &str, extra_env: &[(&str, &str)]) -> Output {
         self.run_with_env(scenario, "0.9.0", "charts/curie", &[], extra_env)
     }
@@ -426,7 +478,7 @@ exec "$UPGRADE_DRIVER_ROOT/recorder/helm" "$@"
         }
         for patch in self.patches() {
             for operation in patch.as_array().into_iter().flatten() {
-                if operation["op"] != "add" {
+                if operation["op"] != "add" && operation["op"] != "replace" {
                     continue;
                 }
                 if operation["path"] == "/metadata/annotations" {
@@ -459,7 +511,7 @@ exec "$UPGRADE_DRIVER_ROOT/recorder/helm" "$@"
         }
         for patch in self.patches() {
             for operation in patch.as_array().into_iter().flatten() {
-                if operation["op"] != "add" {
+                if operation["op"] != "add" && operation["op"] != "replace" {
                     continue;
                 }
                 if operation["path"] == "/metadata/annotations" {
@@ -1189,7 +1241,6 @@ fn installed_chart_version_comes_from_helm_metadata() {
         fixture.argv(),
         visible(&output)
     );
-    let expected = ["helm", "get", "metadata", "rel", "-n", "ns", "-o", "json"];
     let reads: Vec<_> = fixture
         .argv()
         .into_iter()
@@ -1197,10 +1248,30 @@ fn installed_chart_version_comes_from_helm_metadata() {
         .collect();
     assert!(!reads.is_empty(), "chart metadata was never read");
     assert!(
-        reads
+        reads.iter().all(|call| {
+            call.iter()
+                .map(String::as_str)
+                .take(6)
+                .eq(["helm", "get", "metadata", "rel", "-n", "ns"])
+                && call
+                    .windows(2)
+                    .any(|pair| pair == ["--revision", "1"] || pair == ["--revision", "2"])
+                && call.windows(2).any(|pair| pair == ["-o", "json"])
+        }),
+        "chart version reads must select the serving Helm revision: {reads:?}"
+    );
+    let history: Vec<_> = fixture
+        .argv()
+        .into_iter()
+        .filter(|call| argv_starts(call, &["helm", "history"]))
+        .collect();
+    assert!(!history.is_empty(), "serving history was never read");
+    assert!(
+        history.iter().all(|call| call
             .iter()
-            .all(|call| { call.iter().map(String::as_str).collect::<Vec<_>>() == expected }),
-        "chart version reads must use the real Helm metadata command: {reads:?}"
+            .map(String::as_str)
+            .eq(["helm", "history", "rel", "-n", "ns", "-o", "json", "--max", "256",])),
+        "history must use the complete release history command: {history:?}"
     );
     let result = json(&output);
     assert_eq!(result["from_version"], "0.8.6", "{result}");
@@ -1284,7 +1355,8 @@ fn ownership_create_precedes_every_upgrade_snapshot_and_has_server_state() {
     let first_snapshot = argv
         .iter()
         .position(|call| {
-            argv_starts(call, &["helm", "get", "metadata"])
+            argv_starts(call, &["helm", "history"])
+                || argv_starts(call, &["helm", "get", "metadata"])
                 || argv_starts(call, &["helm", "get", "values"])
                 || argv_starts(call, &["helm", "show", "chart"])
                 || argv_starts(call, &["helm", "template"])
@@ -1485,6 +1557,10 @@ fn existing_holder_refusal_names_holder_and_action_without_helm_writes() {
         message.contains("wait") || message.contains("stopped"),
         "refusal must give a safe next action: {message}"
     );
+    assert!(
+        message.contains(&format!("--take-over {holder}")),
+        "refusal must name the explicit recovery flag: {message}"
+    );
     assert!(fixture.patches().is_empty(), "the loser must write nothing");
     assert!(
         fixture.created().is_empty(),
@@ -1494,6 +1570,692 @@ fn existing_holder_refusal_names_holder_and_action_without_helm_writes() {
         fixture.helm_upgrades().is_empty(),
         "the loser must not reach Helm mutation"
     );
+}
+
+fn stale_holder_fixture(record: Option<&Value>) -> Fixture {
+    Fixture::new(None).config_map(&checkpoint_config_map(
+        "41",
+        Some(serde_json::json!({
+            (HOLDER_ANNOTATION): STALE_HOLDER,
+            (ACTION_ANNOTATION): "upgrade to 0.9.0 from stopped CLI",
+            "acme.example/retained": "keep",
+        })),
+        record,
+    ))
+}
+
+fn assert_ownership_released(fixture: &Fixture) {
+    let state = fixture.config_map_state();
+    let annotations = &state["metadata"]["annotations"];
+    assert!(annotations.get(HOLDER_ANNOTATION).is_none(), "{state}");
+    assert!(annotations.get(ACTION_ANNOTATION).is_none(), "{state}");
+}
+
+/// #4334: Helm history and metadata shapes follow Helm's formatters, and
+/// rollback creates a fresh release revision using the selected old chart:
+/// https://github.com/helm/helm/blob/v3.20.0/cmd/helm/history.go
+/// https://github.com/helm/helm/blob/v3.20.0/pkg/action/get_metadata.go
+/// https://github.com/helm/helm/blob/v3.20.0/pkg/action/rollback.go
+/// The driver enforces JSON Patch tests as Kubernetes does, rather than
+/// returning success merely because the CLI requested a takeover:
+/// https://kubernetes.io/docs/reference/using-api/api-concepts/#resource-versions
+#[test]
+fn upgrade_take_over_recovers_a_killed_holder_and_pending_revision() {
+    let durable = checkpoint_through(
+        &[
+            "plan",
+            "validate",
+            "drain_preflight",
+            "checkpoint",
+            "migrate",
+        ],
+        true,
+    );
+    let fixture = stale_holder_fixture(Some(&durable));
+    let output = fixture.run_with(
+        "pending-revision",
+        "0.9.0",
+        "charts/curie",
+        &["--take-over", STALE_HOLDER],
+    );
+    assert!(
+        output.status.success(),
+        "{} / {:?}",
+        visible(&output),
+        fixture.argv()
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "succeeded", "{body}");
+    assert_eq!(body["from_version"], "0.8.6", "{body}");
+    assert_eq!(body["known_good_version"], "0.9.0", "{body}");
+    assert_eq!(
+        body["resumed"], true,
+        "the durable record must resume: {body}"
+    );
+
+    let patches = fixture.patches();
+    let takeover = &patches[0];
+    let operations = takeover.as_array().expect("takeover JSON Patch");
+    assert_eq!(
+        operations[0],
+        serde_json::json!({
+            "op": "test", "path": "/metadata/resourceVersion", "value": "41",
+        })
+    );
+    assert_eq!(
+        operations[1],
+        serde_json::json!({
+            "op": "test", "path": "/metadata/annotations/curietech.ai~1upgrade-holder",
+            "value": STALE_HOLDER,
+        })
+    );
+    assert!(patch_has(
+        takeover,
+        "replace",
+        "/metadata/annotations/curietech.ai~1upgrade-holder"
+    ));
+    assert!(
+        !is_record_patch(takeover),
+        "takeover must preserve the durable record: {takeover}"
+    );
+    let holder = fixture.acquired_holder();
+    assert_ne!(holder, STALE_HOLDER);
+    assert_eq!(fixture.acquired_action(), "upgrade to 0.9.0");
+    assert!(
+        fixture.created().is_empty(),
+        "takeover must preserve the ConfigMap"
+    );
+
+    let argv = fixture.argv();
+    let jobs = argv
+        .iter()
+        .position(|call| argv_starts(call, &["kubectl", "get", "jobs"]))
+        .expect("release hook Job read");
+    assert!(
+        argv[jobs].iter().map(String::as_str).eq([
+            "kubectl",
+            "get",
+            "jobs",
+            "-n",
+            "ns",
+            "-l",
+            "app.kubernetes.io/instance=rel,app.kubernetes.io/managed-by=Helm",
+            "-o",
+            "json",
+        ]),
+        "takeover must use the release hook selector: {:?}",
+        argv[jobs]
+    );
+    let acquire = argv
+        .iter()
+        .position(|call| is_checkpoint_patch(call))
+        .unwrap();
+    let rollback = argv
+        .iter()
+        .position(|call| argv_starts(call, &["helm", "rollback"]))
+        .expect("pending orphan recovery");
+    let apply = argv
+        .iter()
+        .position(|call| argv_starts(call, &["helm", "upgrade"]))
+        .expect("resumed Helm apply");
+    assert!(
+        jobs < acquire && acquire < rollback && rollback < apply,
+        "{argv:?}"
+    );
+    assert!(
+        argv[rollback].iter().map(String::as_str).eq([
+            "helm",
+            "rollback",
+            "rel",
+            "4",
+            "-n",
+            "ns",
+            "--wait",
+            "--timeout",
+            "15m",
+        ]),
+        "recovery must wait for the serving revision: {:?}",
+        argv[rollback]
+    );
+    assert_eq!(
+        argv.iter()
+            .filter(|call| argv_starts(call, &["helm", "rollback"]))
+            .count(),
+        1
+    );
+    assert_eq!(fixture.helm_upgrades().len(), 1);
+    assert!(
+        argv.iter()
+            .enumerate()
+            .filter(|(_, call)| {
+                argv_starts(call, &["helm", "get", "values"])
+                    || argv_starts(call, &["helm", "show", "chart"])
+                    || argv_starts(call, &["helm", "template"])
+                    || is_alembic_current(call)
+            })
+            .all(|(position, _)| rollback < position),
+        "rollback must precede upgrade snapshots: {argv:?}"
+    );
+    for (index, patch) in patches.iter().enumerate().skip(1) {
+        let expected = (41 + index).to_string();
+        assert!(
+            patch.as_array().unwrap().iter().any(|operation| {
+                operation["op"] == "test"
+                    && operation["path"] == "/metadata/resourceVersion"
+                    && operation["value"] == expected
+            }),
+            "record and release must adopt each server resourceVersion: {patch}"
+        );
+        assert!(
+            patch.as_array().unwrap().iter().any(|operation| {
+                operation["op"] == "test"
+                    && operation["path"] == "/metadata/annotations/curietech.ai~1upgrade-holder"
+                    && operation["value"] == holder
+            }),
+            "every later write must retain the new holder: {patch}"
+        );
+    }
+    assert_ownership_released(&fixture);
+    assert_eq!(
+        fixture.config_map_state()["metadata"]["annotations"]["acme.example/retained"],
+        "keep"
+    );
+}
+
+#[test]
+fn take_over_a_stopped_holder_with_no_pending_revision_resumes_and_releases_ownership() {
+    let durable = checkpoint_through(
+        &[
+            "plan",
+            "validate",
+            "drain_preflight",
+            "checkpoint",
+            "migrate",
+        ],
+        true,
+    );
+    let fixture = stale_holder_fixture(Some(&durable));
+    let output = fixture.run_with(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &["--take-over", STALE_HOLDER],
+    );
+    assert!(
+        output.status.success(),
+        "{} / {:?}",
+        visible(&output),
+        fixture.argv()
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "succeeded", "{body}");
+    assert_eq!(body["resumed"], true, "{body}");
+    assert_eq!(body["from_version"], "0.8.6", "{body}");
+    assert_eq!(body["known_good_version"], "0.9.0", "{body}");
+    assert_eq!(fixture.helm_upgrades().len(), 1, "resume must reach Apply");
+    assert!(
+        !fixture.issued(&["helm", "rollback"]),
+        "a deployed newest revision needs no rollback"
+    );
+    assert!(
+        fixture.created().is_empty(),
+        "the durable ConfigMap must survive takeover"
+    );
+
+    let holder = fixture.acquired_holder();
+    assert_ne!(holder, STALE_HOLDER);
+    let patches = fixture.patches();
+    let takeovers: Vec<_> = patches
+        .iter()
+        .filter(|patch| {
+            patch_has(
+                patch,
+                "replace",
+                "/metadata/annotations/curietech.ai~1upgrade-holder",
+            )
+        })
+        .collect();
+    assert_eq!(
+        takeovers.len(),
+        1,
+        "ownership must transfer once: {patches:?}"
+    );
+    assert_eq!(
+        takeovers[0],
+        &serde_json::json!([
+            {"op": "test", "path": "/metadata/resourceVersion", "value": "41"},
+            {"op": "test", "path": "/metadata/annotations/curietech.ai~1upgrade-holder", "value": STALE_HOLDER},
+            {"op": "replace", "path": "/metadata/annotations/curietech.ai~1upgrade-holder", "value": holder},
+            {"op": "add", "path": "/metadata/annotations/curietech.ai~1upgrade-action", "value": "upgrade to 0.9.0"},
+        ]),
+        "takeover must preserve the last durable record"
+    );
+    assert_eq!(patches.first(), Some(takeovers[0]));
+    assert!(
+        patches.iter().skip(1).any(is_record_patch),
+        "resumed lifecycle must store progress"
+    );
+    assert!(is_release_patch(patches.last().expect("ownership release")));
+    for (index, patch) in patches.iter().enumerate().skip(1) {
+        let expected = (41 + index).to_string();
+        assert!(
+            patch.as_array().unwrap().iter().any(|operation| {
+                operation["op"] == "test"
+                    && operation["path"] == "/metadata/resourceVersion"
+                    && operation["value"] == expected
+            }),
+            "later writes must chain the server resourceVersion: {patch}"
+        );
+        assert!(
+            patch.as_array().unwrap().iter().any(|operation| {
+                operation["op"] == "test"
+                    && operation["path"] == "/metadata/annotations/curietech.ai~1upgrade-holder"
+                    && operation["value"] == holder
+            }),
+            "later writes must use the new holder: {patch}"
+        );
+    }
+    assert_ownership_released(&fixture);
+    assert_eq!(
+        fixture.config_map_state()["metadata"]["annotations"]["acme.example/retained"],
+        "keep"
+    );
+}
+
+#[test]
+fn dry_run_take_over_a_stopped_holder_with_no_pending_revision_plans_no_rollback() {
+    let durable = checkpoint_through(&["plan", "validate"], false);
+    let fixture = stale_holder_fixture(Some(&durable));
+    let before = fixture.config_map_state();
+    let output = fixture.run_with(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &["--dry-run", "--take-over", STALE_HOLDER],
+    );
+    assert!(
+        output.status.success(),
+        "{} / {:?}",
+        visible(&output),
+        fixture.argv()
+    );
+    let body = json(&output);
+    let plan = body["plan"].as_array().expect("dry takeover plan");
+    assert!(
+        plan.iter()
+            .any(|line| line == "take over upgrade ownership from stale-holder"),
+        "{body}"
+    );
+    assert!(
+        plan.iter().any(|line| line == "phase plan: 0.8.6 -> 0.9.0"),
+        "{body}"
+    );
+    assert!(
+        plan.iter()
+            .filter_map(Value::as_str)
+            .any(|line| line.starts_with("helm upgrade ")),
+        "{body}"
+    );
+    assert!(
+        !plan
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|line| line.contains("helm rollback")),
+        "{body}"
+    );
+    assert!(fixture.issued(&["helm", "history"]));
+    assert!(fixture.issued(&["kubectl", "get", "jobs"]));
+    assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+    assert_eq!(fixture.config_map_state(), before);
+}
+
+#[test]
+fn take_over_wrong_holder_refuses_without_a_patch() {
+    for dry in [false, true] {
+        let fixture = stale_holder_fixture(None);
+        let before = fixture.config_map_state();
+        let flags: &[&str] = if dry {
+            &["--take-over", "wrong-holder", "--dry-run"]
+        } else {
+            &["--take-over", "wrong-holder"]
+        };
+        let output = fixture.run_with("pending-revision", "0.9.0", "charts/curie", flags);
+        let message = visible(&output);
+        assert!(!output.status.success(), "{message}");
+        assert!(
+            message.contains(STALE_HOLDER),
+            "observed holder missing: {message}"
+        );
+        assert!(
+            message.contains("upgrade to 0.9.0 from stopped CLI"),
+            "observed action missing: {message}"
+        );
+        assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+        assert_eq!(fixture.config_map_state(), before);
+    }
+}
+
+/// Hook annotation and active pods are external Kubernetes/Helm fields:
+/// https://helm.sh/docs/topics/charts_hooks/
+/// https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/job-v1/#JobStatus
+#[test]
+fn take_over_running_hook_refuses_before_patching() {
+    for dry in [false, true] {
+        let fixture = stale_holder_fixture(None);
+        let flags: &[&str] = if dry {
+            &["--take-over", STALE_HOLDER, "--dry-run"]
+        } else {
+            &["--take-over", STALE_HOLDER]
+        };
+        let output = fixture.run_with("take-over-running-hook", "0.9.0", "charts/curie", flags);
+        let message = visible(&output);
+        assert!(!output.status.success(), "{message}");
+        assert!(
+            message.contains("rel-upgrade-drain"),
+            "running hook name missing: {message}"
+        );
+        assert!(fixture.issued(&["kubectl", "get", "jobs"]));
+        assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+        assert_eq!(
+            fixture.config_map_state()["metadata"]["annotations"][HOLDER_ANNOTATION],
+            STALE_HOLDER
+        );
+    }
+}
+
+#[test]
+fn take_over_ignores_an_active_job_without_a_hook_annotation() {
+    let fixture = stale_holder_fixture(None);
+    let output = fixture.run_with(
+        "take-over-active-plain-job",
+        "0.9.0",
+        "charts/curie",
+        &["--take-over", STALE_HOLDER],
+    );
+    assert!(
+        output.status.success(),
+        "{} / {:?}",
+        visible(&output),
+        fixture.argv()
+    );
+    assert_ownership_released(&fixture);
+}
+
+#[test]
+fn take_over_without_a_holder_refuses_without_creating_or_patching() {
+    for existing in [false, true] {
+        for dry in [false, true] {
+            let fixture = Fixture::new(None);
+            if existing {
+                fixture.seed_checkpoint(&checkpoint_through(&["plan"], false));
+            }
+            let flags: &[&str] = if dry {
+                &["--take-over", STALE_HOLDER, "--dry-run"]
+            } else {
+                &["--take-over", STALE_HOLDER]
+            };
+            let output = fixture.run_with("healthy", "0.9.0", "charts/curie", flags);
+            let message = visible(&output);
+            assert!(!output.status.success(), "{message}");
+            assert!(message.contains("nothing to take over"), "{message}");
+            assert!(
+                message.contains("without"),
+                "refusal must say to omit the flag: {message}"
+            );
+            assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+        }
+    }
+}
+
+#[test]
+fn take_over_unreadable_hook_jobs_refuses_without_a_patch() {
+    for scenario in [
+        "take-over-jobs-failed",
+        "take-over-jobs-malformed",
+        "take-over-jobs-not-list",
+    ] {
+        for dry in [false, true] {
+            let fixture = stale_holder_fixture(None);
+            let flags: &[&str] = if dry {
+                &["--take-over", STALE_HOLDER, "--dry-run"]
+            } else {
+                &["--take-over", STALE_HOLDER]
+            };
+            let output = fixture.run_with(scenario, "0.9.0", "charts/curie", flags);
+            let message = visible(&output);
+            assert!(!output.status.success(), "{scenario}: {message}");
+            assert!(
+                message.to_lowercase().contains("job"),
+                "Job list refusal missing: {message}"
+            );
+            assert!(fixture.issued(&["kubectl", "get", "jobs"]));
+            assert!(
+                mutating_calls(&fixture).is_empty(),
+                "{scenario}: {:?}",
+                fixture.argv()
+            );
+            assert_eq!(
+                fixture.config_map_state()["metadata"]["annotations"][HOLDER_ANNOTATION],
+                STALE_HOLDER
+            );
+        }
+    }
+}
+
+#[test]
+fn take_over_cas_race_preserves_the_winner_and_never_rolls_back() {
+    let fixture = stale_holder_fixture(None);
+    let output = fixture.run_with(
+        "take-over-cas-conflict",
+        "0.9.0",
+        "charts/curie",
+        &["--take-over", STALE_HOLDER],
+    );
+    let message = visible(&output);
+    assert!(!output.status.success(), "{message}");
+    assert!(
+        message.contains(PATCH_WINNER),
+        "observed holder missing: {message}"
+    );
+    assert!(
+        message.contains("upgrade to 0.9.0"),
+        "observed action missing: {message}"
+    );
+    assert_eq!(fixture.patches().len(), 1, "takeover must not retry");
+    assert!(fixture.created().is_empty());
+    assert!(!fixture.issued(&["helm", "rollback"]));
+    assert!(fixture.helm_upgrades().is_empty());
+    assert_eq!(
+        fixture
+            .argv()
+            .iter()
+            .filter(|call| is_checkpoint_get(call))
+            .count(),
+        2,
+        "one read and one conflict diagnostic: {:?}",
+        fixture.argv()
+    );
+    let state = fixture.config_map_state();
+    assert_eq!(state["metadata"]["resourceVersion"], "42");
+    assert_eq!(
+        state["metadata"]["annotations"][HOLDER_ANNOTATION],
+        PATCH_WINNER
+    );
+    let record: Value = serde_json::from_str(state["data"]["record"].as_str().unwrap()).unwrap();
+    assert_eq!(record["status"], "external_sentinel", "{record}");
+}
+
+#[test]
+fn take_over_rollback_error_releases_ownership_and_preserves_the_record() {
+    let durable = checkpoint_through(&["plan", "validate"], false);
+    let fixture = stale_holder_fixture(Some(&durable));
+    let output = fixture.run_with(
+        "take-over-rollback-failed",
+        "0.9.0",
+        "charts/curie",
+        &["--take-over", STALE_HOLDER],
+    );
+    let message = visible(&output);
+    assert!(!output.status.success(), "{message}");
+    assert!(message.contains("rollback failed"), "{message}");
+    assert!(
+        !message.contains("acme-rollback-token"),
+        "rollback stderr must be redacted: {message}"
+    );
+    assert!(fixture.issued(&["helm", "rollback", "rel", "4"]));
+    assert!(fixture.helm_upgrades().is_empty());
+    assert_ownership_released(&fixture);
+    let state = fixture.config_map_state();
+    let record: Value = serde_json::from_str(state["data"]["record"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        record, durable,
+        "failed recovery must preserve the last durable phase"
+    );
+    assert_eq!(
+        fixture.patches().len(),
+        2,
+        "takeover then release, with no record patch"
+    );
+    assert!(is_release_patch(&fixture.patches()[1]));
+}
+
+#[test]
+fn pending_revision_without_take_over_refuses_and_releases_ownership() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("pending-revision");
+    let message = visible(&output);
+    assert!(!output.status.success(), "{message}");
+    assert!(
+        message.contains("revision 5") && message.contains("pending-upgrade"),
+        "{message}"
+    );
+    assert!(
+        message.contains("revision 4") && message.contains("0.8.6"),
+        "{message}"
+    );
+    assert!(
+        message.contains("helm rollback rel 4 -n ns --wait --timeout 15m"),
+        "{message}"
+    );
+    assert!(!fixture.issued(&["helm", "rollback"]));
+    assert!(fixture.helm_upgrades().is_empty());
+    assert!(
+        fixture.records().is_empty(),
+        "pending refusal precedes durable lifecycle writes"
+    );
+    assert_ownership_released(&fixture);
+}
+
+#[test]
+fn pending_revision_with_no_serving_revision_refuses_with_or_without_take_over() {
+    for takeover in [false, true] {
+        let fixture = if takeover {
+            stale_holder_fixture(None)
+        } else {
+            Fixture::new(None)
+        };
+        let flags: &[&str] = if takeover {
+            &["--take-over", STALE_HOLDER]
+        } else {
+            &[]
+        };
+        let output = fixture.run_with("pending-no-serving", "0.9.0", "charts/curie", flags);
+        let message = visible(&output);
+        assert!(!output.status.success(), "{message}");
+        assert!(
+            message.contains("no deployed revision") && message.contains("revision 5"),
+            "{message}"
+        );
+        assert!(!fixture.issued(&["helm", "rollback"]));
+        assert!(fixture.helm_upgrades().is_empty());
+        assert_ownership_released(&fixture);
+    }
+}
+
+#[test]
+fn retained_values_refuse_a_nonpending_release_with_no_deployed_revision() {
+    for dry in [false, true] {
+        let fixture = Fixture::new(None);
+        let flags: &[&str] = if dry { &["--dry-run"] } else { &[] };
+        let output = fixture.run_with("failed-no-serving", "0.9.0", "charts/curie", flags);
+        let message = visible(&output);
+        assert!(!output.status.success(), "{message}");
+        assert!(message.contains("no deployed revision"), "{message}");
+        assert!(
+            message.contains("revision 5") && message.contains("failed"),
+            "{message}"
+        );
+        assert!(
+            !fixture.issued(&["helm", "get", "values"]),
+            "retained values must not be attributed to a nonexistent serving revision"
+        );
+        assert!(!fixture.issued(&["helm", "rollback"]));
+        assert!(fixture.helm_upgrades().is_empty());
+        if dry {
+            assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+        } else {
+            assert_ownership_released(&fixture);
+        }
+    }
+}
+
+#[test]
+fn take_over_pending_install_and_rollback_refuse_without_recovery() {
+    for scenario in ["pending-install", "pending-rollback"] {
+        let fixture = stale_holder_fixture(None);
+        let output = fixture.run_with(
+            scenario,
+            "0.9.0",
+            "charts/curie",
+            &["--take-over", STALE_HOLDER],
+        );
+        let message = visible(&output);
+        assert!(!output.status.success(), "{scenario}: {message}");
+        assert!(
+            message.contains(scenario),
+            "pending status missing: {message}"
+        );
+        // Pin the whole sentence so swapped format arguments cannot hide
+        // behind the substring checks below.
+        let interrupted = if scenario == "pending-rollback" {
+            "it is an interrupted rollback to revision 3; run curie cluster rollback --yes to finish it, or "
+        } else {
+            ""
+        };
+        let sentence = format!(
+            "release rel newest revision 5 is {scenario}; serving revision 4 is version 0.8.6; {interrupted}run `helm rollback rel 4 -n ns --wait --timeout 15m`, then rerun cluster upgrade"
+        );
+        assert!(
+            message.contains(&sentence),
+            "refusal sentence changed: want {sentence:?} in {message}"
+        );
+        // #4497: a pending-rollback row records the operator's target as
+        // `Rollback to <N>`, so the refusal names it and the curie command that
+        // finishes it, and keeps the raw serving-revision helm command that
+        // still works under CLI version skew.
+        if scenario == "pending-rollback" {
+            assert!(
+                message.contains("interrupted rollback to revision 3"),
+                "the interrupted target must be named: {message}"
+            );
+            assert!(
+                message.contains("curie cluster rollback --yes"),
+                "the finishing command must be named: {message}"
+            );
+            assert!(
+                message.contains("helm rollback rel 4"),
+                "the serving-revision helm command must stay: {message}"
+            );
+        } else {
+            assert!(
+                !message.contains("interrupted rollback"),
+                "{scenario} is not a rollback: {message}"
+            );
+        }
+        assert!(!fixture.issued(&["helm", "rollback"]));
+        assert!(fixture.helm_upgrades().is_empty());
+        assert_ownership_released(&fixture);
+    }
 }
 
 #[test]
@@ -1901,8 +2663,8 @@ fn dry_run_does_not_acquire_or_mutate_cluster_ownership() {
     assert!(output.status.success(), "{}", visible(&output));
     let argv = fixture.argv();
     assert!(
-        !argv.iter().any(|call| is_checkpoint_get(call)),
-        "dry run must not enter the ownership protocol: {argv:?}"
+        argv.iter().any(|call| is_checkpoint_get(call)),
+        "dry run must read ownership before reporting a plan: {argv:?}"
     );
     assert!(
         fixture.created().is_empty(),
@@ -1922,6 +2684,200 @@ fn dry_run_does_not_acquire_or_mutate_cluster_ownership() {
             .any(|call| argv_starts(call, &["kubectl", "apply"])),
         "dry run must issue no legacy checkpoint apply: {argv:?}"
     );
+}
+
+#[test]
+fn dry_run_refuses_a_held_checkpoint() {
+    let fixture = stale_holder_fixture(None);
+    let before = fixture.config_map_state();
+    let output = fixture.run_with("pending-revision", "0.9.0", "charts/curie", &["--dry-run"]);
+    let message = visible(&output);
+    assert!(!output.status.success(), "{message}");
+    assert!(
+        message.contains(STALE_HOLDER),
+        "dry run must name the holder: {message}"
+    );
+    assert!(
+        message.contains("upgrade to 0.9.0 from stopped CLI"),
+        "{message}"
+    );
+    assert!(message.contains("--take-over stale-holder"), "{message}");
+    assert!(fixture.argv().iter().any(|call| is_checkpoint_get(call)));
+    assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+    assert_eq!(fixture.config_map_state(), before);
+}
+
+#[test]
+fn dry_run_reads_the_serving_revision_not_the_pending_one() {
+    let fixture = stale_holder_fixture(None);
+    let before = fixture.config_map_state();
+    let output = fixture.run_with(
+        "pending-revision",
+        "0.9.0",
+        "charts/curie",
+        &["--dry-run", "--take-over", STALE_HOLDER],
+    );
+    assert!(
+        output.status.success(),
+        "{} / {:?}",
+        visible(&output),
+        fixture.argv()
+    );
+    let body = json(&output);
+    let plan: Vec<_> = body["plan"]
+        .as_array()
+        .expect("dry run plan")
+        .iter()
+        .map(|line| line.as_str().expect("plan line"))
+        .collect();
+    assert!(plan.contains(&"phase plan: 0.8.6 -> 0.9.0"), "{body}");
+    assert!(
+        !plan
+            .iter()
+            .any(|line| line.contains("already installed and known-good")),
+        "a pending target must not become known good: {body}"
+    );
+    let takeover = plan
+        .iter()
+        .position(|line| line.contains("take over upgrade ownership from stale-holder"))
+        .expect("takeover must be planned");
+    let rollback = plan
+        .iter()
+        .position(|line| line.contains("helm rollback rel 4 -n ns --wait --timeout 15m"))
+        .expect("serving rollback must be planned");
+    let upgrade = plan
+        .iter()
+        .position(|line| line.starts_with("helm upgrade "))
+        .expect("target upgrade must still be planned");
+    assert!(takeover < rollback && rollback < upgrade, "{body}");
+    let reads: Vec<_> = fixture
+        .argv()
+        .into_iter()
+        .filter(|call| argv_starts(call, &["helm", "get", "metadata"]))
+        .collect();
+    assert!(!reads.is_empty(), "serving metadata must be read");
+    assert!(
+        reads
+            .iter()
+            .all(|call| call.windows(2).any(|pair| pair == ["--revision", "4"])),
+        "every dry-run metadata read must select serving revision 4: {reads:?}"
+    );
+    assert!(fixture.issued(&["helm", "history"]));
+    assert!(fixture.argv().iter().any(|call| is_checkpoint_get(call)));
+    assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+    assert_eq!(fixture.config_map_state(), before);
+}
+
+/// A revision's retained values are independent of its chart version. Helm
+/// reads the newest revision unless the caller explicitly supplies --revision:
+/// https://github.com/helm/helm/blob/v3.20.0/pkg/action/get_values.go
+/// https://github.com/helm/helm/blob/v3.20.0/pkg/action/action.go
+#[test]
+fn dry_run_take_over_reads_the_serving_revisions_retained_values() {
+    let dry = stale_holder_fixture(None);
+    let output = dry.run_with(
+        "pending-divergent-values",
+        "0.9.0",
+        "charts/curie",
+        &["--dry-run", "--take-over", STALE_HOLDER],
+    );
+    assert!(
+        output.status.success(),
+        "{} / {:?}",
+        visible(&output),
+        dry.argv()
+    );
+    let body = json(&output);
+    let schema = plan_line(&body, "config schema:");
+    assert_eq!(
+        schema, "config schema: 0.8.6 -> 0.9.0",
+        "dry takeover must migrate the serving values, not the pending target's values: {body}"
+    );
+    let upgrade = plan_line(&body, "helm upgrade ");
+    assert!(
+        upgrade.contains("-f <retained-values>"),
+        "the serving overlay must be in the plan: {upgrade}"
+    );
+    let reads: Vec<_> = dry
+        .argv()
+        .into_iter()
+        .filter(|call| argv_starts(call, &["helm", "get", "values"]))
+        .collect();
+    assert_eq!(
+        reads.len(),
+        1,
+        "retained values must be read once: {reads:?}"
+    );
+    assert!(
+        reads[0].windows(2).any(|pair| pair == ["--revision", "4"]),
+        "dry takeover must select the serving values revision: {reads:?}"
+    );
+
+    let rendered = dry.captured_paths("render-values");
+    assert!(
+        !rendered.is_empty(),
+        "target rendering must receive the migrated overlay"
+    );
+    let dry_overlay = values_doc(&fs::read_to_string(&rendered[0]).unwrap());
+    assert_eq!(
+        dry_overlay.pointer("/config/migratedFrom"),
+        Some(&serde_json::json!("0.8.6"))
+    );
+    assert_eq!(
+        dry_overlay.pointer("/worker/runnerTotalTimeoutSeconds"),
+        Some(&serde_json::json!(120))
+    );
+    assert!(
+        extra_env_names(&dry_overlay).contains(&"SERVING_REVISION_ONLY".to_string()),
+        "{dry_overlay}"
+    );
+    assert!(
+        !extra_env_names(&dry_overlay).contains(&"PENDING_REVISION_ONLY".to_string()),
+        "{dry_overlay}"
+    );
+    assert!(mutating_calls(&dry).is_empty(), "{:?}", dry.argv());
+
+    let real = stale_holder_fixture(None);
+    let output = real.run_with(
+        "pending-divergent-values",
+        "0.9.0",
+        "charts/curie",
+        &["--take-over", STALE_HOLDER],
+    );
+    assert!(
+        output.status.success(),
+        "{} / {:?}",
+        visible(&output),
+        real.argv()
+    );
+    assert_eq!(real.helm_upgrades().len(), 1);
+    assert_eq!(
+        values_doc(&real.values(1)),
+        dry_overlay,
+        "the dry plan's rendered overlay must match the real takeover Apply input"
+    );
+    assert_ownership_released(&real);
+}
+
+#[test]
+fn dry_run_pending_revision_without_take_over_refuses_without_mutation() {
+    let fixture = Fixture::new(None);
+    let output = fixture.run_with("pending-revision", "0.9.0", "charts/curie", &["--dry-run"]);
+    let message = visible(&output);
+    assert!(!output.status.success(), "{message}");
+    assert!(
+        message.contains("revision 5") && message.contains("pending-upgrade"),
+        "{message}"
+    );
+    assert!(
+        message.contains("revision 4") && message.contains("0.8.6"),
+        "{message}"
+    );
+    assert!(
+        message.contains("helm rollback rel 4 -n ns --wait --timeout 15m"),
+        "{message}"
+    );
+    assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
 }
 
 // T1(a) -- Ruling 2: the local chart's own metadata is the pin. A chart whose
@@ -2056,10 +3012,7 @@ fn metadata_version_drives_startup_apply_canary_and_commit() {
         .iter()
         .enumerate()
         .filter_map(|(index, call)| {
-            call.iter()
-                .map(String::as_str)
-                .eq(["helm", "get", "metadata", "rel", "-n", "ns", "-o", "json"])
-                .then_some(index)
+            argv_starts(call, &["helm", "get", "metadata"]).then_some(index)
         })
         .collect();
     assert_eq!(metadata_reads.len(), 4, "source, Apply, Canary, Commit");
@@ -2070,6 +3023,21 @@ fn metadata_version_drives_startup_apply_canary_and_commit() {
     );
     assert!(workloads < metadata_reads[2], "Canary observation");
     assert!(metadata_reads[2] < metadata_reads[3], "Commit observation");
+    for (position, expected_revision) in metadata_reads.iter().zip(["1", "2", "2", "2"]) {
+        assert!(
+            calls[*position]
+                .windows(2)
+                .any(|pair| pair == ["--revision", expected_revision]),
+            "every lifecycle observation must select its deployed revision: {:?}",
+            calls[*position]
+        );
+        assert!(
+            calls[..*position]
+                .iter()
+                .any(|call| argv_starts(call, &["helm", "history"])),
+            "each metadata observation needs serving history: {calls:?}"
+        );
+    }
 
     assert_unusable_metadata_after_apply("stale-version", "still reports 0.8.6");
     for scenario in [
@@ -2139,6 +3107,58 @@ fn observed_version_divergence_fails_apply() {
             "Commit must not run once Apply's post-condition read failed: {record}"
         );
     }
+}
+
+// #4495: every failed phase must preserve its report while the process exits 1.
+// Converge and Canary fail on observations; Commit uses the existing phase hook.
+#[test]
+fn failed_upgrade_exits_nonzero_in_every_phase() {
+    for (scenario, phase, hook, exact) in [
+        ("stale-images", "converge", None, false),
+        ("canary-version-drift", "canary", None, true),
+        ("healthy", "commit", Some("commit"), true),
+    ] {
+        let fixture = Fixture::new(None);
+        let extra_env: Vec<_> = hook
+            .into_iter()
+            .map(|phase| ("CURIE_UPGRADE_TEST_FAIL_AT", phase))
+            .collect();
+        let output = fixture.local_env(scenario, &extra_env);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "a failed {phase} must exit 1: {}",
+            visible(&output)
+        );
+        let report = json(&output);
+        assert_eq!(report["status"], "failed", "{report}");
+        assert_eq!(report["phase"], phase, "{report}");
+        assert!(report["convergence"].is_object(), "{report}");
+        assert_eq!(report["convergence"]["exact"], exact, "{report}");
+        assert!(report["fail_forward"].is_object(), "{report}");
+        assert!(
+            report["fail_forward"]["command"]
+                .as_str()
+                .is_some_and(|command| command.starts_with("curie cluster ")),
+            "{report}"
+        );
+        assert!(
+            report["fail_forward"]["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "{report}"
+        );
+        observed_for_real(&fixture);
+        assert_eq!(fixture.helm_upgrades().len(), 1, "{phase}");
+    }
+
+    let fixture = Fixture::new(None);
+    let output = fixture.local("healthy");
+    assert_eq!(output.status.code(), Some(0), "{}", visible(&output));
+    let report = json(&output);
+    assert_eq!(report["status"], "succeeded", "{report}");
+    assert_eq!(report["convergence"]["exact"], true, "{report}");
+    assert_eq!(report["canary"]["passed"], true, "{report}");
 }
 
 // T3 -- #2301 "a target-version canary". Apply's own post-condition read is
@@ -3229,6 +4249,1158 @@ fn retained_connector_caller_secret_and_inline_pair_survive_upgrade_unchanged() 
     }
 }
 
+const LAYER_BOT: &str = "ghcr.io/acme/acme-bot-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const LAYER_OTHER: &str = "ghcr.io/acme/acme-other-runner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// #3849: a retained layered digest is removed from the values Helm applies.
+/// Sibling settings and credentials stay. Convergence and the canary still pass.
+/// The null override that the chart renders as `<nil>` is not passed.
+#[test]
+fn upgrade_omits_stale_runner_layers_and_keeps_credentials() {
+    let values = serde_json::json!({
+        "agentSandbox": {
+            "runnerImages": {
+                "acme-bot": LAYER_BOT,
+                "acme-other": LAYER_OTHER
+            },
+            "connectorSecrets": {"acme-bot": {"API_TOKEN": "acme-secret-name"}}
+        },
+        "api": {"existingSecret": "acme-api-credentials"}
+    });
+    let fixture = Fixture::new(Some(&values.to_string()));
+    let output = fixture.local("healthy");
+    assert!(output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "succeeded", "{body}");
+    assert_eq!(body["convergence"]["exact"], true, "{body}");
+    assert_eq!(body["canary"]["passed"], true, "{body}");
+    let applied = values_doc(&fixture.values(1));
+    assert!(
+        applied
+            .pointer("/agentSandbox/runnerImages/acme-bot")
+            .is_none(),
+        "stale acme-bot layer must be removed: {applied}"
+    );
+    assert!(
+        applied
+            .pointer("/agentSandbox/runnerImages/acme-other")
+            .is_none(),
+        "every layer stops matching when the runner cannot be proved: {applied}"
+    );
+    let images = applied.pointer("/agentSandbox/runnerImages");
+    assert!(
+        images.is_none()
+            || images.is_some_and(|node| node.as_object().is_some_and(|map| map.is_empty())),
+        "runnerImages must not keep a null or stale entry: {images:?}"
+    );
+    assert_eq!(
+        applied
+            .pointer("/agentSandbox/connectorSecrets/acme-bot/API_TOKEN")
+            .and_then(Value::as_str),
+        Some("acme-secret-name"),
+        "{applied}"
+    );
+    assert_eq!(
+        applied
+            .pointer("/api/existingSecret")
+            .and_then(Value::as_str),
+        Some("acme-api-credentials"),
+        "{applied}"
+    );
+    let upgrades = fixture.helm_upgrades();
+    assert_eq!(upgrades.len(), 1, "{:?}", fixture.argv());
+    assert!(
+        upgrades[0].iter().all(|arg| !arg.contains("=null")),
+        "helm argv must not set a null digest: {:?}",
+        upgrades[0]
+    );
+    assert_retired_after_apply(&fixture, &["acme-bot", "acme-other"]);
+}
+
+/// The CRD `live_canary` reads the rendered runner images from (#4321).
+const SANDBOX_TEMPLATES: &str = "sandboxtemplates.extensions.agents.x-k8s.io";
+/// The project's published dark factory layer the v0.8.6 install was bound to.
+const STOCK_OLD: &str = "ghcr.io/curie-eng/curie-dark-factory-runner@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const STOCK_REPOSITORY: &str = "ghcr.io/curie-eng/curie-dark-factory-runner";
+const STOCK_LAYER_PATH: &str = "/v2/curie-eng/curie-dark-factory-runner/manifests/0.9.0";
+const STOCK_BASE_PATH: &str = "/v2/curie-eng/curie-runner/manifests/0.9.0";
+/// The anonymous pull token the stub issues and then requires.
+const STOCK_TOKEN: &str = "anonymous-pull-token";
+
+/// The OCI image indexes GHCR serves for `curie-dark-factory-runner:0.9.0`
+/// and `curie-runner:0.9.0`: `application/vnd.oci.image.index.v1+json`,
+/// schemaVersion 2, one manifest per platform. `published_index_digest` takes
+/// the sha256 of these exact bytes as the digest, as GHCR does. The stub
+/// follows `example_dark_factory_render.rs` and `support/oci_registry_stub.rs`.
+const STOCK_LAYER_INDEX: &str = concat!(
+    r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","#,
+    r#""manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","#,
+    r#""digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444","#,
+    r#""size":2101,"platform":{"architecture":"amd64","os":"linux"}},"#,
+    r#"{"mediaType":"application/vnd.oci.image.manifest.v1+json","#,
+    r#""digest":"sha256:5555555555555555555555555555555555555555555555555555555555555555","#,
+    r#""size":2101,"platform":{"architecture":"arm64","os":"linux"}}]}"#
+);
+const STOCK_BASE_INDEX: &str = concat!(
+    r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","#,
+    r#""manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","#,
+    r#""digest":"sha256:6666666666666666666666666666666666666666666666666666666666666666","#,
+    r#""size":1876,"platform":{"architecture":"amd64","os":"linux"}},"#,
+    r#"{"mediaType":"application/vnd.oci.image.manifest.v1+json","#,
+    r#""digest":"sha256:7777777777777777777777777777777777777777777777777777777777777777","#,
+    r#""size":1876,"platform":{"architecture":"arm64","os":"linux"}}]}"#
+);
+
+fn index_digest(body: &str) -> String {
+    let hex: String = Sha256::digest(body.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("sha256:{hex}")
+}
+
+/// The layer published for 0.9.0, digest pinned, as the rebind must bind it.
+fn stock_new() -> String {
+    format!("{STOCK_REPOSITORY}@{}", index_digest(STOCK_LAYER_INDEX))
+}
+
+/// The platform runner the 0.9.0 chart renders, digest pinned.
+fn platform_runner() -> String {
+    format!(
+        "ghcr.io/curie-eng/curie-runner@{}",
+        index_digest(STOCK_BASE_INDEX)
+    )
+}
+
+/// An anonymous GHCR: `/token?service=ghcr.io&scope=repository:<path>:pull`
+/// answers `{"token": ...}`, and `/v2/<path>/manifests/<tag>` answers the
+/// index to that bearer. The platform runner is always published; the dark
+/// factory layer only when `layer_published`.
+fn stock_registry(layer_published: bool) -> MockServer {
+    serve(move |request| {
+        if request.path.starts_with("/token?") && request.path.contains("service=ghcr.io") {
+            return Response::json(200, &format!(r#"{{"token":"{STOCK_TOKEN}"}}"#));
+        }
+        if request.header("authorization") != Some(format!("Bearer {STOCK_TOKEN}").as_str()) {
+            return Response::json(401, r#"{"errors":[{"code":"UNAUTHORIZED"}]}"#);
+        }
+        let body = match request.path.as_str() {
+            STOCK_BASE_PATH => STOCK_BASE_INDEX,
+            STOCK_LAYER_PATH if layer_published => STOCK_LAYER_INDEX,
+            _ => return Response::json(404, r#"{"errors":[{"code":"MANIFEST_UNKNOWN"}]}"#),
+        };
+        Response {
+            status: 200,
+            content_type: "application/vnd.oci.image.index.v1+json".into(),
+            body: body.as_bytes().to_vec(),
+        }
+    })
+}
+
+/// A v0.8.6 install with one agent on the stock layer and one owner-built
+/// agent, upgrading to a 0.9.0 chart whose runner is digest pinned. The
+/// installed runner stays unknown (the recording `helm history` fails before
+/// Apply), which counts as a change for both.
+fn stock_fixture() -> Fixture {
+    let values = serde_json::json!({
+        "agentSandbox": {
+            "runnerImages": {
+                "acme-bot": LAYER_BOT,
+                "dark-factory": STOCK_OLD
+            },
+            "connectorSecrets": {"dark-factory": {"GITHUB_APP_KEY": "dark-factory-app"}}
+        }
+    });
+    let fixture = Fixture::new(Some(&values.to_string()));
+    fixture.set_chart_values(&serde_json::json!({
+        "agentSandbox": {"runner": {
+            "image": "ghcr.io/curie-eng/curie-runner",
+            "digest": index_digest(STOCK_BASE_INDEX)
+        }}
+    }));
+    fixture
+}
+
+fn run_stock(fixture: &Fixture, scenario: &str, registry: &str, extra: &[&str]) -> Output {
+    fixture.run_with_env(
+        scenario,
+        "0.9.0",
+        "charts/curie",
+        extra,
+        &[("CURIE_TEST_SRE_BOT_REGISTRY_ENDPOINT", registry)],
+    )
+}
+
+fn plan_line(body: &Value, prefix: &str) -> String {
+    body["plan"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no plan line starting {prefix:?}: {body}"))
+        .to_string()
+}
+
+fn retirement(agent: &str) -> String {
+    format!("retire SandboxClaims of agent {agent} whose runner is not the planned layer")
+}
+
+fn claim_deletes(fixture: &Fixture) -> Vec<Vec<String>> {
+    fixture
+        .argv()
+        .into_iter()
+        .filter(|call| argv_starts(call, &["kubectl", "-n", "ns", "delete", "sandboxclaim"]))
+        .collect()
+}
+
+/// Each named agent's claims are retired by a `kubectl delete sandboxclaim`
+/// issued after the `helm upgrade`.
+fn assert_retired_after_apply(fixture: &Fixture, agents: &[&str]) {
+    let argv = fixture.argv();
+    let apply_at = argv
+        .iter()
+        .position(|call| argv_starts(call, &["helm", "upgrade"]))
+        .unwrap_or_else(|| panic!("no helm upgrade: {argv:?}"));
+    for agent in agents {
+        let claim = format!("{agent}-old-claim");
+        let at = argv
+            .iter()
+            .position(|call| {
+                call.iter().map(String::as_str).collect::<Vec<_>>()
+                    == [
+                        "kubectl",
+                        "-n",
+                        "ns",
+                        "delete",
+                        "sandboxclaim",
+                        claim.as_str(),
+                        "--wait=true",
+                        "--ignore-not-found=true",
+                    ]
+            })
+            .unwrap_or_else(|| panic!("{agent}'s claims are not retired: {argv:?}"));
+        assert!(
+            at > apply_at,
+            "{agent} retired before the helm upgrade: {argv:?}"
+        );
+    }
+}
+
+/// After the `helm upgrade`, retirement reads the agent's claims by label and
+/// the namespace's pods with no selector at all, since platform-pool pods
+/// carry no agent label. No pods read anywhere carries `-l`.
+fn assert_retirement_reads_after_apply(fixture: &Fixture, agent: &str) {
+    let argv = fixture.argv();
+    let apply_at = argv
+        .iter()
+        .position(|call| argv_starts(call, &["helm", "upgrade"]))
+        .unwrap_or_else(|| panic!("no helm upgrade: {argv:?}"));
+    let selector = format!("curietech.ai/agent={agent}");
+    let claims_read = [
+        "kubectl",
+        "-n",
+        "ns",
+        "get",
+        "sandboxclaim",
+        "-l",
+        selector.as_str(),
+        "-o",
+        "json",
+    ];
+    let pods_read = ["kubectl", "-n", "ns", "get", "pods", "-o", "json"];
+    for expected in [&claims_read[..], &pods_read[..]] {
+        let read_at = argv
+            .iter()
+            .position(|call| call.iter().map(String::as_str).eq(expected.iter().copied()))
+            .unwrap_or_else(|| panic!("missing read {expected:?}: {argv:?}"));
+        assert!(
+            read_at > apply_at,
+            "retirement observes post-Apply state: {argv:?}"
+        );
+    }
+    assert!(
+        argv.iter()
+            .filter(|call| argv_starts(call, &["kubectl", "-n", "ns", "get", "pods"]))
+            .all(|call| !call.iter().any(|arg| arg == "-l" || arg.starts_with("-l="))),
+        "pods must be read without a label selector: {argv:?}"
+    );
+}
+
+/// #4332: the agent's two claims resolve to different runner images. The
+/// target claim represents work admitted after the post-upgrade drain hook.
+#[test]
+fn runner_layer_retire_keeps_claims_already_on_the_target_layer() {
+    let registry = stock_registry(true);
+    let fixture = stock_retirement_fixture();
+    fixture.set_retirement_inputs(&serde_json::json!({
+        "agents": {"dark-factory": {
+            "claims": retirement_claims(&[
+                ("dark-factory-old-claim", "old-sandbox"),
+                ("dark-factory-target-claim", "target-sandbox"),
+            ]),
+        }},
+        // Namespace-wide, unlabelled. `unrelated-sandbox` runs the old layer
+        // but no claim names it, so it must not cause a delete.
+        "pods": retirement_pods(&[
+            ("old-sandbox", STOCK_OLD),
+            ("target-sandbox", stock_new().as_str()),
+            ("unrelated-sandbox", STOCK_OLD),
+        ]),
+    }));
+    let output = run_stock(&fixture, "healthy", &registry.base_url, &[]);
+    assert!(output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "succeeded", "{body}");
+    assert_eq!(body["canary"]["passed"], true, "{body}");
+    assert_retired_after_apply(&fixture, &["dark-factory"]);
+    let deletes = claim_deletes(&fixture);
+    assert_eq!(deletes.len(), 1, "one named delete per agent: {deletes:?}");
+    assert!(
+        deletes.iter().all(|call| !call
+            .iter()
+            .any(|arg| arg == "dark-factory-target-claim" || arg == "-l")),
+        "target-layer claims must survive every delete: {deletes:?}"
+    );
+    assert_retirement_reads_after_apply(&fixture, "dark-factory");
+}
+
+#[test]
+fn runner_layer_retire_runs_no_delete_when_every_claim_is_on_the_target_layer() {
+    let registry = stock_registry(true);
+    let fixture = stock_retirement_fixture();
+    fixture.set_retirement_inputs(&serde_json::json!({
+        "agents": {"dark-factory": {
+            "claims": retirement_claims(&[("dark-factory-target-claim", "target-sandbox")]),
+        }},
+        "pods": retirement_pods(&[("target-sandbox", stock_new().as_str())]),
+    }));
+    let output = run_stock(&fixture, "healthy", &registry.base_url, &[]);
+    assert!(output.status.success(), "{}", visible(&output));
+    assert_eq!(json(&output)["status"], "succeeded");
+    assert!(claim_deletes(&fixture).is_empty(), "{:?}", fixture.argv());
+}
+
+#[test]
+fn runner_layer_retire_clear_preserves_claims_on_the_platform_template_image() {
+    let registry = stock_registry(true);
+    let fixture = stock_fixture();
+    fixture.set_retained(&serde_json::json!({
+        "agentSandbox": {"runnerImages": {"acme-bot": LAYER_BOT}},
+        "connectorCaller": {"existingSecret": "acme-caller-pair"},
+    }));
+    fixture.set_retirement_inputs(&serde_json::json!({
+        "agents": {"acme-bot": {
+            "claims": retirement_claims(&[
+                ("acme-bot-old-claim", "old-sandbox"),
+                ("acme-bot-target-claim", "target-sandbox"),
+            ]),
+        }},
+        // The target pod comes from the platform template, which renders no
+        // agent label; only a by-name match finds it. `unrelated-sandbox`
+        // still runs the owner layer but belongs to no claim.
+        "pods": retirement_pods(&[
+            ("old-sandbox", LAYER_BOT),
+            ("target-sandbox", platform_runner().as_str()),
+            ("unrelated-sandbox", LAYER_BOT),
+        ]),
+    }));
+    let output = run_stock(&fixture, "healthy", &registry.base_url, &[]);
+    assert!(output.status.success(), "{}", visible(&output));
+    assert_eq!(json(&output)["status"], "succeeded");
+    assert_retired_after_apply(&fixture, &["acme-bot"]);
+    assert_retirement_reads_after_apply(&fixture, "acme-bot");
+    let deletes = claim_deletes(&fixture);
+    assert_eq!(deletes.len(), 1, "{:?}", fixture.argv());
+    assert!(
+        deletes[0].iter().any(|arg| arg == "acme-bot-old-claim"),
+        "{deletes:?}"
+    );
+    assert!(
+        deletes.iter().all(|call| !call
+            .iter()
+            .any(|arg| arg == "acme-bot-target-claim" || arg == "-l")),
+        "the platform-image claim must survive the clear: {deletes:?}"
+    );
+}
+
+/// A read or parse failure after Apply preserves the existing best-effort
+/// retirement behavior, while the later canary reads healthy templates.
+#[test]
+fn runner_layer_retire_falls_back_to_agent_wide_delete_when_a_read_fails() {
+    let registry = stock_registry(true);
+    for (case, inputs) in [
+        ("claims read", serde_json::json!({"fail_read": "claims"})),
+        ("pods read", serde_json::json!({"fail_read": "pods"})),
+        (
+            "templates read",
+            serde_json::json!({"fail_read": "templates"}),
+        ),
+        (
+            "claims parse",
+            serde_json::json!({"agents": {"dark-factory": {"claims": "not JSON"}}}),
+        ),
+        ("pods parse", serde_json::json!({"pods": "not JSON"})),
+        (
+            "templates parse",
+            serde_json::json!({"templates": "not JSON"}),
+        ),
+    ] {
+        let fixture = stock_retirement_fixture();
+        fixture.set_retirement_inputs(&inputs);
+        let output = run_stock(&fixture, "healthy", &registry.base_url, &[]);
+        assert!(output.status.success(), "{case}: {}", visible(&output));
+        let body = json(&output);
+        assert_eq!(body["status"], "succeeded", "{case}: {body}");
+        assert_eq!(body["canary"]["passed"], true, "{case}: {body}");
+        let expected: Vec<String> = [
+            "kubectl",
+            "-n",
+            "ns",
+            "delete",
+            "sandboxclaim",
+            "-l",
+            "curietech.ai/agent=dark-factory",
+            "--wait=true",
+            "--ignore-not-found=true",
+        ]
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect();
+        assert_eq!(
+            claim_deletes(&fixture),
+            vec![expected.clone()],
+            "{case}: {:?}",
+            fixture.argv()
+        );
+        let argv = fixture.argv();
+        let apply_at = argv
+            .iter()
+            .position(|call| argv_starts(call, &["helm", "upgrade"]))
+            .unwrap();
+        let delete_at = argv.iter().position(|call| call == &expected).unwrap();
+        assert!(
+            delete_at > apply_at,
+            "{case}: fallback must follow Apply: {argv:?}"
+        );
+    }
+}
+
+/// #4332: a failing by-name delete names the command to rerun.
+#[test]
+fn runner_layer_retire_reports_a_failed_by_name_delete_with_the_command_to_rerun() {
+    let registry = stock_registry(true);
+    let fixture = stock_retirement_fixture();
+    fixture.set_retirement_inputs(&serde_json::json!({"fail_delete": true}));
+    let output = run_stock(&fixture, "healthy", &registry.base_url, &[]);
+    assert!(!output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    let rerun = "kubectl -n ns delete sandboxclaim dark-factory-old-claim \
+                 --wait=true --ignore-not-found=true";
+    let reason = body["fail_forward"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("retiring its sandboxes failed")
+            && reason.contains("sandboxclaims is forbidden")
+            && reason.contains(&format!("run `{rerun}`")),
+        "{body}"
+    );
+    let expected: Vec<String> = rerun.split(' ').map(str::to_string).collect();
+    assert_eq!(
+        claim_deletes(&fixture),
+        vec![expected],
+        "one by-name delete, no label-wide retry: {:?}",
+        fixture.argv()
+    );
+}
+
+fn stock_retirement_fixture() -> Fixture {
+    let fixture = stock_fixture();
+    fixture.set_retained(&serde_json::json!({
+        "agentSandbox": {"runnerImages": {"dark-factory": STOCK_OLD}},
+        "connectorCaller": {"existingSecret": "acme-caller-pair"},
+    }));
+    fixture
+}
+
+fn retirement_claims(items: &[(&str, &str)]) -> Value {
+    // The vendored CRD prints .status.sandbox.name as the claim's sandbox
+    // (charts/curie/crds/crd-sandboxclaims.yaml), and the worker reads it as
+    // the bound pod's name (apps/worker/src/curie_worker/sandbox/k8s.py).
+    let items: Vec<Value> = items
+        .iter()
+        .map(|(name, sandbox)| {
+            serde_json::json!({
+                "metadata": {"name": name},
+                "status": {"sandbox": {"name": sandbox}},
+            })
+        })
+        .collect();
+    serde_json::json!({"apiVersion": "v1", "kind": "List", "items": items})
+}
+
+fn retirement_pods(items: &[(&str, &str)]) -> Value {
+    // Deliberately no `curietech.ai/agent` label: platform-template pods do
+    // not render one (charts/curie/templates/agent-sandbox.yaml) and claim
+    // labels never reach pods, so retirement must match pods by name only.
+    // Kubernetes PodSpec exposes spec.containers[*].name and image:
+    // https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#PodSpec
+    let items: Vec<Value> = items
+        .iter()
+        .map(|(name, image)| {
+            serde_json::json!({
+                "metadata": {"name": name},
+                "spec": {"containers": [
+                    {"name": "sidecar", "image": "ghcr.io/acme/acme-helper:0.9.0"},
+                    {"name": "runner", "image": image},
+                ]},
+            })
+        })
+        .collect();
+    serde_json::json!({"apiVersion": "v1", "kind": "List", "items": items})
+}
+
+/// #4321 AC1, AC2: a stock binding is rebound in the `-f` document Helm gets
+/// to the layer published for `--to`, whose base is the target runner. The
+/// owner-built binding is still removed. Both agents' claims are retired after
+/// Apply, and the canary reads the rendered templates and passes.
+#[test]
+fn upgrade_rebinds_a_stock_layer_to_the_published_target_layer_and_retires_its_claims() {
+    let registry = stock_registry(true);
+    let fixture = stock_fixture();
+    let output = run_stock(&fixture, "healthy", &registry.base_url, &[]);
+    assert!(output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "succeeded", "{body}");
+    assert_eq!(body["canary"]["passed"], true, "{body}");
+    assert_eq!(body["known_good_version"], "0.9.0", "{body}");
+
+    let applied = values_doc(&fixture.values(1));
+    assert_eq!(
+        applied
+            .pointer("/agentSandbox/runnerImages/dark-factory")
+            .and_then(Value::as_str),
+        Some(stock_new().as_str()),
+        "the stock agent is rebound to the published 0.9.0 layer: {applied}"
+    );
+    assert!(
+        applied
+            .pointer("/agentSandbox/runnerImages/acme-bot")
+            .is_none(),
+        "the owner-built layer is still removed: {applied}"
+    );
+    assert_eq!(
+        applied
+            .pointer("/agentSandbox/connectorSecrets/dark-factory/GITHUB_APP_KEY")
+            .and_then(Value::as_str),
+        Some("dark-factory-app"),
+        "{applied}"
+    );
+    assert_eq!(fixture.helm_upgrades().len(), 1, "{:?}", fixture.argv());
+    assert_retired_after_apply(&fixture, &["acme-bot", "dark-factory"]);
+
+    let argv = fixture.argv();
+    let apply_at = argv
+        .iter()
+        .position(|call| argv_starts(call, &["helm", "upgrade"]))
+        .unwrap();
+    let read_at = argv
+        .iter()
+        .position(|call| argv_starts(call, &["kubectl", "-n", "ns", "get", SANDBOX_TEMPLATES]))
+        .unwrap_or_else(|| panic!("the canary must read the SandboxTemplates: {argv:?}"));
+    assert!(read_at > apply_at, "{argv:?}");
+
+    let paths: Vec<String> = registry.recorded().into_iter().map(|r| r.path).collect();
+    for path in [STOCK_LAYER_PATH, STOCK_BASE_PATH] {
+        assert!(
+            paths.iter().any(|p| p == path),
+            "the registry was asked for {path}: {paths:?}"
+        );
+    }
+    let rebound = plan_line(&body, "runner layers rebound:");
+    assert!(
+        rebound.contains(&format!("dark-factory={}", stock_new())),
+        "{rebound}"
+    );
+}
+
+/// #4321 AC1-AC2 with @spec CLUSTER-VALUES-FILES c1-c4: the stock binding
+/// supplied by an operator file participates in the target rebind, while its
+/// unrelated values remain in the one overlay used by admission and Apply.
+#[test]
+fn operator_file_stock_binding_is_rebound_in_the_admitted_apply_overlay() {
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(helm.status.success(), "real Helm required");
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    let registry = stock_registry(true);
+    let retained = serde_json::json!({
+        "agentSandbox": {
+            "runnerImages": {"acme-bot": LAYER_BOT},
+            "connectorSecrets": {"dark-factory": {"GITHUB_APP_KEY": "dark-factory-app"}}
+        }
+    });
+    let fixture = Fixture::new(Some(&retained.to_string()));
+    fixture.set_chart_values(&serde_json::json!({
+        "agentSandbox": {"runner": {
+            "image": "ghcr.io/curie-eng/curie-runner",
+            "digest": index_digest(STOCK_BASE_INDEX)
+        }}
+    }));
+    let file = fixture.0.path().join("stock-values.yaml");
+    fs::write(
+        &file,
+        format!(
+            "agentSandbox:\n  runnerImages:\n    dark-factory: {STOCK_OLD}\nworker:\n  deliveryBudgetSeconds: 777\n"
+        ),
+    )
+    .unwrap();
+
+    let output = fixture.run_with_env(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &["--values-file", file.to_str().unwrap()],
+        &[
+            ("CURIE_TEST_SRE_BOT_REGISTRY_ENDPOINT", &registry.base_url),
+            ("VALUES_FILES_REAL_HELM", helm.trim()),
+        ],
+    );
+    assert!(output.status.success(), "{}", visible(&output));
+    let applied = values_doc(&fixture.values(1));
+    assert_eq!(
+        applied
+            .pointer("/agentSandbox/runnerImages/dark-factory")
+            .and_then(Value::as_str),
+        Some(stock_new().as_str()),
+        "the file-provided stock binding is rebound: {applied}"
+    );
+    assert!(
+        applied
+            .pointer("/agentSandbox/runnerImages/acme-bot")
+            .is_none(),
+        "the retained owner-built binding is still cleared: {applied}"
+    );
+    assert_eq!(
+        applied.pointer("/worker/deliveryBudgetSeconds"),
+        Some(&serde_json::json!(777)),
+        "the unrelated file value survives the rebind: {applied}"
+    );
+    let schema_values = fixture.captured_paths("schema-values");
+    assert_eq!(
+        schema_values.len(),
+        1,
+        "schema admission did not capture exactly one overlay: {schema_values:?}"
+    );
+    let render_values = fixture.captured_paths("render-values");
+    assert_eq!(
+        render_values.len(),
+        1,
+        "timeout admission did not capture exactly one overlay: {render_values:?}"
+    );
+    for path in schema_values.into_iter().chain(render_values) {
+        let admitted: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            admitted, applied,
+            "admission and Apply used different overlays"
+        );
+    }
+    let rebound = plan_line(&json(&output), "runner layers rebound:");
+    assert!(rebound.contains("dark-factory"), "{rebound}");
+    assert_retired_after_apply(&fixture, &["acme-bot", "dark-factory"]);
+}
+
+/// #4321 AC3: the dry run reads the registry, lists the rebound agent with
+/// its digest-pinned image apart from the cleared owner-built agent, prints
+/// both retirements, and mutates nothing.
+#[test]
+fn dry_run_lists_rebound_and_cleared_layers_and_mutates_nothing() {
+    let registry = stock_registry(true);
+    let fixture = stock_fixture();
+    let output = run_stock(&fixture, "healthy", &registry.base_url, &["--dry-run"]);
+    assert!(output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    let rebound = plan_line(&body, "runner layers rebound:");
+    assert!(
+        rebound.contains(&format!("dark-factory={STOCK_REPOSITORY}@sha256:")),
+        "{rebound}"
+    );
+    assert!(rebound.contains(&stock_new()), "{rebound}");
+    let owner = plan_line(&body, "runner layers:");
+    assert!(owner.contains("acme-bot"), "{owner}");
+    assert!(!owner.contains("dark-factory"), "{owner}");
+    let lines: Vec<&str> = body["plan"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for agent in ["acme-bot", "dark-factory"] {
+        assert!(
+            lines.contains(&retirement(agent).as_str()),
+            "{agent}: {lines:?}"
+        );
+    }
+    assert!(fixture.helm_upgrades().is_empty(), "{:?}", fixture.argv());
+    assert!(
+        mutating_calls(&fixture).is_empty(),
+        "{:?}",
+        mutating_calls(&fixture)
+    );
+}
+
+/// #4344 AC1, AC2: Validate refuses before release, values, record or claim
+/// mutation. Upgrade ownership is acquired and released as for every refusal.
+fn assert_stock_layer_refusal_writes_only_ownership(fixture: &Fixture) {
+    assert!(fixture.helm_upgrades().is_empty(), "{:?}", fixture.argv());
+    let mutations = mutating_calls(fixture);
+    assert_eq!(mutations.len(), 2, "{mutations:?}");
+    assert!(
+        argv_starts(&mutations[0], &["kubectl", "create"]),
+        "{mutations:?}"
+    );
+    assert!(is_checkpoint_patch(&mutations[1]), "{mutations:?}");
+    let created = fixture.created();
+    assert_eq!(created.len(), 1, "{created:?}");
+    assert!(created[0].pointer("/data/record").is_none(), "{created:?}");
+    let patches = fixture.patches();
+    assert_eq!(patches.len(), 1, "{patches:?}");
+    assert!(is_release_patch(&patches[0]), "{patches:?}");
+    assert!(!patches.iter().any(is_record_patch), "{patches:?}");
+    assert_ownership_released(fixture);
+    assert!(
+        !fixture.argv().iter().any(|call| {
+            call.iter().any(|arg| arg == "delete") && call.iter().any(|arg| arg == "sandboxclaim")
+        }),
+        "no claims may be retired before Validate: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        !fixture.issued(&["kubectl", "get", "deploy", "rel-worker"]),
+        "Validate refusal precedes DrainPreflight: {:?}",
+        fixture.argv()
+    );
+}
+
+/// #4344 AC1: a missing stock layer refuses even when --yes approved the plan.
+#[test]
+fn unpublished_stock_layer_refuses_at_validate_before_mutation() {
+    let registry = stock_registry(false);
+    let fixture = stock_fixture();
+    let output = run_stock(&fixture, "healthy", &registry.base_url, &[]);
+    assert!(!output.status.success(), "{}", visible(&output));
+    let text = visible(&output);
+    assert!(
+        text.contains("stock runner layer cannot be rebound for 0.9.0: dark-factory"),
+        "{text}"
+    );
+    assert!(text.contains("is not published"), "{text}");
+    assert!(text.contains("--allow-stock-layer-clear"), "{text}");
+    assert!(!text.contains("acme-bot ("), "{text}");
+    assert_stock_layer_refusal_writes_only_ownership(&fixture);
+    assert!(
+        registry
+            .recorded()
+            .iter()
+            .any(|request| request.path == STOCK_LAYER_PATH),
+        "the layer was looked up"
+    );
+}
+
+/// #4344 AC2: a connection refusal returns with remediation inside 30 seconds.
+#[test]
+fn unreachable_registry_refuses_the_stock_layer_before_mutation() {
+    let fixture = stock_fixture();
+    let started = Instant::now();
+    let output = run_stock(&fixture, "healthy", "http://127.0.0.1:1", &[]);
+    let elapsed = started.elapsed();
+    assert!(!output.status.success(), "{}", visible(&output));
+    let text = visible(&output);
+    assert!(
+        text.contains("stock runner layer cannot be rebound for 0.9.0: dark-factory"),
+        "{text}"
+    );
+    assert!(text.contains("restore read access to ghcr.io"), "{text}");
+    assert_stock_layer_refusal_writes_only_ownership(&fixture);
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "a refused registry must not wait out the client timeout: {elapsed:?}"
+    );
+}
+
+/// #4344 AC3: the refusing dry-run reports its plan and acquires no ownership.
+#[test]
+fn dry_run_shows_the_stock_layer_refusal() {
+    let registry = stock_registry(false);
+    let fixture = stock_fixture();
+    let output = run_stock(&fixture, "healthy", &registry.base_url, &["--dry-run"]);
+    assert!(!output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    let refusal = plan_line(
+        &body,
+        "refusal at validate: stock runner layer cannot be rebound for",
+    );
+    assert!(refusal.contains("dark-factory"), "{refusal}");
+    assert!(refusal.contains("is not published"), "{refusal}");
+    assert!(refusal.contains("--allow-stock-layer-clear"), "{refusal}");
+    assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+    assert!(fixture.created().is_empty(), "{:?}", fixture.created());
+    assert!(fixture.patches().is_empty(), "{:?}", fixture.patches());
+    assert!(
+        !fixture
+            .argv()
+            .iter()
+            .any(|call| call.iter().any(|arg| arg == "sandboxclaim")),
+        "{:?}",
+        fixture.argv()
+    );
+}
+
+/// #4344 AC4: explicit consent retains the old clearing behavior for both
+/// unpublished layers and an unreachable registry, including the canary.
+#[test]
+fn allow_stock_layer_clear_clears_the_unbindable_stock_layer() {
+    let registry = stock_registry(false);
+    for (endpoint, reason) in [
+        (registry.base_url.as_str(), "not published"),
+        ("http://127.0.0.1:1", "registry"),
+    ] {
+        let fixture = stock_fixture();
+        let output = run_stock(
+            &fixture,
+            "healthy",
+            endpoint,
+            &["--allow-stock-layer-clear"],
+        );
+        assert!(output.status.success(), "{}", visible(&output));
+        let body = json(&output);
+        assert_eq!(body["status"], "succeeded", "{body}");
+        assert_eq!(body["canary"]["passed"], true, "{body}");
+        assert_eq!(body["known_good_version"], "0.9.0", "{body}");
+        let applied = values_doc(&fixture.values(1));
+        assert!(
+            applied
+                .pointer("/agentSandbox/runnerImages/dark-factory")
+                .is_none(),
+            "{applied}"
+        );
+        assert_retired_after_apply(&fixture, &["acme-bot", "dark-factory"]);
+        let stock = plan_line(&body, "stock runner layers:");
+        assert!(stock.contains("dark-factory"), "{stock}");
+        assert!(stock.contains(reason), "{stock}");
+        assert!(
+            stock.contains(&format!(
+                "curie cluster factory --namespace ns --release rel --runner-image \
+                 dark-factory={STOCK_REPOSITORY}@sha256:<digest>"
+            )),
+            "{stock}"
+        );
+        assert!(
+            stock.contains("curie example dark-factory render"),
+            "{stock}"
+        );
+        assert!(!stock.contains("curie build --plugin-dir"), "{stock}");
+        assert!(!stock.contains("acme-bot"), "{stock}");
+        let owner = plan_line(&body, "runner layers:");
+        assert!(!owner.contains("dark-factory"), "{owner}");
+    }
+}
+
+/// #4321 AC6: Helm accepts the rebind, but the rendered per-agent template
+/// still runs the platform runner. The canary reads it, fails, and the run
+/// does not commit known-good.
+#[test]
+fn canary_fails_when_a_rebound_template_drops_its_layer() {
+    let registry = stock_registry(true);
+    let fixture = stock_fixture();
+    let output = run_stock(&fixture, "stock-layer-dropped", &registry.base_url, &[]);
+    let body = json(&output);
+    assert_eq!(fixture.helm_upgrades().len(), 1, "{:?}", fixture.argv());
+    assert_eq!(
+        values_doc(&fixture.values(1))
+            .pointer("/agentSandbox/runnerImages/dark-factory")
+            .and_then(Value::as_str),
+        Some(stock_new().as_str()),
+        "Helm was handed the rebind; only the template drops it"
+    );
+    assert_eq!(body["convergence"]["exact"], true, "{body}");
+    assert_eq!(body["canary"]["passed"], false, "{body}");
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "canary", "{body}");
+    assert_ne!(body["known_good_version"], "0.9.0", "{body}");
+    let reason = body["fail_forward"]["reason"].as_str().unwrap_or("");
+    assert!(reason.contains("dark-factory"), "{body}");
+    assert!(reason.contains(&stock_new()), "the planned image: {body}");
+    assert!(
+        reason.contains(&platform_runner()),
+        "the rendered image: {body}"
+    );
+    let record = fixture.last_record();
+    assert!(
+        !record["completed"]
+            .as_array()
+            .is_some_and(|done| done.iter().any(|phase| phase == "commit")),
+        "Commit must not run after a failed canary: {record}"
+    );
+}
+
+/// #3849: a Helm upgrade that exits before a revision still stores a failed
+/// apply checkpoint and releases ownership. The previous known-good version stays.
+#[test]
+fn helm_upgrade_failure_is_a_terminal_checkpoint_and_releases_ownership() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("helm-upgrade-fails");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a failed apply must exit 1: {}",
+        visible(&output)
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], true, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    assert!(
+        body["fail_forward"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("<nil>"),
+        "{body}"
+    );
+    let record = fixture.last_record();
+    assert_eq!(record["status"], "failed", "{record}");
+    assert_eq!(record["failed_phase"], "apply", "{record}");
+    assert!(
+        record["completed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|phase| phase == "migrate"),
+        "{record}"
+    );
+    let annotations = &fixture.config_map_state()["metadata"]["annotations"];
+    assert!(
+        annotations.get(HOLDER_ANNOTATION).is_none(),
+        "ownership holder must be released: {annotations}"
+    );
+    assert!(
+        annotations.get(ACTION_ANNOTATION).is_none(),
+        "ownership action must be released: {annotations}"
+    );
+}
+
+fn deployment_images_observed_around_apply(fixture: &Fixture) {
+    let argv = fixture.argv();
+    let apply = argv
+        .iter()
+        .position(|call| {
+            call.first().map(String::as_str) == Some("helm")
+                && call.get(1).map(String::as_str) == Some("upgrade")
+        })
+        .expect("Helm apply must have been attempted");
+    for component in ["api", "worker", "ui"] {
+        let name = format!("rel-curie-{component}");
+        let reads: Vec<_> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| {
+                call.iter().map(String::as_str).eq([
+                    "kubectl",
+                    "get",
+                    "deployment",
+                    name.as_str(),
+                    "-n",
+                    "ns",
+                    "-o",
+                    "json",
+                ])
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            reads.iter().any(|index| *index < apply) && reads.iter().any(|index| *index > apply),
+            "{name} must be observed before and after Helm apply: {argv:?}"
+        );
+    }
+}
+
+/// #4462: failed post-upgrade hooks can leave Helm's prior deployed revision
+/// in history while only the api Deployment has moved to the target image.
+#[test]
+fn upgrade_failed_after_apply_reports_previous_not_serving() {
+    let scenario = "apply-post-hook-fails-images-changed";
+    let fixture = Fixture::new(None);
+    let output = fixture.local(scenario);
+    assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], false, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    let reason = body["fail_forward"]["reason"].as_str().unwrap();
+    assert!(reason.contains("target manifests are applied"), "{reason}");
+    assert!(reason.contains("upgrade failed after apply"), "{reason}");
+    assert!(
+        reason.contains("Error: post-upgrade hooks failed: job rel-curie-extra-hook failed"),
+        "the first Helm error line must survive: {reason}"
+    );
+    assert!(
+        !reason.contains("hook failure detail"),
+        "the fail-forward reason must quote only the first error line: {reason}"
+    );
+    let command = body["fail_forward"]["command"].as_str().unwrap();
+    assert!(command.contains("cluster upgrade"), "{command}");
+    assert!(!command.contains("rollback"), "{command}");
+    deployment_images_observed_around_apply(&fixture);
+
+    let human = Fixture::new(None).local_human(scenario);
+    assert_eq!(human.status.code(), Some(1), "{}", visible(&human));
+    assert!(
+        visible(&human).contains("previous version is not serving"),
+        "{}",
+        visible(&human)
+    );
+}
+
+/// #4462: a pre-upgrade hook refusal leaves every Deployment image unchanged.
+#[test]
+fn upgrade_failed_before_apply_keeps_previous_serving() {
+    let scenario = "apply-pre-hook-fails-images-unchanged";
+    let fixture = Fixture::new(None);
+    let output = fixture.local(scenario);
+    assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], true, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    let reason = body["fail_forward"]["reason"].as_str().unwrap();
+    assert!(reason.contains("pre-upgrade hooks failed"), "{reason}");
+    assert!(!reason.contains("target manifests are applied"), "{reason}");
+    assert!(!reason.contains("upgrade failed after apply"), "{reason}");
+    assert!(
+        body["fail_forward"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("cluster rollback"),
+        "{body}"
+    );
+    deployment_images_observed_around_apply(&fixture);
+
+    let human = Fixture::new(None).local_human(scenario);
+    assert_eq!(human.status.code(), Some(1), "{}", visible(&human));
+    assert!(
+        !visible(&human).contains("previous version is not serving"),
+        "{}",
+        visible(&human)
+    );
+}
+
+/// #4462: unchanged readable images cannot prove serving when the ui
+/// Deployment becomes unreadable after the failed apply.
+#[test]
+fn upgrade_failed_with_unreadable_deployment_reports_previous_not_serving() {
+    let scenario = "apply-post-hook-fails-deployment-unreadable";
+    let fixture = Fixture::new(None);
+    let output = fixture.local(scenario);
+    assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], false, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    let reason = body["fail_forward"]["reason"].as_str().unwrap();
+    assert!(reason.contains("target manifests are applied"), "{reason}");
+    assert!(reason.contains("upgrade failed after apply"), "{reason}");
+    assert!(reason.contains("post-upgrade hooks failed"), "{reason}");
+    deployment_images_observed_around_apply(&fixture);
+
+    let human = Fixture::new(None).local_human(scenario);
+    assert_eq!(human.status.code(), Some(1), "{}", visible(&human));
+    assert!(
+        visible(&human).contains("previous version is not serving"),
+        "{}",
+        visible(&human)
+    );
+}
+
+/// #4462 Decision 2 counts any unreadable Deployment after failure as changed,
+/// including NotFound for a ui Deployment that was also absent before apply.
+#[test]
+fn upgrade_failed_with_already_absent_deployment_reports_previous_not_serving() {
+    let scenario = "apply-pre-hook-fails-ui-absent";
+    let fixture = Fixture::new(None);
+    let output = fixture.local(scenario);
+    assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], false, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    assert!(
+        body["fail_forward"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("pre-upgrade hooks failed"),
+        "{body}"
+    );
+    deployment_images_observed_around_apply(&fixture);
+
+    let human = Fixture::new(None).local_human(scenario);
+    assert_eq!(human.status.code(), Some(1), "{}", visible(&human));
+    assert!(
+        visible(&human).contains("previous version is not serving"),
+        "{}",
+        visible(&human)
+    );
+}
+
+/// #3849: after a failed apply, previous_serving follows the revision Helm
+/// still marks deployed, not the version cached before Helm ran.
+#[test]
+fn failed_apply_reports_the_revision_helm_still_has_deployed() {
+    let previous = Fixture::new(None);
+    let output = previous.local("upgrade-fails-previous-deployed");
+    assert!(!output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], true, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    assert!(
+        body["fail_forward"]["command"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cluster rollback"),
+        "{body}"
+    );
+
+    let moved = Fixture::new(None);
+    let output = moved.local("upgrade-fails-target-deployed");
+    assert!(!output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["previous_serving"], false, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    assert!(
+        body["fail_forward"]["command"]
+            .as_str()
+            .unwrap_or("")
+            .contains("cluster upgrade"),
+        "{body}"
+    );
+    assert!(
+        !body["fail_forward"]["command"]
+            .as_str()
+            .unwrap_or("")
+            .contains("rollback"),
+        "{body}"
+    );
+}
+
 /// #2588 -- the same pending contract proceeds once `--forward-only` is set.
 /// Clap does not accept the flag on `cluster upgrade` yet, so this fails today.
 #[test]
@@ -3395,6 +5567,7 @@ fn fail_at_plan_on_owned_namespace_fails_before_helm() {
         &[],
         &[("CURIE_UPGRADE_TEST_FAIL_AT", "plan")],
     );
+    assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
     let payload = json(&output);
     assert_eq!(
         payload["status"],
@@ -3786,13 +5959,15 @@ fn valid_dry_run_succeeds_without_mutating() {
 }
 
 /// #2863: the apply line a dry run prints is the argv the real run executes,
-/// with only the retained values tempfile path replaced by a placeholder. The
-/// overlay's contents never reach the plan.
+/// with only an existing release's retained values tempfile path replaced by
+/// a placeholder. An absent release has no retained overlay to pass with -f.
+/// The overlay's contents never reach the plan.
 #[test]
 fn printed_apply_line_matches_executed_helm_argv() {
     let overlay = r#"{"worker":{"replicas":2},"marker":"overlay-value-must-not-print"}"#;
     for (scenario, install) in [("schema-compatible", false), ("fresh-install", true)] {
-        let dry = Fixture::new(Some(overlay));
+        let retained = (!install).then_some(overlay);
+        let dry = Fixture::new(retained);
         let output = dry.run_with(scenario, "0.9.0", "charts/curie", &["--dry-run"]);
         assert!(output.status.success(), "{scenario}: {}", visible(&output));
         assert!(
@@ -3811,16 +5986,26 @@ fn printed_apply_line_matches_executed_helm_argv() {
             .map(str::to_owned)
             .collect();
 
-        let real = Fixture::new(Some(overlay));
+        let real = Fixture::new(retained);
         let real_output = real.run(scenario, "0.9.0", "charts/curie");
         let upgrades = real.helm_upgrades();
         assert_eq!(upgrades.len(), 1, "{scenario}: {}", visible(&real_output));
         let mut executed = upgrades[0].clone();
-        let values_at = executed
-            .iter()
-            .position(|arg| arg == "-f")
-            .unwrap_or_else(|| panic!("{scenario}: apply passed no values: {executed:?}"));
-        executed[values_at + 1] = "<retained-values>".into();
+        let values_at = executed.iter().position(|arg| arg == "-f");
+        if install {
+            assert!(
+                values_at.is_none(),
+                "an absent release has no retained values: {executed:?}"
+            );
+            assert!(
+                real.captured_paths("values").is_empty(),
+                "first install must not invent a retained overlay"
+            );
+        } else {
+            let values_at = values_at
+                .unwrap_or_else(|| panic!("{scenario}: apply passed no values: {executed:?}"));
+            executed[values_at + 1] = "<retained-values>".into();
+        }
 
         assert_eq!(
             printed, executed,
@@ -3832,4 +6017,414 @@ fn printed_apply_line_matches_executed_helm_argv() {
             "{scenario}: --install only for a first install: {printed:?}"
         );
     }
+}
+
+#[test]
+fn operator_files_override_retained_values_in_admission_and_apply() {
+    // @spec CLUSTER-VALUES-FILES c1-c4
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(helm.status.success(), "real Helm required");
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    for reverse in [false, true] {
+        let fixture = Fixture::new(Some(
+            r#"{"worker":{"deliveryBudgetSeconds":600,"extraEnv":[{"name":"OLD","value":"old"}]}}"#,
+        ));
+        let first = fixture.0.path().join("first.yaml");
+        let second = fixture.0.path().join("second.yaml");
+        fs::write(&first, "worker:\n  deliveryBudgetSeconds: 700\n  extraEnv:\n    - name: NUMERIC_STRING\n      value: '8080'\napi:\n  podLabels:\n    example.com/key: 'off'\n").unwrap();
+        fs::write(&second, "worker:\n  deliveryBudgetSeconds: 800\n  extraEnv: []\napi:\n  githubToken: PLACEHOLDER-file-secret\n").unwrap();
+        let files = if reverse {
+            [&second, &first]
+        } else {
+            [&first, &second]
+        };
+        let output = fixture.run_with_env(
+            "healthy",
+            "0.9.0",
+            "charts/curie",
+            &[
+                "-f",
+                files[0].to_str().unwrap(),
+                "--values-file",
+                files[1].to_str().unwrap(),
+            ],
+            &[("VALUES_FILES_REAL_HELM", helm.trim())],
+        );
+        assert!(output.status.success(), "{}", stderr(&output));
+        let applied: Value = serde_json::from_str(&fixture.values(1)).unwrap();
+        assert_eq!(
+            applied.pointer("/worker/deliveryBudgetSeconds"),
+            Some(&serde_json::json!(if reverse { 700 } else { 800 }))
+        );
+        assert_eq!(
+            applied.pointer("/worker/extraEnv"),
+            Some(&if reverse {
+                serde_json::json!([{"name":"NUMERIC_STRING","value":"8080"}])
+            } else {
+                serde_json::json!([])
+            })
+        );
+        assert_eq!(
+            applied.pointer("/api/podLabels/example.com~1key"),
+            Some(&serde_json::json!("off"))
+        );
+        for path in fixture.captured_paths("render-values") {
+            let admitted: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(
+                admitted, applied,
+                "admission and Apply used different overlays"
+            );
+        }
+        assert!(!stderr(&output).contains("PLACEHOLDER-file-secret"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("PLACEHOLDER-file-secret"));
+        assert!(!fixture
+            .argv()
+            .iter()
+            .flatten()
+            .any(|arg| arg.contains("PLACEHOLDER-file-secret")));
+    }
+}
+
+#[test]
+fn explicit_file_repairs_a_retained_config_conflict_before_admission() {
+    // @spec CLUSTER-VALUES-FILES c3
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(helm.status.success(), "real Helm required");
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    let fixture = Fixture::new(Some(&conflict_values("999").to_string()));
+    let file = fixture.0.path().join("repair.yaml");
+    fs::write(&file, "worker:\n  extraEnv: []\n").unwrap();
+    let output = fixture.run_with_env(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &["-f", file.to_str().unwrap()],
+        &[("VALUES_FILES_REAL_HELM", helm.trim())],
+    );
+    assert!(
+        output.status.success(),
+        "admission used superseded retained values: {}",
+        stderr(&output)
+    );
+    let applied: Value = serde_json::from_str(&fixture.values(1)).unwrap();
+    assert_eq!(
+        applied.pointer("/worker/extraEnv"),
+        Some(&serde_json::json!([]))
+    );
+}
+
+#[test]
+fn upgrade_file_inline_credentials_replace_retained_secret_references() {
+    // @spec CLUSTER-VALUES-FILES c1, CLUSTER-VALUES-FILES c3, CLUSTER-VALUES-FILES c4
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(helm.status.success());
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    let fixture = Fixture::new(Some(
+        r#"{"agentSandbox":{"runner":{"credentialsExistingSecret":"old-model","credentialsExistingSecretKey":"token"}},"api":{"githubTokenExistingSecret":"old-github","githubTokenExistingSecretKey":"token"},"postgres":{"existingSecret":"old-postgres"}}"#,
+    ));
+    let file = fixture.0.path().join("credential-replacements.yaml");
+    fs::write(&file, "agentSandbox:\n  runner:\n    credentials: PLACEHOLDER-new-model\napi:\n  githubToken: PLACEHOLDER-new-github\npostgres:\n  auth:\n    password: PLACEHOLDER-new-postgres\n").unwrap();
+    let output = fixture.run_with_env(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &["-f", file.to_str().unwrap()],
+        &[("VALUES_FILES_REAL_HELM", helm.trim())],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let applied: Value = serde_json::from_str(&fixture.values(1)).unwrap();
+    for (path, replacement) in [
+        ("/agentSandbox/runner/credentials", "PLACEHOLDER-new-model"),
+        ("/api/githubToken", "PLACEHOLDER-new-github"),
+        ("/postgres/auth/password", "PLACEHOLDER-new-postgres"),
+    ] {
+        assert_eq!(
+            applied.pointer(path).and_then(Value::as_str),
+            Some(replacement),
+            "file replacement lost at {path}"
+        );
+        assert!(!visible(&output).contains(replacement));
+        assert!(!fixture
+            .argv()
+            .iter()
+            .flatten()
+            .any(|arg| arg.contains(replacement)));
+    }
+    for path in [
+        "/agentSandbox/runner/credentialsExistingSecret",
+        "/agentSandbox/runner/credentialsExistingSecretKey",
+        "/api/githubTokenExistingSecret",
+        "/api/githubTokenExistingSecretKey",
+        "/postgres/existingSecret",
+    ] {
+        assert!(
+            applied
+                .pointer(path)
+                .is_none_or(|value| value.as_str() == Some("")),
+            "retained reference still active: {path}"
+        );
+    }
+    for path in fixture.captured_paths("render-values") {
+        let admitted: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(admitted, applied);
+    }
+}
+
+#[test]
+fn upgrade_refuses_before_render_when_captured_overlay_cannot_be_materialized() {
+    // @spec CLUSTER-VALUES-FILES c3, CLUSTER-VALUES-FILES c4
+    let fixture = Fixture::new(Some(r#"{"worker":{"deliveryBudgetSeconds":600}}"#));
+    let tmp = fixture.0.path().join("owned-temp");
+    fs::create_dir(&tmp).unwrap();
+    let output = fixture.run_with_env(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &[],
+        &[
+            ("TMPDIR", tmp.to_str().unwrap()),
+            (
+                "VALUES_FILES_REMOVE_TMP_AFTER_SCHEMA_PROBE",
+                tmp.to_str().unwrap(),
+            ),
+        ],
+    );
+    assert!(!tmp.exists(), "fixture did not inject the failure");
+    assert!(!output.status.success());
+    assert!(
+        visible(&output).contains("could not prepare target metadata values"),
+        "{}",
+        visible(&output)
+    );
+    assert!(
+        !fixture
+            .argv()
+            .iter()
+            .any(|args| args.iter().any(|arg| arg == "templates/schema-compat.yaml")),
+        "metadata was admitted without its overlay"
+    );
+    // Ownership acquisition/release precedes admission by existing policy.
+    assert!(fixture.helm_upgrades().is_empty());
+    assert!(
+        fixture.records().is_empty(),
+        "lifecycle checkpoint advanced after metadata refusal"
+    );
+}
+
+/// Whether the record lists `phase` as completed.
+fn record_completed(record: &Value, phase: &str) -> bool {
+    record["completed"]
+        .as_array()
+        .is_some_and(|done| done.iter().any(|item| item == phase))
+}
+
+/// #4321 review P1: a run interrupted after Apply cleared acme-bot's
+/// owner-built layer resumes from values that no longer bind acme-bot. The
+/// checkpoint carries the original canary expectations, so the resumed canary
+/// still checks acme-bot's template, finds it on the old layer, and does not
+/// commit known-good.
+#[test]
+fn resumed_canary_checks_a_layer_apply_already_cleared() {
+    let values = serde_json::json!({
+        "agentSandbox": {"runnerImages": {"acme-bot": LAYER_BOT}}
+    });
+    let fixture = Fixture::new(Some(&values.to_string()));
+    let first = fixture.local_env(
+        "healthy",
+        &[("CURIE_UPGRADE_TEST_INTERRUPT_AFTER", "apply")],
+    );
+    assert!(!first.status.success(), "{}", visible(&first));
+    assert!(
+        visible(&first).contains("interrupted"),
+        "{}",
+        visible(&first)
+    );
+    assert_eq!(fixture.helm_upgrades().len(), 1, "{:?}", fixture.argv());
+    assert!(
+        values_doc(&fixture.values(1))
+            .pointer("/agentSandbox/runnerImages/acme-bot")
+            .is_none(),
+        "Apply cleared the owner-built layer"
+    );
+    let interrupted = fixture.last_record();
+    assert_eq!(interrupted["status"], "in_progress", "{interrupted}");
+    assert!(record_completed(&interrupted, "apply"), "{interrupted}");
+    assert_eq!(
+        interrupted["runner_canary"],
+        serde_json::json!([["acme-bot", "PlatformRunner"]]),
+        "the checkpoint records the plan's canary expectations: {interrupted}"
+    );
+
+    let second = fixture.local("stale-cleared-template");
+    let body = json(&second);
+    assert_eq!(body["resumed"], true, "{body}");
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "the resume does not apply again: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        fixture.issued(&["kubectl", "-n", "ns", "get", SANDBOX_TEMPLATES]),
+        "the resumed canary reads the templates: {:?}",
+        fixture.argv()
+    );
+    assert_eq!(body["canary"]["passed"], false, "{body}");
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "canary", "{body}");
+    assert_ne!(body["known_good_version"], "0.9.0", "{body}");
+    let reason = body["fail_forward"]["reason"].as_str().unwrap_or("");
+    assert!(reason.contains("acme-bot"), "{body}");
+    assert!(reason.contains(LAYER_BOT), "the stale layer: {body}");
+    let record = fixture.last_record();
+    assert!(
+        !record_completed(&record, "commit"),
+        "Commit must not run after a failed canary: {record}"
+    );
+    assert_ne!(record["known_good_version"], "0.9.0", "{record}");
+}
+
+/// #4321 review P2: a same-version rerun applies nothing, so every binding is
+/// kept as it is. Here neither runner can be resolved (no target chart values,
+/// and the recording `helm history` fails), which used to plan clears for an
+/// Apply that never runs and then fail the canary against the unchanged
+/// templates. No registry lookup, no overlay edit, no claim retirement.
+#[test]
+fn same_version_rerun_keeps_bindings_when_the_runner_cannot_be_resolved() {
+    let registry = stock_registry(true);
+    let values = serde_json::json!({
+        "agentSandbox": {"runnerImages": {
+            "acme-bot": LAYER_BOT,
+            "dark-factory": STOCK_OLD
+        }}
+    });
+    let fixture = Fixture::new(Some(&values.to_string()));
+    let output = run_stock(&fixture, "resumed-applied", &registry.base_url, &[]);
+    assert!(output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["unchanged"], true, "{body}");
+    assert_eq!(body["status"], "succeeded", "{body}");
+    assert_eq!(body["canary"]["passed"], true, "{body}");
+    assert_eq!(body["known_good_version"], "0.9.0", "{body}");
+    assert!(fixture.helm_upgrades().is_empty(), "{:?}", fixture.argv());
+    assert!(
+        claim_deletes(&fixture).is_empty(),
+        "nothing is retired: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        fixture.issued(&["kubectl", "-n", "ns", "get", SANDBOX_TEMPLATES]),
+        "the canary still checks the kept bindings: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        registry.recorded().is_empty(),
+        "a same-version rerun asks the registry nothing: {:?}",
+        registry
+            .recorded()
+            .into_iter()
+            .map(|r| r.path)
+            .collect::<Vec<_>>()
+    );
+    let lines: Vec<&str> = body["plan"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        !lines.iter().any(|line| {
+            line.starts_with("runner layers") || line.starts_with("stock runner layers")
+        }),
+        "a same-version rerun clears and rebinds nothing: {lines:?}"
+    );
+}
+
+/// #4321 review P2: `fullnameOverride: acme-runner` renders
+/// `acme-runner-runner` and `acme-runner-agent-dark-factory-runner`. The
+/// canary derives the fullname the way the chart does, so the correct rebind
+/// commits.
+#[test]
+fn canary_names_templates_from_a_fullname_override_ending_in_runner() {
+    let registry = stock_registry(true);
+    let fixture = stock_fixture();
+    let mut values: Value =
+        serde_json::from_str(&fs::read_to_string(fixture.0.path().join("retained.json")).unwrap())
+            .unwrap();
+    values["fullnameOverride"] = Value::from("acme-runner");
+    fixture.set_retained(&values);
+    let output = run_stock(&fixture, "healthy", &registry.base_url, &[]);
+    assert!(output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "succeeded", "{body}");
+    assert_eq!(body["canary"]["passed"], true, "{body}");
+    assert_eq!(body["known_good_version"], "0.9.0", "{body}");
+    let applied = values_doc(&fixture.values(1));
+    assert_eq!(
+        applied.pointer("/fullnameOverride").and_then(Value::as_str),
+        Some("acme-runner"),
+        "{applied}"
+    );
+    assert_eq!(
+        applied
+            .pointer("/agentSandbox/runnerImages/dark-factory")
+            .and_then(Value::as_str),
+        Some(stock_new().as_str()),
+        "{applied}"
+    );
+    assert!(
+        fixture.issued(&["kubectl", "-n", "ns", "get", SANDBOX_TEMPLATES]),
+        "{:?}",
+        fixture.argv()
+    );
+}
+
+/// #4321 review round 2 P2: a `fullnameOverride` present only in the target
+/// chart's defaults (`helm show values`) still names the templates, because
+/// Helm renders chart defaults beneath the retained overlay. The retained
+/// overlay omits it, so the canary must read the effective value to find
+/// `acme-runner-agent-dark-factory-runner` and pass the correct rebind.
+#[test]
+fn canary_names_templates_from_a_fullname_override_set_only_in_chart_defaults() {
+    let registry = stock_registry(true);
+    let fixture = stock_fixture();
+    fixture.set_chart_values(&serde_json::json!({
+        "fullnameOverride": "acme-runner",
+        "agentSandbox": {"runner": {
+            "image": "ghcr.io/curie-eng/curie-runner",
+            "digest": index_digest(STOCK_BASE_INDEX)
+        }}
+    }));
+    let output = run_stock(&fixture, "healthy", &registry.base_url, &[]);
+    assert!(output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "succeeded", "{body}");
+    assert_eq!(body["canary"]["passed"], true, "{body}");
+    assert_eq!(body["known_good_version"], "0.9.0", "{body}");
+    let applied = values_doc(&fixture.values(1));
+    assert!(
+        applied.pointer("/fullnameOverride").is_none(),
+        "the retained overlay does not carry the chart default: {applied}"
+    );
+    assert_eq!(
+        applied
+            .pointer("/agentSandbox/runnerImages/dark-factory")
+            .and_then(Value::as_str),
+        Some(stock_new().as_str()),
+        "{applied}"
+    );
+    assert!(
+        fixture.issued(&["kubectl", "-n", "ns", "get", SANDBOX_TEMPLATES]),
+        "{:?}",
+        fixture.argv()
+    );
 }

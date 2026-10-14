@@ -13,6 +13,7 @@ import asyncio
 import sys
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 from curie_worker.capacity_wait import CapacityWaitRequested
@@ -31,13 +32,15 @@ UNSCHEDULABLE = "0/1 nodes are available: 1 Insufficient cpu."
 
 
 class _DeferringWorkItems(_WorkItems):
-    def __init__(self) -> None:
+    def __init__(self, terminal_cause: str | None = None) -> None:
         super().__init__()
         self.defers: list[tuple[uuid.UUID, dict[str, object]]] = []
+        self.terminal_cause = terminal_cause
 
-    async def defer(self, request_id: uuid.UUID, **kwargs: object) -> None:
+    async def defer(self, request_id: uuid.UUID, **kwargs: object) -> str | None:
         self.calls.append("defer")
         self.defers.append((request_id, kwargs))
+        return self.terminal_cause
 
 
 def test_an_unschedulable_execution_defers_as_capacity(make_harness) -> None:
@@ -139,5 +142,52 @@ def test_unschedulable_chat_requests_capacity_wait_without_factory_defer(
         assert unschedulable[2] == []
         assert baseline[1]
         assert baseline[2]
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("terminal_cause", ["start_failed", None])
+def test_a_terminal_unstarted_defer_releases_the_thread_sandbox(
+    make_harness, monkeypatch, terminal_cause: str | None
+) -> None:
+    """#4170: the fifth non-capacity start deferral ends the request
+    ``start_failed``. An unstarted request gets no terminate wake, so, as in
+    #3208, this delivery must hand its thread to the settled-run release. A
+    deferral that leaves the request waiting must not: the next acquire adopts
+    this thread's route."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            claim_timeout_seconds=0.05,
+        ) as h:
+            work_items = _DeferringWorkItems(terminal_cause)
+            h.kernel._work_items = work_items
+            h.fake_k8s.bind_ready = False
+            releases: list[str] = []
+            release = h.kernel._release_work_item_sandbox
+
+            async def observed_release(run: Any) -> None:
+                releases.append(run.thread_key)
+                await release(run)
+
+            monkeypatch.setattr(h.kernel, "_release_work_item_sandbox", observed_release)
+            request_id = uuid.uuid4()
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            assert len(work_items.defers) == 1, work_items.calls
+            assert str(work_items.defers[0][1]["reason"]).startswith("not_started:")
+            assert "start" not in work_items.calls
+            assert h.runner.opened == []
+            assert not h.kernel.owns_work_item(request_id)
+            if terminal_cause is None:
+                assert releases == []
+            else:
+                assert len(releases) == 1
+                assert h.fake_k8s.claims == {}
 
     asyncio.run(exercise())

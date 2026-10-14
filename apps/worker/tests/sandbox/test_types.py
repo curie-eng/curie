@@ -86,4 +86,12 @@ def test_a_route_written_before_the_caller_token_reads_as_carrying_none() -> Non
         "session_id": "sess",
         "state": "live",
     }
-    assert RouteRecord.from_json(json.dumps(legacy)).handle.carries_caller_token is False
+    loaded = RouteRecord.from_json(json.dumps(legacy)).handle
+    assert loaded.carries_caller_token is False
+    assert loaded.caller_run is None
+
+
+def test_a_route_record_keeps_the_run_its_caller_token_names() -> None:
+    run = "11111111-1111-4111-8111-111111111111"
+    record = RouteRecord(handle=_handle(caller_run=run))
+    assert RouteRecord.from_json(record.to_json()).handle.caller_run == run

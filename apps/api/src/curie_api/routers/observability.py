@@ -3,12 +3,13 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from starlette.concurrency import run_in_threadpool
 
+from curie_api.schemas.observability import MetricSeries, MetricsSummary, PodLogs, RunnerPods
+
 from .. import metrics as metrics_service
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import LangfuseDep, PodListerDep, PodLogReaderDep
 from ..k8s import NoClusterConfigured, PodLogError
-from ..schemas import MetricSeries, MetricsSummary, PodLogs, RunnerPods
 
 router = APIRouter(
     prefix="/observability",

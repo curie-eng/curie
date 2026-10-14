@@ -186,7 +186,7 @@ class ThreadLock:
         try:
             capable = await self._owner_liveness.is_capable(owner)
             alive = await self._owner_liveness.is_alive(owner)
-        except Exception:
+        except Exception:  # noqa: BLE001 - existing broad catch retained
             return False
         if not capable or alive:
             return False
@@ -206,7 +206,7 @@ class ThreadLock:
                     return False
                 if not await self._owner_liveness.is_capable(owner):
                     return False
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 return False
         return await self._cas_steal(key, held, token)
 
@@ -282,7 +282,7 @@ class ThreadLock:
                 if not await self._renew(lease.key, lease.token):
                     lease.mark_lost()
                     return
-            except Exception:
+            except Exception:  # noqa: BLE001 - existing broad catch retained
                 lease.mark_lost()
                 return
 

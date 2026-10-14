@@ -3,9 +3,10 @@
 One logical turn chain owns one progress record: its current task state, its
 milestone budget, and the card and milestone deliveries it owes its channel.
 The rules are specified in the worker README's "Deliberate progress (ADR 0130)"
-section; this module is where they run. Nothing reaches it yet: no ingress
-applies a model's command, the kernel opens no chain, and the maintenance tick
-sweeps the outbox without a deliverer.
+section; this module is where they run. A model's command reaches it through
+the API's ingress, the chain's inbox and the kernel's per-turn pump
+(``curie_worker.turn_progress``); nothing delivers from the outbox yet, and the
+maintenance tick sweeps it without a deliverer.
 
 Three structural choices carry the ADR's guarantees:
 
@@ -82,6 +83,9 @@ PROGRESS_SWEEP_BATCH: Final = 64
 PROGRESS_SWEEP_BUDGET_S: Final = 30.0
 PROGRESS_SWEEP_GRACE_S: Final = 60.0
 PROGRESS_MAX_ATTEMPTS: Final = 5
+# The live pump renews this lease every half second. Five seconds tolerates
+# transient scheduling stalls while bounding a failed end-turn clear tightly.
+PROGRESS_ACTIVE_LEASE_MS: Final = 5_000
 
 # The fencing generation field of the ADR-0131 delivery state hash, which
 # ``delivery_lease.py`` HINCRBYs on every change of authority. The fenced-write
@@ -121,8 +125,39 @@ if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
 redis.call('HSET', KEYS[1],
   'state', '', 'summary', '', 'revision', '0', 'epoch', '0', 'last_seq', '0',
   'milestones_used', '0', 'card_ref', '', 'answer_ref', ARGV[2], 'terminal', '0',
-  'inbox_cursor', '', 'update_count', '0')
+  'inbox_cursor', '', 'update_count', '0', 'turn_generation', '0',
+  'active_generation', '0', 'active_until_ms', '0')
 redis.call('EXPIRE', KEYS[1], ARGV[1])
+return 1
+"""
+
+_BEGIN_TURN_LUA = """
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+local generation = redis.call('HINCRBY', KEYS[1], 'turn_generation', 1)
+local now_parts = redis.call('TIME')
+local now_ms = tonumber(now_parts[1]) * 1000 + math.floor(tonumber(now_parts[2]) / 1000)
+local active_until_ms = now_ms + tonumber(ARGV[2])
+redis.call('HSET', KEYS[1],
+  'active_generation', tostring(generation),
+  'active_until_ms', tostring(active_until_ms))
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+return generation
+"""
+
+_END_TURN_LUA = """
+if redis.call('HGET', KEYS[1], 'active_generation') ~= ARGV[1] then return 0 end
+redis.call('HSET', KEYS[1], 'active_generation', '0', 'active_until_ms', '0')
+return 1
+"""
+
+_RENEW_TURN_LUA = """
+if redis.call('HGET', KEYS[1], 'active_generation') ~= ARGV[1] then return 0 end
+local active_until_ms = tonumber(redis.call('HGET', KEYS[1], 'active_until_ms'))
+if active_until_ms == nil then return 0 end
+local now_parts = redis.call('TIME')
+local now_ms = tonumber(now_parts[1]) * 1000 + math.floor(tonumber(now_parts[2]) / 1000)
+if now_ms >= active_until_ms then return 0 end
+redis.call('HSET', KEYS[1], 'active_until_ms', tostring(now_ms + tonumber(ARGV[2])))
 return 1
 """
 
@@ -138,11 +173,11 @@ return 1
 
 # The platform prelude: the ADR-0131 fence, before anything is read or
 # written. KEYS[5] is the lease key and KEYS[6] the delivery state hash, both
-# derived from the caller's own lease triple; ARGV[24..26] are its owner token,
+# derived from the caller's own lease triple; ARGV[25..27] are its owner token,
 # the generation field name and its generation.
 _PLATFORM_PRELUDE = """
-if redis.call('GET', KEYS[5]) ~= ARGV[24] then return {'refused', 'lease-lost'} end
-if redis.call('HGET', KEYS[6], ARGV[25]) ~= ARGV[26] then return {'refused', 'lease-lost'} end
+if redis.call('GET', KEYS[5]) ~= ARGV[25] then return {'refused', 'lease-lost'} end
+if redis.call('HGET', KEYS[6], ARGV[26]) ~= ARGV[27] then return {'refused', 'lease-lost'} end
 local platform = true
 """
 
@@ -158,7 +193,7 @@ local platform = false
 # 6 summary, 7 terminal, 8 max updates, 9 max milestones, 10 revision read,
 # 11 milestones read, 12 milestone requested, 13-16 card id / event / slot /
 # generation, 17-20 the same for the milestone, 21 route, 22 created_at,
-# 23 progress id.
+# 23 progress id, 24 whether to enqueue deliveries.
 #
 # The checks run in the README's order and the first to fail answers. The two
 # "moved" answers are the compare-and-set: the card payload and the delivery
@@ -226,14 +261,19 @@ local function enqueue(key, id, event, slot, generation)
   redis.call('EXPIRE', key, ttl)
   redis.call('SADD', KEYS[2], id)
 end
-if changed then enqueue(KEYS[3], ARGV[13], ARGV[14], ARGV[15], ARGV[16]) end
-if reserve then enqueue(KEYS[4], ARGV[17], ARGV[18], ARGV[19], ARGV[20]) end
-if changed or reserve then redis.call('EXPIRE', KEYS[2], ttl) end
+local enqueue_enabled = ARGV[24] == '1'
+if enqueue_enabled and changed then
+  enqueue(KEYS[3], ARGV[13], ARGV[14], ARGV[15], ARGV[16])
+end
+if enqueue_enabled and reserve then
+  enqueue(KEYS[4], ARGV[17], ARGV[18], ARGV[19], ARGV[20])
+end
+if enqueue_enabled and (changed or reserve) then redis.call('EXPIRE', KEYS[2], ttl) end
 
 local refused_milestone = '0'
 if ARGV[12] == '1' and not reserve then refused_milestone = '1' end
 local enqueued_card = '0'
-if changed then enqueued_card = '1' end
+if enqueue_enabled and changed then enqueued_card = '1' end
 return {'applied', tostring(revision), tostring(ordinal), refused_milestone, enqueued_card}
 """
 
@@ -253,6 +293,42 @@ end
 redis.call('DEL', KEYS[1])
 redis.call('SREM', KEYS[2], ARGV[2])
 return 1
+"""
+
+# Move the record's inbox cursor forward to a stream id, never back, and never
+# onto an expired record. Stream ids compare as (milliseconds, sequence).
+_ADVANCE_CURSOR_LUA = """
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+local nm, ns = string.match(ARGV[1], '^(%d+)-(%d+)$')
+if not nm then return 0 end
+local current = redis.call('HGET', KEYS[1], 'inbox_cursor')
+if current and current ~= '' then
+  local cm, cs = string.match(current, '^(%d+)-(%d+)$')
+  if cm then
+    nm, ns, cm, cs = tonumber(nm), tonumber(ns), tonumber(cm), tonumber(cs)
+    if nm < cm or (nm == cm and ns <= cs) then return 0 end
+  end
+end
+redis.call('HSET', KEYS[1], 'inbox_cursor', ARGV[1])
+return 1
+"""
+
+_RELEASE_INBOX_LUA = """
+if redis.call('EXISTS', KEYS[3]) == 0 then
+  redis.call('SREM', KEYS[2], ARGV[1])
+  return 1
+end
+local latest = redis.call('XREVRANGE', KEYS[1], '+', '-', 'COUNT', 1)
+if #latest == 0 then
+  redis.call('SREM', KEYS[2], ARGV[1])
+  return 1
+end
+local cursor = redis.call('HGET', KEYS[3], 'inbox_cursor')
+if cursor and cursor == latest[1][1] then
+  redis.call('SREM', KEYS[2], ARGV[1])
+  return 1
+end
+return 0
 """
 
 # Charge one attempt BEFORE the delivery is tried, so a crash mid-attempt still
@@ -349,6 +425,9 @@ class ProgressRecord:
     terminal: bool
     inbox_cursor: str
     update_count: int
+    turn_generation: int
+    active_generation: int
+    active_until_ms: int
 
 
 @dataclass(frozen=True)
@@ -363,6 +442,14 @@ class ProgressOutcome:
     deliveries: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class ProgressInboxSweep:
+    """One bounded maintenance pass over durable progress inboxes."""
+
+    chains: int = 0
+    applied: int = 0
+
+
 class MalformedProgressError(RuntimeError):
     """A stored progress hash lacks or garbles a field every writer sets.
 
@@ -374,9 +461,18 @@ class MalformedProgressError(RuntimeError):
 class ProgressStore:
     """The durable progress record, its chain pointers, and its outbox."""
 
-    def __init__(self, redis: Redis, config: WorkerConfig) -> None:
+    def __init__(
+        self,
+        redis: Redis,
+        config: WorkerConfig,
+        *,
+        active_lease_ms: int = PROGRESS_ACTIVE_LEASE_MS,
+    ) -> None:
+        if active_lease_ms < 1:
+            raise ValueError("active_lease_ms must be positive")
         self._redis = redis
         self._config = config
+        self._active_lease_ms = active_lease_ms
 
     @property
     def dead_letter_stream(self) -> str:
@@ -458,11 +554,53 @@ class ProgressStore:
                 terminal=fields["terminal"] == "1",
                 inbox_cursor=fields["inbox_cursor"],
                 update_count=int(fields["update_count"]),
+                turn_generation=int(fields["turn_generation"]),
+                active_generation=int(fields["active_generation"]),
+                active_until_ms=int(fields["active_until_ms"]),
             )
         except (KeyError, ValueError) as exc:
             raise MalformedProgressError(f"progress record {progress_id}: {exc!r}") from exc
 
     # -- updates --------------------------------------------------------------
+
+    async def begin_turn(self, progress_id: str) -> int:
+        """Allocate and activate the chain's next durable turn generation."""
+
+        generation = int(
+            await self._redis.eval(
+                _BEGIN_TURN_LUA,
+                1,
+                self._config.progress_key(progress_id),
+                str(progress_ttl_s(self._config)),
+                str(self._active_lease_ms),
+            )
+        )
+        if generation < 1:
+            raise MalformedProgressError(f"progress record {progress_id} does not exist")
+        return generation
+
+    async def end_turn(self, progress_id: str, generation: int) -> bool:
+        """Deactivate exactly the generation this turn owned."""
+
+        ended = await self._redis.eval(
+            _END_TURN_LUA,
+            1,
+            self._config.progress_key(progress_id),
+            str(generation),
+        )
+        return int(ended) == 1
+
+    async def renew_turn(self, progress_id: str, generation: int) -> bool:
+        """Renew this live generation, but never revive one whose lease lapsed."""
+
+        renewed = await self._redis.eval(
+            _RENEW_TURN_LUA,
+            1,
+            self._config.progress_key(progress_id),
+            str(generation),
+            str(self._active_lease_ms),
+        )
+        return int(renewed) == 1
 
     async def apply_model_command(
         self,
@@ -473,6 +611,7 @@ class ProgressStore:
         seq: int,
         route: TargetRoute,
         target: ReplyTarget,
+        enqueue_deliveries: bool = True,
     ) -> ProgressOutcome:
         """Apply one model command at its ingress position ``(epoch, seq)``."""
         if command.state not in MODEL_PROGRESS_STATES:
@@ -492,6 +631,7 @@ class ProgressStore:
             target=target,
             fence_keys=(),
             fence_args=(),
+            enqueue_deliveries=enqueue_deliveries,
         )
 
     async def apply_platform_update(
@@ -528,6 +668,7 @@ class ProgressStore:
                 self._config.delivery_state_key(lease.stream, lease.group, lease.entry_id),
             ),
             fence_args=(lease.owner, _DELIVERY_GENERATION_FIELD, str(lease.generation)),
+            enqueue_deliveries=True,
         )
 
     async def _read_counts(self, progress_id: str) -> tuple[int, int]:
@@ -552,6 +693,7 @@ class ProgressStore:
         target: ReplyTarget,
         fence_keys: tuple[str, ...],
         fence_args: tuple[str, ...],
+        enqueue_deliveries: bool,
     ) -> ProgressOutcome:
         ttl_s = str(progress_ttl_s(self._config))
         terminal = state in TERMINAL_PROGRESS_STATES
@@ -625,6 +767,7 @@ class ProgressStore:
                 route.model_dump_json(),
                 str(time.time()),
                 progress_id,
+                "1" if enqueue_deliveries else "0",
                 *fence_args,
             )
             answer = [str(_as_str(part)) for part in raw]
@@ -636,7 +779,7 @@ class ProgressStore:
                 return ProgressOutcome(status="duplicate", revision=int(answer[1]))
             ordinal_reserved = int(answer[2])
             deliveries = [card_id] if answer[4] == "1" else []
-            if ordinal_reserved:
+            if ordinal_reserved and enqueue_deliveries:
                 deliveries.append(milestone_args[0])
             return ProgressOutcome(
                 status="applied",
@@ -649,11 +792,80 @@ class ProgressStore:
             f"progress record {progress_id} moved on each of {_MAX_APPLY_ROUNDS} reads"
         )
 
+    # -- the inbox ------------------------------------------------------------
+
+    async def read_inbox(
+        self, progress_id: str, *, after: str, count: int
+    ) -> list[tuple[str, dict[str, str]]]:
+        """Up to ``count`` inbox entries after the stream id ``after`` ('' for all)."""
+        entries: Any = await self._redis.xrange(
+            self._config.progress_inbox_key(progress_id),
+            min=f"({after}" if after else "-",
+            max="+",
+            count=count,
+        )
+        return [
+            (
+                str(_as_str(entry_id)),
+                {str(_as_str(key)): str(_as_str(value)) for key, value in fields.items()},
+            )
+            for entry_id, fields in entries
+        ]
+
+    async def advance_cursor(self, progress_id: str, entry_id: str) -> bool:
+        """Record that the chain's inbox is applied through ``entry_id``.
+
+        Only forward, and never onto an expired record. Returns whether it moved.
+        """
+        moved = await self._redis.eval(
+            _ADVANCE_CURSOR_LUA, 1, self._config.progress_key(progress_id), entry_id
+        )
+        return int(moved) == 1
+
+    async def pending_inboxes(self, limit: int) -> set[str]:
+        """A bounded sample of chains whose accepted inbox may need draining."""
+
+        if limit <= 0:
+            return set()
+        members = await self._redis.srandmember(
+            self._config.progress_inbox_pending_key(), number=limit
+        )
+        if not members:
+            return set()
+        if not isinstance(members, list):
+            members = [members]
+        return {str(_as_str(member)) for member in members}
+
+    async def release_inbox_if_drained(self, progress_id: str) -> bool:
+        """Drop the pending index only if no append raced past the cursor."""
+
+        released = await self._redis.eval(
+            _RELEASE_INBOX_LUA,
+            3,
+            self._config.progress_inbox_key(progress_id),
+            self._config.progress_inbox_pending_key(),
+            self._config.progress_key(progress_id),
+            progress_id,
+        )
+        return int(released) == 1
+
     # -- the outbox -----------------------------------------------------------
 
-    async def ack(
-        self, delivery_id: str, *, generation: str, card_ref: str | None = None
-    ) -> bool:
+    async def discard_deliveries(self, delivery_ids: Sequence[str]) -> None:
+        """Remove owed deliveries that nothing will make.
+
+        For the pump while rendering is off: the record keeps its state and
+        reservations, and no delivery is left for a later deliverer to replay.
+        """
+        if not delivery_ids:
+            return
+        async with self._redis.pipeline(transaction=True) as pipe:
+            for delivery_id in delivery_ids:
+                pipe.delete(self._config.progress_delivery_key(delivery_id))
+            pipe.srem(self._config.progress_pending_key(), *delivery_ids)
+            await pipe.execute()
+
+    async def ack(self, delivery_id: str, *, generation: str, card_ref: str | None = None) -> bool:
         """Clear a delivery the adapter answered, only in the generation read.
 
         ``card_ref`` is the adapter's ref for a post; on the card's first post
@@ -748,6 +960,67 @@ class ProgressStore:
             except MalformedProgressError as exc:
                 out[delivery_id] = exc
         return out
+
+
+ProgressInboxApply = Callable[[str, ProgressCommand, int, int], Awaitable[ProgressOutcome]]
+
+
+async def sweep_pending_progress_inboxes(
+    store: ProgressStore,
+    *,
+    apply: ProgressInboxApply | None = None,
+    batch: int = PROGRESS_SWEEP_BATCH,
+) -> ProgressInboxSweep:
+    """Recover accepted progress commands no live pump finished applying."""
+
+    result = ProgressInboxSweep()
+    for progress_id in sorted(await store.pending_inboxes(batch)):
+        result = ProgressInboxSweep(chains=result.chains + 1, applied=result.applied)
+        record = await store.read(progress_id)
+        if record is None:
+            await store.release_inbox_if_drained(progress_id)
+            continue
+        entries = await store.read_inbox(progress_id, after=record.inbox_cursor, count=batch)
+        for entry_id, fields in entries:
+            if set(fields) != {"command", "generation", "seq"}:
+                logger.warning("progress entry %s of %s is malformed", entry_id, progress_id)
+                await store.advance_cursor(progress_id, entry_id)
+                continue
+            try:
+                command = ProgressCommand.model_validate_json(fields["command"])
+                generation = int(fields["generation"])
+                seq = int(fields["seq"])
+                _require_position("generation", generation)
+                _require_position("seq", seq)
+            except (ValidationError, ValueError):
+                logger.warning("progress entry %s of %s is malformed", entry_id, progress_id)
+                await store.advance_cursor(progress_id, entry_id)
+                continue
+            if apply is None:
+                outcome = await store.apply_model_command(
+                    progress_id,
+                    command,
+                    epoch=generation,
+                    seq=seq,
+                    route=TargetRoute(adapter="progress-maintenance"),
+                    target=ReplyTarget(
+                        kind="slack",
+                        address="C0EXAMPLE1",
+                        conversation_id="maintenance",
+                        reply_ref=None,
+                    ),
+                    enqueue_deliveries=False,
+                )
+            else:
+                outcome = await apply(progress_id, command, generation, seq)
+            await store.advance_cursor(progress_id, entry_id)
+            if outcome.status in {"applied", "duplicate"}:
+                result = ProgressInboxSweep(
+                    chains=result.chains,
+                    applied=result.applied + (outcome.status == "applied"),
+                )
+        await store.release_inbox_if_drained(progress_id)
+    return result
 
 
 ProgressDeliver = Callable[[StoredProgressDelivery], Awaitable[str | None]]

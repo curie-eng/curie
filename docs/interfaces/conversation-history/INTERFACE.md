@@ -69,15 +69,20 @@ conversation, reconstructed through the selected harness adapter.
   rendered system text. A configured load failure blocks boot because continuing
   without approval/tool context could duplicate an operation.
 - **A turn's own message.** The user message a turn records is the prompt the
-  runner sent for it, and the attachments a boot found ride on the first prompt
-  that runner sends: the person's text, then a notice naming each file by its
-  absolute path. Later prompts to the same runner carry no notice, because
+  runner sent for it, and the current message's attachments ride on the first
+  prompt that runner sends: the person's text, then a notice naming each file
+  by its absolute path. Later prompts to the same runner carry no notice, because
   `attachments-init` only runs when a sandbox boots and the worker boots one for
   every turn that carries a file. The portable prefix and a native checkpoint
   therefore both show which message carried which files, so a file re-attached
   under an unchanged name is announced even when this boot's system prompt is
   the one the checkpoint recorded. The legacy `user` projection stays the
-  person's text.
+  person's text. A boot also materializes the files earlier messages in the
+  thread carried, read from the thread's attachment ledger
+  ([ADR 0205](../../adr/0205-an-attachment-belongs-to-its-thread.md)), at the
+  paths their own notices gave. The notice names only the current message's
+  files, and the system prompt preamble lists the earlier ones, so a text-only
+  turn whose runner boots fresh never names them as its own.
 - **Append side.** `append(record)` durably writes one turn. A serving runner
   holds a persistable `DONE` or `AWAITING_APPROVAL` final until append finishes
   within its 15 second budget. A dangling denied tool call gets an explicit
@@ -161,6 +166,18 @@ sandbox all boot with the same ref and rehydrate identically — the
 unplanned-restart case needs no special worker/kernel branch.
 
 ## Known leakage
+
+Claude replay hydration reduces unprovable overlapping calls to the affected turns'
+visible user and assistant text
+(`runner/src/curie_runner/history.py::reduce_unprovable_overlap_turns`). It handles
+overlap within one turn and overlap across turns: a new call while earlier calls remain
+unanswered reduces the new turn and each earlier turn still holding an unanswered call.
+Later turns containing results for a removed call are also reduced, transitively, so no
+structured result survives without its call. Any reduction clears the native checkpoint
+(`runner/src/curie_runner/adapter.py::build_structured_resume`) and uses the reduced portable
+prefix. This loses tool-call and result structure from those turns. Other malformed
+history is still refused by the final grouping validation; reduction cannot turn an
+independently unmatched result into an accepted replay.
 
 - **Scoped history token (was: shared API key).** Same as memory: earlier the
   state API's one shared platform key was forwarded as `CURIE_HISTORY_TOKEN`,

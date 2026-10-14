@@ -28,6 +28,7 @@ from aci_protocol import QueuedTurn, TurnSource
 from curie_api import hook_signing
 from curie_api.config import get_settings
 from curie_api.hook_signing import derive
+from curie_api.main import create_app
 from curie_api.routers import hooks as hooks_router
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
 from curie_telemetry.tracing import configure_tracer_provider
@@ -128,6 +129,7 @@ def _post(
     delivery_id: str | None = "dlv-1",
     timestamp: str | None = None,
     traceparent: str | None = None,
+    params: dict[str, str] | None = None,
 ) -> Any:
     """POST one delivery, signing with `secret` unless a signature is forced.
 
@@ -152,7 +154,9 @@ def _post(
         headers["X-Curie-Delivery-Id"] = delivery_id
     if traceparent is not None:
         headers[TRACEPARENT_STREAM_FIELD] = traceparent
-    return client.post(f"/hooks/{agent_id}/{hook}", content=body, headers=headers)
+    return client.post(
+        f"/hooks/{agent_id}/{hook}", content=body, headers=headers, params=params
+    )
 
 
 @contextmanager
@@ -236,6 +240,143 @@ def test_a_signed_delivery_enqueues_a_webhook_turn_with_no_placeholder(
     assert turn.author == "hook:issues"
 
 
+def test_a_signed_delivery_can_target_a_preposted_reply_in_an_existing_conversation(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+) -> None:
+    """A trusted intake may make the normal worker answer an existing thread.
+
+    Removing either explicit target from the minted turn would make a Slack
+    email intake answer as a new top-level message instead of editing its
+    placeholder inside the source email thread.
+    """
+
+    agent_id = _bind(hooks_client, auth_headers, name="threadtargetagent")
+
+    answer = _post(
+        hooks_client,
+        agent_id,
+        "email-alert",
+        b'{"subject":"ALARM: database unavailable"}',
+        secret=_secret_for(agent_id),
+        params={
+            "conversation_id": "1790706162.161449",
+            "placeholder": "1790706163.000200",
+        },
+    )
+
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["conversation_id"] == "1790706162.161449"
+    (turn,) = _queued(valkey, runs_stream)
+    assert turn.conversation_id == "1790706162.161449"
+    assert turn.reply_handle.placeholder == "1790706163.000200"
+    # Explicit message coordinates do not let the caller replace the bound
+    # channel route or its authenticated egress endpoint.
+    assert turn.reply_handle.kind == "email"
+    assert turn.reply_handle.channel == "threadtargetagent@example.test"
+    assert turn.reply_handle.endpoint == EMAIL_ENDPOINT
+    assert turn.reply_handle.adapter == EMAIL_ADAPTER
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"conversation_id": "1790706162.161449"},
+        {"placeholder": "1790706163.000200"},
+    ],
+)
+def test_an_incomplete_explicit_reply_target_is_refused_before_enqueue(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+    params: dict[str, str],
+) -> None:
+    """A half-addressed reply must not silently fall back to a new message."""
+
+    agent_id = _bind(hooks_client, auth_headers, name="halftargetagent")
+
+    answer = _post(
+        hooks_client,
+        agent_id,
+        "email-alert",
+        b"{}",
+        secret=_secret_for(agent_id),
+        params=params,
+    )
+
+    assert answer.status_code == 422, answer.text
+    assert "conversation_id" in answer.text and "placeholder" in answer.text
+    assert _queued(valkey, runs_stream) == []
+
+
+def test_an_unsigned_caller_cannot_probe_explicit_target_validation(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+) -> None:
+    """Authentication precedes target validation, as it does for delivery ids."""
+
+    agent_id = _bind(hooks_client, auth_headers, name="targetprobeagent")
+
+    answer = _post(
+        hooks_client,
+        agent_id,
+        "email-alert",
+        b"{}",
+        params={"conversation_id": "", "placeholder": ""},
+    )
+
+    assert answer.status_code == 401, answer.text
+    assert answer.json()["detail"] == "missing or invalid signature"
+    assert _queued(valkey, runs_stream) == []
+
+
+def test_a_duplicate_delivery_reports_the_original_explicit_conversation(
+    hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+) -> None:
+    """A retry cannot redirect a delivery after the first turn was queued."""
+
+    agent_id = _bind(hooks_client, auth_headers, name="retargetagent")
+    secret = _secret_for(agent_id)
+    first = _post(
+        hooks_client,
+        agent_id,
+        "email-alert",
+        b"{}",
+        secret=secret,
+        delivery_id="stable-email-root",
+        params={"conversation_id": "100.1", "placeholder": "100.2"},
+    )
+    duplicate = _post(
+        hooks_client,
+        agent_id,
+        "email-alert",
+        b"{}",
+        secret=secret,
+        delivery_id="stable-email-root",
+        params={"conversation_id": "200.1", "placeholder": "200.2"},
+    )
+
+    assert first.status_code == 200, first.text
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["duplicate"] is True
+    assert duplicate.json()["conversation_id"] == "100.1"
+    (turn,) = _queued(valkey, runs_stream)
+    assert turn.conversation_id == "100.1"
+    assert turn.reply_handle.placeholder == "100.2"
+
+
 def test_hook_ingress_producer_injects_the_http_parent_through_owned_enqueue(
     hooks_client: TestClient,
     auth_headers: dict[str, str],
@@ -301,6 +442,59 @@ def test_hook_ingress_producer_injects_the_http_parent_through_owned_enqueue(
     transported = trace.get_current_span(extract_trace_context(fields)).get_span_context()
     assert transported.trace_id == producer.context.trace_id
     assert transported.span_id == producer.context.span_id
+
+
+@pytest.fixture
+def ambient_otlp_hooks_client(
+    monkeypatch: pytest.MonkeyPatch, _disposable_db: Any, runs_stream: str
+) -> Iterator[TestClient]:
+    # FastAPI reads the variable at lifespan startup, so set it before the app
+    # is built and entered.
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4317")
+    with TestClient(create_app()) as test_client:
+        yield test_client
+
+
+def test_ambient_otlp_endpoint_keeps_the_api_http_parent(
+    ambient_otlp_hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+) -> None:
+    """An inherited OTLP endpoint must not let FastAPI's own telemetry take over
+    the request span (#4410). The test sets the variable itself, so it fails on
+    the unfixed base in any environment."""
+
+    client = ambient_otlp_hooks_client
+    agent_id = _bind(client, auth_headers, name="ambientotlpagent")
+    secret = _secret_for(agent_id)
+
+    with _captured_spans() as exporter:
+        accepted = _post(
+            client,
+            agent_id,
+            "issues",
+            b'{"issue": 43}',
+            secret=secret,
+            delivery_id="ambient-otlp-delivery",
+            traceparent=_TRACEPARENT,
+        )
+
+    assert accepted.status_code == 200, accepted.text
+
+    spans = exporter.get_finished_spans()
+    accepted_server = next(
+        span
+        for span in spans
+        if span.name == "http.server.request" and span.context.trace_id == _TRACE_ID
+    )
+    producers = [span for span in spans if span.name == "curie.queue.enqueue"]
+    assert len(producers) == 1
+    producer = producers[0]
+    assert producer.context.trace_id == accepted_server.context.trace_id
+    assert producer.parent is not None
+    assert producer.parent.span_id == accepted_server.context.span_id
 
 
 def test_instruction_shaped_payload_is_delimited_as_untrusted_content(

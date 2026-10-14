@@ -1,8 +1,14 @@
 import { test, expect, type Page } from "@playwright/test";
+import { stubConsoleSession } from "./support/consoleSession";
 
 // Wired Versions tab (stackless via route stubs): real versions joined with the
 // agent's deployments (environment / status / deployed_at), no Eval column, and
 // a ComingSoon fallback when the backend is unreachable.
+
+// The console sits behind the login gate (#1047): sign this spec in.
+test.beforeEach(async ({ page }) => {
+  await stubConsoleSession(page);
+});
 
 const AGENT = { id: "ag-1", name: "deal-desk", channels: [{ kind: "slack", address: "C0DEAL" }], created_at: "2026-07-01T00:00:00Z" };
 

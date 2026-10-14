@@ -24,6 +24,7 @@ from curie_runner.progress import (
     PROGRESS_URL_ENV,
     ProgressActivity,
     build_progress_tool,
+    factory_progress_requested,
     load_phase_declaration,
     resolve_progress,
 )
@@ -151,6 +152,22 @@ def test_progress_needs_both_env_vars_and_a_declaration(tmp_path: Path) -> None:
     assert resolve_progress(env, tmp_path) is None
 
 
+@pytest.mark.parametrize(
+    "env",
+    [
+        {PROGRESS_URL_ENV: "http://api:8000/v1/work-item-progress/x"},
+        {PROGRESS_TOKEN_ENV: TOKEN},
+        {
+            PROGRESS_URL_ENV: "http://api:8000/v1/work-item-progress/x",
+            PROGRESS_TOKEN_ENV: TOKEN,
+        },
+    ],
+)
+def test_any_factory_progress_boot_signal_is_detected(env: dict[str, str]) -> None:
+    assert factory_progress_requested(env)
+    assert not factory_progress_requested({})
+
+
 # --- the tool ----------------------------------------------------------------
 
 
@@ -205,9 +222,7 @@ def test_a_valid_report_posts_the_wire_body_with_the_token_header() -> None:
     async def go() -> dict[str, Any]:
         async with TestServer(recorder.app()) as server:
             tool = _tool(str(server.make_url("/v1/work-item-progress/example-request")), activity)
-            return await tool.handler(
-                {"phase": "plan", "note": "Drafting the plan", "round": 2}
-            )
+            return await tool.handler({"phase": "plan", "note": "Drafting the plan", "round": 2})
 
     result = anyio.run(go)
     assert result.get("is_error") is not True

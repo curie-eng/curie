@@ -421,6 +421,18 @@ services:
       # Only the API verifier and dispatcher producer receive it.
       CURIE_APPROVAL_CHAT_ATTESTER_SECRET: ${CURIE_APPROVAL_CHAT_ATTESTER_SECRET:-curie-dev-approval-chat-attester}
       CURIE_INTERNAL_WORKER_TOKEN: curie-dev-worker-token
+      # The action executor switch (ACTION-EXECUTOR-1). curie-worker reads the
+      # same interpolation, so one CURIE_ACTION_EXECUTOR_ENABLED in the
+      # environment turns both on and an unset one leaves both off.
+      CURIE_ACTION_EXECUTOR_ENABLED: ${CURIE_ACTION_EXECUTOR_ENABLED:-false}
+      # The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+      # executor amendment E9), enforced by the claim route. curie-worker reads
+      # the same interpolation; the two must never differ.
+      CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES: ${CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES:-2}
+      # The automated remediation switch (AUTOMATED-REMEDIATION-1). curie-worker
+      # reads the same interpolation. It requires the executor switch above; the
+      # API and the worker refuse to boot with it on and the executor off.
+      CURIE_REMEDIATION_ENABLED: ${CURIE_REMEDIATION_ENABLED:-false}
       VALKEY_HOST: valkey
       VALKEY_PORT: "6379"
       VALKEY_PASSWORD: ${VALKEY_PASSWORD:-valkeypass}
@@ -436,12 +448,12 @@ services:
       # not receive the App private key or webhook HMAC secret.
       GITHUB_REVIEW_INGRESS_ENABLED: ${GITHUB_REVIEW_INGRESS_ENABLED:-false}
       GITHUB_REVIEW_RECONCILER_INTERVAL_S: ${GITHUB_REVIEW_RECONCILER_INTERVAL_S:-5}
-      GITHUB_FACTORY_INGRESS_ENABLED: ${GITHUB_FACTORY_INGRESS_ENABLED:-false}
-      GITHUB_FACTORY_LABEL: ${GITHUB_FACTORY_LABEL:-}
-      GITHUB_FACTORY_MENTION: ${GITHUB_FACTORY_MENTION:-}
-      GITHUB_FACTORY_CARD_BASE_URL: ${GITHUB_FACTORY_CARD_BASE_URL:-}
-      GITHUB_FACTORY_CI_WAIT_S: ${GITHUB_FACTORY_CI_WAIT_S:-1200}
-      GITHUB_FACTORY_PYTHON_CI: ${GITHUB_FACTORY_PYTHON_CI:-{}}
+      # The factory (#4397): CURIE_FORGES is the typed forge config, whose
+      # credentials name key files the API reads; it carries no secret itself.
+      FACTORY_ENABLED: ${FACTORY_ENABLED:-false}
+      FACTORY_INTAKE: ${FACTORY_INTAKE:-poll}
+      FACTORY_CI_WAIT_S: ${FACTORY_CI_WAIT_S:-1200}
+      CURIE_FORGES: ${CURIE_FORGES:-}
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
       GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-dev-webhook-secret}
@@ -693,9 +705,18 @@ services:
       # alias the local connector container starts under, so the runner
       # derives the identical name it would derive on cluster. The default
       # here must match the CLI's local connector bring-up identity: release
-      # `curie` (cli/src/commands.rs), the same as `local::COMPOSE_PROJECT`.
+      # `curie` (cli/src/commands/connector_images.rs), the same as `local::COMPOSE_PROJECT`.
       - CURIE_RELEASE=${CURIE_RELEASE:-curie}
       - CURIE_NAMESPACE=${CURIE_NAMESPACE:-default}
+      # The action executor switch (ACTION-EXECUTOR-1). curie-api reads the
+      # same interpolation; the two must never differ.
+      - CURIE_ACTION_EXECUTOR_ENABLED=${CURIE_ACTION_EXECUTOR_ENABLED:-false}
+      # The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+      # executor amendment E9). curie-api reads the same interpolation.
+      - CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES=${CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES:-2}
+      # The automated remediation switch (AUTOMATED-REMEDIATION-1). curie-api
+      # reads the same interpolation; the two must never differ.
+      - CURIE_REMEDIATION_ENABLED=${CURIE_REMEDIATION_ENABLED:-false}
     restart: unless-stopped
 
   # Optional real Slack ingress for local development.

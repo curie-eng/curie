@@ -7,6 +7,7 @@ scriptable in-process fake runner; only Slack and the model are faked.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import sys
 import threading
@@ -36,12 +37,20 @@ from aci_protocol import (
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from channel_protocol.reply import ReplyAck, ReplyEvent, ReplyTarget
-from curie_worker import kernel as kernel_module
 from curie_worker.actions import ActionClient
 from curie_worker.attachments import PreparedAttachments
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.capacity_wait import CapacityWaitRequested
-from curie_worker.kernel import ThreadBusyError
+from curie_worker.kernel import attempt as kernel_attempt
+from curie_worker.kernel import clock as kernel_clock
+from curie_worker.kernel import constants as kernel_constants
+from curie_worker.kernel import core as kernel_core
+from curie_worker.kernel import delivery as kernel_delivery
+from curie_worker.kernel import failures as kernel_failures
+from curie_worker.kernel import log as kernel_log
+from curie_worker.kernel import routing as kernel_routing
+from curie_worker.kernel import workspace as kernel_workspace
+from curie_worker.kernel.failures import ThreadBusyError
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerError, TurnStream
 from curie_worker.sandbox import (
@@ -50,7 +59,10 @@ from curie_worker.sandbox import (
     RouteRecord,
     SandboxHandle,
 )
+from curie_worker.sandbox.types import SandboxTermination
 from curie_worker.workspace import (
+    WorkspaceClaimCoordinator,
+    WorkspaceCredentialClient,
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
 )
@@ -115,6 +127,7 @@ class _HistoryBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+        **_: object,
     ) -> dict[str, str]:
         del kind, address
         return {
@@ -177,7 +190,7 @@ class _PressureAttachmentLane:
 
 
 def _capture_pressure_outcomes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    real_record_metric = kernel_module.record_metric
+    real_record_metric = kernel_log.record_metric
     outcomes: list[str] = []
 
     def record(
@@ -194,7 +207,7 @@ def _capture_pressure_outcomes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         ):
             outcomes.append(attributes["outcome"])
 
-    monkeypatch.setattr(kernel_module, "record_metric", record)
+    monkeypatch.setattr(kernel_log, "record_metric", record)
     return outcomes
 
 
@@ -413,6 +426,7 @@ class _BuiltInCodingBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+        **_: object,
     ) -> dict[str, str]:
         return {}
 
@@ -902,16 +916,16 @@ def test_announcement_sits_between_answer_and_receipt(
 ) -> None:
     # A unit on the composition order: answer, announcement, receipt. The stub
     # takes the install's receipt mode too (ADR-0180), which the order ignores.
-    monkeypatch.setattr(kernel_module, "render_receipt", lambda rows, mode="all": "RECEIPT")
+    monkeypatch.setattr(kernel_delivery, "render_receipt", lambda rows, mode="all": "RECEIPT")
 
-    announced = kernel_module._StreamAccumulator(
+    announced = kernel_delivery._StreamAccumulator(
         text_parts=["answer"],
         receipt_rows=[{"x": 1}],
         workspace_inferred_repo="acme-corp/acme-bot",
     )
     assert announced.rendered_with_receipt() == f"answer\n\n{_ANNOUNCEMENT}\n\nRECEIPT"
 
-    unannounced = kernel_module._StreamAccumulator(
+    unannounced = kernel_delivery._StreamAccumulator(
         text_parts=["answer"],
         receipt_rows=[{"x": 1}],
     )
@@ -1156,6 +1170,7 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
             *,
             kind: str | None = None,
             address: str | None = None,
+            **_: object,
         ) -> dict[str, str]:
             return {"CURIE_RUNNER_TOKEN": "workspace-test-token"}
 
@@ -1290,6 +1305,7 @@ def test_workspace_capability_without_selection_keeps_fresh_thread_generic(
             *,
             kind: str | None = None,
             address: str | None = None,
+            **_: object,
         ) -> dict[str, str]:
             return {}
 
@@ -1454,6 +1470,9 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
         (False, False, "idle-awaiting-input", True),
         (False, True, "awaiting-approval", True),
         (False, True, "idle-awaiting-input", False),
+        (True, True, "classified-failure", True),
+        (False, False, "classified-failure", True),
+        (False, True, "classified-failure", False),
     ],
 )
 def test_late_workspace_selection_defers_without_steering_until_boundary_is_safe(
@@ -1509,6 +1528,8 @@ def test_late_workspace_selection_defers_without_steering_until_boundary_is_safe
     [
         pytest.param(SessionStatus.DONE, id="done"),
         pytest.param(SessionStatus.IDLE_AWAITING_INPUT, id="idle-awaiting-input"),
+        # #4188: a failed turn is never recorded, so durable replay is whole.
+        pytest.param(SessionStatus.CLASSIFIED_FAILURE, id="classified-failure"),
     ],
 )
 def test_workspace_handoff_boundary_accepts_completed_durable_status(
@@ -1947,6 +1968,7 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(make_harness, 
             *,
             kind: str | None = None,
             address: str | None = None,
+            **_: object,
         ) -> dict[str, str]:
             return {}
 
@@ -1981,8 +2003,8 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(make_harness, 
 # The refusal half of this ticket is already covered above, by the INFO line the
 # refusal branch emits. These pin the other half: clone and upload failures used
 # to be swallowed by the broad start-failure clause, which names an event id and
-# an anonymous repr. They assert the log line, not the reply; the reply was never
-# the missing half.
+# an anonymous repr. The original #2004 tests pin those log lines. The #4367
+# tests below also pin the stage and reason carried into the terminal reply.
 
 
 def _workspace_binding(
@@ -2016,6 +2038,7 @@ def _workspace_binding(
             *,
             kind: str | None = None,
             address: str | None = None,
+            **_: object,
         ) -> dict[str, str]:
             return dict(boot_env_override or {"CURIE_RUNNER_TOKEN": "workspace-test-token"})
 
@@ -2098,6 +2121,175 @@ def test_workspace_preparation_failure_escalates_by_its_own_name(make_harness, c
             assert "acme-corp/acme-bot" in message, message
             assert "stage=clone" in message, message
             assert "repository not found" in message, message
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_detail", "expected_attempts"),
+    [
+        pytest.param(
+            500,
+            "workspace repository-selection failed: API returned HTTP 500",
+            3,
+            id="fault-exhausts-retry-budget",
+        ),
+        pytest.param(
+            403,
+            "That repository is not in api.githubRepoAllowlist for this installation; "
+            "allow `owner/repo` or `owner/*` in the chart values.",
+            1,
+            id="allowlist-refusal-is-terminal",
+        ),
+        pytest.param(
+            409,
+            "This thread is already bound to a different repository.",
+            1,
+            id="selection-conflict-is-terminal",
+        ),
+    ],
+)
+def test_workspace_selection_http_failure_preserves_diagnostic_and_retry_policy(
+    make_harness, status: int, expected_detail: str, expected_attempts: int
+) -> None:
+    """#4367: selection faults retain the reason while policy refusals stay terminal."""
+
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        requests: list[dict[str, object]] = []
+
+        async def select(request: web.Request) -> web.Response:
+            requests.append(await request.json())
+            return web.json_response(
+                {
+                    "detail": {
+                        "code": "workspace.selection_conflict",
+                        "message": "opaque API response must not become the public reason",
+                    }
+                },
+                status=status,
+            )
+
+        app = web.Application()
+        app.router.add_post(f"/v1/internal/workspaces/{deployment_id}/selection", select)
+        async with TestServer(app) as server:
+            credentials = WorkspaceCredentialClient(
+                api_url=str(server.make_url("")),
+                worker_token="workspace-test-token",
+            )
+            async with make_harness(binding=_workspace_binding(deployment_id), max_attempts=3) as h:
+                h.kernel._workspace = WorkspaceClaimCoordinator(
+                    preparer=SimpleNamespace(credentials=credentials),
+                    substrate=h.substrate,
+                )
+                event = qevent(
+                    "Fix https://github.com/acme-corp/acme-bot",
+                    thread=f"tWorkspaceSelection{status}",
+                )
+                await h.kernel.process_event(event)
+
+                assert len(requests) == expected_attempts
+                assert all(body["repo_full_name"] == "acme-corp/acme-bot" for body in requests)
+                assert h.fake_k8s.claim_envs == []
+                assert h.runner.opened == []
+                assert h.runner.steers == []
+                assert len(h.sink.completions) == 1
+                assert h.sink.completions[0].event_id == event.event_id
+                reply = h.sink.last_text
+                assert reply is not None
+                if status == 500:
+                    assert kernel_failures.failure_class_from_reply(reply) == "workspace-error"
+                    assert expected_detail in reply
+                    assert "after 3 attempt(s)" in reply
+                    assert h.sink.completions[0].outcome == "escalated"
+                else:
+                    assert reply == expected_detail
+                    assert kernel_failures.failure_class_from_reply(reply) is None
+                    assert h.sink.completions[0].outcome == "delivered"
+                assert "opaque API response" not in reply
+                assert await h.kernel._markers.is_terminal(event.event_id)
+
+    asyncio.run(go())
+
+
+def test_workspace_failure_reason_is_redacted_before_clipping(make_harness) -> None:
+    """A credential spanning the bound must be consumed before a prefix is kept."""
+
+    deployment_id = uuid.uuid4()
+    reason = (
+        "git clone exited 128: -----BEGIN PRIVATE KEY-----\n"
+        f"{'SYNTHETIC-PRIVATE-MATERIAL' * 30}\n-----END PRIVATE KEY----- "
+        f"remaining diagnosis {'x' * 1000}"
+    )
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id), max_attempts=1) as h:
+
+            class WorkspaceProbe:
+                def select_repository(self, **_kwargs: object) -> str:
+                    return "acme-corp/acme-bot"
+
+                def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
+                    raise WorkspacePreparationError("clone", reason)
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+            event = qevent("Fix https://github.com/acme-corp/acme-bot", thread="tWorkspaceSecret")
+            await h.kernel.process_event(event)
+
+            reply = h.sink.last_text
+            assert reply is not None
+            assert kernel_failures.failure_class_from_reply(reply) == "workspace-error"
+            detail = reply.split("after 1 attempt(s). ", 1)[1].split(" event_id=", 1)[0]
+            assert detail.startswith(
+                "workspace clone failed: git clone exited 128: [REDACTED:pem_private_key]"
+            )
+            assert len(detail) <= 300
+            assert "remaining diagnosis" in detail
+            assert "SYNTHETIC-PRIVATE-MATERIAL" not in reply
+            assert "-----BEGIN PRIVATE KEY-----" not in reply
+            assert "-----END PRIVATE KEY-----" not in reply
+            assert h.fake_k8s.claim_envs == []
+            assert h.runner.opened == []
+            assert len(h.sink.completions) == 1
+            assert h.sink.completions[0].outcome == "escalated"
+
+    asyncio.run(go())
+
+
+def test_prior_side_effect_does_not_retry_a_workspace_selection_failure(make_harness) -> None:
+    """The durable no-retry marker wins before another workspace request is sent."""
+
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id), max_attempts=3) as h:
+
+            class WorkspaceProbe:
+                selection_calls = 0
+
+                def select_repository(self, **_kwargs: object) -> str:
+                    self.selection_calls += 1
+                    raise WorkspacePreparationError("repository-selection", "API returned HTTP 500")
+
+            probe = WorkspaceProbe()
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            event = qevent(
+                "Fix https://github.com/acme-corp/acme-bot", thread="tWorkspacePriorAction"
+            )
+            await h.kernel._markers.mark_side_effect(event.event_id)
+            await h.kernel.process_event(event)
+
+            assert probe.selection_calls == 0
+            assert h.fake_k8s.claim_envs == []
+            assert h.runner.opened == []
+            reply = h.sink.last_text
+            assert reply is not None
+            assert kernel_failures.failure_class_from_reply(reply) == "prior-side-effect"
+            assert "not retrying automatically" in reply
+            assert len(h.sink.completions) == 1
+            assert h.sink.completions[0].outcome == "escalated"
+            assert await h.kernel._markers.is_terminal(event.event_id)
 
     asyncio.run(go())
 
@@ -2480,7 +2672,7 @@ def test_streamer_adopts_its_own_minted_ref(make_harness) -> None:
 
     async def go() -> None:
         async with make_harness() as h:
-            reply = kernel_module._ThrottledReply(
+            reply = kernel_delivery._ThrottledReply(
                 h.sink,
                 target=ReplyTarget(
                     kind="slack", address="C1", conversation_id="th-1", reply_ref=None
@@ -2741,6 +2933,20 @@ def test_finish_race_falls_back_to_a_fresh_turn(make_harness) -> None:
             id="empty-alone-is-retryable-runner-error",
         ),
         pytest.param(
+            [
+                ErrorEvent(
+                    message="model error: server_error: API Error: Connection refused "
+                    "(ECONNREFUSED)",
+                    classification="model-unreachable",
+                )
+            ],
+            [Final(text="recovered", status=DONE)],
+            "recovered",
+            # #4333: a model endpoint that could not be reached before any
+            # side effect is a transport failure a later attempt can pass.
+            id="model-unreachable-retries",
+        ),
+        pytest.param(
             # Mid-run drop: a delta streams, then the stream ends with no final.
             [TextDelta(text="partial")],
             [TextDelta(text="full"), Final(text="full done", status=DONE)],
@@ -2851,6 +3057,84 @@ def test_pod_termination_cause_reaches_factory_finish_detail(make_harness) -> No
     asyncio.run(go())
 
 
+class _DropAfterSideEffectPersisted:
+    """A runner ``hold`` that drops the stream once the worker persisted the flag.
+
+    ``abort_after_frames`` can close the socket before the client reads the
+    buffered flag frame, and aiohttp then raises before yielding it. Raising
+    from the handler after the headers were sent aborts the chunked stream.
+    """
+
+    def __init__(self, redis: Any, key: str) -> None:
+        self._redis = redis
+        self._key = key
+
+    async def wait(self) -> None:
+        for _ in range(500):
+            if await self._redis.exists(self._key):
+                break
+            await asyncio.sleep(0.01)
+        raise ConnectionResetError("runner pod deleted")
+
+
+def test_deleted_pod_after_side_effect_escalates_as_sandbox_terminated(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=2,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            h.fake_k8s.termination = SandboxTermination("Deleted")
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+            h.runner.default_script = [SideEffectFlag(tool="deploy"), TextDelta(text="partial")]
+            h.runner.hold = _DropAfterSideEffectPersisted(
+                h.async_redis, h.config.side_effect_key(event.event_id)
+            )
+
+            await h.kernel.process_event(event)
+
+            assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
+
+            # ADR 0013: no automatic retry after a side effect, even though
+            # sandbox-terminated is otherwise retryable.
+            assert h.runner.opened == [ISSUE_PROMPT]
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "sandbox_terminated"
+            assert isinstance(finish["detail"], str)
+            assert "Kubernetes pod terminated: Deleted" in finish["detail"]
+            assert h.fake_k8s.termination_queries
+
+    asyncio.run(go())
+
+
+def test_deleted_pod_without_side_effect_retries(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=2,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            h.fake_k8s.termination = SandboxTermination("Deleted")
+            h.runner.default_script = [TextDelta(text="partial")]
+            h.runner.abort_after_frames = True
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [ISSUE_PROMPT, ISSUE_PROMPT]
+            assert len(h.fake_k8s.termination_queries) == 2
+
+    asyncio.run(go())
+
+
 def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factory(
     make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -2905,6 +3189,99 @@ def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factor
             assert 'EmptyDir volume "workspace" exceeds the limit "1Gi"' in finish["detail"]
             assert "exampleSecretValue123456" not in finish["detail"]
             assert len(finish["detail"]) <= 300
+
+    asyncio.run(go())
+
+
+def test_publication_unrecorded_escalation_has_its_own_cause(make_harness) -> None:
+    """#4459: publication diagnosis survives both flag-clean and side-effect escalation."""
+
+    async def go() -> None:
+        for with_side_effect in (False, True):
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                publication_creator=_PublicationApi(),
+                max_attempts=3,
+            ) as h:
+                items = _WorkItems()
+                h.kernel._work_items = items
+                detail = "No valid publication was recorded after the publish attempt."
+                prefix = [SideEffectFlag(tool="deploy")] if with_side_effect else []
+                h.runner.default_script = [
+                    *prefix,
+                    ErrorEvent(message=detail, classification="publication-unrecorded"),
+                    Final(text="failed", status=FAIL),
+                ]
+                event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+                await h.kernel.process_event(event)
+
+                assert h.runner.opened == [ISSUE_PROMPT]
+                assert len(items.finishes) == 1
+                finish = items.finishes[0]
+                assert finish["outcome"] == "failed"
+                assert finish["cause"] == "publication_unrecorded"
+                assert finish["detail"] == detail
+                assert await h.kernel._markers.is_terminal(event.event_id)
+                assert (
+                    bool(await h.async_redis.exists(h.config.side_effect_key(event.event_id)))
+                    == with_side_effect
+                )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("classification", "expected_cause", "max_attempts"),
+    [
+        ("false-completion", "runner_escalated", 3),
+        ("approval-not-acted", "runner_escalated", 3),
+        ("runner-error", "runner_escalated", 1),
+        ("model-credit-exhausted", "model_credit_exhausted", 3),
+        ("model-usage-limited", "model_usage_limited", 3),
+        ("model-credential-rejected", "model_credential_rejected", 3),
+        ("rate-limit", "model_rate_limited", 1),
+        ("server-error", "model_error", 3),
+        ("model-unreachable", "model_unreachable", 1),
+        ("budget-exceeded", "budget_exceeded", 3),
+        ("runner-timeout", "runner_timeout", 1),
+        ("workspace-error", "workspace_error", 1),
+        ("history-persistence-error", "history_capacity", 3),
+        ("max-turns", "max_turns", 3),
+        ("unknown", "unclassified", 3),
+    ],
+)
+def test_other_escalation_classifications_keep_their_factory_causes(
+    make_harness, classification: str, expected_cause: str, max_attempts: int
+) -> None:
+    """#4459: naming publication failures preserves every sibling cause in this matrix."""
+
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=max_attempts,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            detail = "No valid publication was recorded after the publish attempt."
+            h.runner.default_script = [
+                ErrorEvent(message=detail, classification=classification),
+                Final(text="failed", status=FAIL),
+            ]
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [ISSUE_PROMPT]
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == expected_cause
+            assert finish["detail"] == detail
+            assert await h.kernel._markers.is_terminal(event.event_id)
 
     asyncio.run(go())
 
@@ -3026,6 +3403,69 @@ def test_side_effect_failure_escalates_without_retry(make_harness) -> None:
     asyncio.run(go())
 
 
+def test_server_error_model_unreachable_split_server_error_not_retried(make_harness) -> None:
+    """#4333: only model-unreachable joined the retryable set, not server-error."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_scripts = [
+                [
+                    ErrorEvent(
+                        message="model error: server_error: API Error: 500 Internal server error",
+                        classification="server-error",
+                    ),
+                    Final(text="failed", status=FAIL),
+                ],
+                [Final(text="recovered", status=DONE)],
+            ]
+            await h.kernel.process_event(qevent("go", event_id="evt-server-error-4333"))
+
+            assert h.runner.opened == ["go"]  # exactly one attempt, no retry
+            reply = h.sink.last_text
+            assert reply is not None
+            assert "(server-error) after 1 attempt(s)" in reply
+            assert "recovered" not in reply
+
+    asyncio.run(go())
+
+
+def test_model_unreachable_after_side_effect_escalates_without_retry(make_harness) -> None:
+    """ADR 0013: a retryable model-unreachable must not retry after a side effect."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_scripts = [
+                [
+                    SideEffectFlag(tool="deploy"),
+                    ErrorEvent(
+                        message="model error: server_error: API Error: Connection refused "
+                        "(ECONNREFUSED)",
+                        classification="model-unreachable",
+                    ),
+                    Final(text="failed", status=FAIL),
+                ],
+                [Final(text="recovered", status=DONE)],
+            ]
+            ev = qevent("do it", event_id="evt-unreachable-side-effect")
+            await h.kernel.process_event(ev)
+
+            assert h.runner.opened == ["do it"]  # exactly one attempt, no retry
+            reply = h.sink.last_text
+            assert reply is not None
+            assert reply.startswith("curie-turn-failure: model-unreachable\n")
+            assert (
+                "The run hit an error (model-unreachable) after starting an action; "
+                "not retrying automatically."
+            ) in reply
+            assert "ECONNREFUSED" in reply
+            assert "human" in reply.lower()
+            assert "recovered" not in reply
+            assert await h.async_redis.exists(h.config.side_effect_key(ev.event_id))
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
 def test_side_effect_unknown_classification_escalates_with_detail_and_event_id(
     make_harness,
 ) -> None:
@@ -3112,11 +3552,11 @@ def test_turn_start_failure_is_retryable_not_a_stall(make_harness) -> None:
 def test_max_turns_classification_is_platform_vocabulary_and_not_retryable() -> None:
     """#3071: an exhausted turn budget is a named platform failure, and retrying
     it would only burn the same budget again."""
-    from curie_worker.kernel import (
+    from curie_worker.kernel.constants import (
         PLATFORM_ERROR_CLASSIFICATIONS,
         RETRYABLE_CLASSIFICATIONS,
-        map_error_classification,
     )
+    from curie_worker.kernel.failures import map_error_classification
 
     assert "max-turns" in PLATFORM_ERROR_CLASSIFICATIONS
     assert "max-turns" not in RETRYABLE_CLASSIFICATIONS
@@ -3146,7 +3586,7 @@ def test_max_turns_escalates_once_naming_the_turn_budget_knob(make_harness) -> N
             assert "CURIE_MAX_TURNS" in text, text
             assert "CURIE_WORK_ITEM_MAX_TURNS" not in text, text
             assert text.startswith("curie-turn-failure: max-turns\n")
-            assert kernel_module.failure_class_from_reply(text) == "max-turns"
+            assert kernel_failures.failure_class_from_reply(text) == "max-turns"
 
     asyncio.run(go())
 
@@ -3168,7 +3608,7 @@ def test_failed_turn_reply_replaces_success_looking_model_text(make_harness) -> 
 
             reply = h.sink.last_text
             assert reply is not None
-            assert kernel_module.failure_class_from_reply(reply) == "max-turns"
+            assert kernel_failures.failure_class_from_reply(reply) == "max-turns"
             assert model_text not in reply
             assert h.sink.completions[-1].outcome == "escalated"
 
@@ -3186,15 +3626,15 @@ def test_successful_reply_is_not_a_failure_marker(make_harness) -> None:
 
             reply = h.sink.last_text
             assert reply == "the answer is PONG"
-            assert kernel_module.failure_class_from_reply(reply or "") is None
+            assert kernel_failures.failure_class_from_reply(reply or "") is None
             assert (
-                kernel_module.failure_class_from_reply(
+                kernel_failures.failure_class_from_reply(
                     "the answer is PONG\n\ncurie-turn-failure: max-turns"
                 )
                 is None
             )
             assert (
-                kernel_module.failure_class_from_reply(
+                kernel_failures.failure_class_from_reply(
                     "curie-turn-failure: max-turns and more words"
                 )
                 is None
@@ -3458,6 +3898,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
             *,
             kind: str | None = None,
             address: str | None = None,
+            **_: object,
         ) -> dict[str, str]:
             return {
                 "CURIE_HISTORY_REF": f"https://api.example.com/state/transcript/{thread_key}",
@@ -3531,7 +3972,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
             event_id = "idle-route-capacity-trigger"
             lease = await _leased_entry(h, store, event_id=event_id, generation=1)
             h.runner.default_script = [Final(text="started after reclaim", status=DONE)]
-            real_record_metric = kernel_module.record_metric
+            real_record_metric = kernel_log.record_metric
 
             def record(
                 name: str,
@@ -3550,7 +3991,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
                     assert h.substrate.lookup(_thread_key(oldest_thread)) is None
                     outcomes.append(attributes["outcome"])
 
-            monkeypatch.setattr(kernel_module, "record_metric", record)
+            monkeypatch.setattr(kernel_log, "record_metric", record)
 
             await h.kernel.process_event(
                 qevent("start a new turn", thread=trigger_thread, event_id=event_id),
@@ -3666,12 +4107,10 @@ def test_quota_pressure_reclaims_an_idle_eval_route_before_an_older_person_route
 def test_is_eval_thread_key_reads_the_isolate_prefix_from_the_scoped_key() -> None:
     from channel_protocol import scoped_conversation_id
 
-    is_eval = kernel_module._is_eval_thread_key  # noqa: SLF001
+    is_eval = kernel_routing._is_eval_thread_key  # noqa: SLF001
 
     assert is_eval(scoped_conversation_id("slack", "C1", "eval:1720000000.000100"))
-    assert is_eval(
-        scoped_conversation_id("slack", "C1", "eval:1720000000.000100", identity="ops")
-    )
+    assert is_eval(scoped_conversation_id("slack", "C1", "eval:1720000000.000100", identity="ops"))
     assert not is_eval(scoped_conversation_id("slack", "C1", "1720000000.000100"))
     assert not is_eval(scoped_conversation_id("slack", "C1", "eval-1720000000.000100"))
     assert not is_eval(scoped_conversation_id("slack", "eval:C1", "1720000000.000100"))
@@ -4162,6 +4601,91 @@ def test_unreadable_oldest_runner_does_not_block_later_safe_reclamation(
     asyncio.run(go())
 
 
+@pytest.mark.parametrize("stale_routes", [False, True])
+def test_quota_pressure_repeated_passes_reach_completed_route_after_four_unreadable_routes(
+    make_harness,
+    stale_routes: bool,
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            per_sandbox_runners=8,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            unreadable = [
+                await _safe_pressure_candidate(h, f"tUnreadablePressure{number}")
+                for number in range(4)
+            ]
+            active = await _safe_pressure_candidate(h, "tActivePressure")
+            nondurable = await _safe_pressure_candidate(h, "tNondurablePressure")
+            completed = await _safe_pressure_candidate(h, "tCompletedPressure")
+            protected = [*unreadable, active, nondurable]
+
+            # Explicit expiry order keeps all four unreadable routes ahead of
+            # the completed candidate, regardless of Valkey SCAN order.
+            for number, candidate in enumerate([*protected, completed]):
+                assert h.substrate._affinity.touch(  # noqa: SLF001
+                    candidate.thread_key, 30 + number
+                )
+            for candidate in unreadable:
+                h.runners[candidate.port].status_fails = True
+            h.runners[active.port].turn_active = True
+            h.runners[nondurable.port].history_durable = False
+            h.runners[completed.port].session_status = SessionStatus.DONE.value
+
+            if stale_routes:
+                # A prior phase owns only substrate resources. Its affinity
+                # records intentionally survive to reproduce stale routes.
+                for candidate in unreadable:
+                    h.fake_k8s.delete_claim(candidate.claim_name, request_timeout_seconds=1.0)
+                    assert candidate.sandbox_name not in h.fake_k8s.sandboxes
+                    record = h.substrate._affinity.get(candidate.thread_key)  # noqa: SLF001
+                    assert record is not None
+                    assert record.handle == candidate
+            deleted_before_pressure = set(h.fake_k8s.deleted_claims)
+            h.fake_k8s.quota_headroom_results = [True]
+
+            results = []
+            for _ in range(3):
+                probes_before = sum(len(runner.status_headers) for runner in h.runners.values())
+                result = await h.kernel._reclaim_idle_route(  # noqa: SLF001
+                    _thread_key("tPressureTrigger"),
+                    _quota_rejection(),
+                    remaining_s=120.0,
+                )
+                results.append(result)
+                probes_after = sum(len(runner.status_headers) for runner in h.runners.values())
+                # Fairness must not expand the existing per-pass probe cap.
+                assert probes_after - probes_before <= 4
+                for candidate in protected:
+                    record = h.substrate._affinity.get(candidate.thread_key)  # noqa: SLF001
+                    assert record is not None
+                    assert record.handle == candidate
+                assert not (set(h.fake_k8s.deleted_claims) - deleted_before_pressure).intersection(
+                    candidate.claim_name for candidate in protected
+                )
+                if result.reclaimed:
+                    break
+
+            assert results[-1].reclaimed, "old unreadable routes starved a safe completed route"
+            assert results[-1].outcome == "reclaimed"
+            assert len(results) > 1
+            assert h.substrate.lookup(completed.thread_key) is None
+            assert completed.claim_name in h.fake_k8s.deleted_claims
+
+            await h.kernel.process_event(
+                qevent("resume the reclaimed completed thread", thread="tCompletedPressure")
+            )
+            resumed = h.substrate.lookup(completed.thread_key)
+            assert resumed is not None
+            assert resumed.claim_name != completed.claim_name
+            assert resumed.history_ref == completed.history_ref
+            assert h.runners[resumed.port].opened == ["resume the reclaimed completed thread"]
+
+    asyncio.run(go())
+
+
 @pytest.mark.parametrize("race", ["touch", "replace", "lease-loss"])
 def test_quota_pressure_loses_races_without_deleting_the_candidate(
     make_harness,
@@ -4486,7 +5010,7 @@ def test_route_created_between_attachment_retry_locks_keeps_changed_route_outcom
             assert lane.discard_calls == 2
             assert h.substrate.lookup(trigger_key) is not None
             assert h.runner.opened == []
-            assert h.sink.last_text == kernel_module._CHANGED_ATTACHMENT_REPLY
+            assert h.sink.last_text == kernel_constants._CHANGED_ATTACHMENT_REPLY
 
     asyncio.run(go())
 
@@ -4550,7 +5074,7 @@ def test_pressure_can_reclaim_victim_between_its_attachment_locks(
             assert lane.resolve_calls == 1
             assert lane.discard_calls == 1
             assert any(
-                update[2] == kernel_module._CHANGED_ATTACHMENT_REPLY for update in h.sink.updates
+                update[2] == kernel_constants._CHANGED_ATTACHMENT_REPLY for update in h.sink.updates
             )
 
     asyncio.run(go())
@@ -4593,22 +5117,22 @@ def test_quota_without_delivery_budget_refuses_before_pressure_inventory(
 
 def test_pressure_ceiling_is_derived_from_named_transport_slices() -> None:
     cold_redis_operation = (
-        kernel_module._PRESSURE_REDIS_CONNECT_S + 3 * kernel_module._PRESSURE_REDIS_READ_S
+        kernel_constants._PRESSURE_REDIS_CONNECT_S + 3 * kernel_constants._PRESSURE_REDIS_READ_S
     )
-    inventory = kernel_module._PRESSURE_SCAN_DEADLINE_S
+    inventory = kernel_constants._PRESSURE_SCAN_DEADLINE_S
     candidate = (
         2 * cold_redis_operation
-        + kernel_module._PRESSURE_RUNNER_STATUS_S
-        + 3 * kernel_module._PRESSURE_REDIS_READ_S
+        + kernel_constants._PRESSURE_RUNNER_STATUS_S
+        + 3 * kernel_constants._PRESSURE_REDIS_READ_S
     )
-    cleanup = kernel_module._PRESSURE_DELETE_S + kernel_module._PRESSURE_GONE_WAIT_S
+    cleanup = kernel_constants._PRESSURE_DELETE_S + kernel_constants._PRESSURE_GONE_WAIT_S
 
-    assert kernel_module._PRESSURE_REDIS_COLD_OPERATION_S == cold_redis_operation
-    assert kernel_module._PRESSURE_INVENTORY_CEILING_S == inventory
-    assert kernel_module._PRESSURE_CANDIDATE_CEILING_S == candidate
-    assert kernel_module._PRESSURE_CLEANUP_CEILING_S == cleanup
-    assert kernel_module._PRESSURE_CEILING_S == (
-        inventory + kernel_module._PRESSURE_CANDIDATES * candidate + cleanup
+    assert kernel_constants._PRESSURE_REDIS_COLD_OPERATION_S == cold_redis_operation
+    assert kernel_constants._PRESSURE_INVENTORY_CEILING_S == inventory
+    assert kernel_constants._PRESSURE_CANDIDATE_CEILING_S == candidate
+    assert kernel_constants._PRESSURE_CLEANUP_CEILING_S == cleanup
+    assert kernel_constants._PRESSURE_CEILING_S == (
+        inventory + kernel_constants._PRESSURE_CANDIDATES * candidate + cleanup
     )
 
 
@@ -4618,7 +5142,7 @@ def test_pressure_entry_refuses_when_current_budget_is_below_derived_floor(
 ) -> None:
     async def go() -> None:
         claim_timeout = 0.05
-        budget = kernel_module._PRESSURE_CEILING_S + claim_timeout - 0.01
+        budget = kernel_constants._PRESSURE_CEILING_S + claim_timeout - 0.01
         async with make_harness(
             binding=_HistoryBinding(),
             claim_timeout_seconds=claim_timeout,
@@ -4659,7 +5183,7 @@ def test_scan_cap_emits_one_incomplete_pressure_outcome(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     outcomes = _capture_pressure_outcomes(monkeypatch)
-    monkeypatch.setattr(kernel_module, "_PRESSURE_SCAN_RECORDS", 0)
+    monkeypatch.setattr(kernel_constants, "_PRESSURE_SCAN_RECORDS", 0)
 
     async def go() -> None:
         async with make_harness(
@@ -4691,7 +5215,7 @@ def test_expiry_unsupported_is_a_declared_finite_pressure_outcome(
 ) -> None:
     outcomes = _capture_pressure_outcomes(monkeypatch)
 
-    kernel_module.Kernel._record_pressure_outcome("expiry-unsupported")
+    kernel_core.Kernel._record_pressure_outcome("expiry-unsupported")
 
     assert outcomes == ["expiry-unsupported"]
 
@@ -4784,7 +5308,7 @@ def test_approval_resume_capacity_retries_then_escalates(
     names the decision, not an approval.
     """
 
-    real_record_metric = kernel_module.record_metric
+    real_record_metric = kernel_log.record_metric
     recorded: list[tuple[str, dict[str, str]]] = []
 
     def spy(name: str, value: float = 1, *, attributes: dict[str, str] | None = None) -> None:
@@ -4792,7 +5316,7 @@ def test_approval_resume_capacity_retries_then_escalates(
         # Delegate so the metric allowlist still validates the new class.
         real_record_metric(name, value, attributes=attributes)
 
-    monkeypatch.setattr(kernel_module, "record_metric", spy)
+    monkeypatch.setattr(kernel_log, "record_metric", spy)
 
     async def go() -> None:
         async with make_harness(
@@ -5083,7 +5607,7 @@ def test_interrupt_agent_signals_other_threads_past_a_wedged_runner(
                 await h.kernel.process_event(qevent("hi", thread=thread))
             h.kernel._active_by_agent[agent_id] = {_thread_key(t) for t in threads}
 
-            monkeypatch.setattr(kernel_module, "_KILL_INTERRUPT_TIMEOUT_S", 0.2)
+            monkeypatch.setattr(kernel_constants, "_KILL_INTERRUPT_TIMEOUT_S", 0.2)
 
             wedged = asyncio.Event()  # never set: the first thread's runner hangs forever
             attempted: list[str] = []
@@ -5288,6 +5812,7 @@ class _TokenBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
+        **_: object,
     ) -> dict[str, str]:
         return {"CURIE_RUNNER_TOKEN": self._token}
 
@@ -5720,7 +6245,7 @@ def test_release_thread_releases_when_the_runner_never_answers_the_interrupt(
             await h.kernel.process_event(qevent("hi", thread="tWedged"))
             assert h.substrate.lookup(_thread_key("tWedged")) is not None  # the route is live
 
-            monkeypatch.setattr(kernel_module, "_RESET_INTERRUPT_TIMEOUT_S", 0.2)
+            monkeypatch.setattr(kernel_constants, "_RESET_INTERRUPT_TIMEOUT_S", 0.2)
 
             wedged = asyncio.Event()  # never set: the runner answers nothing, ever
 
@@ -5893,7 +6418,7 @@ def test_lock_acquire_timeout_is_a_retryable_turn_start_failure(make_harness) ->
                 TargetRoute(),
                 release_order,
                 pressure_retried=False,
-                workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+                workspace_inference=kernel_workspace._WorkspaceInferenceCarry(),
             )
 
             assert outcome.terminal_ok is False
@@ -5961,6 +6486,260 @@ _PRESSURE_LEASE_KNOBS: dict[str, object] = {
     **_LEASE_KNOBS,
     "delivery_budget_s": 120.0,
 }
+
+
+class _MarkerRetryClock:
+    """Inject arithmetic and sleeps locally; keep actual Valkey writes real."""
+
+    def __init__(self) -> None:
+        # Half-second retry increments stay exact regardless of host uptime.
+        self.now = float(int(time.monotonic()))
+        self.owner_task = asyncio.current_task()
+        self.delays: list[float] = []
+        self.after_sleep: Callable[[], None] | None = None
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        if asyncio.current_task() is not self.owner_task:
+            await asyncio.sleep(delay)
+            return
+        self.delays.append(delay)
+        self.now += delay
+        if self.after_sleep is not None:
+            self.after_sleep()
+        # Yield real time so a separately scheduled liveness renewal can reach
+        # Valkey, without changing shared time or asyncio module functions.
+        await asyncio.sleep(0.01)
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            kernel_clock, "time", SimpleNamespace(**{**vars(time), "monotonic": self.monotonic})
+        )
+        monkeypatch.setattr(
+            kernel_attempt, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": self.sleep})
+        )
+
+
+async def _marker_retry_lease(h: Any, event_id: str) -> Any:
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    await h.async_redis.xgroup_create(
+        h.config.stream, h.config.consumer_group, id="0", mkstream=True
+    )
+    return await _leased_entry(
+        h, DeliveryLeaseStore(h.async_redis, h.config), event_id=event_id, generation=1
+    )
+
+
+def test_side_effect_marker_retries_exact_backoff_and_holds_action_until_durable(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def go() -> None:
+        async with make_harness() as h:
+            event = qevent("marker retry", event_id=uuid.uuid4().hex)
+            lease = await _marker_retry_lease(h, event.event_id)
+            clock = _MarkerRetryClock()
+            lease.local_deadline_monotonic = clock.now + 35.0
+            clock.install(monkeypatch)
+            real_marker = h.kernel._markers.mark_side_effect
+            real_action = h.kernel._record_action
+            writes = 0
+            actions = 0
+
+            async def failed_writes(event_id: str) -> None:
+                nonlocal writes
+                writes += 1
+                assert actions == 0, "the side-effect frame was applied before its marker"
+                if writes <= 5:
+                    raise redis.exceptions.ConnectionError("injected marker transport error")
+                await real_marker(event_id)
+
+            async def observed_action(*args: Any, **kwargs: Any) -> None:
+                nonlocal actions
+                assert await h.kernel._markers.saw_side_effect(event.event_id)
+                actions += 1
+                await real_action(*args, **kwargs)
+
+            monkeypatch.setattr(h.kernel._markers, "mark_side_effect", failed_writes)
+            monkeypatch.setattr(h.kernel, "_record_action", observed_action)
+            token = kernel_constants._DELIVERY_LEASE.set(lease)
+            try:
+                acc = kernel_delivery._StreamAccumulator()
+                await h.kernel._apply_frame(
+                    SideEffectFlag(tool="deploy", call_id="marker-retry"),
+                    acc,
+                    SimpleNamespace(),
+                    event,
+                )
+            finally:
+                kernel_constants._DELIVERY_LEASE.reset(token)
+            assert clock.delays == [0.5, 1.0, 2.0, 4.0, 5.0]
+            assert writes == 6 and actions == 1
+            assert acc.saw_side_effect and acc.classification is None
+            assert not lease.lost.is_set()
+
+    asyncio.run(go())
+
+
+def test_marker_deadline_returns_ownership_store_unavailable_while_liveness_is_healthy(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real runner turn reaches the existing consume timeout outcome path."""
+
+    from curie_worker.consumer import Consumer
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        async with make_harness(consumer_heartbeat_ttl_ms=150) as h:
+            event = qevent("marker deadline", event_id=uuid.uuid4().hex)
+            lease = await _marker_retry_lease(h, event.event_id)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
+            await consumer._publish_liveness()
+            initial_liveness = consumer._last_liveness_renewal
+            liveness = asyncio.create_task(consumer._liveness_refresh_loop())
+            h.runner.default_script = [
+                SideEffectFlag(tool="deploy", call_id="held-marker"),
+                Final(text="must not apply", status=DONE),
+            ]
+            clock = _MarkerRetryClock()
+            started = clock.now
+            lease.local_deadline_monotonic = started + 35.0
+            clock.install(monkeypatch)
+            attempts: list[float] = []
+            actions: list[Any] = []
+
+            async def unavailable(_event_id: str) -> None:
+                attempts.append(clock.now - started)
+                raise redis.exceptions.ConnectionError("injected marker store outage")
+
+            async def forbidden_action(*args: Any, **_kwargs: Any) -> None:
+                actions.append(args)
+                raise AssertionError("an unmarked side-effect frame reached the action ledger")
+
+            monkeypatch.setattr(h.kernel._markers, "mark_side_effect", unavailable)
+            monkeypatch.setattr(h.kernel, "_record_action", forbidden_action)
+            token = kernel_constants._DELIVERY_LEASE.set(lease)
+            try:
+                outcome = await h.kernel._attempt(
+                    event,
+                    TargetRoute(),
+                    lambda: None,
+                    pressure_retried=False,
+                    workspace_inference=kernel_workspace._WorkspaceInferenceCarry(),
+                )
+                assert outcome.terminal_ok is False
+                assert outcome.classification == "ownership-store-unavailable"
+                assert outcome.saw_side_effect
+                assert "must not apply" not in outcome.text
+                assert kernel_failures._display_error_classification(outcome.classification) == (
+                    "ownership-store-unavailable"
+                )
+                assert clock.delays == [0.5, 1.0, 2.0, 4.0, 5.0, 5.0, 5.0, 5.0, 5.0, 2.5]
+                assert attempts == [0.0, 0.5, 1.5, 3.5, 7.5, 12.5, 17.5, 22.5, 27.5, 32.5]
+                assert clock.now - started == 35.0
+                assert not actions
+                assert not await h.kernel._markers.saw_side_effect(event.event_id)
+                assert not liveness.done(), "marker exhaustion terminated healthy liveness"
+                assert consumer._last_liveness_renewal > initial_liveness
+                assert await consumer._liveness_store.is_alive(
+                    stream=h.config.stream,
+                    group=h.config.consumer_group,
+                    consumer=h.config.consumer_name,
+                )
+                assert not lease.lost.is_set()
+            finally:
+                kernel_constants._DELIVERY_LEASE.reset(token)
+                liveness.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await liveness
+                await consumer._cleanup_alive()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("loss_point", ["retry", "confirmed-write"])
+def test_side_effect_marker_cannot_apply_a_frame_after_authority_is_lost(
+    make_harness, monkeypatch: pytest.MonkeyPatch, loss_point: str
+) -> None:
+    from curie_worker.delivery_lease import LeaseLostError
+
+    async def go() -> None:
+        async with make_harness() as h:
+            event = qevent("lost marker", event_id=uuid.uuid4().hex)
+            lease = await _marker_retry_lease(h, event.event_id)
+            clock = _MarkerRetryClock()
+            lease.local_deadline_monotonic = clock.now + 35.0
+            clock.install(monkeypatch)
+            real_marker = h.kernel._markers.mark_side_effect
+            attempts = 0
+            actions: list[Any] = []
+
+            async def lose_during_write(event_id: str) -> None:
+                nonlocal attempts
+                attempts += 1
+                if loss_point == "retry":
+                    raise redis.exceptions.ConnectionError("injected marker outage before refusal")
+                await real_marker(event_id)
+                lease.lost.set()
+
+            async def forbidden_action(*args: Any, **_kwargs: Any) -> None:
+                actions.append(args)
+
+            if loss_point == "retry":
+                clock.after_sleep = lease.lost.set
+            monkeypatch.setattr(h.kernel._markers, "mark_side_effect", lose_during_write)
+            monkeypatch.setattr(h.kernel, "_record_action", forbidden_action)
+            token = kernel_constants._DELIVERY_LEASE.set(lease)
+            try:
+                with pytest.raises(LeaseLostError):
+                    await h.kernel._apply_frame(
+                        SideEffectFlag(tool="deploy"),
+                        kernel_delivery._StreamAccumulator(),
+                        SimpleNamespace(),
+                        event,
+                    )
+            finally:
+                kernel_constants._DELIVERY_LEASE.reset(token)
+            assert attempts == 1, "a lost owner attempted another marker write"
+            assert not actions
+            assert await h.kernel._markers.saw_side_effect(event.event_id) is (
+                loss_point == "confirmed-write"
+            )
+            assert clock.delays == ([0.5] if loss_point == "retry" else [])
+
+    asyncio.run(go())
+
+
+def test_unfenced_side_effect_marker_failure_propagates_without_retry(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def go() -> None:
+        async with make_harness() as h:
+            attempts = 0
+
+            async def unavailable(_event_id: str) -> None:
+                nonlocal attempts
+                attempts += 1
+                raise redis.exceptions.ConnectionError("injected unfenced marker outage")
+
+            monkeypatch.setattr(h.kernel._markers, "mark_side_effect", unavailable)
+            with pytest.raises(redis.exceptions.ConnectionError):
+                await h.kernel._apply_frame(
+                    SideEffectFlag(tool="deploy"),
+                    kernel_delivery._StreamAccumulator(),
+                    SimpleNamespace(),
+                    qevent("unfenced marker"),
+                )
+            assert attempts == 1
+
+    asyncio.run(go())
 
 
 async def _leased_entry(h: Any, store: Any, *, event_id: str, generation: int) -> Any:
@@ -6347,7 +7126,7 @@ def test_stream_timeout_classifies_as_runner_timeout_with_a_named_reason(
                         TargetRoute(),
                         release_order,
                         pressure_retried=False,
-                        workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+                        workspace_inference=kernel_workspace._WorkspaceInferenceCarry(),
                     )
             finally:
                 hold.set()  # let the fake runner's handler unwind
@@ -6491,7 +7270,7 @@ def test_error_event_classification_precedes_unconfirmed_stream_timeout(
                     TargetRoute(),
                     lambda: None,
                     pressure_retried=False,
-                    workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+                    workspace_inference=kernel_workspace._WorkspaceInferenceCarry(),
                 )
             finally:
                 hold.set()
@@ -6503,25 +7282,21 @@ def test_error_event_classification_precedes_unconfirmed_stream_timeout(
 
 
 def test_history_persistence_error_has_dedicated_factory_cause() -> None:
-    failure = kernel_module.TurnOutcome(
+    failure = kernel_failures.TurnOutcome(
         terminal_ok=False,
         classification="history-persistence-error",
         error_message="conversation history capacity exceeded",
     )
 
-    assert kernel_module._escalation_cause(failure) == "history_capacity"
+    assert kernel_failures._escalation_cause(failure) == "history_capacity"
 
 
 def test_max_turns_and_unclassified_have_their_own_factory_causes() -> None:
-    max_turns = kernel_module.TurnOutcome(
-        terminal_ok=False, classification="max-turns"
-    )
-    unclassified = kernel_module.TurnOutcome(
-        terminal_ok=False, classification="unclassified"
-    )
+    max_turns = kernel_failures.TurnOutcome(terminal_ok=False, classification="max-turns")
+    unclassified = kernel_failures.TurnOutcome(terminal_ok=False, classification="unclassified")
 
-    assert kernel_module._escalation_cause(max_turns) == "max_turns"
-    assert kernel_module._escalation_cause(unclassified) == "unclassified"
+    assert kernel_failures._escalation_cause(max_turns) == "max_turns"
+    assert kernel_failures._escalation_cause(unclassified) == "unclassified"
 
 
 @pytest.mark.parametrize(
@@ -6651,7 +7426,7 @@ def test_stream_timeout_without_a_side_effect_still_retries(make_harness, monkey
     the retry folded into the dead turn as a STEER instead of opening a second
     one, which is what ``steers == []`` below guards."""
 
-    real_record_metric = kernel_module.record_metric
+    real_record_metric = kernel_log.record_metric
     recorded: list[tuple[str, dict[str, str]]] = []
 
     def spy(name: str, value: float = 1, *, attributes: dict[str, str] | None = None) -> None:
@@ -6659,7 +7434,7 @@ def test_stream_timeout_without_a_side_effect_still_retries(make_harness, monkey
         # Delegate to the real recorder so the metric allowlist still validates.
         real_record_metric(name, value, attributes=attributes)
 
-    monkeypatch.setattr(kernel_module, "record_metric", spy)
+    monkeypatch.setattr(kernel_log, "record_metric", spy)
 
     async def go() -> None:
         async with make_harness(
@@ -6739,7 +7514,7 @@ def test_reply_delivery_timeout_is_not_a_runner_timeout(make_harness, caplog, mo
                     TargetRoute(),
                     lambda: None,
                     pressure_retried=False,
-                    workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+                    workspace_inference=kernel_workspace._WorkspaceInferenceCarry(),
                 )
 
             assert outcome.terminal_ok is False
@@ -6765,9 +7540,7 @@ def test_streaming_turn_route_survives_the_reaper_past_its_ttl(
     # disables the refresh and must see the claim reaped, proving the TTL
     # really expires inside this test.
     async def go() -> None:
-        async with make_harness() as h:
-            h.substrate._config = replace(h.substrate._config, route_ttl_seconds=1)
-            h.kernel._route_ttl_seconds = 1
+        async with make_harness(substrate_env={"CURIE_ROUTE_TTL_SECONDS": "1"}) as h:
             calls: list[tuple[str, str]] = []
             inner = h.substrate.touch_live
 

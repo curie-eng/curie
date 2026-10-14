@@ -16,6 +16,10 @@ command to say.
 A card whose ``terminal`` flag disagrees with its state is refused with the
 error type ``progress_terminal``, for the reason ``channel_protocol.reply`` gives
 for its own rule types.
+
+``progress_text`` is the one channel-neutral plain-text rendering of a card or a
+milestone, for a channel with nothing richer, and ``progress_heading`` is its
+first half, for a renderer that shows the summary separately.
 """
 
 from enum import StrEnum
@@ -153,3 +157,50 @@ class ProgressMilestone(BaseModel):
             "a fourth milestone inexpressible on the wire."
         ),
     )
+
+
+# The words a reader sees for each state and milestone class. Closed like the
+# enums they key, so a value added there without words here fails
+# ``test_every_state_and_class_has_a_heading`` rather than rendering a slug.
+_STATE_WORDS: dict[ProgressState, str] = {
+    ProgressState.QUEUED: "Queued",
+    ProgressState.INVESTIGATING: "Investigating",
+    ProgressState.AWAITING_APPROVAL: "Waiting for approval",
+    ProgressState.PREPARING_WORKSPACE: "Preparing the workspace",
+    ProgressState.TESTING: "Testing",
+    ProgressState.PUBLISHING: "Publishing",
+    ProgressState.COMPLETE: "Complete",
+    ProgressState.FAILED: "Failed",
+    ProgressState.CANCELLED: "Cancelled",
+}
+_MILESTONE_WORDS: dict[MilestoneClass, str] = {
+    MilestoneClass.EVIDENCE: "Evidence acquired",
+    MilestoneClass.SCOPE: "Scope changed",
+    MilestoneClass.VERIFICATION: "Verification result",
+}
+
+
+def progress_heading(progress: ProgressCard | ProgressMilestone) -> str:
+    """The line a reader sees above the summary, in plain words.
+
+    @spec ADR-0130 d2, d3. A closed card says so in the heading itself, so a
+    renderer that shows only this line still shows the card is closed.
+    """
+
+    if isinstance(progress, ProgressMilestone):
+        return f"Milestone: {_MILESTONE_WORDS[progress.milestone]}"
+    words = _STATE_WORDS[progress.state]
+    if progress.terminal:
+        return f"Task {words.lower()}"
+    return f"Task status: {words}"
+
+
+def progress_text(progress: ProgressCard | ProgressMilestone) -> str:
+    """The channel-neutral plain text of a card or a milestone.
+
+    @spec ADR-0130 d2. A card edit carries no ``message``, so a channel with
+    nothing richer takes its text from here. The summary is carried verbatim:
+    escaping it, or disabling mentions, is each channel's own rendering job.
+    """
+
+    return f"{progress_heading(progress)}. {progress.summary}"

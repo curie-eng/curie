@@ -9,7 +9,7 @@ https://docs.github.com/en/rest/checks/runs#list-check-run-annotations
 
 Green, or no checks inside the grace period, completes. A failure enqueues one
 continuation turn for the SAME request (``work-item-{id}-ci-{round}``), up to
-3 rounds. Time moves only through ``workitems._database_now`` offsets; nothing
+3 rounds. Time moves only through ``workitems.database_now`` offsets; nothing
 here waits in real time. Machine fixtures drive the events.
 """
 
@@ -19,9 +19,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.util
+import io
 import json
 import re
+import socket
+import ssl
+import subprocess
 import sys
+import tarfile
+import time
 import uuid
 from collections.abc import Iterator
 from datetime import datetime, timedelta
@@ -31,30 +38,34 @@ from typing import Any
 import httpx
 import pytest
 import redis
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api.config import get_settings
-from curie_api.factory_notices import FINAL_MARKER, marker_for
+from curie_api.factory_comment_text import marker_for
+from curie_api.factory_notices import FINAL_MARKER
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from test_factory_terminus import (  # noqa: F401  (fixtures)
+from forge_fakes.github import (
+    LABEL,
+    REPO,
+    REPO_ID,
+    _issue_event,
+    _post,
+    factory_env,
+    forges_document,
+    forges_env_json,
+    github_repository_binding,
+)
+from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     HEAD_A,
     HEAD_B,
     HEAD_C,
-    _attach_publication,
     _CommentServer,
-    _label,
-    _notices,
-    _observe_termination,
-    _reconcile,
-    _reconcile_later,
-    _request,
     _rows,
-    _start_running,
     admitted,
     check_run,
     ci_empty,
@@ -64,13 +75,46 @@ from test_factory_terminus import (  # noqa: F401  (fixtures)
     ci_pending,
     comments,
 )
-from test_github_factory_ingress import LABEL, REPO, REPO_ID, _issue_event, _post
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from test_factory_terminus import (  # noqa: F401  (fixtures)
+    _attach_publication,
+    _label,
+    _notices,
+    _observe_termination,
+    _reconcile,
+    _reconcile_later,
+    _request,
+    _set_base_ref,
+    _start_running,
+)
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
 WORKER = {"X-Curie-Worker-Token": "factory-terminus-worker"}
 MARKER_RE = re.compile(r"^Curie wait_ci round ([23]) of 3: ")
 _PRS = iter(range(701, 799))
+
+
+def _set_metadata_ci(
+    monkeypatch: pytest.MonkeyPatch, key_dir: Path, metadata_rerun_keys: list[str]
+) -> None:
+    """Bind ``REPO`` with the given metadata rerun keys on the running fixture's
+    GitHub host; the per-repository CI policy lives on the binding (#4397)."""
+
+    document = forges_document(
+        api_url=get_settings().github_api_url,
+        bindings=[github_repository_binding(ci={"metadata_rerun_keys": metadata_rerun_keys})],
+    )
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, key_dir))
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def _metadata_ci(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
+    _set_metadata_ci(monkeypatch, tmp_path / "metadata-ci", ["Publication description guard"])
+    yield
+    get_settings.cache_clear()
 
 
 # --- helpers -------------------------------------------------------------------
@@ -96,9 +140,9 @@ def _all(number: int) -> list[dict[str, Any]]:
         "w.id AS work_item_id, w.readmit_request_id "
         "FROM curie.execution_requests r "
         "JOIN curie.work_items w ON w.id = r.work_item_id "
-        "WHERE w.github_repository_id = :repo AND w.github_issue_number = :number "
+        "WHERE w.tracker_scope_id = :repo AND w.tracker_issue_id = :number "
         "ORDER BY r.sequence",
-        {"repo": REPO_ID, "number": number},
+        {"repo": str(REPO_ID), "number": str(number)},
     )
 
 
@@ -297,24 +341,24 @@ def _clock_offset(seconds: float) -> Iterator[None]:
     """Shift the database clock both the reconciler and the finish route read."""
 
     import curie_api.workitem_dispatch as workitem_dispatch
-    import curie_api.workitems as workitems
+    import curie_api.workitems.lifecycle as workitems
 
-    original = workitems._database_now
+    original = workitems.database_now
 
     async def later(session: AsyncSession) -> Any:
         real = await original(session)
         return real + timedelta(seconds=seconds)
 
-    workitems._database_now = later
-    dispatch_original = getattr(workitem_dispatch, "_database_now", None)
+    workitems.database_now = later
+    dispatch_original = getattr(workitem_dispatch, "database_now", None)
     if dispatch_original is not None:
-        workitem_dispatch._database_now = later  # type: ignore[attr-defined]
+        workitem_dispatch.database_now = later  # type: ignore[attr-defined]
     try:
         yield
     finally:
-        workitems._database_now = original
+        workitems.database_now = original
         if dispatch_original is not None:
-            workitem_dispatch._database_now = dispatch_original  # type: ignore[attr-defined]
+            workitem_dispatch.database_now = dispatch_original  # type: ignore[attr-defined]
 
 
 def _body(sink: _CommentServer, request_id: uuid.UUID) -> str:
@@ -328,11 +372,27 @@ def _terminal(number: int) -> tuple[str, str | None]:
     return row["status"], row["terminal_cause"]
 
 
-def _finish(client: Any, request_id: uuid.UUID, epoch: int, cause: str) -> Any:
+def _finish(
+    client: Any, request_id: uuid.UUID, epoch: int, cause: str, ci_fix_round: int | None
+) -> Any:
     return client.post(
         f"/v1/internal/work-items/requests/{request_id}/finish",
         headers=WORKER,
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": cause},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": cause,
+            "ci_fix_round": ci_fix_round,
+        },
+    )
+
+
+def _request_version(request_id: uuid.UUID) -> int:
+    return int(
+        _rows(
+            "SELECT version FROM curie.execution_requests WHERE id = :id",
+            {"id": request_id},
+        )[0]["version"]
     )
 
 
@@ -432,6 +492,92 @@ def test_no_checks_within_the_grace_period_completes_with_a_note(admitted: Any) 
     assert _ci_turns(published["id"]) == []
 
 
+def test_a_dirty_pull_without_checks_fails_promptly_without_a_ci_fix(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9761
+    sink.ci_script = [ci_empty()]
+    sink.pull_script = [{"mergeable": False, "mergeable_state": "dirty", "merged": False}]
+    published = _published(client, github, sink, number)
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert _ci_turns(published["id"]) == []
+    _assert_no_final_result(sink)
+
+    _reconcile_later(130)
+
+    assert _terminal(number) == ("failed", "merge_conflict")
+    body = _body(sink, published["id"])
+    assert body.startswith("Could not complete: the pull request has merge conflicts")
+    assert "Reason: merge_conflict" in body
+    assert published["pr_url"] in body
+    assert "Details:" in body
+    assert "Provider message:" not in body
+    assert "Cause: merge_conflict" in body
+    assert _ci_turns(published["id"]) == []
+    assert sink.reruns == []
+
+
+def test_null_pull_mergeability_waits_for_the_third_clean_observation(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9762
+    sink.ci_script = [ci_empty()]
+    sink.pull_script = [
+        {"mergeable": None, "mergeable_state": "unknown", "merged": False},
+        {"mergeable": None, "mergeable_state": "unknown", "merged": False},
+        {"mergeable": True, "mergeable_state": "clean", "merged": False},
+    ]
+    published = _published(client, github, sink, number)
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert sink.pull_observations == [published["pr"]]
+
+    _reconcile_later(130)
+
+    assert _terminal(number) == ("running", None)
+    assert sink.pull_observations == [published["pr"]] * 2
+    _assert_no_final_result(sink)
+    assert _ci_turns(published["id"]) == []
+
+    _reconcile_later(150)
+
+    assert _terminal(number) == ("completed", "completed")
+    assert sink.pull_observations == [published["pr"]] * 3
+    body = _body(sink, published["id"])
+    assert body.startswith(f"Completed: {published['pr_url']}")
+    assert "Note: No CI checks appeared within 120 s." in body
+    assert _ci_turns(published["id"]) == []
+
+
+def test_persistently_null_pull_mergeability_ends_unverified_at_the_deadline(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9763
+    sink.ci_script = [ci_empty()]
+    sink.pull_script = [{"mergeable": None, "mergeable_state": "unknown", "merged": False}]
+    published = _published(client, github, sink, number)
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    _assert_no_final_result(sink)
+
+    _reconcile_later(1210)
+
+    assert _terminal(number) == ("failed", "ci_unverified")
+    body = _body(sink, published["id"])
+    assert "Reason: mergeability_unknown" in body
+    assert published["pr_url"] in body
+    assert "CI could not be verified" in body
+    assert "could not be read" not in body
+    assert _ci_turns(published["id"]) == []
+    assert sink.reruns == []
+
+
 # --- AC2: the fix loop, capped at 3 rounds ---------------------------------------
 
 
@@ -467,7 +613,8 @@ def test_ci_failure_loops_the_same_request_to_the_cap(admitted: Any) -> None:
     turns = _ci_turns(request_id)
     assert [t["event_id"] for t in turns] == [f"work-item-{request_id}-ci-2"]
     lines = turns[0]["text"].split("\n")
-    assert lines[0] == f"https://github.com/{REPO}/issues/{number}"
+    # The tracker links the issue on the HTML base GITHUB_API_URL names.
+    assert lines[0] == f"{get_settings().github_html_base}/{REPO}/issues/{number}"
     assert lines[1] == (
         f"Curie wait_ci round 2 of 3: the checks on {published['pr_url']} failed at {HEAD_A}."
     )
@@ -635,7 +782,9 @@ def test_a_green_fix_round_completes_the_same_request(admitted: Any) -> None:
     assert _count_requests(number) == 1
 
 
-def test_body_only_fix_revision_repolls_checks_on_the_same_head(admitted: Any) -> None:
+def test_body_only_fix_revision_repolls_checks_on_the_same_head(
+    admitted: Any, _metadata_ci: None
+) -> None:
     client, github, sink = admitted
     number = 9707
     old_time = "2020-01-01T00:00:00Z"
@@ -643,13 +792,15 @@ def test_body_only_fix_revision_repolls_checks_on_the_same_head(admitted: Any) -
     sink.ci_scripts = {
         HEAD_A: [
             ci_entry(
-                check_run("PR body (real newlines)", conclusion="failure", started_at=old_time)
+                check_run(
+                    "Publication description guard", conclusion="failure", started_at=old_time
+                )
             ),
             ci_entry(
-                check_run("PR body (real newlines)", started_at=old_time),
+                check_run("Publication description guard", started_at=old_time),
                 check_run("unrelated", started_at=new_time),
             ),
-            ci_entry(check_run("PR body (real newlines)", started_at=new_time)),
+            ci_entry(check_run("Publication description guard", started_at=new_time)),
         ]
     }
     published = _published(client, github, sink, number)
@@ -676,12 +827,241 @@ def test_body_only_fix_revision_repolls_checks_on_the_same_head(admitted: Any) -
     assert _count_requests(number) == 1
 
 
-def test_body_only_fix_waits_for_fresh_checks_then_ends_unverified(admitted: Any) -> None:
+def test_body_only_fix_without_a_metadata_policy_completes_from_recorded_failures(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, github, sink = admitted
+    number = 9792
+    sink.ci_scripts = {
+        HEAD_A: [
+            ci_entry(check_run("Publication description guard", conclusion="failure")),
+            ci_entry(check_run("Publication description guard", started_at="2999-01-01T00:00:00Z")),
+        ]
+    }
+    published = _published(client, github, sink, number)
+    _reconcile()
+    assert len(_ci_turns(published["id"])) == 1
+    _attach_fix(
+        published["work_item_id"],
+        published["id"],
+        revision=2,
+        head_sha=HEAD_A,
+        title="Correct the pull request description",
+        paths=[],
+        base_sha=HEAD_A,
+    )
+
+    _reconcile()
+
+    assert _terminal(number) == ("completed", "completed")
+    assert len(_ci_turns(published["id"])) == 1
+    assert _body(sink, published["id"]).startswith(f"Completed: {published['pr_url']}")
+    assert _count_requests(number) == 1
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        None,
+        "not json",
+        "null",
+        "[]",
+        '{"checks": [], "statuses": []}',
+        '{"checks": "Publication description guard", "statuses": []}',
+        '{"checks": [42], "statuses": []}',
+        '{"checks": [""], "statuses": []}',
+        '{"checks": ["Publication description guard"], "statuses": [null]}',
+        b"\xff",
+    ],
+)
+def test_body_only_fix_without_a_usable_failing_record_ends_unverified(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch, record: str | bytes | None
+) -> None:
+    get_settings.cache_clear()
+    client, github, sink = admitted
+    number = 9793
+    sink.ci_scripts = {
+        HEAD_A: [
+            ci_entry(check_run("Publication description guard", conclusion="failure")),
+            ci_entry(check_run("Publication description guard", started_at="2999-01-01T00:00:00Z")),
+        ]
+    }
+    published = _published(client, github, sink, number)
+    _reconcile()
+    assert len(_ci_turns(published["id"])) == 1
+    valkey = redis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
+    try:
+        key = f"{_ci_key(published['id'], 2)}:failing"
+        assert valkey.exists(key)
+        if record is None:
+            valkey.delete(key)
+        else:
+            valkey.set(key, record)
+    finally:
+        valkey.close()
+    _attach_fix(
+        published["work_item_id"], published["id"], revision=2, head_sha=HEAD_A,
+        title="Correct the pull request description", paths=[], base_sha=HEAD_A,
+    )
+
+    _reconcile()
+
+    assert _terminal(number) == ("failed", "ci_unverified")
+    assert len(_ci_turns(published["id"])) == 1
+    assert "Reason: metadata_ci_not_configured" in _body(sink, published["id"])
+
+
+def test_configured_metadata_policy_takes_precedence_over_recorded_failures(
+    admitted: Any, _metadata_ci: None
+) -> None:
+    client, github, sink = admitted
+    number = 9794
+    old_time = "2020-01-01T00:00:00Z"
+    new_time = "2999-01-01T00:00:00Z"
+    sink.ci_scripts = {
+        HEAD_A: [
+            ci_entry(check_run("Conversion suite", conclusion="failure", started_at=old_time)),
+            ci_entry(
+                check_run("Conversion suite", started_at=new_time),
+                check_run("Publication description guard", started_at=old_time),
+            ),
+            ci_entry(
+                check_run("Conversion suite", started_at=new_time),
+                check_run("Publication description guard", started_at=new_time),
+            ),
+        ]
+    }
+    published = _published(client, github, sink, number)
+    _reconcile()
+    _attach_fix(
+        published["work_item_id"], published["id"], revision=2, head_sha=HEAD_A,
+        title="Correct the pull request description", paths=[], base_sha=HEAD_A,
+    )
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    _assert_no_final_result(sink)
+    _reconcile_later(21)
+    assert _terminal(number) == ("completed", "completed")
+    assert len(_ci_turns(published["id"])) == 1
+
+
+def test_recorded_partial_metadata_rerun_reports_the_stale_failure_at_the_deadline(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    get_settings.cache_clear()
+    client, github, sink = admitted
+    number = 9796
+    old_time = "2020-01-01T00:00:00Z"
+    old_suite = check_run(
+        "Conversion suite", conclusion="failure", started_at=old_time,
+        summary="The unchanged commit still fails its suite.",
+    )
+    sink.ci_scripts = {
+        HEAD_A: [
+            ci_entry(
+                check_run(
+                    "Publication description guard", conclusion="failure", started_at=old_time
+                ),
+                old_suite,
+            ),
+            ci_entry(
+                check_run("Publication description guard", started_at="2999-01-01T00:00:00Z"),
+                old_suite,
+            ),
+        ]
+    }
+    published = _published(client, github, sink, number)
+    _reconcile()
+    _attach_fix(
+        published["work_item_id"], published["id"], revision=2, head_sha=HEAD_A,
+        title="Correct the pull request description", paths=[], base_sha=HEAD_A,
+    )
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert len(_ci_turns(published["id"])) == 1
+    _reconcile_later(1300)
+    turns = _ci_turns(published["id"])
+    assert [turn["event_id"] for turn in turns] == [
+        f"work-item-{published['id']}-ci-2", f"work-item-{published['id']}-ci-3",
+    ]
+    report = json.loads(turns[1]["text"].splitlines()[3])
+    assert [check["name"] for check in report["failing_checks"]] == ["Conversion suite"]
+    assert "The unchanged commit still fails its suite." in turns[1]["text"]
+    valkey = redis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
+    try:
+        record = valkey.get(f"{_ci_key(published['id'], 3)}:failing")
+        assert record is not None
+        assert json.loads(record) == {"checks": ["Conversion suite"], "statuses": []}
+    finally:
+        valkey.close()
+
+
+def test_ci_fix_dispatch_records_caused_failures_with_the_round_ttl_before_enqueue(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from curie_api import factory_ci
+    from curie_api.workitems import lifecycle
+
+    client, github, sink = admitted
+    number = 9795
+    caused_status = {"context": "ci/description", "state": "failure"}
+    base_status = {"context": "ci/base-audit", "state": "failure"}
+    sink.ci_scripts = {
+        HEAD_A: [
+            ci_entry(
+                check_run("Publication description guard", conclusion="failure"),
+                check_run("pip-audit", conclusion="failure"),
+                statuses=(caused_status, base_status),
+            )
+        ],
+        BASE_HEAD: [
+            ci_entry(check_run("pip-audit", conclusion="failure"), statuses=(base_status,))
+        ],
+    }
+    sink.branches = {"main": BASE_HEAD}
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+    original_dispatch = WorkItemReconciler._dispatch_ci_turn
+    records: list[dict[str, Any]] = []
+
+    async def observe_record(
+        self: WorkItemReconciler, request: Any, round_: int, text_: str
+    ) -> bool:
+        key = f"{factory_ci.ci_key(request.id, round_)}:failing"
+        raw = await self._valkey.get(key)
+        assert raw is not None
+        records.append(json.loads(raw))
+        async with self._sessionmaker() as session:
+            now = await lifecycle.database_now(session)
+        assert await self._valkey.ttl(key) >= factory_ci.round_ttl(request, now)
+        assert _ci_turns(request.id) == []
+        return await original_dispatch(self, request, round_, text_)
+
+    monkeypatch.setattr(WorkItemReconciler, "_dispatch_ci_turn", observe_record)
+
+    _reconcile()
+
+    assert records == [
+        {"checks": ["Publication description guard"], "statuses": ["ci/description"]}
+    ]
+    assert len(_ci_turns(published["id"])) == 1
+    assert _key_exists(f"{_ci_key(published['id'], 2)}:failing")
+
+
+def test_body_only_fix_waits_for_fresh_checks_then_ends_unverified(
+    admitted: Any, _metadata_ci: None
+) -> None:
     client, github, sink = admitted
     number = 9790
     old_time = "2020-01-01T00:00:00Z"
     new_time = "2999-01-01T00:00:00Z"
-    old_failure = check_run("PR body (real newlines)", conclusion="failure", started_at=old_time)
+    old_failure = check_run(
+        "Publication description guard", conclusion="failure", started_at=old_time
+    )
     sink.ci_scripts = {
         HEAD_A: [
             ci_entry(old_failure),
@@ -715,19 +1095,26 @@ def test_body_only_fix_waits_for_fresh_checks_then_ends_unverified(admitted: Any
     assert "Reason: checks_not_rerun" in _body(sink, published["id"])
 
 
-def test_body_only_fix_reports_only_a_fresh_unrelated_failure(admitted: Any) -> None:
+def test_body_only_fix_reports_only_a_fresh_unrelated_failure(
+    admitted: Any, _metadata_ci: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_metadata_ci(
+        monkeypatch,
+        tmp_path / "metadata-ci-statuses",
+        ["Publication description guard", "status:ci/publication-description"],
+    )
     client, github, sink = admitted
     number = 9791
     old_time = "2020-01-01T00:00:00Z"
     new_time = "2999-01-01T00:00:00Z"
     old_failure = check_run(
-        "PR body (real newlines)",
+        "Publication description guard",
         conclusion="failure",
         summary="Old body failure",
         started_at=old_time,
     )
     old_status = {
-        "context": "ci/pr-body",
+        "context": "ci/publication-description",
         "state": "failure",
         "description": "Old status failure",
         "created_at": old_time,
@@ -782,7 +1169,7 @@ def test_an_unpublished_fix_turn_before_the_deadline_is_terminal(admitted: Any) 
     _reconcile()
     assert len(_ci_turns(published["id"])) == 1
 
-    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished")
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 2)
 
     assert finished.status_code == 200, finished.text
     assert _terminal(number) == ("failed", "ci_fix_unpublished")
@@ -810,11 +1197,110 @@ def test_an_unpublished_fix_turn_with_a_publication_in_flight_defers(
         status="pending",
     )
 
-    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished")
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 2)
 
     assert finished.status_code == 409, finished.text
     assert "publication_pending" in finished.text
     assert _terminal(number) == ("running", None)
+
+
+def _two_publications(client: Any, github: Any, sink: _CommentServer, number: int) -> Any:
+    """Revisions 1 and 2 succeeded, the state a round 3 fix turn finishes against."""
+
+    sink.ci_scripts = {HEAD_A: [ci_failing()], HEAD_B: [ci_failing()]}
+    published = _published(client, github, sink, number)
+    _reconcile()
+    assert len(_ci_turns(published["id"])) == 1
+    _attach_fix(
+        published["work_item_id"],
+        published["id"],
+        revision=2,
+        head_sha=HEAD_B,
+        title="Fix the test",
+        paths=["src/widget.txt"],
+        status="succeeded",
+    )
+    return published
+
+
+def test_a_final_round_unpublished_fix_turn_after_an_earlier_fix_publication_is_terminal(
+    admitted: Any,
+) -> None:
+    """Round 3 has no publication of its own, so revision 2 cannot settle it (#4330)."""
+
+    client, github, sink = admitted
+    number = 9770
+    published = _two_publications(client, github, sink, number)
+
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 3)
+
+    assert finished.status_code == 200, finished.text
+    assert _terminal(number) == ("failed", "ci_fix_unpublished")
+    _reconcile()
+    body = _body(sink, published["id"])
+    assert body.startswith("Could not complete:")
+    assert "without pushing a fix" in body.splitlines()[0]
+
+
+def test_an_unpublished_fix_turn_defers_when_its_own_round_published(admitted: Any) -> None:
+    """Revision 2 is round 2's own publication, so the CI gate decides, not the worker."""
+
+    client, github, sink = admitted
+    number = 9771
+    published = _two_publications(client, github, sink, number)
+
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 2)
+
+    assert finished.status_code == 409, finished.text
+    assert "publication_pending" in finished.text
+    assert _terminal(number) == ("running", None)
+
+
+def test_a_final_round_unpublished_fix_turn_with_a_publication_in_flight_defers(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9772
+    published = _two_publications(client, github, sink, number)
+    _attach_fix(
+        published["work_item_id"],
+        published["id"],
+        revision=3,
+        head_sha=HEAD_C,
+        title="Fix the test again",
+        paths=["src/widget.txt"],
+        status="pending",
+    )
+
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 3)
+
+    assert finished.status_code == 409, finished.text
+    assert "publication_pending" in finished.text
+    assert _terminal(number) == ("running", None)
+
+
+@pytest.mark.parametrize(
+    ("cause", "ci_fix_round"),
+    [
+        ("ci_fix_unpublished", None),
+        ("ci_fix_unpublished", 1),
+        ("ci_fix_unpublished", 4),
+        ("no_pull_request", 2),
+    ],
+)
+def test_a_finish_with_an_invalid_ci_fix_round_is_rejected(
+    admitted: Any, cause: str, ci_fix_round: int | None
+) -> None:
+    client, github, sink = admitted
+    number = 9773
+    published = _two_publications(client, github, sink, number)
+    version = _request_version(published["id"])
+
+    finished = _finish(client, published["id"], _epoch(published["id"]), cause, ci_fix_round)
+
+    assert finished.status_code == 422, finished.text
+    assert _terminal(number) == ("running", None)
+    assert _request_version(published["id"]) == version
 
 
 def test_an_unpublished_fix_turn_past_the_deadline_expires_instead(admitted: Any) -> None:
@@ -828,7 +1314,9 @@ def test_an_unpublished_fix_turn_past_the_deadline_expires_instead(admitted: Any
     past = (row["execution_deadline"] - _database_now()).total_seconds() + 1
 
     with _clock_offset(past):
-        finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished")
+        finished = _finish(
+            client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 2
+        )
         assert finished.status_code == 409, finished.text
         _reconcile()
 
@@ -858,6 +1346,7 @@ def _racing_pass(count: int) -> None:
         reconcilers = [WorkItemReconciler(maker, c, get_settings()) for c in clients]
         try:
             await asyncio.gather(*(r.run_once() for r in reconcilers))
+            await asyncio.gather(*(r._sync_status_comments() for r in reconcilers))
         finally:
             for c in clients:
                 await c.aclose()
@@ -926,9 +1415,10 @@ def _push_during_observation(
 ) -> list[str]:
     """Land a fix push (head B) while the gate is observing head A."""
 
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
-    original = workitem_outcomes.observe_ci_detail
+    # The gate reads CI through the code host, which reads it here.
+    original = ci.read_ci_detail
     pushed: list[str] = []
 
     async def racing(*args: Any, **kwargs: Any) -> Any:
@@ -945,7 +1435,7 @@ def _push_during_observation(
             )
         return detail
 
-    monkeypatch.setattr(workitem_outcomes, "observe_ci_detail", racing)
+    monkeypatch.setattr(ci, "read_ci_detail", racing)
     return pushed
 
 
@@ -1012,6 +1502,7 @@ def test_relabel_during_the_ci_wait_cancels_then_readmits(admitted: Any) -> None
     assert _terminal(number) == ("running", None)
 
     github.labels = [LABEL]
+    github.advance_label_event(number)
     again = _post(
         client,
         "issues",
@@ -1055,6 +1546,7 @@ def test_relabel_during_a_fix_turn_waits_for_the_old_request_to_settle(
     assert len(_ci_turns(published["id"])) == 1
 
     github.labels = [LABEL]
+    github.advance_label_event(number)
     again = _post(
         client,
         "issues",
@@ -1126,7 +1618,7 @@ def test_unreadable_ci_ends_unverified_at_once(admitted: Any, entry: Any, reason
     assert _terminal(number) == ("failed", "ci_unverified")
     body = _body(sink, published["id"])
     assert body.startswith("Could not complete:")
-    assert "unverified" in body
+    assert "CI could not be verified" in body
     assert f"Reason: {reason}" in body
     assert "BODYTEXT" not in body
     assert "Completed:" not in body
@@ -1155,16 +1647,45 @@ def test_pending_forever_times_out_inside_the_ci_wait(admitted: Any) -> None:
     assert "build" in body
 
 
-def test_ci_timeout_wins_over_the_execution_deadline(admitted: Any) -> None:
+@pytest.mark.parametrize(
+    ("entry", "cause", "summary"),
+    [
+        (ci_failing(), "ci_failed", "Failing checks:"),
+        (ci_entry(check_status=403), "ci_unverified", "Reason: github_forbidden"),
+        (ci_pending(), "ci_timeout", "Pending checks:"),
+    ],
+    ids=["ci_failed", "ci_unverified", "ci_timeout"],
+)
+def test_ci_verdict_wins_over_the_execution_deadline(
+    admitted: Any, entry: Any, cause: str, summary: str
+) -> None:
     client, github, sink = admitted
     number = 9721
-    sink.ci_script = [ci_pending()]
+    sink.ci_script = [entry]
     published = _published(client, github, sink, number)
+    if cause == "ci_failed":
+        # A failing verdict settles only after the three publication rounds.
+        for revision, head_sha in ((2, HEAD_B), (3, HEAD_C)):
+            _attach_fix(
+                published["work_item_id"],
+                published["id"],
+                revision=revision,
+                head_sha=head_sha,
+                title=f"Fix round {revision}",
+                paths=["src/widget.txt"],
+            )
+    deadline = _all(number)[0]["execution_deadline"]
+    past = int((deadline - _database_now()).total_seconds()) + 2
 
-    _reconcile_later(1900)
+    _reconcile_later(past)
 
-    assert _terminal(number) == ("failed", "ci_timeout")
-    assert "Pending checks:" in _body(sink, published["id"])
+    assert _terminal(number) == ("failed", cause)
+    terminal_at = _rows(
+        "SELECT terminal_at FROM curie.execution_requests WHERE id = :id",
+        {"id": published["id"]},
+    )[0]["terminal_at"]
+    assert terminal_at > deadline
+    assert summary in _body(sink, published["id"])
 
 
 def test_transient_errors_until_the_deadline_end_as_ci_timeout(admitted: Any) -> None:
@@ -1191,8 +1712,11 @@ def test_a_lapsed_heartbeat_does_not_lose_a_request_waiting_on_ci(admitted: Any)
     published = _published(client, github, sink, number)
     _execute(
         "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
-        "clock_timestamp() - interval '1 second' WHERE id = :id",
-        {"id": published["id"]},
+        "clock_timestamp() - CAST(:elapsed AS interval) WHERE id = :id",
+        {
+            "id": published["id"],
+            "elapsed": timedelta(seconds=get_settings().work_item_runtime_ttl_seconds + 5),
+        },
     )
 
     _reconcile()
@@ -1243,7 +1767,7 @@ def test_a_fix_turn_finishing_after_its_publication_succeeded_stays_running(
         status="succeeded",
     )
 
-    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished")
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 2)
 
     assert finished.status_code == 409, finished.text
     assert _terminal(number) == ("running", None)
@@ -1262,6 +1786,7 @@ def _passes_on_one_reconciler(count: int) -> None:
         try:
             for _ in range(count):
                 await reconciler.run_once()
+                await reconciler._sync_status_comments()
         finally:
             await valkey.aclose()
             await engine.dispose()
@@ -1396,8 +1921,9 @@ def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due
 ) -> None:
     """Each CI read takes a full poll interval, so older requests are due every pass."""
 
-    import curie_api.workitems as workitems
-    from curie_api import factory_ci, workitem_outcomes
+    import curie_api.workitems.lifecycle as workitems
+    from curie_api import factory_ci
+    from curie_api.forges.github import ci
 
     client, github, sink = admitted
     assert get_settings().work_item_batch_limit >= 5
@@ -1410,8 +1936,8 @@ def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due
     later = _published(client, github, sink, 9759, head_sha=green_head)
 
     elapsed = [0.0]
-    original_now = workitems._database_now
-    original_observe = workitem_outcomes.observe_ci_detail
+    original_now = workitems.database_now
+    original_observe = ci.read_ci_detail
 
     async def now(session: AsyncSession) -> Any:
         return await original_now(session) + timedelta(seconds=elapsed[0])
@@ -1421,8 +1947,8 @@ def test_a_later_green_request_is_observed_when_slow_github_keeps_older_ones_due
         elapsed[0] += factory_ci.CI_POLL_SECONDS
         return detail
 
-    monkeypatch.setattr(workitems, "_database_now", now)
-    monkeypatch.setattr(workitem_outcomes, "observe_ci_detail", slow_observe)
+    monkeypatch.setattr(workitems, "database_now", now)
+    monkeypatch.setattr(ci, "read_ci_detail", slow_observe)
 
     _passes_on_one_reconciler(3)
 
@@ -1809,3 +2335,493 @@ def test_a_dropped_rerun_response_is_not_posted_again(admitted: Any) -> None:
 
     assert sink.reruns == [job_id]
     assert _ci_turns(published["id"]) == []
+
+
+@pytest.fixture
+def recorded_github(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clean_db: None
+) -> Iterator[tuple[Any, Any, dict[str, Any]]]:
+    """Keep every factory component real, substituting only GitHub's HTTPS API."""
+
+    from curie_api.main import create_app
+    from fastapi.testclient import TestClient
+    from forge_fakes.github_comments import _clear_ci_keys
+
+    stub_root = Path(__file__).resolve().parents[3] / "tools" / "github-stub"
+    recording = json.loads((stub_root / "recordings" / "curie-pr-3400.json").read_text())
+    spec = importlib.util.spec_from_file_location(
+        "factory_replay_github_stub", stub_root / "github_stub.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    seed_tree = tmp_path / "seed"
+    seed_tree.mkdir()
+    (seed_tree / "example.py").write_text("def example():\n    return 'example'\n")
+    issue_file = tmp_path / "issue.md"
+    issue_file.write_text("Update example.py.")
+    stub = module.GithubStub(tmp_path, recording, seed_tree=seed_tree, issue_file=issue_file)
+    stream = f"test:curie:github-replay:{uuid.uuid4().hex}"
+    app_key = (
+        rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode()
+    )
+    try:
+        stub.start()
+        python_ci = {
+            "required": {
+                "key": "Python (ruff + mypy + pytest)",
+                "paths": ["apps/api"],
+                "pending_key_prefix": "Python pytest (shard ",
+            }
+        }
+        environment = {
+            **factory_env(
+                tmp_path / "forges",
+                intake="webhook",
+                api_url=stub.base_url,
+                label=LABEL,
+                mention="curie",
+                private_key=app_key,
+                bindings=[github_repository_binding(ci=python_ci)],
+            ),
+            # The code host's repository credential is the clone credential,
+            # which only travels to the configured clone origin.
+            "GITHUB_CLONE_BASE": stub.base_url,
+            "SSL_CERT_FILE": str(stub.ca_file),
+            "GITHUB_APP_PRIVATE_KEY": app_key,
+            "FACTORY_CI_WAIT_S": "3600",
+            "RUNS_STREAM": stream,
+            "INTERNAL_WORKER_TOKEN": "factory-terminus-worker",
+        }
+        for key, value in environment.items():
+            monkeypatch.setenv(key, value)
+        get_settings.cache_clear()
+        with TestClient(create_app()) as client:
+            created = client.post(
+                "/agents",
+                headers={"X-API-Key": get_settings().api_key},
+                json={
+                    "name": f"acme-replay-{uuid.uuid4().hex[:8]}",
+                    "repo_full_name": REPO,
+                    "channel": {"kind": "github", "address": REPO},
+                },
+            )
+            assert created.status_code == 201, created.text
+            yield client, stub, recording
+    finally:
+        try:
+            _clear_ci_keys()
+            valkey = redis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
+            try:
+                valkey.delete(stream)
+            finally:
+                valkey.close()
+        finally:
+            stub.close()
+            get_settings.cache_clear()
+
+
+def _published_stub_pull(stub: Any, tmp_path: Path) -> dict[str, Any]:
+    """Publish an actual Git branch before attaching its provider pull request."""
+
+    import os
+
+    from curie_api.github_app import credentials_for
+
+    token = credentials_for(get_settings()).token_for_verified_installation(REPO, 5501)
+    env = {**os.environ, "GIT_SSL_CAINFO": str(stub.ca_file), "GIT_TERMINAL_PROMPT": "0"}
+    checkout = tmp_path / "publication"
+
+    def git(*args: str, cwd: Path = tmp_path) -> None:
+        completed = subprocess.run(
+            ["git", "-c", f"http.extraHeader=Authorization: Bearer {token}", *args],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert completed.returncode == 0, "owned publication Git command failed"
+
+    git("clone", stub.clone_url, str(checkout))
+    git("checkout", "-b", "factory/replay", cwd=checkout)
+    changed = checkout / "apps" / "api" / "src" / "example.py"
+    changed.parent.mkdir(parents=True)
+    changed.write_text("EXAMPLE = 1\n")
+    git("add", "apps/api/src/example.py", cwd=checkout)
+    git(
+        "-c",
+        "user.name=Example Author",
+        "-c",
+        "user.email=author@example.com",
+        "commit",
+        "-m",
+        "Add example API change",
+        cwd=checkout,
+    )
+    git("push", "origin", "HEAD:refs/heads/factory/replay", cwd=checkout)
+    with httpx.Client(
+        verify=ssl.create_default_context(cafile=str(stub.ca_file)),
+        headers={"Authorization": f"Bearer {token}"},
+        trust_env=False,
+    ) as github:
+        response = github.post(
+            f"{stub.base_url}/repos/{REPO}/pulls",
+            json={
+                "title": "Example publication",
+                "body": "An example change.",
+                "head": "factory/replay",
+                "base": "main",
+            },
+        )
+    assert response.status_code == 201, response.text
+    return dict(response.json())
+
+
+def test_recorded_github_timeline_waits_for_python_aggregate_through_the_factory_gate(
+    recorded_github: tuple[Any, Any, dict[str, Any]],
+    tmp_path: Path,
+) -> None:
+    """Replay #3400's observed lifecycle through HTTP, SQL and the real Valkey.
+
+    The recording contains completed-run timestamps returned by GitHub, rather
+    than polling snapshots. The stub derives visibility and in-progress state
+    from those timestamps. Source: the recording's public repository and PR.
+    https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
+    """
+
+    from test_factory_progress import verification
+
+    client, stub, recording = recorded_github
+    number = 3815
+    response = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "factory_admitted", response.text
+    published = _request(number)
+    _start_running(published["id"])
+    pull = _published_stub_pull(stub, tmp_path)
+    head_sha = pull["head"]["sha"]
+    _attach_publication(
+        published["work_item_id"], status="succeeded", pr=pull["number"], head_sha=head_sha
+    )
+
+    async def python_publication() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE curie.publications SET changed_paths = CAST(:paths AS jsonb) "
+                        "WHERE execution_request_id = :id"
+                    ),
+                    {"paths": '["apps/api/src/example.py"]', "id": published["id"]},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(python_publication())
+    observation = verification(
+        client,
+        published["id"],
+        {
+            "check": "unit_tests",
+            "command": "uv run pytest apps/api/tests -q",
+            "outcome": "passed",
+            "exit_status": 0,
+            "missing_binaries": [],
+            "blocked_services": [],
+        },
+    )
+    assert observation.status_code == 201, observation.text
+
+    stub.advance(180)
+    _reconcile_later(180)
+
+    assert _terminal(number) == ("running", None)
+    assert _terminal_notices(published["id"]) == []
+    assert _ci_turns(published["id"]) == []
+    from curie_api.github_app import credentials_for
+
+    token = credentials_for(get_settings()).token_for_verified_installation(REPO, 5501)
+    with httpx.Client(
+        verify=ssl.create_default_context(cafile=str(stub.ca_file)),
+        headers={"Authorization": f"Bearer {token}"},
+        trust_env=False,
+    ) as github:
+        observed = github.get(f"{stub.base_url}/repos/{REPO}/commits/{head_sha}/check-runs")
+        assert observed.status_code == 200, observed.text
+        checks = observed.json()["check_runs"]
+        assert not any(run["name"] == "Python (ruff + mypy + pytest)" for run in checks)
+        shards = [run for run in checks if run["name"].startswith("Python pytest (shard ")]
+        assert len(shards) == 3
+        assert all(run["status"] == "in_progress" for run in shards)
+
+    epoch = datetime.fromisoformat(recording["epoch"].replace("Z", "+00:00"))
+    final_seconds = (
+        max(
+            (
+                datetime.fromisoformat(run["completed_at"].replace("Z", "+00:00")) - epoch
+            ).total_seconds()
+            for run in recording["check_runs"]
+        )
+        + 1
+    )
+    stub.advance(final_seconds - 180)
+    _reconcile_later(int(final_seconds))
+
+    assert _terminal(number) == ("completed", "completed")
+    assert _ci_turns(published["id"]) == []
+    assert len(_terminal_notices(published["id"])) == 1
+    assert stub.unknown_requests == []
+
+
+@pytest.fixture
+def workspace_api(
+    recorded_github: tuple[Any, Any, dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> Iterator[str]:
+    """Run the production API on an owned socket for the worker's HTTP client."""
+
+    _client, stub, _recording = recorded_github
+    monkeypatch.setenv("GITHUB_CLONE_BASE", stub.base_url)
+    monkeypatch.setenv("GIT_SSL_CAINFO", str(stub.ca_file))
+    get_settings.cache_clear()
+    listener = socket.socket()
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(128)
+        port = listener.getsockname()[1]
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import asyncio,socket,sys,uvicorn; "
+                "listener=socket.socket(fileno=int(sys.argv[1])); "
+                "server=uvicorn.Server(uvicorn.Config('curie_api.main:create_app', "
+                "factory=True,log_level='critical',access_log=False)); "
+                "asyncio.run(server.serve(sockets=[listener]))",
+                str(listener.fileno()),
+            ],
+            pass_fds=(listener.fileno(),),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        api_url = f"http://127.0.0.1:{port}"
+        deadline = time.monotonic() + 15
+        with httpx.Client(timeout=1, trust_env=False) as probe:
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise RuntimeError("owned API process exited before startup")
+                try:
+                    if probe.get(f"{api_url}/health").status_code == 200:
+                        break
+                except httpx.HTTPError:
+                    pass
+                time.sleep(0.05)
+            else:
+                raise RuntimeError("owned API did not become healthy")
+        yield api_url
+    finally:
+        try:
+            if process is not None:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                assert process.poll() is not None
+        finally:
+            listener.close()
+            get_settings.cache_clear()
+
+
+@pytest.fixture
+def workspace_objects(recorded_github: tuple[Any, Any, dict[str, Any]]) -> Iterator[Any]:
+    """Use a unique bucket on the real backing object store and verify teardown."""
+
+    import boto3
+    from botocore.config import Config
+    from botocore.exceptions import ClientError
+    from curie_worker.workspace import WorkspaceObjectStore
+
+    settings = get_settings()
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=settings.s3_endpoint_url,
+        aws_access_key_id=settings.s3_access_key,
+        aws_secret_access_key=settings.s3_secret_key,
+        region_name=settings.s3_region,
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+    bucket = f"test-curie-workspace-{uuid.uuid4().hex}"
+    objects = WorkspaceObjectStore(client=s3, bucket=bucket)
+    created = False
+    try:
+        s3.create_bucket(Bucket=bucket)
+        created = True
+        yield objects
+    finally:
+        try:
+            if created:
+                for key in objects.list_keys(""):
+                    objects.delete(key)
+                assert list(objects.list_keys("")) == []
+                s3.delete_bucket(Bucket=bucket)
+                with pytest.raises(ClientError) as absent:
+                    s3.head_bucket(Bucket=bucket)
+                assert absent.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+        finally:
+            s3.close()
+
+
+def test_managed_workspace_clones_the_tls_github_origin_through_real_api_and_storage(
+    recorded_github: tuple[Any, Any, dict[str, Any]],
+    workspace_api: str,
+    workspace_objects: Any,
+    tmp_path: Path,
+) -> None:
+    """Redeem, clone, archive, store and download without replacing an internal port."""
+
+    from curie_api.github_app import credentials_for
+    from curie_worker.workspace import (
+        SubprocessCommands,
+        WorkspaceCredentialClient,
+        WorkspaceLimits,
+        WorkspacePreparer,
+    )
+
+    client, stub, _recording = recorded_github
+    token = credentials_for(get_settings()).token_for_verified_installation(REPO, 5501)
+    with httpx.Client(
+        verify=ssl.create_default_context(cafile=str(stub.ca_file)),
+        headers={"Authorization": f"Bearer {token}"},
+        trust_env=False,
+    ) as github:
+        branch = github.get(f"{stub.base_url}/repos/{REPO}/branches/main")
+        assert branch.status_code == 200, branch.text
+        head_sha = branch.json()["commit"]["sha"]
+    admitted = _post(client, "issues", _issue_event("labeled", 3815, label={"name": LABEL}))
+    assert admitted.status_code == 200, admitted.text
+    assert admitted.json()["status"] == "factory_admitted", admitted.text
+    request = _request(3815)
+    _start_running(request["id"])
+    pull = _published_stub_pull(stub, tmp_path)
+    _attach_publication(
+        request["work_item_id"], status="succeeded", pr=pull["number"], head_sha=pull["head"]["sha"]
+    )
+    lineage = _rows(
+        "SELECT l.deployment_id, l.conversation_id "
+        "FROM curie.thread_publication_lineages l JOIN curie.work_items w "
+        "ON w.publication_lineage_id = l.id WHERE w.id = :id",
+        {"id": request["work_item_id"]},
+    )[0]
+    credentials = WorkspaceCredentialClient(
+        api_url=workspace_api,
+        worker_token="factory-terminus-worker",
+    )
+    assert (
+        credentials.select(lineage["deployment_id"], lineage["conversation_id"], "octocat", REPO)
+        == REPO
+    )
+    redeemed = credentials.redeem(lineage["deployment_id"], lineage["conversation_id"])
+    assert redeemed.clone_url == stub.clone_url
+    preparer = WorkspacePreparer(
+        credentials=credentials,
+        commands=SubprocessCommands(),
+        objects=workspace_objects,
+        scratch_root=tmp_path / "managed-clone",
+        limits=WorkspaceLimits(),
+    )
+    prepared = preparer.prepare(
+        deployment_id=lineage["deployment_id"],
+        thread_key=lineage["conversation_id"],
+        generation=uuid.uuid4().hex,
+    )
+    try:
+        preparer.verify(prepared)
+        assert prepared.clean_clone_url == stub.clone_url
+        assert prepared.base_sha == head_sha
+        with httpx.Client(trust_env=False) as download:
+            archive = download.get(prepared.reference.url)
+        assert archive.status_code == 200, archive.text
+        with tarfile.open(fileobj=io.BytesIO(archive.content), mode="r:gz") as tar:
+            config = tar.extractfile(".git/config")
+            assert config is not None
+            git_config = config.read()
+            assert git_config.count(stub.clone_url.encode()) == 1
+            assert redeemed.authorization_header.encode() not in git_config
+            assert b"extraheader" not in git_config.lower()
+            assert tar.getmember("example.py").isfile()
+        assert not any((tmp_path / "managed-clone").iterdir())
+        assert stub.unknown_requests == []
+    finally:
+        preparer.delete(prepared)
+        assert list(workspace_objects.list_keys("")) == []
+
+
+# --- #4105: failures already failing on the base branch ---------------------------
+
+BASE_HEAD = "d4" * 20
+
+
+def _audit_failing() -> Any:
+    return ci_entry(
+        check_run("pip-audit", conclusion="failure", summary="multidict advisory"),
+        check_run("lint"),
+    )
+
+
+def test_an_unreadable_base_keeps_todays_fix_round(admitted: Any) -> None:
+    """AC4: a 502 on the base head's check runs counts every failure as caused."""
+
+    client, github, sink = admitted
+    number = 9760
+    sink.ci_scripts = {HEAD_A: [_audit_failing()], BASE_HEAD: [ci_entry(check_status=502)]}
+    sink.branches = {"main": BASE_HEAD}
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+    request_id = published["id"]
+
+    _reconcile()
+
+    # The base head was actually asked for, and its unreadable answer changed nothing.
+    assert ("GET", f"/repos/{REPO}/branches/main", None) in sink.requests
+    assert sink.ci_observations == [HEAD_A, BASE_HEAD]
+    assert _terminal(number) == ("running", None)
+    assert _terminal_notices(request_id) == []
+    _assert_no_final_result(sink)
+    turns = _ci_turns(request_id)
+    assert [t["event_id"] for t in turns] == [f"work-item-{request_id}-ci-2"]
+    assert turns[0]["text"].split("\n")[1] == (
+        f"Curie wait_ci round 2 of 3: the checks on {published['pr_url']} failed at {HEAD_A}."
+    )
+    assert "pip-audit" in turns[0]["text"]
+
+
+def test_a_failure_also_failing_on_the_base_completes_the_request(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9761
+    sink.ci_scripts = {
+        HEAD_A: [_audit_failing()],
+        BASE_HEAD: [ci_entry(check_run("pip-audit", conclusion="failure"), check_run("lint"))],
+    }
+    sink.branches = {"main": BASE_HEAD}
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("completed", "completed")
+    assert _ci_turns(published["id"]) == []
+    body = _body(sink, published["id"])
+    assert body.startswith(f"Completed: {published['pr_url']}")
+    assert "Note: Also failing on the base branch, not caused by this change: pip-audit" in body

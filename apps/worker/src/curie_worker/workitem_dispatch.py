@@ -21,10 +21,14 @@ from channel_protocol.work_item_events import (
     parse_work_item_event_id as _parse_shared_event_id,
 )
 
+from .api_retry import DEFAULT_BUDGET_S, post_with_retry
+
 logger = logging.getLogger(__name__)
 
 _HEARTBEAT_TRANSPORT_FAILURES = 3
 _MIN_HEARTBEAT_INTERVAL_S = 1.0
+_ACQUIRE_RENEW_INTERVAL_S = 20.0
+_renew_sleep = asyncio.sleep
 
 
 class WorkItemConflict(Exception):
@@ -56,6 +60,14 @@ class WorkItemEvent:
     def is_ci_fix(self) -> bool:
         return self.kind == "ci"
 
+    @property
+    def ci_fix_round(self) -> int:
+        """The CI fix round of a ``ci`` event; any other event has none."""
+
+        if self.kind != "ci" or self.generation is None:
+            raise ValueError(f"work-item {self.kind} event carries no CI fix round")
+        return self.generation
+
 
 @dataclass(frozen=True)
 class WorkItemAcquireGrant:
@@ -63,10 +75,10 @@ class WorkItemAcquireGrant:
     work_item_id: uuid.UUID
     conversation_id: str
     wait_deadline: str
-    # The repository the signed delivery bound to the WorkItem. None only on
+    # The repository path frozen on the WorkItem at admission. None only on
     # the synthetic grant an approval resume rebuilds, which keeps the
     # thread's existing workspace selection.
-    repo_full_name: str | None
+    repository_path: str | None
 
 
 @dataclass(frozen=True)
@@ -205,9 +217,9 @@ class WorkItemDispatchClient:
                 # An API replica from before #2992 omits the field mid-rollout.
                 # The acquisition is already committed, so read absence as "no
                 # WorkItem repository" rather than failing the wake.
-                repo_full_name=(
-                    str(body["repo_full_name"])
-                    if body.get("repo_full_name") is not None
+                repository_path=(
+                    str(body["repository_path"])
+                    if body.get("repository_path") is not None
                     else None
                 ),
             )
@@ -224,8 +236,15 @@ class WorkItemDispatchClient:
         generation: int,
         reason: str,
         capacity: bool,
-    ) -> None:
-        await self._post(
+        budget_s: float = DEFAULT_BUDGET_S,
+    ) -> str | None:
+        """Defer the request; return its terminal cause if the deferral ended it.
+
+        A non-capacity deferral past the start limit settles the request
+        ``failed`` instead of rescheduling it (#4170).
+        """
+
+        body = await self._post_settlement(
             f"/v1/internal/work-items/requests/{request_id}/defer",
             {
                 "owner": owner,
@@ -233,7 +252,14 @@ class WorkItemDispatchClient:
                 "reason": reason,
                 "capacity": capacity,
             },
+            budget_s=budget_s,
         )
+        cause = body.get("terminal_cause")
+        if cause is None:
+            return None
+        if not isinstance(cause, str) or not cause:
+            raise WorkItemTransportError("work-item defer returned an unusable body")
+        return cause
 
     async def start(
         self,
@@ -319,10 +345,13 @@ class WorkItemDispatchClient:
                 "work-item running lookup returned an unusable body"
             ) from exc
 
-    async def hold_for_approval(self, request_id: uuid.UUID, *, runtime_epoch: int) -> None:
-        await self._post(
+    async def hold_for_approval(
+        self, request_id: uuid.UUID, *, runtime_epoch: int, budget_s: float = DEFAULT_BUDGET_S
+    ) -> None:
+        await self._post_settlement(
             f"/v1/internal/work-items/requests/{request_id}/hold-approval",
             {"runtime_epoch": runtime_epoch},
+            budget_s=budget_s,
         )
 
     async def finish(
@@ -333,15 +362,19 @@ class WorkItemDispatchClient:
         outcome: str,
         cause: str,
         detail: str | None,
+        ci_fix_round: int | None,
+        budget_s: float = DEFAULT_BUDGET_S,
     ) -> None:
-        await self._post(
+        await self._post_settlement(
             f"/v1/internal/work-items/requests/{request_id}/finish",
             {
                 "runtime_epoch": runtime_epoch,
                 "outcome": outcome,
                 "cause": cause,
                 "detail": detail,
+                "ci_fix_round": ci_fix_round,
             },
+            budget_s=budget_s,
         )
 
     async def claim_termination(
@@ -454,7 +487,8 @@ class WorkItemDispatchClient:
     async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
         """The execution scoped issue read capability (ADR 0187).
 
-        Returns the issue the capability names, as ``owner/repo#number``, and
+        Returns the issue the capability names, as its tracker's display
+        reference (``owner/repo#number`` on GitHub, ``PROJ-12`` on Jira), and
         the capability itself. The worker never reads the issue.
         """
 
@@ -468,7 +502,10 @@ class WorkItemDispatchClient:
             capability = body["capability"]
             if not isinstance(capability, str) or not capability:
                 raise ValueError("issue read context carries no capability")
-            return f"{body['repo_full_name']}#{int(body['issue_number'])}", capability
+            issue = body["issue"]
+            if not isinstance(issue, str) or not issue:
+                raise ValueError("issue read context names no issue")
+            return issue, capability
         except (KeyError, TypeError, ValueError):
             # The body carries the capability: never chain it into a log.
             raise WorkItemTransportError(
@@ -487,6 +524,28 @@ class WorkItemDispatchClient:
             raise WorkItemTransportError(
                 "work-item dispatch endpoint is unreachable"
             ) from exc
+        return self._post_result(response)
+
+    async def _post_settlement(
+        self, path: str, payload: dict[str, Any], *, budget_s: float
+    ) -> dict[str, Any]:
+        try:
+            response = await post_with_retry(
+                self._client,
+                f"{self._base}{path}",
+                headers=self._headers,
+                json=payload,
+                follow_redirects=False,
+                budget_s=budget_s,
+            )
+        except httpx.HTTPError as exc:
+            raise WorkItemTransportError(
+                f"work-item dispatch endpoint is unreachable: {type(exc).__name__}"
+            ) from exc
+        return self._post_result(response)
+
+    @staticmethod
+    def _post_result(response: httpx.Response) -> dict[str, Any]:
         if response.status_code == 409:
             raise WorkItemConflict(_conflict_code(response))
         if response.status_code != 200:
@@ -533,11 +592,16 @@ class WorkItemRun:
         self.work_item_id = grant.work_item_id
         self.owner = owner
         self.generation = grant.generation
-        self.repo_full_name = grant.repo_full_name
+        self.repository_path = grant.repository_path
         self.event_id = event_id
         self.thread_key = thread_key
         self.started = False
         self.finished = False
+        # Set when the heartbeat gives the request up as a stale owner. A
+        # finished run may release its own claim; an abandoned one releases
+        # nothing and creates no approval, since the API termination chain owns
+        # the lost request's teardown (ADR 0206, #4331).
+        self.abandoned = False
         self.held = False
         self.runtime_epoch: int | None = None
         self.claim_name: str | None = None
@@ -551,17 +615,37 @@ class WorkItemRun:
         self._on_stale = on_stale
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._stopping = False
+        self._deferred = False
+        self._acquire_renew_task: asyncio.Task[None] | None = asyncio.create_task(
+            self._acquire_renew_loop(),
+            name=f"work-item-acquire-renew-{self.request_id}",
+        )
 
     async def defer(self, reason: str, *, capacity: bool) -> None:
-        await self._client.defer(
+        self._deferred = True
+        terminal_cause = await self._client.defer(
             self.request_id,
             owner=self.owner,
             generation=self.generation,
             reason=reason,
             capacity=capacity,
+            budget_s=self._write_budget_s(),
         )
+        if terminal_cause is not None:
+            # #4170: the deferral ended the request (start_failed). As in
+            # #3208, an unstarted request gets no terminate wake, so count the
+            # run as settled and let this delivery release its sandbox claim
+            # instead of holding quota until the route TTL lapses. A deferral
+            # that leaves the request waiting keeps the claim for the next
+            # acquire of this thread to adopt.
+            self.finished = True
 
     async def start(self, *, claim_name: str, sandbox_name: str) -> WorkItemStartGrant:
+        # Recorded before the API call so a start refused on a terminal code
+        # (#3208) still knows the claim it made, and its release stays fenced
+        # to that claim (#4331). runtime_epoch stays the started-ness signal.
+        self.claim_name = claim_name
+        self.sandbox_name = sandbox_name
         grant = await self._client.start(
             self.request_id,
             owner=self.owner,
@@ -571,8 +655,6 @@ class WorkItemRun:
         )
         self.started = True
         self.runtime_epoch = grant.runtime_epoch
-        self.claim_name = claim_name
-        self.sandbox_name = sandbox_name
         self.execution_deadline = grant.execution_deadline
         interval = max(_MIN_HEARTBEAT_INTERVAL_S, grant.heartbeat_interval_s)
         self._heartbeat_task = asyncio.create_task(
@@ -592,14 +674,26 @@ class WorkItemRun:
             return left
         return min(remaining_s, left)
 
+    def _write_budget_s(self) -> float:
+        budget = self.bound_remaining_s(DEFAULT_BUDGET_S)
+        assert budget is not None
+        return budget
+
+    @property
+    def heartbeat_running(self) -> bool:
+        task = self._heartbeat_task
+        return task is not None and not task.done() and not self._stopping
+
     async def hold_for_approval(self) -> None:
         if self.runtime_epoch is None:
             raise WorkItemTransportError("work-item hold called before start")
         await self._client.hold_for_approval(
-            self.request_id, runtime_epoch=self.runtime_epoch
+            self.request_id, runtime_epoch=self.runtime_epoch, budget_s=self._write_budget_s()
         )
 
-    async def finish(self, *, outcome: str, cause: str, detail: str | None) -> None:
+    async def finish(
+        self, *, outcome: str, cause: str, detail: str | None, ci_fix_round: int | None
+    ) -> None:
         if self.runtime_epoch is None:
             raise WorkItemTransportError("work-item finish called before start")
         await self._client.finish(
@@ -608,11 +702,28 @@ class WorkItemRun:
             outcome=outcome,
             cause=cause,
             detail=detail,
+            ci_fix_round=ci_fix_round,
+            budget_s=self._write_budget_s(),
         )
         self.finished = True
 
     async def close(self) -> None:
-        """Drop the heartbeat. A stop already in flight is allowed to finish."""
+        """Drop renewal and heartbeat. A stop in flight is allowed to finish."""
+
+        renew_task = self._acquire_renew_task
+        self._acquire_renew_task = None
+        if renew_task is not None:
+            renew_task.cancel()
+            try:
+                await renew_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.warning(
+                    "work-item acquire renewal for %s ended with an error",
+                    self.request_id,
+                    exc_info=True,
+                )
 
         task = self._heartbeat_task
         self._heartbeat_task = None
@@ -630,6 +741,28 @@ class WorkItemRun:
                 self.request_id,
                 exc_info=True,
             )
+
+    async def _acquire_renew_loop(self) -> None:
+        while not (self.started or self.finished or self._stopping or self._deferred):
+            await _renew_sleep(_ACQUIRE_RENEW_INTERVAL_S)
+            if self.started or self.finished or self._stopping or self._deferred:
+                return
+            try:
+                await self._client.acquire(
+                    self.request_id, owner=self.owner, generation=self.generation
+                )
+            except WorkItemConflict as exc:
+                logger.info(
+                    "work-item acquire renewal refused for %s: %s",
+                    self.request_id,
+                    exc.code,
+                )
+                return
+            except WorkItemTransportError:
+                logger.warning(
+                    "work-item acquire renewal transport failed for %s",
+                    self.request_id,
+                )
 
     async def _heartbeat_loop(self, interval_s: float) -> None:
         failures = 0

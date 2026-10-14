@@ -80,6 +80,46 @@ def _post(reply_ref: str) -> dict[str, Any]:
     }
 
 
+def _progress_update(
+    reply_ref: str, *, state: str = "testing", revision: int = 2
+) -> dict[str, Any]:
+    """A reply wire 1.1 card edit (ADR-0130): no text, message, settled or nav."""
+
+    return {
+        "version": "1.1",
+        "event": "reply.update",
+        "target": _target(reply_ref),
+        "delivery_id": f"00000000-0000-4000-8000-{revision:012d}",
+        "progress": {
+            "kind": "card",
+            "state": state,
+            "summary": "Running the integration suite",
+            "revision": revision,
+            "terminal": state in {"complete", "failed", "cancelled"},
+        },
+    }
+
+
+def _progress_post(reply_ref: str) -> dict[str, Any]:
+    """A reply wire 1.1 card's first revision, with its plain-text fallback."""
+
+    return {
+        "version": "1.1",
+        "event": "reply.post",
+        "target": _target(reply_ref),
+        "message": {"version": "1.0", "text": "Queued: waiting for a sandbox"},
+        "requested_by": "U0EXAMPLE1",
+        "delivery_id": "00000000-0000-4000-8000-000000000001",
+        "progress": {
+            "kind": "card",
+            "state": "queued",
+            "summary": "Waiting for a sandbox",
+            "revision": 1,
+            "terminal": False,
+        },
+    }
+
+
 def _completed(
     reply_ref: str,
     *,
@@ -473,3 +513,45 @@ def test_reply_bucket_expires_in_real_valkey(
             assert expired.status_code == 404, expired.text
     finally:
         get_settings.cache_clear()
+
+
+def test_a_terminal_progress_card_does_not_end_the_relay(relay_client: TestClient) -> None:
+    """@spec ADR-0130 d5: a closed card is not the turn's completion.
+
+    The card's ``terminal`` flag closes the task card. Only ``turn.completed``
+    ends the CLI's poll, so the answer that follows the card still arrives.
+    """
+
+    reply_ref = _new_ref()
+    events = [
+        _progress_post(reply_ref),
+        _progress_update(reply_ref, state="complete", revision=3),
+    ]
+    for event in events:
+        response = _write(relay_client, reply_ref, event)
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ref": reply_ref}
+
+    page = _read(relay_client, reply_ref)
+    assert page.status_code == 200, page.text
+    assert page.json() == {"events": events, "next_cursor": 2, "terminal": False}
+
+    _write(relay_client, reply_ref, _update(reply_ref, "the answer"))
+    _write(relay_client, reply_ref, _completed(reply_ref))
+    assert _read(relay_client, reply_ref, after=2).json()["terminal"] is True
+
+
+@pytest.mark.parametrize("event_kind", ["post", "update"])
+def test_a_progress_retry_under_its_delivery_id_is_stored_once(
+    event_kind: str, relay_client: TestClient
+) -> None:
+    """An ambiguous progress delivery is retried with the same body and key."""
+
+    reply_ref = _new_ref()
+    event = _progress_post(reply_ref) if event_kind == "post" else _progress_update(reply_ref)
+
+    first = _write(relay_client, reply_ref, event)
+    retry = _write(relay_client, reply_ref, event)
+
+    assert first.status_code == retry.status_code == 200
+    assert _read(relay_client, reply_ref).json()["events"] == [event]

@@ -1,9 +1,15 @@
 import { test, expect, type Page } from "@playwright/test";
+import { stubConsoleSession } from "./support/consoleSession";
 
 // The cold-start loop (H2 backend-driven shell), stackless via route stubs:
 // empty DB -> onboarding -> create an agent -> it appears in the real Agents
 // list -> honest post-deploy copy -> no fixture agent (deal-desk) anywhere in
 // wired mode (#542 removed the fixture/demo world entirely).
+
+// The console sits behind the login gate (#1047): sign this spec in.
+test.beforeEach(async ({ page }) => {
+  await stubConsoleSession(page);
+});
 
 function json(status: number, body: unknown) {
   return { status, contentType: "application/json", body: JSON.stringify(body) };

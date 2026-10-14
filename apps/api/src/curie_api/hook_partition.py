@@ -19,7 +19,7 @@ invisibly -- a working hook that had quietly stopped fanning out. Everything her
 that cannot resolve raises rather than returning a default, which is why there is
 no ``.get(..., fallback)`` anywhere below.
 
-This module is imported by ``schemas.py`` (the write surface) and by
+This module is imported by ``schemas.agents`` (the write surface) and by
 ``routers/hooks.py`` (the ingress). It must not import either of them back.
 """
 
@@ -187,7 +187,7 @@ def derive_partition(
     if entry is None:
         return None
 
-    # `schemas.HookPartitionConfig` is the only writer of this column and makes
+    # `schemas.agents.HookPartitionConfig` is the only writer of this column and makes
     # `pointer` required, so its absence is a corrupted row rather than a
     # configuration an operator can reach.
     pointer: str = entry["pointer"]

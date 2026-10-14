@@ -50,8 +50,23 @@ fallbacks for platform posts. It does not implement Discord buttons, direct
 messages, file attachments, or interactive approvals. A Discord delivery
 failure never falls back to Slack or another surface.
 
-SQLite stores thread routing and delivery ids but not scoped channel tokens.
-Those remain in the environment or mounted bindings file.
+Deliberate progress (reply wire 1.1, ADR-0130) is rendered as plain text, the
+channel-neutral `channel_protocol.progress.progress_text` of the card or the
+milestone. A card's first revision and each milestone are new messages in the
+thread. A later card revision edits the message its first revision posted and
+nothing else: a progress body never reaches the answer path, so it cannot blank
+the answer or move its continuation messages. Every post that carries a
+`delivery_id` (a progress post, or a placeholderless answer on 1.1) is
+remembered with the Discord message id it created, and a redelivery of the same
+`delivery_id` answers with that message instead of posting again; a
+placeholderless answer redelivered that way edits its first message. The one
+window this does not close is a crash after Discord created the message and
+before SQLite recorded it, which posts again on retry. Mentions are disabled on
+every post and edit, as for every other reply.
+
+SQLite stores thread routing, delivery ids, and the message each outbound
+`delivery_id` posted, but not scoped channel tokens. Those remain in the
+environment or mounted bindings file.
 
 ## Telemetry
 

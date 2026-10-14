@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 
+from curie_telemetry import TRACEPARENT_STREAM_FIELD, inject_trace_context
 from redis.asyncio import Redis
 
 from .config import WorkerConfig
@@ -180,6 +181,7 @@ if redis.call('EXISTS', notice_lock) == 1 then return {0, 'notice_inflight'} end
 local original = redis.call('HGET', record, 'fields')
 if not original then return {0, 'missing_fields'} end
 local fields = cjson.decode(original)
+if ARGV[5] ~= '' and ARGV[6] ~= '' then fields[ARGV[5]] = ARGV[6] end
 local generation = tonumber(redis.call('HGET', record, 'generation')) + 1
 local deadline = redis.call('HGET', record, 'deadline_ms')
 fields[generation_field] = tostring(generation)
@@ -257,6 +259,7 @@ end
 local original = redis.call('HGET', record, 'fields')
 if not original then return {0, 'missing_fields'} end
 local fields = cjson.decode(original)
+if ARGV[7] ~= '' and ARGV[8] ~= '' then fields[ARGV[7]] = ARGV[8] end
 local generation = tonumber(redis.call('HGET', record, 'generation')) + 1
 local cause = redis.call('HGET', record, 'cause')
 if cause ~= 'delivery_exhausted' and cause ~= 'capacity_wait_expired' then
@@ -562,6 +565,8 @@ class CapacityWaitStore:
         count = 0
         for item in due:
             event_id = item.decode() if isinstance(item, bytes) else str(item)
+            carrier: dict[str, str] = {}
+            inject_trace_context(carrier)
             raw = await self._redis.eval(
                 _WAKE_LUA, 8, self._record(event_id), self._due, self._waiting,
                 self._notices, self._notice_lock(event_id),
@@ -569,6 +574,8 @@ class CapacityWaitStore:
                 self._flight,
                 self._config.stream, event_id, WAIT_GENERATION_FIELD,
                 WAIT_REPLY_REF_FIELD,
+                TRACEPARENT_STREAM_FIELD if TRACEPARENT_STREAM_FIELD in carrier else "",
+                carrier.get(TRACEPARENT_STREAM_FIELD, ""),
             )
             if int(raw[0]) == 1:
                 count += 1
@@ -584,6 +591,8 @@ class CapacityWaitStore:
         appended = 0
         for item in ids:
             event_id = item.decode() if isinstance(item, bytes) else str(item)
+            carrier: dict[str, str] = {}
+            inject_trace_context(carrier)
             raw = await self._redis.eval(
                 _RECONCILE_LUA, 5,
                 self._record(event_id), self._flight,
@@ -592,6 +601,8 @@ class CapacityWaitStore:
                 event_id, self._config.stream, self._config.consumer_group,
                 WAIT_GENERATION_FIELD, WAIT_TERMINAL_ONLY_FIELD,
                 WAIT_REPLY_REF_FIELD,
+                TRACEPARENT_STREAM_FIELD if TRACEPARENT_STREAM_FIELD in carrier else "",
+                carrier.get(TRACEPARENT_STREAM_FIELD, ""),
             )
             if int(raw[0]) == 1:
                 appended += 1

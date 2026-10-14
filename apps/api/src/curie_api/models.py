@@ -15,6 +15,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
+    CHAR,
     BigInteger,
     CheckConstraint,
     DateTime,
@@ -37,7 +38,9 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from .approval_wording import approval_display
 from .db import SCHEMA, Base
+from .forges.types import RepositoryRef, TrackerIssueRef
 from .repo_full_name import normalize_repo_full_name
+from .sealed_snapshot import is_sealed_envelope
 
 # Work-item execution deadline bounds (#3071). An agent's
 # `execution_deadline_seconds` NULL means the default; a set value is bounded
@@ -48,6 +51,49 @@ MIN_EXECUTION_DEADLINE_SECONDS = 60
 MAX_EXECUTION_DEADLINE_SECONDS = 10800
 
 GIT_FLOW_CREATED_BY = "git-flow"
+
+
+class DeployNoticeOutbox(Base):
+    """Credential-free, installation-scoped notice owed after git-flow settles."""
+
+    __tablename__ = "deploy_notice_outbox"
+    __table_args__ = (
+        Index(
+            "ix_deploy_notice_outbox_pending",
+            "stream",
+            "created_at",
+            postgresql_where=text("enqueued_at IS NULL"),
+        ),
+        Index("ix_deploy_notice_outbox_enqueued_at", "enqueued_at"),
+        Index("ix_deploy_notice_outbox_repo_window", "stream", "repo", "created_at"),
+        {"schema": SCHEMA},
+    )
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    stream: Mapped[str] = mapped_column(Text)
+    # Case-folded repository full name, which the per-repository notice bound
+    # counts by (docs/operations.md).
+    repo: Mapped[str] = mapped_column(Text)
+    payload: Mapped[str] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(server_default="0", default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+# The tenant self-host auto-provisions (migration 0051), at a fixed id so later
+# migrations and server defaults can name it without a lookup.
+DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
+
+class AgentStatus(enum.StrEnum):
+    """Lifecycle of a bot (ADR 0166 decision 3). A plain string column checked by
+    ``agents_status_ck``. Nothing routes on it yet: which states still answer a
+    channel event is decided where inbound events are authorized (#2914)."""
+
+    active = "active"
+    paused = "paused"
+    draining = "draining"
+    retired = "retired"
 
 
 class Environment(enum.StrEnum):
@@ -105,9 +151,41 @@ class Agent(Base):
             f"BETWEEN {MIN_EXECUTION_DEADLINE_SECONDS} AND {MAX_EXECUTION_DEADLINE_SECONDS}",
             name="agents_execution_deadline_seconds_ck",
         ),
+        CheckConstraint(
+            "status IN ('active', 'paused', 'draining', 'retired')",
+            name="agents_status_ck",
+        ),
+        # Carries tenant_id, so the owning team must be a team of the same tenant.
+        ForeignKeyConstraint(
+            ["tenant_id", "owning_team_id"],
+            [f"{SCHEMA}.teams.tenant_id", f"{SCHEMA}.teams.id"],
+            name="agents_owning_team_fkey",
+        ),
+        Index("ix_agents_owning_team_id", "owning_team_id"),
+        # Target of a tenant-carrying reference to a bot, such as an identity
+        # link's bot target (ADR 0198 decision 5).
+        UniqueConstraint("tenant_id", "id", name="agents_tenant_id_id_key"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # The bot's tenant (ADR 0166 decision 3, migration 0101). The server default is
+    # the default tenant so an N-1 writer inside the schema window, which names
+    # no tenant, still lands its row somewhere valid. The worker's binding
+    # resolver matches only its own tenant's agents.
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id", name="agents_tenant_id_fkey"),
+        default=DEFAULT_TENANT_ID,
+        server_default=text(f"'{DEFAULT_TENANT_ID}'::uuid"),
+    )
+    status: Mapped[str] = mapped_column(
+        default=AgentStatus.active.value, server_default=AgentStatus.active.value
+    )
+    owning_team_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    # Opaque references into policy stores that do not exist yet. Nothing
+    # dereferences them in this release.
+    topic_policy_ref: Mapped[str | None] = mapped_column(default=None)
+    data_classification_ref: Mapped[str | None] = mapped_column(default=None)
+    retention_policy_ref: Mapped[str | None] = mapped_column(default=None)
     name: Mapped[str] = mapped_column(unique=True)
     # The GitHub repo (owner/name) whose pushes deploy this agent (J1).
     #
@@ -121,6 +199,9 @@ class Agent(Base):
     # sharing a repository is intended, two sharing a channel is silent
     # shadowing.
     repo_full_name: Mapped[str | None] = mapped_column(default=None, index=True)
+    # Success notices are opt-in; a rejected push is always reported to bound
+    # Slack channels because no deployment row may exist to inspect afterward.
+    deploy_notifications: Mapped[bool] = mapped_column(default=False, server_default="false")
 
     @validates("repo_full_name")
     def _validate_repo_full_name(self, _key: str, value: str | None) -> str | None:
@@ -138,6 +219,9 @@ class Agent(Base):
     # the platform/worker default model applies. The value is passed straight
     # through to the runner, which resolves it against its configured provider.
     model: Mapped[str | None] = mapped_column(default=None)
+    # Per-agent reviewer model (#4120). NULL lets the runner choose the
+    # credential's default; a value becomes the SDK's Opus alias target.
+    reviewer_model: Mapped[str | None] = mapped_column(default=None)
     # Per-agent thinking depth (#1182, ADR-0098). Forwarded as CURIE_THINKING at
     # sandbox boot; NULL means the worker's CURIE_THINKING default applies, and
     # unset at both layers means the runner sends no thinking configuration and
@@ -157,7 +241,7 @@ class Agent(Base):
     # around a turn (a sampled "working..." line, a canned greeting reply). Stored
     # as JSON here and resolved onto the deployment by the worker's binding layer;
     # NULL means no packs (the platform default). The shape is validated by
-    # schemas.BehaviorPacksConfig on write and parsed by
+    # schemas.agents.BehaviorPacksConfig on write and parsed by
     # curie_worker.behaviorpacks.BehaviorPacks on read.
     behavior_packs: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     # Per-agent permission gates (#245, ADR-0010): tool names whose calls
@@ -235,6 +319,10 @@ class Agent(Base):
     # across every binding. Existing single-binding agents are unaffected
     # either way, since there is nothing else to share with.
     memory: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # Whether the runner mounts its remember/update/forget memory tools for this
+    # agent (#1461, ADR-0167). Operator-owned; off by default. When on, the
+    # worker hands the runner the binding-scoped channel memory URL.
+    memory_writes: Mapped[bool] = mapped_column(default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     versions: Mapped[list[AgentVersion]] = relationship(
@@ -263,6 +351,13 @@ class Agent(Base):
     )
 
 
+# The surface kinds a trigger label may sit on: every tracker surface (#4361,
+# #4397 decision 10). Migration 0105 freezes the same rule.
+TRIGGER_LABEL_KINDS = ("github", "gitlab", "jira")
+TRIGGER_LABEL_CHECK = "trigger_label IS NULL OR kind IN ('github', 'gitlab', 'jira')"
+MAX_TRIGGER_LABEL_LENGTH = 50
+
+
 class AgentChannel(Base):
     """Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).
 
@@ -270,7 +365,7 @@ class AgentChannel(Base):
     channel kind the platform has never heard of without a schema change.
 
     `kind` names the owning adapter, selects the address-shape validator
-    (`schemas._validate_channel_binding`), AND routes: since ADR-0096 phase 2 the
+    (`schemas.channels.validate_channel_binding`), AND routes: since ADR-0096 phase 2 the
     queue wire carries a required `ReplyHandle.kind`, so the worker resolves on
     the PAIR and the uniqueness below widened to match (migration 0023). The
     widening was only safe once no address-only consumer could run -- a
@@ -303,13 +398,23 @@ class AgentChannel(Base):
         # time. The pair leads so `(kind, address)` lookups keep the index
         # prefix, and NULLS NOT DISTINCT keeps two route-less non-Slack rows
         # colliding on the pair.
+        #
+        # Migration 0105 widens it by `trigger_label` (#4361, #4397 decision
+        # 10): two agents may share a tracker location under different labels.
+        # Two unlabelled rows still collide; an explicit label equal to the
+        # configured tracker label beside an unlabelled row does not collide
+        # here, so `crud.channels.refuse_label_overlap` guards that case under
+        # the pair advisory lock.
         UniqueConstraint(
             "kind",
             "address",
             "adapter",
+            "trigger_label",
             name="agent_channels_route_key",
             postgresql_nulls_not_distinct=True,
         ),
+        # A trigger label belongs only on a tracker surface (migration 0105).
+        CheckConstraint(TRIGGER_LABEL_CHECK, name="agent_channels_trigger_label_ck"),
         CheckConstraint(
             "(kind = 'slack' AND adapter IS NOT NULL AND endpoint IS NULL) "
             "OR (kind <> 'slack' AND (endpoint IS NULL) = (adapter IS NULL))",
@@ -323,7 +428,7 @@ class AgentChannel(Base):
         #
         # PLAIN index on agent_id, because dropping that uniqueness dropped the
         # column's only index with it (migration 0030 recreates it as this).
-        # `crud.lock_agent_bindings` filters and orders by agent_id under
+        # `crud.channels.lock_agent_bindings` filters and orders by agent_id under
         # `FOR UPDATE` on every add, move and delete; unindexed, each of those
         # scans the whole table while holding locks.
         Index("ix_agent_channels_agent_id", "agent_id"),
@@ -335,6 +440,15 @@ class AgentChannel(Base):
     )
     kind: Mapped[str]
     address: Mapped[str]
+    # The agent's tenant, copied onto the row by every write path. The resolver
+    # requires both to match, so a row out of step with its agent fails closed.
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id", name="agent_channels_tenant_id_fkey"),
+        server_default=text(f"'{DEFAULT_TENANT_ID}'::uuid"),
+    )
+    # The work-item topic this binding serves; its foreign key arrives with the
+    # work-item subsystem.
+    topic_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
     # The reply route (migration 0024) and, for `slack`, the bot identity
     # (ADR-0168 decision 3): a Slack row names its identity in `adapter` and has
     # no `endpoint`; any other kind sets both or neither.
@@ -356,6 +470,13 @@ class AgentChannel(Base):
     allowed_callers: Mapped[list[str] | None] = mapped_column(
         JSONB(none_as_null=True), default=None
     )
+    # The label that starts factory work through this tracker surface (#4361,
+    # migration 0105). NULL serves the configured tracker label;
+    # `forges.surfaces.effective_trigger_label` is the only reader. Set only
+    # when the binding is added; a move keeps it.
+    trigger_label: Mapped[str | None] = mapped_column(
+        String(MAX_TRIGGER_LABEL_LENGTH), default=None
+    )
 
     agent: Mapped[Agent] = relationship(back_populates="channels")
 
@@ -366,6 +487,11 @@ class AgentVersion(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     agent_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), index=True
+    )
+    # Row scoping only: the agent's tenant, copied by the write path.
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id", name="agent_versions_tenant_id_fkey"),
+        server_default=text(f"'{DEFAULT_TENANT_ID}'::uuid"),
     )
     version_label: Mapped[str]
     bundle_ref: Mapped[str | None] = mapped_column(default=None)
@@ -388,6 +514,11 @@ class Deployment(Base):
     )
     version_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agent_versions.id", ondelete="CASCADE"), index=True
+    )
+    # Row scoping only: the agent's tenant, copied by the write path.
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id", name="deployments_tenant_id_fkey"),
+        server_default=text(f"'{DEFAULT_TENANT_ID}'::uuid"),
     )
     environment: Mapped[Environment] = mapped_column(
         Enum(Environment, name="environment", schema=SCHEMA)
@@ -487,6 +618,7 @@ class Approval(Base):
     reply_placeholder: Mapped[str | None] = mapped_column(nullable=True)
     reply_endpoint: Mapped[str | None] = mapped_column(default=None)
     reply_adapter: Mapped[str | None] = mapped_column(default=None)
+    reply_identity: Mapped[str | None] = mapped_column(default=None)
     # The approval route the request named (#247), and the channel the card
     # was actually routed to after binding resolution. The authorizer proves
     # channel membership against card_channel (falling back to reply_channel
@@ -531,8 +663,10 @@ class Approval(Base):
     granted_arguments: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB(none_as_null=True), default=None
     )
-    # Server-owned purpose. ``publication`` suppresses the ordinary model wake;
-    # requester equality follows the same approver-set rule for every purpose.
+    # Server-owned purpose. ``publication`` and ``remediation`` (an argument-bound
+    # remediation call, AUTOMATED-REMEDIATION-15, or the undo offered for an
+    # unverified one, AUTOMATED-REMEDIATION-19) suppress the ordinary model
+    # wake; requester equality follows the same approver-set rule for every purpose.
     purpose: Mapped[str] = mapped_column(server_default="session", default="session")
     # Set only when the platform resolved this row under ADR 0147. Human
     # resolutions leave both NULL so they stay distinguishable in the audit.
@@ -540,6 +674,21 @@ class Approval(Base):
     policy_version: Mapped[int | None] = mapped_column(default=None)
 
     publication: Mapped[Publication | None] = relationship(back_populates="approval", uselist=False)
+
+
+# The lineage's code host identity: all unset, or complete. Migration 0103
+# carries a frozen copy. IS TRUE because a NULL CHECK expression passes.
+LINEAGE_CODE_HOST_IDENTITY_CHECK = (
+    "((code_host_kind IS NULL AND code_host_host IS NULL AND repository_project_id IS NULL "
+    "AND code_host_installation_id IS NULL AND code_host_pr_id IS NULL AND base_ref IS NULL) "
+    "OR (length(btrim(code_host_kind)) > 0 AND length(btrim(code_host_host)) > 0 "
+    "AND length(btrim(repository_project_id)) > 0 "
+    "AND (code_host_installation_id IS NULL OR code_host_installation_id > 0) "
+    "AND (code_host_kind <> 'github' OR (repository_project_id ~ '^[1-9][0-9]*$' "
+    "AND code_host_installation_id IS NOT NULL)) "
+    "AND length(code_host_pr_id) > 0 AND pr_number IS NOT NULL "
+    "AND length(base_ref) > 0)) IS TRUE"
+)
 
 
 class ThreadPublicationLineage(Base):
@@ -572,27 +721,24 @@ class ThreadPublicationLineage(Base):
             postgresql_where=text("status = 'open'"),
         ),
         CheckConstraint(
-            "(github_repository_id IS NULL AND github_installation_id IS NULL "
-            "AND github_pr_node_id IS NULL AND base_ref IS NULL) "
-            "OR (github_repository_id IS NOT NULL "
-            "AND github_repository_id > 0 "
-            "AND github_installation_id IS NOT NULL AND github_installation_id > 0 "
-            "AND github_pr_node_id IS NOT NULL "
-            "AND length(github_pr_node_id) > 0 AND pr_number IS NOT NULL "
-            "AND base_ref IS NOT NULL AND length(base_ref) > 0)",
-            name="thread_publication_lineages_github_identity_ck",
+            LINEAGE_CODE_HOST_IDENTITY_CHECK,
+            name="thread_publication_lineages_code_host_identity_ck",
         ),
         Index(
-            "uq_publication_github_pr_owner",
-            "github_repository_id",
+            "uq_publication_code_host_pr_owner",
+            "code_host_kind",
+            "code_host_host",
+            "repository_project_id",
             "pr_number",
             unique=True,
         ),
         Index(
-            "uq_active_publication_github_conversation",
+            "uq_active_publication_code_host_conversation",
             "agent_id",
             "conversation_id",
-            "github_repository_id",
+            "code_host_kind",
+            "code_host_host",
+            "repository_project_id",
             unique=True,
             postgresql_where=text("status = 'open'"),
         ),
@@ -623,39 +769,81 @@ class ThreadPublicationLineage(Base):
     )
     binding_generation: Mapped[int | None] = mapped_column(default=None)
     reply_conversation_id: Mapped[str | None] = mapped_column(default=None)
-    github_repository_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
-    github_installation_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
-    github_pr_node_id: Mapped[str | None] = mapped_column(default=None)
+    # The verified code host identity of the pull request (ADR 0197): the
+    # repository's (kind, host, immutable project id), the GitHub installation
+    # that verified it, and the pull request's own immutable id (a GitHub node
+    # id). All NULL on a lineage created before identity was captured.
+    code_host_kind: Mapped[str | None] = mapped_column(Text, default=None)
+    code_host_host: Mapped[str | None] = mapped_column(Text, default=None)
+    repository_project_id: Mapped[str | None] = mapped_column(Text, default=None)
+    code_host_installation_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    code_host_pr_id: Mapped[str | None] = mapped_column(default=None)
     base_ref: Mapped[str | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
     publications: Mapped[list[Publication]] = relationship(back_populates="lineage")
 
+    @property
+    def repository(self) -> RepositoryRef | None:
+        """The verified repository, or None before identity was captured."""
+
+        if (
+            self.code_host_kind is None
+            or self.code_host_host is None
+            or self.repository_project_id is None
+        ):
+            return None
+        return RepositoryRef(
+            self.code_host_kind,
+            self.code_host_host,
+            self.repository_project_id,
+            self.repo_full_name,
+        )
+
 
 class WorkItem(Base):
-    """Durable execution identity for one canonical GitHub issue."""
+    """Durable execution identity for one tracker issue (ADR 0162, ADR 0197).
+
+    Keyed by (tracker kind, tracker host, scope id, issue id). The repository
+    is chosen at admission and frozen here as (code host kind, host, project
+    id) with its path for display. ``code_host_installation_id`` is the GitHub
+    installation that admitted the work, an authority fence other forges leave
+    NULL.
+    """
 
     __tablename__ = "work_items"
     __table_args__ = (
         CheckConstraint(
-            "github_repository_id > 0",
-            name="work_items_github_repository_id_ck",
+            "length(btrim(tracker_kind)) > 0 AND length(btrim(tracker_host)) > 0 "
+            "AND length(btrim(tracker_scope_id)) > 0 AND length(btrim(tracker_issue_id)) > 0 "
+            "AND (tracker_display_key IS NULL OR length(btrim(tracker_display_key)) > 0) "
+            "AND length(btrim(code_host_kind)) > 0 AND length(btrim(code_host_host)) > 0 "
+            "AND length(btrim(repository_project_id)) > 0 "
+            "AND length(btrim(repository_path)) > 0",
+            name="work_items_identity_text_ck",
+        ),
+        # GitHub ids are positive decimals, which the identity derivations
+        # require, and GitHub work carries the installation that admitted it.
+        CheckConstraint(
+            "(tracker_kind <> 'github' OR (tracker_scope_id ~ '^[1-9][0-9]*$' "
+            "AND tracker_issue_id ~ '^[1-9][0-9]*$')) "
+            "AND (code_host_kind <> 'github' OR (repository_project_id ~ '^[1-9][0-9]*$' "
+            "AND code_host_installation_id IS NOT NULL))",
+            name="work_items_github_identity_ck",
         ),
         CheckConstraint(
-            "github_issue_number > 0",
-            name="work_items_github_issue_number_ck",
-        ),
-        CheckConstraint(
-            "github_installation_id > 0",
-            name="work_items_github_installation_id_ck",
+            "code_host_installation_id IS NULL OR code_host_installation_id > 0",
+            name="work_items_code_host_installation_id_ck",
         ),
         CheckConstraint("version >= 1", name="work_items_version_ck"),
         CheckConstraint("next_sequence >= 1", name="work_items_next_sequence_ck"),
         UniqueConstraint(
-            "github_repository_id",
-            "github_issue_number",
-            name="work_items_github_issue_key",
+            "tracker_kind",
+            "tracker_host",
+            "tracker_scope_id",
+            "tracker_issue_id",
+            name="work_items_tracker_issue_key",
         ),
         UniqueConstraint(
             "publication_lineage_id",
@@ -668,18 +856,34 @@ class WorkItem(Base):
             "AND readmit_objective IS NOT NULL)",
             name="work_items_readmit_ck",
         ),
+        CheckConstraint(
+            "(base_branch IS NULL AND base_source IS NULL AND base_commit IS NULL) OR "
+            "(base_branch IS NOT NULL AND base_source IS NOT NULL "
+            "AND base_commit IS NOT NULL)",
+            name="work_items_base_ck",
+        ),
+        CheckConstraint(
+            "base_source IS NULL OR base_source IN ('label', 'default')",
+            name="work_items_base_source_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    github_repository_id: Mapped[int] = mapped_column(BigInteger)
-    github_issue_number: Mapped[int]
-    github_installation_id: Mapped[int] = mapped_column(BigInteger)
+    tracker_kind: Mapped[str] = mapped_column(Text)
+    tracker_host: Mapped[str] = mapped_column(Text)
+    tracker_scope_id: Mapped[str] = mapped_column(Text)
+    tracker_issue_id: Mapped[str] = mapped_column(Text)
+    tracker_display_key: Mapped[str | None] = mapped_column(Text, default=None)
+    code_host_kind: Mapped[str] = mapped_column(Text)
+    code_host_host: Mapped[str] = mapped_column(Text)
+    repository_project_id: Mapped[str] = mapped_column(Text)
+    repository_path: Mapped[str]
+    code_host_installation_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
     agent_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
     )
-    repo_full_name: Mapped[str]
     conversation_id: Mapped[str]
     publication_lineage_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey(
@@ -691,6 +895,13 @@ class WorkItem(Base):
     cancelled_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
+    # The trigger label that admitted (or last readmitted) this WorkItem (#4361
+    # decision 10, migration 0105). Removing exactly this label cancels it; a
+    # replay leaves it alone. NULL on a row admitted before 0105 or by a
+    # non-label admission.
+    trigger_label: Mapped[str | None] = mapped_column(
+        String(MAX_TRIGGER_LABEL_LENGTH), default=None
+    )
     # A relabel that arrived while a request was still running. The
     # reconciler admits it once that request reaches a terminus.
     readmit_request_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -698,6 +909,19 @@ class WorkItem(Base):
     )
     readmit_requester: Mapped[str | None] = mapped_column(Text, default=None)
     readmit_objective: Mapped[str | None] = mapped_column(Text, default=None)
+    # The base resolved for that deferred relabel (ADR 0186). It replaces the
+    # recorded base only when the replacement request is admitted.
+    readmit_base_branch: Mapped[str | None] = mapped_column(Text, default=None)
+    readmit_base_source: Mapped[str | None] = mapped_column(Text, default=None)
+    readmit_base_commit: Mapped[str | None] = mapped_column(Text, default=None)
+    # The base resolved at admission and frozen for every later run (ADR
+    # 0186). All three are NULL on a legacy row, which uses the repository
+    # default branch. ``base_label_ignored`` is the branch a later ``base:``
+    # label names when it disagrees with the recorded one.
+    base_branch: Mapped[str | None] = mapped_column(Text, default=None)
+    base_source: Mapped[str | None] = mapped_column(Text, default=None)
+    base_commit: Mapped[str | None] = mapped_column(Text, default=None)
+    base_label_ignored: Mapped[str | None] = mapped_column(Text, default=None)
     version: Mapped[int] = mapped_column(default=1, server_default="1")
     next_sequence: Mapped[int] = mapped_column(default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(
@@ -713,6 +937,42 @@ class WorkItem(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+
+    @property
+    def tracker_issue(self) -> TrackerIssueRef:
+        return TrackerIssueRef(
+            self.tracker_kind,
+            self.tracker_host,
+            self.tracker_scope_id,
+            self.tracker_issue_id,
+            self.tracker_display_key,
+        )
+
+    @property
+    def repository(self) -> RepositoryRef:
+        """The repository frozen at admission."""
+
+        return RepositoryRef(
+            self.code_host_kind,
+            self.code_host_host,
+            self.repository_project_id,
+            self.repository_path,
+        )
+
+
+# The typed reply target's shape. Migration 0078 carries a frozen copy.
+REPLY_TARGET_CHECK = (
+    "((reply_target_kind = 'issue' AND reply_target_pr_number IS NULL "
+    "AND reply_target_comment_id IS NULL AND reply_target_url IS NULL) "
+    "OR (reply_target_kind = 'pull_request' "
+    "AND length(btrim(reply_target_pr_number)) > 0 "
+    "AND reply_target_comment_id IS NULL "
+    "AND (reply_target_url IS NULL OR length(btrim(reply_target_url)) > 0)) "
+    "OR (reply_target_kind = 'review_thread' "
+    "AND length(btrim(reply_target_pr_number)) > 0 "
+    "AND length(btrim(reply_target_comment_id)) > 0 "
+    "AND (reply_target_url IS NULL OR length(btrim(reply_target_url)) > 0))) IS TRUE"
+)
 
 
 class ExecutionRequest(Base):
@@ -750,7 +1010,10 @@ class ExecutionRequest(Base):
             name="execution_requests_deadline_ck",
         ),
         CheckConstraint(
-            "((status = 'queued' AND wait_deadline IS NULL AND started_at IS NULL "
+            "((status = 'failed' AND started_at IS NULL "
+            "AND execution_deadline IS NULL AND terminal_at IS NOT NULL "
+            "AND terminal_cause = 'start_failed' AND termination_observation IS NULL) "
+            "OR (status = 'queued' AND wait_deadline IS NULL AND started_at IS NULL "
             "AND execution_deadline IS NULL AND terminal_at IS NULL "
             "AND terminal_cause IS NULL AND termination_observation IS NULL) "
             "OR (status = 'waiting' AND wait_deadline IS NOT NULL AND started_at IS NULL "
@@ -814,6 +1077,10 @@ class ExecutionRequest(Base):
             name="execution_requests_capacity_deferrals_ck",
         ),
         CheckConstraint(
+            "start_deferrals >= 0",
+            name="execution_requests_start_deferrals_ck",
+        ),
+        CheckConstraint(
             "dispatch_epoch >= 0",
             name="execution_requests_dispatch_epoch_ck",
         ),
@@ -837,6 +1104,7 @@ class ExecutionRequest(Base):
             "AND length(btrim(reply_conversation_id)) > 0)",
             name="execution_requests_snapshot_ck",
         ),
+        CheckConstraint(REPLY_TARGET_CHECK, name="execution_requests_reply_target_ck"),
         UniqueConstraint(
             "work_item_id",
             "sequence",
@@ -915,6 +1183,7 @@ class ExecutionRequest(Base):
         DateTime(timezone=True), default=None
     )
     capacity_deferrals: Mapped[int] = mapped_column(default=0, server_default="0")
+    start_deferrals: Mapped[int] = mapped_column(default=0, server_default="0")
     last_deferral_reason: Mapped[str | None] = mapped_column(Text, default=None)
     execution_attempts: Mapped[int] = mapped_column(default=0, server_default="0")
     runtime_owner: Mapped[str | None] = mapped_column(Text, default=None)
@@ -943,6 +1212,16 @@ class ExecutionRequest(Base):
     reply_kind: Mapped[str | None] = mapped_column(Text, default=None)
     reply_address: Mapped[str | None] = mapped_column(Text, default=None)
     reply_conversation_id: Mapped[str | None] = mapped_column(Text, default=None)
+    # Admitted because its predecessor ended failed/owner_lost (ADR 0206).
+    owner_lost_retry: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # Where the factory status reply lands (ADR 0197 decision fact 4): the
+    # tracker issue, a pull request conversation, or one review thread. A
+    # revision answers on its pull request; every other request on the issue.
+    # Identifiers are text because a forge's PR or comment id need not be an int.
+    reply_target_kind: Mapped[str] = mapped_column(Text, default="issue", server_default="issue")
+    reply_target_pr_number: Mapped[str | None] = mapped_column(Text, default=None)
+    reply_target_comment_id: Mapped[str | None] = mapped_column(Text, default=None)
+    reply_target_url: Mapped[str | None] = mapped_column(Text, default=None)
 
     work_item: Mapped[WorkItem] = relationship(back_populates="execution_requests")
 
@@ -1045,6 +1324,12 @@ class FactoryStatusComment(Base):
     detail: Mapped[str | None] = mapped_column(Text, default=None)
     attempts: Mapped[int] = mapped_column(default=0, server_default="0")
     scan_page: Mapped[int] = mapped_column(default=1, server_default="1")
+    sync_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    sync_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # Set when the comment is invalidated while a sync holds the lease.
+    sync_invalidated: Mapped[bool] = mapped_column(default=False, server_default="false")
     posted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
@@ -1404,6 +1689,7 @@ class Publication(Base):
     reply_placeholder: Mapped[str | None] = mapped_column(default=None)
     reply_endpoint: Mapped[str | None] = mapped_column(default=None)
     reply_adapter: Mapped[str | None] = mapped_column(default=None)
+    reply_identity: Mapped[str | None] = mapped_column(default=None)
     # Durable initial approval-card outbox. Its lease/version are separate from
     # publication mutation, while claim_next gates Job creation on delivery so
     # even an immediate CLI approval cannot race ahead of the required card.
@@ -1512,7 +1798,7 @@ class ApprovalAuditEntry(Base):
     __table_args__ = (
         CheckConstraint(
             "principal_kind IS NULL OR principal_kind IN "
-            "('chat', 'console', 'operator', 'adapter', 'platform')",
+            "('chat', 'console', 'operator', 'adapter', 'platform', 'test_driver')",
             name="approval_audit_principal_kind_ck",
         ),
     )
@@ -1549,6 +1835,30 @@ class ApprovalAuditEntry(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+# @spec AUTOMATED-REMEDIATION-14 (executor amendment E1): the closed sets the
+# ledger checks enforce. ``authority_kind`` names what permitted a
+# platform-executed call; ``actor_kind`` who acted; the outcome is written by
+# verification. Revision 0089 carries the same literals.
+AUTHORITY_KINDS: tuple[str, ...] = (
+    "undo_ruling",
+    "capability_probe",
+    "policy",
+    "approval",
+    "qualification",
+)
+ACTOR_KINDS: tuple[str, ...] = ("model_turn", "policy", "approval", "undo_ruling")
+VERIFICATION_OUTCOMES: tuple[str, ...] = (
+    "verified",
+    "not-recovered",
+    "verifier-unavailable",
+    "superseded",
+)
+
+
+def _sql_values(values: tuple[str, ...]) -> str:
+    return ", ".join(f"'{value}'" for value in values)
+
+
 class AgentAction(Base):
     """One thing an agent did to the world, and what it takes to put it back.
 
@@ -1569,6 +1879,26 @@ class AgentAction(Base):
     """
 
     __tablename__ = "agent_actions"
+    __table_args__ = (
+        # @spec ACTION-EXECUTOR-2: the target of the composite key that binds an
+        # execution to its subject action's agent. ``id`` alone is already
+        # unique, so this adds no restriction on the ledger itself.
+        UniqueConstraint("id", "agent_id", name="uq_agent_actions_id_agent_id"),
+        # @spec AUTOMATED-REMEDIATION-14: closed domains, as database checks.
+        CheckConstraint(
+            f"authority_kind IS NULL OR authority_kind IN ({_sql_values(AUTHORITY_KINDS)})",
+            name="agent_actions_authority_kind_ck",
+        ),
+        CheckConstraint(
+            f"actor_kind IS NULL OR actor_kind IN ({_sql_values(ACTOR_KINDS)})",
+            name="agent_actions_actor_kind_ck",
+        ),
+        CheckConstraint(
+            "verification_outcome IS NULL OR verification_outcome IN "
+            f"({_sql_values(VERIFICATION_OUTCOMES)})",
+            name="agent_actions_verification_outcome_ck",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # Nullable for the same reason ``Approval.agent_id`` is: a run without a
@@ -1619,30 +1949,74 @@ class AgentAction(Base):
     # written by later slices; they live here because they are lifecycle of this
     # row, and a two-column migration later buys nothing.
     completed_at: Mapped[datetime | None] = mapped_column(default=None)
+    # Written only when a restore execution is CONFIRMED (ACTION-EXECUTOR-11);
+    # rows from before the executor may carry the ruling-time claim instead.
     undone_at: Mapped[datetime | None] = mapped_column(default=None)
     undone_by: Mapped[str | None] = mapped_column(default=None)
+    # @spec ACTION-EXECUTOR-11: what a pinned, sealed restore needs beyond the
+    # envelope in ``prior_state``. ``post_version`` is the opaque version the
+    # call left, compared with ``observe_version`` before any restore;
+    # ``connector`` and ``connector_digest`` pin the image the restore must run
+    # under; ``authority_kind`` and ``authority_ref`` name what permitted a
+    # platform-executed forward call (shared with #4068). All NULL on rows
+    # written before the executor, which are therefore never undoable.
+    post_version: Mapped[str | None] = mapped_column(Text, default=None)
+    connector: Mapped[str | None] = mapped_column(Text, default=None)
+    connector_digest: Mapped[str | None] = mapped_column(Text, default=None)
+    authority_kind: Mapped[str | None] = mapped_column(Text, default=None)
+    authority_ref: Mapped[str | None] = mapped_column(Text, default=None)
+    # @spec AUTOMATED-REMEDIATION-14: a remediation's provenance and outcome.
+    # ``delivery_event_id`` is the protected delivery the action was nominated
+    # from and ``nomination_id`` the nomination (not a foreign key, like
+    # ``gate_approval_id``: the record outlives the nomination row).
+    # ``actor_kind`` says who acted: ``model_turn`` for a call a turn recorded,
+    # ``policy`` or ``approval`` for a platform-executed remediation. All NULL
+    # on rows written before revision 0089.
+    delivery_event_id: Mapped[str | None] = mapped_column(String(256), default=None)
+    nomination_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    verification_outcome: Mapped[str | None] = mapped_column(Text, default=None)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    actor_kind: Mapped[str | None] = mapped_column(Text, default=None)
 
-    @property
-    def undoable(self) -> bool:
-        """Whether this record holds what a restore needs -- derived, never stored.
+    def restore_record_refusal(self) -> str | None:
+        """The ruling code for the first record ingredient missing, or None.
 
-        A stored flag can be set by a writer that captured nothing, and the
-        platform would then offer an undo it cannot honor. Deny-by-default falls
-        out of this: a third-party tool that reports neither a prior state nor a
-        target lands on ``False`` without anyone declaring anything.
+        @spec ACTION-EXECUTOR-11. The record-level half of ``undoable``,
+        derived and never stored: not yet undone, succeeded, a valid sealed
+        envelope in ``prior_state`` (ACTION-EXECUTOR-9), attributed to an agent,
+        a ``post_version``, a ``target``, and a ``connector`` with its
+        ``connector_digest``. A cleartext ``prior_state`` is history, not a
+        snapshot, so a legacy row is ``refused_unsealed``. ``post_state`` is no
+        longer read for a sealed record.
 
-        ``post_state`` is required too: the undo route compares the live resource
-        against it and refuses without it, so a row lacking it is not one an undo
-        can be granted on.
+        The other half (no live restore, capability and key custody) needs the
+        database and the in-force bundle. ``curie_api.action_undoable`` combines
+        both and is the only place ``undoable`` and its refusal are answered.
         """
 
-        return (
-            self.status == ActionStatus.succeeded
-            and self.prior_state is not None
-            and self.post_state is not None
-            and self.target is not None
-            and self.undone_at is None
-        )
+        if self.undone_at is not None:
+            return "refused_already_undone"
+        if self.status != ActionStatus.succeeded:
+            return "refused_unsuccessful"
+        # A record without a sealed snapshot holds nothing to restore under any
+        # agent, so that is the most specific reason and comes first.
+        if not is_sealed_envelope(self.prior_state):
+            return "refused_unsealed"
+        if self.agent_id is None:
+            return "refused_no_agent"
+        if not self.post_version:
+            return "refused_unversioned"
+        if self.target is None:
+            return "refused_irreversible"
+        if not self.connector or not self.connector_digest:
+            return "refused_no_digest"
+        return None
+
+    @property
+    def holds_restore_record(self) -> bool:
+        """Whether every record-level ingredient is present (ACTION-EXECUTOR-11)."""
+
+        return self.restore_record_refusal() is None
 
 
 class ActionAuditEntry(Base):
@@ -1656,6 +2030,12 @@ class ActionAuditEntry(Base):
     """
 
     __tablename__ = "action_audit_entries"
+    __table_args__ = (
+        CheckConstraint(
+            f"actor_kind IS NULL OR actor_kind IN ({_sql_values(ACTOR_KINDS)})",
+            name="action_audit_entries_actor_kind_ck",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     action_id: Mapped[uuid.UUID] = mapped_column(
@@ -1674,6 +2054,195 @@ class ActionAuditEntry(Base):
     # point: an operator has to see that their manual fix is what stopped it.
     evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    # @spec AUTOMATED-REMEDIATION-14: who acted, from ``ACTOR_KINDS``. A policy
+    # actor is ``policy`` with the policy reference as ``actor``, never an
+    # empty human field. NULL on rows written before revision 0089.
+    actor_kind: Mapped[str | None] = mapped_column(Text, default=None)
+
+
+class ExecutionKind(enum.StrEnum):
+    """What an action execution runs (ACTION-EXECUTOR-2)."""
+
+    restore = "restore"
+    forward = "forward"
+    probe = "probe"
+    # @spec AUTOMATED-REMEDIATION-12 (executor amendment E2): one remediation
+    # sample, which never enters ``dispatched``.
+    read = "read"
+
+
+class ExecutionState(enum.StrEnum):
+    """Lifecycle of one action execution (ACTION-EXECUTOR-17).
+
+    ``refused`` is a provable non-write and releases the action; ``confirmed``,
+    ``failed`` and ``indeterminate`` are terminal and may have written, so a
+    restore in any state but ``refused`` holds its action.
+    """
+
+    requested = "requested"
+    claimed = "claimed"
+    dispatched = "dispatched"
+    confirmed = "confirmed"
+    failed = "failed"
+    indeterminate = "indeterminate"
+    refused = "refused"
+
+
+def _sql_in(values: type[enum.StrEnum]) -> str:
+    return ", ".join(f"'{member.value}'" for member in values)
+
+
+class ActionExecution(Base):
+    """One call the platform runs without a model (ACTION-EXECUTOR-2).
+
+    @spec ACTION-EXECUTOR-2. A restore of a recorded action, a forward action
+    whose authority its owner verified, or a read-only capability probe, each
+    run under the target connector's own binding. Created only by the undo
+    ruling, the forward creation function and the probe route
+    (ACTION-EXECUTOR-1). ``idempotency_key`` is unique within one agent, so a
+    replayed creation adopts that agent's existing row and no other's, and a
+    composite key ties ``agent_id`` to the subject action's agent. At most one
+    restore that is not ``refused`` may name one action, enforced by a partial
+    unique index rather than a writer.
+    ``outcome`` carries version strings, a key identifier and codes only, never
+    an envelope, a state or a result.
+    """
+
+    __tablename__ = "action_executions"
+    __table_args__ = (
+        CheckConstraint(f"kind IN ({_sql_in(ExecutionKind)})", name="action_executions_kind_ck"),
+        CheckConstraint(
+            f"state IN ({_sql_in(ExecutionState)})", name="action_executions_state_ck"
+        ),
+        # @spec AUTOMATED-REMEDIATION-14 (executor amendment E1).
+        CheckConstraint(
+            f"authority_kind IN ({_sql_values(AUTHORITY_KINDS)})",
+            name="action_executions_authority_kind_ck",
+        ),
+        # A replayed creation adopts the existing row on (agent_id, key), so one
+        # agent's key can never adopt another agent's execution.
+        UniqueConstraint(
+            "agent_id", "idempotency_key", name="uq_action_executions_agent_idempotency_key"
+        ),
+        # An execution always runs under the agent whose action it concerns. An
+        # action with no agent matches no pair, so it can never be a subject.
+        ForeignKeyConstraint(
+            ["subject_action_id", "agent_id"],
+            [f"{SCHEMA}.agent_actions.id", f"{SCHEMA}.agent_actions.agent_id"],
+            ondelete="CASCADE",
+            name="fk_action_executions_subject_agent",
+        ),
+        Index(
+            "uq_action_executions_live_restore",
+            "subject_action_id",
+            unique=True,
+            postgresql_where=text("kind = 'restore' AND state <> 'refused'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    kind: Mapped[str] = mapped_column(Text)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), index=True
+    )
+    connector: Mapped[str] = mapped_column(Text)
+    # The upstream tool name; ``restore`` for a restore, NULL for a probe.
+    tool: Mapped[str | None] = mapped_column(Text, default=None)
+    # Restore: the action put back. Forward: the record created at dispatch.
+    subject_action_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    arguments_sha256: Mapped[str | None] = mapped_column(Text, default=None)
+    forward_arguments: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    connector_digest: Mapped[str] = mapped_column(Text)
+    authority_kind: Mapped[str] = mapped_column(Text)
+    authority_ref: Mapped[str] = mapped_column(Text)
+    requested_by: Mapped[str | None] = mapped_column(Text, default=None)
+    idempotency_key: Mapped[str] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(
+        Text, server_default=ExecutionState.requested, index=True
+    )
+    refusal_code: Mapped[str | None] = mapped_column(Text, default=None)
+    failure_code: Mapped[str | None] = mapped_column(Text, default=None)
+    attempt: Mapped[int] = mapped_column(Integer, server_default="0", default=0)
+    lease_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    outcome: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # @spec AUTOMATED-REMEDIATION-12 (executor amendment E9): handed out only
+    # once due; NULL is due.
+    not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # A read's RFC 6901 pointer, bound by its producer with tool and arguments.
+    pointer: Mapped[str | None] = mapped_column(Text, default=None)
+    # A read's ``{"sample", "value"}`` as reported, or the API's ``skipped``.
+    sample: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+
+
+class ConnectorCapability(Base):
+    """Whether one connector image can restore, as its probe observed it.
+
+    @spec ACTION-EXECUTOR-13. Keyed on the agent, connector and image digest:
+    a digest's tool list is a property of the image, so one probe answers for
+    every action recorded under it, including actions recorded before the probe
+    completed. Key custody depends on the version's declarations, not the image,
+    and is deliberately not stored here (ACTION-EXECUTOR-16).
+    """
+
+    __tablename__ = "connector_capabilities"
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), primary_key=True
+    )
+    connector: Mapped[str] = mapped_column(Text, primary_key=True)
+    digest: Mapped[str] = mapped_column(Text, primary_key=True)
+    restore_capable: Mapped[bool]
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class ChannelCanvasEdit(Base):
+    """One agent edit of one canvas cell (ADR 0200), append and settle.
+
+    The row is committed ``attempted`` before Slack is called, then settled
+    ``applied`` or ``failed`` only when Slack's answer is definite. A row left
+    ``attempted`` means the edit may have applied. ``before_text`` and
+    ``after_text`` are never logged or rendered.
+    """
+
+    __tablename__ = "channel_canvas_edits"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('attempted', 'applied', 'failed')",
+            name="channel_canvas_edits_status_ck",
+        ),
+        Index("ix_channel_canvas_edits_canvas_created", "canvas_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), index=True
+    )
+    deployment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    turn: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(Text)
+    channel_address: Mapped[str] = mapped_column(Text)
+    canvas_id: Mapped[str] = mapped_column(Text)
+    section_id: Mapped[str] = mapped_column(Text)
+    before_text: Mapped[str] = mapped_column(Text)
+    after_text: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
 class WorkflowStateEntry(Base):
@@ -1705,8 +2274,10 @@ class WorkflowStateEntry(Base):
         ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
     )
     # NULL is one agent-wide shared identity: for general state when the owning
-    # agent has `memory=True`, and always for the reserved `memory`/`transcript`
-    # namespaces. The binding's own `"{kind}:{address}"` is the isolated identity
+    # agent has `memory=True`, and for the reserved `memory` namespace's
+    # agent-wide rows. The `transcript` namespace is not stored in this table at
+    # all: it lives in `thread_transcripts` (ADR-0170), keyed by its own
+    # `binding_scope`. The binding's own `"{kind}:{address}"` is the isolated identity
     # for general state when `memory=False` (#1525 follow-up). Minted into the
     # worker's `state.app`/`state` token per turn from the agent's CURRENT
     # `memory` value, never read back off this column -- the column only picks
@@ -1768,6 +2339,72 @@ class ThreadTranscript(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
+class ThreadAttachmentRef(Base):
+    """One file a thread's agent was given (ADR 0205, #4079).
+
+    Keyed exactly like ``ThreadTranscript`` and removed with it
+    (``curie_api.thread_attachments``). Only the worker writes it, through the
+    internal routes. It records the channel's file id and the route it came
+    from, never an endpoint, a URL or bytes. ``seq`` is the arrival order;
+    ``disk_name`` is fixed when recorded and unique in the thread, so a path a
+    notice named is the path on every later boot.
+    """
+
+    __tablename__ = "thread_attachment_refs"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            "event_id",
+            "file_id",
+            name="uq_thread_attachment_refs_event_file",
+            postgresql_nulls_not_distinct=True,
+        ),
+        UniqueConstraint(
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            "disk_name",
+            name="uq_thread_attachment_refs_disk_name",
+            postgresql_nulls_not_distinct=True,
+        ),
+        Index(
+            "ix_thread_attachment_refs_thread_seq",
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            "seq",
+        ),
+        Index("ix_thread_attachment_refs_expires_at", "expires_at"),
+        # The orphan sweep runs on every transcript write, scoped to one agent.
+        Index("ix_thread_attachment_refs_agent_expires_at", "agent_id", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(always=True))
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    binding_scope: Mapped[str | None] = mapped_column(Text, default=None)
+    thread_key: Mapped[str] = mapped_column(Text)
+    event_id: Mapped[str] = mapped_column(Text)
+    file_id: Mapped[str] = mapped_column(Text)
+    ordinal: Mapped[int] = mapped_column(Integer)
+    name: Mapped[str] = mapped_column(Text)
+    disk_name: Mapped[str] = mapped_column(Text)
+    mime_type: Mapped[str | None] = mapped_column(Text, default=None)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    sha256: Mapped[str] = mapped_column(Text)
+    route_kind: Mapped[str] = mapped_column(Text)
+    route_adapter: Mapped[str | None] = mapped_column(Text, default=None)
+    route_identity: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class ConsoleSession(Base):
     """One console login: the code that establishes it and the session it becomes.
 
@@ -1784,11 +2421,22 @@ class ConsoleSession(Base):
     """
 
     __tablename__ = "console_sessions"
+    __table_args__ = (Index("ix_console_sessions_principal_id", "principal_id"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # Administrator-selected at login-code mint and immutable thereafter. NULL
     # preserves pre-ADR-0106 sessions, which cannot resolve approvals.
     subject: Mapped[str | None] = mapped_column(default=None)
+    # The principal an OIDC login established (#2908, ADR 0155 step 3). NULL on
+    # every login-code session. Deliberately a separate column from `subject`
+    # rather than the IdP `sub` written into it: approver sets match `subject`
+    # against provider ids (Slack user ids and the like), so an IdP-controlled
+    # `sub` stored there could equal a listed approver and inherit authority.
+    # CASCADE because a principal that is deleted outright must not leave a
+    # session behind that still names it.
+    principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.principals.id", ondelete="CASCADE"), default=None
+    )
     # SHA-256 hex of the single-use login code. Unique so a hash collision or a
     # duplicate mint cannot produce two rows one code could satisfy.
     login_code_hash: Mapped[str] = mapped_column(unique=True, index=True)
@@ -1816,6 +2464,335 @@ class ScheduleControl(Base):
     generation: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
 
 
+class HookSourcePolicy(Base):
+    """@spec PROTECTED-HOOK-SOURCE-1."""
+
+    __tablename__ = "hook_source_policies"
+    __table_args__ = (
+        CheckConstraint("generation > 0", name="hook_source_policies_generation_ck"),
+        CheckConstraint(
+            "mode IN ('protected', 'ordinary')", name="hook_source_policies_mode_ck"
+        ),
+        CheckConstraint(
+            "(mode = 'protected' AND tool_access IS NOT NULL "
+            "AND tool_access = 'read-only' AND runtime_id IS NOT NULL "
+            "AND qualification_id IS NOT NULL AND bundle_digest IS NOT NULL) "
+            "OR (mode = 'ordinary' AND tool_access IS NULL AND runtime_id IS NULL "
+            "AND qualification_id IS NULL AND bundle_digest IS NULL)",
+            name="hook_source_policies_policy_ck",
+        ),
+    )
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    hook: Mapped[str] = mapped_column(String(63), primary_key=True)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    operation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    mode: Mapped[str] = mapped_column(String, nullable=False)
+    tool_access: Mapped[str | None] = mapped_column(String, nullable=True)
+    runtime_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    qualification_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    bundle_digest: Mapped[str | None] = mapped_column(String, nullable=True)
+    legacy_generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class HookSourceOperation(Base):
+    """@spec PROTECTED-HOOK-SOURCE-10."""
+
+    __tablename__ = "hook_source_operations"
+    __table_args__ = (
+        CheckConstraint("generation > 0", name="hook_source_operations_generation_ck"),
+        CheckConstraint(
+            "status IN ('pending', 'committed')", name="hook_source_operations_status_ck"
+        ),
+        CheckConstraint(
+            "intent_sha256 ~ '^[0-9a-f]{64}$'", name="hook_source_operations_intent_ck"
+        ),
+        UniqueConstraint(
+            "agent_id", "hook", "generation", name="uq_hook_source_operation_generation"
+        ),
+    )
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    hook: Mapped[str] = mapped_column(String(63), primary_key=True)
+    operation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    intent_sha256: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    attempted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class RemediationPolicy(Base):
+    """The current remediation policy generation of one bound hook.
+
+    @spec AUTOMATED-REMEDIATION-2.
+    """
+
+    __tablename__ = "remediation_policies"
+    __table_args__ = (
+        CheckConstraint("generation > 0", name="remediation_policies_generation_ck"),
+        CheckConstraint("active OR NOT armed", name="remediation_policies_armed_ck"),
+    )
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    hook: Mapped[str] = mapped_column(String(63), primary_key=True)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    operation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    armed: Mapped[bool] = mapped_column(nullable=False)
+    active: Mapped[bool] = mapped_column(nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class RemediationPolicyGeneration(Base):
+    """One immutable remediation policy generation, kept while the agent exists.
+
+    @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3.
+    """
+
+    __tablename__ = "remediation_policy_generations"
+    __table_args__ = (
+        CheckConstraint("generation > 0", name="remediation_policy_generations_generation_ck"),
+        CheckConstraint(
+            "intent_sha256 ~ '^[0-9a-f]{64}$'", name="remediation_policy_generations_intent_ck"
+        ),
+        CheckConstraint("active OR NOT armed", name="remediation_policy_generations_armed_ck"),
+        CheckConstraint(
+            "length(btrim(bound_by)) > 0", name="remediation_policy_generations_bound_by_ck"
+        ),
+        UniqueConstraint(
+            "agent_id", "hook", "operation_id", name="uq_remediation_policy_generation_operation"
+        ),
+    )
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    hook: Mapped[str] = mapped_column(String(63), primary_key=True)
+    generation: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    operation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    intent_sha256: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    document: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    armed: Mapped[bool] = mapped_column(nullable=False)
+    active: Mapped[bool] = mapped_column(nullable=False)
+    bound_by: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class RemediationNominationSubmission(Base):
+    """The one accepted nomination submission of a protected event.
+
+    Keyed on the event so the first accepted submission wins; ``block_sha256``
+    decides a byte-identical replay from a ``nomination_conflict``.
+    @spec AUTOMATED-REMEDIATION-6.
+    """
+
+    __tablename__ = "remediation_nomination_submissions"
+    __table_args__ = (
+        CheckConstraint(
+            "block_sha256 ~ '^[0-9a-f]{64}$'", name="remediation_nomination_submissions_digest_ck"
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    hook: Mapped[str] = mapped_column(String(63), nullable=False)
+    block_sha256: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    # The protected delivery's conversation (its envelope's
+    # ``logical_conversation_key``), which an approval raised later names
+    # (AUTOMATED-REMEDIATION-15). NULL for a submission recorded before 0093.
+    conversation_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The reply surface the delivery's turn named, copied from its
+    # ``remediation_delivery_surfaces`` row at nomination time; an approval is
+    # raised on it (AUTOMATED-REMEDIATION-15). NULL when none was recorded.
+    reply_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_channel: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_adapter: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class RemediationNomination(Base):
+    """One nominated action of a protected turn, or one malformed block.
+
+    @spec AUTOMATED-REMEDIATION-7 @spec AUTOMATED-REMEDIATION-8.
+    """
+
+    __tablename__ = "remediation_nominations"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('received', 'refused', 'precondition_pending', 'admitted', "
+            "'approval_requested', 'approved', 'rejected', 'expired', 'executing', "
+            "'verifying', 'finished')",
+            name="remediation_nominations_state_ck",
+        ),
+        CheckConstraint(
+            "refusal_code IS NULL OR refusal_code IN ('nomination_malformed', 'unknown_action', "
+            "'nomination_duplicate', 'arguments_schema_mismatch', 'agent_stopped', "
+            "'reply_surface_unavailable', 'tune_execution_not_automated')",
+            name="remediation_nominations_refusal_ck",
+        ),
+        CheckConstraint(
+            "(state = 'refused') = (refusal_code IS NOT NULL)",
+            name="remediation_nominations_refused_ck",
+        ),
+        CheckConstraint(
+            "refusal_code = 'nomination_malformed' OR "
+            "(action IS NOT NULL AND arguments IS NOT NULL AND arguments_sha256 IS NOT NULL)",
+            name="remediation_nominations_action_ck",
+        ),
+        CheckConstraint(
+            "kind IS NULL OR kind IN ('remediate', 'prevent', 'tune')",
+            name="remediation_nominations_kind_ck",
+        ),
+        CheckConstraint(
+            "verification_outcome IS NULL OR verification_outcome IN "
+            "('verified', 'not-recovered', 'verifier-unavailable', 'superseded')",
+            name="remediation_nominations_outcome_ck",
+        ),
+        CheckConstraint(
+            "arguments_sha256 IS NULL OR arguments_sha256 ~ '^[0-9a-f]{64}$'",
+            name="remediation_nominations_digest_ck",
+        ),
+        CheckConstraint(
+            "admitted_generation IS NULL OR admitted_generation > 0",
+            name="remediation_nominations_admitted_ck",
+        ),
+        CheckConstraint(
+            "current_generation IS NULL OR current_generation > 0",
+            name="remediation_nominations_current_ck",
+        ),
+        CheckConstraint(
+            "approval_reason IS NULL OR approval_reason IN ('generation_not_current', "
+            "'policy_disarmed', 'not_automatic', 'qualification_missing', "
+            "'qualification_stale', 'verifier_not_independent', 'out_of_bounds', "
+            "'not_reversible_now', 'breaker_open', 'policy_rate_limit', "
+            "'action_rate_limit', 'incident_limit', 'turn_limit', 'target_live', "
+            "'precondition_not_met', 'precondition_unavailable', 'admission_unreadable', "
+            "'policy_changed')",
+            name="remediation_nominations_approval_reason_ck",
+        ),
+        Index("ix_remediation_nominations_event", "event_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    hook: Mapped[str] = mapped_column(String(63), nullable=False)
+    event_id: Mapped[str] = mapped_column(
+        String(256),
+        ForeignKey(f"{SCHEMA}.remediation_nomination_submissions.event_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    admitted_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    current_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    action: Mapped[str | None] = mapped_column(Text, nullable=True)
+    kind: Mapped[str | None] = mapped_column(Text, nullable=True)
+    arguments: Mapped[str | None] = mapped_column(Text, nullable=True)
+    arguments_sha256: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
+    target: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    refusal_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approval_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    execution_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    verification_outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The admission check that sent the nomination to approval (AUTOMATED-REMEDIATION-8).
+    approval_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The code of a forward execution that ended failed, indeterminate or refused after
+    # admission (AUTOMATED-REMEDIATION-18); the nomination then finishes not-recovered.
+    execution_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RemediationApprovalRequest(Base):
+    """One remediation approval: who raised it, what attached, and its card outbox.
+
+    @spec AUTOMATED-REMEDIATION-15. Keyed by the approval; the deduplication
+    fields are the raising nomination's agent, hook, action and argument digest.
+    """
+
+    __tablename__ = "remediation_approval_requests"
+    __table_args__ = (
+        UniqueConstraint("nomination_id", name="remediation_approval_requests_nomination_key"),
+        CheckConstraint(
+            "arguments_sha256 ~ '^[0-9a-f]{64}$'",
+            name="remediation_approval_requests_digest_ck",
+        ),
+        CheckConstraint(
+            "attached_count >= 0 AND card_attempts >= 0",
+            name="remediation_approval_requests_counts_ck",
+        ),
+        Index(
+            "ix_remediation_approval_requests_identity",
+            "agent_id",
+            "hook",
+            "action",
+            "arguments_sha256",
+        ),
+    )
+
+    approval_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.approvals.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    nomination_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.remediation_nominations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    hook: Mapped[str] = mapped_column(String(63), nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    arguments_sha256: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    failed_check: Mapped[str] = mapped_column(Text, nullable=False)
+    observed: Mapped[Any | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    attached_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    newest_event_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    card_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    card_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    card_lease_owner: Mapped[str | None] = mapped_column(Text, nullable=True)
+    card_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    card_posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    card_dead_lettered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    card_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class HookRun(Base):
     """One claimed trigger slot for an agent version."""
 
@@ -1832,6 +2809,10 @@ class HookRun(Base):
             "('ran', 'deferred', 'skipped', 'blocked', 'reclaimed', 'failed')",
             name="hook_runs_outcome_ck",
         ),
+        CheckConstraint(
+            "source IN ('schedule', 'manual')",
+            name="hook_runs_source_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -1845,7 +2826,11 @@ class HookRun(Base):
     version_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agent_versions.id", ondelete="CASCADE")
     )
+    source: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'schedule'")
+    )
     outcome: Mapped[str | None] = mapped_column(String, default=None)
+    reason: Mapped[str | None] = mapped_column(Text, default=None)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
@@ -1879,9 +2864,11 @@ class Tenant(Base):
 class Principal(Base):
     """A tenant scoped human or service identity (#2907, ADR 0155 step 2).
 
-    Keyed on the IdP subject within a tenant; ``email`` and ``display_name``
-    are attributes and never the identity key. A rebuildable projection of the
-    customer IdP, with no callers yet.
+    Keyed on the IdP issuer and subject within a tenant (#2908: an OIDC ``sub``
+    is only unique per issuer, so switching IdPs must not let the new one
+    inherit an old principal); ``email`` and ``display_name`` are attributes
+    and never the identity key. A rebuildable projection of the customer IdP,
+    created lazily by the generic OIDC login.
     """
 
     __tablename__ = "principals"
@@ -1896,7 +2883,10 @@ class Principal(Base):
             name="principals_authorization_version_ck",
         ),
         UniqueConstraint(
-            "tenant_id", "idp_subject", name="principals_tenant_idp_subject_key"
+            "tenant_id",
+            "idp_issuer",
+            "idp_subject",
+            name="principals_tenant_issuer_subject_key",
         ),
         # Target of principal_teams' tenant-scoped foreign key.
         UniqueConstraint("tenant_id", "id", name="principals_tenant_id_id_key"),
@@ -1904,6 +2894,9 @@ class Principal(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey(f"{SCHEMA}.tenants.id"))
+    # The OIDC `iss` that vouched for `idp_subject`. '' for rows that predate
+    # 0100, which no login can match because every login carries its issuer.
+    idp_issuer: Mapped[str] = mapped_column(String, default="", server_default="")
     idp_subject: Mapped[str] = mapped_column(String)
     type: Mapped[str] = mapped_column(String)
     status: Mapped[str] = mapped_column(String, default="active", server_default="active")
@@ -1989,3 +2982,638 @@ class PrincipalTeam(Base):
     synced_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class FactoryPollCursor(Base):
+    """One tracker scope's factory poll cursors and conditional-request tags (#3745).
+
+    Keyed by the scope a tracker issue id is unique within (ADR 0197): the
+    repository id on GitHub, the site's cloudId on Jira. ``scope_path`` is for
+    display. ``etags`` holds conditional-request tags and, under
+    ``marked:<label>``, the opaque `Tracker.poll_marked` cursors (#4358 plan D2).
+    """
+
+    __tablename__ = "factory_poll_cursors"
+    __table_args__ = (
+        CheckConstraint(
+            "jsonb_typeof(etags) = 'object'",
+            name="factory_poll_cursors_etags_object_ck",
+        ),
+    )
+
+    tracker_kind: Mapped[str] = mapped_column(Text, primary_key=True)
+    tracker_host: Mapped[str] = mapped_column(Text, primary_key=True)
+    tracker_scope_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    scope_path: Mapped[str] = mapped_column(Text)
+    comments_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    review_comments_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    reviews_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    etags: Mapped[dict[str, Any]] = mapped_column(JSONB,
+        nullable=False, server_default=text("'{}'::jsonb"), default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# A secret-store reference, never a value (#2909): ``env:NAME`` or
+# ``k8s-secret:name/key``. The DB CHECK and the API's 422 both use it.
+PROVIDER_REFERENCE_PATTERN = (
+    r"^(env:[A-Z_][A-Z0-9_]*"
+    r"|k8s-secret:[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?/[-._a-zA-Z0-9]{1,253})$"
+)
+PROVIDER_REFERENCE_MAX_LENGTH = 512
+# Refuses the shapes of well-known credentials the grammar above would admit
+# (a Secret key may hold hyphens, so ``k8s-secret:x/xoxb-...`` would pass):
+# a segment opening with a known token prefix, an env name that is an AWS
+# access key id, or a 32+ character hex run (signing secrets, hex tokens).
+# Best effort against a pasted value; no syntax can prove a string is not one.
+PROVIDER_REFERENCE_DENY_PATTERN = (
+    r"[:/](xox[a-z]-|xoxe\.|xapp-|gh[pousr]_|github_pat_|sk-|sk_live_|rk_live_|lin_api_|AIza|eyJ)"
+    r"|^env:(AKIA|ASIA)[A-Z0-9]{16}$"
+    r"|[0-9a-fA-F]{32}"
+)
+
+
+def _provider_reference_check(table: str, column: str) -> CheckConstraint:
+    return CheckConstraint(
+        f"{column} IS NULL OR (length({column}) <= {PROVIDER_REFERENCE_MAX_LENGTH} "
+        f"AND {column} ~ '{PROVIDER_REFERENCE_PATTERN}' "
+        f"AND {column} !~ '{PROVIDER_REFERENCE_DENY_PATTERN}')",
+        name=f"{table}_{column}_ck",
+    )
+
+
+_PROVIDER_CK = (
+    "provider IN ('slack', 'm365', 'github', 'jira', 'linear', "
+    "'confluence', 'quickbooks', 'other')"
+)
+
+
+class ProviderInstallation(Base):
+    """A connected external account the tenant authorised (#2909, ADR 0166 step 4).
+
+    ADR 0193 decision 3 restores this to ADR 0166's original meaning after ADR
+    0168 decision 1 had made it one row per channel identity; that meaning now
+    belongs to :class:`ChannelIdentity`. ``authority`` is the provider endpoint
+    ``external_account_id`` belongs to: empty for a provider with one global
+    service (Slack, Google, Atlassian Cloud), the canonical hostname for a
+    self-hosted or per-host one (a GHES instance, an Atlassian Data Center base
+    URL) -- so a self-hosted installation's id cannot collide with the same id
+    on another host. It is NOT NULL with an empty default, never nullable, so
+    two global installations' empty authorities still compare equal for
+    uniqueness (Postgres never treats two NULLs as equal). ``disconnected_at``
+    is set exactly while the row is disconnected. The installer FK carries
+    ``tenant_id``, so the installer must be a principal of the same tenant.
+    """
+
+    __tablename__ = "provider_installations"
+    __table_args__ = (
+        CheckConstraint(_PROVIDER_CK, name="provider_installations_provider_ck"),
+        CheckConstraint(
+            "status IN ('connected', 'disconnected')",
+            name="provider_installations_status_ck",
+        ),
+        CheckConstraint(
+            "(status = 'disconnected') = (disconnected_at IS NOT NULL)",
+            name="provider_installations_disconnected_at_ck",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "installed_by_principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="provider_installations_installer_fkey",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "authority",
+            "external_account_id",
+            name="provider_installations_tenant_provider_authority_account_key",
+        ),
+        # Lets channel_identities.provider_installation_id's composite FK
+        # require an identity to attach only to an installation of its own
+        # tenant and provider; `id` alone is already the primary key.
+        UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "id",
+            name="provider_installations_tenant_provider_id_key",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id", name="provider_installations_tenant_id_fkey")
+    )
+    provider: Mapped[str] = mapped_column(String)
+    authority: Mapped[str] = mapped_column(String, default="", server_default="")
+    external_account_id: Mapped[str] = mapped_column(String)
+    display_name: Mapped[str | None] = mapped_column(default=None)
+    status: Mapped[str] = mapped_column(String, default="connected", server_default="connected")
+    installed_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    installed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    disconnected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+
+
+class ChannelIdentity(Base):
+    """Who Curie speaks as: one row per bot (#2909, ADR 0168 decision 1, as
+    scoped by ADR 0193 decision 4).
+
+    ``name`` is unique within the provider and tenant and is what a binding's
+    ``adapter`` names (ADR 0168 decision 3): one Slack workspace with two bots
+    is two installations' worth of identities sharing nothing but the tenant
+    and provider, never a ``name``. ``attributes`` holds whatever that
+    provider's identity needs beyond the fixed columns -- for Slack, the
+    app-token reference alongside ``credential_ref``'s bot-token reference.
+
+    ``credential_ref`` and ``webhook_verification_ref`` point into the
+    deployment's secret store; the CHECKs hold them to the reference grammar
+    and refuse well-known credential shapes, whoever writes them.
+
+    ``provider_installation_id`` is nullable: a declared identity is created at
+    boot unattached, since only the identity's own credential can later report
+    which installation it belongs to (#3039); until then, an operator attaches
+    it through the admin routes. ``installation_mismatch`` is set when a later
+    report names a different installation than the identity is attached to; it
+    does not detach the identity on its own.
+    """
+
+    __tablename__ = "channel_identities"
+    __table_args__ = (
+        CheckConstraint(_PROVIDER_CK, name="channel_identities_provider_ck"),
+        CheckConstraint(
+            "status IN ('active', 'disabled', 'revoked')",
+            name="channel_identities_status_ck",
+        ),
+        _provider_reference_check("channel_identities", "credential_ref"),
+        _provider_reference_check("channel_identities", "webhook_verification_ref"),
+        ForeignKeyConstraint(
+            ["tenant_id", "provider", "provider_installation_id"],
+            [
+                f"{SCHEMA}.provider_installations.tenant_id",
+                f"{SCHEMA}.provider_installations.provider",
+                f"{SCHEMA}.provider_installations.id",
+            ],
+            name="channel_identities_installation_fkey",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "name",
+            name="channel_identities_tenant_provider_name_key",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id", name="channel_identities_tenant_id_fkey")
+    )
+    provider: Mapped[str] = mapped_column(String)
+    # Unique with (tenant_id, provider); what a binding's `adapter` names
+    # (ADR 0168 decision 3). "default" is the one identity an install need not
+    # name explicitly.
+    name: Mapped[str] = mapped_column(String, default="default", server_default="default")
+    credential_ref: Mapped[str | None] = mapped_column(default=None)
+    scopes: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]")
+    webhook_verification_ref: Mapped[str | None] = mapped_column(default=None)
+    # Provider-specific identity details that don't fit a fixed column: for
+    # Slack, today just the app-token reference; later, once something
+    # resolves them, the team/app/bot user ids.
+    attributes: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default="{}")
+    status: Mapped[str] = mapped_column(String, default="active", server_default="active")
+    installation_mismatch: Mapped[bool] = mapped_column(default=False, server_default="false")
+    provider_installation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class OidcLoginAttempt(Base):
+    """One in-flight OIDC authorization-code login (#2908, ADR 0155).
+
+    Server-side, short-lived and single-use: the row exists from the redirect to
+    the IdP until the callback consumes it. It holds what the callback needs and
+    the browser must not be trusted with -- the nonce the ID token has to echo
+    and the PKCE verifier that makes a stolen authorization code useless -- the
+    same preference for durable server state over client-held state ADR-0083
+    took for console sessions. Only a HASH of ``state`` is stored, so reading
+    this table does not yield a value that completes someone's login.
+    """
+
+    __tablename__ = "oidc_login_attempts"
+    __table_args__ = (
+        UniqueConstraint("state_hash", name="oidc_login_attempts_state_hash_key"),
+        # The unauthenticated login start prunes and counts by expiry; without
+        # this both scan every live attempt, so a flood makes each request dearer.
+        Index("ix_oidc_login_attempts_expires_at", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # SHA-256 hex of the `state` the browser carries in the query and cookie.
+    state_hash: Mapped[str] = mapped_column(String)
+    nonce: Mapped[str] = mapped_column(String)
+    code_verifier: Mapped[str] = mapped_column(String)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # Stamped by the one callback allowed to use this attempt.
+    consumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class RemediationDeliverySurface(Base):
+    """The reply surface the hook route chose for one protected delivery.
+
+    @spec AUTOMATED-REMEDIATION-15. Written by the protected ingress (remediation
+    on) for an admitted delivery, keyed by its event id, so an approval for its
+    nominations is raised on the surface its ``QueuedTurn`` names. The broker's
+    admission records keep their released key sets.
+    """
+
+    __tablename__ = "remediation_delivery_surfaces"
+
+    event_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    hook: Mapped[str] = mapped_column(String(63), nullable=False)
+    reply_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    reply_channel: Mapped[str] = mapped_column(Text, nullable=False)
+    reply_endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_adapter: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The thread the receipts post into (AUTOMATED-REMEDIATION-20), recorded by
+    # the ingress with the surface; NULL for a surface recorded before 0097.
+    reply_conversation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class RemediationBreaker(Base):
+    """One breaker on an agent's connector, tool and target key.
+
+    @spec AUTOMATED-REMEDIATION-11. Opened on any verification outcome other
+    than ``verified``; closed only through the policy's administrative route,
+    which records the operator principal and a reason. At most one breaker per
+    key is open.
+    """
+
+    __tablename__ = "remediation_breakers"
+    __table_args__ = (
+        CheckConstraint(
+            "(closed_at IS NULL) = (closed_by IS NULL) "
+            "AND (closed_at IS NULL) = (close_reason IS NULL)",
+            name="remediation_breakers_closed_ck",
+        ),
+        Index(
+            "uq_remediation_breakers_open",
+            "agent_id",
+            "connector",
+            "tool",
+            "target",
+            unique=True,
+            postgresql_where=text("closed_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    connector: Mapped[str] = mapped_column(Text, nullable=False)
+    tool: Mapped[str] = mapped_column(Text, nullable=False)
+    target: Mapped[str] = mapped_column(Text, nullable=False)
+    opened_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    close_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class RemediationReservation(Base):
+    """The check 11 reservation of one nomination admitted to its precondition read.
+
+    @spec AUTOMATED-REMEDIATION-10. Taken under the per-agent admission lock in
+    the transaction that admits the nomination; ``released_at`` is set when the
+    nomination does not execute, after which it counts toward nothing.
+    """
+
+    __tablename__ = "remediation_reservations"
+    __table_args__ = (Index("ix_remediation_reservations_agent", "agent_id", "reserved_at"),)
+
+    nomination_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.remediation_nominations.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    hook: Mapped[str] = mapped_column(String(63), nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    target: Mapped[str] = mapped_column(Text, nullable=False)
+    event_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    reserved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RemediationQualification(Base):
+    """One qualification record of an agent's action (AUTOMATED-REMEDIATION-22).
+
+    @spec AUTOMATED-REMEDIATION-22. For one ``(agent_id, connector, tool,
+    connector_digest, verifier_sha256)``: the evidence references the API checked
+    by state and digest when the record was written, the worst case statement and
+    the operator principal that recorded it. Never updated; valid only while the
+    acting connector's in-force digest is ``connector_digest``.
+    """
+
+    __tablename__ = "remediation_qualifications"
+    __table_args__ = (
+        CheckConstraint(
+            "char_length(worst_case) BETWEEN 1 AND 2000",
+            name="remediation_qualifications_worst_case_ck",
+        ),
+        CheckConstraint(
+            "verifier_sha256 ~ '^[0-9a-f]{64}$'",
+            name="remediation_qualifications_verifier_ck",
+        ),
+        CheckConstraint(
+            "reversibility IN ('reversible', 'idempotent')",
+            name="remediation_qualifications_reversibility_ck",
+        ),
+        Index("ix_remediation_qualifications_agent", "agent_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    connector: Mapped[str] = mapped_column(Text, nullable=False)
+    tool: Mapped[str] = mapped_column(Text, nullable=False)
+    connector_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    verifier_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    reversibility: Mapped[str] = mapped_column(Text, nullable=False)
+    recorded_by: Mapped[str] = mapped_column(Text, nullable=False)
+    worst_case: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    # The hook, action and generation whose bounds the record was evaluated against.
+    hook: Mapped[str | None] = mapped_column(String(63), nullable=True)
+    action: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class RemediationQualificationVerifierRun(Base):
+    """One verifier evaluation an operator started for a qualification.
+
+    @spec AUTOMATED-REMEDIATION-22. Its samples are ``read`` executions of the
+    declared verifier with ``authority_kind`` ``qualification`` and this run's
+    id as ``authority_ref``, anchored on ``started_at``; the outcome is written
+    once.
+    """
+
+    __tablename__ = "remediation_qualification_verifier_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IS NULL OR outcome IN ('verified', 'not-recovered', 'verifier-unavailable')",
+            name="remediation_qualification_verifier_runs_outcome_ck",
+        ),
+        CheckConstraint(
+            "(outcome IS NULL) = (decided_at IS NULL)",
+            name="remediation_qualification_verifier_runs_decided_ck",
+        ),
+        Index(
+            "ix_remediation_qualification_verifier_runs_qualification",
+            "agent_id",
+            "qualification_id",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    qualification_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    hook: Mapped[str] = mapped_column(String(63), nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    verifier_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    target: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    started_by: Mapped[str] = mapped_column(Text, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RemediationEscalation(Base):
+    """The failure report of one remediation whose outcome is not ``verified``.
+
+    @spec AUTOMATED-REMEDIATION-19. Written in the transaction that writes the
+    outcome (``remediation_escalation.escalate``), once per nomination. It is
+    what the worker remediation loop delivers to the policy's route and the
+    delivery's thread. ``undo_approval_id`` is the undo approval (purpose
+    ``remediation``, dedupe key ``remediation-undo:<nomination id>``) offered
+    for a ``reversible`` action whose record was undoable, else null.
+    """
+
+    __tablename__ = "remediation_escalations"
+    __table_args__ = (
+        UniqueConstraint("nomination_id", name="uq_remediation_escalations_nomination"),
+        UniqueConstraint("undo_approval_id", name="uq_remediation_escalations_undo_approval"),
+        CheckConstraint(
+            "outcome IN ('not-recovered', 'verifier-unavailable', 'superseded')",
+            name="remediation_escalations_outcome_ck",
+        ),
+        CheckConstraint(
+            "undo_approval_id IS NULL OR action_id IS NOT NULL",
+            name="remediation_escalations_undo_ck",
+        ),
+        Index("ix_remediation_escalations_agent", "agent_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    nomination_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    action_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    undo_approval_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.approvals.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class RemediationReceiptPost(Base):
+    """One remediation receipt the worker loop has claimed: its lease and whether it posted.
+
+    @spec AUTOMATED-REMEDIATION-20. Keyed by nomination and stage, so a stage
+    posts once across passes, leases and worker replicas. It holds no message
+    text, argument or reason; the message is rendered from the nomination row
+    when it is posted.
+    """
+
+    __tablename__ = "remediation_receipt_posts"
+    __table_args__ = (
+        CheckConstraint(
+            "stage IN ('nominated', 'refused', 'approval_requested', 'executed', 'verified', "
+            "'not-recovered', 'verifier-unavailable', 'superseded', 'undo_requested', "
+            "'undone', 'escalated')",
+            name="remediation_receipt_posts_stage_ck",
+        ),
+        CheckConstraint("attempts >= 0", name="remediation_receipt_posts_attempts_ck"),
+    )
+
+    nomination_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.remediation_nominations.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    stage: Mapped[str] = mapped_column(Text, primary_key=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    dead_lettered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class IdentityNamespace(Base):
+    """Where a provider's user ids are unique, per tenant (#2910, ADR 0198 decision 1).
+
+    For Slack, one ``slack_workspace`` per team id. ``authority`` is always the
+    receiving installation's, never the event's (ADR 0198 decision 6, property
+    3). Disabling a namespace keeps its links; resolution into it answers
+    ``namespace_disabled`` (decision 9).
+    """
+
+    __tablename__ = "identity_namespaces"
+    __table_args__ = (
+        CheckConstraint(_PROVIDER_CK, name="identity_namespaces_provider_ck"),
+        CheckConstraint("kind IN ('slack_workspace')", name="identity_namespaces_kind_ck"),
+        CheckConstraint("status IN ('active', 'disabled')", name="identity_namespaces_status_ck"),
+        CheckConstraint(
+            "kind <> 'slack_workspace' OR (provider = 'slack' AND key ~ '^T[A-Z0-9]{2,}$')",
+            name="identity_namespaces_slack_workspace_key_ck",
+        ),
+        CheckConstraint("length(key) > 0", name="identity_namespaces_key_ck"),
+        UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "authority",
+            "kind",
+            "key",
+            name="identity_namespaces_tenant_provider_authority_kind_key_key",
+        ),
+        # Target of identity_links' tenant-scoped namespace foreign key.
+        UniqueConstraint("tenant_id", "id", name="identity_namespaces_tenant_id_id_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id", name="identity_namespaces_tenant_id_fkey")
+    )
+    provider: Mapped[str] = mapped_column(String)
+    authority: Mapped[str] = mapped_column(String, default="", server_default="")
+    kind: Mapped[str] = mapped_column(String)
+    key: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String, default="active", server_default="active")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class IdentityLink(Base):
+    """One native id in one namespace, bound to one principal or one bot (#2910).
+
+    Immutable apart from ``revoked_at`` (ADR 0198 decision 5): changing a
+    mapping revokes the link and creates a new one. Only active links count toward uniqueness, so a
+    revoked row keeps its evidence. Every foreign key is NO ACTION, and the
+    namespace, principal and bot keys carry ``tenant_id``, so no link crosses a
+    tenant.
+    """
+
+    __tablename__ = "identity_links"
+    __table_args__ = (
+        CheckConstraint(
+            "(principal_id IS NULL) <> (bot_id IS NULL)", name="identity_links_target_xor_ck"
+        ),
+        CheckConstraint(
+            "verification_source IN ('provider_event_verified', 'admin_mapped')",
+            name="identity_links_verification_source_ck",
+        ),
+        CheckConstraint("length(provider_native_id) > 0", name="identity_links_native_id_ck"),
+        ForeignKeyConstraint(
+            ["tenant_id", "identity_namespace_id"],
+            [f"{SCHEMA}.identity_namespaces.tenant_id", f"{SCHEMA}.identity_namespaces.id"],
+            name="identity_links_namespace_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="identity_links_principal_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "created_by_principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="identity_links_created_by_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "bot_id"],
+            [f"{SCHEMA}.agents.tenant_id", f"{SCHEMA}.agents.id"],
+            name="identity_links_bot_fkey",
+        ),
+        Index(
+            "identity_links_active_native_key",
+            "identity_namespace_id",
+            "provider_native_id",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    identity_namespace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    provider_native_id: Mapped[str] = mapped_column(String)
+    principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    bot_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    verification_source: Mapped[str] = mapped_column(String)
+    created_by_principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    verified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)

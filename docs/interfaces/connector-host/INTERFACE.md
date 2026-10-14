@@ -157,13 +157,17 @@ placeholder, and gives none to a remote or fallback URL. The signing key never
 enters a sandbox
 (`apps/worker/src/curie_worker/sandbox/types.py::HOST_APPLICATION_CREDENTIAL_ENV_NAMES`).
 
-When the API holds the matching public key, `render` puts a caller proxy in
-front of every hosted connector it renders
+Hosted rendering requires a caller proxy with a valid public key: `render`
+refuses a hosted connector without one with `hosted_connector_requires_caller_key`.
+A remote connector returns no objects and needs no caller key. Every hosted
+connector that renders has the proxy in front of it
 (`packages/plugin-format/src/plugin_format/connector_render.py::ConnectorProxy`).
 The proxy runs from the worker image as `python -m curie_connector_proxy`, pulled
-with the worker's pull policy and pull secrets, and holds only the public keys
-and the connector's `admits` list, resolved at render
-(`packages/plugin-format/src/plugin_format/connector_render.py::resolved_admits`).
+with the worker's pull policy and pull secrets, and holds the public keys, the
+connector's `admits` list, resolved at render
+(`packages/plugin-format/src/plugin_format/connector_render.py::resolved_admits`),
+the connector's gated tool patterns, its name and the grant store URL
+(`apps/worker/src/curie_connector_proxy/server.py::ProxyConfig`).
 The Service keeps the connector's port, so the URL and the allowed hosts do not
 move, and lands it on the proxy's port. Both rendered NetworkPolicies open only
 that port, so nothing Curie renders opens the server's own port.
@@ -175,28 +179,53 @@ which selects the same pods and targets the server's own port
 (`packages/plugin-format/src/plugin_format/connector_render.py::render_direct_service`).
 No rendered policy opens that port, so a sandbox cannot use it. It admits only
 the peers of an operator-applied ingress policy naming the server's port,
-because policies are additive. An install with no caller key renders no
-`-direct` Service.
+because policies are additive. An install with no caller key cannot render a
+hosted connector, including its `-direct` Service.
 
 The proxy admits a request whose token either configured key
 verifies, that has not expired and that names a listed agent
-(`apps/worker/src/curie_connector_proxy/caller.py::decide`), strips the header
-and forwards it to the server over loopback with its `Host` unchanged and its
-body as sent, never decoded
-(`apps/worker/src/curie_connector_proxy/server.py::make_app`). It checks every
+(`apps/worker/src/curie_connector_proxy/caller.py::decide`) and, for a POST,
+that passes the grant check below. It strips the header and forwards the
+request to the server over loopback with its `Host` unchanged and its body as
+sent
+(`apps/worker/src/curie_connector_proxy/server.py::make_app`). On that forward
+it sets `X-Curie-Agent` from the verified token. When the token also carries
+`run` and `work_item` (ADR 0178), it sets `X-Curie-Run` and
+`X-Curie-Work-Item` from those claims. Inbound copies of the three headers
+are dropped first, so a caller cannot supply them. A token without the pair
+sets no run headers. A connector trusts the identity headers only on this
+loopback forward. The `-direct` Service skips the proxy, so a connector
+reached there has no run. It checks every
 path the same way, the MCP client's OAuth discovery and registration requests
 included. Its log line quotes the path, and aiohttp's own error and access logs
-redact a caller token. Any other request gets a 403 carrying a JSON-RPC error and no
+redact a caller token.
+
+An admitted POST is also read before it is forwarded. When its body holds a
+`tools/call` for a gated tool, the proxy needs exactly one
+`X-Curie-Connector-Grant` header whose grant verifies against the same keys,
+has not expired, and names this agent, this connector, this tool and the call's
+canonical arguments
+(`apps/worker/src/curie_connector_proxy/server.py::_grant_refused`). The grant's
+`jti` is then spent once in Valkey with `SET NX EX`, so a replayed grant, a
+missing grant store or a failed spend refuses the call. A body with two or more
+gated calls is refused before any grant is spent. The grant header is stripped
+before the forward. A refused grant check answers with the JSON-RPC refusal
+below, reason `grant_required`
+(`apps/worker/src/curie_connector_proxy/caller.py::GRANT_REQUIRED`). A body
+over 1 MiB is refused with a plain-text 403, not the JSON-RPC refusal, and never
+reaches the server.
+
+A request the token check does not admit gets a 403 carrying a JSON-RPC error and no
 challenge, and never reaches the server; the shape is frozen in
 `tests/vectors/connector-caller-refusal.json`, and the runner reports it as the
 connector refusing this sandbox
 (`runner/src/curie_runner/mcp_tool_capability.py::ConnectorCapabilityFailure`).
 The token wire is frozen in `tests/vectors/connector-caller-token.json`. An API
-with no public key renders no proxy, and the network policy is then the whole
-of the check again. A runner booted by a worker that held no key carries no
+with no public key refuses hosted rendering rather than relying only on network
+policy. A runner booted by a worker that held no key carries no
 token, and every proxied connector refuses its calls until the next turn on its
 thread that a worker holding the key takes, which claims a fresh one
-(`apps/worker/src/curie_worker/kernel.py::_boots_differently`). The minting
+(`apps/worker/src/curie_worker/kernel/claim.py::_boots_differently`). The minting
 worker and the proxy ship in the same release, so during the upgrade that gives
 an install its key this covers every runner from before it and any runner a
 worker pod the roll has not replaced yet boots; `charts/curie/README.md` says
@@ -268,7 +297,7 @@ The port is a real `Protocol`, and the values crossing it are Kubernetes:
   (`ConnectorStartSpec` in `cli/src/docker.rs`), tags it with its own
   `CONNECTOR_COMPONENT_LABEL` and reaps undesired ones by that label, then
   blocks on its own readiness wait, `wait_for_connectors_ready`, called from
-  `bring_up_local` and `start_skill_connectors` in `cli/src/commands.rs`. That
+  `bring_up_local` and `start_skill_connectors` in `cli/src/commands/connector_images.rs`. That
   path goes around both `render` and `ConnectorClient`: it neither consumes the
   rendered Kubernetes objects nor implements the port, so it is leakage, not a
   second implementation. Of the two cluster appliers, the CLI applies the same

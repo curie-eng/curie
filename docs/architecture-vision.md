@@ -29,9 +29,11 @@ runtimes on Kubernetes or Docker, `runner/` serves the ACI protocol inside the
 sandbox, `apps/api` owns agents/versions/deployments and the git-flow deploy
 engine, and `apps/ui` and `cli/` are the operator surfaces. The core's own
 internal seams are already contracts: `packages/aci-protocol` and
-`packages/plugin-format` are frozen, tri-language (Pydantic source of truth,
-committed JSON Schema, generated TypeScript and Rust), and guarded by a
-schema-compat CI test.
+`packages/plugin-format` are frozen and guarded by schema-compat CI tests.
+`aci-protocol` is tri-language (Pydantic source of truth, committed JSON
+Schema, generated TypeScript and Rust). `plugin-format` is a frozen JSON
+Schema plus a CLI field-parity gate; its Rust is hand-written and not
+generated ([ADR 0194](adr/0194-plugin-format-contract-is-the-frozen-schema-plus-a-parity-gate.md)).
 
 ## The six swappable jobs
 
@@ -49,14 +51,17 @@ all compile against the generated artifacts; none of them import the SDK.
 claude-agent-sdk-coupled: `runner/src/curie_runner/adapter.py` defines a
 `ModelSession` protocol and implements it with `ClaudeSDKClient` in
 streaming-input mode (native steer and interrupt), and `translate.py` maps SDK
-messages to ACI events. Above the session sits the declared-package layer from
-ADR-0060: a `HarnessContribution` manifest (name, image, install, auth,
-read-only tool set, spawn env) registered through the `curie.harness`
-entry-point group (`runner/src/curie_runner/harness/`), selected at boot via
-`CURIE_HARNESS` and defaulting to the built-in Claude contribution. Exactly
-one contribution exists today, so the registry is a guarded indirection around
-the same adapter; conformance checks for third-party contributions are pending
-(ADR-0062).
+messages to ACI events. Above the session sits `HarnessContribution`, whose
+fields are `name`, `aliases`, `readonly_tools`, `build_spawn_env`,
+`compile_bundle`, and `supports_structured_replay`. The `curie.harness` entry
+point registry retains guarded discovery, but the internal `CURIE_HARNESS`
+setting admits only Claude and its existing aliases at boot. Every other name
+is refused before discovery, including a registered nonClaude contribution.
+[ADR 0140](adr/0140-curie-supports-one-model-harness-until-a-second-one-exists.md)
+limits supported engines to Claude and stops the unfinished selector and
+conformance program until a real second engine exists. Approval policy stays
+in the core gate without SDK imports; its SDK callbacks and hook matchers live
+in `runner/src/curie_runner/harness/claude/approval.py`.
 
 **Swap (candidates: ADK, Codex, Strands, other Claude Agent SDK variants):**
 implement a new ACI server (an HTTP process that accepts `/v1/event`,
@@ -87,7 +92,7 @@ over OTLP-HTTP to the collector (`runner/src/curie_runner/otel.py`), and the
 collector is the single component that authenticates and forwards to Langfuse
 (`charts/curie/templates/otel-collector.yaml`, needed because Langfuse OTLP
 ingest is HTTP-only). On the read side the UI consumes only our API's schemas
-(`ObservationNode`, `MetricsSummary` in `apps/api/src/curie_api/schemas.py`).
+(`ObservationNode`, `MetricsSummary` in `apps/api/src/curie_api/schemas/observability.py`).
 
 **Current adapter:** `apps/api/src/curie_api/langfuse.py` (trace list, tree
 reconstruction from `parentObservationId`, metrics queries) plus

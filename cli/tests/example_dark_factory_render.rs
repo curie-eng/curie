@@ -6,7 +6,7 @@
 //! build with no published layer still renders, and says which `curie build`
 //! replaces it, instead of leaving the refusal to the deploy.
 
-mod support;
+use crate::support;
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -121,6 +121,27 @@ fn the_render_receipt_schema_rejects_malformed_nullable_fields() {
             "{field} must accept only a string or null"
         );
     }
+}
+
+#[test]
+fn a_rendered_bundle_includes_its_runner_environment_overlay() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("factory");
+    receipt(&render(&out, None, None));
+
+    let overlay = std::fs::read(out.join("values.yaml")).expect("render wrote values.yaml");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/dark-factory/values.yaml");
+    assert_eq!(overlay, std::fs::read(source).unwrap());
+    let values: Value = serde_norway::from_slice(&overlay).unwrap();
+    assert_eq!(
+        values.pointer("/agentSandbox/runnerEnv/dark-factory/CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
+        Some(&serde_json::json!("16000")),
+        "the rendered overlay configures the selected agent's process environment"
+    );
+    assert!(
+        values.pointer("/agentSandbox/runnerImages").is_none(),
+        "the output ceiling must also work with the platform runner"
+    );
 }
 
 #[test]

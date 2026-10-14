@@ -9,5 +9,16 @@
     "kind": "chat",
     "scope": "approval.resolve",
     "sub": "U0EXAMPLE1"
+  },
+  "test_driver": {
+    "claims": {
+      "actor_channel": "C0EXAMPLE1",
+      "approval_id": "00000000-0000-4000-8000-000000000153",
+      "exp": 160,
+      "kind": "test_driver",
+      "scope": "approval.resolve",
+      "sub": "U0EXAMPLE1"
+    },
+    "token": "apr.eyJhY3Rvcl9jaGFubmVsIjoiQzBFWEFNUExFMSIsImFwcHJvdmFsX2lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMTUzIiwiZXhwIjoxNjAsImtpbmQiOiJ0ZXN0X2RyaXZlciIsInNjb3BlIjoiYXBwcm92YWwucmVzb2x2ZSIsInN1YiI6IlUwRVhBTVBMRTEifQ.wLwxXLFt0HVQtStLSUUJmnUcph1_kmCZwnFQBxX9bLM"
   }
 }

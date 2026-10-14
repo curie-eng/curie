@@ -12,8 +12,10 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 python3 - "$CHART" "$WORK" <<'PY'
+import base64
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -23,14 +25,36 @@ import yaml
 chart = pathlib.Path(sys.argv[1])
 work = pathlib.Path(sys.argv[2])
 
+# Compare full pod templates with stable credentials across offline renders.
+# An upgrade also needs a constant externally persisted installation identity;
+# replace only that Kubernetes lookup input in a disposable candidate copy.
+INSTALLATION_ID = "acme" + "0" * 28
+fixture = work / "chart-fixture"
+shutil.copytree(chart, fixture)
+helpers_path = fixture / "templates" / "_helpers.tpl"
+helpers = helpers_path.read_text()
+lookup_boundary = 'lookup "v1" "Secret" .Release.Namespace (include "curie.secretName" .) | default dict'
+if helpers.count(lookup_boundary) != 1:
+    raise SystemExit("identity fixture requires exactly one managed Secret lookup boundary")
+encoded_id = base64.b64encode(INSTALLATION_ID.encode()).decode()
+helpers_path.write_text(helpers.replace(
+    lookup_boundary,
+    f'(dict "data" (dict "installationId" "{encoded_id}")) | default dict',
+    1,
+))
+chart = fixture
+
 SECRET = "acme-curie-secrets"
 DECLARATION = "CURIE_SLACK_IDENTITIES"
 INDEXED = ("CURIE_SLACK_APP_TOKEN__", "CURIE_SLACK_BOT_TOKEN__", "CURIE_SLACK_SIGNING_SECRET__")
-# Generated credentials differ on every render; compare these by key set only.
+# Preserve the existing key-set checks for credential and upgrade-hook docs.
+# Workload comparisons retain checksum/secret and every other pod-template field.
 RANDOM_DOCS = {
     ("Secret", SECRET),
+    ("Secret", "acme-curie-runner-token"),
     ("Job", "acme-curie-upgrade-drain"),
     ("Job", "acme-curie-upgrade-drain-attest"),
+    ("Job", "acme-curie-upgrade-drain-hold"),
     ("Job", "acme-curie-upgrade-drain-release"),
 }
 PLAIN = {"dispatcher": {"slack": {"appToken": "xapp-example", "botToken": "xoxb-example"}}}
@@ -47,7 +71,7 @@ def render(values, *args, source=None, ok=True):
     output = work / str(count)
     result = subprocess.run(
         ["helm", "template", "acme", str(source or chart), "-f", str(values_file),
-         "--output-dir", str(output), *args],
+         "--set", "security.allowDevDefaults=true", "--output-dir", str(output), *args],
         text=True,
         capture_output=True,
     )
@@ -116,7 +140,7 @@ def identity_env_names(output):
     return names
 
 
-def same_objects(label, left, right, ignore=()):
+def same_objects(label, left, right, ignore=(), *, is_upgrade):
     """Every deterministic object equal, and the random ones equal by key set."""
     a, b = documents(left), documents(right)
     assert a.keys() == b.keys(), f"{label}: object sets differ: {sorted(set(a) ^ set(b))}"
@@ -128,6 +152,33 @@ def same_objects(label, left, right, ignore=()):
                 f"{label}: {key} carries a different set of keys"
             )
             continue
+        if key == ("Job", "acme-curie-schema-migrate"):
+            # Validate the real identity resolution against the managed Secret
+            # and persisted lookup fixture, then compare the complete Job.
+            for docs, job in ((a, a[key]), (b, b[key])):
+                containers = job["spec"]["template"]["spec"]["containers"]
+                migrate = [item for item in containers if item.get("name") == "schema-migrate"]
+                assert len(migrate) == 1, f"{label}: schema-migrate container is missing or ambiguous"
+                identities = named(migrate[0].get("env", []), "CURIE_INSTALLATION_ID")
+                if not is_upgrade:
+                    assert not identities, f"{label}: install migrate must omit pause installation identity"
+                    continue
+                assert len(identities) == 1, f"{label}: migrate installation identity is duplicated"
+                identity = identities[0]
+                assert set(identity) == {"name", "value"}, (
+                    f"{label}: migrate installation identity must be one literal value"
+                )
+                value = identity["value"]
+                assert isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9]{32}", value), (
+                    f"{label}: installation identity must be 32 alphanumeric characters"
+                )
+                secret = docs[("Secret", SECRET)]
+                assert value == (secret.get("stringData") or {}).get("installationId"), (
+                    f"{label}: migrate identity differs from its own managed Secret installationId"
+                )
+                assert value == INSTALLATION_ID, (
+                    f"{label}: upgrade did not retain the lookup fixture installationId"
+                )
         assert a[key] == b[key], f"{label}: {key} differs from the reference render"
 
 
@@ -229,12 +280,12 @@ assert identity_env_names(byo) == []
 # --- S4: an empty or null list is the stock shape, fresh and on upgrade -----
 for label, identities in (("S4 empty", []), ("S4 null", None)):
     _, output = render({"dispatcher": {"slack": {**PLAIN["dispatcher"]["slack"], "identities": identities}}})
-    same_objects(label, plain, output)
+    same_objects(label, plain, output, is_upgrade=False)
 _, plain_upgrade = render(PLAIN, "--is-upgrade")
 _, empty_upgrade = render(
     {"dispatcher": {"slack": {**PLAIN["dispatcher"]["slack"], "identities": []}}}, "--is-upgrade"
 )
-same_objects("S4 upgrade", plain_upgrade, empty_upgrade)
+same_objects("S4 upgrade", plain_upgrade, empty_upgrade, is_upgrade=True)
 
 # --- T1: the block plus two listed identities -------------------------------
 _, block_only = render(slack(**BLOCK_REFS))
@@ -285,6 +336,7 @@ same_objects(
     "T1 everything else",
     block_only,
     two,
+    is_upgrade=False,
     ignore={("Deployment", "acme-curie-dispatcher"), ("Deployment", "acme-curie-worker"),
             ("Deployment", "acme-curie-api")},
 )

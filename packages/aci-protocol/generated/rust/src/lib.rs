@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.5.11";
+pub const PROTOCOL_VERSION: &str = "0.5.22";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -163,6 +163,8 @@ pub struct BootEnv {
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
+    pub reviewer_model: Option<String>,
+    #[serde(default)]
     pub fake_model: Option<bool>,
     #[serde(default)]
     pub history_ref: Option<String>,
@@ -170,6 +172,10 @@ pub struct BootEnv {
     pub history_token: Option<String>,
     #[serde(default)]
     pub memory_token: Option<String>,
+    #[serde(default)]
+    pub channel_memory_ref: Option<String>,
+    #[serde(default)]
+    pub memory_writes: Option<bool>,
     #[serde(default)]
     pub state_url: Option<String>,
     #[serde(default)]
@@ -182,6 +188,8 @@ pub struct BootEnv {
     pub issue_read_url: Option<String>,
     #[serde(default)]
     pub issue_read_token: Option<String>,
+    #[serde(default)]
+    pub attachments_manifest: Option<String>,
     #[serde(default)]
     pub approval_required_tools: Option<Vec<String>>,
     #[serde(default)]
@@ -215,6 +223,14 @@ pub struct BootEnv {
     #[serde(default)]
     pub channel_bound: Option<bool>,
     #[serde(default)]
+    pub channel_kind: Option<String>,
+    #[serde(default)]
+    pub repo_origin: Option<String>,
+    #[serde(default)]
+    pub repo_path: Option<String>,
+    #[serde(default)]
+    pub repo_ca_bundle: Option<String>,
+    #[serde(default)]
     pub model_env_key: Option<String>,
     #[serde(default)]
     pub metrics_temporality_preference: Option<String>,
@@ -224,6 +240,8 @@ pub struct BootEnv {
     pub history_max_turns: Option<i64>,
     #[serde(default)]
     pub history_max_bytes: Option<i64>,
+    #[serde(default)]
+    pub memory_max_facts: Option<i64>,
 }
 
 /// Boot-env variable names, generated from aci_protocol.session.BootEnv.
@@ -236,10 +254,13 @@ pub mod env_keys {
     pub const CURIE_APPROVAL_GRANT_TOOL: &str = "CURIE_APPROVAL_GRANT_TOOL";
     pub const CURIE_APPROVAL_REQUIRED_TOOLS: &str = "CURIE_APPROVAL_REQUIRED_TOOLS";
     pub const CURIE_APPROVAL_RESUMED_KIND: &str = "CURIE_APPROVAL_RESUMED_KIND";
+    pub const CURIE_ATTACHMENTS_MANIFEST: &str = "CURIE_ATTACHMENTS_MANIFEST";
     pub const CURIE_BUDGET: &str = "CURIE_BUDGET";
     pub const CURIE_BUNDLE_REF: &str = "CURIE_BUNDLE_REF";
     pub const CURIE_BUNDLE_VERSION: &str = "CURIE_BUNDLE_VERSION";
     pub const CURIE_CHANNEL_BOUND: &str = "CURIE_CHANNEL_BOUND";
+    pub const CURIE_CHANNEL_KIND: &str = "CURIE_CHANNEL_KIND";
+    pub const CURIE_CHANNEL_MEMORY_REF: &str = "CURIE_CHANNEL_MEMORY_REF";
     pub const CURIE_CONNECTOR_AGENT: &str = "CURIE_CONNECTOR_AGENT";
     pub const CURIE_CONNECTOR_CALLER_TOKEN: &str = "CURIE_CONNECTOR_CALLER_TOKEN";
     pub const CURIE_CONNECTOR_NAMESPACE: &str = "CURIE_CONNECTOR_NAMESPACE";
@@ -255,14 +276,20 @@ pub mod env_keys {
     pub const CURIE_ISSUE_READ_TOKEN: &str = "CURIE_ISSUE_READ_TOKEN";
     pub const CURIE_ISSUE_READ_URL: &str = "CURIE_ISSUE_READ_URL";
     pub const CURIE_MAX_TURNS: &str = "CURIE_MAX_TURNS";
+    pub const CURIE_MEMORY_MAX_FACTS: &str = "CURIE_MEMORY_MAX_FACTS";
     pub const CURIE_MEMORY_REF: &str = "CURIE_MEMORY_REF";
     pub const CURIE_MEMORY_TOKEN: &str = "CURIE_MEMORY_TOKEN";
+    pub const CURIE_MEMORY_WRITES: &str = "CURIE_MEMORY_WRITES";
     pub const CURIE_MODEL: &str = "CURIE_MODEL";
     pub const CURIE_MODEL_API_BACKEND: &str = "CURIE_MODEL_API_BACKEND";
     pub const CURIE_MODEL_ENV_KEY: &str = "CURIE_MODEL_ENV_KEY";
     pub const CURIE_PLUGIN_DIR: &str = "CURIE_PLUGIN_DIR";
     pub const CURIE_PROGRESS_TOKEN: &str = "CURIE_PROGRESS_TOKEN";
     pub const CURIE_PROGRESS_URL: &str = "CURIE_PROGRESS_URL";
+    pub const CURIE_REPO_CA_BUNDLE: &str = "CURIE_REPO_CA_BUNDLE";
+    pub const CURIE_REPO_ORIGIN: &str = "CURIE_REPO_ORIGIN";
+    pub const CURIE_REPO_PATH: &str = "CURIE_REPO_PATH";
+    pub const CURIE_REVIEWER_MODEL: &str = "CURIE_REVIEWER_MODEL";
     pub const CURIE_RUNNER_PORT: &str = "CURIE_RUNNER_PORT";
     pub const CURIE_RUNNER_TOKEN: &str = "CURIE_RUNNER_TOKEN";
     pub const CURIE_SANDBOX_ID: &str = "CURIE_SANDBOX_ID";
@@ -366,6 +393,8 @@ pub struct ApprovalRequest {
     pub reply_endpoint: Option<String>,
     #[serde(default)]
     pub reply_adapter: Option<String>,
+    #[serde(default)]
+    pub reply_identity: Option<String>,
     pub dedupe_key: String,
     #[serde(default)]
     pub route: Option<String>,
@@ -400,6 +429,22 @@ pub struct PublicationContext {
     pub observed_at: String,
 }
 
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ChannelReadCapability {
+    pub url: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for ChannelReadCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChannelReadCapability")
+            .field("url", &self.url)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum InboundMessage {
@@ -417,6 +462,10 @@ pub enum InboundMessage {
         publication_context: Option<PublicationContext>,
         #[serde(default)]
         tool_access: Option<ToolAccess>,
+        #[serde(default)]
+        memory_token: Option<String>,
+        #[serde(default)]
+        channel_read: Option<ChannelReadCapability>,
     },
     #[serde(rename = "interrupt")]
     Interrupt {
@@ -550,6 +599,8 @@ mod tests {
             publication_context: None,
             // TOOL-ACCESS-1: the enum's wire spelling round-trips too.
             tool_access: Some(ToolAccess::ReadOnly),
+            memory_token: None,
+            channel_read: None,
         };
         let encoded = serde_json::to_string(&message).unwrap();
         assert!(encoded.contains(r#""tool_access":"read-only""#));
@@ -558,6 +609,106 @@ mod tests {
         assert!(serde_json::from_str::<InboundMessage>(&unknown).is_err());
         let decoded: InboundMessage = serde_json::from_str(&encoded).unwrap();
         assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn channel_read_roundtrips_without_debug_disclosure() {
+        let token = "channel.read.example.signature-sentinel";
+        let capability = ChannelReadCapability {
+            url: "https://api.example.com/channel-read".to_string(),
+            token: token.to_string(),
+        };
+        for rendered in [format!("{:?}", capability), format!("{:#?}", capability)] {
+            assert!(!rendered.contains(token));
+            assert!(rendered.contains("[REDACTED]"));
+        }
+        let message = InboundMessage::Event {
+            r#type: EventType::Message,
+            text: "hello".to_string(),
+            user: "U0EXAMPLE1".to_string(),
+            ts: "1.0".to_string(),
+            session_id: None,
+            history_ref: None,
+            publication_context: None,
+            tool_access: None,
+            memory_token: None,
+            channel_read: Some(capability),
+        };
+        for rendered in [format!("{:?}", message), format!("{:#?}", message)] {
+            assert!(!rendered.contains(token));
+            assert!(rendered.contains("[REDACTED]"));
+        }
+        let encoded = serde_json::to_string(&message).unwrap();
+        assert!(encoded.contains(token));
+        let decoded: InboundMessage = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn channel_read_requires_both_children() {
+        for capability in [
+            serde_json::json!({"url": "https://api.example.com/channel-read"}),
+            serde_json::json!({"token": "channel.read.example.signature-sentinel"}),
+            serde_json::json!({"url": null, "token": "example-token"}),
+            serde_json::json!({"url": "https://api.example.com/channel-read", "token": null}),
+        ] {
+            let frame = serde_json::json!({
+                "kind": "event", "type": "message", "text": "hello",
+                "user": "U0EXAMPLE1", "ts": "1.0", "channel_read": capability,
+            });
+            assert!(serde_json::from_value::<InboundMessage>(frame).is_err());
+        }
+    }
+
+    #[test]
+    fn channel_read_remains_optional_for_existing_events() {
+        let mut frame = serde_json::json!({
+            "kind": "event", "type": "message", "text": "hello",
+            "user": "U0EXAMPLE1", "ts": "1.0",
+        });
+        let omitted: InboundMessage = serde_json::from_value(frame.clone()).unwrap();
+        assert!(matches!(omitted, InboundMessage::Event { channel_read: None, .. }));
+        frame["channel_read"] = serde_json::Value::Null;
+        let explicit_null: InboundMessage = serde_json::from_value(frame).unwrap();
+        assert_eq!(omitted, explicit_null);
+    }
+
+    #[test]
+    fn previous_event_reader_ignores_the_new_channel_read_object() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        struct PreviousEvent {
+            kind: String,
+            r#type: EventType,
+            text: String,
+            user: String,
+            ts: String,
+            #[serde(default)]
+            session_id: Option<String>,
+            #[serde(default)]
+            history_ref: Option<String>,
+            #[serde(default)]
+            publication_context: Option<PublicationContext>,
+            #[serde(default)]
+            tool_access: Option<ToolAccess>,
+            #[serde(default)]
+            memory_token: Option<String>,
+        }
+        let mut frame = serde_json::json!({
+            "kind": "event", "type": "message", "text": "hello",
+            "user": "U0EXAMPLE1", "ts": "1.0", "session_id": "example-session",
+            "history_ref": "https://api.example.com/history",
+            "tool_access": "read-only",
+        });
+        let before: PreviousEvent = serde_json::from_value(frame.clone()).unwrap();
+        frame["channel_read"] = serde_json::json!({
+            "url": "https://api.example.com/channel-read",
+            "token": "channel.read.example.signature-sentinel",
+            "future_nested_field": true,
+        });
+        let after: PreviousEvent = serde_json::from_value(frame.clone()).unwrap();
+        assert_eq!(before, after);
+        let current: InboundMessage = serde_json::from_value(frame).unwrap();
+        assert!(matches!(current, InboundMessage::Event { channel_read: Some(_), .. }));
     }
 
     #[test]
@@ -592,13 +743,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.5.12","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.23","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.5.11","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.22","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

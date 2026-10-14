@@ -48,16 +48,31 @@ def test_packaged_schema_metadata_matches_api_authority() -> None:
     ],
 )
 def test_revision_gate_rejects_stale_packaged_metadata(tmp_path: Path, mutation: str) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
     for source in [
         "scripts/check-alembic-revisions.py",
         "apps/api/src/curie_api/schema_compat.json",
         "apps/api/src/curie_api/revision_kinds.json",
+        "cli/src/application_schema_windows.json",
         str(ARTIFACT),
     ]:
         target = tmp_path / source
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(REPO / source, target)
     shutil.copytree(REPO / "apps/api/alembic", tmp_path / "apps/api/alembic")
+    # @spec PROTECTED-HOOK-SOURCE-2: derive the owned copy from its actual graph.
+    graph = {}
+    for revision in ScriptDirectory(str(tmp_path / "apps/api/alembic")).walk_revisions():
+        parent = revision.down_revision
+        graph[revision.revision] = (
+            list(parent) if isinstance(parent, (list, tuple)) else [parent] if parent else []
+        )
+    catalog = json.loads((tmp_path / "cli/src/application_schema_windows.json").read_text())
+    candidate = catalog["candidate"]
+    owner = tmp_path / "packages/protected-hooks/src/curie_protected_hooks/schema_serving.json"
+    owner.parent.mkdir(parents=True, exist_ok=True)
+    owner.write_text(json.dumps(dict(**candidate, revision_parents=graph),
+                                indent=2, sort_keys=True) + "\n")
     checker = tmp_path / "scripts/check-alembic-revisions.py"
     healthy = run_script(checker)
     assert healthy.returncode == 0, healthy.stderr

@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 
 use curie::artifacts::{ensure_cached, Resolved};
 use std::fs;

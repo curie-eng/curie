@@ -1,5 +1,4 @@
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -370,6 +369,7 @@ if [ -n "${{CURIE_TEST_CALL_LOG:-}}" ]; then
     printf 'KUBECTL_CALL: %s\n' "$*" >> "$CURIE_TEST_CALL_LOG"
 fi
 all="$*"
+curie_test_capacity_read "$@"
 script=""
 previous=""
 for argument in "$@"; do
@@ -433,6 +433,12 @@ case "$verb $object" in
     # Empty stdout with exit 0 is kubectl --ignore-not-found for an absent class.
     :
     ;;
+'get runtimeclass')
+    # A real-model install now GETs the RuntimeClass. Forbidden keeps these
+    # tests on the install path they already assert.
+    printf '%s\n' 'Error from server (Forbidden): runtimeclasses.node.k8s.io "gvisor" is forbidden: User "system:serviceaccount:example:example" cannot get resource "runtimeclasses" in API group "node.k8s.io" at the cluster scope' >&2
+    exit 1
+    ;;
 'get namespace')
     case "$all" in
         *'get namespace parity '*)
@@ -483,6 +489,7 @@ case "$verb $object" in
     fi
     case "$all" in
         '-n parity rollout restart deployment/parity-curie-worker'|\
+        '-n parity rollout restart deployment/parity-curie-api'|\
         '-n parity rollout restart deployment/parity-curie-dispatcher') : ;;
         *) unexpected ;;
     esac
@@ -493,6 +500,7 @@ case "$verb $object" in
     fi
     case "$all" in
         '-n parity rollout status deployment/parity-curie-worker --timeout=120s'|\
+        '-n parity rollout status deployment/parity-curie-api --timeout=120s'|\
         '-n parity rollout status deployment/parity-curie-dispatcher --timeout=120s') : ;;
         *) unexpected ;;
     esac
@@ -2213,7 +2221,7 @@ fn declarative_comms_replaces_byo_sources_in_diff_and_apply_but_omission_preserv
             "the follow-up comms upgrade must consume the declared Slack replacement"
         );
     }
-    for component in ["worker", "dispatcher"] {
+    for component in ["worker", "api", "dispatcher"] {
         for (action, suffix) in [("restart", ""), ("status", " --timeout=120s")] {
             let expected = format!(
                 "KUBECTL_CALL: -n parity rollout {action} deployment/parity-curie-{component}{suffix}"
@@ -5668,6 +5676,42 @@ fn diff_answers_the_same_against_an_explicitly_passed_chart() {
     );
 }
 
+fn assert_fake_model_is_only_set_by_gvisor_counterfactual(calls: &str) {
+    for call in calls.lines().filter(|call| call.contains("fakeModel")) {
+        assert!(
+            call.starts_with("HELM_CALL: template "),
+            "only the gVisor counterfactual render may set fakeModel:\n{call}"
+        );
+        let arguments: Vec<_> = call.split_whitespace().collect();
+        let templates: Vec<_> = arguments
+            .windows(2)
+            .filter(|pair| pair[0] == "--show-only")
+            .map(|pair| pair[1])
+            .collect();
+        assert_eq!(
+            templates,
+            ["templates/preflight-gvisor.yaml"],
+            "fakeModel may only override the gVisor preflight render:\n{call}"
+        );
+        let fake_model_arguments: Vec<_> = arguments
+            .iter()
+            .copied()
+            .filter(|argument| argument.contains("fakeModel"))
+            .collect();
+        assert_eq!(
+            fake_model_arguments,
+            ["agentSandbox.runner.fakeModel=false"],
+            "the counterfactual may only set fakeModel to false:\n{call}"
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--set", "agentSandbox.runner.fakeModel=false"]),
+            "the counterfactual fakeModel override must use --set:\n{call}"
+        );
+    }
+}
+
 /// #2459: `--fake-model` must IGNORE a recorded BYO credential reference, not
 /// erase it.
 ///
@@ -5723,12 +5767,12 @@ fn fake_model_up_preserves_a_recorded_byo_credential_reference() {
         "the key travels with the name; half a reference is not one:\n{supplied}"
     );
 
-    // Preserving it must not turn the fake model back into the real one. The
-    // CLI only ever pins this key to `false`, so its absence is the assertion.
-    let visible = format!("{}\n{supplied}", fixture.calls());
+    // The gVisor counterfactual may render real-model admission requirements,
+    // but preserving the reference must not change the applied model mode.
+    assert_fake_model_is_only_set_by_gvisor_counterfactual(&fixture.calls());
     assert!(
-        !visible.contains("fakeModel"),
-        "--fake-model must not select the real model off the value it preserved:\n{visible}"
+        !supplied.contains("fakeModel"),
+        "--fake-model must not select the real model off the value it preserved:\n{supplied}"
     );
 }
 
@@ -5787,12 +5831,12 @@ fn fake_model_up_preserves_a_recorded_model_and_inline_credential() {
         "--fake-model must re-supply the recorded model id:\n{calls}"
     );
 
-    // The CLI only ever pins this key to `false`, so its absence is the
-    // assertion that the effective runner is still fake.
-    let visible = format!("{calls}\n{supplied}");
+    // Only the gVisor counterfactual render may override fakeModel. The applied
+    // values must still preserve fake mode.
+    assert_fake_model_is_only_set_by_gvisor_counterfactual(&calls);
     assert!(
-        !visible.contains("fakeModel"),
-        "--fake-model must not select the real model off the values it preserved:\n{visible}"
+        !supplied.contains("fakeModel"),
+        "--fake-model must not select the real model off the values it preserved:\n{supplied}"
     );
 }
 
@@ -5883,10 +5927,7 @@ fn plain_up_preserves_a_recorded_local_model_install() {
         calls.contains("inference.persistence.size=40Gi"),
         "a recorded PVC size must not shrink back to the chart default:\n{calls}"
     );
-    assert!(
-        !calls.contains("agentSandbox.runner.fakeModel=false"),
-        "inference is the model source; do not pin fakeModel off a blank credential:\n{calls}"
-    );
+    assert_fake_model_is_only_set_by_gvisor_counterfactual(&calls);
 }
 
 /// #2510: `CURIE_CREDENTIALS` after `--local-model` replaces the inference

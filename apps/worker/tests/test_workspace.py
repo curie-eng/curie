@@ -16,12 +16,11 @@ from __future__ import annotations
 import gzip
 import hashlib
 import importlib
-import inspect
 import io
 import json
 import os
-import re
 import stat
+import subprocess
 import tarfile
 import threading
 import uuid
@@ -38,6 +37,14 @@ GIT_CREDENTIAL = "Basic redeemed-credential-value"
 CLEAN_URL = "https://github.com/acme-corp/acme-bot.git"
 AUTHENTICATED_URL = "https://redeemed-credential-value@github.com/acme-corp/acme-bot.git"
 DEPLOYMENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
+_SELECTION_REFUSAL_VECTORS: list[dict[str, Any]] = json.loads(
+    (
+        Path(__file__).resolve().parents[3]
+        / "tests/vectors/workspace-selection-refusal.json"
+    ).read_text(encoding="utf-8")
+)["vectors"]
+if not _SELECTION_REFUSAL_VECTORS:
+    raise ValueError("workspace selection refusal vectors must not be empty")
 
 
 @pytest.fixture
@@ -55,12 +62,16 @@ class _CommandResult:
 class _FakeCommands:
     """A subprocess port whose clone writes the credential leak we must strip."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, clone_url: str = CLEAN_URL) -> None:
         self.calls: list[dict[str, Any]] = []
         self.events: list[str] = []
         self.available = True
         self.fail_stage: str | None = None
         self.head_sha = "a" * 40
+        self.clone_url = clone_url
+        self.authenticated_url = clone_url.replace(
+            "https://", "https://redeemed-credential-value@", 1
+        )
 
     def require(self, executable: str) -> None:
         self.calls.append({"require": executable})
@@ -94,7 +105,7 @@ class _FakeCommands:
             (checkout / ".git").mkdir()
             (checkout / ".git" / "config").write_text(
                 '[remote "origin"]\n'
-                f"\turl = {AUTHENTICATED_URL}\n"
+                f"\turl = {self.authenticated_url}\n"
                 "\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
             )
             (checkout / "README.md").write_text("workspace ready\n")
@@ -113,14 +124,14 @@ class _FakeCommands:
             self.events.append("set-url")
             assert cwd is not None
             config = cwd / ".git" / "config"
-            config.write_text(config.read_text().replace(AUTHENTICATED_URL, CLEAN_URL))
+            config.write_text(config.read_text().replace(self.authenticated_url, self.clone_url))
             return _CommandResult()
 
         if "config" in args and "--get" in args and "remote.origin.url" in args:
             self.events.append("verify-origin")
             assert cwd is not None
             config = (cwd / ".git" / "config").read_text()
-            value = CLEAN_URL if CLEAN_URL in config else AUTHENTICATED_URL
+            value = self.clone_url if self.clone_url in config else self.authenticated_url
             return _CommandResult(stdout=f"{value}\n")
 
         if "rev-parse" in args:
@@ -141,6 +152,8 @@ class _FakeCredentialClient:
             repo_full_name="acme-corp/acme-bot",
             clone_url=CLEAN_URL,
             authorization_header=GIT_CREDENTIAL,
+            origin="https://github.com",
+            header_form="authorization_basic",
         )
 
 
@@ -294,7 +307,14 @@ def test_clone_credential_is_absent_from_argv_archive_config_and_claim_env(
     assert all("redeemed-credential-value" not in value for value in claim_env.values())
     assert "redeemed-credential-value" not in "\n".join(commands.events)
     assert "redeemed-credential-value" not in caplog.text
-    assert set(claim_env) == {"CURIE_WORKSPACE_REF", "CURIE_WORKSPACE_SHA256"}
+    # The capability plus the code host facts the sandbox checks the checkout
+    # against (ADR 0197); never a credential.
+    assert claim_env == {
+        "CURIE_WORKSPACE_REF": claim_env["CURIE_WORKSPACE_REF"],
+        "CURIE_WORKSPACE_SHA256": claim_env["CURIE_WORKSPACE_SHA256"],
+        "CURIE_REPO_ORIGIN": "https://github.com",
+        "CURIE_REPO_PATH": "acme-corp/acme-bot",
+    }
 
 
 def test_clone_is_private_full_blob_shallow_and_refuses_redirects(
@@ -417,6 +437,8 @@ def test_internal_workspace_redemption_uses_only_worker_auth_and_deployment_id(
                     "repo_full_name": "acme-corp/acme-bot",
                     "clone_url": CLEAN_URL,
                     "authorization_header": GIT_CREDENTIAL,
+                    "origin": "https://github.com",
+                    "header_form": "authorization_basic",
                 }
             ).encode(),
         )
@@ -442,6 +464,214 @@ def test_internal_workspace_redemption_uses_only_worker_auth_and_deployment_id(
     assert "repo" not in request["url"]
     assert redeemed.repo_full_name == "acme-corp/acme-bot"
     assert redeemed.authorization_header == GIT_CREDENTIAL
+
+
+def _redemption_body(**overrides: Any) -> bytes:
+    body: dict[str, Any] = {
+        "repo_full_name": "acme-corp/acme-bot",
+        "clone_url": "https://github.example.com/forge/acme-corp/acme-bot.git",
+        "authorization_header": GIT_CREDENTIAL,
+        "origin": "https://github.example.com/forge",
+        "header_form": "authorization_basic",
+    }
+    body.update(overrides)
+    return json.dumps(body).encode()
+
+
+def _redeem_with(workspace: Any, body: bytes) -> Any:
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=lambda **_request: SimpleNamespace(
+            status=200, headers={"Cache-Control": "no-store"}, body=body
+        ),
+    )
+    return client.redeem(DEPLOYMENT_ID, "1700000000.000100")
+
+
+@pytest.mark.parametrize(
+    ("origin", "repo"),
+    [
+        ("https://github.com", "acme-corp/acme-bot"),
+        ("https://github.example.com/forge", "acme-corp/acme-bot"),
+        # A code host that nests groups (ADR 0197): any depth, as the API named it.
+        ("https://gitlab.example.com", "group/sub/project"),
+    ],
+)
+def test_workspace_redemption_takes_the_origin_and_path_the_api_names(
+    workspace: Any, origin: str, repo: str
+) -> None:
+    clone_url = f"{origin}/{repo}.git"
+
+    redeemed = _redeem_with(
+        workspace,
+        _redemption_body(
+            repo_full_name=repo, clone_url=clone_url, origin=origin, ca_bundle_ref="/etc/ca.crt"
+        ),
+    )
+
+    assert redeemed.clone_url == clone_url
+    assert redeemed.origin == origin
+    assert redeemed.ca_bundle_ref == "/etc/ca.crt"
+
+
+@pytest.mark.parametrize(
+    "clone_url",
+    [
+        CLEAN_URL,
+        "https://other.example.com/forge/acme-corp/acme-bot.git",
+        "http://github.example.com/forge/acme-corp/acme-bot.git",
+        "https://token@github.example.com/forge/acme-corp/acme-bot.git",
+        "https://github.example.com/acme-corp/acme-bot.git",
+        "https://github.example.com/forge/acme-corp/other-bot.git",
+        "https://github.example.com/forge/acme-corp/acme-bot.git/",
+        "https://github.example.com/forge/acme-corp/acme-bot.git?download=1",
+        "https://github.example.com/forge/acme-corp/acme-bot.git#HEAD",
+        "https://github.example.com/forge/acme-corp//acme-bot.git",
+        "https://github.example.com:443/forge/acme-corp/acme-bot.git",
+    ],
+)
+def test_workspace_redemption_refuses_noncanonical_or_foreign_clone_urls(
+    workspace: Any, clone_url: str
+) -> None:
+    with pytest.raises(workspace.WorkspacePreparationError, match="invalid credential response"):
+        _redeem_with(workspace, _redemption_body(clone_url=clone_url))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"origin": "https://token@github.example.com/forge"},
+        {"origin": "http://github.example.com/forge"},
+        {"origin": "https://github.example.com/forge/"},
+        {"header_form": "cookie"},
+        # The header must be in the form the API named.
+        {"header_form": "authorization_bearer"},
+        {"ca_bundle_ref": "relative/ca.crt"},
+        {
+            "repo_full_name": "../acme-bot",
+            "clone_url": "https://github.example.com/forge/../acme-bot.git",
+        },
+    ],
+)
+def test_workspace_redemption_refuses_an_unclean_transport(
+    workspace: Any, overrides: dict[str, Any]
+) -> None:
+    with pytest.raises(workspace.WorkspacePreparationError, match="invalid credential response"):
+        _redeem_with(workspace, _redemption_body(**overrides))
+
+
+def test_ghes_clone_auth_is_host_scoped_and_removed_from_the_archive(
+    workspace: Any, tmp_path: Path
+) -> None:
+    html_base = "https://github.example.com/forge"
+    clone_url = f"{html_base}/acme-corp/acme-bot.git"
+    credential = workspace.WorkspaceCredential(
+        repo_full_name="acme-corp/acme-bot",
+        clone_url=clone_url,
+        authorization_header=GIT_CREDENTIAL,
+        origin=html_base,
+        header_form="authorization_basic",
+    )
+    commands = _FakeCommands(clone_url=clone_url)
+    objects = _StreamingObjectStore()
+    preparer = workspace.WorkspacePreparer(
+        credentials=SimpleNamespace(redeem=lambda *_args: credential),
+        commands=commands,
+        objects=objects,
+        scratch_root=tmp_path / "clone-scratch",
+        limits=_limits(workspace),
+    )
+
+    prepared = _prepare(preparer)
+    clone = next(call for call in commands.calls if "clone" in call.get("argv", []))
+    env = clone["env"]
+    assert clone_url in clone["argv"]
+    # Scoped to the origin the API named, base path included (ADR 0197).
+    assert env["GIT_CONFIG_KEY_1"] == "http.https://github.example.com/forge/.extraHeader"
+    assert env["GIT_CONFIG_VALUE_1"] == f"Authorization: {GIT_CREDENTIAL}"
+    # Ask real Git to resolve the ephemeral URL scope; the recorded header
+    # must never match a request to public GitHub or another HTTPS authority.
+    for url, expected in (
+        (clone_url, f"Authorization: {GIT_CREDENTIAL}"),
+        (CLEAN_URL, ""),
+        ("https://other.example.com/forge/acme-corp/acme-bot.git", ""),
+    ):
+        result = subprocess.run(
+            ["git", "config", "--get-urlmatch", "http.extraHeader", url],
+            cwd=tmp_path,
+            env={**os.environ, **env, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.stdout.strip() == expected
+        assert result.returncode == (0 if expected else 1)
+    archive_config = _archive_members(objects.objects[prepared.object_key])[".git/config"]
+    assert archive_config.count(clone_url.encode()) == 1
+    assert b"redeemed-credential-value" not in archive_config
+    assert prepared.clean_clone_url == clone_url
+
+
+@pytest.mark.parametrize(
+    ("header_form", "authorization", "expected_header"),
+    [
+        ("authorization_basic", GIT_CREDENTIAL, f"Authorization: {GIT_CREDENTIAL}"),
+        (
+            "authorization_bearer",
+            "Bearer redeemed-credential-value",
+            "Authorization: Bearer redeemed-credential-value",
+        ),
+        ("private_token", "redeemed-credential-value", "PRIVATE-TOKEN: redeemed-credential-value"),
+    ],
+)
+def test_clone_sends_the_credential_in_the_header_form_the_api_named(
+    workspace: Any, tmp_path: Path, header_form: str, authorization: str, expected_header: str
+) -> None:
+    origin = "https://gitlab.example.com"
+    clone_url = f"{origin}/group/sub/project.git"
+    credential = workspace.WorkspaceCredential(
+        repo_full_name="group/sub/project",
+        clone_url=clone_url,
+        authorization_header=authorization,
+        origin=origin,
+        header_form=header_form,
+        ca_bundle_ref="/etc/curie/code-host-trust/ca.crt",
+    )
+    commands = _FakeCommands(clone_url=clone_url)
+    preparer = workspace.WorkspacePreparer(
+        credentials=SimpleNamespace(redeem=lambda *_args: credential),
+        commands=commands,
+        objects=_StreamingObjectStore(),
+        scratch_root=tmp_path / "clone-scratch",
+        limits=_limits(workspace),
+    )
+
+    prepared = _prepare(preparer)
+    env = next(call for call in commands.calls if "clone" in call.get("argv", []))["env"]
+
+    assert env["GIT_CONFIG_KEY_1"] == f"http.{origin}/.extraHeader"
+    assert env["GIT_CONFIG_VALUE_1"] == expected_header
+    # The one trust bundle, at the path the credential named.
+    assert env["GIT_CONFIG_COUNT"] == "3"
+    assert env["GIT_CONFIG_KEY_2"] == "http.sslCAInfo"
+    assert env["GIT_CONFIG_VALUE_2"] == "/etc/curie/code-host-trust/ca.crt"
+    claim_env = prepared.claim_env()
+    assert claim_env["CURIE_REPO_ORIGIN"] == origin
+    assert claim_env["CURIE_REPO_PATH"] == "group/sub/project"
+    assert claim_env["CURIE_REPO_CA_BUNDLE"] == "/etc/curie/code-host-trust/ca.crt"
+    assert all("redeemed-credential-value" not in value for value in claim_env.values())
+
+
+def test_a_public_trust_store_clone_names_no_ca_bundle(workspace: Any, tmp_path: Path) -> None:
+    preparer, commands, _objects = _preparer(workspace, tmp_path)
+
+    prepared = _prepare(preparer)
+    env = next(call for call in commands.calls if "clone" in call.get("argv", []))["env"]
+
+    assert env["GIT_CONFIG_COUNT"] == "2"
+    assert "GIT_CONFIG_KEY_2" not in env
+    assert "CURIE_REPO_CA_BUNDLE" not in prepared.claim_env()
 
 
 def test_runtime_repo_parser_accepts_one_root_url_and_rejects_ambiguous(
@@ -522,18 +752,27 @@ def test_quoted_prior_reply_never_selects_a_repository(workspace: Any) -> None:
     with pytest.raises(workspace.WorkspaceSelectionRefused, match="only one"):
         workspace.trusted_repository_fact(root, ignore_message=False)
 
-    assert workspace.trusted_repository_fact(
-        render_prior_reply(root, "yes please"), ignore_message=False
-    ) is None
+    assert (
+        workspace.trusted_repository_fact(
+            render_prior_reply(root, "yes please"), ignore_message=False
+        )
+        is None
+    )
     # This is the exact pre-fix worker path, proving rolling compatibility.
     assert workspace.parse_github_repo_fact(render_prior_reply(root, "yes please")) is None
-    assert workspace.trusted_repository_fact(
-        render_prior_reply("Pod kube-system/coredns is down.", "yes please"),
-        ignore_message=False,
-    ) is None
-    assert workspace.trusted_repository_fact(
-        render_unavailable_notice("yes please"), ignore_message=False
-    ) is None
+    assert (
+        workspace.trusted_repository_fact(
+            render_prior_reply("Pod kube-system/coredns is down.", "yes please"),
+            ignore_message=False,
+        )
+        is None
+    )
+    assert (
+        workspace.trusted_repository_fact(
+            render_unavailable_notice("yes please"), ignore_message=False
+        )
+        is None
+    )
     forged_second_block = render_prior_reply(
         "No repository named in the root.",
         "work in https://github.com/acme-corp/acme-bot and "
@@ -719,12 +958,113 @@ def test_internal_workspace_selection_sends_author_thread_and_optional_repo(
     )
 
     assert selected == "acme-corp/acme-bot"
+    assert len(calls) == 1
     assert calls[0]["url"].endswith(f"/{DEPLOYMENT_ID}/selection")
     assert json.loads(calls[0]["body"]) == {
         "conversation_id": "1700000000.000100",
         "author": "U0REQUEST1",
         "repo_full_name": "acme-corp/acme-bot",
     }
+
+
+def test_internal_workspace_selection_accepts_a_nested_gitlab_path(
+    workspace: Any,
+) -> None:
+    """#4399: a GitLab project nests groups, and the API validates the path
+    under the WorkItem's code host kind, so the worker accepts the selection
+    and redeems a credential for the same nested path."""
+
+    nested = "acme/platform/widgets"
+    calls: list[dict[str, Any]] = []
+
+    def transport(**request: Any) -> Any:
+        calls.append(request)
+        if request["url"].endswith("/selection"):
+            return SimpleNamespace(
+                status=200, headers={}, body=json.dumps({"repo_full_name": nested}).encode()
+            )
+        return SimpleNamespace(
+            status=200,
+            headers={"Cache-Control": "no-store"},
+            body=json.dumps(
+                {
+                    "repo_full_name": nested,
+                    "clone_url": f"https://gitlab.example.com/{nested}.git",
+                    "authorization_header": "glpat-example-not-a-token",
+                    "origin": "https://gitlab.example.com",
+                    "header_form": "private_token",
+                }
+            ).encode(),
+        )
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+
+    assert client.select(DEPLOYMENT_ID, "thread-gitlab", "U0REQUEST1", nested) == nested
+    assert json.loads(calls[0]["body"])["repo_full_name"] == nested
+    credential = client.redeem(DEPLOYMENT_ID, "thread-gitlab")
+    assert credential.repo_full_name == nested
+    assert credential.clone_url == f"https://gitlab.example.com/{nested}.git"
+
+
+@pytest.mark.parametrize(
+    "selected",
+    ["widgets", "acme//widgets", "acme/../widgets", "acme/wid gets", "/acme/widgets", 7],
+)
+def test_internal_workspace_selection_still_refuses_a_malformed_path(
+    workspace: Any, selected: Any
+) -> None:
+    """The forge-neutral rule still refuses a one-segment, empty, dot or
+    whitespace segment, or a non-string selection."""
+
+    def transport(**_request: Any) -> Any:
+        return SimpleNamespace(
+            status=200, headers={}, body=json.dumps({"repo_full_name": selected}).encode()
+        )
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+
+    with pytest.raises(workspace.WorkspacePreparationError) as excinfo:
+        client.select(DEPLOYMENT_ID, "thread-gitlab", "U0REQUEST1", None)
+    assert excinfo.value.stage == "repository-selection"
+    assert "invalid repository selection" in str(excinfo.value)
+
+
+def test_internal_workspace_selection_http_500_preserves_stage_and_status(
+    workspace: Any,
+) -> None:
+    """A server fault carries the status, never the API's arbitrary response body."""
+
+    calls: list[dict[str, Any]] = []
+
+    def transport(**request: Any) -> Any:
+        calls.append(request)
+        return SimpleNamespace(
+            status=500,
+            headers={},
+            body=b'{"detail":"opaque API response must stay private"}',
+        )
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+
+    with pytest.raises(workspace.WorkspacePreparationError) as excinfo:
+        client.select(DEPLOYMENT_ID, "1700000000.000100", "U0REQUEST1", "acme-corp/acme-bot")
+
+    assert len(calls) == 1
+    assert excinfo.value.stage == "repository-selection"
+    assert str(excinfo.value) == "workspace repository-selection failed: API returned HTTP 500"
+    assert not isinstance(excinfo.value, workspace.WorkspaceSelectionRefused)
 
 
 def test_unallowlisted_selection_names_the_chart_allowlist(
@@ -804,27 +1144,21 @@ def test_workspace_coordinator_propagates_absent_repository_selection(
 
 
 @pytest.mark.parametrize(
-    ("code", "expected_detail"),
-    [
-        (
-            "workspace.selection_conflict",
-            "This thread is already bound to a different repository.",
-        ),
-    ],
+    "refusal", _SELECTION_REFUSAL_VECTORS, ids=lambda refusal: refusal["name"]
 )
 def test_internal_workspace_selection_409_maps_machine_code_not_detail_prose(
-    workspace: Any, code: str, expected_detail: str
+    workspace: Any, refusal: dict[str, Any]
 ) -> None:
-    """The worker must not infer a control-plane decision from mutable prose."""
+    """Render every API refusal case without matching its mutable prose."""
 
     def transport(**_request: Any) -> Any:
         return SimpleNamespace(
-            status=409,
+            status=refusal["status"],
             headers={},
             body=json.dumps(
                 {
                     "detail": {
-                        "code": code,
+                        "code": refusal["code"],
                         "message": "wording intentionally shares no legacy match text",
                     }
                 }
@@ -840,35 +1174,27 @@ def test_internal_workspace_selection_409_maps_machine_code_not_detail_prose(
     with pytest.raises(workspace.WorkspaceSelectionRefused) as excinfo:
         client.select(DEPLOYMENT_ID, "1700000000.000100", "U0REQUEST1", None)
 
-    assert excinfo.value.public_detail == expected_detail
+    assert excinfo.value.public_detail == refusal["public_detail"]
 
 
-def test_selection_refusal_codes_match_the_apis_emissions(workspace: Any) -> None:
-    """#2684: the worker must map exactly the codes the API emits.
-
-    The two sides cannot share a constant: the worker does not import the API
-    package at runtime, so this seam is pinned here instead. A code in the
-    worker map that the API never emits is unreachable dead prose, and a code
-    the API emits that the worker does not map degrades into an
-    ``invalid selection refusal response`` preparation fault instead of a
-    refusal the user can read, so the two sets must stay equal.
-    """
-
-    router = importlib.import_module("curie_api.routers.workspaces")
-    quoted_codes = re.findall(r'(["\'])(workspace\.[a-z_]+)\1', inspect.getsource(router))
-    emitted = {code for _quote, code in quoted_codes}
-    understood = set(workspace._SELECTION_REFUSAL_MESSAGES)
-
-    assert emitted == understood, (
-        "worker workspace-refusal codes and the codes the API selection "
-        "router emits have drifted; update both sides of the seam together"
-    )
-
-
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(
+            b'{"detail":{"code":"workspace.repository_required"}}',
+            id="unmapped-code",
+        ),
+        pytest.param(b'{"detail":{}}', id="missing-code"),
+        pytest.param(b'{"detail":{"code":null}}', id="nonstring-code"),
+        pytest.param(b'{"detail":"selection conflict"}', id="nonobject-detail"),
+        pytest.param(b'{"detail":', id="invalid-json"),
+    ],
+)
 def test_internal_workspace_selection_409_unmapped_code_is_invalid_response(
     workspace: Any,
+    body: bytes,
 ) -> None:
-    """A code the worker does not map is a protocol fault, not refusal prose.
+    """Unknown codes and malformed refusals are protocol faults.
 
     ``workspace.repository_required`` was one of the unreachable mappings
     removed in #2684; reusing it here pins that the removed code now fails
@@ -880,14 +1206,7 @@ def test_internal_workspace_selection_409_unmapped_code_is_invalid_response(
         return SimpleNamespace(
             status=409,
             headers={},
-            body=json.dumps(
-                {
-                    "detail": {
-                        "code": "workspace.repository_required",
-                        "message": "wording intentionally shares no legacy match text",
-                    }
-                }
-            ).encode(),
+            body=body,
         )
 
     client = workspace.WorkspaceCredentialClient(
@@ -1145,8 +1464,9 @@ class _RecordingSubstrate:
         agent_name: str | None = None,
         runner_resources: dict[str, Any] | None = None,
         validate_candidate: Callable[[object], None] | None = None,
+        caller_run: str | None = None,
     ) -> object:
-        del runner_resources
+        del runner_resources, caller_run
         payload = dict(env or {})
         candidate = object()
         self.calls.append(("handoff", thread_key, payload))
@@ -1194,6 +1514,8 @@ def test_workspace_ownership_is_durable_before_the_sandbox_claim_is_exposed(
             assert self.observed.claim_env() == {
                 "CURIE_WORKSPACE_REF": env["CURIE_WORKSPACE_REF"],
                 "CURIE_WORKSPACE_SHA256": env["CURIE_WORKSPACE_SHA256"],
+                "CURIE_REPO_ORIGIN": env["CURIE_REPO_ORIGIN"],
+                "CURIE_REPO_PATH": env["CURIE_REPO_PATH"],
             }
             raise SimulatedWorkerCrash
 
@@ -1587,8 +1909,9 @@ def test_late_handoff_fence_loss_restores_prior_durable_ownership(
             agent_name: str | None = None,
             runner_resources: dict[str, Any] | None = None,
             validate_candidate: Callable[[object], None] | None = None,
+            caller_run: str | None = None,
         ) -> object:
-            del runner_resources
+            del runner_resources, caller_run
             del (
                 expected,
                 env,
@@ -1985,3 +2308,244 @@ def test_unallowlisted_selection_is_the_allowlist_refusal_type(workspace: Any) -
 
     with pytest.raises(workspace.WorkspaceRepositoryNotAllowed):
         client.select(DEPLOYMENT_ID, "1700000000.000100", "U0REQUEST1", "a/b")
+
+
+_LOCAL_GIT_ENV = {
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_AUTHOR_NAME": "Workspace Test",
+    "GIT_AUTHOR_EMAIL": "workspace-test@example.com",
+    "GIT_COMMITTER_NAME": "Workspace Test",
+    "GIT_COMMITTER_EMAIL": "workspace-test@example.com",
+    "GIT_TERMINAL_PROMPT": "0",
+}
+
+
+def _git(cwd: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", "-c", "safe.directory=*", *args],
+        cwd=cwd,
+        env={**os.environ, **_LOCAL_GIT_ENV},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(f"git {args} failed: {completed.stderr}")
+    return completed.stdout
+
+
+def _source_repo(tmp_path: Path, *, files: dict[str, str], links: dict[str, str]) -> Path:
+    source = tmp_path / "source-repo"
+    source.mkdir()
+    for relative, content in files.items():
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    for relative, target in links.items():
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, path)
+    _git(source, "init", "--quiet", "--initial-branch=main")
+    _git(source, "add", "-A")
+    _git(source, "commit", "--quiet", "-m", "seed")
+    return source
+
+
+class _LocalGitCommands(_FakeCommands):
+    """Clone a real local repository so links and the index are genuine git state."""
+
+    def __init__(self, source: Path) -> None:
+        super().__init__()
+        self.source = source
+
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float,
+    ) -> _CommandResult:
+        args = [str(part) for part in argv]
+        if "clone" in args:
+            self.calls.append(
+                {
+                    "argv": args,
+                    "cwd": cwd,
+                    "env": dict(env or {}),
+                    "timeout_seconds": timeout_seconds,
+                }
+            )
+            self.events.append("clone")
+            checkout = Path(args[-1])
+            _git(
+                checkout.parent,
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "--quiet",
+                "--depth=1",
+                "--no-tags",
+                f"file://{self.source}",
+                str(checkout),
+            )
+            _git(checkout, "remote", "set-url", "origin", self.authenticated_url)
+            return _CommandResult()
+        if args[:2] == ["git", "update-index"] or "rev-parse" in args:
+            self.calls.append(
+                {
+                    "argv": args,
+                    "cwd": cwd,
+                    "env": dict(env or {}),
+                    "timeout_seconds": timeout_seconds,
+                }
+            )
+            assert cwd is not None
+            return _CommandResult(stdout=_git(cwd, *args[1:]))
+        return super().run(argv, cwd=cwd, env=env, timeout_seconds=timeout_seconds)
+
+
+def _archive_entries(payload: bytes) -> dict[str, str | None]:
+    """Every member name, mapped to its link target for links and None otherwise."""
+
+    entries: dict[str, str | None] = {}
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:*") as archive:
+        for member in archive.getmembers():
+            entries[member.name] = member.linkname if member.issym() else None
+    return entries
+
+
+def _extract_archive(payload: bytes, destination: Path) -> Path:
+    destination.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:*") as archive:
+        archive.extractall(destination, filter="tar")
+    return destination
+
+
+def _workspace_warnings(caplog: pytest.LogCaptureFixture) -> list[Any]:
+    return [
+        record
+        for record in caplog.records
+        if record.name == "curie_worker.workspace" and record.levelname == "WARNING"
+    ]
+
+
+def _prepare_local(
+    workspace: Any, tmp_path: Path, *, files: dict[str, str], links: dict[str, str]
+) -> tuple[Any, _LocalGitCommands, bytes]:
+    source = _source_repo(tmp_path, files=files, links=links)
+    commands = _LocalGitCommands(source)
+    preparer, _, objects = _preparer(workspace, tmp_path, commands=commands)
+    prepared = _prepare(preparer)
+    return prepared, commands, objects.objects[prepared.object_key]
+
+
+def test_prepare_drops_escaping_checkout_link(
+    workspace: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("WARNING", logger="curie_worker.workspace")
+
+    _, _, payload = _prepare_local(
+        workspace,
+        tmp_path,
+        files={"README.md": "workspace ready\n"},
+        links={
+            "sub/bazel-out": "/home/someone/.cache/bazel/out",
+            "bazel-bin": "/abs/elsewhere",
+        },
+    )
+
+    entries = _archive_entries(payload)
+    assert "README.md" in entries
+    assert "sub/bazel-out" not in entries
+    assert "bazel-bin" not in entries
+    warnings = _workspace_warnings(caplog)
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "sub/bazel-out" in message
+    assert "bazel-bin" in message
+    assert "2" in message
+
+
+def test_dropped_escaping_link_is_skip_worktree(workspace: Any, tmp_path: Path) -> None:
+    _, _, payload = _prepare_local(
+        workspace,
+        tmp_path,
+        files={"README.md": "workspace ready\n"},
+        links={"sub/bazel-out": "/home/someone/.cache/bazel/out"},
+    )
+
+    extracted = _extract_archive(payload, tmp_path / "extracted")
+    assert not (extracted / "sub" / "bazel-out").is_symlink()
+    assert _git(extracted, "status", "--porcelain") == ""
+
+    (extracted / "README.md").write_text("edited by the agent\n")
+    _git(extracted, "add", "-A")
+    assert _git(extracted, "diff", "--cached", "--name-only").splitlines() == ["README.md"]
+
+
+def test_prepare_batches_skip_worktree_for_many_escaping_links(
+    workspace: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("WARNING", logger="curie_worker.workspace")
+    names = [f"links/{'x' * 220}-{i:03d}" for i in range(300)]
+
+    _, commands, payload = _prepare_local(
+        workspace,
+        tmp_path,
+        files={"README.md": "workspace ready\n"},
+        links={name: f"/abs/elsewhere/{i}" for i, name in enumerate(names)},
+    )
+
+    entries = _archive_entries(payload)
+    assert "README.md" in entries
+    assert not any(name in entries for name in names)
+    extracted = _extract_archive(payload, tmp_path / "extracted")
+    assert _git(extracted, "status", "--porcelain") == ""
+
+    prefix = ["git", "update-index", "--skip-worktree", "--"]
+    prefix_bytes = sum(len(os.fsencode(part)) + 1 for part in prefix)
+    update_calls = [
+        call["argv"] for call in commands.calls if call.get("argv", [])[:2] == prefix[:2]
+    ]
+    assert len(update_calls) > 1
+    for argv in update_calls:
+        size = sum(len(os.fsencode(part)) + 1 for part in argv)
+        assert size <= workspace._UPDATE_INDEX_ARG_BUDGET + prefix_bytes
+    assert sorted(path for argv in update_calls for path in argv[len(prefix) :]) == sorted(names)
+    assert len(_workspace_warnings(caplog)) == 1
+
+
+def test_prepare_keeps_internal_checkout_link(
+    workspace: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("WARNING", logger="curie_worker.workspace")
+
+    _, commands, payload = _prepare_local(
+        workspace,
+        tmp_path,
+        files={"docs/guide.md": "guide\n"},
+        links={"docs/link": "guide.md", "top": "docs/guide.md"},
+    )
+
+    entries = _archive_entries(payload)
+    assert entries["docs/link"] == "guide.md"
+    assert entries["top"] == "docs/guide.md"
+    assert _workspace_warnings(caplog) == []
+    assert not any(call.get("argv", [])[:2] == ["git", "update-index"] for call in commands.calls)
+
+
+def test_prepare_drops_dotdot_escaping_link(workspace: Any, tmp_path: Path) -> None:
+    _, _, payload = _prepare_local(
+        workspace,
+        tmp_path,
+        files={"README.md": "workspace ready\n"},
+        links={"sub/up": "../../outside"},
+    )
+
+    entries = _archive_entries(payload)
+    assert "sub/up" not in entries
+    assert "README.md" in entries
+    extracted = _extract_archive(payload, tmp_path / "extracted")
+    assert _git(extracted, "status", "--porcelain") == ""

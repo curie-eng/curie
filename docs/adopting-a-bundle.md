@@ -1,5 +1,10 @@
 # Adopting an existing agent into a plugin bundle
 
+For the general compatibility and adoption path, start with
+[Bring your agent](bring-your-agent.md). This page preserves the migration
+recipe for a legacy Python agent with its own Slack server. For workspace setup
+after conversion, continue to [Your first Slack agent](your-first-slack-agent.md).
+
 You already have an agent — a pre-plugin (`agent-ss-template`) project: a Python
 package with `src/`, a `Makefile`, a `Dockerfile`, a `compose.yaml`, and a
 Flask/Slack `server.py`. Curie runs a different shape — a **plugin bundle**

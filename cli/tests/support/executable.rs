@@ -15,9 +15,14 @@ pub fn install(path: &Path, body: &str) {
     staging
         .write_all(body.as_bytes())
         .expect("write executable staging file");
+    staging
+        .as_file()
+        .sync_all()
+        .expect("sync executable staging file");
 
     // Closing the write descriptor before setting the execute bit is essential:
-    // another test thread may fork at any point after this line.
+    // another test thread may fork at any point after this line. Sync first so
+    // the bytes are durable when the descriptor goes away.
     let staging = staging.into_temp_path();
     std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))
         .expect("make staged executable runnable");

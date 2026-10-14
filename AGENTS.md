@@ -9,27 +9,29 @@ citing a live test, or recording provenance. Review the exact outgoing content
 before committing, pushing, or posting; a green secret scan is not clearance.
 See "This repo is PUBLIC" below for the full rule.
 
-Agent instructions for this repo. Start with [`README.md`](README.md) for what
-the product is and how to run it, and [`ARCHITECTURE.md`](ARCHITECTURE.md) for
-the component diagram, the message-flow sequence (Slack mention -> dispatcher ->
-worker -> sandbox -> runner -> Slack reply), and the deploy-flow sequence (git
-push -> webhook -> bundle pipeline -> deployment). The one-line version: a Slack
-message is answered by a versioned plugin running in an isolated Kubernetes
-sandbox, traced through Langfuse and steerable mid-turn; a git push deploys that
-plugin under a bot identity via the API's git-flow engine. Relay is the project
-codename; `curie` is the product-surface name (bot handle, CLI binary). Read
-`ARCHITECTURE.md` before touching a cross-component seam. If you are a coding
-agent orienting in this repo, [`llms.txt`](llms.txt) is the curated machine map
-of these docs, organized around the parity ladder. This file is for an agent
-working **on** this repository; an agent **driving** Curie (a released binary,
-someone else's bundle) wants [`docs/agents.md`](docs/agents.md), the
-verification contract that names the exact command proving each outcome. The two questions this repo
-exists to answer are
-[why did my agent work locally but break once deployed?](README.md#why-did-my-agent-work-locally-but-break-once-deployed)
-and
-[how do I test an agent the same way locally and on Kubernetes?](README.md#how-do-i-test-an-agent-the-same-way-locally-and-on-kubernetes) —
-the same immutable bundle and the same `evals/cases.json` across `skill`,
-`local`, and `cluster` is the answer to both.
+Agent instructions for this repo. Curie turns agents into co-workers that run
+in the user's infrastructure. The [Software Factory](docs/software-factory.md)
+is the first developer adoption path; the [SRE example](examples/sre-bot/README.md)
+and [supported custom bundles](docs/bring-your-agent.md) use the same platform.
+Read [`README.md`](README.md) for the product entry points,
+[`docs/co-workers.md`](docs/co-workers.md) for the shared collaboration model,
+and [`docs/capabilities.md`](docs/capabilities.md) before making support claims.
+
+Read [`ARCHITECTURE.md`](ARCHITECTURE.md) before touching a cross-component
+seam. It maps the message flow (Slack mention -> dispatcher -> worker -> sandbox
+-> runner -> Slack reply) and deployment flow (git push -> webhook -> bundle
+pipeline -> deployment). Relay is the project codename; `curie` is the product
+surface name (bot handle, CLI binary). [`llms.txt`](llms.txt) is the curated
+machine map. This file is for an agent working **on** this repository; an agent
+**driving** Curie (a released binary or someone else's bundle) wants
+[`docs/agents.md`](docs/agents.md), the verification contract that names the exact
+command proving each outcome.
+
+The same immutable bundle and `evals/cases.json` across `skill`, `local`, and
+`cluster` support the developer's test and deployment loop. Environment parity
+helps expose deployment differences; it cannot guarantee model behavior under
+production traffic. The [architecture's parity reference](ARCHITECTURE.md#local-to-production-parity)
+retains the technical rationale behind that commitment.
 
 ## Directory map
 
@@ -41,6 +43,7 @@ before editing there, in addition to this file.
 |---|---|---|
 | `packages/aci-protocol` | Python (Pydantic + codegen) | [`packages/CLAUDE.md`](packages/CLAUDE.md) |
 | `packages/plugin-format` | Python (Pydantic + codegen) | [`packages/CLAUDE.md`](packages/CLAUDE.md) |
+| `packages/protected-hooks` | Python (internal source authority and transport) | [`packages/CLAUDE.md`](packages/CLAUDE.md) |
 | `apps/api` | Python (FastAPI) | [`apps/api/CLAUDE.md`](apps/api/CLAUDE.md) |
 | `apps/dispatcher` | Python (Slack Bolt) | [`apps/dispatcher/CLAUDE.md`](apps/dispatcher/CLAUDE.md) |
 | `apps/mail-adapter` | Python (stdlib HTTP + Pydantic) | [`apps/mail-adapter/CLAUDE.md`](apps/mail-adapter/CLAUDE.md) |
@@ -124,7 +127,6 @@ Set `base=next` when your worktree targets `next`.
   export TEST_LANGFUSE_HOST=${TEST_LANGFUSE_HOST:-${LANGFUSE_HOST:-http://127.0.0.1:23000}}
   export LANGFUSE_HOST="$TEST_LANGFUSE_HOST"
   export TEST_OTEL_COLLECTOR_ENDPOINT=${TEST_OTEL_COLLECTOR_ENDPOINT:-http://127.0.0.1:24318/v1/traces}
-  langfuse_health_url="$TEST_LANGFUSE_HOST/api/public/health"
   exec 9>"$baseline_lock"
   if ! flock -n 9; then
     echo "Another local Python CI baseline is already running"
@@ -139,25 +141,25 @@ Set `base=next` when your worktree targets `next`.
   uv lock --check
   uv sync
   uv run python scripts/check-alembic-revisions.py
+  case "$base" in
+    main) other_train=next ;;
+    next) other_train=main ;;
+    *) other_train= ;;
+  esac
+  if [[ -n "$other_train" ]]; then
+    git fetch --no-tags origin "$other_train"
+    uv run python scripts/check-alembic-revisions.py --other-train-ref "origin/$other_train"
+  else
+    echo "cross-train lineage skipped: base $base is not a train branch"
+  fi
   uv run python scripts/check-schema-window.py
   uv run ruff check .
   uv run mypy
   uv run lint-imports
   bash scripts/check-docs.sh
   bash scripts/check-wire-tolerance.sh
-  "${compose[@]}" up -d \
-    postgres valkey clickhouse rustfs rustfs-init \
-    langfuse-web langfuse-worker otel-collector
-  "${compose[@]}" up -d --wait --wait-timeout 300 \
-    postgres valkey clickhouse rustfs \
-    langfuse-web langfuse-worker otel-collector
-  for i in $(seq 1 60); do
-    if curl -fsS "$langfuse_health_url" >/dev/null 2>&1; then
-      break
-    fi
-    sleep 3
-  done
-  curl -fsS "$langfuse_health_url" >/dev/null
+  COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME" COMPOSE_FILE="$compose_file_list" \
+    python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480
   git fetch --force --tags origin refs/heads/main:refs/remotes/origin/main
   uv run python scripts/check-released-upgrade.py --self-test
   uv run python scripts/check-released-upgrade.py
@@ -247,7 +249,8 @@ is an exception to the CLI entry point guidance in `CLAUDE.md`.
    `CURIE_RELEASED_UPGRADE_POSTGRES_PORT`. Also export matching
    `TEST_VALKEY_HOST`, `TEST_VALKEY_PORT`, `TEST_S3_ENDPOINT_URL`,
    `TEST_LANGFUSE_HOST`, and `TEST_OTEL_COLLECTOR_ENDPOINT`. The baseline derives
-   runtime consumer variables and the Langfuse health URL from those values.
+   runtime consumer variables from those values, and the readiness helper reads
+   `TEST_LANGFUSE_HOST` for its web endpoint.
    For example:
 
    ```bash
@@ -303,6 +306,34 @@ or older worktree does not automatically acquire newer instructions; read this
 section from the updated base when resuming. Do not edit a live claimed Bonus
 Drain task or launch a second copy to apply the guidance.
 
+### Preflight checks
+
+There is no required pre-PR preflight. Do not run the full tier (`curie dev
+preflight` without `--fast`) while implementing a change or before opening or
+updating a pull request. It starts a private Compose project with the full
+Langfuse, ClickHouse, and OTel stack and runs the changed Python suites, and
+several agent runs doing that at once overload the shared host. CI runs those
+suites and the PR body and Fix pin guards on every pull request; require
+current-head PR checks to pass instead. Run the full tier only when a person
+asks for it explicitly.
+
+The fast tier starts no services. The tracked pre-push hook runs it on every
+push, so do not run it separately. It selects the cheap PR gates for the
+committed change and runs their CI commands. To run it by hand, use
+`curie dev preflight --fast` from the source checkout. The default base is
+`main`; use `--base <branch>` to compare against another fetched
+`origin/<branch>`. Use `--dry-run` to inspect the selected commands and
+`--json` for one structured report. A failing gate includes its output tail
+and is a failure to fix before pushing. This fast tier does not replace any
+required verification below.
+
+`curie install`, `curie update`, and `curie dev hooks install` configure the
+shared relative `core.hooksPath=.githooks`. Each linked worktree runs its own
+tracked hook. A differing existing path is preserved with a warning; use
+`git config --local core.hooksPath .githooks` to select the Curie hooks
+explicitly. The tracked pre-push hook runs fast preflight. The explicit escape
+hatch is `git push --no-verify`.
+
 **Rust CLI:**
 ```bash
 cd cli
@@ -331,7 +362,7 @@ path and Python symbol resolves, that each graded seam's `grade:` agrees with th
 `docs/adr/` claim the same number prefix, and that every `curie ...` command named in
 `docs/agents.md` resolves against `cli/command-manifest.json`. Run it after editing any interface-catalog doc
 and commit the regenerated files; CI runs the same check (`scripts/check-docs.sh`) in the
-`python` job. To exempt a genuinely illustrative example path, put
+`python-static` job. To exempt a genuinely illustrative example path, put
 `<!-- doclint:ignore-line -->` on that line (or the line before it).
 
 Test discipline: test-first for behavior-bearing code; mock ONLY external
@@ -365,6 +396,17 @@ stale-version conflict test (match the CAS pattern in
 `apps/api/src/curie_api/routers/state.py`). Every stream consumer lane derives
 bounded delivery + dead-letter from the shared transport; a lane without a
 delivery cap is a bug.
+
+## Test policy
+
+1. Test behavior through the nearest executable boundary. Assert outcomes and state transitions rather than source names, syntax or implementation structure.
+2. Cross artifact contracts use shared inputs and expected outputs under `tests/vectors`. Every reader exercises its own production parser or behavior against the same vector.
+3. Text pins are permitted only for security configuration that cannot be executed by the test. Each pin names the issue requiring it.
+4. Do not pin prompt wording. Test the claimed capability with graded evals and a falsifiable control.
+5. File readers fail closed on missing, unreadable or malformed required inputs. Test those failures alongside valid input.
+6. Infrastructure tests may skip locally when their prerequisites are absent, but never in CI. Required verification treats unavailable infrastructure as an error.
+7. Harnesses use production wiring. Do not copy builder arguments or substitute private fields to prove configuration reaches its consumer.
+8. A text pin expires when a behavioral test covers its contract. Delete the pin and name the covering test in the change description.
 
 ## The dev stack: compose.dev.yaml
 
@@ -600,7 +642,7 @@ as a whole; remembered only):
 
 - worker vs CLI credential forwarding -- `_SDK_PASSTHROUGH_ENV`
   (`apps/worker/src/curie_worker/sandbox/docker.py`) and the CLI picker
-  (`cli/src/commands.rs`) can't share code across Python/Rust, so they are frozen
+  (`cli/src/commands/credential_env.rs`) can't share code across Python/Rust, so they are frozen
   together in `tests/vectors/model-credential-forwarding.json`.
   [vector: `tests/vectors/model-credential-forwarding.json`]
 - dispatcher vs CLI approval action ids -- the approval-card action-id constants
@@ -609,6 +651,13 @@ as a whole; remembered only):
   Python/Rust, so they are frozen together in
   `tests/vectors/approval-action-ids.json`.
   [vector: `tests/vectors/approval-action-ids.json`]
+- worker vs CLI progress block ids -- the Slack progress card and milestone
+  `block_id` prefixes (`PROGRESS_CARD_BLOCK_ID_PREFIX` and
+  `PROGRESS_MILESTONE_BLOCK_ID_PREFIX` in `apps/worker/src/curie_worker/blocks.py`)
+  and the CLI stub's copies (`cli/src/chat.rs`), which tell a progress post or
+  edit from the turn's answer, can't share code across Python/Rust, so they are
+  frozen together in `tests/vectors/progress-blocks.json`.
+  [vector: `tests/vectors/progress-blocks.json`]
 - dispatcher vs API approval-principal tokens -- the dispatcher mint codec
   (`apps/dispatcher/src/curie_dispatcher/approval_principal.py`) and API verifier
   (`apps/api/src/curie_api/approval_principal.py`) are frozen together in
@@ -645,7 +694,17 @@ as a whole; remembered only):
   cannot share code because the worker does not import the API package at
   runtime; the worker maps each code to its own prose and treats an unmapped
   code as an invalid refusal response (#2684).
-  [gate: `apps/worker/tests/test_workspace.py::test_selection_refusal_codes_match_the_apis_emissions`]
+  [vector: `tests/vectors/workspace-selection-refusal.json`]
+  [gate: `apps/api/tests/test_workspace_control_plane.py::test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe`]
+  [gate: `apps/worker/tests/test_workspace.py::test_internal_workspace_selection_409_maps_machine_code_not_detail_prose`]
+- API vs CLI snapshot sealing key custody -- the reserved names, refusal
+  reason and reference grammar (`packages/curie-internal/src/curie_internal/sealing_key.py`)
+  with the API's bundle check (`apps/api/src/curie_api/bundles.py::sealing_key_custody_issues`)
+  and the CLI deploy preflight's mirror (`cli/src/sealing_key.rs`) can't share
+  code across Python/Rust, so the names, the reason verbatim and every bundle's
+  refusals with their locations are frozen together in
+  `tests/vectors/sealing-key-custody.json` (ACTION-EXECUTOR-23).
+  [vector: `tests/vectors/sealing-key-custody.json`]
 - real SDK vs fake model session in the runner (`FakeModelSession`,
   `runner/src/curie_runner/fake.py`).
   [by construction: `runner/src/curie_runner/adapter.py::ModelSession`]
@@ -675,6 +734,89 @@ as a whole; remembered only):
   `caller_refused` reason (`runner/src/curie_runner/mcp_tool_capability.py`)
   ship in different images, so they are frozen together.
   [vector: `tests/vectors/connector-caller-refusal.json`]
+- worker vs runner vs API deliberate progress capability (ADR-0130) -- the
+  runner control headers and `turn.progress` token scope the worker mints
+  (`apps/worker/src/curie_worker/turn_progress.py`), the runner reads
+  (`runner/src/curie_runner/turn_progress.py`) and the API verifies, and the
+  inbox stream the API appends to (`apps/api/src/curie_api/turn_progress.py`)
+  and the worker's pump reads, cross three images, so they are frozen together.
+  [vector: `tests/vectors/turn-progress-capability.json`]
+- worker vs runner executor route (ACTION-EXECUTOR-24) -- the worker's
+  `execute` client and executor mode variable
+  (`apps/worker/src/curie_worker/runner_client.py`) and the runner's
+  `/v1/execute` route and executor mode status body
+  (`runner/src/curie_runner/server.py::create_executor_app`) ship in different
+  images and cannot share code at runtime, so the request and response of every
+  phase, the route's refusal codes and the worker code each maps to, the status
+  body and the mode variable are frozen together. The `observe_version` and
+  `restore` call arguments and the reply-to-outcome mapping the two sides apply
+  around those phases are frozen beside it. The remediation `read` phase
+  (AUTOMATED-REMEDIATION-12: the request's `pointer`, one `read` per sandbox,
+  `tool_not_read_only` without dialing, the read refusals' worker codes) and
+  the codes it adds, which the API's
+  `apps/api/src/curie_api/action_execution_codes.py` also reads (the
+  worker-reported pre-dispatch code and the sample results that are never
+  refusals), are frozen in the same vector.
+  [vector: `tests/vectors/runner-execute.json`]
+  [vector: `tests/vectors/executor-restore-calls.json`]
+- runner vs worker remediation sample (AUTOMATED-REMEDIATION-12, -17) -- the
+  runner's pointer extraction in the `read` phase
+  (`runner/src/curie_runner/executor.py`: structured content, or a single text
+  block's strict JSON, otherwise `result_unstructured`) and the worker's sample
+  report (`apps/worker/src/curie_worker/action_executor.py::sample_report`) ship
+  in different images, so every pointer, result shape and sample kind is frozen
+  together with the comparator cases the API's evaluator
+  (`apps/api/src/curie_api/remediation_predicate.py::evaluate_sample`, which
+  judges each verifier sample, plan task 11) reads too: ordering comparators
+  read a JSON number or a strict numeric string, `eq`, `ne` and `in` never
+  coerce, and every unsuccessful sample (including the API's own `skipped`) is
+  `unsuccessful`. Read by `apps/api/tests/test_remediation_predicate_vector.py`.
+  [vector: `tests/vectors/remediation-predicate.json`]
+- API vs CLI remediation policy validation and policy refusal codes
+  (AUTOMATED-REMEDIATION-3) -- the API validator
+  (`apps/api/src/curie_api/remediation_policy_document.py`) and the CLI's
+  mirrored validation (`cli/src/remediation_policy.rs`) cannot share code
+  across Python/Rust, so the valid and invalid documents, each refusal's code
+  and path, and the numeric edge cases are frozen together; the closed policy
+  refusal codes the API returns (`POLICY_REFUSALS` in
+  `apps/api/src/curie_api/remediation_codes.py`) are the set the CLI renders
+  (`POLICY_REFUSALS` in `cli/src/remediation.rs`), frozen as `policy_refusals`.
+  The receipt vocabulary (AUTOMATED-REMEDIATION-20) is a third reader: the
+  worker's thread receipts (`apps/worker/src/curie_worker/remediation_receipts.py`:
+  `RECEIPT_STAGES`, `VERIFICATION_OUTCOMES`, `AUTHORITIES`, `RECEIPT_CODES`), the
+  API's nomination read (`remediation_codes.py`) and the CLI's `remediation list`
+  and `show` (`NOMINATION_STATES`, `RECEIPT_STAGES` and the rest in
+  `cli/src/remediation.rs`) all read the same frozen sets.
+  [vector: `tests/vectors/remediation-policy.json`]
+  [vector: `tests/vectors/remediation-codes.json`]
+- runner vs worker sealed envelope (ACTION-EXECUTOR-9, -10) -- the runner's
+  redactor (`runner/src/curie_runner/redact.py::OutboundRedactor`) decides
+  whether an envelope crosses unaltered and the worker's `_snapshot`
+  (`apps/worker/src/curie_worker/actions.py`) decides whether it is recorded;
+  both validate the same envelope grammar in different images, so they read one
+  sealed-reply vector, as does the API's `undoable` grammar
+  (`apps/api/src/curie_api/sealed_snapshot.py`).
+  [vector: `tests/vectors/sealed-snapshot-reply.json`]
+- API vs worker vs proxy vs runner canonical arguments (ACTION-EXECUTOR-7) --
+  the undo ruling's `arguments_sha256`
+  (`apps/api/src/curie_api/routers/actions.py::restore_arguments_sha256`), the
+  worker's canonicalizer and digest (`apps/worker/src/curie_worker/connector_grant.py`),
+  the caller proxy's production parser
+  (`apps/worker/src/curie_connector_proxy/server.py::_canonical_arguments`) and
+  the runner's `call` preflight must agree byte for byte, and they ship in
+  different images, so the canonical texts and digests are frozen together.
+  [vector: `tests/vectors/action-canonical-arguments.json`]
+- attachments-init vs docker `_prepare_attachments` (ADR 0205) -- the program
+  the chart renders into the sandbox's `attachments-init` container
+  (`charts/curie/templates/agent-sandbox.yaml`) cannot import the worker, so the
+  docker driver (`apps/worker/src/curie_worker/sandbox/docker.py`) reimplements
+  it: exact names, current files first and all-or-nothing, earlier files best
+  effort with a recorded reason, digest mismatch always fatal, and the hidden
+  `.curie-attachments-status.json`, and the pre-ADR rules for a payload
+  without "c" (mixed-version rollout). Both run one payload-to-outcome corpus
+  (`charts/curie/ci/attachment-init-behavior-assertions.sh` and
+  `apps/worker/tests/sandbox/test_docker_attachment_claim.py`).
+  [vector: `tests/vectors/attachment-init-outcomes.json`]
 
 A PR touching one side of a seam must route the behavior through a shared helper
 both sides call, change both sides in the same PR, or name the sibling in the PR
@@ -771,16 +913,16 @@ just that unit tests pass.
 ### The tier decision rule
 
 Applicability is a recorded decision, not a matter of taste. Every
-behavior-bearing change classifies all six tiers below as **required** or
+behavior-bearing change classifies all seven tiers below as **required** or
 **not applicable**, and a not-applicable row states a concrete reason naming
 the surface the change does not reach. "Unit tests cover it", "low risk", "CI
 is green", and "no time" are not reasons.
 
 A behavior-bearing change has at least one required tier, on the quick path as
-much as the build path. A classification that marks all six not applicable is
+much as the build path. A classification that marks all seven not applicable is
 a claim that the change alters no runtime behavior on any surface: either say
 that plainly and carry no tier, or the tier set is wrong for this change and
-the maintainer decides, but do not proceed on all six not applicable while
+the maintainer decides, but do not proceed on all seven not applicable while
 still calling the change behavior-bearing. A change that genuinely bears no
 runtime behavior records that reason once and is exempt from tier
 classification and E2E evidence for each acceptance criterion, including on
@@ -802,11 +944,41 @@ required and proved, not carried on the original classification.
 | Tier | Required when the change reaches | Command |
 | --- | --- | --- |
 | skill | plugin or skill packaging, the runner turn loop, ACI events, skill eval or check | `CURIE_E2E_TIERS=skill curie dev e2e-ladder` |
-| local | compose services, dispatcher, worker, or API wiring, boot env crossing a service boundary, the console UI, or any `curie` verb whose output, exit code, or `--json` shape changed | `CURIE_E2E_TIERS=local curie dev e2e-ladder` |
+| local | compose services, dispatcher, worker, or API wiring, boot env crossing a service boundary, the console UI, or any `curie` verb whose output, exit code, or `--json` shape changed | `CURIE_E2E_TIERS=local curie dev e2e-ladder`; for console login (OIDC against a real Dex, login codes, sessions, logout) also `curie dev oidc-e2e` |
 | local-release | released binary or image identity, the install path, version pins, release compose | `CURIE_E2E_TIERS=local-release curie dev e2e-ladder` |
 | cluster | chart templates, RBAC, securityContext, NetworkPolicy, sandbox claims, init containers | `CURIE_E2E_TIERS=cluster curie dev e2e-ladder`, or `curie dev chart-runtime-e2e` for a chart, sandbox, or bundle slice |
 | live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow; also the MCP/workspace/coding-tool path set below | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |
 | external integration | Slack, git push webhooks, connector OAuth, or any third-party API shape; Slack is required on the MCP/workspace/coding-tool path set below | drive the real integration; a replayed fixture or a fake does not close this tier |
+| factory | API factory runtime, CI, progress, or publication behavior; runner verification preflight or factory progress; the dark factory example; worker work item execution | `curie dev factory-e2e scripted` from a source checkout (add `--build-images` when the four local images are not built), or the `E2E scripted factory scenario (kind, scripted model)` PR CI job, which runs it whenever a factory path changes |
+
+The factory path set includes `apps/api/src/curie_api/factory_runtime*`,
+`factory_ci*`, `factory_progress*`, and `routers/publications*`;
+runner verification preflight and progress; `examples/dark-factory/`; and
+worker work item execution. `curie dev factory-e2e scripted` creates and deletes
+its own kind cluster, installs the candidate chart, replays the recorded
+transcript against the GitHub stub and the unitconv fixture, drives one labelled
+issue to a pull request, and exits nonzero when the preflight outcome, the
+published paths, or the final comment are wrong.
+
+The PR body guard derives minimum required tiers from changed files. A row
+required by those paths cannot be omitted or marked not applicable through
+body prose. Classify all seven rows and supply the changed files and current
+open issues to the guard. Skill and local may use fake in the mode column when
+the row supplies its exact command and an observed completed outcome. Live
+provider, external integration, and factory require `live` in the mode column;
+a blank cell or any other mode leaves the row unproved.
+
+Evidence text saying blocked, not run, or fake leaves a required row unproved
+at any tier. For a completed negative test, describe the observed outcome as
+denied, refused, or returned 401; reserve blocked, not run, and fake for
+unproved status requiring a waiver. To proceed as discovery, include the
+visible line
+`Discovery waiver: <reason> #N`, naming an open issue that tracks the missing
+proof. Table rows and waiver lines must be visible. Text inside HTML comments,
+fenced code blocks, or indented code blocks does not count as evidence.
+Any follow up named in the tier table must include its issue number.
+A waiver records the missing proof; it does not change the tier to not
+applicable or claim that the acceptance criterion passed.
 
 The path set is runner MCP catalog projection, unscoped PreToolUse,
 in-process platform MCP tools, workspace publication, and
@@ -836,8 +1008,9 @@ Every meaningful acceptance criterion needs two observations, not one.
 Record both against the run, per the run state contract in
 `.claude/skills/implement/SKILL.md`, and expose them in the pull request
 through the checklist in `.github/PULL_REQUEST_TEMPLATE.md`. A required tier
-with no passing evidence record blocks completion; it is reported as a blocker,
-not carried as a note.
+with no passing evidence record blocks completion unless the discovery waiver
+above names an open issue. Report the missing proof as a blocker, including
+when proceeding under that waiver.
 
 ## Playwright: two modes
 
@@ -892,6 +1065,26 @@ release train branch.
 Bug fixes, security fixes, and anything shared by both lines land on the stable
 `main` line first. Features for the next feature release land on `next`.
 
+For a patch cut whose fixes are still under preparation, use one short-lived
+preparation PR to `main` carrying those fixes, the version bump, and the atlas
+snapshot. Commit all non-version changes first and pin the atlas to that final
+non-version commit. Follow it with the version/snapshot commit, whose paths must
+stay inside `release/atlas.py::version_only_paths` for the release tag. Keep the
+head up to date with `main`; if the base or a non-version change advances,
+regenerate the pin and snapshot and rerun the required checks on the final head.
+Do not require a separate candidate PR or candidate CI round.
+
+The atlas may accept the merge commit across that version-only delta. Current
+tag authorization under
+[ADR 0195](docs/adr/0195-a-version-only-delta-reuses-its-parents-checks.md) still
+excludes the second-parent PR head as inherited CI proof. A combined preparation
+merge therefore needs its own complete required checks on `main` before direct
+tagging. [Draft ADR 0196](docs/adr/0196-combined-preparation-pr-checks.md) proposes
+reusing full green PR-head checks for an up-to-date merge with a version-only or
+empty delta; that path remains blocked until explicit ADR acceptance and
+implementation. The complete procedure is in
+[release verification](docs/release-verification.md#one-preparation-pr-carries-the-fixes-and-version).
+
 To cut a feature release candidate, merge `main` into `next` through a PR, tag
 the release candidate on `next`, and test that candidate extensively. The
 forward merge from `main` into `next` happens at release candidate prep, not
@@ -936,14 +1129,19 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
   keyword in a PR that targets `next` never fires on its own. Issues referenced
   by a `next` targeted PR are closed at the `next` into `main` merge, where the
   magic words fire once on the default branch.
-- PR bodies must contain real line breaks. The PR body guard rejects escaped
-  newline sequences because GitHub treats them as text, making closing keywords
-  inert. A patch release PR (title `Prepare the vX.Y.Z release` with Z not 0)
-  must also fill Trigger (issue numbers) and Live proof (a run URL or
-  `waiver: <reason>`); the same guard rejects either section left empty. Run
-  `scripts/check-pr-body.sh <body-file>` before opening or editing a PR
-  (`--title-file` for a release PR). See
-  [`docs/release-verification.md`](docs/release-verification.md#patch-releases-name-their-trigger-and-live-proof).
+
+PR bodies must contain real line breaks. The PR body guard rejects escaped
+newline sequences because GitHub treats them as text, making closing keywords
+inert. A patch release PR (title `Prepare the vX.Y.Z release` with Z not 0)
+must also fill Trigger (issue numbers) and Live proof (a run URL, the exact
+standalone `this-pr-ci` line inside that section, or `waiver: <reason>`);
+the same guard rejects either section left empty. The marker references the
+preparation PR's own CI and proves only the rungs that CI actually ran; a
+required live surface outside that run still needs a run URL or waiver. Run
+`scripts/check-pr-body.sh <body-file> --changed-files-file <changed-files-json> --open-issues-file <open-issues-json>` before opening or editing a PR
+(`--title-file` for a release PR). See
+[`docs/release-verification.md`](docs/release-verification.md#patch-releases-name-their-trigger-and-live-proof).
+
 - **Never mention any AI assistant (Claude, Codex, GPT, etc.) or AI in general in
   commit messages OR pull request bodies, and never add `Co-Authored-By` lines
   referencing AI.** This applies to the PR body as much as to the commits: many
@@ -954,7 +1152,7 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
 
   ```bash
   scripts/check-commit-messages.sh origin/<base>..HEAD
-  scripts/check-pr-body.sh <body-file>
+  scripts/check-pr-body.sh <body-file> --changed-files-file <changed-files-json> --open-issues-file <open-issues-json>
   scripts/check-commit-messages.sh --self-test
   scripts/check-pr-body.sh --self-test
   ```
@@ -1015,6 +1213,15 @@ the work in a linked GitHub issue and pull request. Follow
   it is deletable and does not change the architecture, so it is a feature, not an
   architectural decision. The issue carries the what and the why; the *how* lives in
   the PR. An issue may cite an ADR.
+- **An example bundle or agent is never the subject of an ADR.** What a bundle
+  under `examples/` does (its skill text, prompts, tool policy, test or verdict
+  rules, safety rules, operator guidance) is that bundle's design, even when it
+  is safety relevant. Record it in the bundle's README or `docs/`, and track
+  changes in issues. When a bundle needs the platform itself to change shape,
+  the ADR covers only that platform contract, seam or invariant, stated so that
+  it holds for every bundle, not the bundle's own rules. The mean tester ADRs
+  (0169, 0172, 0181) are the counterexample: they record one example bundle's
+  behavior.
 - **When in doubt, write the issue.** Promote to an ADR only when the same decision
   gets re-explained across a third issue or PR.
 

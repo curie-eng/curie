@@ -1,7 +1,7 @@
 //! Integration: the platform API client's deploy flow against the OpenAPI
 //! contract shapes (apps/api openapi.json), served by a wire-level test server.
 
-mod support;
+use crate::support;
 
 use curie::api::{ApiClient, ChannelOutcome, DeployOutcome, WorkspaceIntent};
 use curie::bundle::pack_tar_gz;
@@ -26,9 +26,6 @@ const DEPLOYMENT_ID: &str = "33333333-3333-3333-3333-333333333333";
 const BOUND: &str = "C0EXAMPLE1";
 /// A second, not-yet-bound channel: what `--slack-channel` asks to ADD.
 const OTHER: &str = "C0EXAMPLE2";
-
-#[cfg(unix)]
-static PATH_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(unix)]
 struct GitEnvGuard {
@@ -135,6 +132,7 @@ fn assert_command_deploy_wire(server: &MockServer, commit_sha: Option<&str>) {
         vec![
             ("GET".to_string(), "/agents".to_string()),
             ("POST".to_string(), "/agents".to_string()),
+            ("PATCH".to_string(), format!("/agents/{AGENT_ID}")),
             ("POST".to_string(), format!("/agents/{AGENT_ID}/versions"),),
             (
                 "PUT".to_string(),
@@ -144,10 +142,10 @@ fn assert_command_deploy_wire(server: &MockServer, commit_sha: Option<&str>) {
         ]
     );
 
-    let version_request = &recorded[2];
+    let version_request = &recorded[3];
     let version_body: serde_json::Value =
         serde_json::from_slice(&version_request.body).expect("version body should be JSON");
-    let deployment_request = &recorded[4];
+    let deployment_request = &recorded[5];
     let deployment_body: serde_json::Value =
         serde_json::from_slice(&deployment_request.body).expect("deployment body should be JSON");
 
@@ -252,7 +250,7 @@ exec "$CURIE_TEST_REAL_GIT" "$@"
     permissions.set_mode(0o755);
     std::fs::set_permissions(&wrapper, permissions).unwrap();
     let count_file = wrapper_dir.path().join("git-count");
-    let _path_env = PATH_ENV_LOCK.lock().await;
+    let _path_env = support::ENV_LOCK.lock().await;
     let git_env = GitEnvGuard::install(&git, &count_file, wrapper_dir.path());
 
     let git_server = serve(|req| route(&req.method, &req.path));
@@ -372,6 +370,12 @@ fn route(method: &str, path: &str) -> Response {
                 r#"{{"id":"{DEPLOYMENT_ID}","agent_id":"{AGENT_ID}","version_id":"{VERSION_ID}","environment":"dev","status":"active","deployed_at":"2026-07-05T00:00:00Z"}}"#
             ),
         ),
+        ("PATCH", p) if p == format!("/agents/{AGENT_ID}") => Response::json(
+            200,
+            &format!(
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#local-dev"}}],"created_at":"2026-07-05T00:00:00Z","memory":false}}"##
+            ),
+        ),
         other => panic!("unexpected request: {other:?}"),
     }
 }
@@ -417,6 +421,7 @@ async fn deploy_walks_the_full_contract_flow_with_auth() {
         vec![
             ("GET".to_string(), "/agents".to_string()),
             ("POST".to_string(), "/agents".to_string()),
+            ("PATCH".to_string(), format!("/agents/{AGENT_ID}")),
             ("POST".to_string(), format!("/agents/{AGENT_ID}/versions")),
             (
                 "PUT".to_string(),
@@ -430,7 +435,7 @@ async fn deploy_walks_the_full_contract_flow_with_auth() {
     }
 
     // The bundle upload is multipart with the archive under the `file` field.
-    let upload = &recorded[3];
+    let upload = &recorded[4];
     assert!(upload
         .header("content-type")
         .unwrap()
@@ -484,6 +489,10 @@ fn deploy_tail(method: &str, path: &str) -> Option<Response> {
                 r#"{{"id":"{DEPLOYMENT_ID}","agent_id":"{AGENT_ID}","version_id":"{VERSION_ID}","environment":"dev","status":"active","deployed_at":"2026-07-05T00:00:00Z"}}"#
             ),
         )),
+        // Every deploy declares its connector-secret map, including `{}` when
+        // the bundle binds none (#3853). Answer it so the recording can see
+        // the body. Callers that match PATCH themselves still win.
+        ("PATCH", p) if p == format!("/agents/{AGENT_ID}") => Some(patched_agent(BOUND, None)),
         _ => None,
     }
 }
@@ -537,28 +546,29 @@ fn patch_bodies(server: &MockServer) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Assert that the deploy issued no `PATCH /agents/{id}` at all.
+fn empty_secret_declaration(body: &serde_json::Value) -> bool {
+    body.as_object().is_some_and(|obj| {
+        obj.len() == 1
+            && obj
+                .get("secrets")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(serde_json::Map::is_empty)
+    })
+}
+
+/// Assert the deploy wrote no agent field except the connector-secret
+/// declaration. An empty declaration is required (#3853). A repo or channel
+/// key is still a failure.
 ///
-/// This assertion is only load-bearing because the no-PATCH tests ANSWER an
-/// unexpected PATCH instead of panicking on it. The mock records a request
-/// only AFTER its handler returns (`cli/tests/support/mod.rs`), so a handler
-/// that panics on a PATCH means the PATCH is never recorded: the check then
-/// runs over a list that could not contain the thing it looks for and passes
-/// no matter what the CLI did. Such a test goes red only through the socket
-/// error the unwound handler thread causes, which is red for the wrong reason
-/// and is equally red for unrelated breakage. Answering keeps the request in
-/// the recording, so "the CLI sent a PATCH it must not send" is what fails,
-/// and the offending body is the failure message.
+/// Load-bearing only because the tests ANSWER an unexpected PATCH instead of
+/// panicking on it. The mock records a request only AFTER its handler returns
+/// (`cli/tests/support/mod.rs`), so a handler that panics on a PATCH means the
+/// PATCH is never recorded.
 fn assert_no_patch(server: &MockServer) {
-    let patches: Vec<String> = server
-        .recorded()
-        .iter()
-        .filter(|r| r.method == "PATCH")
-        .map(|r| format!("{} {}", r.path, String::from_utf8_lossy(&r.body)))
-        .collect();
+    let patches = patch_bodies(server);
     assert!(
-        patches.is_empty(),
-        "no PATCH should have been issued, got {patches:?}"
+        patches.iter().all(empty_secret_declaration),
+        "only an empty secret declaration may be patched, got {patches:?}"
     );
 }
 
@@ -592,6 +602,13 @@ fn assert_no_binding_write(server: &MockServer) {
         .recorded()
         .iter()
         .filter(|r| {
+            let secret_clear = r.method == "PATCH"
+                && serde_json::from_slice::<serde_json::Value>(&r.body)
+                    .ok()
+                    .is_some_and(|body| empty_secret_declaration(&body));
+            if secret_clear {
+                return false;
+            }
             r.method == "PATCH"
                 || ((r.method == "POST" || r.method == "DELETE") && r.path == channels_path())
         })
@@ -740,9 +757,9 @@ async fn valid_repo_full_names_preserve_bind_behavior() {
         ("PATCH", path) if *path == format!("/agents/{AGENT_ID}") => {
             let body: serde_json::Value =
                 serde_json::from_slice(&req.body).expect("PATCH /agents/{id} body should be JSON");
-            let repo = body["repo_full_name"]
-                .as_str()
-                .expect("PATCH /agents/{id} should carry repo_full_name");
+            let Some(repo) = body["repo_full_name"].as_str() else {
+                return patched_agent("#old", None);
+            };
             patched_agent("#old", Some(repo))
         }
         (method, path) => deploy_tail(method, path)
@@ -765,8 +782,20 @@ async fn valid_repo_full_names_preserve_bind_behavior() {
     }
 
     let patches = patch_bodies(&server);
-    assert_eq!(patches.len(), vectors.valid.len());
-    for (body, case) in patches.iter().zip(&vectors.valid) {
+    let repo_patches: Vec<&serde_json::Value> = patches
+        .iter()
+        .filter(|body| body.get("repo_full_name").is_some())
+        .collect();
+    assert_eq!(repo_patches.len(), vectors.valid.len());
+    assert_eq!(
+        patches
+            .iter()
+            .filter(|body| body.get("secrets").is_some())
+            .count(),
+        vectors.valid.len(),
+        "each redeploy also declares its connector secrets: {patches:?}"
+    );
+    for (body, case) in repo_patches.iter().zip(&vectors.valid) {
         assert_eq!(body["repo_full_name"].as_str(), Some(case.value.as_str()));
         assert!(
             body.get("channel").is_none(),
@@ -1036,19 +1065,27 @@ async fn deploy_binds_an_unbound_agents_repo() {
     let outcome = run_deploy(&client, None, Some("acme/bundle")).await;
 
     let patches = patch_bodies(&server);
+    let repo_patches: Vec<&serde_json::Value> = patches
+        .iter()
+        .filter(|body| body.get("repo_full_name").is_some())
+        .collect();
     assert_eq!(
-        patches.len(),
+        repo_patches.len(),
         1,
-        "expected exactly one PATCH, got {patches:?}"
+        "expected exactly one repo PATCH, got {patches:?}"
     );
-    assert_eq!(patches[0]["repo_full_name"], "acme/bundle");
+    assert_eq!(repo_patches[0]["repo_full_name"], "acme/bundle");
     // `AgentUpdate.channel` is retired (ADR-0118): bindings move through the
     // subresource, so a `channel` key here is not merely unasked-for, it now
     // 422s at the router.
     assert!(
-        patches[0].get("channel").is_none(),
+        repo_patches[0].get("channel").is_none(),
         "AgentUpdate no longer carries a channel: {}",
-        patches[0]
+        repo_patches[0]
+    );
+    assert!(
+        patches.iter().any(empty_secret_declaration),
+        "the same deploy clears connector secrets when it binds none: {patches:?}"
     );
     assert!(
         outcome.repo_note.is_none(),
@@ -1088,16 +1125,24 @@ async fn deploy_binds_the_repo_while_also_adding_the_channel() {
     assert_eq!(posts[0]["address"], OTHER);
 
     let patches = patch_bodies(&server);
+    let repo_patches: Vec<&serde_json::Value> = patches
+        .iter()
+        .filter(|body| body.get("repo_full_name").is_some())
+        .collect();
     assert_eq!(
-        patches.len(),
+        repo_patches.len(),
         1,
         "the repo bind is its own PATCH: {patches:?}"
     );
-    assert_eq!(patches[0]["repo_full_name"], "acme/bundle");
+    assert_eq!(repo_patches[0]["repo_full_name"], "acme/bundle");
     assert!(
-        patches[0].get("channel").is_none(),
+        repo_patches[0].get("channel").is_none(),
         "the binding went via the subresource, so the PATCH carries no channel: {}",
-        patches[0]
+        repo_patches[0]
+    );
+    assert!(
+        patches.iter().any(empty_secret_declaration),
+        "the secret declaration is a separate PATCH: {patches:?}"
     );
 
     let flow = flow(&server);
@@ -1141,12 +1186,20 @@ async fn deploy_warns_when_the_platform_drops_the_repo_binding() {
 
     // The CLI did its half: the key went out on the wire.
     let patches = patch_bodies(&server);
+    let repo_patches: Vec<&serde_json::Value> = patches
+        .iter()
+        .filter(|body| body.get("repo_full_name").is_some())
+        .collect();
     assert_eq!(
-        patches.len(),
+        repo_patches.len(),
         1,
-        "expected exactly one PATCH, got {patches:?}"
+        "expected exactly one repo PATCH, got {patches:?}"
     );
-    assert_eq!(patches[0]["repo_full_name"], "acme/bundle");
+    assert_eq!(repo_patches[0]["repo_full_name"], "acme/bundle");
+    assert!(
+        patches.iter().any(empty_secret_declaration),
+        "the secret declaration still goes out when the repo key is ignored: {patches:?}"
+    );
     // And it reports the row the API returned, not the one it asked for.
     assert_eq!(outcome.agent.repo_full_name, None);
     let note = outcome
@@ -1813,6 +1866,7 @@ async fn a_local_deploy_narrows_the_bring_up_to_the_targets_connectors() {
          secrets: [D8_TEST_KEPT_TOKEN]\n",
     )
     .unwrap();
+    let _env = support::ENV_LOCK.lock().await;
     std::env::remove_var("D8_TEST_EXCLUDED_TOKEN");
     std::env::remove_var("D8_TEST_KEPT_TOKEN");
 
@@ -1827,4 +1881,184 @@ async fn a_local_deploy_narrows_the_bring_up_to_the_targets_connectors() {
         !message.contains("D8_TEST_EXCLUDED_TOKEN"),
         "excluded is not this target's connector and must never reach bring_up_local: {message}"
     );
+}
+
+const OTHER_AGENT_ID: &str = "44444444-4444-4444-4444-444444444444";
+
+/// A redeploy that binds no connector secret must PATCH `{}` so the API drops
+/// names a previous deploy stored (#3853). Helm already clears its binding on
+/// that same empty declaration.
+#[tokio::test]
+async fn redeploy_without_connector_secrets_clears_the_agent_record() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json(AGENT_ID, AGENT_NAME, BOUND, None)),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent(BOUND, None),
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    run_deploy(&client, None, None).await;
+    let patches = patch_bodies(&server);
+    assert_eq!(
+        patches.len(),
+        1,
+        "the deploy must clear connector secrets with one empty declaration, got {patches:?}"
+    );
+    assert!(
+        empty_secret_declaration(&patches[0]),
+        "the declaration must be an empty secret map, got {}",
+        patches[0]
+    );
+}
+
+// @spec #4129 optional-secret contract: declaration alone must never synthesize a binding.
+#[tokio::test]
+async fn optional_secrets_are_absent_from_local_and_cluster_deploy_records() {
+    for tier in [commands::DeployTier::Local, commands::DeployTier::Cluster] {
+        let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/agents") => existing_agents(&agent_json(AGENT_ID, AGENT_NAME, BOUND, None)),
+            ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent(BOUND, None),
+            ("GET", p) if p.starts_with("/deployments?") => Response::json(200, "[]"),
+            (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        scaffold(dir.path(), AGENT_NAME).unwrap();
+        let manifest_path = dir.path().join(".claude-plugin/plugin.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["optionalSecrets"] = serde_json::json!(["OPTIONAL_TOKEN"]);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let mut opts = identity_deploy_opts(&server, dir.path(), None, None, None);
+        opts.tier = tier;
+        opts.env = Some(commands::DeployEnv::Dev);
+        // The production prepare path executes the gate and writes the record;
+        // it stops before cluster deployment, so this is API wiring proof.
+        commands::prepare_deploy(opts).await.unwrap();
+        let patches = patch_bodies(&server);
+        assert_eq!(patches.len(), 1, "{tier:?}: {patches:?}");
+        assert!(
+            empty_secret_declaration(&patches[0]),
+            "{tier:?}: {patches:?}"
+        );
+
+        manifest["secrets"] = serde_json::json!(["REQUIRED_TOKEN"]);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let before = server.recorded().len();
+        let mut opts = identity_deploy_opts(&server, dir.path(), None, None, None);
+        opts.tier = tier;
+        opts.env = Some(commands::DeployEnv::Dev);
+        let err = commands::prepare_deploy(opts)
+            .await
+            .err()
+            .expect("required refusal");
+        assert_eq!(curie::exit::classify(&err).0.code(), 2);
+        let message = format!("{err:#}");
+        assert!(message.contains(
+            "declares connector secret(s) that were not bound on deploy: REQUIRED_TOKEN"
+        ));
+        assert!(!message.contains("OPTIONAL_TOKEN"));
+        assert_eq!(server.recorded().len(), before, "refuse before networking");
+    }
+}
+
+// @spec #4129 optional-secret contract: an explicit optional binding follows normal local delivery.
+#[cfg(unix)]
+#[tokio::test]
+async fn local_cli_delivers_only_explicitly_bound_optional_secrets() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json(AGENT_ID, AGENT_NAME, BOUND, None)),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent(BOUND, None),
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    let manifest_path = dir.path().join(".claude-plugin/plugin.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["optionalSecrets"] = serde_json::json!(["OPTIONAL_TOKEN", "UNBOUND_TOKEN"]);
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+    command
+        .args(["local", "deploy", "--plugin-dir"])
+        .arg(dir.path())
+        .args(["--api-url", &server.base_url, "--secret", "OPTIONAL_TOKEN"])
+        .env("CURIE_CONFIG_DIR", config.path())
+        .env("OPTIONAL_TOKEN", "example-bound-value")
+        .env("UNBOUND_TOKEN", "example-ambient-value");
+    let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let patches = patch_bodies(&server);
+    assert_eq!(patches.len(), 1, "{patches:?}");
+    assert_eq!(
+        patches[0]["secrets"],
+        serde_json::json!({"OPTIONAL_TOKEN": "example-bound-value"})
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("example-bound-value"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("example-bound-value"));
+}
+
+/// A nonempty declaration replaces the stored map, and a second agent's row
+/// is not part of this deploy.
+#[tokio::test]
+async fn redeploy_with_connector_secrets_replaces_only_that_agents_record() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(
+            200,
+            &format!(
+                "[{},{}]",
+                agent_json(AGENT_ID, AGENT_NAME, BOUND, None),
+                agent_json(OTHER_AGENT_ID, "acme-keep", "C0EXAMPLE2", None)
+            ),
+        ),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent(BOUND, None),
+        ("PATCH", p) if *p == format!("/agents/{OTHER_AGENT_ID}") => Response::json(
+            200,
+            &agent_json(OTHER_AGENT_ID, "acme-keep", "C0EXAMPLE2", None),
+        ),
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    let archive = pack_tar_gz(dir.path()).unwrap();
+    let mut secrets = std::collections::BTreeMap::new();
+    secrets.insert("ACME_TOKEN_B".to_string(), "secretKeyRef".to_string());
+    client
+        .deploy(
+            AGENT_NAME,
+            None,
+            "0.1.0-1",
+            "tester",
+            "dev",
+            archive,
+            &secrets,
+            None,
+            None,
+            WorkspaceIntent::Preserve,
+        )
+        .await
+        .unwrap();
+
+    let patches = patch_bodies(&server);
+    assert_eq!(
+        patches.len(),
+        1,
+        "one declaration for the deployed agent: {patches:?}"
+    );
+    assert_eq!(patches[0]["secrets"]["ACME_TOKEN_B"], "secretKeyRef");
+    assert_eq!(
+        patches[0]["secrets"].as_object().map(serde_json::Map::len),
+        Some(1)
+    );
+    let other = server
+        .recorded()
+        .into_iter()
+        .any(|r| r.method == "PATCH" && r.path == format!("/agents/{OTHER_AGENT_ID}"));
+    assert!(!other, "the unrelated agent must keep its own credentials");
 }

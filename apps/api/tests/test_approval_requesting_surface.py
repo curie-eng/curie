@@ -8,15 +8,18 @@ Postgres and Valkey:
    mix of the mode and a fixed target is refused. A fixed target stays Slack.
 2. An adapter principal is served an approval whose card went to one of its
    own bindings: the conversation that asked, routeless or in the new mode.
-3. A card shown on a non-Slack surface is answered by the requester alone: the
-   sender the serving adapter authenticated, and only when it equals the
-   approval's author. Nobody copied on the thread, no operator, no console
-   session and no Slack principal can answer it.
+3. A card shown in an email thread is answered only by a sender the serving
+   adapter verified whose address is on the route's approver ``emails``
+   (ADR-0177 amendment), after the binding's ``allowed_callers`` admit that sender
+   (ADR 0175). The requester is not admitted by default, a routeless email
+   approval and an empty list admit nobody, and no operator, console session or
+   Slack principal can answer it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from collections.abc import Iterator
@@ -38,10 +41,15 @@ PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
 ADAPTER_SUBJECT = "mail-adapter-test"
 REQUESTER = "requester@example.com"
 COPIED = "copied@example.com"
+APPROVER = "approver@example.com"
 EMAIL_ENDPOINT = "http://curie-mail-adapter:8080/"
 EMAIL_ADAPTER = "agentmail-sandbox"
 REQUESTING_SURFACE = {"mode": "requesting_surface"}
 NOT_FOUND = "approval not found"
+# The route every email agent here is created with unless a test names its own:
+# the card is shown in the asking thread and only APPROVER may answer it.
+LISTED_ROUTE = "approve"
+LISTED = {"resolution": REQUESTING_SURFACE, "approvers": {"emails": [APPROVER]}}
 
 
 @pytest.fixture
@@ -107,8 +115,7 @@ def _email_agent(
             "adapter": EMAIL_ADAPTER,
         },
     }
-    if routes is not None:
-        body["approval_routes"] = routes
+    body["approval_routes"] = routes if routes is not None else {LISTED_ROUTE: LISTED}
     created = client.post("/agents", json=body, headers=auth)
     assert created.status_code == 201, created.text
     agent_id = str(created.json()["id"])
@@ -313,15 +320,17 @@ def test_one_agent_two_inboxes_the_adapter_serves_only_its_own_thread(
         headers=auth_headers,
     )
     assert added.status_code == 201, added.text
-    on_a = _email_approval(surface_client, auth_headers, agent)
-    on_b = _email_approval(surface_client, auth_headers, {**agent, "inbox": inbox_b})
+    on_a = _email_approval(surface_client, auth_headers, agent, route=LISTED_ROUTE)
+    on_b = _email_approval(
+        surface_client, auth_headers, {**agent, "inbox": inbox_b}, route=LISTED_ROUTE
+    )
     token = _adapter_token([agent["binding_id"]])
 
     assert _listed(surface_client, token) == {on_a["id"]}
-    refused = _resolve(surface_client, on_b["id"], _adp(token, REQUESTER))
+    refused = _resolve(surface_client, on_b["id"], _adp(token, APPROVER))
     assert refused.status_code == 404, refused.text
     assert _status(surface_client, auth_headers, on_b["id"]) == "pending"
-    accepted = _resolve(surface_client, on_a["id"], _adp(token, REQUESTER))
+    accepted = _resolve(surface_client, on_a["id"], _adp(token, APPROVER))
     assert accepted.status_code == 200, accepted.text
 
 
@@ -356,9 +365,8 @@ def test_a_route_repointed_after_the_ask_leaves_the_card_where_it_was_shown(
     not move it. The email card stays answerable only in the email thread, and
     a listed Slack user (here through an operator token) cannot answer it."""
 
-    agent = _email_agent(
-        surface_client, auth_headers, routes={"confirm": {"resolution": REQUESTING_SURFACE}}
-    )
+    listed = {"resolution": REQUESTING_SURFACE, "approvers": {"emails": [REQUESTER]}}
+    agent = _email_agent(surface_client, auth_headers, routes={"confirm": listed})
     approval = _email_approval(surface_client, auth_headers, agent, route="confirm")
     token = _adapter_token([agent["binding_id"]])
     _repoint(
@@ -382,18 +390,24 @@ def test_a_route_repointed_after_the_ask_leaves_the_card_where_it_was_shown(
     refused = _resolve(surface_client, approval["id"], {PRINCIPAL_HEADER: operator})
     assert refused.status_code == 403, refused.text
     # The new approvers are Slack users nobody on the email thread can prove
-    # to be, so the requester cannot answer either: it fails closed.
+    # to be, and the route lists no emails now: it fails closed.
     closed = _resolve(surface_client, approval["id"], _adp(token, REQUESTER))
     assert closed.status_code == 403, closed.text
     assert _status(surface_client, auth_headers, approval["id"]) == "pending"
 
-    # Re-pointed without approvers, the card is still the requester's to answer.
+    # Re-pointed without approvers, nobody is listed either (ADR-0177 amendment: no
+    # requester-only default), so the email card still admits nobody.
     _repoint(
         surface_client,
         auth_headers,
         agent["agent_id"],
         {"resolution": {"kind": "slack", "address": "C0EXAMPLE1"}},
     )
+    still_closed = _resolve(surface_client, approval["id"], _adp(token, REQUESTER))
+    assert still_closed.status_code == 403, still_closed.text
+
+    # The list is read fresh: listing the address again lets it answer.
+    _repoint(surface_client, auth_headers, agent["agent_id"], listed)
     accepted = _resolve(surface_client, approval["id"], _adp(token, REQUESTER))
     assert accepted.status_code == 200, accepted.text
 
@@ -536,42 +550,75 @@ def test_a_slack_shaped_asking_address_is_never_read_as_the_asking_card(
     assert _status(surface_client, auth_headers, approval["id"]) == "pending"
 
 
-# --- 3. the requester-only approver set ---------------------------------------
+# --- 3. the approver email list (ADR-0177 amendment) -------------------------
 
 
-@pytest.mark.parametrize("route", [None, "confirm"])
-def test_the_requester_answers_by_the_serving_adapter_and_the_session_resumes(
+def _set_callers(
+    client: TestClient, auth: dict[str, str], agent: dict[str, str], callers: list[str] | None
+) -> None:
+    """Set the asking binding's inbound allowlist (ADR 0175)."""
+
+    response = client.put(
+        f"/agents/{agent['agent_id']}/channels/callers",
+        params={"kind": "email", "address": agent["inbox"], "adapter": EMAIL_ADAPTER},
+        json={"allowed_callers": callers},
+        headers=auth,
+    )
+    assert response.status_code == 200, response.text
+
+
+def _write_routes_raw(agent_id: str, routes: dict[str, Any]) -> None:
+    """Write the route map around the API, as an out-of-band JSONB edit would."""
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    sql_text(
+                        "UPDATE curie.agents SET approval_routes = CAST(:routes AS jsonb) "
+                        "WHERE id = :aid"
+                    ),
+                    {"routes": json.dumps(routes), "aid": agent_id},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("actor", [APPROVER, f"  {APPROVER.upper()} "])
+def test_a_listed_verified_sender_answers_and_the_session_resumes(
     surface_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
     valkey: redis.Redis,
     runs_stream: str,
-    route: str | None,
+    actor: str,
 ) -> None:
-    agent = _email_agent(
-        surface_client, auth_headers, routes={"confirm": {"resolution": REQUESTING_SURFACE}}
-    )
-    approval = _email_approval(surface_client, auth_headers, agent, route=route)
+    """The listed approver is not the person who asked: anyone on the list may
+    answer. The match ignores case and the adapter's surrounding whitespace,
+    and nothing else."""
+
+    agent = _email_agent(surface_client, auth_headers)
+    approval = _email_approval(surface_client, auth_headers, agent, route=LISTED_ROUTE)
     token = _adapter_token([agent["binding_id"]])
 
-    # Surrounding whitespace is the adapter's formatting, not a second identity.
-    accepted = _resolve(surface_client, approval["id"], _adp(token, f"  {REQUESTER} "))
+    accepted = _resolve(surface_client, approval["id"], _adp(token, actor))
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["status"] == "approved"
-    assert accepted.json()["resolved_by"] == REQUESTER
     assert accepted.json()["resolution_note"] == "looks right"
 
     audit = _audit(surface_client, auth_headers, approval["id"])
     assert len(audit) == 1
     assert audit[0]["action"] == "resolved"
-    assert audit[0]["authorizer"] == "RequesterOnly"
+    assert audit[0]["authorizer"] == "EmailApproverList"
     assert audit[0]["principal_kind"] == "adapter"
     assert audit[0]["principal_subject"] == ADAPTER_SUBJECT
-    assert audit[0]["actor"] == REQUESTER
     assert audit[0]["evidence"] == {
-        "kind": "requester_only",
-        "surface_kind": "email",
-        "actor_is_requester": True,
+        "kind": "email_list",
+        "emails": [APPROVER],
+        "actor_listed": True,
     }
     # The answer wakes the paused session; it is never a new turn of its own.
     entries = valkey.xrange(runs_stream)
@@ -579,54 +626,298 @@ def test_the_requester_answers_by_the_serving_adapter_and_the_session_resumes(
     assert f"approval-{approval['id']}-resolved" in str(entries[0][1])
 
     # A replayed answer loses: the first one won.
-    again = _resolve(surface_client, approval["id"], _adp(token, REQUESTER), "rejected")
+    again = _resolve(surface_client, approval["id"], _adp(token, APPROVER), "rejected")
     assert again.status_code == 409, again.text
-    assert f"already resolved by {REQUESTER}" in again.json()["detail"]
 
 
-def test_a_person_copied_on_the_thread_cannot_answer(
+def test_a_listed_requester_may_approve_their_own_request(
     surface_client: TestClient,
     auth_headers: dict[str, str],
     clean_db: None,
     valkey: redis.Redis,
     runs_stream: str,
 ) -> None:
+    """ADR-0177 amendment A5, as Slack under ADR-0106: being the person who asked
+    neither grants nor blocks. A requester whose own address is listed answers
+    their own request, and the audit row says the list admitted them."""
+
+    agent = _email_agent(
+        surface_client,
+        auth_headers,
+        routes={
+            LISTED_ROUTE: {
+                "resolution": REQUESTING_SURFACE,
+                "approvers": {"emails": [REQUESTER, APPROVER]},
+            }
+        },
+    )
+    approval = _email_approval(surface_client, auth_headers, agent, route=LISTED_ROUTE)
+    assert approval["author"] == REQUESTER
+    token = _adapter_token([agent["binding_id"]])
+
+    accepted = _resolve(surface_client, approval["id"], _adp(token, REQUESTER))
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["status"] == "approved"
+    assert accepted.json()["resolved_by"] == REQUESTER
+    (row,) = _audit(surface_client, auth_headers, approval["id"])
+    assert (row["action"], row["authorizer"]) == ("resolved", "EmailApproverList")
+    assert row["evidence"]["actor_listed"] is True
+    assert len(valkey.xrange(runs_stream)) == 1
+
+
+def test_several_listed_approvers_on_the_thread_the_first_answer_wins(
+    surface_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """ADR-0177 amendment A5: several listed approvers may be copied in. The first
+    answer the platform accepts settles the approval for good: a second listed
+    approver, answering the other way, is refused and changes nothing."""
+
+    agent = _email_agent(
+        surface_client,
+        auth_headers,
+        routes={
+            LISTED_ROUTE: {
+                "resolution": REQUESTING_SURFACE,
+                "approvers": {"emails": [APPROVER, COPIED]},
+            }
+        },
+    )
+    approval = _email_approval(surface_client, auth_headers, agent, route=LISTED_ROUTE)
+    token = _adapter_token([agent["binding_id"]])
+
+    first = _resolve(surface_client, approval["id"], _adp(token, COPIED), "rejected")
+    assert first.status_code == 200, first.text
+    second = _resolve(surface_client, approval["id"], _adp(token, APPROVER), "approved")
+    assert second.status_code == 409, second.text
+
+    record = surface_client.get(f"/approvals/{approval['id']}", headers=auth_headers).json()
+    assert (record["status"], record["resolved_by"]) == ("rejected", COPIED)
+    assert len(valkey.xrange(runs_stream)) == 1
+
+
+@pytest.mark.parametrize("actor", [COPIED, REQUESTER, f"{APPROVER}.example.net"])
+def test_an_unlisted_sender_the_inbox_admits_cannot_answer(
+    surface_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    actor: str,
+) -> None:
+    """Being allowed to talk to the bot is not being allowed to approve. Every
+    actor here is on the binding's ``allowed_callers``, and none is on the
+    approver list: a copied person, the person who asked (no requester-only
+    default), and a near miss of the listed address."""
+
+    agent = _email_agent(surface_client, auth_headers)
+    _set_callers(surface_client, auth_headers, agent, [COPIED, REQUESTER, APPROVER, actor])
+    approval = _email_approval(surface_client, auth_headers, agent, route=LISTED_ROUTE)
+    token = _adapter_token([agent["binding_id"]])
+
+    denied = _resolve(surface_client, approval["id"], _adp(token, actor))
+    assert denied.status_code == 403, denied.text
+    assert "not an approver" in denied.json()["detail"]
+    assert _status(surface_client, auth_headers, approval["id"]) == "pending"
+    audit = _audit(surface_client, auth_headers, approval["id"])
+    assert [(row["action"], row["authorizer"]) for row in audit] == [
+        ("denied", "EmailApproverList")
+    ]
+    assert audit[0]["evidence"]["actor_listed"] is False
+    assert valkey.xrange(runs_stream) == []
+
+
+def test_a_sender_outside_allowed_callers_is_refused_before_the_approver_list(
+    surface_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """ADR-0177 amendment A2: the inbound allowlist comes first. A listed approver
+    the binding does not admit is refused with the channel port's own refusal,
+    before any approval logic, so no audit row is written. Admitting them then
+    lets the list decide."""
+
+    agent = _email_agent(surface_client, auth_headers)
+    _set_callers(surface_client, auth_headers, agent, [REQUESTER])
+    approval = _email_approval(surface_client, auth_headers, agent, route=LISTED_ROUTE)
+    token = _adapter_token([agent["binding_id"]])
+
+    refused = _resolve(surface_client, approval["id"], _adp(token, APPROVER))
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"] == "caller_not_allowed"
+    assert _status(surface_client, auth_headers, approval["id"]) == "pending"
+    assert _audit(surface_client, auth_headers, approval["id"]) == []
+    assert valkey.xrange(runs_stream) == []
+
+    _set_callers(surface_client, auth_headers, agent, [REQUESTER, APPROVER.upper()])
+    accepted = _resolve(surface_client, approval["id"], _adp(token, APPROVER))
+    assert accepted.status_code == 200, accepted.text
+
+
+def test_a_routeless_email_approval_admits_nobody(
+    surface_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """A routeless approval has no binding, so no approver list. The person who
+    asked is no longer admitted by default (ADR-0177 amendment A3)."""
+
     agent = _email_agent(surface_client, auth_headers)
     approval = _email_approval(surface_client, auth_headers, agent)
     token = _adapter_token([agent["binding_id"]])
 
-    denied = _resolve(surface_client, approval["id"], _adp(token, COPIED))
-    assert denied.status_code == 403, denied.text
-    assert "only the person who asked" in denied.json()["detail"]
+    for actor in (REQUESTER, APPROVER):
+        denied = _resolve(surface_client, approval["id"], _adp(token, actor))
+        assert denied.status_code == 403, denied.text
+        assert "only an address on the approval's approver list" in denied.json()["detail"]
     assert _status(surface_client, auth_headers, approval["id"]) == "pending"
     audit = _audit(surface_client, auth_headers, approval["id"])
-    assert [(row["action"], row["authorizer"], row["actor"]) for row in audit] == [
-        ("denied", "RequesterOnly", COPIED)
-    ]
-    assert audit[0]["evidence"]["actor_is_requester"] is False
-    assert valkey.xrange(runs_stream) == []
+    assert {row["authorizer"] for row in audit} == {"NoVerifiableApprovers"}
+    assert audit[0]["evidence"] == {
+        "kind": "no_verifiable_approvers",
+        "surface_kind": "email",
+        "slack_approvers_declared": False,
+    }
 
 
-def test_no_operator_console_or_slack_principal_can_answer_for_the_requester(
+def test_an_empty_email_list_is_refused_when_written_and_admits_nobody_when_read(
     surface_client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """Each one presents the requester's own address as its subject, so the
-    only thing that can refuse it is the set's principal eligibility."""
+    written = surface_client.post(
+        "/agents",
+        json={
+            "name": f"surface-empty-{_uid()}",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE2"},
+            "approval_routes": {
+                "confirm": {"resolution": REQUESTING_SURFACE, "approvers": {"emails": []}}
+            },
+        },
+        headers=auth_headers,
+    )
+    assert written.status_code == 422, written.text
+    assert "at least one address" in written.text
+
+    # Written around the API, the empty list reaches the resolver anyway. It
+    # must not read as "no list" and fall back to anyone.
+    agent = _email_agent(surface_client, auth_headers)
+    approval = _email_approval(surface_client, auth_headers, agent, route=LISTED_ROUTE)
+    _write_routes_raw(
+        agent["agent_id"],
+        {LISTED_ROUTE: {"resolution": REQUESTING_SURFACE, "approvers": {"emails": []}}},
+    )
+    token = _adapter_token([agent["binding_id"]])
+    for actor in (APPROVER, REQUESTER):
+        denied = _resolve(surface_client, approval["id"], _adp(token, actor))
+        assert denied.status_code == 403, denied.text
+    assert _status(surface_client, auth_headers, approval["id"]) == "pending"
+    assert {row["authorizer"] for row in _audit(surface_client, auth_headers, approval["id"])} == {
+        "InvalidApproversSpec"
+    }
+
+
+@pytest.mark.parametrize(
+    ("emails", "why"),
+    [
+        (["Approver <approver@example.com>"], "not one bare email address"),
+        (["*@example.com"], "not one bare email address"),
+        (["example.com"], "not one bare email address"),
+        (["a@example.com, b@example.com"], "not one bare email address"),
+    ],
+)
+def test_approver_emails_must_be_bare_addresses(
+    surface_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    emails: list[str],
+    why: str,
+) -> None:
+    created = surface_client.post(
+        "/agents",
+        json={
+            "name": f"surface-bad-email-{_uid()}",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE2"},
+            "approval_routes": {
+                "confirm": {"resolution": REQUESTING_SURFACE, "approvers": {"emails": emails}}
+            },
+        },
+        headers=auth_headers,
+    )
+    assert created.status_code == 422, created.text
+    assert why in created.text
+
+
+def test_approver_emails_need_a_requesting_surface_route(
+    surface_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """A fixed target is a Slack channel, where an address is never proof."""
+
+    created = surface_client.post(
+        "/agents",
+        json={
+            "name": f"surface-fixed-email-{_uid()}",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE2"},
+            "approval_routes": {
+                "finance": {
+                    "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+                    "approvers": {"emails": [APPROVER]},
+                }
+            },
+        },
+        headers=auth_headers,
+    )
+    assert created.status_code == 422, created.text
+    assert "need a requesting_surface resolution" in created.text
+
+
+def test_approver_emails_are_stored_lowercase_once_and_read_back(
+    surface_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent = _email_agent(
+        surface_client,
+        auth_headers,
+        routes={
+            "confirm": {
+                "resolution": REQUESTING_SURFACE,
+                "approvers": {
+                    "users": ["U0EXAMPLE1"],
+                    "emails": ["Approver@Example.com", APPROVER, COPIED],
+                },
+            }
+        },
+    )
+
+    stored = _stored_routes(agent["agent_id"])["confirm"]["approvers"]
+    assert stored == {"users": ["U0EXAMPLE1"], "emails": [APPROVER, COPIED]}
+    shown = surface_client.get(f"/agents/{agent['agent_id']}", headers=auth_headers)
+    assert shown.json()["approval_routes"]["confirm"]["approvers"]["emails"] == [
+        APPROVER,
+        COPIED,
+    ]
+
+
+def test_no_operator_console_or_slack_principal_can_answer_for_a_listed_address(
+    surface_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Each one presents the listed address as its subject, so the only thing
+    that can refuse it is the set's principal eligibility."""
 
     agent = _email_agent(surface_client, auth_headers)
-    approval = _email_approval(surface_client, auth_headers, agent)
+    approval = _email_approval(surface_client, auth_headers, agent, route=LISTED_ROUTE)
     now = int(time.time())
 
     operator = approval_principal.mint(
         get_settings().api_key,
-        subject=REQUESTER,
+        subject=APPROVER,
         kind="operator",
         scope=approval_principal.APPROVE_SCOPE,
         exp=now + 60,
     )
     chat = approval_principal.mint(
         get_settings().approval_chat_attester_secret,
-        subject=REQUESTER,
+        subject=APPROVER,
         kind="chat",
         actor_channel=agent["inbox"],
         approval_id=approval["id"],
@@ -634,7 +925,7 @@ def test_no_operator_console_or_slack_principal_can_answer_for_the_requester(
         exp=now + 60,
     )
     login = surface_client.post(
-        "/console/login-codes", json={"subject": REQUESTER}, headers=auth_headers
+        "/console/login-codes", json={"subject": APPROVER}, headers=auth_headers
     )
     assert login.status_code == 201, login.text
     session = surface_client.post("/console/session", json={"code": login.json()["code"]})
@@ -652,7 +943,7 @@ def test_no_operator_console_or_slack_principal_can_answer_for_the_requester(
     ):
         denied = _resolve(surface_client, approval["id"], headers)
         assert denied.status_code == 403, (kind, denied.text)
-        assert "only the person who asked" in denied.json()["detail"], kind
+        assert "only an address on this approval's approver list" in denied.json()["detail"]
     assert _status(surface_client, auth_headers, approval["id"]) == "pending"
     audit = _audit(surface_client, auth_headers, approval["id"])
     assert [(row["principal_kind"], row["authorized"]) for row in audit] == [
@@ -663,38 +954,141 @@ def test_no_operator_console_or_slack_principal_can_answer_for_the_requester(
     assert all(row["evidence"]["kind"] == "principal_set_eligibility" for row in audit)
 
 
-def test_approvers_added_to_a_moded_route_after_the_ask_fail_closed(
+def test_slack_approvers_added_to_a_moded_route_after_the_ask_fail_closed(
     surface_client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """The worker escalates a route with approvers that lands on email, so no
-    such approval is created. If the operator adds approvers while one pends,
-    nobody on the email thread can prove to be a listed Slack user: it admits
-    nobody rather than falling back to the requester."""
+    """The worker escalates an email approval whose route lists no emails, so
+    no such approval is created. If the operator swaps the emails for Slack
+    users while one pends, nobody on the email thread can prove to be one: it
+    admits nobody rather than falling back to anyone."""
 
-    agent = _email_agent(
-        surface_client, auth_headers, routes={"confirm": {"resolution": REQUESTING_SURFACE}}
+    agent = _email_agent(surface_client, auth_headers)
+    approval = _email_approval(surface_client, auth_headers, agent, route=LISTED_ROUTE)
+    _repoint_named(
+        surface_client,
+        auth_headers,
+        agent["agent_id"],
+        LISTED_ROUTE,
+        {"resolution": REQUESTING_SURFACE, "approvers": {"users": ["U0EXAMPLE1"]}},
     )
-    approval = _email_approval(surface_client, auth_headers, agent, route="confirm")
-    narrowed = surface_client.patch(
-        f"/agents/{agent['agent_id']}",
-        json={
-            "approval_routes": {
-                "confirm": {
-                    "resolution": REQUESTING_SURFACE,
-                    "approvers": {"users": ["U0EXAMPLE1"]},
-                }
-            }
-        },
-        headers=auth_headers,
-    )
-    assert narrowed.status_code == 200, narrowed.text
     token = _adapter_token([agent["binding_id"]])
 
-    denied = _resolve(surface_client, approval["id"], _adp(token, REQUESTER))
+    denied = _resolve(surface_client, approval["id"], _adp(token, APPROVER))
     assert denied.status_code == 403, denied.text
     assert _status(surface_client, auth_headers, approval["id"]) == "pending"
     audit = _audit(surface_client, auth_headers, approval["id"])
+    assert audit[-1]["authorizer"] == "NoVerifiableApprovers"
+    assert audit[-1]["evidence"]["slack_approvers_declared"] is True
+
+
+def _repoint_named(
+    client: TestClient, auth: dict[str, str], agent_id: str, name: str, binding: dict
+) -> None:
+    moved = client.patch(
+        f"/agents/{agent_id}", json={"approval_routes": {name: binding}}, headers=auth
+    )
+    assert moved.status_code == 200, moved.text
+
+
+def _slack_moded_approval(
+    client: TestClient, auth: dict[str, str], approvers: dict[str, Any] | None
+) -> tuple[str, str, dict[str, Any]]:
+    """An agent on a Slack channel whose route is in requesting_surface mode,
+    and an approval asked in that channel: ``(agent_id, channel, approval)``."""
+
+    channel = f"C0SURF{_uid().upper()}"
+    route: dict[str, Any] = {"resolution": REQUESTING_SURFACE}
+    if approvers is not None:
+        route["approvers"] = approvers
+    created = client.post(
+        "/agents",
+        json={
+            "name": f"surface-slack-{_uid()}",
+            "channel": {"kind": "slack", "address": channel},
+            "approval_routes": {"confirm": route},
+        },
+        headers=auth,
+    )
+    assert created.status_code == 201, created.text
+    agent_id = str(created.json()["id"])
+    response = client.post(
+        "/approvals",
+        json={
+            "conversation_id": f"th-{_uid()}",
+            "author": "U0EXAMPLE2",
+            "summary": "Confirm the requested action",
+            "reply_kind": "slack",
+            "reply_channel": channel,
+            "reply_placeholder": "p-1",
+            "dedupe_key": uuid.uuid4().hex,
+            "agent_id": agent_id,
+            "route": "confirm",
+            "card_channel": channel,
+            "gate_kind": "policy",
+        },
+        headers=auth,
+    )
+    assert response.status_code == 201, response.text
+    return agent_id, channel, response.json()
+
+
+def _chat_click(approval_id: str, subject: str, from_channel: str) -> dict[str, str]:
+    return {
+        PRINCIPAL_HEADER: approval_principal.mint(
+            get_settings().approval_chat_attester_secret,
+            subject=subject,
+            kind="chat",
+            actor_channel=from_channel,
+            approval_id=approval_id,
+            scope=approval_principal.APPROVE_SCOPE,
+            exp=int(time.time()) + 60,
+        )
+    }
+
+
+def test_a_slack_card_whose_route_lists_only_emails_admits_nobody(
+    surface_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """ADR-0177 amendment A4: an address is never proof on Slack, and a route that
+    narrowed its approvers to emails must not widen back to channel membership
+    when it is asked in Slack."""
+
+    _agent_id, channel, approval = _slack_moded_approval(
+        surface_client, auth_headers, {"emails": [APPROVER]}
+    )
+
+    member = _resolve(surface_client, approval["id"], _chat_click(approval["id"], "U0EX1", channel))
+    assert member.status_code == 403, member.text
+    assert _status(surface_client, auth_headers, approval["id"]) == "pending"
+    audit = _audit(surface_client, auth_headers, approval["id"])
     assert audit[-1]["authorizer"] == "InvalidApproversSpec"
+
+
+@pytest.mark.parametrize("actor", [APPROVER, "U0EXAMPLE1"])
+def test_an_adapter_principal_is_still_refused_on_a_slack_approver_set(
+    surface_client: TestClient, auth_headers: dict[str, str], clean_db: None, actor: str
+) -> None:
+    """A route listing both Slack users and emails, asked in Slack: the Slack
+    card reads only the Slack users, and an adapter serving the Slack binding
+    cannot answer it by naming either a listed address or a listed Slack id
+    (ADR-0177, "A separate finding")."""
+
+    agent_id, channel, approval = _slack_moded_approval(
+        surface_client, auth_headers, {"users": ["U0EXAMPLE1"], "emails": [APPROVER]}
+    )
+    token = _adapter_token([_binding_ids(agent_id)[channel]])
+
+    denied = _resolve(surface_client, approval["id"], _adp(token, actor))
+    assert denied.status_code == 403, denied.text
+    assert "only a Slack click can prove a Slack identity" in denied.json()["detail"]
+    audit = _audit(surface_client, auth_headers, approval["id"])
+    assert [(row["authorizer"], row["principal_kind"]) for row in audit] == [
+        ("ExplicitUserListAuthorizer", "adapter")
+    ]
+    listed = _resolve(
+        surface_client, approval["id"], _chat_click(approval["id"], "U0EXAMPLE1", "C0EXAMPLE9")
+    )
+    assert listed.status_code == 200, listed.text
 
 
 def test_a_moded_route_asked_in_slack_keeps_slack_channel_membership(
@@ -800,17 +1194,17 @@ def test_two_adapters_on_one_address_serve_only_their_own_card(
     asking = _binding_id_for(agent["agent_id"], agent["inbox"], EMAIL_ADAPTER)
     other = _binding_id_for(agent["agent_id"], agent["inbox"], other_adapter)
     assert asking != other
-    approval = _email_approval(surface_client, auth_headers, agent)
+    approval = _email_approval(surface_client, auth_headers, agent, route=LISTED_ROUTE)
 
     other_token = _adapter_token([other])
     assert _listed(surface_client, other_token) == set()
-    refused = _resolve(surface_client, approval["id"], _adp(other_token, REQUESTER))
+    refused = _resolve(surface_client, approval["id"], _adp(other_token, APPROVER))
     assert refused.status_code == 404, refused.text
     assert _status(surface_client, auth_headers, approval["id"]) == "pending"
 
     asking_token = _adapter_token([asking])
     assert _listed(surface_client, asking_token) == {approval["id"]}
-    accepted = _resolve(surface_client, approval["id"], _adp(asking_token, REQUESTER))
+    accepted = _resolve(surface_client, approval["id"], _adp(asking_token, APPROVER))
     assert accepted.status_code == 200, accepted.text
 
 

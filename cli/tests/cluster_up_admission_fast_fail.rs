@@ -1,8 +1,7 @@
 //! Binary regression contract for fast, ownership-checked admission failures
 //! during `curie cluster up` (#3354).
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -80,8 +79,14 @@ if [ "$1" = "template" ]; then
             exit 1
             ;;
     esac
-    printf 'unexpected helm template invocation: %s\n' "$*" >&2
-    exit 64
+    case " $* " in
+        *" --show-only "*|*" --show-only="*)
+            printf 'unexpected helm template invocation: %s\n' "$*" >&2
+            exit 64
+            ;;
+    esac
+    printf '%s\n' 'apiVersion: apps/v1' 'kind: Deployment' 'metadata:' '  name: acme-platform' 'spec:' '  template:' '    spec:' '      containers:' '        - name: platform' '          resources:' '            requests:' '              cpu: 100m' '              memory: 128Mi'
+    exit 0
 fi
 
 if [ "$1" = "upgrade" ] && [ "$2" = "--install" ]; then
@@ -121,6 +126,7 @@ exit 64
             &bin_dir,
             "kubectl",
             r#"#!/bin/sh
+curie_test_capacity_read "$@"
 if [ "$1" = "get" ] && [ "$2" = "namespace" ]; then
     if [ "$3" = "target-namespace" ]; then
         printf '%s\n' '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"target-namespace","labels":{"curietech.ai/created-by":"target-release","curietech.ai/created-in":"target-namespace"},"uid":"uid-target-namespace","resourceVersion":"17"}}'
@@ -225,6 +231,11 @@ JSON
         exit 0
         ;;
 esac
+
+if [ "$1" = "get" ] && [ "$2" = "runtimeclass" ]; then
+    printf '%s\n' 'Error from server (Forbidden): runtimeclasses.node.k8s.io "gvisor" is forbidden: User "system:serviceaccount:example:example" cannot get resource "runtimeclasses" in API group "node.k8s.io" at the cluster scope' >&2
+    exit 1
+fi
 
 printf 'unexpected kubectl invocation: %s\n' "$*" >&2
 exit 64

@@ -24,12 +24,13 @@ jobs:
     # suite. Run 34528877480 is one of those: the build ran, for 251s.
     #
     # Nothing here is waste in itself, so this does not delete a step, it moves
-    # them off the path. They are unchanged, including the direct cargo build:
-    # a `rust` selector makes verify-fix-pin.sh run `cargo test` out of
-    # CARGO_TARGET_DIR, so that build warms the directory the verification then
-    # compiles in, and is not merely producing the binary the check invokes.
-    # Swapping it for the artifact rust-build already uploads would leave a
-    # rust selector to compile from cold, which is why it stays a direct build.
+    # them off the path. The build stays direct and restores a shared dependency
+    # Cargo cache. rust-cache v2 defaults cache-workspace-crates to false,
+    # removing the workspace's curie artifacts before saving. Its key hashes
+    # rustc, Cargo.lock and Cargo.toml; Cargo fingerprints version, features,
+    # profile and rustc, so curie is always compiled from this checkout.
+    # A `rust` selector builds the debug crate in a detached worktree. Its
+    # reversed run never uses the release driver as the code under test.
     # The comment it carried about living "inside the required Python status"
     # is now met by this job being its own required status.
     #
@@ -58,7 +59,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -68,7 +69,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Sync workspace
@@ -83,6 +84,13 @@ jobs:
           python3 tools/fix-pin-ci/check.py
           --event "$GITHUB_EVENT_PATH"
           --needs-curie
+      - name: Cargo cache
+        if: steps.fix-pin-curie.outputs.needed == 'true'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: cli
+          shared-key: curie-cli-release
+          cache-on-failure: true
       - name: Build the current curie binary for fix pin verification
         if: steps.fix-pin-curie.outputs.needed == 'true'
         run: cargo build --release --locked --manifest-path cli/Cargo.toml
@@ -92,29 +100,14 @@ jobs:
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.16.4
-      # Same boot as the Python job: the first `up` starts the one-shot
-      # rustfs-init alongside the long-lived services, the second `--wait`s only
-      # on the long-lived ones because `--wait` reads rustfs-init's exit(0) as a
-      # failure.
+      # Use the same migration, authenticated read and worker readiness gate
+      # as the Python job before executing any pinned integration selector.
       - name: Start dev stack
         if: steps.fix-pin-curie.outputs.needed == 'true'
-        run: |
-          docker compose -f compose.dev.yaml up -d \
-            postgres valkey clickhouse rustfs rustfs-init \
-            langfuse-web langfuse-worker otel-collector
-          docker compose -f compose.dev.yaml up -d --wait --wait-timeout 300 \
-            postgres valkey clickhouse rustfs \
-            langfuse-web langfuse-worker otel-collector
+        run: python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480
       - name: Wait for Langfuse to serve
         if: steps.fix-pin-curie.outputs.needed == 'true'
-        run: |
-          for i in $(seq 1 60); do
-            if curl -fsS http://localhost:23000/api/public/health >/dev/null 2>&1; then
-              echo "Langfuse ready after attempt ${i}"; exit 0
-            fi
-            sleep 3
-          done
-          echo "Langfuse did not become ready within 180s"; exit 1
+        run: python3 scripts/wait-for-langfuse.py
       # A pinned worker binding test dials the shared default database and
       # assumes the curie schema exists, exactly as it does under the Python
       # job, so the same migration runs here.

@@ -297,10 +297,45 @@ type (`reply_wire_version`, `progress_delivery_id`, `progress_not_an_answer`,
 `progress_not_actionable`, `progress_terminal`), so match on the type, not on
 message text.
 
-Nothing on the platform sends a 1.1 body yet. The Discord and mail adapters in
-this repository decode 1.1 through the shared package, but neither handles
-`progress`, so a card edit would reach their answer path. Progress must not be
-routed to either until it does.
+What an adapter that decodes 1.1 must do with progress:
+
+- **Branch on `progress` first**, on both events, before any answer or
+  approval handling. A progress `reply.update` carries no answer fields, so an
+  adapter that reads `text` first sees an empty answer and can blank the
+  message it edits or clear the answer it is buffering.
+- **Post idempotently.** A progress `reply.post` is a create, so key it on
+  `delivery_id`: remember the `ref` you acked for it and answer a repeat with
+  that `ref` instead of posting again. A redelivery after an ambiguous attempt
+  carries the same `delivery_id`, never a new one.
+- **Edit the card, never the answer.** A card `reply.update` names the card
+  through `target.reply_ref`, the `ref` you acked for its first post. Edit that
+  message and nothing else; it is not the placeholder and not the approval card.
+- **Keep the card after completion.** A `terminal` card is rendered closed and
+  left in the conversation. The final answer arrives separately and does not
+  replace it.
+- **Render the summary so it cannot notify anyone.** It is short, model-authored
+  task state. Send it through whatever your channel offers that does not turn
+  text into a mention or a broadcast.
+- **Stay silent if your channel cannot show progress usefully.** A channel that
+  sends one message per turn, as email does, may answer every progress body
+  2xx with no `ref` and render nothing. Silence is conforming; changing the answer
+  is not.
+
+`channel_protocol.progress.progress_text` is the channel-neutral plain-text
+rendering of a card or a milestone, for a channel with no card affordance. A
+card edit carries no `message`, so that function, not a `message.text`, is
+where an adapter gets the text for one; the adapters in this repository use it
+for posts too, so every revision of a card reads alike.
+
+The adapters in this repository handle progress this way. Slack renders the
+card and milestones as Block Kit and maps `delivery_id` to the post's
+`client_msg_id`; its rendering contract is in the
+[worker README](../../apps/worker/README.md#how-the-slack-adapter-renders-progress).
+[`adapters/discord`](../../adapters/discord/) posts and edits the plain-text
+fallback and keeps each `delivery_id` with the message it posted in its SQLite
+state. [`apps/mail-adapter`](../../apps/mail-adapter) is silent: a progress
+body never touches the reply it buffers for the turn's email. Nothing on the
+platform sends a 1.1 body yet.
 
 Answer 2xx with a JSON body. The only field read off it is `ref`, an optional
 adapter-minted handle for what you just posted; a channel with nothing editable
@@ -347,16 +382,20 @@ From [`apps/mail-adapter`](../../apps/mail-adapter):
   same thread before the first turn completes, and the first answer then lands on the
   wrong message or clear the second turn's text. Persist ownership at the same
   granularity as the target.
-- **Filtering inbound senders is not authenticating them.** Find out what your
-  provider already drops or withholds by default, ask for that filtering explicitly in
-  every request rather than inheriting it, so a changed provider default cannot widen
-  your install silently, and keep a cheap check on the provider's own verdict behind
-  that as defense in depth. An allow-list on a sender identifier the sender controls
-  (an email `From` header, a display name, a caller ID) sits on top of all three and
-  authenticates nobody: it is meaningful only where that identifier is independently
-  enforced, which for email means the sending domain publishing an enforcing DMARC
-  policy. [`apps/mail-adapter/README.md`](../../apps/mail-adapter/README.md) is the
-  worked version, with AgentMail's parameter names and the key permissions it needs.
+
+**Verify sender authentication before accepting a turn or approval answer.**
+An allowlist filters a claimed sender identifier and never authenticates it.
+Require a positive authentication verdict that your own code verifies. A
+provider label, the absence of a rejection label, or a provider supplied header
+cannot supply that verdict. If no verifiable verdict is available, refuse the
+message with a named reason before either platform endpoint is called. Keep
+provider result exclusions explicit as an additional filter. For email,
+AgentMail supplies no trusted positive aligned verdict, guarantees neither
+header provenance nor stripping, and permits DMARC failure under `p=none`;
+Curie refuses every message with `authentication_unverifiable`, including
+allowlisted senders and approval answers. A wildcard needs a separate boot opt
+in and never bypasses authentication. The provider evidence and complete gate
+contract are in [`apps/mail-adapter/README.md`](../../apps/mail-adapter/README.md).
 
 ## 7. Conformance floor
 
@@ -383,6 +422,33 @@ An adapter must:
    repeated `delivery_id` with the first attempt's result, and handle
    `progress` before any answer path so a progress body never changes answer
    text.
+
+### Running the floor
+
+The floor is executable. `channel_protocol.conformance`
+(`packages/channel-protocol/src/channel_protocol/conformance.py`) ships fourteen
+checks covering ingress normalization, reply delivery, edit and buffered streaming,
+attachments, approval cards, progress, and error mapping. Wrap your adapter in a
+`ChannelAdapterSubject` and declare its `Capabilities`: kind, streaming mode (edit,
+buffered, silent or relay), ingress, authenticates, refuses_foreign_targets and
+serves_attachments. Then run every check
+`packages/channel-protocol/src/channel_protocol/conformance.py::applicable_checks`
+returns for that declaration. A check your declaration does not cover is not
+returned, never skipped.
+
+```python
+for check in applicable_checks(subject.capabilities):
+    await check.run(subject, CheckContext(validate_turn=my_validator))
+```
+
+In this repository, the suite in `tests/channel_conformance/` runs every check
+against Discord, the mail adapter, GitHub and the worker's `HttpReplyAdapter`, each
+driven through the worker's real `ReplySinkRouter`. Adding an adapter is one `_Entry`
+(its declared `Capabilities` plus a factory that opens the subject) in the `_ENTRIES`
+table of `tests/channel_conformance/subjects.py`, which feeds the `REGISTRY` the
+tests parametrize over. If you build a third-party relay, drive your egress through
+the worker's `HttpReplyAdapter` so header names and statuses are proven across the
+real wire.
 
 ## Related
 

@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 
 fn restore_var(name: &str, value: Option<std::ffi::OsString>) {
     match value {
@@ -14,6 +14,7 @@ async fn required_valkey_panics_when_valkey_is_unreachable() {
     let port = listener.local_addr().expect("read reserved port").port();
     drop(listener);
 
+    let _env = support::ENV_LOCK.lock().await;
     let previous_url = std::env::var_os("TEST_VALKEY_URL");
     let previous_required = std::env::var_os("CI_REQUIRE_VALKEY_TESTS");
     std::env::set_var("TEST_VALKEY_URL", format!("redis://127.0.0.1:{port}"));

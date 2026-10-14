@@ -18,7 +18,7 @@
 //!   approval gate exists to prevent, so validation runs before the connection
 //!   is opened and the negative tests assert on `recorded()` being empty.
 
-mod support;
+use crate::support;
 
 use curie::commands::{approvals, AgentActionOpts, ApprovalCmd, ApprovalsOutput};
 use curie::credcheck::check_channel_id;
@@ -1276,6 +1276,72 @@ async fn a_requesting_surface_route_refuses_a_notification_an_unknown_mode_and_a
     ] {
         let message = rejected_routes_file(route, expected).await;
         assert!(message.contains("confirm"), "{expected}: {message}");
+        assert!(message.contains(expected), "{expected}: {message}");
+    }
+}
+
+// --- ADR-0177 amendment: an email approval is answered only by a listed address ---
+
+#[tokio::test]
+async fn routes_from_forwards_approver_emails_beside_slack_users() {
+    let bound = r#"{"confirm":{"resolution":{"mode":"requesting_surface"},"approvers":{"users":["U0EXAMPLE1"],"emails":["approver@example.com"]}}}"#;
+    let server = stub(bound, bound);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("routes.json");
+    std::fs::write(&path, bound).expect("write routes file");
+
+    run(
+        &server,
+        ApprovalCmd {
+            routes_from: Some(path),
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    .expect("a requesting_surface route with approver emails should be written");
+
+    let body = patch_body(&server);
+    assert_eq!(
+        body["approval_routes"]["confirm"]["approvers"],
+        serde_json::json!({"users": ["U0EXAMPLE1"], "emails": ["approver@example.com"]}),
+        "the PATCH must forward the emails untouched, got {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn approver_emails_refuse_a_fixed_target_an_empty_list_and_a_display_name() {
+    for (route, expected) in [
+        (
+            serde_json::json!({"finance": {
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+                "approvers": {"emails": ["approver@example.com"]}
+            }}),
+            "approvers emails need a requesting_surface resolution",
+        ),
+        (
+            serde_json::json!({"finance": {
+                "resolution": {"mode": "requesting_surface"},
+                "approvers": {"emails": []}
+            }}),
+            "must contain at least one address",
+        ),
+        (
+            serde_json::json!({"finance": {
+                "resolution": {"mode": "requesting_surface"},
+                "approvers": {"emails": ["Approver <approver@example.com>"]}
+            }}),
+            "is not one bare email address",
+        ),
+        (
+            serde_json::json!({"finance": {
+                "resolution": {"mode": "requesting_surface"},
+                "approvers": {"emails": ["*@example.com"]}
+            }}),
+            "is not one bare email address",
+        ),
+    ] {
+        let message = rejected_routes_file(route, expected).await;
+        assert!(message.contains("finance"), "{expected}: {message}");
         assert!(message.contains(expected), "{expected}: {message}");
     }
 }

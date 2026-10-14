@@ -13,20 +13,26 @@ import os
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LEASE_SECONDS = 300.0
 BODY_FAILURE_BACKOFF_SECONDS = 60.0
 TERMINAL_RECEIPT_MAX = 4096
 TERMINAL_COMPLETION_MAX = 4096
 _TERMINAL_COMPLETION_SQL = "delivered=1 OR deleted=1"
 
-_TERMINAL_STATES = ("accepted", "oversize", "primed", "rejected")
-_COMPACTABLE_TERMINAL_STATES = ("oversize", "rejected")
+_TERMINAL_STATES = ("accepted", "oversize", "primed", "rejected", "answered")
+# ``answered``: a reply in a thread with an approval pending, handled as an
+# answer or an instruction and never admitted as a turn (ADR-0177).
+_COMPACTABLE_TERMINAL_STATES = ("oversize", "rejected", "answered")
+_COMPACTABLE_PLACEHOLDERS = ", ".join("?" for _ in _COMPACTABLE_TERMINAL_STATES)
+# Approval references past this many settled (answered or spent) rows are
+# compacted oldest first; a live reference is never evicted to make room.
+SETTLED_APPROVAL_REF_MAX = 4096
 _ADMISSION_BACKPRESSURE_CODES = frozenset(
     {
         sqlite3.SQLITE_BUSY,
@@ -40,6 +46,7 @@ _ADMISSION_BACKPRESSURE_CODES = frozenset(
 
 DeliveryAdmission = Literal["admitted", "known", "full"]
 EventClaim = Literal["claimed", "busy", "done", "deleted"]
+ApprovalRefState = Literal["live", "answered", "settling", "spent"]
 
 
 class MailState:
@@ -181,6 +188,39 @@ class MailState:
                 """
             )
 
+        if version < 3:
+            # ADR-0177: one random single-use reference per approval card this
+            # adapter rendered. It links a reply to its approval; it proves
+            # nothing about who sent the reply, which the platform decides from
+            # the verified sender (ADR-0177 amendment). ``requester`` and ``approvers``
+            # (a JSON list) word the emails; ``answer_message_id`` and
+            # ``answer_participants`` (a JSON list) say where the outcome goes;
+            # ``follow_ups_sent`` counts the follow-up sends already made, so a
+            # retried settlement never sends one twice (ADR-0177 amendment A5).
+            self.connection.executescript(
+                """
+                BEGIN IMMEDIATE;
+                CREATE TABLE approval_refs (
+                    reference TEXT PRIMARY KEY,
+                    approval_id TEXT NOT NULL UNIQUE,
+                    conversation_id TEXT NOT NULL,
+                    reply_ref TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    requester TEXT NOT NULL DEFAULT '',
+                    approvers TEXT NOT NULL DEFAULT '[]',
+                    answer_message_id TEXT,
+                    answer_participants TEXT,
+                    follow_ups_sent INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX approval_refs_conversation
+                    ON approval_refs(conversation_id, state);
+                PRAGMA user_version=3;
+                COMMIT;
+                """
+            )
+
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         """Begin one serialized write and roll it back on every failure."""
@@ -301,7 +341,7 @@ class MailState:
     ) -> None:
         count = int(
             connection.execute(
-                "SELECT count(*) FROM deliveries WHERE state IN (?, ?)",
+                f"SELECT count(*) FROM deliveries WHERE state IN ({_COMPACTABLE_PLACEHOLDERS})",
                 _COMPACTABLE_TERMINAL_STATES,
             ).fetchone()[0]
         )
@@ -310,7 +350,7 @@ class MailState:
             return
         connection.execute(
             "DELETE FROM deliveries WHERE message_id IN ("
-            "SELECT message_id FROM deliveries WHERE state IN (?, ?) "
+            f"SELECT message_id FROM deliveries WHERE state IN ({_COMPACTABLE_PLACEHOLDERS}) "
             "ORDER BY updated_at, message_id LIMIT ?)",
             (*_COMPACTABLE_TERMINAL_STATES, excess),
         )
@@ -554,6 +594,200 @@ class MailState:
                 (time.time(), event_id),
             )
             self._compact_terminal_completions(connection)
+
+
+    # -- approval references (ADR-0177) --------------------------------------
+
+    def issue_approval_ref(
+        self,
+        approval_id: str,
+        conversation_id: str,
+        reply_ref: str,
+        reference: str,
+        *,
+        requester: str = "",
+        approvers: Sequence[str] = (),
+    ) -> str:
+        """Keep ``reference`` for this approval, or return the one already kept.
+
+        Idempotent on the approval id, so a redelivered card post renders the
+        same reference rather than minting a second one for one approval.
+
+        Args:
+            approval_id: the platform's approval id.
+            conversation_id: the thread the card was rendered in.
+            reply_ref: the asking message, whose reply carries the card.
+            reference: the fresh reference to keep if none is kept yet.
+            requester: the bare address of the person who asked.
+            approvers: the route's listed approver addresses, for wording only.
+
+        Returns:
+            The reference kept for this approval.
+        """
+        now = time.time()
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT reference FROM approval_refs WHERE approval_id=?", (approval_id,)
+            ).fetchone()
+            if row is not None:
+                return str(row[0])
+            connection.execute(
+                "INSERT INTO approval_refs(reference, approval_id, conversation_id, "
+                "reply_ref, state, requester, approvers, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, 'live', ?, ?, ?, ?)",
+                (
+                    reference,
+                    approval_id,
+                    conversation_id,
+                    reply_ref,
+                    requester,
+                    json.dumps(list(approvers)),
+                    now,
+                    now,
+                ),
+            )
+            return reference
+
+    _REF_COLUMNS = (
+        "reference, approval_id, conversation_id, reply_ref, state, requester, approvers, "
+        "answer_message_id, answer_participants, follow_ups_sent"
+    )
+
+    @staticmethod
+    def _ref_row(row: Sequence[Any]) -> dict[str, Any]:
+        """One ``approval_refs`` row, in ``_REF_COLUMNS`` order, as a dict."""
+        return {
+            "reference": row[0],
+            "approval_id": row[1],
+            "conversation_id": row[2],
+            "reply_ref": row[3],
+            "state": row[4],
+            "requester": row[5],
+            "approvers": list(json.loads(row[6] or "[]")),
+            "answer_message_id": row[7],
+            "answer_participants": list(json.loads(row[8] or "[]")),
+            "follow_ups_sent": int(row[9]),
+        }
+
+    def approval_refs_in(self, conversation_id: str) -> list[dict[str, Any]]:
+        """Every reference this adapter issued in one conversation, any state."""
+        with self.lock:
+            rows = self.connection.execute(
+                f"SELECT {self._REF_COLUMNS} "
+                "FROM approval_refs WHERE conversation_id=? ORDER BY created_at",
+                (conversation_id,),
+            ).fetchall()
+        return [self._ref_row(row) for row in rows]
+
+    def approval_ref_for(self, approval_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.connection.execute(
+                f"SELECT {self._REF_COLUMNS} FROM approval_refs WHERE approval_id=?",
+                (approval_id,),
+            ).fetchone()
+        return None if row is None else self._ref_row(row)
+
+    def live_approval_on(self, conversation_id: str, reply_ref: str) -> bool:
+        """Whether this reply carries a card whose approval is still open.
+
+        That reply is the request email, which goes to everyone on the asking
+        message so listed approvers copied there see it (ADR-0177 amendment A5).
+        """
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT 1 FROM approval_refs "
+                "WHERE conversation_id=? AND reply_ref=? AND state='live' LIMIT 1",
+                (conversation_id, reply_ref),
+            ).fetchone()
+        return row is not None
+
+    def record_approval_answer(
+        self, reference: str, message_id: str, participants: Sequence[str]
+    ) -> None:
+        """Remember the message that carried the winning answer, once.
+
+        The outcome is sent to everyone on that message. The first one recorded
+        stands: resolve is resolve-once, so a later message cannot have won.
+        """
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE approval_refs SET answer_message_id=?, answer_participants=?, "
+                "updated_at=? WHERE reference=? AND answer_message_id IS NULL",
+                (message_id, json.dumps(list(participants)), time.time(), reference),
+            )
+
+    def record_follow_ups_sent(self, reference: str, count: int) -> None:
+        """Count the follow-up sends made so far for a settlement in progress."""
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE approval_refs SET follow_ups_sent=?, updated_at=? WHERE reference=?",
+                (count, time.time(), reference),
+            )
+
+    def set_approval_ref_state(self, reference: str, state: ApprovalRefState) -> None:
+        """Move a reference forward; a spent reference never comes back."""
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE approval_refs SET state=?, updated_at=? "
+                "WHERE reference=? AND state!='spent'",
+                (state, time.time(), reference),
+            )
+            count = int(
+                connection.execute(
+                    "SELECT count(*) FROM approval_refs WHERE state!='live'"
+                ).fetchone()[0]
+            )
+            excess = count - SETTLED_APPROVAL_REF_MAX
+            if excess > 0:
+                connection.execute(
+                    "DELETE FROM approval_refs WHERE reference IN ("
+                    "SELECT reference FROM approval_refs WHERE state!='live' "
+                    "ORDER BY updated_at, reference LIMIT ?)",
+                    (excess,),
+                )
+
+    def claim_approval_settlement(self, reference: str) -> bool:
+        """Take the one right to send a card's follow-up, or report it is taken.
+
+        A timed lease, like a completion claim: a delivery that died holding it
+        is reclaimable after ``LEASE_SECONDS``, and a spent reference is never
+        claimed again. Concurrent settle deliveries therefore send once.
+        """
+        now = time.time()
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE approval_refs SET state='settling', updated_at=? "
+                "WHERE reference=? AND (state IN ('live', 'answered') "
+                "OR (state='settling' AND updated_at<?))",
+                (now, reference, now - LEASE_SECONDS),
+            )
+            return int(cursor.rowcount) == 1
+
+    def release_approval_settlement(self, reference: str) -> None:
+        """Give the claim back after a failed send, so a retry can take it."""
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE approval_refs SET state='answered', updated_at=? "
+                "WHERE reference=? AND state='settling'",
+                (time.time(), reference),
+            )
+
+    def reopen_reply(self, conversation_id: str, reply_ref: str) -> None:
+        """Make the asking message's reply owner live again for the resumed turn.
+
+        The paused turn's completion finished that owner when it sent the
+        request email; the resume streams its answer onto the same ref, so the
+        owner must accept text again, empty, before the resume arrives.
+        """
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO reply_state(conversation_id, reply_ref, text, active, updated_at) "
+                "VALUES(?, ?, NULL, 1, ?) "
+                "ON CONFLICT(conversation_id, reply_ref) DO UPDATE SET "
+                "text=CASE WHEN reply_state.active=1 THEN reply_state.text ELSE NULL END, "
+                "active=1, updated_at=excluded.updated_at",
+                (conversation_id, reply_ref, time.time()),
+            )
 
 
 def _receipt_json(message_id: str) -> str:

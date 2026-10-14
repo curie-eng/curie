@@ -1,5 +1,10 @@
 See [AGENTS.md](AGENTS.md) - the agent instructions for this repo live there.
 
+Curie turns agents into co-workers in the user's infrastructure. Start with the
+[Software Factory](docs/software-factory.md); the
+[co-worker overview](docs/co-workers.md) explains the shared platform and the
+[capability reference](docs/capabilities.md) bounds support claims.
+
 Never publish real customer or downstream deployment information in files,
 commit messages, branch or tag names, PRs, issues, comments, releases, or CI
 logs and artifacts. Anonymize live-test evidence and provenance before
@@ -22,9 +27,11 @@ stay the *implementation*; it just isn't the interface.
 - Contributor/CI scripts (contract codegen, chart render-asserts, the e2e round-trip) → `curie dev <...>`. The `dev` namespace fences off commands that need a **source checkout + dev toolchains**; they error clearly when run from a released binary.
 - Operator/product commands stay top-level: `init`, `build`, `skill`, `local`, `cluster`.
 
-New tooling ships as a `curie` subcommand (add the clap surface in
-`cli/src/main.rs`, the handler in `cli/src/commands.rs`); a new loose script in
-`scripts/` should be the exception with a reason, not the default.
+New tooling ships as a `curie` subcommand: add the clap surface to its tier's
+module under `cli/src/args/`, the dispatch arm under `cli/src/dispatch/`, and
+the handler in the command-group module under `cli/src/commands/` it belongs to.
+`cli/src/main.rs` stays a thin entry point. A new loose script in `scripts/`
+should be the exception with a reason, not the default.
 
 ## Release train selection
 

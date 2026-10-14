@@ -15,6 +15,7 @@ from typing import Any
 
 import curie_worker.binding as binding_module
 from aci_protocol import Final, SessionStatus, TextDelta, ToolAccess
+from curie_internal.keyspace import kill_key
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import (
     BUDGET_ENV,
@@ -24,7 +25,6 @@ from curie_worker.binding import (
     ResolvedDeployment,
 )
 from curie_worker.config import WorkerConfig
-from curie_worker.killswitch import kill_key
 from curie_worker.reply_sink import TargetRoute
 
 # importlib import mode does not add the test root to sys.path.
@@ -74,6 +74,7 @@ class StubBinding:
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+    **_: object,
     ) -> dict[str, str]:
         env = {
             BUDGET_ENV: '{"max_output_tokens_per_run":100000,"max_usd_per_day":10.0}',
@@ -104,6 +105,7 @@ class RealBootEnvBinding(StubBinding):
         kind: str | None = None,
         address: str | None = None,
         isolate_memory: bool = False,
+    **_: object,
     ) -> dict[str, str]:
         resolver = BindingResolver.__new__(BindingResolver)
         resolver._config = WorkerConfig()

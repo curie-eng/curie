@@ -278,10 +278,9 @@ fn error_json_validates_against_error_schema() {
 // new inlined `to_json` arm would slip past the gate the way `Enqueued` did.
 
 // The `syn` walk that reads the enum's variants straight out of the source, in
-// the same `#[path = ...]` shape the sibling AST gates use
+// the same shared `support` module shape the sibling AST gates use
 // (`cli/tests/schema_inventory.rs`, `cli/tests/api_emit_parity.rs`).
-#[path = "support/enum_variants.rs"]
-mod enum_variants;
+use crate::support::enum_variants;
 
 /// The compiled `message.schema.json` validator. Every message-schema test
 /// below takes it from here rather than re-inlining the load + compile pair.
@@ -400,7 +399,7 @@ fn message_outcome_samples_cover_every_declared_variant() {
 // EXECUTION -- the same "guard rejects a violating input" convention the sibling
 // AST gates follow (`cli/tests/schema_inventory.rs`, `cli/tests/api_emit_parity.rs`),
 // over small inline source fixtures, since `variant_names` takes source text and
-// needs no file on disk. They live here, beside the `#[path]` include and the
+// needs no file on disk. They live here, beside the `support` import and the
 // real-tree assertion that consumes it, because that is where each sibling gate
 // keeps its own rejection cases.
 
@@ -1060,9 +1059,9 @@ use curie::api::{ApprovalRecord, MemoryEntry, Version};
 use curie::commands::{
     ApprovalsOutput, BudgetOutput, BumpVersionOutput, ChartCheckOutcome, ChartCheckOutput,
     CheckMatch, CheckReport, ConnectorBuildOutput, ConnectorBuildRecord, DeclaredServer,
-    DeleteOutput, DeployOutput, KillOutput, ListAgentsOutput, LocalAgentSummary, MemoryOutput,
-    ResetThreadOutput, ResumeOutput, SkillApprovalsOutput, SkillMessageOutput, SweepRow,
-    VersionsOutput,
+    DeleteOutput, DeployOutput, KillOutput, ListAgentsOutput, LocalAgentSummary, MemoryChannel,
+    MemoryFact, MemoryOutput, ResetThreadOutput, ResumeOutput, SkillApprovalsOutput,
+    SkillMessageOutput, SweepRow, VersionsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::local::{
@@ -1304,6 +1303,8 @@ fn deploy_output_validates() {
         deployment_id: "dep_1".to_string(),
         deployment_environment: "prod".to_string(),
         deployment_status: "active".to_string(),
+        cron_triggers: Vec::new(),
+        warnings: Vec::new(),
     };
     assert_valid("deploy.schema.json", &out.to_json());
 }
@@ -1329,6 +1330,8 @@ fn deploy_result_for_target(target: &str) -> serde_json::Value {
         deployment_id: format!("deployment-{target}"),
         deployment_environment: environment.to_string(),
         deployment_status: "active".to_string(),
+        cron_triggers: Vec::new(),
+        warnings: Vec::new(),
     }
     .to_json()
 }
@@ -1375,6 +1378,109 @@ fn deploy_all_targets_failure_outputs_validate() {
         "fix": null
     });
     assert_valid("deploy.schema.json", &connector_failure);
+}
+
+#[test]
+fn deploy_v1_1_payload_without_cron_receipts_remains_valid() {
+    let schema = load_schema("deploy.schema.json");
+    assert_eq!(
+        schema["$id"],
+        serde_json::json!("https://schemas.curietech.ai/cli/deploy/v1.2.json")
+    );
+    let mut value = deploy_result_for_target("dev");
+    let object = value.as_object_mut().expect("deploy result object");
+    object.remove("cron_triggers");
+    object.remove("warnings");
+    assert!(
+        validator(&schema).is_valid(&value),
+        "v1.2 must continue accepting v1.1 receipts without the optional fields: {value}"
+    );
+}
+
+fn deploy_result_with_cron() -> serde_json::Value {
+    let mut value = deploy_result_for_target("dev");
+    value["cron_triggers"] = serde_json::json!([
+        {"name": "nightly", "schedule": "0 2 * * *", "zone": "Europe/London", "target": "C0NOTBOUND1"},
+        {"name": "maintenance", "schedule": "0 0 * * 0", "zone": "UTC", "target": null}
+    ]);
+    value["warnings"] = serde_json::json!([
+        "cron trigger `nightly` targets `C0NOTBOUND1`, which matches no single channel bound to `acme-dev`; every slot records failed until that address is bound."
+    ]);
+    value
+}
+
+#[test]
+fn deploy_cron_receipts_validate_in_single_aggregate_and_partial_failure_results() {
+    let result = deploy_result_with_cron();
+    assert_valid("deploy.schema.json", &result);
+    let aggregate = serde_json::json!({
+        "results": [{"target": "dev", "result": result.clone()}]
+    });
+    assert_valid("deploy.schema.json", &aggregate);
+    let partial = serde_json::json!({
+        "failed_target": "prod",
+        "stage": "deploy",
+        "completed": [{"target": "dev", "result": result.clone()}],
+        "error": "creating the deployment failed with 500",
+        "fix": null
+    });
+    assert_valid("deploy.schema.json", &partial);
+    let connector_failure = serde_json::json!({
+        "failed_target": "dev",
+        "stage": "connector_sync",
+        "completed": [],
+        "failed_result": result,
+        "error": "connector sync failed",
+        "fix": null
+    });
+    assert_valid("deploy.schema.json", &connector_failure);
+}
+
+#[test]
+fn deploy_schema_rejects_invalid_cron_receipt_fields_and_warning_types() {
+    let schema = load_schema("deploy.schema.json");
+    let validator = validator(&schema);
+    let valid = deploy_result_with_cron();
+    for (field, invalid) in [
+        ("name", serde_json::json!(1)),
+        ("schedule", serde_json::json!(["0 2 * * *"])),
+        ("zone", serde_json::json!(null)),
+        ("target", serde_json::json!(true)),
+    ] {
+        let mut value = valid.clone();
+        value["cron_triggers"][0][field] = invalid;
+        assert!(
+            !validator.is_valid(&value),
+            "cron receipt {field} must retain its declared type: {value}"
+        );
+        let mut missing = valid.clone();
+        missing["cron_triggers"][0]
+            .as_object_mut()
+            .expect("cron object")
+            .remove(field);
+        assert!(
+            !validator.is_valid(&missing),
+            "every cron receipt must require {field}: {missing}"
+        );
+    }
+    for invalid in [
+        serde_json::json!([1]),
+        serde_json::json!(null),
+        serde_json::json!("warning"),
+    ] {
+        let mut value = valid.clone();
+        value["warnings"] = invalid;
+        assert!(
+            !validator.is_valid(&value),
+            "warnings must be an array of strings: {value}"
+        );
+    }
+    let mut extra = valid;
+    extra["cron_triggers"][0]["unexpected"] = serde_json::json!("field");
+    assert!(
+        !validator.is_valid(&extra),
+        "cron objects must be closed: {extra}"
+    );
 }
 
 #[test]
@@ -2316,12 +2422,79 @@ fn memory_output_validates_all_variants() {
     let list = MemoryOutput::List {
         agent: "d".to_string(),
         entries,
+        facts: vec![
+            MemoryFact {
+                id: "fact-0123456789abcdef0123456789abcdef".to_string(),
+                scope: "agent".to_string(),
+                channel: None,
+                statement: "prefer terse".to_string(),
+                author: "operator@example.com".to_string(),
+                stated_at: "2026-10-01T03:04:05.123456+00:00".to_string(),
+            },
+            MemoryFact {
+                id: "fact-11111111111111111111111111111111".to_string(),
+                scope: "channel".to_string(),
+                channel: Some(MemoryChannel {
+                    kind: "slack".to_string(),
+                    address: "C0EXAMPLE1".to_string(),
+                }),
+                statement: "prefer morning updates".to_string(),
+                author: "U0EXAMPLE1".to_string(),
+                stated_at: "2026-10-02T03:04:05Z".to_string(),
+            },
+        ],
     };
     assert_valid("memory.schema.json", &list.to_json());
-    let empty = MemoryOutput::Empty {
+    let empty = MemoryOutput::List {
         agent: "d".to_string(),
+        entries: vec![],
+        facts: vec![],
     };
     assert_valid("memory.schema.json", &empty.to_json());
+    for (scope, channel) in [
+        ("agent", None),
+        (
+            "channel",
+            Some(MemoryChannel {
+                kind: "slack".to_string(),
+                address: "C0EXAMPLE1".to_string(),
+            }),
+        ),
+    ] {
+        let deleted = MemoryOutput::Deleted {
+            agent: "d".to_string(),
+            id: "fact-0123456789abcdef0123456789abcdef".to_string(),
+            scope: scope.to_string(),
+            channel,
+        };
+        assert_valid("memory.schema.json", &deleted.to_json());
+    }
+    let schema = load_schema("memory.schema.json");
+    assert_eq!(
+        schema["$id"],
+        "https://schemas.curietech.ai/cli/memory/v2.2.json"
+    );
+    // The minor schema extension also accepts a previously emitted list.
+    assert_valid(
+        "memory.schema.json",
+        &serde_json::json!({"agent": "d", "entries": []}),
+    );
+    let v = validator(&schema);
+    let mut incomplete_fact = list.to_json();
+    incomplete_fact["facts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("author");
+    assert!(
+        !v.is_valid(&incomplete_fact),
+        "a fact must retain its stored author"
+    );
+    let mut invalid_scope = list.to_json();
+    invalid_scope["facts"][0]["scope"] = serde_json::json!("global");
+    assert!(
+        !v.is_valid(&invalid_scope),
+        "only agent and channel scopes exist"
+    );
     let dry = MemoryOutput::DryRun(DryRunPlan {
         lines: vec!["GET /memory".to_string()],
     });
@@ -2509,6 +2682,7 @@ fn cluster_status_output_validates_both_variants() {
         urls: vec![],
         upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
         delivery: curie::completion_outbox::Report::unknown(),
+        credentials: Vec::new(),
     };
     let out = ClusterStatusOutput::Status(Box::new(status));
     assert_valid("cluster-status.schema.json", &out.to_json());
@@ -2546,6 +2720,7 @@ fn cluster_status_output_validates_both_variants() {
         urls: vec![],
         upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
         delivery: curie::completion_outbox::Report::unknown(),
+        credentials: Vec::new(),
     };
     let with_mail = ClusterStatusOutput::Status(Box::new(with_mail)).to_json();
     assert_eq!(
@@ -2558,6 +2733,74 @@ fn cluster_status_output_validates_both_variants() {
         lines: vec!["helm status".to_string()],
     });
     assert_valid("cluster-status.schema.json", &dry.to_json());
+}
+
+// #4397 AC 7: each configured forge credential is listed in status JSON with
+// its expiry, and the list is part of the published schema.
+#[test]
+fn cluster_status_lists_forge_credentials_in_the_schema() {
+    let now = time::OffsetDateTime::parse(
+        "2026-10-25T00:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let values = serde_json::json!({"factory": {
+        "codeHosts": [{"name": "github", "kind": "github",
+            "credential": {"type": "github_app", "appId": "7001"}}],
+        "trackers": [{"name": "corp-gitlab", "kind": "gitlab",
+            "credential": {"type": "static_token", "expiresAt": "2026-11-01T00:00:00Z"}}]
+    }});
+    let credentials = curie::forge_expiry::report(&values, now);
+    let status = ClusterStatus {
+        namespace: "curie".to_string(),
+        revision: "3".to_string(),
+        release_state: "deployed".to_string(),
+        release_found: true,
+        release_missing_note: None,
+        pods: vec![],
+        ready: 0,
+        total: 0,
+        unhealthy: vec![],
+        warnings: vec![],
+        pods_listed: true,
+        urls: vec![],
+        upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
+        delivery: curie::completion_outbox::Report::unknown(),
+        credentials,
+    };
+    let value = ClusterStatusOutput::Status(Box::new(status)).to_json();
+    assert_valid("cluster-status.schema.json", &value);
+    let listed = value["credentials"]
+        .as_array()
+        .expect("credentials is a list");
+    assert_eq!(listed.len(), 2, "{value}");
+    for entry in listed {
+        let keys: std::collections::BTreeSet<&str> = entry
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["expires_at", "expiry", "name", "section", "type", "warning"]
+                .into_iter()
+                .collect(),
+            "{entry}"
+        );
+    }
+    assert_eq!(listed[0]["expiry"], "none", "{value}");
+    assert_eq!(listed[1]["expiry"], "known", "{value}");
+    assert!(listed[1]["warning"]
+        .as_str()
+        .is_some_and(|w| w.contains("7 days left")));
+    let schema = load_schema("cluster-status.schema.json");
+    let mut invalid = value.clone();
+    invalid["credentials"][0]["expiry"] = serde_json::json!("soon");
+    assert!(
+        !validator(&schema).is_valid(&invalid),
+        "the schema must restrict expiry to known, unknown and none"
+    );
 }
 
 #[test]

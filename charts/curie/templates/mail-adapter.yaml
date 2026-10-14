@@ -275,6 +275,13 @@ spec:
   template:
     metadata:
       annotations:
+        {{- with (include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list )
+        "refs" (list (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.mailAdapter.channelTokenExistingSecret "existingSecretKey" $.Values.mailAdapter.channelTokenExistingSecretKey "defaultKey" "mailChannelToken") | fromYaml) (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.mailAdapter.egressSecretExistingSecret "existingSecretKey" $.Values.mailAdapter.egressSecretExistingSecretKey "defaultKey" "mailEgressSecret") | fromYaml) (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.mailAdapter.agentmail.apiKeyExistingSecret "existingSecretKey" $.Values.mailAdapter.agentmail.apiKeyExistingSecretKey "defaultKey" "mailAgentmailApiKey") | fromYaml))
+        "env" (include "curie.env.otel" (dict "root" $ "extraEnv" list)))) }}
+        checksum/secret: {{ . }}
+        {{- end }}
         {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}
@@ -361,6 +368,8 @@ spec:
             # process fall back to its own default and start.
             - name: CURIE_MAIL_ALLOWED_SENDERS
               value: {{ join "," .Values.mailAdapter.allowedSenders | quote }}
+            - name: CURIE_MAIL_ALLOW_ALL_SENDERS
+              value: {{ .Values.mailAdapter.allowAllSenders | default false | quote }}
             # #2731: the exact set of addresses the egress NetworkPolicy admits
             # on TCP 443, comma-joined in the same order as its ipBlock rules, so
             # the adapter can pin to /32 entries when DNS rotates the provider's

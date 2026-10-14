@@ -5,6 +5,7 @@ storing a bundle. It returns a ValidationResult with actionable, path-qualified
 errors instead of raising, so the caller can surface every problem at once.
 """
 
+import enum
 import json
 import re
 from collections.abc import Callable, Mapping
@@ -33,8 +34,8 @@ from .connector_lock import (
     validate_connector_lock,
 )
 from .connectors import (
+    CHANNEL_READ_SERVER_NAME,
     CONNECTORS_FILE,
-    RESERVED_CONNECTOR_NAMES,
     ConnectorsFile,
     validate_connectors,
 )
@@ -75,6 +76,10 @@ from .yaml_loader import DuplicateKeyError, safe_load_unique
 # to validate both the inline object and a declared hooks file.
 _HOOKS_ADAPTER = TypeAdapter(dict[str, list[HookMatcherConfig]])
 _TRIGGERS_ADAPTER = TypeAdapter(list[TriggerDeclaration])
+
+# The two existing platform exemptions are separate from the reserved names.
+# The reserved channel read server remains subject to toolPolicy when granted.
+_TOOL_POLICY_EXEMPT_PLATFORM_SERVERS = frozenset({"curie", "curie-state"})
 
 # Claude Code plugin names are kebab-case: lowercase alphanumerics and hyphens.
 _NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
@@ -865,6 +870,15 @@ def _validate_mcp_object(obj: object, location: str, c: _Collector) -> set[str] 
         return None
 
     for name, server in config.mcpServers.items():
+        if name == CHANNEL_READ_SERVER_NAME:
+            c.error(
+                "mcp.reserved_name",
+                f"mcp server {name!r} is reserved for the platform owned channel read "
+                "capability. A bundle cannot declare it; grant it with channelRead, "
+                "canvasList, canvasRead or canvasEdit set to true, and restrict its "
+                "tools with toolPolicy.",
+                location,
+            )
         if server.command is None and server.url is None:
             c.error(
                 "mcp.server_incomplete",
@@ -953,13 +967,14 @@ _DOW_NAMES: dict[str, int] = {
     "fri": 5,
     "sat": 6,
 }
-# minute, hour, day of month, month, day of week. Names only on the last two.
-_CRON_FIELDS: tuple[tuple[int, int, Mapping[str, int] | None], ...] = (
-    (0, 59, None),
-    (0, 23, None),
-    (1, 31, None),
-    (1, 12, _MONTH_NAMES),
-    (0, 7, _DOW_NAMES),
+# name, low, high, value names. Fields run minute, hour, day of month, month, day
+# of week. Names only on the last two.
+_CRON_FIELDS: tuple[tuple[str, int, int, Mapping[str, int] | None], ...] = (
+    ("minute", 0, 59, None),
+    ("hour", 0, 23, None),
+    ("day-of-month", 1, 31, None),
+    ("month", 1, 12, _MONTH_NAMES),
+    ("day-of-week", 0, 7, _DOW_NAMES),
 )
 _CRON_PART_RE = re.compile(
     r"^(?:\*|(?P<start>[A-Za-z]+|[0-9]+)(?:-(?P<end>[A-Za-z]+|[0-9]+))?)(?:/(?P<step>[0-9]+))?$"
@@ -972,72 +987,99 @@ def _stripped(value: object) -> str:
     return value.strip()
 
 
-def _cron_bound(token: str, low: int, high: int, names: Mapping[str, int] | None) -> int | None:
+class _CronCheck(enum.Enum):
+    """Outcome of checking one cron part or field."""
+
+    OK = enum.auto()
+    OUT_OF_RANGE = enum.auto()
+    MALFORMED = enum.auto()
+
+
+def _cron_value(token: str, names: Mapping[str, int] | None) -> int | None:
+    """The number a bound token stands for, or None when it is not a number or known name."""
+
     if token.isdigit():
         # Cron fields are at most two digits. A longer digit string is not a
         # field, and int() raises ValueError past the interpreter digit cap.
         if len(token) > 4:
             return None
         try:
-            value = int(token)
+            return int(token)
         except ValueError:
             return None
-    elif names is None:
+    if names is None:
         return None
-    else:
-        found = names.get(token.lower())
-        if found is None:
-            return None
-        value = found
-    if value < low or value > high:
-        return None
-    return value
+    return names.get(token.lower())
 
 
-def _cron_part_ok(part: str, low: int, high: int, names: Mapping[str, int] | None) -> bool:
+def _cron_part_check(part: str, low: int, high: int, names: Mapping[str, int] | None) -> _CronCheck:
     match = _CRON_PART_RE.fullmatch(part)
     if match is None:
-        return False
+        return _CronCheck.MALFORMED
     step_text = match.group("step")
     if step_text is not None:
         if len(step_text) > 4:
-            return False
+            return _CronCheck.MALFORMED
         try:
             step = int(step_text)
         except ValueError:
-            return False
+            return _CronCheck.MALFORMED
         if step < 1:
-            return False
+            return _CronCheck.MALFORMED
     start_text = match.group("start")
     if start_text is None:
-        return True
-    start = _cron_bound(start_text, low, high, names)
-    if start is None:
-        return False
+        return _CronCheck.OK
+    bounds = [_cron_value(start_text, names)]
     end_text = match.group("end")
-    if end_text is None:
-        return True
-    end = _cron_bound(end_text, low, high, names)
-    return end is not None and start <= end
+    if end_text is not None:
+        bounds.append(_cron_value(end_text, names))
+    values = [value for value in bounds if value is not None]
+    if len(values) != len(bounds):
+        return _CronCheck.MALFORMED
+    if any(value < low or value > high for value in values):
+        return _CronCheck.OUT_OF_RANGE
+    if values != sorted(values):
+        return _CronCheck.MALFORMED
+    return _CronCheck.OK
 
 
-def _cron_field_ok(field: str, low: int, high: int, names: Mapping[str, int] | None) -> bool:
+def _cron_field_check(
+    field: str, low: int, high: int, names: Mapping[str, int] | None
+) -> _CronCheck:
     # Reject empty fields and leading, trailing, or doubled commas before parts.
     if not field or field.startswith(",") or field.endswith(",") or ",," in field:
-        return False
-    return all(_cron_part_ok(part, low, high, names) for part in field.split(","))
+        return _CronCheck.MALFORMED
+    checks = {_cron_part_check(part, low, high, names) for part in field.split(",")}
+    # A malformed part wins over an out-of-range one: fix the syntax first.
+    if _CronCheck.MALFORMED in checks:
+        return _CronCheck.MALFORMED
+    if _CronCheck.OUT_OF_RANGE in checks:
+        return _CronCheck.OUT_OF_RANGE
+    return _CronCheck.OK
 
 
-def _five_field_cron(expression: str) -> bool:
-    """True when ``expression`` is five cron fields, not an alias or quartz form."""
+def _cron_schedule_error(expression: str) -> str | None:
+    """Why ``expression`` is not a five-field cron schedule, or None when it is.
 
+    The field count is checked first, then each field in order (minute, hour,
+    day-of-month, month, day-of-week). Only the first failing field is reported,
+    as out of range when it is well formed but a number falls outside the field's
+    bounds, and as malformed for any other fault. Aliases and quartz forms fail
+    the count check.
+    """
+
+    prefix = "a 'cron' trigger 'schedule'"
     fields = expression.split()
     if len(fields) != len(_CRON_FIELDS):
-        return False
-    return all(
-        _cron_field_ok(field, low, high, names)
-        for field, (low, high, names) in zip(fields, _CRON_FIELDS, strict=True)
-    )
+        names = " ".join(name for name, *_ in _CRON_FIELDS)
+        return f"{prefix} must have five fields ({names}); got {len(fields)}"
+    for field, (name, low, high, value_names) in zip(fields, _CRON_FIELDS, strict=True):
+        check = _cron_field_check(field, low, high, value_names)
+        if check is _CronCheck.OUT_OF_RANGE:
+            return f"{prefix} field {name} `{field}` is outside {low}-{high}"
+        if check is _CronCheck.MALFORMED:
+            return f"{prefix} field {name} `{field}` is not a valid cron field"
+    return None
 
 
 def _target_acceptable(value: object) -> bool:
@@ -1125,12 +1167,8 @@ def _validate_triggers(manifest: PluginManifest, c: _Collector) -> None:
                     "a 'cron' trigger must define a non-empty 'schedule'",
                     loc,
                 )
-            elif not _five_field_cron(schedule_text):
-                c.error(
-                    "triggers.cron_invalid_schedule",
-                    "a 'cron' trigger 'schedule' must be a five-field cron expression",
-                    loc,
-                )
+            elif (schedule_error := _cron_schedule_error(schedule_text)) is not None:
+                c.error("triggers.cron_invalid_schedule", schedule_error, loc)
             if not name_text:
                 c.error(
                     "triggers.cron_missing_name",
@@ -1441,9 +1479,9 @@ def _validate_tool_policy(
 
     # The declared-server cross-check. A pattern whose server segment is a
     # LITERAL name (``literal_server_segment`` returns ``None`` for a wildcarded
-    # or malformed one) must name a server the bundle actually declares, in
-    # either the MCP map or connectors.yaml -- a typo'd segment is an inert rule
-    # the author believes is live. A wildcard segment is the deliberate escape
+    # or malformed one) must name a declared server or the granted channel read
+    # capability. An unknown literal names an inert rule the author believes
+    # is live. A wildcard segment is the deliberate escape
     # hatch for a bundle whose servers are not statically declared and is never
     # cross-checked; that makes this check advisory, which is accepted, because
     # the property that actually defends the capability is classify_tool's
@@ -1453,23 +1491,31 @@ def _validate_tool_policy(
         if mcp_servers is not None and connector_servers is not None
         else None
     )
+    slack_granted = bool(manifest.platform_slack_grants())
+    if expected_servers is not None and slack_granted:
+        expected_servers.add(CHANNEL_READ_SERVER_NAME)
     if expected_servers is not None:
         for collection, i, pattern in policy_patterns(policy):
             server = literal_server_segment(pattern)
+            if server == CHANNEL_READ_SERVER_NAME and not slack_granted:
+                c.error(
+                    "channel_read.grant_required",
+                    f"tool pattern {pattern!r} names {CHANNEL_READ_SERVER_NAME!r}, but "
+                    "none of channelRead, canvasList, canvasRead or canvasEdit is true. "
+                    "Grant one of them with a literal true before declaring a policy for "
+                    "its tools. Its server name is reserved and cannot be declared by "
+                    "the bundle.",
+                    f"plugin.json (toolPolicy.{collection}[{i}])",
+                )
+                continue
             if server is None or server in expected_servers:
                 continue
-            # Same error, better message, and NOTHING new is rejected here
-            # (#2286). The branch sits INSIDE the undeclared case on purpose: a
-            # reserved name is only reserved against connectors.yaml, so a
-            # bundle may legally declare a plugin-mounted mcpServers entry
-            # called `curie`, whose live names carry the plugin infix and stay
-            # fully inside policy scope. That bundle passes the guard above and
-            # never reaches this line. What lands here is the dead end: a
-            # pattern naming a server the bundle does not declare and, because
-            # the platform owns the name, cannot declare as a connector either.
-            # The generic advice would send that author in a circle, telling
-            # them to declare exactly what `connectors.reserved_name` refuses.
-            if server in RESERVED_CONNECTOR_NAMES:
+            # Only the existing two exempt identities use this diagnostic.
+            # A bundle may plugin mount either name with the plugin infix and
+            # full policy scope; those declarations pass the guard above.
+            # An undeclared literal cannot become a connector, so generic
+            # advice to declare it would contradict the reserved name check.
+            if server in _TOOL_POLICY_EXEMPT_PLATFORM_SERVERS:
                 c.error(
                     "tool_policy.platform_server",
                     _platform_tool_policy_server_message(pattern, server),
@@ -1538,9 +1584,9 @@ def _platform_tool_policy_server_message(pattern: str, server: str) -> str:
     the author is still looking: the pattern cannot be made live, and the thing
     it was reaching for was never in danger.
 
-    The reserved set is imported rather than retyped for the #453/#544 reason:
-    a second copy of a name list owned by a different module is how a validator
-    and the thing it validates drift into disagreeing.
+    Only the two existing exempt platform servers use this diagnostic.
+    Reservation does not imply exemption: the channel read capability remains
+    policy governed and has its own unavailable grant diagnostic.
     """
 
     return (
@@ -1581,24 +1627,40 @@ def _unknown_tool_policy_server_message(
 
 
 def _validate_secrets(manifest: PluginManifest, c: _Collector) -> None:
-    """Validate the manifest ``secrets`` policy (deploy-time gate, ADR-0009 / #429).
+    """Validate the manifest secret policy (deploy-time gate, ADR-0009 / #429, ADR 0210).
 
-    ``secrets`` is a list of the named connector secrets the bundle needs (the
-    NAMES only, never values). Each must be an environment-variable-style name
+    ``secrets`` lists the named connector secrets the bundle requires and
+    ``optionalSecrets`` the ones it can use but does not need (the NAMES only,
+    never values). Each must be an environment-variable-style name
     (``^[A-Z_][A-Z0-9_]*$``) so it can be forwarded into the sandbox env and
     consumed by ``.mcp.json`` ``${VAR}`` expansion; a malformed name is rejected
-    at deploy before an agent ships expecting a secret that can never bind.
+    at deploy before an agent ships expecting a secret that can never bind. A
+    name may not be both required and optional.
     """
 
-    declared = manifest.secrets
-    if declared is None:
-        return
-    if not isinstance(declared, list):
-        c.error("secrets.invalid", "secrets must be a list of names", "plugin.json")
-        return
+    required = _validate_secret_names(manifest.secrets, "secrets", c)
+    optional = _validate_secret_names(manifest.optionalSecrets, "optionalSecrets", c)
+    for name in sorted(set(required) & set(optional)):
+        c.error(
+            "secrets.optional_overlap",
+            f"secret name {name!r} is declared in both `secrets` and `optionalSecrets`; "
+            "declare it once, as required or as optional",
+            "plugin.json (optionalSecrets)",
+        )
 
+
+def _validate_secret_names(declared: object, field: str, c: _Collector) -> list[str]:
+    """Validate one secret NAME list and return its string entries."""
+
+    if declared is None:
+        return []
+    if not isinstance(declared, list):
+        c.error("secrets.invalid", f"{field} must be a list of names", "plugin.json")
+        return []
+
+    names: list[str] = []
     for i, name in enumerate(declared):
-        loc = f"plugin.json (secrets[{i}])"
+        loc = f"plugin.json ({field}[{i}])"
         if not isinstance(name, str) or not SECRET_NAME_RE.match(name):
             c.error(
                 "secrets.name_invalid",
@@ -1606,7 +1668,9 @@ def _validate_secrets(manifest: PluginManifest, c: _Collector) -> None:
                 "(uppercase letters, digits, underscore; not starting with a digit)",
                 loc,
             )
-        elif is_reserved_boot_env_name(name):
+            continue
+        names.append(name)
+        if is_reserved_boot_env_name(name):
             # Reserved sandbox boot-env / model-credential keys (#457, #445):
             # the whole CURIE_* namespace plus the runner's non-prefixed
             # credential keys (ANTHROPIC_BASE_URL etc). A connector secret must
@@ -1619,6 +1683,7 @@ def _validate_secrets(manifest: PluginManifest, c: _Collector) -> None:
                 "used for a connector secret",
                 loc,
             )
+    return names
 
 
 def _validate_scripts(root: Path, c: _Collector) -> None:

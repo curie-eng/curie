@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
+from channel_protocol.work_item_events import CI_FIRST_FIX_ROUND, CI_MAX_ROUNDS
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from curie_api.workitems.lifecycle import WorkItemConflict, WorkItemOutcome
 
 from .. import workitem_dispatch
 from ..auth import require_internal_worker_token
 from ..config import get_settings
-from ..deps import SessionDep
+from ..deps import LivenessSessionDep, SessionDep
+from ..forges.types import RepositoryRef, TrackerIssueRef
 from ..workitem_dispatch import DispatchConflict
-from ..workitems import WorkItemConflict, WorkItemOutcome
 
 router = APIRouter(
     prefix="/v1/internal/work-items",
@@ -23,18 +26,59 @@ router = APIRouter(
 )
 
 
+class TrackerIssueIn(BaseModel):
+    """The tracker issue that keys the WorkItem (ADR 0197 identity rule 1)."""
+
+    kind: str = Field(min_length=1)
+    host: str = Field(min_length=1)
+    scope_id: str = Field(min_length=1)
+    issue_id: str = Field(min_length=1)
+    display_key: str | None = Field(default=None, min_length=1)
+
+
+class RepositoryIn(BaseModel):
+    """The repository frozen on the WorkItem (ADR 0197 identity rules 2 and 3)."""
+
+    code_host_kind: str = Field(min_length=1)
+    host: str = Field(min_length=1)
+    project_id: str = Field(min_length=1)
+    path: str = Field(min_length=1)
+
+
 class AdmissionFacts(BaseModel):
     agent_id: uuid.UUID
     kind: str = Field(min_length=1)
     address: str = Field(min_length=1)
     reply_conversation_id: str = Field(min_length=1)
-    repo_full_name: str = Field(min_length=1)
-    github_repository_id: int = Field(gt=0)
-    github_issue_number: int = Field(gt=0)
-    github_installation_id: int = Field(gt=0)
+    tracker: TrackerIssueIn
+    repository: RepositoryIn
+    code_host_installation_id: int | None = Field(default=None, gt=0)
     objective: str = Field(min_length=1, max_length=65536)
     requester: str = Field(min_length=1)
     request_id: uuid.UUID
+
+    def admission(self) -> workitem_dispatch.Admission:
+        tracker, repository = self.tracker, self.repository
+        return workitem_dispatch.Admission(
+            agent_id=self.agent_id,
+            kind=self.kind,
+            address=self.address,
+            reply_conversation_id=self.reply_conversation_id,
+            issue=TrackerIssueRef(
+                tracker.kind,
+                tracker.host,
+                tracker.scope_id,
+                tracker.issue_id,
+                tracker.display_key,
+            ),
+            repository=RepositoryRef(
+                repository.code_host_kind, repository.host, repository.project_id, repository.path
+            ),
+            code_host_installation_id=self.code_host_installation_id,
+            objective=self.objective,
+            requester=self.requester,
+            request_id=self.request_id,
+        )
 
 
 class CancelBody(BaseModel):
@@ -75,6 +119,18 @@ class FinishBody(BaseModel):
     cause: str = Field(min_length=1)
     # The provider's own failure message (#3073). The API redacts and clips it.
     detail: str | None = Field(default=None, max_length=4000)
+    # The CI fix round whose turn ended unpublished (#4330). Required for
+    # ``ci_fix_unpublished`` and refused for every other cause.
+    ci_fix_round: int | None = Field(default=None, ge=CI_FIRST_FIX_ROUND, le=CI_MAX_ROUNDS)
+
+    @model_validator(mode="after")
+    def _round_matches_cause(self) -> Self:
+        unpublished = self.cause.strip() == "ci_fix_unpublished"
+        if unpublished and self.ci_fix_round is None:
+            raise ValueError("ci_fix_unpublished requires ci_fix_round")
+        if not unpublished and self.ci_fix_round is not None:
+            raise ValueError("ci_fix_round is only valid with cause ci_fix_unpublished")
+        return self
 
 
 class TerminationClaimBody(BaseModel):
@@ -113,7 +169,7 @@ def _admission_body(result: WorkItemOutcome) -> dict[str, Any]:
 async def admit_work_item(
     facts: AdmissionFacts, session: SessionDep
 ) -> dict[str, Any]:
-    result = await workitem_dispatch.admit(session, facts)
+    result = await workitem_dispatch.admit(session, facts.admission())
     if isinstance(result, WorkItemOutcome):
         if result.request is None:
             raise HTTPException(status.HTTP_409_CONFLICT, {"code": "not_found"})
@@ -208,7 +264,7 @@ async def acquire_work_item_request(
         "work_item_id": result.work_item_id,
         "conversation_id": result.conversation_id,
         "wait_deadline": result.wait_deadline,
-        "repo_full_name": result.repo_full_name,
+        "repository_path": result.repository_path,
     }
 
 
@@ -230,6 +286,7 @@ async def defer_work_item_request(
     return {
         "dispatch_generation": result.dispatch_generation,
         "not_before": result.not_before,
+        "terminal_cause": result.terminal_cause,
     }
 
 
@@ -258,7 +315,7 @@ async def start_work_item_request(
 
 @router.post("/requests/{request_id}/heartbeat")
 async def heartbeat_work_item_request(
-    request_id: uuid.UUID, body: HeartbeatBody, session: SessionDep
+    request_id: uuid.UUID, body: HeartbeatBody, session: LivenessSessionDep
 ) -> dict[str, Any]:
     result = await workitem_dispatch.heartbeat(
         session, request_id, runtime_epoch=body.runtime_epoch
@@ -314,6 +371,7 @@ async def finish_work_item_request(
         outcome=body.outcome,
         cause=body.cause,
         detail=body.detail,
+        ci_fix_round=body.ci_fix_round,
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)

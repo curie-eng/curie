@@ -102,9 +102,40 @@ _KNOB_TABLE = [
     ),
     pytest.param({"CURIE_RUNNER_TOKEN": "abc123"}, "runner_token", "abc123", id="token-read"),
     pytest.param({}, "runner_token", None, id="token-absent"),
-    # The token is enforced only when configured (#63), so an empty value must
-    # read as unset rather than turning on enforcement with an unusable token.
+    # An empty value must read as unset rather than as an unusable token (#63);
+    # the process entrypoint then refuses to boot on it (#3821), not the parse.
     pytest.param({"CURIE_RUNNER_TOKEN": ""}, "runner_token", None, id="token-empty-is-unset"),
+    # CURIE_RUNNER_ALLOW_TOKENLESS is a runner-local dev knob (#3821), not a
+    # BootEnv key. Only 1/true (any case, trimmed) turns it on: unlike
+    # CURIE_FAKE_MODEL, "yes" is off, so nobody harmonizes the two later.
+    pytest.param({}, "allow_tokenless", False, id="allow-tokenless-default-off"),
+    pytest.param(
+        {"CURIE_RUNNER_ALLOW_TOKENLESS": "1"}, "allow_tokenless", True, id="allow-tokenless-1"
+    ),
+    pytest.param(
+        {"CURIE_RUNNER_ALLOW_TOKENLESS": "true"}, "allow_tokenless", True, id="allow-tokenless-true"
+    ),
+    pytest.param(
+        {"CURIE_RUNNER_ALLOW_TOKENLESS": " TRUE "},
+        "allow_tokenless",
+        True,
+        id="allow-tokenless-true-any-case-trimmed",
+    ),
+    pytest.param(
+        {"CURIE_RUNNER_ALLOW_TOKENLESS": "0"}, "allow_tokenless", False, id="allow-tokenless-0"
+    ),
+    pytest.param(
+        {"CURIE_RUNNER_ALLOW_TOKENLESS": "yes"}, "allow_tokenless", False, id="allow-tokenless-yes"
+    ),
+    pytest.param(
+        {"CURIE_RUNNER_ALLOW_TOKENLESS": "false"},
+        "allow_tokenless",
+        False,
+        id="allow-tokenless-false",
+    ),
+    pytest.param(
+        {"CURIE_RUNNER_ALLOW_TOKENLESS": ""}, "allow_tokenless", False, id="allow-tokenless-empty"
+    ),
 ]
 
 
@@ -173,6 +204,59 @@ def test_history_window_degrades_rather_than_raising(raw: str) -> None:
 
     assert config.history_max_turns is None
     assert config.history_max_bytes is None
+
+
+def test_memory_fact_limit_defaults_to_200_when_unset() -> None:
+    """Unset, each memory holds and shows at most 200 facts, as before (#3624)."""
+
+    from curie_runner.memory_facts import MAX_FACTS_PER_MEMORY
+
+    assert MAX_FACTS_PER_MEMORY == 200
+    assert RunnerConfig.from_env(dict(_BASE)).memory_max_facts == 200
+
+
+@pytest.mark.parametrize("raw", ["3", "250"])
+def test_memory_fact_limit_comes_through_the_declared_surface(raw: str) -> None:
+    config = RunnerConfig.from_env(dict(_BASE, CURIE_MEMORY_MAX_FACTS=raw))
+
+    assert config.memory_max_facts == int(raw)
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "lots", "0", "-3", "1.5"])
+def test_memory_fact_limit_falls_back_to_200_rather_than_raising(raw: str) -> None:
+    """A typo or a limit of zero or less must not crash boot; the default applies."""
+
+    config = RunnerConfig.from_env(dict(_BASE, CURIE_MEMORY_MAX_FACTS=raw))
+
+    assert config.memory_max_facts == 200
+
+
+def test_repository_trust_comes_through_the_declared_surface() -> None:
+    """ADR 0197: the code host origin and deep path reach the snapshot check."""
+
+    config = RunnerConfig.from_env(
+        dict(
+            _BASE,
+            CURIE_REPO_ORIGIN="https://gitlab.example.com",
+            CURIE_REPO_PATH="platform/team/infra",
+        )
+    )
+
+    assert config.repo_origin == "https://gitlab.example.com"
+    assert config.repo_path == "platform/team/infra"
+
+
+@pytest.mark.parametrize("raw", [None, ""])
+def test_repository_trust_is_absent_on_a_github_boot(raw: str | None) -> None:
+    """Unset or blank is a GitHub boot: the configured host and owner/name."""
+
+    env = dict(_BASE)
+    if raw is not None:
+        env |= {"CURIE_REPO_ORIGIN": raw, "CURIE_REPO_PATH": raw}
+    config = RunnerConfig.from_env(env)
+
+    assert config.repo_origin is None
+    assert config.repo_path is None
 
 
 def test_malformed_budget_still_raises() -> None:

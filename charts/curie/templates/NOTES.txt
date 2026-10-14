@@ -86,6 +86,7 @@ Reach the UI (port-forward):
 When exposed as NodePort (`curie up` does this by default), the UI is reachable at:
   http://<any-node-ip>:{{ .Values.ui.service.nodePort }}
 The nodePort is pinned in values (ui.service.nodePort) so it survives a down/up cycle.
+The console session cookie is Secure, so sign-in works only over HTTPS or from http://localhost; over plain HTTP from another host it cannot sign in. Use the port-forward above, or serve the UI over HTTPS (https://github.com/curie-eng/curie/issues/3968).
 {{- end }}
 {{- end }}
 
@@ -139,6 +140,10 @@ Kernel isolation (gVisor, security.gvisor.mode={{ $gvisorMode }}):
 
 Sandbox capacity (resourceQuota vs. node allocatable):
 {{- include "curie.sandboxCapacity.notes" (dict "fits" $cap.fits "ceiling" $cap.ceiling "cpu" $perSandbox.cpu "memory" $perSandbox.memory "fullname" (include "curie.fullname" .) "namespace" .Release.Namespace) }}
+{{- if .Values.worker.deploy }}
+{{- $workerMaxConcurrency := dig "maxConcurrency" 16 .Values.worker }}
+  - Worker turn slots: worker.replicas {{ .Values.worker.replicas }} x worker.maxConcurrency {{ $workerMaxConcurrency }} = {{ mul (int64 .Values.worker.replicas) (int64 $workerMaxConcurrency) }} concurrent turns; the sandbox quota admits {{ $cap.ceiling }}.
+{{- end }}
 {{- end }}
 {{- end }}
 {{- end }}

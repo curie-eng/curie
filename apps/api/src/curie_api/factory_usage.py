@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -29,15 +30,16 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .config import get_settings
-from .models import ExecutionRequest, ExecutionRequestModelUsage
-from .schemas import (
+from curie_api.schemas.workitems import (
     WorkItemUsageModel,
     WorkItemUsageOut,
     WorkItemUsagePriceSource,
     WorkItemUsageRequest,
     WorkItemUsageRole,
 )
+
+from .config import get_settings
+from .models import ExecutionRequest, ExecutionRequestModelUsage
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,8 @@ PRICE_TTL_S = 6 * 3600
 PRICE_FAILURE_TTL_S = 300
 _FETCH_TIMEOUT_S = 10.0
 _COST_QUANTUM = Decimal("0.000001")
+# A trailing context-window token on a model id, such as ``[1m]`` (#3992).
+_CONTEXT_WINDOW_SUFFIX = re.compile(r"\[[^\[\]]*\]$")
 
 
 # --- wire -------------------------------------------------------------------------
@@ -128,11 +132,15 @@ def _rates(entry: dict[str, Any]) -> dict[str, Decimal] | None:
 
 
 def match_price(models_payload: dict[str, Any], model: str) -> dict[str, Decimal] | None:
-    """Rates for ``model``: exact id first, else a unique normalized-name match."""
+    """Rates for ``model``: exact id first, else a unique normalized-name match.
+
+    A context-window suffix such as ``[1m]`` is priced at its base model's rates.
+    """
 
     data = models_payload.get("data") if isinstance(models_payload, dict) else None
     if not isinstance(data, list):
         return None
+    model = _CONTEXT_WINDOW_SUFFIX.sub("", model) or model
     entries = [e for e in data if isinstance(e, dict) and isinstance(e.get("id"), str)]
     for entry in entries:
         if entry["id"] == model:
@@ -330,7 +338,10 @@ async def work_item_usage(session: AsyncSession, work_item_id: uuid.UUID) -> Wor
     complete = True
     for row in rows:
         tokens = _tokens(row)
+        # Zero tokens cost zero whether or not a price matched.
         cost = row.estimated_cost_usd
+        if cost is None and not tokens:
+            cost = Decimal(0)
         complete = complete and cost is not None
         total = _add(total, cost)
         role = roles.setdefault(row.role, WorkItemUsageRole())

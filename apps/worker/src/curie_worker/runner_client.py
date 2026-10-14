@@ -21,7 +21,7 @@ import binascii
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Literal, TypeVar
@@ -59,6 +59,48 @@ TimeoutResult = Literal["accepted", "conflict", "unconfirmed"]
 
 logger = logging.getLogger(__name__)
 
+# @spec ACTION-EXECUTOR-5 @spec ACTION-EXECUTOR-24. The runner-private boot
+# variable (outside ``BootEnv``) an executor claim sets, and its value. Frozen
+# with the runner's reader by ``tests/vectors/runner-execute.json``.
+RUNNER_MODE_ENV = "CURIE_RUNNER_MODE"
+EXECUTOR_MODE = "execute"
+
+# @spec ACTION-EXECUTOR-6. The executor route's one request shape: every key is
+# present on every phase, and a key the phase does not use is null.
+EXECUTE_PATH = "/v1/execute"
+EXECUTE_REQUEST_KEYS = frozenset(
+    {"execution_id", "phase", "connector", "tool", "arguments", "grant", "target"}
+)
+EXECUTE_PHASES = frozenset({"list", "observe", "call", "read"})
+# @spec AUTOMATED-REMEDIATION-12 (executor amendment E3): the ``read`` request
+# alone adds the predicate's pointer to the frozen keys.
+EXECUTE_READ_KEYS = EXECUTE_REQUEST_KEYS | {"pointer"}
+# @spec ACTION-EXECUTOR-20. A route refusal that provably dialed nothing (or, for
+# ``connector_unreachable`` on ``list``/``observe``, only a read) maps to one
+# pre-dispatch code. Ordering and shape refusals are the worker's own fault
+# against a healthy runner, reported as ``runner_unavailable``.
+_EXECUTE_REFUSALS = {
+    "phase_out_of_order": "runner_unavailable",
+    "invalid_request": "runner_unavailable",
+    "tool_not_advertised": "tool_not_advertised",
+    "restore_not_advertised": "restore_not_advertised",
+    "restore_schema_mismatch": "restore_schema_mismatch",
+    "arguments_mismatch": "arguments_mismatch",
+    # A ``call`` whose connector has no URL the grant header could ride to; the
+    # route refuses before dialing, so it is pre-dispatch, never response_lost.
+    "connector_not_hosted": "connector_not_hosted",
+}
+# ``list``, ``observe`` and ``read`` dial reads only, so an unknown refusal is
+# ``runner_unavailable``, never ``response_lost`` (AUTOMATED-REMEDIATION-12).
+_READ_PHASE_REFUSALS = {
+    **_EXECUTE_REFUSALS,
+    "connector_unreachable": "connector_unreachable",
+    # Executor amendment E4: a read tool not advertised ``readOnlyHint: true``.
+    "tool_not_read_only": "tool_not_read_only",
+}
+_EXECUTE_REFUSAL_BODY_KEY = "refused"
+_EXECUTE_BODY_MAX_BYTES = 1_048_576
+
 
 def _auth_headers(token: str | None) -> dict[str, str] | None:
     """Per-call Authorization header for the per-sandbox runner token (issue #63).
@@ -94,6 +136,46 @@ def _valid_turn_epoch(value: str | None) -> bool:
 
 class RunnerError(Exception):
     """The runner returned an unexpected HTTP status or an unreadable stream."""
+
+
+class ExecuteRefused(RunnerError):
+    """An executor route call ended without a usable phase response.
+
+    ``code`` is the closed ACTION-EXECUTOR-20 code the worker reports: a
+    pre-dispatch code (``runner_unavailable`` for a runner without the route, an
+    unreachable runner or an ordering refusal) or, for a ``call`` whose outcome
+    may have reached the connector, ``response_lost``, which is never a refusal
+    (ACTION-EXECUTOR-17).
+    """
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(f"/v1/execute: {code} ({detail})")
+        self.code = code
+
+
+def _execute_failure_code(phase: str, status: int | None, refused: object) -> str:
+    """The ACTION-EXECUTOR-20 code for a failed executor route call.
+
+    ``status`` is None for a transport failure. Only a refusal the route makes
+    before dialing is a provable non-write; anything else on a ``call``, an
+    unknown code above all, may have reached the connector and is
+    ``response_lost``.
+    """
+
+    if status == 404:
+        # A runner image without the route (ACTION-EXECUTOR-24); it dials nothing.
+        return "runner_unavailable"
+    if phase == "call":
+        if isinstance(refused, str) and refused in _EXECUTE_REFUSALS:
+            return _EXECUTE_REFUSALS[refused]
+        return "response_lost"
+    if isinstance(refused, str) and refused in _READ_PHASE_REFUSALS:
+        return _READ_PHASE_REFUSALS[refused]
+    return "runner_unavailable"
+
+
+class RunnerSnapshotReadError(RunnerError):
+    """The publication snapshot could not be read or validated at its boundary."""
 
 
 class RunnerStreamTimeout(TimeoutError):
@@ -289,6 +371,19 @@ class TurnStream:
             self.close()
 
 
+def _rejected_frame(endpoint: str, status: int, body: str) -> RunnerError:
+    """The error for a runner that refused a turn-opening frame.
+
+    Only the status and the body's length, never the body (MEMORY-TOKEN-3). A
+    runner's validation response can repeat the frame it rejected, and the frame
+    carries the turn's memory credential and its publication capability. An
+    older runner repeats it as pydantic's ``str(ValidationError)``, which cuts
+    the input in the middle, so no string replace of the whole credential can
+    redact what is left of it. This error is logged."""
+
+    return RunnerError(f"{endpoint} -> {status} (body: {len(body)} chars, not logged)")
+
+
 class RunnerClient:
     """Dials a claimed runner over its base_url. One client serves all threads."""
 
@@ -332,6 +427,16 @@ class RunnerClient:
         self._snapshot_body_max_bytes = (
             4 * ((snapshot_patch_max_bytes + 2) // 3) + 131_072
         )
+
+    def turn_deadline_s(self, remaining_s: float | None) -> float:
+        """How long a turn opened now may stream: ``_request_timeout``'s bound.
+
+        ``min(total_timeout_s, remaining_s)``, or the ceiling when there is no
+        budget in hand. ADR-0188's per-turn memory credential expires with it.
+        """
+        if remaining_s is None:
+            return self._total_timeout_s
+        return max(_MIN_REQUEST_TIMEOUT_S, min(self._total_timeout_s, remaining_s))
 
     def _request_timeout(self, remaining_s: float | None) -> aiohttp.ClientTimeout | Any:
         """The per-request timeout for a delivery with ``remaining_s`` of budget.
@@ -389,7 +494,7 @@ class RunnerClient:
             inject_trace_context(headers)
             try:
                 result, outcome = await request(headers or None)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 outcome = "timeout" if isinstance(exc, TimeoutError) else "failure"
                 _mark_rpc_failed(span, outcome, exc)
@@ -415,8 +520,14 @@ class RunnerClient:
         *,
         remaining_s: float | None = None,
         capacity_admission: bool = False,
+        progress: Mapping[str, str] | None = None,
     ) -> TurnStream:
-        """Open a turn. Capacity turns need a separate post-lock grant."""
+        """Open a turn. Capacity turns need a separate post-lock grant.
+
+        ``progress`` is the turn's deliberate progress capability (ADR 0130),
+        sent as runner control headers beside the capacity admission one;
+        ``curie_worker.turn_progress`` names and mints them.
+        """
         request_timeout = self._request_timeout(remaining_s)
         stream_timeout_s = (
             self._total_timeout_s
@@ -436,6 +547,8 @@ class RunnerClient:
             request_headers = dict(headers or {})
             if capacity_admission:
                 request_headers[_CAPACITY_ADMISSION_HEADER] = "wait"
+            if progress:
+                request_headers.update(progress)
             resp = await self._session.post(
                 f"{base_url}/v1/event",
                 json=event.model_dump(mode="json"),
@@ -443,13 +556,11 @@ class RunnerClient:
                 timeout=request_timeout,
             )
             if resp.status != 200:
-                if event.publication_context is not None:
-                    # A validation response can echo the submitted capability.
+                try:
+                    body = await resp.text()
+                finally:
                     resp.release()
-                    raise RunnerError(f"/v1/event -> {resp.status}")
-                body = await resp.text()
-                resp.release()
-                raise RunnerError(f"/v1/event -> {resp.status}: {body}")
+                raise _rejected_frame("/v1/event", resp.status, body)
             turn_epoch = resp.headers.get(_TURN_EPOCH_HEADER)
             if capacity_admission and not _valid_turn_epoch(turn_epoch):
                 resp.release()
@@ -533,10 +644,7 @@ class RunnerClient:
                 if resp.status == 409:
                     return False, "conflict"
                 if resp.status != 200:
-                    if event.publication_context is not None:
-                        raise RunnerError(f"/v1/steer -> {resp.status}")
-                    body = await resp.text()
-                    raise RunnerError(f"/v1/steer -> {resp.status}: {body}")
+                    raise _rejected_frame("/v1/steer", resp.status, await resp.text())
                 return True, "success"
 
         return await self._rpc("steer", token, request)
@@ -619,11 +727,15 @@ class RunnerClient:
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
+                if resp.status >= 500:
+                    raise RunnerSnapshotReadError(f"/v1/snapshot -> {resp.status}: {body}")
                 raise RunnerError(f"/v1/snapshot -> {resp.status}: {body}")
+            raw = bytearray()
             try:
-                raw = await resp.content.read(self._snapshot_body_max_bytes + 1)
-                if len(raw) > self._snapshot_body_max_bytes:
-                    raise ValueError("snapshot response exceeds its encoded byte limit")
+                async for chunk in resp.content.iter_chunked(65_536):
+                    raw.extend(chunk)
+                    if len(raw) > self._snapshot_body_max_bytes:
+                        raise ValueError("snapshot response exceeds its encoded byte limit")
                 body = json.loads(raw)
                 encoded = body["patch_base64"]
                 if not isinstance(encoded, str):
@@ -661,7 +773,10 @@ class RunnerClient:
                     publication_body=description,
                 )
             except (KeyError, TypeError, ValueError, binascii.Error, json.JSONDecodeError) as exc:
-                raise RunnerError("/v1/snapshot returned an invalid bounded payload") from exc
+                raise RunnerSnapshotReadError(
+                    "/v1/snapshot returned an invalid bounded payload "
+                    f"after {len(raw)} bytes: {type(exc).__name__}: {str(exc)[:160]}"
+                ) from exc
 
     async def status(
         self,
@@ -742,6 +857,68 @@ class RunnerClient:
                 return None, "success"
 
         await self._rpc("turn-admit", token, request)
+
+    async def execute(
+        self,
+        base_url: str,
+        request: Mapping[str, Any],
+        *,
+        token: str,
+        remaining_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Run one executor phase on an executor-mode runner. @spec ACTION-EXECUTOR-24.
+
+        Posts ``request`` (exactly the ACTION-EXECUTOR-6 keys, plus ``pointer``
+        on a ``read``, AUTOMATED-REMEDIATION-12) to
+        ``/v1/execute`` with the per-sandbox bearer and returns the phase's
+        response body. Every other ending raises ``ExecuteRefused`` with the
+        code the worker reports; nothing about the arguments, grant or reply is
+        logged or carried in the error.
+        """
+
+        if not token:
+            raise RunnerError("/v1/execute requires a runner token")
+        phase = request.get("phase")
+        if phase not in EXECUTE_PHASES:
+            raise RunnerError("/v1/execute request names an unknown phase")
+        expected = EXECUTE_READ_KEYS if phase == "read" else EXECUTE_REQUEST_KEYS
+        if set(request) != expected:
+            raise RunnerError("/v1/execute request does not carry exactly the frozen keys")
+        body = dict(request)
+
+        async def send(headers: dict[str, str] | None) -> tuple[dict[str, Any], str]:
+            try:
+                async with self._session.post(
+                    f"{base_url}{EXECUTE_PATH}",
+                    json=body,
+                    headers=headers,
+                    timeout=self._request_timeout(remaining_s),
+                ) as resp:
+                    raw = await resp.content.read(_EXECUTE_BODY_MAX_BYTES + 1)
+                    status = resp.status
+            except (aiohttp.ClientError, TimeoutError) as exc:
+                code = _execute_failure_code(phase, None, None)
+                raise ExecuteRefused(code, f"transport {type(exc).__name__}") from exc
+            parsed: object = None
+            if len(raw) <= _EXECUTE_BODY_MAX_BYTES:
+                try:
+                    parsed = json.loads(raw)
+                except (ValueError, UnicodeDecodeError):
+                    parsed = None
+            if status != 200:
+                refused = (
+                    parsed.get(_EXECUTE_REFUSAL_BODY_KEY) if isinstance(parsed, dict) else None
+                )
+                code = _execute_failure_code(phase, status, refused)
+                raise ExecuteRefused(code, f"HTTP {status}")
+            if not isinstance(parsed, dict) or parsed.get("phase") != phase:
+                # A 200 the worker cannot read: on ``call`` the write may have
+                # happened, so it is lost, never refused.
+                code = "response_lost" if phase == "call" else "runner_unavailable"
+                raise ExecuteRefused(code, "unreadable phase response")
+            return parsed, "success"
+
+        return await self._rpc("execute", token, send)
 
     async def close(self) -> None:
         if self._own_session:

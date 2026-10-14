@@ -59,6 +59,19 @@ def test_platform_progress_tool_is_idempotent_under_any_harness() -> None:
     assert not classifier.is_side_effecting(PROGRESS_TOOL_NAME)
 
 
+def test_the_turn_progress_tool_is_idempotent_under_any_harness() -> None:
+    """ADR 0130's ``progress`` tool reports task state and acts on nothing, so a
+    repeat on retry duplicates nothing real and the turn stays retryable. The
+    name comes from the constant that mounts the tool, so the two cannot drift."""
+
+    from curie_runner.approval import TURN_PROGRESS_TOOL_NAME
+
+    assert TURN_PROGRESS_TOOL_NAME == "mcp__curie__progress"
+    assert TURN_PROGRESS_TOOL_NAME in PLATFORM_IDEMPOTENT_TOOLS
+    classifier = SideEffectClassifier(["read"])
+    assert not classifier.is_side_effecting(TURN_PROGRESS_TOOL_NAME)
+
+
 def test_opencode_named_read_only_tools_do_not_flag() -> None:
     """#308 regression: a second harness declares lowercase read-only names.
 
@@ -90,3 +103,15 @@ def test_default_is_the_claude_declaration_plus_platform_tools() -> None:
     for tool in CLAUDE_READONLY_TOOLS:
         assert not default_classifier.is_side_effecting(tool)
         assert not claude_classifier.is_side_effecting(tool)
+
+
+def test_canvas_list_and_read_are_idempotent_and_the_cell_edit_is_not() -> None:
+    """ADR 0200: listing and reading a canvas act on nothing, so a retry repeats
+    no real-world action; replacing a cell writes to Slack and must stay a side
+    effect (deny-by-default), so a failed turn that edited is never blindly retried."""
+
+    assert {
+        "mcp__curie-slack__list_channel_canvases",
+        "mcp__curie-slack__read_canvas",
+    } <= PLATFORM_IDEMPOTENT_TOOLS
+    assert "mcp__curie-slack__edit_canvas_cell" not in PLATFORM_IDEMPOTENT_TOOLS

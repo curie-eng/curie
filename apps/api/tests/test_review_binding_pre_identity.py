@@ -19,8 +19,9 @@ from typing import Any
 
 import pytest
 from channel_protocol import scoped_conversation_id
-from curie_api import crud
 from curie_api.config import get_settings
+from curie_api.crud import errors as crud_errors
+from curie_api.crud import lineages as crud_lineages
 from curie_api.github_review_events import FeedbackIgnored, UnverifiedFeedback
 from curie_api.github_review_store import review_context
 from curie_api.models import (
@@ -117,9 +118,11 @@ async def _review_fixture(
     await session.flush()
     github_fields: dict[str, Any] = (
         {
-            "github_repository_id": 9101,
-            "github_installation_id": 41,
-            "github_pr_node_id": "PR_example_review",
+            "code_host_kind": "github",
+            "code_host_host": "github.com",
+            "repository_project_id": "9101",
+            "code_host_installation_id": 41,
+            "code_host_pr_id": "PR_example_review",
             "base_ref": "main",
             "pr_number": 71,
             "pr_url": f"https://github.com/{REPO}/pull/71",
@@ -165,7 +168,7 @@ def test_require_review_binding_accepts_a_mail_lineage_keyed_before_the_identity
             lineage_conversation_id=old_key,
             reply_conversation_id=MAIL_THREAD,
         )
-        resolved = await crud._require_review_binding(session, lineage)
+        resolved = await crud_lineages.require_review_binding(session, lineage)
         assert resolved.id == binding.id
 
     _with_session(body)
@@ -187,8 +190,8 @@ def test_require_review_binding_refuses_a_bare_slack_lineage_after_a_named_rebin
             lineage_conversation_id=bare_key,
             reply_conversation_id=SLACK_TS,
         )
-        with pytest.raises(crud.PublicationLineageConflict) as caught:
-            await crud._require_review_binding(session, lineage)
+        with pytest.raises(crud_errors.PublicationLineageConflict) as caught:
+            await crud_lineages.require_review_binding(session, lineage)
         assert caught.value.code == "publication.review_ineligible"
 
     _with_session(body)

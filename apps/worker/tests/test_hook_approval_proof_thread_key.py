@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 from aci_protocol import QueuedTurn, ReplyHandle
-from curie_worker.kernel import _thread_key_for
+from curie_worker.kernel.routing import _thread_key_for
 
 _SCRIPT_PATH = (
     Path(__file__).resolve().parents[3] / "charts" / "curie" / "ci" / "hook-approval-proof.py"

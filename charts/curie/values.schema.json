@@ -1,6 +1,172 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
+  "definitions": {
+    "forge": {"properties": {"egress": {"type": "array", "items": {"required": ["cidr", "ports"]}}}},
+    "runnerProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "command"],
+      "properties": {
+        "name": {"type": "string", "pattern": "\\S"},
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "items": [{"type": "string", "pattern": "\\S"}],
+          "additionalItems": {"type": "string"}
+        }
+      }
+    },
+    "repositoryRunner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tools", "image", "base", "platformDigests"],
+      "properties": {
+        "tools": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "enum": ["uv", "rust", "pnpm", "build-essential", "docker-cli"]}
+        },
+        "image": {"type": "string", "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"},
+        "base": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "platformDigests": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["linux/amd64", "linux/arm64"],
+          "properties": {
+            "linux/amd64": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "linux/arm64": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+          }
+        },
+        "dockerfile": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "probes": {"type": "array", "items": {"$ref": "#/definitions/runnerProbe"}}
+      }
+    },
+    "runnerDocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "egressAllowlist": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["cidr", "ports"],
+            "properties": {
+              "cidr": {"type": "string", "pattern": "^[^\\s/]+/[0-9]{1,3}$"},
+              "ports": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["port"],
+                  "properties": {
+                    "protocol": {"type": "string", "enum": ["TCP"], "default": "TCP"},
+                    "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "computePodDisruptionBudget": {
+      "type": "object",
+      "description": "Optional PodDisruptionBudget for a compute-plane Deployment (issue #1574). minAvailable, when set, replaces maxUnavailable. A budget allowing zero voluntary disruptions at the configured replica count needs allowBlockingDrain: true; the template refuses it otherwise.",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "maxUnavailable": {"type": "integer", "minimum": 0},
+        "minAvailable": {"type": "integer", "minimum": 0},
+        "allowBlockingDrain": {"type": "boolean"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "testInstallation"
+        ],
+        "properties": {
+          "testInstallation": {
+            "required": [
+              "enabled"
+            ],
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "api": {
+            "properties": {
+              "environment": {
+                "not": {
+                  "pattern": "^\\s*[Pp][Rr][Oo][Dd]\\s*$"
+                }
+              }
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "required": [
+                "security"
+              ],
+              "properties": {
+                "security": {
+                  "required": [
+                    "allowDevDefaults"
+                  ],
+                  "properties": {
+                    "allowDevDefaults": {
+                      "const": true
+                    }
+                  }
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "api": {
+                  "properties": {
+                    "apiKey": {
+                      "not": {
+                        "const": "curie-dev-key"
+                      }
+                    },
+                    "approvalChatAttesterSecret": {
+                      "not": {
+                        "const": "curie-dev-approval-chat-attester"
+                      }
+                    }
+                  }
+                },
+                "worker": {
+                  "properties": {
+                    "internalWorkerToken": {
+                      "not": {
+                        "const": "curie-dev-worker-token"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  ],
   "properties": {
     "config": {
       "type": "object",
@@ -16,9 +182,69 @@
         }
       }
     },
+    "codeHostTrust": {
+      "type": "object",
+      "description": "One PEM CA bundle for a self-managed code host (ADR 0197, issue #3831), mounted at /etc/curie/code-host-trust/ca.crt in the api, worker, agent sandboxes and publication Jobs. An empty ConfigMap name mounts nothing.",
+      "additionalProperties": false,
+      "properties": {
+        "caBundle": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "configMapRef": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": {"type": "string", "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$"},
+                "key": {"type": "string", "pattern": "^[-._a-zA-Z0-9]+$"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "factory": {
+      "type": "object",
+      "description": "Rendered as CURIE_FORGES (#4397); the api validates the entries. appId stays untyped like api.githubAppId.",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "intake": {"type": "string", "enum": ["poll", "webhook"]},
+        "cardBaseUrl": {"type": "string"},
+        "ciWaitSeconds": {"type": "integer", "minimum": 1, "maximum": 10800},
+        "codeHosts": {"type": "array", "items": {"$ref": "#/definitions/forge"}},
+        "trackers": {"type": "array", "items": {"$ref": "#/definitions/forge"}},
+        "bindings": {"type": "array", "items": {"type": "object", "properties": {"repos": {"type": "array", "items": {
+          "type": "object",
+          "allOf": [{
+            "if": {
+              "required": ["docker"],
+              "properties": {"docker": {"required": ["enabled"], "properties": {"enabled": {"const": true}}}}
+            },
+            "then": {
+              "required": ["runner"],
+              "properties": {"runner": {"properties": {"tools": {"contains": {"const": "docker-cli"}}}}}
+            }
+          }],
+          "properties": {
+            "runner": {"$ref": "#/definitions/repositoryRunner"},
+            "docker": {"$ref": "#/definitions/runnerDocker"},
+            "ci": {
+              "type": "object", "additionalProperties": false,
+              "properties": {
+                "required": {"type": "object", "additionalProperties": false, "required": ["key", "paths"], "properties": {
+                  "key": {"type": "string", "minLength": 1},
+                  "paths": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+                  "pendingKeyPrefix": {"type": ["string", "null"], "minLength": 1}}},
+                "metadataRerunKeys": {"type": "array", "items": {"type": "string", "minLength": 1}}}}
+          }
+        }}}}},
+        "sandboxEgress": {"type": "object", "additionalProperties": {"type": "boolean"}}
+      }
+    },
     "api": {
       "type": "object",
       "properties": {
+        "podDisruptionBudget": {"$ref": "#/definitions/computePodDisruptionBudget"},
         "approvalChatAttesterSecret": {
           "type": "string",
           "minLength": 1,
@@ -34,58 +260,6 @@
           "exclusiveMinimum": 0,
           "description": "Positive cadence in seconds for reconciling accepted GitHub review feedback."
         },
-        "githubFactoryIngressEnabled": {
-          "type": "boolean",
-          "description": "Opt-in gate for signed GitHub issue admission. The API validates the App credentials, label, mention login, allowlist, and non-default webhook secret at boot."
-        },
-        "githubFactoryLabel": {
-          "type": "string",
-          "description": "Issue label that requests initial factory admission. Empty while intake is off."
-        },
-        "githubFactoryCardBaseUrl": {
-          "type": "string",
-          "description": "Public https origin GitHub's image proxy fetches the live factory status card from. Empty omits the card image."
-        },
-        "githubFactoryCiWaitSeconds": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 10800,
-          "description": "Seconds a published factory run waits on its pull request's CI, from the push. The execution deadline still caps it."
-        },
-        "githubFactoryPythonCi": {
-          "type": "object",
-          "description": "Required Python CI per repository, keyed by owner/name. A repository without an entry is judged on its own checks.",
-          "propertyNames": {
-            "pattern": "^[^/]+/[^/]+$"
-          },
-          "additionalProperties": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["check", "paths"],
-            "properties": {
-              "check": {
-                "type": "string",
-                "minLength": 1
-              },
-              "paths": {
-                "type": "array",
-                "minItems": 1,
-                "items": {
-                  "type": "string",
-                  "pattern": "^[^/].*[^/]$|^[^/]$"
-                }
-              },
-              "pendingCheckPrefix": {
-                "type": ["string", "null"],
-                "minLength": 1
-              }
-            }
-          }
-        },
-        "githubFactoryMention": {
-          "type": "string",
-          "description": "GitHub login an authorized human must mention to request another execution. Empty while intake is off."
-        },
         "githubRepoAllowlist": {
           "type": "array",
           "uniqueItems": true,
@@ -96,9 +270,30 @@
         }
       }
     },
+    "security": {
+      "type": "object",
+      "properties": {
+        "dataTierNetworkPolicy": {
+          "type": "object",
+          "properties": {
+            "allowMcpConnectorValkeyIngress": {
+              "type": "boolean",
+              "description": "Keep the MCP connector peer in the in-chart Valkey allow-ingress policy (issue #4318)."
+            }
+          }
+        }
+      }
+    },
     "worker": {
       "type": "object",
       "properties": {
+        "maxConcurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256,
+          "description": "Turns one worker runs at once (issue #760), rendered as CURIE_WORKER_MAX_CONCURRENCY. The worker refuses the same range at boot."
+        },
+        "podDisruptionBudget": {"$ref": "#/definitions/computePodDisruptionBudget"},
         "claimTimeoutSeconds": {
           "type": "number",
           "exclusiveMinimum": 0,
@@ -116,6 +311,17 @@
           "exclusiveMinimum": 0,
           "maximum": 31536000,
           "description": "Seconds a route suspended awaiting an approval pins its sandbox. Must be greater than 0 and at most 31536000 (one year). Integer rather than number for the same reason as routeTtlSeconds: a YAML float renders through `| quote` as scientific notation for larger values (ci/github-app-credential-assertions.sh:11)."
+        },
+        "streamRetention": {
+          "type": ["object", "null"],
+          "properties": {
+            "minAgeSeconds": {
+              "type": "integer",
+              "minimum": 3600,
+              "maximum": 31536000,
+              "description": "Seconds a settled stream entry is kept before the worker trims it (ADR 0184). At least 3600, above the three-hour delivery budget ceiling, and at most 31536000 (one year). Integer for the same reason as routeTtlSeconds."
+            }
+          }
         },
         "deliveryBudgetSeconds": {
           "type": "integer",
@@ -181,7 +387,10 @@
               "maximum": 86400,
               "description": "Roll hold: lifetime of the fleet-wide quiesce flag after a clean drain, capped at the effective drain wait (issue #3127). While the gate waits, the flag is a short lease renewed every poll, so a killed gate releases the fleet within one lease. Finite by construction, so an upgrade killed between the two hooks cannot leave the fleet permanently unable to claim."
             },
-            "resources": {"type": "object"}
+            "resources": {
+              "type": "object",
+              "description": "Shared resources for the drain, attest and release hook Jobs. Worker dependency imports peaked at approximately 148Mi in subprocess measurements, so the default memory request and limit are both 384Mi. When overriding, size both memory request and limit to at least twice the deployed worker image's measured peak."
+            }
           }
         },
         "workspace": {
@@ -198,6 +407,13 @@
             "maxCompressionRatio": {"type": "number", "minimum": 1, "maximum": 1000},
             "referenceTtlSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
             "bucket": {"type": "string", "minLength": 3}
+          }
+        },
+        "attachments": {
+          "type": "object",
+          "properties": {
+            "threadMaxFiles": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "threadMaxBytes": {"type": "integer", "minimum": 1}
           }
         },
           "publication": {
@@ -218,13 +434,21 @@
               "type": "array",
               "items": {"type": "string", "minLength": 1, "maxLength": 512}
             },
-            "githubHttpsCidrs": {
-              "type": "array",
-              "minItems": 1,
-              "items": {"type": "string", "pattern": "^[0-9a-fA-F:.]+/[0-9]{1,3}$"}
-            }
+            "allowDependencyAdditions": {"type": "boolean"}
             }
           }
+      }
+    },
+    "ui": {
+      "type": "object",
+      "properties": {
+        "podDisruptionBudget": {"$ref": "#/definitions/computePodDisruptionBudget"}
+      }
+    },
+    "dispatcher": {
+      "type": "object",
+      "properties": {
+        "podDisruptionBudget": {"$ref": "#/definitions/computePodDisruptionBudget"}
       }
     },
     "agentSandbox": {
@@ -242,6 +466,77 @@
                 "fetchTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 150},
                 "extractTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 150}
               }
+            }
+          }
+        }
+      }
+    },
+    "e2eConnector": {
+      "type": "object",
+      "description": "Factory side of the end to end connector (ADR 0176 decisions 1 to 3, issue #3244).",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "namespacePrefix": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?-$"},
+        "ownerLabel": {
+          "type": "object",
+          "properties": {
+            "key": {"type": "string", "minLength": 1},
+            "value": {"type": "string"}
+          }
+        },
+        "serviceAccount": {"type": "string"},
+        "serviceAccountNamespace": {"type": "string"},
+        "workerClusterRole": {"type": "string"},
+        "ttlSeconds": {"type": "integer", "minimum": 60, "maximum": 86400},
+        "podSecurity": {"type": "string", "enum": ["baseline", "restricted"]},
+        "reaperIntervalSeconds": {"type": "integer", "minimum": 10},
+        "registry": {"type": "string"},
+        "buildCacheRepo": {"type": ["string", "null"]},
+        "registryInsecure": {"type": "boolean"},
+        "registryTokenHosts": {"type": "array", "items": {"type": "string"}},
+        "builderImage": {"type": "string"},
+        "gitImage": {"type": "string"},
+        "pushImage": {"type": "string"},
+        "buildTimeoutSeconds": {"type": "integer", "minimum": 60, "maximum": 3600},
+        "sourceHosts": {"type": "array", "items": {"type": "string"}, "minItems": 1}
+      }
+    },
+    "actionExecutor": {
+      "type": "object",
+      "description": "The connector action executor switch (ACTION-EXECUTOR-1), rendered into both the API and the worker. A boolean, so a quoted \"false\" cannot turn it on.",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "maxConcurrentSandboxes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12, executor amendment E9), rendered into both the API and the worker. An integer of at least 1, so 0 or a quoted \"3\" does not render."
+        }
+      }
+    },
+    "remediation": {
+      "type": "object",
+      "description": "The automated remediation switch (AUTOMATED-REMEDIATION-1), rendered into both the API and the worker. Requires actionExecutor.enabled. A boolean, so a quoted \"true\" cannot turn it on.",
+      "properties": {
+        "enabled": {"type": "boolean"}
+      }
+    },
+    "testInstallation": {
+      "type": "object",
+      "description": "The test installation declaration (ADR 0202 decision 1), rendered into the API and the dispatcher. enabled is a boolean, so a quoted \"true\" cannot turn it on. Each driver is a channel id, a Slack bot id and that bot's user id; a sibling driver also names its agent. A new key, so typed in full; the template fail in _test-installation.tpl is the backstop for the values coalescing gap.",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "threadTurnLimit": {"type": "integer", "minimum": 1, "maximum": 100},
+        "drivers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["channel_id", "bot_id", "bot_user_id"],
+            "properties": {
+              "channel_id": {"type": "string", "pattern": "^[CG][A-Z0-9]+$"},
+              "bot_id": {"type": "string", "pattern": "^B[A-Z0-9]+$"},
+              "bot_user_id": {"type": "string", "pattern": "^U[A-Z0-9]+$"},
+              "agent": {"type": "string", "pattern": "\\S"}
             }
           }
         }

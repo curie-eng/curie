@@ -8,6 +8,8 @@ from typing import Annotated, Any
 import redis.asyncio as redis
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
+from curie_api.schemas.channels import ClusterMessageReplyAck, ClusterMessageReplyPage
+
 from ..auth import require_api_key, require_internal_adapter_secret
 from ..cluster_message_replies import (
     ClusterMessageReplyStore,
@@ -15,7 +17,6 @@ from ..cluster_message_replies import (
     ReplyBucketFullError,
 )
 from ..config import get_settings
-from ..schemas import ClusterMessageReplyAck, ClusterMessageReplyPage
 
 router = APIRouter(
     prefix="/cluster-message-replies",

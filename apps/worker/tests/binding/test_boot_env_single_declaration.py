@@ -100,6 +100,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_ATTACHMENT_MAX_FILE_BYTES",
         "CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS",
         "CURIE_ATTACHMENT_RETENTION_TTL_SECONDS",
+        # ADR 0205 decision 7 (#4079): the per-thread budget every boot's
+        # rebuild is bounded by, and the worker's own prepare timeout.
+        "CURIE_ATTACHMENT_THREAD_MAX_FILES",
+        "CURIE_ATTACHMENT_THREAD_MAX_BYTES",
+        "CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS",
         "CURIE_BOOTING_TEXT",
         # Read by the worker capacity wait store, which bounds how long a
         # queued chat turn may wait. It is never sent to a sandbox.
@@ -127,6 +132,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # WorkerConfig and consumed where the kernel assembles the final reply.
         # It decides what the person is shown, never what a sandbox boots with.
         "CURIE_TURN_RECEIPT",
+        # The temporary deliberate progress rendering switch (ADR 0130), read
+        # from the WORKER's env by WorkerConfig and consumed by the kernel's
+        # progress pump. It decides whether progress reaches an adapter, never
+        # what a sandbox boots with.
+        "CURIE_PROGRESS_RENDER",
         # The per-adapter EGRESS credentials (ADR-0096 D4.2), read from the
         # WORKER's env by ``build_reply_sink`` and presented to a channel
         # adapter as ``X-Curie-Adapter-Secret``. Never a sandbox boot key, and
@@ -146,6 +156,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_WORKER_SUPERVISE_BACKOFF_MAX_S",
         "CURIE_WORKER_SUPERVISE_MAX_CONSECUTIVE_FAILURES",
         "CURIE_WORKER_SUPERVISE_FAILURE_RESET_S",
+        # How many turns one worker runs at once (#760), read from the WORKER's
+        # env by WorkerConfig and consumed by the consumer's in-flight bound.
+        # It sizes the worker's own concurrency; nothing about it reaches a
+        # sandbox.
+        "CURIE_WORKER_MAX_CONCURRENCY",
         # Managed-workspace operator settings, read from the WORKER's env by
         # WorkerConfig and consumed by WorkspacePreparer, WorkspaceObjectStore,
         # and the internal credential client. They govern worker-side clone,
@@ -192,17 +207,21 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_PUBLICATION_RECONCILE_MAX_ATTEMPTS",
         "CURIE_PUBLICATION_JOB_ACTIVE_DEADLINE_SECONDS",
         "CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS",
-        "CURIE_PUBLICATION_GITHUB_API_URL",
         "CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS",
         "CURIE_PUBLICATION_LEASE_SECONDS",
         "CURIE_PUBLICATION_IMAGE_PULL_POLICY",
         "CURIE_PUBLICATION_IMAGE_PULL_SECRETS",
         "CURIE_PUBLICATION_PRIORITY_CLASS_NAME",
         "CURIE_PUBLICATION_PROTECTED_PATHS",
+        "CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS",
         "CURIE_PUBLICATION_SERVICE_ACCOUNT_NAME",
         "CURIE_PUBLICATION_OWNER_NAME",
         "CURIE_PUBLICATION_GIT_USER_NAME",
         "CURIE_PUBLICATION_GIT_USER_EMAIL",
+        # The worker's mounted code host CA bundle (chart codeHostTrust, ADR
+        # 0197), copied into each publication Job's own ConfigMap. Worker
+        # config, not a boot key.
+        "CURIE_CODE_HOST_CA_BUNDLE",
         "CURIE_PUBLICATION_CPU_REQUEST",
         "CURIE_PUBLICATION_CPU_LIMIT",
         "CURIE_PUBLICATION_MEMORY_REQUEST",
@@ -270,12 +289,46 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # match the pod selector the connector NetworkPolicy uses.
         "CURIE_CONNECTOR_RECONCILE",
         "CURIE_CONNECTOR_RECONCILE_INTERVAL_S",
+        # The runner's executor mode switch (ACTION-EXECUTOR-5/25, #4067): set by
+        # the worker only on an executor sandbox claim and read by the runner's
+        # _serve before harness resolution. Runner-private by design, so it is
+        # deliberately not a BootEnv key (BootEnv is a frozen contract).
+        "CURIE_RUNNER_MODE",
+        # The connector action executor switch (ACTION-EXECUTOR, #4067): read by
+        # the API settings and by WorkerConfig at worker startup to decide
+        # whether executions are claimed and dispatched. Never a sandbox boot key.
+        "CURIE_ACTION_EXECUTOR_ENABLED",
+        # The automated remediation switch (AUTOMATED-REMEDIATION-1): read by the
+        # API settings and by WorkerConfig at startup. Never a sandbox boot key.
+        "CURIE_REMEDIATION_ENABLED",
+        # The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+        # executor amendment E9): read by the API settings and by WorkerConfig
+        # at startup. Never a sandbox boot key.
+        "CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES",
+        # End to end namespace reaper (#3245), read by the worker process only.
+        # The test cluster kubeconfig is not among them: the reaper reads it
+        # from the connector Secret at sweep time.
+        "CURIE_E2E_CONNECTOR_ENABLED",
+        "CURIE_E2E_NAMESPACE_PREFIX",
+        "CURIE_E2E_OWNER_LABEL_KEY",
+        "CURIE_E2E_OWNER_LABEL_VALUE",
+        "CURIE_E2E_REAPER_INTERVAL_S",
+        # Registry retention for the image build tool (#3246), read by the
+        # worker process only. The push credential is not among them: the
+        # reaper reads it from the connector Secret at sweep time.
+        "CURIE_E2E_REGISTRY",
+        "CURIE_E2E_REGISTRY_INSECURE",
+        "CURIE_E2E_REGISTRY_TOKEN_HOSTS",
         # Cron scheduler tick (#268), read by the worker process only.
         "CURIE_CRON_TICK_INTERVAL_S",
         # Cron hook run claim lease (#2931), read by the worker process only.
         "CURIE_HOOK_CLAIM_LEASE_S",
         # WorkItem orphan sweep cadence (#3076), read by the worker process only.
         "CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S",
+        # Settled stream retention window and cadence (ADR 0184), read by the
+        # worker process only.
+        "CURIE_STREAM_RETENTION_MIN_AGE_S",
+        "CURIE_STREAM_RETENTION_INTERVAL_S",
         "CURIE_CONNECTOR_APP_NAME",
         "CURIE_RUNNER_IMAGE",
         "CURIE_SANDBOX_SUBSTRATE",
@@ -284,6 +337,8 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_AGENT_SANDBOX_POOLS",
         # Agents whose per-agent pool carries connector secrets (#2943), substrate only.
         "CURIE_AGENT_CONNECTOR_SECRET_POOLS",
+        # Repository runner pools (ADR 0216): run.py parses it for the substrate only.
+        "CURIE_REPO_RUNNER_POOLS",
         # The runner-facing API base (#678): WorkerConfig reads it from the
         # WORKER's env to MINT CURIE_MEMORY_REF/CURIE_HISTORY_REF (which ARE
         # declared boot keys, rendered from the declaration). It is a worker-side
@@ -322,6 +377,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # The Claude SDK consumes this background model setting for session
         # titles. The runner passes it to the SDK, outside the BootEnv contract.
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        # SDK-owned runtime target for model: opus; BootEnv carries only the
+        # per-agent CURIE_REVIEWER_MODEL override (#4120).
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
         # PR #663 operator-tunable Docker runner hardening knobs; the docker
         # substrate reads these from its OWN env, never injected into the runner
         # boot contract.
@@ -343,6 +401,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # runner-local false-completion knob; read by the runner from its own env,
         # not a boot contract key.
         "CURIE_FALSE_COMPLETION_CHECK",
+        # ADR 0130 deliberately keeps ACI frozen. This direct worker-to-runner
+        # sandbox boot fact is instead frozen across both declaration sites by
+        # tests/vectors/turn-progress-capability.json.
+        "CURIE_TURN_PROGRESS_ENABLED",
         # One-shot connector grant. The worker writes it beside BootEnv on an
         # approved resume. The runner (connectors.py) reads it and adds the
         # header only when it is set. It is not a BootEnv field: the caller
@@ -360,6 +422,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # runner-local SDK deny list (#2429); read by the runner from its own env
         # via extraEnv, unset keeps every tool available. Not a boot contract key.
         "CURIE_DISALLOWED_TOOLS",
+        # runner-local dev flag (#3821); read by runner/src/curie_runner/config.py
+        # to let a local skill-tier runner serve without a bearer token. Emitted
+        # only by the CLI skill tier, reserved in the chart, never injected by
+        # the worker. Not a boot contract key.
+        "CURIE_RUNNER_ALLOW_TOKENLESS",
         # Delivery budget and ownership lease (ADR-0131, #1971), read from the
         # WORKER's env by WorkerConfig. Never a sandbox boot key: they govern
         # how the worker paces and reclaims its own delivery loop, not
@@ -542,9 +609,9 @@ def test_boot_env_keys_are_declared_once_in_aci_protocol() -> None:
     # one of them "unclassified" instead of naming it the drift it is.
     boot_keys = set(BootEnv.env_keys())
     assert boot_keys, "BootEnv declares no keys; the scan would be vacuous"
-    assert not boot_keys - {
-        k for k in boot_keys if k.startswith(_PREFIXES)
-    }, "a declared boot key sits outside the scanned prefixes; widen _PREFIXES"
+    assert not boot_keys - {k for k in boot_keys if k.startswith(_PREFIXES)}, (
+        "a declared boot key sits outside the scanned prefixes; widen _PREFIXES"
+    )
 
     redeclared: list[str] = []
     unclassified: list[str] = []
@@ -564,8 +631,7 @@ def test_boot_env_keys_are_declared_once_in_aci_protocol() -> None:
             "side and the sandbox still boots, still runs, and silently drops the\n"
             "feature. Read the key from the BootEnv declaration (render it via\n"
             "BootEnv.render_worker on the worker side, parse it via BootEnv.from_env\n"
-            "on the runner side) instead of retyping the literal:\n"
-            + "\n".join(sorted(redeclared))
+            "on the runner side) instead of retyping the literal:\n" + "\n".join(sorted(redeclared))
         )
     if unclassified:
         problems.append(
@@ -574,8 +640,7 @@ def test_boot_env_keys_are_declared_once_in_aci_protocol() -> None:
             "one of them is one or the other: if the sandbox reads it, declare it on\n"
             "BootEnv; if some other process reads it, add it to _NON_BOOT_ALLOWLIST\n"
             "in this file with the consumer named. An unclassified one is how the\n"
-            "next straggler is born:\n"
-            + "\n".join(sorted(unclassified))
+            "next straggler is born:\n" + "\n".join(sorted(unclassified))
         )
 
     assert not problems, "\n\n".join(problems)
@@ -611,6 +676,5 @@ def test_agent_id_is_not_declared_anywhere_in_the_lanes() -> None:
     hits = [f"{rel}:{lineno}" for rel, lineno, name in _scan() if name == "CURIE_AGENT_ID"]
     assert not hits, (
         "CURIE_AGENT_ID is injected into every sandbox boot env and no consumer "
-        "ever reads it. Delete the write site rather than declaring it:\n  "
-        + "\n  ".join(hits)
+        "ever reads it. Delete the write site rather than declaring it:\n  " + "\n  ".join(hits)
     )

@@ -53,7 +53,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from aci_protocol.service_config import STREAM_PAYLOAD_FIELD
 from channel_protocol.reply import TurnCompleted
+from curie_internal.channel_read_ledger import LEDGER_TTL_S as _CHANNEL_READ_PIN_TTL_S
+from curie_internal.channel_read_ledger import refresh_owner as _refresh_channel_read_owner
+from curie_internal.channel_read_ledger import revoke_by_owner as _revoke_channel_read_by_owner
+from curie_internal.channel_read_ledger import revoke_owner as _revoke_channel_read_owner
+from curie_internal.channel_read_ledger import tombstone_owner as _tombstone_channel_read_owner
 from pydantic import BaseModel
 from redis.asyncio import Redis
 
@@ -61,6 +67,86 @@ from .config import WorkerConfig
 from .reply_sink import ProviderEgressRefusedError, TargetRoute
 
 DoneMarkerValue = Literal["1", "history_capacity"]
+
+# The longest a per-turn memory credential lives: ``binding.SANDBOX_TOKEN_TTL_SECONDS``
+# (not imported: binding imports this package's config, and the value is tiny).
+_MEMORY_STEER_TURNS_TTL_S = 24 * 60 * 60
+
+# ADR 0100 (#2877): delete the live channel read record only when its owner
+# is the caller, so an earlier attempt's late settlement never deletes the
+# record a newer turn on the thread wrote. A value that is not JSON is left.
+_TAKE_CHANNEL_READ_TURN_LUA = """
+local value = redis.call('GET', KEYS[1])
+if not value then return 0 end
+local ok, record = pcall(cjson.decode, value)
+if ok and type(record) == 'table' and record['owner'] == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+  return 1
+end
+return 0
+"""
+
+
+@dataclass(frozen=True)
+class LiveChannelReadTurn:
+    """The live channel read logical turn on one thread (ADR 0100, #2877).
+
+    Written by the attempt that opened it, read by a steer on any worker so it
+    can renew the same logical turn with the opener's event id and default
+    channel. Carries no token. ``default`` is None for a targetless turn.
+    """
+
+    agent_id: uuid.UUID
+    deployment_id: uuid.UUID
+    event_id: str
+    owner: str
+    default: tuple[str, str] | None
+
+    def to_json(self) -> str:
+        kind, address = self.default if self.default is not None else (None, None)
+        return json.dumps(
+            {
+                "agent_id": str(self.agent_id),
+                "deployment_id": str(self.deployment_id),
+                "event_id": self.event_id,
+                "owner": self.owner,
+                "kind": kind,
+                "address": address,
+            },
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def from_json(cls, raw: str) -> LiveChannelReadTurn | None:
+        try:
+            data = json.loads(raw)
+            kind, address = data.get("kind"), data.get("address")
+            default = (
+                (kind, address) if isinstance(kind, str) and isinstance(address, str) else None
+            )
+            event_id, owner = data["event_id"], data["owner"]
+            if not isinstance(event_id, str) or not isinstance(owner, str):
+                return None
+            return cls(
+                agent_id=uuid.UUID(data["agent_id"]),
+                deployment_id=uuid.UUID(data["deployment_id"]),
+                event_id=event_id,
+                owner=owner,
+                default=default,
+            )
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return None
+
+
+@dataclass(frozen=True)
+class ChannelReadPin:
+    """The deployment one sandbox claim on a thread was booted for (ADR 0100)."""
+
+    claim_name: str
+    agent_id: uuid.UUID
+    deployment_id: uuid.UUID
+    bundle_ref: str | None
+
 
 # Stored fields of the completion hash. The done flag is its OWN field rather
 # than a value inside the record JSON so it can be set in the same MULTI as the
@@ -133,6 +219,29 @@ else
 end
 return 1
 """
+
+# The fenced settlement that also publishes the next slice of a long scheduled
+# sweep (ADR-0160, #2878): ``_SETTLE_FENCED_LUA`` exactly, plus five lines placed
+# right after both guards. Built from the shared text so the guards cannot
+# drift: a fenced-out owner writes nothing and publishes nothing.
+#
+# These run before the record writes. A replay (the production client retries
+# EVAL after a lost reply) finds the event's published marker (``KEYS[7]``)
+# holding THIS call's record generation and returns success without writing or
+# publishing again. The marker, not the completion record, is the evidence: an
+# outbox clear deletes the record but never the marker. Otherwise the successor
+# is XADDed FIRST, with the marker set beside it, before the record, the index
+# and the done marker, so a failing XADD aborts the script with nothing
+# written: the slice is never settled without its successor.
+_SETTLE_FENCED_AND_PUBLISH_LUA = _SETTLE_FENCED_LUA.replace(
+    "\nredis.call('HDEL', KEYS[2], ARGV[11])\n",
+    "\nif redis.call('GET', KEYS[7]) == ARGV[6] then"
+    "\n  return 1"
+    "\nend"
+    "\nredis.call('XADD', KEYS[6], '*', ARGV[13], ARGV[14])"
+    "\nredis.call('SET', KEYS[7], ARGV[6], 'EX', ARGV[1])"
+    "\nredis.call('HDEL', KEYS[2], ARGV[11])\n",
+)
 
 # The fenced MARKER-ONLY settlement (#2963): a targetless cron turn owes no
 # ``turn.completed`` (no adapter is waiting), so it writes no outbox record. The
@@ -244,6 +353,157 @@ class Markers:
         self._redis = redis
         self._config = config
 
+    async def push_steer_memory_turns(
+        self, agent_id: uuid.UUID, live_turn: str, turns: Sequence[tuple[uuid.UUID, str]]
+    ) -> None:
+        """Hand a steer's memory turn claims to the live turn it joined (#3776).
+
+        ``live_turn`` names the runner turn the steer landed in. The attempt
+        that owns that turn drains them when it ends. The TTL is the longest a
+        turn credential lives, so an owner that never drains leaves nothing
+        behind once the credentials have expired anyway."""
+
+        if not turns:
+            return
+        key = self._config.memory_steer_turns_key(str(agent_id), live_turn)
+        values = [json.dumps([str(agent), turn]) for agent, turn in turns]
+        async with self._redis.pipeline(transaction=True) as pipe:
+            pipe.rpush(key, *values)
+            pipe.expire(key, _MEMORY_STEER_TURNS_TTL_S)
+            await pipe.execute()
+
+    async def record_channel_read_turn(
+        self, thread_key: str, record: LiveChannelReadTurn, ttl_s: int
+    ) -> None:
+        """Record the live channel read logical turn on a thread (ADR 0100).
+
+        Expires with the capability it describes, so a record whose owner
+        never settles leaves nothing behind once the token is dead anyway."""
+
+        await self._redis.set(
+            self._config.channel_read_turn_key(thread_key), record.to_json(), ex=max(1, ttl_s)
+        )
+
+    async def read_channel_read_turn(self, thread_key: str) -> LiveChannelReadTurn | None:
+        """The live channel read logical turn on a thread, or None."""
+
+        raw = _as_str(await self._redis.get(self._config.channel_read_turn_key(thread_key)))
+        return None if raw is None else LiveChannelReadTurn.from_json(raw)
+
+    async def take_channel_read_turn(self, thread_key: str, owner: str) -> bool:
+        """Delete the thread's live record only if ``owner`` wrote it."""
+
+        taken = await self._redis.eval(
+            _TAKE_CHANNEL_READ_TURN_LUA,
+            1,
+            self._config.channel_read_turn_key(thread_key),
+            owner,
+        )
+        return bool(taken)
+
+    async def read_channel_read_pin(self, thread_key: str) -> ChannelReadPin | None:
+        """The deployment the thread's current sandbox claim was booted for."""
+
+        raw = _as_str(await self._redis.get(self._config.channel_read_pin_key(thread_key)))
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw)
+            return ChannelReadPin(
+                claim_name=str(data["claim_name"]),
+                agent_id=uuid.UUID(data["agent_id"]),
+                deployment_id=uuid.UUID(data["deployment_id"]),
+                bundle_ref=data.get("bundle_ref")
+                if isinstance(data.get("bundle_ref"), str)
+                else None,
+            )
+        except (ValueError, TypeError, KeyError):
+            return None
+
+    async def pin_channel_read_deployment(
+        self,
+        thread_key: str,
+        claim_name: str,
+        agent_id: uuid.UUID,
+        deployment_id: uuid.UUID,
+        bundle_ref: str | None,
+    ) -> None:
+        """Record the deployment a freshly claimed sandbox was booted for."""
+
+        await self._redis.set(
+            self._config.channel_read_pin_key(thread_key),
+            json.dumps(
+                {
+                    "claim_name": claim_name,
+                    "agent_id": str(agent_id),
+                    "deployment_id": str(deployment_id),
+                    "bundle_ref": bundle_ref,
+                },
+                separators=(",", ":"),
+            ),
+            ex=_CHANNEL_READ_PIN_TTL_S,
+        )
+
+    async def refresh_channel_read_owner(
+        self, agent_id: uuid.UUID, turn_key: str, owner: str
+    ) -> bool:
+        """Renew the opener's lease on a live logical turn (owner checked)."""
+
+        return await _refresh_channel_read_owner(
+            self._redis, self._config.key_prefix, agent_id, turn_key, owner
+        )
+
+    async def tombstone_channel_read_owner(
+        self, agent_id: uuid.UUID, owner: str, ttl_s: int
+    ) -> None:
+        """Mark an attempt's owner settled, so a late open under it is refused."""
+
+        await _tombstone_channel_read_owner(
+            self._redis, self._config.key_prefix, agent_id, owner, ttl_s
+        )
+
+    async def revoke_channel_read_by_owner(self, agent_id: uuid.UUID, owner: str) -> bool:
+        """Revoke every logical turn ``owner`` opened, through the ledger's index.
+
+        For an attempt whose mint answer may have been lost. Owner checked per
+        turn, so a newer owner's capability is untouched."""
+
+        return await _revoke_channel_read_by_owner(
+            self._redis, self._config.key_prefix, agent_id, owner
+        )
+
+    async def revoke_channel_read_owner(
+        self, agent_id: uuid.UUID, turn_key: str, owner: str
+    ) -> bool:
+        """Revoke a logical turn's channel read capability as its opener.
+
+        The owner checked delete runs directly in the Valkey the API reads, so
+        revocation holds while the API is down. False when the active value
+        belongs to another owner (a resume opener) or is already gone."""
+
+        return await _revoke_channel_read_owner(
+            self._redis, self._config.key_prefix, agent_id, turn_key, owner
+        )
+
+    async def drain_steer_memory_turns(
+        self, agent_id: uuid.UUID, live_turn: str
+    ) -> list[tuple[uuid.UUID, str]]:
+        """Take every memory turn claim steered into one live turn."""
+
+        key = self._config.memory_steer_turns_key(str(agent_id), live_turn)
+        async with self._redis.pipeline(transaction=True) as pipe:
+            pipe.lrange(key, 0, -1)
+            pipe.delete(key)
+            raw, _ = await pipe.execute()
+        turns: list[tuple[uuid.UUID, str]] = []
+        for item in raw or []:
+            try:
+                agent, turn = json.loads(_as_str(item) or "")
+                turns.append((uuid.UUID(agent), str(turn)))
+            except (ValueError, TypeError):
+                continue
+        return turns
+
     async def is_terminal(self, event_id: str) -> bool:
         """Has this event ALREADY been handled to a terminal state?
 
@@ -291,9 +551,7 @@ class Markers:
         exceeded history capacity keeps its distinct marker without expiry
         until the API mirrors the refusal to SQL.
         """
-        ttl_s = max(
-            self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s)
-        )
+        ttl_s = max(self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s))
         await self._redis.eval(
             _MARK_DONE_LUA,
             2,
@@ -305,9 +563,7 @@ class Markers:
         )
 
     def _done_ttl_s(self) -> int:
-        return max(
-            self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s)
-        )
+        return max(self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s))
 
     async def mark_done_without_completion(self, event_id: str) -> None:
         """Leaseless marker-only done, for a targetless turn (#2963).
@@ -416,9 +672,7 @@ class Markers:
         lease_key = self._config.delivery_lease_key(stream, group, entry_id)
         state_key = self._config.delivery_state_key(stream, group, entry_id)
         record_generation = uuid.uuid4().hex
-        ttl_s = max(
-            self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s)
-        )
+        ttl_s = max(self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s))
         settled = await self._redis.eval(
             _SETTLE_FENCED_LUA,
             5,
@@ -442,6 +696,69 @@ class Markers:
         )
         return record_generation if int(settled) == 1 else None
 
+    async def settle_fenced_and_publish(
+        self,
+        event_id: str,
+        record: CompletionRecord,
+        *,
+        stream: str,
+        group: str,
+        entry_id: str,
+        owner: str,
+        generation: int,
+        marker_value: DoneMarkerValue,
+        successor_stream: str,
+        successor_payload: str,
+        record_generation: str,
+    ) -> str | None:
+        """``settle_fenced``, plus publishing a sweep's next slice in the same script.
+
+        The caller supplies ``record_generation`` so that, when the reply is
+        lost, it can read ``sweep_published_generation`` and tell a committed
+        script from one that never ran. Returns ``record_generation`` on success and
+        None when the fence refused, in which case nothing was written and
+        nothing was published.
+        """
+        lease_key = self._config.delivery_lease_key(stream, group, entry_id)
+        state_key = self._config.delivery_state_key(stream, group, entry_id)
+        ttl_s = max(self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s))
+        settled = await self._redis.eval(
+            _SETTLE_FENCED_AND_PUBLISH_LUA,
+            7,
+            self._config.done_key(event_id),
+            self._config.completion_key(event_id),
+            self._config.completions_pending_key(),
+            lease_key,
+            state_key,
+            successor_stream,
+            self._config.sweep_published_key(event_id),
+            str(ttl_s),
+            _DONE_FIELD,
+            _RECORD_FIELD,
+            _GENERATION_FIELD,
+            record.model_dump_json(),
+            record_generation,
+            owner,
+            _DELIVERY_GENERATION_FIELD,
+            str(generation),
+            event_id,
+            _CAUSE_FIELD,
+            marker_value,
+            STREAM_PAYLOAD_FIELD,
+            successor_payload,
+        )
+        return record_generation if int(settled) == 1 else None
+
+    async def sweep_published_generation(self, event_id: str) -> str | None:
+        """The record generation of the settle that published this slice's
+        successor, or None. Survives an outbox clear, unlike the record."""
+        value = await self._redis.get(self._config.sweep_published_key(event_id))
+        return _as_str(value)
+
+    async def publish_successor(self, stream: str, payload: str) -> None:
+        """Publish a sweep's next slice with no fence (the leaseless path only)."""
+        await self._redis.xadd(stream, {STREAM_PAYLOAD_FIELD: payload})
+
     async def note_provider_egress_refusal(self, event_id: str, *, generation: str) -> bool:
         """Retain the fixed refusal cause only on the observed outbox generation."""
         return await self._update_completion_cause(
@@ -452,9 +769,7 @@ class Markers:
         """Remove an earlier refusal when this generation fails for another cause."""
         return await self._update_completion_cause(event_id, generation=generation, cause="")
 
-    async def _update_completion_cause(
-        self, event_id: str, *, generation: str, cause: str
-    ) -> bool:
+    async def _update_completion_cause(self, event_id: str, *, generation: str, cause: str) -> bool:
         updated = await self._redis.eval(
             _UPDATE_COMPLETION_CAUSE_LUA,
             1,
@@ -475,9 +790,7 @@ class Markers:
         corruption, not an older shape to fall back for -- the outbox has no
         pre-upgrade records. The caller quarantines rather than guessing.
         """
-        stored: dict[Any, Any] = await self._redis.hgetall(
-            self._config.completion_key(event_id)
-        )
+        stored: dict[Any, Any] = await self._redis.hgetall(self._config.completion_key(event_id))
         return _parse_stored(event_id, stored)
 
     async def read_completions(
@@ -585,9 +898,7 @@ class Markers:
         """
         # With a count, SRANDMEMBER answers with a list; the client's signature
         # also covers the countless single-member form, hence the narrowing.
-        members: Any = await self._redis.srandmember(
-            self._config.completions_pending_key(), limit
-        )
+        members: Any = await self._redis.srandmember(self._config.completions_pending_key(), limit)
         if not members:
             return set()
         if not isinstance(members, list):

@@ -36,8 +36,15 @@ _SIGNATURE_BYTES = 64
 # Far above any minted token; bounds the work one header can ask for.
 _MAX_TOKEN_CHARS = 4096
 _SEGMENT = re.compile(r"[A-Za-z0-9_-]+")
+# ADR 0178 decision 1. The same spelling the worker mints.
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _CLAIMS = frozenset({"agent", "exp"})
+_RUN_CLAIMS = frozenset({"run", "work_item"})
 _GRANT_CLAIMS = frozenset({"agent", "connector", "tool", "args", "exp", "jti"})
+
+AGENT_HEADER = "X-Curie-Agent"
+RUN_HEADER = "X-Curie-Run"
+WORK_ITEM_HEADER = "X-Curie-Work-Item"
 
 
 @dataclass(frozen=True)
@@ -46,6 +53,10 @@ class Decision:
 
     agent: str | None
     refusal: str | None
+    # Set only when the token carried a verified pair (ADR 0178). Absent on
+    # refusal and on a token that names only the agent.
+    run: str | None = None
+    work_item: str | None = None
 
     @property
     def admitted(self) -> bool:
@@ -114,16 +125,31 @@ def _opened(keys: Sequence[VerifyKey], token: str, prefix: str) -> dict[str, obj
     return parsed
 
 
-def claims(keys: Sequence[VerifyKey], token: str) -> tuple[str, int] | None:
-    """The ``(agent, exp)`` a token carries when one of ``keys`` signed it."""
+def claims(keys: Sequence[VerifyKey], token: str) -> Decision | None:
+    """The signed caller, or None. ``run`` and ``work_item`` are a pair or absent."""
 
     parsed = _opened(keys, token, PREFIX)
-    if parsed is None or set(parsed) != _CLAIMS:
+    if parsed is None:
+        return None
+    keys_present = set(parsed)
+    if keys_present != _CLAIMS and keys_present != _CLAIMS | _RUN_CLAIMS:
         return None
     agent, exp = parsed["agent"], parsed["exp"]
     if not isinstance(agent, str) or not agent or type(exp) is not int:
         return None
-    return agent, exp
+    run: str | None = None
+    work_item: str | None = None
+    if "run" in parsed:
+        run_value, work_value = parsed["run"], parsed["work_item"]
+        if (
+            not isinstance(run_value, str)
+            or _UUID.fullmatch(run_value) is None
+            or not isinstance(work_value, str)
+            or _UUID.fullmatch(work_value) is None
+        ):
+            return None
+        run, work_item = run_value, work_value
+    return Decision(agent=agent, refusal=None, run=run, work_item=work_item)
 
 
 @dataclass(frozen=True)
@@ -177,12 +203,21 @@ def decide(
     carried = claims(keys, token)
     if carried is None:
         return Decision(agent=None, refusal=INVALID)
-    agent, exp = carried
     # Accept is `exp > now`, the comparison `sandbox_token.verify` makes.
-    if exp <= now:
-        return Decision(agent=agent, refusal=EXPIRED)
+    # Read exp back from the signed payload. ``claims`` already checked the type.
+    opened = _opened(keys, token, PREFIX)
+    exp = opened["exp"] if opened is not None else 0
+    if not isinstance(exp, int) or exp <= now:
+        return Decision(
+            agent=carried.agent,
+            refusal=EXPIRED,
+            run=carried.run,
+            work_item=carried.work_item,
+        )
     # Exact: no case folding and no normalization, so a stored name outside
     # the bundle shape is admitted only through `self`.
-    if agent not in admits:
-        return Decision(agent=agent, refusal=NOT_ADMITTED)
-    return Decision(agent=agent, refusal=None)
+    if carried.agent not in admits:
+        return Decision(
+            agent=carried.agent, refusal=NOT_ADMITTED, run=carried.run, work_item=carried.work_item
+        )
+    return carried

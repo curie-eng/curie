@@ -24,6 +24,32 @@ permissions:
   contents: read
 
 jobs:
+  adapter-credential-reconciliation:
+    name: SRE bot adapter credential reconciliation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Test reconciliation decisions and Kubernetes transport
+        run: uv run pytest -q examples/tests/test_adapter_credentials_sync.py examples/tests/test_adapter_credentials_transport.py
+
   action-pins:
     name: Action SHA pins
     runs-on: ubuntu-latest
@@ -32,7 +58,17 @@ jobs:
         with:
           persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - name: Require third party action SHA pins and version comments
         run: |
           uv run --no-project --with pyyaml==6.0.3 python3 - <<'PY'
@@ -95,17 +131,25 @@ jobs:
           PY
 
   # The suite runs as parallel shards, each on its own runner with its own dev
-  # stack; the required `Python (ruff + mypy + pytest)` job below runs the static
-  # gates and then aggregates the shard results. One -n 4 job was 13.5 minutes
-  # on the critical path of every required run.
+  # stack; the static gates run in `python-static` beside them, and the required
+  # `Python (ruff + mypy + pytest)` job below aggregates both. One -n 4 job was
+  # 13.5 minutes on the critical path of every required run.
   python-pytest:
     name: Python pytest (shard ${{ matrix.shard }}/3)
+    # Job-level gate (#3858): an unselected run (docs-only or version-only)
+    # skips the shards instead of booting three runners that only record a
+    # skip. The required `python` job below still reports, and its aggregate
+    # step accepts the skipped shard job only when it too selected no pytest.
+    needs: [changes]
+    if: ${{ needs.changes.outputs.pytest == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
       CI_REQUIRE_VALKEY_TESTS: "1"
       CI_REQUIRE_POSTGRES_TESTS: "1"
+      CURIE_PRIMARY_SOURCE_RESOURCES: "1"
+      CURIE_SETTLEMENT_TEST_REDIS_URL: "redis://:valkeypass@127.0.0.1:26379/0"
     strategy:
       fail-fast: false
       matrix:
@@ -122,10 +166,12 @@ jobs:
       # build, test, or gate, so a retry there cannot hide a defect in our
       # code. Never wrap a step that builds, tests, or gates that code.
       # Enforced by tools/ci-retry-gate/tests/test_retry_eligibility.py.
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -135,22 +181,25 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Sync workspace
         run: uv sync
-      # Docs-only diffs still run ruff/mypy/docs/alembic/wire-lock above. Reuse
-      # ignored_prefixes from .github/e2e-selection.yaml so a guides edit does
-      # not boot postgres; packages/, apps/, runner/, examples/tests/, cli,
-      # uv.lock, and pyproject.toml still select pytest. The required check
-      # name stays `Python (ruff + mypy + pytest)` so the ruleset gates the
-      # suite when it is selected.
+      - name: API private import boundaries
+        run: |
+          uv run python3 scripts/check-private-imports.py --self-test
+          uv run python3 scripts/check-private-imports.py
+      # The job-level gate above already skips the shards when `changes` did
+      # not select pytest. The shard still recomputes the selection itself and
+      # records it, so the required job can cross-check that every shard agreed
+      # with its own decision. Every event other than a pull request selects
+      # everything, as `changes` does (#3858).
       - name: Decide whether compose and pytest are needed
         id: python-runtime
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
             uv run python tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --push
@@ -164,10 +213,9 @@ jobs:
           fi
       # Integration tests dial the real dev stack (Postgres 25432, Valkey 26379,
       # RustFS 29000, Langfuse 23000 + ClickHouse + OTel Collector). Boot it after
-      # ruff/mypy so cheap failures stay fast. The first up starts the one-shot
-      # rustfs-init that creates the Langfuse bucket alongside the long-lived
-      # services; the second --waits only on the long-lived ones (rustfs-init is
-      # kept out of the wait set because --wait treats its exit(0) as a failure).
+      # ruff/mypy so cheap failures stay fast. The readiness helper waits for
+      # backing services and bucket creation, then starts Langfuse web before
+      # its worker so migrations and bootstrap cannot race worker startup.
       # The app services (curie-api, curie-migrate) are deliberately NOT
       # started: the suite runs the app in-process via uv and migrates the shared
       # DB with alembic below, so their image is never needed here -- and it lives
@@ -175,27 +223,12 @@ jobs:
       - name: Start dev stack
         id: dev-stack
         if: steps.python-runtime.outputs.pytest == 'true'
-        run: |
-          docker compose -f compose.dev.yaml up -d \
-            postgres valkey clickhouse rustfs rustfs-init \
-            langfuse-web langfuse-worker otel-collector
-          docker compose -f compose.dev.yaml up -d --wait --wait-timeout 300 \
-            postgres valkey clickhouse rustfs \
-            langfuse-web langfuse-worker otel-collector
-      # Langfuse web has no compose healthcheck, so --wait returns once its
-      # container is merely running. Poll its public health endpoint until it is
-      # actually serving, so the full-stack readiness gate fails fast with an
-      # actionable error before integration tests begin.
+        run: python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480
+      # Recheck authenticated web reads and worker readiness at the test
+      # boundary. A running container alone does not prove usable Langfuse.
       - name: Wait for Langfuse to serve
         if: steps.python-runtime.outputs.pytest == 'true'
-        run: |
-          for i in $(seq 1 60); do
-            if curl -fsS http://localhost:23000/api/public/health >/dev/null 2>&1; then
-              echo "Langfuse ready after attempt ${i}"; exit 0
-            fi
-            sleep 3
-          done
-          echo "Langfuse did not become ready within 180s"; exit 1
+        run: python3 scripts/wait-for-langfuse.py
       - name: Released database upgrade gate
         if: steps.python-runtime.outputs.pytest == 'true'
         run: |
@@ -230,7 +263,18 @@ jobs:
       - name: Pytest
         id: pytest
         if: steps.python-runtime.outputs.pytest == 'true'
-        run: uv run pytest -q -n 4 --dist loadgroup --ci-shard ${{ matrix.shard }}/3 --reruns 1 -rsR --durations=25
+        env:
+          SHARD: ${{ matrix.shard }}
+          PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
+        run: |
+          pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/3" --reruns 1 -rsR --durations=25)
+          if [[ -n "$PYTEST_DESELECT" ]]; then
+            IFS=, read -r -a deselect_files <<< "$PYTEST_DESELECT"
+            for path in "${deselect_files[@]}"; do
+              pytest_args+=(--deselect "$path")
+            done
+          fi
+          uv run pytest "${pytest_args[@]}"
       # Record what this shard decided and did, for the required job to check.
       # Written on every outcome, so a failed shard still reports.
       - name: Record shard result
@@ -240,10 +284,12 @@ jobs:
           PYTEST_SELECTED: ${{ steps.python-runtime.outputs.pytest }}
           PYTEST_RESULT: ${{ steps.pytest.outcome }}
           STACK_RESULT: ${{ steps.dev-stack.outcome }}
+          PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
         run: |
           mkdir -p shard-result
-          printf 'shard=%s selected=%s pytest=%s stack=%s\n' \
+          printf 'shard=%s selected=%s pytest=%s stack=%s deselect=%s\n' \
             "$SHARD" "${PYTEST_SELECTED:-}" "${PYTEST_RESULT:-}" "${STACK_RESULT:-}" \
+            "${PYTEST_DESELECT:-}" \
             > "shard-result/shard-${SHARD}.txt"
           cat "shard-result/shard-${SHARD}.txt"
       - name: Upload shard result
@@ -256,12 +302,129 @@ jobs:
         if: ${{ failure() && steps.python-runtime.outputs.pytest == 'true' }}
         run: docker compose -f compose.dev.yaml logs --no-color --tail=200
 
+  # The cheap static gates run beside the pytest shards so a lint, type or docs
+  # failure surfaces in about 2 minutes instead of after the slowest shard. The
+  # required `python` job below requires this job's success.
+  python-static:
+    name: Python static gates
+    needs: [changes]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Retry eligibility (#1106): only a step whose whole job is to ACQUIRE a
+      # third-party dependency (a tool binary, an image, a registry session, a
+      # build artifact) may be wrapped. Such a step can fail only on a network
+      # or registry error, never on a non-zero exit from this repository's own
+      # build, test, or gate, so a retry there cannot hide a defect in our
+      # code. Never wrap a step that builds, tests, or gates that code.
+      # Enforced by tools/ci-retry-gate/tests/test_retry_eligibility.py.
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      # Fail fast if uv.lock has drifted from the pyproject.toml files (a
+      # dependency edit committed without re-locking). --check resolves and
+      # compares without writing, so it never mutates the checkout.
+      - name: Lockfile is up to date
+        run: uv lock --check
+      - name: Sync workspace
+        run: uv sync
+      - name: Alembic revision gate
+        run: uv run python scripts/check-alembic-revisions.py
+      - name: Alembic cross-train lineage
+        env:
+          BASE: ${{ github.base_ref || github.ref_name }}
+        run: |
+          case "$BASE" in
+            main) other_train=next ;;
+            next) other_train=main ;;
+            *)
+              echo "cross-train lineage skipped: base $BASE is not a train branch"
+              exit 0
+              ;;
+          esac
+          git fetch --no-tags origin "$other_train"
+          uv run python scripts/check-alembic-revisions.py --other-train-ref "origin/$other_train"
+      - name: Schema window gate
+        run: uv run python scripts/check-schema-window.py
+      - name: Ruff
+        run: uv run ruff check .
+      - name: Mypy
+        run: uv run mypy
+      # ADR-0062 (#844): the harness boundary is gated, not just documented. Two
+      # contracts today -- the platform never imports a harness SDK, and the
+      # harness PORT (contribution + registry) stays vendor-neutral. Transitive,
+      # so a leak arriving through an intermediate module is caught too.
+      - name: Import boundaries (harness SDK containment)
+        run: uv run lint-imports
+      # Regenerate the interface-catalog seam table and per-doc headers from
+      # each seam's front-matter, fail on drift, resolve every `curie ...`
+      # command named in the agent verification contract (docs/agents.md)
+      # against cli/command-manifest.json (#1041), then lint every citation
+      # under docs/ (excluding docs/adr/). A cheap, cluster-free gate, so it
+      # runs right after ruff/mypy.
+      - name: Docs gate (catalog drift + agent contract + citations)
+        run: bash scripts/check-docs.sh
+      # _AciModel tolerant-decode gate (#625, following #492): every direct
+      # ClassName.model_validate*(...) call on an _AciModel subclass must thread
+      # READER_CONTEXT or be a declared allowlist exception. Another cheap,
+      # cluster-free static gate, so it runs alongside the docs gate.
+      - name: Wire tolerance gate (_AciModel model_validate call sites)
+        run: bash scripts/check-wire-tolerance.sh
+      # The platform-upgrade Job runs examples/sre-bot/platform-upgrade/upgrade.sh
+      # as its body. That script had no test and no CI; a helm upgrade the bot
+      # can start must be shellchecked on every PR, cheap and cluster-free, so
+      # this sits with the other static gates.
+      - name: Shellcheck sre-bot platform-upgrade script
+        run: shellcheck --severity=warning examples/sre-bot/platform-upgrade/upgrade.sh
+      # The shards run release/tests whenever pytest is selected. When the
+      # `changes` selection skipped pytest (a docs-only or version-only diff),
+      # run them here so a release bump still proves the tag gate and release
+      # tooling on the new commit (#3858). The required `python` job already
+      # fails if that selection disagrees with its own, so `changes` is the
+      # trusted selection.
+      - name: Release tests
+        if: needs.changes.outputs.pytest == 'false'
+        run: uv run pytest -q release/tests
+      # The committed-lock test only proves the lock matches the current wire; it
+      # passes even if the lock was regenerated without a version bump. Compare
+      # against the BASE branch's lock so an unbumped wire change actually fails
+      # CI. Refresh that remote ref before reading it; a missing or empty base
+      # lock (base predates the lock) skips cleanly (exit 0), and only a genuine
+      # unbumped wire change vs an existing base lock exits 1.
+      - name: ACI wire-lock base gate
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref || github.ref_name }}" || true
+          git show "origin/${{ github.base_ref || github.ref_name }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
+          uv run python -m aci_protocol.wire_lock --check-base /tmp/base-wire.lock
+
   python:
     name: Python (ruff + mypy + pytest)
-    # `needs` only orders this job after the shards; `always()` keeps it
+    # `needs` orders this job after the shards; `always()` keeps it
     # running (and so reporting the required check) whatever the shards did.
-    # A failed, cancelled, or skipped shard fails the aggregate step below.
-    needs: python-pytest
+    # A failed or cancelled shard fails the aggregate step below, and so does a
+    # skipped shard job unless this job also selected no pytest (#3858). It also
+    # needs `changes` so a failed or disagreeing selection cannot pass as a
+    # legitimate skip. It also waits on `python-static` and requires it to
+    # succeed.
+    needs: [changes, python-pytest, python-static]
     if: always()
     runs-on: ubuntu-latest
     # A job-level block REPLACES the workflow-level one, so `contents: read` is
@@ -284,7 +447,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -294,61 +457,26 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
-      # Fail fast if uv.lock has drifted from the pyproject.toml files (a
-      # dependency edit committed without re-locking). --check resolves and
-      # compares without writing, so it never mutates the checkout.
-      - name: Lockfile is up to date
-        run: uv lock --check
       - name: Sync workspace
         run: uv sync
-      - name: Alembic revision gate
-        run: uv run python scripts/check-alembic-revisions.py
-      - name: Schema window gate
-        run: uv run python scripts/check-schema-window.py
-      - name: Ruff
-        run: uv run ruff check .
-      - name: Mypy
-        run: uv run mypy
-      # ADR-0062 (#844): the harness boundary is gated, not just documented. Two
-      # contracts today -- the platform never imports a harness SDK, and the
-      # harness PORT (contribution + registry) stays vendor-neutral. Transitive,
-      # so a leak arriving through an intermediate module is caught too.
-      - name: Import boundaries (harness SDK containment)
-        run: uv run lint-imports
-      # Regenerate the interface-catalog seam table and per-doc headers from
-      # each seam's front-matter, fail on drift, resolve every `curie ...`
-      # command named in the agent verification contract (docs/agents.md)
-      # against cli/command-manifest.json (#1041), then lint every citation
-      # under docs/ (excluding docs/adr/). A cheap, cluster-free gate, so it
-      # runs right after ruff/mypy and before the dev stack boots.
-      - name: Docs gate (catalog drift + agent contract + citations)
-        run: bash scripts/check-docs.sh
-      # _AciModel tolerant-decode gate (#625, following #492): every direct
-      # ClassName.model_validate*(...) call on an _AciModel subclass must thread
-      # READER_CONTEXT or be a declared allowlist exception. Another cheap,
-      # cluster-free static gate, so it runs alongside the docs gate.
-      - name: Wire tolerance gate (_AciModel model_validate call sites)
-        run: bash scripts/check-wire-tolerance.sh
-      # The platform-upgrade Job runs examples/sre-bot/platform-upgrade/upgrade.sh
-      # as its body. That script had no test and no CI; a helm upgrade the bot
-      # can start must be shellchecked on every PR, cheap and cluster-free, so
-      # this sits with the other static gates before the dev stack boots.
-      - name: Shellcheck sre-bot platform-upgrade script
-        run: shellcheck --severity=warning examples/sre-bot/platform-upgrade/upgrade.sh
-      # Docs-only diffs still run ruff/mypy/docs/alembic/wire-lock above. Reuse
-      # ignored_prefixes from .github/e2e-selection.yaml so a guides edit does
-      # not boot postgres; packages/, apps/, runner/, examples/tests/, cli,
-      # uv.lock, and pyproject.toml still select pytest. The required check
-      # name stays `Python (ruff + mypy + pytest)` so the ruleset gates the
-      # suite when it is selected.
+      # Docs-only diffs still run ruff/mypy/docs/alembic/wire-lock in
+      # `python-static`. Reuse ignored_prefixes from .github/e2e-selection.yaml
+      # so a guides edit does not boot postgres; packages/, apps/, runner/,
+      # examples/tests/, cli,
+      # uv.lock, and pyproject.toml still select pytest, except on a
+      # version-only release bump, which reuses the proof its base already has
+      # (#3858). Every event other than a pull request selects everything, as
+      # `changes` does. The required check name stays
+      # `Python (ruff + mypy + pytest)` so the ruleset gates the suite when it
+      # is selected.
       - name: Decide whether compose and pytest are needed
         id: python-runtime
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
             uv run python tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --push
@@ -360,43 +488,75 @@ jobs:
               --base "origin/$base" \
               --head HEAD
           fi
-      # The committed-lock test only proves the lock matches the current wire; it
-      # passes even if the lock was regenerated without a version bump. Compare
-      # against the BASE branch's lock so an unbumped wire change actually fails
-      # CI. Refresh that remote ref before reading it; a missing or empty base
-      # lock (base predates the lock) skips cleanly (exit 0), and only a genuine
-      # unbumped wire change vs an existing base lock exits 1.
-      - name: ACI wire-lock base gate
+      # always() above keeps this job reporting the required check whatever the
+      # static job did, so require its success explicitly; a failed, skipped or
+      # cancelled static job must not pass the required check.
+      - name: Require static gates to pass
+        env:
+          STATIC_RESULT: ${{ needs.python-static.result }}
         run: |
-          git fetch --no-tags --depth=1 origin "${{ github.base_ref || 'main' }}" || true
-          git show "origin/${{ github.base_ref || 'main' }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
-          uv run python -m aci_protocol.wire_lock --check-base /tmp/base-wire.lock
+          if [[ "$STATIC_RESULT" != "success" ]]; then
+            echo "Python static gates finished ${STATIC_RESULT:-<empty>}" >&2
+            exit 1
+          fi
+          echo "Python static gates passed"
       - name: Download shard results
+        if: steps.python-runtime.outputs.pytest == 'true'
         uses: actions/download-artifact@v8
         with:
           pattern: python-pytest-shard-*
           path: shard-results
           merge-multiple: true
-      # Keep the required Python check honest: every shard must have reported,
-      # agreed with this job's own selection, and matched it (a selected skip or
-      # an unselected run fails), and the shard jobs themselves must have
-      # succeeded, so a real test failure in any shard fails this check.
+      # Keep the required Python check honest. When this job selected pytest,
+      # every shard must have reported, agreed with that selection, and run it,
+      # and the shard jobs themselves must have succeeded, so a real test
+      # failure in any shard fails this check. When it did not, the shard job
+      # must have been skipped by its job-level gate and left no shard record
+      # (#3858); a shard job that ran, or any record, means the two selections
+      # disagreed.
       - name: Require pytest outcome to match selection
         if: success()
         env:
           PYTEST_SELECTED: ${{ steps.python-runtime.outputs.pytest }}
+          PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
           SHARDS_RESULT: ${{ needs.python-pytest.result }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHANGES_PYTEST: ${{ needs.changes.outputs.pytest }}
+          CHANGES_DESELECT: ${{ needs.changes.outputs.pytest_deselect }}
           SHARD_COUNT: "3"
           SHARD_RESULTS_DIR: shard-results
         run: |
           set -euo pipefail
-          expected=skipped
-          if [[ "$PYTEST_SELECTED" == "true" ]]; then
-            expected=success
-          elif [[ "$PYTEST_SELECTED" != "false" ]]; then
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "the changes job finished $CHANGES_RESULT; pytest selection cannot be trusted" >&2
+            exit 1
+          fi
+          if [[ "$CHANGES_PYTEST" != "$PYTEST_SELECTED" ]]; then
+            echo "changes job selected pytest=${CHANGES_PYTEST:-<empty>}, but this job selected ${PYTEST_SELECTED:-<empty>}" >&2
+            exit 1
+          fi
+          if [[ "$CHANGES_DESELECT" != "$PYTEST_DESELECT" ]]; then
+            echo "changes job selected deselect=${CHANGES_DESELECT:-<empty>}, but this job selected ${PYTEST_DESELECT:-<empty>}" >&2
+            exit 1
+          fi
+          if [[ "$PYTEST_SELECTED" == "false" ]]; then
+            if [[ "$SHARDS_RESULT" != "skipped" ]]; then
+              echo "pytest was not selected, but the shards finished $SHARDS_RESULT" >&2
+              exit 1
+            fi
+            if [[ -d "$SHARD_RESULTS_DIR" ]] \
+              && [[ -n "$(find "$SHARD_RESULTS_DIR" -type f -print -quit)" ]]; then
+              echo "pytest was not selected, but a shard reported a result" >&2
+              exit 1
+            fi
+            echo "Python pytest not selected; the shard job was skipped"
+            exit 0
+          fi
+          if [[ "$PYTEST_SELECTED" != "true" ]]; then
             echo "pytest selection must be true or false, got ${PYTEST_SELECTED:-<empty>}" >&2
             exit 1
           fi
+          expected=success
           if [[ "$SHARDS_RESULT" != "success" ]]; then
             echo "pytest shards finished $SHARDS_RESULT" >&2
             exit 1
@@ -407,7 +567,7 @@ jobs:
               echo "pytest shard $shard reported no result" >&2
               exit 1
             fi
-            want="shard=$shard selected=$PYTEST_SELECTED pytest=$expected stack=$expected"
+            want="shard=$shard selected=$PYTEST_SELECTED pytest=$expected stack=$expected deselect=$PYTEST_DESELECT"
             got="$(cat "$record")"
             if [[ "$got" != "$want" ]]; then
               echo "pytest shard $shard: expected '$want', got '$got'" >&2
@@ -416,10 +576,11 @@ jobs:
           done
           echo "Python pytest selection matched $expected on $SHARD_COUNT shards"
 
-  # The Rust quality gate is four jobs so the test suite runs in parallel
+  # The Rust quality gate is five jobs so the test suite runs in parallel
   # partitions beside fmt and clippy instead of one 14.5 minute serial step.
   # `rust` keeps the required check name and fails unless lint passed and the
-  # test partitions passed (or were legitimately skipped by rust-select).
+  # test build and partitions passed (or were legitimately skipped by
+  # rust-select).
   rust-lint:
     name: Rust (fmt + clippy)
     runs-on: ubuntu-latest
@@ -427,8 +588,10 @@ jobs:
       run:
         working-directory: cli
     steps:
+      # Full history so the schema window gate can read release tags.
       - uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Toolchain
         run: rustup component add rustfmt clippy
@@ -458,7 +621,19 @@ jobs:
       - name: Schema baseline
         run: bash scripts/refresh-schema-baseline.sh --check
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Schema window gate
@@ -475,6 +650,7 @@ jobs:
   # a path the list misses is still caught before a release.
   rust-select:
     name: Select Rust tests
+    needs: [changes]
     runs-on: ubuntu-latest
     outputs:
       tests: ${{ steps.select.outputs.tests }}
@@ -487,11 +663,19 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          VERSION_ONLY: ${{ needs.changes.outputs.version_only }}
         run: |
           set -euo pipefail
           if [ "$EVENT" != "pull_request" ]; then
             echo "tests=true ($EVENT always runs the Rust tests)"
             echo "tests=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A version-only release bump (#3858) reuses the base's Rust proof;
+          # rust-lint still checks version consistency and clippy on it.
+          if [ "$VERSION_ONLY" = "true" ]; then
+            echo "Version-only change; skipping the Rust test partitions."
+            echo "tests=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git fetch --quiet origin "$BASE_REF"
@@ -513,13 +697,50 @@ jobs:
             echo "tests=false" >> "$GITHUB_OUTPUT"
           fi
 
-  # cargo-nextest runs every test binary in parallel and splits the suite into
-  # three count partitions on separate runners. The debug profile is kept on
-  # purpose: the CLI tests depend on cfg(debug_assertions) CURIE_TEST_* hooks.
+  # Compiles the CLI test suite once per run and hands it to the partitions as
+  # a nextest archive, so the three runners only run tests (#4383). The debug
+  # profile is kept on purpose: the CLI tests depend on cfg(debug_assertions)
+  # CURIE_TEST_* hooks.
+  rust-test-build:
+    name: Rust test build
+    runs-on: ubuntu-latest
+    needs: [rust-select]
+    if: ${{ needs.rust-select.outputs.tests == 'true' }}
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: rustc --version
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: cli
+          shared-key: rust-test
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest@0.9.146
+      - name: Build and archive the tests
+        run: cargo nextest archive --locked --archive-file nextest-archive.tar.zst
+      - name: Upload the test archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nextest-archive-${{ github.sha }}
+          path: cli/nextest-archive.tar.zst
+          if-no-files-found: error
+          # Already zstd-compressed.
+          compression-level: 0
+
+  # cargo-nextest runs the archived test binaries in parallel and splits the
+  # suite into three count partitions on separate runners.
   rust-test:
     name: Rust test (partition ${{ matrix.partition }}/3)
     runs-on: ubuntu-latest
-    needs: [rust-select]
+    needs: [rust-select, rust-test-build]
     if: ${{ needs.rust-select.outputs.tests == 'true' }}
     strategy:
       fail-fast: false
@@ -551,16 +772,8 @@ jobs:
           persist-credentials: false
       - name: Toolchain
         run: rustc --version
-      # One cache shared by the three partitions; only the first saves it so
-      # the jobs do not race to upload identical entries.
-      - name: Cargo cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: cli
-          shared-key: rust-test
-          save-if: ${{ matrix.partition == 1 }}
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-nextest@0.9.146
       # write_allowlist_bundle_passes_the_real_bundle_validator (AC3) shells out
@@ -571,33 +784,69 @@ jobs:
       # syncs the environment itself, and the test invokes it with an explicit
       # repo-root `current_dir`.
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Install Helm for CLI consumer render tests
+        id: install_helm_for_cli_consumer_render_tests
+        continue-on-error: true
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.16.4
+      - name: Back off before retrying Install Helm for CLI consumer render tests
+        if: steps.install_helm_for_cli_consumer_render_tests.outcome == 'failure'
+        run: |
+          echo "Install Helm for CLI consumer render tests failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm for CLI consumer render tests (retry)
+        if: steps.install_helm_for_cli_consumer_render_tests.outcome == 'failure'
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v3.16.4
+      - name: Download the test archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive-${{ github.sha }}
+          path: ${{ runner.temp }}/nextest
+      # --extract-to . puts the archived target/ back at cli/target, the path
+      # the build job compiled into, because the tests read the compile-time
+      # env!("CARGO_BIN_EXE_curie") path. nextest's default temp-dir extract
+      # would leave that path empty.
       - name: Test
         run: >-
-          cargo nextest run --locked --profile ci
-          --partition count:${{ matrix.partition }}/3
+          cargo nextest run
+          --archive-file "$RUNNER_TEMP/nextest/nextest-archive.tar.zst"
+          --workspace-remap . --extract-to .
+          --profile ci --partition count:${{ matrix.partition }}/3
 
   rust:
     name: Rust (fmt + clippy + test)
     runs-on: ubuntu-latest
-    needs: [rust-lint, rust-select, rust-test]
+    needs: [rust-lint, rust-select, rust-test-build, rust-test]
     if: ${{ always() }}
     steps:
-      - name: Require lint and the selected test partitions to pass
+      - name: Require lint, the test build, and the selected test partitions to pass
         env:
           LINT: ${{ needs.rust-lint.result }}
           SELECT: ${{ needs.rust-select.result }}
           SELECTED: ${{ needs.rust-select.outputs.tests }}
+          BUILD: ${{ needs.rust-test-build.result }}
           TESTS: ${{ needs.rust-test.result }}
         run: |
           set -euo pipefail
-          echo "lint=$LINT select=$SELECT selected=${SELECTED:-<empty>} tests=$TESTS"
+          echo "lint=$LINT select=$SELECT selected=${SELECTED:-<empty>} build=$BUILD tests=$TESTS"
           if [ "$LINT" != success ]; then
             echo "Rust fmt + clippy did not pass" >&2
             exit 1
@@ -611,6 +860,10 @@ jobs:
             false) expected=skipped ;;
             *) echo "Rust test selection must be true or false" >&2; exit 1 ;;
           esac
+          if [ "$BUILD" != "$expected" ]; then
+            echo "Rust test build: expected $expected, got $BUILD" >&2
+            exit 1
+          fi
           if [ "$TESTS" != "$expected" ]; then
             echo "Rust test partitions: expected $expected, got $TESTS" >&2
             exit 1
@@ -643,6 +896,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: cli
+          shared-key: curie-cli-release
       - name: Release build
         run: cargo build --release --locked
       - name: Upload curie binary
@@ -673,6 +927,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -807,19 +1063,53 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Install pnpm
+        id: install_pnpm
+        continue-on-error: true
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 9.15.9
+      - name: Back off before retrying Install pnpm
+        if: steps.install_pnpm.outcome == 'failure'
+        run: |
+          echo "Install pnpm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install pnpm (retry)
+        if: steps.install_pnpm.outcome == 'failure'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 9.15.9
       - name: Install Node
+        id: install_node
+        continue-on-error: true
         uses: actions/setup-node@v7
         with:
           node-version: "22"
+          cache: pnpm
+          cache-dependency-path: tools/contract-codegen/pnpm-lock.yaml
+      - name: Back off before retrying Install Node
+        if: steps.install_node.outcome == 'failure'
+        run: |
+          echo "Install Node failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Node (retry)
+        if: steps.install_node.outcome == 'failure'
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: tools/contract-codegen/pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm --dir tools/contract-codegen install --frozen-lockfile
       - name: Regenerate TypeScript from the committed schema and check for drift
         run: |
-          npx --yes json-schema-to-typescript@15.0.4 \
-            packages/aci-protocol/schema/aci-protocol.schema.json \
+          pnpm --dir tools/contract-codegen exec json2ts \
+            "${{ github.workspace }}/packages/aci-protocol/schema/aci-protocol.schema.json" \
             --unreachableDefinitions \
-            -o packages/aci-protocol/generated/ts/aci-protocol.ts
+            -o "${{ github.workspace }}/packages/aci-protocol/generated/ts/aci-protocol.ts"
           git diff --exit-code -- packages/aci-protocol/generated/ts/aci-protocol.ts
       - name: tsc --noEmit on generated ACI types
-        run: npx --yes -p typescript@5.9.3 tsc --noEmit -p packages/aci-protocol/generated/ts/tsconfig.json
+        run: pnpm --dir tools/contract-codegen exec tsc --noEmit -p "${{ github.workspace }}/packages/aci-protocol/generated/ts/tsconfig.json"
       - name: Architecture atlas preview route test
         run: node --test docs/architecture-atlas/test-update-hash.mjs
 
@@ -834,10 +1124,36 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pnpm
+        id: install_pnpm
+        continue-on-error: true
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 9
+      - name: Back off before retrying Install pnpm
+        if: steps.install_pnpm.outcome == 'failure'
+        run: |
+          echo "Install pnpm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install pnpm (retry)
+        if: steps.install_pnpm.outcome == 'failure'
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 9
       - name: Install Node
+        id: install_node
+        continue-on-error: true
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: apps/ui/pnpm-lock.yaml
+      - name: Back off before retrying Install Node
+        if: steps.install_node.outcome == 'failure'
+        run: |
+          echo "Install Node failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Node (retry)
+        if: steps.install_node.outcome == 'failure'
         uses: actions/setup-node@v7
         with:
           node-version: "22"
@@ -853,6 +1169,12 @@ jobs:
           pnpm gen:manifest
           git diff --exit-code src/generated/commandManifest.ts \
             || (echo "commandManifest.ts is stale; run 'pnpm gen:manifest' in apps/ui and commit." && exit 1)
+      - name: API types are current
+        # The committed src/api/generated.ts must match what apps/api/openapi.json
+        # generates, so a changed API response field cannot land without the UI
+        # types (and the consumers typecheck reaches through them) following it.
+        # Generation never runs inside the UI Docker build.
+        run: pnpm gen:api-types --check
       - name: Lint
         run: pnpm lint
       - name: Unit tests (vitest)
@@ -875,6 +1197,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Generate the release compose
         run: python3 compose/generate_release_compose.py > compose.release.yaml
       # compose.release.yaml is generated from compose.dev.yaml (the single
@@ -946,10 +1270,30 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Set up a cache-only buildx builder (named, NOT the default -- preserves the overlay's FROM)
         id: imagescache
+        continue-on-error: true
         uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
+          config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+          use: false
+      - name: Back off before retrying Set up a cache-only buildx builder (named, NOT the default -- preserves the overlay's FROM)
+        if: steps.imagescache.outcome == 'failure'
+        run: |
+          echo "Set up a cache-only buildx builder (named, NOT the default -- preserves the overlay's FROM) failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Set up a cache-only buildx builder (named, NOT the default -- preserves the overlay's FROM) (retry)
+        id: imagescache_retry
+        if: steps.imagescache.outcome == 'failure'
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
           use: false
       - name: Write the CI image bake definition
         run: |
@@ -968,7 +1312,7 @@ jobs:
       - name: Build the CI images in parallel
         uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
         with:
-          builder: ${{ steps.imagescache.outputs.name }}
+          builder: ${{ steps.imagescache.outcome == 'success' && steps.imagescache.outputs.name || steps.imagescache_retry.outputs.name }}
           source: .
           files: ci-images-bake.json
           push: false
@@ -1049,7 +1393,7 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-  # The two example connectors are the only images CI does not run, and the
+  # The example connectors are the only images CI does not run, and the
   # only ones release.yaml publishes for a second architecture. They are
   # validated here, build only, for both architectures: validating only amd64
   # leaves an arm64-only Dockerfile failure to appear for the first time during
@@ -1073,14 +1417,52 @@ jobs:
             context: examples/sre-bot/connectors/self-upgrade
             dockerfile: examples/sre-bot/connectors/self-upgrade/Dockerfile
             platforms: linux/amd64,linux/arm64
+          - name: github-activity-github
+            context: examples/github-activity/connectors/github
+            dockerfile: examples/github-activity/connectors/github/Dockerfile
+            platforms: linux/amd64,linux/arm64
+          - name: curie-manager-platform
+            context: examples/curie-manager/connectors/platform
+            dockerfile: examples/curie-manager/connectors/platform/Dockerfile
+            platforms: linux/amd64,linux/arm64
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Set up QEMU
+        id: set_up_qemu
+        continue-on-error: true
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - name: Back off before retrying Set up QEMU
+        if: steps.set_up_qemu.outcome == 'failure'
+        run: |
+          echo "Set up QEMU failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Set up QEMU (retry)
+        if: steps.set_up_qemu.outcome == 'failure'
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: Set up Buildx
+        id: set_up_buildx
+        continue-on-error: true
         uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - name: Back off before retrying Set up Buildx
+        if: steps.set_up_buildx.outcome == 'failure'
+        run: |
+          echo "Set up Buildx failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Set up Buildx (retry)
+        if: steps.set_up_buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
       - name: Build (no push)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -1096,6 +1478,114 @@ jobs:
           # writing a single layer into the shared namespace.
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  # The per-run Docker daemon image (ADR 0217 decision 4): the curie-authz
+  # plugin crate's fmt, clippy and tests, a build for both release arches (the
+  # Dockerfile cross compiles on the build platform, so no QEMU), and the
+  # black-box escape test against the amd64 image. Self-gated rather than wired
+  # into `changes`: on a pull request it runs only when apps/docker-daemon or
+  # this workflow changed; pushes and dispatches always run it.
+  docker-daemon:
+    name: Docker daemon image (authz plugin + escape test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/docker-daemon
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scope
+        id: scope
+        working-directory: ${{ github.workspace }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT_NAME" != pull_request ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags origin "$BASE_REF"
+          if git diff --quiet "origin/${BASE_REF}...HEAD" -- apps/docker-daemon .github/workflows/ci.yaml; then
+            echo "No change under apps/docker-daemon or ci.yaml; skipping"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Toolchain
+        if: steps.scope.outputs.run == 'true'
+        run: rustup component add rustfmt clippy
+      - name: Cargo cache
+        if: steps.scope.outputs.run == 'true'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: apps/docker-daemon
+      - name: Fmt
+        if: steps.scope.outputs.run == 'true'
+        run: cargo fmt --check
+      - name: Clippy
+        if: steps.scope.outputs.run == 'true'
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        if: steps.scope.outputs.run == 'true'
+        run: cargo test --locked
+      - name: Entrypoint test
+        if: steps.scope.outputs.run == 'true'
+        working-directory: ${{ github.workspace }}
+        run: bash apps/docker-daemon/tests/entrypoint_test.sh
+      - name: Pull Docker Hub images through the mirror
+        if: steps.scope.outputs.run == 'true'
+        working-directory: ${{ github.workspace }}
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
+      - name: Set up Buildx
+        id: set_up_buildx
+        if: steps.scope.outputs.run == 'true'
+        continue-on-error: true
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - name: Back off before retrying Set up Buildx
+        if: steps.set_up_buildx.outcome == 'failure'
+        run: |
+          echo "Set up Buildx failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Set up Buildx (retry)
+        if: steps.set_up_buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - name: Build both release arches (no push)
+        if: steps.scope.outputs.run == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: apps/docker-daemon
+          file: apps/docker-daemon/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          load: false
+          cache-from: type=gha,scope=docker-daemon
+          cache-to: type=gha,mode=max,scope=docker-daemon
+      - name: Build the amd64 candidate
+        if: steps.scope.outputs.run == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: apps/docker-daemon
+          file: apps/docker-daemon/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: curie-ci/docker-daemon:candidate
+          cache-from: type=gha,scope=docker-daemon
+      - name: Escape test against the candidate
+        if: steps.scope.outputs.run == 'true'
+        working-directory: ${{ github.workspace }}
+        run: bash apps/docker-daemon/tests/e2e.sh curie-ci/docker-daemon:candidate --registry-mirror=https://mirror.gcr.io
   # only the package's DECLARED dependencies. aci-protocol is a uv workspace
   # member imported by handlers.py/queue.py; if it is not declared in
   # apps/dispatcher/pyproject.toml it stays importable from a source checkout
@@ -1460,7 +1950,19 @@ jobs:
         with:
           persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Sync workspace
@@ -1526,6 +2028,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Download the curie binary built by the Rust job
         uses: actions/download-artifact@v8
         with:
@@ -1694,6 +2198,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Download the curie binary built by the Rust job
         uses: actions/download-artifact@v8
         with:
@@ -1725,6 +2231,48 @@ jobs:
           CURIE_BASE_TAG: ci-local
           CURIE_E2E_TIERS: ${{ needs.changes.outputs.skill_local_tiers }}
         run: bash cli/scripts/e2e-ladder.sh
+
+  # OIDC console login against a real Dex IdP (#2908, #3800). Runs whenever the
+  # local tier is selected: the API, the console UI proxy and compose wiring it
+  # drives are the local tier's surfaces. Its own runner, so it runs in parallel
+  # with the ladder. `curie dev oidc-e2e` runs the same driver locally.
+  e2e-oidc:
+    name: E2E OIDC console login (real Dex)
+    runs-on: ubuntu-latest
+    needs: [rust-build, changes, ci-images]
+    if: ${{ needs.changes.outputs.local == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Download the curie binary built by the Rust job
+        uses: actions/download-artifact@v8
+        with:
+          name: curie-x86_64-linux-${{ github.sha }}
+          path: cli/target/release
+      - name: Make the binary executable
+        run: chmod +x cli/target/release/curie
+      - name: Load the images built by the ci-images job
+        uses: ./.github/actions/load-ci-images
+        with:
+          images: "{api,ui}"
+      - name: Tag the candidate API and console UI for the driver
+        run: |
+          set -euo pipefail
+          docker tag curie-ci/api:candidate ghcr.io/curie-eng/curie-api:oidc-e2e
+          docker tag curie-ci/ui:candidate ghcr.io/curie-eng/curie-ui:oidc-e2e
+      - name: OIDC end to end (real Dex, isolated compose project)
+        env:
+          CURIE_BIN: cli/target/release/curie
+          CURIE_OIDC_E2E_IMAGE_TAG: oidc-e2e
+        run: bash cli/scripts/oidc-e2e.sh --evidence "$RUNNER_TEMP/oidc-e2e-evidence.json"
+      - name: Upload the OIDC evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: oidc-e2e-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/oidc-e2e-evidence.json
+          if-no-files-found: warn
 
   # LOCAL-RELEASE RUNG -- split into its own job (issue #695 follow-up) so it
   # runs in PARALLEL with the skill+local rung above instead of appended after
@@ -1828,11 +2376,17 @@ jobs:
       local: ${{ steps.filter.outputs.local }}
       local_release: ${{ steps.filter.outputs.local_release }}
       cluster: ${{ steps.filter.outputs.cluster }}
+      chart_scenarios: ${{ steps.filter.outputs.chart_scenarios }}
       released_upgrade: ${{ steps.filter.outputs.released_upgrade }}
       released_upgrade_full: ${{ steps.filter.outputs.released_upgrade_full }}
       skill_local_tiers: ${{ steps.filter.outputs.skill_local_tiers }}
       images: ${{ steps.filter.outputs.images }}
       cli_release: ${{ steps.filter.outputs.cli_release }}
+      pytest: ${{ steps.filter.outputs.pytest }}
+      pytest_deselect: ${{ steps.filter.outputs.pytest_deselect }}
+      version_only: ${{ steps.filter.outputs.version_only }}
+      factory: ${{ steps.filter.outputs.factory }}
+      approval_resume: ${{ steps.filter.outputs.approval_resume }}
       runtime_assertions: ${{ steps.runtime.outputs.runtime_assertions }}
     steps:
       - uses: actions/checkout@v7
@@ -1840,7 +2394,17 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       # Kind normally stays on main. Next pull requests and pushes to next
       # omit it except when a PR changes cluster runtime assertions or the
       # released-upgrade jobs; a dispatch (including nightly) keeps it.
@@ -1902,6 +2466,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Download the curie binary built by the Rust job
         uses: actions/download-artifact@v8
         with:
@@ -1910,6 +2476,22 @@ jobs:
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      # The images come from the ci-images job, which built them once for this
+      # run; they are loaded into the local daemon store so `kind load` picks
+      # them up with no registry round trip. The four product images drive the
+      # cluster round trip. The dispatcher is not deployed.
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -1961,10 +2543,12 @@ jobs:
       # versions. The `kind` Docker network (created here) is the bridge every
       # node container sits on; its gateway is the host address the in-cluster
       # worker reaches the reply stub through, resolved below.
+      - name: Ensure kind-registry exists
+        run: bash cli/scripts/ensure-kind-registry.sh
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
-        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
@@ -1980,10 +2564,11 @@ jobs:
         run: |
           echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
           kind delete cluster --name curie-e2e 2>/dev/null || true
+          bash cli/scripts/ensure-kind-registry.sh
           sleep 15
       - name: Create the kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
-        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
@@ -1994,7 +2579,12 @@ jobs:
       - name: Install Calico so NetworkPolicy is actually enforced
         run: |
           set -euo pipefail
-          kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
+            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
+            | sha256sum --check --strict
+          kubectl apply -f "$calico_manifest"
           kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
           kubectl wait --for=condition=Ready node --all --timeout=300s
       # Load the product images into the node store with no registry round trip.
@@ -2009,7 +2599,19 @@ jobs:
             kind load docker-image "$img" --name curie-e2e
           done
       - name: Install uv for publication proof
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        id: install_uv_for_publication_proof
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv for publication proof
+        if: steps.install_uv_for_publication_proof.outcome == 'failure'
+        run: |
+          echo "Install uv for publication proof failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv for publication proof (retry)
+        if: steps.install_uv_for_publication_proof.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       - name: Prove publication Job adoption and failure reporting
@@ -2145,6 +2747,13 @@ jobs:
       # neither reads nor disturbs the release installed above.
       - name: Mail-adapter external-collector egress enforces (not just rendered)
         run: bash scripts/check-mail-adapter-otel-egress.sh charts/curie
+      # #3853: a credential free redeploy must clear the API secret names and
+      # the Helm binding, then a turn must start. Runs after the enforcement
+      # checks because the redeploy helm-upgrades the release.
+      - name: Credential free redeploy clears stale secret metadata
+        env:
+          CURIE_BIN: cli/target/release/curie
+        run: bash cli/scripts/credential-free-redeploy-cluster.sh
       # Surface why on any failure above: pod states, recent events, and the
       # worker/runner logs are what localize a reachability or scheduling break.
       - name: Dump cluster diagnostics on failure
@@ -2173,25 +2782,136 @@ jobs:
           path: ${{ runner.temp }}/runtime-assertion-receipts
           if-no-files-found: ignore
 
-  # CHART RUNTIME REGRESSIONS, in parallel with the cluster rung. Single
-  # regression proofs that need an enforcing Calico cluster but neither the
-  # curie binary nor the product images, so this job does not wait on the Rust
-  # build and finishes inside the rung. It is selected by the same cluster tier
-  # (every charts/ change), and `E2E required` needs it: the Langfuse readiness
-  # assertion and the connector readiness probe are registered runtime
-  # assertions (#3391), and a failure here reddens the required verdict exactly
-  # as the rung does. Each proof uses its own namespace, so they share the
-  # cluster.
-  e2e-cluster-chart-regressions:
-    name: E2E chart runtime regressions (kind, Calico)
+  # The factory driver owns its kind cluster, registry, and local endpoints.
+  # Replay drives the production factory from one labelled fixture issue to
+  # its pull request and final comment without a provider key.
+  e2e-scripted-factory:
+    name: E2E scripted factory scenario (kind, scripted model)
     runs-on: ubuntu-latest
-    needs: [changes, ci-images]
-    if: ${{ needs.changes.outputs.cluster == 'true' }}
+    needs: [rust-build, changes, ci-images]
+    if: ${{ needs.changes.outputs.factory == 'true' }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
+      - name: Download the curie binary built by the Rust job
+        uses: actions/download-artifact@v8
+        with:
+          name: curie-x86_64-linux-${{ github.sha }}
+          path: cli/target/release
+      - name: Make the binary executable
+        run: chmod +x cli/target/release/curie
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      # The driver creates and deletes its own cluster. The action only installs
+      # kind and kubectl; its post step still removes kind-registry, so that
+      # container must exist.
+      - name: Ensure kind-registry exists
+        run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Install kind and kubectl without creating a cluster
+        id: install_kind
+        continue-on-error: true
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          install_only: true
+      - name: Back off before retrying Install kind and kubectl without creating a cluster
+        if: steps.install_kind.outcome == 'failure'
+        run: |
+          echo "Install kind and kubectl without creating a cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          bash cli/scripts/ensure-kind-registry.sh
+          sleep 15
+      - name: Install kind and kubectl without creating a cluster (retry)
+        if: steps.install_kind.outcome == 'failure'
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          install_only: true
+      # This ubuntu-latest job owns a disposable hosted runner. The Android,
+      # .NET and Haskell SDKs are unused here; remove only those preinstalled
+      # SDK trees before downloading images to preserve the driver's 30 GB floor.
+      - name: Free disk for the disposable factory cluster
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+      - name: Load the four images built by the ci-images job
+        uses: ./.github/actions/load-ci-images
+        with:
+          images: "{api,worker,ui,runner}"
+      - name: Tag the images for the factory driver
+        run: |
+          set -euo pipefail
+          docker tag curie-ci/api:candidate curie-api:local
+          docker tag curie-ci/worker:candidate curie-worker:local
+          docker tag curie-ci/ui:candidate curie-ui:local
+          docker tag curie-ci/runner:candidate curie-runner:latest
+      - name: Run the scripted factory scenario
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          BUILDX_BUILDER: default
+        run: python3 tools/factory-e2e/factory_e2e.py scripted
+      - name: Upload scripted factory evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: scripted-factory-evidence-${{ github.sha }}
+          path: target/factory-e2e/scripted-*.json
+          if-no-files-found: warn
+
+  # CHART RUNTIME REGRESSIONS, in parallel with the cluster rung. Most
+  # regression proofs use this job's enforcing Calico cluster. The workspace
+  # regression also uses the release CLI and candidate product images built
+  # by the upstream jobs. The selector chooses each proof from its inputs
+  # whenever the cluster tier is selected, and `E2E required` needs the job:
+  # the Langfuse readiness
+  # assertion and the connector readiness probe are registered runtime
+  # assertions (#3391), and a failure here reddens the required verdict exactly
+  # as the rung does. Proofs using this job's cluster each own their namespace.
+  e2e-cluster-chart-regressions:
+    name: E2E chart runtime regressions (kind, Calico)
+    runs-on: ubuntu-latest
+    needs: [rust-build, changes, ci-images]
+    if: ${{ needs.changes.outputs.chart_scenarios != '[]' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
+      - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      # The fixture image delays Postgres for the Langfuse startup regression.
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -2224,10 +2944,12 @@ jobs:
           EOF
       # Disposable kind cluster. Pins both the action and the kind/node-image
       # versions.
+      - name: Ensure kind-registry exists
+        run: bash cli/scripts/ensure-kind-registry.sh
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
-        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
@@ -2243,10 +2965,11 @@ jobs:
         run: |
           echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
           kind delete cluster --name curie-e2e 2>/dev/null || true
+          bash cli/scripts/ensure-kind-registry.sh
           sleep 15
       - name: Create the kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
-        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
@@ -2257,7 +2980,12 @@ jobs:
       - name: Install Calico so NetworkPolicy is actually enforced
         run: |
           set -euo pipefail
-          kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
+            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
+            | sha256sum --check --strict
+          kubectl apply -f "$calico_manifest"
           kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
           kubectl wait --for=condition=Ready node --all --timeout=300s
       - name: Install YAML parser for the installation identity proof
@@ -2269,6 +2997,7 @@ jobs:
           set -euo pipefail
           install -m 600 /home/runner/.kube/config "$KUBECONFIG"
       - name: Installation identity Secret lifecycle
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'installation-identity') }}
         env:
           KUBECONFIG: ${{ runner.temp }}/curie-upgrade-drain-kubeconfig
           CURIE_UPGRADE_DRAIN_KIND_CONTEXT: kind-curie-e2e
@@ -2280,6 +3009,7 @@ jobs:
       # API server of 1.30 or newer, which this kind node image is. The script
       # names every object from RUN_ID and deletes them on exit.
       - name: End to end connector identity is denied outside its scope
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-identity') }}
         env:
           CURIE_E2E_IDENTITY_CONTEXT: kind-curie-e2e
           RUN_ID: ${{ github.run_id }}${{ github.run_attempt }}
@@ -2290,13 +3020,29 @@ jobs:
       # Per-agent runner resources (#3209, #3485). A render assertion that
       # lives under ci/runtime, so it runs here through the receipt runner.
       - name: Per-agent runner resource override renders
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-resources-render') }}
         run: |
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/runner-resources-assertions.sh
+      # Runner template admission (#3842). The worker's template and Secret
+      # writes are refused unless they keep the chart's shape: each denial must
+      # carry the policy's own message, and the same hostPath template from the
+      # cluster admin is admitted. Needs a real API server of 1.30 or newer.
+      # Every object is named from RUN_ID and verified gone on exit.
+      - name: Runner template admission refuses host escapes, token mounts, and unlisted images
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-template-admission') }}
+        env:
+          CURIE_ADMISSION_CONTEXT: kind-curie-e2e
+          RUN_ID: ${{ github.run_id }}${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/runner-template-admission-runtime.sh
       - name: Load the Postgres readiness fixture into the kind cluster
         run: kind load docker-image "curie-postgres-readiness:${GITHUB_SHA}" --name curie-e2e
       - name: Langfuse web waits for delayed Postgres without restarting
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'langfuse-postgres-readiness') }}
         env:
           READINESS_NAMESPACE: curie-1853-${{ github.run_id }}-${{ github.run_attempt }}
           READINESS_RELEASE: curie-1853-${{ github.run_id }}-${{ github.run_attempt }}
@@ -2311,13 +3057,26 @@ jobs:
       # The connector render needs the workspace. Kept out of the assertion
       # step so that step is only the receipt runner (#3391).
       - name: Install uv for the connector readiness render
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        id: install_uv_for_the_connector_readiness_render
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv for the connector readiness render
+        if: steps.install_uv_for_the_connector_readiness_render.outcome == 'failure'
+        run: |
+          echo "Install uv for the connector readiness render failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv for the connector readiness render (retry)
+        if: steps.install_uv_for_the_connector_readiness_render.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.13"
       # Connector readiness (#3338). The script defaults to k8scratch; this
       # job's kube context is kind-curie-e2e and must be passed explicitly.
       # The namespace is this run's id so a retry does not reuse a leftover.
       - name: Connector that never listens stays not-Ready until it binds
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-readiness') }}
         env:
           CONNECTOR_READINESS_CONTEXT: kind-curie-e2e
           CONNECTOR_READINESS_NAMESPACE: c3338-${{ github.run_id }}-${{ github.run_attempt }}
@@ -2331,8 +3090,72 @@ jobs:
       # undeclared control is blocked. Same non-vacuity gate as the mail
       # adapter check: a non-enforcing CNI FAILS, it does not skip. Own
       # namespace, so it neither reads nor disturbs the release above.
+      # It also holds a runner-labelled pod to the rendered policies for
+      # allowedEgress 0.0.0.0/0 and requires a private-range pod peer it reached
+      # under the pre-change shape to be refused (#3842 AC3).
       - name: Runner BYO egress enforces (not just rendered)
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-byo-egress') }}
         run: bash scripts/check-runner-byo-egress.sh charts/curie
+      # The actual packaged-chart hooks must judge a no-restart upgrade and
+      # still reject an informer RBAC failure (#4197). The scenario owns and
+      # tears down its separate kind cluster; render assertions alone cannot
+      # prove Helm leaves a serving release deployed.
+      - name: Controller preflight accepts a serving upgrade and refuses broken RBAC
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'controller-preflight') }}
+        run: |
+          set -euo pipefail
+          uv run bash charts/curie/ci/scenarios/controller-preflight-kind.sh
+      - name: Download the workspace diagnostic CLI
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: curie-x86_64-linux-${{ github.sha }}
+          path: cli/target/release
+      - name: Load the workspace diagnostic candidate images
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
+        uses: ./.github/actions/load-ci-images
+        with:
+          images: "{api,worker,runner}"
+      - name: Stage the workspace diagnostic images in kind
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
+        run: |
+          set -euo pipefail
+          chmod +x cli/target/release/curie
+          docker tag curie-ci/api:candidate curie-api:wsdiag-${{ github.sha }}
+          docker tag curie-ci/worker:candidate curie-worker:wsdiag-${{ github.sha }}
+          docker tag curie-ci/runner:candidate curie-runner:wsdiag-${{ github.sha }}
+          kind load docker-image \
+            curie-api:wsdiag-${{ github.sha }} \
+            curie-worker:wsdiag-${{ github.sha }} \
+            curie-runner:wsdiag-${{ github.sha }} --name curie-e2e
+      - name: Workspace dependency failure reaches the terminal diagnostic
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') }}
+        timeout-minutes: 30
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
+          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh
+      - name: Quota progress regression
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
+        timeout-minutes: 30
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
+          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh
       - name: Dump cluster diagnostics on failure
         if: failure()
         run: |
@@ -2366,6 +3189,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Download the curie binary built by the Rust job
         uses: actions/download-artifact@v8
         with:
@@ -2374,6 +3199,22 @@ jobs:
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      # The images come from the ci-images job, which built them once for this
+      # run; they are loaded into the local daemon store so `kind load` picks
+      # them up with no registry round trip. The four product images drive the
+      # cluster round trip. The dispatcher is not deployed.
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -2425,10 +3266,12 @@ jobs:
       # versions. The `kind` Docker network (created here) is the bridge every
       # node container sits on; its gateway is the host address the in-cluster
       # worker reaches the reply stub through, resolved below.
+      - name: Ensure kind-registry exists
+        run: bash cli/scripts/ensure-kind-registry.sh
       - name: Create the kind cluster
         id: create_kind_cluster
         continue-on-error: true
-        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
@@ -2444,10 +3287,11 @@ jobs:
         run: |
           echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
           kind delete cluster --name curie-e2e 2>/dev/null || true
+          bash cli/scripts/ensure-kind-registry.sh
           sleep 15
       - name: Create the kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
-        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
@@ -2458,7 +3302,12 @@ jobs:
       - name: Install Calico so NetworkPolicy is actually enforced
         run: |
           set -euo pipefail
-          kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
+            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
+            | sha256sum --check --strict
+          kubectl apply -f "$calico_manifest"
           kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
           kubectl wait --for=condition=Ready node --all --timeout=300s
       # Load the product images into the node store with no registry round trip.
@@ -2575,6 +3424,254 @@ jobs:
         run: |
           kubectl delete namespace curie \
 
+  # APPROVAL RESUME AFTER WORKER AND STORE RESTARTS (#4016). An approval
+  # resolved while the resume store (Valkey) and the worker restart must still
+  # resume the original turn within 300 s, running the gated tool exactly once.
+  # Unlike the rollout recovery job it runs on pull requests, because the
+  # resolve-to-resume path is only proven end to end on a real install. The
+  # selector picks it for worker and approval paths, and kind omission on next
+  # drops it like every other kind job.
+  e2e-cluster-approval-resume-restarts:
+    name: E2E approval resume after worker and store restarts (kind)
+    runs-on: ubuntu-latest
+    needs: [rust-build, changes, ci-images]
+    if: ${{ needs.changes.outputs.approval_resume == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
+      - name: Download the curie binary built by the Rust job
+        uses: actions/download-artifact@v8
+        with:
+          name: curie-x86_64-linux-${{ github.sha }}
+          path: cli/target/release
+      - name: Make the binary executable
+        run: chmod +x cli/target/release/curie
+      - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      # The images come from the ci-images job, which built them once for this
+      # run; they are loaded into the local daemon store so `kind load` picks
+      # them up with no registry round trip. The four product images drive the
+      # cluster round trip. The dispatcher is not deployed.
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      # The images come from the ci-images job, which built them once for this
+      # run; they are loaded into the local daemon store so `kind load` picks
+      # them up with no registry round trip. The four product images drive the
+      # cluster round trip. The dispatcher is not deployed.
+      - name: Load the images built by the ci-images job
+        uses: ./.github/actions/load-ci-images
+        with:
+          images: "{api,worker,ui,runner}"
+      - name: Tag the images for the kind node store
+        run: |
+          set -euo pipefail
+          docker tag curie-ci/api:candidate curie-api:local
+          docker tag curie-ci/worker:candidate curie-worker:local
+          docker tag curie-ci/ui:candidate curie-ui:local
+          docker tag curie-ci/runner:candidate curie-runner:latest
+      # kind config: map the UI NodePort (chart default 30080) to the host so
+      # `cluster deploy`'s UI `/api` NodePort discovery -- which resolves the
+      # loopback kubeconfig host (127.0.0.1) -- reaches the in-cluster API.
+      #
+      # disableDefaultCNI is load-bearing (#1153). kind's default kindnet
+      # implements NO NetworkPolicy controller, so every policy the chart ships
+      # -- including Rail 1's default-deny egress for runner sandboxes
+      # (ADR-0067) -- is applied and then silently never evaluated. A totally
+      # broken policy is indistinguishable from a correct one, which is how an
+      # egress rule naming a Service ClusterIP (unmatchable: kube-proxy DNATs
+      # to a pod IP before policy runs) reached a real cluster. Calico is
+      # installed below so this cluster behaves like the k3s and EKS clusters
+      # Curie actually runs on.
+      - name: Write the kind cluster config
+        run: |
+          cat > kind-config.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          networking:
+            disableDefaultCNI: true
+            podSubnet: "192.168.0.0/16"
+          nodes:
+            - role: control-plane
+              extraPortMappings:
+                - containerPort: 30080
+                  hostPort: 30080
+                  listenAddress: "127.0.0.1"
+                  protocol: TCP
+          EOF
+      # Disposable kind cluster. Pins both the action and the kind/node-image
+      # versions. The `kind` Docker network (created here) is the bridge every
+      # node container sits on; its gateway is the host address the in-cluster
+      # worker reaches the reply stub through, resolved below.
+      - name: Ensure kind-registry exists
+        run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Create the kind cluster
+        id: create_kind_cluster
+        continue-on-error: true
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          cluster_name: curie-e2e
+          config: kind-config.yaml
+      # A first attempt that died partway can leave nodes behind, and
+      # `kind create cluster` refuses to run against a cluster name that
+      # already has any. Tear the partial cluster down so the retry starts
+      # clean. `kind` is absent from PATH when attempt 1 died before the
+      # action installed it, which is what the `|| true` covers.
+      - name: Back off before retrying Create the kind cluster
+        if: steps.create_kind_cluster.outcome == 'failure'
+        run: |
+          echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          kind delete cluster --name curie-e2e 2>/dev/null || true
+          bash cli/scripts/ensure-kind-registry.sh
+          sleep 15
+      - name: Create the kind cluster (retry)
+        if: steps.create_kind_cluster.outcome == 'failure'
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          cluster_name: curie-e2e
+          config: kind-config.yaml
+      # The cluster has no CNI until this lands (disableDefaultCNI above), so
+      # every node stays NotReady and nothing schedules until Calico is up.
+      - name: Install Calico so NetworkPolicy is actually enforced
+        run: |
+          set -euo pipefail
+          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
+            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
+            | sha256sum --check --strict
+          kubectl apply -f "$calico_manifest"
+          kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
+          kubectl wait --for=condition=Ready node --all --timeout=300s
+      # Load the product images into the node store with no registry round trip.
+      - name: Load images into the kind cluster
+        run: |
+          set -euo pipefail
+          for img in \
+            curie-api:local \
+            curie-worker:local \
+            curie-ui:local \
+            curie-runner:latest; do
+            kind load docker-image "$img" --name curie-e2e
+          done
+      # The pod-reachable host for the reply stub: the kind Docker network
+      # gateway. Every node container sits on this bridge, so a pod egressing
+      # through its node reaches the host here; the stub binds 0.0.0.0 and answers
+      # on it. Auto-detection (the loopback API server) cannot produce this value
+      # on kind. Resolved before the install now that
+      # the install trusts the stub origin, and it only needs the kind node
+      # container, which is already running by here.
+      - name: Resolve the pod-reachable host for the reply stub
+        run: |
+          set -euo pipefail
+          # The kind bridge's IPv4 gateway is the host address every node -- and
+          # every pod egressing through its node -- can reach; the stub binds
+          # 0.0.0.0 and answers on it. The `kind` Docker network is frequently
+          # dual-stack, so IPAM.Config carries both an IPv4 and an IPv6 entry in
+          # an unspecified order (and an entry may omit Gateway) -- `index 0` is
+          # not reliably the IPv4 one, which is why it came back empty. Read the
+          # gateway the control-plane node container actually got first, then
+          # fall back to ranging the network's IPAM for a dotted-quad gateway.
+          node="curie-e2e-control-plane"
+          gw="$(docker inspect "$node" --format '{{ .NetworkSettings.Networks.kind.Gateway }}' 2>/dev/null || true)"
+          if [[ ! "$gw" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            gw="$(docker network inspect kind \
+                    --format '{{range .IPAM.Config}}{{println .Gateway}}{{end}}' 2>/dev/null \
+                  | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | head -1 || true)"
+          fi
+          if [[ ! "$gw" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            echo "could not resolve the kind network IPv4 gateway" >&2
+            echo "--- docker network inspect kind ---" >&2
+            docker network inspect kind >&2 || true
+            echo "--- docker inspect $node (.NetworkSettings.Networks) ---" >&2
+            docker inspect "$node" --format '{{json .NetworkSettings.Networks}}' >&2 || true
+            exit 1
+          fi
+          echo "kind network gateway (worker->stub reply host): $gw"
+          echo "CURIE_E2E_LISTEN_HOST=$gw" >> "$GITHUB_ENV"
+      # Helm-install the platform through the operator wrapper. --dev pins the
+      # chart's deterministic published secrets (so `cluster message` can read
+      # them back); --fake-model seals the install credential-free. The --set
+      # overrides repoint every first-party image at the just-loaded local tags
+      # with pullPolicy Never (the runner AND its prewarm DaemonSet), force gVisor
+      # off (no runsc on kind nodes), and drop the dispatcher (no Slack; its
+      # presence would trip the `cluster message` reply-hijack guard).
+      - name: Install the platform (curie cluster up)
+        env:
+          CURIE_BIN: cli/target/release/curie
+        run: |
+          set -euo pipefail
+          "$CURIE_BIN" cluster up \
+            --chart charts/curie \
+            --dev \
+            --fake-model \
+            --set security.gvisor.mode=off \
+            --set dispatcher.deploy=false \
+            --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
+            --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
+            --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \
+            --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=latest --set agentSandbox.runner.imagePullPolicy=Never \
+            --set agentSandbox.runner.prewarm.imagePullPolicy=Never
+      # `cluster up` does not `helm --wait` (the argv stays a thin wrapper), so
+      # wait for the rollouts the round trip depends on before driving it. The
+      # controller-ready preflight already gated the agent-sandbox controller
+      # during install; these cover the app tier and the prewarm cache. Langfuse
+      # and ClickHouse are intentionally NOT waited on -- a fake-model turn does
+      # not need traces to have flushed, and they are the slowest pods to settle.
+      - name: Wait for the platform to become ready
+        run: |
+          set -euo pipefail
+          kubectl rollout status deploy/curie-api -n curie --timeout=300s
+          kubectl rollout status deploy/curie-worker -n curie --timeout=300s
+          kubectl rollout status deploy/curie-ui -n curie --timeout=300s
+          kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=300s
+      # #4016: resolve a pending Bash approval through an operator principal
+      # while Valkey and the worker restart, then require the original turn to
+      # finalize within 300 s with exactly one gated tool call. The script
+      # deletes only the resources it created.
+      - name: Approval resume after worker and store restarts
+        env:
+          CURIE_BIN: cli/target/release/curie
+        run: bash cli/scripts/e2e-cluster-approval-resume-restarts.sh
+      # Surface why on any failure above: pod states, recent events, and the
+      # worker, api, and runner logs. The api log carries the resolve and the
+      # resume enqueue or reconciler retry; the runner log carries the tool call.
+      - name: Dump cluster diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl get events -n curie --sort-by=.lastTimestamp | tail -50 || true
+          kubectl describe pods -n curie -l app.kubernetes.io/component=runner-sandbox || true
+          kubectl logs -n curie -l app.kubernetes.io/component=worker --tail=100 || true
+          kubectl logs -n curie -l app.kubernetes.io/component=api --tail=200 || true
+          kubectl logs -n curie -l app.kubernetes.io/component=runner-sandbox --all-containers --prefix --tail=200 || true
+      # Delete only this job's namespaced release resources. Do not uninstall or
+      # delete the shared controller namespace: the pinned kind action owns final
+      # disposal of the whole single-use cluster. This still runs after failure.
+      - name: Tear down the disposable cluster release
+        if: always()
+        run: |
+          kubectl delete namespace curie \
+            --ignore-not-found --wait=false 2>/dev/null || true
+
   # RELEASED CHART UPGRADE REGRESSION (issues #2097 and #2194). This is separate
   # from the fresh install cluster rung because it starts from published charts
   # and their published image tags. v0.8.2 covers placement-null and blank
@@ -2592,6 +3689,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Download the candidate curie binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -2600,6 +3699,18 @@ jobs:
       - name: Make the candidate binary executable
         run: chmod +x cli/target/release/curie
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -2631,8 +3742,27 @@ jobs:
                   listenAddress: "127.0.0.1"
                   protocol: TCP
           EOF
+      - name: Ensure kind-registry exists
+        run: bash cli/scripts/ensure-kind-registry.sh
       - name: Create the disposable kind cluster
-        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        id: create_the_disposable_kind_cluster
+        continue-on-error: true
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+          cluster_name: curie-upgrade
+          config: kind-upgrade-config.yaml
+      - name: Back off before retrying Create the disposable kind cluster
+        if: steps.create_the_disposable_kind_cluster.outcome == 'failure'
+        run: |
+          echo "Create the disposable kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          bash cli/scripts/ensure-kind-registry.sh
+          kind delete cluster --name curie-upgrade 2>/dev/null || true
+          sleep 15
+      - name: Create the disposable kind cluster (retry)
+        if: steps.create_the_disposable_kind_cluster.outcome == 'failure'
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
@@ -2642,7 +3772,7 @@ jobs:
         run: |
           set -euo pipefail
           calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
-          curl -fsSL -o "$calico_manifest" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
             https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
           echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
             | sha256sum --check --strict
@@ -2982,7 +4112,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -3003,8 +4147,27 @@ jobs:
           nodes:
             - role: control-plane
           EOF
+      - name: Ensure kind-registry exists
+        run: bash cli/scripts/ensure-kind-registry.sh
       - name: Create the disposable kind cluster
-        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        id: create_the_disposable_kind_cluster
+        continue-on-error: true
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+          cluster_name: curie-upgrade-negative
+          config: kind-upgrade-negative-config.yaml
+      - name: Back off before retrying Create the disposable kind cluster
+        if: steps.create_the_disposable_kind_cluster.outcome == 'failure'
+        run: |
+          echo "Create the disposable kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          bash cli/scripts/ensure-kind-registry.sh
+          kind delete cluster --name curie-upgrade-negative 2>/dev/null || true
+          sleep 15
+      - name: Create the disposable kind cluster (retry)
+        if: steps.create_the_disposable_kind_cluster.outcome == 'failure'
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
@@ -3014,7 +4177,7 @@ jobs:
         run: |
           set -euo pipefail
           calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
-          curl -fsSL -o "$calico_manifest" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
             https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
           echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
             | sha256sum --check --strict
@@ -3178,6 +4341,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Download the candidate curie binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -3186,6 +4351,18 @@ jobs:
       - name: Make the candidate binary executable
         run: chmod +x cli/target/release/curie
       - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
@@ -3217,10 +4394,12 @@ jobs:
                   listenAddress: "127.0.0.1"
                   protocol: TCP
           EOF
+      - name: Ensure kind-registry exists
+        run: bash cli/scripts/ensure-kind-registry.sh
       - name: Create the disposable kind cluster
         id: create_kind_cluster
         continue-on-error: true
-        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
@@ -3231,10 +4410,11 @@ jobs:
         run: |
           echo "Create the disposable kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
           kind delete cluster --name curie-upgrade-matrix 2>/dev/null || true
+          bash cli/scripts/ensure-kind-registry.sh
           sleep 15
       - name: Create the disposable kind cluster (retry)
         if: steps.create_kind_cluster.outcome == 'failure'
-        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           version: v0.24.0
           node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
@@ -3244,7 +4424,7 @@ jobs:
         run: |
           set -euo pipefail
           calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
-          curl -fsSL -o "$calico_manifest" \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
             https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
           echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
             | sha256sum --check --strict
@@ -3291,6 +4471,56 @@ jobs:
           kubectl delete namespace acme-2590 --ignore-not-found --wait=false 2>/dev/null || true
           kind delete cluster --name curie-upgrade-matrix 2>/dev/null || true
 
+  # Needs only `changes`, so an unregistered or untiered runtime assertion
+  # fails within minutes instead of after the kind matrix. It is a separate job
+  # rather than steps in `changes` because a failed `changes` would skip every
+  # downstream job and hide their evidence; `E2E required` carries its result.
+  runtime-assertion-registration:
+    name: Runtime assertion registration
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: [changes]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install uv for the runtime assertion gate
+        id: install_uv_for_the_runtime_assertion_gate
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Back off before retrying Install uv for the runtime assertion gate
+        if: steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure'
+        run: |
+          echo "Install uv for the runtime assertion gate failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv for the runtime assertion gate (retry)
+        if: steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      # #3391: an added or changed charts/curie/ci/runtime assertion counts only
+      # when a Calico cluster job this verdict needs runs it through the
+      # receipt runner, and that exact blob left a pass receipt. The negative
+      # controls run on every verdict so the gate can never pass vacuously.
+      - name: Runtime assertion gate negative controls
+        run: |
+          set -euo pipefail
+          uv run --no-project --with pyyaml==6.0.3 python tools/runtime-assertion-gate/gate.py \
+            self-test --workflow .github/workflows/ci.yaml \
+            --registered charts/curie/ci/runtime/publication-job-assertions.sh
+      - name: Changed runtime assertions are registered
+        if: needs.changes.outputs.runtime_assertions != '[]'
+        env:
+          RUNTIME_ASSERTIONS: ${{ needs.changes.outputs.runtime_assertions }}
+          CLUSTER_SELECTED: ${{ needs.changes.outputs.cluster }}
+        run: |
+          set -euo pipefail
+          if [[ "$CLUSTER_SELECTED" != "true" ]]; then
+            echo "Changed runtime assertions need the cluster tier, which was not selected" >&2
+            exit 1
+          fi
+          uv run --no-project --with pyyaml==6.0.3 python tools/runtime-assertion-gate/gate.py \
+            registration --workflow .github/workflows/ci.yaml --scripts "$RUNTIME_ASSERTIONS"
+
   e2e-required:
     name: E2E required
     runs-on: ubuntu-latest
@@ -3300,7 +4530,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
+    needs: [changes, runtime-assertion-registration, e2e-ladder, e2e-oidc, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-cluster-approval-resume-restarts, e2e-scripted-factory, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
     # A cancelled run leaves no evidence and must rerun. In a completed run,
     # every dependency outcome reaches the strict matcher below, which rejects
     # selected results other than success.
@@ -3309,18 +4539,25 @@ jobs:
       - name: Require exact selected outcomes
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
+          REGISTRATION_RESULT: ${{ needs.runtime-assertion-registration.result }}
           EVENT_NAME: ${{ github.event_name }}
           SKILL_SELECTED: ${{ needs.changes.outputs.skill }}
           LOCAL_SELECTED: ${{ needs.changes.outputs.local }}
           LOCAL_RELEASE_SELECTED: ${{ needs.changes.outputs.local_release }}
           CLUSTER_SELECTED: ${{ needs.changes.outputs.cluster }}
+          CHART_SCENARIOS: ${{ needs.changes.outputs.chart_scenarios }}
           RELEASED_UPGRADE_SELECTED: ${{ needs.changes.outputs.released_upgrade }}
           RELEASED_UPGRADE_FULL: ${{ needs.changes.outputs.released_upgrade_full }}
+          APPROVAL_RESUME_SELECTED: ${{ needs.changes.outputs.approval_resume }}
+          FACTORY_SELECTED: ${{ needs.changes.outputs.factory }}
           SKILL_LOCAL_RESULT: ${{ needs.e2e-ladder.result }}
+          OIDC_RESULT: ${{ needs.e2e-oidc.result }}
           LOCAL_RELEASE_RESULT: ${{ needs.e2e-ladder-release.result }}
           CLUSTER_RESULT: ${{ needs.e2e-ladder-cluster.result }}
           CLUSTER_CHART_RESULT: ${{ needs.e2e-cluster-chart-regressions.result }}
           ROLLOUT_RECOVERY_RESULT: ${{ needs.e2e-cluster-rollout-recovery.result }}
+          APPROVAL_RESUME_RESULT: ${{ needs.e2e-cluster-approval-resume-restarts.result }}
+          FACTORY_RESULT: ${{ needs.e2e-scripted-factory.result }}
           RELEASED_UPGRADE_RESULT: ${{ needs.e2e-released-upgrade.result }}
           RELEASED_UPGRADE_NEGATIVE_RESULT: ${{ needs.e2e-released-upgrade-negative.result }}
           UPGRADE_MATRIX_SHARDS_RESULT: ${{ needs.e2e-cluster-upgrade-matrix-shards.result }}
@@ -3330,10 +4567,13 @@ jobs:
 
           validate_selected_outcomes() {
             if [[ "$SKILL_LOCAL_RESULT" != "$skill_local_expected" ||
+                  "$OIDC_RESULT" != "$oidc_expected" ||
                   "$LOCAL_RELEASE_RESULT" != "$local_release_expected" ||
                   "$CLUSTER_RESULT" != "$cluster_expected" ||
-                  "$CLUSTER_CHART_RESULT" != "$cluster_expected" ||
+                  "$CLUSTER_CHART_RESULT" != "$cluster_chart_expected" ||
                   "$ROLLOUT_RECOVERY_RESULT" != "$rollout_recovery_expected" ||
+                  "$APPROVAL_RESUME_RESULT" != "$approval_resume_expected" ||
+                  "$FACTORY_RESULT" != "$factory_expected" ||
                   "$RELEASED_UPGRADE_RESULT" != "$released_upgrade_expected" ||
                   "$RELEASED_UPGRADE_NEGATIVE_RESULT" != "$released_upgrade_expected" ||
                   "$UPGRADE_MATRIX_RESULT" != "$upgrade_matrix_expected" ]]; then
@@ -3343,13 +4583,18 @@ jobs:
           }
 
           if [[ "$CHANGES_RESULT" != "success" ||
+                "$REGISTRATION_RESULT" != "success" ||
                 "$UPGRADE_MATRIX_SHARDS_RESULT" != "success" ||
                 ( "$SKILL_SELECTED" != "true" && "$SKILL_SELECTED" != "false" ) ||
                 ( "$LOCAL_SELECTED" != "true" && "$LOCAL_SELECTED" != "false" ) ||
                 ( "$LOCAL_RELEASE_SELECTED" != "true" && "$LOCAL_RELEASE_SELECTED" != "false" ) ||
                 ( "$CLUSTER_SELECTED" != "true" && "$CLUSTER_SELECTED" != "false" ) ||
+                "$CHART_SCENARIOS" != \[*\] ||
+                ( "$CHART_SCENARIOS" != "[]" && "$CLUSTER_SELECTED" == "false" ) ||
                 ( "$RELEASED_UPGRADE_SELECTED" != "true" && "$RELEASED_UPGRADE_SELECTED" != "false" ) ||
                 ( "$RELEASED_UPGRADE_FULL" != "true" && "$RELEASED_UPGRADE_FULL" != "false" ) ||
+                ( "$APPROVAL_RESUME_SELECTED" != "true" && "$APPROVAL_RESUME_SELECTED" != "false" ) ||
+                ( "$FACTORY_SELECTED" != "true" && "$FACTORY_SELECTED" != "false" ) ||
                 ( "$RELEASED_UPGRADE_FULL" == "true" && "$RELEASED_UPGRADE_SELECTED" != "true" ) ]]; then
             echo "E2E required failed" >&2
             exit 1
@@ -3359,6 +4604,11 @@ jobs:
           if [[ "$SKILL_SELECTED" == "true" || "$LOCAL_SELECTED" == "true" ]]; then
             skill_local_expected="success"
           fi
+          # Mirrors the OIDC job's if: it runs whenever the local tier does.
+          oidc_expected="skipped"
+          if [[ "$LOCAL_SELECTED" == "true" ]]; then
+            oidc_expected="success"
+          fi
           local_release_expected="skipped"
           if [[ "$LOCAL_RELEASE_SELECTED" == "true" ]]; then
             local_release_expected="success"
@@ -3367,10 +4617,24 @@ jobs:
           if [[ "$CLUSTER_SELECTED" == "true" ]]; then
             cluster_expected="success"
           fi
+          cluster_chart_expected="skipped"
+          if [[ "$CHART_SCENARIOS" != "[]" ]]; then
+            cluster_chart_expected="success"
+          fi
           # Mirrors the rollout recovery job's if: pushes and dispatches only.
           rollout_recovery_expected="skipped"
           if [[ "$CLUSTER_SELECTED" == "true" && "$EVENT_NAME" != "pull_request" ]]; then
             rollout_recovery_expected="success"
+          fi
+          # Mirrors the approval resume job's if (#4016), pull requests included.
+          approval_resume_expected="skipped"
+          if [[ "$APPROVAL_RESUME_SELECTED" == "true" ]]; then
+            approval_resume_expected="success"
+          fi
+          # Mirrors the scripted factory job's if, pull requests included.
+          factory_expected="skipped"
+          if [[ "$FACTORY_SELECTED" == "true" ]]; then
+            factory_expected="success"
           fi
           # Full runs include pushes, dispatches, and PRs editing an upgrade
           # job. Ordinary PRs selecting released-upgrade run one smoke shard.
@@ -3391,8 +4655,10 @@ jobs:
 
           # Flip every checked result in turn. Each flipped verdict must be
           # rejected, so no dependency can drop out of the validator unnoticed.
-          for name in SKILL_LOCAL_RESULT LOCAL_RELEASE_RESULT CLUSTER_RESULT \
-            CLUSTER_CHART_RESULT ROLLOUT_RECOVERY_RESULT RELEASED_UPGRADE_RESULT \
+          for name in SKILL_LOCAL_RESULT OIDC_RESULT LOCAL_RELEASE_RESULT CLUSTER_RESULT \
+            CLUSTER_CHART_RESULT ROLLOUT_RECOVERY_RESULT APPROVAL_RESUME_RESULT \
+            FACTORY_RESULT \
+            RELEASED_UPGRADE_RESULT \
             RELEASED_UPGRADE_NEGATIVE_RESULT UPGRADE_MATRIX_RESULT; do
             flipped="success"
             if [[ "${!name}" == "success" ]]; then
@@ -3411,32 +4677,22 @@ jobs:
         with:
           persist-credentials: false
       - name: Install uv for the runtime assertion gate
+        id: install_uv_for_the_runtime_assertion_gate
+        continue-on-error: true
         if: ${{ !cancelled() }}
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       # #3391: an added or changed charts/curie/ci/runtime assertion counts only
       # when a Calico cluster job this verdict needs runs it through the
-      # receipt runner, and that exact blob left a pass receipt. The negative
-      # controls run on every verdict so the gate can never pass vacuously.
-      - name: Runtime assertion gate negative controls
-        if: ${{ !cancelled() }}
+      # receipt runner, and that exact blob left a pass receipt. Registration
+      # and the negative controls run in runtime-assertion-registration.
+      - name: Back off before retrying Install uv for the runtime assertion gate
+        if: ${{ !cancelled() && steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure' }}
         run: |
-          set -euo pipefail
-          uv run --no-project --with pyyaml==6.0.3 python tools/runtime-assertion-gate/gate.py \
-            self-test --workflow .github/workflows/ci.yaml \
-            --registered charts/curie/ci/runtime/publication-job-assertions.sh
-      - name: Changed runtime assertions are registered
-        if: ${{ !cancelled() && needs.changes.outputs.runtime_assertions != '[]' }}
-        env:
-          RUNTIME_ASSERTIONS: ${{ needs.changes.outputs.runtime_assertions }}
-          CLUSTER_SELECTED: ${{ needs.changes.outputs.cluster }}
-        run: |
-          set -euo pipefail
-          if [[ "$CLUSTER_SELECTED" != "true" ]]; then
-            echo "Changed runtime assertions need the cluster tier, which was not selected" >&2
-            exit 1
-          fi
-          uv run --no-project --with pyyaml==6.0.3 python tools/runtime-assertion-gate/gate.py \
-            registration --workflow .github/workflows/ci.yaml --scripts "$RUNTIME_ASSERTIONS"
+          echo "Install uv for the runtime assertion gate failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv for the runtime assertion gate (retry)
+        if: ${{ !cancelled() && steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure' }}
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - name: Download runtime assertion receipts
         if: ${{ !cancelled() && needs.changes.outputs.runtime_assertions != '[]' }}
         uses: actions/download-artifact@v8
@@ -3456,3 +4712,29 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 tools/e2e-ci-selection/assert_upgrade_matrix_budget.py
+
+  turn-canary-contract:
+    name: Turn canary contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - run: uv sync --frozen
+      - run: uv run pytest -q examples/tests/test_turn_canary.py

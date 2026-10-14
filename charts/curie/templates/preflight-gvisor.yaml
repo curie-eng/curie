@@ -11,13 +11,13 @@ A pre-install / pre-upgrade hook (also runnable via `helm test`) whose pod runs
 UNDER the runner's RuntimeClass. This makes the check RBAC-free and tests the
 real property:
 
-  - RuntimeClass missing  -> the pod is rejected at admission ("RuntimeClass
+  1. RuntimeClass missing -> the pod is rejected at admission ("RuntimeClass
     '<name>' not found"), the hook Job fails, and the install is blocked -- so a
     runsc-less cluster never silently ships runner pods with no kernel isolation.
-  - RuntimeClass present but downgraded to runc -> the pod runs but /proc reports
-    the host kernel, and the script fails.
-  - gVisor actually enforced -> `uname` reports a gVisor sentry kernel
-    (e.g. 4.19.0-gvisor), distinct from the host, and the check passes.
+  2. RuntimeClass present but downgraded to runc -> the pod runs but `uname -v`
+    reports the host kernel version, and the script fails.
+  3. gVisor actually enforced -> `uname -v` equals the sentry version constant
+    from curie.gvisor.sentryKernelVersion, and the check passes.
 
 This fail-hard behavior is the `require` posture and, for real-model runs, the
 `auto` posture too. Only fake-model `auto` skips this Job (degrading to
@@ -37,7 +37,7 @@ metadata:
     # still fails the release closed. Otherwise it runs pre-install to block a
     # broken install up front. Both branches also run on `helm test`.
     "helm.sh/hook": {{ if .Values.security.gvisor.installRuntimeClass }}post-install,post-upgrade,test{{ else }}pre-install,pre-upgrade,test{{ end }}
-    "helm.sh/hook-weight": "-9"
+    "helm.sh/hook-weight": {{ if .Values.security.gvisor.installRuntimeClass }}"-9"{{ else }}"-11"{{ end }}
     "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   backoffLimit: 0
@@ -75,12 +75,15 @@ spec:
               set -eu
               echo "== Curie gVisor RuntimeClass preflight (mode={{ .Values.security.gvisor.mode | default "auto" }}) =="
               echo "requested RuntimeClass: {{ $gvisorClass }}"
-              kernel=$(uname -a)
-              echo "pod kernel: ${kernel}"
-              if echo "${kernel}" | grep -qi gvisor; then
+              kernel_version=$(uname -v)
+              expected_kernel_version={{ include "curie.gvisor.sentryKernelVersion" . | quote }}
+              echo "pod kernel release: $(uname -r)"
+              echo "pod kernel version: ${kernel_version}"
+              if [ "${kernel_version}" = "${expected_kernel_version}" ]; then
                 echo "RESULT: PASS - pod runs under a gVisor sentry kernel; kernel isolation enforced."
                 exit 0
               fi
+              echo "expected uname -v \"${expected_kernel_version}\" (the gVisor sentry); got \"${kernel_version}\""
               echo "RESULT: FAIL - the pod scheduled but its kernel is NOT gVisor. The RuntimeClass"
               echo "        exists but is downgraded to runc, so runner pods would have no kernel"
               echo "        isolation. Fix the containerd runsc handler on every node, OR run the"

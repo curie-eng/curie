@@ -18,6 +18,22 @@
 useDefault = true
 
 [[rules]]
+id = "private-key"
+# Inherit the default detector. These redaction fixtures use source expressions
+# that produce deliberately invalid synthetic PEM material at runtime.
+  [[rules.allowlists]]
+  description = "Synthetic PEM interpolation in both workspace diagnostic regressions"
+  condition = "AND"
+  regexTarget = "match"
+  paths = [
+    '''^apps/worker/tests/kernel/test_kernel\.py$''',
+    '''^apps/worker/tests/kernel/test_work_item_workspace\.py$''',
+  ]
+  regexes = [
+    '''^-----BEGIN PRIVATE KEY-----\\n"\n[ \t]+f"\{'SYNTHETIC-PRIVATE-MATERIAL' \* 30\}\\n-----END PRIVATE KEY-----$''',
+  ]
+
+[[rules]]
 id = "slack-conversation-id"
 description = "Slack conversation id (channel/group/DM) -- use an EXAMPLE id in docs and tests"
 # Slack ids are C/G/D, then a digit, then 7-9 more uppercase alphanumerics
@@ -105,9 +121,14 @@ regex = '''(?i)\b[A-Za-z][A-Za-z0-9-]*/[A-Za-z0-9._-]+#[0-9]+\b'''
 tags = ["identifier", "repo"]
 
   [rules.allowlist]
-  description = "This repo's own issues, written in the qualified form"
+  description = "This repo's own issues and the Slack setup Markdown heading link"
   regexTarget = "match"
-  regexes = ['''(?i)^curie-eng/(curie|agentos)#[0-9]+$''']
+  regexes = [
+    '''(?i)^curie-eng/(curie|agentos)#[0-9]+$''',
+    # The README's local heading link is matched only through its numeric prefix.
+    # Exempt that exact match for this rule; every file and other rule stays scanned.
+    '''^docs/your-first-slack-agent\.md#2$''',
+  ]
 
 [allowlist]
 description = "Placeholder values this repo uses deliberately, plus generated artifacts"
@@ -136,19 +157,35 @@ regexes = [
   # Historical redaction regression input. Every token component is a repeated
   # zero or the literal FAKE marker, so it cannot identify a real Slack app.
   '''\bxapp-0-0000000000-0000000000-FAKEFAKEFAKEFAKE\b''',
+  # This is a fixed, public validator name in the protected delivery schema,
+  # not an authentication credential. Keep the exception scoped to its schema,
+  # test, and spec occurrences.
+  '''fresh-owned-launch-v1''',
 ]
 
 paths = [
   # Build output and caches. Without these the scan walks >1GB of target/ and
   # node_modules and takes minutes, which is how a gate gets skipped in practice.
-  '''(^|/)(target|node_modules|\.venv|venv|dist|build)/''',
-  '''(^|/)\.(pytest_cache|mypy_cache|ruff_cache|curie)/''',
-  '''(^|/)target-linux-[^/]+/''',
+  #
+  # Anchored to the roots where those directories are actually generated (#3843).
+  # The earlier any-depth `build/` and `dist/` skips also hid a committed file
+  # under e.g. docs/build/, so a leak there was never scanned. The roots come
+  # from .gitignore (repo root caches, cli/target, apps/ui node_modules and
+  # dist, per-project Python build and cache dirs) and from the release
+  # workflow's dist/ at the repo root. A new generated root gets its own entry.
+  '''^(\.venv|venv|node_modules|dist|build|target|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.curie)/''',
+  '''^cli/(target|target-linux-[^/]+)/''',
+  '''^apps/ui/(node_modules|dist)/''',
+  '''^((apps|adapters|packages|tools)/[^/]+|runner)/(build|dist|\.venv|\.pytest_cache|\.mypy_cache|\.ruff_cache)/''',
   # Lockfiles and generated code carry hashes that look like ids and are not.
   '''(^|/)(pnpm-lock\.yaml|Cargo\.lock|uv\.lock)$''',
   '''(^|/)packages/[^/]+/generated/''',
   # This file names the patterns it forbids.
   '''^\.gitleaks\.toml$''',
+  '''^packages/protected-hooks/src/curie_protected_hooks/artifact_measurement\.py$''',
+  '''^packages/protected-hooks/tests/test_artifact_measurement\.py$''',
+  '''^apps/worker/tests/test_protected_kubernetes_projection\.py$''',
+  '''^docs/superpowers/specs/2026-10-02-protected-hook-lane\.md$''',
 ]
 
 # Gitleaks stopwords are case insensitive substring matches, so an entry
@@ -226,6 +263,8 @@ stopwords = [
   "C0LOCALDEV",
   "C0MALFORMED",
   "C0MANAGERS",
+  # Issue #4009 uses this invented word fixture for an explicitly unbound target.
+  "C0NOTBOUND1",
   "C0OLDROOM0",
   "C0REQ0001",
   "C0TRIAGE01",
@@ -301,16 +340,16 @@ stopwords = [
 # the values remain readable in the public log and should be treated as
 # disclosed.
 commits = [
-  "30c81f1d27ace4fb8dda2e284eddbd8834fed79f",  # plugin-format: deploy.yaml (mine -- ADR-0089 tests + docstring)
-  "46f694f4a9c7d90a94a32909ac05403623183344",  # ADR-0089 Draft (mine -- the worked example)
-  "5d8df34bdfd96fe531142ec81a37b3d52cf278bf",  # approval plane docs (predates this work)
-  "c958a3b90b87fe0c87019097e5086b5d8f7b7746",  # validate_slack_channel test (predates this work)
-  "ddd2cd8402ffc6da1e96eddbfa90e487385b68e2",  # approval note dialog (predates this work)
+  "2db6cc1807c0f3b7e564f91b90faefb043cc9138",  # plugin-format: deploy.yaml (mine -- ADR-0089 tests + docstring)
+  "bae794ce8c90878855cc0d084a95f360c17f69e0",  # ADR-0089 Draft (mine -- the worked example)
+  "63e9b091c74520cde2e009cf6cc68dacc14b5c3b",  # approval plane docs (predates this work)
+  "22dbc0317bef8ba6d2bdad6dd80380aeea7d1b3f",  # validate_slack_channel test (predates this work)
+  "5613528c97f5dc84c0fad3f655bbebab75fa288c",  # approval note dialog (predates this work)
   # The downstream-repo slug, scrubbed from HEAD alongside the agent names it
   # travelled with. Same disclosure posture as the Slack ids above: the slug
   # stays readable in the public log until history is rewritten, so treat the
   # repository's existence and name as disclosed.
-  "39b0bd3990b2e0ea816e4e0a99d1f4159efcefe5",  # ADR-0091 impl: the slug as a test fixture
-  "cde1ac43c284b17eb2253af02b50345b808d6711",  # ADR-0090 Draft: the slug + its issue, cited as evidence
+  "953fd9dd5310d6483f1af65449f7b2e41d5ba83d",  # ADR-0091 impl: the slug as a test fixture
+  "170825501825f630c16b26737abb4185aa59c1d8",  # ADR-0090 Draft: the slug + its issue, cited as evidence
   "33505bd401c915ed7254ab6172a4f337eeeb5f77",  # object store role examples, scrubbed from HEAD
 ]

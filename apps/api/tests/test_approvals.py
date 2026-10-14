@@ -27,16 +27,16 @@ import redis.asyncio as aioredis
 from _migration_support import IsolatedMigrationDb, alembic_config
 from aci_protocol import QueuedTurn
 from alembic import command
-from curie_api import approval_principal, crud
+from curie_api import approval_principal
 from curie_api import sweeper as sweeper_module
 from curie_api.config import get_settings
+from curie_api.crud import approvals as crud_approvals
 from curie_api.deps import get_approver_sets
 from curie_api.main import create_app
 from curie_api.models import Approval
 from curie_api.resumequeue import ResumeQueue
 from curie_api.resumereconciler import ResumeReconciler
 from curie_api.routers import approvals as approvals_module
-from curie_api.sandbox_token import mint
 from curie_api.slack_approvers import SlackApproverSetSelector
 from curie_api.slack_usergroups import SlackUserGroupClient
 from curie_api.sweeper import (
@@ -44,6 +44,7 @@ from curie_api.sweeper import (
     run_expiry_sweeper,
     sweep_expired_approvals,
 )
+from curie_internal.sandbox_token import mint
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     extract_trace_context,
@@ -357,6 +358,89 @@ def _read_approval_traceparent(approval_id: str) -> str | None:
     return asyncio.run(_run())
 
 
+def _read_reply_route(approval_id: str) -> tuple[str | None, str | None]:
+    async def read() -> tuple[str | None, str | None]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT reply_identity, reply_adapter FROM curie.approvals WHERE id = :id"
+                    ),
+                    {"id": uuid.UUID(approval_id)},
+                )
+                row = result.one()
+                return row[0], row[1]
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read())
+
+
+@pytest.mark.parametrize(
+    ("reply_adapter", "requested_identity", "reply_identity"),
+    [
+        ("curie-cluster-message", "acme-named", "acme-named"),
+        ("curie-cluster-message", None, None),
+        ("curie-cluster-message", "default", None),
+        ("acme-named", "acme-named", None),
+    ],
+)
+@pytest.mark.parametrize("outcome", ["approved", "expired"])
+def test_reply_identity_survives_http_creation_and_resume(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    reply_adapter: str,
+    requested_identity: str | None,
+    reply_identity: str | None,
+    outcome: str,
+) -> None:
+    """A durable pause retains the binding separately from relay delivery."""
+    payload = _payload(
+        reply_adapter=reply_adapter,
+        reply_placeholder=str(uuid.uuid4()),
+        expires_in_seconds=600,
+    )
+    if requested_identity is not None:
+        payload["reply_identity"] = requested_identity
+    response = approvals_client.post("/approvals", json=payload, headers=auth_headers)
+    assert response.status_code == 201, response.text
+    approval_id = response.json()["id"]
+    assert _read_reply_route(approval_id) == (reply_identity, reply_adapter)
+
+    if outcome == "approved":
+        resolved = approvals_client.post(
+            f"/approvals/{approval_id}/resolve",
+            json={"decision": "approved"},
+            headers=_chat_resolve_headers(approval_id, "U9", "C1", base=auth_headers),
+        )
+        assert resolved.status_code == 200, resolved.text
+    else:
+        async def expire() -> int:
+            async with _sweeper_stack(runs_stream) as (sessionmaker, queue, _client):
+                async with sessionmaker() as session:
+                    return await sweep_expired_approvals(session, queue, now=_naive_utc(601))
+
+        assert asyncio.run(expire()) == 1
+
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    turn = QueuedTurn.model_validate(json.loads(entries[0][1]["payload"]))
+    assert turn.event_id == f"approval-{approval_id}-resolved"
+    assert turn.conversation_id == payload["conversation_id"]
+    assert turn.reply_handle.identity == reply_identity
+    assert turn.reply_handle.adapter == reply_adapter
+    assert turn.reply_handle.placeholder == payload["reply_placeholder"]
+    assert turn.reply_handle.endpoint is None
+    stored = approvals_client.get(f"/approvals/{approval_id}", headers=auth_headers)
+    assert stored.status_code == 200, stored.text
+    assert stored.json()["status"] == outcome
+    assert _read_resumed_at(approval_id) is not None
+
+
 def test_resolve_endpoint_stays_200_when_enqueue_fails(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
@@ -464,6 +548,78 @@ def test_failed_inline_enqueue_then_reconciler_keeps_the_stored_parent(
     ).get_span_context()
     assert carried.trace_id == _TRACE_ID
     assert carried.span_id == enqueue.context.span_id
+    assert _read_resumed_at(created["id"]) is not None
+
+
+def test_resolve_during_valkey_restart_is_resumed_by_the_next_reconciler_pass(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#4016: the resolve that hit a just-restarted Valkey is resumed on the next
+    reconciler pass, not three hours later.
+
+    The fault is the app's own Valkey client raising ``ConnectionError`` on its
+    first ``xadd`` to the runs stream (the first command after the store
+    restarted), BELOW ``ResumeQueue.enqueue``, so the queue's failure handling
+    runs exactly as in production. The resolve still returns 200 with nothing
+    on the stream. A reconciler built on the SAME app resume queue, with the
+    production grace (10860 s, from the chart), then delivers the resume even
+    though the approval was resolved seconds ago.
+    """
+
+    created = approvals_client.post(
+        "/approvals", json=_payload(), headers=auth_headers
+    ).json()
+    app_state = approvals_client.app.state
+    app_valkey = app_state.valkey
+    real_xadd = app_valkey.xadd
+    failed: list[str] = []
+
+    async def _xadd_after_restart(
+        name: Any, fields: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        if name == runs_stream and not failed:
+            failed.append(json.loads(fields["payload"])["event_id"])
+            raise redis.exceptions.ConnectionError(
+                "Error -3 connecting to valkey:6379. Temporary failure in name resolution."
+            )
+        return await real_xadd(name, fields, *args, **kwargs)
+
+    monkeypatch.setattr(app_valkey, "xadd", _xadd_after_restart)
+
+    resolved = approvals_client.post(
+        f"/approvals/{created['id']}/resolve",
+        json={"decision": "approved"},
+        headers=_chat_resolve_headers(created["id"], "U9", "C1", base=auth_headers),
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["status"] == "approved"
+    event_id = f"approval-{created['id']}-resolved"
+    assert failed == [event_id]  # the inline resume hit the fault
+    assert valkey.xrange(runs_stream) == []
+    assert _read_resumed_at(created["id"]) is None
+
+    reconciler = ResumeReconciler(
+        app_state.sessionmaker,
+        app_state.resume_queue,
+        interval_seconds=30,
+        grace_seconds=10860,
+        batch_limit=100,
+    )
+    # The app's engine and Valkey pool are bound to the TestClient's loop.
+    portal = approvals_client.portal
+    assert portal is not None
+    count = portal.call(reconciler.reconcile_once)
+
+    assert count == 1
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    turn = QueuedTurn.model_validate(json.loads(entries[0][1]["payload"]))
+    assert turn.event_id == event_id
     assert _read_resumed_at(created["id"]) is not None
 
 
@@ -1861,7 +2017,7 @@ def test_resolve_path_expiry_returns_410_when_the_resumed_mark_fails(
     assert created["expires_at"] is not None
     lapsed_at = _lapse(created["id"])
 
-    real_mark = crud.mark_approval_resumed
+    real_mark = crud_approvals.mark_approval_resumed
 
     async def _failing_mark(session: Any, approval_id: uuid.UUID) -> Any:
         # Wrap the real collaborator: only this record's mark fails (a DB blip),
@@ -1870,7 +2026,7 @@ def test_resolve_path_expiry_returns_410_when_the_resumed_mark_fails(
             raise RuntimeError("postgres unreachable")
         return await real_mark(session, approval_id)
 
-    monkeypatch.setattr(crud, "mark_approval_resumed", _failing_mark)
+    monkeypatch.setattr(crud_approvals, "mark_approval_resumed", _failing_mark)
 
     # Observe the real 500 the error middleware would return in production rather
     # than letting TestClient re-raise it -- the regression pinned here is
@@ -2046,7 +2202,7 @@ def test_run_expiry_sweeper_loop_sweeps_and_stops(
                     )
                     await asyncio.sleep(0.1)
                     async with sessionmaker() as session:
-                        record = await crud.get_approval(session, approval_id)
+                        record = await crud_approvals.get_approval(session, approval_id)
                         assert record is not None
                         status = record.status
                 # The loop also enqueued the expiry resume turn -- but the flip

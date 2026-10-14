@@ -28,6 +28,13 @@
 #
 # Issue #1530 (runner sandbox API egress), Assertion 11.
 #
+# Issue #3821 (the runner fails closed without a bearer), Assertion 19 and its
+# negative controls. Every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from
+# the chart-owned runner token Secret and nothing renders the tokenless dev flag.
+#
+# Issue #4171 (runner boot failure log capture), Assertion 20 and its negative
+# controls. The worker gets exactly one read-only pods/log rule for diagnosis.
+#
 # Issue #1109/#1124 (the API's outbound GitHub credential), Assertion 12 and its
 # negative control. api.githubToken is the one OPTIONAL credential in the
 # Secret, so it is a deliberate plain pass-through rather than a
@@ -51,8 +58,8 @@
 # exactly one connected client. A RollingUpdate starts the replacement pod while
 # the old one is still connected, so events are split between them and the ones
 # handed to the terminating pod are lost. The dispatcher must render
-# `strategy: Recreate` with no rollingUpdate block, and every other workload must
-# keep the strategy it rendered before the fix.
+# `strategy: Recreate` with no rollingUpdate block. The API availability policy
+# is explicit (#4174); all remaining workloads keep their existing strategies.
 #
 # Issue #3182 (sandbox pods preempt Langfuse, the OTel collector and the UI),
 # Assertion 8 extension. Those workloads ran at priority 0, so sandbox pods
@@ -69,6 +76,26 @@
 # is available to every hook. A chart-created gVisor RuntimeClass moves its
 # preflight to post-install, so that hook uses the platform class too. Negative
 # controls prove both pod spec shapes and both phase exceptions.
+#
+# Issue #4162, Assertion 20. Metadata CI policy has a first-class chart value,
+# defaults to an empty JSON object, and rejects malformed values and extraEnv
+# overrides. Retained values from before the key existed keep the empty default.
+#
+# Issue #4174, Assertion 22. API rollouts retain an available pod and let
+# terminating pods drain before shutdown. Removing either template block must
+# fail the same rendered-manifest assertion.
+#
+# Issue #4294, Assertion 23. Dependency additions require an explicit install
+# opt-in, with a typed chart value and a reserved worker environment name.
+#
+# Issue #4378, Assertion 24. API and worker S3 clients use the same signing
+# region as bundle fetches, with static credentials or web identity. Removing
+# either service's region must fail the same rendered-manifest assertion.
+#
+# Issue #4394, Assertion 25. With codeHostTrust.caBundle configured, the worker
+# passes its ConfigMap name and key to publication Jobs so they trust the same
+# code host as workspace preparation. Unset renders no variable, and
+# removing it while the value is set must fail the same assertion.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
@@ -405,17 +432,32 @@ ATTESTER_MUTANT="$TMP/mutant-managed-secret-nil"
 cp -a "$CHART" "$ATTESTER_MUTANT"
 python3 - "$ATTESTER_MUTANT/templates/_helpers.tpl" <<'PYEOF'
 import pathlib
+import re
 import sys
 
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
 start_marker = '{{- define "curie.managedSecret" -}}'
-end_marker = '{{/* ---- Shared first-party-app environment fragments ---- */}}'
-start = text.find(start_marker)
-end = text.find(end_marker, start)
-if start == -1 or end == -1:
-    sys.stderr.write("negative control could not find curie.managedSecret to mutate\n")
-    sys.exit(1)
+if text.count(start_marker) != 1:
+    sys.exit("negative control requires exactly one curie.managedSecret definition")
+start = text.index(start_marker)
+# Stop at this definition's matching end. The adjacent Secret memo and checksum
+# helpers must survive so the mutant still exercises the normal Secret render.
+depth = 0
+end = None
+for action in re.finditer(r'{{-?\s*(.*?)\s*-?}}', text[start:], re.DOTALL):
+    command = action.group(1).strip().split(None, 1)[0]
+    if command in {"define", "if", "range", "with", "block"}:
+        depth += 1
+    elif command == "end":
+        depth -= 1
+        if depth == 0:
+            end = start + action.end()
+            break
+if end is None:
+    sys.exit("negative control could not find curie.managedSecret's matching end")
+if text[start:end].count('{{- if kindIs "invalid" $value -}}') != 1:
+    sys.exit("negative control requires the nil-safe managedSecret guard")
 old_body = r'''{{- define "curie.managedSecret" -}}
 {{- if eq (toString .root.Values.security.allowDevDefaults) "true" -}}{{/* string-coercion safety -- a quoted "false" must not read as truthy and silently ship a published default (fail closed to generation). */}}
 {{- .value -}}
@@ -429,7 +471,7 @@ old_body = r'''{{- define "curie.managedSecret" -}}
 {{- randAlphaNum 32 -}}
 {{- end -}}
 {{- end -}}'''
-path.write_text(text[:start] + old_body + "\n\n" + text[end:])
+path.write_text(text[:start] + old_body + text[end:])
 PYEOF
 ATTESTER_MUTANT_OUT="$TMP/mutant-managed-secret-nil.yaml"
 helm template legacy-attester "$ATTESTER_MUTANT" \
@@ -660,7 +702,7 @@ import sys
 
 import yaml
 
-# Env names in these namespaces are boot-env contract keys and must be declared.
+# Env names in these namespaces must be declared boot-env keys.
 # Anything else the runner container carries (HOME, and operator free-form
 # extraEnv on a non-default render) is out of scope by design: extraEnv is
 # operator-supplied and the contract does not govern it (issue #488, edge case 6).
@@ -708,7 +750,10 @@ if not found:
 
 # Non-vacuity floor: the render must actually carry boot env. Without this a
 # template that dropped its whole env block would sail through the subset check.
-contract_names = {n for n in found if n.startswith(CONTRACT_PREFIXES)}
+contract_names = {
+    n for n in found
+    if n.startswith(CONTRACT_PREFIXES)
+}
 if "CURIE_SESSION_ID" not in contract_names or len(contract_names) < 4:
     sys.stderr.write(
         "runner env does not carry a plausible boot env (expected CURIE_SESSION_ID "
@@ -1260,7 +1305,7 @@ check_github_token_empty() {
     return 1
   fi
   if [[ -n "$got" ]]; then
-    echo "sealed render must leave githubToken EMPTY (empty means 'no GitHub credential, public repos only'); got '${got}' -- api.githubToken has been routed through a generating helper (#1109 regression)." >&2
+    echo "sealed render must leave githubToken EMPTY (empty means 'no GitHub credential, public repos only'); got a nonempty credential -- api.githubToken has been routed through a generating helper (#1109 regression)." >&2
     return 1
   fi
   echo "  ok: $label leaves githubToken empty (not generated)"
@@ -1291,16 +1336,17 @@ echo "=== Assertion 12b negative control: routing githubToken through curie.mana
 # regression and require the check to reject it, naming the key.
 GHT_MUTANT="$TMP/mutant-githubtoken"
 cp -a "$CHART" "$GHT_MUTANT"
-python3 - "$GHT_MUTANT/templates/secrets.yaml" <<'PYEOF'
+python3 - "$GHT_MUTANT/templates/_helpers.tpl" <<'PYEOF'
 import pathlib, sys
 p = pathlib.Path(sys.argv[1])
 text = p.read_text()
-old = '  githubToken: {{ .Values.api.githubToken | default "" | quote }}'
-new = ('  githubToken: {{ include "curie.managedSecret" (dict "root" . "key" "githubToken" '
-       '"value" .Values.api.githubToken "default" "" "hex" false "existingData" $existingSecret) | quote }}')
-if old not in text:
-    sys.stderr.write(f"negative control could not find {old!r} to mutate\n")
-    sys.exit(1)
+# Mutate effective resolution in the memo; Secret emission reads this dict.
+old = '{{- $_ := set $content "githubToken" ((.Values.api.githubToken | default "") | toString) -}}'
+new = ('{{- $_ := set $content "githubToken" ((include "curie.managedSecret" '
+       '(dict "root" . "key" "githubToken" "value" .Values.api.githubToken '
+       '"default" "" "hex" false "existingData" $existingSecretData)) | toString) -}}')
+if text.count(old) != 1:
+    sys.exit("negative control requires exactly one githubToken memo resolution")
 p.write_text(text.replace(old, new, 1))
 PYEOF
 GHT_MUTANT_RENDER="$TMP/mutant-githubtoken.yaml"
@@ -1454,9 +1500,10 @@ expected = {
     ("Job", f"{prefix}-netpol-probe"): "hooks",
     ("Job", f"{prefix}-security-probe"): "hooks",
     ("Job", f"{prefix}-langfuse-model-pricing"): "hooks",
-    # The pre-upgrade drain gate, its attest hook, and its post-upgrade release (issue #2010).
+    # The pre-upgrade drain gate, attest and hold hooks, and post-upgrade release.
     ("Job", f"{prefix}-upgrade-drain"): "hooks",
     ("Job", f"{prefix}-upgrade-drain-attest"): "hooks",
+    ("Job", f"{prefix}-upgrade-drain-hold"): "hooks",
     ("Job", f"{prefix}-upgrade-drain-release"): "hooks",
     # The single schema upgrade phase (#2300).
     ("Job", f"{prefix}-schema-migrate"): "hooks",
@@ -2020,12 +2067,13 @@ def fail(message):
     raise SystemExit(message)
 
 
-# The API schema-wait init and the schema-migrate Job share one Postgres
-# readiness loop; both run through this checker (#2865).
+# The API schema-wait init and legacy migrate fallback use the bounded shell
+# readiness loop. The current migrate image delegates readiness to Python;
+# this checker verifies all three dispatch paths (#2865, #4295).
 MODE = sys.argv[2] if len(sys.argv) > 2 else "api"
-if MODE not in {"api", "migrate"}:
+if MODE not in {"api", "migrate", "legacy"}:
     fail(f"unknown readiness checker mode {MODE!r}")
-EXEC_VERB = "wait" if MODE == "api" else "upgrade"
+EXEC_VERB = "wait" if MODE == "api" else "upgrade" if MODE == "migrate" else "-c alembic.ini upgrade head"
 WAIT_LINE = "Waiting for Postgres readiness"
 STILL_LINE = "Still waiting for Postgres readiness"
 
@@ -2033,7 +2081,7 @@ STILL_LINE = "Still waiting for Postgres readiness"
 def migrate_container(manifest):
     matches = []
     for doc in yaml.safe_load_all(pathlib.Path(manifest).read_text()):
-        if MODE == "migrate":
+        if MODE in {"migrate", "legacy"}:
             if isinstance(doc, dict) and doc.get("kind") == "Job":
                 containers = doc["spec"]["template"]["spec"].get("containers", [])
                 matches.extend(
@@ -2067,7 +2115,7 @@ def shell_process(container):
     if process[1] != "-c":
         fail("schema-wait init container shell command must use -c")
     script = process[2]
-    if MODE == "migrate":
+    if MODE in {"migrate", "legacy"}:
         return process
     if "alembic" in script:
         fail("schema-wait init must not invoke Alembic; migrations belong on the upgrade Job")
@@ -2102,10 +2150,12 @@ def run_case(process, readiness_failures, error_class="InvalidPasswordError"):
         compat_pkg = fake_modules / "curie_api"
         compat_pkg.mkdir()
         (compat_pkg / "__init__.py").write_text("")
-        (compat_pkg / "schema_compat.py").write_text(
-            "import os, pathlib, sys\n"
-            "pathlib.Path(os.environ['WAIT_CALLS']).write_text(' '.join(sys.argv[1:]) + '\\n')\n"
-        )
+        if MODE != "legacy":
+            (compat_pkg / "schema_compat.py").write_text(
+                "import os, pathlib, sys\n"
+                "pathlib.Path(os.environ['WAIT_CALLS']).write_text(' '.join(sys.argv[1:]) + '\\n')\n"
+            )
+        write_program(fake_bin / "alembic", 'printf "%s\\n" "$*" > "$WAIT_CALLS"\n')
         (fake_modules / "asyncpg.py").write_text(
             """\
 import os
@@ -2178,6 +2228,19 @@ async def connect(database_url, timeout):
 
 container = migrate_container(sys.argv[1])
 process = shell_process(container)
+
+if MODE == "migrate":
+    # The current image owns readiness in Python. Any shell probe before this
+    # dispatch would run before the supervisor can confirm pause ownership.
+    for failures in (0, 2, 60):
+        result, attempts, calls = run_case(process, failures)
+        if result.returncode != 0 or attempts or calls != ["upgrade"]:
+            fail(
+                "current-image migrate must delegate readiness before any shell probe; "
+                f"exit={result.returncode}, attempts={len(attempts)}, calls={calls!r}"
+            )
+    print("  ok (migrate): current image delegates readiness immediately to schema_compat upgrade")
+    raise SystemExit(0)
 
 ready, ready_attempts, ready_calls = run_case(process, 0)
 if ready.returncode != 0:
@@ -2263,7 +2326,35 @@ python3 "$API_MIGRATE_CHECK" "$API_MIGRATE_RENDER" \
 SCHEMA_MIGRATE_RENDER="$API_MIGRATE_OUT/curie/templates/schema-migrate.yaml"
 [[ -f "$SCHEMA_MIGRATE_RENDER" ]] || fail "schema-migrate.yaml did not render"
 python3 "$API_MIGRATE_CHECK" "$SCHEMA_MIGRATE_RENDER" migrate \
-  || fail "schema-migrate Job does not implement the same readiness diagnostics contract."
+  || fail "schema-migrate Job must delegate current-image readiness before any shell probe."
+python3 "$API_MIGRATE_CHECK" "$SCHEMA_MIGRATE_RENDER" legacy \
+  || fail "schema-migrate legacy fallback lost its bounded readiness diagnostics contract."
+
+echo "=== Assertion 14 negative control: a current-image shell probe before dispatch FAILS ==="
+SCHEMA_MIGRATE_ORDER_MUTANT="$TMP/schema-migrate-order-mutant.yaml"
+python3 - "$SCHEMA_MIGRATE_RENDER" "$SCHEMA_MIGRATE_ORDER_MUTANT" <<'PYEOF'
+import pathlib
+import sys
+import yaml
+
+docs = list(yaml.safe_load_all(pathlib.Path(sys.argv[1]).read_text()))
+for doc in docs:
+    if isinstance(doc, dict) and doc.get("kind") == "Job":
+        container = doc["spec"]["template"]["spec"]["containers"][0]
+        container["args"][0] = (
+            "python -c 'import asyncio, asyncpg; asyncio.run(asyncpg.connect(\"unused\", timeout=2))'\n"
+            + container["args"][0]
+        )
+pathlib.Path(sys.argv[2]).write_text(yaml.safe_dump_all(docs))
+PYEOF
+schema_migrate_order_negative_output=""
+if schema_migrate_order_negative_output="$(python3 "$API_MIGRATE_CHECK" "$SCHEMA_MIGRATE_ORDER_MUTANT" migrate 2>&1)"; then
+  fail "negative control did not fire: current-image readiness ran before the supervisor."
+fi
+if [[ "$schema_migrate_order_negative_output" != *"before any shell probe"* ]]; then
+  fail "migrate-order negative control failed unexpectedly: $schema_migrate_order_negative_output"
+fi
+echo "  ok: a shell probe before current-image dispatch is rejected"
 
 echo "=== Assertion 14 negative control: changed readiness bound FAILS ==="
 API_MIGRATE_BOUND_MUTANT="$TMP/mutant-api-migrate-bound"
@@ -2524,7 +2615,7 @@ helm template curie "$CHART" \
   --set dispatcher.slack.appToken=xapp-render-assert \
   --set dispatcher.slack.botToken=xoxb-render-assert \
   >"$STRATEGY_RENDER"
-python3 - "$STRATEGY_RENDER" <<'PYEOF' || fail "dispatcher must render strategy Recreate and every other workload must keep its strategy (issue #2944)."
+python3 - "$STRATEGY_RENDER" <<'PYEOF' || fail "dispatcher must render strategy Recreate, API must retain availability, and other workloads must keep their strategies (#2944, #4174)."
 import sys
 
 import yaml
@@ -2534,7 +2625,9 @@ import yaml
 EXPECTED = {
     ("Deployment", "curie-dispatcher"): ("strategy", {"type": "Recreate"}),
     ("Deployment", "agent-sandbox-controller"): ("strategy", None),
-    ("Deployment", "curie-api"): ("strategy", None),
+    ("Deployment", "curie-api"): ("strategy", {
+        "type": "RollingUpdate", "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1},
+    }),
     ("Deployment", "curie-ui"): ("strategy", None),
     ("Deployment", "curie-worker"): ("strategy", None),
     ("Deployment", "curie-langfuse-web"): ("strategy", {"type": "Recreate"}),
@@ -2561,7 +2654,7 @@ for err in errors:
     sys.stderr.write(err + "\n")
 sys.exit(1 if errors else 0)
 PYEOF
-echo "  ok: dispatcher renders strategy Recreate; every other workload keeps its strategy"
+echo "  ok: dispatcher renders strategy Recreate; API retains availability; other workloads keep their strategies"
 
 echo "=== Assertion 17: rustfs-init caps Langfuse event-upload objects with a lifecycle rule (issue #2870) ==="
 # Langfuse never deletes its S3 event-upload objects after ingest. Each trace
@@ -2635,6 +2728,7 @@ expected_preupgrade = {
     ("Job", "curie-schema-migrate"): {"post-install", "pre-upgrade"},
     ("Job", "curie-upgrade-drain"): {"pre-upgrade"},
     ("Job", "curie-upgrade-drain-attest"): {"pre-upgrade"},
+    ("Job", "curie-upgrade-drain-hold"): {"pre-upgrade"},
 }
 expected_grafana = {
     ("Job", "curie-grafana-token-updater"): {"post-install", "post-upgrade"},
@@ -2833,8 +2927,8 @@ for source, label, kind, preinstall, classified, class_name, target in (
 PYEOF
 for case_name in job pod exempt upgrade operator operator_upgrade gvisor; do
   case "$case_name" in
-    job) expected_error="hook Job "*"has priorityClassName=None" ;;
-    pod) expected_error="hook Pod "*"has priorityClassName=None" ;;
+    job) expected_error="hook Job *has priorityClassName=None" ;;
+    pod) expected_error="hook Pod *has priorityClassName=None" ;;
     exempt) expected_error="hook Job curie-preflight-avx has priorityClassName='curie-platform', expected None" ;;
     upgrade) expected_error="hook Job curie-schema-migrate has priorityClassName='curie-platform', expected None" ;;
     operator) expected_error="hook Job curie-preflight-avx has priorityClassName=None, expected 'operator-platform-class'" ;;
@@ -2865,5 +2959,810 @@ for case_name in job pod exempt upgrade operator operator_upgrade gvisor; do
 done
 echo "  ok: classless Job and Pod hooks, classified chart-managed early hooks, classless operator-provided early hooks, and a classless gVisor post-install hook are rejected"
 
+echo "=== Assertion 19: every runner template carries the chart-owned token and never the dev flag (#3821) ==="
+# The runner refuses to boot without a bearer (#3821), so a cluster runner must
+# always get one: every SandboxTemplate's runner takes CURIE_RUNNER_TOKEN from
+# the chart-owned <fullname>-runner-token Secret (the worker's per-claim
+# Overrides injection replaces it on every bound claim), and nothing the chart
+# renders may carry CURIE_RUNNER_ALLOW_TOKENLESS, the local-dev opt-out that
+# only `curie skill up` sets. Rendered with an explicit release name so the
+# expected Secret name is derived, not guessed.
+TOKEN_CHECK="$TMP/check_runner_token.py"
+cat > "$TOKEN_CHECK" <<'PYEOF'
+"""Assert every rendered runner takes its bearer from the chart-owned Secret.
+
+argv: <rendered-dir> <release fullname> <present|absent>
+"present": every SandboxTemplate runner carries exactly one CURIE_RUNNER_TOKEN
+secretKeyRef to <fullname>-runner-token, that Secret renders with a strong
+value, and nothing carries the tokenless dev flag. "absent" (agentSandbox.deploy
+false): neither a SandboxTemplate nor the Secret renders.
+Exits 0 on pass, 1 naming the defect on failure.
+"""
+import pathlib
+import sys
+
+import yaml
+
+TOKEN = "CURIE_RUNNER_TOKEN"
+FLAG = "CURIE_RUNNER_ALLOW_TOKENLESS"
+
+rendered, fullname, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+secret_name = f"{fullname}-runner-token"
+expected_ref = {"name": secret_name, "key": "runnerToken", "optional": False}
+
+docs = []
+for path in sorted(pathlib.Path(rendered).rglob("*.yaml")):
+    for doc in yaml.safe_load_all(path.read_text()):
+        if isinstance(doc, dict):
+            docs.append((path.name, doc))
+
+templates = [(f, d) for f, d in docs if d.get("kind") == "SandboxTemplate"]
+secrets = [
+    d for _f, d in docs
+    if d.get("kind") == "Secret" and (d.get("metadata") or {}).get("name") == secret_name
+]
+errors = []
+
+if mode == "absent":
+    if templates:
+        errors.append(f"agentSandbox.deploy=false rendered {len(templates)} SandboxTemplate(s)")
+    if secrets:
+        errors.append(f"agentSandbox.deploy=false rendered the {secret_name} Secret")
+    for e in errors:
+        sys.stderr.write(e + "\n")
+    if errors:
+        sys.exit(1)
+    print("  ok: no SandboxTemplate and no runner token Secret without agentSandbox.deploy")
+    sys.exit(0)
+
+if not templates:
+    sys.stderr.write("found no SandboxTemplate; the token assert would pass vacuously\n")
+    sys.exit(1)
+
+for fname, doc in templates:
+    name = doc["metadata"]["name"]
+    pod = ((doc.get("spec") or {}).get("podTemplate") or {}).get("spec") or {}
+    runners = [c for c in pod.get("containers") or [] if c.get("name") == "runner"]
+    if len(runners) != 1:
+        errors.append(f"{fname}:{name} has {len(runners)} containers named runner, expected 1")
+        continue
+    entries = [e for e in runners[0].get("env") or [] if e.get("name") == TOKEN]
+    if len(entries) != 1:
+        errors.append(f"{fname}:{name} runner carries {len(entries)} {TOKEN} entries, expected 1")
+        continue
+    entry = entries[0]
+    if "value" in entry:
+        errors.append(f"{fname}:{name} runner {TOKEN} is a literal value, not a secretKeyRef")
+    ref = (entry.get("valueFrom") or {}).get("secretKeyRef")
+    if ref != expected_ref:
+        errors.append(f"{fname}:{name} runner {TOKEN} secretKeyRef is {ref!r}, expected {expected_ref!r}")
+
+if len(secrets) != 1:
+    errors.append(f"expected exactly one {secret_name} Secret, found {len(secrets)}")
+else:
+    value = (secrets[0].get("stringData") or {}).get("runnerToken")
+    if not isinstance(value, str) or not value.strip() or len(value) < 32:
+        errors.append(f"{secret_name} stringData.runnerToken is blank or shorter than 32 characters")
+
+# The dev flag may appear on no container or init container of any document.
+def env_names(node):
+    if isinstance(node, dict):
+        for key in ("containers", "initContainers"):
+            for c in node.get(key) or []:
+                if isinstance(c, dict):
+                    for e in c.get("env") or []:
+                        if isinstance(e, dict):
+                            yield c.get("name"), e.get("name")
+        for value in node.values():
+            yield from env_names(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from env_names(value)
+
+for fname, doc in docs:
+    for container, env in env_names(doc):
+        if env == FLAG:
+            errors.append(f"{fname}:{doc.get('kind')}/{(doc.get('metadata') or {}).get('name')} "
+                          f"container {container} carries the tokenless dev flag {FLAG}")
+
+# The security probe embeds its fixture SandboxTemplates as script text, so the
+# container walk above cannot see them; hold the script text to the same rule.
+probes = [
+    d for _f, d in docs
+    if d.get("kind") == "Job"
+    and (d.get("metadata") or {}).get("name") == f"{fullname}-security-probe"
+]
+for probe in probes:
+    text = yaml.safe_dump(probe)
+    if TOKEN not in text:
+        errors.append(f"security probe fixture templates do not carry {TOKEN}")
+    if FLAG in text:
+        errors.append(f"security probe fixture templates carry the tokenless dev flag {FLAG}")
+
+for e in errors:
+    sys.stderr.write(e + "\n")
+if errors:
+    sys.exit(1)
+print(f"  ok: {len(templates)} SandboxTemplate runner(s) take {TOKEN} from {secret_name}; "
+      f"{len(probes)} security probe(s) checked; no {FLAG} anywhere")
+PYEOF
+
+TOKEN_RELEASE=acme
+TOKEN_FULLNAME=acme-curie
+
+# Render one chart dir and check it; returns nonzero (rather than exiting) so
+# the negative controls can assert the failure.
+check_runner_token() {
+  # $1 = chart dir, $2 = present|absent, $3 = label, rest = extra helm args
+  local chart="$1" mode="$2" label="$3"
+  shift 3
+  local out
+  out="$(mktemp -d -p "$TMP")"
+  # --output-dir, not a stdout pipe (see Assertion 6).
+  helm template "$TOKEN_RELEASE" "$chart" --output-dir "$out" "$@" > /dev/null
+  echo "  render: $label"
+  python3 "$TOKEN_CHECK" "$out" "$TOKEN_FULLNAME" "$mode"
+}
+
+check_runner_token "$CHART" present "default values" \
+  || fail "default render: a SandboxTemplate runner does not take CURIE_RUNNER_TOKEN from the chart-owned Secret, or something renders the tokenless dev flag."
+# values-dev turns the sandbox substrate off; the sandbox e2e re-enables it on
+# top of the overlay, which is the dev-overlay render that carries runners.
+check_runner_token "$CHART" present "dev overlay + agentSandbox.deploy" \
+  -f "$CHART/values-dev.yaml" --set agentSandbox.deploy=true \
+  || fail "dev overlay render breaks the runner token contract."
+check_runner_token "$CHART" absent "dev overlay" -f "$CHART/values-dev.yaml" \
+  || fail "the bare dev overlay renders a SandboxTemplate or the runner token Secret."
+check_runner_token "$CHART" present "per-agent template" \
+  --set-string agentSandbox.connectorSecrets.acme-a.GITHUB_PERSONAL_ACCESS_TOKEN=example \
+  || fail "per-agent template render breaks the runner token contract."
+check_runner_token "$CHART" present "real-model credentials" \
+  --set agentSandbox.runner.credentials=dummy \
+  --set agentSandbox.runner.fakeModel=false \
+  || fail "real-model credentials render breaks the runner token contract."
+check_runner_token "$CHART" present "in-cluster inference" \
+  --set inference.deploy=true \
+  --set inference.persistence.enabled=true \
+  || fail "in-cluster inference render breaks the runner token contract."
+check_runner_token "$CHART" absent "agentSandbox.deploy=false" \
+  --set agentSandbox.deploy=false \
+  || fail "agentSandbox.deploy=false still renders a SandboxTemplate or the runner token Secret."
+
+echo "=== Assertion 19 negative controls: a tokenless or flag-carrying runner FAILS ==="
+# Each control mutates a TEMP COPY of the chart (never the real template), proves
+# the mutation found its target, and requires Assertion 19 to reject it.
+token_mutant() {
+  # $1 = control id; prints the mutant chart dir
+  local dir="$TMP/token-mutant-$1"
+  rm -rf "$dir"
+  cp -a "$CHART" "$dir"
+  printf '%s\n' "$dir"
+}
+
+MUTANT_19A="$(token_mutant 19a)"
+python3 - "$MUTANT_19A/templates/agent-sandbox.yaml" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+lines = p.read_text().splitlines(keepends=True)
+hits = [i for i, line in enumerate(lines) if line.strip() == "- name: CURIE_RUNNER_TOKEN"]
+if len(hits) != 1:
+    sys.stderr.write(f"19a could not find exactly one '- name: CURIE_RUNNER_TOKEN' entry (found {len(hits)})\n")
+    sys.exit(1)
+i = hits[0]
+# The entry and its five valueFrom/secretKeyRef/name/key/optional lines.
+del lines[i:i + 6]
+p.write_text("".join(lines))
+PYEOF
+if check_runner_token "$MUTANT_19A" present "19a: runner token entry removed" 2>&1; then
+  fail "negative control 19a did not fire: a runner with no CURIE_RUNNER_TOKEN passed Assertion 19."
+fi
+echo "  ok: 19a a runner template without the token entry is rejected"
+
+MUTANT_19B="$(token_mutant 19b)"
+[[ -f "$MUTANT_19B/templates/runner-token.yaml" ]] \
+  || fail "negative control 19b could not find templates/runner-token.yaml to delete."
+rm "$MUTANT_19B/templates/runner-token.yaml"
+if check_runner_token "$MUTANT_19B" present "19b: runner token Secret deleted" 2>&1; then
+  fail "negative control 19b did not fire: a render without the runner token Secret passed Assertion 19."
+fi
+echo "  ok: 19b a render without the runner token Secret is rejected"
+
+MUTANT_19C="$(token_mutant 19c)"
+python3 - "$MUTANT_19C/templates/agent-sandbox.yaml" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+lines = p.read_text().splitlines(keepends=True)
+hits = [i for i, line in enumerate(lines) if line.strip() == "- name: CURIE_RUNNER_PORT"]
+if len(hits) != 1:
+    sys.stderr.write(f"19c could not find exactly one '- name: CURIE_RUNNER_PORT' entry (found {len(hits)})\n")
+    sys.exit(1)
+i = hits[0]
+indent = lines[i][: len(lines[i]) - len(lines[i].lstrip())]
+lines[i:i] = [f"{indent}- name: CURIE_RUNNER_ALLOW_TOKENLESS\n", f'{indent}  value: "1"\n']
+p.write_text("".join(lines))
+PYEOF
+if check_runner_token "$MUTANT_19C" present "19c: tokenless dev flag injected" 2>&1; then
+  fail "negative control 19c did not fire: a runner carrying CURIE_RUNNER_ALLOW_TOKENLESS passed Assertion 19."
+fi
+echo "  ok: 19c a runner template carrying the tokenless dev flag is rejected"
+
+echo "=== Assertion 20: worker runner log capture grants only namespaced pods/log get (#4171) ==="
+assert_worker_log_rule() {
+  python3 - "$1" <<'PYEOF'
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as source:
+    roles = [
+        doc for doc in yaml.safe_load_all(source)
+        if isinstance(doc, dict)
+        and doc.get("kind") == "Role"
+        and (doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")) == "worker"
+    ]
+if len(roles) != 1:
+    sys.exit(f"worker pods/log rule requires one worker Role, got {len(roles)}")
+log_rules = [
+    rule for rule in roles[0].get("rules") or []
+    if set(rule.get("apiGroups") or []) & {"", "*"}
+    and set(rule.get("resources") or []) & {"pods/log", "*/log", "*"}
+]
+expected = {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]}
+if log_rules != [expected]:
+    sys.exit(f"worker pods/log rule must grant only namespaced get: {log_rules}")
+print("  ok: worker grants exactly namespaced get on pods/log")
+PYEOF
+}
+WORKER_LOG_RENDER="$TMP/worker-log-tail.yaml"
+helm template acme "$CHART" --namespace acme \
+  --show-only templates/worker.yaml > "$WORKER_LOG_RENDER"
+assert_worker_log_rule "$WORKER_LOG_RENDER" \
+  || fail "worker runner log capture requires only namespaced get on pods/log."
+
+echo "=== Assertion 20 negative controls: absent and broader pods/log rules FAIL ==="
+for case_name in absent broader; do
+  mutant_chart="$TMP/worker-log-tail-$case_name"
+  cp -a "$CHART" "$mutant_chart"
+  python3 - "$mutant_chart/templates/worker.yaml" "$case_name" <<'PYEOF'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text()
+rule = '  - apiGroups: [""]\n    resources: ["pods/log"]\n    verbs: ["get"]\n'
+if source.count(rule) != 1:
+    sys.exit("worker log negative control requires exactly one pods/log get rule")
+replacement = "" if sys.argv[2] == "absent" else rule.replace(
+    'verbs: ["get"]', 'verbs: ["get", "list"]'
+)
+path.write_text(source.replace(rule, replacement))
+PYEOF
+  mutant_render="$TMP/worker-log-tail-$case_name.yaml"
+  helm template acme "$mutant_chart" --namespace acme \
+    --show-only templates/worker.yaml > "$mutant_render"
+  negative_output=""
+  if negative_output="$(assert_worker_log_rule "$mutant_render" 2>&1)"; then
+    fail "worker log negative control $case_name passed the pods/log rule assertion."
+  fi
+  if [[ "$negative_output" != *"worker pods/log rule must grant only namespaced get"* ]]; then
+    fail "worker log negative control $case_name failed unexpectedly: $negative_output"
+  fi
+  echo "  ok: $case_name worker pods/log rule is rejected"
+done
+
+echo "=== Assertion 21: per-repository CI policy renders from factory.bindings[].repos[].ci (#4162, #4397) ==="
+python3 - "$CHART" "$TMP/reuse-render/curie/templates/api.yaml" <<'PYEOF'
+import copy
+import json
+import pathlib
+import subprocess
+import sys
+
+import yaml
+
+chart = sys.argv[1]
+env_name = "CURIE_FORGES"
+ci_path = "factory.bindings.0.repos.0.ci"
+
+CREDENTIAL = {
+    "type": "github_app",
+    "appId": "42",
+    "existingSecret": "factory-app",
+    "existingSecretKey": "privateKey",
+}
+GOOD_CI = {
+    "required": {"key": "python", "paths": ["src/", "tests/"], "pendingKeyPrefix": "python/"},
+    "metadataRerunKeys": ["check:pr-body", "status:lint"],
+}
+
+
+def factory(ci):
+    repo = {"alias": "repo", "codeHost": "github", "projectId": "101", "path": "acme/repo"}
+    if ci is not None:
+        repo["ci"] = ci
+    entry = {
+        "name": "github",
+        "kind": "github",
+        "host": "github.com",
+        "apiUrl": "https://api.github.com",
+        "credential": dict(CREDENTIAL),
+    }
+    tracker = dict(entry, label="curie-factory", mention="example-factory", pollIntervalSeconds=45)
+    return {
+        "enabled": True,
+        "intake": "poll",
+        "codeHosts": [entry],
+        "trackers": [tracker],
+        "bindings": [
+            {"name": "acme", "tracker": "github", "trackerScopeId": "acme/repo", "repos": [repo]}
+        ],
+    }
+
+
+def forges(documents):
+    apis = [
+        doc for doc in documents
+        if isinstance(doc, dict)
+        and doc.get("kind") == "Deployment"
+        and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "api"
+    ]
+    assert len(apis) == 1, f"expected one API Deployment, found {len(apis)}"
+    containers = apis[0]["spec"]["template"]["spec"]["containers"]
+    api = [container for container in containers if container["name"] == "api"]
+    assert len(api) == 1, f"expected one API container, found {len(api)}"
+    entries = [entry for entry in api[0]["env"] if entry["name"] == env_name]
+    assert len(entries) == 1, f"expected exactly one {env_name}, found {entries!r}"
+    assert set(entries[0]) == {"name", "value"}, entries[0]
+    assert isinstance(entries[0]["value"], str), entries[0]
+    return json.loads(entries[0]["value"] or "{}")
+
+
+def render(ci):
+    return subprocess.run(
+        ["helm", "template", "acme", chart, "--set-json", f"factory={json.dumps(factory(ci))}"],
+        text=True, capture_output=True,
+    )
+
+
+def rendered_ci(ci):
+    result = render(ci)
+    assert result.returncode == 0, f"valid ci {ci!r} refused: {result.stderr}"
+    config = forges(yaml.safe_load_all(result.stdout))
+    repos = config["bindings"][0]["repos"]
+    assert len(repos) == 1, repos
+    return repos[0].get("ci")
+
+
+assert rendered_ci(GOOD_CI) == {
+    "required": {"key": "python", "paths": ["src/", "tests/"], "pending_key_prefix": "python/"},
+    "metadata_rerun_keys": ["check:pr-body", "status:lint"],
+}, "factory repo ci must render as the snake_case CiPolicyConfig"
+
+retained = forges(yaml.safe_load_all(pathlib.Path(sys.argv[2]).read_text()))
+assert not retained.get("bindings"), f"retained values without a factory block rendered bindings: {retained!r}"
+
+
+def with_required(**changes):
+    ci = copy.deepcopy(GOOD_CI)
+    for key, value in changes.items():
+        if value is None:
+            ci["required"].pop(key)
+        else:
+            ci["required"][key] = value
+    return ci
+
+
+# Each malformed ci is paired with the nearest valid ci, which must render:
+# the refusal is the mutation's, not a broken base document.
+for bad, good, diagnostics in (
+    ([], {}, ("ci",)),
+    ({"unknown": []}, {"metadataRerunKeys": []}, ("unknown",)),
+    (with_required(extra=1), GOOD_CI, ("extra",)),
+    (with_required(key=None), GOOD_CI, ("key",)),
+    (with_required(key=""), GOOD_CI, ("key",)),
+    (with_required(paths=None), GOOD_CI, ("paths",)),
+    (with_required(paths="src/"), GOOD_CI, ("paths",)),
+    (with_required(paths=[1]), GOOD_CI, ("paths",)),
+    (with_required(pendingKeyPrefix=""), GOOD_CI, ("pendingKeyPrefix",)),
+    (dict(GOOD_CI, metadataRerunKeys="check:pr-body"), GOOD_CI, ("metadataRerunKeys",)),
+    (dict(GOOD_CI, metadataRerunKeys=[1]), GOOD_CI, ("metadataRerunKeys",)),
+):
+    rendered_ci(good)
+    result = render(bad)
+    assert result.returncode != 0, f"accepted malformed {ci_path}: {bad!r}"
+    assert "schema(s)" in result.stderr, result.stderr
+    # Helm 3.16 prints dotted paths, newer releases JSON pointers.
+    normalized = result.stderr.replace("/", ".")
+    assert ci_path in normalized, result.stderr
+    assert all(diagnostic in result.stderr for diagnostic in diagnostics), result.stderr
+
+result = subprocess.run(
+    [
+        "helm", "template", "acme", chart,
+        "--set", f"api.extraEnv[0].name={env_name}",
+        "--set-string", "api.extraEnv[0].value={}",
+    ],
+    text=True, capture_output=True,
+)
+assert result.returncode != 0, f"accepted reserved api.extraEnv {env_name}"
+assert "api.extraEnv" in result.stderr and "factory.bindings" in result.stderr, result.stderr
+print("  ok: factory repo ci renders and is retained empty; schema and extraEnv refuse invalid inputs")
+PYEOF
+
+echo "=== Assertion 22: API rollouts retain availability and drain before shutdown (#4174) ==="
+assert_api_rollout() {
+  python3 - "$1" <<'PYEOF'
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as source:
+    deployments = [
+        doc for doc in yaml.safe_load_all(source)
+        if isinstance(doc, dict)
+        and doc.get("kind") == "Deployment"
+        and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "api"
+    ]
+if len(deployments) != 1:
+    sys.exit(f"API rollout assertion requires one API Deployment, got {len(deployments)}")
+spec = deployments[0]["spec"]
+strategy = spec.get("strategy") or {}
+rolling = strategy.get("rollingUpdate") or {}
+if (
+    strategy.get("type") != "RollingUpdate"
+    or type(rolling.get("maxUnavailable")) is not int
+    or rolling.get("maxUnavailable") != 0
+    or type(rolling.get("maxSurge")) is not int
+    or rolling.get("maxSurge") != 1
+):
+    sys.exit("API strategy must use RollingUpdate with maxUnavailable 0 and maxSurge 1")
+containers = [
+    container for container in spec["template"]["spec"]["containers"]
+    if container.get("name") == "api"
+]
+if len(containers) != 1:
+    sys.exit(f"API rollout assertion requires one container named api, got {len(containers)}")
+command = (
+    containers[0].get("lifecycle", {}).get("preStop", {}).get("exec", {}).get("command")
+)
+if command != ["sleep", "5"]:
+    sys.exit("API preStop must exec sleep 5")
+print("  ok: API RollingUpdate keeps an available pod and preStop sleeps for 5 seconds")
+PYEOF
+}
+API_ROLLOUT_RENDER="$TMP/api-rollout.yaml"
+helm template acme "$CHART" --namespace acme \
+  --show-only templates/api.yaml > "$API_ROLLOUT_RENDER"
+assert_api_rollout "$API_ROLLOUT_RENDER" \
+  || fail "API rollout must retain availability and drain before shutdown."
+
+echo "=== Assertion 22 negative controls: absent API strategy and preStop blocks FAIL ==="
+for case_name in strategy lifecycle; do
+  mutant_chart="$TMP/api-rollout-$case_name"
+  cp -a "$CHART" "$mutant_chart"
+  python3 - "$mutant_chart/templates/api.yaml" "$case_name" <<'PYEOF'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text()
+blocks = {
+    "strategy": (
+        "  strategy:\n"
+        "    type: RollingUpdate\n"
+        "    rollingUpdate:\n"
+        "      maxUnavailable: 0\n"
+        "      maxSurge: 1\n"
+    ),
+    "lifecycle": (
+        "          lifecycle:\n"
+        "            preStop:\n"
+        "              exec:\n"
+        "                command: [\"sleep\", \"5\"]\n"
+    ),
+}
+block = blocks[sys.argv[2]]
+if source.count(block) != 1:
+    sys.exit(f"API rollout negative control requires exactly one {sys.argv[2]} block")
+path.write_text(source.replace(block, ""))
+PYEOF
+  mutant_render="$TMP/api-rollout-$case_name.yaml"
+  helm template acme "$mutant_chart" --namespace acme \
+    --show-only templates/api.yaml > "$mutant_render"
+  negative_output=""
+  if negative_output="$(assert_api_rollout "$mutant_render" 2>&1)"; then
+    fail "API rollout negative control $case_name passed the assertion."
+  fi
+  if [[ "$case_name" == strategy ]]; then
+    expected_error="API strategy must use RollingUpdate with maxUnavailable 0 and maxSurge 1"
+  else
+    expected_error="API preStop must exec sleep 5"
+  fi
+  if [[ "$negative_output" != *"$expected_error"* ]]; then
+    fail "API rollout negative control $case_name failed unexpectedly: $negative_output"
+  fi
+  echo "  ok: absent API $case_name block is rejected"
+done
+
+echo "=== Assertion 23: publication dependency additions require an explicit opt-in (#4294) ==="
+python3 - "$CHART" "$TMP/reuse-render/curie/templates/worker.yaml" <<'PYEOF'
+import json
+import pathlib
+import subprocess
+import sys
+
+import yaml
+
+chart = pathlib.Path(sys.argv[1])
+env_name = "CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS"
+value_key = "worker.publication.allowDependencyAdditions"
+
+
+def dependency_opt_in(documents):
+    workers = [
+        doc for doc in documents
+        if isinstance(doc, dict)
+        and doc.get("kind") == "Deployment"
+        and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "worker"
+    ]
+    assert len(workers) == 1, f"expected one worker Deployment, found {len(workers)}"
+    containers = workers[0]["spec"]["template"]["spec"]["containers"]
+    worker = [container for container in containers if container["name"] == "worker"]
+    assert len(worker) == 1, f"expected one worker container, found {len(worker)}"
+    entries = [entry for entry in worker[0]["env"] if entry["name"] == env_name]
+    assert len(entries) == 1, f"expected exactly one {env_name}, found {entries!r}"
+    assert set(entries[0]) == {"name", "value"}, entries[0]
+    assert isinstance(entries[0]["value"], str), entries[0]
+    return entries[0]["value"]
+
+
+def render(*args):
+    return subprocess.run(
+        ["helm", "template", "acme", str(chart), *args],
+        text=True, capture_output=True,
+    )
+
+
+for args, expected in (
+    ([], "false"),
+    (["--set", f"{value_key}=true"], "true"),
+    (["--set", f"{value_key}=false"], "false"),
+):
+    result = render(*args)
+    assert result.returncode == 0, result.stderr
+    value = dependency_opt_in(yaml.safe_load_all(result.stdout))
+    assert value == expected, f"{env_name} rendered {value!r}, expected {expected!r}"
+
+retained = pathlib.Path(sys.argv[2]).read_text()
+assert dependency_opt_in(yaml.safe_load_all(retained)) == "false", (
+    "retained values must refuse dependency additions by default"
+)
+
+for malformed in ("true", "false", "enabled", 1, [], {}):
+    result = render("--set-json", f"{value_key}={json.dumps(malformed)}")
+    assert result.returncode != 0, f"accepted non-boolean {value_key}: {malformed!r}"
+    assert "schema(s)" in result.stderr, result.stderr
+    assert "allowDependencyAdditions" in result.stderr, result.stderr
+
+reserved = yaml.safe_load((chart / "files" / "reserved-env.yaml").read_text())
+assert reserved["worker"].get(env_name) == value_key, f"{env_name} must be registered as reserved"
+for publication_enabled in (True, False):
+    result = render(
+        "--set", f"worker.publication.enabled={str(publication_enabled).lower()}",
+        "--set", f"worker.extraEnv[0].name={env_name}",
+        "--set-string", "worker.extraEnv[0].value=true",
+    )
+    assert result.returncode != 0, f"accepted reserved worker.extraEnv {env_name}"
+    assert "worker.extraEnv" in result.stderr and value_key in result.stderr, result.stderr
+print("  ok: dependency additions default false, explicit true renders, schema and extraEnv refuse bypasses")
+PYEOF
+
+echo "=== Assertion 24: API and worker S3 regions match bundle fetches (#4378) ==="
+python3 - "$CHART" <<'PYEOF'
+import copy
+import json
+import subprocess
+import sys
+
+import yaml
+
+chart = sys.argv[1]
+
+
+def service_container(documents, component):
+    deployments = [
+        doc for doc in documents
+        if isinstance(doc, dict)
+        and doc.get("kind") == "Deployment"
+        and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == component
+    ]
+    assert len(deployments) == 1, f"expected one {component} Deployment, found {len(deployments)}"
+    containers = [
+        container for container in deployments[0]["spec"]["template"]["spec"]["containers"]
+        if container["name"] == component
+    ]
+    assert len(containers) == 1, f"expected one {component} container, found {len(containers)}"
+    return containers[0]
+
+
+def assert_regions(documents, expected):
+    for component in ("api", "worker"):
+        entries = [
+            entry for entry in service_container(documents, component)["env"]
+            if entry["name"] == "S3_REGION"
+        ]
+        assert entries == [{"name": "S3_REGION", "value": expected}], (
+            f"{component} S3_REGION must equal {expected!r} exactly once"
+        )
+    fetches = [
+        container for doc in documents
+        if isinstance(doc, dict) and doc.get("kind") == "SandboxTemplate"
+        for container in doc["spec"]["podTemplate"]["spec"].get("initContainers", [])
+        if container["name"] == "bundle-fetch"
+    ]
+    assert fetches, "expected at least one bundle-fetch init container"
+    for container in fetches:
+        entries = [entry for entry in container["env"] if entry["name"] == "AWS_DEFAULT_REGION"]
+        assert entries == [{"name": "AWS_DEFAULT_REGION", "value": expected}], (
+            f"bundle-fetch AWS_DEFAULT_REGION must equal {expected!r} exactly once"
+        )
+
+
+def render(*args):
+    result = subprocess.run(
+        ["helm", "template", "acme", chart, "--namespace", "acme", *args],
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return list(yaml.safe_load_all(result.stdout))
+
+
+assert_regions(render(), "us-east-1")
+override = render("--set", "rustfs.region=eu-west-1")
+assert_regions(override, "eu-west-1")
+web_identity = render(
+    "--set", "rustfs.region=eu-west-1",
+    "--set", "rustfs.deploy=false",
+    "--set", "rustfs.host=s3.example.com",
+    "--set", "rustfs.port=443",
+    "--set", "rustfs.auth.accessKey=",
+    "--set-json", "rustfs.egress=" + json.dumps([
+        {"cidr": "192.0.2.10/32", "ports": [{"protocol": "TCP", "port": 443}]},
+    ]),
+    "--set-json", "rustfs.stsEgress=" + json.dumps([
+        {"cidr": "192.0.2.11/32", "ports": [{"protocol": "TCP", "port": 443}]},
+    ]),
+)
+assert_regions(web_identity, "eu-west-1")
+for component in ("api", "worker"):
+    names = {entry["name"] for entry in service_container(web_identity, component)["env"]}
+    assert not names & {"S3_ACCESS_KEY", "S3_SECRET_KEY"}, (
+        f"{component} web identity render must omit static S3 credentials"
+    )
+print("  ok: default us-east-1 and override eu-west-1 reach API, worker and bundle fetches with either auth mode")
+
+for component in ("api", "worker"):
+    for region in ("us-east-1", "eu-west-1"):
+        result = subprocess.run(
+            [
+                "helm", "template", "acme", chart, "--namespace", "acme",
+                "--set", "rustfs.region=eu-west-1",
+                "--set", f"{component}.extraEnv[0].name=S3_REGION",
+                "--set-string", f"{component}.extraEnv[0].value={region}",
+            ],
+            text=True, capture_output=True,
+        )
+        assert result.returncode != 0, f"accepted reserved {component}.extraEnv S3_REGION={region}"
+        for expected in (f"{component}.extraEnv", "S3_REGION", "rustfs.region"):
+            assert expected in result.stderr, result.stderr
+    extension = render(
+        "--set", "rustfs.region=eu-west-1",
+        "--set", f"{component}.extraEnv[0].name=ACME_EXTENSION",
+        "--set-string", f"{component}.extraEnv[0].value=preserved",
+    )
+    assert_regions(extension, "eu-west-1")
+    entries = [
+        entry for entry in service_container(extension, component)["env"]
+        if entry["name"] == "ACME_EXTENSION"
+    ]
+    assert entries == [{"name": "ACME_EXTENSION", "value": "preserved"}], (
+        f"{component} ACME_EXTENSION must be preserved exactly once"
+    )
+    print(f"  ok: {component}.extraEnv rejects conflicting and identical S3_REGION entries and preserves an unrelated extension")
+
+for component in ("api", "worker"):
+    mutant = copy.deepcopy(override)
+    container = service_container(mutant, component)
+    container["env"] = [entry for entry in container["env"] if entry["name"] != "S3_REGION"]
+    try:
+        assert_regions(mutant, "eu-west-1")
+    except AssertionError as error:
+        assert str(error) == f"{component} S3_REGION must equal 'eu-west-1' exactly once", str(error)
+    else:
+        raise AssertionError(f"missing {component} S3_REGION passed the region assertion")
+    print(f"  ok: missing {component} S3_REGION is rejected")
+PYEOF
+
+echo "=== Assertion 25: worker hands its mounted code-host CA bundle to publication Jobs (#4394) ==="
+python3 - "$CHART" <<'PYEOF'
+import copy
+import subprocess
+import sys
+
+import yaml
+
+chart = sys.argv[1]
+env_name = "CURIE_CODE_HOST_CA_BUNDLE"
+ca_path = "/etc/curie/code-host-trust/ca.crt"
+
+
+def worker_container(documents):
+    workers = [
+        doc for doc in documents
+        if isinstance(doc, dict)
+        and doc.get("kind") == "Deployment"
+        and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "worker"
+    ]
+    assert len(workers) == 1, f"expected one worker Deployment, found {len(workers)}"
+    containers = [
+        container for container in workers[0]["spec"]["template"]["spec"]["containers"]
+        if container["name"] == "worker"
+    ]
+    assert len(containers) == 1, f"expected one worker container, found {len(containers)}"
+    return containers[0]
+
+
+def ca_entries(documents):
+    return [entry for entry in worker_container(documents)["env"] if entry["name"] == env_name]
+
+
+def assert_ca_file(documents):
+    entries = ca_entries(documents)
+    assert entries == [{"name": env_name, "value": ca_path}], (
+        f"worker {env_name} must equal {ca_path!r} exactly once, found {entries!r}"
+    )
+    workers = [doc for doc in documents if isinstance(doc, dict) and doc.get("kind") == "Deployment" and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "worker"]
+    volumes = [volume for volume in workers[0]["spec"]["template"]["spec"]["volumes"] if volume["name"] == "code-host-trust"]
+    assert len(volumes) == 1
+    assert volumes[0]["configMap"] == {"name": "github-stub-ca", "items": [{"key": "ca.pem", "path": "ca.crt"}]}
+    mounts = [
+        mount for mount in worker_container(documents).get("volumeMounts", [])
+        if mount["name"] == "code-host-trust"
+    ]
+    assert len(mounts) == 1, f"expected one worker github-stub-ca mount, found {mounts!r}"
+    assert mounts[0]["mountPath"] == ca_path.rsplit("/", 1)[0], (
+        f"{env_name} directory must equal the github-stub-ca mountPath {mounts[0]['mountPath']!r}"
+    )
+
+
+def render(*args):
+    result = subprocess.run(
+        ["helm", "template", "acme", chart, *args],
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return list(yaml.safe_load_all(result.stdout))
+
+
+default = render()
+assert ca_entries(default) == [], f"default render must not set {env_name}"
+print(f"  ok: default render gives the worker no {env_name}")
+
+configured = render("--set", "codeHostTrust.caBundle.configMapRef.name=github-stub-ca", "--set", "codeHostTrust.caBundle.configMapRef.key=ca.pem")
+assert_ca_file(configured)
+print(f"  ok: codeHostTrust.caBundle.configMapRef renders {env_name}={ca_path}, the worker's own mounted copy of the bundle")
+
+mutant = copy.deepcopy(configured)
+container = worker_container(mutant)
+container["env"] = [entry for entry in container["env"] if entry["name"] != env_name]
+try:
+    assert_ca_file(mutant)
+except AssertionError as error:
+    assert env_name in str(error), str(error)
+else:
+    raise AssertionError(f"a configured render without {env_name} passed the CA assertion")
+print(f"  ok: negative control, a configured render without {env_name} is rejected")
+PYEOF
+
 echo
-echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate while every other workload keeps its strategy; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays."
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate, the API uses RollingUpdate with maxUnavailable 0 and maxSurge 1 plus a preStop sleep 5, proven by both removed-block negative controls, and other workloads keep their strategies; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays; every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from the chart-owned runner token Secret and none renders the tokenless dev flag, proven by three failing negative controls; and codeHostTrust.caBundle.configMapRef hands the worker the path of its own mounted code-host CA bundle for publication Jobs and is absent by default, proven by a failing negative control."

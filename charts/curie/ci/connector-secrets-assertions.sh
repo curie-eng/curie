@@ -203,6 +203,73 @@ if ! helm template curie "$CHART" \
   fail "legitimate connector-secret name GITHUB_PERSONAL_ACCESS_TOKEN failed to render"
 fi
 
+# @spec ACTION-EXECUTOR-16: key custody. The snapshot sealing key reaches only
+# the hosted connector, as a SecretRef. Under agentSandbox.connectorSecrets it
+# would land in the per-agent Secret the runner sandbox reads, so the render
+# fails and names the key -- a `fail`, not the silent skip the E2E names get,
+# because a skipped key would deploy a connector that cannot seal. Rendered
+# output and errors go to temp files, never through process arguments.
+custody_work="$(mktemp -d)"
+trap 'rm -rf "$custody_work"' EXIT
+
+for key in SNAPSHOT_SEALING_KEY SNAPSHOT_SEALING_KEYS_RETAINED; do
+  if helm template curie "$CHART" \
+    --set-string "agentSandbox.connectorSecrets.demo.${key}=seal-sentinel" \
+    >"$custody_work/out.yaml" 2>"$custody_work/err.txt"; then
+    fail "sealing key '${key}' under agentSandbox.connectorSecrets rendered instead of failing"
+  fi
+  # The custody refusal specifically (review L5): the path it was set under,
+  # the key, and the sealing-key wording. Any other guard that happens to name
+  # the key (the boot-env reserved guard, a schema error) does not satisfy it.
+  grep -qF "agentSandbox.connectorSecrets.demo.${key} is a reserved snapshot sealing key" \
+    "$custody_work/err.txt" \
+    || fail "sealing key '${key}' render failed without the custody refusal: $(head -c 400 "$custody_work/err.txt")"
+  grep -qF "SecretRef" "$custody_work/err.txt" \
+    || fail "sealing key '${key}' refusal does not say to declare it as a SecretRef"
+  if grep -qF "seal-sentinel" "$custody_work/err.txt"; then
+    fail "sealing key '${key}' refusal echoes the submitted value"
+  fi
+done
+
+# @spec ACTION-EXECUTOR-16 (review L4): agentSandbox.runner.extraEnv puts a
+# variable into every runner sandbox, so the sealing key there would reach
+# every agent's sandbox (and, outside the connector-secret marker, unredacted).
+# The render fails, naming the key, and never echoes the value.
+for key in SNAPSHOT_SEALING_KEY SNAPSHOT_SEALING_KEYS_RETAINED; do
+  if helm template curie "$CHART" \
+    --set-string "agentSandbox.runner.extraEnv[0].name=${key}" \
+    --set-string "agentSandbox.runner.extraEnv[0].value=seal-sentinel" \
+    >"$custody_work/out.yaml" 2>"$custody_work/err.txt"; then
+    fail "sealing key '${key}' under agentSandbox.runner.extraEnv rendered instead of failing"
+  fi
+  grep -qF "$key" "$custody_work/err.txt" \
+    || fail "sealing key '${key}' extraEnv render failed without naming it: $(head -c 400 "$custody_work/err.txt")"
+  grep -qi "sealing key" "$custody_work/err.txt" \
+    || fail "sealing key '${key}' extraEnv render failed without saying it is the sealing key: $(head -c 400 "$custody_work/err.txt")"
+  if grep -qF "seal-sentinel" "$custody_work/err.txt"; then
+    fail "sealing key '${key}' extraEnv refusal echoes the submitted value"
+  fi
+done
+
+# Paired control: an unreserved runner extraEnv name renders into the runner env.
+helm template curie "$CHART" \
+  --set-string 'agentSandbox.runner.extraEnv[0].name=MY_SEAL_KEY' \
+  --set-string 'agentSandbox.runner.extraEnv[0].value=seal-control' \
+  >"$custody_work/extra-control.yaml" 2>"$custody_work/extra-control-err.txt" \
+  || fail "unreserved runner extraEnv MY_SEAL_KEY failed to render: $(head -c 400 "$custody_work/extra-control-err.txt")"
+grep -Eq '^ +- name: MY_SEAL_KEY$' "$custody_work/extra-control.yaml" \
+  || fail "MY_SEAL_KEY did not render into the runner env via agentSandbox.runner.extraEnv"
+
+# Paired control: an unreserved name of the same shape renders and lands in the
+# per-agent Secret, so the refusal above cannot pass because connector Secrets
+# stopped rendering. (A plain MY_SEAL_KEY fails custody at the API instead.)
+helm template curie "$CHART" \
+  --set-string 'agentSandbox.connectorSecrets.demo.MY_SEAL_KEY=seal-control' \
+  >"$custody_work/control.yaml" 2>"$custody_work/control-err.txt" \
+  || fail "unreserved connector-secret name MY_SEAL_KEY failed to render: $(head -c 400 "$custody_work/control-err.txt")"
+grep -Eq '^  MY_SEAL_KEY: "seal-control"$' "$custody_work/control.yaml" \
+  || fail "MY_SEAL_KEY did not render into the per-agent connector Secret"
+
 # Per-agent egress (#1488): two agents with distinct connector CIDRs render
 # policies that select only that agent's pods. Cross-agent selection is the
 # leak this exists to prevent. The shared runner-allow-egress policy stays
@@ -452,3 +519,140 @@ assert_probe_delivery curie curie \
   --set security.gvisor.runtimeClassName=acme-runsc
 
 echo "OK: per-agent connector-secret render assertions passed"
+
+# ADR 0176: the test cluster kubeconfig is a connector secret the sandbox must
+# not receive. A normal connector token still renders beside it.
+withheld="$(helm template curie "$CHART" \
+  --set-string 'agentSandbox.connectorSecrets.acme-a.GITHUB_PERSONAL_ACCESS_TOKEN=agent-a-sentinel' \
+  --set-string 'agentSandbox.connectorSecrets.acme-a.E2E_CLUSTER_KUBECONFIG=kubeconfig-sentinel' \
+  --set-string 'agentSandbox.connectorSecrets.acme-a.E2E_REGISTRY_PUSH_CONFIG=registry-sentinel' \
+  --set-string 'agentSandbox.connectorSecrets.acme-a.E2E_BUILD_CACHE_CONFIG=cache-sentinel' \
+  2>/dev/null)"
+withheld_secret="$(require_resource "$withheld" Secret curie-agent-acme-a-connector-secrets)"
+withheld_template="$(require_resource "$withheld" SandboxTemplate curie-agent-acme-a-runner)"
+require_text "$withheld_secret" 'GITHUB_PERSONAL_ACCESS_TOKEN: "agent-a-sentinel"' \
+  "withheld render dropped the ordinary connector secret"
+forbid_text "$withheld_secret" \
+  'E2E_CLUSTER_KUBECONFIG|E2E_REGISTRY_PUSH_CONFIG|E2E_BUILD_CACHE_CONFIG|kubeconfig-sentinel|registry-sentinel|cache-sentinel' \
+  "sandbox Secret stored a test cluster or registry credential"
+forbid_text "$withheld_template" \
+  'E2E_CLUSTER_KUBECONFIG|E2E_REGISTRY_PUSH_CONFIG|E2E_BUILD_CACHE_CONFIG|kubeconfig-sentinel|registry-sentinel|cache-sentinel' \
+  "sandbox template referenced a test cluster or registry credential"
+require_text "$withheld_template" 'name: GITHUB_PERSONAL_ACCESS_TOKEN' \
+  "sandbox template dropped the ordinary connector secret"
+
+stock_api="$(require_resource "$(helm template curie "$CHART" 2>/dev/null)" Deployment curie-api)"
+require_text "$stock_api" 'name: CURIE_E2E_CONNECTOR_ENABLED' \
+  "API lacks CURIE_E2E_CONNECTOR_ENABLED"
+require_text "$(grep -A1 'name: CURIE_E2E_CONNECTOR_ENABLED' <<<"$stock_api")" 'value: "false"' \
+  "e2e connector must be disabled on a stock install"
+
+if helm template curie "$CHART" --set e2eConnector.enabled=true >/dev/null 2>&1; then
+  fail "e2eConnector.enabled without the test cluster identity rendered"
+fi
+
+e2e_identity=(
+  --set e2eConnector.enabled=true
+  --set e2eConnector.ownerLabel.value=acme
+  --set e2eConnector.serviceAccount=curie-e2e-connector
+  --set e2eConnector.serviceAccountNamespace=test-system
+  --set e2eConnector.workerClusterRole=curie-e2e-connector-namespace
+)
+enabled_render="$(helm template curie "$CHART" "${e2e_identity[@]}" \
+  --set worker.connectorReconciler.enabled=true 2>/dev/null)"
+enabled_api="$(require_resource "$enabled_render" Deployment curie-api)"
+require_text "$(grep -A1 'name: CURIE_E2E_CONNECTOR_ENABLED' <<<"$enabled_api")" 'value: "true"' \
+  "enabled install did not tell the API the test cluster is configured"
+require_text "$enabled_api" 'value: "acme"' \
+  "enabled install did not pass the owner label value"
+
+# #3245: the worker's end to end namespace reaper gets the same scope as the
+# API, only when e2eConnector is enabled.
+stock_worker="$(require_resource "$(helm template curie "$CHART" 2>/dev/null)" Deployment curie-worker)"
+forbid_text "$stock_worker" 'name: CURIE_E2E_' \
+  "a stock install configured the e2e reaper on the worker"
+enabled_worker="$(require_resource "$enabled_render" Deployment curie-worker)"
+for name in CURIE_E2E_NAMESPACE_PREFIX CURIE_E2E_OWNER_LABEL_KEY CURIE_E2E_REAPER_INTERVAL_S; do
+  require_text "$enabled_worker" "name: ${name}\$" "enabled install did not give the worker ${name}"
+done
+require_text "$(grep -A1 'name: CURIE_E2E_CONNECTOR_ENABLED' <<<"$enabled_worker")" 'value: "true"' \
+  "enabled install did not turn the worker's e2e reaper on"
+require_text "$(grep -A1 'name: CURIE_E2E_OWNER_LABEL_VALUE' <<<"$enabled_worker")" 'value: "acme"' \
+  "the worker's reaper owner label value differs from the API's"
+require_text "$(grep -A1 'name: CURIE_E2E_REAPER_INTERVAL_S' <<<"$enabled_worker")" 'value: "60"' \
+  "the worker's reaper interval did not default to 60 seconds"
+
+# The reaper reads the kubeconfig through the reconciler's Secret list grant,
+# so enabling e2eConnector without the reconciler is refused by name.
+if no_reconciler="$(helm template curie "$CHART" "${e2e_identity[@]}" 2>&1)"; then
+  fail "e2eConnector.enabled without worker.connectorReconciler.enabled rendered"
+fi
+require_text "$no_reconciler" 'e2eConnector.enabled requires worker.connectorReconciler.enabled' \
+  "the missing reconciler refusal did not name worker.connectorReconciler.enabled"
+
+if helm template curie "$CHART" "${e2e_identity[@]}" --set worker.connectorReconciler.enabled=true \
+  --set e2eConnector.reaperIntervalSeconds=5 >/dev/null 2>&1; then
+  fail "a reaper interval below 10 seconds passed the schema"
+fi
+
+# #3246: the image build values reach the API (the connector render) and the
+# worker (registry retention), and the push and cache configs stay off the sandbox.
+build_render="$(helm template curie "$CHART" "${e2e_identity[@]}" \
+  --set worker.connectorReconciler.enabled=true \
+  --set e2eConnector.registry=registry.test:5000/e2e \
+  --set 'e2eConnector.registryTokenHosts={auth.test,auth2.test:8443}' \
+  --set e2eConnector.registryInsecure=true 2>/dev/null)"
+build_api="$(require_resource "$build_render" Deployment curie-api)"
+build_worker="$(require_resource "$build_render" Deployment curie-worker)"
+for name in CURIE_E2E_REGISTRY CURIE_E2E_BUILD_CACHE_REPO CURIE_E2E_REGISTRY_INSECURE \
+  CURIE_E2E_REGISTRY_TOKEN_HOSTS CURIE_E2E_BUILDER_IMAGE CURIE_E2E_GIT_IMAGE \
+  CURIE_E2E_PUSH_IMAGE CURIE_E2E_BUILD_TIMEOUT_SECONDS CURIE_E2E_SOURCE_HOSTS; do
+  require_text "$build_api" "name: ${name}\$" "enabled install did not give the API ${name}"
+done
+require_text "$(grep -A1 'name: CURIE_E2E_REGISTRY$' <<<"$build_api")" \
+  'value: "registry.test:5000/e2e"' "the API did not receive the registry prefix"
+# An unset cache repository defaults to <registry>/cache.
+require_text "$(grep -A1 'name: CURIE_E2E_BUILD_CACHE_REPO' <<<"$build_api")" \
+  'value: "registry.test:5000/e2e/cache"' "the cache repository did not default to <registry>/cache"
+require_text "$(grep -A1 'name: CURIE_E2E_BUILD_TIMEOUT_SECONDS' <<<"$build_api")" \
+  'value: "1200"' "the build timeout did not default to 1200 seconds"
+require_text "$(grep -A1 'name: CURIE_E2E_REGISTRY_TOKEN_HOSTS' <<<"$build_api")" \
+  'value: "auth.test,auth2.test:8443"' "the API token hosts were not joined with commas"
+require_text "$(grep -A1 'name: CURIE_E2E_REGISTRY_INSECURE' <<<"$build_api")" \
+  'value: "true"' "the API did not receive registryInsecure"
+require_text "$(grep -A1 'name: CURIE_E2E_SOURCE_HOSTS' <<<"$build_api")" \
+  'value: "github.com"' "the source hosts did not default to github.com"
+for name in CURIE_E2E_REGISTRY CURIE_E2E_REGISTRY_INSECURE CURIE_E2E_REGISTRY_TOKEN_HOSTS; do
+  require_text "$build_worker" "name: ${name}\$" "enabled install did not give the worker ${name}"
+done
+require_text "$(grep -A1 'name: CURIE_E2E_REGISTRY$' <<<"$build_worker")" \
+  'value: "registry.test:5000/e2e"' "the worker did not receive the registry prefix"
+require_text "$(grep -A1 'name: CURIE_E2E_REGISTRY_TOKEN_HOSTS' <<<"$build_worker")" \
+  'value: "auth.test,auth2.test:8443"' "the worker token hosts were not joined with commas"
+require_text "$(grep -A1 'name: CURIE_E2E_REGISTRY_INSECURE' <<<"$build_worker")" \
+  'value: "true"' "the worker did not receive registryInsecure"
+forbid_text "$build_worker" 'E2E_REGISTRY_PUSH_CONFIG|E2E_BUILD_CACHE_CONFIG' \
+  "the worker env named a registry credential"
+
+# An installation with no registry still renders, with the registry empty.
+unset_render="$(helm template curie "$CHART" "${e2e_identity[@]}" \
+  --set worker.connectorReconciler.enabled=true 2>/dev/null)"
+unset_api="$(require_resource "$unset_render" Deployment curie-api)"
+require_text "$(grep -A1 'name: CURIE_E2E_REGISTRY$' <<<"$unset_api")" 'value: ""' \
+  "an unset registry did not render empty"
+
+# An explicit empty cache repository disables the cache.
+nocache_render="$(helm template curie "$CHART" "${e2e_identity[@]}" \
+  --set worker.connectorReconciler.enabled=true \
+  --set e2eConnector.registry=registry.test:5000/e2e \
+  --set-string e2eConnector.buildCacheRepo= 2>/dev/null)"
+nocache_api="$(require_resource "$nocache_render" Deployment curie-api)"
+require_text "$(grep -A1 'name: CURIE_E2E_BUILD_CACHE_REPO' <<<"$nocache_api")" 'value: ""' \
+  "an explicit empty buildCacheRepo did not disable the cache"
+
+if helm template curie "$CHART" "${e2e_identity[@]}" --set worker.connectorReconciler.enabled=true \
+  --set e2eConnector.buildTimeoutSeconds=30 >/dev/null 2>&1; then
+  fail "a build timeout below 60 seconds passed the schema"
+fi
+
+echo "OK: end to end connector render assertions passed"

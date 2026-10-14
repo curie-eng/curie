@@ -37,7 +37,7 @@ pub const PERMISSIONS: [(&str, &str); 7] = [
     ("pull_requests", "write"),
     ("checks", "read"),
     ("statuses", "write"),
-    ("actions", "read"),
+    ("actions", "write"),
 ];
 
 /// `curie-factory-<8 lowercase hex>`: unique enough that the GitHub-wide App
@@ -80,7 +80,7 @@ pub fn registration_steps() -> Vec<String> {
         "Open the link and click Create GitHub App; the name, permissions, and the disabled webhook are already filled in.".to_string(),
         "On the new App's settings page, note the App ID and click Generate a private key to download the .pem file.".to_string(),
         "Click Install App and install it on the repositories the factory may work in.".to_string(),
-        "Rerun: curie cluster factory --app-id <APP_ID> --private-key-file <PATH.pem> --webhook-secret-file <PATH>".to_string(),
+        "Rerun: curie cluster factory --intake poll --app-id <APP_ID> --private-key-file <PATH.pem> --repo <OWNER/REPO>".to_string(),
     ]
 }
 
@@ -153,22 +153,24 @@ impl GithubApi {
     }
 
     /// One call; returns the status and the parsed body (Null when not JSON).
-    /// `auth` is a bearer credential and is never echoed.
+    /// `auth`, when required by the endpoint, is never echoed.
     async fn call(
         &self,
         method: reqwest::Method,
         url: reqwest::Url,
-        auth: &str,
+        auth: Option<&str>,
         body: Option<&serde_json::Value>,
     ) -> Result<(u16, serde_json::Value)> {
         let shown = format!("{method} {}", url.path());
         let mut request = self
             .client
             .request(method, url)
-            .header("Authorization", format!("Bearer {auth}"))
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .header("User-Agent", format!("curie/{}", env!("CARGO_PKG_VERSION")));
+        if let Some(auth) = auth {
+            request = request.bearer_auth(auth);
+        }
         if let Some(body) = body {
             request = request.json(body);
         }
@@ -188,9 +190,208 @@ impl GithubApi {
     }
 
     async fn get_app(&self, jwt: &str) -> Result<(u16, serde_json::Value)> {
-        self.call(reqwest::Method::GET, self.url(&["app"]), jwt, None)
+        self.call(reqwest::Method::GET, self.url(&["app"]), Some(jwt), None)
             .await
     }
+
+    /// The numeric user id comes from GitHub's documented user response,
+    /// not the App id. Public user data requires no authentication:
+    /// https://docs.github.com/en/rest/users/users#get-a-user.
+    pub async fn bot_publication_identity(&self, slug: &str) -> Result<PublicationIdentity> {
+        let name = format!("{slug}[bot]");
+        let failure = |detail: String| {
+            let remedy = "check the App bot account and retry; to override commit identity separately, use curie cluster upgrade --set worker.publication.gitUserEmail=<email> and --set worker.publication.gitUserName=<name>";
+            CliError::transient(format!(
+                "GitHub bot lookup GET /users/{name} failed: {detail}; nothing was applied; {remedy}"
+            ))
+            .with_fix(remedy)
+        };
+        let (status, body) = self
+            .call(
+                reqwest::Method::GET,
+                self.url(&["users", &name]),
+                None,
+                None,
+            )
+            .await
+            .map_err(|error| failure(error.to_string()))?;
+        if status != 200 {
+            return Err(failure(format!("GitHub returned HTTP {status}")).into());
+        }
+        let id = body
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|id| *id > 0)
+            .ok_or_else(|| failure("GitHub returned no positive numeric user id".into()))?;
+        Ok(PublicationIdentity {
+            email: format!("{id}+{name}@users.noreply.github.com"),
+            name,
+        })
+    }
+
+    /// Resolve once, then keep every Contents API read on the same commit.
+    /// Shapes and `ref` semantics are documented at
+    /// https://docs.github.com/en/rest/repos/repos#get-a-repository and
+    /// https://docs.github.com/en/rest/commits/commits#get-a-commit.
+    pub async fn default_branch_commit(&self, app: &InstalledApp, repo: &str) -> Result<String> {
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| CliError::usage("repository must be owner/repo"))?;
+        let token = app
+            .token_for(repo)
+            .ok_or_else(|| CliError::failure("repository is outside the App installation"))?;
+        let (status, metadata) = self
+            .call(
+                reqwest::Method::GET,
+                self.url(&["repos", owner, name]),
+                Some(token),
+                None,
+            )
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(unexpected(status, "GET repository metadata"));
+        }
+        let branch = metadata
+            .get("default_branch")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                CliError::failure("GitHub repository response carries no default_branch")
+            })?;
+        let (status, commit) = self
+            .call(
+                reqwest::Method::GET,
+                self.url(&["repos", owner, name, "commits", branch]),
+                Some(token),
+                None,
+            )
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(unexpected(status, "GET default branch commit"));
+        }
+        commit
+            .get("sha")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.len() >= 40 && s.chars().all(|c| c.is_ascii_hexdigit()))
+            .map(str::to_string)
+            .ok_or_else(|| CliError::failure("GitHub commit response carries no valid sha").into())
+    }
+
+    /// The numeric id of `repo`, read with the App's installation token so a
+    /// private repository answers (#4358). A repository outside the
+    /// installation is refused with the allowlist's install fix.
+    /// https://docs.github.com/en/rest/repos/repos#get-a-repository
+    pub async fn repository_id(&self, app: &InstalledApp, repo: &str) -> Result<u64> {
+        resolve_allowlist(&[repo.to_string()], app, false)?;
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| CliError::usage("repository must be owner/repo"))?;
+        let token = app
+            .token_for(repo)
+            .ok_or_else(|| CliError::failure("repository is outside the App installation"))?;
+        let (status, metadata) = self
+            .call(
+                reqwest::Method::GET,
+                self.url(&["repos", owner, name]),
+                Some(token),
+                None,
+            )
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(unexpected(status, &format!("GET repository {repo}")));
+        }
+        metadata
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|id| *id > 0)
+            .ok_or_else(|| {
+                CliError::failure(format!("GitHub returned no repository id for {repo}")).into()
+            })
+    }
+
+    /// A directory is an array and a file has base64 content. Neither auth
+    /// failures nor malformed successful responses mean a missing manifest.
+    /// https://docs.github.com/en/rest/repos/contents#get-repository-content
+    pub async fn contents(
+        &self,
+        app: &InstalledApp,
+        repo: &str,
+        path: &str,
+        commit: &str,
+    ) -> Result<RepositoryContent> {
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| CliError::usage("repository must be owner/repo"))?;
+        let token = app
+            .token_for(repo)
+            .ok_or_else(|| CliError::failure("repository is outside the App installation"))?;
+        let mut segments = vec!["repos", owner, name, "contents"];
+        segments.extend(path.split('/').filter(|part| !part.is_empty()));
+        let mut url = self.url(&segments);
+        url.query_pairs_mut().append_pair("ref", commit);
+        let (status, body) = self
+            .call(reqwest::Method::GET, url, Some(token), None)
+            .await?;
+        if status == 404 {
+            return Ok(RepositoryContent::Missing);
+        }
+        if !(200..300).contains(&status) {
+            return Err(unexpected(status, "GET repository contents"));
+        }
+        if body.is_array() {
+            let entries: Vec<RepositoryEntry> = serde_json::from_value(body).map_err(|_| {
+                CliError::failure(format!(
+                    "GitHub returned a malformed contents directory for {path}"
+                ))
+            })?;
+            return Ok(RepositoryContent::Directory(entries));
+        }
+        #[derive(serde::Deserialize)]
+        struct File {
+            #[serde(rename = "type")]
+            kind: String,
+            encoding: String,
+            content: String,
+        }
+        let file: File = serde_json::from_value(body).map_err(|_| {
+            CliError::failure(format!("GitHub returned malformed contents for {path}"))
+        })?;
+        if file.kind != "file" || file.encoding != "base64" {
+            return Err(CliError::failure(format!(
+                "GitHub returned unsupported contents encoding for {path}"
+            ))
+            .into());
+        }
+        let encoded: String = file
+            .content
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| {
+                CliError::failure(format!(
+                    "GitHub returned invalid base64 contents for {path}"
+                ))
+            })?;
+        let text = String::from_utf8(bytes).map_err(|_| {
+            CliError::failure(format!("repository toolchain file {path} is not UTF-8"))
+        })?;
+        Ok(RepositoryContent::File(text))
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct RepositoryEntry {
+    pub path: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+pub enum RepositoryContent {
+    Missing,
+    Directory(Vec<RepositoryEntry>),
+    File(String),
 }
 
 fn unexpected(status: u16, what: &str) -> anyhow::Error {
@@ -215,6 +416,12 @@ pub struct InstalledApp {
     pub repos: Vec<String>,
     /// Lowercased `owner/repo` -> installation access token.
     tokens: BTreeMap<String, String>,
+}
+
+/// The GitHub App bot's author identity for factory publication.
+pub struct PublicationIdentity {
+    pub name: String,
+    pub email: String,
 }
 
 impl InstalledApp {
@@ -280,7 +487,9 @@ pub async fn inspect_app(api: &GithubApi, app_id: &str, pem: &str) -> Result<Ins
         url.query_pairs_mut()
             .append_pair("per_page", "100")
             .append_pair("page", &page.to_string());
-        let (status, installations) = api.call(reqwest::Method::GET, url, &jwt, None).await?;
+        let (status, installations) = api
+            .call(reqwest::Method::GET, url, Some(&jwt), None)
+            .await?;
         if !(200..300).contains(&status) {
             return Err(unexpected(status, "GET /app/installations"));
         }
@@ -310,7 +519,7 @@ pub async fn inspect_app(api: &GithubApi, app_id: &str, pem: &str) -> Result<Ins
             .call(
                 reqwest::Method::POST,
                 api.url(&["app", "installations", &id, "access_tokens"]),
-                &jwt,
+                Some(&jwt),
                 None,
             )
             .await?;
@@ -335,7 +544,9 @@ pub async fn inspect_app(api: &GithubApi, app_id: &str, pem: &str) -> Result<Ins
             url.query_pairs_mut()
                 .append_pair("per_page", "100")
                 .append_pair("page", &page.to_string());
-            let (status, body) = api.call(reqwest::Method::GET, url, &token, None).await?;
+            let (status, body) = api
+                .call(reqwest::Method::GET, url, Some(&token), None)
+                .await?;
             if !(200..300).contains(&status) {
                 return Err(unexpected(status, "GET /installation/repositories"));
             }
@@ -373,10 +584,29 @@ pub async fn inspect_app(api: &GithubApi, app_id: &str, pem: &str) -> Result<Ins
     })
 }
 
-/// Validate `--repo` entries against the installation. Empty input means the
-/// installed repositories become the allowlist.
-pub fn resolve_allowlist(requested: &[String], app: &InstalledApp) -> Result<Vec<String>> {
+pub(crate) fn repository_scope_error() -> anyhow::Error {
+    let message = "--app-id needs a repository scope: pass --repo OWNER/REPO (repeatable) or --all-installed-repos; nothing was applied";
+    let fix = "rerun with --repo <owner>/<name> once per repository the factory may serve, or with --all-installed-repos to allow every repository the GitHub App is installed on";
+    let source: anyhow::Error = CliError::usage(message).with_fix(fix).into();
+    let payload = crate::exit::error_json(&source);
+    crate::exit::operator_context(
+        crate::exit::with_json_payload(source, payload),
+        message.to_string(),
+        Some(fix.to_string()),
+    )
+}
+
+/// Validate `--repo` entries against the installation. Empty input allows
+/// installed repositories only when `all_installed` is explicitly true.
+pub fn resolve_allowlist(
+    requested: &[String],
+    app: &InstalledApp,
+    all_installed: bool,
+) -> Result<Vec<String>> {
     if requested.is_empty() {
+        if !all_installed {
+            return Err(repository_scope_error());
+        }
         return Ok(app.repos.clone());
     }
     let missing: Vec<&String> = requested
@@ -635,7 +865,7 @@ pub async fn label_exists(
         .call(
             reqwest::Method::GET,
             api.url(&["repos", owner, name, "labels", label]),
-            token,
+            Some(token),
             None,
         )
         .await?;
@@ -680,7 +910,7 @@ pub async fn create_label(
         .call(
             reqwest::Method::POST,
             api.url(&["repos", owner, name, "labels"]),
-            token,
+            Some(token),
             Some(&body),
         )
         .await?;
@@ -725,7 +955,7 @@ pub struct Chosen<T> {
     pub inferred: bool,
 }
 
-/// `cluster factory --app-id ... --private-key-file ...` result.
+/// `cluster factory --app-id ... --private-key-file ... --repo ...` result.
 pub struct FactoryAppSetupOutput {
     pub app_id: String,
     pub slug: String,
@@ -918,5 +1148,27 @@ mod tests {
         assert!(!repo_entry_installed("other/*", &installed));
         assert!(!repo_entry_installed("/*", &installed));
         assert!(!repo_entry_installed("acme/bot/*", &installed));
+    }
+
+    #[test]
+    fn empty_allowlist_requires_an_explicit_all_installed_choice() {
+        let app = InstalledApp {
+            slug: "acme-app".into(),
+            repos: vec!["acme/bot".into(), "acme/web".into()],
+            tokens: BTreeMap::new(),
+        };
+        let error = resolve_allowlist(&[], &app, false).expect_err("scope must be explicit");
+        assert_eq!(
+            error.to_string(),
+            "--app-id needs a repository scope: pass --repo OWNER/REPO (repeatable) or --all-installed-repos; nothing was applied"
+        );
+        let (class, fix) = crate::exit::classify(&error);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert_eq!(fix.as_deref(), Some("rerun with --repo <owner>/<name> once per repository the factory may serve, or with --all-installed-repos to allow every repository the GitHub App is installed on"));
+        assert_eq!(resolve_allowlist(&[], &app, true).unwrap(), app.repos);
+        assert_eq!(
+            resolve_allowlist(&["acme/bot".into()], &app, false).unwrap(),
+            vec!["acme/bot"]
+        );
     }
 }

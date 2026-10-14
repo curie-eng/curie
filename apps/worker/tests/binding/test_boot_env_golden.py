@@ -31,6 +31,7 @@ import json
 import time
 import uuid
 
+from curie_internal.sandbox_token import verify
 from curie_worker.binding import (
     SANDBOX_TOKEN_TTL_SECONDS,
     BindingResolver,
@@ -38,7 +39,6 @@ from curie_worker.binding import (
     inject_connector_secrets,
 )
 from curie_worker.config import WorkerConfig
-from curie_worker.sandbox_token import verify
 from nacl.signing import SigningKey
 
 _AGENT = uuid.UUID("11111111-1111-4111-8111-111111111111")
@@ -142,9 +142,7 @@ def test_state_refs_are_minted_from_the_runner_facing_base() -> None:
     )
     env = _boot_env(config, _resolved())
 
-    assert env["CURIE_MEMORY_REF"] == (
-        f"http://curie-api:8000/agents/{_AGENT}/state/memory"
-    )
+    assert env["CURIE_MEMORY_REF"] == (f"http://curie-api:8000/agents/{_AGENT}/state/memory")
     assert env["CURIE_HISTORY_REF"] == (
         f"http://curie-api:8000/agents/{_AGENT}/state/transcript/{_THREAD}"
     )
@@ -158,9 +156,7 @@ def test_state_refs_fall_back_to_the_self_dial_base_when_undivided() -> None:
     own URL (k8s in-cluster, single-host local), so the refs are unchanged."""
     env = _boot_env(WorkerConfig(api_base_url="http://in-cluster-api:8000"), _resolved())
 
-    assert env["CURIE_MEMORY_REF"] == (
-        f"http://in-cluster-api:8000/agents/{_AGENT}/state/memory"
-    )
+    assert env["CURIE_MEMORY_REF"] == (f"http://in-cluster-api:8000/agents/{_AGENT}/state/memory")
     assert env["CURIE_HISTORY_REF"] == (
         f"http://in-cluster-api:8000/agents/{_AGENT}/state/transcript/{_THREAD}"
     )
@@ -286,6 +282,33 @@ def test_boot_env_never_writes_the_kernel_owned_resume_keys() -> None:
     assert "CURIE_APPROVAL_RESUMED_KIND" not in env
 
 
+def test_the_e2e_kubeconfig_is_withheld_from_the_sandbox() -> None:
+    """ADR 0176 decision 2. The test cluster credential never enters boot env."""
+
+    import json
+    from pathlib import Path
+
+    vector_path = Path(__file__).resolve().parents[4] / "tests/vectors/e2e-connector-sandbox.json"
+    vector = json.loads(vector_path.read_text())
+    withheld = vector["withheld_from_sandbox"]
+    assert vector["kubeconfig_secret"] in withheld
+    assert vector["registry_push_secret"] in withheld
+    assert vector["build_cache_secret"] in withheld
+    # Each withheld name carries its own sentinel so a leak names the secret.
+    sentinels = {name: f"{name.lower()}-sentinel" for name in withheld}
+    env = _boot_env(
+        WorkerConfig(),
+        _resolved(secrets={**sentinels, "GITHUB_TOKEN": "ghp-1"}),
+    )
+
+    rendered = json.dumps(env)
+    for secret, sentinel in sentinels.items():
+        assert sentinel not in rendered, secret
+        assert secret not in env, secret
+        assert secret not in env.get("CURIE_CONNECTOR_SECRET_KEYS", ""), secret
+    assert env["GITHUB_TOKEN"] == "ghp-1"
+
+
 def test_connector_secret_with_a_reserved_name_is_dropped_and_unmarked() -> None:
     """#457: the filter is name-policy-based, so it holds on this path too.
 
@@ -402,13 +425,20 @@ def test_a_scoped_boot_carries_a_caller_token_signed_for_its_agent() -> None:
     assert before + SANDBOX_TOKEN_TTL_SECONDS <= exp <= after + SANDBOX_TOKEN_TTL_SECONDS
 
 
-def test_the_caller_token_expires_with_the_state_tokens() -> None:
+def test_the_caller_token_keeps_the_day_cap_when_state_tokens_do_not() -> None:
+    # ADR 0178 keeps the caller token on SANDBOX_TOKEN_TTL_SECONDS. #3823
+    # shortens only the boot state tokens, so the two expiries no longer match.
+    before = int(time.time())
     env = _boot_env(
         WorkerConfig(connector_caller_signing_key=_caller_seed(), **_SCOPED), _resolved()
     )
-    assert _claims(env["CURIE_CONNECTOR_CALLER_TOKEN"])["exp"] == _claims(
-        env["CURIE_STATE_TOKEN"]
-    )["exp"]
+    after = int(time.time())
+    caller_exp = _claims(env["CURIE_CONNECTOR_CALLER_TOKEN"])["exp"]
+    state_exp = _claims(env["CURIE_STATE_TOKEN"])["exp"]
+    assert isinstance(caller_exp, int)
+    assert isinstance(state_exp, int)
+    assert before + SANDBOX_TOKEN_TTL_SECONDS <= caller_exp <= after + SANDBOX_TOKEN_TTL_SECONDS
+    assert state_exp < caller_exp
 
 
 def test_without_a_signing_key_a_scoped_boot_is_unchanged() -> None:
@@ -431,6 +461,28 @@ def test_an_unscoped_boot_carries_no_caller_token_even_with_a_key() -> None:
     assert "CURIE_CONNECTOR_CALLER_TOKEN" not in env
 
 
+def test_a_work_item_boot_signs_the_run_pair_and_caps_exp() -> None:
+    seed = _caller_seed()
+    run = "11111111-1111-4111-8111-111111111111"
+    work_item = "22222222-2222-4222-8222-222222222222"
+    ceiling = int(time.time()) + 90
+    resolver = BindingResolver.__new__(BindingResolver)
+    resolver._config = WorkerConfig(connector_caller_signing_key=seed, **_SCOPED)  # type: ignore[attr-defined]
+    env = resolver.boot_env(
+        _resolved(),
+        _THREAD,
+        caller_run=run,
+        caller_work_item=work_item,
+        caller_exp_ceiling=ceiling,
+    )
+    claims = _claims(env["CURIE_CONNECTOR_CALLER_TOKEN"])
+    assert claims["run"] == run
+    assert claims["work_item"] == work_item
+    assert claims["exp"] == ceiling
+    plain = _boot_env(WorkerConfig(connector_caller_signing_key=seed, **_SCOPED), _resolved())
+    assert "run" not in _claims(plain["CURIE_CONNECTOR_CALLER_TOKEN"])
+
+
 def _boot_env_with_channel(
     config: WorkerConfig,
     resolved: ResolvedDeployment,
@@ -449,9 +501,7 @@ def test_boot_env_omits_channel_bound_without_kind_or_address() -> None:
 
 
 def test_boot_env_marks_a_turn_bound_to_a_channel() -> None:
-    env = _boot_env_with_channel(
-        WorkerConfig(), _resolved(), kind="slack", address="C0EXAMPLE1"
-    )
+    env = _boot_env_with_channel(WorkerConfig(), _resolved(), kind="slack", address="C0EXAMPLE1")
     assert env["CURIE_CHANNEL_BOUND"] == "1"
 
 
@@ -461,7 +511,19 @@ def test_boot_env_omits_channel_bound_when_the_address_is_blank() -> None:
 
 
 def test_boot_env_omits_channel_bound_when_the_kind_is_blank() -> None:
+    env = _boot_env_with_channel(WorkerConfig(), _resolved(), kind="", address="C0EXAMPLE1")
+    assert "CURIE_CHANNEL_BOUND" not in env
+
+
+def test_boot_env_emits_channel_kind_for_a_slack_binding() -> None:
     env = _boot_env_with_channel(
-        WorkerConfig(), _resolved(), kind="", address="C0EXAMPLE1"
+        WorkerConfig(), _resolved(), kind="slack", address="C0EXAMPLE1"
     )
+    assert env["CURIE_CHANNEL_KIND"] == "slack"
+    assert env["CURIE_CHANNEL_BOUND"] == "1"
+
+
+def test_boot_env_omits_channel_kind_when_no_kind_is_passed() -> None:
+    env = _boot_env(WorkerConfig(), _resolved())
+    assert "CURIE_CHANNEL_KIND" not in env
     assert "CURIE_CHANNEL_BOUND" not in env

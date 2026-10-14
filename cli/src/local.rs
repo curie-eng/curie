@@ -1453,12 +1453,13 @@ pub fn with_stack_secret_env(
 }
 
 /// The `local up` note naming where the install's API key lives. The key itself
-/// is never printed; the console needs it as `?api_key=`.
+/// is never printed, and the console never takes it: it signs in with a code
+/// minted by `curie local console login`.
 fn stack_key_note(path: &Path) -> String {
     format!(
         "This install's API key is the `api_key` field of {} (mode 0600). `curie local` \
-         verbs send it to localhost automatically; for the console, append \
-         `&api_key=<that key>` to its URL (`?api_key=<that key>` if it has no query).",
+         verbs send it to localhost automatically. To sign in to the console, run \
+         `curie local console login --subject <you>` and paste the code it prints.",
         path.display()
     )
 }
@@ -3485,7 +3486,9 @@ mod tests {
     fn stack_key_note_names_the_path_not_the_key() {
         let note = stack_key_note(Path::new("/cfg/local/curie.json"));
         assert!(note.contains("/cfg/local/curie.json"), "{note}");
-        assert!(note.contains("?api_key="), "{note}");
+        // #1047: the console signs in with a CLI-minted login code, never the key.
+        assert!(note.contains("curie local console login"), "{note}");
+        assert!(!note.contains("api_key="), "{note}");
     }
 
     #[test]

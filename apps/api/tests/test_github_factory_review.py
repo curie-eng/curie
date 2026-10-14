@@ -25,17 +25,23 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import importlib
 import itertools
 import sys
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import httpx
+import jwt
 import pytest
 import redis.asyncio as redis
+from curie_api import github_app
 from curie_api.config import get_settings
+from curie_api.forges.github.identity import issue_lock_keys_for
+from curie_api.github_factory_review import admit_parsed_feedback
+from curie_api.github_review_events import parse_feedback
 from curie_api.main import create_app
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
@@ -45,8 +51,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_github_factory_ingress import (  # noqa: E402
-    _ENV,
+from forge_fakes.github import (  # noqa: E402
     INSTALLATION_ID,
     LABEL,
     MENTION,
@@ -55,14 +60,13 @@ from test_github_factory_ingress import (  # noqa: E402
     SENDER,
     SENDER_ID,
     GitHubAPI,
-    _code,
-    _Credentials,
     _issue_event,
-    _mark_running,
     _post,
-    _rows,
     _sender,
+    factory_env,
+    fake_installation_tokens,
 )
+from test_github_factory_ingress import _code, _mark_running, _PermissionGate, _rows  # noqa: E402
 
 HEAD = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 BASE_REF = "main"
@@ -196,27 +200,13 @@ def _feedback_event(
     return payload, fid
 
 
-def _patch_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in (
-        "curie_api.github_factory",
-        "curie_api.github_review_truth",
-        "curie_api.github_factory_review",
-        "curie_api.factory_notices",
-    ):
-        try:
-            module = importlib.import_module(name)
-        except ImportError:
-            continue
-        monkeypatch.setattr(
-            module, "credentials_for", lambda _settings: _Credentials(), raising=False
-        )
-
-
-def _boot(monkeypatch: pytest.MonkeyPatch, api: ReviewGitHubAPI, env: dict[str, str]) -> Any:
-    for key, value in {**_ENV, **env}.items():
+def _boot(
+    monkeypatch: pytest.MonkeyPatch, api: ReviewGitHubAPI, env: dict[str, str], key_dir: Path
+) -> Any:
+    for key, value in {**factory_env(key_dir), **env}.items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
-    _patch_credentials(monkeypatch)
+    fake_installation_tokens(monkeypatch)
     return api
 
 
@@ -244,8 +234,13 @@ def _client_with_agent(api: ReviewGitHubAPI) -> Any:
 
 
 @pytest.fixture
-def factory(monkeypatch: pytest.MonkeyPatch, clean_db: None, review_api: ReviewGitHubAPI) -> Any:
-    _boot(monkeypatch, review_api, {})
+def factory(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_db: None,
+    review_api: ReviewGitHubAPI,
+    tmp_path: Path,
+) -> Any:
+    _boot(monkeypatch, review_api, {}, tmp_path)
     client_cm, client, external = _client_with_agent(review_api)
     try:
         yield client, review_api
@@ -322,11 +317,12 @@ def _own_pull_request(
                         "INSERT INTO curie.thread_publication_lineages "
                         "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
                         "base_sha, branch, pr_number, pr_url, head_sha, status, version, "
-                        "latest_revision, github_repository_id, github_installation_id, "
-                        "github_pr_node_id, base_ref) VALUES "
+                        "latest_revision, code_host_kind, code_host_host, "
+                        "repository_project_id, code_host_installation_id, "
+                        "code_host_pr_id, base_ref) VALUES "
                         "(:id, :agent, :deployment, :conversation, :repo, :base, :branch, "
-                        ":pr, :url, :head, :status, 1, 1, :repo_id, :installation, "
-                        ":node, :base_ref)"
+                        ":pr, :url, :head, :status, 1, 1, 'github', 'github.com', :repo_id, "
+                        ":installation, :node, :base_ref)"
                     ),
                     {
                         "id": lineage_id,
@@ -340,7 +336,7 @@ def _own_pull_request(
                         "url": _pr_url(pr),
                         "head": HEAD,
                         "status": lineage_status,
-                        "repo_id": REPO_ID,
+                        "repo_id": str(REPO_ID),
                         "installation": INSTALLATION_ID,
                         "node": f"PR_acme_{pr}",
                         "base_ref": BASE_REF,
@@ -374,13 +370,15 @@ def _requests(number: int) -> list[dict[str, Any]]:
     return _rows(
         "SELECT r.id, r.sequence, r.status, r.terminal_cause, "
         "r.objective, r.requester, r.reply_kind, "
-        "r.reply_address, r.reply_conversation_id, w.id AS work_item_id, "
+        "r.reply_address, r.reply_conversation_id, r.reply_target_kind, "
+        "r.reply_target_pr_number, r.reply_target_comment_id, r.reply_target_url, "
+        "w.id AS work_item_id, "
         "w.conversation_id AS work_item_conversation "
         "FROM curie.execution_requests r "
         "JOIN curie.work_items w ON w.id = r.work_item_id "
-        "WHERE w.github_repository_id = :repo AND w.github_issue_number = :number "
+        "WHERE w.tracker_scope_id = :repo AND w.tracker_issue_id = :number "
         "ORDER BY r.sequence",
-        {"repo": REPO_ID, "number": number},
+        {"repo": str(REPO_ID), "number": str(number)},
     )
 
 
@@ -397,6 +395,22 @@ def _owned(client: TestClient, api: ReviewGitHubAPI) -> tuple[int, int, dict[str
     _own_pull_request(first["work_item_id"], pr)
     _complete(first["id"])
     return number, pr, first
+
+
+def _reply_target(event: str, pr: int, fid: int) -> dict[str, Any]:
+    """Where the revision's status reply lands, as admission stores it (#3831)."""
+
+    thread = event == "pull_request_review_comment"
+    return {
+        "reply_target_kind": "review_thread" if thread else "pull_request",
+        "reply_target_pr_number": str(pr),
+        "reply_target_comment_id": str(fid) if thread else None,
+        "reply_target_url": f"{_pr_url(pr)}#{FRAGMENTS[event].format(id=fid)}",
+    }
+
+
+def _stored_reply_target(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in row.items() if key.startswith("reply_target_")}
 
 
 def _mention() -> str:
@@ -427,6 +441,148 @@ def test_authorized_mention_admits_the_next_request_on_the_same_work_item(
     assert revision["reply_address"] == REPO
     assert revision["reply_conversation_id"] == f"issue-{number}"
     assert revision["requester"] == f"github:{SENDER_ID}:{SENDER}"
+    assert _stored_reply_target(revision) == _reply_target(event, pr, fid)
+    assert _stored_reply_target(rows[0]) == {
+        "reply_target_kind": "issue",
+        "reply_target_pr_number": None,
+        "reply_target_comment_id": None,
+        "reply_target_url": None,
+    }
+
+
+def test_review_admission_retains_issue_lock_until_caller_commit(
+    factory: tuple[TestClient, ReviewGitHubAPI],
+) -> None:
+    client, api = factory
+    number, pr, _first = _owned(client, api)
+    payload, _ = _feedback_event(api, "issue_comment", pr, _mention())
+    feedback = parse_feedback(
+        "issue_comment",
+        payload,
+        str(uuid.uuid4()),
+        github_html_base=get_settings().github_html_base,
+    )
+    request_id = uuid.uuid5(uuid.NAMESPACE_URL, feedback.event_id)
+    classid, objid = issue_lock_keys_for(REPO_ID, number)
+
+    async def go() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with (
+                sessions() as session,
+                engine.connect() as observer,
+                httpx.AsyncClient(transport=httpx.MockTransport(api.handle)) as github,
+            ):
+                caller_pid = await session.scalar(text("SELECT pg_backend_pid()"))
+                admitted = await admit_parsed_feedback(
+                    session, feedback, settings=get_settings(), client=github, verified=None
+                )
+                assert admitted.status == "factory_admitted", admitted
+                issue_lock_held = text(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' "
+                    "AND granted AND pid = :caller_pid AND objsubid = 2 "
+                    "AND classid::bigint = :classid AND objid::bigint = :objid "
+                    "AND database = (SELECT oid FROM pg_database "
+                    "WHERE datname = current_database()))"
+                )
+                lock_params = {
+                    "caller_pid": caller_pid,
+                    "classid": classid & 0xFFFFFFFF,
+                    "objid": objid & 0xFFFFFFFF,
+                }
+                assert await observer.scalar(issue_lock_held, lock_params)
+                request_visible = text(
+                    "SELECT EXISTS (SELECT 1 FROM curie.execution_requests WHERE id = :request_id)"
+                )
+                assert not await observer.scalar(request_visible, {"request_id": request_id})
+                await session.commit()
+                assert await observer.scalar(request_visible, {"request_id": request_id})
+                assert not await observer.scalar(issue_lock_held, lock_params)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_unlabel_during_review_admission_waits_and_then_cancels(
+    factory: tuple[TestClient, ReviewGitHubAPI],
+) -> None:
+    client, api = factory
+    number, pr, _first = _owned(client, api)
+    payload, _ = _feedback_event(api, "issue_comment", pr, _mention())
+    review_delivery = uuid.uuid4()
+    entered = threading.Event()
+    release = asyncio.Event()
+    classid, objid = issue_lock_keys_for(REPO_ID, number)
+
+    async def observe_cancellation_blocked() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as observer, asyncio.timeout(5):
+                while not await observer.scalar(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks waiting "
+                        "JOIN pg_locks holder ON holder.locktype = waiting.locktype "
+                        "AND holder.database = waiting.database "
+                        "AND holder.classid = waiting.classid "
+                        "AND holder.objid = waiting.objid "
+                        "AND holder.objsubid = waiting.objsubid "
+                        "WHERE waiting.locktype = 'advisory' AND NOT waiting.granted "
+                        "AND holder.granted AND waiting.objsubid = 2 "
+                        "AND waiting.database = (SELECT oid FROM pg_database "
+                        "WHERE datname = current_database()) "
+                        "AND waiting.classid::bigint = :classid "
+                        "AND waiting.objid::bigint = :objid "
+                        "AND holder.pid = ANY(pg_blocking_pids(waiting.pid)))"
+                    ),
+                    {"classid": classid & 0xFFFFFFFF, "objid": objid & 0xFFFFFFFF},
+                ):
+                    await asyncio.sleep(0.01)
+        finally:
+            await engine.dispose()
+
+    previous = client.app.state.http_client
+    github = httpx.AsyncClient(transport=_PermissionGate(api, entered, release))
+    client.app.state.http_client = github
+    try:
+        with ThreadPoolExecutor(max_workers=2) as deliveries:
+            try:
+                admission = deliveries.submit(
+                    _post, client, "issue_comment", payload, delivery=str(review_delivery)
+                )
+                assert entered.wait(5)
+                api.labels = []
+                cancellation = deliveries.submit(
+                    _post,
+                    client,
+                    "issues",
+                    _issue_event("unlabeled", number, label={"name": LABEL}),
+                )
+                asyncio.run(observe_cancellation_blocked())
+                assert not cancellation.done()
+                client.portal.call(release.set)
+                admitted = admission.result(timeout=10)
+                cancelled = cancellation.result(timeout=10)
+            finally:
+                client.portal.call(release.set)
+    finally:
+        client.app.state.http_client = previous
+        client.portal.call(github.aclose)
+
+    assert admitted.status_code == 200, admitted.text
+    assert admitted.json()["status"] == "factory_admitted", admitted.text
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "factory_cancelled", cancelled.text
+    assert _rows(
+        "SELECT status FROM curie.github_review_deliveries WHERE delivery_id = :delivery",
+        {"delivery": review_delivery},
+    ) == [{"status": "accepted"}]
+    rows = _requests(number)
+    assert [row["sequence"] for row in rows] == [1, 2]
+    assert rows[0]["status"] == "completed"
+    assert rows[1]["status"] == "cancelled"
+    assert rows[1]["terminal_cause"] == "issue_cancelled"
 
 
 def test_redelivery_of_the_same_comment_is_a_duplicate(
@@ -601,6 +757,7 @@ def test_review_mention_during_live_run_waits_then_becomes_next_request(
     assert revision["objective"].splitlines()[0] == (
         f"{_pr_url(pr)}#{FRAGMENTS[event].format(id=fid)}"
     )
+    assert _stored_reply_target(revision) == _reply_target(event, pr, fid)
     assert len(
         _rows(
             "SELECT execution_request_id FROM curie.factory_terminal_notices "
@@ -697,11 +854,26 @@ def test_review_admission_survives_work_item_version_change_during_verification(
     verify = github_factory_review.verify_feedback_truth
     bumped = False
 
-    async def verify_with_version_change(*args: Any, **kwargs: Any) -> None:
+    async def verify_with_version_change(
+        feedback: Any,
+        lineage: Any,
+        *,
+        settings: Any,
+        client: httpx.AsyncClient,
+        credentials: github_app.GitHubCredentials,
+        api_url: str,
+    ) -> str:
         nonlocal bumped
-        await verify(*args, **kwargs)
+        head = await verify(
+            feedback,
+            lineage,
+            settings=settings,
+            client=client,
+            credentials=credentials,
+            api_url=api_url,
+        )
         if bumped:
-            return
+            return head
         bumped = True
         engine = create_async_engine(get_settings().database_url)
         try:
@@ -715,6 +887,7 @@ def test_review_admission_survives_work_item_version_change_during_verification(
                 )
         finally:
             await engine.dispose()
+        return head
 
     monkeypatch.setattr(
         github_factory_review, "verify_feedback_truth", verify_with_version_change
@@ -796,8 +969,7 @@ def test_closed_lineage_cancels_queued_review_revision_after_live_run_ends(
     assert _requests(number)[1]["status"] == "cancelled"
 
 
-@pytest.fixture
-def review_key() -> str:
+def _rsa_pem() -> str:
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
 
@@ -809,11 +981,17 @@ def review_key() -> str:
     ).decode()
 
 
+@pytest.fixture
+def review_key() -> str:
+    return _rsa_pem()
+
+
 def test_review_ingress_still_owns_pull_requests_no_work_item_owns(
     monkeypatch: pytest.MonkeyPatch,
     clean_db: None,
     review_api: ReviewGitHubAPI,
     review_key: str,
+    tmp_path: Path,
 ) -> None:
     stream = f"test:curie:factory-review:{uuid.uuid4().hex}"
     _boot(
@@ -826,6 +1004,7 @@ def test_review_ingress_still_owns_pull_requests_no_work_item_owns(
             "RUNS_STREAM": stream,
             "KEY_PREFIX": f"{stream}:worker",
         },
+        tmp_path,
     )
     client_cm, client, external = _client_with_agent(review_api)
     try:
@@ -843,4 +1022,71 @@ def test_review_ingress_still_owns_pull_requests_no_work_item_owns(
     finally:
         client.portal.call(external.aclose)
         client_cm.__exit__(None, None, None)
+        get_settings.cache_clear()
+
+
+def test_factory_review_truth_mints_with_the_code_host_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_db: None,
+    review_api: ReviewGitHubAPI,
+    tmp_path: Path,
+) -> None:
+    """#4397 R2 finding 2: factory review truth mints with the code host
+    entry's App, never the non-factory settings App."""
+
+    env = {
+        **factory_env(tmp_path, app_id="2222", private_key=_rsa_pem()),
+        "GITHUB_APP_ID": "1111",
+        "GITHUB_APP_PRIVATE_KEY": _rsa_pem(),
+    }
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    get_settings.cache_clear()
+
+    issuers: list[str] = []
+    installation_path = f"/repos/{REPO}/installation"
+    token_path = f"/app/installations/{INSTALLATION_ID}/access_tokens"
+
+    def github_app_endpoints(request: httpx.Request) -> httpx.Response:
+        # https://docs.github.com/en/rest/apps/apps#get-a-repository-installation-for-the-authenticated-app
+        # https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
+        authorization = request.headers.get("authorization", "")
+        if authorization.startswith("Bearer "):
+            app_jwt = authorization.removeprefix("Bearer ")
+            issuers.append(jwt.decode(app_jwt, options={"verify_signature": False})["iss"])
+        if request.method == "GET" and request.url.path == installation_path:
+            return httpx.Response(200, json={"id": INSTALLATION_ID})
+        if request.method == "POST" and request.url.path == token_path:
+            return httpx.Response(
+                201,
+                json={"token": "ghs_code_host_fixture", "expires_at": "2099-01-01T00:00:00Z"},
+            )
+        return httpx.Response(404, json={"message": "missing fixture"})
+
+    transport = httpx.MockTransport(github_app_endpoints)
+    real_client = httpx.Client
+
+    def stub_client(**kwargs: Any) -> httpx.Client:
+        kwargs.pop("verify", None)
+        return real_client(transport=transport, **kwargs)
+
+    github_app._RESOLVERS.clear()
+    client_cm, client, external = _client_with_agent(review_api)
+    try:
+        monkeypatch.setattr("curie_api.github_app.httpx.Client", stub_client)
+        number, pr, first = _owned(client, review_api)
+        payload, _ = _feedback_event(review_api, "issue_comment", pr, _mention())
+
+        response = _post(client, "issue_comment", payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "factory_admitted", response.text
+        rows = _requests(number)
+        assert [row["sequence"] for row in rows] == [1, 2]
+        assert rows[1]["work_item_id"] == first["work_item_id"]
+        assert set(issuers) == {"2222"}
+    finally:
+        client.portal.call(external.aclose)
+        client_cm.__exit__(None, None, None)
+        github_app._RESOLVERS.clear()
         get_settings.cache_clear()

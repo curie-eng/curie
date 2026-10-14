@@ -1,0 +1,2 @@
+# runner.Dockerfile copies only from other images, so nothing else here is build input.
+*

@@ -16,7 +16,7 @@
 //! DISTINCT messages, and neither may read as a membership or permission-denied
 //! failure.
 
-mod support;
+use crate::support;
 
 use std::process::{Command, Output};
 

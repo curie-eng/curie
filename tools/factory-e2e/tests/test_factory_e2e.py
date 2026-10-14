@@ -128,10 +128,12 @@ def test_secrets_stay_out_of_repr(tmp_path: Path) -> None:
     assert "actor-token" not in text
 
 
-def test_cli_exits_2_with_clear_message_when_credentials_missing(tmp_path: Path) -> None:
+def test_cli_exits_2_with_clear_message_when_credentials_missing(
+    tmp_path: Path, candidate_curie: Path
+) -> None:
     result = subprocess.run(
         ["python3", str(REPO_ROOT / "tools/factory-e2e/factory_e2e.py"), "preflight"],
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "CURIE_BIN": str(candidate_curie)},
         capture_output=True,
         text=True,
     )
@@ -193,6 +195,17 @@ def test_app_jwt_is_rs256_and_verifies(tmp_path: Path) -> None:
 def test_request_id_matches_api_derivation() -> None:
     expected = uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com/factory/label/123/9/d-1")
     assert fe.request_id_for(123, 9, "d-1") == expected
+
+
+def test_last_label_event_id_keeps_the_newest_matching_event() -> None:
+    events = [
+        {"event": "labeled", "id": 10, "label": {"name": "factory"}},
+        {"event": "labeled", "id": 11, "label": {"name": "other"}},
+        {"event": "labeled", "id": "12", "label": {"name": "factory"}},
+        {"event": "labeled", "id": 13, "label": {"name": "factory"}},
+    ]
+    assert fe.last_label_event_id(events, "factory") == 13
+    assert fe.last_label_event_id(events, "missing") is None
 
 
 def _delivery(guid: str, number: int, repo: str, *, action: str = "labeled") -> dict[str, Any]:
@@ -269,6 +282,14 @@ def test_namespace_is_owned_and_rfc1123() -> None:
     assert fe.validate_namespace("test-factory-x1") == "test-factory-x1"
 
 
+def _github_entry(values: dict[str, Any], section: str) -> dict[str, Any]:
+    """The one ``factory.<section>`` entry named ``github``."""
+
+    entries = [entry for entry in values["factory"][section] if entry["name"] == "github"]
+    assert len(entries) == 1, values["factory"][section]
+    return entries[0]
+
+
 def test_install_values_pin_every_image_and_enable_factory_ingress(tmp_path: Path) -> None:
     config = fe.load_config(_env(_app_dir(tmp_path)), context=None, gh_token=_no_gh)
     values = fe.install_values(
@@ -282,10 +303,26 @@ def test_install_values_pin_every_image_and_enable_factory_ingress(tmp_path: Pat
         assert values[component]["image"]["tag"] == tag
     assert values["agentSandbox"]["runner"]["tag"] == tag
     assert values["agentSandbox"]["controller"]["deploy"] is False
+    factory = values["factory"]
+    assert factory["enabled"] is True
+    assert factory["intake"] == "poll"
+    credential = {
+        "type": "github_app",
+        "appId": "42",
+        "existingSecret": "factory-app",
+        "existingSecretKey": "privateKey",
+    }
+    code_host = _github_entry(values, "codeHosts")
+    assert code_host["kind"] == "github"
+    assert code_host["host"] == "github.com"
+    assert code_host["credential"] == credential
+    tracker = _github_entry(values, "trackers")
+    assert tracker["kind"] == "github"
+    assert tracker["host"] == "github.com"
+    assert tracker["credential"] == credential
+    assert tracker["label"] == "curie-factory"
+    assert tracker["mention"] == "example-factory"
     api = values["api"]
-    assert api["githubFactoryIngressEnabled"] is True
-    assert api["githubFactoryLabel"] == "curie-factory"
-    assert api["githubFactoryMention"] == "example-factory"
     assert api["githubAppId"] == "42"
     assert api["githubAppExistingSecret"] == "factory-app"
     assert api["githubRepoAllowlist"] == ["acme/fixture"]
@@ -304,12 +341,12 @@ def test_install_values_point_the_status_card_at_the_public_webhook_base(
         consumer_controller=True,
         card_base_url=base,
     )
-    assert values["api"]["githubFactoryCardBaseUrl"] == base
+    assert values["factory"]["cardBaseUrl"] == base
     # Before the tunnel exists there is no public base, so the value stays unset.
     unset = fe.install_values(
         config, candidate="c" * 40, app_key_secret="factory-app", consumer_controller=True
     )
-    assert "githubFactoryCardBaseUrl" not in unset["api"]
+    assert "cardBaseUrl" not in unset["factory"]
 
 
 def test_namespace_undo_is_registered_before_the_create_call(
@@ -354,8 +391,9 @@ def test_existing_publication_namespace_refuses_the_run(
     )
 
     def fake_run(argv: list[str], *, check: bool = True, input_text: str | None = None) -> str:
-        if "test-factory-unit-curie-publication" in argv:
-            return "namespace/test-factory-unit-curie-publication"
+        publication = f"test-factory-unit-{fe.release_name('test-factory-unit')}-publication"
+        if publication in argv:
+            return f"namespace/{publication}"
         return ""
 
     monkeypatch.setattr(fe, "run", fake_run)
@@ -430,12 +468,104 @@ def test_config_env_overrides_model_bundle_and_curie_bin(tmp_path: Path) -> None
         tmp_path,
         CURIE_FACTORY_MODEL="vendor/other-model",
         CURIE_FACTORY_BUNDLE_DIR=str(bundle),
-        CURIE_FACTORY_CURIE_BIN="/opt/bin/curie",
+        CURIE_BIN="/opt/bin/curie",
     )
     assert config.model == "vendor/other-model"
     assert isinstance(config.bundle_dir, Path)
     assert config.bundle_dir == bundle
     assert config.curie_bin == "/opt/bin/curie"
+
+
+@pytest.mark.parametrize("mode", [["preflight"], ["run", "--scenario", "cancel-waiting"]])
+@pytest.mark.parametrize("selection", ["absolute", "relative", "path-name", "default"])
+def test_main_records_and_uses_the_resolved_curie_binary(
+    mode: list[str],
+    selection: str,
+    candidate_curie: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    for key, value in _env(_app_dir(tmp_path)).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(candidate_curie.parent))
+    if selection == "default":
+        monkeypatch.delenv("CURIE_BIN")
+    else:
+        value = {
+            "absolute": str(candidate_curie),
+            "relative": "./bin/curie",
+            "path-name": "curie",
+        }[selection]
+        monkeypatch.setenv("CURIE_BIN", value)
+    monkeypatch.setattr(fe, "_repo_root", lambda: REPO_ROOT)
+    monkeypatch.setattr(fe, "_resolve_candidate", lambda *a, **k: "c" * 40)
+    monkeypatch.setattr(fe.signal, "signal", lambda *a: None)
+
+    def execute(preflight: fe.Preflight, _driver: Any) -> None:
+        assert preflight.config.curie_bin == str(candidate_curie)
+        monkeypatch.setenv("CURIE_BIN", str(tmp_path / "changed-selection"))
+        monkeypatch.setenv("PATH", "")
+        assert fe.run([preflight.config.curie_bin, "build"]).strip() == str(candidate_curie)
+
+    monkeypatch.setattr(fe.Preflight, "run", execute)
+    evidence_path = tmp_path / "evidence.json"
+
+    assert fe.main([*mode, "--evidence", str(evidence_path)]) == 0
+    evidence = json.loads(evidence_path.read_text())
+    assert evidence["curie_bin"] == str(candidate_curie)
+    assert evidence["curie_version"] == "curie 0.0.0-test"
+    assert (
+        f"factory-e2e: curie binary {candidate_curie} (curie 0.0.0-test)"
+        in capsys.readouterr().err
+    )
+
+
+@pytest.mark.parametrize("mode", [["preflight"], ["run", "--scenario", "cancel-waiting"]])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing",
+        "not-executable",
+        "version-failed",
+        "empty-version",
+        "symlink-loop",
+        "invalid-version",
+    ],
+)
+def test_invalid_curie_binary_refuses_before_factory_actions(
+    mode: list[str],
+    failure: str,
+    candidate_curie: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    if failure == "missing":
+        monkeypatch.setenv("CURIE_BIN", str(tmp_path / "missing-curie"))
+    elif failure == "not-executable":
+        candidate_curie.chmod(0o644)
+    elif failure == "version-failed":
+        candidate_curie.write_text("#!/bin/sh\nexit 9\n")
+    elif failure == "empty-version":
+        candidate_curie.write_text("#!/bin/sh\nexit 0\n")
+    elif failure == "symlink-loop":
+        candidate_curie.unlink()
+        candidate_curie.symlink_to(candidate_curie.name)
+    else:
+        candidate_curie.write_text("#!/bin/sh\nprintf '\\377\\n'\n")
+
+    def refuse_action(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("binary validation must precede cluster and GitHub actions")
+
+    monkeypatch.setattr(fe, "load_config", refuse_action)
+    monkeypatch.setattr(fe, "_resolve_candidate", refuse_action)
+    monkeypatch.setattr(fe, "http_json", refuse_action)
+    monkeypatch.setattr(fe.Preflight, "run", refuse_action)
+
+    assert fe.main(mode) == fe.EXIT_CONFIG
+    assert "CURIE_BIN" in capsys.readouterr().err
 
 
 def test_bundle_dir_that_is_not_a_directory_is_refused(tmp_path: Path) -> None:
@@ -493,11 +623,46 @@ def test_install_values_with_a_model_key_run_the_real_model(tmp_path: Path) -> N
     for component in ("api", "worker", "dispatcher", "mailAdapter", "ui"):
         assert values[component]["image"]["tag"] == tag
     assert values["agentSandbox"]["runner"]["tag"] == tag
+    assert values["factory"]["enabled"] is True
     api = values["api"]
-    assert api["githubFactoryIngressEnabled"] is True
     assert api["githubAppId"] == "42"
     assert api["githubAppExistingSecret"] == "factory-app"
     assert api["githubRepoAllowlist"] == ["acme/fixture"]
+
+
+def test_model_base_url_sets_worker_env_and_proxy_egress(tmp_path: Path) -> None:
+    config = _config(
+        tmp_path,
+        CURIE_FACTORY_MODEL_BASE_URL="http://10.1.2.3:8080",
+        CURIE_FACTORY_MODEL_API_KEY="model-key-value",
+    )
+    values = _values(config)
+    assert {"name": "CURIE_MODEL_BASE_URL", "value": "http://10.1.2.3:8080"} in values["worker"][
+        "extraEnv"
+    ]
+    assert values["agentSandbox"]["runner"]["fakeModel"] is False
+    assert {"cidr": "10.1.2.3/32", "ports": [{"protocol": "TCP", "port": 8080}]} in values[
+        "security"
+    ]["networkPolicy"]["allowedEgress"]
+    # The GitHub API allowance from the caller stays beside the proxy pod.
+    assert {"cidr": "1.2.3.4/32", "ports": [{"protocol": "TCP", "port": 443}]} in values[
+        "security"
+    ]["networkPolicy"]["allowedEgress"]
+
+
+def test_model_base_url_without_a_key_dials_the_proxy(tmp_path: Path) -> None:
+    config = _config(tmp_path, CURIE_FACTORY_MODEL_BASE_URL="http://10.1.2.3:8080")
+    values = _values(config)
+    runner = values["agentSandbox"]["runner"]
+    assert runner["fakeModel"] is False
+    assert runner["credentials"] == "not-needed"
+    assert values["worker"]["extraEnv"][0]["name"] == "CURIE_MODEL_BASE_URL"
+
+
+def test_model_base_url_hostname_is_refused(tmp_path: Path) -> None:
+    config = _config(tmp_path, CURIE_FACTORY_MODEL_BASE_URL="http://model.example.com:8080")
+    with pytest.raises(fe.ConfigError, match="proxy pod IP"):
+        _values(config)
 
 
 def test_issue_file_parses_title_and_body(tmp_path: Path) -> None:
@@ -804,9 +969,10 @@ def test_terminus_matcher_ignores_a_live_status_comment_without_the_final_marker
         body="- [ ] **Plan** (in progress)\nStatus: RUNNING\n"
         f"<!-- curie-execution-request:{_RID} -->\n",
     )
-    assert fe.match_terminus_comments(
-        [live], mention="factory", app_id="42", request_ids=[str(_RID)]
-    ) == []
+    assert (
+        fe.match_terminus_comments([live], mention="factory", app_id="42", request_ids=[str(_RID)])
+        == []
+    )
     final = _notice("runner_failed")
     matched = fe.match_terminus_comments(
         [live, final], mention="factory", app_id="42", request_ids=[str(_RID)]
@@ -1323,9 +1489,7 @@ def test_evaluation_report_rejects_a_skipped_pull_request_check() -> None:
     assert any("hidden_tests" in item for item in fe.evaluation_report_failures(report))
     report = _evaluation_report()
     report["passes"][1]["cases"][0]["configured_model"] = "z-ai/glm-5.3"
-    assert any(
-        "configured_model" in item for item in fe.evaluation_report_failures(report)
-    )
+    assert any("configured_model" in item for item in fe.evaluation_report_failures(report))
 
 
 def test_helm_upgrade_reuses_values_so_the_agent_pool_survives() -> None:
@@ -1420,9 +1584,7 @@ def test_runner_escalation_without_a_pull_request_is_a_refusal() -> None:
         agent_final_reply=None,
     )
     assert (
-        fe.judge_outcome(
-            ending, "comment", expect_causes={"no_pull_request", "runner_escalated"}
-        )
+        fe.judge_outcome(ending, "comment", expect_causes={"no_pull_request", "runner_escalated"})
         == []
     )
     assert fe.judge_outcome(ending, "comment")
@@ -1881,8 +2043,9 @@ def test_sql_sets_the_chart_schema_on_the_install_postgres(monkeypatch: pytest.M
     p = object.__new__(fe.Preflight)
     p.config = type("C", (), {"kube_context": "k"})()
     p.namespace = "test-factory-x"
+    p.release = fe.release_name(p.namespace)
     assert p.sql("SELECT 1") == [["", ""]]
-    assert "statefulset/curie-postgres" in seen["argv"]
+    assert f"statefulset/{fe.release_name('test-factory-x')}-postgres" in seen["argv"]
     assert "-csearch_path=curie" in seen["argv"][-1]
     assert seen["input"] == "SELECT 1"
 
@@ -2114,13 +2277,15 @@ def test_sweep_removes_only_stale_namespaces_and_their_release_objects(
     monkeypatch.setattr(fe, "pid_alive", lambda pid: False)
     deleted: list[tuple[str, str]] = []
     helm: list[list[str]] = []
+    dead_release = fe.release_name("test-factory-dead")
+    dead_publication = f"test-factory-dead-{dead_release}-publication"
 
     def kubectl(*args: str, check: bool = True) -> str:
         if args[:2] == ("get", "namespaces"):
             return json.dumps(listing)
         if args[:2] == ("get", "namespace") and ("namespace", args[2]) in deleted:
             return ""
-        if args[:3] == ("get", "namespace", "test-factory-dead-curie-publication"):
+        if args[:3] == ("get", "namespace", dead_publication):
             return json.dumps(
                 {
                     "metadata": {
@@ -2165,9 +2330,11 @@ def test_sweep_removes_only_stale_namespaces_and_their_release_objects(
     monkeypatch.setattr(fe.subprocess, "run", fake_subprocess)
     preflight.sweep_stale_namespaces()
     assert [argv[argv.index("-n") + 1] for argv in helm] == ["test-factory-dead"]
+    # The sweep uninstalls the stale namespace's own release, never "curie".
+    assert [argv[argv.index("uninstall") + 1] for argv in helm] == [dead_release]
     assert deleted == [
         ("namespace", "test-factory-dead"),
-        ("namespace", "test-factory-dead-curie-publication"),
+        ("namespace", dead_publication),
         ("clusterrole", "dead-role"),
     ]
     step = preflight.evidence["steps"][-1]
@@ -2263,6 +2430,167 @@ def test_install_creates_the_crds_it_adds_already_labelled_before_helm(
         "helm install",
     ]
     assert preflight.created_crds == ["sandboxes.agents.x-k8s.io"]
+
+
+@pytest.mark.parametrize(
+    "namespace",
+    ["test-factory-unit", "test-factory-a", "test-factory-0123abcd", "test-factory-" + "z" * 27],
+)
+def test_release_name_is_a_short_deterministic_per_namespace_name(namespace: str) -> None:
+    fe.validate_namespace(namespace)
+    release = fe.release_name(namespace)
+    assert release == fe.release_name(namespace)
+    assert release != "curie"
+    assert release.startswith("curie-")
+    suffix = release.removeprefix("curie-")
+    assert len(suffix) == 4
+    assert all(ch in "0123456789abcdef" for ch in suffix)
+
+
+def test_release_name_differs_between_namespaces() -> None:
+    assert fe.release_name("test-factory-a") != fe.release_name("test-factory-b")
+
+
+def test_longest_namespace_keeps_the_publication_namespace_within_63(tmp_path: Path) -> None:
+    namespace = "test-factory-" + "a" * 27
+    assert len(namespace) == 40
+    fe.validate_namespace(namespace)
+    config = fe.load_config(_env(_app_dir(tmp_path)), context=None, gh_token=_no_gh)
+    preflight = fe.Preflight(
+        config,
+        repo_root=REPO_ROOT,
+        candidate="c" * 40,
+        namespace=namespace,
+        evidence_path=tmp_path / "e.json",
+        admission_timeout=1,
+    )
+    publication = preflight.publication_namespace()
+    # The chart's printf "%s-%s-publication" .Release.Namespace fullname, with
+    # fullname equal to the release because it contains "curie".
+    assert publication == f"{namespace}-{fe.release_name(namespace)}-publication"
+    assert len(publication) == 63
+    assert preflight.release == fe.release_name(namespace)
+    assert preflight.evidence["release"] == preflight.release
+
+
+def test_priority_class_values_create_per_release_classes_unless_configured() -> None:
+    assert fe.priority_class_values(None, "curie-ab12") == {
+        "platform": {"create": True, "name": "curie-ab12-platform"},
+        "sandbox": {"create": True, "name": "curie-ab12-sandbox"},
+    }
+    assert fe.priority_class_values(("plat", "sand"), "curie-ab12") == {
+        "platform": {"create": False, "name": "plat"},
+        "sandbox": {"create": False, "name": "sand"},
+    }
+
+
+def test_release_values_carry_per_run_priority_classes_and_install_values_does_not(
+    tmp_path: Path,
+) -> None:
+    preflight = _preflight(tmp_path)
+    bare = fe.install_values(
+        preflight.config, candidate="c" * 40, app_key_secret="k", consumer_controller=False
+    )
+    assert "priorityClasses" not in bare
+    values = preflight.release_values(preflight.config, sandbox_pod_quota=None)
+    release = fe.release_name("test-factory-unit")
+    assert values["priorityClasses"] == {
+        "platform": {"create": True, "name": f"{release}-platform"},
+        "sandbox": {"create": True, "name": f"{release}-sandbox"},
+    }
+
+
+def _install_until_helm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, controller: str | Exception
+) -> tuple[fe.Preflight, list[str], dict[str, Any] | None]:
+    """Drive install() up to a helm install that fails, recording the order."""
+
+    preflight = _preflight(tmp_path)
+    chart = tmp_path / "chart"
+    (chart / "crds").mkdir(parents=True)
+    (chart / "crds" / "sandbox.yaml").write_text("metadata:\n  name: sandboxes.agents.x-k8s.io\n")
+    order: list[str] = []
+    captured: dict[str, Any] = {}
+
+    def kubectl(*args: str, check: bool = True) -> str:
+        if args[:3] == ("-n", fe.SANDBOX_CONTROLLER_NAMESPACE, "get"):
+            assert args[3:5] == ("deployment", fe.SANDBOX_CONTROLLER_DEPLOYMENT)
+            order.append("read controller")
+            if isinstance(controller, Exception):
+                raise controller
+            return controller
+        if args[0] == "label":
+            return "labelled-crd-yaml"
+        if "create" in args:
+            order.append("create secret")
+        return ""
+
+    def fake_run(argv: list[str], *, check: bool = True, input_text: str | None = None) -> str:
+        if argv[0] == "helm":
+            order.append("helm")
+            values_file = Path(argv[argv.index("-f") + 1])
+            captured["values"] = json.loads(values_file.read_text())
+            raise fe.PreflightFailed("helm install stopped by the test")
+        if "create" in argv:
+            order.append("create crd")
+        return ""
+
+    def extract_chart() -> Path:
+        order.append("extract chart")
+        return chart
+
+    monkeypatch.setattr(preflight, "extract_chart", extract_chart)
+    monkeypatch.setattr(preflight, "egress_cidrs", lambda: [])
+    monkeypatch.setattr(preflight, "kubectl", kubectl)
+    monkeypatch.setattr(fe, "run", fake_run)
+    with pytest.raises(fe.PreflightFailed) as raised:
+        preflight.install()
+    captured["error"] = str(raised.value)
+    return preflight, order, captured
+
+
+def test_install_reuses_an_existing_sandbox_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight, order, captured = _install_until_helm(
+        tmp_path, monkeypatch, "deployment.apps/agent-sandbox-controller\n"
+    )
+    assert order[0] == "read controller"
+    assert order[-1] == "helm"
+    assert captured["values"]["agentSandbox"]["controller"]["deploy"] is False
+    assert {
+        "step": "sandbox controller reused",
+        "namespace": "agent-sandbox-system",
+        "deployment": "agent-sandbox-controller",
+    } in preflight.evidence["steps"]
+
+
+def test_install_deploys_the_controller_when_none_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight, order, captured = _install_until_helm(tmp_path, monkeypatch, "")
+    assert order[0] == "read controller"
+    assert order[-1] == "helm"
+    assert captured["values"]["agentSandbox"]["controller"]["deploy"] is True
+    release = fe.release_name("test-factory-unit")
+    assert captured["values"]["priorityClasses"]["platform"]["name"] == f"{release}-platform"
+    steps = [step["step"] for step in preflight.evidence["steps"]]
+    assert "sandbox controller reused" not in steps
+
+
+def test_install_stops_before_any_mutation_when_the_controller_read_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = fe.PreflightFailed(
+        "kubectl --context failed: Error from server (Forbidden): deployments.apps "
+        '"agent-sandbox-controller" is forbidden'
+    )
+    preflight, order, captured = _install_until_helm(tmp_path, monkeypatch, error)
+    assert order == ["read controller"]
+    assert "is forbidden" in captured["error"]
+    assert "agent-sandbox-system/agent-sandbox-controller" in captured["error"]
+    assert "values" not in captured
+    assert preflight.created_crds == []
 
 
 def test_newest_published_skips_unpublished_commits() -> None:
@@ -2566,8 +2894,7 @@ def test_the_final_reply_falls_back_to_the_transcript_without_a_comment_block() 
 # --- quiesce scenario (#3198) ---
 
 _QUIESCING_LINE = (
-    '{"state":"quiescing","since":"2026-09-27T10:00:00+00:00",'
-    '"revision":3,"ttl_seconds":28}'
+    '{"state":"quiescing","since":"2026-09-27T10:00:00+00:00","revision":3,"ttl_seconds":28}'
 )
 
 
@@ -2603,8 +2930,7 @@ def test_paused_for_upgrade_line_matches_the_api_constant() -> None:
     value = None
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "_PAUSED_FOR_UPGRADE_LINE"
-            for t in node.targets
+            isinstance(t, ast.Name) and t.id == "_PAUSED_FOR_UPGRADE_LINE" for t in node.targets
         ):
             value = ast.literal_eval(node.value)
     assert value is not None
@@ -2799,6 +3125,23 @@ def test_locked_layer_needs_no_registry(tmp_path: Path) -> None:
     assert config.layer_registry is None
 
 
+def test_a_kind_candidate_build_refuses_a_locked_layer_without_a_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "bundle"
+    shutil.copytree(fe.DEFAULT_BUNDLE, bundle)
+    (bundle / "connectors.lock.yaml").write_text("version: 1\n")
+    env = _env(_app_dir(tmp_path))
+    del env["CURIE_FACTORY_LAYER_REGISTRY"]
+    env["CURIE_FACTORY_BUNDLE_DIR"] = str(bundle)
+    preflight = _preflight(tmp_path, env)
+    preflight.kind_cluster = "candidate"
+    monkeypatch.setenv("BUILDX_BUILDER", "candidate-builder")
+    monkeypatch.setattr(fe.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    with pytest.raises(fe.ConfigError, match="CURIE_FACTORY_LAYER_REGISTRY"):
+        preflight.check_build_tools()
+
+
 def test_layer_is_built_into_a_private_copy_on_the_candidate_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2838,3 +3181,46 @@ def test_failed_layer_build_fails_the_preflight(
     )
     with pytest.raises(fe.PreflightFailed, match="push denied"):
         preflight.build_runner_layer(fe.DEFAULT_BUNDLE)
+
+
+# #4397 AC 6: egress has one source. The sandbox reaches GitHub through
+# factory.sandboxEgress.<agent> (the chart's built-in GitHub set on the github
+# code host and tracker); only model egress stays in allowedEgress.
+def test_install_values_enroll_the_factory_agent_for_forge_egress(tmp_path: Path) -> None:
+    values = _values(_config(tmp_path))
+    assert values["factory"]["sandboxEgress"] == {fe.FACTORY_AGENT: True}
+    for section in ("codeHosts", "trackers"):
+        (entry,) = values["factory"][section]
+        assert entry["kind"] == "github"
+        assert "egress" not in entry, f"a github {section} entry uses the built-in set"
+    assert "connectorEgress" not in values["agentSandbox"]
+
+
+def test_egress_cidrs_reads_no_github_meta(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_http(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(f"egress_cidrs must not call the GitHub API: {args}")
+
+    monkeypatch.setattr(fe, "http_json", no_http)
+    preflight = _preflight(tmp_path)
+    assert preflight.egress_cidrs() == []
+
+
+def test_egress_cidrs_keeps_only_model_egress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_http(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(f"egress_cidrs must not call the GitHub API: {args}")
+
+    def resolve(host: str, port: int, *args: Any) -> list[Any]:
+        assert (host, port) == (fe.OPENROUTER_HOST, 443)
+        return [
+            (None, None, None, "", ("104.18.2.9", 443)),
+            (None, None, None, "", ("104.18.3.9", 443)),
+        ]
+
+    monkeypatch.setattr(fe, "http_json", no_http)
+    monkeypatch.setattr(fe.socket, "getaddrinfo", resolve)
+    env = _env(_app_dir(tmp_path))
+    env["CURIE_FACTORY_MODEL_API_KEY"] = "model-key-value"
+    preflight = _preflight(tmp_path, env)
+    assert preflight.egress_cidrs() == ["104.18.2.9/32", "104.18.3.9/32"]

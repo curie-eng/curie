@@ -50,6 +50,14 @@ structure and wiring detail in `apps/ui/README.md`.
   changes, run `pnpm gen:manifest` and commit the regenerated manifest. CI
   checks the manifest for drift.
 
+The browser manifest generator recursively removes `default_values` from
+credential arguments (`api_key`, `valkey_password`, `app_token`, `bot_token`,
+`private_key`, `github_token`, and `recovery_key`). Preserve secret-reference
+metadata such as `existing_secret` and `existing_secret_key`, along with ordinary
+defaults and the host CLI manifest. Browser API requests authenticate with the
+HttpOnly console session cookie; the platform key stays in the CLI or Node test
+harness.
+
 ## Playwright ports (do not confuse these)
 
 - `pnpm dev` -> `5173` (interactive dev server, hot reload).
@@ -94,3 +102,23 @@ schema applied):
 (cd ../api && uv run uvicorn curie_api.main:app --port 8000) &
 PW_INTEGRATION=1 CURIE_API_TARGET=http://localhost:8000 pnpm exec playwright test --project=integration
 ```
+
+For the console credential proof, follow the isolated stack and harness setup in
+`apps/ui/README.md` under "Console credential proof". Leave `PW_BASE_URL` unset
+and choose an unused loopback `PW_PORT` so the assertions inspect a fresh
+production build:
+
+```bash
+CI=1 pnpm exec playwright test e2e/console-assets.spec.ts --project=chromium
+PW_INTEGRATION=1 pnpm exec playwright test e2e/integration/console-secret-proof.spec.ts --project=integration
+```
+
+The first spec inspects actual `dist/` files. The wired spec signs in through the
+real API, checks URLs, history, Referer headers, and absence of a platform-key
+request header. It checks request bodies and completed API response bodies for
+platform key values, verifies cookie authentication and the login exchange
+fields, and checks an unauthenticated request through the preview proxy receives
+401. Verify a local key-in-URL negative control fails the credential assertion,
+then restore the candidate, rebuild, and rerun the passing proofs. Tear down this
+run's stack and verify its resources are gone as required by the repository
+instructions.

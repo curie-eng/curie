@@ -16,6 +16,7 @@ from pydantic import RootModel
 from pydantic.json_schema import models_json_schema
 
 from .events import (
+    ChannelReadCapability,
     ErrorEvent,
     Event,
     Final,
@@ -53,6 +54,7 @@ _MODELS = (
     InboundMessage,
     OutboundEvent,
     Event,
+    ChannelReadCapability,
     PublicationContext,
     Interrupt,
     TextDelta,

@@ -60,6 +60,85 @@ doctor`), a second issue queued meanwhile shows the paused-for-upgrade status
 comment, and deleting the drain Job clears the marker within one lease so the
 queued request starts. A Job deleted while helm still waits clears it at once.
 
+`--candidate-images build` (any mode) tests a commit with no published
+images, a pull request head included (`--candidate refs/pull/<n>/head`). From
+the candidate's tracked tree it builds the api, worker, dispatcher,
+mail-adapter, ui and runner images with the contexts and Dockerfiles of the
+release workflow, on the buildx builder BUILDX_BUILDER names (never selected
+or changed), for the cluster nodes' platforms. On a kind context (`kind-<name>`,
+or `--kind-cluster`) it loads them with `kind load`; otherwise it pushes them
+to CURIE_FACTORY_LAYER_REGISTRY under a fresh `factory-e2e-<random>` prefix,
+tagged `cand-<short sha>`. The install points every component and the runner
+at those images, the bundle's runner layer is built FROM the built runner, and
+after install every pod's container imageID must equal the built digest;
+both are recorded in the evidence. The default `published` installs the
+release workflow's `sha-<commit>` images as before.
+
+`forge-loop --forge <name> [--forge-target <target>] [--issue-file]
+[--revision-file]` drives the whole loop and observes the forge only through
+the ForgeDriver protocol in tools/factory-e2e/forges/base.py. Each module in
+tools/factory-e2e/forges/ registers one forge entry; a forge whose driver is
+not written registers it not installed, and naming it is refused with "not
+installed" before anything is installed. A forge with targets (gitlab:
+`fixture` or `saas`) needs `--forge-target`, and a forge that installs no
+GitHub App (gitlab) skips the App check, label, tunnel and webhook around the
+loop and binds the agent with its own setup. `github-loop` is forge-loop with the GitHub
+driver. The driver opens and labels the ticket; the labelled run opens a pull
+request; the test actor sets CI red on its first head with one failing commit
+status (the factory CI gate reads statuses, so the first head is red whatever
+the fixture workflow says, and the status names a small change to push); the
+factory's CI fix round pushes a new commit whose checks are green and the
+first request completes; a pull request review from the test actor that
+mentions the factory adds a second request that pushes another commit to the
+same pull request; the test actor merges it; and the forge, the api
+work-items route and `curie cluster work-items <id> --json` must all read it
+merged. judge_github_loop decides. Both need CURIE_FACTORY_MODEL_API_KEY. A
+new forge is a new entry file that calls register_forge; nothing shared
+changes.
+
+`acceptance --pairing <tracker>+<code host>[@<target>] [--dry-run]` runs one entry of
+the acceptance table in tools/factory-e2e/acceptance.py. Each entry fixes its
+inputs, its `run` commands, a deadline per command, what the forge must show,
+the evidence fields that must hold, and the teardown checks. A real run
+executes each command as a subprocess under its deadline with the shared
+flags and its own evidence file, then checks that evidence and that the
+namespace is gone on the kube context, and writes a summary to `--evidence`
+when given. `--dry-run` lists every step and fails on an entry with an unset
+field. Only github+github is installed; the pairings that need the GitLab,
+Jira or Bitbucket drivers list their steps and report "not installed".
+
+`tls-code-host` (tls_code_host.py) never touches real GitHub. It needs
+CURIE_FACTORY_MODEL_API_KEY and a kube context, plus
+CURIE_FACTORY_LAYER_REGISTRY, a registry the cluster can pull from, because
+the default bundle declares a runner layer and carries no connectors lock.
+With `--candidate-images build` it also needs BUILDX_BUILDER, like every
+other build run. It reads no GitHub App, webhook, actor or fixture
+repository setting. It runs the recorded TLS
+GitHub stub (tools/github-stub) as one Pod in the test namespace on the
+candidate worker image, publishes only the stub's public CA as the ConfigMap
+`code-host-ca`, and installs with `codeHostTrust.caBundle.configMapRef`, the
+api's GitHub API and clone bases on the stub's Service name, and sandbox and
+publication egress limited to the stub and the model provider. A throwaway
+App key is generated per run. The stub's human-labelled seed issue carries
+the ticket. The judge requires that the request ran and completed, the
+sandbox claim carried CURIE_REPO_CA_BUNDLE, the publication Job mounted
+`code-host-trust` and completed, the stub repository got a pushed branch
+and exactly one pull request, the stub saw no unsupported request, and no
+log shows a TLS verification failure.
+
+`repo-runner` (repo_runner.py) installs the operator's repository bindings in
+its own k8 namespace under release `factory-tools`. It uses a local scripted
+Messages endpoint that requests the actual image tool manifest, then drives X
+and Y on the same thread and both refusal faults on fresh threads. Set
+CURIE_FACTORY_REPO_RUNNER_PLAN to the JSON plan documented in that module and
+CURIE_LOCAL_STUB_HOST to an IPv4 reachable from k8. The scenario uses the
+ordinary GitHub fixture/App settings and refuses model credentials or an
+external model URL. Live acceptance is deferred to the w1 runtime wave: the
+current sticky repository selection produces workspace.selection_conflict,
+which fails the scenario. Synthetic observation samples are only judge tests.
+`curie dev factory-e2e judge-repo-runner --observation <file>` runs the offline
+judge with no credentials or cluster contact.
+
 The App, fixture repository, mention author and model credentials come only
 from operator files or environment variables; nothing here names a real one.
 Standard library only, so it runs from a bare source checkout.
@@ -72,7 +151,10 @@ import base64
 import dataclasses
 import datetime as dt
 import fcntl
+import hashlib
 import http.client
+import importlib.util
+import ipaddress
 import json
 import os
 import re
@@ -92,7 +174,42 @@ import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+
+if __name__ == "__main__":
+    # Forge entry modules import this module by name; run as a script it must
+    # be the same module object, not a second copy.
+    sys.modules.setdefault("factory_e2e", sys.modules[__name__])
+
+FORGE_DIR = Path(__file__).resolve().parent / "forges"
+# The driver protocol module; the forge entry loader skips it.
+FORGE_BASE = "base.py"
+
+
+def _load_by_path(module_name: str, path: Path) -> Any:
+    """Import ``path`` once as ``module_name``, from a script run or an import alike."""
+
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        del sys.modules[module_name]
+        raise
+    return module
+
+
+_forge_base = _load_by_path("factory_e2e_forges.base", FORGE_DIR / FORGE_BASE)
+ChangeRef = _forge_base.ChangeRef
+ForgeDriver = _forge_base.ForgeDriver
+ForgeNotInstalled = _forge_base.ForgeNotInstalled
+not_installed_driver = _forge_base.not_installed_driver
 
 GITHUB_API = "https://api.github.com"
 GHCR = "https://ghcr.io"
@@ -107,13 +224,15 @@ CHART_COMPONENTS = {
     "ui": "curie-ui",
 }
 RUNNER_IMAGE = "curie-runner"
-RELEASE = "curie"
 # The chart's DB_SCHEMA; the in-chart role's search_path does not include it.
 DB_SCHEMA = "curie"
 DEFAULT_LABEL = "curie-factory"
 NAMESPACE_PREFIX = "test-factory-"
 APP_KEY_REF = "factory-e2e-github-app"
-SANDBOX_CRD = "sandboxes.agents.x-k8s.io"
+# The shared agent-sandbox controller, read the same way `curie cluster up`
+# reads it (cli/src/ops/up.rs) to decide whether this install deploys one.
+SANDBOX_CONTROLLER_NAMESPACE = "agent-sandbox-system"
+SANDBOX_CONTROLLER_DEPLOYMENT = "agent-sandbox-controller"
 OWNER_LABEL = "app.kubernetes.io/managed-by=curie-factory-e2e"
 RUN_ANNOTATION = "curie.dev/factory-e2e-run"
 # "<hostname>:<pid>" of the process that created the namespace, so a later run
@@ -277,8 +396,13 @@ SCENARIOS: dict[str, ScenarioDriver | None] = {
     "cancel-running": None,
     "evaluation": None,
     "quiesce": None,
+    "forge-loop": None,
+    "github-loop": None,
+    "tls-code-host": None,  # bound at the bottom from tls_code_host.py
+    "repo-runner": None,  # bound at the bottom from repo_runner.py
 }
 SCENARIO_NAMES = tuple(SCENARIOS)
+WHOLE_FLOW_SCENARIOS = frozenset({"tls-code-host", "repo-runner"})
 
 
 def resolve_scenario(name: str) -> ScenarioDriver:
@@ -291,14 +415,21 @@ def resolve_scenario(name: str) -> ScenarioDriver:
     return driver
 
 
+# The loop scenarios and the forge each one fixes; None means `--forge` names it.
+LOOP_SCENARIOS: dict[str, str | None] = {"forge-loop": None, "github-loop": "github"}
+
+
 def scenario_opens_seed_issue(name: str | None) -> bool:
-    """The preflight seed issue is for every mode except evaluation.
+    """The preflight seed issue is for every mode except evaluation and the loops.
 
     Evaluation opens one issue per case itself. A seed issue would admit a
-    second, unjudged run beside the first case.
+    second, unjudged run beside the first case. A loop opens its ticket
+    through its forge driver.
     """
 
-    return name != "evaluation"
+    return (
+        name != "evaluation" and name not in LOOP_SCENARIOS and name not in WHOLE_FLOW_SCENARIOS
+    )
 
 
 # --------------------------------------------------------------------------
@@ -330,6 +461,9 @@ class FactoryConfig:
     layer_registry: str | None = None
     # The operator's own GitHub login; None means ask gh at check time.
     operator_login: str | None = None
+    # Anthropic-compatible base URL injected into the worker. None keeps the
+    # chart's own model route.
+    model_base_url: str | None = None
 
 
 def _read_secret_file(path: Path) -> str | None:
@@ -518,6 +652,260 @@ def unpublished_images(
     return [image for image in [*CHART_COMPONENTS.values(), RUNNER_IMAGE] if not head(image, tag)]
 
 
+# --------------------------------------------------------------------------
+# Candidate images built from the checkout (--candidate-images build)
+# --------------------------------------------------------------------------
+
+CANDIDATE_IMAGE_MODES = ("published", "build")
+# Build context and Dockerfile per image, mirroring the image matrix in
+# .github/workflows/release.yaml (no build args there for these six).
+CANDIDATE_BUILDS: dict[str, tuple[str, str]] = {
+    "curie-api": (".", "apps/api/Dockerfile"),
+    "curie-worker": (".", "apps/worker/Dockerfile"),
+    "curie-dispatcher": (".", "apps/dispatcher/Dockerfile"),
+    "curie-mail-adapter": (".", "apps/mail-adapter/Dockerfile"),
+    "curie-ui": (".", "apps/ui/Dockerfile"),
+    RUNNER_IMAGE: (".", "runner/Dockerfile"),
+}
+KIND_CONTEXT_PREFIX = "kind-"
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+@dataclasses.dataclass(frozen=True)
+class CandidateImage:
+    """One image built from the candidate checkout.
+
+    ``digests`` are the ids a running container may report for it: the pushed
+    manifest digest, or for a kind load the local image id plus any repo digest
+    the node recorded on import.
+    """
+
+    name: str
+    repository: str
+    tag: str
+    digests: tuple[str, ...]
+
+    @property
+    def ref(self) -> str:
+        return f"{self.repository}:{self.tag}"
+
+    @property
+    def pinned(self) -> str:
+        """The digest reference a registry pull resolves; the tag when loaded."""
+
+        return f"{self.repository}@{self.digests[0]}" if self.digests else self.ref
+
+
+def candidate_image_tag(candidate: str) -> str:
+    return f"cand-{candidate[:12]}"
+
+
+def kind_cluster_name(context: str, *, named: str | None = None) -> str | None:
+    """The kind cluster a context targets, or None when images must be pushed.
+
+    kind names its contexts ``kind-<cluster>``; ``named`` (--kind-cluster)
+    covers a renamed context and wins over the prefix.
+    """
+
+    if named:
+        return named
+    if context.startswith(KIND_CONTEXT_PREFIX):
+        return context.removeprefix(KIND_CONTEXT_PREFIX)
+    return None
+
+
+def candidate_repository_prefix(registry: str | None, kind: bool, token: str) -> str:
+    """A fresh repository prefix per run, so no run reuses another's images."""
+
+    if kind:
+        return f"factory-e2e-{token}"
+    if not registry:
+        raise ConfigError(
+            "--candidate-images build pushes to CURIE_FACTORY_LAYER_REGISTRY on a cluster "
+            "that is not kind; set it to a registry the cluster can pull from"
+        )
+    return f"{registry.rstrip('/')}/factory-e2e-{token}"
+
+
+def candidate_platforms(architectures: Sequence[str]) -> list[str]:
+    """``linux/<arch>`` for every node architecture; one entry builds single-platform."""
+
+    found = sorted({f"linux/{arch.strip()}" for arch in architectures if arch.strip()})
+    if not found:
+        raise PreflightFailed("the cluster reported no node architecture")
+    return found
+
+
+def candidate_build_argv(
+    *,
+    builder: str,
+    ref: str,
+    dockerfile: Path,
+    context_dir: Path,
+    platforms: Sequence[str],
+    load: bool,
+    metadata_file: Path | None = None,
+) -> list[str]:
+    """`docker buildx build` on the named builder. Never selects or changes a default builder.
+
+    ``load`` puts a single-platform image in the local daemon for `kind load`;
+    otherwise every platform is pushed and the digest lands in ``metadata_file``.
+    """
+
+    if load and len(platforms) != 1:
+        raise ConfigError(f"a kind load builds one platform, the cluster reports {platforms}")
+    argv = [
+        "docker",
+        "buildx",
+        "build",
+        "--builder",
+        builder,
+        "--platform",
+        ",".join(platforms),
+        "--provenance=false",
+        "-f",
+        str(dockerfile),
+        "-t",
+        ref,
+    ]
+    if load:
+        argv.append("--load")
+    else:
+        if metadata_file is None:
+            raise ValueError("a pushed build needs a metadata file for its digest")
+        argv += ["--push", "--metadata-file", str(metadata_file)]
+    argv.append(str(context_dir))
+    return argv
+
+
+def pushed_digest(metadata: Mapping[str, Any]) -> str:
+    """The manifest digest buildx reports in its `--metadata-file`."""
+
+    digest = metadata.get("containerimage.digest")
+    if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+        raise PreflightFailed("buildx reported no containerimage.digest for a pushed image")
+    return digest
+
+
+def digest_of(image_id: str) -> str | None:
+    """The trailing ``sha256:<hex>`` of a container status imageID, if any."""
+
+    matches = _DIGEST.findall(image_id or "")
+    return matches[-1] if matches else None
+
+
+def candidate_values(images: Mapping[str, CandidateImage], *, kind: bool) -> dict[str, Any]:
+    """Chart values that point every component and the runner at built images. Pure.
+
+    A kind-loaded image exists only in the node store, so nothing may try a
+    registry pull of it: components drop to IfNotPresent and the prewarm
+    DaemonSet too.
+    """
+
+    values: dict[str, Any] = {}
+    for component, name in CHART_COMPONENTS.items():
+        image = images[name]
+        entry: dict[str, Any] = {"repository": image.repository, "tag": image.tag}
+        if kind:
+            entry["pullPolicy"] = "IfNotPresent"
+        values[component] = {"image": entry}
+    runner = images[RUNNER_IMAGE]
+    values["agentSandbox"] = {
+        "runner": {"image": runner.repository, "tag": runner.tag, "imagePullPolicy": "IfNotPresent"}
+    }
+    if kind:
+        values["agentSandbox"]["runner"]["prewarm"] = {"imagePullPolicy": "IfNotPresent"}
+    return values
+
+
+def judge_running_images(
+    pods: Mapping[str, Any], images: Mapping[str, CandidateImage], *, required: Sequence[str]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Every running container of a candidate repository, and how it disagrees. Pure.
+
+    ``pods`` is a `kubectl get pods -o json` body. A container counts when its
+    spec image names a candidate repository; its status imageID must carry one
+    of that image's digests. Each name in ``required`` must be seen running.
+    """
+
+    by_repository = {image.repository: image for image in images.values()}
+    records: list[dict[str, Any]] = []
+    failures: list[str] = []
+    seen: set[str] = set()
+    for pod in pods.get("items") or []:
+        if not isinstance(pod, dict):
+            continue
+        name = str((pod.get("metadata") or {}).get("name") or "")
+        spec = pod.get("spec") or {}
+        status = pod.get("status") or {}
+        spec_images = {
+            str(c.get("name")): str(c.get("image") or "")
+            for c in [*(spec.get("initContainers") or []), *(spec.get("containers") or [])]
+            if isinstance(c, dict)
+        }
+        statuses = [
+            s
+            for s in [
+                *(status.get("initContainerStatuses") or []),
+                *(status.get("containerStatuses") or []),
+            ]
+            if isinstance(s, dict)
+        ]
+        for container in statuses:
+            spec_image = spec_images.get(str(container.get("name")), "")
+            repository = re.split(r"[@:](?=[^/]*$)", spec_image, maxsplit=1)[0]
+            image = by_repository.get(repository)
+            if image is None:
+                continue
+            image_id = str(container.get("imageID") or "")
+            running = digest_of(image_id)
+            record = {
+                "pod": name,
+                "container": container.get("name"),
+                "image": spec_image,
+                "image_id": image_id,
+                "expected": list(image.digests),
+            }
+            records.append(record)
+            if running is None:
+                failures.append(f"{name}/{container.get('name')} reports no image id yet")
+            elif running not in image.digests:
+                failures.append(
+                    f"{name}/{container.get('name')} runs {running}, not the built "
+                    f"{image.name} ({', '.join(image.digests)})"
+                )
+            else:
+                seen.add(image.name)
+    for wanted in required:
+        if wanted not in seen:
+            failures.append(f"no running container uses the built {wanted}")
+    return records, failures
+
+
+def candidate_workload_images(
+    workloads: Mapping[str, Any], images: Mapping[str, CandidateImage]
+) -> list[str]:
+    """Names of built images some Deployment, StatefulSet or DaemonSet runs. Pure."""
+
+    by_repository = {image.repository: image.name for image in images.values()}
+    found: set[str] = set()
+    for item in workloads.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        pod_spec = ((item.get("spec") or {}).get("template") or {}).get("spec") or {}
+        for container in [
+            *(pod_spec.get("initContainers") or []),
+            *(pod_spec.get("containers") or []),
+        ]:
+            if not isinstance(container, dict):
+                continue
+            image = str(container.get("image") or "")
+            repository = re.split(r"[@:](?=[^/]*$)", image, maxsplit=1)[0]
+            if repository in by_repository:
+                found.add(by_repository[repository])
+    return sorted(found)
+
+
 def load_config(
     env: Mapping[str, str],
     *,
@@ -663,9 +1051,10 @@ def load_config(
         model=model,
         model_context_tokens=model_context_tokens,
         bundle_dir=bundle_dir,
-        curie_bin=env.get("CURIE_FACTORY_CURIE_BIN") or "curie",
+        curie_bin=env.get("CURIE_BIN") or "curie",
         layer_registry=layer_registry,
         operator_login=env.get("CURIE_FACTORY_OPERATOR_LOGIN") or None,
+        model_base_url=env.get("CURIE_FACTORY_MODEL_BASE_URL") or None,
     )
 
 
@@ -742,14 +1131,36 @@ def app_jwt(app_id: str, key_file: Path, *, now: int | None = None) -> str:
     return f"{header}.{payload}.{_b64url(signed.stdout)}"
 
 
-def request_id_for(repository_id: int, issue_number: int, delivery_id: str) -> uuid.UUID:
+def request_id_for(repository_id: int, issue_number: int, admission_id: str) -> uuid.UUID:
     """The execution request id the api derives for a label admission.
 
-    Each labeled delivery is its own request, so the delivery id is part of it.
+    The admission id is the issue timeline event id when GitHub returned one,
+    which is the identity `FactoryNotice.request_id` uses. A delivery id is
+    only the fallback when that event id is absent.
     """
 
-    identity = f"https://github.com/factory/label/{repository_id}/{issue_number}/{delivery_id}"
+    identity = f"https://github.com/factory/label/{repository_id}/{issue_number}/{admission_id}"
     return uuid.uuid5(uuid.NAMESPACE_URL, identity)
+
+
+def last_label_event_id(events: list[Any], label: str) -> int | None:
+    """The newest ``labeled`` event id for ``label``, or None.
+
+    Same selection as the api's label-event admission identity: the last
+    matching event in the list GitHub returns.
+    """
+
+    found: int | None = None
+    for event in events:
+        if (
+            isinstance(event, dict)
+            and event.get("event") == "labeled"
+            and isinstance(event.get("label"), dict)
+            and event["label"].get("name") == label
+            and type(event.get("id")) is int
+        ):
+            found = event["id"]
+    return found
 
 
 def revision_request_id(repository_id: int, comment_id: int) -> uuid.UUID:
@@ -813,6 +1224,32 @@ def delivery_api_status(delivery: dict[str, Any]) -> str | None:
     return status if isinstance(status, str) else None
 
 
+def model_proxy_egress(url: str) -> dict[str, Any]:
+    """The sandbox egress rule for a model proxy pod IP.
+
+    NetworkPolicy cannot name a DNS host. The base URL's host must already be
+    that pod's IP. The port is the URL port, or the scheme default.
+    """
+
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname
+    if not host:
+        raise ConfigError("model base URL must include a host")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        raise ConfigError(
+            "model base URL host must be the proxy pod IP so sandbox egress can allow it"
+        ) from None
+    if parsed.port is not None:
+        port = parsed.port
+    elif parsed.scheme == "https":
+        port = 443
+    else:
+        port = 80
+    return {"cidr": f"{host}/32", "ports": [{"protocol": "TCP", "port": port}]}
+
+
 def install_values(
     config: FactoryConfig,
     *,
@@ -822,8 +1259,20 @@ def install_values(
     egress_cidrs: Sequence[str] = (),
     sandbox_pod_quota: int | None = None,
     card_base_url: str = "",
+    local_images: bool = False,
+    candidate_images: Mapping[str, CandidateImage] | None = None,
+    kind: bool = False,
+    forge: str = "github",
 ) -> dict[str, Any]:
     """Helm values for the disposable install. Written to a 0600 file, never argv.
+
+    ``forge`` is the loop forge. One whose entry installs no GitHub App
+    (gitlab) gets no App values and no factory block: its entry's setup writes
+    the factory's code host, tracker and binding with the quickstart.
+
+    Without ``candidate_images`` every image is the published ``sha-<candidate>``
+    tag. With them, each component and the runner point at the images built
+    from the checkout (``candidate_values``).
 
     ``card_base_url`` is the public base the webhook is registered under; the
     api serves the status card there, so GitHub can fetch the image.
@@ -835,23 +1284,66 @@ def install_values(
 
     tag = f"sha-{candidate}"
     values: dict[str, Any] = {component: {"image": {"tag": tag}} for component in CHART_COMPONENTS}
-    values["api"].update(
-        {
-            "githubWebhookSecret": config.webhook_secret,
-            "githubFactoryIngressEnabled": True,
-            "githubFactoryLabel": config.label,
-            "githubFactoryMention": config.mention,
-            "githubAppId": config.app_id,
-            "githubAppExistingSecret": app_key_secret,
-            "githubRepoAllowlist": [config.repo],
+    if local_images:
+        for component, repository in (
+            ("api", "curie-api"),
+            ("worker", "curie-worker"),
+            ("dispatcher", "curie-dispatcher"),
+            ("mailAdapter", "curie-mail-adapter"),
+            ("ui", "curie-ui"),
+        ):
+            values[component]["image"]["repository"] = repository
+            values[component]["image"]["tag"] = "local"
+            values[component]["image"]["pullPolicy"] = "Never"
+    if FORGES[forge].github_app:
+        values["api"].update(
+            {
+                "githubWebhookSecret": config.webhook_secret,
+                "githubAppId": config.app_id,
+                "githubAppExistingSecret": app_key_secret,
+                "githubRepoAllowlist": [config.repo],
+            }
+        )
+        # The factory reads its GitHub App from the same Secret git-flow uses, as a
+        # mounted file named by CURIE_FORGES (#4397).
+        credential = {
+            "type": "github_app",
+            "appId": config.app_id,
+            "existingSecret": app_key_secret,
+            "existingSecretKey": "privateKey",
         }
-    )
-    if card_base_url:
-        values["api"]["githubFactoryCardBaseUrl"] = card_base_url
+        github = {"name": "github", "kind": "github", "host": "github.com", "apiUrl": GITHUB_API}
+        values["factory"] = {
+            "enabled": True,
+            "intake": "poll",
+            "codeHosts": [{**github, "credential": dict(credential)}],
+            "trackers": [
+                {
+                    **github,
+                    "credential": dict(credential),
+                    "label": config.label,
+                    "mention": config.mention,
+                }
+            ],
+            # The github entries carry no egress, so the chart's built-in GitHub
+            # set applies to the factory agent's sandboxes (#4397).
+            "sandboxEgress": {FACTORY_AGENT: True},
+        }
+        if card_base_url:
+            values["factory"]["cardBaseUrl"] = card_base_url
+    runner_values: dict[str, Any] = {"tag": "latest" if local_images else tag}
+    if local_images:
+        runner_values["image"] = "curie-runner"
+        runner_values["imagePullPolicy"] = "IfNotPresent"
     values["agentSandbox"] = {
-        "runner": {"tag": tag},
+        "runner": runner_values,
         "controller": {"deploy": not consumer_controller},
     }
+    if candidate_images is not None:
+        built = candidate_values(candidate_images, kind=kind)
+        for component in CHART_COMPONENTS:
+            values[component]["image"] = built[component]["image"]
+        values["agentSandbox"]["runner"] = built["agentSandbox"]["runner"]
     # A disposable install proves the factory flow, not sandbox isolation, and
     # most scratch clusters carry no gVisor runtime class.
     values["security"] = {"gvisor": {"mode": "off"}}
@@ -885,15 +1377,58 @@ def install_values(
         # it. The runner ceiling must not exceed the delivery budget.
         values["worker"]["deliveryBudgetSeconds"] = EXECUTION_BOUND_SECONDS
         values["worker"]["runnerTotalTimeoutSeconds"] = EXECUTION_BOUND_SECONDS
+    if config.model_base_url:
+        if not config.model_api_key:
+            values["agentSandbox"]["runner"].update(
+                {
+                    "fakeModel": False,
+                    "model": config.model,
+                    "credentials": "not-needed",
+                }
+            )
+            values["worker"]["deliveryBudgetSeconds"] = EXECUTION_BOUND_SECONDS
+            values["worker"]["runnerTotalTimeoutSeconds"] = EXECUTION_BOUND_SECONDS
+        worker_env = list(values["worker"].get("extraEnv") or [])
+        worker_env.append({"name": "CURIE_MODEL_BASE_URL", "value": config.model_base_url})
+        worker_env.append({"name": "CURIE_MODEL", "value": config.model})
+        values["worker"]["extraEnv"] = worker_env
+        allowed = list(values["security"].get("networkPolicy", {}).get("allowedEgress") or [])
+        allowed.append(model_proxy_egress(config.model_base_url))
+        values["security"].setdefault("networkPolicy", {})["allowedEgress"] = allowed
     if sandbox_pod_quota is not None:
         values["resourceQuota"] = {"hard": {"sandboxPodCount": str(sandbox_pod_quota)}}
-    if config.priority_classes is not None:
-        platform, sandbox = config.priority_classes
-        values["priorityClasses"] = {
-            "platform": {"create": False, "name": platform},
-            "sandbox": {"create": False, "name": sandbox},
-        }
     return values
+
+
+def release_name(namespace: str) -> str:
+    """The Helm release for a run in ``namespace``.
+
+    Per run, not "curie": the chart names its cluster-scoped objects (the
+    ValidatingAdmissionPolicy ``<release>-runner-resources``, ClusterRoles,
+    PriorityClasses) from the release, so a fixed name collides with another
+    release named curie on the same cluster.
+    """
+
+    return "curie-" + hashlib.sha256(namespace.encode()).hexdigest()[:4]
+
+
+def priority_class_values(priority_classes: tuple[str, str] | None, release: str) -> dict[str, Any]:
+    """The chart's priorityClasses block for one run.
+
+    Configured names are reused as they are. Otherwise the release creates its
+    own per-release classes, which ``helm uninstall`` removes again.
+    """
+
+    if priority_classes is None:
+        return {
+            "platform": {"create": True, "name": f"{release}-platform"},
+            "sandbox": {"create": True, "name": f"{release}-sandbox"},
+        }
+    platform, sandbox = priority_classes
+    return {
+        "platform": {"create": False, "name": platform},
+        "sandbox": {"create": False, "name": sandbox},
+    }
 
 
 def helm_upgrade_command(
@@ -945,8 +1480,8 @@ def quota_hard_pods(listing: Mapping[str, Any]) -> str | None:
     for item in items:
         if not isinstance(item, dict):
             continue
-        spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
-        hard = spec.get("hard") if isinstance(spec.get("hard"), dict) else {}
+        spec = item["spec"] if isinstance(item.get("spec"), dict) else {}
+        hard = spec["hard"] if isinstance(spec.get("hard"), dict) else {}
         pods = hard.get("pods")
         if isinstance(pods, str) and pods.strip():
             return pods.strip()
@@ -1364,6 +1899,40 @@ def run(argv: list[str], *, check: bool = True, input_text: str | None = None) -
     return result.stdout
 
 
+def resolve_curie_binary(binary: str) -> tuple[str, str]:
+    try:
+        if os.path.dirname(binary):
+            path = Path(binary)
+            resolved = str(path) if path.is_file() and os.access(path, os.X_OK) else None
+        else:
+            resolved = shutil.which(binary)
+        if resolved is None:
+            raise ConfigError(f"CURIE_BIN {binary!r} cannot be resolved to an executable")
+        curie_bin = str(Path(resolved).resolve())
+    except (OSError, RuntimeError):
+        raise ConfigError(f"CURIE_BIN {binary!r} cannot be resolved to an executable") from None
+    try:
+        result = subprocess.run(
+            [curie_bin, "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
+        raise ConfigError(f"CURIE_BIN {curie_bin!r} could not run --version") from None
+    if result.returncode:
+        raise ConfigError(
+            f"CURIE_BIN {curie_bin!r} failed --version (exit {result.returncode})"
+        )
+    lines = result.stdout.splitlines()
+    version = lines[0] if lines else ""
+    if not version.strip():
+        raise ConfigError(f"CURIE_BIN {curie_bin!r} did not report a version")
+    print(f"factory-e2e: curie binary {curie_bin} ({version})", file=sys.stderr, flush=True)
+    return curie_bin, version
+
+
 def http_json(
     method: str,
     url: str,
@@ -1500,6 +2069,14 @@ def _stop(process: subprocess.Popen[Any]) -> bool:
 # --------------------------------------------------------------------------
 
 
+def _image_remover(ref: str) -> Callable[[], dict[str, Any]]:
+    def remove() -> dict[str, Any]:
+        result = subprocess.run(["docker", "image", "rm", ref], capture_output=True, check=False)
+        return {"removed": result.returncode == 0}
+
+    return remove
+
+
 class Preflight:
     def __init__(
         self,
@@ -1516,9 +2093,24 @@ class Preflight:
         expect_reasons: Sequence[str] = (),
         scenario_name: str | None = None,
         revision_text: str | None = None,
+        candidate_images: str = "published",
+        kind_cluster: str | None = None,
     ) -> None:
         if expect not in EXPECTATIONS:
             raise ConfigError(f"--expect must be one of {EXPECTATIONS}")
+        if candidate_images not in CANDIDATE_IMAGE_MODES:
+            raise ConfigError(f"--candidate-images must be one of {CANDIDATE_IMAGE_MODES}")
+        self.candidate_image_mode = candidate_images
+        self.kind_cluster = (
+            kind_cluster_name(config.kube_context, named=kind_cluster)
+            if candidate_images == "build"
+            else None
+        )
+        # Filled by build_candidate_images; None installs the published images.
+        self.candidate_images: dict[str, CandidateImage] | None = None
+        self._candidate_platforms: list[str] = []
+        self._candidate_fetched = False
+        self._layer_base = ""
         self.issue_spec = issue_spec
         self.scenario_name = scenario_name
         self.revision_text = revision_text
@@ -1533,15 +2125,21 @@ class Preflight:
         self.admission_timeout = admission_timeout
         self.teardown = Teardown()
         self.run_id = uuid.uuid4().hex[:12]
+        self.release = release_name(namespace)
         self.created_crds: list[str] = []
         self.evidence: dict[str, Any] = {
             "schema": "curie.factory-e2e.evidence/v1",
             "mode": "preflight",
             "candidate_commit": candidate,
-            "image_tag": f"sha-{candidate}",
+            "image_tag": (
+                candidate_image_tag(candidate)
+                if candidate_images == "build"
+                else f"sha-{candidate}"
+            ),
+            "candidate_image_mode": candidate_images,
             "kube_context": config.kube_context,
             "namespace": namespace,
-            "release": RELEASE,
+            "release": self.release,
             "run_id": "",
             "started_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
             "steps": [],
@@ -1570,6 +2168,7 @@ class Preflight:
         self._fixture_base_sha = ""
         self._issue_token_minted = 0.0
         self._fixture_restore_pushed = False
+        self._loop_driver: ForgeDriver | None = None
 
     # --- small wrappers -------------------------------------------------
 
@@ -1593,7 +2192,7 @@ class Preflight:
                 self.namespace,
                 "exec",
                 "-i",
-                f"statefulset/{RELEASE}-postgres",
+                f"statefulset/{self.release}-postgres",
                 "--",
                 "sh",
                 "-c",
@@ -1645,13 +2244,15 @@ class Preflight:
             "git",
             "openssl",
             self.config.cloudflared,
-            self.config.curie_bin,
         ]
         absent = [tool for tool in wanted if shutil.which(tool) is None]
         if absent:
             raise ConfigError(f"required tools not on PATH: {', '.join(absent)}")
 
     def check_images(self) -> None:
+        if self.candidate_image_mode == "build":
+            self.check_build_tools()
+            return
         tag = f"sha-{self.candidate}"
         missing = unpublished_images(tag)
         if missing:
@@ -1703,8 +2304,214 @@ class Preflight:
         self.evidence["actor_login"] = actor_login
         self.step("App JWT and actor token verified", actor_login=actor_login)
 
+    def check_build_tools(self) -> None:
+        """What a candidate build needs, refused before anything live is touched."""
+
+        if not os.environ.get("BUILDX_BUILDER"):
+            raise ConfigError(
+                "--candidate-images build needs BUILDX_BUILDER naming the buildx builder to "
+                "build on; the driver never selects or changes the default builder"
+            )
+        wanted = ["docker"] + (["kind"] if self.kind_cluster else [])
+        absent = [tool for tool in wanted if shutil.which(tool) is None]
+        if absent:
+            raise ConfigError(f"required tools not on PATH: {', '.join(absent)}")
+        if self.kind_cluster is None and not self.config.layer_registry:
+            raise ConfigError(
+                "--candidate-images build on a cluster that is not kind pushes every image to "
+                "CURIE_FACTORY_LAYER_REGISTRY; set it to a registry the cluster can pull from"
+            )
+        if not self.config.layer_registry and bundle_declares_runner_layer(self.config.bundle_dir):
+            raise ConfigError(
+                "--candidate-images build rebuilds the bundle's runner layer on the candidate "
+                "runner; set CURIE_FACTORY_LAYER_REGISTRY, since a committed lock names a layer "
+                "built on another runner"
+            )
+        self.step(
+            "candidate build tools present",
+            builder=os.environ["BUILDX_BUILDER"],
+            delivery="kind load" if self.kind_cluster else "registry push",
+        )
+
+    def _fetch_candidate(self) -> None:
+        if not self._candidate_fetched:
+            run(["git", "-C", str(self.repo_root), "fetch", "--quiet", "origin", self.candidate])
+            self._candidate_fetched = True
+
+    def export_source(self) -> Path:
+        """The candidate commit's whole tracked tree, the build context CI checks out."""
+
+        self._fetch_candidate()
+        source = self.workdir / "source"
+        shutil.rmtree(source, ignore_errors=True)
+        source.mkdir()
+        archive = self.workdir / "source.tar"
+        run(
+            [
+                "git",
+                "-C",
+                str(self.repo_root),
+                "archive",
+                "--output",
+                str(archive),
+                self.candidate,
+            ]
+        )
+        run(["tar", "-xf", str(archive), "-C", str(source)])
+        archive.unlink()
+        return source
+
+    def node_platforms(self) -> list[str]:
+        out = self.kubectl(
+            "get", "nodes", "-o", "jsonpath={.items[*].status.nodeInfo.architecture}"
+        )
+        return candidate_platforms(out.split())
+
+    def _buildx(self, argv: list[str], name: str) -> None:
+        result = subprocess.run(argv, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout).strip()[-1500:]
+            raise PreflightFailed(f"building {name} from the candidate failed: {tail}")
+
+    def _kind_digests(self, ref: str) -> tuple[str, ...]:
+        """The local image id, plus any repo digest the kind node recorded on load."""
+
+        image_id = run(["docker", "image", "inspect", "--format", "{{.Id}}", ref]).strip()
+        digests = [image_id] if _DIGEST.fullmatch(image_id) else []
+        node = f"{self.kind_cluster}-control-plane"
+        inspected = subprocess.run(
+            ["docker", "exec", node, "crictl", "inspecti", "-o", "json", ref],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        try:
+            status = json.loads(inspected.stdout).get("status") or {}
+        except (ValueError, AttributeError):
+            status = {}
+        for value in [status.get("id"), *(status.get("repoDigests") or [])]:
+            found = digest_of(str(value or ""))
+            if found and found not in digests:
+                digests.append(found)
+        if not digests:
+            raise PreflightFailed(f"could not read the image id of {ref}")
+        return tuple(digests)
+
+    def build_candidate_images(self) -> None:
+        """Build every image the chart installs, plus the runner, from the checkout.
+
+        On kind each image is loaded into the cluster; otherwise it is pushed
+        under a fresh repository prefix in CURIE_FACTORY_LAYER_REGISTRY. The
+        runner is also pushed whenever the bundle's runner layer is built,
+        because the layer builds FROM it through the registry.
+        """
+
+        builder = os.environ["BUILDX_BUILDER"]
+        source = self.export_source()
+        kind = self.kind_cluster is not None
+        platforms = self.node_platforms()
+        if kind and len(platforms) > 1:
+            platforms = platforms[:1]
+        self._candidate_platforms = platforms
+        tag = candidate_image_tag(self.candidate)
+        token = uuid.uuid4().hex[:10]
+        prefix = candidate_repository_prefix(self.config.layer_registry, kind, token)
+        layer = self.config.layer_registry is not None and bundle_declares_runner_layer(
+            self.config.bundle_dir
+        )
+        images: dict[str, CandidateImage] = {}
+        for name, (context, dockerfile) in CANDIDATE_BUILDS.items():
+            repository = f"{prefix}/{name}"
+            ref = f"{repository}:{tag}"
+            log(f"buildx {name} from the candidate ({', '.join(platforms)})")
+            if kind:
+                self._buildx(
+                    candidate_build_argv(
+                        builder=builder,
+                        ref=ref,
+                        dockerfile=source / dockerfile,
+                        context_dir=source / context,
+                        platforms=platforms,
+                        load=True,
+                    ),
+                    name,
+                )
+                self.teardown.push(f"remove local image {name}", _image_remover(ref))
+                run(["kind", "load", "docker-image", ref, "--name", str(self.kind_cluster)])
+                digests = self._kind_digests(ref)
+            else:
+                digests = (self._push_candidate(builder, ref, source, context, dockerfile, name),)
+            images[name] = CandidateImage(name, repository, tag, digests)
+        if kind and layer:
+            # The layer builds FROM the runner through the registry.
+            assert self.config.layer_registry is not None
+            pushed = f"{self.config.layer_registry.rstrip('/')}/factory-e2e-{token}/{RUNNER_IMAGE}"
+            context, dockerfile = CANDIDATE_BUILDS[RUNNER_IMAGE]
+            digest = self._push_candidate(
+                builder, f"{pushed}:{tag}", source, context, dockerfile, RUNNER_IMAGE
+            )
+            self._layer_base = f"{pushed}@{digest}"
+        elif layer:
+            self._layer_base = images[RUNNER_IMAGE].pinned
+        shutil.rmtree(source, ignore_errors=True)
+        self.candidate_images = images
+        self.evidence["candidate_images"] = {
+            "mode": "build",
+            "delivery": "kind load" if kind else "registry push",
+            "kind_cluster": self.kind_cluster,
+            "platforms": platforms,
+            "tag": tag,
+            "images": {
+                name: {"repository": image.repository, "digests": list(image.digests)}
+                for name, image in images.items()
+            },
+            "runner_layer_base": self._layer_base,
+        }
+        self.step("candidate images built", tag=tag, platforms=platforms, images=len(images))
+
+    def _push_candidate(
+        self, builder: str, ref: str, source: Path, context: str, dockerfile: str, name: str
+    ) -> str:
+        metadata = self.workdir / f"buildx-{name}.json"
+        log(f"buildx push {name}")
+        self._buildx(
+            candidate_build_argv(
+                builder=builder,
+                ref=ref,
+                dockerfile=source / dockerfile,
+                context_dir=source / context,
+                platforms=self._candidate_platforms,
+                load=False,
+                metadata_file=metadata,
+            ),
+            name,
+        )
+        try:
+            digest = pushed_digest(json.loads(metadata.read_text()))
+        finally:
+            metadata.unlink(missing_ok=True)
+        return digest
+
+    def assert_running_images(self) -> None:
+        """Each pod built from a candidate image runs exactly the built digest."""
+
+        if self.candidate_images is None:
+            return
+        workloads = json.loads(
+            self.kubectl(
+                "-n", self.namespace, "get", "deployments,statefulsets,daemonsets", "-o", "json"
+            )
+        )
+        required = candidate_workload_images(workloads, self.candidate_images)
+        pods = json.loads(self.kubectl("-n", self.namespace, "get", "pods", "-o", "json"))
+        records, failures = judge_running_images(pods, self.candidate_images, required=required)
+        self.evidence["running_images"] = records
+        if failures:
+            raise PreflightFailed("running images differ from the build: " + "; ".join(failures))
+        self.step("running images are the candidate build", containers=len(records))
+
     def extract_chart(self) -> Path:
-        run(["git", "-C", str(self.repo_root), "fetch", "--quiet", "origin", self.candidate])
+        self._fetch_candidate()
         archive = self.workdir / "chart.tar"
         run(
             [
@@ -1738,12 +2545,15 @@ class Preflight:
         # applied it, the client lost the answer) is still reconciled, and the
         # run annotation keeps the undo from touching anyone else's namespace.
         self.teardown.push("delete namespaces", self.delete_namespaces)
+        labels = dict([OWNER_LABEL.split("=", 1)])
+        if self.scenario_name == "repo-runner":
+            labels["owner"] = "factory-tools"
         manifest = {
             "apiVersion": "v1",
             "kind": "Namespace",
             "metadata": {
                 "name": self.namespace,
-                "labels": dict([OWNER_LABEL.split("=", 1)]),
+                "labels": labels,
                 "annotations": {
                     RUN_ANNOTATION: self.run_id,
                     HOLDER_ANNOTATION: f"{socket.gethostname()}:{os.getpid()}",
@@ -1757,7 +2567,7 @@ class Preflight:
         self.step("namespace created", namespace=self.namespace)
 
     def publication_namespace(self) -> str:
-        return f"{self.namespace}-{RELEASE}-publication"
+        return f"{self.namespace}-{self.release}-publication"
 
     def _owned(self, name: str) -> bool:
         raw = self.kubectl("get", "namespace", name, "--ignore-not-found", "-o", "json")
@@ -1814,7 +2624,7 @@ class Preflight:
                 "--kube-context",
                 self.config.kube_context,
                 "uninstall",
-                RELEASE,
+                release_name(name),
                 "-n",
                 name,
                 "--no-hooks",
@@ -1832,7 +2642,7 @@ class Preflight:
                 f"{uninstall.stderr.strip()[-500:]}"
             )
         names = [name]
-        publication = f"{name}-{RELEASE}-publication"
+        publication = f"{name}-{release_name(name)}-publication"
         raw = self.kubectl("get", "namespace", publication, "--ignore-not-found", "-o", "json")
         if raw.strip():
             annotations = json.loads(raw)["metadata"].get("annotations") or {}
@@ -1864,7 +2674,7 @@ class Preflight:
                     "--kube-context",
                     self.config.kube_context,
                     "uninstall",
-                    RELEASE,
+                    self.release,
                     "-n",
                     self.namespace,
                     "--no-hooks",
@@ -1909,11 +2719,75 @@ class Preflight:
             "verified_absent": True,
         }
 
-    def install(self) -> None:
-        chart = self.extract_chart()
-        consumer = bool(
-            self.kubectl("get", "crd", SANDBOX_CRD, "--ignore-not-found", "-o", "name").strip()
+    def existing_sandbox_controller(self) -> bool:
+        """Whether the shared agent-sandbox controller Deployment already runs.
+
+        Same rule as `curie cluster up`: an existing controller is reused, a
+        NotFound means this release deploys its own, and any other read failure
+        stops the run before Helm touches the cluster.
+        """
+
+        try:
+            out = self.kubectl(
+                "-n",
+                SANDBOX_CONTROLLER_NAMESPACE,
+                "get",
+                "deployment",
+                SANDBOX_CONTROLLER_DEPLOYMENT,
+                "--ignore-not-found",
+                "-o",
+                "name",
+            )
+        except PreflightFailed as exc:
+            raise PreflightFailed(
+                f"cannot read deployment {SANDBOX_CONTROLLER_NAMESPACE}/"
+                f"{SANDBOX_CONTROLLER_DEPLOYMENT} to decide sandbox controller reuse: {exc}"
+            ) from exc
+        return bool(out.strip())
+
+    def release_values(
+        self,
+        config: FactoryConfig,
+        *,
+        sandbox_pod_quota: int | None,
+        card_base_url: str = "",
+    ) -> dict[str, Any]:
+        """install_values plus this run's per-release PriorityClasses.
+
+        The one builder for install() and helm_upgrade(), so the two agree.
+        """
+
+        values = install_values(
+            config,
+            candidate=self.candidate,
+            app_key_secret=APP_KEY_REF,
+            consumer_controller=self._consumer_controller,
+            egress_cidrs=self._egress_cidrs,
+            sandbox_pod_quota=sandbox_pod_quota,
+            card_base_url=card_base_url,
+            candidate_images=self.candidate_images,
+            kind=self.kind_cluster is not None,
+            forge=self.install_forge,
         )
+        values["priorityClasses"] = priority_class_values(config.priority_classes, self.release)
+        return values
+
+    def install(
+        self,
+        *,
+        egress_cidrs: Sequence[str] | None = None,
+        extra_values: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
+        # Read before any CRD, Secret or Helm call: a failed read must leave
+        # the cluster untouched.
+        consumer = self.existing_sandbox_controller()
+        if consumer:
+            self.step(
+                "sandbox controller reused",
+                namespace=SANDBOX_CONTROLLER_NAMESPACE,
+                deployment=SANDBOX_CONTROLLER_DEPLOYMENT,
+            )
+        chart = self.extract_chart()
         for manifest in sorted((chart / "crds").glob("*.yaml")):
             match = re.search(r"^  name:\s*(\S+)", manifest.read_text(), re.MULTILINE)
             if (
@@ -1936,18 +2810,20 @@ class Preflight:
         # so each one must be served before the install starts.
         for crd in self.created_crds:
             self.kubectl("wait", "--for=condition=Established", f"crd/{crd}", "--timeout=120s")
-        key_file = str(self.config.private_key_file)
-        self.kubectl(
-            "-n",
-            self.namespace,
-            "create",
-            "secret",
-            "generic",
-            APP_KEY_REF,
-            f"--from-file=privateKey={key_file}",
-        )
+        if self.uses_github_app:
+            key_file = str(self.config.private_key_file)
+            self.kubectl(
+                "-n",
+                self.namespace,
+                "create",
+                "secret",
+                "generic",
+                APP_KEY_REF,
+                f"--from-file=privateKey={key_file}",
+            )
         self.chart_dir = chart
-        egress_cidrs = self.egress_cidrs()
+        if egress_cidrs is None:
+            egress_cidrs = self.egress_cidrs()
         # cancel-waiting holds the request in `waiting` by refusing every
         # sandbox claim through the namespace quota.
         # evaluation starts at quota 0 so cancel-waiting is judged before any
@@ -1956,14 +2832,9 @@ class Preflight:
         self._consumer_controller = consumer
         self._egress_cidrs = list(egress_cidrs)
         self._sandbox_quota = quota
-        values = install_values(
-            self.config,
-            candidate=self.candidate,
-            app_key_secret=APP_KEY_REF,
-            consumer_controller=consumer,
-            egress_cidrs=egress_cidrs,
-            sandbox_pod_quota=quota,
-        )
+        values = self.release_values(self.config, sandbox_pod_quota=quota)
+        if extra_values is not None:
+            values = extra_values(values)
         values_file = self.workdir / "values.json"
         fd = os.open(values_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as handle:
@@ -1975,7 +2846,7 @@ class Preflight:
                 "--kube-context",
                 self.config.kube_context,
                 "install",
-                RELEASE,
+                self.release,
                 str(chart),
                 "-n",
                 self.namespace,
@@ -1992,6 +2863,7 @@ class Preflight:
         for kind in ("deployment", "statefulset"):
             for workload in self.kubectl("-n", self.namespace, "get", kind, "-o", "name").split():
                 self.kubectl("-n", self.namespace, "rollout", "status", workload, "--timeout=15m")
+        self.assert_running_images()
         self.step(
             "installed",
             chart="charts/curie@candidate",
@@ -2003,22 +2875,21 @@ class Preflight:
         )
 
     def egress_cidrs(self) -> list[str]:
-        """Sandbox egress: GitHub's API ranges (the bundle's GitHub MCP server
-        calls it from the sandbox) and, with a real model, OpenRouter."""
+        """Model egress for the sandbox: OpenRouter, with a real model. GitHub
+        is forge egress, reached through factory.sandboxEgress (#4397)."""
 
-        status, meta = http_json("GET", GITHUB_API + "/meta")
-        ranges = meta.get("api") if status == 200 and isinstance(meta, dict) else None
-        if not isinstance(ranges, list) or not ranges:
-            raise PreflightFailed(f"could not read GitHub's API address ranges (HTTP {status})")
-        cidrs = [str(cidr) for cidr in ranges if ":" not in str(cidr)]
-        if self.config.model_api_key:
-            try:
-                infos = socket.getaddrinfo(OPENROUTER_HOST, 443, socket.AF_INET, socket.SOCK_STREAM)
-            except OSError as exc:
-                raise PreflightFailed(f"could not resolve {OPENROUTER_HOST}: {exc}") from None
-            for address in sorted({str(info[4][0]) for info in infos}):
-                cidrs.append(f"{address}/32")
-        return cidrs
+        return self.model_provider_cidrs()
+
+    def model_provider_cidrs(self) -> list[str]:
+        """OpenRouter's current IPv4 addresses with a real model, else none."""
+
+        if not self.config.model_api_key:
+            return []
+        try:
+            infos = socket.getaddrinfo(OPENROUTER_HOST, 443, socket.AF_INET, socket.SOCK_STREAM)
+        except OSError as exc:
+            raise PreflightFailed(f"could not resolve {OPENROUTER_HOST}: {exc}") from None
+        return [f"{address}/32" for address in sorted({str(info[4][0]) for info in infos})]
 
     def port_forward(self) -> None:
         if self._api_forward is not None:
@@ -2035,7 +2906,7 @@ class Preflight:
                 "-n",
                 self.namespace,
                 "port-forward",
-                f"svc/{RELEASE}-api",
+                f"svc/{self.release}-api",
                 f"{port}:8000",
                 "--address",
                 "127.0.0.1",
@@ -2056,14 +2927,16 @@ class Preflight:
 
         _wait("the api through port-forward", 120, healthy)
         secret = json.loads(
-            self.kubectl("-n", self.namespace, "get", "secret", f"{RELEASE}-secrets", "-o", "json")
+            self.kubectl(
+                "-n", self.namespace, "get", "secret", f"{self.release}-secrets", "-o", "json"
+            )
         )
         data = secret["data"]
         self.api_key = base64.b64decode(data["apiKey"]).decode()
         self.worker_token = base64.b64decode(data["internalWorkerToken"]).decode()
         self.step("api reachable")
 
-    def bind_agent(self) -> None:
+    def bind_agent(self, *, github_token: bool = True) -> None:
         status, body = self.api(
             "POST",
             "/agents",
@@ -2090,7 +2963,7 @@ class Preflight:
                 f"setting the agent execution deadline failed (HTTP {status}): {patched}"
             )
         self.step("factory agent execution deadline set", seconds=EXECUTION_BOUND_SECONDS)
-        self.deploy_bundle()
+        self.deploy_bundle(github_token=github_token)
 
     def _write_kubeconfig(self) -> Path:
         result = subprocess.run(
@@ -2174,7 +3047,16 @@ class Preflight:
         copy = self.workdir / "bundle"
         shutil.rmtree(copy, ignore_errors=True)
         shutil.copytree(bundle, copy)
-        runner = f"{GHCR.removeprefix('https://')}/{IMAGE_OWNER}/{RUNNER_IMAGE}:sha-{self.candidate}"
+        if self._layer_base:
+            # Built from the checkout: the layer must sit on that runner, for
+            # the platforms it was built for.
+            runner = self._layer_base
+            platforms = [arg for p in self._candidate_platforms for arg in ("--platform", p)]
+        else:
+            runner = (
+                f"{GHCR.removeprefix('https://')}/{IMAGE_OWNER}/{RUNNER_IMAGE}:sha-{self.candidate}"
+            )
+            platforms = []
         log(f"curie build (the bundle's runner layer on {runner})")
         argv = [
             self.config.curie_bin,
@@ -2185,6 +3067,7 @@ class Preflight:
             registry,
             "--runner-image",
             runner,
+            *platforms,
         ]
         result = subprocess.run(argv, capture_output=True, text=True, check=False)
         if result.returncode != 0:
@@ -2192,27 +3075,36 @@ class Preflight:
             raise PreflightFailed(f"curie build --plugin-dir failed: {tail}")
         return copy
 
-    def deploy_bundle(self) -> None:
+    def deploy_bundle(self, *, github_token: bool = True) -> None:
         """Deploy the default dark-factory bundle onto the bound agent and let
-        the platform resolve its publication approval (policy auto)."""
+        the platform resolve its publication approval (policy auto).
+
+        ``github_token=False`` deploys with no GitHub credential secret: the
+        bundle reads its issue through the platform's get_issue tool, and the
+        tls-code-host stub run mints nothing from real GitHub."""
 
         assert self.chart_dir is not None, "install() extracts the chart first"
         bundle = self.build_runner_layer(self.config.bundle_dir)
         manifest = json.loads((bundle / ".claude-plugin" / "plugin.json").read_text())
         kubeconfig = self._write_kubeconfig()
-        token = self._issue_read_token()
+        token = self._issue_read_token() if github_token else ""
         env = {
             "KUBECONFIG": str(kubeconfig),
             "CURIE_API_KEY": self.api_key,
-            "GITHUB_PERSONAL_ACCESS_TOKEN": token,
             # The secret arrives through the environment; an empty private
             # config dir keeps the operator's own vault out of this run.
             "CURIE_CONFIG_DIR": str(self._curie_config_dir()),
         }
-        self.issue_token = token
-        self._issue_token_minted = time.time()
-        secrets = [token, self.api_key, self.config.model_api_key, self.worker_token]
-        common = ["--namespace", self.namespace, "--release", RELEASE, "--api-url", self.api_url]
+        secret_args: list[str] = []
+        if github_token:
+            env["GITHUB_PERSONAL_ACCESS_TOKEN"] = token
+            secret_args = ["--secret", "GITHUB_PERSONAL_ACCESS_TOKEN"]
+            self.issue_token = token
+            self._issue_token_minted = time.time()
+        secrets = [token or None, self.api_key, self.config.model_api_key, self.worker_token]
+        common = [
+            "--namespace", self.namespace, "--release", self.release, "--api-url", self.api_url
+        ]
         log("curie cluster deploy (the default dark-factory bundle)")
         self._curie(
             [
@@ -2226,8 +3118,7 @@ class Preflight:
                 "prod",
                 "--chart",
                 str(self.chart_dir),
-                "--secret",
-                "GITHUB_PERSONAL_ACCESS_TOKEN",
+                *secret_args,
                 *common,
             ],
             env,
@@ -2248,11 +3139,15 @@ class Preflight:
             "path": shown,
             "model": self.config.model if self.config.model_api_key else "fake",
             "publication_policy": "auto",
-            "issue_read_token": {
-                "permissions": {"issues": "read"},
-                "repository": self.config.repo,
-                "held": "in memory only; passed to curie through the environment",
-            },
+            "issue_read_token": (
+                {
+                    "permissions": {"issues": "read"},
+                    "repository": self.config.repo,
+                    "held": "in memory only; passed to curie through the environment",
+                }
+                if github_token
+                else None
+            ),
         }
         self.step(
             "default bundle deployed",
@@ -2422,6 +3317,23 @@ class Preflight:
         elif status != 200:
             raise PreflightFailed(f"reading the factory label failed (HTTP {status})")
 
+    def label_admission_event_id(self, issue_number: int) -> int:
+        """The timeline event id the api used as the admission identity."""
+
+        def probe() -> int | None:
+            status, body = self.as_actor(
+                "GET",
+                f"/repos/{self.config.repo}/issues/{issue_number}/events?per_page=100",
+            )
+            if status != 200 or not isinstance(body, list):
+                return None
+            return last_label_event_id(body, self.config.label)
+
+        found = _wait("the labelled timeline event", 60, probe, 2)
+        if type(found) is not int:
+            raise PreflightFailed("the labelled issue has no labeled timeline event")
+        return found
+
     def open_labelled_issue(self) -> int:
         if self.issue_spec is not None:
             title, body_text = self.issue_spec
@@ -2496,7 +3408,8 @@ class Preflight:
                 f"{delivery.get('status_code')}, api status {api_status!r}"
             )
         self.step("delivery accepted", delivery_id=delivery.get("guid"))
-        request_id = request_id_for(self.repository_id, issue_number, str(delivery.get("guid")))
+        event_id = self.label_admission_event_id(issue_number)
+        request_id = request_id_for(self.repository_id, issue_number, str(event_id))
         status, body = self.api(
             "GET",
             f"/v1/internal/work-items/requests/{request_id}",
@@ -2516,15 +3429,7 @@ class Preflight:
 
         assert self.chart_dir is not None, "install() extracts the chart first"
         config = self.config if model is None else dataclasses.replace(self.config, model=model)
-        values = install_values(
-            config,
-            candidate=self.candidate,
-            app_key_secret=APP_KEY_REF,
-            consumer_controller=self._consumer_controller,
-            egress_cidrs=self._egress_cidrs,
-            sandbox_pod_quota=quota,
-            card_base_url=self.tunnel_url,
-        )
+        values = self.release_values(config, sandbox_pod_quota=quota, card_base_url=self.tunnel_url)
         values_file = self.workdir / "values.json"
         fd = os.open(str(values_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as handle:
@@ -2536,7 +3441,7 @@ class Preflight:
         run(
             helm_upgrade_command(
                 context=self.config.kube_context,
-                release=RELEASE,
+                release=self.release,
                 chart=str(self.chart_dir),
                 namespace=self.namespace,
                 values_file=str(values_file),
@@ -2564,7 +3469,7 @@ class Preflight:
         it, deploy the bundle again; that is what creates the pool.
         """
 
-        name = agent_warm_pool_name(RELEASE, FACTORY_AGENT)
+        name = agent_warm_pool_name(self.release, FACTORY_AGENT)
         if self._pool_exists(name):
             return
         log(f"sandbox warm pool {name} is missing; deploying the bundle again")
@@ -2676,7 +3581,7 @@ class Preflight:
         for pod in listing.get("items") or []:
             if not isinstance(pod, dict):
                 continue
-            status = pod.get("status") if isinstance(pod.get("status"), dict) else {}
+            status = pod["status"] if isinstance(pod.get("status"), dict) else {}
             phase = status.get("phase")
             if phase not in ("Running", "Succeeded"):
                 continue
@@ -2685,7 +3590,7 @@ class Preflight:
                 parsed = dt.datetime.fromisoformat(started.replace("Z", "+00:00"))
                 if parsed.timestamp() + 1 < since:
                     continue
-            spec = pod.get("spec") if isinstance(pod.get("spec"), dict) else {}
+            spec = pod["spec"] if isinstance(pod.get("spec"), dict) else {}
             for container in spec.get("containers") or []:
                 if not isinstance(container, dict):
                     continue
@@ -2826,28 +3731,82 @@ class Preflight:
         if self._fixture_base_sha and self.default_branch_head() != self._fixture_base_sha:
             self.move_default_branch(self._fixture_base_sha)
 
+    @property
+    def install_forge(self) -> str:
+        """The forge the install is for: the loop's, else GitHub (every other scenario)."""
+
+        forge = self.evidence.get("forge")
+        return forge if isinstance(forge, str) else "github"
+
+    @property
+    def uses_github_app(self) -> bool:
+        """Whether the install and the steps around the loop use the test GitHub App."""
+
+        return FORGES[self.install_forge].github_app
+
+    def loop_driver(self) -> ForgeDriver:
+        """The forge driver a loop scenario observes and mutates through, built once.
+
+        The forge is the one main recorded as ``evidence["forge"]``.
+        """
+
+        if self._loop_driver is None:
+            name = self.evidence.get("forge")
+            entry = FORGES.get(name) if isinstance(name, str) else None
+            if entry is None:
+                raise ConfigError(f"the loop has no forge to drive (evidence forge {name!r})")
+            self._loop_driver = entry.driver(self)
+        return self._loop_driver
+
     def run(self, scenario: ScenarioDriver | None) -> None:
+        if scenario is not None and self.scenario_name in WHOLE_FLOW_SCENARIOS:
+            # Each whole-flow driver owns setup and observation in this teardown.
+            self.evidence["scenario"] = scenario(self)
+            return
+        # A loop scenario resets and reads its fixture only through its forge
+        # driver; every other scenario uses the GitHub fixture directly. Built
+        # first, so a driver missing its own inputs fails before any install.
+        driver = self.loop_driver() if self.scenario_name in LOOP_SCENARIOS else None
+        entry = FORGES.get(self.evidence.get("forge") or "") if driver is not None else None
+        setup = entry.setup if entry is not None else None
+        github = self.uses_github_app
         self.check_tools()
-        self._lock(f"app-{self.config.app_id}", "this App and its fixture repository")
+        if github:
+            self._lock(f"app-{self.config.app_id}", "this App and its fixture repository")
         self._lock(f"context-{self.config.kube_context}", "this kube context")
         self.check_images()
-        self.check_app()
+        if github:
+            self.check_app()
+        if self.candidate_image_mode == "build":
+            self.build_candidate_images()
         self.sweep_stale_namespaces()
         self.create_namespace()
         self.install()
         self.port_forward()
-        self.bind_agent()
+        if setup is None:
+            self.bind_agent()
+        reset = driver.reset_fixture if driver is not None else self.reset_fixture
         # Reset BEFORE the webhook points here, so the closures stay off the
         # install; the after-reset is pushed now so it runs once the webhook
         # is already restored.
-        self.step("fixture reset before", **self.reset_fixture())
-        self.teardown.push("reset fixture repository", self.reset_fixture)
-        self.ensure_label()
-        self.tunnel()
-        self.point_card_at_tunnel()
-        self.repoint_webhook()
+        self.step("fixture reset before", **reset())
+        self.teardown.push("reset fixture repository", reset)
+        # Pushed before the driver creates anything, so they run on every exit.
+        for name, step in driver.teardowns() if driver is not None else ():
+            self.teardown.push(name, step)
+        if github:
+            self.ensure_label()
+            self.tunnel()
+            self.point_card_at_tunnel()
+            self.repoint_webhook()
+        if setup is not None:
+            # After the card upgrade: that upgrade rewrites factory.trackers
+            # whole, which would drop a tracker the setup writes.
+            setup(self)
         if scenario is not None:
-            self.record_baseline()
+            self.record_baseline(
+                driver.default_branch_head if driver is not None else self.default_branch_head
+            )
         if scenario_opens_seed_issue(self.scenario_name):
             since = time.time()
             self.labelled_at = since
@@ -2881,9 +3840,9 @@ class Preflight:
         usage = data.get("usage") if isinstance(data, dict) else None
         return float(usage) if isinstance(usage, (int, float)) else None
 
-    def record_baseline(self) -> None:
+    def record_baseline(self, default_branch_head: Callable[[], str]) -> None:
         self.scenario_started = dt.datetime.now(dt.UTC).replace(microsecond=0)
-        self.head_before = self.default_branch_head()
+        self.head_before = default_branch_head()
         self.usage_before = self.model_usage()
         self.step("scenario baseline recorded", default_branch_head=self.head_before)
 
@@ -2906,6 +3865,11 @@ class Preflight:
     def cli_work_items(self, work_item_id: str) -> dict[str, Any]:
         """`curie cluster work-items <id> --json`: secrets only in the environment."""
 
+        return parse_work_item_cli(*self.cli_work_items_raw(work_item_id))
+
+    def cli_work_items_raw(self, work_item_id: str) -> tuple[int, str]:
+        """The exit code and stdout of `curie cluster work-items <id> --json`."""
+
         if self._kubeconfig is None:
             self._kubeconfig = self._write_kubeconfig()
         argv = [
@@ -2919,7 +3883,7 @@ class Preflight:
             "--namespace",
             self.namespace,
             "--release",
-            RELEASE,
+            self.release,
             "--api-url",
             self.api_url,
         ]
@@ -2930,7 +3894,7 @@ class Preflight:
             "CURIE_CONFIG_DIR": str(self._curie_config_dir()),
         }
         result = subprocess.run(argv, capture_output=True, text=True, env=env, check=False)
-        return parse_work_item_cli(result.returncode, result.stdout)
+        return result.returncode, result.stdout
 
     def cli_check(
         self,
@@ -3007,7 +3971,7 @@ class Preflight:
         return {
             "kube_context": self.config.kube_context,
             "namespace": self.namespace,
-            "release": RELEASE,
+            "release": self.release,
             "api_url": self.api_url,
             "tunnel_url": self.tunnel_url,
             "webhook_url": f"{self.tunnel_url}/github/webhook" if self.tunnel_url else "",
@@ -3723,10 +4687,7 @@ def revision(p: Preflight) -> dict[str, Any]:
         comment["body"], hit = record_agent_text(comment["body"], known)
         disclosed = disclosed or hit
     ended_at = min(
-        (
-            str(comment.get("updated_at") or comment.get("created_at") or "")
-            for comment in comments
-        ),
+        (str(comment.get("updated_at") or comment.get("created_at") or "") for comment in comments),
         default=None,
     )
     elapsed, _execution = ending_times(latest, labelled_at=p.labelled_at, ended_at=ended_at)
@@ -4096,7 +5057,7 @@ def _open_case(p: Preflight, title: str, body: str) -> None:
 
 
 def _hidden_for_case(p: Preflight, case_id: str, result: Mapping[str, Any]) -> dict[str, Any]:
-    prs = result.get("pull_requests") if isinstance(result.get("pull_requests"), list) else []
+    prs = result["pull_requests"] if isinstance(result.get("pull_requests"), list) else []
     if case_id in _PR_CASE_IDS:
         if len(prs) != 1 or not isinstance(prs[0], dict) or not prs[0].get("number"):
             return {"status": "failed", "failures": ["no single pull request to test"]}
@@ -4353,6 +5314,7 @@ def evaluation(p: Preflight) -> dict[str, Any]:
         p.helm_upgrade(quota=CODING_SANDBOX_POD_QUOTA)
     except PreflightFailed as exc:
         quota_error = str(exc)
+    revision_record: dict[str, Any] | None
     if quota_error:
         configured_cases = _failed_pass(configured_model, quota_error)
         revision_record = _blank_revision(quota_error, configured_model)
@@ -4650,7 +5612,7 @@ def _doctor_claims_line(p: Preflight) -> str | None:
         "--namespace",
         p.namespace,
         "--release",
-        RELEASE,
+        p.release,
     ]
     env = {
         **os.environ,
@@ -4673,7 +5635,7 @@ def _doctor_claims_line(p: Preflight) -> str | None:
 def _helm_popen(p: Preflight, values_file: Path, timeout: str) -> subprocess.Popen[str]:
     argv = helm_upgrade_command(
         context=p.config.kube_context,
-        release=RELEASE,
+        release=p.release,
         chart=str(p.chart_dir),
         namespace=p.namespace,
         values_file=str(values_file),
@@ -4726,7 +5688,7 @@ def _sigkill_drain(p: Preflight, obs: dict[str, Any]) -> str:
     host = os.environ.get("CURIE_FACTORY_NODE_SSH_HOST") or node
     script = (
         f"pid=$(sudo -n crictl inspect {container_id} | "
-        "python3 -c 'import json,sys;print(json.load(sys.stdin)[\"info\"][\"pid\"])') "
+        'python3 -c \'import json,sys;print(json.load(sys.stdin)["info"]["pid"])\') '
         '&& sudo -n kill -KILL "$pid" && echo "$pid"'
     )
     try:
@@ -4836,7 +5798,7 @@ def quiesce(p: Preflight) -> dict[str, Any]:
         obs["path_a_drain_job_active_after_cancel"] = bool(
             job and int((job.get("status") or {}).get("active") or 0) > 0
         )
-        job_name = ((job or {}).get("metadata") or {}).get("name") or f"{RELEASE}-upgrade-drain"
+        job_name = ((job or {}).get("metadata") or {}).get("name") or f"{p.release}-upgrade-drain"
         obs["doctor_worker_claims_line"] = _doctor_claims_line(p)
         cancelled_at = time.time()
 
@@ -4959,6 +5921,370 @@ SCENARIOS["quiesce"] = quiesce
 
 
 # --------------------------------------------------------------------------
+# Forge-neutral loop: ticket, change, red then green CI, review, merge
+# --------------------------------------------------------------------------
+
+# How long a merged change may take to read back as merged on the WorkItem.
+LOOP_MERGE_OBSERVE_SECONDS = 600
+# The change is polled fast so the red CI lands before the gate settles green.
+LOOP_CHANGE_POLL_SECONDS = 3
+DEFAULT_LOOP_ISSUE = (
+    "Add nautical miles to unitconv",
+    "The Python unitconv project in this repository converts between units. Add the "
+    "nautical mile (symbol `nmi`, exactly 1852 meters) to the length family so it "
+    "converts to and from every existing length unit, add unit tests for it, and "
+    "mention it in the README. Run the full test suite and fix every failure before "
+    "opening the pull request.",
+)
+DEFAULT_LOOP_REVIEW_TEXT = (
+    "Please make one follow-up change on this pull request: add a round trip unit test "
+    "that converts 3.5 nautical miles to meters and back. Push it to this same branch."
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class ForgeEntry:
+    """One forge the loop can drive: its driver and whether that driver is written.
+
+    ``setup`` binds the factory agent for this forge in place of
+    ``Preflight.bind_agent`` (the GitHub binding); None keeps bind_agent.
+    ``targets`` are the deployments ``run --forge-target`` picks between; a
+    forge with none takes no target. ``github_app`` False installs the release
+    without the test GitHub App and skips every GitHub step around the loop
+    (App check and lock, label, tunnel, card base and webhook).
+    """
+
+    name: str
+    driver: Callable[[Preflight], ForgeDriver]
+    installed: bool
+    setup: Callable[[Preflight], None] | None = None
+    targets: tuple[str, ...] = ()
+    github_app: bool = True
+
+
+# Populated by the entry modules in tools/factory-e2e/forges/, one file per
+# forge, so a new forge is a new file and no edit here.
+FORGES: dict[str, ForgeEntry] = {}
+
+
+def register_forge(entry: ForgeEntry) -> None:
+    FORGES[entry.name] = entry
+
+
+def load_forge_entries(directory: Path = FORGE_DIR) -> list[str]:
+    """Import every forge entry module once; each registers itself."""
+
+    loaded: list[str] = []
+    for path in sorted(directory.glob("*.py")):
+        if path.name.startswith("_") or path.name == FORGE_BASE:
+            continue
+        module_name = f"factory_e2e_forges.{path.stem}"
+        if module_name not in sys.modules:
+            try:
+                _load_by_path(module_name, path)
+            except ImportError as exc:
+                raise ConfigError(f"cannot load forge entry {path}: {exc}") from exc
+        loaded.append(path.stem)
+    return loaded
+
+
+def loop_forge(scenario: str, requested: str | None) -> str | None:
+    """The installed forge a loop scenario drives; None for any other scenario.
+
+    Decided before anything is installed: forge-loop needs ``--forge``,
+    github-loop is the GitHub forge, and a forge whose driver is not
+    installed raises ForgeNotInstalled.
+    """
+
+    if scenario not in LOOP_SCENARIOS:
+        if requested is not None:
+            raise ConfigError(f"--forge applies only to {' and '.join(LOOP_SCENARIOS)}")
+        return None
+    fixed = LOOP_SCENARIOS[scenario]
+    if fixed is not None and requested not in (None, fixed):
+        raise ConfigError(
+            f"{scenario} drives the {fixed} forge; use --scenario forge-loop --forge {requested}"
+        )
+    name = requested or fixed
+    if name is None:
+        raise ConfigError(f"forge-loop needs --forge <name>, one of {', '.join(sorted(FORGES))}")
+    entry = FORGES.get(name)
+    if entry is None:
+        raise ConfigError(f"no forge entry {name!r}; expected {FORGE_DIR}/{name}.py")
+    if not entry.installed:
+        raise ForgeNotInstalled(f"{name} forge driver is not installed")
+    return name
+
+
+def loop_forge_target(forge: str | None, requested: str | None) -> str | None:
+    """The ``--forge-target`` of a loop forge that has targets; None for any other.
+
+    Decided before anything is installed: a forge with targets needs one of
+    them, and a forge without targets refuses the flag.
+    """
+
+    targets = FORGES[forge].targets if forge is not None else ()
+    if not targets:
+        if requested is not None:
+            raise ConfigError(f"--forge-target applies only to a forge with targets ({forge})")
+        return None
+    if requested not in targets:
+        raise ConfigError(
+            f"the {forge} forge needs --forge-target, one of {', '.join(targets)} "
+            f"(got {requested!r})"
+        )
+    return requested
+
+
+def forge_loop(p: Preflight) -> dict[str, Any]:
+    """The loop scenario: drive the forge main recorded as ``evidence["forge"]``."""
+
+    return run_loop(p, p.loop_driver())
+
+
+def work_item_cli_pr_status(stdout: str) -> str | None:
+    """``item.pr.status`` from `curie cluster work-items <id> --json`. Pure."""
+
+    try:
+        parsed = json.loads(stdout)
+    except ValueError:
+        return None
+    item = parsed.get("item") if isinstance(parsed, dict) else None
+    pr = item.get("pr") if isinstance(item, dict) else None
+    status = pr.get("status") if isinstance(pr, dict) else None
+    return status if isinstance(status, str) else None
+
+
+def judge_github_loop(obs: Mapping[str, Any]) -> list[str]:
+    """Every way the full loop falls short. Empty means it passed. Pure.
+
+    The loop: one change opened, CI red on its first head, a CI fix commit that
+    turns it green and completes the first request, a review that adds a second
+    request pushing another commit to the same change, then a merge by the test
+    actor that the forge and the WorkItem (api and CLI) both read as merged.
+    """
+
+    failures: list[str] = []
+    number = obs.get("change_number")
+    if not number:
+        failures.append("the run opened no pull request")
+        failures.extend(f"cli: {f}" for f in obs.get("cli_failures") or [])
+        return failures
+    red = obs.get("red_ci") or {}
+    if red.get("state") != "failure" or red.get("sha") != obs.get("head_initial"):
+        failures.append("CI was not set red on the pull request's first head")
+    first = list(obs.get("first_run_statuses") or [])
+    if not first or first[-1] != "completed":
+        last = first[-1] if first else None
+        failures.append(f"the first request ended {last!r}, expected 'completed' after CI recovery")
+    head_ci = obs.get("head_after_ci")
+    if not head_ci or head_ci == obs.get("head_initial"):
+        failures.append("no CI fix commit: the head did not move after the red CI")
+    if int(obs.get("commits_after_ci") or 0) <= int(obs.get("commits_initial") or 0):
+        failures.append("the CI fix added no commit")
+    ci_state = (obs.get("ci_after_fix") or {}).get("state")
+    if ci_state != "passing":
+        failures.append(f"checks on the CI fix head read {ci_state!r}, expected 'passing'")
+    if obs.get("review_delivery_status_code") != 200:
+        failures.append(f"the review delivery got HTTP {obs.get('review_delivery_status_code')}")
+    if obs.get("review_delivery_api_status") != "factory_admitted":
+        failures.append(
+            f"the review was not admitted: api status {obs.get('review_delivery_api_status')!r}"
+        )
+    statuses = list(obs.get("request_statuses") or [])
+    if len(statuses) != 2:
+        failures.append(f"the WorkItem has {len(statuses)} request(s), expected 2")
+    elif statuses[-1] != "completed":
+        failures.append(f"the review request ended {statuses[-1]!r}, expected 'completed'")
+    head_review = obs.get("head_after_review")
+    if not head_review or head_review == head_ci:
+        failures.append("the review revision pushed no commit")
+    if int(obs.get("commits_after_review") or 0) <= int(obs.get("commits_after_ci") or 0):
+        failures.append("the review revision added no commit")
+    if obs.get("work_item_change_number") != number:
+        failures.append(
+            f"the WorkItem records pull request #{obs.get('work_item_change_number')}, "
+            f"not #{number}"
+        )
+    numbers = list(obs.get("change_numbers") or [])
+    if numbers != [number]:
+        failures.append(f"pull requests {numbers} were opened, expected only #{number}")
+    if obs.get("default_branch_moved_before_merge"):
+        failures.append("the default branch moved before the merge")
+    merge = obs.get("merge") or {}
+    if merge.get("status_code") != 200 or merge.get("merged") is not True:
+        failures.append(f"the test actor's merge failed (HTTP {merge.get('status_code')})")
+    if obs.get("forge_merged") is not True:
+        failures.append("the forge does not read the pull request as merged")
+    if obs.get("work_item_pr_status") != "merged":
+        failures.append(
+            f"the WorkItem api reads the pull request {obs.get('work_item_pr_status')!r}, "
+            "expected 'merged'"
+        )
+    if obs.get("cli_pr_status") != "merged":
+        failures.append(
+            f"`curie cluster work-items` reads the pull request {obs.get('cli_pr_status')!r}, "
+            "expected 'merged'"
+        )
+    failures.extend(f"cli: {f}" for f in obs.get("cli_failures") or [])
+    return failures
+
+
+def await_work_item_change(p: Preflight, work_item_id: str) -> ChangeRef | None:
+    """The change the WorkItem records, polled fast; None if the request ends without one.
+
+    Bounded like ``_await_ending``: the execution deadline plus the publication
+    allowance once started, else NEVER_STARTED_CAP_SECONDS from labelling.
+    """
+
+    while True:
+        detail = p.work_item_detail(work_item_id) or {}
+        pr = detail.get("pr")
+        if isinstance(pr, dict) and pr.get("number"):
+            return ChangeRef(int(pr["number"]), str(pr.get("url") or ""))
+        requests = [r for r in detail.get("requests") or [] if isinstance(r, dict)]
+        if requests and not any(r.get("status") in ACTIVE_REQUEST_STATUSES for r in requests):
+            return None
+        latest = _latest_request(detail)
+        started = _parse_time((latest or {}).get("started_at"))
+        give_up = (
+            started.timestamp() + EXECUTION_BOUND_SECONDS + PUBLICATION_ALLOWANCE_SECONDS
+            if started is not None
+            else p.labelled_at + NEVER_STARTED_CAP_SECONDS
+        )
+        if time.time() > give_up:
+            return None
+        time.sleep(LOOP_CHANGE_POLL_SECONDS)
+
+
+def _work_item_pr(detail: Mapping[str, Any]) -> dict[str, Any]:
+    pr = detail.get("pr")
+    return pr if isinstance(pr, dict) else {}
+
+
+def _await_work_item_merged(p: Preflight, work_item_id: str) -> dict[str, Any]:
+    deadline = time.time() + LOOP_MERGE_OBSERVE_SECONDS
+    detail: dict[str, Any] = {}
+    while True:
+        detail = p.work_item_detail(work_item_id) or detail
+        if _work_item_pr(detail).get("status") == "merged":
+            return detail
+        if time.time() > deadline:
+            return detail
+        time.sleep(POLL_SECONDS)
+
+
+def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
+    """Drive one forge through the whole loop and judge it with judge_github_loop."""
+
+    obs = _new_obs(p) if p.issue_number else {"cli": [], "cli_failures": []}
+    obs["forge"] = driver.forge
+    obs["pairing"] = driver.pairing
+    if not p.issue_number:
+        title, body = p.issue_spec or DEFAULT_LOOP_ISSUE
+        since = time.time()
+        p.labelled_at = since
+        driver.open_and_label_ticket(title, body, since)
+        obs.update(_new_obs(p))
+        obs["forge"] = driver.forge
+        obs["pairing"] = driver.pairing
+    work_item_id = str(obs["work_item_id"])
+    # The merge moves the default branch; the driver puts it back on teardown.
+    driver.pin_fixture_base()
+
+    log("loop: waiting for the labelled run to open a pull request")
+    change = driver.await_change(work_item_id)
+    if change is None:
+        obs["tracker"] = driver.tracker_evidence(None, work_item_id)
+        _timeline(obs, "tracker evidence", **obs["tracker"])
+        return _finish(p, obs, judge_github_loop(obs) + driver.judge_tracker(obs["tracker"]))
+    obs["change_number"] = change.number
+    obs["change_url"] = change.url
+    head, commits = driver.change_head(change)
+    obs["head_initial"], obs["commits_initial"] = head, commits
+    _timeline(obs, "pull request opened", number=change.number, head_sha=head)
+    if head:
+        obs["red_ci"] = driver.set_ci_red(head)
+        _timeline(obs, "CI set red", **obs["red_ci"])
+
+    log("loop: waiting for the CI fix and the first request to end")
+    detail, terminal = _await_ending(
+        p, work_item_id, since=p.labelled_at, ended=lambda _d: True, what="CI recovery"
+    )
+    obs["first_run_terminal"] = terminal
+    obs["first_run_statuses"] = _ordered_statuses(detail)
+    obs["first_run_cause"] = (_latest_request(detail) or {}).get("terminal_cause")
+    obs["head_after_ci"], obs["commits_after_ci"] = driver.change_head(change)
+    obs["ci_on_initial_head"] = driver.ci_state(head) if head else None
+    obs["ci_after_fix"] = (
+        driver.ci_state(str(obs["head_after_ci"])) if obs["head_after_ci"] else None
+    )
+    _timeline(obs, "first request ended", head_sha=obs["head_after_ci"])
+    p.cli_check(
+        obs,
+        work_item_id,
+        expected_state=str(detail.get("state")),
+        expected_statuses=obs["first_run_statuses"],
+        label="after CI recovery",
+    )
+    requests_before = len(detail.get("requests") or [])
+
+    review = driver.post_review(change, p.revision_text or DEFAULT_LOOP_REVIEW_TEXT)
+    obs.update({f"review_{key}": value for key, value in review.items()})
+    _timeline(obs, "review posted", **review)
+    log("loop: waiting for the review revision to end")
+    detail, terminal = _await_ending(
+        p,
+        work_item_id,
+        since=time.time(),
+        ended=lambda _d: True,
+        what="review revision",
+        min_requests=requests_before + 1,
+    )
+    obs["review_terminal"] = terminal
+    obs["request_statuses"] = _ordered_statuses(detail)
+    obs["head_after_review"], obs["commits_after_review"] = driver.change_head(change)
+    obs["work_item_change_number"] = _work_item_pr(detail).get("number")
+    obs["default_branch_moved_before_merge"] = driver.default_branch_head() != p.head_before
+    _timeline(obs, "review revision ended", head_sha=obs["head_after_review"])
+    p.cli_check(
+        obs,
+        work_item_id,
+        expected_state=str(detail.get("state")),
+        expected_statuses=obs["request_statuses"],
+        label="after review revision",
+    )
+
+    obs["merge"] = driver.merge(change)
+    _timeline(obs, "merged by the test actor", **obs["merge"])
+    obs["forge_merged"] = driver.change_merged(change)
+    detail = _await_work_item_merged(p, work_item_id)
+    obs["work_item_pr_status"] = _work_item_pr(detail).get("status")
+    exit_code, stdout = p.cli_work_items_raw(work_item_id)
+    obs["cli_pr_status"] = work_item_cli_pr_status(stdout)
+    obs["cli"].append(
+        {
+            "check": "after merge",
+            "at": _now_iso(),
+            **parse_work_item_cli(exit_code, stdout),
+            "pr_status": obs["cli_pr_status"],
+        }
+    )
+    if exit_code != 0:
+        obs["cli_failures"].append(f"after merge: work-items exited {exit_code}, expected 0")
+    obs["change_numbers"] = driver.changes_opened()
+    _timeline(obs, "merge observed", work_item=obs["work_item_pr_status"])
+    obs["tracker"] = driver.tracker_evidence(change, work_item_id)
+    _timeline(obs, "tracker evidence", **obs["tracker"])
+    p.cli_not_found_check(obs)
+    return _finish(p, obs, judge_github_loop(obs) + driver.judge_tracker(obs["tracker"]))
+
+
+SCENARIOS["forge-loop"] = forge_loop
+SCENARIOS["github-loop"] = forge_loop
+
+
+# --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 
@@ -4973,9 +6299,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     common.add_argument(
         "--candidate",
         help=(
-            "commit whose published images to install (default: the newest commit of "
-            "origin/next with every image published)"
+            "commit or ref to install, a pull request head included with --candidate-images "
+            "build (default: the newest commit of origin/next with every image published, or "
+            "the tip of origin/next when building)"
         ),
+    )
+    common.add_argument(
+        "--candidate-images",
+        choices=CANDIDATE_IMAGE_MODES,
+        default="published",
+        help=(
+            "published: install the release workflow's sha-<commit> images. build: build every "
+            "chart image and the runner from the candidate checkout on BUILDX_BUILDER, load them "
+            "into kind or push them to CURIE_FACTORY_LAYER_REGISTRY, and assert the running "
+            "image ids"
+        ),
+    )
+    common.add_argument(
+        "--kind-cluster",
+        help="kind cluster to load built images into (default: from a kind-<name> context)",
     )
     common.add_argument("--namespace", help=f"owned namespace (default {NAMESPACE_PREFIX}<commit>)")
     common.add_argument(
@@ -4994,12 +6336,45 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="after a passing run, keep the install up until Ctrl-C or SIGTERM, then tear down",
     )
+    common.add_argument(
+        "--model-base-url",
+        help=(
+            "Anthropic-compatible base URL passed to the worker as "
+            "CURIE_MODEL_BASE_URL through worker.extraEnv. The host must be "
+            "the proxy pod IP; sandbox egress allows that IP."
+        ),
+    )
     sub = parser.add_subparsers(dest="mode", required=True)
     sub.add_parser(
         "preflight", parents=[common], help="install, deliver one labelled issue, assert admission"
     )
-    scenario = sub.add_parser("run", parents=[common], help="preflight, then one scenario driver")
-    scenario.add_argument("--scenario", required=True, choices=SCENARIO_NAMES)
+    scenario = sub.add_parser(
+        "run", parents=[common], help="preflight, then one scenario driver",
+        description=(
+            "repo-runner: k8 only, release factory-tools, local scripted model. "
+            "Set CURIE_FACTORY_REPO_RUNNER_PLAN (full chart bindings and four turns) "
+            "and CURIE_LOCAL_STUB_HOST. Requires the later w1 runner routing, manifest "
+            "and same-thread repository-switching runtime; current behavior fails closed."
+        ),
+    )
+    scenario.add_argument("--scenario", required=True, choices=tuple(SCENARIOS))
+    judge = sub.add_parser("judge-repo-runner", help="judge repository runner observations offline")
+    judge.add_argument("--observation", type=Path, required=True)
+    scenario.add_argument(
+        "--forge",
+        choices=tuple(FORGES),
+        help=(
+            "forge-loop (required) and github-loop (github only): the forge entry under "
+            "tools/factory-e2e/forges/ whose driver the loop observes through"
+        ),
+    )
+    scenario.add_argument(
+        "--forge-target",
+        help=(
+            "forge-loop on a forge with targets (gitlab: fixture or saas): which "
+            "deployment of that forge the loop drives"
+        ),
+    )
     scenario.add_argument(
         "--issue-file",
         type=Path,
@@ -5012,7 +6387,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     scenario.add_argument(
         "--revision-file",
         type=Path,
-        help="revision: the mention comment's text (default: a small follow-up change)",
+        help=(
+            "revision, forge-loop and github-loop: the mention or review text (default: a small "
+            "follow-up change)"
+        ),
     )
     scenario.add_argument(
         "--expect",
@@ -5033,7 +6411,44 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=[],
         help="issue-to-pr: a case-insensitive regex the agent's stated reason must match",
     )
+    scripted = sub.add_parser(
+        "scripted",
+        help="kind-rung factory scenario with the GitHub stub and a scripted model",
+    )
+    scripted.add_argument(
+        "--transcript",
+        type=Path,
+        default=Path("tools/model-script/transcripts/unitconv-issue.json"),
+    )
+
+    pairings = _acceptance_module().PAIRINGS
+    pairing = sub.add_parser(
+        "acceptance",
+        parents=[common],
+        help="run one tracker and code host pairing of the acceptance table",
+    )
+    pairing.add_argument(
+        "--pairing",
+        required=True,
+        choices=tuple(pairings),
+        help="the entry of tools/factory-e2e/acceptance.py to run, <tracker>+<code host>",
+    )
+    pairing.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="list every step of the entry and its install state; launch nothing",
+    )
+    pairing.add_argument("--issue-file", type=Path, help="the loop ticket (default: a small task)")
+    pairing.add_argument("--revision-file", type=Path, help="the review text")
+    scripted.add_argument("--build-images", action="store_true")
+    scripted.add_argument("--record", action="store_true")
     return parser.parse_args(argv)
+
+
+def _acceptance_module() -> Any:
+    """tools/factory-e2e/acceptance.py, imported once under the name ``acceptance``."""
+
+    return _load_by_path("acceptance", Path(__file__).resolve().parent / "acceptance.py")
 
 
 def _repo_root() -> Path:
@@ -5054,7 +6469,8 @@ def _resolve_candidate(
 
     Without --candidate: the newest first-parent commit of origin/next whose
     images are all published, so a run started while CI still builds the tip
-    uses the last complete build instead of refusing.
+    uses the last complete build instead of refusing. A build run passes a
+    ``published`` that accepts every commit, so it takes the tip.
     """
 
     if requested is None:
@@ -5293,9 +6709,7 @@ def run_hidden_tests(case_id: str, checkout: Path) -> dict[str, Any]:
     """Run the case's hidden checks against a checkout the coding run never saw."""
 
     if case_id == "positive":
-        failures = _probe_convert(
-            checkout, [(1, "nmi", "m", 1852), (1, "nmi", "km", 1.852)]
-        )
+        failures = _probe_convert(checkout, [(1, "nmi", "m", 1852), (1, "nmi", "km", 1.852)])
     elif case_id == "failing-test":
         tests = checkout / "unitconv" / "tests" / "test_convert.py"
         text = tests.read_text() if tests.is_file() else ""
@@ -5396,6 +6810,7 @@ def evaluation_report_failures(report: Mapping[str, Any]) -> list[str]:
     if roles != ["configured", "reference"]:
         failures.append("passes must contain the configured run and then the reference run")
         return failures
+    passes = cast(list[Any], passes)
     models: list[str] = []
     for index, item in enumerate(passes):
         assert isinstance(item, dict)
@@ -5486,15 +6901,36 @@ def evaluation_exit_code(report: Mapping[str, Any]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.mode == "judge-repo-runner":
+        return int(load_repo_runner().main(["judge", str(args.observation)]))
+    if args.mode == "scripted":
+        import importlib.util
+
+        path = Path(__file__).with_name("scripted_kind.py")
+        spec = importlib.util.spec_from_file_location("scripted_kind", path)
+        if spec is None or spec.loader is None:
+            raise ConfigError("scripted kind driver is missing")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return int(module.main(args))
+    if args.mode == "acceptance":
+        acceptance = _acceptance_module()
+        if args.dry_run:
+            return int(acceptance.dry_run(args.pairing, sys.stdout))
+        return int(acceptance.run(args))
     driver: ScenarioDriver | None = None
     issue_spec: tuple[str, str] | None = None
     expect = "any"
     expect_causes: list[str] = []
     expect_reasons: list[str] = []
     revision_text: str | None = None
+    forge: str | None = None
+    forge_target: str | None = None
     try:
         if args.mode == "run":
             driver = resolve_scenario(args.scenario)
+            forge = loop_forge(args.scenario, args.forge)
+            forge_target = loop_forge_target(forge, args.forge_target)
             if args.scenario == "issue-to-pr":
                 if args.issue_file is None:
                     print(
@@ -5528,18 +6964,45 @@ def main(argv: list[str] | None = None) -> int:
                         raise ConfigError(
                             f"cannot read the revision file {args.revision_file}: {exc.strerror}"
                         ) from None
+            elif args.scenario in LOOP_SCENARIOS:
+                issue_spec = (
+                    parse_issue_file(args.issue_file)
+                    if args.issue_file is not None
+                    else DEFAULT_LOOP_ISSUE
+                )
+                if args.revision_file is not None:
+                    try:
+                        revision_text = args.revision_file.read_text().strip() or None
+                    except OSError as exc:
+                        raise ConfigError(
+                            f"cannot read the revision file {args.revision_file}: {exc.strerror}"
+                        ) from None
             elif args.scenario in ("cancel-running", "quiesce"):
                 issue_spec = (
                     parse_issue_file(args.issue_file)
                     if args.issue_file is not None
                     else DEFAULT_CANCEL_RUNNING_ISSUE
                 )
-        config = load_config(os.environ, context=args.context)
-        if args.mode == "run" and args.scenario in (
-            "revision",
-            "cancel-running",
-            "evaluation",
-            "quiesce",
+        whole_flow = args.mode == "run" and args.scenario in WHOLE_FLOW_SCENARIOS
+        # Whole-flow input refusal must precede even a local binary command.
+        # Ordinary preflight checks its binary before loading factory actions.
+        if not whole_flow:
+            curie_bin, curie_version = resolve_curie_binary(os.environ.get("CURIE_BIN") or "curie")
+        if whole_flow:
+            if args.scenario == "repo-runner" and args.model_base_url:
+                raise ConfigError("repo-runner refuses an external model endpoint")
+            loaders = {
+                "tls-code-host": load_tls_code_host().load_tls_config,
+                "repo-runner": load_repo_runner().load_repo_runner_config,
+            }
+            config = loaders[args.scenario](os.environ, context=args.context)
+        else:
+            config = load_config(os.environ, context=args.context)
+        if args.model_base_url:
+            config = dataclasses.replace(config, model_base_url=args.model_base_url)
+        if args.mode == "run" and (
+            args.scenario in ("revision", "cancel-running", "evaluation", "quiesce")
+            or args.scenario in LOOP_SCENARIOS
         ):
             if not config.model_api_key:
                 raise ConfigError(
@@ -5553,12 +7016,19 @@ def main(argv: list[str] | None = None) -> int:
                     "CURIE_FACTORY_REFERENCE_MODEL must name a different model than "
                     "CURIE_FACTORY_MODEL"
                 )
+        if whole_flow:
+            curie_bin, curie_version = resolve_curie_binary(os.environ.get("CURIE_BIN") or "curie")
+        config = dataclasses.replace(config, curie_bin=curie_bin)
         repo_root = _repo_root()
-        candidate = _resolve_candidate(repo_root, args.candidate)
+        candidate = (
+            _resolve_candidate(repo_root, args.candidate, published=lambda _commit: True)
+            if args.candidate_images == "build"
+            else _resolve_candidate(repo_root, args.candidate)
+        )
         namespace = (
             validate_namespace(args.namespace) if args.namespace else default_namespace(candidate)
         )
-    except ScenarioUnavailable as exc:
+    except (ScenarioUnavailable, ForgeNotInstalled) as exc:
         print(f"factory-e2e: {exc}", file=sys.stderr)
         return EXIT_SCENARIO
     except (ConfigError, PreflightFailed) as exc:
@@ -5579,9 +7049,16 @@ def main(argv: list[str] | None = None) -> int:
         expect_reasons=expect_reasons,
         scenario_name=args.scenario if args.mode == "run" else None,
         revision_text=revision_text,
+        candidate_images=args.candidate_images,
+        kind_cluster=args.kind_cluster,
     )
+    preflight.evidence.update(curie_bin=curie_bin, curie_version=curie_version)
     if args.mode == "run":
         preflight.evidence["mode"] = f"run:{args.scenario}"
+    if forge is not None:
+        preflight.evidence["forge"] = forge
+    if forge_target is not None:
+        preflight.evidence["forge_target"] = forge_target
 
     def _terminate(signum: int, _frame: Any) -> None:
         raise SystemExit(128 + signum)
@@ -5623,6 +7100,8 @@ def main(argv: list[str] | None = None) -> int:
         results = preflight.teardown.run()
         preflight.evidence["teardown"] = results
         preflight.evidence["teardown_clean"] = all(r["ok"] for r in results)
+        # By step name, so a check can name one step by a dotted evidence path.
+        preflight.evidence["teardown_ok"] = {r["step"]: r["ok"] for r in results}
         preflight.evidence["finished_at"] = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
         shutil.rmtree(preflight.workdir, ignore_errors=True)
         preflight.write_evidence()
@@ -5635,6 +7114,40 @@ def main(argv: list[str] | None = None) -> int:
     print(f"factory-e2e: {preflight.evidence['result']}; evidence {evidence_path}", file=sys.stderr)
     return code
 
+
+load_forge_entries()
+
+TLS_CODE_HOST_MODULE = Path(__file__).resolve().parent / "tls_code_host.py"
+
+
+def load_tls_code_host() -> Any:
+    """The tls-code-host scenario module, loaded once under its own name."""
+
+    module = sys.modules.get("tls_code_host")
+    if module is None:
+        spec = importlib.util.spec_from_file_location("tls_code_host", TLS_CODE_HOST_MODULE)
+        if spec is None or spec.loader is None:
+            raise ConfigError(f"cannot load {TLS_CODE_HOST_MODULE}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["tls_code_host"] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            del sys.modules["tls_code_host"]
+            raise
+    return module
+
+
+SCENARIOS["tls-code-host"] = load_tls_code_host().drive
+
+
+def load_repo_runner() -> Any:
+    """Load the repository runner scenario and offline judge once."""
+
+    return _load_by_path("repo_runner", Path(__file__).with_name("repo_runner.py"))
+
+
+SCENARIOS["repo-runner"] = load_repo_runner().drive
 
 if __name__ == "__main__":
     sys.exit(main())

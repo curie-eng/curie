@@ -26,6 +26,14 @@ main push and the continuous image tags stopped being published. 0066 guards
 each of those jobs. The gate itself (ancestry, checks, the environment
 reference) is unaffected and stands as decided.
 
+**Amended by [ADR-0195](0195-a-version-only-delta-reuses-its-parents-checks.md)**
+(back-link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+the Checks bullet's requirement that the tagged commit's own check-runs pass
+now has one exception. When those checks are absent or still running and none
+has concluded non-passing, a version-only delta from a first-parent ancestor
+whose required checks passed is accepted as the proof. Ancestry and the
+environment reference stand as decided.
+
 Implements [#628](https://github.com/curie-eng/curie/issues/628).
 
 ## Context

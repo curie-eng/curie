@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
 from runner_dockerfile_support import logical_instructions
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -22,6 +23,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 FIRST_PARTY_DOCKERFILES = (
     "apps/api/Dockerfile",
     "apps/dispatcher/Dockerfile",
+    "apps/docker-daemon/Dockerfile",
     "apps/mail-adapter/Dockerfile",
     "apps/ui/Dockerfile",
     "apps/worker/Dockerfile",
@@ -108,15 +110,43 @@ def test_floating_from_in_a_first_party_dockerfile_is_rejected() -> None:
     assert "missing sha256 digest" in errors
 
 
-def _dependabot_ecosystem_blocks(text: str) -> dict[str, str]:
+def _dependabot_ecosystem_blocks(text: str) -> dict[str, list[str]]:
     parts = re.split(r"(?m)^  - package-ecosystem:\s*", text)
-    blocks: dict[str, str] = {}
+    blocks: dict[str, list[str]] = {}
     for part in parts[1:]:
         first, _, rest = part.partition("\n")
         name = first.strip()
-        assert name not in blocks, f"duplicate dependabot ecosystem {name}"
-        blocks[name] = rest
+        assert name == "npm" or name not in blocks, f"duplicate dependabot ecosystem {name}"
+        blocks.setdefault(name, []).append(rest)
     return blocks
+
+
+def test_dependabot_parser_accepts_separate_npm_projects() -> None:
+    blocks = _dependabot_ecosystem_blocks(
+        "updates:\n"
+        "  - package-ecosystem: npm\n"
+        "    directory: /apps/ui\n"
+        "  - package-ecosystem: npm\n"
+        "    directory: /tools/contract-codegen\n"
+        "  - package-ecosystem: docker\n"
+        "    directory: /runner\n"
+    )
+    assert blocks["npm"] == [
+        "    directory: /apps/ui\n",
+        "    directory: /tools/contract-codegen\n",
+    ]
+    assert blocks["docker"] == ["    directory: /runner\n"]
+
+
+def test_dependabot_parser_rejects_duplicate_docker_ecosystem() -> None:
+    with pytest.raises(AssertionError, match="duplicate dependabot ecosystem docker"):
+        _dependabot_ecosystem_blocks(
+            "updates:\n"
+            "  - package-ecosystem: docker\n"
+            "    directory: /runner\n"
+            "  - package-ecosystem: docker\n"
+            "    directory: /apps/api\n"
+        )
 
 
 def test_dependabot_watches_first_party_docker_directories() -> None:
@@ -125,7 +155,7 @@ def test_dependabot_watches_first_party_docker_directories() -> None:
     assert "docker" in blocks, (
         "dependabot.yml must configure the docker ecosystem so base bumps arrive as reviewable PRs"
     )
-    docker_block = blocks["docker"]
+    docker_block = blocks["docker"][0]
     missing = [
         directory
         for directory in sorted(

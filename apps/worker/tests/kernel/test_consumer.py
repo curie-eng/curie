@@ -10,8 +10,10 @@ import logging
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -25,30 +27,44 @@ from aci_protocol import (
     TextDelta,
     TurnSource,
 )
+from curie_api.config import Settings
+from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_dispatcher.queue import to_stream_fields
+from curie_protected_hooks.source_policy_sql import SourceGate
+from curie_telemetry import tracing as telemetry_tracing
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker import capacity_wait as capacity_wait_module
 from curie_worker import consumer as consumer_module
-from curie_worker import kernel as kernel_module
+from curie_worker import delivery_lease as delivery_lease_module
+from curie_worker import stream_consumer as stream_consumer_module
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.capacity_wait import WAIT_GENERATION_FIELD
-from curie_worker.consumer import (
-    THREAD_RESET_INFLIGHT_SET,
-    THREAD_RESET_SET,
-    Consumer,
+from curie_worker.capacity_wait import (
+    WAIT_GENERATION_FIELD,
+    WAIT_TERMINAL_ONLY_FIELD,
+    CapacityWaitStore,
 )
+from curie_worker.consumer import Consumer
 from curie_worker.consumer_liveness import (
     ConsumerLivenessStore,
     consumer_heartbeat_capable_key,
     consumer_heartbeat_key,
 )
-from curie_worker.delivery_lease import DeliveryLeaseStore
+from curie_worker.cron_loop import CronSchedulerLoop, _Target
+from curie_worker.delivery_lease import DeliveryBudget, DeliveryLeaseStore, LeaseLostError
+from curie_worker.hook_source_guard import CronHookSourceGuard
+from curie_worker.kernel import constants as kernel_constants
+from curie_worker.kernel import routing as kernel_routing
 from curie_worker.runner_client import TurnStream
 from curie_worker.sandbox import QuotaRejection
 from curie_worker.stream_consumer import ConsumerLivenessExpired
 from curie_worker.threadlock import ThreadLock
 from curie_worker.workspace import WorkspacePreparationError
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind
 from redis.asyncio import Redis as AsyncRedis
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 # importlib import mode does not add the test root to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -59,6 +75,804 @@ from queue_fixtures import wait_until as _wait_until  # noqa: E402
 DONE = SessionStatus.DONE
 
 HEARTBEAT_TTL_MS = 15_000
+
+# ADR 0207 production clocks scaled by 0.1, including the one-heartbeat
+# safety margin. The 70ms tolerance is 2% of the 3.5s ownership window.
+_OUTAGE_KNOBS: dict[str, object] = {
+    "delivery_lease_ttl_s": 4.5,
+    "delivery_lease_heartbeat_s": 1.0,
+    "consumer_heartbeat_ttl_ms": 4500,
+    "consumer_capability_ttl_ms": 9000,
+    "delivery_budget_s": 60.0,
+    "runner_total_timeout_s": 30.0,
+}
+
+
+async def _outage_delivery(h: Any) -> tuple[Consumer, DeliveryLeaseStore, str, dict[str, str]]:
+    store = DeliveryLeaseStore(h.async_redis, h.config)
+    consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+    await consumer.ensure_group()
+    await h.async_redis.xadd(
+        h.config.stream, to_stream_fields(_qevent("outage", event_id=uuid.uuid4().hex))
+    )
+    rows = await h.async_redis.xreadgroup(
+        h.config.consumer_group, h.config.consumer_name, {h.config.stream: ">"}, count=1
+    )
+    entry_id, fields = rows[0][1][0]
+    return consumer, store, entry_id, dict(fields)
+
+
+def test_delivery_transport_outage_loses_at_thirty_five_seconds_not_first_error(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_OUTAGE_KNOBS) as h:
+            consumer, store, entry_id, fields = await _outage_delivery(h)
+            attempts: list[float] = []
+            real_heartbeat = store.heartbeat
+            real_finish_loss = consumer._finish_lease_loss
+            real_on_lost = consumer._on_lease_lost
+            losses = {"finish": 0, "callback": 0}
+            outage_until = time.monotonic() + 5.0
+
+            async def finish_loss(*args: Any, **kwargs: Any) -> None:
+                losses["finish"] += 1
+                await real_finish_loss(*args, **kwargs)
+
+            async def on_lost(*args: Any, **kwargs: Any) -> None:
+                losses["callback"] += 1
+                assert real_on_lost is not None
+                await real_on_lost(*args, **kwargs)
+
+            async def unavailable(*args: Any, **kwargs: Any) -> Any:
+                attempts.append(time.monotonic())
+                if time.monotonic() < outage_until:
+                    raise redis.exceptions.ConnectionError("injected 50s ownership outage")
+                return await real_heartbeat(*args, **kwargs)
+
+            monkeypatch.setattr(store, "heartbeat", unavailable)
+            monkeypatch.setattr(consumer, "_finish_lease_loss", finish_loss)
+            assert real_on_lost is not None
+            consumer._on_lease_lost = on_lost
+            async with consumer._delivery_lease(entry_id, fields) as lease:
+                assert lease is not None
+                started = lease.local_deadline_monotonic - 3.5
+                await asyncio.sleep(max(0, started + 3.43 - time.monotonic()))
+                assert not lease.lost.is_set(), "a transient raise dropped a still-valid lease"
+                await asyncio.wait_for(lease.lost.wait(), timeout=0.2)
+                assert time.monotonic() - started == pytest.approx(3.5, abs=0.07)
+                assert len(attempts) == 3, "renewals must retry at 10, 20 and 30 seconds"
+                assert [instant - started for instant in attempts] == pytest.approx(
+                    [1.0, 2.0, 3.0], abs=0.07
+                )
+                await _wait_until(lambda: losses["callback"] == 1)
+                await asyncio.gather(*list(consumer._lease_loss_tasks))
+                assert losses == {"finish": 1, "callback": 1}
+                await asyncio.sleep(0.05)
+                assert len(attempts) == 3, "a lost lease continued attempting renewals"
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("outage_s", [2.5, 5.0], ids=["25s-survives", "50s-expires"])
+def test_liveness_transport_outage_uses_thirty_five_second_deadline(
+    make_harness, monkeypatch: pytest.MonkeyPatch, outage_s: float
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_OUTAGE_KNOBS) as h:
+            consumer = _capacity_consumer(h)
+            await consumer._publish_liveness()
+            started = consumer._last_liveness_renewal
+            assert started is not None
+            store = consumer._liveness_store
+            assert store is not None
+            real_renew = store.renew
+            attempts: list[float] = []
+
+            async def unavailable(**kwargs: Any) -> bool:
+                attempts.append(time.monotonic())
+                if time.monotonic() < started + outage_s:
+                    raise redis.exceptions.ConnectionError("injected liveness outage")
+                return await real_renew(**kwargs)
+
+            monkeypatch.setattr(store, "renew", unavailable)
+            task = asyncio.create_task(consumer._liveness_refresh_loop())
+            try:
+                if outage_s == 5.0:
+                    await asyncio.sleep(max(0, started + 3.43 - time.monotonic()))
+                    assert not task.done(), "liveness expired before its local deadline"
+                    with pytest.raises(ConsumerLivenessExpired):
+                        await asyncio.wait_for(task, timeout=0.2)
+                    assert time.monotonic() - started == pytest.approx(3.5, abs=0.07)
+                    assert len(attempts) == 3
+                else:
+                    await asyncio.sleep(max(0, started + 2.5 - time.monotonic()))
+                    assert not task.done(), "a 25s transport outage killed the generation"
+                    await _wait_until(lambda: consumer._last_liveness_renewal > started)
+                    assert not task.done()
+                    assert await store.is_alive(
+                        stream=h.config.stream,
+                        group=h.config.consumer_group,
+                        consumer=h.config.consumer_name,
+                    )
+                    assert [instant - started for instant in attempts[:3]] == pytest.approx(
+                        [1.0, 2.0, 3.0], abs=0.07
+                    )
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, ConsumerLivenessExpired):
+                    await task
+                await consumer._cleanup_alive()
+
+    asyncio.run(go())
+
+
+def test_delivery_and_liveness_deadlines_anchor_before_sending_delayed_calls(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def go() -> None:
+        async with make_harness(consumer_heartbeat_ttl_ms=45000) as h:
+            consumer, store, entry_id, fields = await _outage_delivery(h)
+            real_eval = h.async_redis.eval
+            clock = SimpleNamespace(now=100.0)
+            calls = 0
+            phase = "delivery"
+            delivery_done = asyncio.Event()
+            liveness_done = asyncio.Event()
+            never = asyncio.Event()
+
+            async def delayed_reply(*args: Any, **kwargs: Any) -> Any:
+                nonlocal calls
+                result = await real_eval(*args, **kwargs)
+                calls += 1
+                clock.now += 3.0
+                if phase == "delivery" and calls == 2:
+                    delivery_done.set()
+                return result
+
+            async def virtual_sleep(delay: float) -> None:
+                if delivery_done.is_set():
+                    await never.wait()
+                clock.now += delay
+                await asyncio.sleep(0)
+
+            async def virtual_generation_sleep(delay: float) -> None:
+                if liveness_done.is_set():
+                    await never.wait()
+                clock.now += delay
+                await asyncio.sleep(0)
+
+            # Replace module references, preserving the real server TIME and
+            # the process-wide asyncio/time modules used by other tests.
+            for module in (delivery_lease_module, stream_consumer_module):
+                monkeypatch.setattr(
+                    module,
+                    "time",
+                    SimpleNamespace(**{**vars(time), "monotonic": lambda: clock.now}),
+                )
+            monkeypatch.setattr(
+                stream_consumer_module,
+                "asyncio",
+                SimpleNamespace(**{**vars(asyncio), "sleep": virtual_sleep}),
+            )
+            monkeypatch.setattr(h.async_redis, "eval", delayed_reply)
+            sent = clock.now
+            lease = await store.acquire(
+                h.config.stream,
+                h.config.consumer_group,
+                entry_id,
+                consumer=h.config.consumer_name,
+            )
+            assert clock.now == sent + 3.0
+            assert lease.local_deadline_monotonic == sent + 35.0
+            previous_deadline = lease.local_deadline_monotonic
+            heartbeat = asyncio.create_task(consumer._heartbeat_lease(lease, entry_id, fields))
+            try:
+                await asyncio.wait_for(delivery_done.wait(), timeout=1.0)
+                assert lease.budget.anchor_monotonic == sent + 10.0
+                assert clock.now == sent + 13.0
+                assert lease.local_deadline_monotonic == sent + 10.0 + 35.0
+                assert lease.local_deadline_monotonic != clock.now + 35.0
+                assert lease.local_deadline_monotonic > previous_deadline
+            finally:
+                heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat
+            # The liveness adapter is a real transaction. Delay its confirmed
+            # response, retaining its true pre-send anchor in the consumer.
+            phase = "liveness"
+            liveness = consumer._liveness_store
+            assert liveness is not None
+            real_publish = liveness.publish
+            real_renew = liveness.renew
+            renewed_sends: list[float] = []
+
+            async def delayed_publish(**kwargs: Any) -> str:
+                token = await real_publish(**kwargs)
+                clock.now += 3.0
+                return token
+
+            async def delayed_renew(**kwargs: Any) -> bool:
+                renewed_sends.append(clock.now)
+                result = await real_renew(**kwargs)
+                liveness_done.set()
+                return result
+
+            monkeypatch.setattr(liveness, "publish", delayed_publish)
+            monkeypatch.setattr(liveness, "renew", delayed_renew)
+            monkeypatch.setattr(consumer, "_sleep_generation", virtual_generation_sleep)
+            sent = clock.now
+            await consumer._publish_liveness()
+            assert clock.now == sent + 3.0
+            assert consumer._last_liveness_renewal == sent
+            previous = consumer._last_liveness_renewal
+            task = asyncio.create_task(consumer._liveness_refresh_loop())
+            try:
+                await asyncio.wait_for(liveness_done.wait(), timeout=1.0)
+                confirmed = consumer._last_liveness_renewal
+                assert confirmed is not None
+                assert renewed_sends == [sent + 10.0]
+                assert confirmed == renewed_sends[0]
+                assert clock.now == confirmed + 3.0
+                assert confirmed + 35.0 < clock.now + 35.0
+                assert confirmed > previous
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                await consumer._cleanup_alive()
+                await store.release(
+                    lease.stream,
+                    lease.group,
+                    lease.entry_id,
+                    owner=lease.owner,
+                    resume_event_id=None,
+                )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("refusal", ["key-gone", "wrong-token", "wrong-generation", "pel-gone"])
+def test_delivery_confirmed_refusals_drop_authority_on_the_first_renewal(
+    make_harness, refusal: str
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_OUTAGE_KNOBS) as h:
+            consumer, store, entry_id, fields = await _outage_delivery(h)
+            async with consumer._delivery_lease(entry_id, fields) as lease:
+                assert lease is not None
+                key = h.config.delivery_lease_key(lease.stream, lease.group, entry_id)
+                started = time.monotonic()
+                if refusal == "key-gone":
+                    await h.async_redis.delete(key)
+                elif refusal == "wrong-token":
+                    await h.async_redis.set(key, "another-owner", px=4500)
+                elif refusal == "wrong-generation":
+                    await h.async_redis.hincrby(
+                        h.config.delivery_state_key(lease.stream, lease.group, entry_id), "gen", 1
+                    )
+                else:
+                    await h.async_redis.xack(lease.stream, lease.group, entry_id)
+                await asyncio.wait_for(lease.lost.wait(), timeout=1.25)
+                assert time.monotonic() - started < 1.2
+                with pytest.raises(LeaseLostError):
+                    lease.raise_if_lost()
+                # A separate valid delivery still renews through the same store.
+                await h.async_redis.xadd(
+                    lease.stream, to_stream_fields(_qevent("control", event_id=uuid.uuid4().hex))
+                )
+                rows = await h.async_redis.xreadgroup(
+                    lease.group, h.config.consumer_name, {lease.stream: ">"}, count=1
+                )
+                control_id = rows[0][1][0][0]
+                control = await store.acquire(
+                    lease.stream, lease.group, control_id, consumer=h.config.consumer_name
+                )
+                assert (
+                    await store.heartbeat(
+                        control.stream,
+                        control.group,
+                        control.entry_id,
+                        consumer=h.config.consumer_name,
+                        owner=control.owner,
+                        generation=control.generation,
+                        resume_event_id=None,
+                    )
+                    is not None
+                )
+                await store.release(
+                    control.stream,
+                    control.group,
+                    control.entry_id,
+                    owner=control.owner,
+                    resume_event_id=None,
+                )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("refusal", ["key-gone", "new-generation"])
+def test_liveness_token_refusal_never_resurrects_or_overwrites_a_generation(
+    make_harness, refusal: str
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_OUTAGE_KNOBS) as h:
+            consumer = _capacity_consumer(h)
+            await consumer._publish_liveness()
+            store = consumer._liveness_store
+            assert store is not None
+            old_token = consumer._liveness_token
+            assert isinstance(old_token, str) and len(old_token) == 32
+            key = consumer_heartbeat_key(
+                h.config.stream, h.config.consumer_group, h.config.consumer_name
+            )
+            capable = consumer_heartbeat_capable_key(
+                h.config.stream, h.config.consumer_group, h.config.consumer_name
+            )
+            kwargs = dict(
+                stream=h.config.stream,
+                group=h.config.consumer_group,
+                consumer=h.config.consumer_name,
+                heartbeat_ttl_ms=4500,
+                capability_ttl_ms=9000,
+            )
+            replacement = None
+            if refusal == "key-gone":
+                await h.async_redis.delete(key)
+            else:
+                replacement = await store.publish(**kwargs)
+                assert replacement != old_token
+            # Give the capability key a distinguishable value and TTL. A CAS
+            # refusal must change neither key, even the longer-lived marker.
+            await h.async_redis.set(capable, "sentinel", px=2000)
+            assert await store.renew(**kwargs, token=old_token) is False
+            assert await h.async_redis.get(key) == replacement
+            assert await h.async_redis.get(capable) == "sentinel"
+            assert 0 < await h.async_redis.pttl(capable) <= 2000
+            started = time.monotonic()
+            with pytest.raises(ConsumerLivenessExpired):
+                await asyncio.wait_for(consumer._liveness_refresh_loop(), timeout=1.25)
+            assert time.monotonic() - started < 1.2
+            assert await h.async_redis.get(key) == replacement
+            assert await h.async_redis.get(capable) == "sentinel"
+            # The newly published generation is valid, including after a
+            # durable key loss, and refreshes both TTLs through the real Lua.
+            if replacement is None:
+                replacement = await store.publish(**kwargs)
+            assert await store.renew(**kwargs, token=replacement) is True
+            assert await h.async_redis.get(key) == replacement
+            assert await h.async_redis.pttl(key) > 4300
+            assert await h.async_redis.pttl(capable) > 8800
+            await consumer._cleanup_alive()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("failure", ["connection-error", "hung-call"])
+def test_terminal_xack_retries_without_starving_the_delivery_heartbeat(
+    make_harness, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_OUTAGE_KNOBS) as h:
+            consumer, store, entry_id, fields = await _outage_delivery(h)
+            real_xack = h.async_redis.xack
+            real_heartbeat = store.heartbeat
+            attempted = asyncio.Event()
+            confirmed = asyncio.Event()
+            cancelled = asyncio.Event()
+            calls = 0
+            outage_until: float | None = None
+            retry_sleeps: list[float] = []
+
+            async def observe_heartbeat(*args: Any, **kwargs: Any) -> Any:
+                result = await real_heartbeat(*args, **kwargs)
+                if result is not None:
+                    confirmed.set()
+                return result
+
+            async def flaky_xack(*args: Any, **kwargs: Any) -> Any:
+                nonlocal calls, outage_until
+                calls += 1
+                attempted.set()
+                if failure == "connection-error":
+                    if outage_until is None:
+                        outage_until = time.monotonic() + 2.0
+                    if time.monotonic() < outage_until:
+                        raise redis.exceptions.ConnectionError("injected 20s terminal XACK outage")
+                if failure == "hung-call" and calls == 1:
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        cancelled.set()
+                assert confirmed.is_set(), "XACK retries retained the heartbeat lock"
+                return await real_xack(*args, **kwargs)
+
+            async def settlement_sleep(delay: float) -> None:
+                task = asyncio.current_task()
+                if (
+                    failure == "connection-error"
+                    and task is not None
+                    and task.get_name() == "test:terminal-xack"
+                ):
+                    retry_sleeps.append(delay)
+                    await asyncio.sleep(delay * 0.1)
+                else:
+                    await asyncio.sleep(delay)
+
+            monkeypatch.setattr(store, "heartbeat", observe_heartbeat)
+            monkeypatch.setattr(h.async_redis, "xack", flaky_xack)
+            monkeypatch.setattr(
+                stream_consumer_module,
+                "asyncio",
+                SimpleNamespace(**{**vars(asyncio), "sleep": settlement_sleep}),
+            )
+            async with consumer._delivery_lease(entry_id, fields) as lease:
+                assert lease is not None
+                task = asyncio.create_task(consumer._ack(entry_id), name="test:terminal-xack")
+                try:
+                    await attempted.wait()
+                    if failure == "connection-error":
+                        # Sleep/backoff must happen after releasing the lock.
+                        async with asyncio.timeout(0.1), lease.settlement_lock:
+                            assert not task.done()
+                    await asyncio.wait_for(confirmed.wait(), timeout=1.25)
+                    await asyncio.wait_for(task, timeout=2.0)
+                    assert not lease.lost.is_set()
+                    assert lease.acknowledged.is_set()
+                    assert calls == (8 if failure == "connection-error" else 2)
+                    if failure == "connection-error":
+                        assert outage_until is not None and time.monotonic() >= outage_until
+                        assert retry_sleeps == [0.5, 1.0, 2.0, 4.0, 5.0, 5.0, 5.0]
+                    assert cancelled.is_set() is (failure == "hung-call")
+                    assert (await h.async_redis.xpending(lease.stream, lease.group))["pending"] == 0
+                finally:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+    asyncio.run(go())
+
+
+def test_terminal_xack_stops_retrying_after_a_confirmed_lease_loss(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_OUTAGE_KNOBS) as h:
+            consumer, _store, entry_id, fields = await _outage_delivery(h)
+            attempts = 0
+            failed = asyncio.Event()
+
+            async def unavailable(*_args: Any, **_kwargs: Any) -> Any:
+                nonlocal attempts
+                attempts += 1
+                failed.set()
+                raise redis.exceptions.ConnectionError("injected settlement outage")
+
+            monkeypatch.setattr(h.async_redis, "xack", unavailable)
+            async with consumer._delivery_lease(entry_id, fields) as lease:
+                assert lease is not None
+                task = asyncio.create_task(consumer._ack(entry_id))
+                try:
+                    await failed.wait()
+                    lease.lost.set()
+                    with pytest.raises(LeaseLostError):
+                        await asyncio.wait_for(task, timeout=0.75)
+                    assert attempts == 1
+                    assert not lease.acknowledged.is_set()
+                    assert (await h.async_redis.xpending(lease.stream, lease.group))["pending"] == 1
+                finally:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, LeaseLostError):
+                        await task
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("first_attempt", ["success", "transport-error", "lost-fence"])
+def test_expired_delivery_budget_allows_only_the_initial_fenced_terminal_ack(
+    make_harness, monkeypatch: pytest.MonkeyPatch, first_attempt: str
+) -> None:
+    """Exhaustion bars settlement retries while preserving the first fenced ACK."""
+
+    async def go() -> None:
+        async with make_harness(**_OUTAGE_KNOBS) as h:
+            consumer, _store, entry_id, fields = await _outage_delivery(h)
+            real_xack = h.async_redis.xack
+            attempts = 0
+
+            async def acknowledge(*args: Any, **kwargs: Any) -> Any:
+                nonlocal attempts
+                attempts += 1
+                if first_attempt == "transport-error":
+                    raise redis.exceptions.ConnectionError("injected first terminal ACK failure")
+                return await real_xack(*args, **kwargs)
+
+            monkeypatch.setattr(h.async_redis, "xack", acknowledge)
+            async with consumer._delivery_lease(entry_id, fields) as lease:
+                assert lease is not None
+                lease.budget = DeliveryBudget(
+                    deadline_ms=lease.budget.anchor_server_ms - 1,
+                    anchor_server_ms=lease.budget.anchor_server_ms,
+                    anchor_monotonic=time.monotonic(),
+                )
+                assert lease.remaining_s() <= 0
+                assert lease.local_deadline_monotonic > time.monotonic()
+                if first_attempt == "lost-fence":
+                    lease.lost.set()
+                    with pytest.raises(LeaseLostError):
+                        await consumer._ack(entry_id)
+                    assert attempts == 0
+                elif first_attempt == "transport-error":
+                    with pytest.raises(TimeoutError, match="delivery budget exhausted"):
+                        await consumer._ack(entry_id)
+                    assert attempts == 1, "an exhausted delivery retried its terminal ACK"
+                else:
+                    await consumer._ack(entry_id)
+                    assert attempts == 1
+                assert lease.acknowledged.is_set() is (first_attempt == "success")
+                pending = await h.async_redis.xpending(lease.stream, lease.group)
+                assert pending["pending"] == (0 if first_attempt == "success" else 1)
+
+    asyncio.run(go())
+
+
+@pytest.fixture
+def producer_spans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[tuple[TracerProvider, InMemorySpanExporter]]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(telemetry_tracing, "_tracer", provider.get_tracer("curie-telemetry"))
+    try:
+        yield provider, exporter
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize("producer", ["cron", "work_item"])
+def test_enqueue_producer_is_the_real_consumer_parent(
+    make_harness,
+    make_hook_run,
+    producer_spans: tuple[TracerProvider, InMemorySpanExporter],
+    producer: str,
+) -> None:
+    """@spec PROTECTED-HOOK-SOURCE-2."""
+    provider, exporter = producer_spans
+
+    async def go() -> None:
+        async with make_hook_run() as run, make_harness(hook_runs=run.recorder()) as h:
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            with provider.get_tracer("test-ingress").start_as_current_span("test.ingress"):
+                if producer == "work_item":
+                    settings = Settings(
+                        runs_stream=h.config.stream,
+                        runs_consumer_group=h.config.consumer_group,
+                    )
+                    reconciler = WorkItemReconciler(
+                        async_sessionmaker(run.engine), h.async_redis, settings
+                    )
+                    await reconciler._xadd(
+                        _qevent(
+                            "work item",
+                            event_id=f"work-item-{uuid.uuid4()}-execute-1",
+                            source=TurnSource.WEBHOOK,
+                        )
+                    )
+                else:
+
+                    async def not_killed(_agent_id: uuid.UUID) -> bool:
+                        return False
+
+                    gate_engine = create_async_engine(
+                        run.engine.url, pool_size=4, max_overflow=0, pool_timeout=30
+                    )
+                    guard = CronHookSourceGuard(SourceGate(gate_engine), run.engine)
+                    try:
+                        loop = CronSchedulerLoop(
+                            source_guard=guard,
+                            engine=run.engine,
+                            redis=h.async_redis,
+                            source=SimpleNamespace(triggers=lambda _bundle: []),
+                            is_killed=not_killed,
+                            db_schema="curie",
+                            stream=h.config.stream,
+                            interval_seconds=1,
+                            claim_lease_s=300,
+                            default_max_usd_per_day=10,
+                            default_max_output_tokens_per_run=100_000,
+                        )
+                        async with guard.locked_snapshot(run.agent_id, run.ref.name) as context:
+                            await loop._enqueue(
+                                _Target(
+                                    agent_id=run.agent_id,
+                                    agent_name="acme-bot",
+                                    version_id=run.version_id,
+                                    bundle_ref=None,
+                                    deployed_at=None,
+                                    max_usd_per_day=None,
+                                    max_output_tokens_per_run=None,
+                                ),
+                                {"name": run.ref.name, "prompt": "cron prompt"},
+                                _qevent("route").reply_handle,
+                                datetime.fromisoformat(run.ref.slot_utc),
+                                run.run_id,
+                                source_context=context,
+                            )
+                    finally:
+                        await gate_engine.dispose()
+            rows = await h.async_redis.xreadgroup(
+                h.config.consumer_group,
+                h.config.consumer_name,
+                {h.config.stream: ">"},
+                count=1,
+            )
+            entry_id, fields = rows[0][1][0]
+            await consumer._sem.acquire()
+            await consumer._handle(entry_id, fields)
+            spans = exporter.get_finished_spans()
+            enqueue = [span for span in spans if span.name == "curie.queue.enqueue"]
+            process = [span for span in spans if span.name == "curie.queue.process"]
+            assert len(enqueue) == len(process) == 1
+            assert enqueue[0].kind is SpanKind.PRODUCER
+            assert process[0].kind is SpanKind.CONSUMER
+            assert process[0].parent.span_id == enqueue[0].context.span_id
+            assert process[0].context.trace_id == enqueue[0].context.trace_id
+            assert int(fields["traceparent"].split("-")[2], 16) == enqueue[0].context.span_id
+            if producer == "cron":
+                assert h.runner.opened == ["cron prompt"]
+
+    asyncio.run(go())
+
+
+def test_carrierless_cli_entry_starts_a_real_root_consumer_span(
+    make_harness,
+    producer_spans: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    provider, exporter = producer_spans
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.default_script = [Final(text="root answer", status=DONE)]
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            event = _qevent("carrierless CLI turn")
+            await h.async_redis.xadd(h.config.stream, {"payload": event.model_dump_json()})
+            rows = await h.async_redis.xreadgroup(
+                h.config.consumer_group,
+                h.config.consumer_name,
+                {h.config.stream: ">"},
+                count=1,
+            )
+            entry_id, fields = rows[0][1][0]
+            assert set(fields) == {"payload"}
+            with provider.get_tracer("test-unrelated").start_as_current_span("test.unrelated"):
+                await consumer._sem.acquire()
+                await consumer._handle(entry_id, fields)
+            process = [
+                span for span in exporter.get_finished_spans() if span.name == "curie.queue.process"
+            ]
+            assert len(process) == 1
+            assert process[0].parent is None
+            assert process[0].context.is_valid
+            assert h.runner.opened == ["carrierless CLI turn"]
+            assert not any(
+                span.name == "curie.queue.enqueue" for span in exporter.get_finished_spans()
+            )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("recover", [False, True], ids=["wake", "lost_wake"])
+@pytest.mark.parametrize("active", [False, True], ids=["stored", "active"])
+@pytest.mark.parametrize(
+    "stored",
+    [None, "00-3123456789abcdef0123456789abcdef-3123456789abcdef-01"],
+    ids=["absent", "present"],
+)
+def test_capacity_publication_injects_active_context_and_preserves_stored_fields(
+    make_harness,
+    producer_spans: tuple[TracerProvider, InMemorySpanExporter],
+    recover: bool,
+    active: bool,
+    stored: str | None,
+) -> None:
+    provider, exporter = producer_spans
+
+    async def go() -> None:
+        async with make_harness() as h:
+            consumer = _capacity_consumer(h)
+            await consumer.ensure_group()
+            store = CapacityWaitStore(h.async_redis, h.config)
+            leases = DeliveryLeaseStore(h.async_redis, h.config)
+            event = _qevent("wait for capacity")
+            original = to_stream_fields(event)
+            if stored is not None:
+                original["traceparent"] = stored
+            original["test_transport"] = "retained"
+            entry_id = await h.async_redis.xadd(h.config.stream, original)
+            rows = await h.async_redis.xreadgroup(
+                h.config.consumer_group,
+                h.config.consumer_name,
+                {h.config.stream: ">"},
+                count=1,
+            )
+            assert rows[0][1][0][0] == entry_id
+            lease = await leases.acquire(
+                h.config.stream,
+                h.config.consumer_group,
+                entry_id,
+                consumer=h.config.consumer_name,
+            )
+            try:
+                parked = await store.park(entry_id, original, event.event_id, lease)
+            finally:
+                await leases.release(
+                    h.config.stream,
+                    h.config.consumer_group,
+                    entry_id,
+                    owner=lease.owner,
+                    resume_event_id=None,
+                )
+            await h.async_redis.zadd(store._due, {event.event_id: 0})
+            if recover:
+                assert await store.wake_due() == 1
+                wake_id = (await h.async_redis.xrevrange(h.config.stream, count=1))[0][0]
+                await h.async_redis.xdel(h.config.stream, wake_id)
+                await h.async_redis.hset(store._record(event.event_id), "deadline_ms", "0")
+                await h.async_redis.zadd(store._flight, {event.event_id: 0})
+            if active:
+                with provider.get_tracer("test-capacity").start_as_current_span("test.capacity"):
+                    published = await (
+                        store.reconcile_lost_wakes() if recover else store.wake_due()
+                    )
+                    assert published == 1
+            else:
+                wake_task = asyncio.create_task(consumer._capacity_wake_loop())
+                try:
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        latest = await h.async_redis.xrevrange(h.config.stream, count=1)
+                        if latest and latest[0][0] != entry_id:
+                            break
+                        if wake_task.done():
+                            await wake_task
+                            raise AssertionError("capacity wake loop exited before publication")
+                        await asyncio.sleep(0.005)
+                    else:
+                        raise AssertionError("capacity wake loop did not publish the due entry")
+                finally:
+                    consumer.request_stop()
+                    await wake_task
+            rows = await h.async_redis.xrevrange(h.config.stream, count=1)
+            fields = rows[0][1]
+            assert fields["payload"] == original["payload"]
+            assert fields["test_transport"] == "retained"
+            assert fields[WAIT_GENERATION_FIELD] == str(parked.generation + (2 if recover else 1))
+            assert (fields.get(WAIT_TERMINAL_ONLY_FIELD) == "1") is recover
+            if active:
+                maintenance = next(
+                    span for span in exporter.get_finished_spans() if span.name == "test.capacity"
+                )
+                carrier = fields["traceparent"].split("-")
+                assert int(carrier[1], 16) == maintenance.context.trace_id
+                assert int(carrier[2], 16) == maintenance.context.span_id
+                assert fields["traceparent"] != stored
+            else:
+                assert fields.get("traceparent") == stored
+                assert {key: fields[key] for key in original} == original
+                if stored is None:
+                    assert "traceparent" not in fields
+            record = await store.get(event.event_id)
+            assert record is not None and record.fields == original
+            assert not any(
+                span.name == "curie.queue.enqueue" for span in exporter.get_finished_spans()
+            )
+            assert await (store.reconcile_lost_wakes() if recover else store.wake_due()) == 0
+
+    asyncio.run(go())
 
 
 async def _wait_consumer_idle(
@@ -168,10 +982,10 @@ class _RenewalProbeStore:
         self.slow_completed = 0
         self._never = asyncio.Event()
 
-    async def publish(self, **kwargs: Any) -> None:
-        await self._delegate.publish(**kwargs)
+    async def publish(self, **kwargs: Any) -> str:
+        return await self._delegate.publish(**kwargs)
 
-    async def renew(self, **kwargs: Any) -> None:
+    async def renew(self, **kwargs: Any) -> bool:
         self.renew_calls += 1
         if self.renew_calls <= self._fail_renewals:
             raise redis.exceptions.ConnectionError("injected transient renewal failure")
@@ -182,7 +996,7 @@ class _RenewalProbeStore:
         if self._slow_renewal_s > 0:
             await asyncio.sleep(self._slow_renewal_s)
             self.slow_completed += 1
-        await self._delegate.renew(**kwargs)
+        return await self._delegate.renew(**kwargs)
 
     async def is_alive(self, **kwargs: Any) -> bool:
         return await self._delegate.is_alive(**kwargs)
@@ -392,9 +1206,7 @@ def test_capacity_wait_wakes_once_after_restart_and_rejects_stale_generation(
                 )
                 assert h.runner.opened == ["hello"]
                 assert h.runner.queried == ["hello"]
-                assert h.runner.admissions == [
-                    (h.runner.request_epochs[0][1], True)
-                ]
+                assert h.runner.admissions == [(h.runner.request_epochs[0][1], True)]
                 assert await h.async_redis.exists(h.config.done_key(event.event_id))
                 finished = await replacement._waits.get(event.event_id)
                 assert finished is not None and finished.state == "done"
@@ -490,7 +1302,9 @@ def test_capacity_wake_defers_when_runner_lacks_admission(make_harness) -> None:
             replacement_task = asyncio.create_task(replacement.run())
             try:
                 deferred = await _wait_capacity_state(
-                    replacement, event.event_id, "waiting",
+                    replacement,
+                    event.event_id,
+                    "waiting",
                     generation=parked.generation + 2,
                 )
                 assert deferred.deadline_ms == parked.deadline_ms
@@ -545,7 +1359,9 @@ def test_capacity_wake_defers_behind_live_turn_without_steering(make_harness) ->
             replacement_task = asyncio.create_task(replacement.run())
             try:
                 deferred = await _wait_capacity_state(
-                    replacement, event.event_id, "waiting",
+                    replacement,
+                    event.event_id,
+                    "waiting",
                     generation=parked.generation + 2,
                 )
                 assert deferred.deadline_ms == parked.deadline_ms
@@ -643,11 +1459,16 @@ def test_capacity_wake_headers_before_runner_lock_do_not_start_turn(
 
 
 def test_failed_capacity_grant_cannot_start_after_original_deadline(make_harness) -> None:
+    """@spec ADR-0130 d1: pre-stream admission failure closes progress authority."""
+
+    from curie_worker.progress import ProgressStore, progress_id_for
+
     async def go() -> None:
         async with make_harness(
             slack_no_edit_streaming=True,
             claim_timeout_seconds=0.05,
             capacity_wait_budget_s=1.0,
+            progress_factory=lambda redis, config: ProgressStore(redis, config),
         ) as h:
             h.fake_k8s.quota_rejection = QuotaRejection(
                 quota_name="curie-sandbox-quota",
@@ -696,6 +1517,10 @@ def test_failed_capacity_grant_cannot_start_after_original_deadline(make_harness
                 await owner._handle(wake_id, wake_fields)
             finally:
                 h.kernel._runner.admit_turn = real_admit  # type: ignore[method-assign]
+            progress_id = progress_id_for(kernel_routing._thread_key_for(event), event.event_id)
+            progress = await ProgressStore(h.async_redis, h.config).read(progress_id)
+            assert progress is not None
+            assert progress.active_generation == 0
             assert failed_grants == [h.runner.request_epochs[0][1]]
             assert h.runner.opened == ["hello"]
             assert h.runner.queried == []
@@ -726,8 +1551,7 @@ def test_failed_capacity_grant_cannot_start_after_original_deadline(make_harness
             assert h.runner.queried == []
             assert h.runner.admissions == []
             assert h.sink.last_text == (
-                "Your request could not start before its capacity wait ended. "
-                "Please send it again."
+                "Your request could not start before its capacity wait ended. Please send it again."
             )
             await _wait_for_pending_count(
                 h.async_redis, h.config.stream, h.config.consumer_group, 0
@@ -843,17 +1667,13 @@ def test_expired_parked_wait_does_not_interrupt_later_turn_on_same_thread(
                 used={"pods": "2"},
                 hard={"pods": "2"},
             )
-            parked_event = _qevent(
-                "parked", thread="shared-thread", event_id="parked-turn"
-            )
+            parked_event = _qevent("parked", thread="shared-thread", event_id="parked-turn")
             first = _capacity_consumer(h)
             await first.ensure_group()
             await h.async_redis.xadd(h.config.stream, to_stream_fields(parked_event))
             first_task = asyncio.create_task(first.run())
             try:
-                parked = await _wait_capacity_state(
-                    first, parked_event.event_id, "waiting"
-                )
+                parked = await _wait_capacity_state(first, parked_event.event_id, "waiting")
             finally:
                 first.request_stop()
                 await first_task
@@ -863,9 +1683,7 @@ def test_expired_parked_wait_does_not_interrupt_later_turn_on_same_thread(
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="working")]
             h.runner.tail = [Final(text="later answer", status=DONE)]
-            later_event = _qevent(
-                "later", thread="shared-thread", event_id="later-turn"
-            )
+            later_event = _qevent("later", thread="shared-thread", event_id="later-turn")
             consumer = _capacity_consumer(h)
             await consumer.ensure_group()
             await h.async_redis.xadd(h.config.stream, to_stream_fields(later_event))
@@ -878,9 +1696,7 @@ def test_expired_parked_wait_does_not_interrupt_later_turn_on_same_thread(
                 now_ms = int(server_time[0]) * 1000 + int(server_time[1]) // 1000
                 await asyncio.sleep(max(0, parked.deadline_ms - now_ms) / 1000 + 0.05)
                 await consumer._waits.wake_due()
-                expired = await _wait_capacity_state(
-                    consumer, parked_event.event_id, "expired"
-                )
+                expired = await _wait_capacity_state(consumer, parked_event.event_id, "expired")
                 assert expired.cause == "capacity_wait_expired"
                 assert h.runner.turn_active
                 assert h.runner.interrupts == 0
@@ -918,9 +1734,7 @@ def test_lost_capacity_wake_lease_does_not_stop_later_turn(
                 used={"pods": "2"},
                 hard={"pods": "2"},
             )
-            parked_event = _qevent(
-                "parked", thread="lease-shared", event_id="lease-parked"
-            )
+            parked_event = _qevent("parked", thread="lease-shared", event_id="lease-parked")
             first = _capacity_consumer(h)
             await first.ensure_group()
             await h.async_redis.xadd(h.config.stream, to_stream_fields(parked_event))
@@ -936,9 +1750,7 @@ def test_lost_capacity_wake_lease_does_not_stop_later_turn(
             h.runner.hold = hold
             h.runner.default_script = [TextDelta(text="working")]
             h.runner.tail = [Final(text="later answer", status=DONE)]
-            later_event = _qevent(
-                "later", thread="lease-shared", event_id="lease-later"
-            )
+            later_event = _qevent("later", thread="lease-shared", event_id="lease-later")
             later_task = asyncio.create_task(h.kernel.process_event(later_event))
             try:
                 await _wait_until(lambda: h.runner.queried == ["later"])
@@ -946,9 +1758,7 @@ def test_lost_capacity_wake_lease_does_not_stop_later_turn(
                 assert later_epoch is not None
                 consumer = _capacity_consumer(h)
                 await consumer.ensure_group()
-                await h.async_redis.zadd(
-                    consumer._waits._due, {parked_event.event_id: 0}
-                )
+                await h.async_redis.zadd(consumer._waits._due, {parked_event.event_id: 0})
                 assert await consumer._waits.wake_due() == 1
                 woken = await consumer._waits.get(parked_event.event_id)
                 assert woken is not None and woken.state == "woken"
@@ -962,23 +1772,26 @@ def test_lost_capacity_wake_lease_does_not_stop_later_turn(
                 )[0][1][0]
                 lease_store = DeliveryLeaseStore(h.async_redis, h.config)
                 lease = await lease_store.acquire(
-                    h.config.stream, h.config.consumer_group, wake_id,
+                    h.config.stream,
+                    h.config.consumer_group,
+                    wake_id,
                     consumer=h.config.consumer_name,
                 )
                 old_epoch = uuid.uuid4().hex
                 if record_old_epoch:
                     assert old_epoch != later_epoch
-                    assert await consumer._waits.mark_active(
-                        parked_event.event_id, woken.generation, lease, old_epoch
-                    ) == "active"
+                    assert (
+                        await consumer._waits.mark_active(
+                            parked_event.event_id, woken.generation, lease, old_epoch
+                        )
+                        == "active"
+                    )
                     assert await consumer._waits.confirm_grant(
                         parked_event.event_id, woken.generation, lease, old_epoch
                     )
                     h.runner.admission_results[old_epoch] = "granted"
                 await h.async_redis.delete(
-                    h.config.delivery_lease_key(
-                        h.config.stream, h.config.consumer_group, wake_id
-                    )
+                    h.config.delivery_lease_key(h.config.stream, h.config.consumer_group, wake_id)
                 )
 
                 await consumer._interrupt_on_lease_lost(wake_id, wake_fields)
@@ -1113,9 +1926,9 @@ def test_wake_before_deadline_expires_if_turn_cannot_start_until_after_it(
                 expired = await _wait_capacity_state(replacement, event.event_id, "expired")
                 assert expired.cause == "capacity_wait_expired"
                 assert h.runner.opened == []
-                assert len(
-                    [text for _, _, text in h.sink.updates if "could not start" in text]
-                ) == 1
+                assert (
+                    len([text for _, _, text in h.sink.updates if "could not start" in text]) == 1
+                )
                 await _wait_for_pending_count(
                     h.async_redis, h.config.stream, h.config.consumer_group, 0
                 )
@@ -1513,31 +2326,44 @@ def test_dead_lettered_wake_gets_one_terminal_reply_and_owed_completion(
                 granted_epoch = uuid.uuid4().hex
                 lease_store = DeliveryLeaseStore(h.async_redis, h.config)
                 lease = await lease_store.acquire(
-                    h.config.stream, h.config.consumer_group, wake_id,
+                    h.config.stream,
+                    h.config.consumer_group,
+                    wake_id,
                     consumer=h.config.consumer_name,
                 )
-                assert await replacement._waits.mark_active(
-                    event.event_id, woken.generation, lease, granted_epoch
-                ) == "active"
+                assert (
+                    await replacement._waits.mark_active(
+                        event.event_id, woken.generation, lease, granted_epoch
+                    )
+                    == "active"
+                )
                 assert await replacement._waits.confirm_grant(
                     event.event_id, woken.generation, lease, granted_epoch
                 )
                 assert await lease_store.release(
-                    h.config.stream, h.config.consumer_group, wake_id,
+                    h.config.stream,
+                    h.config.consumer_group,
+                    wake_id,
                     owner=lease.owner,
                     resume_event_id=None,
                 )
             await h.async_redis.xclaim(
-                h.config.stream, h.config.consumer_group, h.config.consumer_name, 0,
+                h.config.stream,
+                h.config.consumer_group,
+                h.config.consumer_name,
+                0,
                 [wake_id],
             )
             assert (await _deliveries(h.async_redis, h.config.stream, h.config.consumer_group))[
                 wake_id
             ] == 2
             assert await replacement._dead_letter_over_cap() == {wake_id}
-            assert await _pending_owner(
-                h.async_redis, h.config.stream, h.config.consumer_group, wake_id
-            ) is None
+            assert (
+                await _pending_owner(
+                    h.async_redis, h.config.stream, h.config.consumer_group, wake_id
+                )
+                is None
+            )
             assert len(await h.async_redis.xrange(h.config.dead_letter_stream_name())) == 1
             assert h.runner.opened == []
 
@@ -1617,7 +2443,10 @@ def test_dead_lettered_terminal_recovery_is_requeued_once(make_harness) -> None:
                 )
             )[0][1][0]
             await h.async_redis.xclaim(
-                h.config.stream, h.config.consumer_group, h.config.consumer_name, 0,
+                h.config.stream,
+                h.config.consumer_group,
+                h.config.consumer_name,
+                0,
                 [wake_id],
             )
             assert await replacement._dead_letter_over_cap() == {wake_id}
@@ -1641,7 +2470,10 @@ def test_dead_lettered_terminal_recovery_is_requeued_once(make_harness) -> None:
                 )
             )[0][1][0]
             await h.async_redis.xclaim(
-                h.config.stream, h.config.consumer_group, h.config.consumer_name, 0,
+                h.config.stream,
+                h.config.consumer_group,
+                h.config.consumer_name,
+                0,
                 [terminal_id],
             )
             assert await replacement._dead_letter_over_cap() == {terminal_id}
@@ -1663,15 +2495,10 @@ def test_dead_lettered_terminal_recovery_is_requeued_once(make_harness) -> None:
             assert expired.cause == "capacity_wait_expired"
             assert expired.generation == first_terminal.generation + 1
             assert h.runner.opened == []
-            assert [
-                text for _, _, text in h.sink.updates if "could not start" in text
-            ] == [
-                "Your request could not start before its capacity wait ended. "
-                "Please send it again."
+            assert [text for _, _, text in h.sink.updates if "could not start" in text] == [
+                "Your request could not start before its capacity wait ended. Please send it again."
             ]
-            assert [completion.event_id for completion in h.sink.completions] == [
-                event.event_id
-            ]
+            assert [completion.event_id for completion in h.sink.completions] == [event.event_id]
             assert await h.async_redis.xlen(h.config.stream) == 4
             assert len(await h.async_redis.xrange(h.config.dead_letter_stream_name())) == 2
             await _wait_for_pending_count(
@@ -1735,7 +2562,10 @@ def test_active_dead_letter_stops_runner_before_terminal_reply(make_harness) -> 
                 assert (await _wait_capacity_state(owner, event.event_id, "active")).cause == ""
                 await _wait_until(lambda: h.runner.turn_active)
                 await h.async_redis.xclaim(
-                    h.config.stream, h.config.consumer_group, h.config.consumer_name, 0,
+                    h.config.stream,
+                    h.config.consumer_group,
+                    h.config.consumer_name,
+                    0,
                     [wake_id],
                 )
                 server_time = await h.async_redis.time()
@@ -1744,9 +2574,7 @@ def test_active_dead_letter_stops_runner_before_terminal_reply(make_harness) -> 
                 assert h.runner.turn_active
                 assert not owner_task.done()
                 await h.async_redis.delete(
-                    h.config.delivery_lease_key(
-                        h.config.stream, h.config.consumer_group, wake_id
-                    )
+                    h.config.delivery_lease_key(h.config.stream, h.config.consumer_group, wake_id)
                 )
 
                 recovery = _capacity_consumer(h)
@@ -1770,8 +2598,8 @@ def test_active_dead_letter_stops_runner_before_terminal_reply(make_harness) -> 
                 ) -> Any:
                     if (
                         reply.event == "reply.update"
-                        and reply.text == "Your request started but could not finish. "
-                        "Please send it again."
+                        and reply.text
+                        == "Your request started but could not finish. Please send it again."
                     ):
                         active_at_terminal_reply.append(h.runner.turn_active)
                     return await real_emit(
@@ -1783,9 +2611,9 @@ def test_active_dead_letter_stops_runner_before_terminal_reply(make_harness) -> 
                 await recovery._handle(terminal_id, terminal_fields)
                 expired = await _wait_capacity_state(recovery, event.event_id, "expired")
                 assert expired.cause == "delivery_exhausted"
-                assert [
-                    headers["X-Curie-Turn-Epoch"] for headers in h.runner.timeout_headers
-                ] == [h.runner.request_epochs[0][1]]
+                assert [headers["X-Curie-Turn-Epoch"] for headers in h.runner.timeout_headers] == [
+                    h.runner.request_epochs[0][1]
+                ]
                 assert h.runner.interrupts == 0
                 assert active_at_terminal_reply == [False]
                 assert not h.runner.turn_active
@@ -1881,9 +2709,7 @@ def test_capacity_wait_expires_at_its_original_deadline_after_restart(
             replacement = _capacity_consumer(h)
             replacement_task = asyncio.create_task(replacement.run())
             try:
-                expired = await _wait_capacity_state(
-                    replacement, event.event_id, "expired"
-                )
+                expired = await _wait_capacity_state(replacement, event.event_id, "expired")
                 await _wait_for_pending_count(
                     h.async_redis, h.config.stream, h.config.consumer_group, 0
                 )
@@ -1904,9 +2730,7 @@ def test_capacity_wait_expires_at_its_original_deadline_after_restart(
                 ]
                 assert len(expiry_replies) == (0 if reply_outage else 1)
                 if reply_outage:
-                    assert await h.async_redis.exists(
-                        h.config.completion_key(event.event_id)
-                    )
+                    assert await h.async_redis.exists(h.config.completion_key(event.event_id))
                 else:
                     assert [c.event_id for c in h.sink.completions] == [event.event_id]
             finally:
@@ -1917,11 +2741,10 @@ def test_capacity_wait_expires_at_its_original_deadline_after_restart(
                 h.sink.fail_events.clear()
                 await h.kernel.sweep_pending_completions()
                 assert [c.event_id for c in h.sink.completions] == [event.event_id]
-                assert not await h.async_redis.exists(
-                    h.config.completion_key(event.event_id)
-                )
+                assert not await h.async_redis.exists(h.config.completion_key(event.event_id))
 
     asyncio.run(go())
+
 
 def test_reclaim_skips_this_consumers_own_inflight_entry(make_harness) -> None:
     async def go() -> None:
@@ -1977,9 +2800,7 @@ def test_dispatch_applies_backpressure_at_capacity(make_harness) -> None:
             )
             await consumer.ensure_group()
 
-            first_id, first = await _pending_local_entry(
-                h, _qevent("a", thread="ta", event_id="a")
-            )
+            first_id, first = await _pending_local_entry(h, _qevent("a", thread="ta", event_id="a"))
             await consumer._dispatch(first_id, first)
             await _wait_until(lambda: h.runner.turn_active)  # slot taken, turn hanging
 
@@ -2102,12 +2923,21 @@ def test_maintenance_tick_sweeps_the_progress_outbox_after_completions(make_harn
             h.kernel.reap_orphans = lambda: step("reap")  # type: ignore[method-assign]
             h.kernel.sweep_pending_completions = lambda: step("sweep")  # type: ignore[method-assign]
             consumer._sweep_pending_progress = lambda: step("progress")  # type: ignore[method-assign]
+            consumer._drain_pending_progress_inboxes = lambda: step("inboxes")  # type: ignore[method-assign]
             consumer._drain_thread_reset_requests = lambda: step("reset")  # type: ignore[method-assign]
             consumer._observe_queue_state = observe  # type: ignore[method-assign]
 
             await consumer._maintenance_loop()
 
-            assert calls == ["reclaim", "reap", "sweep", "progress", "reset", "observe"]
+            assert calls == [
+                "reclaim",
+                "reap",
+                "sweep",
+                "progress",
+                "inboxes",
+                "reset",
+                "observe",
+            ]
 
     asyncio.run(go())
 
@@ -2923,9 +3753,7 @@ def test_slow_renewal_inside_guard_keeps_lease_alive(make_harness) -> None:
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
             )
-            probe = _RenewalProbeStore(
-                ConsumerLivenessStore(h.async_redis), slow_renewal_s=0.04
-            )
+            probe = _RenewalProbeStore(ConsumerLivenessStore(h.async_redis), slow_renewal_s=0.04)
             consumer._liveness_store = probe  # type: ignore[assignment]
             alive = consumer_heartbeat_key(
                 h.config.stream, h.config.consumer_group, h.config.consumer_name
@@ -3057,7 +3885,7 @@ def test_alive_restoration_resets_two_absence_proof(make_harness) -> None:
             )
             assert await consumer._prompt_reclaim_once() == 0
 
-            await store.renew(
+            await store.publish(
                 stream=h.config.stream,
                 group=h.config.consumer_group,
                 consumer="peer",
@@ -3247,6 +4075,9 @@ def test_transient_liveness_renewal_failure_recovers_before_lease_expiry(
             reclaim_min_idle_ms=300,
             consumer_heartbeat_ttl_ms=150,
             consumer_capability_ttl_ms=450,
+            # Normal cadence retries at 80ms before the 110ms local deadline;
+            # a TTL/3 cadence would put its retry exactly at the deadline.
+            delivery_lease_heartbeat_s=0.04,
             read_block_ms=10,
         ) as h:
             consumer = Consumer(
@@ -3279,8 +4110,9 @@ def test_timed_out_liveness_renewal_retries_before_lease_expiry(make_harness) ->
     async def go() -> None:
         async with make_harness(
             reclaim_min_idle_ms=300,
-            consumer_heartbeat_ttl_ms=150,
+            consumer_heartbeat_ttl_ms=450,
             consumer_capability_ttl_ms=450,
+            delivery_lease_heartbeat_s=0.1,
             read_block_ms=10,
         ) as h:
             consumer = Consumer(
@@ -3289,9 +4121,7 @@ def test_timed_out_liveness_renewal_retries_before_lease_expiry(make_harness) ->
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
             )
-            probe = _RenewalProbeStore(
-                ConsumerLivenessStore(h.async_redis), timeout_renewals=1
-            )
+            probe = _RenewalProbeStore(ConsumerLivenessStore(h.async_redis), timeout_renewals=1)
             consumer._liveness_store = probe  # type: ignore[assignment]
 
             task = asyncio.create_task(consumer.run())
@@ -3377,14 +4207,10 @@ def test_terminal_liveness_failure_cancels_generation_and_clean_restart_recovers
             h.runner.default_script = [Final(text="recovered", status=DONE)]
             consumer._liveness_store = ConsumerLivenessStore(h.async_redis)
             second = asyncio.create_task(consumer.run())
-            await _wait_until(
-                lambda: h.runner.opened.count("restart") == 2, timeout=3
-            )
+            await _wait_until(lambda: h.runner.opened.count("restart") == 2, timeout=3)
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
-                summary = await h.async_redis.xpending(
-                    h.config.stream, h.config.consumer_group
-                )
+                summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
                 if summary["pending"] == 0:
                     break
                 await asyncio.sleep(0.01)
@@ -3394,9 +4220,7 @@ def test_terminal_liveness_failure_cancels_generation_and_clean_restart_recovers
             await second
 
             assert h.runner.opened.count("restart") == 2
-            assert await _deliveries(
-                h.async_redis, h.config.stream, h.config.consumer_group
-            ) == {}
+            assert await _deliveries(h.async_redis, h.config.stream, h.config.consumer_group) == {}
             assert (await h.async_redis.xpending(h.config.stream, h.config.consumer_group))[
                 "pending"
             ] == 0
@@ -3517,7 +4341,9 @@ def test_prompt_selection_stays_timely_while_heavy_reclaim_waits_for_capacity(
     asyncio.run(go())
 
 
-def test_next_turn_drains_queued_eval_reset_before_claiming(make_harness) -> None:
+def test_next_turn_drains_queued_eval_reset_before_claiming(
+    make_harness, thread_reset_keys
+) -> None:
     """#1534: eval-owned sandboxes are SADDed onto THREAD_RESET_SET after each
     case. The next runs-lane turn must release them before it claims, so a
     following eval case or cluster message does not wait for the 30s
@@ -3532,7 +4358,7 @@ def test_next_turn_drains_queued_eval_reset_before_claiming(make_harness) -> Non
             second_thread_key = _thread_key("tEval2")
             assert h.substrate.lookup(first_thread_key) is not None
 
-            await h.async_redis.sadd(THREAD_RESET_SET, first_thread_key)
+            await h.async_redis.sadd(thread_reset_keys.requests, first_thread_key)
             consumer = Consumer(
                 redis=h.async_redis,
                 kernel=h.kernel,
@@ -3547,15 +4373,15 @@ def test_next_turn_drains_queued_eval_reset_before_claiming(make_harness) -> Non
 
             assert h.substrate.lookup(first_thread_key) is None
             assert h.substrate.lookup(second_thread_key) is not None
-            assert await h.async_redis.scard(THREAD_RESET_SET) == 0
-            assert not await h.async_redis.sismember(
-                THREAD_RESET_INFLIGHT_SET, first_thread_key
-            )
+            assert await h.async_redis.scard(thread_reset_keys.requests) == 0
+            assert not await h.async_redis.sismember(thread_reset_keys.inflight, first_thread_key)
 
     asyncio.run(go())
 
 
-def test_next_turn_drains_reset_before_claiming_when_quota_is_full(make_harness) -> None:
+def test_next_turn_drains_reset_before_claiming_when_quota_is_full(
+    make_harness, thread_reset_keys
+) -> None:
     """#1534: drain must run BEFORE the follow-up claim. If it ran after
     process_event, tEval2 would see ResourceQuota still full (tEval1 still
     holding the slot), raise CapacityExhaustedError, and never bind.
@@ -3577,9 +4403,7 @@ def test_next_turn_drains_reset_before_claiming_when_quota_is_full(make_harness)
             )
             original_delete = h.fake_k8s.delete_claim
 
-            def delete_and_free(
-                name: str, *, request_timeout_seconds: float
-            ) -> None:
+            def delete_and_free(name: str, *, request_timeout_seconds: float) -> None:
                 original_delete(
                     name,
                     request_timeout_seconds=request_timeout_seconds,
@@ -3588,7 +4412,7 @@ def test_next_turn_drains_reset_before_claiming_when_quota_is_full(make_harness)
 
             h.fake_k8s.delete_claim = delete_and_free  # type: ignore[method-assign]
 
-            await h.async_redis.sadd(THREAD_RESET_SET, first_thread_key)
+            await h.async_redis.sadd(thread_reset_keys.requests, first_thread_key)
             consumer = Consumer(
                 redis=h.async_redis,
                 kernel=h.kernel,
@@ -3608,7 +4432,7 @@ def test_next_turn_drains_reset_before_claiming_when_quota_is_full(make_harness)
 
 
 def test_sadd_of_bare_eval_conversation_id_does_not_release_scoped_sandbox(
-    make_harness,
+    make_harness, thread_reset_keys
 ) -> None:
     """#2259 negative: after ADR-0096 the worker keys sandboxes as
     quote(kind):quote(channel):quote(conversation_id). SADDing the bare
@@ -3621,11 +4445,11 @@ def test_sadd_of_bare_eval_conversation_id_does_not_release_scoped_sandbox(
             h.runner.default_script = [Final(text="hi", status=DONE)]
             event = _qevent("eval-case-1", thread="eval:1720000000.000100")
             await h.kernel.process_event(event)
-            scoped = kernel_module._thread_key_for(event)
+            scoped = kernel_routing._thread_key_for(event)
             assert h.substrate.lookup(scoped) is not None
             assert scoped == "slack:C1:eval%3A1720000000.000100"
 
-            await h.async_redis.sadd(THREAD_RESET_SET, event.conversation_id)
+            await h.async_redis.sadd(thread_reset_keys.requests, event.conversation_id)
             consumer = Consumer(
                 redis=h.async_redis,
                 kernel=h.kernel,
@@ -3646,7 +4470,9 @@ def test_sadd_of_bare_eval_conversation_id_does_not_release_scoped_sandbox(
     asyncio.run(go())
 
 
-def test_sadd_of_scoped_eval_isolate_key_releases_the_sandbox(make_harness) -> None:
+def test_sadd_of_scoped_eval_isolate_key_releases_the_sandbox(
+    make_harness, thread_reset_keys
+) -> None:
     """#2259: the CLI must SADD the same percent-encoded triple the worker
     claimed, including the ``eval:`` conversation_id whose colon encodes.
     """
@@ -3656,10 +4482,10 @@ def test_sadd_of_scoped_eval_isolate_key_releases_the_sandbox(make_harness) -> N
             h.runner.default_script = [Final(text="hi", status=DONE)]
             event = _qevent("eval-case-1", thread="eval:1720000000.000100")
             await h.kernel.process_event(event)
-            scoped = kernel_module._thread_key_for(event)
+            scoped = kernel_routing._thread_key_for(event)
             assert h.substrate.lookup(scoped) is not None
 
-            await h.async_redis.sadd(THREAD_RESET_SET, scoped)
+            await h.async_redis.sadd(thread_reset_keys.requests, scoped)
             consumer = Consumer(
                 redis=h.async_redis,
                 kernel=h.kernel,
@@ -3677,7 +4503,9 @@ def test_sadd_of_scoped_eval_isolate_key_releases_the_sandbox(make_harness) -> N
     asyncio.run(go())
 
 
-def test_maintenance_tick_drains_pending_thread_reset_requests(make_harness) -> None:
+def test_maintenance_tick_drains_pending_thread_reset_requests(
+    make_harness, thread_reset_keys
+) -> None:
     """#713: an operator-requested thread reset (the API SADDs the thread_key
     into THREAD_RESET_SET) is picked up and applied by the maintenance tick,
     releasing that thread's sandbox and popping it off the pending set."""
@@ -3695,21 +4523,22 @@ def test_maintenance_tick_drains_pending_thread_reset_requests(make_harness) -> 
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
             )
-            await h.async_redis.sadd(THREAD_RESET_SET, thread_key)
+            await h.async_redis.sadd(thread_reset_keys.requests, thread_key)
 
             await consumer._drain_thread_reset_requests()
 
             assert h.substrate.lookup(thread_key) is None  # released
-            assert await h.async_redis.scard(THREAD_RESET_SET) == 0  # popped, not left behind
+            # Popped, not left behind.
+            assert await h.async_redis.scard(thread_reset_keys.requests) == 0
             # #812: the in-progress marker is cleared only after the release
             # actually lands, so a successful drain leaves nothing pending.
-            assert not await h.async_redis.sismember(THREAD_RESET_INFLIGHT_SET, thread_key)
+            assert not await h.async_redis.sismember(thread_reset_keys.inflight, thread_key)
 
     asyncio.run(go())
 
 
 def test_maintenance_tick_thread_reset_failed_release_keeps_the_signal_pending(
-    make_harness, caplog
+    make_harness, caplog, thread_reset_keys
 ) -> None:
     """#812 (was #806 incomplete): the observable "reset outstanding" signal --
     membership of THREAD_RESET_SET UNION THREAD_RESET_INFLIGHT_SET, which the
@@ -3728,7 +4557,7 @@ def test_maintenance_tick_thread_reset_failed_release_keeps_the_signal_pending(
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
             )
-            await h.async_redis.sadd(THREAD_RESET_SET, "tFailRelease")
+            await h.async_redis.sadd(thread_reset_keys.requests, "tFailRelease")
 
             async def boom_release(thread_key: str) -> bool:
                 raise RuntimeError("injected release failure")
@@ -3739,10 +4568,10 @@ def test_maintenance_tick_thread_reset_failed_release_keeps_the_signal_pending(
                 await consumer._drain_thread_reset_requests()
 
             # Claimed off the request set (atomic SPOP: no second replica double-releases)...
-            assert await h.async_redis.scard(THREAD_RESET_SET) == 0
+            assert await h.async_redis.scard(thread_reset_keys.requests) == 0
             # ...but the in-progress marker is STILL set: the pending signal the
             # CLI gates on stays True, so it never reports a false success.
-            assert await h.async_redis.sismember(THREAD_RESET_INFLIGHT_SET, "tFailRelease")
+            assert await h.async_redis.sismember(thread_reset_keys.inflight, "tFailRelease")
             assert any("tFailRelease" in r.getMessage() for r in caplog.records)
 
     asyncio.run(go())
@@ -3774,7 +4603,7 @@ def _text(raw: object) -> str | None:
 
 
 def test_thread_reset_drain_records_no_route_when_the_key_matched_no_route(
-    make_harness, caplog, monkeypatch
+    make_harness, caplog, monkeypatch, thread_reset_keys
 ) -> None:
     """#3699: ``release_thread`` returns False when the key matched no route
     (a hand-built key that left out a named bot's identity segment). Nothing was
@@ -3792,18 +4621,18 @@ def test_thread_reset_drain_records_no_route_when_the_key_matched_no_route(
             )
             thread_key = "slack:C0EXAMPLE1:missing"
             assert h.substrate.lookup(thread_key) is None
-            await h.async_redis.sadd(THREAD_RESET_SET, thread_key)
+            await h.async_redis.sadd(thread_reset_keys.requests, thread_key)
 
             with caplog.at_level(logging.INFO):
                 await consumer._drain_thread_reset_requests()
 
-            result_key = f"{consumer_module.THREAD_RESET_RESULT_PREFIX}{thread_key}"
+            result_key = f"{thread_reset_keys.result_prefix}{thread_key}"
             assert _text(await h.async_redis.get(result_key)) == "no-route"
             ttl = await h.async_redis.ttl(result_key)
             assert 0 < ttl <= 3600, ttl
             # The in-flight marker is cleared only after the result is written,
             # so a poll that reads "not pending" always finds the result.
-            assert not await h.async_redis.sismember(THREAD_RESET_INFLIGHT_SET, thread_key)
+            assert not await h.async_redis.sismember(thread_reset_keys.inflight, thread_key)
 
             warnings = [
                 r
@@ -3824,7 +4653,7 @@ def test_thread_reset_drain_records_no_route_when_the_key_matched_no_route(
 
 
 def test_thread_reset_drain_records_released_when_a_route_existed(
-    make_harness, monkeypatch
+    make_harness, monkeypatch, thread_reset_keys
 ) -> None:
     """#3699: a reset that matched a route behaves as before and records
     ``released`` with the same one-hour lifetime."""
@@ -3843,15 +4672,15 @@ def test_thread_reset_drain_records_released_when_a_route_existed(
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
             )
-            await h.async_redis.sadd(THREAD_RESET_SET, thread_key)
+            await h.async_redis.sadd(thread_reset_keys.requests, thread_key)
 
             await consumer._drain_thread_reset_requests()
 
-            result_key = f"{consumer_module.THREAD_RESET_RESULT_PREFIX}{thread_key}"
+            result_key = f"{thread_reset_keys.result_prefix}{thread_key}"
             assert _text(await h.async_redis.get(result_key)) == "released"
             ttl = await h.async_redis.ttl(result_key)
             assert 0 < ttl <= 3600, ttl
-            assert not await h.async_redis.sismember(THREAD_RESET_INFLIGHT_SET, thread_key)
+            assert not await h.async_redis.sismember(thread_reset_keys.inflight, thread_key)
 
     asyncio.run(go())
     assert outcomes == [
@@ -3860,7 +4689,7 @@ def test_thread_reset_drain_records_released_when_a_route_existed(
 
 
 def test_thread_reset_drain_records_failed_and_no_result_when_the_release_raises(
-    make_harness, monkeypatch
+    make_harness, monkeypatch, thread_reset_keys
 ) -> None:
     """#3699: a release that raises writes no result (the request stays in
     flight, as before) and counts as ``failed``."""
@@ -3875,8 +4704,8 @@ def test_thread_reset_drain_records_failed_and_no_result_when_the_release_raises
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
             )
             thread_key = "tResultFailed"
-            result_key = f"{consumer_module.THREAD_RESET_RESULT_PREFIX}{thread_key}"
-            await h.async_redis.sadd(THREAD_RESET_SET, thread_key)
+            result_key = f"{thread_reset_keys.result_prefix}{thread_key}"
+            await h.async_redis.sadd(thread_reset_keys.requests, thread_key)
             await h.async_redis.delete(result_key)
 
             async def boom_release(key: str) -> bool:
@@ -3887,7 +4716,7 @@ def test_thread_reset_drain_records_failed_and_no_result_when_the_release_raises
             await consumer._drain_thread_reset_requests()
 
             assert not await h.async_redis.exists(result_key)
-            assert await h.async_redis.sismember(THREAD_RESET_INFLIGHT_SET, thread_key)
+            assert await h.async_redis.sismember(thread_reset_keys.inflight, thread_key)
 
     asyncio.run(go())
     assert outcomes == [
@@ -3896,7 +4725,7 @@ def test_thread_reset_drain_records_failed_and_no_result_when_the_release_raises
 
 
 def test_maintenance_tick_thread_reset_is_not_stalled_by_a_wedged_runner(
-    make_harness, monkeypatch
+    make_harness, monkeypatch, thread_reset_keys
 ) -> None:
     """#739: the maintenance tick runs stream reclaim, orphan reaping, and the
     thread-reset drain in one pass, so a reset whose runner never answers the
@@ -3912,7 +4741,7 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_wedged_runner(
             thread_key = _thread_key("tWedgedDrain")
             assert h.substrate.lookup(thread_key) is not None
 
-            monkeypatch.setattr(kernel_module, "_RESET_INTERRUPT_TIMEOUT_S", 0.2)
+            monkeypatch.setattr(kernel_constants, "_RESET_INTERRUPT_TIMEOUT_S", 0.2)
 
             wedged = asyncio.Event()  # never set
 
@@ -3927,7 +4756,7 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_wedged_runner(
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
             )
-            await h.async_redis.sadd(THREAD_RESET_SET, thread_key)
+            await h.async_redis.sadd(thread_reset_keys.requests, thread_key)
 
             await asyncio.wait_for(consumer._drain_thread_reset_requests(), timeout=2.0)
 
@@ -3936,7 +4765,9 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_wedged_runner(
     asyncio.run(go())
 
 
-def test_maintenance_tick_thread_reset_is_a_noop_when_nothing_pending(make_harness) -> None:
+def test_maintenance_tick_thread_reset_is_a_noop_when_nothing_pending(
+    make_harness, thread_reset_keys
+) -> None:
     async def go() -> None:
         async with make_harness() as h:
             consumer = Consumer(
@@ -3951,7 +4782,7 @@ def test_maintenance_tick_thread_reset_is_a_noop_when_nothing_pending(make_harne
 
 
 def test_maintenance_tick_thread_reset_one_failure_does_not_block_the_rest(
-    make_harness, caplog
+    make_harness, caplog, thread_reset_keys
 ) -> None:
     """A release failure for one requested thread (e.g. a transient substrate
     error) is logged and does not prevent the rest of the batch from being
@@ -3969,7 +4800,7 @@ def test_maintenance_tick_thread_reset_one_failure_does_not_block_the_rest(
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
             )
-            await h.async_redis.sadd(THREAD_RESET_SET, "tBoom", "tOk")
+            await h.async_redis.sadd(thread_reset_keys.requests, "tBoom", "tOk")
 
             original_release_thread = h.kernel.release_thread
 
@@ -3984,14 +4815,15 @@ def test_maintenance_tick_thread_reset_one_failure_does_not_block_the_rest(
                 await consumer._drain_thread_reset_requests()
 
             assert h.substrate.lookup("tOk") is None  # still processed despite tBoom's failure
-            assert await h.async_redis.scard(THREAD_RESET_SET) == 0  # both popped either way
+            # Both popped either way.
+            assert await h.async_redis.scard(thread_reset_keys.requests) == 0
             assert any("tBoom" in r.getMessage() for r in caplog.records)
 
     asyncio.run(go())
 
 
 def test_maintenance_tick_reset_drain_has_a_per_tick_budget_and_defers_the_rest(
-    make_harness, monkeypatch
+    make_harness, monkeypatch, thread_reset_keys
 ) -> None:
     """#743: a large operator-populated batch of wedged resets must not cost
     N x the per-request release bound inline in one maintenance tick -- that
@@ -3999,26 +4831,44 @@ def test_maintenance_tick_reset_drain_has_a_per_tick_budget_and_defers_the_rest(
     just scaled by batch size instead of by the runner's HTTP timeout. The
     drain now stops once its per-tick time budget is spent and leaves
     whatever is left in THREAD_RESET_SET for a later tick, so one call to
-    ``_drain_thread_reset_requests`` never blocks proportionally to N."""
+    ``_drain_thread_reset_requests`` never blocks proportionally to N.
+
+    #3807: the test owns its reset keys (per-test request, in-flight and
+    result keys under the ``names`` prefix), so a concurrent consumer on the
+    shared Valkey cannot drain or steal them. It also drives the budget with a
+    controlled clock (each release advances it by exactly one second) instead
+    of wall time, so the number of requests per pass is deterministic."""
 
     async def go() -> None:
         async with make_harness() as h:
-            budget_s = 0.2
-            monkeypatch.setattr(consumer_module, "_THREAD_RESET_DRAIN_BUDGET_S", budget_s)
+            # Controlled clock. Only consumer_module's ``time`` is replaced (the
+            # real ``time.monotonic`` is left alone because asyncio's loop uses
+            # it); every other attribute forwards to the real module.
+            fake_now = [0.0]
+
+            class _FakeTime:
+                @staticmethod
+                def monotonic() -> float:
+                    return fake_now[0]
+
+                def __getattr__(self, name: str) -> object:
+                    return getattr(time, name)
+
+            monkeypatch.setattr(consumer_module, "time", _FakeTime())
+            monkeypatch.setattr(consumer_module, "_THREAD_RESET_DRAIN_BUDGET_S", 4.0)
 
             processed: list[str] = []
 
             async def slow_release_thread(thread_key: str) -> bool:
                 processed.append(thread_key)
-                await asyncio.sleep(0.05)  # each request "wedged" for a while
+                fake_now[0] += 1.0  # each request "wedged" for one fake second
                 return True
 
             h.kernel.release_thread = slow_release_thread  # type: ignore[method-assign]
 
-            # A batch large enough that draining it all at 0.05s/request would
-            # take roughly 1s -- five times the budget.
+            # A batch of 20 against a 4 second budget at 1 second per request.
             keys = [f"tBatch{i}" for i in range(20)]
-            await h.async_redis.sadd(THREAD_RESET_SET, *keys)
+            await h.async_redis.sadd(thread_reset_keys.requests, *keys)
 
             consumer = Consumer(
                 redis=h.async_redis,
@@ -4026,29 +4876,30 @@ def test_maintenance_tick_reset_drain_has_a_per_tick_budget_and_defers_the_rest(
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
             )
-            start = time.monotonic()
-            await asyncio.wait_for(consumer._drain_thread_reset_requests(), timeout=2.0)
-            elapsed = time.monotonic() - start
+            await asyncio.wait_for(consumer._drain_thread_reset_requests(), timeout=5.0)
 
-            # Bounded by the budget (plus slack for the one in-flight request
-            # that pushed the check past it), not by N * per-request cost.
-            assert elapsed < 0.6
-            assert len(processed) < len(keys)  # did not drain the whole batch in one pass
-            remaining = await h.async_redis.scard(THREAD_RESET_SET)
-            assert remaining > 0  # the rest is left for the next tick, not lost
+            # The budget check runs after each release, so exactly four requests
+            # fit; the other sixteen are left for the next tick, not lost.
+            assert len(processed) == 4
+            assert fake_now[0] == 4.0
+            assert await h.async_redis.scard(thread_reset_keys.requests) == 16
+            # Each landed release SREMs it.
+            assert await h.async_redis.scard(thread_reset_keys.inflight) == 0
 
             # A later tick picks up where this one left off: draining again
             # (with the budget restored to a generous value) finishes the batch.
             monkeypatch.setattr(consumer_module, "_THREAD_RESET_DRAIN_BUDGET_S", 30.0)
             await asyncio.wait_for(consumer._drain_thread_reset_requests(), timeout=5.0)
-            assert await h.async_redis.scard(THREAD_RESET_SET) == 0
-            assert len(processed) == len(keys)
+            assert await h.async_redis.scard(thread_reset_keys.requests) == 0
+            assert await h.async_redis.scard(thread_reset_keys.inflight) == 0
+            assert len(processed) == len(set(processed)) == 20
+            assert sorted(processed) == sorted(keys)
 
     asyncio.run(go())
 
 
 def test_maintenance_tick_thread_reset_is_not_stalled_by_a_hanging_substrate_release(
-    make_harness, monkeypatch
+    make_harness, monkeypatch, thread_reset_keys
 ) -> None:
     """#743: the courtesy interrupt bound (#739) only covers a wedged runner.
     `release_thread`'s own substrate release runs on a bare `asyncio.to_thread`
@@ -4063,7 +4914,7 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_hanging_substrate_rel
             thread_key = _thread_key("tHangRelease")
             assert h.substrate.lookup(thread_key) is not None
 
-            monkeypatch.setattr(kernel_module, "_RESET_RELEASE_TIMEOUT_S", 0.2)
+            monkeypatch.setattr(kernel_constants, "_RESET_RELEASE_TIMEOUT_S", 0.2)
 
             def hanging_release(thread_key: str) -> bool:
                 time.sleep(5.0)  # never returns within the test's window
@@ -4077,14 +4928,14 @@ def test_maintenance_tick_thread_reset_is_not_stalled_by_a_hanging_substrate_rel
                 config=h.config,
                 leases=DeliveryLeaseStore(h.async_redis, h.config),
             )
-            await h.async_redis.sadd(THREAD_RESET_SET, thread_key)
+            await h.async_redis.sadd(thread_reset_keys.requests, thread_key)
 
             # Must finish well under the 5s hang, bounded instead by the
             # (monkeypatched) release timeout.
             await asyncio.wait_for(consumer._drain_thread_reset_requests(), timeout=2.0)
 
             # The request was popped either way; a fresh reset is needed to retry.
-            assert await h.async_redis.scard(THREAD_RESET_SET) == 0
+            assert await h.async_redis.scard(thread_reset_keys.requests) == 0
 
     asyncio.run(go())
 
@@ -4127,6 +4978,7 @@ def _workspace_binding(deployment_id: uuid.UUID) -> object:
             *,
             kind: str | None = None,
             address: str | None = None,
+            **_: object,
         ) -> dict[str, str]:
             return {}
 
@@ -4214,8 +5066,7 @@ def test_failed_workspace_preparation_acks_the_entry_and_is_not_silent(
             # the assertions below, which is the thing this test exists to
             # pin.
             await _wait_until(
-                lambda: h.sink.last_text is not None
-                and "Flagging for a human" in h.sink.last_text
+                lambda: h.sink.last_text is not None and "Flagging for a human" in h.sink.last_text
             )
             consumer.request_stop()
             await task
@@ -4254,7 +5105,9 @@ def test_failed_workspace_preparation_acks_the_entry_and_is_not_silent(
     asyncio.run(go())
 
 
-def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) -> None:
+def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(
+    make_harness, thread_reset_keys
+) -> None:
     """#855: claiming a reset request and marking it in-progress must be ONE
     server-side step. As an SPOP followed by a separate SADD they are two round
     trips, and between them the thread_key is in NEITHER set -- so the API's
@@ -4326,7 +5179,7 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
                 if (
                     not started.is_set()
                     and name in {"SADD", "SMOVE"}
-                    and THREAD_RESET_INFLIGHT_SET in args[1:]
+                    and thread_reset_keys.inflight in args[1:]
                 ):
                     inflight_marks.append(args)
                 result = await original_execute(*args, **options)
@@ -4341,44 +5194,40 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
                     observed.append(name)
                     try:
                         in_requests = await observer_redis.sismember(
-                            THREAD_RESET_SET, thread_key
+                            thread_reset_keys.requests, thread_key
                         )
                         in_flight = await observer_redis.sismember(
-                            THREAD_RESET_INFLIGHT_SET, thread_key
+                            thread_reset_keys.inflight, thread_key
                         )
                         if not in_requests and not in_flight:
                             violations.append(name)
-                    except Exception as exc:  # never raise inside the spy
+                    except Exception as exc:  # noqa: BLE001 - never raise inside the spy
                         observer_errors.append(f"{name}: {exc!r}")
                 return result
 
             h.kernel.release_thread = blocking_release  # type: ignore[method-assign]
             task: asyncio.Task[None] | None = None
             try:
-                # THREAD_RESET_SET / THREAD_RESET_INFLIGHT_SET are FIXED
-                # cross-service constants -- unlike this harness's stream and
-                # sandbox keys they are not namespaced per run, so their contents
-                # outlive the test, the process, and the run on a shared Valkey.
-                # Residue matters asymmetrically: a leftover "tAtomicClaim" in
-                # the in-progress set makes the observer read `in_flight` True at
-                # every boundary, so arm (a) can never record a violation and
-                # goes SILENTLY VACUOUS rather than red. This test also *creates*
-                # that residue -- an assertion firing mid-release leaves the drain
-                # blocked before its SREM -- so both the pre-clean here and the
-                # unconditional post-clean below are load-bearing.
+                # The request and in-progress sets are this test's own keys
+                # (``thread_reset_keys``, #3807), so no other test or run can
+                # leave residue in them. Residue would matter asymmetrically: a
+                # leftover "tAtomicClaim" in the in-progress set makes the
+                # observer read `in_flight` True at every boundary, so arm (a)
+                # can never record a violation and goes SILENTLY VACUOUS rather
+                # than red. The pre-clean and its assertions below keep that
+                # precondition explicit, and the post-clean settles any residue
+                # an assertion firing mid-release leaves behind.
                 # These writes happen before the spy is installed (and, in the
                 # `finally`, after it is restored), so they can never be counted
                 # as violations or as inflight_marks.
-                await original_srem(THREAD_RESET_SET, thread_key)
-                await original_srem(THREAD_RESET_INFLIGHT_SET, thread_key)
-                assert not await observer_redis.sismember(
-                    THREAD_RESET_SET, thread_key
+                await original_srem(thread_reset_keys.requests, thread_key)
+                await original_srem(thread_reset_keys.inflight, thread_key)
+                assert not await observer_redis.sismember(thread_reset_keys.requests, thread_key)
+                assert not await observer_redis.sismember(thread_reset_keys.inflight, thread_key), (
+                    "stale in-progress residue would make arm (a) vacuous"
                 )
-                assert not await observer_redis.sismember(
-                    THREAD_RESET_INFLIGHT_SET, thread_key
-                ), "stale in-progress residue would make arm (a) vacuous"
 
-                await original_sadd(THREAD_RESET_SET, thread_key)
+                await original_sadd(thread_reset_keys.requests, thread_key)
                 # The live request now exists; install the spy before the drain
                 # can issue its first command. The spy is only ever installed
                 # between here and the `finally` below, so its own presence is
@@ -4398,9 +5247,7 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
 
                 # (b) The mark landed -- the pending signal is still True while
                 # the release runs...
-                assert await observer_redis.sismember(
-                    THREAD_RESET_INFLIGHT_SET, thread_key
-                )
+                assert await observer_redis.sismember(thread_reset_keys.inflight, thread_key)
                 # ...and it came from the atomic claim, not a second round trip
                 # through the command boundary.
                 assert inflight_marks == []
@@ -4424,7 +5271,7 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
                             await task
                 # Exception-safe so a cleanup failure cannot mask the assertion
                 # that brought us here.
-                for _set in (THREAD_RESET_SET, THREAD_RESET_INFLIGHT_SET):
+                for _set in (thread_reset_keys.requests, thread_reset_keys.inflight):
                     with contextlib.suppress(Exception):
                         await original_srem(_set, thread_key)
                 with contextlib.suppress(Exception):
@@ -4450,10 +5297,8 @@ def test_maintenance_tick_thread_reset_claim_and_mark_is_atomic(make_harness) ->
 
             # End state is clean: released, and nothing left pending.
             assert h.substrate.lookup(thread_key) is None
-            assert not await h.async_redis.sismember(THREAD_RESET_SET, thread_key)
-            assert not await h.async_redis.sismember(
-                THREAD_RESET_INFLIGHT_SET, thread_key
-            )
+            assert not await h.async_redis.sismember(thread_reset_keys.requests, thread_key)
+            assert not await h.async_redis.sismember(thread_reset_keys.inflight, thread_key)
 
     asyncio.run(go())
 
@@ -4467,14 +5312,10 @@ class _LockOwnerLiveness:
         self._group = group
 
     async def is_alive(self, owner: str) -> bool:
-        return await self._store.is_alive(
-            stream=self._stream, group=self._group, consumer=owner
-        )
+        return await self._store.is_alive(stream=self._stream, group=self._group, consumer=owner)
 
     async def is_capable(self, owner: str) -> bool:
-        return await self._store.is_capable(
-            stream=self._stream, group=self._group, consumer=owner
-        )
+        return await self._store.is_capable(stream=self._stream, group=self._group, consumer=owner)
 
 
 def _wire_stealable_lock(h: Any, *, owner: str, proof_s: float) -> ThreadLock:
@@ -4566,9 +5407,7 @@ def test_force_killed_worker_lock_is_stolen_and_cluster_message_reply_is_deliver
                 heartbeat_ttl_ms=1,
                 capability_ttl_ms=h.config.consumer_capability_ttl_ms,
             )
-            alive_key = consumer_heartbeat_key(
-                h.config.stream, h.config.consumer_group, dead_name
-            )
+            alive_key = consumer_heartbeat_key(h.config.stream, h.config.consumer_group, dead_name)
             await _wait_key(h.async_redis, alive_key, present=False)
             await _wait_consumer_idle(
                 h.async_redis,

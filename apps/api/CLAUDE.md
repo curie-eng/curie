@@ -7,21 +7,25 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
 
 ## Load-bearing invariants
 
-- **Administrative auth is one shared API key today.** `require_api_key`
-  (`auth.py`) compares the `X-API-Key` header against `Settings.api_key` with
-  `hmac.compare_digest`. This is explicitly MVP-only; GitHub-App identity work
-  is expected to replace it eventually. The approval resolver is the recorded
-  exception (ADR-0106): the platform key may mint a subject-bound operator or
-  console credential but cannot resolve by itself, while Slack clicks arrive as
-  approval-bound attestations signed with an independent dispatcher/API key.
-  Resolver identity and channel are derived from those credentials, never the
-  request body. Do not add another auth scheme without an Accepted ADR.
+- **Administrative auth is the platform key or a live console session (ADR-0083).** `require_api_key`
+  (`auth.py`) follows ADR-0083 order: the platform key is checked first via
+  `verify_platform_key` with no database read, then a live
+  `__Host-curie_console_session` cookie through `live_console_session`.
+  `require_platform_key` never accepts a session. This is explicitly MVP-only;
+  GitHub-App identity work is expected to replace it eventually. The approval
+  resolver is the recorded exception (ADR-0106): the platform key may mint a
+  subject-bound operator or console credential but cannot resolve by itself,
+  while Slack clicks arrive as approval-bound attestations signed with an
+  independent dispatcher/API key. Resolver identity and channel are derived
+  from those credentials, never the request body. Do not add another auth
+  scheme without an Accepted ADR.
 - **The `state` router authenticates differently, on purpose (ADR-0033, #410).**
   `require_state_access` (`routers/state.py`) accepts EITHER the platform key OR a
   scoped, path-`agent_id`-bound `state` token minted by the worker for the
   sandbox, so a sandboxed agent can rehydrate its own memory/transcript without
-  holding a resolve-capable platform-wide key. Every OTHER router keeps
-  `require_api_key` (platform key only); a scoped token is rejected everywhere
+  holding a resolve-capable platform-wide key. A console session is not accepted
+  there, and a state token is still rejected by `require_api_key`. Every OTHER
+  router keeps `require_api_key`; a scoped token is rejected everywhere
   else, including `/approvals/{id}/resolve`. Do not collapse the state router
   back onto `require_api_key`, and do not extend scoped-token acceptance to
   another router without a new ADR.
@@ -44,7 +48,7 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   `POST /channels/token` (only for a binding it serves; else 403),
   `GET /approvals` (filtered to approvals it serves) and
   `/approvals/{id}/resolve` (with `X-Curie-Approval-Actor`; unserved is 404).
-  Served is ONE predicate, `crud._approval_served`, for both. Presenting it
+  Served is ONE predicate, `crud.approvals._approval_served`, for both. Presenting it
   with the platform key or another resolver credential is 401, never a
   precedence choice. The resolver kinds are `chat`, `console`, `operator` and
   `adapter`; `operator` resolves only explicit-user routes, and no Slack approver
@@ -77,15 +81,51 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
 - **The factory issue read is a scoped credential exception (ADR 0187).**
   `POST /work-items/issue-read` accepts only the API issued `wir` capability
   in `X-Curie-Issue-Read`. Its sole scope is `work_item.issue_read`, and it
-  names one execution request and its WorkItem's repository and issue. The
-  worker mints it at sandbox boot through
-  `POST /v1/internal/work-items/issue-read/context` using its internal worker
-  credential. The read refuses any other repository or issue, re-checks that
-  the request is still running before its deadline and that its WorkItem is
-  not cancelled, then reads the issue and its comments with a freshly minted
-  App installation token and returns them verbatim. It stores nothing.
+  names one execution request, its WorkItem, and that WorkItem's tracker
+  issue (tracker kind, host, scope id and issue id). The worker mints it at
+  sandbox boot through `POST /v1/internal/work-items/issue-read/context` using
+  its internal worker credential. The read takes no body: it refuses a
+  capability whose issue is not the durable WorkItem's, re-checks that the
+  request is still running before its deadline and that its WorkItem is not
+  cancelled, then reads the ticket through the WorkItem's tracker
+  (`Tracker.read_ticket`; a GitHub issue with an App installation token
+  freshly minted only for the recorded installation) and returns it as
+  markdown with its link. It stores nothing.
   State and other scoped credentials do not authorize it, and `wir`
   authorizes no other route.
+- **Channel read is a scoped credential exception (ADR 0100, #2877).**
+  `POST /channel-read` accepts only the API issued `chr` capability in
+  `X-Curie-Channel-Read`. Its sole audience is `channel.read`, and it names
+  one agent, deployment, grant digest, logical turn and generation. The worker
+  mints it through `POST /v1/internal/channel-read/context` using its internal
+  worker credential. The active ledger key is a 90 second lease that the worker
+  renews every 30 seconds with an owner checked refresh; the worker ends the
+  turn with an owner tombstone (a late committed open is refused) and an owner
+  checked revoke in the shared Valkey ledger
+  (`curie_internal.channel_read_ledger`), so revocation holds while the API is
+  down and a dead worker's capability lapses within one lease. Every read
+  repeats the generation, the grant (read locally from the agent's active
+  stored bundle manifest, cached by digest), the binding and provider membership.
+  Authorization is surface neutral; a kind is readable only through a
+  `channel_read/readers.py` reader that advertises `history-read`, and Slack
+  reads live only in `channel_read/slack_reads.py`. A turn may spend
+  8 pages, a window is at most 7 days, and `limit` defaults to 50 with a 100
+  maximum. Refusals are named `channel_read.*` codes; a 429 carries
+  `Retry-After`. It stores no message body. State, issue read
+  and other scoped credentials do not authorize it, and `chr` authorizes only
+  `/channel-read` and its canvas sibling `/channel-canvas` (ADR 0200). The
+  history read also requires the `channelRead` grant carried in the claims, so
+  a canvas only bundle never reads history. `/channel-canvas` repeats the same
+  generation and digest checks, requires the operation's own grant carried in
+  the claims (`canvasList`, `canvasRead`, `canvasEdit`), checks that the canvas
+  is shared into one of the agent's bindings with the bot a member before any
+  download or edit, charges one page per successful operation, and edits only
+  a table cell a read recorded in the same logical turn
+  (`channel_read/canvas_sections.py`). Slack canvas calls live only in
+  `channel_read/slack_canvas.py`. Each edit is written to
+  `channel_canvas_edits` (attempted, then applied or failed; an unconfirmed
+  outcome stays attempted) before and after the Slack call. Retrieved canvas
+  content is not stored.
 - **Git-flow never calls the GitHub API.** `gitflow.py` builds the bundle by
   archiving the pushed sha directly from the repo over the git protocol (bare
   repos in tests, the real remote in production). This keeps the flow
@@ -112,8 +152,11 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
   already-bundled sha therefore needs no access to the git remote -- which
   matters because the platform's GitHub credential can expire or be revoked
   without stopping webhook delivery (#1211). A **dev-branch** push is not
-  affected by this: it always clones and always validates, redeliveries
-  included, because the clone is also where the ancestry check (#1139) runs.
+  affected by this: it always clones and always validates, including a new
+  delivery (a new `X-GitHub-Delivery` id) of the same commit, because the
+  clone is also where the ancestry check (#1139) runs. A webhook delivery whose
+  id already deployed or promoted answers `push_duplicate` and does nothing
+  (#3820); polling has no delivery id and is unaffected.
   If you find yourself rebuilding on promote, that is a bug, not a feature --
   promotion is meant to be "the exact artifact that passed on dev," not a
   fresh build.

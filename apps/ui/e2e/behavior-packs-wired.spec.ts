@@ -1,9 +1,15 @@
 import { test, expect, type Page, type Route } from "@playwright/test";
+import { stubConsoleSession } from "./support/consoleSession";
 
 // #870: the wired behavior-packs panel on the agent-detail page. Open an agent,
 // toggle a pack + edit a load line, Save, and assert the PUT carried the full
 // config with the edit applied. Backend stubbed with real-shaped responses, so
 // this runs stackless (chromium project).
+
+// The console sits behind the login gate (#1047): sign this spec in.
+test.beforeEach(async ({ page }) => {
+  await stubConsoleSession(page);
+});
 
 const AGENT = { id: "a1", name: "deal-desk", channels: [{ kind: "slack", address: "C0123ABCD" }], model: null, created_at: "2026-07-01T00:00:00Z" };
 

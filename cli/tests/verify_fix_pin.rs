@@ -1,5 +1,4 @@
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -172,6 +171,125 @@ grep -qx 'value=fixed' runner/Dockerfile
 "#;
 
 #[test]
+fn unknown_chart_provisioning_token_refuses_before_selector_or_infrastructure() {
+    let fixture = Fixture::new("charts/curie/ci/assert-pin.sh", CHART_OLD);
+    let change = fixture.commit(
+        &[
+            ("runner/Dockerfile", "value=fixed\n"),
+            (
+                "charts/curie/ci/assert-pin.sh",
+                "#!/bin/sh\n# fix-pin-provision: unknown-stack\nset -eu\nprintf 'selector\\n' >> \"$VERIFY_PROVISION_LOG\"\ngrep -qx 'value=fixed' runner/Dockerfile\n",
+            ),
+        ],
+        "Fix chart with unsupported provisioning",
+    );
+    let run_log = fixture.external_path("provision.log");
+    for tool in ["cargo", "docker", "kind", "kubectl", "helm"] {
+        test_executable::install_in(
+            &fixture.tools,
+            tool,
+            "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> \"$VERIFY_PROVISION_LOG\"\nexit 78\n",
+        );
+    }
+
+    let output = fixture
+        .command(&change, "charts/curie/ci/assert-pin.sh")
+        .env("VERIFY_PROVISION_LOG", &run_log)
+        .output()
+        .expect("run verify fix pin");
+    let shown = output_text(&output);
+    assert!(
+        !output.status.success(),
+        "an unknown provisioning token must fail\n{shown}"
+    );
+    assert!(
+        shown.contains("unknown-stack") && shown.to_lowercase().contains("provision"),
+        "the refusal must identify the unknown provisioning token\n{shown}"
+    );
+    assert!(
+        !run_log.exists(),
+        "the selector and infrastructure tools must not run"
+    );
+    assert!(!stdout_has_result(&output, "PINNED"));
+    assert!(!stdout_has_result(&output, "UNPINNED"));
+    fixture.assert_clean_and_single_worktree();
+}
+
+#[test]
+fn known_chart_provisioning_tokens_enter_setup_before_the_selector() {
+    for token in ["kind-calico", "candidate-stack"] {
+        let fixture = Fixture::new("charts/curie/ci/assert-pin.sh", CHART_OLD);
+        let assertion = format!(
+            "#!/bin/sh\n# fix-pin-provision: {token}\nset -eu\nprintf 'selector\\n' >> \"$VERIFY_PROVISION_LOG\"\ngrep -qx 'value=fixed' runner/Dockerfile\n"
+        );
+        let change = fixture.commit(
+            &[
+                ("runner/Dockerfile", "value=fixed\n"),
+                ("charts/curie/ci/assert-pin.sh", &assertion),
+            ],
+            "Fix chart with declared provisioning",
+        );
+        let run_log = fixture.external_path("provision.log");
+        // A controlled external-tool failure makes this boundary test offline
+        // and proves setup precedes selector execution for both known tokens.
+        for tool in ["cargo", "docker", "kind", "kubectl", "helm"] {
+            test_executable::install_in(
+                &fixture.tools,
+                tool,
+                "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> \"$VERIFY_PROVISION_LOG\"\nexit 78\n",
+            );
+        }
+        let output = fixture
+            .command(&change, "charts/curie/ci/assert-pin.sh")
+            .env("VERIFY_PROVISION_LOG", &run_log)
+            .output()
+            .expect("run verify fix pin");
+        let shown = output_text(&output);
+        assert!(
+            !output.status.success(),
+            "a provisioning failure must fail verification: {token}\n{shown}"
+        );
+        let calls = fs::read_to_string(&run_log).expect("provisioning must reach an external tool");
+        assert!(
+            calls.lines().any(|line| !line.starts_with("selector")),
+            "the known token must enter provisioning: {token}\n{calls}"
+        );
+        assert!(
+            !calls.lines().any(|line| line == "selector"),
+            "a provisioning failure must prevent the selector: {token}\n{calls}"
+        );
+        assert!(!stdout_has_result(&output, "PINNED"));
+        fixture.assert_clean_and_single_worktree();
+    }
+}
+
+#[test]
+fn chart_provisioning_header_after_line_twenty_keeps_the_existing_route() {
+    let fixture = Fixture::new("charts/curie/ci/assert-pin.sh", CHART_OLD);
+    let assertion = format!(
+        "#!/bin/sh\n{}# fix-pin-provision: unknown-stack\nset -eu\ngrep -qx 'value=fixed' runner/Dockerfile\n",
+        "# introductory comment\n".repeat(19)
+    );
+    let change = fixture.commit(
+        &[
+            ("runner/Dockerfile", "value=fixed\n"),
+            ("charts/curie/ci/assert-pin.sh", &assertion),
+        ],
+        "Fix chart assertion without an early provisioning declaration",
+    );
+    let output = fixture
+        .command(&change, "charts/curie/ci/assert-pin.sh")
+        .output()
+        .expect("run verify fix pin");
+    assert!(
+        output.status.success() && stdout_has_result(&output, "PINNED"),
+        "a header after the declaration window must preserve the existing route\n{}",
+        output_text(&output)
+    );
+    fixture.assert_clean_and_single_worktree();
+}
+
+#[test]
 fn commit_is_pinned_only_when_reversing_product_code_breaks_the_changed_chart_assertion() {
     let fixture = Fixture::new("charts/curie/ci/assert-pin.sh", CHART_OLD);
     let change = fixture.commit(
@@ -311,8 +429,9 @@ fn ci_gate_rejects_rust_test_flag_injection_before_it_can_report_pinned() {
         &[
             (
                 "cli/Cargo.toml",
-                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\nautotests = false\n\n[[test]]\nname = \"integration\"\npath = \"tests/integration.rs\"\n",
             ),
+            ("cli/tests/integration.rs", "mod verify_pin;\n"),
             ("cli/src/lib.rs", "pub fn old() -> i32 {\n    1\n}\n"),
         ],
         "Add Rust fixture",
@@ -811,6 +930,66 @@ pythonpath = ["."]
 }
 
 #[test]
+fn factory_python_selector_is_pinned_by_a_real_selected_assertion_failure() {
+    let selector = "tools/factory-e2e/tests/test_pin.py::test_selected";
+    let fixture = Fixture::new(
+        "tools/factory-e2e/tests/test_pin.py",
+        "from pin_fixture import value\n\n\ndef test_selected():\n    assert value() == 1\n",
+    );
+    fixture.commit(
+        &[
+            (
+                "pyproject.toml",
+                r#"[project]
+name = "pin-fixture"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8.3"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+"#,
+            ),
+            ("pin_fixture.py", "def value():\n    return 1\n"),
+        ],
+        "Add factory Python fixture",
+    );
+    let change = fixture.commit(
+        &[
+            ("pin_fixture.py", "def value():\n    return 2\n"),
+            (
+                "tools/factory-e2e/tests/test_pin.py",
+                "from pin_fixture import value\n\n\ndef test_selected():\n    assert value() == 2\n",
+            ),
+        ],
+        "Fix factory Python behavior",
+    );
+
+    let output = fixture
+        .command(&change, selector)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run verify fix pin");
+    let shown = output_text(&output);
+    assert!(
+        output.status.success(),
+        "the factory selector must prove the pin\n{shown}"
+    );
+    assert!(stdout_has_result(&output, "PINNED"), "{shown}");
+    assert!(
+        shown.contains("1 failed"),
+        "pytest must report the selected failure\n{shown}"
+    );
+    fixture.assert_clean_and_single_worktree();
+}
+
+#[test]
 fn local_python_selector_reports_unpinned_when_reversal_stays_green() {
     let selector = "cli/tests/local/test_pin.py::test_selected";
     let fixture = Fixture::new(
@@ -873,12 +1052,12 @@ fn rust_selector_uses_cargo_with_an_exact_safe_test_name() {
             "--manifest-path",
             "cli/Cargo.toml",
             "--test",
-            "verify_pin",
+            "integration",
             "--",
             "--exact",
-            "pin_breaks",
+            "verify_pin::pin_breaks",
         ],
-        "test pin_breaks ... FAILED",
+        "test verify_pin::pin_breaks ... FAILED",
     );
 }
 
@@ -895,12 +1074,12 @@ fn one_line_rust_test_function_can_prove_a_pin() {
             "--manifest-path",
             "cli/Cargo.toml",
             "--test",
-            "verify_pin",
+            "integration",
             "--",
             "--exact",
-            "pin_breaks",
+            "verify_pin::pin_breaks",
         ],
-        "test pin_breaks ... FAILED",
+        "test verify_pin::pin_breaks ... FAILED",
     );
 }
 
@@ -1026,7 +1205,7 @@ printf 'run\n' >> "$VERIFY_RUN_LOG"
 if grep -qx 'value=fixed' runner/Dockerfile; then
     exit 0
 fi
-printf 'test selected_pin ... FAILED\n'
+printf 'test verify_pin::selected_pin ... FAILED\n'
 exit 1
 "#,
     );
@@ -1478,8 +1657,9 @@ fn other_pin() {
         &[
             (
                 "cli/Cargo.toml",
-                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\nautotests = false\n\n[[test]]\nname = \"integration\"\npath = \"tests/integration.rs\"\n",
             ),
+            ("cli/tests/integration.rs", "mod verify_pin;\n"),
             ("cli/src/lib.rs", "pub fn value() -> i32 {\n    1\n}\n"),
         ],
         "Add Rust fixture",
@@ -1542,8 +1722,9 @@ fn selected_pin() {
         &[
             (
                 "cli/Cargo.toml",
-                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\nautotests = false\n\n[[test]]\nname = \"integration\"\npath = \"tests/integration.rs\"\n",
             ),
+            ("cli/tests/integration.rs", "mod verify_pin;\n"),
             ("cli/src/lib.rs", "pub fn value() -> i32 {\n    1\n}\n"),
         ],
         "Add Rust fixture",
@@ -1608,8 +1789,9 @@ fn other_pin() {
         &[
             (
                 "cli/Cargo.toml",
-                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\nautotests = false\n\n[[test]]\nname = \"integration\"\npath = \"tests/integration.rs\"\n",
             ),
+            ("cli/tests/integration.rs", "mod verify_pin;\n"),
             ("cli/src/lib.rs", "pub fn value() -> i32 {\n    1\n}\n"),
         ],
         "Add Rust fixture",
@@ -1675,8 +1857,9 @@ fn selected_pin() {
         &[
             (
                 "cli/Cargo.toml",
-                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\nautotests = false\n\n[[test]]\nname = \"integration\"\npath = \"tests/integration.rs\"\n",
             ),
+            ("cli/tests/integration.rs", "mod verify_pin;\n"),
             ("cli/src/lib.rs", "pub fn value() -> i32 {\n    1\n}\n"),
         ],
         "Add Rust fixture",

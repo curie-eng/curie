@@ -4,6 +4,12 @@ Date: 2026-09-18
 
 Status: Accepted
 
+**Partially amended by [ADR 0197](0197-the-factory-reaches-code-hosts-and-trackers-through-two-ports.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+in Decision, the WorkItem identity is no longer a GitHub repository id and
+issue number; it is (tracker kind, tracker host, scope id, issue id), with the
+repository chosen at admission. Everything else in this ADR stands.
+
 Partially amended by [ADR 0157](0157-factory-work-dispatches-from-sql-over-the-runs-stream.md), which realizes dispatch, runtime admission and termination.
 
 Partially superseded by [ADR 0171](0171-a-factory-run-may-take-three-hours-and-is-bounded-by-time-not-turns.md): the execution deadline is the owning agent's value from 60 to 10800 seconds, default 1800, not exactly 1800 seconds.

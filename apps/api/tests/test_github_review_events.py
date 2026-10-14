@@ -25,6 +25,7 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
+import jwt
 import pytest
 from aci_protocol import parse_queued_turn
 from channel_protocol import scoped_conversation_id
@@ -32,7 +33,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from curie_api import approval_principal
 from curie_api.config import Settings, get_settings
-from curie_api.github_app import _RESOLVERS
+from curie_api.github_app import _RESOLVERS, GitHubAuth, GitHubCredentials, credentials_for
 from curie_api.github_review_events import FeedbackIgnored, parse_feedback
 from curie_api.github_review_truth import BoundReviewLineage, verify_feedback_truth
 from curie_api.main import create_app
@@ -412,6 +413,8 @@ async def verify_truth(truth: GitHubTruth, monkeypatch: pytest.MonkeyPatch) -> s
                 truth.lineage,
                 settings=truth.settings,
                 client=client,
+                credentials=credentials_for(truth.settings),
+                api_url=truth.settings.github_api_url,
             )
     finally:
         _RESOLVERS.clear()
@@ -633,8 +636,6 @@ def test_verified_reinstallation_retires_old_cached_token_before_any_repo_read(
     review_app_key: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from curie_api.github_app import GitHubCredentials
-
     truth = GitHubTruth("issue_comment", review_app_key)
     requests: list[httpx.Request] = []
 
@@ -656,7 +657,7 @@ def test_verified_reinstallation_retires_old_cached_token_before_any_repo_read(
         "curie_api.github_app.httpx.Client",
         lambda *a, **kw: real_client(transport=httpx.MockTransport(github)),
     )
-    credentials = GitHubCredentials(truth.settings)
+    credentials = GitHubCredentials(auth=GitHubAuth.from_settings(truth.settings))
     assert credentials.token_for_verified_installation(REPO, 11) == "fixture-installation-11"
     # An unchanged installation may reuse its cache; a different installation
     # must mint a new token even when the previous token has not yet expired.
@@ -709,21 +710,41 @@ def publish_through_worker(
 
     The real Postgres store, reconciler and API lineage client execute; only the
     Kubernetes Job, write credential, GitHub branch lookup and reply transport
-    are the worker suite's fixtures. The Job reports these exact PR markers.
+    are the worker suite's fixtures. The Job reports its pushed commit and the
+    code host reports this exact PR.
     """
     from curie_worker.publication_clients import PublicationLineageClient
     from curie_worker.publication_k8s import PublicationJobSettings
-    from curie_worker.publication_loop import PublicationJobObservation, PublicationReconciler
+    from curie_worker.publication_loop import PublicationReconciler
     from curie_worker.publication_store import PostgresPublicationStore
 
     from apps.worker.tests.test_publication_loop import (
         _Cluster,
+        _CodeHost,
         _Credentials,
-        _GitHub,
+        _job,
         _Replies,
     )
 
     pr_url = f"https://github.com/{pr_repo}/pull/{pr_number}"
+
+    class _ReportedPull(_CodeHost):
+        """The code host reports the PR the Job's pushed commit opened."""
+
+        branch = ""
+
+        def recover_pull_request(
+            self, publication_id: uuid.UUID, *, expected_head_sha: str
+        ) -> object:
+            assert expected_head_sha == head_sha
+            self.calls.append("recover_pull_request")
+            return self.module.PublicationPullState(
+                number=pr_number,
+                url=pr_url,
+                state="open",
+                head_sha=head_sha,
+                head_ref=self.branch,
+            )
 
     async def run() -> dict:
         import curie_worker.publication_loop as module
@@ -740,18 +761,17 @@ def publish_through_worker(
             work = await store.claim_next()
             assert work is not None
             cluster = _Cluster(module)
-            cluster.observation = PublicationJobObservation(
-                phase="succeeded",
-                pr_url=pr_url,
-                pr_number=pr_number,
-                commit_sha=head_sha,
-                logs="",
-            )
+            # The Job already ran and printed its pushed commit marker.
+            cluster.observation = _job(module, "succeeded", commit_sha=head_sha)
+            cluster.active_jobs.add(module.publication_resource_names(work.publication_id).job)
+            code_host = _ReportedPull(module)
+            code_host.branch = work.branch
+            code_host.allow_exact_revision(head_sha, work.revision_id, work.expected_prior_head)
             reconciler = PublicationReconciler(
                 store=store,
                 credentials=_Credentials(module),
                 cluster=cluster,
-                github=_GitHub(),
+                code_host=code_host,
                 replies=_Replies(),
                 lineage=PublicationLineageClient(
                     api_base_url="http://api",
@@ -855,6 +875,8 @@ def _review_stack(
     publish: bool,
     agent_channel: str = "C0EXAMPLE1",
     cluster_message: bool = False,
+    env: dict[str, str] | None = None,
+    reply_identity: str | None = None,
 ) -> Iterator[tuple[TestClient, GitHubTruth, object, str]]:
     """Real migrated Postgres/Valkey/API, with only GitHub HTTP replaced.
 
@@ -889,6 +911,31 @@ def _review_stack(
         if cluster_message
         else {"reply_placeholder": "1700000000.000002"}
     )
+    if reply_identity is not None:
+        reply_route.update(
+            reply_identity=reply_identity,
+            conversation_id=scoped_conversation_id(
+                "slack", reply_channel, "1700000000.000001", identity=reply_identity
+            ),
+            reply_conversation_id="1700000000.000001",
+        )
+        monkeypatch.setenv(
+            "CURIE_SLACK_IDENTITIES",
+            json.dumps([
+                {
+                    "name": "default",
+                    "app_token_env": "SLACK_APP_TOKEN",
+                    "bot_token_env": "SLACK_BOT_TOKEN",
+                    "signing_secret_env": "SLACK_SIGNING_SECRET",
+                },
+                {
+                    "name": reply_identity,
+                    "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+                    "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0",
+                    "signing_secret_env": None,
+                },
+            ]),
+        )
     stream = f"test:curie:github-review:{uuid.uuid4().hex}"
     held_index = f"{stream}:held"
     monkeypatch.setattr("curie_api.github_review_store._HELD_INDEX", held_index)
@@ -908,6 +955,7 @@ def _review_stack(
         "CURIE_WORK_ITEM_RECONCILER_ENABLED": "false",
         "RESUME_RECONCILER_ENABLED": "false",
         "DEAD_LETTER_WATCH_INTERVAL_S": "0",
+        **(env or {}),
     }.items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
@@ -953,7 +1001,11 @@ def _review_stack(
             json={
                 "name": f"acme-review-{uuid.uuid4().hex[:8]}",
                 "repo_full_name": REPO,
-                "channel": {"kind": "slack", "address": agent_channel},
+                "channel": {
+                    "kind": "slack",
+                    "address": agent_channel,
+                    **({"adapter": reply_identity} if reply_identity is not None else {}),
+                },
             },
         )
         assert agent.status_code == 201, agent.text
@@ -979,7 +1031,7 @@ def _review_stack(
             headers={"X-Curie-Worker-Token": "fixture-review-worker-token"},
             json={
                 "conversation_id": scoped_conversation_id(
-                    "slack", reply_channel, "1700000000.000001"
+                    "slack", reply_channel, "1700000000.000001", identity=reply_identity
                 ),
                 "author": "U0REQUEST1",
                 "repo_full_name": REPO,
@@ -1043,12 +1095,15 @@ def _review_stack(
             yield client, truth, valkey, stream
             return
         assert review_rows(
-            "SELECT github_repository_id, github_installation_id, github_pr_node_id, base_ref "
+            "SELECT code_host_kind, code_host_host, repository_project_id, "
+            "code_host_installation_id, code_host_pr_id, base_ref "
             "FROM curie.thread_publication_lineages"
         ) == [{
-            "github_repository_id": 21,
-            "github_installation_id": 11,
-            "github_pr_node_id": "PR_example_17",
+            "code_host_kind": "github",
+            "code_host_host": "github.com",
+            "repository_project_id": "21",
+            "code_host_installation_id": 11,
+            "code_host_pr_id": "PR_example_17",
             "base_ref": "main",
         }]
         truth.calls.clear()  # Attribute subsequent reads to the ingress under test.
@@ -1082,6 +1137,63 @@ def post_review(
             "Content-Type": "application/json",
         },
     )
+
+
+def _pem_key() -> str:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+
+
+def test_review_ingress_truth_mints_with_the_settings_credential(
+    clean_db: None,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Review ingress is not factory: it mints under the install's own App.
+
+    Twin of the factory review-truth test (#4397 R2 finding 2). The settings
+    carry App "1111" while the forge config's code host carries App "2222";
+    every App JWT the real webhook path signs must name "1111".
+    """
+    from forge_fakes.github import forges_document, forges_env_json
+
+    settings_key, code_host_key = _pem_key(), _pem_key()
+    forges = forges_env_json(forges_document(app_id="2222", private_key=code_host_key), tmp_path)
+    # Capture before the stack patches `httpx.Client` (the patch is module-global).
+    real_client = httpx.Client
+    with _review_stack(
+        request,
+        monkeypatch,
+        settings_key,
+        publish=True,
+        env={"GITHUB_APP_ID": "1111", "CURIE_FORGES": forges},
+    ) as (client, truth, _valkey, _stream):
+        issuers: list[str] = []
+
+        def recording(github_request: httpx.Request) -> httpx.Response:
+            path = github_request.url.path
+            if path.endswith("/installation") or path.endswith("/access_tokens"):
+                bearer = github_request.headers["Authorization"].removeprefix("Bearer ")
+                claims = jwt.decode(bearer, options={"verify_signature": False})
+                issuers.append(str(claims["iss"]))
+            return truth.handle(github_request)
+
+        monkeypatch.setattr(
+            "curie_api.github_app.httpx.Client",
+            lambda *a, **kw: real_client(transport=httpx.MockTransport(recording)),
+        )
+        # Drop the publication's cached token so admission mints afresh.
+        _RESOLVERS.clear()
+        admitted = post_review(client, truth)
+        assert admitted.status_code == 200, admitted.text
+        assert admitted.json()["status"] == "feedback_queued"
+        assert issuers, "review ingress minted no App token"
+        assert set(issuers) == {"1111"}
 
 
 @pytest.mark.parametrize(
@@ -1153,6 +1265,83 @@ def test_cluster_message_lineage_binds_its_channel_and_admits_real_review(
     assert str(uuid.UUID(handle.placeholder)) == handle.placeholder
 
 
+def test_named_cluster_message_lineage_binds_its_identity_and_refuses_a_default_agent(
+    clean_db: None,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    review_app_key: str,
+) -> None:
+    """Named relay authority cannot be consumed by a sibling default deployment."""
+    with _review_stack(
+        request,
+        monkeypatch,
+        review_app_key,
+        publish=True,
+        agent_channel="C0LOCALDEV",
+        cluster_message=True,
+        reply_identity="acme-named",
+    ) as (client, truth, valkey, stream):
+        assert review_rows(
+            "SELECT c.adapter, l.conversation_id, p.reply_identity AS publication_identity, "
+            "a.reply_identity AS approval_identity, l.binding_generation = c.generation AS current "
+            "FROM curie.thread_publication_lineages l "
+            "JOIN curie.agent_channels c ON c.id = l.binding_id "
+            "JOIN curie.publications p ON p.lineage_id = l.id "
+            "JOIN curie.approvals a ON a.id = p.approval_id"
+        ) == [{
+            "adapter": "acme-named",
+            "conversation_id": "slack:acme-named:C0LOCALDEV:1700000000.000001",
+            "publication_identity": "acme-named",
+            "approval_identity": "acme-named",
+            "current": True,
+        }]
+        response = post_review(client, truth)
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "feedback_queued"
+        entries = valkey.xrange(stream)
+        assert len(entries) == 1
+        turn = parse_queued_turn(entries[0][1]["payload"])
+        assert turn.reply_handle.adapter == "curie-cluster-message"
+
+        auth = {"X-API-Key": get_settings().api_key}
+        agent = client.post(
+            "/agents",
+            json={
+                "name": f"acme-default-{uuid.uuid4().hex[:8]}",
+                "channel": {"kind": "slack", "address": "C0LOCALDEV"},
+            },
+            headers=auth,
+        )
+        assert agent.status_code == 201, agent.text
+        version = client.post(
+            f"/agents/{agent.json()['id']}/versions",
+            json={"version_label": "fixture", "created_by": "operator"},
+            headers=auth,
+        )
+        assert version.status_code == 201, version.text
+        deployment = client.post(
+            "/deployments",
+            json={
+                "agent_id": agent.json()["id"],
+                "version_id": version.json()["id"],
+                "environment": "dev",
+            },
+            headers=auth,
+        )
+        assert deployment.status_code == 201, deployment.text
+        refused = client.post(
+            f"/v1/internal/github/reviews/{truth.feedback.event_id}/verify",
+            json={
+                "turn": turn.model_dump(mode="json"),
+                "deployment_id": deployment.json()["id"],
+            },
+            headers={"X-Curie-Worker-Token": "fixture-review-worker-token"},
+        )
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"]["code"] == "deployment_no_longer_authorized"
+        assert review_rows("SELECT id FROM curie.publication_review_reservations") == []
+
+
 def test_unbound_cluster_message_lineage_is_still_refused(
     unbound_cluster_message_review_stack,
 ) -> None:
@@ -1179,16 +1368,19 @@ def test_worker_publication_success_stamps_verified_identity_on_the_lineage(
     client, truth, valkey, stream = approved_review_producer
     publish_through_worker(client, pr_number=17)
     assert review_rows(
-        "SELECT l.pr_number, l.head_sha, l.github_repository_id, l.github_installation_id, "
-        "l.github_pr_node_id, l.base_ref, p.status, p.lease_owner "
+        "SELECT l.pr_number, l.head_sha, l.code_host_kind, l.code_host_host, "
+        "l.repository_project_id, l.code_host_installation_id, "
+        "l.code_host_pr_id, l.base_ref, p.status, p.lease_owner "
         "FROM curie.thread_publication_lineages l "
         "JOIN curie.publications p ON p.lineage_id = l.id"
     ) == [{
         "pr_number": 17,
         "head_sha": HEAD,
-        "github_repository_id": 21,
-        "github_installation_id": 11,
-        "github_pr_node_id": "PR_example_17",
+        "code_host_kind": "github",
+        "code_host_host": "github.com",
+        "repository_project_id": "21",
+        "code_host_installation_id": 11,
+        "code_host_pr_id": "PR_example_17",
         "base_ref": "main",
         "status": "succeeded",
         "lease_owner": None,
@@ -1203,10 +1395,10 @@ def test_worker_publication_accepts_github_canonical_repository_casing(
     # operator configured in lowercase; repository names are case-insensitive.
     publish_through_worker(client, pr_number=17, pr_repo="Acme-Corp/Acme-Bot")
     assert review_rows(
-        "SELECT l.pr_number, l.github_repository_id, p.status "
+        "SELECT l.pr_number, l.repository_project_id, p.status "
         "FROM curie.thread_publication_lineages l "
         "JOIN curie.publications p ON p.lineage_id = l.id"
-    ) == [{"pr_number": 17, "github_repository_id": 21, "status": "succeeded"}]
+    ) == [{"pr_number": 17, "repository_project_id": "21", "status": "succeeded"}]
 
 
 def test_worker_publication_with_mismatched_github_identity_is_refused(
@@ -1216,16 +1408,19 @@ def test_worker_publication_with_mismatched_github_identity_is_refused(
     truth.repo["id"] = 22  # GitHub's repository no longer matches the PR's base repo.
     publish_through_worker(client, pr_number=17)
     assert review_rows(
-        "SELECT l.pr_number, l.head_sha, l.github_repository_id, l.github_installation_id, "
-        "l.github_pr_node_id, l.base_ref, p.status, p.reconcile_attempts, p.error "
+        "SELECT l.pr_number, l.head_sha, l.code_host_kind, l.code_host_host, "
+        "l.repository_project_id, l.code_host_installation_id, "
+        "l.code_host_pr_id, l.base_ref, p.status, p.reconcile_attempts, p.error "
         "FROM curie.thread_publication_lineages l "
         "JOIN curie.publications p ON p.lineage_id = l.id"
     ) == [{
         "pr_number": None,
         "head_sha": None,
-        "github_repository_id": None,
-        "github_installation_id": None,
-        "github_pr_node_id": None,
+        "code_host_kind": None,
+        "code_host_host": None,
+        "repository_project_id": None,
+        "code_host_installation_id": None,
+        "code_host_pr_id": None,
         "base_ref": None,
         "status": "launching",
         "reconcile_attempts": 1,
@@ -1435,7 +1630,8 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                     return WorkspaceClaimCoordinator(
                         preparer=WorkspacePreparer(
                             credentials=WorkspaceCredentialClient(
-                                api_url=api_url, worker_token="fixture-review-worker-token"
+                                api_url=api_url,
+                                worker_token="fixture-review-worker-token",
                             ),
                             commands=SubprocessCommands(),
                             objects=WorkspaceObjectStore(client=objects_client, bucket=bucket),
@@ -2622,7 +2818,7 @@ def test_legacy_name_only_lineage_cannot_override_verified_github_owner(
     # A name/number-only historical row cannot become review authority when the
     # verified owner is no longer open. Keep the valid queued receipt untouched.
     review_rows("UPDATE curie.thread_publication_lineages SET status='closed' "
-                "WHERE github_repository_id IS NOT NULL")
+                "WHERE repository_project_id IS NOT NULL")
     truth.payload["comment"].update(
         id=72, html_url=f"https://github.com/{REPO}/pull/17#issuecomment-72"
     )
@@ -2637,12 +2833,13 @@ def test_legacy_name_only_lineage_cannot_override_verified_github_owner(
 @pytest.mark.parametrize(
     ("mutation", "code"),
     [
-        ("UPDATE curie.thread_publication_lineages SET github_installation_id=12",
+        ("UPDATE curie.thread_publication_lineages SET code_host_installation_id=12",
          "lineage_authority_unproved"),
         # Migration 0042 makes GitHub identity all-or-nothing, so the only
         # identity-less lineage is a historical one with none of it.
-        ("UPDATE curie.thread_publication_lineages SET github_repository_id=NULL,"
-         "github_installation_id=NULL,github_pr_node_id=NULL,base_ref=NULL",
+        ("UPDATE curie.thread_publication_lineages SET code_host_kind=NULL,"
+         "code_host_host=NULL,repository_project_id=NULL,"
+         "code_host_installation_id=NULL,code_host_pr_id=NULL,base_ref=NULL",
          "lineage_absent_or_ambiguous"),
         ("UPDATE curie.thread_publication_lineages SET binding_id=NULL",
          "lineage_authority_unproved"),
@@ -3803,9 +4000,9 @@ def _identity_pending_review(client: TestClient, truth: GitHubTruth, valkey, str
     """Deliver a review while the PR exists on GitHub but the lineage lacks identity (#2962)."""
     valkey.delete(stream)  # Only the fixture's approval-resume input; no review yet.
     assert review_rows(
-        "SELECT github_repository_id, pr_number, binding_id IS NOT NULL AS bound "
+        "SELECT repository_project_id, pr_number, binding_id IS NOT NULL AS bound "
         "FROM curie.thread_publication_lineages"
-    ) == [{"github_repository_id": None, "pr_number": None, "bound": True}]
+    ) == [{"repository_project_id": None, "pr_number": None, "bound": True}]
     return post_review(client, truth)
 
 

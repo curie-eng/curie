@@ -4,10 +4,16 @@
   "discovery": "These schema files are bundled into released `curie` CLI binaries and printed on demand: `curie schema-index` emits this index, `curie schema-index <name>` emits a named schema. In a source checkout they live at cli/schema/.",
   "results": [
     {
+      "result": "ActionsOutput",
+      "kind": "CliOutput",
+      "schema": "actions.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "AllTargetsDeployOutput",
       "kind": "CliOutput",
       "schema": "deploy.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "ApplyOutput",
@@ -49,7 +55,7 @@
       "result": "ChannelsOutput",
       "kind": "CliOutput",
       "schema": "surfaces.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "ChartCheckOutput",
@@ -73,13 +79,13 @@
       "result": "ClusterRollbackOutput",
       "kind": "CliOutput",
       "schema": "cluster-rollback.schema.json",
-      "version": "1.0"
+      "version": "1.1"
     },
     {
       "result": "ClusterStatusOutput",
       "kind": "CliOutput",
       "schema": "cluster-status.schema.json",
-      "version": "1.4"
+      "version": "1.5"
     },
     {
       "result": "ClusterUpOutput",
@@ -121,7 +127,7 @@
       "result": "DeployOutput",
       "kind": "CliOutput",
       "schema": "deploy.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "DiffOutput",
@@ -133,7 +139,7 @@
       "result": "DoctorOutput",
       "kind": "CliOutput",
       "schema": "doctor.schema.json",
-      "version": "2.1"
+      "version": "2.2"
     },
     {
       "result": "DryRunPlan",
@@ -175,7 +181,7 @@
       "result": "GuideOutput",
       "kind": "CliOutput",
       "schema": "guide.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "HookOutput",
@@ -232,10 +238,16 @@
       "version": "1.0"
     },
     {
+      "result": "MemoryGuidanceOutput",
+      "kind": "CliOutput",
+      "schema": "memory.schema.json",
+      "version": "2.2"
+    },
+    {
       "result": "MemoryOutput",
       "kind": "CliOutput",
       "schema": "memory.schema.json",
-      "version": "2.0"
+      "version": "2.2"
     },
     {
       "result": "MessageDryRunOutput",
@@ -253,6 +265,12 @@
       "result": "MigrateStoreOutput",
       "kind": "CliOutput",
       "schema": "migrate-store.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "ModelCreditOutput",
+      "kind": "CliOutput",
+      "schema": "model-credit.schema.json",
       "version": "1.0"
     },
     {
@@ -295,7 +313,13 @@
       "result": "OverridesOutput",
       "kind": "CliOutput",
       "schema": "overrides.schema.json",
-      "version": "1.2"
+      "version": "3.0"
+    },
+    {
+      "result": "PreflightOutput",
+      "kind": "CliOutput",
+      "schema": "preflight.schema.json",
+      "version": "2.0"
     },
     {
       "result": "PublicationPolicyOutput",
@@ -304,9 +328,39 @@
       "version": "1.0"
     },
     {
+      "result": "QuickstartOutput",
+      "kind": "CliOutput",
+      "schema": "factory-quickstart.schema.json",
+      "version": "1.2"
+    },
+    {
       "result": "ReleaseAcceptOutput",
       "kind": "CliOutput",
       "schema": "release-accept.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "RemediationOutput",
+      "kind": "CliOutput",
+      "schema": "remediation-nominations.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "RemediationPolicyOutput",
+      "kind": "CliOutput",
+      "schema": "remediation-policy.schema.json",
+      "version": "1.3"
+    },
+    {
+      "result": "RemediationQualificationOutput",
+      "kind": "CliOutput",
+      "schema": "remediation-qualification.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "RepoRunnerBuildOutput",
+      "kind": "CliOutput",
+      "schema": "repo-runner-build.schema.json",
       "version": "1.0"
     },
     {
@@ -355,13 +409,13 @@
       "result": "SchedulesOutput",
       "kind": "CliOutput",
       "schema": "schedules.schema.json",
-      "version": "2.0"
+      "version": "3.0"
     },
     {
       "result": "HookFireOutput",
       "kind": "CliOutput",
       "schema": "hook-fire.schema.json",
-      "version": "1.0"
+      "version": "1.2"
     },
     {
       "result": "SreBotRenderOutput",
@@ -379,13 +433,13 @@
       "result": "WorkItemsOutput",
       "kind": "CliOutput",
       "schema": "work-items.schema.json",
-      "version": "1.1"
+      "version": "2.0"
     },
     {
       "result": "all_targets_deploy_failure_json",
       "kind": "builder",
       "schema": "deploy.schema.json",
-      "version": "1.1"
+      "version": "1.2"
     },
     {
       "result": "error_json",
@@ -457,6 +511,6 @@
   "raw_emit_sites": {
     "cli/src/ui.rs": 1,
     "cli/src/main.rs": 1,
-    "cli/src/commands.rs": 1
+    "cli/src/commands/eval.rs": 1
   }
 }

@@ -14,12 +14,15 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import re
 
 from nacl.signing import SigningKey
 
 PREFIX = "cct"
 
 _SEED_BYTES = 32
+# ADR 0178 decision 1: lowercase hyphenated UUID text, one spelling.
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 def _b64url(raw: bytes) -> str:
@@ -39,21 +42,37 @@ def signing_key(text: str) -> SigningKey:
         raise ValueError("the caller signing key is not standard base64") from None
     if len(seed) != _SEED_BYTES:
         raise ValueError(
-            f"the caller signing key decodes to {len(seed)} bytes; an Ed25519 seed is "
-            f"{_SEED_BYTES}"
+            f"the caller signing key decodes to {len(seed)} bytes; an Ed25519 seed is {_SEED_BYTES}"
         )
     return SigningKey(seed)
 
 
-def mint(signing_key_text: str, *, agent: str, exp: int) -> str:
+def mint(
+    signing_key_text: str,
+    *,
+    agent: str,
+    exp: int,
+    run: str | None = None,
+    work_item: str | None = None,
+) -> str:
     """Sign ``agent`` with absolute expiry ``exp`` (unix seconds).
 
-    Deterministic: Ed25519 signatures are, and the caller supplies ``exp``.
+    ``run`` and ``work_item`` are present together or not at all (ADR 0178).
+    Omitted, the payload stays ``{agent, exp}``. Deterministic: Ed25519
+    signatures are, and the caller supplies ``exp``.
     """
 
-    payload = json.dumps(
-        {"agent": agent, "exp": exp}, separators=(",", ":"), sort_keys=True
-    ).encode("ascii")
+    if (run is None) != (work_item is None):
+        raise ValueError("run and work_item are present together or not at all")
+    if run is not None and (
+        _UUID.fullmatch(run) is None or _UUID.fullmatch(work_item or "") is None
+    ):
+        raise ValueError("run and work_item must be lowercase hyphenated uuids")
+    body: dict[str, object] = {"agent": agent, "exp": exp}
+    if run is not None:
+        body["run"] = run
+        body["work_item"] = work_item
+    payload = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("ascii")
     signing_input = f"{PREFIX}.{_b64url(payload)}"
     signature = signing_key(signing_key_text).sign(signing_input.encode("ascii")).signature
     return f"{signing_input}.{_b64url(signature)}"

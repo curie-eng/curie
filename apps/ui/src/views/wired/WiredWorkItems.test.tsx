@@ -38,9 +38,15 @@ function outcome(overrides: Partial<WorkItemOutcome> = {}): WorkItemOutcome {
   return {
     id: "wi-1",
     agent_id: "ag-1",
-    repo_full_name: "acme-corp/acme-bot",
-    github_issue_number: 2577,
-    issue_url: "https://github.com/acme-corp/acme-bot/issues/2577",
+    tracker: {
+      kind: "github",
+      host: "github.com",
+      scope_id: "4401",
+      issue_id: "2577",
+      display_key: null,
+      url: "https://github.com/acme-corp/acme-bot/issues/2577",
+    },
+    repository: { code_host_kind: "github", host: "github.com", project_id: "4401", path: "acme-corp/acme-bot" },
     cancelled_at: null,
     created_at: "2026-09-22T10:00:00Z",
     updated_at: "2026-09-22T10:05:00Z",
@@ -74,8 +80,15 @@ function outcome(overrides: Partial<WorkItemOutcome> = {}): WorkItemOutcome {
 
 const WAITING = outcome({
   id: "wi-2",
-  github_issue_number: 2578,
-  issue_url: "https://github.com/acme-corp/acme-bot/issues/2578",
+  tracker: {
+    kind: "github",
+    host: "github.com",
+    scope_id: "4401",
+    issue_id: "2578",
+    display_key: null,
+    url: "https://github.com/acme-corp/acme-bot/issues/2578",
+  },
+  repository: { code_host_kind: "github", host: "github.com", project_id: "4401", path: "acme-corp/acme-bot" },
   state: "waiting",
   actionable_cause: "no capacity yet; zq-waiting-verbatim",
   pr: null,
@@ -105,6 +118,28 @@ beforeEach(() => {
 });
 
 describe("WiredWorkItems (#2577)", () => {
+  it("labels an issue by its tracker display key and links to the tracker's url (ADR 0197)", async () => {
+    const jira = outcome({
+      id: "wi-3",
+      tracker: {
+        kind: "jira_cloud",
+        host: "acme.atlassian.net",
+        scope_id: "cloud-1",
+        issue_id: "10012",
+        display_key: "PROJ-12",
+        url: "https://acme.atlassian.net/browse/PROJ-12",
+      },
+    });
+    vi.mocked(listWorkItems).mockResolvedValue({ items: [jira], limit: 50, truncated: false });
+    renderView();
+
+    const [row] = await screen.findAllByTestId("work-item-row");
+    expect(within(row).getByRole("link", { name: "PROJ-12" })).toHaveAttribute(
+      "href",
+      "https://acme.atlassian.net/browse/PROJ-12",
+    );
+  });
+
   it("renders one row per item with the API state, issue link, PR link and cause", async () => {
     vi.mocked(listWorkItems).mockResolvedValue({ items: [outcome(), WAITING], limit: 50, truncated: false });
     renderView();

@@ -22,6 +22,20 @@
 #   * a filename carrying ../ path traversal            -> never escape the mount
 #   * NO reference at all                               -> exit 0, touch nothing
 #
+# ADR 0205 (decisions 4, 6, 8) adds the thread's earlier files to the same
+# payload, and the outcome for each case is a SHARED VECTOR,
+# tests/vectors/attachment-init-outcomes.json, which
+# apps/worker/tests/sandbox/test_docker_attachment_claim.py also runs through the
+# docker driver -- so the two substrates cannot drift into treating the same
+# payload differently. In short: an entry's "n" is written exactly (never
+# renamed), and an unclean, reserved (.curie-) or duplicate name is fatal; the
+# current message's entries ("c": 1, or no "c" from an older worker) are fetched
+# first and any failure of theirs is fatal; an earlier entry ("c": 0) that is
+# expired, answered with an HTTP error, times out, or is reached after the
+# overall fetch deadline is skipped and recorded unavailable with a reason; a
+# digest mismatch is fatal either way; and the outcome of every entry is written
+# to the hidden /attachments/.curie-attachments-status.json.
+#
 # The reference wire shape (base64url of a JSON list keyed n/u/s/b/e/m) is built
 # by hand below rather than by importing the worker, because a chart CI script
 # must not depend on the python packages. The same shape is pinned from the
@@ -45,8 +59,14 @@ mkdir -p "$MOUNT"
 # operator would use -- so this also proves the cap is templated rather than a
 # literal in the template.
 CAP=64
+# The init container's overall fetch deadline, small enough that the vector's
+# `stall` entries (a server that goes silent for STALL seconds) cross it in a CI
+# run. The per-fetch socket timeout is bounded by what is left of it.
+FETCH_TIMEOUT=2
+STALL=5
+VECTOR="${VECTOR:-$(cd "$CHART/../.." && pwd)/tests/vectors/attachment-init-outcomes.json}"
 
-echo "=== Rendering the sandbox pod (mountPath=$MOUNT, maxFileBytes=$CAP) ==="
+echo "=== Rendering the sandbox pod (mountPath=$MOUNT, maxFileBytes=$CAP, fetchTimeoutSeconds=$FETCH_TIMEOUT) ==="
 # The lane ships OFF (worker.attachments.enabled: false), so every assertion
 # below is about what an operator gets after switching it on. The off state has
 # its own gate in attachment-init-assertions.sh: with the flag false the
@@ -55,9 +75,10 @@ helm template curie "$CHART" --namespace dev \
   --set "worker.attachments.enabled=true" \
   --set "agentSandbox.runner.attachments.mountPath=$MOUNT" \
   --set "worker.attachments.maxFileBytes=$CAP" \
+  --set "agentSandbox.runner.attachments.fetchTimeoutSeconds=$FETCH_TIMEOUT" \
   > "$TMP/rendered.yaml"
 
-python3 - "$TMP/rendered.yaml" "$MOUNT" "$CAP" <<'PY'
+python3 - "$TMP/rendered.yaml" "$MOUNT" "$CAP" "$VECTOR" "$FETCH_TIMEOUT" "$STALL" <<'PY'
 import base64
 import hashlib
 import json
@@ -66,12 +87,24 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import yaml
 
 RENDERED, MOUNT, CAP = sys.argv[1], Path(sys.argv[2]), int(sys.argv[3])
+VECTOR = json.loads(Path(sys.argv[4]).read_text())
+FETCH_TIMEOUT, STALL = int(sys.argv[5]), int(sys.argv[6])
+# A drip byte every DRIP seconds: far inside any socket timeout, while the
+# vector's drip bodies (>= 15 bytes) take several times the deadline in total.
+DRIP = 0.4
+# How long past the deadline a boot may still be running when it finishes:
+# writing the status file and tearing down, not waiting out a slow store.
+GRACE = 1.5
+if VECTOR["cap_bytes"] != CAP:
+    fail(f"the vector's cap_bytes {VECTOR['cap_bytes']} is not the rendered cap {CAP}")
+STATUS_FILE = VECTOR["status_file"]
 
 INIT_NAME = "attachments-init"
 REF_ENV = "CURIE_ATTACHMENTS_REF"
@@ -120,8 +153,54 @@ else:
 
 class _Store(BaseHTTPRequestHandler):
     objects: dict[str, bytes] = {}
+    # path -> HTTP status to answer with instead of the object.
+    errors: dict[str, int] = {}
+    # paths that send the headers and one byte, then go silent for STALL seconds.
+    stalls: set[str] = set()
+    # paths that send one byte every DRIP seconds: no single read ever waits long
+    # enough to trip a socket timeout, but the whole body outlasts the deadline.
+    drips: set[str] = set()
+    # path -> Location a 302 points at (a redirect is refused, never followed).
+    redirects: dict[str, str] = {}
+    requested: list[str] = []
 
     def do_GET(self):  # noqa: N802 -- BaseHTTPRequestHandler's own name
+        self.requested.append(self.path)
+        if self.path in self.errors:
+            self.send_response(self.errors[self.path])
+            self.end_headers()
+            return
+        if self.path in self.stalls:
+            payload = self.objects[self.path]
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            try:
+                self.wfile.write(payload[:1])
+                self.wfile.flush()
+                time.sleep(STALL)
+                self.wfile.write(payload[1:])
+            except OSError:
+                pass
+            return
+        if self.path in self.redirects:
+            self.send_response(302)
+            self.send_header("Location", self.redirects[self.path])
+            self.end_headers()
+            return
+        if self.path in self.drips:
+            payload = self.objects[self.path]
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            try:
+                for index in range(len(payload)):
+                    self.wfile.write(payload[index : index + 1])
+                    self.wfile.flush()
+                    time.sleep(DRIP)
+            except OSError:
+                pass
+            return
         if self.path == "/redirect":
             self.send_response(302)
             self.send_header("Location", "/object-0")
@@ -252,64 +331,19 @@ if len(landed) != 2:
     fail(f"expected two visible files in the mount, got {sorted(landed)}")
 print(f"  ok: two attachments materialized byte-exactly as {sorted(landed)}")
 
-# The names a person recognises must survive: the whole point of the lane is
-# that the agent can say which file it read.
-if not any("report" in name for name in landed):
-    fail(f"the uploader's filename did not survive into the mount: {sorted(landed)}")
-print("  ok: the uploader's filename is recoverable from the mount")
+# The names a person recognises must survive EXACTLY: the name on the reference
+# is the one the worker recorded in the thread's ledger and told the agent
+# about, so the path a notice gave is the path on disk (ADR 0205 decision 4).
+if landed != {"report.csv": first, "notes.txt": second}:
+    fail(f"the recorded names were not written exactly: {sorted(landed)}")
+print("  ok: each file is written under exactly the recorded name")
 
-# --- (a2) two uploads sharing a filename ------------------------------------
+# --- (a2) names are never renamed -------------------------------------------
 #
-# Two `report.pdf` in one message is ordinary. Until this was fixed both were
-# written to `<mount>/report.pdf` and the second silently destroyed the first --
-# the agent saw one file where two arrived. The k8s half of the fix lives in the
-# rendered program below; the worker half is
-# curie_worker.attachments.unique_attachment_leaf, and
-# apps/worker/tests/sandbox/test_docker_attachment_claim.py runs this same case
-# through the Docker driver. Both tiers must produce the SAME names, so this
-# asserts the names and the bytes rather than just the count.
-
-one, two, three = b"first report", b"second report", b"third report"
-completed = run(
-    encode(
-        [
-            entry("report.pdf", publish(7, one), one, mime="application/pdf"),
-            entry("report.pdf", publish(8, two), two, mime="application/pdf"),
-            entry("report.pdf", publish(9, three), three, mime="application/pdf"),
-        ]
-    )
-)
-if completed.returncode != 0:
-    fail(
-        "three same-named attachments were not materialized "
-        f"(exit {completed.returncode})\n    stderr={completed.stderr!r}"
-    )
-landed = visible()
-if landed != {"report.pdf": one, "report-2.pdf": two, "report-3.pdf": three}:
-    fail(
-        "duplicate filenames did not disambiguate to report.pdf / report-2.pdf / "
-        f"report-3.pdf; the mount holds {sorted(landed)}. A same-named upload "
-        "that overwrites its predecessor is the silent loss this lane exists to close."
-    )
-print("  ok: three uploads named report.pdf all materialize, byte-exactly and distinctly")
-
-# The counter must skip a name a person really did send, or the disambiguation
-# becomes the overwrite it was added to prevent.
-completed = run(
-    encode(
-        [
-            entry("report.pdf", publish(10, one), one, mime="application/pdf"),
-            entry("report-2.pdf", publish(11, two), two, mime="application/pdf"),
-            entry("report.pdf", publish(12, three), three, mime="application/pdf"),
-        ]
-    )
-)
-if completed.returncode != 0:
-    fail(f"a literal report-2.pdf alongside two report.pdf was refused\n    stderr={completed.stderr!r}")
-landed = visible()
-if landed != {"report.pdf": one, "report-2.pdf": two, "report-3.pdf": three}:
-    fail(f"a literal report-2.pdf was overwritten by the disambiguator: {sorted(landed)}")
-print("  ok: a literal report-2.pdf is not overwritten by the disambiguator")
+# Two uploads sharing a filename used to be disambiguated HERE (report.pdf,
+# report-2.pdf). ADR 0205 decision 4 moves that to the worker, which fixes the
+# on-disk name once against the whole thread's ledger; this program writes "n"
+# exactly and refuses a duplicate. The vector below carries those cases.
 
 # --- (b) a digest that does not match ---------------------------------------
 
@@ -363,23 +397,10 @@ expect_refusal(
 
 # --- (g) a filename carrying path traversal ---------------------------------
 #
-# `name` is text supplied by whoever uploaded the file. The worker already keeps
-# it out of the object key (test_a_hostile_filename_never_reaches_the_object_key);
-# the init container is the second place it could escape, and here it would
-# escape onto the pod's filesystem.
-
-escape_target = MOUNT.parent / "escaped.bin"
-completed = run(
-    encode([entry("../escaped.bin", publish(6, first), first)])
-)
-if escape_target.exists():
-    fail(
-        f"a ../ filename wrote outside the mount to {escape_target}. The name is "
-        "uploader-supplied text; it must be reduced to a basename or refused."
-    )
-if completed.returncode == 0 and not visible():
-    fail("a ../ filename was accepted but materialized nothing visible")
-print("  ok: a ../ filename never escapes the mount")
+# `name` is text supplied by whoever uploaded the file. It used to be reduced to
+# a basename here; the worker now records a clean name, so anything that is not
+# already its own basename is refused rather than repaired. The vector below
+# carries ../, dir/, "", ".", "..", "/" and the reserved .curie- prefix.
 
 # --- (h) no reference at all -------------------------------------------------
 #
@@ -405,6 +426,190 @@ if visible():
     fail(f"an empty {REF_ENV} still wrote {sorted(visible())}")
 print(f"  ok: an empty {REF_ENV} (the baked template value) is the same no-op")
 
+# --- (i) the shared ADR 0205 vector -----------------------------------------
+#
+# Every case in tests/vectors/attachment-init-outcomes.json, through the
+# rendered program. The docker driver runs the same file, so a case that changes
+# here and not there fails one of the two.
+
+PAST, FUTURE = 1_000_000_000, 2_000_000_000
+
+
+def vector_ref(case_index, case):
+    """(encoded ref, {url path -> entry}) for one vector case."""
+
+    wire, paths = [], {}
+    for index, item in enumerate(case["entries"]):
+        body = item["body"].encode()
+        if item["serve"] == "oversize":
+            body = b"z" * (VECTOR["cap_bytes"] + 1)
+        path = f"/vector-{case_index}-{index}"
+        served = body + b" tampered" if item["serve"] == "digest_mismatch" else body
+        _Store.objects[path] = served
+        if item["serve"].startswith("http_"):
+            _Store.errors[path] = int(item["serve"].removeprefix("http_"))
+        if item["serve"] == "stall":
+            _Store.stalls.add(path)
+        if item["serve"] == "drip":
+            _Store.drips.add(path)
+        if item["serve"] == "redirect":
+            _Store.objects[path + "-moved"] = body
+            _Store.redirects[path] = path + "-moved"
+        entry_wire = {
+            "n": item["n"],
+            "u": f"{BASE}{path}",
+            "s": hashlib.sha256(body).hexdigest(),
+            "b": len(body),
+            "e": PAST if item["serve"] == "expired" else FUTURE,
+            "m": "text/plain",
+        }
+        if "c" in item:
+            entry_wire["c"] = item["c"]
+        wire.append(entry_wire)
+        paths[path] = item
+    return encode(wire), paths
+
+
+def is_current(item):
+    return item.get("c", 1) == 1
+
+
+def check_common(label, case, paths, requested):
+    """The invariants every case carries, whatever its outcome."""
+
+    fetched = [paths[path] for path in requested if path in paths]
+    seen_earlier = False
+    for item in fetched:
+        if not is_current(item):
+            seen_earlier = True
+        elif seen_earlier:
+            fail(
+                f"{label}: current entry {item['n']!r} was fetched after an earlier "
+                f"one (fetch order {[i['n'] for i in fetched]}). The current "
+                "message's files come first, so a slow earlier file can never "
+                "starve the ones the person just sent."
+            )
+    for item in fetched:
+        if item["serve"] == "expired":
+            fail(f"{label}: expired reference {item['n']!r} was fetched; it must be skipped unfetched")
+    if case.get("refused_before_fetch") and requested:
+        fail(
+            f"{label}: the payload was refused, but only after fetching "
+            f"{[i['n'] for i in fetched]}; an unusable name must be refused before "
+            "any byte is pulled"
+        )
+    moved = [path for path in requested if path.endswith("-moved")]
+    if moved:
+        fail(f"{label}: a redirect was followed to {moved}; it must be refused")
+    strays = sorted(child.name for child in MOUNT.parent.iterdir())
+    if strays != sorted(["attachments", "rendered.yaml"]):
+        fail(f"{label}: something was written outside the mount: {strays}")
+    for row in case.get("status") or []:
+        if row["reason"] == "deadline" and any(
+            i["n"] == row["name"] and i["serve"] != "drip" for i in fetched
+        ):
+            fail(
+                f"{label}: {row['name']!r} was fetched although it was reached past "
+                "the overall deadline; it must be recorded and skipped without a fetch"
+            )
+
+
+def hidden_entries():
+    return sorted(child.name for child in MOUNT.iterdir() if child.name.startswith("."))
+
+
+def read_status():
+    path = MOUNT / STATUS_FILE
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text())
+
+
+def by_name(rows):
+    return sorted(rows, key=lambda row: row["name"])
+
+
+def status_matches(actual, expected):
+    """Rows equal by name; an expected reason given as a list accepts any member."""
+
+    actual, expected = by_name(actual), by_name(expected)
+    if [row["name"] for row in actual] != [row["name"] for row in expected]:
+        return False
+    for got, want in zip(actual, expected):
+        reasons = want["reason"] if isinstance(want["reason"], list) else [want["reason"]]
+        if got["status"] != want["status"] or got["reason"] not in reasons:
+            return False
+    return True
+
+
+def run_vector_case(case_index, case):
+    label = f"vector {case['name']}"
+    ref, paths = vector_ref(case_index, case)
+    _Store.requested.clear()
+    started = time.monotonic()
+    completed = run(ref)
+    elapsed = time.monotonic() - started
+    requested = list(_Store.requested)
+
+    if case["outcome"] == "fatal":
+        if completed.returncode == 0:
+            fail(
+                f"{label}: the init container exited 0; the vector says this boot "
+                f"is refused.\n    stdout={completed.stdout!r}\n    stderr={completed.stderr!r}"
+            )
+        if visible():
+            fail(f"{label}: refused but left {sorted(visible())} visible in the mount")
+        if any(i["serve"] == "drip" for i in case["entries"]) and elapsed > FETCH_TIMEOUT + GRACE:
+            fail(f"{label}: refused only after {elapsed:.1f}s; the {FETCH_TIMEOUT}s deadline did not cut the drip off")
+        check_common(label, case, paths, requested)
+        print(f"  ok: {label}: refused (exit {completed.returncode}), nothing visible")
+        return
+
+    if completed.returncode != 0:
+        fail(
+            f"{label}: the init container exited {completed.returncode}; the vector "
+            f"says this boot proceeds.\n    stdout={completed.stdout!r}\n"
+            f"    stderr={completed.stderr!r}"
+        )
+    expected_visible = {name: body.encode() for name, body in case["visible"].items()}
+    if visible() != expected_visible:
+        fail(f"{label}: the mount holds {sorted(visible())}, expected {sorted(expected_visible)} (bytes included)")
+    # Only the status file may remain hidden: a leftover stage dir or a status
+    # temp file means the write was not finished by a rename. A legacy payload
+    # (no "c") may or may not write it.
+    allowed = [[STATUS_FILE]] if case["status"] is not None else [[], [STATUS_FILE]]
+    if hidden_entries() not in allowed:
+        fail(
+            f"{label}: hidden entries {hidden_entries()} in the mount; expected one of "
+            f"{allowed} (status written to a temp name and renamed, stage dir removed)"
+        )
+    if case["status"] is not None:
+        status = read_status()
+        if not isinstance(status, dict) or set(status) != {"v", "files"} or status["v"] != VECTOR["status_version"]:
+            fail(f"{label}: {STATUS_FILE} is {status!r}, expected {{'v': {VECTOR['status_version']}, 'files': [...]}}")
+        for row in status["files"]:
+            if set(row) != {"name", "status", "reason"}:
+                fail(f"{label}: status row {row!r} must carry exactly name, status and reason")
+        if not status_matches(status["files"], case["status"]):
+            fail(f"{label}: status files {by_name(status['files'])} != expected {by_name(case['status'])}")
+    if any(i["serve"] == "drip" for i in case["entries"]) and elapsed > FETCH_TIMEOUT + GRACE:
+        fail(f"{label}: finished after {elapsed:.1f}s; the {FETCH_TIMEOUT}s deadline did not cut the drip off")
+    if elapsed > FETCH_TIMEOUT + STALL:
+        fail(f"{label}: took {elapsed:.1f}s; the {FETCH_TIMEOUT}s deadline did not bound the boot")
+    check_common(label, case, paths, requested)
+    print(f"  ok: {label}: {sorted(expected_visible)} visible, status recorded")
+
+
+# Every case runs even after one fails, so a red run names the whole gap at once.
+vector_failed = []
+for case_index, case in enumerate(VECTOR["cases"]):
+    try:
+        run_vector_case(case_index, case)
+    except SystemExit:
+        vector_failed.append(case["name"])
+if vector_failed:
+    fail(f"{len(vector_failed)} of {len(VECTOR['cases'])} vector cases failed: {vector_failed}")
+
 server.shutdown()
 
 print()
@@ -412,7 +617,9 @@ print(
     "PASS: the rendered attachments-init program materializes verified bytes, "
     "and refuses -- writing nothing the runner could announce -- on a digest "
     "mismatch, an over-cap body, an expired reference, a redirect, a non-HTTP "
-    "url and a traversal filename, while an absent or empty reference is a "
-    "clean no-op."
+    "url and an unclean name, while an absent or empty reference is a clean "
+    "no-op; and every case in the shared ADR 0205 vector -- exact names, current "
+    "first and all-or-nothing, earlier files best effort with a recorded reason, "
+    "digest mismatch always fatal -- comes out as the vector says."
 )
 PY

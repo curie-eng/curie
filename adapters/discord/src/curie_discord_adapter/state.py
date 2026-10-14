@@ -32,6 +32,10 @@ class DiscordState:
             CREATE TABLE IF NOT EXISTS ingress_deliveries (
                 delivery_id TEXT PRIMARY KEY
             );
+            CREATE TABLE IF NOT EXISTS posted_deliveries (
+                delivery_id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL
+            );
             """
         )
         self._db.commit()
@@ -108,6 +112,29 @@ class DiscordState:
         with self._db:
             self._db.execute(
                 "DELETE FROM ingress_deliveries WHERE delivery_id = ?", (delivery_id,)
+            )
+
+    def posted_message(self, delivery_id: str) -> str | None:
+        """The Discord message an outbound reply wire 1.1 ``delivery_id`` posted.
+
+        That ``delivery_id`` is the platform's key for one post (ADR-0130), a
+        different namespace from the inbound Gateway ids ``claim_delivery``
+        keeps, which is why it has its own table.
+        """
+
+        row = self._db.execute(
+            "SELECT message_id FROM posted_deliveries WHERE delivery_id = ?",
+            (delivery_id,),
+        ).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def remember_post(self, delivery_id: str, message_id: str) -> None:
+        """Record the message a post created, so a redelivery adopts it."""
+
+        with self._db:
+            self._db.execute(
+                "INSERT OR IGNORE INTO posted_deliveries (delivery_id, message_id) VALUES (?, ?)",
+                (delivery_id, message_id),
             )
 
     def close(self) -> None:

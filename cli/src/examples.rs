@@ -15,6 +15,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::commands::{self, DeployOpts, DeployTier};
+use crate::ops::capacity::{is_transient_condition_taint, parse_memory_quantity};
 use crate::ui::{CliOutput, DryRunPlan, Ui};
 
 const OBSERVABILITY_NAMESPACE: &str = "observability";
@@ -830,12 +831,20 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../examples/dark-factory/.gitignore"),
     ),
     (
+        ".dockerignore",
+        include_bytes!("../../examples/dark-factory/.dockerignore"),
+    ),
+    (
         "connectors.yaml",
         include_bytes!("../../examples/dark-factory/connectors.yaml"),
     ),
     (
         "runner.Dockerfile",
         include_bytes!("../../examples/dark-factory/runner.Dockerfile"),
+    ),
+    (
+        "values.yaml",
+        include_bytes!("../../examples/dark-factory/values.yaml"),
     ),
     (
         ".claude-plugin/plugin.json",
@@ -869,6 +878,10 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
         "skills/implement-issue/SKILL.md",
         include_bytes!("../../examples/dark-factory/skills/implement-issue/SKILL.md"),
     ),
+    (
+        "verification/contract.md",
+        include_bytes!("../../examples/dark-factory/verification/contract.md"),
+    ),
 ];
 
 /// Files rendered with the executable bit, matching their tracked mode.
@@ -884,6 +897,29 @@ pub struct DarkFactoryRenderOpts {
 pub const DARK_FACTORY_RUNNER_REPOSITORY: &str = "ghcr.io/curie-eng/curie-dark-factory-runner";
 /// The platform runner the published layer is built on, at the same version.
 const PLATFORM_RUNNER_REPOSITORY: &str = "ghcr.io/curie-eng/curie-runner";
+
+/// The dark factory runner layer published for one version, and the platform
+/// runner it was built on, both digest-pinned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublishedStockRunner {
+    pub(crate) layer_image: String,
+    pub(crate) base_image: String,
+}
+
+/// The dark factory runner layer published for `tag` (#3747,
+/// #4321). Asks for the layer, then its base; `None` when either tag is
+/// absent. A registry error on either read is an error.
+pub(crate) async fn published_stock_runner(tag: &str) -> Result<Option<PublishedStockRunner>> {
+    let layer = published_index_digest(DARK_FACTORY_RUNNER_REPOSITORY, tag).await?;
+    let base = published_index_digest(PLATFORM_RUNNER_REPOSITORY, tag).await?;
+    Ok(match (layer, base) {
+        (Some(layer), Some(base)) => Some(PublishedStockRunner {
+            layer_image: format!("{DARK_FACTORY_RUNNER_REPOSITORY}@{layer}"),
+            base_image: format!("{PLATFORM_RUNNER_REPOSITORY}@{base}"),
+        }),
+        _ => None,
+    })
+}
 
 pub struct DarkFactoryRenderOutput {
     pub path: PathBuf,
@@ -914,17 +950,10 @@ impl CliOutput for DarkFactoryRenderOutput {
     }
 }
 
-/// Write the embedded dark-factory bundle into `opts.out`. Touches no cluster.
-/// Refuses an existing non-empty directory before writing anything.
-///
-/// A release build then locks the runner layer the release published for its
-/// own version, so `cluster deploy` needs no build step (#3747). A source build
-/// has no published layer to name, and says so instead of failing at deploy.
-pub async fn render_dark_factory(opts: DarkFactoryRenderOpts) -> Result<DarkFactoryRenderOutput> {
-    let out = opts.out;
+fn write_dark_factory_bundle(out: &Path) -> Result<()> {
     if out.exists() {
         let non_empty = !out.is_dir()
-            || std::fs::read_dir(&out)
+            || std::fs::read_dir(out)
                 .with_context(|| format!("reading render output {}", out.display()))?
                 .next()
                 .is_some();
@@ -949,6 +978,18 @@ pub async fn render_dark_factory(opts: DarkFactoryRenderOpts) -> Result<DarkFact
                 .with_context(|| format!("marking {} executable", path.display()))?;
         }
     }
+    Ok(())
+}
+
+/// Write the embedded dark-factory bundle into `opts.out`. Touches no cluster.
+/// Refuses an existing non-empty directory before writing anything.
+///
+/// A release build then locks the runner layer the release published for its
+/// own version, so `cluster deploy` needs no build step (#3747). A source build
+/// has no published layer to name, and says so instead of failing at deploy.
+pub async fn render_dark_factory(opts: DarkFactoryRenderOpts) -> Result<DarkFactoryRenderOutput> {
+    let out = opts.out;
+    write_dark_factory_bundle(&out)?;
     let version = crate::artifacts::version();
     let published = match crate::artifacts::Channel::current() {
         crate::artifacts::Channel::Dev => Err(format!(
@@ -956,29 +997,21 @@ pub async fn render_dark_factory(opts: DarkFactoryRenderOpts) -> Result<DarkFact
              published for it."
         )),
         crate::artifacts::Channel::Release => {
-            let layer = published_index_digest(DARK_FACTORY_RUNNER_REPOSITORY, version).await?;
-            let base = published_index_digest(PLATFORM_RUNNER_REPOSITORY, version).await?;
-            match (layer, base) {
-                (Some(layer), Some(base)) => Ok((layer, base)),
-                _ => Err(format!(
+            published_stock_runner(version).await?.ok_or_else(|| {
+                format!(
                     "no dark factory runner layer is published for curie {version} \
-                     ({DARK_FACTORY_RUNNER_REPOSITORY}:{version} or \
-                     {PLATFORM_RUNNER_REPOSITORY}:{version} was not found)."
-                )),
-            }
+                 ({DARK_FACTORY_RUNNER_REPOSITORY}:{version} or \
+                 {PLATFORM_RUNNER_REPOSITORY}:{version} was not found)."
+                )
+            })
         }
     };
     match published {
-        Ok((layer, base)) => {
-            let image = format!("{DARK_FACTORY_RUNNER_REPOSITORY}@{layer}");
-            lock_published_runner(
-                &out,
-                &image,
-                &format!("{PLATFORM_RUNNER_REPOSITORY}@{base}"),
-            )?;
+        Ok(published) => {
+            lock_published_runner(&out, &published.layer_image, &published.base_image)?;
             Ok(DarkFactoryRenderOutput {
                 path: out,
-                runner_image: Some(image),
+                runner_image: Some(published.layer_image),
                 runner_note: None,
             })
         }
@@ -992,6 +1025,21 @@ pub async fn render_dark_factory(opts: DarkFactoryRenderOpts) -> Result<DarkFact
             runner_image: None,
         }),
     }
+}
+
+/// Quickstart has already resolved every candidate image before any cluster
+/// call. Record those exact runner digests without resolving a release tag.
+pub(crate) fn render_dark_factory_with_published_runner(
+    out: PathBuf,
+    published: &PublishedStockRunner,
+) -> Result<DarkFactoryRenderOutput> {
+    write_dark_factory_bundle(&out)?;
+    lock_published_runner(&out, &published.layer_image, &published.base_image)?;
+    Ok(DarkFactoryRenderOutput {
+        path: out,
+        runner_image: Some(published.layer_image.clone()),
+        runner_note: None,
+    })
 }
 
 /// Record the published layer in the rendered bundle's lock, exactly as
@@ -1575,7 +1623,7 @@ async fn resolve_index_digest(repository: &str, tag: &str) -> Result<String> {
 /// [`resolve_index_digest`], with "this tag was never published" as `None`
 /// rather than an error. Any other failure, an unreachable registry included,
 /// stays an error: absence is a fact about the release, an outage is not.
-async fn published_index_digest(repository: &str, tag: &str) -> Result<Option<String>> {
+pub(crate) async fn published_index_digest(repository: &str, tag: &str) -> Result<Option<String>> {
     let path = repository
         .strip_prefix("ghcr.io/")
         .with_context(|| format!("{repository} is not a ghcr.io repository"))?
@@ -2544,6 +2592,7 @@ fn sre_approvals_route_map(
             approvers: Some(crate::api::ApprovalApprovers {
                 group: None,
                 users: Some(approvers.to_vec()),
+                emails: None,
             }),
         },
     );
@@ -3440,16 +3489,6 @@ fn alloy_can_schedule_on(node: &Node) -> bool {
         })
 }
 
-fn is_transient_condition_taint(key: &str) -> bool {
-    matches!(
-        key,
-        "node.kubernetes.io/not-ready"
-            | "node.kubernetes.io/unreachable"
-            | "node.kubernetes.io/network-unavailable"
-            | "node.cloudprovider.kubernetes.io/uninitialized"
-    )
-}
-
 fn select_log_runtime(nodes: &[Node]) -> Result<LogRuntime> {
     if nodes.is_empty() {
         bail!("no nodes found to select Alloy log parser; inspect `kubectl get nodes -o json`");
@@ -3731,43 +3770,6 @@ fn optional_memory(requests: &BTreeMap<String, String>, pod: &str, owner: &str) 
 fn checked_add(left: u128, right: u128) -> Result<u128> {
     left.checked_add(right)
         .ok_or_else(|| anyhow!("pod memory request overflowed"))
-}
-
-fn parse_memory_quantity(quantity: &str) -> Result<u128> {
-    let quantity = quantity.trim();
-    let (number, multiplier) = [
-        ("Ei", 1024f64.powi(6)),
-        ("Pi", 1024f64.powi(5)),
-        ("Ti", 1024f64.powi(4)),
-        ("Gi", 1024f64.powi(3)),
-        ("Mi", 1024f64.powi(2)),
-        ("Ki", 1024f64),
-        ("E", 1000f64.powi(6)),
-        ("P", 1000f64.powi(5)),
-        ("T", 1000f64.powi(4)),
-        ("G", 1000f64.powi(3)),
-        ("M", 1000f64.powi(2)),
-        ("K", 1000f64),
-        ("k", 1000f64),
-        ("m", 0.001f64),
-        ("u", 0.000_001f64),
-        ("n", 0.000_000_001f64),
-    ]
-    .into_iter()
-    .find_map(|(suffix, multiplier)| {
-        quantity
-            .strip_suffix(suffix)
-            .map(|number| (number, multiplier))
-    })
-    .unwrap_or((quantity, 1f64));
-    let number = number
-        .parse::<f64>()
-        .with_context(|| format!("unsupported Kubernetes memory quantity {quantity:?}"))?;
-    let bytes = number * multiplier;
-    if !bytes.is_finite() || bytes < 0.0 || bytes > u128::MAX as f64 {
-        bail!("unsupported Kubernetes memory quantity {quantity:?}");
-    }
-    Ok(bytes.ceil() as u128)
 }
 
 #[cfg(test)]

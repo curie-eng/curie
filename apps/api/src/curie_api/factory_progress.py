@@ -9,17 +9,23 @@ the pure phase view the status comment and the SVG card render from.
 from __future__ import annotations
 
 import json
+import logging
+import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from curie_api.workitems.lifecycle import lock_active_request
+
 from .models import ExecutionRequest, ExecutionRequestPhaseReport, FactoryStatusComment
-from .workitems import _lock_active_request
+
+logger = logging.getLogger(__name__)
 
 PROGRESS_SCOPE = "work_item.progress"
 REPORT_LIMIT = 200
@@ -28,6 +34,7 @@ VERIFICATION_PREFLIGHT_PHASE = "verification_preflight"
 VERIFICATION_CHECK_PATTERN = r"^[a-z][a-z0-9_]{0,31}$"
 VERIFICATION_CHECK_LIMIT = 4
 PYTHON_CHECK_ID = "python"
+_DELEGATED_FORBIDDEN = re.compile(r"[\x00-\x1f\x7f`]")
 
 
 class _Strict(BaseModel):
@@ -144,7 +151,9 @@ class VerificationObservation(_Strict):
     ``check`` is the declared check id and ``command`` the exact command the
     runner ran for it. ``not_declared`` records that neither the bundle nor the
     repository declared a check, so no command ran: its check, command and
-    exit_status are null and it carries no blockers.
+    exit_status are null and it carries no blockers. ``delegated_to`` optionally
+    names the required CI check that stands in for a declared check; it is
+    never valid on ``not_declared``.
     """
 
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -155,6 +164,18 @@ class VerificationObservation(_Strict):
     exit_status: int | None = Field(ge=-255, le=255)
     missing_binaries: list[str] = Field(max_length=8)
     blocked_services: list[str] = Field(max_length=8)
+    delegated_to: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @field_validator("delegated_to")
+    @classmethod
+    def _delegated_to_printable(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if value != value.strip() or _DELEGATED_FORBIDDEN.search(value):
+            raise ValueError(
+                "delegated_to must be printable characters without backticks or surrounding spaces"
+            )
+        return value
 
     @field_validator("command")
     @classmethod
@@ -165,16 +186,12 @@ class VerificationObservation(_Strict):
 
     @field_validator("missing_binaries", "blocked_services")
     @classmethod
-    def _unique_nonblank_names(
-        cls, values: list[str], info: ValidationInfo
-    ) -> list[str]:
+    def _unique_nonblank_names(cls, values: list[str], info: ValidationInfo) -> list[str]:
         normalized: list[str] = []
         for value in values:
             name = value.strip()
             if not name or len(name) > 64:
-                raise ValueError(
-                    f"{info.field_name} entries must be 1 to 64 characters"
-                )
+                raise ValueError(f"{info.field_name} entries must be 1 to 64 characters")
             normalized.append(name)
         if len(set(normalized)) != len(normalized):
             raise ValueError(f"{info.field_name} entries must be unique")
@@ -189,9 +206,11 @@ class VerificationObservation(_Strict):
                 or self.command is not None
                 or self.exit_status is not None
                 or has_blocker
+                or self.delegated_to is not None
             ):
                 raise ValueError(
-                    "not_declared requires a null check, command and exit_status and no blockers"
+                    "not_declared requires a null check, command and exit_status, "
+                    "no blockers and no delegated_to"
                 )
         elif self.check is None or self.command is None:
             raise ValueError(f"{self.outcome} requires a declared check and its command")
@@ -203,22 +222,42 @@ class VerificationObservation(_Strict):
                 raise ValueError("passed requires exit_status 0 and no blockers")
         elif self.exit_status in (None, 0):
             raise ValueError("failed requires a nonzero exit_status")
-        note = json.dumps(self.model_dump(), sort_keys=True, separators=(",", ":"))
-        if len(note.encode("utf-8")) > 280:
+        if len(verification_observation_note(self).encode("utf-8")) > 280:
             raise ValueError("verification observation exceeds the 280-byte storage limit")
         return self
 
 
 def verification_observation_note(observation: VerificationObservation) -> str:
-    """Serialize a validated observation into its compact, deterministic note."""
+    """Serialize a validated observation into its compact, deterministic note.
 
-    return json.dumps(observation.model_dump(), sort_keys=True, separators=(",", ":"))
+    A ``None`` ``delegated_to`` is omitted: that is the canonical form, so every
+    note stored before the field existed stays canonical.
+    """
+
+    record = observation.model_dump()
+    if record["delegated_to"] is None:
+        del record["delegated_to"]
+    return json.dumps(record, sort_keys=True, separators=(",", ":"))
+
+
+def verification_route(
+    observation: VerificationObservation,
+) -> Literal["sandbox", "required_ci", "blocked"] | None:
+    """Where an observed check is proven: the sandbox, the required CI check it
+    delegates to, or nowhere yet. ``None`` when no check was declared."""
+
+    if observation.outcome in ("passed", "failed"):
+        return "sandbox"
+    if observation.outcome == "unavailable":
+        return "required_ci" if observation.delegated_to is not None else "blocked"
+    return None
 
 
 @dataclass(frozen=True)
 class RecordResult:
     outcome: Literal[
         "recorded",
+        "replayed",
         "request_not_found",
         "no_active_request",
         "declaration_changed",
@@ -240,7 +279,7 @@ async def record_report(
     if token_request is None:
         await session.rollback()
         return RecordResult("request_not_found")
-    active = await _lock_active_request(session, token_request.work_item_id)
+    active = await lock_active_request(session, token_request.work_item_id)
     # A completed request's sandbox can carry on into a revision on the same
     # thread, so its token follows the WorkItem's newer request. A token from a
     # failed or cancelled request never writes onto the run that replaced it.
@@ -252,25 +291,31 @@ async def record_report(
     # Read before any rollback below expires the instance.
     active_id = active.id
 
-    row: FactoryStatusComment | None = await session.scalar(
-        select(FactoryStatusComment)
-        .where(FactoryStatusComment.execution_request_id == active.id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    if row is None:
-        # Admitted before 0055 and still active: give it its status row now.
-        row = FactoryStatusComment(
-            execution_request_id=active.id,
+    # Admitted before 0055 and still active: give it its status row now.
+    await session.execute(
+        insert(FactoryStatusComment)
+        .values(
+            execution_request_id=active_id,
             work_item_id=active.work_item_id,
             applied_label=None,
         )
-        session.add(row)
-
+        .on_conflict_do_nothing(index_elements=["execution_request_id"])
+    )
     declaration = body.declaration.model_dump(exclude_none=True)
-    if row.declaration is None:
-        row.declaration = declaration
-    elif row.declaration != declaration:
+    await session.execute(
+        update(FactoryStatusComment)
+        .where(
+            FactoryStatusComment.execution_request_id == active_id,
+            FactoryStatusComment.declaration.is_(None),
+        )
+        .values(declaration=declaration)
+    )
+    stored = await session.scalar(
+        select(FactoryStatusComment.declaration).where(
+            FactoryStatusComment.execution_request_id == active_id
+        )
+    )
+    if stored != declaration:
         await session.rollback()
         return RecordResult("declaration_changed", active_id)
 
@@ -292,7 +337,11 @@ async def record_report(
         )
     )
     if body.activity is not None:
-        row.activity = body.activity.model_dump(exclude_none=True)
+        await session.execute(
+            update(FactoryStatusComment)
+            .where(FactoryStatusComment.execution_request_id == active_id)
+            .values(activity=body.activity.model_dump(exclude_none=True))
+        )
     await session.commit()
     return RecordResult("recorded", active.id)
 
@@ -306,9 +355,10 @@ async def record_verification(
     """Store one immutable preflight observation per declared check on the token's
     active request.
 
-    A repeated check id, a second ``not_declared`` record, or mixing
-    ``not_declared`` with declared checks is ``verification_exists``; the first
-    stored rows stand.
+    A repeated check id with the same command is ``replayed``; the first
+    observation stays authoritative, even when the replay's result differs.
+    A changed command, mixing ``not_declared`` with declared checks, or a fifth
+    distinct check is ``verification_exists``.
     """
 
     token_request: ExecutionRequest | None = await session.scalar(
@@ -317,7 +367,7 @@ async def record_verification(
     if token_request is None:
         await session.rollback()
         return RecordResult("request_not_found")
-    active = await _lock_active_request(session, token_request.work_item_id)
+    active = await lock_active_request(session, token_request.work_item_id)
     if active is None or active.id != token_request.id:
         await session.rollback()
         return RecordResult("no_active_request")
@@ -329,13 +379,27 @@ async def record_verification(
         # Unreadable stored evidence is never extended; the gates fail closed on it.
         await session.rollback()
         return RecordResult("verification_exists", active_id)
+    for observation in existing:
+        if observation.check != body.check:
+            continue
+        if observation.command != body.command:
+            await session.rollback()
+            return RecordResult("verification_exists", active_id)
+        if observation != body:
+            logger.info(
+                "verification replay retained first observation: "
+                "request_id=%s check=%s stored_outcome=%s replayed_outcome=%s",
+                active_id,
+                body.check,
+                observation.outcome,
+                body.outcome,
+            )
+        await session.rollback()
+        return RecordResult("replayed", active_id)
     if existing and (
         body.outcome == "not_declared"
         or len(existing) >= VERIFICATION_CHECK_LIMIT
-        or any(
-            observation.outcome == "not_declared" or observation.check == body.check
-            for observation in existing
-        )
+        or any(observation.outcome == "not_declared" for observation in existing)
     ):
         await session.rollback()
         return RecordResult("verification_exists", active_id)
@@ -574,14 +638,25 @@ def phase_view(
         else [(phase_id, label, (phase_id,)) for phase_id, label in phases]
     )
     stage_by_phase = {
-        phase_id: stage_id
-        for stage_id, _label, phase_ids in stage_specs
-        for phase_id in phase_ids
+        phase_id: stage_id for stage_id, _label, phase_ids in stage_specs for phase_id in phase_ids
     }
     ordered = sorted(reports, key=lambda report: report.id or 0)
     completed = status == "completed"
-    latest = ordered[-1].phase if ordered else None
-    current = None if completed or latest not in ids else latest
+    current: str | None = None
+    if not completed:
+        for report in ordered:
+            if report.phase not in ids:
+                continue
+            loop_return = any(
+                report.phase == str(loop["start"])
+                and (
+                    current == str(loop["review"])
+                    or (current == WAIT_CI_PHASE and str(loop["review"]) == "review_diff")
+                )
+                for loop in declaration.get("loops", [])
+            )
+            if current is None or ids.index(report.phase) >= ids.index(current) or loop_return:
+                current = report.phase
     reported = {report.phase for report in ordered}
     latest_ci = max(
         (index for index, report in enumerate(ordered) if report.phase == WAIT_CI_PHASE),
@@ -636,8 +711,7 @@ def phase_view(
             active = active and latest_ci <= latest_diff_review
         if staged and review == WAIT_CI_PHASE:
             active = status == "running" and (
-                current == review
-                or (current == start and latest_ci > latest_diff_review)
+                current == review or (current == start and latest_ci > latest_diff_review)
             )
         if active:
             round_label = f"round {loop_round} of {cap}"
@@ -723,17 +797,21 @@ _PILLS: dict[str, tuple[str, str, bool]] = {
     "running": ("RUNNING", "#2f81f7", True),
     "cancellation_requested": ("STOPPING", "#bc4c00", True),
     "completed": ("SUCCEEDED", "#1a7f37", False),
-    "failed": ("FAILED", "#cf222e", False),
-    "expired": ("EXPIRED", "#953800", False),
+    # Failed and expired runs need a human unless an owner_lost successor was admitted.
+    "failed": ("NEEDS HUMAN", "#bf8700", False),
+    "expired": ("NEEDS HUMAN", "#bf8700", False),
     "cancelled": ("CANCELLED", "#6e7781", False),
 }
 _PUBLISHING = ("PUBLISHING", "#8250df", True)
+_RETRYING = ("RETRYING", "#2f81f7", False)
 _UNKNOWN_COLOR = "#6e7781"
 
 
-def pill_for(status: str, publishing: bool) -> tuple[str, str, bool]:
+def pill_for(status: str, publishing: bool, *, retrying: bool = False) -> tuple[str, str, bool]:
     """The status pill: label, color, and whether its dot pulses."""
 
+    if retrying:
+        return _RETRYING
     if status == "running" and publishing:
         return _PUBLISHING
     return _PILLS.get(status, (status.upper(), _UNKNOWN_COLOR, False))

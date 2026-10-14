@@ -69,6 +69,10 @@ export const WIRED_ACTIONS = [
   { id: "observability-metrics-cluster", label: "Query metrics (prod)", mapping: { command: "cluster.observability.metrics" } },
   { id: "observability-metrics-local", label: "Query metrics (dev)", mapping: { command: "local.observability.metrics" } },
 
+  // LoginScreen (#1047): mint the code the console exchanges for its session cookie.
+  { id: "console-login-local", label: "Mint a console login code (dev)", mapping: { command: "local.console.login" } },
+  { id: "console-login-cluster", label: "Mint a console login code (prod)", mapping: { command: "cluster.console.login" } },
+
   // Genuinely-unmapped actions: no dedicated CLI verb exists yet. These render
   // the honest amber glyph linking to the parity epic instead of a command.
   { id: "rollback", label: "Roll back to an earlier version", mapping: { noCliEquivalent: PARITY_TRACKING_ISSUE } },

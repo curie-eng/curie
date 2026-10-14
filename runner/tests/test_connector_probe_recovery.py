@@ -19,6 +19,13 @@ from curie_runner.fake import FakeModelSession, default_turn
 from curie_runner.session import SessionRunner
 
 
+def _sent(text: str, user: str = "U") -> str:
+    # Imported at call time so a pin that reverts a newer runner still collects.
+    from curie_runner.sender_frame import frame_user_turn
+
+    return frame_user_turn("message", user, text, None)
+
+
 def test_transient_probe_failure_recovers_on_a_later_turn(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -110,7 +117,7 @@ def test_transient_probe_failure_recovers_on_a_later_turn(
         first, first_decision, second, second_decision = anyio.run(go)
 
     assert calls == ["dial", "dial", "dial"]
-    assert fake.queries == ["go", "again"]
+    assert fake.queries == [_sent("go"), _sent("again")]
 
     assert not any(isinstance(e, ErrorEvent) for e in first)
     assert first[-1].status == SessionStatus.DONE

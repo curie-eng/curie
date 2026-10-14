@@ -9,7 +9,7 @@
 //! shows up by inspecting the actual outgoing request path, not by
 //! hand-constructing `ApprovalsOutput::Pending`.
 
-mod support;
+use crate::support;
 
 use curie::api::ApiClient;
 use curie::commands::{approvals, AgentActionOpts, ApprovalCmd, ApprovalsOutput};

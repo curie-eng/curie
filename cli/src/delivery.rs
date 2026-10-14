@@ -3,7 +3,7 @@
 //! Binding and delivery are two different facts. `cluster deploy --repo`
 //! historically printed `git-flow pushes to <owner>/<name> deploy this agent`
 //! from binding evidence alone -- a delivery promise nothing had observed.
-//! This module owns the single statement of the delivery rule, so `commands.rs`
+//! This module owns the single statement of the delivery rule, so `commands/deploy.rs`
 //! (the deploy bind line) and `doctor.rs` (the `webhook` check) cannot drift
 //! apart the way they already did: #1239 shipped `api.commitPollIntervalSeconds`
 //! as the no-ingress delivery path and never taught doctor about it.

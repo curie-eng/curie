@@ -22,6 +22,15 @@ VERSION_ONLY_PATHS = frozenset(
 )
 
 
+def version_only_paths(version: str) -> frozenset[str]:
+    """Paths a release bump for `version` may change without changing behavior.
+
+    The shared set plus that release's own atlas snapshot. The CI selector and
+    the release tag gate both read this one definition (#3858).
+    """
+    return VERSION_ONLY_PATHS | {f"docs/architecture-atlas/snapshots/{version}.json"}
+
+
 def require_release_snapshot(
     atlas_dir: Path,
     version: str,
@@ -53,10 +62,7 @@ def require_release_snapshot(
                 f"architecture atlas {version} names commit {snapshot_commit!r}, not tag "
                 f"commit {commit}, and no release-delta evidence was supplied"
             )
-        allowed = VERSION_ONLY_PATHS | {
-            f"docs/architecture-atlas/snapshots/{version}.json"
-        }
-        disallowed = sorted(set(changed_paths) - allowed)
+        disallowed = sorted(set(changed_paths) - version_only_paths(version))
         if disallowed:
             raise AtlasError(
                 "architecture changed after the release snapshot pin: "

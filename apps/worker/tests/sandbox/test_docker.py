@@ -103,6 +103,31 @@ def test_create_claim_argv_carries_boot_env() -> None:
     assert argv[-1] == "curie-runner"
 
 
+def test_create_claim_forwards_the_claims_code_host_origin_and_no_github_url() -> None:
+    """ADR 0197: the runner checks its checkout against the claim's origin and path.
+
+    The worker sets them from the API's credential; the substrate injects no
+    GitHub URL of its own.
+    """
+
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+
+    client.create_claim(
+        "thread-code-host",
+        pool="pool",
+        env={
+            "CURIE_FAKE_MODEL": "1",
+            "CURIE_REPO_ORIGIN": "https://gitlab.example.com",
+            "CURIE_REPO_PATH": "group/sub/project",
+        },
+    )
+
+    envs = _flag_values(client.calls[0], "-e")
+    assert "CURIE_REPO_ORIGIN=https://gitlab.example.com" in envs
+    assert "CURIE_REPO_PATH=group/sub/project" in envs
+    assert not any(item.startswith("CURIE_GITHUB_API_URL=") for item in envs)
+
+
 def test_create_claim_excludes_host_credentials_from_child_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -912,7 +937,10 @@ def test_ensure_image_is_best_effort_on_pull_failure(caplog) -> None:
                 raise DockerError("docker pull failed (1): SENTINEL_STDERR_LEAK")
             return ""  # inspect: absent
 
-    client = _PullFailsDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    client = _PullFailsDocker(
+        image="curie-runner",
+        bundle_store=_FakeBundleStore(),
+    )
     with caplog.at_level(logging.WARNING, logger="curie_worker.sandbox.docker"):
         client.ensure_image()  # must return normally, no exception propagates
     assert ["pull", "curie-runner"] in client.calls
@@ -947,7 +975,10 @@ def test_ensure_image_is_best_effort_when_docker_unavailable(caplog) -> None:
                 raise FileNotFoundError("docker")
             return ""
 
-    client = _DockerUnavailable(image="curie-runner", bundle_store=_FakeBundleStore())
+    client = _DockerUnavailable(
+        image="curie-runner",
+        bundle_store=_FakeBundleStore(),
+    )
     with caplog.at_level(logging.WARNING, logger="curie_worker.sandbox.docker"):
         client.ensure_image()  # must return normally, no exception propagates
     assert ["image", "inspect", "curie-runner"] in client.calls
@@ -994,7 +1025,9 @@ def test_docker_error_without_a_matching_network_name_carries_no_hint() -> None:
     missing -- an unrelated docker failure (e.g. no such image) must not gain
     a misleading "run curie local up" tacked onto it."""
     client = DockerSandboxClient(
-        image="curie-runner", bundle_store=_FakeBundleStore(), network="curie_runner"
+        image="curie-runner",
+        bundle_store=_FakeBundleStore(),
+        network="curie_runner",
     )
     hint = client._network_remediation_hint("Error: No such image: curie-runner:latest")
     assert hint == ""

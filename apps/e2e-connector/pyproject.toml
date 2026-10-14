@@ -1,0 +1,17 @@
+[project]
+name = "curie-e2e-connector"
+version = "0.0.0"
+description = "Platform hosted end to end connector (ADR 0176, issue #3244)"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28",
+    "mcp>=1.28.1",
+    "pyyaml>=6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/curie_e2e_connector"]

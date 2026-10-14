@@ -209,6 +209,7 @@ def _post_push(client: Any, ref: str, sha: str, clone_url: str) -> Any:
         content=body,
         headers={
             "X-GitHub-Event": "push",
+            "X-GitHub-Delivery": str(uuid.uuid4()),
             "X-Hub-Signature-256": sig,
             "Content-Type": "application/json",
         },

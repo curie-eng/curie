@@ -64,7 +64,7 @@ def _assert_known_keys(vector: dict[str, object]) -> None:
             f"{sorted(_EXPECTED_VECTOR_KEYS - keys)}. A new input is rejected on "
             "purpose: one this lane cannot see would pass vacuously. Teach the new "
             "key to _EXPECTED_VECTOR_KEYS and _run_vector here, to ForwardingVector "
-            "in cli/src/commands.rs, and to both implementations of the rule."
+            "in cli/src/commands/tests.rs, and to both implementations of the rule."
         )
 
 

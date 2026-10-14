@@ -11,7 +11,13 @@ fn main() {
     }
     println!("cargo:rustc-env=CURIE_BUILD_CHANNEL={channel}");
 
-    stamp_repo_commit();
+    // Only release builds can run the installer that records the commit
+    // (#2128): `cargo install` uses the release profile and the release
+    // workflow sets the channel. Debug and test builds skip the stamp so a
+    // moved HEAD does not rerun this script and rebuild every unit (#4381).
+    if std::env::var("PROFILE").as_deref() == Ok("release") || channel == "release" {
+        stamp_repo_commit();
+    }
     embed_result_schemas();
 }
 

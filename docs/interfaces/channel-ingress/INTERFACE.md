@@ -31,10 +31,12 @@ routing, concurrency, sandboxing — is opinionated core and channel-agnostic. S
 longer the least-clean seam by its wire contract, and #1459 took the Slack shape off the
 binding surface too; the remaining vendor shape is on the egress semantics
 (edit-in-place streaming, plus posting and settling platform-owned cards). Three
-implementations today, Slack, Discord, and email, confirm that the seam boundary is the
+channel implementations today, Slack, Discord, and email egress, confirm that the seam boundary is the
 HTTP wire rather than only the in-process port: `adapters/discord` and
 `apps/mail-adapter` are services outside the core that neither construct a `QueuedTurn`
-nor implement `ReplySink`.
+nor implement `ReplySink`. Email's authenticated HTTP reply receiver is shipped; the
+AgentMail inbound gate currently refuses every message before fetching its body or
+handling an approval reply, so it is not an admitted email turn producer.
 
 ## Current contract
 
@@ -107,16 +109,27 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   [ACI producer seam](../aci-producer/INTERFACE.md). A turn producer sets it
   only toward a worker and runner that implement it (TOOL-ACCESS-6): one that
   does not decodes the field and drops it, and the turn then runs
-  unrestricted. No first-party ingress sets it (for example the Slack
-  dispatcher, the wire ingress and the API resume queue); an operator's own
-  synthetic producer, such as a canary on the disconnected cluster-message
-  relay, is the intended caller. An absent value is today's turn.
+  unrestricted. The Slack dispatcher, the wire ingress and the API resume
+  queue never set it. The one first-party ingress that sets it is the signed
+  hook route (`apps/api/src/curie_api/routers/hooks.py::ingest_hook`), when the
+  caller passes the `tool_access` query parameter; the signature covers that
+  policy with the body, and the operator must first confirm the worker and
+  runner implement it. Its receipt proves the queued policy, not runner
+  enforcement. An operator's own synthetic producer, such as a canary on the
+  disconnected cluster-message relay, may set it too. An absent value is
+  today's turn.
 - **Egress** — the `ReplySink` Protocol (`apps/worker/src/curie_worker/reply_sink.py::ReplySink`),
   whose one method is `async def emit(self, event, *, route, best_effort_unreachable=False)`
   (`apps/worker/src/curie_worker/reply_sink.py::ReplySink.emit`) — four versioned neutral
   events (`turn.status`, `reply.update`, `reply.post`, `turn.completed`) over a
-  worker-local `TargetRoute`. One verb, but a second channel still supports three shapes,
-  not one:
+  worker-local `TargetRoute`. Beside the verb, the kernel asks two optional capability
+  questions that are not on the Protocol: `undeliverable_reason(kind, route)`, which drops a
+  turn addressed to a Slack identity this worker holds no token for before any model call,
+  and `edits_in_place(kind, route)`, which decides whether a sibling-limit notice can edit
+  the placeholder. `ReplySinkRouter`
+  (`apps/worker/src/curie_worker/reply_sink.py::ReplySinkRouter`) finds them with `getattr`
+  and answers `None` and `False` for an adapter without them. One verb, but a second channel
+  still supports three shapes, not one:
   - `reply.update` (`packages/channel-protocol/src/channel_protocol/reply.py::ReplyUpdate`)
     carries either a streamed or final `text`, edited in place over the ingress placeholder,
     or a `message` plus `settled` pair that turns an already-posted platform message into
@@ -175,14 +188,15 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   different adapter kinds.
   `curie-cluster-message` is reserved for the built-in cluster-message relay
   (`apps/worker/src/curie_worker/reply_sink.py::_ClusterMessageReplyAdapter`) and is refused
-  on an operator binding by `apps/api/src/curie_api/schemas.py::ChannelBindingWrite`.
+  on an operator binding by `apps/api/src/curie_api/schemas/channels.py::ChannelBindingWrite`.
 
 ## Implementations today
 
-Three first-party production channels, plus a CLI transport stub. Slack ingress
+Slack and Discord provide production ingress and egress; email provides HTTP egress,
+with AgentMail inbound admission disabled. There is also a CLI transport stub. Slack ingress
 is `apps/dispatcher` (Bolt / Socket Mode); Slack egress is `SlackReplyAdapter`
 (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) on the Slack
-Web API. Discord (`adapters/discord`) and email (`apps/mail-adapter`) join on
+Web API. Discord (`adapters/discord`) and email's reply receiver (`apps/mail-adapter`) join on
 the authenticated HTTP edge: they neither construct a `QueuedTurn` nor implement
 `ReplySink`; the worker delivers through `HttpReplyAdapter`
 (`apps/worker/src/curie_worker/reply_sink.py::HttpReplyAdapter`) to the
@@ -190,10 +204,11 @@ binding's server-controlled endpoint. The built-in cluster-message publication p
 `_ClusterMessageReplyAdapter`
 (`apps/worker/src/curie_worker/reply_sink.py::_ClusterMessageReplyAdapter`) as the third
 `ReplySink` implementation and relays replies to the API. The fourth is
-`GitHubReplySink` (`apps/worker/src/curie_worker/reply_sink.py::GitHubReplySink`),
-selected for `kind == "github"` routes. It only acknowledges: it makes no network
-call and posts no streamed model text. A factory turn bound to a GitHub repository
-answers on GitHub through the factory notice and publication path instead: the API
+`TrackerReplySink` (`apps/worker/src/curie_worker/reply_sink.py::TrackerReplySink`),
+selected for the tracker kinds `github`, `gitlab` and `jira`. It only acknowledges:
+it makes no network call and posts no streamed model text. A factory turn bound to
+a tracker surface answers on its tracker through the factory notice and publication
+path instead: the API
 keeps the one live status comment and its labels
 (`apps/api/src/curie_api/factory_notices.py::sync_status_comments`), and the
 approval-gated pull request is recorded by the API publication control plane
@@ -227,6 +242,7 @@ tests assert the two sets equal in both directions.
 |---|---|
 | `MALFORMED_ENVELOPE` | The delivery omits a field the turn is minted from -- the event id on an event, the channel, the thread key, or the interaction identity on a click -- and refusing it before the idempotency claim beats raising after it, because Bolt has already acked and would swallow the exception while the claim survived for work that never happened. |
 | `UNSUBSCRIBED_LANE` | The delivered envelope is outside the adapter's declared subscription surface — `apps/dispatcher/slack-app-manifest.yaml` subscribes to `app_mention` and `message.im` only, so a message event on any other channel type cannot legitimately arrive, and refusing it is envelope validation rather than a relevance judgement. |
+| `TEST_ACTION_REFUSED` | A bot-authored mention begins with `[test action]` after the target mention is stripped, but the installation is not enabled, the driver/channel is not listed, or the per-thread budget is exhausted. Refused after the caller check, with a fixed thread reply and no routing (ADR 0202). |
 | `BOT_AUTHORED_THREAD_REPLY` | Loop guard across installations: Curie's own replies and placeholders are always threaded, so admitting a bot-authored mention that carries a thread timestamp would let two Curie installations in one workspace mention-loop each other indefinitely, which Bolt's self filter cannot stop because the two bot identities differ. An exact operator-trusted sender/channel pair may bypass this refusal; self-event suppression remains mandatory. |
 | `NON_CONTENT_SUBTYPE` | The subtype marks something other than new user content: an edit, a delete, a tombstone, a body redacted by Enterprise Key Management, or an assistant thread-start marker. |
 | `DUPLICATE_DELIVERY` | Slack redelivered a delivery whose idempotency key was already claimed, so processing it again would post a second placeholder and mint a second turn for one message. |
@@ -289,6 +305,21 @@ absent — it is *handled* by the dedicated approval listener, not dropped.
   and `message.im` subscribed, channel-lane noise (joins, leaves, topic and purpose
   changes, pins) cannot reach these lanes in production, so the denylist stays small rather
   than becoming a speculative catalogue of every subtype Slack documents.
+- **Marked test actions have a separate installation boundary (ADR 0202 decisions 2–3).**
+  A bot-authored mention beginning with `[test action]` after stripping the target's
+  mention bypasses the ordinary threaded-bot filter so the caller list can be checked
+  first. A refused caller receives no reply. Otherwise only an enabled declaration's
+  exact driver/channel pair can start a turn, with its configured bot user as author;
+  all other marked mentions receive `This installation does not accept test actions.`
+  after dedupe, before routing. People typing the mark and direct messages retain their
+  ordinary behavior. A listed driver's root `[test action] ping` receives a fixed
+  admission reply in its own thread without a turn; a ping in an existing thread is
+  refused. `testInstallation.threadTurnLimit` defaults to 10 (1–100) per addressed
+  identity/channel/thread in any ten minutes, shared across drivers. Atomic Valkey
+  reservations expire after ten minutes; pings and duplicate deliveries spend no budget.
+  The production ingress and Bolt regressions use real Valkey in
+  `apps/dispatcher/tests/test_test_actions.py`; they do not establish a live Slack
+  exchange or enable approval replies.
 - **Bot authorship is a mention-lane rule, and its cost is accepted.** A foreign bot's
   *root* `@`-mention is admitted — the alert-app case this work exists for, whose body
   typically arrives as Block Kit and is normalized by
@@ -328,10 +359,93 @@ absent — it is *handled* by the dedicated approval listener, not dropped.
   need no equivalent vocabulary today, and extending the enumerated reasons to them if they
   ever grow relevance logic is deliberately deferred.
 
+## Sender identity field mapping (Slack)
+
+ADR 0198 decision 6 fixes the properties a sender's identity namespace must have
+(sender-bound, canonical, connection-scoped authority, fail-closed). ADR 0201 moves
+*which Slack fields* satisfy them out of the ADR and into the realization: the code in
+`apps/api/src/curie_api/identity/slack.py::derive`, the fixture tests, and this note. The
+dispatcher sends the fields below as
+`apps/api/src/curie_api/identity/slack.py::SlackEvidence` to `POST /identity/resolve`
+(`apps/api/src/curie_api/routers/identity.py`), and
+`apps/api/src/curie_api/identity/service.py::resolve_principal` runs ADR 0198 decision 7's
+ordered checks around the mapping. The native id is the payload's user id, unchanged:
+nothing is case-folded or trimmed.
+
+**Fields used, per delivery type.**
+
+| Delivery | Sender team | User id | Context fields checked |
+|---|---|---|---|
+| `block_actions`, `view_submission` | `user.team_id` (documented) | `user.id` | enterprise signals; the stored `auth.test` Grid check (`slack_auth_test` with a non-null `enterprise_id` or `is_enterprise_install: true` refuses) |
+| any event carrying `event.user_team` | `event.user_team` (documented); an `event.team` that differs is `namespace_conflict` | `event.user` | enterprise signals; the stored `auth.test` Grid check (`slack_auth_test` with a non-null `enterprise_id` or `is_enterprise_install: true` refuses) |
+| `app_mention` without `user_team` | `event.team`, only in the context below | `event.user` | enterprise signals; the stored `auth.test` Grid check; envelope `is_ext_shared_channel`; the identity's stored `auth.test` non-Grid evidence; the receiving installation's team and authority |
+
+**Fields refused.** The envelope `team_id`, `source_team` and `authorizations[]` describe
+the channel or the installation and are never a sender team. Any enterprise id (envelope
+`enterprise_id`, `authorizations[].enterprise_id`, `enterprise.id`, `team.enterprise_id`,
+`user.enterprise_id`, `event.enterprise_id`, a non-null `context_enterprise_id`), an
+`is_enterprise_install: true` on the event body, an `authorizations[]` entry or the
+interaction payload, and a stored `auth.test` answer with a non-null `enterprise_id` or
+`is_enterprise_install: true`, refuses the delivery on every path:
+canonical ids under Enterprise Grid cannot be confirmed from these payloads.
+
+**Contexts covered.**
+
+- `app_mention` uses `event.team` only when every statement is positive: the envelope has
+  `is_ext_shared_channel` present and `false`; the identity's stored
+  `attributes.slack_auth_test` (written only by `POST /identity/slack-reports`, from the
+  identity's own ok `auth.test`) has `enterprise_id` absent or null,
+  `is_enterprise_install` present and exactly `false` (absent or null is not evidence), and
+  a `team_id` equal to the receiving installation's `external_account_id`; and the
+  installation's `authority` is empty. `enterprise_id_present` is recorded but not
+  required: an ordinary workspace's `auth.test` omits `enterprise_id`, which Slack sends
+  only within an Enterprise organization. A present `enterprise_id` that is neither a
+  string nor null is malformed: the dispatcher does not report it, and the report route
+  refuses it with 422. `event.team` must
+  then equal the installation's team; a disagreement is `namespace_conflict`. The
+  installation's team is a consistency check, never a fallback.
+- Interactions use the documented `user.team_id` and need no stored evidence.
+- Enterprise Grid is refused, whatever else the payload carries.
+- Direct messages (`message`) without `user_team` are unobserved, so they are refused, as
+  is any other event type: `event.team` was observed on `app_mention` only.
+
+**Evidence.** A capture on 2026-10-05 of real Socket Mode deliveries to an app in an
+ordinary, non-Grid workspace recorded `app_mention`, `block_actions` and
+`view_submission`; a direct message was not captured. The anonymised records are
+`apps/api/tests/fixtures/slack_identity_capture.json` (ADR 0201, decision 3: placeholder
+ids, field presence and equalities kept, no text, names or tokens). In the capture
+`event.team`, the envelope `team_id`, `user.team_id` and `team.id` were all the app's own
+workspace, which is why `event.team` is accepted only in a context that establishes the
+sender's team by itself. The same workspace's bot-token `auth.test`, observed on
+2026-10-07, omitted `enterprise_id` and carried `is_enterprise_install: false`; its
+anonymised keys are `apps/api/tests/fixtures/slack_auth_test_capture.json`, the basis of
+the absent-or-null rule above.
+
+**Refusal reasons** (Slack mapping, decision 7 step 4):
+
+| Reason | When |
+|---|---|
+| `subject_unidentified` | No user id, or a blank one; no sender team on the path the delivery takes; an `app_mention` outside the positive context above; any other event type without `user_team`; any Enterprise Grid signal; no evidence sent at all. |
+| `namespace_conflict` | `event.user_team` and `event.team` disagree, or an in-context `app_mention`'s `event.team` differs from the receiving installation's team. |
+
+A changed mapping is a code change reviewed against ADR 0198's properties, with its own
+capture as fixture evidence (ADR 0201, decision 1); it needs no new ADR.
+
 ## Known leakage
 
 Two ends and the binding surface were cleaned; what remains is egress semantics and
-incomplete adapter coverage and conformance.
+incomplete adapter coverage (no registered address shapes for most kinds, and no
+attachments from Discord or mail).
+
+Email sender authentication remains adapter-owned. A channel token authenticates the
+adapter and binding, not the sender named in a turn. The platform trusts that adapter's
+sender assertion before applying caller authorization. The AgentMail provider exposes
+labels and arbitrary headers without a trusted aligned authentication verdict or header
+provenance guarantee, so `MailAdapter._listing_rejection`
+(`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter._listing_rejection`)
+refuses all inbound messages, including approval replies. An allowed sender list cannot
+replace that authentication evidence. Outbound reply and approval-card rendering remain
+implemented through `apps/mail-adapter/src/curie_mail_adapter/egress.py::EgressHandler`.
 
 - **Fixed (#7).** The ingress field names were Slack's (`slack_event_id`, `thread_ts`,
   `placeholder_ts`); the payload was promoted into `packages/aci-protocol` as `QueuedTurn`
@@ -350,13 +464,21 @@ incomplete adapter coverage and conformance.
   Email is another datapoint: it accumulates reply events per
   `(conversation_id, reply_ref)` and sends one threaded mail on `turn.completed`
   (`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.send_reply`).
+- **Still leaks: Slack-only capability queries.** The kernel calls
+  `undeliverable_reason` and `edits_in_place` on its sink
+  (`apps/worker/src/curie_worker/kernel/core.py::Kernel`), but only `SlackReplyAdapter`
+  (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.undeliverable_reason`,
+  `apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.edits_in_place`) implements
+  them. They are duck-typed rather than declared on `ReplySink`, so a second adapter that
+  edits in place or holds per-identity credentials gets the defaults silently, with no
+  conformance failure.
 - **Fixed (#1459, ADR-0096).** The binding surface was Slack-typed in the control plane, not
   just at the channel edges: the agents table carried a `slack_channel` column, and agent
   create/update validated it as a Slack channel id, so binding any other channel kind took a
   schema change. The binding is now a neutral `{kind, address}` object
-  (`apps/api/src/curie_api/schemas.py::ChannelBinding`) on its own table
+  (`apps/api/src/curie_api/schemas/channels.py::ChannelBinding`) on its own table
   (`apps/api/src/curie_api/models.py::AgentChannel`), and the write gate is kind-dispatched
-  (`apps/api/src/curie_api/schemas.py::_validate_channel_binding`): a registered kind
+  (`apps/api/src/curie_api/schemas/channels.py::validate_channel_binding`): a registered kind
   validates on its own address shape, an unregistered one on a generic non-empty rule, so a
   new kind binds with no schema change. Still no multi-channel adapter framework (#27) — the
   restraint stands; only the Slack-shaped assumption is gone.
@@ -366,13 +488,13 @@ incomplete adapter coverage and conformance.
   silently selecting one another's binding.
 - **Still leaks — registered address shapes.** Slack is the only registered kind in
   `_CHANNEL_ADDRESS_SHAPES`
-  (`apps/api/src/curie_api/schemas.py::_CHANNEL_ADDRESS_SHAPES`); Discord and email
+  (`apps/api/src/curie_api/schemas/channels.py::_CHANNEL_ADDRESS_SHAPES`); Discord and email
   bind under the generic non-empty rule. There is still no multi-channel adapter
   framework (#27). The routing pair removes the binding ambiguity; it does not by
   itself give other kinds a registered address shape.
 - **Fixed (#3678, ADR-0153) — attachment resolution.** The kernel hands the
   turn's reply handle to the lane
-  (`apps/worker/src/curie_worker/kernel.py::Kernel._resolve_attachments`), and the
+  (`apps/worker/src/curie_worker/kernel/core.py::Kernel._resolve_attachments`), and the
   lane picks the file port from its kind
   (`apps/worker/src/curie_worker/attachments.py::AttachmentCoordinator`). Slack keeps
   `apps/worker/src/curie_worker/attachments.py::SlackFileClient` (`files.info` /
@@ -383,6 +505,11 @@ incomplete adapter coverage and conformance.
   egress secret. The channel-port ingress carries the references on `TurnIn.attachments`
   (`apps/api/src/curie_api/routers/channels.py::TurnIn`). Discord and the first-party
   mail adapter do not emit attachments yet.
+- **Fixed (#3830) — adapter conformance.** One suite now drives every first-party
+  adapter (Discord, mail, GitHub and `HttpReplyAdapter`) through the `ReplySink` port
+  with the kit in `packages/channel-protocol/src/channel_protocol/conformance.py`. It
+  caught the Discord reply app answering a provider failure with a bare 500 that
+  closed the socket; it now answers 502.
 
 ## Cross-links
 

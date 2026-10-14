@@ -32,7 +32,6 @@ from curie_telemetry import (
 )
 from curie_telemetry.metrics import record_metric as validate_record_metric
 from curie_worker import consumer as consumer_module
-from curie_worker import kernel as kernel_module
 from curie_worker import runner_client as runner_client_module
 from curie_worker import stream_consumer as stream_consumer_module
 from curie_worker import threadlock as threadlock_module
@@ -41,6 +40,9 @@ from curie_worker.attachments import AttachmentResolutionError
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore
+from curie_worker.kernel import constants as kernel_constants
+from curie_worker.kernel import log as kernel_log
+from curie_worker.kernel import routing as kernel_routing
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.sandbox import MissingAgentPoolError, QuotaRejection
 from curie_worker.sandbox import substrate as substrate_module
@@ -81,7 +83,7 @@ def _install(monkeypatch: pytest.MonkeyPatch) -> Probe:
         monkeypatch,
         consumer_module,
         stream_consumer_module,
-        kernel_module,
+        kernel_log,
         threadlock_module,
         runner_client_module,
         substrate_module,
@@ -287,6 +289,7 @@ def test_a_resolved_agent_labels_only_the_agent_turn_counter(
             *,
             kind: str | None = None,
             address: str | None = None,
+        **_: object,
         ) -> dict[str, str]:
             del kind, address
             return {
@@ -325,11 +328,11 @@ def test_a_resolved_agent_labels_only_the_agent_turn_counter(
                 "curie.turn.completed",
                 attributes=fleet[-1].attributes,
             )
-            token = kernel_module._TURN_AGENT.set("unbound")
+            token = kernel_constants._TURN_AGENT.set("unbound")
             try:
                 named.kernel._record_agent_turn("done")
             finally:
-                kernel_module._TURN_AGENT.reset(token)
+                kernel_constants._TURN_AGENT.reset(token)
             assert _metrics(probe, "curie.agent.turn.completed")[-1].attributes["agent"] == "other"
 
     asyncio.run(go())
@@ -606,7 +609,7 @@ def test_turn_lifecycle_covers_lock_start_steer_reply_and_retry(
             ]
             await h.kernel.process_event(_qevent("retry", thread="thread-retry"))
             await h.kernel.reap_orphans()
-            await h.kernel.release_thread(kernel_module._thread_key_for(first_event))
+            await h.kernel.release_thread(kernel_routing._thread_key_for(first_event))
             await h.kernel.reap_orphans()
 
             route = {p.attributes["outcome"] for p in _metrics(probe, "curie.thread.route")}
@@ -783,7 +786,7 @@ class _Approvals:
     def __init__(self) -> None:
         self.requests: list[ApprovalRequest] = []
 
-    async def create(self, request: ApprovalRequest) -> CreatedApproval:
+    async def create(self, request: ApprovalRequest, *, budget_s: float = 120) -> CreatedApproval:
         self.requests.append(request)
         return CreatedApproval(id=f"appr-example-{len(self.requests)}", status="pending")
 
@@ -1320,6 +1323,7 @@ def test_no_event_id_survives_a_turn_or_crosses_into_the_next_one(
 def test_thread_reset_drain_spans_are_not_stamped_with_the_turns_event_id(
     make_harness,
     monkeypatch: pytest.MonkeyPatch,
+    thread_reset_keys,
 ) -> None:
     """T9 (R1, AC 3/AC 5): the wrong-correlation pin for the scope placement.
 
@@ -1345,39 +1349,35 @@ def test_thread_reset_drain_spans_are_not_stamped_with_the_turns_event_id(
             await consumer.ensure_group()
             # A DIFFERENT thread than the turn's: the drain tears down thread B
             # while turn A is in flight on the same handler task.
-            await h.async_redis.sadd(consumer_module.THREAD_RESET_SET, "thread-reset-victim")
-            try:
-                event = _qevent(
-                    "turn under a drain",
-                    thread="thread-drain-turn",
-                    event_id="Ev0EXAMPLEDRAIN1",
-                )
-                await _deliver(consumer, h, {"payload": event.model_dump_json()})
+            await h.async_redis.sadd(thread_reset_keys.requests, "thread-reset-victim")
+            event = _qevent(
+                "turn under a drain",
+                thread="thread-drain-turn",
+                event_id="Ev0EXAMPLEDRAIN1",
+            )
+            await _deliver(consumer, h, {"payload": event.model_dump_json()})
 
-                releases = _spans(probe, "curie.sandbox.release")
-                # (a) Fail loudly rather than pass vacuously: no release span
-                #     means the drain never ran and (b) below proves nothing.
-                assert releases, (
-                    "the thread-reset drain did not run, so this test could not "
-                    "observe whether its spans were wrongly stamped"
+            releases = _spans(probe, "curie.sandbox.release")
+            # (a) Fail loudly rather than pass vacuously: no release span
+            #     means the drain never ran and (b) below proves nothing.
+            assert releases, (
+                "the thread-reset drain did not run, so this test could not "
+                "observe whether its spans were wrongly stamped"
+            )
+            # (b) The drain describes ANOTHER thread; a Tempo query for this
+            #     turn must not return it.
+            assert [span.attributes.get("event_id") for span in releases] == [None] * len(
+                releases
+            ), (
+                "a thread-reset teardown span was stamped with the in-flight "
+                "turn's event id: the scope opens before the drain"
+            )
+            # The turn's own spans are stamped, so this is not passing
+            # because stamping is broken everywhere.
+            for name in _REQUEST_PATH_SPANS:
+                assert set(_event_ids(probe, name)) == {"Ev0EXAMPLEDRAIN1"}, (
+                    f"{name} lost the event id"
                 )
-                # (b) The drain describes ANOTHER thread; a Tempo query for this
-                #     turn must not return it.
-                assert [span.attributes.get("event_id") for span in releases] == [None] * len(
-                    releases
-                ), (
-                    "a thread-reset teardown span was stamped with the in-flight "
-                    "turn's event id: the scope opens before the drain"
-                )
-                # The turn's own spans are stamped, so this is not passing
-                # because stamping is broken everywhere.
-                for name in _REQUEST_PATH_SPANS:
-                    assert set(_event_ids(probe, name)) == {"Ev0EXAMPLEDRAIN1"}, (
-                        f"{name} lost the event id"
-                    )
-            finally:
-                await h.async_redis.delete(consumer_module.THREAD_RESET_SET)
-                await h.async_redis.delete(consumer_module.THREAD_RESET_INFLIGHT_SET)
 
     asyncio.run(go())
 
@@ -1391,9 +1391,8 @@ def test_claim_latency_log_line_is_unchanged(request: pytest.FixtureRequest) -> 
 
     from pathlib import Path
 
-    kernel_source = (
-        Path(__file__).resolve().parents[2] / "src" / "curie_worker" / "kernel.py"
-    ).read_text()
+    kernel_dir = Path(__file__).resolve().parents[2] / "src" / "curie_worker" / "kernel"
+    kernel_source = "\n".join(path.read_text() for path in sorted(kernel_dir.glob("*.py")))
     line = 'logger.info("claim latency for %s: %d ms", thread_key, claim_ms)'
     assert kernel_source.count(line) == 1, (
         "AC 6 is a no-change assertion: the claim-latency log line must stay "

@@ -171,6 +171,43 @@ _MAX_REJECTED_BREAKS = 4
 _HELD_ENCODING_MIN_LENGTH = 8
 
 
+# @spec ACTION-EXECUTOR-9: the sealed envelope grammar, frozen in
+# tests/vectors/sealed-snapshot-reply.json and read in other images by the
+# worker's ``_snapshot`` and the API's ``undoable`` grammar.
+SEALED_ENVELOPE_CONSTANT = "curie.snapshot.v1"
+_SEALED_ENVELOPE_KEYS = frozenset(("sealed", "kid", "ciphertext"))
+_SEALED_KID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+_SEALED_CIPHERTEXT_MAX_BYTES = 65536
+
+
+def is_sealed_envelope(value: object) -> bool:
+    """True when ``value`` is exactly a sealed snapshot envelope.
+
+    Exactly the keys ``sealed`` (the constant), ``kid`` (1 to 64 characters of
+    ``[A-Za-z0-9._-]``) and ``ciphertext`` (standard base64 with padding, no
+    line breaks, 1 to 65536 decoded bytes). The ciphertext is never opened.
+    """
+
+    if not isinstance(value, dict) or set(value) != _SEALED_ENVELOPE_KEYS:
+        return False
+    kid = value["kid"]
+    ciphertext = value["ciphertext"]
+    if value["sealed"] != SEALED_ENVELOPE_CONSTANT:
+        return False
+    if not isinstance(kid, str) or _SEALED_KID.fullmatch(kid) is None:
+        return False
+    if not isinstance(ciphertext, str) or not ciphertext.isascii():
+        return False
+    # A cheap bound before decoding: 65536 bytes encode to 87384 characters.
+    if len(ciphertext) > 4 * ((_SEALED_CIPHERTEXT_MAX_BYTES + 2) // 3):
+        return False
+    try:
+        decoded = base64.b64decode(ciphertext, validate=True)
+    except ValueError:
+        return False
+    return 1 <= len(decoded) <= _SEALED_CIPHERTEXT_MAX_BYTES
+
+
 def _held_literals(held_secrets: Collection[str]) -> tuple[str, ...]:
     """Exact held values plus standard and URL-safe base64 of the longer ones."""
 
@@ -309,6 +346,81 @@ class OutboundRedactor:
             return result
         return value
 
+    def _matches(self, value: object) -> bool:
+        """True when held literals or pattern rules would change ``value``."""
+
+        return self._content(value) != value
+
+    def _held(self, value: object) -> bool:
+        """True when a held literal occurs in any string or key of ``value``."""
+
+        if isinstance(value, str):
+            return bool(self._literal_intervals(value))
+        if isinstance(value, list):
+            return any(self._held(item) for item in value)
+        if isinstance(value, dict):
+            return any(self._held(key) or self._held(item) for key, item in value.items())
+        return False
+
+    def _held_in_bytes(self, data: bytes) -> bool:
+        """True when a held literal (raw or base64 form) occurs in ``data``.
+
+        @spec ACTION-EXECUTOR-10: the decoded ciphertext of a valid envelope, so
+        a plaintext secret that is merely base64-wrapped never crosses. Real
+        ciphertext is random bytes and does not contain a held value.
+        """
+
+        return any(secret.encode("utf-8") in data for secret in self._secrets)
+
+    def _side_effect_result(self, result: dict[str, object]) -> tuple[dict[str, object], bool]:
+        """Scrub a ``side_effect_flag`` result; replay inputs verbatim or withheld.
+
+        @spec ACTION-EXECUTOR-10. The replay inputs are ``prior`` when it
+        validates as a sealed envelope, ``version`` and ``target``. They are
+        never altered: pattern rules skip a valid envelope's ciphertext but run
+        over its ``kid``, ``version`` and ``target``; the held literal check runs
+        over all of them, ciphertext included, and over the decoded ciphertext
+        bytes. Any match withholds all three
+        (set to null). Every other field keeps the ordinary scrubbing. Returns
+        the result and whether anything in it was replaced or withheld, which
+        is the frozen meaning of ``redacted``.
+        """
+
+        prior = result.get("prior")
+        sealed = is_sealed_envelope(prior)
+        replay = {"version", "target"} | ({"prior"} if sealed else set())
+        withhold = any(self._matches(result.get(key)) for key in ("version", "target"))
+        if sealed:
+            envelope = cast("dict[str, object]", prior)
+            withhold = (
+                withhold
+                or self._matches(envelope["kid"])
+                or self._held(envelope["ciphertext"])
+                or self._held_in_bytes(base64.b64decode(cast("str", envelope["ciphertext"])))
+            )
+        others = {key: value for key, value in result.items() if key not in replay}
+        scrubbed_others = cast("dict[str, object]", self._content(others))
+        altered = withhold or scrubbed_others != others
+        if withhold:
+            # The three are withheld together, so no partial restore state crosses.
+            replay_values: dict[str, object] = {"prior": None, "version": None, "target": None}
+            if not sealed:
+                replay_values.pop("prior")
+        else:
+            replay_values = {key: result[key] for key in replay if key in result}
+        # Keep the connector's field order; scrubbed keys map one to one, in order.
+        renamed = dict(zip(others, scrubbed_others, strict=True))
+        out: dict[str, object] = {}
+        for key in result:
+            if key in replay:
+                if key in replay_values:
+                    out[key] = replay_values.pop(key)
+            else:
+                scrubbed_key = renamed[key]
+                out[scrubbed_key] = scrubbed_others[scrubbed_key]
+        out.update(replay_values)
+        return out, altered
+
     def _encode(self, record: dict[str, object]) -> str:
         return json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
 
@@ -368,12 +480,19 @@ class OutboundRedactor:
                     final_text, [lead + at for at in self._streamed_breaks], ""
                 )
         for name in _CONTENT_FIELDS & record.keys():
-            scrubbed = self._content(record[name])
+            scrubbed: object
             if (
                 name == "result"
                 and record.get("type") == "side_effect_flag"
-                and scrubbed != record[name]
+                and isinstance(record[name], dict)
             ):
+                scrubbed, altered = self._side_effect_result(
+                    cast("dict[str, object]", record[name])
+                )
+            else:
+                scrubbed = self._content(record[name])
+                altered = scrubbed != record[name]
+            if name == "result" and record.get("type") == "side_effect_flag" and altered:
                 # The worker builds the ledger's restore state from this result;
                 # a placeholder in it is not a state anything can put back (#1873).
                 record["redacted"] = True
@@ -404,7 +523,9 @@ __all__ = [
     "RedactingLogFilter",
     "RedactionRule",
     "OutboundRedactor",
+    "SEALED_ENVELOPE_CONSTANT",
     "collect_held_secrets",
+    "is_sealed_envelope",
     "install_stdout_redaction",
     "redact_span_attribute",
     "redact_text",

@@ -126,6 +126,7 @@ pub fn interview<R: BufRead, W: Write>(
             input,
             grader,
             shared_history: false,
+            sender: None,
             expect_status: ExpectedStatus::default(),
         });
 

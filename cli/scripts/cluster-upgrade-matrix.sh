@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Isolated cluster-upgrade matrix for the next-train verb (#2590).
 #
-# Every mutating upgrade row is `curie cluster upgrade --yes --to ...`.
+# Upgrade rows use `curie cluster upgrade --yes --to ...`; rollback-to-serving
+# injects its interrupted history with one raw Helm upgrade, and
+# rollback-uncatalogued applies an uncatalogued app version with raw Helm.
 # Refuses the permanent soak (namespace/release `curie`, namespace `default`).
 # Never mutates soak, never prints secret values, never messages a human.
 #
@@ -42,7 +44,6 @@ WORKDIR=""
 CANDIDATE=""
 OWNED_KIND=0
 OWNED_HELM=0
-PUBLISHED_BIN=""
 ASSET_DIR=""
 STARTED_AT=""
 CHART_0100=""
@@ -52,6 +53,16 @@ REV_089=""
 SENTINEL_ID="acme-2590"
 FAIL_AT_HOOK=""
 INTERRUPT_AFTER_HOOK=""
+KUBECTL_CONTEXT_ARGS=()
+HELM_CONTEXT_ARGS=()
+APPLY_KILL_PID=""
+APPLY_KILL_PIDS=()
+APPLY_KILL_HELM_SEEN=0
+ROLLBACK_SERVING_HELM_PID=""
+ROLLBACK_INTERRUPTED_HELM_PID=""
+RETIRE_RUNNER_ORIGINAL_ID=""
+RETIRE_RUNNER_DERIVED_TAG=""
+RETIRE_LAYER_TAG=""
 
 CHART_088_SHA="88664c2f991bed7a3e4bc0513ae73bfcbac08077d99a69e7087138aa6f8f3af2"
 CLI_088_SHA="dc0e1ab1b928522f1ca1c03e05d823e08218800c2d2a33d0d88af623972f6685"
@@ -81,6 +92,13 @@ SCENARIOS_ALL=(
     migration-crash
     converge-negative
     previous-serves
+    apply-kill-takeover
+    rollback-to-serving
+    rollback-interrupted
+    runner-layer-retire
+    hook-fail-not-serving
+    terminal-pods
+    rollback-uncatalogued
 )
 
 MATRIX_PHASES=(plan validate drain_preflight checkpoint migrate apply converge canary commit)
@@ -110,7 +128,14 @@ s08 setup interrupt-resume:apply+commit
 s09 setup n-to-n1 guarded-rollback
 s11 nosetup rollback-published-089
 s13 setup converge-negative
-s14 setup previous-serves"
+s14 setup previous-serves
+s15 setup runner-layer-retire
+s16 setup apply-kill-takeover
+s17 setup rollback-to-serving
+s18 setup hook-fail-not-serving
+s19 setup terminal-pods
+s20 setup rollback-interrupted
+s21 setup rollback-uncatalogued"
 SHARDS="${CURIE_E2E_SHARDS_OVERRIDE:-$SHARDS_CANONICAL}"
 
 log() { printf '%s\n' "$*" >&2; }
@@ -122,7 +147,7 @@ die() {
 
 usage() {
     cat <<'EOF' >&2
-usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
+usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves|apply-kill-takeover|rollback-to-serving|rollback-interrupted|runner-layer-retire|hook-fail-not-serving|terminal-pods|rollback-uncatalogued] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
 EOF
 }
 
@@ -295,7 +320,9 @@ run_self_test() {
         log "self-test: soak release helper is wrong"
         failed=1
     fi
-    if valid_scenario "all" && valid_scenario "fresh-n" && valid_scenario "fail-every-phase" && ! valid_scenario "not-a-scenario"; then
+    if valid_scenario "all" && valid_scenario "fresh-n" && valid_scenario "fail-every-phase" \
+        && valid_scenario "runner-layer-retire" && valid_scenario "hook-fail-not-serving" \
+        && valid_scenario "rollback-interrupted" && valid_scenario "terminal-pods" && ! valid_scenario "not-a-scenario"; then
         log "unknown scenario refused"
     else
         log "self-test: scenario helper is wrong"
@@ -359,6 +386,8 @@ run_self_test() {
         log "self-test: mutator must be cluster upgrade"
         failed=1
     fi
+    # Match the source's variable names without expanding them in this shell.
+    # shellcheck disable=SC2016
     if awk '/^restore_n\(\)/,/^}/' "$script_path" | grep -q '"$status" == "in_progress" && "$target" == "0.10.0"'; then
         log "restore_n resumes leftover in_progress 0.10.0"
     else
@@ -448,6 +477,43 @@ run_self_test() {
         log "self-test: rollback-published-089 must run the guarded rollback proof"
         failed=1
     fi
+    if declare -F run_rollback_to_serving >/dev/null 2>&1 \
+        && ! awk '/^run_rollback_to_serving\(\)/,/^}/' "$script_path" \
+            | grep -E 'settle_helm_operation|recover_helm_lock|recover_killed_upgrade_ownership' >/dev/null; then
+        log "rollback-to-serving leaves the pending revision for the CLI"
+    else
+        log "self-test: rollback-to-serving must leave the pending revision for the CLI without recovery helpers"
+        failed=1
+    fi
+    if declare -F run_rollback_interrupted >/dev/null 2>&1 \
+        && awk '/^run_rollback_interrupted\(\)/,/^}/' "$script_path" | awk '
+            /settle_helm_operation|recover_helm_lock|recover_killed_upgrade_ownership/ { forbidden=1 }
+            /^[[:space:]]*helm --kubeconfig .* rollback "\$RELEASE"/ { inbg=1; waits=0 }
+            inbg && /--wait/ { waits=1 }
+            inbg && /&[[:space:]]*$/ { bg=waits; inbg=0 }
+            /ROLLBACK_INTERRUPTED_HELM_PID=\$!/ { if (bg) pid=1 }
+            /kill -9 "\$ROLLBACK_INTERRUPTED_HELM_PID"/ { if (pid) killed=1 }
+            /"\$BIN" --json cluster rollback/ { if (killed) cli=1 }
+            killed && !cli && /(^|[^[:alnum:]_-])helm(_ns)? / && !/ history / { recovered=1 }
+            END { exit (bg && pid && killed && cli && !forbidden && !recovered) ? 0 : 1 }
+        '; then
+        log "rollback-interrupted kills a direct background helm rollback and leaves it for the CLI"
+    else
+        log "self-test: rollback-interrupted must start helm rollback --wait directly in the background, kill -9 it, and call the CLI without recovering the pending revision"
+        failed=1
+    fi
+    if awk '/^run_rollback_uncatalogued\(\)/,/^}/' "$script_path" | awk '
+        /cluster rollback --dry-run/ { dry=1 }
+        /cluster rollback --yes/ { if (dry) real=1 }
+        /fail forward to application/ { if (real) fix=1 }
+        /settle_helm_operation|recover_helm_lock|recover_killed_upgrade_ownership/ { bad=1 }
+        END { exit (fix && !bad) ? 0 : 1 }
+    '; then
+        log "rollback-uncatalogued refuses as dry run and real run and checks the fail forward fix"
+    else
+        log "self-test: rollback-uncatalogued must run cluster rollback --dry-run then --yes and check fail forward to application, without recovery helpers"
+        failed=1
+    fi
     if awk '/^run_migration_crash\(\)/,/^}/' "$script_path" | awk '
         /interrupt_schema_migrate$/ { interrupt=NR }
         /SECONDS \+ 120/ { if (interrupt) bound=NR }
@@ -462,19 +528,122 @@ run_self_test() {
         log "self-test: migration-crash must wait at most 120s for the interrupted upgrade, then terminate it and recover ownership and the helm lock before retrying"
         failed=1
     fi
+    if awk '/^run_apply_kill_takeover\(\)/,/^}/' "$script_path" | awk '
+        /cluster_upgrade|exclusive_kind_tag|settle_helm_operation|recover_killed_upgrade_ownership|recover_helm_lock|terminate_tree/ { forbidden=1 }
+        /"\$BIN" --json cluster upgrade/ { direct++ }
+        END { exit (!forbidden && direct >= 5) ? 0 : 1 }
+    '; then
+        log "apply-kill-takeover uses the binary without harness recovery"
+    else
+        log "self-test: apply-kill-takeover must call the binary directly for every upgrade and use no harness recovery helper"
+        failed=1
+    fi
+    if awk '/^run_apply_kill_takeover\(\)/,/^}/' "$script_path" | awk '
+        /SECONDS \+ 600/ { bound=NR }
+        /running_hooks="\$\(running_release_hook_jobs\)"/ { poll=NR }
+        /release hook Jobs still running after 600s/ { refusal=NR }
+        /"\$BIN" --json cluster upgrade.*--dry-run --take-over/ { dry=NR }
+        END { exit (bound && poll > bound && refusal > poll && dry > refusal) ? 0 : 1 }
+    '; then
+        log "apply-kill-takeover waits at most 600s for hooks before matching dry takeover"
+    else
+        log "self-test: apply-kill-takeover must wait at most 600s for no running hook Jobs before matching dry takeover"
+        failed=1
+    fi
+    if awk '/^sigkill_tree\(\)/,/^}/' "$script_path" | awk '
+        /pgrep -P/ { walks=1 }
+        /sigkill_tree "\$child"/ { descendants=1 }
+        /kill -KILL "\$pid"/ { killed=1 }
+        END { exit (walks && descendants && killed) ? 0 : 1 }
+    ' && awk '/^run_apply_kill_takeover\(\)/,/^}/' "$script_path" | awk '
+        /sigkill_tree "\$pid"/ { found=1 }
+        END { exit found ? 0 : 1 }
+    '; then
+        log "apply-kill-takeover sends SIGKILL to every descendant"
+    else
+        log "self-test: apply-kill-takeover must send SIGKILL to the binary and every descendant"
+        failed=1
+    fi
+    if awk '/^prepare_takeover_context\(\)/,/^}/' "$script_path" | awk '
+        /kubeconfig_is_named_kind/ { verifies=1 }
+        /--kubeconfig "\$KUBECONFIG_FILE" config rename-context "kind-\$KIND_CLUSTER" k8/ { private=1 }
+        /KUBECTL_CONTEXT_ARGS=\(--context k8\)/ { kubectl=1 }
+        /HELM_CONTEXT_ARGS=\(--kube-context k8\)/ { helm=1 }
+        END { exit (verifies && private && kubectl && helm) ? 0 : 1 }
+    '; then
+        log "apply-kill-takeover pins its private kind cluster to context k8"
+    else
+        log "self-test: apply-kill-takeover must verify its named kind cluster before selecting k8 in its private kubeconfig"
+        failed=1
+    fi
     if shard_manifest check "$SHARDS"; then
         log "shard manifest covers every scenario exactly once"
     else
         log "self-test: shard coverage failed for the active manifest"
         failed=1
     fi
+    if [[ "$(shard_manifest lookup "$SHARDS_CANONICAL" s15)" == $'setup\nrunner-layer-retire' ]] \
+        && [[ "$(scenario_fn runner-layer-retire)" == run_runner_layer_retire ]]; then
+        log "runner-layer-retire runs in setup shard s15"
+    else
+        log "self-test: runner-layer-retire must run in setup shard s15"
+        failed=1
+    fi
+    if [[ "$(shard_manifest lookup "$SHARDS_CANONICAL" s18)" == $'setup\nhook-fail-not-serving' ]] \
+        && [[ "$(scenario_fn hook-fail-not-serving)" == run_hook_fail_not_serving ]]; then
+        log "hook-fail-not-serving runs in setup shard s18"
+    else
+        log "self-test: hook-fail-not-serving must run in setup shard s18"
+        failed=1
+    fi
+    if [[ "$(shard_manifest lookup "$SHARDS_CANONICAL" s19)" == $'setup\nterminal-pods' ]] \
+        && [[ "$(scenario_fn terminal-pods)" == run_terminal_pods ]]; then
+        log "terminal-pods runs in setup shard s19"
+    else
+        log "self-test: terminal-pods must run in setup shard s19"
+        failed=1
+    fi
+    if awk '/^terminal_pod_create\(\)/,/^}/' "$script_path" | awk '
+        /"restartPolicy": "Never"/ { never=1 }
+        /pod-template-hash/ { hash=1 }
+        /matchLabels/ { labels=1 }
+        END { exit (never && hash && labels) ? 0 : 1 }
+    ' && awk '/^run_terminal_pods\(\)/,/^}/' "$script_path" | awk '
+        /terminal_pod_wait_phase "\$succeeded" Succeeded/ { if (!terminal) terminal=NR }
+        /terminal_pod_wait_phase "\$failed_pod" Failed/ { if (terminal) failed_wait=NR }
+        /"\$BIN" --json cluster status/ { status++; if (status == 1 && failed_wait) first=NR; if (status == 2) second=NR }
+        /\[\[ "\$healthy" == true \]\]/ { if (first && !healthy) healthy=NR }
+        /cluster_upgrade "0.10.1"/ { if (healthy && !upgrade) upgrade=NR }
+        /assert_upgrade_status "succeeded"/ { if (upgrade) succeeded=NR }
+        /terminal_pod_create "\$surplus"/ { if (succeeded) surplus=NR }
+        /\[\[ "\$status" -eq 1 \]\]/ { if (second && second > surplus && surplus) refused=NR }
+        /\[\[ "\$healthy" == false \]\]/ { if (refused) unhealthy=NR }
+        /surplus or missing target replicas/ { if (unhealthy) named=NR }
+        /terminal_pods_cleanup$/ { if (named) cleaned=NR }
+        END { exit (status == 2 && cleaned) ? 0 : 1 }
+    '; then
+        log "terminal-pods asserts healthy status with terminal pods, a succeeded upgrade, and the surplus refusal"
+    else
+        log "self-test: terminal-pods must assert healthy status with Succeeded and Failed bare pods, a succeeded 0.10.1 upgrade, then exit 1 naming the surplus for a running bare pod"
+        failed=1
+    fi
+    if [[ "$(shard_manifest lookup "$SHARDS_CANONICAL" s20)" == $'setup\nrollback-interrupted' ]] \
+        && [[ "$(scenario_fn rollback-interrupted)" == run_rollback_interrupted ]]; then
+        log "rollback-interrupted runs in setup shard s20"
+    else
+        log "self-test: rollback-interrupted must run in setup shard s20"
+        failed=1
+    fi
     local mutated label
-    for label in "dropped scenario" "duplicated scenario" "dropped phase" "duplicated phase"; do
+    for label in "dropped scenario" "duplicated scenario" "dropped phase" "duplicated phase" "dropped runner-layer-retire" "dropped hook-fail-not-serving" "dropped terminal-pods"; do
         case "$label" in
             "dropped scenario") mutated="${SHARDS_CANONICAL/ migration-crash/}" ;;
             "duplicated scenario") mutated="${SHARDS_CANONICAL/s11 nosetup rollback-published-089/s11 nosetup rollback-published-089 fresh-n}" ;;
             "dropped phase") mutated="${SHARDS_CANONICAL/interrupt-resume:checkpoint+migrate/interrupt-resume:checkpoint}" ;;
             "duplicated phase") mutated="${SHARDS_CANONICAL/fail-every-phase:converge/fail-every-phase:converge+plan}" ;;
+            "dropped runner-layer-retire") mutated="${SHARDS_CANONICAL/s15 setup runner-layer-retire/}" ;;
+            "dropped hook-fail-not-serving") mutated="${SHARDS_CANONICAL/s18 setup hook-fail-not-serving/}" ;;
+            "dropped terminal-pods") mutated="${SHARDS_CANONICAL/s19 setup terminal-pods/}" ;;
         esac
         if [[ "$mutated" == "$SHARDS_CANONICAL" ]]; then
             log "self-test: $label negative control did not mutate the manifest"
@@ -486,6 +655,103 @@ run_self_test() {
             log "shard coverage refused a $label"
         fi
     done
+    local claim_probe
+    claim_probe="$(mktemp -d)"
+    python3 - "$claim_probe" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+claim = {"metadata": {"name": "acme-target", "uid": "acme-claim-uid",
+                      "labels": {"curietech.ai/agent": "acme-bot"}},
+         "status": {"sandbox": {"name": "acme-sandbox"},
+                    "conditions": [{"type": "Ready", "status": "True"}]}}
+pod = {"metadata": {"name": "acme-sandbox", "labels": {"app.kubernetes.io/component": "runner-sandbox"}},
+       "spec": {"containers": [{"name": "runner", "image": "acme-runner@sha256:target"}]},
+       "status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+for name, document in (("claim", claim), ("pod", pod)):
+    (root / f"{name}.json").write_text(json.dumps(document))
+for name, value in (("managed", "curie-worker"), ("deleting", "2026-01-01T00:00:00Z")):
+    changed = json.loads(json.dumps(claim))
+    if name == "managed":
+        changed["metadata"]["labels"]["curietech.ai/managed-by"] = value
+    else:
+        changed["metadata"]["deletionTimestamp"] = value
+    (root / f"{name}.json").write_text(json.dumps(changed))
+(root / "pod-labels.json").write_text(json.dumps(pod["metadata"]["labels"]))
+(root / "pod-labels-empty.json").write_text("")
+labelled = dict(pod["metadata"]["labels"], **{"curietech.ai/agent": "acme-bot"})
+(root / "pod-labels-agent.json").write_text(json.dumps(labelled))
+pod["status"]["conditions"][0]["status"] = "False"
+(root / "unready.json").write_text(json.dumps(pod))
+unready_claim = json.loads(json.dumps(claim))
+unready_claim["status"]["conditions"] = [{"type": "Ready", "status": "False",
+                                          "reason": "DependenciesNotReady"}]
+(root / "unready-claim.json").write_text(json.dumps(unready_claim))
+unready_claim["metadata"]["labels"]["curietech.ai/managed-by"] = "curie-worker"
+(root / "unready-managed.json").write_text(json.dumps(unready_claim))
+PY
+    if runner_layer_pod_lacks_agent_label "$claim_probe/pod-labels.json" \
+        && runner_layer_pod_lacks_agent_label "$claim_probe/pod-labels-empty.json"; then
+        log "runner-layer-retire accepts a target Pod with no agent label"
+    else
+        log "self-test: runner-layer-retire rejected a target Pod with no agent label"
+        failed=1
+    fi
+    if runner_layer_pod_lacks_agent_label "$claim_probe/pod-labels-agent.json" >/dev/null 2>&1; then
+        log "self-test: runner-layer-retire accepted the agent-labelled target Pod control"
+        failed=1
+    else
+        log "runner-layer-retire refused the agent-labelled target Pod control"
+    fi
+    if [[ "$(runner_layer_claim_observation "$claim_probe/claim.json" "$claim_probe/pod.json" \
+        acme-bot acme-runner@sha256:target acme-claim-uid ready)" == acme-claim-uid ]]; then
+        log "runner-layer-retire accepts an unchanged Ready target claim"
+    else
+        log "self-test: runner-layer-retire rejected its Ready target claim"
+        failed=1
+    fi
+    local control claim_file pod_file expected_image expected_uid
+    for control in managed deleting unready old-image replaced-uid; do
+        claim_file="$claim_probe/claim.json"
+        pod_file="$claim_probe/pod.json"
+        expected_image="acme-runner@sha256:target"
+        expected_uid="acme-claim-uid"
+        case "$control" in
+            managed|deleting) claim_file="$claim_probe/$control.json" ;;
+            unready) pod_file="$claim_probe/unready.json" ;;
+            old-image) expected_image="acme-runner@sha256:old" ;;
+            replaced-uid) expected_uid="acme-replacement-uid" ;;
+        esac
+        if runner_layer_claim_observation "$claim_file" "$pod_file" acme-bot \
+            "$expected_image" "$expected_uid" ready >/dev/null 2>&1; then
+            log "self-test: runner-layer-retire accepted the $control control"
+            failed=1
+        else
+            log "runner-layer-retire refused the $control control"
+        fi
+    done
+    if [[ "$(runner_layer_claim_observation "$claim_probe/unready-claim.json" "$claim_probe/unready.json" \
+        acme-bot acme-runner@sha256:target "" bound)" == acme-claim-uid ]]; then
+        log "runner-layer-retire accepts a bound but unready old claim on the layer image"
+    else
+        log "self-test: runner-layer-retire rejected a bound but unready old claim"
+        failed=1
+    fi
+    for control in managed old-image; do
+        claim_file="$claim_probe/unready-claim.json"
+        expected_image="acme-runner@sha256:target"
+        case "$control" in
+            managed) claim_file="$claim_probe/unready-managed.json" ;;
+            old-image) expected_image="acme-runner@sha256:old" ;;
+        esac
+        if runner_layer_claim_observation "$claim_file" "$claim_probe/unready.json" acme-bot \
+            "$expected_image" "" bound >/dev/null 2>&1; then
+            log "self-test: runner-layer-retire bound observation accepted the $control control"
+            failed=1
+        else
+            log "runner-layer-retire bound observation refused the $control control"
+        fi
+    done
+    rm -rf "$claim_probe"
     local saved_evidence="$EVIDENCE_DIR" saved_summary="${GITHUB_STEP_SUMMARY-}" timing_dir
     timing_dir="$(mktemp -d)"
     EVIDENCE_DIR="$timing_dir"
@@ -506,6 +772,351 @@ raise SystemExit(0 if ok else 1)
     rm -rf "$timing_dir"
     EVIDENCE_DIR="$saved_evidence"
     GITHUB_STEP_SUMMARY="$saved_summary"
+    if awk '/^cluster_upgrade\(\)/,/^}/' "$script_path" | awk '
+        /settle_helm_operation/ { if (!upgrade) settled=1 }
+        /cluster upgrade --yes/ { upgrade=1 }
+        END { exit (settled && upgrade) ? 0 : 1 }
+    '; then
+        log "cluster_upgrade settles helm before the next upgrade"
+    else
+        log "self-test: cluster_upgrade must settle a pending helm operation before the next upgrade"
+        failed=1
+    fi
+    if ! declare -F settle_helm_operation >/dev/null 2>&1; then
+        log "self-test: settle_helm_operation is missing"
+        failed=1
+    else
+        local probe bindir state logf saved_ns saved_kube saved_wait
+        probe="$(mktemp -d)"
+        bindir="$probe/bin"
+        state="$probe/state"
+        logf="$probe/log"
+        mkdir -p "$bindir" "$state"
+        cat >"$bindir/kubectl" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >>"$CURIE_SETTLE_LOG"
+if [[ "$1" == "--kubeconfig" ]]; then
+    shift 2
+fi
+if [[ "$1" == "--context" ]]; then
+    shift 2
+fi
+if [[ "$1" == "config" ]]; then
+    case "$2" in
+        current-context) cat "$CURIE_SETTLE_STATE/current-context" ;;
+        view) cat "$CURIE_SETTLE_STATE/server" ;;
+        rename-context)
+            [[ "$(cat "$CURIE_SETTLE_STATE/current-context")" == "$3" ]] || exit 1
+            printf '%s' "$4" >"$CURIE_SETTLE_STATE/current-context"
+            ;;
+        *) exit 1 ;;
+    esac
+    exit 0
+fi
+if [[ "$1" == "get" && "$2" == "namespace" ]]; then
+    if [[ -f "$CURIE_SETTLE_STATE/lookup_fail" ]]; then
+        echo "The connection to the server was refused" >&2
+        exit 1
+    fi
+    if [[ -s "$CURIE_SETTLE_STATE/phases" ]]; then
+        phase="$(head -n 1 "$CURIE_SETTLE_STATE/phases")"
+        tail -n +2 "$CURIE_SETTLE_STATE/phases" >"$CURIE_SETTLE_STATE/phases.next"
+        mv "$CURIE_SETTLE_STATE/phases.next" "$CURIE_SETTLE_STATE/phases"
+        if [[ "$phase" == "absent" ]]; then
+            echo 'Error from server (NotFound): namespaces "acme-2590" not found' >&2
+            exit 1
+        fi
+        printf '%s' "$phase"
+        exit 0
+    fi
+    if [[ -f "$CURIE_SETTLE_STATE/phase" ]]; then
+        cat "$CURIE_SETTLE_STATE/phase"
+        exit 0
+    fi
+    echo 'Error from server (NotFound): namespaces "acme-2590" not found' >&2
+    exit 1
+fi
+if [[ "$1" == "create" && "$2" == "namespace" ]]; then
+    if [[ -f "$CURIE_SETTLE_STATE/create_fail" ]]; then
+        echo "namespace create refused" >&2
+        exit 1
+    fi
+    printf 'Active' >"$CURIE_SETTLE_STATE/phase"
+    exit 0
+fi
+exit 0
+EOF
+        cat >"$bindir/helm" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >>"$CURIE_SETTLE_LOG"
+cmd=""
+for arg in "$@"; do
+    if [[ "$arg" == "status" || "$arg" == "rollback" ]]; then
+        cmd="$arg"
+    fi
+done
+if [[ "$cmd" == "status" ]]; then
+    if [[ -f "$CURIE_SETTLE_STATE/rolled" ]]; then
+        printf '%s\n' '{"info":{"status":"deployed"}}'
+        exit 0
+    fi
+    if [[ -f "$CURIE_SETTLE_STATE/status_fail" ]]; then
+        echo "The connection to the server was refused" >&2
+        exit 1
+    fi
+    if [[ -s "$CURIE_SETTLE_STATE/statuses" ]]; then
+        status="$(head -n 1 "$CURIE_SETTLE_STATE/statuses")"
+        tail -n +2 "$CURIE_SETTLE_STATE/statuses" >"$CURIE_SETTLE_STATE/statuses.next"
+        if [[ "$status" == "pending-upgrade" && ! -s "$CURIE_SETTLE_STATE/statuses.next" ]]; then
+            rm -f "$CURIE_SETTLE_STATE/statuses.next"
+            printf '%s\n' '{"info":{"status":"pending-upgrade"}}'
+            exit 0
+        fi
+        mv "$CURIE_SETTLE_STATE/statuses.next" "$CURIE_SETTLE_STATE/statuses"
+        if [[ "$status" == "missing" ]]; then
+            echo "Error: release: not found" >&2
+            exit 1
+        fi
+        printf '{"info":{"status":"%s"}}\n' "$status"
+        exit 0
+    fi
+    printf '%s\n' '{"info":{"status":"deployed"}}'
+    exit 0
+fi
+if [[ "$cmd" == "rollback" ]]; then
+    printf '1' >"$CURIE_SETTLE_STATE/rolled"
+    exit 0
+fi
+exit 0
+EOF
+        cat >"$bindir/kind" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >>"$CURIE_SETTLE_LOG"
+if [[ "$1" == get && "$2" == clusters ]]; then
+    printf '%s\n' "$CURIE_SETTLE_KIND_CLUSTER"
+elif [[ "$1" == get && "$2" == kubeconfig && "$3" == --name && "$4" == "$CURIE_SETTLE_KIND_CLUSTER" ]]; then
+    printf 'apiVersion: v1\nkind: Config\ncurrent-context: kind-%s\nclusters:\n  - name: kind-%s\n    cluster:\n      server: %s\n' \
+        "$CURIE_SETTLE_KIND_CLUSTER" "$CURIE_SETTLE_KIND_CLUSTER" "$(cat "$CURIE_SETTLE_STATE/kind-server")"
+else
+    exit 1
+fi
+EOF
+        cat >"$bindir/curie" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >>"$CURIE_SETTLE_LOG"
+printf '%s\n' '{"status":"succeeded"}'
+EOF
+        chmod +x "$bindir/kubectl" "$bindir/helm" "$bindir/kind" "$bindir/curie"
+        saved_ns="$NAMESPACE"
+        saved_kube="$KUBECONFIG_FILE"
+        saved_path="$PATH"
+        saved_wait="${CURIE_HELM_SETTLE_WAIT_SECONDS-}"
+        saved_poll="${CURIE_HELM_SETTLE_POLL_SECONDS-}"
+        NAMESPACE="acme-2590"
+        KUBECONFIG_FILE="$probe/kubeconfig"
+        export CURIE_SETTLE_STATE="$state" CURIE_SETTLE_LOG="$logf"
+        export PATH="$bindir:$PATH"
+        export CURIE_HELM_SETTLE_WAIT_SECONDS=0 CURIE_HELM_SETTLE_POLL_SECONDS=0
+        printf 'pending-upgrade\n' >"$state/statuses"
+        if ! settle_helm_operation; then
+            log "self-test: pending helm with a missing namespace did not settle"
+            failed=1
+        elif [[ "$(cat "$state/phase" 2>/dev/null)" != "Active" || ! -f "$state/rolled" ]]; then
+            log "self-test: pending helm must create the namespace and roll back"
+            failed=1
+        elif ! grep -q 'create namespace acme-2590' "$logf"; then
+            log "self-test: namespace create was not issued"
+            failed=1
+        else
+            log "pending helm created the namespace and rolled back"
+        fi
+        rm -f "$state/rolled" "$state/phase" "$state/lookup_fail" "$state/status_fail" \
+            "$state/create_fail" "$logf" "$state/phases" "$state/statuses"
+        printf 'Active' >"$state/phase"
+        printf 'deployed\n' >"$state/statuses"
+        if ! settle_helm_operation; then
+            log "self-test: a deployed release in an Active namespace was refused"
+            failed=1
+        elif [[ -f "$state/rolled" ]] || grep -q 'create namespace' "$logf"; then
+            log "self-test: a healthy release must not create a namespace or roll back"
+            failed=1
+        else
+            log "healthy release left the namespace and helm release alone"
+        fi
+        rm -f "$state/rolled" "$state/phase" "$logf" "$state/statuses"
+        printf 'Terminating\nabsent\n' >"$state/phases"
+        printf 'missing\n' >"$state/statuses"
+        export CURIE_HELM_SETTLE_WAIT_SECONDS=5 CURIE_HELM_SETTLE_POLL_SECONDS=0
+        if ! settle_helm_operation; then
+            log "self-test: a terminating namespace that disappeared was refused"
+            failed=1
+        elif [[ -f "$state/rolled" || "$(cat "$state/phase" 2>/dev/null)" != "Active" ]]; then
+            log "self-test: a finished terminating namespace must be created without a rollback"
+            failed=1
+        else
+            log "terminating namespace was created after it disappeared"
+        fi
+        rm -f "$state/rolled" "$state/phase" "$logf" "$state/phases" "$state/statuses"
+        printf 'Active' >"$state/phase"
+        printf 'pending-upgrade\ndeployed\n' >"$state/statuses"
+        if ! settle_helm_operation; then
+            log "self-test: a pending upgrade that finished was refused"
+            failed=1
+        elif [[ -f "$state/rolled" ]]; then
+            log "self-test: a pending upgrade that finished inside the wait was rolled back"
+            failed=1
+        else
+            log "pending upgrade that finished inside the wait was left in place"
+        fi
+        rm -f "$state/rolled" "$logf" "$state/statuses"
+        printf 'Active' >"$state/phase"
+        touch "$state/lookup_fail"
+        if settle_helm_operation; then
+            log "self-test: a failed namespace lookup was treated as settled"
+            failed=1
+        elif grep -q 'create namespace' "$logf"; then
+            log "self-test: a failed namespace lookup created a namespace"
+            failed=1
+        else
+            log "failed namespace lookup stopped the next upgrade"
+        fi
+        rm -f "$state/lookup_fail" "$state/rolled" "$logf"
+        touch "$state/status_fail"
+        if settle_helm_operation; then
+            log "self-test: a failed helm status was treated as settled"
+            failed=1
+        elif [[ -f "$state/rolled" ]]; then
+            log "self-test: a failed helm status rolled the release back"
+            failed=1
+        else
+            log "failed helm status stopped the next upgrade"
+        fi
+        rm -f "$state/status_fail" "$state/rolled" "$logf" "$state/statuses"
+        printf 'Active' >"$state/phase"
+        printf 'deployed\n' >"$state/statuses"
+        local errexit_out
+        errexit_out="$probe/errexit.out"
+        (
+            set +e
+            settle_helm_operation
+            false
+            printf 'continued:%s\n' "$?"
+        ) >"$errexit_out"
+        if [[ "$(cat "$errexit_out")" != "continued:1" ]]; then
+            log "self-test: settlement turned errexit back on before the expected upgrade failure"
+            failed=1
+        else
+            log "settlement left a disabled errexit disabled"
+        fi
+        rm -f "$state/lookup_fail" "$logf"
+        touch "$state/lookup_fail"
+        errexit_out="$probe/errexit-on.out"
+        set +e
+        (
+            set -e
+            settle_helm_operation
+            echo "next:$-:$?" >&2
+            printf 'continued\n'
+        ) >"$errexit_out"
+        set -e
+        if grep -q continued "$errexit_out"; then
+            log "self-test: a settle failure did not stop a caller that has errexit on"
+            failed=1
+        else
+            log "a settle failure still stops a caller that has errexit on"
+        fi
+        export CURIE_SETTLE_KIND_CLUSTER=curie-matrix-adopted
+        printf 'kind-%s' "$CURIE_SETTLE_KIND_CLUSTER" >"$state/current-context"
+        printf 'https://127.0.0.1:6443' >"$state/server"
+        cp "$state/server" "$state/kind-server"
+        : >"$logf"
+        if (
+            KIND_CLUSTER="$CURIE_SETTLE_KIND_CLUSTER"
+            EVIDENCE_DIR="$probe/evidence"
+            FORCE=0
+            OWNED_KIND=1
+            ensure_kind
+            (( OWNED_KIND == 0 )) || die "self-test: ensure_kind did not adopt the named cluster"
+            [[ "${KUBECTL_CONTEXT_ARGS[*]}" == "--context kind-$KIND_CLUSTER" \
+                && "${HELM_CONTEXT_ARGS[*]}" == "--kube-context kind-$KIND_CLUSTER" ]] \
+                || die "self-test: ensure_kind did not pin its verified named context"
+            kubectl_ns get pods >/dev/null
+            helm_ns history "$RELEASE" >/dev/null
+            rm -f "$state/lookup_fail"
+            BIN="$bindir/curie"
+            FAIL_AT_HOOK=""
+            INTERRUPT_AFTER_HOOK=""
+            cluster_upgrade "0.9.0" "$probe/chart.tgz"
+            grep -Fq -- "--kubeconfig $KUBECONFIG_FILE --context kind-$KIND_CLUSTER -n $NAMESPACE get pods" "$logf" \
+                || die "self-test: kubectl runtime call omitted the verified kind context"
+            grep -Fq -- "--kubeconfig $KUBECONFIG_FILE --kube-context kind-$KIND_CLUSTER -n $NAMESPACE history $RELEASE" "$logf" \
+                || die "self-test: Helm runtime call omitted the verified kind context"
+            grep -Fq -- "--json cluster upgrade --yes --to 0.9.0 --namespace $NAMESPACE --release $RELEASE --chart $probe/chart.tgz --context kind-$KIND_CLUSTER" "$logf" \
+                || die "self-test: cluster upgrade omitted the verified kind context"
+            log "verified named kind context reaches kubectl helm and cluster upgrade"
+            prepare_takeover_context
+            [[ "$(cat "$state/current-context")" == k8 ]] || die "self-test: adopted kind context was not renamed"
+            [[ "${KUBECTL_CONTEXT_ARGS[*]}" == '--context k8' && "${HELM_CONTEXT_ARGS[*]}" == '--kube-context k8' ]] \
+                || die "self-test: adopted kind context was not passed to both clients"
+            (( OWNED_KIND == 0 )) || die "self-test: context preparation changed cluster cleanup ownership"
+        ); then
+            if grep -Fq -- "--kubeconfig $KUBECONFIG_FILE config rename-context kind-$CURIE_SETTLE_KIND_CLUSTER k8" "$logf"; then
+                log "adopted named kind cluster prepared private context k8"
+            else
+                log "self-test: adopted kind context preparation did not select the private kubeconfig"
+                failed=1
+            fi
+        else
+            log "self-test: a verified adopted named kind cluster could not prepare context k8"
+            failed=1
+        fi
+        printf 'other-context' >"$state/current-context"
+        : >"$logf"
+        if (
+            KIND_CLUSTER="$CURIE_SETTLE_KIND_CLUSTER"
+            OWNED_KIND=0
+            prepare_takeover_context
+        ); then
+            log "self-test: an invalid adopted kind kubeconfig was accepted"
+            failed=1
+        elif grep -Fq 'rename-context' "$logf" || [[ "$(cat "$state/current-context")" != other-context ]]; then
+            log "self-test: invalid kind kubeconfig was changed before refusal"
+            failed=1
+        else
+            log "invalid kind kubeconfig refused before selecting k8"
+        fi
+        printf 'kind-%s' "$CURIE_SETTLE_KIND_CLUSTER" >"$state/current-context"
+        printf 'https://127.0.0.1:7443' >"$state/server"
+        : >"$logf"
+        if (
+            KIND_CLUSTER="$CURIE_SETTLE_KIND_CLUSTER"
+            OWNED_KIND=0
+            prepare_takeover_context
+        ); then
+            log "self-test: a mismatched adopted kind server was accepted"
+            failed=1
+        elif grep -Fq 'rename-context' "$logf"; then
+            log "self-test: mismatched kind server was renamed before refusal"
+            failed=1
+        else
+            log "mismatched kind server refused before selecting k8"
+        fi
+        NAMESPACE="$saved_ns"
+        KUBECONFIG_FILE="$saved_kube"
+        export PATH="$saved_path"
+        if [[ -n "$saved_wait" ]]; then
+            export CURIE_HELM_SETTLE_WAIT_SECONDS="$saved_wait"
+        else
+            unset CURIE_HELM_SETTLE_WAIT_SECONDS
+        fi
+        if [[ -n "$saved_poll" ]]; then
+            export CURIE_HELM_SETTLE_POLL_SECONDS="$saved_poll"
+        else
+            unset CURIE_HELM_SETTLE_POLL_SECONDS
+        fi
+        unset CURIE_SETTLE_STATE CURIE_SETTLE_LOG CURIE_SETTLE_KIND_CLUSTER
+        rm -rf "$probe"
+    fi
     (( failed == 0 )) || die "self-test failed"
     log "self-test passed"
     if (( JSON )); then
@@ -533,11 +1144,146 @@ candidate_identity() {
 }
 
 kubectl_ns() {
-    kubectl --kubeconfig "$KUBECONFIG_FILE" -n "$NAMESPACE" "$@"
+    kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" -n "$NAMESPACE" "$@"
 }
 
 helm_ns() {
-    helm --kubeconfig "$KUBECONFIG_FILE" -n "$NAMESPACE" "$@"
+    helm --kubeconfig "$KUBECONFIG_FILE" "${HELM_CONTEXT_ARGS[@]}" -n "$NAMESPACE" "$@"
+}
+
+# Prints the phase and returns 0 when the namespace exists, 2 when it is
+# absent, and 1 when kubectl itself fails. Absence is NotFound only. A
+# connection error must not look like a missing namespace. Status is captured
+# in an AND/OR list so this does not change the caller's errexit setting.
+lookup_namespace() {
+    local err rc out
+    err="$(mktemp)"
+    out="$(kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" get namespace "$NAMESPACE" \
+        -o jsonpath='{.status.phase}' 2>"$err")" && rc=0 || rc=$?
+    if (( rc == 0 )); then
+        printf '%s' "$out"
+        rm -f "$err"
+        return 0
+    fi
+    if grep -qi 'NotFound' "$err"; then
+        rm -f "$err"
+        return 2
+    fi
+    log "namespace lookup failed: $(tr '\n' ' ' <"$err")"
+    rm -f "$err"
+    return 1
+}
+
+# Prints the Helm status. Returns 0 and an empty string when the release is
+# absent. Returns 1 when helm itself fails, including a missing namespace.
+read_helm_settle_status() {
+    local err rc raw
+    err="$(mktemp)"
+    raw="$(helm_ns status "$RELEASE" -o json 2>"$err")" && rc=0 || rc=$?
+    if (( rc != 0 )); then
+        if grep -qi 'release: not found' "$err"; then
+            rm -f "$err"
+            return 0
+        fi
+        log "helm status failed: $(tr '\n' ' ' <"$err")"
+        rm -f "$err"
+        return 1
+    fi
+    rm -f "$err"
+    printf '%s' "$raw" | python3 -c 'import json,sys
+try:
+    print((json.load(sys.stdin).get("info") or {}).get("status") or "")
+except Exception:
+    raise SystemExit(1)'
+}
+
+# Helm upgrade does not create the release namespace. A shard that assumes
+# acme-2590 still exists fails the next step when the previous operation
+# removed it. A Terminating namespace that finishes inside the wait is created
+# again. A lookup or create failure is returned to the caller.
+ensure_namespace() {
+    local phase rc wait_s deadline poll err
+    wait_s="${CURIE_HELM_SETTLE_WAIT_SECONDS:-30}"
+    poll="${CURIE_HELM_SETTLE_POLL_SECONDS:-1}"
+    deadline=$((SECONDS + wait_s))
+    while true; do
+        phase="$(lookup_namespace)" && rc=0 || rc=$?
+        if (( rc == 1 )); then
+            return 1
+        fi
+        if (( rc == 0 )) && [[ "$phase" == "Active" ]]; then
+            return 0
+        fi
+        if (( rc == 2 )); then
+            break
+        fi
+        if (( SECONDS >= deadline )); then
+            log "namespace $NAMESPACE is ${phase:-unknown}; refusing to use it"
+            return 1
+        fi
+        sleep "$poll"
+    done
+    log "creating namespace $NAMESPACE"
+    err="$(mktemp)"
+    kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" create namespace "$NAMESPACE" 2>"$err" && rc=0 || rc=$?
+    if (( rc != 0 )); then
+        log "namespace create failed: $(tr '\n' ' ' <"$err")"
+        rm -f "$err"
+        return 1
+    fi
+    rm -f "$err"
+}
+
+# A killed `helm upgrade` leaves the release pending, and the next upgrade
+# then fails with "another operation is in progress" (run 36125059536, s14).
+# Poll while a live operation can finish, then roll back a stuck pending
+# release. A deployed release returns without a rollback. Helm and kubectl
+# failures return to the caller instead of looking like a settled release.
+settle_helm_operation() {
+    local wait_s deadline poll st rc
+    ensure_namespace || return $?
+    wait_s="${CURIE_HELM_SETTLE_WAIT_SECONDS:-30}"
+    poll="${CURIE_HELM_SETTLE_POLL_SECONDS:-1}"
+    deadline=$((SECONDS + wait_s))
+    st=""
+    while true; do
+        st="$(read_helm_settle_status)" && rc=0 || rc=$?
+        if (( rc != 0 )); then
+            return "$rc"
+        fi
+        case "$st" in
+            pending-upgrade|pending-rollback|pending-install|uninstalling)
+                if (( SECONDS >= deadline )); then
+                    break
+                fi
+                sleep "$poll"
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    done
+    log "helm status stayed ${st:-unknown}; rolling back so the next upgrade can start"
+    recover_helm_lock
+    deadline=$((SECONDS + wait_s))
+    while true; do
+        st="$(read_helm_settle_status)" && rc=0 || rc=$?
+        if (( rc != 0 )); then
+            return "$rc"
+        fi
+        case "$st" in
+            pending-upgrade|pending-rollback|pending-install|uninstalling)
+                if (( SECONDS >= deadline )); then
+                    log "helm status stayed $st after rollback"
+                    return 1
+                fi
+                sleep "$poll"
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+    done
 }
 
 fullname() {
@@ -582,20 +1328,37 @@ run_scenario_timed() {
 }
 
 cleanup() {
-    local status=$?
+    local status=$? restore_failed=0
+    restore_retire_runner_tags || restore_failed=1
+    if [[ -n "$APPLY_KILL_PID" ]]; then
+        sigkill_tree "$APPLY_KILL_PID"
+        wait "$APPLY_KILL_PID" 2>/dev/null || true
+        APPLY_KILL_PID=""
+    fi
+    if [[ -n "$ROLLBACK_SERVING_HELM_PID" ]]; then
+        kill -9 "$ROLLBACK_SERVING_HELM_PID" 2>/dev/null || true
+        wait "$ROLLBACK_SERVING_HELM_PID" 2>/dev/null || true
+        ROLLBACK_SERVING_HELM_PID=""
+    fi
+    if [[ -n "$ROLLBACK_INTERRUPTED_HELM_PID" ]]; then
+        kill -9 "$ROLLBACK_INTERRUPTED_HELM_PID" 2>/dev/null || true
+        wait "$ROLLBACK_INTERRUPTED_HELM_PID" 2>/dev/null || true
+        ROLLBACK_INTERRUPTED_HELM_PID=""
+    fi
     if [[ -n "$CURRENT_LABEL" ]]; then
         record_timing_row "$CURRENT_LABEL" "$CURRENT_NAME" "$CURRENT_PHASES" failed $((SECONDS - CURRENT_STARTED))
         CURRENT_LABEL=""
     fi
     if (( KEEP )); then
         log "keeping owned resources (kind=$KIND_CLUSTER ns=$NAMESPACE release=$RELEASE)"
+        (( restore_failed == 0 )) || exit 1
         return 0
     fi
     if (( OWNED_HELM )); then
         refuse_soak "$NAMESPACE" "$RELEASE"
         log "uninstalling release $RELEASE in $NAMESPACE"
         helm_ns uninstall "$RELEASE" --wait --timeout 180s >/dev/null 2>&1 || true
-        kubectl --kubeconfig "$KUBECONFIG_FILE" delete namespace "$NAMESPACE" --wait=true --timeout=180s >/dev/null 2>&1 || true
+        kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" delete namespace "$NAMESPACE" --wait=true --timeout=180s >/dev/null 2>&1 || true
     fi
     if (( OWNED_KIND )); then
         log "deleting kind cluster $KIND_CLUSTER"
@@ -606,6 +1369,10 @@ cleanup() {
     fi
     if (( status != 0 )); then
         log "cleanup finished after failure (exit $status)"
+    fi
+    if (( restore_failed )); then
+        log "runner-layer-retire could not restore its host image tags"
+        exit 1
     fi
 }
 
@@ -618,7 +1385,9 @@ download_pin() {
         rm -f "$dest"
     fi
     log "downloading $(basename "$dest")"
-    curl -fsSL --retry 3 -o "$dest" "$url"
+    # --retry alone does not retry a connection reset (curl exit 35). That
+    # reset dropped the 0.8.9 binary on upgrade shard s03.
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$dest" "$url"
     verify_sha256 "$sha" "$dest"
 }
 
@@ -628,7 +1397,6 @@ fetch_published() {
     download_pin "$REL_088/curie-0.8.8.tgz" "$ASSET_DIR/curie-0.8.8.tgz" "$CHART_088_SHA"
     download_pin "$REL_088/curie-x86_64-unknown-linux-gnu" "$ASSET_DIR/curie-0.8.8" "$CLI_088_SHA"
     chmod +x "$ASSET_DIR/curie-0.8.8"
-    PUBLISHED_BIN="$ASSET_DIR/curie-0.8.8"
     download_pin "$REL_089/curie-0.8.9.tgz" "$ASSET_DIR/curie-0.8.9.tgz" "$CHART_089_SHA"
     download_pin "$REL_089/curie-x86_64-unknown-linux-gnu" "$ASSET_DIR/curie-0.8.9" "$CLI_089_SHA"
     chmod +x "$ASSET_DIR/curie-0.8.9"
@@ -681,12 +1449,30 @@ ensure_kind() {
             kubeconfig_is_named_kind \
                 || die "kind cluster $KIND_CLUSTER exists but kubeconfig $KUBECONFIG_FILE is not that cluster; pass --force to recreate this task-owned cluster only"
             OWNED_KIND=0
+            KUBECTL_CONTEXT_ARGS=(--context "kind-$KIND_CLUSTER")
+            HELM_CONTEXT_ARGS=(--kube-context "kind-$KIND_CLUSTER")
             return 0
         fi
     fi
     kind create cluster --name "$KIND_CLUSTER" --kubeconfig "$KUBECONFIG_FILE" --wait 120s
     kubeconfig_is_named_kind || die "created kind cluster $KIND_CLUSTER but kubeconfig does not select it"
     OWNED_KIND=1
+    KUBECTL_CONTEXT_ARGS=(--context "kind-$KIND_CLUSTER")
+    HELM_CONTEXT_ARGS=(--kube-context "kind-$KIND_CLUSTER")
+}
+
+prepare_takeover_context() {
+    kubeconfig_is_named_kind || die "apply-kill-takeover private kubeconfig does not select the named kind cluster"
+    kubectl --kubeconfig "$KUBECONFIG_FILE" config rename-context "kind-$KIND_CLUSTER" k8 >/dev/null
+    KUBECTL_CONTEXT_ARGS=(--context k8)
+    HELM_CONTEXT_ARGS=(--kube-context k8)
+    local server expected
+    server="$(kubectl --kubeconfig "$KUBECONFIG_FILE" --context k8 config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
+    expected="$(kind get kubeconfig --name "$KIND_CLUSTER" | awk '/server:/{print $2; exit}')"
+    [[ -n "$server" && "$server" == "$expected" ]] || die "private k8 context does not point to the named kind cluster"
+    [[ "$(kubectl --kubeconfig "$KUBECONFIG_FILE" config current-context)" == k8 ]] \
+        || die "private kubeconfig did not select context k8"
+    log "private context k8 selects kind cluster $KIND_CLUSTER"
 }
 
 image_for() {
@@ -945,10 +1731,10 @@ uninstall_owned() {
     if helm_ns status "$RELEASE" >/dev/null 2>&1; then
         helm_ns uninstall "$RELEASE" --wait --timeout 180s >/dev/null 2>&1 || true
     fi
-    kubectl --kubeconfig "$KUBECONFIG_FILE" delete namespace "$NAMESPACE" --wait=true --timeout=180s >/dev/null 2>&1 || true
+    kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" delete namespace "$NAMESPACE" --wait=true --timeout=180s >/dev/null 2>&1 || true
     local deadline=$((SECONDS + 180))
     while (( SECONDS < deadline )); do
-        if ! kubectl --kubeconfig "$KUBECONFIG_FILE" get namespace "$NAMESPACE" >/dev/null 2>&1; then
+        if ! kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" get namespace "$NAMESPACE" >/dev/null 2>&1; then
             break
         fi
         sleep 2
@@ -959,7 +1745,7 @@ uninstall_owned() {
 helm_install_088() {
     refuse_soak "$NAMESPACE" "$RELEASE"
     load_tag_images "0.8.8"
-    kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace "$NAMESPACE" >/dev/null 2>&1 || true
+    kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" create namespace "$NAMESPACE" >/dev/null 2>&1 || true
     local sets=()
     local line
     while IFS= read -r line; do
@@ -985,7 +1771,7 @@ helm_install_089() {
         docker pull "$ref"
     done
     load_tag_images "0.8.9"
-    kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace "$NAMESPACE" >/dev/null 2>&1 || true
+    kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" create namespace "$NAMESPACE" >/dev/null 2>&1 || true
     local sets=()
     local line
     while IFS= read -r line; do
@@ -1028,6 +1814,7 @@ cluster_upgrade() {
     shift 2
     local extra=("$@")
     refuse_soak "$NAMESPACE" "$RELEASE"
+    settle_helm_operation || return $?
     if [[ "$to" == "0.10.0" || "$to" == "0.10.1" ]]; then
         exclusive_kind_tag "$to"
     fi
@@ -1047,6 +1834,7 @@ cluster_upgrade() {
     log "cluster upgrade --to $to chart=$chart fail_at=${CURIE_UPGRADE_TEST_FAIL_AT-} interrupt_after=${CURIE_UPGRADE_TEST_INTERRUPT_AFTER-}"
     local cmd=("$BIN" --json cluster upgrade --yes --to "$to"
         --namespace "$NAMESPACE" --release "$RELEASE" --chart "$chart")
+    cmd+=("${KUBECTL_CONTEXT_ARGS[@]}")
     cmd+=("${extra[@]}")
     if [[ -n "$FAIL_AT_HOOK" || -n "$INTERRUPT_AFTER_HOOK" ]]; then
         local envcmd=(/usr/bin/env)
@@ -1166,6 +1954,7 @@ run_fail_every_phase() {
         set -e
         FAIL_AT_HOOK=""
         record_upgrade_json "fail-$phase"
+        [[ "$status" -ne 0 ]] || die "FAIL_AT=$phase exited 0 despite a failed upgrade"
         local st
         st="$(json_field "$EVIDENCE_DIR/last-upgrade.json" "status" || true)"
         [[ "$st" == "failed" ]] || die "FAIL_AT=$phase status='$st' (need structured status=failed)"
@@ -1174,12 +1963,17 @@ run_fail_every_phase() {
     done
     if [[ "$(helm_version)" == "0.10.1" ]]; then
         log "fail-every-phase left helm at 0.10.1; retrying to succeed"
-        cluster_upgrade "0.10.1" "$CHART_0101" || true
+        status=0
+        cluster_upgrade "0.10.1" "$CHART_0101" || status=$?
+        record_upgrade_json "fail-phase-recovery"
+        [[ "$status" -eq 0 ]] || die "fail-every-phase recovery exited $status"
+        assert_upgrade_status "succeeded"
         wait_rollout || true
         cluster_upgrade "0.10.0" "$CHART_0100" || true
         wait_rollout || true
         if [[ "$(helm_version)" == "0.10.1" ]]; then
             "$BIN" --json cluster rollback --yes --namespace "$NAMESPACE" --release "$RELEASE" \
+                "${KUBECTL_CONTEXT_ARGS[@]}" \
                 >"$EVIDENCE_DIR/fail-phase-restore.json" || true
             wait_rollout || true
         fi
@@ -1590,6 +2384,12 @@ run_converge_negative() {
     status=$?
     set -e
     record_upgrade_json "converge-negative"
+    [[ "$status" -ne 0 ]] || die "converge-negative exited 0 despite a failed upgrade"
+    assert_upgrade_phase "converge"
+    local recovery_command
+    recovery_command="$(json_field "$EVIDENCE_DIR/last-upgrade.json" "fail_forward.command")"
+    [[ "$recovery_command" == *"--context "* ]] \
+        || die "converge-negative fail-forward command omitted --context"
     local images manifest
     images="$(json_field "$EVIDENCE_DIR/last-upgrade.json" "convergence.images" || true)"
     manifest="$(json_field "$EVIDENCE_DIR/last-upgrade.json" "convergence.manifest_matches" || true)"
@@ -1625,6 +2425,45 @@ terminate_tree() {
         terminate_tree "$child"
     done
     kill "$pid" 2>/dev/null || true
+}
+
+sigkill_tree() {
+    local pid="$1" child command args children
+    [[ -n "$pid" ]] || return 0
+    command="$(ps -p "$pid" -o comm= 2>/dev/null | tr -d '[:space:]' || true)"
+    args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    if [[ "$command" == helm && "$args" =~ (^|[[:space:]])upgrade([[:space:]]|$) ]]; then
+        APPLY_KILL_HELM_SEEN=1
+    fi
+    children="$(pgrep -P "$pid" 2>/dev/null || true)"
+    APPLY_KILL_PIDS+=("$pid")
+    # Stop the parent before its child exits can trigger normal cleanup.
+    kill -KILL "$pid" 2>/dev/null || true
+    for child in $children; do
+        sigkill_tree "$child"
+    done
+}
+
+running_release_hook_jobs() {
+    kubectl_ns get jobs -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/managed-by=Helm" \
+        -o json | python3 -c '
+import json, sys
+document = json.load(sys.stdin)
+items = document["items"]
+if not isinstance(items, list):
+    raise SystemExit("release hook Job list has no items array")
+for item in items:
+    metadata = item.get("metadata") or {}
+    hook = (metadata.get("annotations") or {}).get("helm.sh/hook")
+    active = (item.get("status") or {}).get("active", 0)
+    if not isinstance(active, int) or isinstance(active, bool) or active < 0:
+        raise SystemExit("release hook Job has an invalid active count")
+    if hook and active > 0:
+        name = metadata.get("name")
+        if not isinstance(name, str) or not name:
+            raise SystemExit("running release hook Job has no name")
+        print(name)
+'
 }
 
 recover_killed_upgrade_ownership() {
@@ -1704,6 +2543,1047 @@ run_previous_serves() {
     log "fail-forward retry after previous-serves kill succeeded"
 }
 
+run_apply_kill_takeover() {
+    [[ "$(helm_version)" == "0.10.0" && "$(helm_release_status)" == deployed ]] \
+        || die "apply-kill-takeover must start from the shard's deployed 0.10.0 state"
+    local img from_image to_image from_id to_id
+    EXCLUSIVE_KIND_TAG=""
+    for img in "${IMAGES[@]}"; do
+        from_image="$(image_for "$img" "0.10.0")"
+        to_image="$(image_for "$img" "0.10.1")"
+        docker build --tag "$to_image" - <<EOF
+FROM $from_image
+LABEL curie.matrix/variant=0.10.1
+EOF
+        docker tag "$to_image" "${img}:0.10.1"
+        from_id="$(docker image inspect --format '{{.Id}}' "$from_image")"
+        to_id="$(docker image inspect --format '{{.Id}}' "$to_image")"
+        [[ "$from_id" != "$to_id" ]] || die "$img 0.10.0 and 0.10.1 image digests must differ"
+        kind load docker-image "$from_image" "$to_image" --name "$KIND_CLUSTER"
+        log "$img has distinct 0.10.0 and 0.10.1 image digests on kind"
+    done
+
+    local history="$EVIDENCE_DIR/apply-kill-takeover-history.json" serving_revision
+    helm_ns history "$RELEASE" -o json --max 256 >"$history"
+    serving_revision="$(python3 -c '
+import json, sys
+rows = json.load(open(sys.argv[1]))
+deployed = [row for row in rows if row["status"] == "deployed"]
+row = max(deployed, key=lambda row: int(row["revision"]))
+if row.get("app_version") != "0.10.0":
+    raise SystemExit("serving revision is not 0.10.0")
+print(row["revision"])
+' "$history")"
+    local pid status=0 seen=0 killed_revision newest newest_status
+    local CURIE_UPGRADE_TEST_FAIL_AT="" CURIE_UPGRADE_TEST_INTERRUPT_AFTER=""
+    "$BIN" --json cluster upgrade --yes --to "0.10.1" \
+        --namespace "$NAMESPACE" --release "$RELEASE" --chart "$CHART_0101" \
+        >"$EVIDENCE_DIR/apply-kill-takeover-killed.json" 2>"$EVIDENCE_DIR/apply-kill-takeover-killed.err" &
+    pid=$!
+    APPLY_KILL_PID="$pid"
+    local deadline=$((SECONDS + 300))
+    while (( SECONDS < deadline )); do
+        helm_ns history "$RELEASE" -o json --max 256 >"$history"
+        newest="$(python3 -c '
+import json, sys
+row = max(json.load(open(sys.argv[1])), key=lambda row: int(row["revision"]))
+print(row["revision"], row["status"])
+' "$history")"
+        read -r killed_revision newest_status <<<"$newest"
+        if [[ "$newest_status" == pending-upgrade ]]; then
+            seen=1
+            break
+        fi
+        kill -0 "$pid" 2>/dev/null || die "upgrade exited before a pending-upgrade revision was observed"
+        sleep 1
+    done
+    (( seen == 1 )) || die "apply-kill-takeover did not observe pending-upgrade within 300s"
+    sleep 20
+    kill -0 "$pid" 2>/dev/null || die "upgrade finished before the apply SIGKILL"
+    APPLY_KILL_PIDS=()
+    APPLY_KILL_HELM_SEEN=0
+    sigkill_tree "$pid"
+    wait "$pid" || status=$?
+    APPLY_KILL_PID=""
+    (( status == 137 )) || die "apply-kill-takeover expected the binary's SIGKILL exit 137, got $status"
+    (( APPLY_KILL_HELM_SEEN == 1 )) || die "apply SIGKILL did not include a running helm upgrade descendant"
+    local killed_pid process_state stop_deadline=$((SECONDS + 30))
+    for killed_pid in "${APPLY_KILL_PIDS[@]}"; do
+        while true; do
+            process_state="$(ps -p "$killed_pid" -o stat= 2>/dev/null | tr -d '[:space:]' || true)"
+            [[ -n "$process_state" && "$process_state" != Z* ]] || break
+            (( SECONDS < stop_deadline )) || die "SIGKILL descendant $killed_pid is still running"
+            sleep 0.2
+        done
+    done
+
+    local cm="${RELEASE}-upgrade-checkpoint" holder resource_version
+    holder="$(kubectl_ns get configmap "$cm" -o jsonpath='{.metadata.annotations.curietech\.ai/upgrade-holder}')"
+    [[ -n "$holder" ]] || die "SIGKILL did not leave the upgrade holder annotation"
+    resource_version="$(kubectl_ns get configmap "$cm" -o jsonpath='{.metadata.resourceVersion}')"
+    helm_ns history "$RELEASE" -o json --max 256 >"$history"
+    python3 -c '
+import json, sys
+rows = json.load(open(sys.argv[1]))
+newest = max(rows, key=lambda row: int(row["revision"]))
+assert int(newest["revision"]) == int(sys.argv[2]) and newest["status"] == "pending-upgrade", "SIGKILL did not retain the pending-upgrade revision"
+assert any(int(row["revision"]) == int(sys.argv[3]) and row["status"] == "deployed" for row in rows), "SIGKILL changed the serving revision"
+' "$history" "$killed_revision" "$serving_revision"
+    log "SIGKILL stopped the binary and helm child; revision $killed_revision is pending above serving revision $serving_revision"
+
+    status=0
+    "$BIN" --json cluster upgrade --yes --to "0.10.1" \
+        --namespace "$NAMESPACE" --release "$RELEASE" --chart "$CHART_0101" \
+        >"$EVIDENCE_DIR/apply-kill-takeover-refused.json" 2>"$EVIDENCE_DIR/apply-kill-takeover-refused.err" || status=$?
+    (( status != 0 )) || die "plain rerun accepted the killed holder"
+    grep -Fq -- "$holder" "$EVIDENCE_DIR/apply-kill-takeover-refused.json" "$EVIDENCE_DIR/apply-kill-takeover-refused.err" \
+        || die "plain rerun refusal did not name the killed holder"
+    grep -Fq -- "--take-over $holder" "$EVIDENCE_DIR/apply-kill-takeover-refused.json" "$EVIDENCE_DIR/apply-kill-takeover-refused.err" \
+        || die "plain rerun refusal did not name the exact takeover command"
+    status=0
+    "$BIN" --json cluster upgrade --yes --to "0.10.1" --dry-run \
+        --namespace "$NAMESPACE" --release "$RELEASE" --chart "$CHART_0101" \
+        >"$EVIDENCE_DIR/apply-kill-takeover-dry-refused.json" 2>"$EVIDENCE_DIR/apply-kill-takeover-dry-refused.err" || status=$?
+    (( status != 0 )) || die "dry run accepted the killed holder without --take-over"
+    grep -Fq -- "$holder" "$EVIDENCE_DIR/apply-kill-takeover-dry-refused.json" "$EVIDENCE_DIR/apply-kill-takeover-dry-refused.err" \
+        || die "dry-run refusal did not name the killed holder"
+    # Cluster hook Jobs can outlive the killed Helm process. Both takeover
+    # paths refuse active hooks, so wait before planning or mutating.
+    local running_hooks deadline=$((SECONDS + 600))
+    while true; do
+        running_hooks="$(running_release_hook_jobs)"
+        [[ -n "$running_hooks" ]] || break
+        (( SECONDS < deadline )) || die "release hook Jobs still running after 600s: $running_hooks"
+        sleep 1
+    done
+    "$BIN" --json cluster upgrade --yes --to "0.10.1" --dry-run --take-over "$holder" \
+        --namespace "$NAMESPACE" --release "$RELEASE" --chart "$CHART_0101" \
+        >"$EVIDENCE_DIR/apply-kill-takeover-dry-plan.json" 2>"$EVIDENCE_DIR/apply-kill-takeover-dry-plan.err"
+    python3 -c '
+import json, shlex, sys
+document = json.load(open(sys.argv[1]))
+assert document["dry_run"] is True, "matching takeover did not emit a dry-run plan"
+plan = document["plan"]
+assert "phase plan: 0.10.0 -> 0.10.1" in plan, "dry run did not plan from serving version 0.10.0"
+assert f"take over upgrade ownership from {sys.argv[2]}" in plan, "dry run did not plan the named takeover"
+commands = [shlex.split(line) for line in plan if line.startswith("helm ")]
+rollback = next(index for index, argv in enumerate(commands) if argv[:4] == ["helm", "rollback", sys.argv[3], sys.argv[4]])
+upgrade = next(index for index, argv in enumerate(commands) if argv[:2] == ["helm", "upgrade"])
+assert rollback < upgrade, "dry run did not plan rollback before upgrade"
+assert commands[rollback][4:] == ["-n", sys.argv[5], "--wait", "--timeout", "15m"], "dry run rollback did not use the prescribed namespace, wait and timeout"
+' "$EVIDENCE_DIR/apply-kill-takeover-dry-plan.json" "$holder" "$RELEASE" "$serving_revision" "$NAMESPACE"
+    [[ "$(kubectl_ns get configmap "$cm" -o jsonpath='{.metadata.resourceVersion}')" == "$resource_version" ]] \
+        || die "refused runs or dry-run plans mutated upgrade ownership"
+    [[ "$(helm_revision)" == "$killed_revision" && "$(helm_release_status)" == pending-upgrade ]] \
+        || die "refused runs or dry-run plans mutated the pending Helm revision"
+
+    status=0
+    "$BIN" --json cluster upgrade --yes --to "0.10.1" --take-over "$holder" \
+        --namespace "$NAMESPACE" --release "$RELEASE" --chart "$CHART_0101" \
+        >"$EVIDENCE_DIR/apply-kill-takeover.json" 2>"$EVIDENCE_DIR/apply-kill-takeover.err" || status=$?
+    (( status == 0 )) || die "real takeover exited $status"
+    [[ "$(json_field "$EVIDENCE_DIR/apply-kill-takeover.json" status)" == succeeded ]] \
+        || die "real takeover did not report succeeded"
+    helm_ns history "$RELEASE" -o json --max 256 >"$history"
+    python3 -c '
+import json, sys
+rows = json.load(open(sys.argv[1]))
+newest = max(rows, key=lambda row: int(row["revision"]))
+assert newest["status"] == "deployed" and newest["app_version"] == "0.10.1", "takeover did not deploy 0.10.1"
+assert any(int(sys.argv[2]) < int(row["revision"]) < int(newest["revision"]) and row.get("description") == f"Rollback to {sys.argv[3]}" for row in rows), "takeover did not create a rollback revision between the killed and deployed revisions"
+' "$history" "$killed_revision" "$serving_revision"
+    [[ -z "$(kubectl_ns get configmap "$cm" -o jsonpath='{.metadata.annotations.curietech\.ai/upgrade-holder}')" ]] \
+        || die "successful takeover left an upgrade holder annotation"
+    [[ "$(helm_version)" == "0.10.1" ]] || die "successful takeover metadata is not 0.10.1"
+    wait_rollout
+    kubectl_ns get deploy "$(fullname)-api" -o json | python3 -c '
+import json, sys
+deployment = json.load(sys.stdin)
+assert (deployment.get("status") or {}).get("readyReplicas", 0) > 0, "API is not Ready after takeover"
+'
+    api_health >/dev/null || die "API health failed after takeover"
+    log "apply-kill-takeover deployed 0.10.1 through the CLI rollback with a Ready API and no holder"
+}
+
+run_hook_fail_not_serving() {
+    local version chart_dir chart hook mode status before_image target_image live_image reason prefix
+    version="$(awk '$1 == "version:" { print $2; exit }' "$REPO_ROOT/charts/curie/Chart.yaml")"
+    [[ -n "$version" && "$version" != 0.10.0 ]] \
+        || die "hook-fail-not-serving needs a target chart version different from 0.10.0"
+    # Use the checkout version's schema window, as in rollback-to-serving.
+    retag_candidate_versions "0.10.0" "$version" required
+    target_image="$(image_for curie-api "$version")"
+    chart_dir="$WORKDIR/hook-fail-not-serving/chart"
+    mkdir -p "$chart_dir" "$WORKDIR/hook-fail-not-serving/packaged"
+    cp -a "$REPO_ROOT/charts/curie" "$chart_dir/curie"
+    # This fault is confined to the private chart copy. Its image is already
+    # loaded for the target release, so failure must be an executed exit 1.
+    cat >"$chart_dir/curie/templates/matrix-hook-fail.yaml" <<'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "curie.fullname" . }}-matrix-hook-fail
+  annotations:
+    "helm.sh/hook": post-upgrade
+    "helm.sh/hook-weight": "10000"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 120
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: hook-fail
+          image: {{ include "curie.image" (dict "repository" .Values.api.image.repository "tag" .Values.api.image.tag "digest" .Values.api.image.digest "defaultTag" .Chart.AppVersion) | quote }}
+          imagePullPolicy: Never
+          command: ["python3", "-c", "raise SystemExit(1)"]
+EOF
+    helm package "$chart_dir/curie" --version "$version" --app-version "$version" \
+        -d "$WORKDIR/hook-fail-not-serving/packaged" >/dev/null
+    chart="$WORKDIR/hook-fail-not-serving/packaged/curie-${version}.tgz"
+    [[ -f "$chart" ]] || die "hook-fail-not-serving target chart package is missing"
+    hook="$(fullname)-matrix-hook-fail"
+    for mode in json human; do
+        # Both output paths must begin with the previous images serving.
+        restore_n
+        wait_rollout
+        before_image="$(kubectl_ns get "deploy/$(fullname)-api" -o jsonpath='{.spec.template.spec.containers[?(@.name=="api")].image}')"
+        [[ "$before_image" == "$(image_for curie-api 0.10.0)" ]] \
+            || die "hook-fail-not-serving $mode did not start from the previous API image"
+        exclusive_kind_tag "$version"
+        prefix="hook-fail-not-serving-$mode"
+        status=0
+        if [[ "$mode" == json ]]; then
+            cluster_upgrade "$version" "$chart" || status=$?
+            record_upgrade_json "$prefix"
+            (( status != 0 )) || die "hook-fail-not-serving JSON upgrade unexpectedly succeeded"
+            assert_upgrade_status failed
+            assert_upgrade_phase apply
+            [[ "$(json_field "$EVIDENCE_DIR/last-upgrade.json" previous_serving)" == false ]] \
+                || die "post-upgrade hook failure claimed the previous version is serving"
+            reason="$(json_field "$EVIDENCE_DIR/last-upgrade.json" fail_forward.reason)"
+            [[ "$reason" == *"target manifests are applied"* \
+                && "$reason" == *"upgrade failed after apply"* \
+                && "$reason" == *"post-upgrade hooks failed"* ]] \
+                || die "post-upgrade hook failure omitted the applied-target fail-forward reason"
+        else
+            "$BIN" cluster upgrade --yes --to "$version" \
+                --namespace "$NAMESPACE" --release "$RELEASE" --chart "$chart" \
+                "${KUBECTL_CONTEXT_ARGS[@]}" >"$EVIDENCE_DIR/$prefix.log" 2>&1 || status=$?
+            (( status != 0 )) || die "hook-fail-not-serving human upgrade unexpectedly succeeded"
+            grep -Fq 'previous version is not serving; follow the fail-forward path' \
+                "$EVIDENCE_DIR/$prefix.log" || die "post-upgrade hook failure omitted the operator warning"
+        fi
+        kubectl_ns get job "$hook" -o json >"$EVIDENCE_DIR/$prefix-job.json"
+        kubectl_ns get pods -l "job-name=$hook" -o json >"$EVIDENCE_DIR/$prefix-pods.json"
+        python3 - "$EVIDENCE_DIR/$prefix-job.json" "$EVIDENCE_DIR/$prefix-pods.json" <<'PY'
+import json, sys
+job, pods = (json.load(open(path)) for path in sys.argv[1:])
+if not any(c.get("type") == "Failed" and c.get("status") == "True"
+           for c in job.get("status", {}).get("conditions", [])):
+    raise SystemExit("injected post-upgrade hook Job did not fail")
+if not any(c.get("name") == "hook-fail" and c.get("state", {}).get("terminated", {}).get("exitCode") == 1
+           for pod in pods["items"] for c in pod.get("status", {}).get("containerStatuses", [])):
+    raise SystemExit("injected post-upgrade hook container did not exit 1")
+PY
+        kubectl_ns get "deploy/$(fullname)-api" -o json >"$EVIDENCE_DIR/$prefix-api.json"
+        live_image="$(python3 -c 'import json,sys; print(next(c["image"] for c in json.load(sys.stdin)["spec"]["template"]["spec"]["containers"] if c["name"] == "api"))' \
+            <"$EVIDENCE_DIR/$prefix-api.json")"
+        [[ "$live_image" == "$target_image" && "$live_image" != "$before_image" ]] \
+            || die "post-upgrade hook failure did not apply the target API image"
+        log "hook-fail-not-serving $mode observed exit 1 after target API image $live_image was applied"
+    done
+    assert_sentinel
+}
+
+run_rollback_to_serving() {
+    local V CHART_V serving pending="" status=0
+    V="$(awk '$1 == "version:" { print $2; exit }' "$REPO_ROOT/charts/curie/Chart.yaml")"
+    [[ -n "$V" ]] || die "rollback-to-serving could not read the checkout chart version"
+    # The checkout version admits the live tree head; 0.10.x does not.
+    retag_candidate_versions "0.10.0" "$V" required
+    helm package "$REPO_ROOT/charts/curie" --version "$V" --app-version "$V" -d "$WORKDIR/charts" >/dev/null
+    CHART_V="$WORKDIR/charts/curie-${V}.tgz"
+    [[ -f "$CHART_V" ]] || die "rollback-to-serving chart package is missing"
+    exclusive_kind_tag "$V"
+    cluster_upgrade "$V" "$CHART_V" || status=$?
+    record_upgrade_json "rollback-serving-setup"
+    (( status == 0 )) || die "rollback-to-serving setup upgrade exited $status"
+    assert_upgrade_status "succeeded"
+    wait_rollout
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-serving-before.json"
+    serving="$(python3 -c '
+import json, sys
+row = max(json.load(sys.stdin), key=lambda r: int(r["revision"]))
+if row["status"] != "deployed" or row["app_version"] != sys.argv[1] or row["chart"] != "curie-" + sys.argv[1]:
+    raise SystemExit("newest revision is not deployed at the checkout version")
+print(row["revision"])
+' "$V" <"$EVIDENCE_DIR/rollback-serving-before.json")" \
+        || die "rollback-to-serving setup did not establish a serving revision at $V"
+
+    # Start Helm directly so the recorded PID is the process that holds its lock.
+    helm --kubeconfig "$KUBECONFIG_FILE" "${HELM_CONTEXT_ARGS[@]}" upgrade "$RELEASE" "$CHART_V" -n "$NAMESPACE" \
+        --reuse-values --wait --timeout 10m \
+        >"$EVIDENCE_DIR/rollback-serving-interrupted.log" 2>&1 &
+    ROLLBACK_SERVING_HELM_PID=$!
+    local deadline=$((SECONDS + 300))
+    while (( SECONDS < deadline )); do
+        helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-serving-pending.json"
+        pending="$(python3 -c '
+import json, sys
+row = max(json.load(sys.stdin), key=lambda r: int(r["revision"]))
+if row["status"] == "pending-upgrade" and int(row["revision"]) > int(sys.argv[1]):
+    print(row["revision"])
+' "$serving" <"$EVIDENCE_DIR/rollback-serving-pending.json")"
+        [[ -z "$pending" ]] || break
+        kill -0 "$ROLLBACK_SERVING_HELM_PID" 2>/dev/null || break
+        sleep 0.2
+    done
+    [[ -n "$pending" ]] || die "rollback-to-serving did not observe pending-upgrade within 300s"
+    kill -9 "$ROLLBACK_SERVING_HELM_PID" \
+        || die "rollback-to-serving Helm exited before SIGKILL"
+    status=0
+    wait "$ROLLBACK_SERVING_HELM_PID" 2>/dev/null || status=$?
+    ROLLBACK_SERVING_HELM_PID=""
+    (( status != 0 )) || die "rollback-to-serving interrupted Helm reported success"
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-serving-killed.json"
+    python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+newest = max(rows, key=lambda r: int(r["revision"]))
+serving, pending, version = sys.argv[1:]
+if int(newest["revision"]) != int(pending) or newest["status"] != "pending-upgrade":
+    raise SystemExit("killed upgrade did not leave its newest revision pending-upgrade")
+if not any(int(r["revision"]) == int(serving) and r["status"] == "deployed" and r["app_version"] == version for r in rows):
+    raise SystemExit("killed upgrade did not retain the serving revision")
+' "$serving" "$pending" "$V" <"$EVIDENCE_DIR/rollback-serving-killed.json" \
+        || die "rollback-to-serving did not preserve the required interrupted history"
+
+    status=0
+    "$BIN" --json cluster rollback --dry-run --namespace "$NAMESPACE" --release "$RELEASE" \
+        >"$EVIDENCE_DIR/rollback-serving-dry-run.json" 2>"$EVIDENCE_DIR/rollback-serving-dry-run.err" \
+        || status=$?
+    (( status == 0 )) || die "rollback-to-serving dry run exited $status"
+    python3 -c '
+import json, shlex, sys
+doc = json.load(sys.stdin)
+release, serving, pending, version = sys.argv[1:]
+plan = doc["plan"]
+summary = f"selected revision {serving} (deployed, curie-{version}) from revision {pending}; skipped none"
+commands = [shlex.split(line) for line in plan]
+if doc.get("dry_run") is not True or summary not in plan:
+    raise SystemExit("dry run does not identify the serving and pending revisions")
+if not any(args[:4] == ["helm", "rollback", release, serving] for args in commands):
+    raise SystemExit("dry run does not name the serving revision in its Helm rollback command")
+' "$RELEASE" "$serving" "$pending" "$V" <"$EVIDENCE_DIR/rollback-serving-dry-run.json" \
+        || die "rollback-to-serving dry run selected the wrong target"
+
+    status=0
+    "$BIN" --json cluster rollback --yes --namespace "$NAMESPACE" --release "$RELEASE" \
+        >"$EVIDENCE_DIR/rollback-serving.json" 2>"$EVIDENCE_DIR/rollback-serving.err" \
+        || status=$?
+    (( status == 0 )) || die "rollback-to-serving rollback exited $status"
+    [[ "$(json_field "$EVIDENCE_DIR/rollback-serving.json" "to_revision")" == "$serving" ]] \
+        || die "rollback-to-serving rollback did not target serving revision $serving"
+    [[ "$(json_field "$EVIDENCE_DIR/rollback-serving.json" "from_revision")" == "$pending" ]] \
+        || die "rollback-to-serving rollback did not start from pending revision $pending"
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-serving-after.json"
+    python3 -c '
+import json, sys
+row = max(json.load(sys.stdin), key=lambda r: int(r["revision"]))
+serving, pending, version = sys.argv[1:]
+if int(row["revision"]) <= int(pending) or row["status"] != "deployed" or row["app_version"] != version or row["chart"] != "curie-" + version:
+    raise SystemExit("newest rollback revision is not deployed at the serving version")
+if row["description"] != "Rollback to " + serving:
+    raise SystemExit("newest revision does not record rollback to the serving revision")
+' "$serving" "$pending" "$V" <"$EVIDENCE_DIR/rollback-serving-after.json" \
+        || die "rollback-to-serving did not restore the serving version in Helm history"
+    wait_rollout
+    kubectl_ns get deploy "$(fullname)-api" -o json | python3 -c '
+import json, sys
+if int(json.load(sys.stdin).get("status", {}).get("readyReplicas", 0)) < 1:
+    raise SystemExit("API has no ready replicas")
+' || die "rollback-to-serving API is not Ready"
+    api_health >/dev/null || die "rollback-to-serving API health failed"
+    log "rollback-to-serving restored revision $serving at $V over pending revision $pending; API is Ready and healthy"
+}
+
+# Prints the API Deployment's LOG_LEVEL env value, the pod template field the
+# rollback-interrupted scenario changes between revisions A and B.
+rollback_interrupted_api_log_level() {
+    kubectl_ns get deploy "$(fullname)-api" -o json | python3 -c '
+import json, sys
+spec = json.load(sys.stdin)["spec"]["template"]["spec"]
+values = [e.get("value", "") for c in spec.get("containers", []) for e in c.get("env", []) if e.get("name") == "LOG_LEVEL"]
+if not values:
+    raise SystemExit("API Deployment has no LOG_LEVEL env")
+print(values[0])
+'
+}
+
+run_rollback_interrupted() {
+    local V CHART_V target newer pending="" status=0 level_a level_b level_after
+    V="$(awk '$1 == "version:" { print $2; exit }' "$REPO_ROOT/charts/curie/Chart.yaml")"
+    [[ -n "$V" ]] || die "rollback-interrupted could not read the checkout chart version"
+    # The checkout version admits the live tree head; 0.10.x does not.
+    retag_candidate_versions "0.10.0" "$V" required
+    helm package "$REPO_ROOT/charts/curie" --version "$V" --app-version "$V" -d "$WORKDIR/charts" >/dev/null
+    CHART_V="$WORKDIR/charts/curie-${V}.tgz"
+    [[ -f "$CHART_V" ]] || die "rollback-interrupted chart package is missing"
+    exclusive_kind_tag "$V"
+    cluster_upgrade "$V" "$CHART_V" || status=$?
+    record_upgrade_json "rollback-interrupted-setup"
+    (( status == 0 )) || die "rollback-interrupted setup upgrade exited $status"
+    assert_upgrade_status "succeeded"
+    wait_rollout
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-interrupted-setup.json"
+    target="$(python3 -c '
+import json, sys
+row = max(json.load(sys.stdin), key=lambda r: int(r["revision"]))
+if row["status"] != "deployed" or row["app_version"] != sys.argv[1] or row["chart"] != "curie-" + sys.argv[1]:
+    raise SystemExit("newest revision is not deployed at the checkout version")
+print(row["revision"])
+' "$V" <"$EVIDENCE_DIR/rollback-interrupted-setup.json")" \
+        || die "rollback-interrupted setup did not establish revision A at $V"
+    level_a="$(rollback_interrupted_api_log_level)" \
+        || die "rollback-interrupted could not read the API log level at revision $target"
+    level_b="DEBUG"
+    [[ "$level_a" != "$level_b" ]] || level_b="WARNING"
+
+    # Revision B: same chart, different values, so rolling back to A changes
+    # the API pod template and the rollback --wait has pods to wait for.
+    status=0
+    helm_ns upgrade "$RELEASE" "$CHART_V" --reuse-values --set "api.logLevel=$level_b" --wait --timeout 10m \
+        >"$EVIDENCE_DIR/rollback-interrupted-revision-b.log" 2>&1 || status=$?
+    (( status == 0 )) || die "rollback-interrupted upgrade to revision B exited $status"
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-interrupted-before.json"
+    newer="$(python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+target, version = sys.argv[1:]
+newest = max(rows, key=lambda r: int(r["revision"]))
+if int(newest["revision"]) <= int(target) or newest["status"] != "deployed" or newest["chart"] != "curie-" + version:
+    raise SystemExit("revision B is not the newest deployed revision at the checkout version")
+if not any(int(r["revision"]) == int(target) and r["status"] == "superseded" and r["chart"] == "curie-" + version for r in rows):
+    raise SystemExit("revision A is not superseded at the checkout version")
+print(newest["revision"])
+' "$target" "$V" <"$EVIDENCE_DIR/rollback-interrupted-before.json")" \
+        || die "rollback-interrupted did not establish revision B over revision A"
+    [[ "$(rollback_interrupted_api_log_level)" == "$level_b" ]] \
+        || die "rollback-interrupted revision B did not change the API pod template"
+
+    # Start Helm directly so the recorded PID is the process that holds its lock.
+    helm --kubeconfig "$KUBECONFIG_FILE" "${HELM_CONTEXT_ARGS[@]}" rollback "$RELEASE" "$target" -n "$NAMESPACE" \
+        --wait --timeout 10m \
+        >"$EVIDENCE_DIR/rollback-interrupted-killed-helm.log" 2>&1 &
+    ROLLBACK_INTERRUPTED_HELM_PID=$!
+    local deadline=$((SECONDS + 300))
+    while (( SECONDS < deadline )); do
+        helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-interrupted-pending.json"
+        pending="$(python3 -c '
+import json, sys
+row = max(json.load(sys.stdin), key=lambda r: int(r["revision"]))
+if row["status"] == "pending-rollback" and int(row["revision"]) > int(sys.argv[1]):
+    print(row["revision"])
+' "$newer" <"$EVIDENCE_DIR/rollback-interrupted-pending.json")"
+        [[ -z "$pending" ]] || break
+        kill -0 "$ROLLBACK_INTERRUPTED_HELM_PID" 2>/dev/null || break
+        sleep 0.2
+    done
+    [[ -n "$pending" ]] || die "rollback-interrupted did not observe pending-rollback within 300s"
+    kill -9 "$ROLLBACK_INTERRUPTED_HELM_PID" \
+        || die "rollback-interrupted Helm exited before SIGKILL"
+    status=0
+    wait "$ROLLBACK_INTERRUPTED_HELM_PID" 2>/dev/null || status=$?
+    ROLLBACK_INTERRUPTED_HELM_PID=""
+    (( status != 0 )) || die "rollback-interrupted interrupted Helm reported success"
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-interrupted-killed.json"
+    python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+newest = max(rows, key=lambda r: int(r["revision"]))
+target, newer, pending, version = sys.argv[1:]
+if int(newest["revision"]) != int(pending) or newest["status"] != "pending-rollback":
+    raise SystemExit("killed rollback did not leave its newest revision pending-rollback")
+if (newest.get("description") or "").strip() != "Rollback to " + target or newest["chart"] != "curie-" + version:
+    raise SystemExit("pending-rollback revision does not record the rollback to revision A")
+if not any(int(r["revision"]) == int(newer) and r["status"] == "deployed" for r in rows):
+    raise SystemExit("killed rollback did not retain revision B as deployed")
+' "$target" "$newer" "$pending" "$V" <"$EVIDENCE_DIR/rollback-interrupted-killed.json" \
+        || die "rollback-interrupted did not preserve the required interrupted history"
+
+    status=0
+    "$BIN" --json cluster rollback --dry-run --namespace "$NAMESPACE" --release "$RELEASE" \
+        >"$EVIDENCE_DIR/rollback-interrupted-dry-run.json" 2>"$EVIDENCE_DIR/rollback-interrupted-dry-run.err" \
+        || status=$?
+    (( status == 0 )) || die "rollback-interrupted dry run exited $status"
+    python3 -c '
+import json, shlex, sys
+doc = json.load(sys.stdin)
+release, target, pending, version = sys.argv[1:]
+plan = doc["plan"]
+resuming = f"revision {pending} is an interrupted rollback to revision {target}; resuming it"
+summary = f"selected revision {target} (superseded, curie-{version}) from revision {pending}; skipped none"
+commands = [shlex.split(line) for line in plan]
+if doc.get("dry_run") is not True:
+    raise SystemExit("dry run output is not marked dry_run")
+if resuming not in plan:
+    raise SystemExit("dry run does not name the interrupted rollback")
+if summary not in plan:
+    raise SystemExit("dry run does not select revision A from the pending revision")
+if not any(args[:4] == ["helm", "rollback", release, target] for args in commands):
+    raise SystemExit("dry run does not name revision A in its Helm rollback command")
+' "$RELEASE" "$target" "$pending" "$V" <"$EVIDENCE_DIR/rollback-interrupted-dry-run.json" \
+        || die "rollback-interrupted dry run did not resume the interrupted rollback"
+
+    status=0
+    "$BIN" --json cluster rollback --yes --namespace "$NAMESPACE" --release "$RELEASE" \
+        >"$EVIDENCE_DIR/rollback-interrupted.json" 2>"$EVIDENCE_DIR/rollback-interrupted.err" \
+        || status=$?
+    (( status == 0 )) || die "rollback-interrupted rollback exited $status"
+    [[ "$(json_field "$EVIDENCE_DIR/rollback-interrupted.json" "to_revision")" == "$target" ]] \
+        || die "rollback-interrupted rollback did not target revision A ($target)"
+    [[ "$(json_field "$EVIDENCE_DIR/rollback-interrupted.json" "from_revision")" == "$pending" ]] \
+        || die "rollback-interrupted rollback did not start from pending revision $pending"
+    [[ "$(json_field "$EVIDENCE_DIR/rollback-interrupted.json" "resumed_interrupted_rollback")" == "true" ]] \
+        || die "rollback-interrupted rollback did not report resumed_interrupted_rollback true"
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-interrupted-after.json"
+    python3 -c '
+import json, sys
+row = max(json.load(sys.stdin), key=lambda r: int(r["revision"]))
+target, pending, version = sys.argv[1:]
+if int(row["revision"]) <= int(pending) or row["status"] != "deployed" or row["chart"] != "curie-" + version:
+    raise SystemExit("newest rollback revision is not deployed at the checkout chart")
+if (row.get("description") or "").strip() != "Rollback to " + target:
+    raise SystemExit("newest revision does not record the rollback to revision A")
+' "$target" "$pending" "$V" <"$EVIDENCE_DIR/rollback-interrupted-after.json" \
+        || die "rollback-interrupted did not finish the rollback to revision A in Helm history"
+    wait_rollout
+    level_after="$(rollback_interrupted_api_log_level)" \
+        || die "rollback-interrupted could not read the API log level after the rollback"
+    [[ "$level_after" == "$level_a" ]] \
+        || die "rollback-interrupted API pod template did not return to revision A values"
+    kubectl_ns get deploy "$(fullname)-api" -o json | python3 -c '
+import json, sys
+if int(json.load(sys.stdin).get("status", {}).get("readyReplicas", 0)) < 1:
+    raise SystemExit("API has no ready replicas")
+' || die "rollback-interrupted API is not Ready"
+    api_health >/dev/null || die "rollback-interrupted API health failed"
+    log "rollback-interrupted resumed the rollback to revision $target from pending revision $pending over revision $newer at $V; API is Ready and healthy"
+}
+
+# Compare two `helm history -o json` captures by (revision, status, app_version).
+assert_helm_history_unchanged() {
+    local before="$1" after="$2" label="$3"
+    python3 -c '
+import json, sys
+def rows(path):
+    return sorted((int(r["revision"]), r["status"], r.get("app_version", "")) for r in json.load(open(path)))
+if rows(sys.argv[1]) != rows(sys.argv[2]):
+    raise SystemExit("Helm history changed")
+' "$before" "$after" || die "$label changed Helm history"
+}
+
+# AC4 of issue #4498: a bare rollback whose selected target has no catalog
+# window refuses before mutation, both as a dry run and as a real run.
+run_rollback_uncatalogued() {
+    local V U CHART_V CHART_U before node img ref status=0
+    V="$(awk '$1 == "version:" { print $2; exit }' "$REPO_ROOT/charts/curie/Chart.yaml")"
+    [[ -n "$V" ]] || die "rollback-uncatalogued could not read the checkout chart version"
+    # A valid image tag that no catalog window names. The CLI resolves windows
+    # from the embedded catalog by exact key, so an absent key is a miss.
+    U="sha-4498fa0"
+    python3 -c '
+import json, sys
+if sys.argv[2] in json.load(open(sys.argv[1]))["windows"]:
+    raise SystemExit("uncatalogued app version is catalogued")
+' "$REPO_ROOT/cli/src/application_schema_windows.json" "$U" \
+        || die "rollback-uncatalogued app version $U has a catalog window"
+
+    retag_candidate_versions "0.10.0" "$V" required
+    helm package "$REPO_ROOT/charts/curie" --version "$V" --app-version "$V" -d "$WORKDIR/charts" >/dev/null
+    CHART_V="$WORKDIR/charts/curie-${V}.tgz"
+    [[ -f "$CHART_V" ]] || die "rollback-uncatalogued chart package is missing"
+    # Same chart version, different app version: a separate directory keeps
+    # the two packages from overwriting each other.
+    mkdir -p "$WORKDIR/charts-uncatalogued"
+    helm package "$REPO_ROOT/charts/curie" --version "$V" --app-version "$U" \
+        -d "$WORKDIR/charts-uncatalogued" >/dev/null
+    CHART_U="$WORKDIR/charts-uncatalogued/curie-${V}.tgz"
+    [[ -f "$CHART_U" ]] || die "rollback-uncatalogued uncatalogued chart package is missing"
+
+    exclusive_kind_tag "$V"
+    cluster_upgrade "$V" "$CHART_V" || status=$?
+    record_upgrade_json "rollback-uncatalogued-setup"
+    (( status == 0 )) || die "rollback-uncatalogued setup upgrade exited $status"
+    assert_upgrade_status "succeeded"
+    wait_rollout
+
+    # untag_kind_siblings never touches V or U, so loading U alongside V keeps
+    # both tags on the node: pods for either revision start with pullPolicy
+    # Never. load_tag_images clears EXCLUSIVE_KIND_TAG while U is present.
+    retag_candidate_versions "0.10.0" "$U" required
+    load_tag_images "$U"
+    # Raw Helm on both legs: the CLI upgrade verb owns the schema gate and is
+    # not the thing under test, and the leg back to V starts from an
+    # uncatalogued current version the CLI is free to refuse.
+    helm --kubeconfig "$KUBECONFIG_FILE" "${HELM_CONTEXT_ARGS[@]}" upgrade "$RELEASE" "$CHART_U" -n "$NAMESPACE" \
+        --reuse-values --wait --timeout 10m \
+        >"$EVIDENCE_DIR/rollback-uncatalogued-apply.log" 2>&1 \
+        || die "rollback-uncatalogued helm upgrade to $U failed"
+    wait_rollout
+    helm --kubeconfig "$KUBECONFIG_FILE" "${HELM_CONTEXT_ARGS[@]}" upgrade "$RELEASE" "$CHART_V" -n "$NAMESPACE" \
+        --reuse-values --wait --timeout 10m \
+        >"$EVIDENCE_DIR/rollback-uncatalogued-return.log" 2>&1 \
+        || die "rollback-uncatalogued helm upgrade back to $V failed"
+    wait_rollout
+    # Restore V as the only app tag on the node so no later step sees U.
+    node="$(kind_node)"
+    if [[ -n "$node" ]]; then
+        for img in "${IMAGES[@]}"; do
+            for ref in "ghcr.io/curie-eng/${img}:${U}" "docker.io/library/${img}:${U}" "${img}:${U}"; do
+                docker exec "$node" crictl rmi "$ref" >/dev/null 2>&1 || true
+                docker exec "$node" ctr -n k8s.io images untag "$ref" >/dev/null 2>&1 || true
+            done
+        done
+    fi
+    EXCLUSIVE_KIND_TAG=""
+    exclusive_kind_tag "$V"
+
+    before="$EVIDENCE_DIR/rollback-uncatalogued-before.json"
+    helm_ns history "$RELEASE" -o json >"$before"
+    python3 -c '
+import json, sys
+rows = sorted(json.load(open(sys.argv[1])), key=lambda r: int(r["revision"]))
+version, uncatalogued = sys.argv[2:]
+if len(rows) < 2:
+    raise SystemExit("history has fewer than two revisions")
+newest, previous = rows[-1], rows[-2]
+if newest["status"] != "deployed" or newest["app_version"] != version:
+    raise SystemExit("newest revision is not deployed at the checkout version")
+if previous["status"] != "superseded" or previous["app_version"] != uncatalogued:
+    raise SystemExit("revision below the newest is not the superseded uncatalogued revision")
+' "$before" "$V" "$U" \
+        || die "rollback-uncatalogued setup did not leave $U as the bare rollback target"
+
+    status=0
+    "$BIN" cluster rollback --dry-run --namespace "$NAMESPACE" --release "$RELEASE" \
+        >"$EVIDENCE_DIR/rollback-uncatalogued-dry-run.out" 2>"$EVIDENCE_DIR/rollback-uncatalogued-dry-run.err" \
+        || status=$?
+    (( status == 1 )) || die "rollback-uncatalogued dry run exited $status, want 1"
+    grep -qF "refusing rollback to application $U: no declared schema range for that version" \
+        "$EVIDENCE_DIR/rollback-uncatalogued-dry-run.err" \
+        || die "rollback-uncatalogued dry run did not refuse the uncatalogued target"
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-uncatalogued-after-dry-run.json"
+    assert_helm_history_unchanged "$before" "$EVIDENCE_DIR/rollback-uncatalogued-after-dry-run.json" \
+        "rollback-uncatalogued dry run"
+
+    status=0
+    "$BIN" cluster rollback --yes --namespace "$NAMESPACE" --release "$RELEASE" \
+        >"$EVIDENCE_DIR/rollback-uncatalogued.out" 2>"$EVIDENCE_DIR/rollback-uncatalogued.err" \
+        || status=$?
+    (( status == 1 )) || die "rollback-uncatalogued rollback exited $status, want 1"
+    grep -qF "refusing rollback to application $U: no declared schema range for that version" \
+        "$EVIDENCE_DIR/rollback-uncatalogued.err" \
+        || die "rollback-uncatalogued rollback did not refuse the uncatalogued target"
+    grep -qF "fail forward to application $V" "$EVIDENCE_DIR/rollback-uncatalogued.err" \
+        || die "rollback-uncatalogued rollback did not name fail forward to application $V"
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-uncatalogued-after.json"
+    assert_helm_history_unchanged "$before" "$EVIDENCE_DIR/rollback-uncatalogued-after.json" \
+        "rollback-uncatalogued rollback"
+    log "rollback-uncatalogued refused rollback to $U as dry run and real run, named fail forward to $V, and left Helm history unchanged"
+}
+
+# These observations come from the real claim and its bound Pod. A replacement
+# claim, a deleting claim, or a Pod on another image cannot pass the proof.
+# The Pod's labels are not checked: a platform-template Pod carries no agent
+# label, and the claim is matched to its Pod by status.sandbox.name only.
+# The last argument is "ready" (claim and Pod must be Ready) or "bound" (the
+# claim binds a live Pod on the image; readiness is not required).
+runner_layer_claim_observation() {
+    python3 - "$@" <<'PY'
+import json, sys
+claim_file, pod_file, agent, image, expected_uid, mode = sys.argv[1:]
+if mode not in ("ready", "bound"):
+    raise SystemExit(f"unknown observation mode {mode!r}")
+claim = json.load(open(claim_file))
+pod = json.load(open(pod_file))
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+def ready(document):
+    return any(row.get("type") == "Ready" and row.get("status") == "True"
+               for row in document.get("status", {}).get("conditions", []))
+metadata = claim["metadata"]
+uid = metadata.get("uid")
+require(bool(uid) and (not expected_uid or uid == expected_uid), "claim UID changed or is absent")
+require(not metadata.get("deletionTimestamp"), "claim is being deleted")
+require(metadata.get("labels", {}).get("curietech.ai/agent") == agent, "claim agent label differs")
+require("curietech.ai/managed-by" not in metadata.get("labels", {}), "claim is visible to the orphan reaper")
+require(claim.get("status", {}).get("sandbox", {}).get("name") == pod["metadata"]["name"],
+        "claim does not bind the observed Pod")
+require(not pod["metadata"].get("deletionTimestamp"), "Pod is being deleted")
+runners = [container for container in pod.get("spec", {}).get("containers", [])
+           if container.get("name") == "runner"]
+require(len(runners) == 1 and runners[0].get("image") == image, "bound runner image differs")
+if mode == "ready":
+    require(ready(claim) and ready(pod), "claim or bound Pod is not Ready")
+print(uid)
+PY
+}
+
+assert_runner_layer_claim() {
+    local claim="$1" agent="$2" image="$3" expected_uid="${4:-}" pod
+    kubectl_ns wait --for=condition=Ready "sandboxclaim/$claim" --timeout=180s >&2 || return $?
+    kubectl_ns get sandboxclaim "$claim" -o json >"$WORKDIR/retire-claim.json" || return $?
+    pod="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("status", {}).get("sandbox", {}).get("name", ""))' \
+        "$WORKDIR/retire-claim.json")" || return $?
+    [[ -n "$pod" ]] || die "runner-layer-retire claim $claim has no bound sandbox"
+    kubectl_ns wait --for=condition=Ready "pod/$pod" --timeout=180s >&2 || return $?
+    kubectl_ns get pod "$pod" -o json >"$WORKDIR/retire-pod.json" || return $?
+    runner_layer_claim_observation "$WORKDIR/retire-claim.json" "$WORKDIR/retire-pod.json" \
+        "$agent" "$image" "$expected_uid" ready
+}
+
+# The old claim sits on the chart's per-agent pool, whose template has no
+# per-claim plugin bundle, so its runner cannot become Ready. The scenario only
+# needs it bound to a live Pod on the layer image so the upgrade must delete it.
+assert_runner_layer_bound_claim() {
+    local claim="$1" agent="$2" image="$3" pod="" deadline
+    deadline=$((SECONDS + 180))
+    while :; do
+        pod="$(kubectl_ns get sandboxclaim "$claim" -o jsonpath='{.status.sandbox.name}' 2>/dev/null || true)"
+        [[ -z "$pod" ]] && (( SECONDS < deadline )) || break
+        sleep 2
+    done
+    [[ -n "$pod" ]] || die "runner-layer-retire claim $claim bound no sandbox within 180s"
+    deadline=$((SECONDS + 180))
+    until kubectl_ns get pod "$pod" -o json >"$WORKDIR/retire-pod.json" 2>/dev/null; do
+        (( SECONDS < deadline )) || die "runner-layer-retire claim $claim Pod $pod did not appear within 180s"
+        sleep 2
+    done
+    kubectl_ns get sandboxclaim "$claim" -o json >"$WORKDIR/retire-claim.json" || return $?
+    runner_layer_claim_observation "$WORKDIR/retire-claim.json" "$WORKDIR/retire-pod.json" \
+        "$agent" "$image" "" bound
+}
+
+# Fails unless the Pod labels file (kubectl jsonpath '{.metadata.labels}'
+# output, possibly empty) lacks curietech.ai/agent, as a platform-template
+# Pod does (#4332).
+runner_layer_pod_lacks_agent_label() {
+    python3 - "$1" <<'PY'
+import json, sys
+text = open(sys.argv[1]).read().strip()
+labels = json.loads(text) if text else {}
+if "curietech.ai/agent" in labels:
+    raise SystemExit("target Pod carries a curietech.ai/agent label")
+PY
+}
+
+kind_runner_digest() {
+    local reference="$1" node digest
+    node="$(kind_node)"
+    [[ -n "$node" ]] || die "runner-layer-retire has no kind node"
+    digest="$(docker exec "$node" ctr -n k8s.io images list \
+        | awk -v ref="$reference" '$1 == ref {print $3}')"
+    if [[ "$digest" != sha256:* ]] || ! is_sha256 "${digest#sha256:}"; then
+        die "kind has no manifest digest for runner $reference"
+    fi
+    printf '%s' "$digest"
+}
+
+restore_retire_runner_tags() {
+    if [[ -n "$RETIRE_RUNNER_ORIGINAL_ID" ]]; then
+        docker tag "$RETIRE_RUNNER_ORIGINAL_ID" "$(image_for curie-runner 0.10.1)" || return $?
+        docker tag "$RETIRE_RUNNER_ORIGINAL_ID" curie-runner:0.10.1 || return $?
+        RETIRE_RUNNER_ORIGINAL_ID=""
+    fi
+    if [[ -n "$RETIRE_RUNNER_DERIVED_TAG" ]]; then
+        docker image rm "$RETIRE_RUNNER_DERIVED_TAG" >/dev/null || return $?
+        RETIRE_RUNNER_DERIVED_TAG=""
+    fi
+    if [[ -n "$RETIRE_LAYER_TAG" ]]; then
+        docker image rm "$RETIRE_LAYER_TAG" >/dev/null || return $?
+        RETIRE_LAYER_TAG=""
+    fi
+}
+
+run_runner_layer_retire() {
+    restore_n
+    local agent=acme-retire old_claim=acme-retire-old target_claim=acme-retire-target
+    local current_runner target_runner current_id target_id target_digest layer_tag layer_digest layer_image
+    local node target_image target_pod target_uid target_uid_after old_uid old_remaining status=0 saved_chart="$CHART_0101"
+    current_runner="$(image_for curie-runner 0.10.0)"
+    target_runner="$(image_for curie-runner 0.10.1)"
+    current_id="$(docker image inspect "$current_runner" --format '{{.Id}}')"
+    target_id="$(docker image inspect "$target_runner" --format '{{.Id}}')"
+    if [[ "$current_id" == "$target_id" ]]; then
+        # The candidate's two version tags normally alias one image. A LABEL
+        # changes its digest without changing any runner behavior.
+        RETIRE_RUNNER_ORIGINAL_ID="$target_id"
+        RETIRE_RUNNER_DERIVED_TAG="${target_runner%:*}:matrix-${KIND_CLUSTER}-retire"
+        printf 'FROM %s\nLABEL curietech.ai/matrix="runner-layer-retire"\n' "$current_runner" \
+            | docker build --pull=false -t "$RETIRE_RUNNER_DERIVED_TAG" - >&2
+        docker tag "$RETIRE_RUNNER_DERIVED_TAG" "$target_runner"
+        docker tag "$target_runner" curie-runner:0.10.1
+    fi
+    EXCLUSIVE_KIND_TAG=""
+    kind load docker-image "$target_runner" --name "$KIND_CLUSTER" >&2
+    target_digest="$(kind_runner_digest "$target_runner")"
+    [[ "$target_digest" != "$(kind_runner_digest "$current_runner")" ]] \
+        || die "runner-layer-retire needs distinct 0.10.0 and 0.10.1 runner digests"
+    node="$(kind_node)"
+    # The layer is owner-built by repository identity, retagged from this
+    # candidate, and addressable by the digest the chart requires for a bind.
+    # It is the 0.10.0 runner image, so the upgrade's exclusive_kind_tag 0.10.1
+    # may crictl rmi it from the node. Nothing may schedule on the layer after
+    # the upgrade starts; only the pre-upgrade old claim uses it.
+    layer_tag="ghcr.io/acme-corp/acme-runner:matrix-${KIND_CLUSTER}"
+    docker tag "$current_runner" "$layer_tag"
+    RETIRE_LAYER_TAG="$layer_tag"
+    kind load docker-image "$layer_tag" --name "$KIND_CLUSTER" >&2
+    layer_digest="$(kind_runner_digest "$layer_tag")"
+    layer_image="${layer_tag%:*}@${layer_digest}"
+    docker exec "$node" ctr -n k8s.io images tag --force "$layer_tag" "$layer_image" >/dev/null
+    docker exec "$node" ctr -n k8s.io images tag --force "$target_runner" \
+        "${target_runner%:*}@${target_digest}" >/dev/null
+    local chart_dir="$WORKDIR/runner-layer-retire/chart"
+    mkdir -p "$chart_dir" "$WORKDIR/runner-layer-retire/packaged"
+    tar -xzf "$CHART_0101" -C "$chart_dir"
+    # Planning pins tagged refs through the registry, not the node's local
+    # tags. Pin only this private packaged chart so the planner observes the
+    # kind-loaded target digest even when the published version tags alias.
+    python3 - "$chart_dir/curie/values.yaml" "$target_digest" <<'PY'
+import json, pathlib, sys
+path, digest = pathlib.Path(sys.argv[1]), sys.argv[2]
+lines = path.read_text().splitlines(keepends=True)
+in_sandbox = in_runner = False
+changed = 0
+for index, line in enumerate(lines):
+    if line.strip() and not line.startswith((" ", "#")):
+        in_sandbox = line.startswith("agentSandbox:")
+        in_runner = False
+    if in_sandbox and line.startswith("  ") and not line.startswith("   ") and not line.lstrip().startswith("#"):
+        in_runner = line.startswith("  runner:")
+    if in_sandbox and in_runner and line.startswith("    digest:"):
+        lines[index] = "    digest: " + json.dumps(digest) + "\n"
+        changed += 1
+if changed != 1:
+    raise SystemExit("private target chart must contain exactly one runner digest field")
+path.write_text("".join(lines))
+PY
+    helm package "$chart_dir/curie" -d "$WORKDIR/runner-layer-retire/packaged" >/dev/null
+    CHART_0101="$WORKDIR/runner-layer-retire/packaged/curie-0.10.1.tgz"
+    helm_ns upgrade "$RELEASE" "$CHART_0100" --reset-then-reuse-values \
+        --set-string "agentSandbox.runnerImages.${agent}=${layer_image}" --wait --timeout 15m >&2
+    wait_rollout >&2
+    helm_ns get values "$RELEASE" -o json >"$WORKDIR/retire-target-values.json"
+    python3 - "$WORKDIR/retire-target-values.json" "$agent" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+values = json.loads(path.read_text())
+sandbox = values.get("agentSandbox", {})
+if "digest" in sandbox.get("runner", {}):
+    raise SystemExit("retirement setup must not retain a platform runner digest override")
+sandbox.get("runnerImages", {}).pop(sys.argv[2], None)
+path.write_text(json.dumps(values))
+PY
+    helm_ns template "$RELEASE" "$CHART_0101" -f "$WORKDIR/retire-target-values.json" \
+        --show-only templates/agent-sandbox.yaml >"$WORKDIR/retire-target-render.yaml"
+    python3 - "$WORKDIR/retire-target-render.yaml" "$(fullname)-runner" <<'PY' \
+        | kubectl_ns create --dry-run=client -f - -o json >"$WORKDIR/retire-platform-template.json"
+import pathlib, re, sys
+documents = re.split(r"(?m)^---\s*$", pathlib.Path(sys.argv[1]).read_text())
+templates = [document for document in documents
+             if re.search(r"(?m)^kind: SandboxTemplate$", document)
+             and re.search(r"(?m)^  name: " + re.escape(sys.argv[2]) + r"$", document)]
+if len(templates) != 1:
+    raise SystemExit("target chart must render exactly one platform SandboxTemplate")
+print(templates[0])
+PY
+    target_image="$(python3 -c 'import json,sys; print(next(c["image"] for c in json.load(open(sys.argv[1]))["spec"]["podTemplate"]["spec"]["containers"] if c["name"] == "runner"))' \
+        "$WORKDIR/retire-platform-template.json")"
+    [[ "$target_image" == "${target_runner%:*}@${target_digest}" ]] \
+        || die "target chart does not render the kind-loaded runner digest"
+    docker run --rm --entrypoint test "$target_runner" \
+        -f /app/packages/plugin-format/tests/fixtures/valid_bundle/.claude-plugin/plugin.json \
+        || die "runner-layer-retire target runner $target_runner lacks the fixture plugin bundle at /app/packages/plugin-format/tests/fixtures/valid_bundle"
+    python3 - "$WORKDIR/retire-platform-template.json" "$agent" "$old_claim" "$target_claim" \
+        "$(fullname)-agent-${agent}-runner-pool" >"$WORKDIR/retire-resources.json" <<'PY'
+import json, sys
+template_file, agent, old_claim, target_claim, old_pool = sys.argv[1:]
+template = json.load(open(template_file))
+api = template["apiVersion"]
+template["metadata"] = {"name": "acme-retire-admin-template"}
+# The worker injects a real plugin bundle per claim and the template's
+# CURIE_PLUGIN_DIR is a placeholder. This admin claim gets no bundle, so point
+# the runner at the fixture bundle the runner image ships; its Pod then boots
+# Ready on the unchanged target image.
+runners = [container for container in template["spec"]["podTemplate"]["spec"]["containers"]
+           if container.get("name") == "runner"]
+if len(runners) != 1:
+    raise SystemExit("admin template must have exactly one runner container")
+plugin_env = [row for row in runners[0].get("env", []) if row.get("name") == "CURIE_PLUGIN_DIR"]
+if len(plugin_env) != 1:
+    raise SystemExit("admin template runner has no CURIE_PLUGIN_DIR env entry")
+plugin_env[0].pop("valueFrom", None)
+plugin_env[0]["value"] = "/app/packages/plugin-format/tests/fixtures/valid_bundle"
+# No curietech.ai/agent label on the pod template: a platform-template Pod
+# carries none, so retirement must match this claim's Pod by name alone.
+template["spec"]["podTemplate"]["metadata"] = {}
+pool = {"apiVersion": api, "kind": "SandboxWarmPool",
+        "metadata": {"name": "acme-retire-admin-pool"},
+        "spec": {"replicas": 0, "updateStrategy": {"type": "OnReplenish"},
+                 "sandboxTemplateRef": {"name": template["metadata"]["name"]}}}
+def claim(name, warm_pool):
+    # No managed-by label: neither real claim may be deleted by the worker's
+    # orphan reaper before the retirement operation being tested.
+    return {"apiVersion": api, "kind": "SandboxClaim",
+            "metadata": {"name": name, "labels": {"curietech.ai/agent": agent}},
+            "spec": {"warmPoolRef": {"name": warm_pool}}}
+print(json.dumps({"apiVersion": "v1", "kind": "List", "items": [
+    template, pool, claim(old_claim, old_pool), claim(target_claim, pool["metadata"]["name"])]}))
+PY
+    kubectl_ns create -f "$WORKDIR/retire-resources.json" >&2
+    old_uid="$(assert_runner_layer_bound_claim "$old_claim" "$agent" "$layer_image")"
+    target_uid="$(assert_runner_layer_claim "$target_claim" "$agent" "$target_image")"
+    target_pod="$(kubectl_ns get sandboxclaim "$target_claim" \
+        -o jsonpath='{.status.sandbox.name}')"
+    [[ -n "$target_pod" ]] || die "runner-layer-retire target claim has no bound sandbox"
+    kubectl_ns get pod "$target_pod" -o jsonpath='{.metadata.labels}' \
+        >"$EVIDENCE_DIR/runner-layer-retire-target-pod-labels.json"
+    runner_layer_pod_lacks_agent_label "$EVIDENCE_DIR/runner-layer-retire-target-pod-labels.json" \
+        || die "runner-layer-retire target Pod $target_pod carries a curietech.ai/agent label"
+    log "runner-layer-retire has the old claim bound on the layer image, a Ready target claim with the same agent label, and a target Pod with no agent label"
+    cluster_upgrade "0.10.1" "$CHART_0101" || status=$?
+    record_upgrade_json runner-layer-retire
+    [[ "$status" -eq 0 ]] || die "runner-layer-retire cluster upgrade exited $status"
+    assert_upgrade_status succeeded
+    [[ "$(helm_version)" == 0.10.1 ]] || die "runner-layer-retire did not reach 0.10.1"
+    helm_ns get values "$RELEASE" -o json | python3 -c '
+import json, sys
+images = json.load(sys.stdin).get("agentSandbox", {}).get("runnerImages", {})
+if sys.argv[1] in (images or {}):
+    raise SystemExit("upgrade did not clear the owner-built layer")
+' "$agent"
+    old_remaining="$(kubectl_ns get sandboxclaim "$old_claim" --ignore-not-found -o name)"
+    [[ -z "$old_remaining" ]] \
+        || die "runner-layer-retire left the old-layer claim in place"
+    target_uid_after="$(assert_runner_layer_claim "$target_claim" "$agent" "$target_image" "$target_uid")"
+    [[ "$target_uid_after" == "$target_uid" ]] \
+        || die "runner-layer-retire did not preserve the target-layer claim"
+    python3 -c 'import json,sys; print(json.dumps({"old_claim_uid":sys.argv[1], "old_claim_deleted":True, "target_claim_uid":sys.argv[2], "target_claim_uid_unchanged":True, "target_pod_ready":True, "target_image":sys.argv[3]}))' \
+        "$old_uid" "$target_uid" "$target_image" >"$EVIDENCE_DIR/runner-layer-retire-claims.json"
+    CHART_0101="$saved_chart"
+    restore_retire_runner_tags
+    log "runner-layer-retire deleted the old claim and preserved the target claim UID and Ready Pod"
+}
+
+TERMINAL_PODS=(matrix-terminal-succeeded matrix-terminal-failed matrix-surplus-running)
+
+# terminal_pod_create <name> <shell command>: a bare Pod (no owner, no
+# pod-template-hash) carrying exactly the api Deployment's selector labels, on
+# the image the api Deployment runs now, so the node already holds it.
+terminal_pod_create() {
+    local name="$1" shell_cmd="$2" deploy image
+    deploy="$(fullname)-api"
+    image="$(kubectl_ns get deploy "$deploy" -o jsonpath='{.spec.template.spec.containers[?(@.name=="api")].image}')"
+    [[ -n "$image" ]] || die "terminal-pods could not read the $deploy api image"
+    kubectl_ns get deploy "$deploy" -o json | python3 -c '
+import json, sys
+name, image, cmd = sys.argv[1:]
+labels = json.load(sys.stdin)["spec"]["selector"].get("matchLabels") or {}
+if not labels:
+    raise SystemExit("api Deployment selector has no matchLabels")
+if "pod-template-hash" in labels:
+    raise SystemExit("api Deployment selector unexpectedly names pod-template-hash")
+print(json.dumps({"apiVersion": "v1", "kind": "Pod",
+                  "metadata": {"name": name, "labels": labels},
+                  "spec": {"restartPolicy": "Never", "terminationGracePeriodSeconds": 1,
+                           "automountServiceAccountToken": False,
+                           "containers": [{"name": "probe", "image": image, "imagePullPolicy": "Never",
+                                           "command": ["sh", "-c", cmd]}]}}))
+' "$name" "$image" "$shell_cmd" | kubectl_ns create -f - >&2
+    log "terminal-pods created bare pod $name on $image with the api selector labels"
+}
+
+# terminal_pod_wait_phase <name> <phase> <seconds>
+terminal_pod_wait_phase() {
+    local name="$1" want="$2" deadline=$((SECONDS + $3)) phase=""
+    while (( SECONDS < deadline )); do
+        phase="$(kubectl_ns get pod "$name" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+        [[ "$phase" == "$want" ]] && return 0
+        sleep 2
+    done
+    kubectl_ns get pod "$name" -o yaml >"$EVIDENCE_DIR/terminal-pods-$name.yaml" 2>/dev/null || true
+    die "terminal-pods pod $name phase '$phase' did not reach $want within $3s"
+}
+
+terminal_pods_cleanup() {
+    kubectl_ns delete pod "${TERMINAL_PODS[@]}" --ignore-not-found --wait=true --timeout=120s >&2 \
+        || die "terminal-pods could not delete its bare pods within 120s"
+}
+
+run_terminal_pods() {
+    # The serial chain reaches this from runner-layer-retire at 0.10.1;
+    # restore_n rolls back to 0.10.0 and clears any leftover checkpoint.
+    restore_n
+    wait_rollout
+    local succeeded="${TERMINAL_PODS[0]}" failed_pod="${TERMINAL_PODS[1]}" surplus="${TERMINAL_PODS[2]}"
+    local status=0 healthy phase pair
+    terminal_pods_cleanup
+    terminal_pod_create "$succeeded" 'exit 0'
+    terminal_pod_create "$failed_pod" 'exit 1'
+    terminal_pod_wait_phase "$succeeded" Succeeded 180
+    terminal_pod_wait_phase "$failed_pod" Failed 180
+    log "terminal-pods left one Succeeded and one Failed bare pod under the api selector"
+
+    "$BIN" --json cluster status --namespace "$NAMESPACE" --release "$RELEASE" "${KUBECTL_CONTEXT_ARGS[@]}" \
+        >"$EVIDENCE_DIR/terminal-pods-status.json" 2>"$EVIDENCE_DIR/terminal-pods-status.err" || status=$?
+    [[ "$status" -eq 0 ]] || die "terminal-pods cluster status exited $status with only terminal extra pods"
+    healthy="$(json_field "$EVIDENCE_DIR/terminal-pods-status.json" "healthy")"
+    [[ "$healthy" == true ]] || die "terminal-pods cluster status healthy='$healthy' with only terminal extra pods"
+    log "terminal-pods cluster status exit 0 healthy true with terminal pods present"
+
+    status=0
+    cluster_upgrade "0.10.1" "$CHART_0101" || status=$?
+    record_upgrade_json "terminal-pods"
+    [[ "$status" -eq 0 ]] || die "terminal-pods cluster upgrade exited $status"
+    assert_upgrade_status "succeeded"
+    wait_rollout
+    [[ "$(helm_version)" == "0.10.1" ]] || die "terminal-pods upgrade left helm at $(helm_version)"
+    # The upgrade's converge saw them only if they survived it unchanged.
+    for pair in "$succeeded:Succeeded" "$failed_pod:Failed"; do
+        phase="$(kubectl_ns get pod "${pair%%:*}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+        [[ "$phase" == "${pair#*:}" ]] \
+            || die "terminal-pods pod ${pair%%:*} is '$phase' after the upgrade, wanted ${pair#*:}"
+    done
+    log "terminal-pods upgrade to 0.10.1 succeeded with both terminal pods still present"
+
+    terminal_pod_create "$surplus" 'sleep 3600'
+    terminal_pod_wait_phase "$surplus" Running 180
+    status=0
+    "$BIN" --json cluster status --namespace "$NAMESPACE" --release "$RELEASE" "${KUBECTL_CONTEXT_ARGS[@]}" \
+        >"$EVIDENCE_DIR/terminal-pods-surplus-status.json" 2>"$EVIDENCE_DIR/terminal-pods-surplus-status.err" || status=$?
+    [[ "$status" -eq 1 ]] || die "terminal-pods cluster status exited $status with an active surplus pod, wanted 1"
+    healthy="$(json_field "$EVIDENCE_DIR/terminal-pods-surplus-status.json" "healthy")"
+    [[ "$healthy" == false ]] || die "terminal-pods cluster status healthy='$healthy' with an active surplus pod"
+    python3 -c '
+import json, sys
+raw = open(sys.argv[1]).read().strip().splitlines()[-1]
+reasons = json.loads(raw)["pods"]["unhealthy"]
+want = sys.argv[2] + ": selected pods="
+if not any(r.startswith(want) and "surplus or missing target replicas" in r for r in reasons):
+    raise SystemExit(f"no surplus reason for {sys.argv[2]} in {reasons}")
+' "$EVIDENCE_DIR/terminal-pods-surplus-status.json" "$(fullname)-api" \
+        || die "terminal-pods cluster status did not name the api surplus"
+    log "terminal-pods cluster status exit 1 names the api surplus or missing target replicas"
+
+    terminal_pods_cleanup
+    log "terminal-pods deleted its bare pods"
+}
+
 write_evidence() {
     local elapsed=$((SECONDS - STARTED_AT)) shard_json scenarios_json
     shard_json="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1] or None))' "$SHARD")"
@@ -1759,6 +3639,13 @@ scenario_fn() {
         migration-crash) echo run_migration_crash ;;
         converge-negative) echo run_converge_negative ;;
         previous-serves) echo run_previous_serves ;;
+        apply-kill-takeover) echo run_apply_kill_takeover ;;
+        rollback-to-serving) echo run_rollback_to_serving ;;
+        rollback-interrupted) echo run_rollback_interrupted ;;
+        rollback-uncatalogued) echo run_rollback_uncatalogued ;;
+        runner-layer-retire) echo run_runner_layer_retire ;;
+        hook-fail-not-serving) echo run_hook_fail_not_serving ;;
+        terminal-pods) echo run_terminal_pods ;;
         *) die "no runner for scenario '$1'" ;;
     esac
 }
@@ -1810,6 +3697,10 @@ run_serial() {
     for name in "${SCENARIOS_ALL[@]}"; do
         [[ "$name" == soak-refusal ]] && continue
         scenario_wanted "$name" || continue
+        if [[ "$name" == apply-kill-takeover ]]; then
+            prepare_takeover_context
+            run_timed "setup=nonempty-n" "setup=nonempty-n" all setup_nonempty_n
+        fi
         phases="all"
         case "$name" in
             fail-every-phase) [[ -z "${CURIE_E2E_FAIL_PHASES:-}" ]] || phases="${CURIE_E2E_FAIL_PHASES// /+}" ;;
@@ -1840,6 +3731,9 @@ run_matrix() {
     fetch_published
     package_n_charts
     ensure_kind
+    if [[ "$SHARD" == s16 ]]; then
+        prepare_takeover_context
+    fi
     prepare_candidate_images
     log "prelude elapsed_seconds=$((SECONDS - prelude_started))"
     if [[ -n "$SHARD" ]]; then
