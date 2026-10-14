@@ -1091,6 +1091,14 @@ async def _apply_frame(
         acc.approval_granted_tool = frame.approval_granted_tool
         acc.approval_granted_arguments = frame.approval_granted_arguments
         acc.approval_display = frame.approval_display
+        acc.final_text_mode = frame.text_mode
+        if frame.text_mode is not None and not acc.verbatim_answer:
+            # A literal-delivery mark without negotiated exact output cannot
+            # be honored or safely decorated. Fail closed (ADR 0227).
+            acc.status = SessionStatus.CLASSIFIED_FAILURE
+            acc.classification = "final-answer-validation"
+            acc.final_text = "run failed: final answer validation required"
+            acc.final_text_mode = None
 
 
 async def _mark_side_effect_with_retry(
@@ -1175,7 +1183,7 @@ async def _finish(
 ) -> failures.TurnOutcome:
     if acc.status in (SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT):
         text = acc.rendered_with_receipt()
-        verbatim = acc.verbatim_answer and acc.status is SessionStatus.DONE
+        verbatim = acc.delivers_verbatim
         durable_answer = self._markers.supports_answer_outbox
         if not durable_answer:
             # The protected lane has a witnessed settlement contract. Preserve

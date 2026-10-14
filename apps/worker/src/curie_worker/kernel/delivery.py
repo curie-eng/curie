@@ -86,8 +86,19 @@ class _StreamAccumulator:
     # The repository this turn attached from its own message (#2659), announced
     # at finalize only. Intermediate streaming edits show `rendered()` alone.
     workspace_inferred_repo: str | None = None
-    # Bound to the actual turn response, never inherited from a sandbox.
+    # Bound to the actual turn response, never inherited from a sandbox: the
+    # runner enforces a final-answer policy and this caller preserves text.
     verbatim_answer: bool = False
+    # The final's own ADR 0227 mark; set only on a validated DONE.
+    final_text_mode: str | None = None
+
+    @property
+    def delivers_verbatim(self) -> bool:
+        return (
+            self.verbatim_answer
+            and self.status is SessionStatus.DONE
+            and self.final_text_mode == "verbatim"
+        )
 
     def rendered(self) -> str:
         return self.final_text if self.final_text is not None else "".join(self.text_parts)
@@ -106,7 +117,7 @@ class _StreamAccumulator:
         sits directly after the answer so the receipt stays the last block.
         """
 
-        if self.verbatim_answer and self.status is SessionStatus.DONE:
+        if self.delivers_verbatim:
             return self.rendered()
         return _join_reply_blocks(
             self.rendered(),
