@@ -904,8 +904,13 @@ class SessionRunner:
             # @spec RUNNER-TOOL-ACCESS-4: a restricted turn accepts no steer,
             # and a restricted steer joins no turn.
             return False
-        if self._active_state.final_answer is not None:
-            self._active_state.final_answer.invalidate()
+        # Captured: cleanup must settle this turn's validation even if the
+        # turn ends or a later turn starts while the injection is pending.
+        validation = self._active_state.final_answer
+        with validation.suspended() if validation is not None else contextlib.nullcontext():
+            return await self._inject_steer(self._session, text, event)
+
+    async def _inject_steer(self, session: ModelSession, text: str, event: Event | None) -> bool:
         self._unrestricted_prompt_sent = True
         if event is not None and self._memory_turn is not None:
             self._memory_turn.begin(event)
@@ -920,7 +925,7 @@ class SessionRunner:
         # Same redaction as a turn start: the user text is the recorded size,
         # and an echo of the framed query does not reach the trace.
         self._tracer.remember_turn_prompt(text, framed)
-        await self._session.query(framed)
+        await session.query(framed)
         if self._active_state is not None:
             self._active_state.assistant_group = None
             self._active_state.history_messages.append(

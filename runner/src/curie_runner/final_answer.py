@@ -9,7 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -118,6 +119,22 @@ class FinalAnswerValidation:
     _digest: str | None = field(default=None, repr=False)
     _approved: str | None = field(default=None, repr=False)
     _resolved: bool = field(default=False, repr=False)
+    _suspended: int = field(default=0, repr=False)
+
+    @contextmanager
+    def suspended(self) -> Iterator[None]:
+        """Withhold authorization while steered input is being injected.
+
+        Anything observed before the injection settles may belong to the
+        superseded request, so settling (or cancellation) invalidates again.
+        """
+        self.invalidate()
+        self._suspended += 1
+        try:
+            yield
+        finally:
+            self._suspended -= 1
+            self.invalidate()
 
     def invalidate(self) -> None:
         # Keep seen/outstanding identities: delayed results cannot resurrect a
@@ -126,7 +143,7 @@ class FinalAnswerValidation:
         self._resolved = False
 
     def accepts(self, text: str) -> bool:
-        return self._approved is not None and text == self._approved
+        return not self._suspended and self._approved is not None and text == self._approved
 
     def observe_calls(self, calls: Sequence[ValidationCall], *, nested: bool) -> None:
         """Observe all calls from one assistant message as an atomic group."""
@@ -143,7 +160,13 @@ class FinalAnswerValidation:
             fresh = call.id not in self._seen
             self._seen.add(call.id)
             self._outstanding.add(call.id)
-            if eligible and fresh and not call.hosted and call.name == self.policy.tool:
+            if (
+                eligible
+                and fresh
+                and not self._suspended
+                and not call.hosted
+                and call.name == self.policy.tool
+            ):
                 try:
                     if not isinstance(call.input, dict):
                         continue
