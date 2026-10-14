@@ -26,6 +26,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 import factory_e2e as fe
@@ -109,6 +110,7 @@ def scripted_values(
     # The factory reads the stub through its own code host and tracker entries.
     for entry in (*values["factory"]["codeHosts"], *values["factory"]["trackers"]):
         entry["apiUrl"] = github_api
+        entry["host"] = urlsplit(github_api).netloc
     values["factory"]["trackers"][0]["pollIntervalSeconds"] = 5
     values["codeHostTrust"] = {
         "caBundle": {"configMapRef": {"name": ca_configmap, "key": "ca.pem"}}
@@ -1121,6 +1123,104 @@ class ScriptedRun:
         if self.evidence["elapsed_seconds"] > BOUND_SECONDS:
             raise ScriptedScenarioError("factory scenario exceeded 2400 seconds")
 
+    def capture_failure_diagnostics(self) -> None:
+        """Write bounded pod diagnostics only to stderr, before owned teardown."""
+
+        previous_deadline = self.deadline
+        diagnostic_deadline = time.monotonic() + 30
+        self.deadline = diagnostic_deadline
+
+        def emit(operation: str, value: str) -> None:
+            sanitized = re.sub(
+                r"-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----.*?(?:-----END \1-----|\Z)",
+                "[REDACTED PRIVATE KEY]",
+                f"factory-e2e pod diagnostics: {operation}\n{value}",
+                flags=re.DOTALL,
+            )
+            sanitized = re.sub(
+                r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"<>]+", "https://example.com", sanitized
+            )
+            recorded, _ = fe.record_agent_text(sanitized, self.secrets)
+            print(
+                (recorded or "").encode("utf-8")[:4096].decode("utf-8", errors="ignore"),
+                file=sys.stderr,
+                flush=True,
+            )
+
+        def capture(namespace: str, operation: str, *argv: str) -> str:
+            remaining = diagnostic_deadline - time.monotonic()
+            if remaining <= 0:
+                return ""
+            try:
+                output = self.kubectl("-n", namespace, *argv, timeout=min(5, remaining))
+                value = output
+                if argv[0] == "describe":
+                    # Keep state and events only. Environment, command arguments,
+                    # annotations and other arbitrary pod inputs can hold secrets.
+                    lines = []
+                    state = False
+                    events = False
+                    for line in value.splitlines():
+                        if not line.startswith("      "):
+                            state = line.startswith(("    State:", "    Last State:"))
+                        events = events or line.startswith("Events:")
+                        if (
+                            state
+                            or events
+                            or line.startswith(("Status:", "    Ready:", "    Restart Count:"))
+                        ):
+                            lines.append(line)
+                    value = "\n".join(lines)
+                emit(f"{namespace} {operation}", value)
+                return output
+            except Exception as exc:  # noqa: BLE001 - diagnostics must never block teardown
+                emit(f"{namespace} {operation}", f"unavailable ({type(exc).__name__})")
+                return ""
+
+        try:
+            namespaces = [self.namespace]
+            try:
+                publication_namespace = self.publication_namespace()
+                if publication_namespace != self.namespace:
+                    namespaces.insert(0, publication_namespace)
+            except Exception as exc:  # noqa: BLE001 - the release can have failed before install
+                emit("publication namespace", f"unavailable ({type(exc).__name__})")
+            # List both namespaces before collecting details, with publication
+            # pods first because the worker can remove them after a failed clone.
+            snapshots = [
+                (
+                    namespace,
+                    capture(
+                        namespace,
+                        "get pods",
+                        "get",
+                        "pods",
+                        "-o",
+                        "jsonpath={range .items[:4]}{.metadata.name}"
+                        '{"\\t"}{.status.phase}{"\\n"}{end}',
+                    ),
+                )
+                for namespace in namespaces
+            ]
+            for namespace, pods in snapshots:
+                for row in pods.splitlines()[:4]:
+                    pod = row.split("\t", 1)[0]
+                    capture(namespace, f"describe pod/{pod}", "describe", "pod", pod)
+                    for previous in (True, False):
+                        capture(
+                            namespace,
+                            f"logs pod/{pod}" + (" --previous" if previous else ""),
+                            "logs",
+                            pod,
+                            "--all-containers=true",
+                            "--tail=40",
+                            "--limit-bytes=4096",
+                            "--pod-running-timeout=2s",
+                            *(("--previous",) if previous else ()),
+                        )
+        finally:
+            self.deadline = previous_deadline
+
     def cleanup(self) -> list[str]:
         """Attempt every owned teardown and verify deletion even after failures."""
 
@@ -1348,8 +1448,11 @@ def main(args: argparse.Namespace) -> int:
     run.evidence.update(curie_bin=curie_bin, curie_version=curie_version)
     result = fe.EXIT_FAILED
     previous_handlers: dict[int, Any] = {}
+    was_interrupted = False
 
     def interrupted(signum: int, _frame: Any) -> None:
+        nonlocal was_interrupted
+        was_interrupted = True
         raise ScriptedScenarioError(f"scripted scenario interrupted by signal {signum}")
 
     try:
@@ -1374,6 +1477,11 @@ def main(args: argparse.Namespace) -> int:
     finally:
         for restored_signum, handler in previous_handlers.items():
             signal.signal(restored_signum, handler)
+        if result != 0 and run.cluster_attempted and not was_interrupted:
+            try:
+                run.capture_failure_diagnostics()
+            except BaseException:  # noqa: BLE001 - diagnostics cannot prevent cleanup
+                pass
         try:
             if run.cleanup():
                 result = fe.EXIT_FAILED

@@ -515,9 +515,10 @@ class _AcceptedCensusCorruptionRelay(helpers.ResponseDropRelay):
                             self.injected = True
                     self.upstream.sendall(command)
                     reply = self.frame(replies)
-                    self.downstream.sendall(reply)
                     if self.injected and reply.startswith(b"-WRONGTYPE"):
                         self.observed_error = True
+                    self.downstream.sendall(reply)
+                    if self.observed_error:
                         break
         except (OSError, ValueError, RedisError):
             self.error = True
