@@ -17,8 +17,10 @@ CURIE_BITBUCKET_CLOUD_REVIEWER_ACCOUNT_ID.
 
 The entry's setup, ``install_bitbucket_cloud``, installs the factory with
 `curie factory quickstart --tracker jira-cloud --code-host bitbucket-cloud`,
-with the factory's token and the reviewer as the review account. Every request goes through an opener that refuses every
-redirect, so a token is only ever sent to the URL the driver named.
+with the factory's token and the reviewer as the review account.
+
+Every request goes through an opener that refuses every redirect, so a token
+is only ever sent to the URL the driver named.
 
 Red CI is set deliberately, as the GitHub driver does: the test actor posts a
 FAILED build status (LOOP_GATE_KEY) on the pull request's first head.

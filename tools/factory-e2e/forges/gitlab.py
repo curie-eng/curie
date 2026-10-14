@@ -1177,9 +1177,7 @@ def fixture_bridge_egress(
     return {"factory": out}
 
 
-def allow_fixture_bridge(
-    p: fe.Preflight, subnets: Any, port: int, kind: str = "gitlab"
-) -> None:
+def allow_fixture_bridge(p: fe.Preflight, subnets: Any, port: int, kind: str = "gitlab") -> None:
     """Admit the fixture's Docker bridge ``subnets`` on ``port`` for ``kind``'s entries."""
 
     if not isinstance(subnets, list) or not subnets:
