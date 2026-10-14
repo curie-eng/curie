@@ -204,25 +204,25 @@ CHECKS = (
         "always",
         GITLEAKS_COMMAND,
     ),
-    exact("python", "Lockfile is up to date", "uv lock --check", ".", "python"),
+    exact("python-static", "Lockfile is up to date", "uv lock --check", ".", "python"),
     exact(
-        "python",
+        "python-static",
         "Alembic revision gate",
         "uv run python scripts/check-alembic-revisions.py",
         ".",
         "python",
     ),
     exact(
-        "python",
+        "python-static",
         "Schema window gate",
         "uv run python scripts/check-schema-window.py",
         ".",
         "python",
     ),
-    exact("python", "Ruff", "uv run ruff check .", ".", "python"),
-    exact("python", "Mypy", "uv run mypy", ".", "python"),
+    exact("python-static", "Ruff", "uv run ruff check .", ".", "python"),
+    exact("python-static", "Mypy", "uv run mypy", ".", "python"),
     exact(
-        "python",
+        "python-static",
         "Import boundaries (harness SDK containment)",
         "uv run lint-imports",
         ".",
@@ -580,7 +580,9 @@ def select_ci_only(root: Path, paths: list[str], base: str, head: str) -> list[s
         if flags.get(tier.replace("-", "_")) == "true"
     ]
     if flags.get("cluster") == "true":
-        selected.extend(("e2e-ladder-cluster", "e2e-cluster-chart-regressions"))
+        selected.append("e2e-ladder-cluster")
+    if flags["chart_scenarios"] != "[]":
+        selected.append("e2e-cluster-chart-regressions")
     if flags.get("approval_resume") == "true":
         selected.append("e2e-cluster-approval-resume-restarts")
     if flags.get("factory") == "true":

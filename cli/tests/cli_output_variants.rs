@@ -949,6 +949,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 to_revision: 19,
                 skipped: vec![20],
                 forced: false,
+                resumed_interrupted_rollback: false,
             },
         ],
     );

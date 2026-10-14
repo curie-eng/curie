@@ -131,9 +131,9 @@ jobs:
           PY
 
   # The suite runs as parallel shards, each on its own runner with its own dev
-  # stack; the required `Python (ruff + mypy + pytest)` job below runs the static
-  # gates and then aggregates the shard results. One -n 4 job was 13.5 minutes
-  # on the critical path of every required run.
+  # stack; the static gates run in `python-static` beside them, and the required
+  # `Python (ruff + mypy + pytest)` job below aggregates both. One -n 4 job was
+  # 13.5 minutes on the critical path of every required run.
   python-pytest:
     name: Python pytest (shard ${{ matrix.shard }}/3)
     # Job-level gate (#3858): an unselected run (docs-only or version-only)
@@ -261,7 +261,18 @@ jobs:
       - name: Pytest
         id: pytest
         if: steps.python-runtime.outputs.pytest == 'true'
-        run: uv run pytest -q -n 4 --dist loadgroup --ci-shard ${{ matrix.shard }}/3 --reruns 1 -rsR --durations=25
+        env:
+          SHARD: ${{ matrix.shard }}
+          PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
+        run: |
+          pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/3" --reruns 1 -rsR --durations=25)
+          if [[ -n "$PYTEST_DESELECT" ]]; then
+            IFS=, read -r -a deselect_files <<< "$PYTEST_DESELECT"
+            for path in "${deselect_files[@]}"; do
+              pytest_args+=(--deselect "$path")
+            done
+          fi
+          uv run pytest "${pytest_args[@]}"
       # Record what this shard decided and did, for the required job to check.
       # Written on every outcome, so a failed shard still reports.
       - name: Record shard result
@@ -271,10 +282,12 @@ jobs:
           PYTEST_SELECTED: ${{ steps.python-runtime.outputs.pytest }}
           PYTEST_RESULT: ${{ steps.pytest.outcome }}
           STACK_RESULT: ${{ steps.dev-stack.outcome }}
+          PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
         run: |
           mkdir -p shard-result
-          printf 'shard=%s selected=%s pytest=%s stack=%s\n' \
+          printf 'shard=%s selected=%s pytest=%s stack=%s deselect=%s\n' \
             "$SHARD" "${PYTEST_SELECTED:-}" "${PYTEST_RESULT:-}" "${STACK_RESULT:-}" \
+            "${PYTEST_DESELECT:-}" \
             > "shard-result/shard-${SHARD}.txt"
           cat "shard-result/shard-${SHARD}.txt"
       - name: Upload shard result
@@ -287,20 +300,13 @@ jobs:
         if: ${{ failure() && steps.python-runtime.outputs.pytest == 'true' }}
         run: docker compose -f compose.dev.yaml logs --no-color --tail=200
 
-  python:
-    name: Python (ruff + mypy + pytest)
-    # `needs` orders this job after the shards; `always()` keeps it
-    # running (and so reporting the required check) whatever the shards did.
-    # A failed or cancelled shard fails the aggregate step below, and so does a
-    # skipped shard job unless this job also selected no pytest (#3858). It also
-    # needs `changes` so a failed or disagreeing selection cannot pass as a
-    # legitimate skip.
-    needs: [changes, python-pytest]
-    if: always()
+  # The cheap static gates run beside the pytest shards so a lint, type or docs
+  # failure surfaces in about 2 minutes instead of after the slowest shard. The
+  # required `python` job below requires this job's success.
+  python-static:
+    name: Python static gates
+    needs: [changes]
     runs-on: ubuntu-latest
-    # A job-level block REPLACES the workflow-level one, so `contents: read` is
-    # repeated here. The Issues scope that used to sit alongside it followed the
-    # fix pin gate into its own job; the suite never read issue labels.
     permissions:
       contents: read
     steps:
@@ -371,7 +377,7 @@ jobs:
       # command named in the agent verification contract (docs/agents.md)
       # against cli/command-manifest.json (#1041), then lint every citation
       # under docs/ (excluding docs/adr/). A cheap, cluster-free gate, so it
-      # runs right after ruff/mypy and before the dev stack boots.
+      # runs right after ruff/mypy.
       - name: Docs gate (catalog drift + agent contract + citations)
         run: bash scripts/check-docs.sh
       # _AciModel tolerant-decode gate (#625, following #492): every direct
@@ -383,12 +389,81 @@ jobs:
       # The platform-upgrade Job runs examples/sre-bot/platform-upgrade/upgrade.sh
       # as its body. That script had no test and no CI; a helm upgrade the bot
       # can start must be shellchecked on every PR, cheap and cluster-free, so
-      # this sits with the other static gates before the dev stack boots.
+      # this sits with the other static gates.
       - name: Shellcheck sre-bot platform-upgrade script
         run: shellcheck --severity=warning examples/sre-bot/platform-upgrade/upgrade.sh
-      # Docs-only diffs still run ruff/mypy/docs/alembic/wire-lock above. Reuse
-      # ignored_prefixes from .github/e2e-selection.yaml so a guides edit does
-      # not boot postgres; packages/, apps/, runner/, examples/tests/, cli,
+      # The shards run release/tests whenever pytest is selected. When the
+      # `changes` selection skipped pytest (a docs-only or version-only diff),
+      # run them here so a release bump still proves the tag gate and release
+      # tooling on the new commit (#3858). The required `python` job already
+      # fails if that selection disagrees with its own, so `changes` is the
+      # trusted selection.
+      - name: Release tests
+        if: needs.changes.outputs.pytest == 'false'
+        run: uv run pytest -q release/tests
+      # The committed-lock test only proves the lock matches the current wire; it
+      # passes even if the lock was regenerated without a version bump. Compare
+      # against the BASE branch's lock so an unbumped wire change actually fails
+      # CI. Refresh that remote ref before reading it; a missing or empty base
+      # lock (base predates the lock) skips cleanly (exit 0), and only a genuine
+      # unbumped wire change vs an existing base lock exits 1.
+      - name: ACI wire-lock base gate
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref || github.ref_name }}" || true
+          git show "origin/${{ github.base_ref || github.ref_name }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
+          uv run python -m aci_protocol.wire_lock --check-base /tmp/base-wire.lock
+
+  python:
+    name: Python (ruff + mypy + pytest)
+    # `needs` orders this job after the shards; `always()` keeps it
+    # running (and so reporting the required check) whatever the shards did.
+    # A failed or cancelled shard fails the aggregate step below, and so does a
+    # skipped shard job unless this job also selected no pytest (#3858). It also
+    # needs `changes` so a failed or disagreeing selection cannot pass as a
+    # legitimate skip. It also waits on `python-static` and requires it to
+    # succeed.
+    needs: [changes, python-pytest, python-static]
+    if: always()
+    runs-on: ubuntu-latest
+    # A job-level block REPLACES the workflow-level one, so `contents: read` is
+    # repeated here. The Issues scope that used to sit alongside it followed the
+    # fix pin gate into its own job; the suite never read issue labels.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Retry eligibility (#1106): only a step whose whole job is to ACQUIRE a
+      # third-party dependency (a tool binary, an image, a registry session, a
+      # build artifact) may be wrapped. Such a step can fail only on a network
+      # or registry error, never on a non-zero exit from this repository's own
+      # build, test, or gate, so a retry there cannot hide a defect in our
+      # code. Never wrap a step that builds, tests, or gates that code.
+      # Enforced by tools/ci-retry-gate/tests/test_retry_eligibility.py.
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Sync workspace
+        run: uv sync
+      # Docs-only diffs still run ruff/mypy/docs/alembic/wire-lock in
+      # `python-static`. Reuse ignored_prefixes from .github/e2e-selection.yaml
+      # so a guides edit does not boot postgres; packages/, apps/, runner/,
+      # examples/tests/, cli,
       # uv.lock, and pyproject.toml still select pytest, except on a
       # version-only release bump, which reuses the proof its base already has
       # (#3858). Every event other than a pull request selects everything, as
@@ -411,23 +486,18 @@ jobs:
               --base "origin/$base" \
               --head HEAD
           fi
-      # The shards run release/tests whenever pytest is selected. When it is
-      # not (a docs-only or version-only diff), run them here so a release bump
-      # still proves the tag gate and release tooling on the new commit (#3858).
-      - name: Release tests
-        if: steps.python-runtime.outputs.pytest == 'false'
-        run: uv run pytest -q release/tests
-      # The committed-lock test only proves the lock matches the current wire; it
-      # passes even if the lock was regenerated without a version bump. Compare
-      # against the BASE branch's lock so an unbumped wire change actually fails
-      # CI. Refresh that remote ref before reading it; a missing or empty base
-      # lock (base predates the lock) skips cleanly (exit 0), and only a genuine
-      # unbumped wire change vs an existing base lock exits 1.
-      - name: ACI wire-lock base gate
+      # always() above keeps this job reporting the required check whatever the
+      # static job did, so require its success explicitly; a failed, skipped or
+      # cancelled static job must not pass the required check.
+      - name: Require static gates to pass
+        env:
+          STATIC_RESULT: ${{ needs.python-static.result }}
         run: |
-          git fetch --no-tags --depth=1 origin "${{ github.base_ref || 'main' }}" || true
-          git show "origin/${{ github.base_ref || 'main' }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
-          uv run python -m aci_protocol.wire_lock --check-base /tmp/base-wire.lock
+          if [[ "$STATIC_RESULT" != "success" ]]; then
+            echo "Python static gates finished ${STATIC_RESULT:-<empty>}" >&2
+            exit 1
+          fi
+          echo "Python static gates passed"
       - name: Download shard results
         if: steps.python-runtime.outputs.pytest == 'true'
         uses: actions/download-artifact@v8
@@ -446,9 +516,11 @@ jobs:
         if: success()
         env:
           PYTEST_SELECTED: ${{ steps.python-runtime.outputs.pytest }}
+          PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
           SHARDS_RESULT: ${{ needs.python-pytest.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           CHANGES_PYTEST: ${{ needs.changes.outputs.pytest }}
+          CHANGES_DESELECT: ${{ needs.changes.outputs.pytest_deselect }}
           SHARD_COUNT: "3"
           SHARD_RESULTS_DIR: shard-results
         run: |
@@ -459,6 +531,10 @@ jobs:
           fi
           if [[ "$CHANGES_PYTEST" != "$PYTEST_SELECTED" ]]; then
             echo "changes job selected pytest=${CHANGES_PYTEST:-<empty>}, but this job selected ${PYTEST_SELECTED:-<empty>}" >&2
+            exit 1
+          fi
+          if [[ "$CHANGES_DESELECT" != "$PYTEST_DESELECT" ]]; then
+            echo "changes job selected deselect=${CHANGES_DESELECT:-<empty>}, but this job selected ${PYTEST_DESELECT:-<empty>}" >&2
             exit 1
           fi
           if [[ "$PYTEST_SELECTED" == "false" ]]; then
@@ -489,7 +565,7 @@ jobs:
               echo "pytest shard $shard reported no result" >&2
               exit 1
             fi
-            want="shard=$shard selected=$PYTEST_SELECTED pytest=$expected stack=$expected"
+            want="shard=$shard selected=$PYTEST_SELECTED pytest=$expected stack=$expected deselect=$PYTEST_DESELECT"
             got="$(cat "$record")"
             if [[ "$got" != "$want" ]]; then
               echo "pytest shard $shard: expected '$want', got '$got'" >&2
@@ -818,6 +894,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: cli
+          shared-key: curie-cli-release
       - name: Release build
         run: cargo build --release --locked
       - name: Upload curie binary
@@ -2293,12 +2370,14 @@ jobs:
       local: ${{ steps.filter.outputs.local }}
       local_release: ${{ steps.filter.outputs.local_release }}
       cluster: ${{ steps.filter.outputs.cluster }}
+      chart_scenarios: ${{ steps.filter.outputs.chart_scenarios }}
       released_upgrade: ${{ steps.filter.outputs.released_upgrade }}
       released_upgrade_full: ${{ steps.filter.outputs.released_upgrade_full }}
       skill_local_tiers: ${{ steps.filter.outputs.skill_local_tiers }}
       images: ${{ steps.filter.outputs.images }}
       cli_release: ${{ steps.filter.outputs.cli_release }}
       pytest: ${{ steps.filter.outputs.pytest }}
+      pytest_deselect: ${{ steps.filter.outputs.pytest_deselect }}
       version_only: ${{ steps.filter.outputs.version_only }}
       factory: ${{ steps.filter.outputs.factory }}
       approval_resume: ${{ steps.filter.outputs.approval_resume }}
@@ -2794,20 +2873,19 @@ jobs:
           if-no-files-found: warn
 
   # CHART RUNTIME REGRESSIONS, in parallel with the cluster rung. Most
-  # regression proofs that need an enforcing Calico cluster but neither the
-  # curie binary nor the product images use this job's cluster. The workspace
-  # regression builds its own CLI and product images from source and owns a
-  # separate disposable kind cluster. This job does not wait on the Rust build
-  # and is selected by the same cluster tier
-  # (every charts/ change), and `E2E required` needs it: the Langfuse readiness
+  # regression proofs use this job's enforcing Calico cluster. The workspace
+  # regression also uses the release CLI and candidate product images built
+  # by the upstream jobs. The selector chooses each proof from its inputs
+  # whenever the cluster tier is selected, and `E2E required` needs the job:
+  # the Langfuse readiness
   # assertion and the connector readiness probe are registered runtime
   # assertions (#3391), and a failure here reddens the required verdict exactly
   # as the rung does. Proofs using this job's cluster each own their namespace.
   e2e-cluster-chart-regressions:
     name: E2E chart runtime regressions (kind, Calico)
     runs-on: ubuntu-latest
-    needs: [changes, ci-images]
-    if: ${{ needs.changes.outputs.cluster == 'true' }}
+    needs: [rust-build, changes, ci-images]
+    if: ${{ needs.changes.outputs.chart_scenarios != '[]' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -2913,6 +2991,7 @@ jobs:
           set -euo pipefail
           install -m 600 /home/runner/.kube/config "$KUBECONFIG"
       - name: Installation identity Secret lifecycle
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'installation-identity') }}
         env:
           KUBECONFIG: ${{ runner.temp }}/curie-upgrade-drain-kubeconfig
           CURIE_UPGRADE_DRAIN_KIND_CONTEXT: kind-curie-e2e
@@ -2924,6 +3003,7 @@ jobs:
       # API server of 1.30 or newer, which this kind node image is. The script
       # names every object from RUN_ID and deletes them on exit.
       - name: End to end connector identity is denied outside its scope
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-identity') }}
         env:
           CURIE_E2E_IDENTITY_CONTEXT: kind-curie-e2e
           RUN_ID: ${{ github.run_id }}${{ github.run_attempt }}
@@ -2934,6 +3014,7 @@ jobs:
       # Per-agent runner resources (#3209, #3485). A render assertion that
       # lives under ci/runtime, so it runs here through the receipt runner.
       - name: Per-agent runner resource override renders
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-resources-render') }}
         run: |
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
@@ -2944,6 +3025,7 @@ jobs:
       # cluster admin is admitted. Needs a real API server of 1.30 or newer.
       # Every object is named from RUN_ID and verified gone on exit.
       - name: Runner template admission refuses host escapes, token mounts, and unlisted images
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-template-admission') }}
         env:
           CURIE_ADMISSION_CONTEXT: kind-curie-e2e
           RUN_ID: ${{ github.run_id }}${{ github.run_attempt }}
@@ -2954,6 +3036,7 @@ jobs:
       - name: Load the Postgres readiness fixture into the kind cluster
         run: kind load docker-image "curie-postgres-readiness:${GITHUB_SHA}" --name curie-e2e
       - name: Langfuse web waits for delayed Postgres without restarting
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'langfuse-postgres-readiness') }}
         env:
           READINESS_NAMESPACE: curie-1853-${{ github.run_id }}-${{ github.run_attempt }}
           READINESS_RELEASE: curie-1853-${{ github.run_id }}-${{ github.run_attempt }}
@@ -2987,6 +3070,7 @@ jobs:
       # job's kube context is kind-curie-e2e and must be passed explicitly.
       # The namespace is this run's id so a retry does not reuse a leftover.
       - name: Connector that never listens stays not-Ready until it binds
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-readiness') }}
         env:
           CONNECTOR_READINESS_CONTEXT: kind-curie-e2e
           CONNECTOR_READINESS_NAMESPACE: c3338-${{ github.run_id }}-${{ github.run_attempt }}
@@ -3004,21 +3088,68 @@ jobs:
       # allowedEgress 0.0.0.0/0 and requires a private-range pod peer it reached
       # under the pre-change shape to be refused (#3842 AC3).
       - name: Runner BYO egress enforces (not just rendered)
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-byo-egress') }}
         run: bash scripts/check-runner-byo-egress.sh charts/curie
       # The actual packaged-chart hooks must judge a no-restart upgrade and
       # still reject an informer RBAC failure (#4197). The scenario owns and
       # tears down its separate kind cluster; render assertions alone cannot
       # prove Helm leaves a serving release deployed.
       - name: Controller preflight accepts a serving upgrade and refuses broken RBAC
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'controller-preflight') }}
         run: |
           set -euo pipefail
           uv run bash charts/curie/ci/scenarios/controller-preflight-kind.sh
+      - name: Download the workspace diagnostic CLI
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: curie-x86_64-linux-${{ github.sha }}
+          path: cli/target/release
+      - name: Load the workspace diagnostic candidate images
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
+        uses: ./.github/actions/load-ci-images
+        with:
+          images: "{api,worker,runner}"
+      - name: Stage the workspace diagnostic images in kind
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
+        run: |
+          set -euo pipefail
+          chmod +x cli/target/release/curie
+          docker tag curie-ci/api:candidate curie-api:wsdiag-${{ github.sha }}
+          docker tag curie-ci/worker:candidate curie-worker:wsdiag-${{ github.sha }}
+          docker tag curie-ci/runner:candidate curie-runner:wsdiag-${{ github.sha }}
+          kind load docker-image \
+            curie-api:wsdiag-${{ github.sha }} \
+            curie-worker:wsdiag-${{ github.sha }} \
+            curie-runner:wsdiag-${{ github.sha }} --name curie-e2e
       - name: Workspace dependency failure reaches the terminal diagnostic
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') }}
         timeout-minutes: 30
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
+          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
         run: |
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh
+      - name: Quota progress regression
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
+        timeout-minutes: 30
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
+          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh
       - name: Dump cluster diagnostics on failure
         if: failure()
         run: |
@@ -4334,6 +4465,56 @@ jobs:
           kubectl delete namespace acme-2590 --ignore-not-found --wait=false 2>/dev/null || true
           kind delete cluster --name curie-upgrade-matrix 2>/dev/null || true
 
+  # Needs only `changes`, so an unregistered or untiered runtime assertion
+  # fails within minutes instead of after the kind matrix. It is a separate job
+  # rather than steps in `changes` because a failed `changes` would skip every
+  # downstream job and hide their evidence; `E2E required` carries its result.
+  runtime-assertion-registration:
+    name: Runtime assertion registration
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: [changes]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install uv for the runtime assertion gate
+        id: install_uv_for_the_runtime_assertion_gate
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Back off before retrying Install uv for the runtime assertion gate
+        if: steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure'
+        run: |
+          echo "Install uv for the runtime assertion gate failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv for the runtime assertion gate (retry)
+        if: steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      # #3391: an added or changed charts/curie/ci/runtime assertion counts only
+      # when a Calico cluster job this verdict needs runs it through the
+      # receipt runner, and that exact blob left a pass receipt. The negative
+      # controls run on every verdict so the gate can never pass vacuously.
+      - name: Runtime assertion gate negative controls
+        run: |
+          set -euo pipefail
+          uv run --no-project --with pyyaml==6.0.3 python tools/runtime-assertion-gate/gate.py \
+            self-test --workflow .github/workflows/ci.yaml \
+            --registered charts/curie/ci/runtime/publication-job-assertions.sh
+      - name: Changed runtime assertions are registered
+        if: needs.changes.outputs.runtime_assertions != '[]'
+        env:
+          RUNTIME_ASSERTIONS: ${{ needs.changes.outputs.runtime_assertions }}
+          CLUSTER_SELECTED: ${{ needs.changes.outputs.cluster }}
+        run: |
+          set -euo pipefail
+          if [[ "$CLUSTER_SELECTED" != "true" ]]; then
+            echo "Changed runtime assertions need the cluster tier, which was not selected" >&2
+            exit 1
+          fi
+          uv run --no-project --with pyyaml==6.0.3 python tools/runtime-assertion-gate/gate.py \
+            registration --workflow .github/workflows/ci.yaml --scripts "$RUNTIME_ASSERTIONS"
+
   e2e-required:
     name: E2E required
     runs-on: ubuntu-latest
@@ -4343,7 +4524,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    needs: [changes, e2e-ladder, e2e-oidc, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-cluster-approval-resume-restarts, e2e-scripted-factory, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
+    needs: [changes, runtime-assertion-registration, e2e-ladder, e2e-oidc, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-cluster-approval-resume-restarts, e2e-scripted-factory, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
     # A cancelled run leaves no evidence and must rerun. In a completed run,
     # every dependency outcome reaches the strict matcher below, which rejects
     # selected results other than success.
@@ -4352,11 +4533,13 @@ jobs:
       - name: Require exact selected outcomes
         env:
           CHANGES_RESULT: ${{ needs.changes.result }}
+          REGISTRATION_RESULT: ${{ needs.runtime-assertion-registration.result }}
           EVENT_NAME: ${{ github.event_name }}
           SKILL_SELECTED: ${{ needs.changes.outputs.skill }}
           LOCAL_SELECTED: ${{ needs.changes.outputs.local }}
           LOCAL_RELEASE_SELECTED: ${{ needs.changes.outputs.local_release }}
           CLUSTER_SELECTED: ${{ needs.changes.outputs.cluster }}
+          CHART_SCENARIOS: ${{ needs.changes.outputs.chart_scenarios }}
           RELEASED_UPGRADE_SELECTED: ${{ needs.changes.outputs.released_upgrade }}
           RELEASED_UPGRADE_FULL: ${{ needs.changes.outputs.released_upgrade_full }}
           APPROVAL_RESUME_SELECTED: ${{ needs.changes.outputs.approval_resume }}
@@ -4381,7 +4564,7 @@ jobs:
                   "$OIDC_RESULT" != "$oidc_expected" ||
                   "$LOCAL_RELEASE_RESULT" != "$local_release_expected" ||
                   "$CLUSTER_RESULT" != "$cluster_expected" ||
-                  "$CLUSTER_CHART_RESULT" != "$cluster_expected" ||
+                  "$CLUSTER_CHART_RESULT" != "$cluster_chart_expected" ||
                   "$ROLLOUT_RECOVERY_RESULT" != "$rollout_recovery_expected" ||
                   "$APPROVAL_RESUME_RESULT" != "$approval_resume_expected" ||
                   "$FACTORY_RESULT" != "$factory_expected" ||
@@ -4394,11 +4577,14 @@ jobs:
           }
 
           if [[ "$CHANGES_RESULT" != "success" ||
+                "$REGISTRATION_RESULT" != "success" ||
                 "$UPGRADE_MATRIX_SHARDS_RESULT" != "success" ||
                 ( "$SKILL_SELECTED" != "true" && "$SKILL_SELECTED" != "false" ) ||
                 ( "$LOCAL_SELECTED" != "true" && "$LOCAL_SELECTED" != "false" ) ||
                 ( "$LOCAL_RELEASE_SELECTED" != "true" && "$LOCAL_RELEASE_SELECTED" != "false" ) ||
                 ( "$CLUSTER_SELECTED" != "true" && "$CLUSTER_SELECTED" != "false" ) ||
+                "$CHART_SCENARIOS" != \[*\] ||
+                ( "$CHART_SCENARIOS" != "[]" && "$CLUSTER_SELECTED" == "false" ) ||
                 ( "$RELEASED_UPGRADE_SELECTED" != "true" && "$RELEASED_UPGRADE_SELECTED" != "false" ) ||
                 ( "$RELEASED_UPGRADE_FULL" != "true" && "$RELEASED_UPGRADE_FULL" != "false" ) ||
                 ( "$APPROVAL_RESUME_SELECTED" != "true" && "$APPROVAL_RESUME_SELECTED" != "false" ) ||
@@ -4424,6 +4610,10 @@ jobs:
           cluster_expected="skipped"
           if [[ "$CLUSTER_SELECTED" == "true" ]]; then
             cluster_expected="success"
+          fi
+          cluster_chart_expected="skipped"
+          if [[ "$CHART_SCENARIOS" != "[]" ]]; then
+            cluster_chart_expected="success"
           fi
           # Mirrors the rollout recovery job's if: pushes and dispatches only.
           rollout_recovery_expected="skipped"
@@ -4487,8 +4677,8 @@ jobs:
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       # #3391: an added or changed charts/curie/ci/runtime assertion counts only
       # when a Calico cluster job this verdict needs runs it through the
-      # receipt runner, and that exact blob left a pass receipt. The negative
-      # controls run on every verdict so the gate can never pass vacuously.
+      # receipt runner, and that exact blob left a pass receipt. Registration
+      # and the negative controls run in runtime-assertion-registration.
       - name: Back off before retrying Install uv for the runtime assertion gate
         if: ${{ !cancelled() && steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure' }}
         run: |
@@ -4497,30 +4687,6 @@ jobs:
       - name: Install uv for the runtime assertion gate (retry)
         if: ${{ !cancelled() && steps.install_uv_for_the_runtime_assertion_gate.outcome == 'failure' }}
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-      # #3391: an added or changed charts/curie/ci/runtime assertion counts only
-      # when a Calico cluster job this verdict needs runs it through the
-      # receipt runner, and that exact blob left a pass receipt. The negative
-      # controls run on every verdict so the gate can never pass vacuously.
-      - name: Runtime assertion gate negative controls
-        if: ${{ !cancelled() }}
-        run: |
-          set -euo pipefail
-          uv run --no-project --with pyyaml==6.0.3 python tools/runtime-assertion-gate/gate.py \
-            self-test --workflow .github/workflows/ci.yaml \
-            --registered charts/curie/ci/runtime/publication-job-assertions.sh
-      - name: Changed runtime assertions are registered
-        if: ${{ !cancelled() && needs.changes.outputs.runtime_assertions != '[]' }}
-        env:
-          RUNTIME_ASSERTIONS: ${{ needs.changes.outputs.runtime_assertions }}
-          CLUSTER_SELECTED: ${{ needs.changes.outputs.cluster }}
-        run: |
-          set -euo pipefail
-          if [[ "$CLUSTER_SELECTED" != "true" ]]; then
-            echo "Changed runtime assertions need the cluster tier, which was not selected" >&2
-            exit 1
-          fi
-          uv run --no-project --with pyyaml==6.0.3 python tools/runtime-assertion-gate/gate.py \
-            registration --workflow .github/workflows/ci.yaml --scripts "$RUNTIME_ASSERTIONS"
       - name: Download runtime assertion receipts
         if: ${{ !cancelled() && needs.changes.outputs.runtime_assertions != '[]' }}
         uses: actions/download-artifact@v8

@@ -275,6 +275,13 @@ spec:
   template:
     metadata:
       annotations:
+        {{- with (include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list )
+        "refs" (list (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.mailAdapter.channelTokenExistingSecret "existingSecretKey" $.Values.mailAdapter.channelTokenExistingSecretKey "defaultKey" "mailChannelToken") | fromYaml) (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.mailAdapter.egressSecretExistingSecret "existingSecretKey" $.Values.mailAdapter.egressSecretExistingSecretKey "defaultKey" "mailEgressSecret") | fromYaml) (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.mailAdapter.agentmail.apiKeyExistingSecret "existingSecretKey" $.Values.mailAdapter.agentmail.apiKeyExistingSecretKey "defaultKey" "mailAgentmailApiKey") | fromYaml))
+        "env" (include "curie.env.otel" (dict "root" $ "extraEnv" list)))) }}
+        checksum/secret: {{ . }}
+        {{- end }}
         {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}

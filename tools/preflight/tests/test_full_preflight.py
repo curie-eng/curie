@@ -722,6 +722,34 @@ def test_ci_only_docs_change_has_no_tiers(repository: Path) -> None:
     assert load_tool().select_ci_only(repository, [path], "main", head) == []
 
 
+@pytest.mark.parametrize(
+    ("path", "base", "cluster_selected", "chart_selected"),
+    [
+        ("apps/api/src/curie_api/main.py", "main", True, True),
+        ("charts/curie/templates/agent-sandbox.yaml", "main", True, True),
+        ("charts/curie/ci/runtime/connector-readiness-runtime.sh", "main", True, True),
+        ("charts/curie/ci/scenarios/controller-preflight-kind.sh", "main", True, True),
+        ("scripts/check-runner-byo-egress.sh", "main", True, True),
+        ("charts/curie/ci/runtime/metrics-alerts-runtime.sh", "main", True, False),
+        ("examples/weather/evals/cases.json", "main", True, False),
+        ("scripts/check-netpol-enforcement.sh", "main", True, False),
+        ("docs/example.md", "main", False, False),
+        ("apps/api/src/curie_api/main.py", "next", False, False),
+        ("charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh", "next", True, True),
+    ],
+)
+def test_ci_only_chart_job_listing_follows_chart_scenarios(
+    repository: Path, path: str, base: str, cluster_selected: bool, chart_selected: bool,
+) -> None:
+    if base == "next":
+        git(repository, "update-ref", "refs/remotes/origin/next", "origin/main")
+    head = commit_paths(repository, [path])
+    selected = load_tool().select_ci_only(repository, [path], base, head)
+    assert ("cluster" in selected) is cluster_selected
+    assert ("e2e-ladder-cluster" in selected) is cluster_selected
+    assert ("e2e-cluster-chart-regressions" in selected) is chart_selected
+
+
 def test_private_services_shared_worktree_lock_refuses_detached_checkout(
     tmp_path: Path,
 ) -> None:

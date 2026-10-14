@@ -1388,7 +1388,7 @@ def test_install_jira_runs_the_quickstart_with_the_token_file_never_the_token(
     assert argv.index("factory") < argv.index("quickstart")
     assert _flag(argv, "--context") == [rig.p.config.kube_context]
     assert _flag(argv, "--namespace") == [rig.p.namespace]
-    assert _flag(argv, "--release") == [fe.RELEASE]
+    assert _flag(argv, "--release") == [rig.p.release]
     assert _flag(argv, "--agent") == [fe.FACTORY_AGENT]
     assert _flag(argv, "--repo") == [REPO]
     assert _flag(argv, "--chart") == [str(rig.p.chart_dir)]

@@ -1366,21 +1366,146 @@ fn truncate_reason(detail: &str) -> String {
 }
 
 fn fail_forward_for(opts: &UpgradeOpts, previous_serving: bool, reason: &str) -> FailForward {
-    if previous_serving {
-        FailForward {
-            command: format!(
-                "curie cluster rollback --yes --release {} --namespace {}",
-                opts.common.release, opts.common.namespace
-            ),
-            reason: reason.to_string(),
-        }
+    let mut args = if previous_serving {
+        vec![plain("cluster"), plain("rollback"), plain("--yes")]
     } else {
-        FailForward {
-            command: format!(
-                "curie cluster upgrade --to {} --release {} --namespace {}",
-                opts.to, opts.common.release, opts.common.namespace
-            ),
-            reason: reason.to_string(),
+        vec![
+            plain("cluster"),
+            plain("upgrade"),
+            plain("--to"),
+            plain(&opts.to),
+        ]
+    };
+    args.extend([
+        plain("--release"),
+        plain(&opts.common.release),
+        plain("--namespace"),
+        plain(&opts.common.namespace),
+    ]);
+    if let Ok(context) = std::env::var("HELM_KUBECONTEXT") {
+        if !context.trim().is_empty() {
+            args.push(plain("--context"));
+            args.push(plain(context));
+        }
+    }
+    if !previous_serving && opts.chart.pending_release().is_none() {
+        args.push(plain("--chart"));
+        args.push(plain(opts.chart.operand()));
+    }
+    FailForward {
+        command: OpsCommand::new("curie", args).display(),
+        reason: reason.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod fail_forward_tests {
+    use super::*;
+
+    fn opts(chart: UpgradeChart) -> UpgradeOpts {
+        UpgradeOpts {
+            file_values: None,
+            common: CommonOpts {
+                namespace: "acme-test".into(),
+                release: "acme-bot".into(),
+                dry_run: false,
+            },
+            to: "0.9.0".into(),
+            chart,
+            yes: true,
+            forward_only: false,
+            allow_stock_layer_clear: false,
+            take_over: None,
+        }
+    }
+
+    struct ContextGuard(Option<String>);
+
+    impl ContextGuard {
+        fn set(context: Option<&str>) -> Self {
+            let guard = Self(std::env::var("HELM_KUBECONTEXT").ok());
+            match context {
+                Some(context) => std::env::set_var("HELM_KUBECONTEXT", context),
+                None => std::env::remove_var("HELM_KUBECONTEXT"),
+            }
+            guard
+        }
+    }
+
+    impl Drop for ContextGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(context) => std::env::set_var("HELM_KUBECONTEXT", context),
+                None => std::env::remove_var("HELM_KUBECONTEXT"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_recovery_preserves_context_and_available_chart_operand() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let _guard = ContextGuard::set(Some("acme-context"));
+        for chart in [
+            UpgradeChart::AvailableLocal("charts/curie".into()),
+            UpgradeChart::HelmReference("acme/curie".into()),
+        ] {
+            let opts = opts(chart);
+            let recovery = fail_forward_for(&opts, false, "convergence failed");
+            assert_eq!(
+                recovery.command,
+                format!(
+                    "curie cluster upgrade --to 0.9.0 --release acme-bot --namespace acme-test --context acme-context --chart {}",
+                    opts.chart.operand()
+                )
+            );
+            assert_eq!(recovery.reason, "convergence failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_release_recovery_preserves_context_without_chart() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let _guard = ContextGuard::set(Some("acme-context"));
+        let opts = opts(UpgradeChart::PendingRelease {
+            source_url: "https://example.com/curie-0.9.0.tgz".into(),
+            cache_path: "/cache/curie-0.9.0.tgz".into(),
+        });
+        let recovery = fail_forward_for(&opts, false, "convergence failed");
+        assert_eq!(
+            recovery.command,
+            "curie cluster upgrade --to 0.9.0 --release acme-bot --namespace acme-test --context acme-context"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_recovery_preserves_context_without_chart() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let _guard = ContextGuard::set(Some("acme-context"));
+        let recovery = fail_forward_for(
+            &opts(UpgradeChart::AvailableLocal("charts/curie".into())),
+            true,
+            "migration failed",
+        );
+        assert_eq!(
+            recovery.command,
+            "curie cluster rollback --yes --release acme-bot --namespace acme-test --context acme-context"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_omits_unset_or_blank_context() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        for context in [None, Some(""), Some("  ")] {
+            let _guard = ContextGuard::set(context);
+            let opts = opts(UpgradeChart::HelmReference("acme/curie".into()));
+            assert_eq!(
+                fail_forward_for(&opts, false, "failed").command,
+                "curie cluster upgrade --to 0.9.0 --release acme-bot --namespace acme-test --chart acme/curie"
+            );
+            assert_eq!(
+                fail_forward_for(&opts, true, "failed").command,
+                "curie cluster rollback --yes --release acme-bot --namespace acme-test"
+            );
         }
     }
 }
@@ -1946,6 +2071,8 @@ struct LiveHost {
     opts: UpgradeOpts,
     current: Option<String>,
     known_good: Option<String>,
+    /// A failed apply changed live Deployment images or left them unreadable.
+    target_applied: bool,
     record: Option<UpgradeRecord>,
     fail_at: Option<UpgradePhase>,
     interrupt_after: Option<UpgradePhase>,
@@ -2160,6 +2287,7 @@ impl LiveHost {
             opts: opts.clone(),
             current: None,
             known_good: None,
+            target_applied: false,
             record: None,
             fail_at,
             interrupt_after,
@@ -3202,11 +3330,16 @@ impl LiveHost {
                 .get("status")
                 .and_then(serde_json::Value::as_str)
                 .context("release history has an invalid status")?;
-            if newest.is_none_or(|(previous, _)| revision > previous) {
-                newest = Some((revision, status));
+            let description = row
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if newest.is_none_or(|(previous, _, _)| revision > previous) {
+                newest = Some((revision, status, description));
             }
         }
-        let Some((revision, status)) = newest.filter(|(_, status)| status.starts_with("pending-"))
+        let Some((revision, status, description)) =
+            newest.filter(|(_, status, _)| status.starts_with("pending-"))
         else {
             return Ok(());
         };
@@ -3219,10 +3352,19 @@ impl LiveHost {
         rollback
             .args
             .extend([plain("--wait"), plain("--timeout"), plain("15m")]);
-        if self.opts.take_over.is_none() || status != "pending-upgrade" {
+        let interrupted = (status == "pending-rollback")
+            .then(|| super::verbs::interrupted_rollback_target(description))
+            .flatten()
+            .map(|target| {
+                format!(
+                    "it is an interrupted rollback to revision {target}; run curie cluster rollback --yes to finish it, or "
+                )
+            });
+        if interrupted.is_some() || self.opts.take_over.is_none() || status != "pending-upgrade" {
             bail!(
-                "release {} newest revision {revision} is {status}; serving revision {serving} is version {version}; run `{}`, then rerun cluster upgrade",
+                "release {} newest revision {revision} is {status}; serving revision {serving} is version {version}; {}run `{}`, then rerun cluster upgrade",
                 self.opts.common.release,
+                interrupted.unwrap_or_default(),
                 rollback.display()
             );
         }
@@ -3343,6 +3485,57 @@ impl LiveHost {
         self.adopt_checkpoint_observation(observation);
         self.checkpoint_resource_version = None;
         Ok(())
+    }
+
+    fn deployment_images(&self, name: &str) -> Result<BTreeMap<String, String>> {
+        let cmd = OpsCommand::new(
+            "kubectl",
+            vec![
+                plain("get"),
+                plain("deployment"),
+                plain(name),
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("-o"),
+                plain("json"),
+            ],
+        );
+        let (ok, out, err) = self.run(&cmd)?;
+        if !ok {
+            bail!("could not read Deployment {name}: {}", err.trim());
+        }
+        let deployment: serde_json::Value =
+            serde_json::from_str(&out).context("Deployment image snapshot is malformed")?;
+        let pod_spec = deployment
+            .pointer("/spec/template/spec")
+            .context("Deployment image snapshot has no pod spec")?;
+        let mut images = BTreeMap::new();
+        for field in ["containers", "initContainers"] {
+            let containers = match pod_spec.get(field) {
+                Some(value) => value
+                    .as_array()
+                    .context("Deployment image snapshot has a malformed container list")?,
+                None if field == "initContainers" => continue,
+                None => bail!("Deployment image snapshot has no containers"),
+            };
+            if field == "containers" && containers.is_empty() {
+                bail!("Deployment image snapshot has no containers");
+            }
+            for container in containers {
+                let name = container
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .context("Deployment image snapshot has an unnamed container")?;
+                let image = container
+                    .get("image")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|image| !image.is_empty())
+                    .context("Deployment image snapshot has a container without an image")?;
+                images.insert(format!("{field}/{name}"), image.to_owned());
+            }
+        }
+        Ok(images)
     }
 
     fn helm_upgrade(&self, to: &str) -> Result<()> {
@@ -3623,10 +3816,30 @@ impl UpgradeDriver for LiveHost {
         self.live_drain_preflight()
     }
     fn apply_target(&mut self, to: &str) -> Result<()> {
+        let fullname = self.release_fullname();
+        let deployments =
+            ["api", "worker", "ui"].map(|component| format!("{fullname}-{component}"));
+        let before = deployments
+            .each_ref()
+            .map(|name| self.deployment_images(name).ok());
         if let Err(error) = self.helm_upgrade(to) {
+            // Read every workload before comparing: Helm can leave mixed images
+            // while its history still marks the previous revision deployed.
+            let after = deployments
+                .each_ref()
+                .map(|name| self.deployment_images(name).ok());
+            self.target_applied = before
+                .iter()
+                .zip(&after)
+                .any(|(before, after)| after.is_none() || before != after);
             // Helm can fail after it has already moved the deployed revision.
             // Re-read that revision so previous_serving is not the pre-apply cache.
             self.observe_deployed_version();
+            if self.target_applied {
+                let detail = error.to_string();
+                let first_line = detail.lines().next().unwrap_or_default();
+                bail!("target manifests are applied; upgrade failed after apply: {first_line}");
+            }
             return Err(error);
         }
         // R2: what the release reports, not what was requested, is what was
@@ -3713,6 +3926,9 @@ impl UpgradeDriver for LiveHost {
         self.live_canary(expected)
     }
     fn serving_previous(&self) -> bool {
+        if self.target_applied {
+            return false;
+        }
         match (&self.current, &self.known_good) {
             (Some(cur), Some(kg)) => cur == kg,
             (None, _) => true,
@@ -3788,12 +4004,12 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         Err(error) => Err(error),
     };
     let result = wrap_schema_refusal(&live, result);
-    // Apply failures stay a non-zero exit. The checkpoint is already the
+    // Every failed phase exits nonzero. The checkpoint is already the
     // terminal failed record, and ownership is released first (#3849).
-    refuse_failed_apply(finish_owned_upgrade(&mut live, result))
+    refuse_failed_upgrade(finish_owned_upgrade(&mut live, result))
 }
 
-fn refuse_failed_apply(result: Result<ClusterUpgradeOutput>) -> Result<ClusterUpgradeOutput> {
+fn refuse_failed_upgrade(result: Result<ClusterUpgradeOutput>) -> Result<ClusterUpgradeOutput> {
     match result {
         Ok(output) => match &output {
             ClusterUpgradeOutput::Completed {
@@ -3801,11 +4017,11 @@ fn refuse_failed_apply(result: Result<ClusterUpgradeOutput>) -> Result<ClusterUp
                 phase,
                 fail_forward,
                 ..
-            } if status == "failed" && phase == "apply" => {
+            } if status == "failed" => {
                 let reason = fail_forward
                     .as_ref()
                     .map(|item| item.reason.clone())
-                    .unwrap_or_else(|| "upgrade failed during apply".to_string());
+                    .unwrap_or_else(|| format!("upgrade failed during {phase}"));
                 Err(crate::ui::ui().failed_report(&output, anyhow::anyhow!(reason)))
             }
             _ => Ok(output),

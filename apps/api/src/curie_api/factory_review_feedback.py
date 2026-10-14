@@ -248,7 +248,12 @@ async def _admit(
         reply_target=_reply_target(feedback),
         reply_url=lineage.pr_url,
     )
-    result = await workitem_dispatch.admit_revision(session, facts)
+    async with AsyncSession(
+        bind=await session.connection(),
+        join_transaction_mode="create_savepoint",
+        expire_on_commit=False,
+    ) as admission:
+        result = await workitem_dispatch.admit_revision(admission, facts)
     await session.commit()
     logger.info(
         "review feedback %s on lineage %s: %s",

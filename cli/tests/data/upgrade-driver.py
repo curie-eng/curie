@@ -79,6 +79,13 @@ WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 #                             `version` field instead of a chart version string
 #   metadata_missing_before  metadata reports no release before Apply
 #   served_before/after  container image tag actually running pre/post upgrade
+#   deployment_tags_after  selected Deployment image tags after Apply; failed
+#                     upgrades otherwise keep their pre-upgrade images
+#   deployment_unreadable_after  component whose named image read fails only
+#                     after Apply, even while the other images stay unchanged
+#   deployment_absent  component whose named image read returns NotFound both
+#                     before and after Apply
+#   upgrade_error     stderr returned by a failed Helm upgrade
 #   target            image tag the rendered target manifest asks for
 #   show_chart        version `helm show chart <local path>` reports
 #   ready/updated/unavailable  replica counts on the live Deployment
@@ -129,6 +136,8 @@ WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 #                     values say, the way a template a failed or partial render
 #                     left behind survives (#4321)
 #   pending_status    orphaned newest revision status above serving revision 4
+#   pending_description  that pending row's description; Helm writes
+#                     `Rollback to <N>` on a rollback's row (pkg/action/rollback.go)
 #   no_serving_revision  history contains only the pending revision
 #   hook_jobs_shape   "valid" | "failed" | "malformed" | "not-list"
 #   active_hook       a selected hook Job still has active pods
@@ -169,6 +178,9 @@ BASE = {
     "metadata_numeric_version": False,
     "served_before": "0.8.6",
     "served_after": "0.9.0",
+    "deployment_tags_after": {},
+    "deployment_unreadable_after": None,
+    "deployment_absent": None,
     "target": "0.9.0",
     "show_chart": "0.9.0",
     "ready": 1,
@@ -195,10 +207,12 @@ BASE = {
     "drain_annotation": "auto",
     "drain_render_fails": False,
     "upgrade_fails": False,
+    "upgrade_error": None,
     "history_after_upgrade": None,
     "revision_versions": None,
     "revision_values": None,
     "pending_status": None,
+    "pending_description": "Preparing upgrade",
     "no_serving_revision": False,
     "hook_jobs_shape": "valid",
     "active_hook": False,
@@ -263,7 +277,13 @@ SCENARIOS = {
         "no_serving_revision": True,
     },
     "pending-install": {"pending_status": "pending-install"},
-    "pending-rollback": {"pending_status": "pending-rollback"},
+    # A killed `helm rollback` leaves its row pending with the target it was
+    # asked for. Revision 3 is not in this history: the upgrade refusal only
+    # reads the description (#4497).
+    "pending-rollback": {
+        "pending_status": "pending-rollback",
+        "pending_description": "Rollback to 3",
+    },
     # Keep the release cache target distinct from the running CLI version so
     # the resolver test can prove that --to owns the cache key.
     "release-cache-prior": {
@@ -343,6 +363,56 @@ SCENARIOS = {
         "history_after_upgrade": [
             {"revision": 1, "status": "superseded", "chart": "curie-0.8.6", "app_version": "0.8.6"},
             {"revision": 2, "status": "deployed", "chart": "curie-0.9.0", "app_version": "0.9.0"},
+        ],
+        "revision_versions": {"1": "0.8.6", "2": "0.9.0"},
+    },
+    # Post-upgrade failure: Helm still marks the old revision deployed, while
+    # only the api Deployment runs the target image. Helm status alone cannot
+    # prove that the previous version is serving (#4462).
+    "apply-post-hook-fails-images-changed": {
+        "upgrade_fails": True,
+        "upgrade_error": (
+            "Error: post-upgrade hooks failed: job rel-curie-extra-hook failed\n"
+            "hook failure detail must not reach the fail-forward reason"
+        ),
+        "deployment_tags_after": {"api": "0.9.0"},
+        "history_after_upgrade": [
+            {"revision": 1, "status": "deployed", "chart": "curie-0.8.6", "app_version": "0.8.6"},
+            {"revision": 2, "status": "failed", "chart": "curie-0.9.0", "app_version": "0.9.0"},
+        ],
+        "revision_versions": {"1": "0.8.6", "2": "0.9.0"},
+    },
+    # Pre-upgrade failure: no target manifests reached the live Deployments.
+    "apply-pre-hook-fails-images-unchanged": {
+        "upgrade_fails": True,
+        "upgrade_error": "Error: pre-upgrade hooks failed: job rel-curie-extra-hook failed",
+        "history_after_upgrade": [
+            {"revision": 1, "status": "deployed", "chart": "curie-0.8.6", "app_version": "0.8.6"},
+            {"revision": 2, "status": "failed", "chart": "curie-0.9.0", "app_version": "0.9.0"},
+        ],
+        "revision_versions": {"1": "0.8.6", "2": "0.9.0"},
+    },
+    # Decision 2 of #4462 has no exception for an already absent Deployment:
+    # NotFound after failure cannot prove the previous version is serving.
+    "apply-pre-hook-fails-ui-absent": {
+        "upgrade_fails": True,
+        "upgrade_error": "Error: pre-upgrade hooks failed: job rel-curie-extra-hook failed",
+        "deployment_absent": "ui",
+        "history_after_upgrade": [
+            {"revision": 1, "status": "deployed", "chart": "curie-0.8.6", "app_version": "0.8.6"},
+            {"revision": 2, "status": "failed", "chart": "curie-0.9.0", "app_version": "0.9.0"},
+        ],
+        "revision_versions": {"1": "0.8.6", "2": "0.9.0"},
+    },
+    # The images that remain readable are unchanged. Losing the ui Deployment
+    # read alone must prevent claiming that the previous version serves.
+    "apply-post-hook-fails-deployment-unreadable": {
+        "upgrade_fails": True,
+        "upgrade_error": "Error: post-upgrade hooks failed: job rel-curie-extra-hook failed",
+        "deployment_unreadable_after": "ui",
+        "history_after_upgrade": [
+            {"revision": 1, "status": "deployed", "chart": "curie-0.8.6", "app_version": "0.8.6"},
+            {"revision": 2, "status": "failed", "chart": "curie-0.9.0", "app_version": "0.9.0"},
         ],
         "revision_versions": {"1": "0.8.6", "2": "0.9.0"},
     },
@@ -489,7 +559,9 @@ def release_history():
         rows = [] if scenario["no_serving_revision"] else [
             history_row(4, "deployed", scenario["before"], "Upgrade complete")
         ]
-        rows.append(history_row(5, pending, scenario["target"], "Preparing upgrade"))
+        rows.append(
+            history_row(5, pending, scenario["target"], scenario["pending_description"])
+        )
         if rollback_attempted:
             # Helm leaves the old pending row unchanged. A successful
             # rollback supersedes deployed rows; a wait failure stores the
@@ -1229,8 +1301,10 @@ if program == "helm":
             capture("values", ".yaml", values)
         if scenario["upgrade_fails"]:
             print(
-                "Error: execution error at (curie/templates/agent-sandbox.yaml:870:4): "
-                'agentSandbox.runnerImages.acme-bot must be a digest reference, got "<nil>"',
+                scenario["upgrade_error"] or (
+                    "Error: execution error at (curie/templates/agent-sandbox.yaml:870:4): "
+                    'agentSandbox.runnerImages.acme-bot must be a digest reference, got "<nil>"'
+                ),
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -1238,6 +1312,44 @@ if program == "helm":
         sys.exit(0)
 
 if program == "kubectl":
+    # apps/v1 Deployment pod template container shape:
+    # https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/deployment-v1/
+    if args[:2] == ["get", "deployment"]:
+        name = args[2] if len(args) > 2 else ""
+        component = name.removeprefix(f"{RELEASE}-curie-")
+        if component not in {"api", "worker", "ui"} or args != [
+            "get", "deployment", name, "-n", NAMESPACE, "-o", "json"
+        ]:
+            print("image snapshots require a named release Deployment JSON read", file=sys.stderr)
+            sys.exit(1)
+        if scenario["deployment_absent"] == component:
+            print(
+                f'Error from server (NotFound): deployments.apps "{name}" not found',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if upgraded and scenario["deployment_unreadable_after"] == component:
+            print(
+                f'Error from server (Forbidden): deployments.apps "{name}" is forbidden',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        tag = scenario["served_before"]
+        if upgraded:
+            tag = scenario["deployment_tags_after"].get(
+                component,
+                scenario["served_before"]
+                if scenario["upgrade_fails"]
+                else scenario["served_after"],
+            )
+        emit({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": name, "namespace": NAMESPACE},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": component, "image": f"ghcr.io/curie-eng/curie-{component}:{tag}"},
+            ]}}},
+        })
     if args[:2] == ["get", "jobs"]:
         shape = scenario["hook_jobs_shape"]
         if shape == "failed":

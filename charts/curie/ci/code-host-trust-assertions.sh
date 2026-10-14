@@ -101,6 +101,11 @@ print(f"  ok: codeHostTrust {mode}")
 }
 
 render | check unset
+# A retained pre-forge value must not recreate env pointing at a removed mount.
+render --set api.githubStubCaConfigMap=old-stub-ca | check unset
+render --set api.githubStubCaConfigMap=old-stub-ca \
+  --set codeHostTrust.caBundle.configMapRef.name=corp-ca \
+  --set codeHostTrust.caBundle.configMapRef.key=bundle.pem | check set
 render --set codeHostTrust.caBundle.configMapRef.name=corp-ca \
   --set codeHostTrust.caBundle.configMapRef.key=bundle.pem | check set
 

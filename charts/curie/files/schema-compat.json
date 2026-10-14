@@ -834,12 +834,29 @@
     {
       "kind": "expand",
       "parents": [
+        "0093"
+      ],
+      "revision": "0106",
+      "sha256": "84129e3142badb2f3108d6d538d44794a9cc211cd30aedb3d7f681fa8d86fe30"
+    },
+    {
+      "kind": "expand",
+      "parents": [
         "0105"
       ],
       "revision": "0107",
       "sha256": "92a5e85709c7119b60194877bfa3f6c0eb980ad8a84363def99498b68417f5b5"
+    },
+    {
+      "kind": "expand",
+      "parents": [
+        "0107",
+        "0106"
+      ],
+      "revision": "0108",
+      "sha256": "c91142341e5c8255e36c6123b8dd04d79a8d366b339db829518c7e6c2e90949a"
     }
   ],
-  "schema_head": "0107",
-  "schema_min": "0105"
+  "schema_head": "0108",
+  "schema_min": "0108"
 }

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import tomllib
+import uuid
 from pathlib import Path
 
 import pytest
 import yaml
-from _migration_support import IsolatedMigrationDb, alembic_config
+from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts, sql_rows
 from alembic import command
 from curie_api.config import get_settings
 from curie_api.main import create_app
@@ -34,18 +35,20 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     )
     # The next-only migrations follow the immutable published 0.12.2 chain.
     # The minimum tracks the newest schema the app reads (#2911's tenant scope).
-    assert window == {"schema_min": "0105", "schema_head": "0107"}
+    assert window == {"schema_min": "0108", "schema_head": "0108"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
-def test_new_candidate_release_fields_are_0130(field: str) -> None:
+def test_current_release_fields_match_cli_version(field: str) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2."""
+    expected = tomllib.loads((ROOT / "cli/Cargo.toml").read_text())["package"]["version"]
     if field == "cargo":
-        value = tomllib.loads((ROOT / "cli/Cargo.toml").read_text())["package"]["version"]
+        value = expected
     else:
         chart = yaml.safe_load((ROOT / "charts/curie/Chart.yaml").read_text())
         value = chart["version" if field == "chart" else "appVersion"]
     assert value == "0.13.0"
+    assert value in catalog()["windows"]
 
 
 def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
@@ -54,8 +57,10 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.12.2") == {"schema_min": "0076", "schema_head": "0081"}
     assert data["windows"].get("0.12.3") == {"schema_min": "0076", "schema_head": "0093"}
     assert data["windows"].get("0.12.4") == {"schema_min": "0076", "schema_head": "0093"}
-    assert data["windows"].get("0.13.0") == {"schema_min": "0105", "schema_head": "0107"}
-    assert data["revisions"][-10:] == [
+    assert data["windows"].get("0.12.5") == {"schema_min": "0076", "schema_head": "0106"}
+    assert data["windows"].get("0.13.0") == {"schema_min": "0108", "schema_head": "0108"}
+    assert data["revisions"][-12:] == [
+        "0095",
         "0096",
         "0097",
         "0098",
@@ -66,12 +71,15 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0103",
         "0105",
         "0107",
+        "0108",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
     assert kinds["0103"] == "contract"
     assert kinds["0105"] == "expand"
+    assert kinds["0106"] == "expand"
     assert kinds["0107"] == "expand"
+    assert kinds["0108"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -84,7 +92,9 @@ def test_every_prior_registered_window_is_exactly_preserved() -> None:
     actual = catalog()["windows"]
     assert {name: actual[name] for name in expected} == expected
     assert actual["0.12.1"] == {"schema_min": "0076", "schema_head": "0076"}
-    assert set(actual) - set(expected) <= {"0.12.1", "0.12.2", "0.12.3", "0.12.4", "0.13.0"}
+    assert set(actual) - set(expected) <= {
+        "0.12.1", "0.12.2", "0.12.3", "0.12.4", "0.12.5", "0.13.0"
+    }
 
 
 def test_released_0076_startup_refuses_without_migrating_then_0101_starts(
@@ -115,11 +125,44 @@ def test_released_0076_startup_refuses_without_migrating_then_0101_starts(
             with TestClient(create_app()):
                 pass
         assert current_revision() == "0100"
-        command.upgrade(alembic_config(), "0105")
-        assert current_revision() == "0105"
+        command.upgrade(alembic_config(), "0108")
+        assert current_revision() == "0108"
         with TestClient(create_app()) as client:
             response = client.get("/health")
             assert response.status_code == 200
             assert response.json() == {"status": "ok"}
     finally:
         get_settings.cache_clear()
+
+
+@pytest.mark.parametrize("source", ["0105", "0107", "0106"])
+def test_both_train_heads_upgrade_without_losing_existing_rows(
+    source: str, isolated_migration_db: IsolatedMigrationDb
+) -> None:
+    """The join applies each train's expansion and preserves stored agent rows."""
+    isolated_migration_db.at(source)
+    agent_id = uuid.uuid4()
+    sql_rows(
+        "INSERT INTO curie.agents (id, name) VALUES (:id, 'acme-retained')",
+        {"id": agent_id},
+    )
+    with pytest.raises(RuntimeError, match="below application min"):
+        with TestClient(create_app()):
+            pass
+    assert current_revision() == source
+
+    command.upgrade(alembic_config(), "head")
+
+    assert current_revision() == "0108"
+    assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
+        {"name": "acme-retained"}
+    ]
+    columns = {
+        (row["table_name"], row["column_name"])
+        for row in sql_dicts(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema = 'curie'"
+        )
+    }
+    assert {("approvals", "reply_identity"), ("publications", "reply_identity")} <= columns
+    assert {("agent_channels", "trigger_label"), ("work_items", "trigger_label")} <= columns

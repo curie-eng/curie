@@ -52,6 +52,13 @@ spec:
   template:
     metadata:
       annotations:
+        {{- with (include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list )
+        "refs" (list (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.clickhouse)) "key" "clickhousePassword"))
+        "env" "")) }}
+        checksum/secret: {{ . }}
+        {{- end }}
         {{- with (include "curie.placement.annotations" (dict "root" $ "class" "data")) }}
         {{- . | nindent 8 }}
         {{- end }}

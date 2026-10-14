@@ -3345,6 +3345,10 @@ enum ClusterUpInference {
         image: Option<String>,
     },
     GvisorOffFromLookup,
+    GvisorOffFromScheduling {
+        name: String,
+        selector: String,
+    },
     GvisorOffFromAdmission,
 }
 
@@ -3377,6 +3381,9 @@ impl ClusterUpInference {
             Self::GvisorOffFromLookup => ui.note(&format!(
                 "inferred that the cluster has no `gvisor` RuntimeClass from the RuntimeClass lookup (NotFound); applying `--set {GVISOR_MODE_KEY}=off`"
             )),
+            Self::GvisorOffFromScheduling { name, selector } => ui.note(&format!(
+                "inferred that RuntimeClass `{name}` cannot schedule: no node matches its nodeSelector `{selector}` (on GKE, add a GKE Sandbox node pool to keep gVisor); applying `--set {GVISOR_MODE_KEY}=off`"
+            )),
             Self::GvisorOffFromAdmission => ui.note(&format!(
                 "inferred that the cluster has no `gvisor` RuntimeClass from admission; applying `--set {GVISOR_MODE_KEY}=off`"
             )),
@@ -3384,11 +3391,122 @@ impl ClusterUpInference {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum RuntimeClassLookup {
     Present,
     Absent,
     Forbidden,
+    Unschedulable { selector: String },
+}
+
+fn runtime_class_node_selector(value: &serde_json::Value) -> Option<String> {
+    let selector = value.pointer("/scheduling/nodeSelector")?.as_object()?;
+    if selector.is_empty() {
+        return None;
+    }
+    let sorted = selector
+        .iter()
+        .map(|(key, value)| Some((key.as_str(), value.as_str()?)))
+        .collect::<Option<BTreeMap<_, _>>>()?;
+    Some(
+        sorted
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+async fn runtime_class_selector_matches_no_node(selector: &str) -> bool {
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("nodes"),
+            plain("-l"),
+            plain(selector),
+            plain("-o"),
+            plain("name"),
+        ],
+    );
+    // Only a readable, empty node list authorizes the reduced isolation posture.
+    // Taints, tolerations and cordons are outside this node pool selector check.
+    match run_capture(&cmd).await {
+        Ok((true, out, _)) => out.trim().is_empty(),
+        Ok((false, _, err)) => {
+            crate::ui::ui().plumbing(&format!(
+                "gVisor node selector lookup unavailable: {}",
+                failure_reason(&err)
+            ));
+            false
+        }
+        Err(error) => {
+            crate::ui::ui().plumbing(&format!("gVisor node selector lookup unavailable: {error}"));
+            false
+        }
+    }
+}
+
+async fn gvisor_preflight_scheduling_failure(
+    common: &CommonOpts,
+    preflight: &RenderedGvisorPreflight,
+    invocation: UpInvocation,
+) -> Option<anyhow::Error> {
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("events"),
+            plain("-n"),
+            plain(&common.namespace),
+            plain("--field-selector"),
+            plain("reason=FailedScheduling,involvedObject.kind=Pod"),
+            plain("-o"),
+            plain("json"),
+        ],
+    );
+    let (ok, out, _) = run_capture(&cmd).await.ok()?;
+    if !ok {
+        return None;
+    }
+    let events: serde_json::Value = serde_json::from_str(&out).ok()?;
+    let pod_prefix = format!("{}-", preflight.job_name);
+    if !events.get("items")?.as_array()?.iter().any(|event| {
+        event.get("reason").and_then(|value| value.as_str()) == Some("FailedScheduling")
+            && event
+                .pointer("/involvedObject/kind")
+                .and_then(|value| value.as_str())
+                == Some("Pod")
+            && event
+                .pointer("/involvedObject/name")
+                .and_then(|value| value.as_str())
+                .is_some_and(|name| name.starts_with(&pod_prefix))
+    }) {
+        return None;
+    }
+
+    let name = &preflight.runtime_class_name;
+    let selector_clause = match lookup_runtime_class(name).await {
+        Ok(RuntimeClassLookup::Unschedulable { selector }) => format!(
+            ": RuntimeClass `{name}` requires nodes labelled `{selector}` and no node has that label; on GKE this means the cluster has no GKE Sandbox node pool"
+        ),
+        _ => String::new(),
+    };
+    let fix = invocation.gvisor_fix();
+    let instruction = match invocation {
+        UpInvocation::ClusterUp => format!("run `{fix}`"),
+        UpInvocation::Apply => fix.to_string(),
+    };
+    // Event messages can contain private configuration. Only the reason code
+    // and the selector read directly from the RuntimeClass enter this error.
+    Some(
+        crate::exit::CliError::failure(format!(
+            "gVisor preflight Job `{}` was never scheduled (FailedScheduling){selector_clause}. To install without gVisor isolation, {instruction}.",
+            preflight.job_name
+        ))
+        .with_fix(fix)
+        .into(),
+    )
 }
 
 fn runtime_class_read_error(
@@ -3427,6 +3545,11 @@ async fn lookup_runtime_class(name: &str) -> Result<RuntimeClassLookup> {
                 .and_then(|metadata| metadata.get("name"))
                 .and_then(|found| found.as_str());
             if found == Some(name) {
+                if let Some(selector) = runtime_class_node_selector(&value) {
+                    if runtime_class_selector_matches_no_node(&selector).await {
+                        return Ok(RuntimeClassLookup::Unschedulable { selector });
+                    }
+                }
                 return Ok(RuntimeClassLookup::Present);
             }
         }
@@ -5707,16 +5830,68 @@ async fn run_prepared_up(
     // runtimeClassName default is not `gvisor`.
     let mut gvisor_preflight =
         rendered_gvisor_preflight_job(&opts.chart, &opts.common, &value_plan).await?;
+    // A fake-model auto install omits the Job but can still use the class on
+    // runner pods. Let the chart identify that path with one real-model render.
+    let fake_model_preflight = if detect_facts && gvisor_preflight.is_none() {
+        let mut real_model_plan = value_plan.clone();
+        real_model_plan.set(FAKE_MODEL_KEY, "false");
+        rendered_gvisor_preflight_job(&opts.chart, &opts.common, &real_model_plan)
+            .await?
+            .filter(|preflight| !preflight.creates_runtime_class)
+    } else {
+        None
+    };
     if detect_facts {
-        if let Some(preflight) = gvisor_preflight.as_ref() {
+        if let Some(preflight) = gvisor_preflight.as_ref().or(fake_model_preflight.as_ref()) {
             let name = preflight.runtime_class_name.clone();
             let creates_runtime_class = preflight.creates_runtime_class;
-            match lookup_runtime_class(&name).await? {
+            let fake_model_auto = fake_model_preflight.is_some();
+            let lookup = match lookup_runtime_class(&name).await {
+                Ok(lookup) => lookup,
+                Err(error) if fake_model_auto => {
+                    ui.plumbing(&format!("gVisor RuntimeClass lookup unavailable: {error}"));
+                    RuntimeClassLookup::Present
+                }
+                Err(error) => return Err(error),
+            };
+            match lookup {
                 RuntimeClassLookup::Present => {}
+                RuntimeClassLookup::Forbidden | RuntimeClassLookup::Absent if fake_model_auto => {}
                 RuntimeClassLookup::Forbidden => {
                     runtime_class_lookup_forbidden = true;
                 }
                 RuntimeClassLookup::Absent if creates_runtime_class => {}
+                RuntimeClassLookup::Unschedulable { .. } if creates_runtime_class => {}
+                RuntimeClassLookup::Unschedulable { selector } => {
+                    match final_operator_value(&opts, GVISOR_MODE_KEY) {
+                        Some("auto") => {
+                            let assignment = format!("{GVISOR_MODE_KEY}=auto");
+                            let fix = format!(
+                                "remove the explicit `{assignment}` setting and rerun to accept the inferred gVisor posture"
+                            );
+                            return Err(crate::exit::CliError::usage(format!(
+                                "explicit `{assignment}` contradicts the detected RuntimeClass scheduling: no node matches `{name}` nodeSelector `{selector}`; {fix}"
+                            ))
+                            .with_fix(fix)
+                            .into());
+                        }
+                        // The operator may rely on sandbox nodes provisioned
+                        // on demand. The preflight remains the enforcement gate.
+                        Some("require") => {}
+                        _ => {
+                            value_plan.set(GVISOR_MODE_KEY, "off");
+                            ClusterUpInference::GvisorOffFromScheduling { name, selector }
+                                .render(ui);
+                            cmds = up_commands_with_plan(&opts, &value_plan);
+                            gvisor_preflight = rendered_gvisor_preflight_job(
+                                &opts.chart,
+                                &opts.common,
+                                &value_plan,
+                            )
+                            .await?;
+                        }
+                    }
+                }
                 RuntimeClassLookup::Absent => {
                     if let Some(mode @ ("auto" | "require")) =
                         final_operator_value(&opts, GVISOR_MODE_KEY)
@@ -5786,9 +5961,17 @@ async fn run_prepared_up(
         {
             Ok(outcome) => outcome,
             Err(error) => {
+                if let Some(preflight) = gvisor_preflight.as_ref() {
+                    if let Some(diagnosis) =
+                        gvisor_preflight_scheduling_failure(&opts.common, preflight, invocation)
+                            .await
+                    {
+                        return Err(diagnosis);
+                    }
+                }
                 return Err(
                     convergence::installation_failure(&opts.common, error, invocation).await,
-                )
+                );
             }
         };
         match outcome {

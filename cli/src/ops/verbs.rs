@@ -1665,6 +1665,10 @@ pub struct RollbackChoice {
     /// True only when `--allow-failed-revision` admitted a revision whose status
     /// is not `deployed`/`superseded`.
     pub forced: bool,
+    /// True only when the newest revision is a `pending-rollback` whose
+    /// recorded target was confirmed, so this choice finishes that interrupted
+    /// rollback instead of restoring the serving revision (#4497).
+    pub resumes_interrupted_rollback: bool,
 }
 
 /// The outcome of the pure selection. `NoEligible` is a legitimate reading of a
@@ -1718,7 +1722,16 @@ impl RollbackTarget {
 /// Otherwise pick the newest eligible revision strictly below the current one.
 ///
 /// This preserves known good state after an interrupted or failed upgrade
-/// (#4335). The status filter fixes #1899: a `cluster up` against a cluster with no
+/// (#4335). A `pending-rollback` newest revision is the one exception (#4497,
+/// amending #4335 for that status only): its row records the operator's last
+/// instruction as `Rollback to <N>`, and Helm history is the only place that
+/// intent survives a kill. When N parses, is in history below the pending row,
+/// is eligible, and carries the pending row's chart, the choice finishes that
+/// rollback toward N. Otherwise selection refuses and names the explicit
+/// choices, rather than silently restoring the serving revision the operator
+/// was leaving. Every other ineligible newest status restores serving.
+///
+/// The status filter fixes #1899: a `cluster up` against a cluster with no
 /// `runsc` RuntimeClass records a FAILED revision before its successful retry,
 /// so the history alternates failed/superseded and the immediately preceding
 /// revision -- the one bare `helm rollback` targets -- is a failed one. Skipping
@@ -1733,11 +1746,19 @@ pub fn select_rollback_revision(history: &[HelmRevision]) -> Result<RollbackTarg
         .max_by_key(|row| row.revision)
         .filter(|row| row.revision > current && !is_eligible_rollback_status(&row.status))
     {
+        if newest
+            .status
+            .trim()
+            .eq_ignore_ascii_case("pending-rollback")
+        {
+            return resume_interrupted_rollback(history, newest, current);
+        }
         return Ok(RollbackTarget::Eligible(RollbackChoice {
             from_revision: newest.revision,
             to_revision: current,
             skipped: skipped_between(history, current, newest.revision),
             forced: false,
+            resumes_interrupted_rollback: false,
         }));
     }
 
@@ -1752,6 +1773,7 @@ pub fn select_rollback_revision(history: &[HelmRevision]) -> Result<RollbackTarg
             to_revision,
             skipped: skipped_between(history, to_revision, current),
             forced: false,
+            resumes_interrupted_rollback: false,
         })),
         None => Ok(RollbackTarget::NoEligible {
             current,
@@ -1799,7 +1821,60 @@ pub fn resolve_explicit_revision(
         to_revision: revision,
         skipped: skipped_between(history, revision, current),
         forced: !eligible,
+        resumes_interrupted_rollback: false,
     })
+}
+
+/// The target revision of an interrupted `helm rollback`, read from its
+/// pending row's description. Helm writes that description as
+/// `Rollback to %d` (helm pkg/action/rollback.go,
+/// `Description = fmt.Sprintf("Rollback to %d", r.Version)`), so only that
+/// exact shape, trimmed, with a nonempty run of ASCII digits that fits a
+/// `u32`, is read as a target. Anything else is `None`.
+pub(crate) fn interrupted_rollback_target(description: &str) -> Option<u32> {
+    let digits = description.trim().strip_prefix("Rollback to ")?;
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Finish a `pending-rollback` newest revision toward its recorded target, or
+/// refuse with both explicit choices when that target cannot be confirmed.
+fn resume_interrupted_rollback(
+    history: &[HelmRevision],
+    pending: &HelmRevision,
+    serving: u32,
+) -> Result<RollbackTarget> {
+    let target = interrupted_rollback_target(&pending.description)
+        .and_then(|n| history.iter().find(|row| row.revision == n));
+    if let Some(row) = target.filter(|row| {
+        row.revision < pending.revision
+            && is_eligible_rollback_status(&row.status)
+            && row.chart == pending.chart
+    }) {
+        return Ok(RollbackTarget::Eligible(RollbackChoice {
+            from_revision: pending.revision,
+            to_revision: row.revision,
+            skipped: skipped_between(history, row.revision, pending.revision),
+            forced: false,
+            resumes_interrupted_rollback: true,
+        }));
+    }
+    let restore = format!("curie cluster rollback --revision {serving} --yes");
+    let fix = match target {
+        Some(row) => format!(
+            "run curie cluster rollback --revision {} --yes to finish it, or {restore} to restore the serving revision",
+            row.revision
+        ),
+        None => format!("run {restore} to restore the serving revision"),
+    };
+    Err(crate::exit::CliError::failure(format!(
+        "revision {} is an interrupted rollback whose target cannot be confirmed; {fix}",
+        pending.revision
+    ))
+    .with_fix(fix)
+    .into())
 }
 
 /// Parse `helm history -o json`: an array of objects. Unknown fields are
@@ -1990,6 +2065,7 @@ pub enum ClusterRollbackOutput {
         to_revision: u32,
         skipped: Vec<u32>,
         forced: bool,
+        resumed_interrupted_rollback: bool,
     },
 }
 
@@ -2005,12 +2081,14 @@ impl crate::ui::CliOutput for ClusterRollbackOutput {
                 to_revision,
                 skipped,
                 forced,
+                resumed_interrupted_rollback,
             } => serde_json::json!({
                 "rolled_back": true,
                 "from_revision": from_revision,
                 "to_revision": to_revision,
                 "skipped": skipped,
                 "forced": forced,
+                "resumed_interrupted_rollback": resumed_interrupted_rollback,
             }),
         }
     }
@@ -2024,6 +2102,7 @@ impl crate::ui::CliOutput for ClusterRollbackOutput {
                 to_revision,
                 skipped,
                 forced,
+                ..
             } => {
                 ui.payload(&format!(
                     "curie rolled back from revision {from_revision} to revision {to_revision}"
@@ -2170,6 +2249,87 @@ async fn probe_live_schema_revision(common: &CommonOpts, ui: &crate::ui::Ui) -> 
     })
 }
 
+/// Fix a schema-gated dry run carries when no live revision was asserted: the
+/// fail-forward version depends on a revision the dry run never probes.
+const DRY_RUN_FAIL_FORWARD_FIX: &str = "the newest safe fail-forward version depends on the live database revision; pass --live-schema-revision <id> to name it";
+
+/// One shape for every rollback schema-gate refusal. The next step rides in the
+/// message as well as the fix, as in [`RollbackTarget::require_eligible`]: the
+/// human presenter shows only the message, and `--json` keeps `fix`.
+fn schema_gate_refusal(message: &str, fix: &str) -> anyhow::Error {
+    crate::exit::CliError::failure(format!("{message}; {fix}"))
+        .with_fix(fix)
+        .into()
+}
+
+/// The operator-asserted `--live-schema-revision`, or the refusal both the dry
+/// run and the real run return when it names no revision.
+fn parse_asserted_live_schema_revision(raw: &str) -> Result<String> {
+    crate::schema_window::parse_alembic_current_output(raw).ok_or_else(|| {
+        schema_gate_refusal(
+            "refusing rollback: --live-schema-revision did not contain a database revision",
+            "pass a revision id such as 0039",
+        )
+    })
+}
+
+/// The application version the selected target revision installed, or the
+/// refusal both the dry run and the real run return when it has none.
+fn require_target_application_version(
+    history: &[HelmRevision],
+    to_revision: u32,
+) -> Result<String> {
+    history
+        .iter()
+        .find(|row| row.revision == to_revision)
+        .and_then(HelmRevision::application_version)
+        .ok_or_else(|| {
+            schema_gate_refusal(
+                &format!(
+                    "refusing rollback to Helm revision {to_revision}: no application version on that revision"
+                ),
+                "inspect `helm history <release> -n <namespace> -o json` and fail forward to a revision whose app_version is catalogued",
+            )
+        })
+}
+
+/// The offline half of the rollback schema gate, run by a dry run: the target
+/// has an application version and the embedded catalog declares its range. The
+/// live window stays real-run only, so a live revision here only names the
+/// fail-forward version in the refusal.
+fn dry_run_schema_catalog_check(
+    history: &[HelmRevision],
+    to_revision: u32,
+    live_schema_revision: Option<&str>,
+) -> Result<()> {
+    let live = live_schema_revision
+        .map(parse_asserted_live_schema_revision)
+        .transpose()?;
+    let target_app = require_target_application_version(history, to_revision)?;
+    if crate::schema_window::window_for(&target_app).is_some() {
+        return Ok(());
+    }
+    let refusal = match live {
+        Some(live) => crate::schema_window::missing_target_window_refusal(
+            &target_app,
+            &live,
+            &history_application_versions(history),
+        ),
+        None => crate::schema_window::SchemaRefusal {
+            message: crate::schema_window::missing_target_window_message(&target_app),
+            fix: DRY_RUN_FAIL_FORWARD_FIX.to_string(),
+        },
+    };
+    Err(schema_gate_refusal(&refusal.message, &refusal.fix))
+}
+
+fn history_application_versions(history: &[HelmRevision]) -> Vec<String> {
+    history
+        .iter()
+        .filter_map(HelmRevision::application_version)
+        .collect()
+}
+
 pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
     let ui = crate::ui::ui();
     let history_cmd = helm_history_cmd(&opts.common);
@@ -2206,6 +2366,13 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
     };
 
     if opts.common.dry_run {
+        if !opts.disable_schema_gate {
+            dry_run_schema_catalog_check(
+                &history,
+                choice.to_revision,
+                opts.live_schema_revision.as_deref(),
+            )?;
+        }
         let target = history
             .iter()
             .find(|row| row.revision == choice.to_revision)
@@ -2224,6 +2391,9 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
             .iter()
             .map(plan_line)
             .collect();
+        if choice.resumes_interrupted_rollback {
+            lines.push(interrupted_rollback_note(&choice));
+        }
         lines.push(format!(
             "selected revision {} ({}, {}) from revision {}; skipped {}",
             choice.to_revision, target.status, target.chart, choice.from_revision, skipped
@@ -2234,42 +2404,19 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
     }
 
     if !opts.disable_schema_gate {
-        let target_row = history
-            .iter()
-            .find(|row| row.revision == choice.to_revision);
-        let target_app = target_row.and_then(HelmRevision::application_version);
-        let history_apps: Vec<String> = history
-            .iter()
-            .filter_map(HelmRevision::application_version)
-            .collect();
+        let history_apps = history_application_versions(&history);
         let live = match opts.live_schema_revision.as_deref() {
-            Some(raw) => {
-                crate::schema_window::parse_alembic_current_output(raw).ok_or_else(|| {
-                    crate::exit::CliError::failure(
-                    "refusing rollback: --live-schema-revision did not contain a database revision",
-                )
-                .with_fix("pass a revision id such as 0039")
-                })?
-            }
+            Some(raw) => parse_asserted_live_schema_revision(raw)?,
             None => probe_live_schema_revision(&opts.common, ui).await?,
         };
-        let Some(target_app) = target_app else {
-            return Err(crate::exit::CliError::failure(format!(
-                "refusing rollback to Helm revision {}: no application version on that revision",
-                choice.to_revision
-            ))
-            .with_fix("inspect `helm history <release> -n <namespace> -o json` and fail forward to a revision whose app_version is catalogued")
-            .into());
-        };
+        let target_app = require_target_application_version(&history, choice.to_revision)?;
         let Some(catalog_window) = crate::schema_window::window_for(&target_app) else {
             let refusal = crate::schema_window::missing_target_window_refusal(
                 &target_app,
                 &live,
                 &history_apps,
             );
-            return Err(crate::exit::CliError::failure(refusal.message)
-                .with_fix(refusal.fix)
-                .into());
+            return Err(schema_gate_refusal(&refusal.message, &refusal.fix));
         };
         let catalog_ambiguous = catalog_window.artifact_identity_ambiguous;
         let catalog_head = catalog_window.schema_head.clone();
@@ -2353,9 +2500,7 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
                 let fix = published_identity_fix
                     .map(|identity| format!("{}. {identity}", refusal.fix))
                     .unwrap_or(refusal.fix);
-                return Err(crate::exit::CliError::failure(refusal.message)
-                    .with_fix(fix)
-                    .into());
+                return Err(schema_gate_refusal(&refusal.message, &fix));
             }
         }
         if opts.live_schema_revision.is_some() {
@@ -2371,6 +2516,9 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
     // `payload` -- ADR-0021 (#474) reserves that channel for `CliOutput::render`,
     // and routing it here told an operator who then declined the prompt that the
     // release was rolling back, on stdout, while printing it twice on success.
+    if choice.resumes_interrupted_rollback {
+        ui.note(&interrupted_rollback_note(&choice));
+    }
     ui.note(&format!(
         "rolling release '{}' back from revision {} to revision {}",
         opts.common.release, choice.from_revision, choice.to_revision
@@ -2420,7 +2568,17 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
         to_revision: choice.to_revision,
         skipped: choice.skipped,
         forced: choice.forced,
+        resumed_interrupted_rollback: choice.resumes_interrupted_rollback,
     })
+}
+
+/// The sentence a dry run and the pre-prompt note share when a bare rollback
+/// finishes an interrupted one (#4497).
+fn interrupted_rollback_note(choice: &RollbackChoice) -> String {
+    format!(
+        "revision {} is an interrupted rollback to revision {}; resuming it",
+        choice.from_revision, choice.to_revision
+    )
 }
 
 /// Read a y/N confirmation from stderr/stdin for `down` when `--yes` is absent.
@@ -2481,8 +2639,9 @@ fn render_pod_table(ui: &crate::ui::Ui, pods: &[PodRow]) {
 
 /// Summarise `kubectl get pods` output into (rows, ready count, steady-state
 /// total, names of pods not Running) WITHOUT printing, so the caller can render
-/// or serialize it (#485). Terminal and terminating pods stay in the rows but are
-/// excluded from the tally.
+/// or serialize it (#485). Terminal (`Succeeded`, `Failed`, `Completed`) and
+/// terminating pods stay in the rows but are excluded from the tally; a kubelet
+/// eviction leaves a `Failed` pod its ReplicaSet never deletes (#4496).
 fn collect_pod_summary(pods: &[serde_json::Value]) -> (Vec<PodRow>, usize, usize, Vec<String>) {
     let mut ready = 0usize;
     let mut total = 0usize;
@@ -2538,7 +2697,7 @@ fn collect_pod_summary(pods: &[serde_json::Value]) -> (Vec<PodRow>, usize, usize
             status: display_status.to_string(),
             mail_channel: None,
         });
-        if phase == "Succeeded" || reason == "Completed" || terminating {
+        if phase == "Succeeded" || phase == "Failed" || reason == "Completed" || terminating {
             continue;
         }
         total += 1;
@@ -6193,6 +6352,33 @@ mod tests {
         let items: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
         let (_, ready, total, unhealthy) = collect_pod_summary(&items);
         assert_eq!((ready, total, unhealthy), (10, 10, vec![]));
+    }
+
+    #[test]
+    fn pod_summary_lists_but_does_not_tally_evicted_failed_pods() {
+        // Node-pressure eviction leaves a Failed pod with reason Evicted:
+        // https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/
+        let json = r#"[
+            {"metadata":{"name":"api0"},"status":{"phase":"Running","containerStatuses":[{"ready":true,"restartCount":0}]}},
+            {"metadata":{"name":"langfuse-evicted"},"status":{"phase":"Failed","reason":"Evicted","containerStatuses":[{"ready":false,"restartCount":0}]}},
+            {"metadata":{"name":"langfuse-evicted-deleting","deletionTimestamp":"2026-10-12T14:56:00Z"},"status":{"phase":"Failed","reason":"Evicted","containerStatuses":[{"ready":false,"restartCount":0}]}}
+        ]"#;
+
+        let items: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
+        let (rows, ready, total, unhealthy) = collect_pod_summary(&items);
+        assert_eq!((ready, total, unhealthy), (1, 1, vec![]));
+        let listed: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|row| (row.name.as_str(), row.status.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("api0", "Running"),
+                ("langfuse-evicted", "Evicted"),
+                ("langfuse-evicted-deleting", "Terminating"),
+            ]
+        );
     }
 
     #[test]

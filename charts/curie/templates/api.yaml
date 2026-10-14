@@ -4,6 +4,35 @@
 {{- $connectorProxyPullSecrets = append $connectorProxyPullSecrets .name }}
 {{- end }}
 {{- if .Values.api.deploy }}
+{{- $checksumExtraEnv := include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (merge (dict "FORWARDED_ALLOW_IPS" "socket peer identity" "S3_REGION" "rustfs.region") (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson))) -}}
+{{- $checksumRefs := list
+  (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.langfuse)) "key" "langfuseInitProjectSecretKey")
+  (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.api.githubTokenExistingSecret "existingSecretKey" $.Values.api.githubTokenExistingSecretKey "defaultKey" "githubToken") | fromYaml)
+  (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.api.githubAppPrivateKeyExistingSecret "existingSecretKey" $.Values.api.githubAppPrivateKeyExistingSecretKey "defaultKey" "githubAppPrivateKey") | fromYaml)
+  (include "curie.secretRef" (dict "root" $ "existingSecret" (get ($.Values.connectorCaller | default dict) "existingSecret") "existingSecretKey" ((get ($.Values.connectorCaller | default dict) "verifyKeyKey") | default "verifyKey") "defaultKey" "connectorCallerVerifyKey") | fromYaml)
+-}}
+{{- if include "curie.rustfs.staticCredentials" $ -}}
+{{- $checksumRefs = append $checksumRefs (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.rustfs)) "key" "rustfsSecretKey") -}}
+{{- end -}}
+{{- $githubAppId := .Values.api.githubAppId }}
+{{- $githubAppIdDigits := "" }}
+{{- $githubAppIdError := "api.githubAppId must be an empty string or a positive integer of 1 to 18 decimal digits (1..999999999999999999)" }}
+{{- if kindIs "string" $githubAppId }}
+  {{- if and (ne $githubAppId "") (not (regexMatch "^[1-9][0-9]{0,17}$" $githubAppId)) }}
+    {{- fail $githubAppIdError }}
+  {{- end }}
+  {{- $githubAppIdDigits = $githubAppId }}
+{{- else if has (kindOf $githubAppId) (list "int" "int8" "int16" "int32" "int64" "uint" "uint8" "uint16" "uint32" "uint64" "float32" "float64") }}
+  {{- $githubAppIdInteger := int64 $githubAppId }}
+  {{- $githubAppIdDigits = printf "%d" $githubAppIdInteger }}
+  {{- /* Check converted digits to reject float64 values rounded up to 1e18.
+         A float64 upper-bound comparison would round the limit up as well. */}}
+  {{- if or (ne (float64 $githubAppId) (float64 $githubAppIdInteger)) (not (regexMatch "^[1-9][0-9]{0,17}$" $githubAppIdDigits)) }}
+    {{- fail $githubAppIdError }}
+  {{- end }}
+{{- else }}
+  {{- fail $githubAppIdError }}
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -50,6 +79,13 @@ spec:
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 8 }}
       annotations:
+        {{- with (include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list "apiKey" "approvalChatAttesterSecret" "internalWorkerToken" "installationId" "githubWebhookSecret")
+        "refs" $checksumRefs
+        "env" (printf "%s\n%s\n%s\n%s\n%s" (include "curie.env.postgres" $) (include "curie.env.valkey" $) (include "curie.env.slack" (dict "root" $ "workload" "api")) (include "curie.env.otel" (dict "root" $ "extraEnv" $.Values.api.extraEnv)) $checksumExtraEnv))) }}
+        checksum/secret: {{ . }}
+        {{- end }}
         {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}
@@ -334,7 +370,7 @@ spec:
             # cloning, instead of using GITHUB_TOKEN above. Both empty is fine:
             # public repositories clone with no credential.
             - name: GITHUB_APP_ID
-              value: {{ if .Values.api.githubAppId }}{{ .Values.api.githubAppId | int64 | quote }}{{ else }}""{{ end }}
+              value: {{ $githubAppIdDigits | quote }}
             - name: GITHUB_APP_PRIVATE_KEY
               valueFrom:
                 secretKeyRef:
@@ -440,7 +476,7 @@ spec:
             # Per-thread conversation transcript cap in bytes (#3301).
             - name: TRANSCRIPT_MAX_THREAD_BYTES
               value: {{ .Values.api.transcriptMaxThreadBytes | int64 | quote }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (merge (dict "FORWARDED_ALLOW_IPS" "socket peer identity" "S3_REGION" "rustfs.region") (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson))) | nindent 12 }}
+            {{- $checksumExtraEnv | nindent 12 }}
           ports:
             - name: http
               containerPort: 8000

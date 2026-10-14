@@ -301,6 +301,34 @@ exec "$UPGRADE_DRIVER_ROOT/recorder/helm" "$@"
         self.run(scenario, "0.9.0", "charts/curie")
     }
 
+    fn local_human(&self, scenario: &str) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_curie"))
+            .args([
+                "--color=never",
+                "cluster",
+                "upgrade",
+                "--to",
+                "0.9.0",
+                "--namespace",
+                "ns",
+                "--release",
+                "rel",
+                "--chart",
+                "charts/curie",
+                "--yes",
+            ])
+            .current_dir(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap(),
+            )
+            .env("PATH", format!("{}:/usr/bin:/bin", self.0.path().display()))
+            .env("UPGRADE_DRIVER_ROOT", self.0.path())
+            .env("UPGRADE_DRIVER_SCENARIO", scenario)
+            .output()
+            .unwrap()
+    }
+
     fn local_env(&self, scenario: &str, extra_env: &[(&str, &str)]) -> Output {
         self.run_with_env(scenario, "0.9.0", "charts/curie", &[], extra_env)
     }
@@ -2187,6 +2215,43 @@ fn take_over_pending_install_and_rollback_refuse_without_recovery() {
             message.contains(scenario),
             "pending status missing: {message}"
         );
+        // Pin the whole sentence so swapped format arguments cannot hide
+        // behind the substring checks below.
+        let interrupted = if scenario == "pending-rollback" {
+            "it is an interrupted rollback to revision 3; run curie cluster rollback --yes to finish it, or "
+        } else {
+            ""
+        };
+        let sentence = format!(
+            "release rel newest revision 5 is {scenario}; serving revision 4 is version 0.8.6; {interrupted}run `helm rollback rel 4 -n ns --wait --timeout 15m`, then rerun cluster upgrade"
+        );
+        assert!(
+            message.contains(&sentence),
+            "refusal sentence changed: want {sentence:?} in {message}"
+        );
+        // #4497: a pending-rollback row records the operator's target as
+        // `Rollback to <N>`, so the refusal names it and the curie command that
+        // finishes it, and keeps the raw serving-revision helm command that
+        // still works under CLI version skew.
+        if scenario == "pending-rollback" {
+            assert!(
+                message.contains("interrupted rollback to revision 3"),
+                "the interrupted target must be named: {message}"
+            );
+            assert!(
+                message.contains("curie cluster rollback --yes"),
+                "the finishing command must be named: {message}"
+            );
+            assert!(
+                message.contains("helm rollback rel 4"),
+                "the serving-revision helm command must stay: {message}"
+            );
+        } else {
+            assert!(
+                !message.contains("interrupted rollback"),
+                "{scenario} is not a rollback: {message}"
+            );
+        }
         assert!(!fixture.issued(&["helm", "rollback"]));
         assert!(fixture.helm_upgrades().is_empty());
         assert_ownership_released(&fixture);
@@ -3042,6 +3107,58 @@ fn observed_version_divergence_fails_apply() {
             "Commit must not run once Apply's post-condition read failed: {record}"
         );
     }
+}
+
+// #4495: every failed phase must preserve its report while the process exits 1.
+// Converge and Canary fail on observations; Commit uses the existing phase hook.
+#[test]
+fn failed_upgrade_exits_nonzero_in_every_phase() {
+    for (scenario, phase, hook, exact) in [
+        ("stale-images", "converge", None, false),
+        ("canary-version-drift", "canary", None, true),
+        ("healthy", "commit", Some("commit"), true),
+    ] {
+        let fixture = Fixture::new(None);
+        let extra_env: Vec<_> = hook
+            .into_iter()
+            .map(|phase| ("CURIE_UPGRADE_TEST_FAIL_AT", phase))
+            .collect();
+        let output = fixture.local_env(scenario, &extra_env);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "a failed {phase} must exit 1: {}",
+            visible(&output)
+        );
+        let report = json(&output);
+        assert_eq!(report["status"], "failed", "{report}");
+        assert_eq!(report["phase"], phase, "{report}");
+        assert!(report["convergence"].is_object(), "{report}");
+        assert_eq!(report["convergence"]["exact"], exact, "{report}");
+        assert!(report["fail_forward"].is_object(), "{report}");
+        assert!(
+            report["fail_forward"]["command"]
+                .as_str()
+                .is_some_and(|command| command.starts_with("curie cluster ")),
+            "{report}"
+        );
+        assert!(
+            report["fail_forward"]["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "{report}"
+        );
+        observed_for_real(&fixture);
+        assert_eq!(fixture.helm_upgrades().len(), 1, "{phase}");
+    }
+
+    let fixture = Fixture::new(None);
+    let output = fixture.local("healthy");
+    assert_eq!(output.status.code(), Some(0), "{}", visible(&output));
+    let report = json(&output);
+    assert_eq!(report["status"], "succeeded", "{report}");
+    assert_eq!(report["convergence"]["exact"], true, "{report}");
+    assert_eq!(report["canary"]["passed"], true, "{report}");
 }
 
 // T3 -- #2301 "a target-version canary". Apply's own post-condition read is
@@ -5036,9 +5153,10 @@ fn canary_fails_when_a_rebound_template_drops_its_layer() {
 fn helm_upgrade_failure_is_a_terminal_checkpoint_and_releases_ownership() {
     let fixture = Fixture::new(None);
     let output = fixture.local("helm-upgrade-fails");
-    assert!(
-        !output.status.success(),
-        "a failed apply must not report process success: {}",
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a failed apply must exit 1: {}",
         visible(&output)
     );
     let body = json(&output);
@@ -5072,6 +5190,172 @@ fn helm_upgrade_failure_is_a_terminal_checkpoint_and_releases_ownership() {
     assert!(
         annotations.get(ACTION_ANNOTATION).is_none(),
         "ownership action must be released: {annotations}"
+    );
+}
+
+fn deployment_images_observed_around_apply(fixture: &Fixture) {
+    let argv = fixture.argv();
+    let apply = argv
+        .iter()
+        .position(|call| {
+            call.first().map(String::as_str) == Some("helm")
+                && call.get(1).map(String::as_str) == Some("upgrade")
+        })
+        .expect("Helm apply must have been attempted");
+    for component in ["api", "worker", "ui"] {
+        let name = format!("rel-curie-{component}");
+        let reads: Vec<_> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| {
+                call.iter().map(String::as_str).eq([
+                    "kubectl",
+                    "get",
+                    "deployment",
+                    name.as_str(),
+                    "-n",
+                    "ns",
+                    "-o",
+                    "json",
+                ])
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            reads.iter().any(|index| *index < apply) && reads.iter().any(|index| *index > apply),
+            "{name} must be observed before and after Helm apply: {argv:?}"
+        );
+    }
+}
+
+/// #4462: failed post-upgrade hooks can leave Helm's prior deployed revision
+/// in history while only the api Deployment has moved to the target image.
+#[test]
+fn upgrade_failed_after_apply_reports_previous_not_serving() {
+    let scenario = "apply-post-hook-fails-images-changed";
+    let fixture = Fixture::new(None);
+    let output = fixture.local(scenario);
+    assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], false, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    let reason = body["fail_forward"]["reason"].as_str().unwrap();
+    assert!(reason.contains("target manifests are applied"), "{reason}");
+    assert!(reason.contains("upgrade failed after apply"), "{reason}");
+    assert!(
+        reason.contains("Error: post-upgrade hooks failed: job rel-curie-extra-hook failed"),
+        "the first Helm error line must survive: {reason}"
+    );
+    assert!(
+        !reason.contains("hook failure detail"),
+        "the fail-forward reason must quote only the first error line: {reason}"
+    );
+    let command = body["fail_forward"]["command"].as_str().unwrap();
+    assert!(command.contains("cluster upgrade"), "{command}");
+    assert!(!command.contains("rollback"), "{command}");
+    deployment_images_observed_around_apply(&fixture);
+
+    let human = Fixture::new(None).local_human(scenario);
+    assert_eq!(human.status.code(), Some(1), "{}", visible(&human));
+    assert!(
+        visible(&human).contains("previous version is not serving"),
+        "{}",
+        visible(&human)
+    );
+}
+
+/// #4462: a pre-upgrade hook refusal leaves every Deployment image unchanged.
+#[test]
+fn upgrade_failed_before_apply_keeps_previous_serving() {
+    let scenario = "apply-pre-hook-fails-images-unchanged";
+    let fixture = Fixture::new(None);
+    let output = fixture.local(scenario);
+    assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], true, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    let reason = body["fail_forward"]["reason"].as_str().unwrap();
+    assert!(reason.contains("pre-upgrade hooks failed"), "{reason}");
+    assert!(!reason.contains("target manifests are applied"), "{reason}");
+    assert!(!reason.contains("upgrade failed after apply"), "{reason}");
+    assert!(
+        body["fail_forward"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("cluster rollback"),
+        "{body}"
+    );
+    deployment_images_observed_around_apply(&fixture);
+
+    let human = Fixture::new(None).local_human(scenario);
+    assert_eq!(human.status.code(), Some(1), "{}", visible(&human));
+    assert!(
+        !visible(&human).contains("previous version is not serving"),
+        "{}",
+        visible(&human)
+    );
+}
+
+/// #4462: unchanged readable images cannot prove serving when the ui
+/// Deployment becomes unreadable after the failed apply.
+#[test]
+fn upgrade_failed_with_unreadable_deployment_reports_previous_not_serving() {
+    let scenario = "apply-post-hook-fails-deployment-unreadable";
+    let fixture = Fixture::new(None);
+    let output = fixture.local(scenario);
+    assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], false, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    let reason = body["fail_forward"]["reason"].as_str().unwrap();
+    assert!(reason.contains("target manifests are applied"), "{reason}");
+    assert!(reason.contains("upgrade failed after apply"), "{reason}");
+    assert!(reason.contains("post-upgrade hooks failed"), "{reason}");
+    deployment_images_observed_around_apply(&fixture);
+
+    let human = Fixture::new(None).local_human(scenario);
+    assert_eq!(human.status.code(), Some(1), "{}", visible(&human));
+    assert!(
+        visible(&human).contains("previous version is not serving"),
+        "{}",
+        visible(&human)
+    );
+}
+
+/// #4462 Decision 2 counts any unreadable Deployment after failure as changed,
+/// including NotFound for a ui Deployment that was also absent before apply.
+#[test]
+fn upgrade_failed_with_already_absent_deployment_reports_previous_not_serving() {
+    let scenario = "apply-pre-hook-fails-ui-absent";
+    let fixture = Fixture::new(None);
+    let output = fixture.local(scenario);
+    assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    assert_eq!(body["previous_serving"], false, "{body}");
+    assert_eq!(body["known_good_version"], "0.8.6", "{body}");
+    assert!(
+        body["fail_forward"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("pre-upgrade hooks failed"),
+        "{body}"
+    );
+    deployment_images_observed_around_apply(&fixture);
+
+    let human = Fixture::new(None).local_human(scenario);
+    assert_eq!(human.status.code(), Some(1), "{}", visible(&human));
+    assert!(
+        visible(&human).contains("previous version is not serving"),
+        "{}",
+        visible(&human)
     );
 }
 
@@ -5283,6 +5567,7 @@ fn fail_at_plan_on_owned_namespace_fails_before_helm() {
         &[],
         &[("CURIE_UPGRADE_TEST_FAIL_AT", "plan")],
     );
+    assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
     let payload = json(&output);
     assert_eq!(
         payload["status"],

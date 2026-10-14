@@ -324,6 +324,61 @@ fn legitimate_live_scaling_keeps_target_identity_and_rejects_surplus() {
     }
 }
 
+// #4496: a kubelet-initiated termination (node-pressure eviction, graceful node
+// shutdown) leaves a Succeeded or Failed pod its ReplicaSet never deletes, while
+// the Deployment status counts active pods only.
+// https://kubernetes.io/docs/concepts/workloads/pods/disruptions/#pod-disruption-conditions
+// https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/
+#[test]
+fn terminal_pods_left_by_evictions_do_not_count_as_replicas() {
+    for verb in ["up", "status"] {
+        for scenario in [
+            "evicted-succeeded",
+            "evicted-failed",
+            "evicted-old-image-gone-node",
+        ] {
+            let output = Fixture::new().run(verb, scenario);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{verb} {scenario}: {stdout} / {stderr}"
+            );
+            let json = Fixture::json(&output);
+            if verb == "status" {
+                assert_eq!(json["healthy"], true, "{verb} {scenario}: {json}");
+            }
+            assert!(!stdout.contains("PRIVATE_MESSAGE_SENTINEL"), "{stdout}");
+            assert!(!stderr.contains("PRIVATE_MESSAGE_SENTINEL"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn terminating_terminal_pod_and_active_surplus_still_fail_converge() {
+    for verb in ["up", "status"] {
+        for scenario in ["evicted-terminating", "surplus"] {
+            let output = Fixture::new().run(verb, scenario);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{verb} {scenario}: {} / {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let json = Fixture::json(&output);
+            if verb == "status" {
+                assert_eq!(json["healthy"], false, "{verb} {scenario}: {json}");
+            }
+            assert!(
+                json.to_string()
+                    .contains("selected pods=2 desired=1; surplus or missing target replicas"),
+                "{verb} {scenario}: {json}"
+            );
+        }
+    }
+}
+
 #[test]
 fn healthy_admission_sidecar_preserves_named_target_image_verification() {
     let output = Fixture::new().run("status", "healthy-sidecar");

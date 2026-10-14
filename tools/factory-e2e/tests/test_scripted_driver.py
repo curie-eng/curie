@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from subprocess import run as subprocess_run
 from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -125,6 +126,98 @@ def _evidence(tmp_path: Path) -> dict[str, Any]:
     return json.loads(files[0].read_text())
 
 
+def test_scripted_driver_records_the_curie_bin_it_used(
+    candidate_curie: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+
+    def execute(run: sk.ScriptedRun) -> None:
+        assert run.curie == str(candidate_curie)
+        monkeypatch.setenv("CURIE_BIN", str(tmp_path / "changed-selection"))
+        run.env["PATH"] = ""
+        assert run.command(run.curie, "build").strip() == str(candidate_curie)
+
+    monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
+
+    assert sk.main(_replay_args(tmp_path)) == 0
+    evidence = _evidence(tmp_path)
+    assert evidence["curie_bin"] == str(candidate_curie)
+    assert evidence["curie_version"] == "curie 0.0.0-test"
+    assert evidence["cleanup_verified"] is True
+    assert (
+        f"factory-e2e: curie binary {candidate_curie} (curie 0.0.0-test)"
+        in capsys.readouterr().err
+    )
+
+
+@pytest.mark.parametrize("selection", ["relative", "path-name", "default"])
+def test_scripted_driver_resolves_relative_and_path_binaries(
+    selection: str,
+    candidate_curie: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(candidate_curie.parent))
+    if selection == "default":
+        monkeypatch.delenv("CURIE_BIN")
+    else:
+        monkeypatch.setenv("CURIE_BIN", "./bin/curie" if selection == "relative" else "curie")
+
+    def execute(run: sk.ScriptedRun) -> None:
+        assert run.command(run.curie, "build").strip() == str(candidate_curie)
+
+    monkeypatch.setattr(sk.ScriptedRun, "execute", execute)
+
+    assert sk.main(_replay_args(tmp_path)) == 0
+    evidence = _evidence(tmp_path)
+    assert evidence["curie_bin"] == str(candidate_curie)
+    assert evidence["curie_version"] == "curie 0.0.0-test"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing",
+        "not-executable",
+        "version-failed",
+        "empty-version",
+        "symlink-loop",
+        "invalid-version",
+    ],
+)
+def test_scripted_driver_refuses_invalid_curie_before_external_actions(
+    failure: str,
+    candidate_curie: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    if failure == "missing":
+        monkeypatch.setenv("CURIE_BIN", str(tmp_path / "missing-curie"))
+    elif failure == "not-executable":
+        candidate_curie.chmod(0o644)
+    elif failure == "version-failed":
+        candidate_curie.write_text("#!/bin/sh\nexit 9\n")
+    elif failure == "empty-version":
+        candidate_curie.write_text("#!/bin/sh\nexit 0\n")
+    elif failure == "symlink-loop":
+        candidate_curie.unlink()
+        candidate_curie.symlink_to(candidate_curie.name)
+    else:
+        candidate_curie.write_text("#!/bin/sh\nprintf '\\377\\n'\n")
+    monkeypatch.setattr(sk.ScriptedRun, "execute", _refuse_external_command)
+    monkeypatch.setattr(fe, "http_json", _refuse_external_command)
+
+    assert sk.main(_replay_args(tmp_path)) == fe.EXIT_CONFIG
+    assert "CURIE_BIN" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("failure_stage", ["registry", "cluster"])
 def test_partial_resource_creation_failure_deletes_every_attempted_owned_resource(
     failure_stage: str,
@@ -138,6 +231,8 @@ def test_partial_resource_creation_failure_deletes_every_attempted_owned_resourc
     calls: list[tuple[str, ...]] = []
 
     def command(argv: tuple[str, ...], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if len(argv) == 2 and argv[1] == "--version":
+            return subprocess_run(argv, capture_output=True, text=True, check=False)
         calls.append(argv)
         output = ""
         if argv[:2] == ("docker", "run"):
@@ -190,6 +285,8 @@ def test_remaining_owned_cluster_overrides_a_successful_scenario(
 
     def command(argv: tuple[str, ...], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         nonlocal cluster
+        if len(argv) == 2 and argv[1] == "--version":
+            return subprocess_run(argv, capture_output=True, text=True, check=False)
         calls.append(argv)
         output = ""
         if argv[:3] == ("kind", "delete", "cluster"):
@@ -224,6 +321,8 @@ def test_cluster_delete_error_does_not_prevent_registry_deletion(
     calls: list[tuple[str, ...]] = []
 
     def command(argv: tuple[str, ...], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if len(argv) == 2 and argv[1] == "--version":
+            return subprocess_run(argv, capture_output=True, text=True, check=False)
         calls.append(argv)
         if argv[:3] == ("kind", "delete", "cluster"):
             return subprocess.CompletedProcess(argv, 1, "", "owned cluster deletion failed")
@@ -427,6 +526,8 @@ def test_registry_publishes_the_explicit_port_its_mirror_names(
     mirrors: list[str] = []
 
     def command(argv: tuple[str, ...], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if len(argv) == 2 and argv[1] == "--version":
+            return subprocess_run(argv, capture_output=True, text=True, check=False)
         if argv[:2] == ("docker", "run"):
             published.append(argv[argv.index("-p") + 1])
         elif argv[:3] == ("kind", "create", "cluster"):
@@ -997,6 +1098,70 @@ def test_driver_pins_the_default_docker_context_and_keeps_an_inherited_docker_ho
     assert run.env["DOCKER_HOST"] == "unix:///run/example/docker.sock"
 
 
+@pytest.mark.parametrize("docker_host", [None, "", "unix:///var/run/docker.sock"])
+def test_local_engine_keeps_the_kind_gateway_for_in_process_servers(
+    docker_host: str | None,
+) -> None:
+    """A local engine's pods reach this process through the kind gateway."""
+
+    assert (
+        sk.in_process_callback_host(
+            docker_host=docker_host,
+            stub_host="192.0.2.10",
+            gateway="172.18.0.1",
+        )
+        == "172.18.0.1"
+    )
+
+
+def test_remote_engine_binds_in_process_servers_to_the_stub_host() -> None:
+    """Pods on a remote engine cannot use that host's kind gateway."""
+
+    assert (
+        sk.in_process_callback_host(
+            docker_host="ssh://builder@engine.example",
+            stub_host="192.0.2.10",
+            gateway="172.18.0.1",
+        )
+        == "192.0.2.10"
+    )
+
+
+def test_remote_engine_without_a_stub_host_is_refused() -> None:
+    with pytest.raises(sk.ScriptedScenarioError, match="CURIE_LOCAL_STUB_HOST"):
+        sk.in_process_callback_host(
+            docker_host="tcp://10.0.0.8:2375",
+            stub_host=None,
+            gateway="172.18.0.1",
+        )
+
+
+def test_registry_publish_retries_when_the_engine_already_holds_the_port(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The client probe cannot see a port held on a remote engine."""
+
+    run = sk.ScriptedRun(_replay_args(tmp_path))
+    monkeypatch.setattr(sk, "registry_port_candidates", lambda: [24111, 24112])
+    monkeypatch.setattr(sk, "client_loopback_port_is_free", lambda _port: True)
+    published: list[str] = []
+
+    def command(*argv: str, timeout: float = 900) -> str:
+        del timeout
+        mapping = argv[argv.index("-p") + 1]
+        if mapping.startswith("127.0.0.1:24111:"):
+            raise sk.ScriptedScenarioError("docker run failed: port is already allocated")
+        published.append(mapping)
+        return "registry-id"
+
+    monkeypatch.setattr(run, "command", command)
+    port, ref = run.start_registry()
+    assert port == 24112
+    assert ref == "localhost:24112"
+    assert published == ["127.0.0.1:24112:5000"]
+
+
 @pytest.mark.parametrize("remaining", [None, -1, "nan", "inf"])
 def test_provider_balance_requires_an_observed_finite_remaining_limit(
     tmp_path: Path,
@@ -1146,6 +1311,8 @@ def _image_check_commands(
     mutating: list[tuple[str, ...]] = []
 
     def command(argv: tuple[str, ...], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if len(argv) == 2 and argv[1] == "--version":
+            return subprocess_run(argv, capture_output=True, text=True, check=False)
         calls.append(argv)
         if argv[:2] in _READ_ONLY_PREREQUISITES:
             output = "kind v0.24.0 go1.22 linux/amd64" if argv[0] == "kind" else ""

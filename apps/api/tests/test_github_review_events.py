@@ -876,6 +876,7 @@ def _review_stack(
     agent_channel: str = "C0EXAMPLE1",
     cluster_message: bool = False,
     env: dict[str, str] | None = None,
+    reply_identity: str | None = None,
 ) -> Iterator[tuple[TestClient, GitHubTruth, object, str]]:
     """Real migrated Postgres/Valkey/API, with only GitHub HTTP replaced.
 
@@ -910,6 +911,31 @@ def _review_stack(
         if cluster_message
         else {"reply_placeholder": "1700000000.000002"}
     )
+    if reply_identity is not None:
+        reply_route.update(
+            reply_identity=reply_identity,
+            conversation_id=scoped_conversation_id(
+                "slack", reply_channel, "1700000000.000001", identity=reply_identity
+            ),
+            reply_conversation_id="1700000000.000001",
+        )
+        monkeypatch.setenv(
+            "CURIE_SLACK_IDENTITIES",
+            json.dumps([
+                {
+                    "name": "default",
+                    "app_token_env": "SLACK_APP_TOKEN",
+                    "bot_token_env": "SLACK_BOT_TOKEN",
+                    "signing_secret_env": "SLACK_SIGNING_SECRET",
+                },
+                {
+                    "name": reply_identity,
+                    "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+                    "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0",
+                    "signing_secret_env": None,
+                },
+            ]),
+        )
     stream = f"test:curie:github-review:{uuid.uuid4().hex}"
     held_index = f"{stream}:held"
     monkeypatch.setattr("curie_api.github_review_store._HELD_INDEX", held_index)
@@ -975,7 +1001,11 @@ def _review_stack(
             json={
                 "name": f"acme-review-{uuid.uuid4().hex[:8]}",
                 "repo_full_name": REPO,
-                "channel": {"kind": "slack", "address": agent_channel},
+                "channel": {
+                    "kind": "slack",
+                    "address": agent_channel,
+                    **({"adapter": reply_identity} if reply_identity is not None else {}),
+                },
             },
         )
         assert agent.status_code == 201, agent.text
@@ -1001,7 +1031,7 @@ def _review_stack(
             headers={"X-Curie-Worker-Token": "fixture-review-worker-token"},
             json={
                 "conversation_id": scoped_conversation_id(
-                    "slack", reply_channel, "1700000000.000001"
+                    "slack", reply_channel, "1700000000.000001", identity=reply_identity
                 ),
                 "author": "U0REQUEST1",
                 "repo_full_name": REPO,
@@ -1233,6 +1263,83 @@ def test_cluster_message_lineage_binds_its_channel_and_admits_real_review(
     assert handle.placeholder is not None
     assert uuid.UUID(handle.placeholder).version == 4
     assert str(uuid.UUID(handle.placeholder)) == handle.placeholder
+
+
+def test_named_cluster_message_lineage_binds_its_identity_and_refuses_a_default_agent(
+    clean_db: None,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    review_app_key: str,
+) -> None:
+    """Named relay authority cannot be consumed by a sibling default deployment."""
+    with _review_stack(
+        request,
+        monkeypatch,
+        review_app_key,
+        publish=True,
+        agent_channel="C0LOCALDEV",
+        cluster_message=True,
+        reply_identity="acme-named",
+    ) as (client, truth, valkey, stream):
+        assert review_rows(
+            "SELECT c.adapter, l.conversation_id, p.reply_identity AS publication_identity, "
+            "a.reply_identity AS approval_identity, l.binding_generation = c.generation AS current "
+            "FROM curie.thread_publication_lineages l "
+            "JOIN curie.agent_channels c ON c.id = l.binding_id "
+            "JOIN curie.publications p ON p.lineage_id = l.id "
+            "JOIN curie.approvals a ON a.id = p.approval_id"
+        ) == [{
+            "adapter": "acme-named",
+            "conversation_id": "slack:acme-named:C0LOCALDEV:1700000000.000001",
+            "publication_identity": "acme-named",
+            "approval_identity": "acme-named",
+            "current": True,
+        }]
+        response = post_review(client, truth)
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "feedback_queued"
+        entries = valkey.xrange(stream)
+        assert len(entries) == 1
+        turn = parse_queued_turn(entries[0][1]["payload"])
+        assert turn.reply_handle.adapter == "curie-cluster-message"
+
+        auth = {"X-API-Key": get_settings().api_key}
+        agent = client.post(
+            "/agents",
+            json={
+                "name": f"acme-default-{uuid.uuid4().hex[:8]}",
+                "channel": {"kind": "slack", "address": "C0LOCALDEV"},
+            },
+            headers=auth,
+        )
+        assert agent.status_code == 201, agent.text
+        version = client.post(
+            f"/agents/{agent.json()['id']}/versions",
+            json={"version_label": "fixture", "created_by": "operator"},
+            headers=auth,
+        )
+        assert version.status_code == 201, version.text
+        deployment = client.post(
+            "/deployments",
+            json={
+                "agent_id": agent.json()["id"],
+                "version_id": version.json()["id"],
+                "environment": "dev",
+            },
+            headers=auth,
+        )
+        assert deployment.status_code == 201, deployment.text
+        refused = client.post(
+            f"/v1/internal/github/reviews/{truth.feedback.event_id}/verify",
+            json={
+                "turn": turn.model_dump(mode="json"),
+                "deployment_id": deployment.json()["id"],
+            },
+            headers={"X-Curie-Worker-Token": "fixture-review-worker-token"},
+        )
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"]["code"] == "deployment_no_longer_authorized"
+        assert review_rows("SELECT id FROM curie.publication_review_reservations") == []
 
 
 def test_unbound_cluster_message_lineage_is_still_refused(

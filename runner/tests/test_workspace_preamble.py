@@ -267,7 +267,10 @@ def test_unavailable_check_result_is_scoped_to_that_check() -> None:
         line for line in preamble.splitlines() if line.startswith("- Check python:")
     )
     assert "delegat" in instruction.casefold()
-    assert "CI is pending proof" in instruction
+    assert (
+        "had not reported when this pull request was opened; "
+        "the issue status comment reports its result."
+    ) in instruction
     assert "do not publish and the work item cannot succeed" not in preamble
     assert "If no matching required check exists" not in preamble
     fenced = re.search(r"```json\n(.*?)\n```", preamble, flags=re.DOTALL)
