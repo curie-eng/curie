@@ -2156,3 +2156,23 @@ def test_a_proxied_connector_is_ready_only_when_its_proxy_accepts() -> None:
         assert "livenessProbe" not in proxy
         assert "startupProbe" not in proxy
         assert containers["server"]["readinessProbe"]["tcpSocket"] == {"port": "http"}
+
+
+# @spec ADR-0229 d2
+def test_a_declared_upstream_host_reaches_the_proxy_env_only() -> None:
+    spec = HOSTED.model_copy(update={"proxy_upstream_host": "localhost"})
+    objs = _proxied(spec=spec)
+    assert _proxy_env(objs)["CURIE_CALLER_PROXY_UPSTREAM_HOST"] == "localhost"
+    server = _containers(objs)["server"]
+    assert "CURIE_CALLER_PROXY_UPSTREAM_HOST" not in json.dumps(server)
+    # Everything else is rendered exactly as without the field: the Services,
+    # the direct Service and both policies do not move.
+    baseline = _proxied()
+    for key in ("Service", "Service/direct", "NetworkPolicy/Egress", "NetworkPolicy/Ingress"):
+        assert objs[key] == baseline[key], key
+    assert server == _containers(baseline)["server"]
+
+
+# @spec ADR-0229 d1, d2
+def test_without_a_declared_upstream_host_the_proxy_env_does_not_name_one() -> None:
+    assert "CURIE_CALLER_PROXY_UPSTREAM_HOST" not in _proxy_env(_proxied())
