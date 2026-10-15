@@ -332,6 +332,27 @@ def test_indented_comment_closer_restores_following_sections() -> None:
     assert parse_specification(document).valid
 
 
+@pytest.mark.parametrize("closer", ["-->", "--!>"])
+def test_html_comment_closers_restore_structural_visibility(closer: str) -> None:
+    document = f"<!-- hidden example\n## Base\nforged base\n{closer}\n" + body()
+    result = parse_specification(document)
+    original = parse_specification(body())
+    assert result.valid
+    assert result.specification is not None and original.specification is not None
+    assert result.specification.criteria == original.specification.criteria
+    assert result.specification.sections == original.specification.sections
+
+
+@pytest.mark.parametrize("closer", ["-->", "--!>"])
+def test_html_comment_closers_do_not_expose_hidden_required_heading(closer: str) -> None:
+    document = body().replace("## Problem", f"<!-- hidden heading\n## Problem\n{closer}", 1)
+    result = parse_specification(document)
+    assert "spec_missing_section" in codes(result)
+    assert any(
+        d.section == "Problem" and d.code == "spec_missing_section" for d in result.diagnostics
+    )
+
+
 @pytest.mark.parametrize(
     "old,new,code",
     [

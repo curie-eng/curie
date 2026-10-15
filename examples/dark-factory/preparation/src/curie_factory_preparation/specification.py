@@ -97,10 +97,10 @@ def _visible_lines(markdown: str) -> list[tuple[str, str]]:
         if comment or (not raw.startswith(("    ", "\t")) and "<!--" in raw):
             # Walk every transition: one line may close and reopen a comment.
             # An active comment can close on an indented line (not literal code).
-            for transition in re.finditer(r"<!--|-->", raw):
+            for transition in re.finditer(r"<!--|--!?>", raw):
                 if transition[0] == "<!--" and not comment:
                     comment = True
-                elif transition[0] == "-->" and comment:
+                elif transition[0] in ("-->", "--!>") and comment:
                     comment = False
             # Never manufacture structural tokens by joining comment neighbors.
             lines.append((raw, ""))
