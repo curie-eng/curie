@@ -192,12 +192,13 @@ class BitbucketCloudCodeHost:
         self,
         client: httpx.AsyncClient,
         *,
+        entry: str,
         api_url: str,
         token: str,
         credentials: StaticTokenProvider,
         page_size: int = 100,
     ) -> None:
-        self._http = CloudTransport(client, api_url=api_url, token=token)
+        self._http = CloudTransport(client, entry=entry, api_url=api_url, token=token)
         self._credentials = credentials
         self._page_size = page_size
         # Abbreviated hash -> full hash, per repository; a commit never changes.

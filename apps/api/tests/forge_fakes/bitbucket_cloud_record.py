@@ -107,6 +107,7 @@ def adapter_for(client: httpx.AsyncClient, token: str, *, api_url: str = API_URL
 
     return BitbucketCloudCodeHost(
         client,
+        entry="bitbucket-cloud",
         api_url=api_url,
         token=token,
         credentials=StaticTokenProvider(
