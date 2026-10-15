@@ -125,6 +125,7 @@ def validate_bundle(
     *,
     enforces_tool_policy: str | None = None,
     enforces_input_contracts: str | None = None,
+    input_contract_context: str = "tracked-implementation",
     profile: str = PROFILE_CLAUDE_PLUGIN,
 ) -> ValidationResult:
     """Validate the plugin bundle at ``path`` and return a ValidationResult.
@@ -132,7 +133,10 @@ def validate_bundle(
     ``enforces_input_contracts`` similarly names admission AND start enforcement
     of opaque input identity. A declaration-bearing bundle is refused unless the
     caller passes ``curie/input-contracts@1``; this is never inferred from an ID
-    parser or a passing local authoring report.
+    parser or a passing local authoring report. ``input_contract_context`` is
+    explicit: standalone evaluation has no tracker implementation admission and
+    validates declaration syntax without claiming enforcement. The default is
+    tracked implementation and requires the handshake. Unknown contexts refuse.
 
     ``enforces_tool_policy`` is the CALLER's statement of which vanilla MCP
     tool-policy contract it enforces at runtime. It is the enforcement handshake,
@@ -178,6 +182,8 @@ def validate_bundle(
     passes a profile, so neither can trigger it.
     """
 
+    if input_contract_context not in {"tracked-implementation", "standalone"}:
+        raise ValueError("unknown input contract context")
     if profile not in PROFILES:
         raise ValueError(
             f"unknown validation profile {profile!r}: expected "
@@ -215,7 +221,10 @@ def validate_bundle(
                     "invalid inputContracts declaration",
                     "inputContracts",
                 )
-            if enforces_input_contracts != INPUT_CONTRACT_ENFORCEMENT:
+            if (
+                input_contract_context == "tracked-implementation"
+                and enforces_input_contracts != INPUT_CONTRACT_ENFORCEMENT
+            ):
                 c.error(
                     "input_contracts.unenforceable",
                     "inputContracts requires admission and start enforcement",

@@ -191,3 +191,16 @@ def test_correctly_hashed_but_incompatible_input_is_rejected(changes: dict[str, 
             deployment_id=DEPLOYMENT,
             bundle_sha256=BUNDLE,
         )
+
+
+def test_standalone_bundle_validation_does_not_claim_managed_input_enforcement(tmp_path: Path) -> None:
+    root = bundle(tmp_path, {"inputContracts": declaration()})
+    assert not validate_bundle(root).valid
+    local = validate_bundle(root, input_contract_context="standalone")
+    assert local.valid, local.errors
+
+
+def test_unknown_input_contract_context_is_not_silently_standalone(tmp_path: Path) -> None:
+    root = bundle(tmp_path, {"inputContracts": declaration()})
+    with pytest.raises(ValueError):
+        validate_bundle(root, input_contract_context="unknown-context")

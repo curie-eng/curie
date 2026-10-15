@@ -174,6 +174,7 @@ def _full_boot_env() -> BootEnv:
         bundle_ref="bundles/demo/abc123.tar.gz",
         bundle_version="abc123def456",
         runner_token="rt-full-token",
+        input_contract_enforcement="curie/input-contracts@1",
         model="claude-opus-4-6",
         reviewer_model="claude-opus-5-5",
         fake_model=True,
@@ -502,6 +503,7 @@ def test_render_worker_omits_unset_optionals_rather_than_emitting_empty_strings(
     for key in (
         "CURIE_BUNDLE_REF",
         "CURIE_BUNDLE_VERSION",
+        "CURIE_INPUT_CONTRACT_ENFORCEMENT",
         "CURIE_RUNNER_TOKEN",
         "CURIE_MODEL",
         "CURIE_REVIEWER_MODEL",
@@ -575,6 +577,7 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         connector_agent="acme-dev",
         connector_namespace="curie",
         connector_caller_token="cct.payload.signature",
+        input_contract_enforcement="curie/input-contracts@1",
         bundle_version="abc123def456",
         channel_memory_ref=_CHANNEL_MEMORY_REF,
         memory_writes=True,
@@ -845,6 +848,7 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         # platform-operational, declared on BootEnv itself
         "CURIE_BUNDLE_REF",
         "CURIE_BUNDLE_VERSION",
+        "CURIE_INPUT_CONTRACT_ENFORCEMENT",
         "CURIE_RUNNER_TOKEN",
         "CURIE_MODEL",
         "CURIE_REVIEWER_MODEL",
