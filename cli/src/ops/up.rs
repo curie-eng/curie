@@ -5416,6 +5416,19 @@ pub async fn up(
         *merged = values.0.clone();
         opts.file_values = Some(values);
     }
+    // #4622, ADR 0197: once the release's values were read, the merged
+    // snapshot is the whole document Helm renders, so dangling tracker
+    // references and duplicate tracker scopes refuse before any mutation. A
+    // dry run reads no release values, so its files alone are not that
+    // document; the chart render refuses those at apply.
+    if should_read_existing(opts.dev, opts.common.dry_run) {
+        if let Some(values) = &opts.file_values {
+            crate::factory_intake::check_factory_document(&values.0).map_err(|message| {
+                crate::exit::CliError::usage(message)
+                    .with_fix("fix factory.trackers or factory.bindings; nothing was applied")
+            })?;
+        }
+    }
     opts = complete_up_opts_without_runner_egress(
         opts,
         effective_existing.as_ref(),

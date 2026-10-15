@@ -24,6 +24,22 @@ conditional_pytest_files:
     - .github/workflows/ci.yaml
     - .github/e2e-selection.yaml
     - tools/e2e-ci-selection
+  tools/factory-e2e/tests/test_c4_tracker_scope.py:
+    - charts/curie
+    - cli/src
+    - cli/Cargo.toml
+    - cli/Cargo.lock
+    - apps/api/src/curie_api/forges
+    - apps/api/Dockerfile
+    - tests/vectors/forge-tracker-scopes.json
+    - tools/factory-e2e/tests/test_c4_tracker_scope.py
+    - tools/factory-e2e/tests/conftest.py
+    - uv.lock
+    - pyproject.toml
+    - conftest.py
+    - .github/workflows/ci.yaml
+    - .github/e2e-selection.yaml
+    - tools/e2e-ci-selection
 chart_scenarios:
   job: e2e-cluster-chart-regressions
   shared_inputs:

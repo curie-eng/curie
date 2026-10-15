@@ -2243,6 +2243,17 @@ fn helm_values_document(values: &serde_json::Value) -> Result<String> {
     serde_json::to_string_pretty(values).context("could not serialize the migrated overlay")
 }
 
+/// The Validate refusal for an overlay whose factory trackers and bindings
+/// the API would reject (#4622): a dangling tracker reference or two bindings
+/// on one tracker scope. `None` when the overlay passes.
+fn factory_refusal(overlay: &str) -> Option<String> {
+    let values: serde_json::Value = match serde_json::from_str(overlay) {
+        Ok(values) => values,
+        Err(error) => return Some(format!("retained values overlay is malformed: {error}")),
+    };
+    crate::factory_intake::check_factory_document(&values).err()
+}
+
 fn merge_forward_only(overlay: Option<&str>) -> Result<String> {
     let mut doc: serde_json::Value = match overlay {
         Some(text) if !text.trim().is_empty() => {
@@ -2790,6 +2801,12 @@ impl LiveHost {
             }
             Ok(None) => {}
             Err(error) => self.config_refusal = Some(format!("{error:#}")),
+        }
+        // #4622, ADR 0197: the retained values merged with every
+        // --values-file are the document Apply hands Helm, so its forge
+        // references are checked here, before any mutation.
+        if self.config_refusal.is_none() {
+            self.config_refusal = self.overlay.as_deref().and_then(factory_refusal);
         }
         if self.current.is_some() && self.config_refusal.is_none() {
             let caller_configured = self
@@ -5451,5 +5468,52 @@ mod runner_layer_guard_tests {
         let defaults = serde_json::json!({"nameOverride": "acme"});
         let overlay = serde_json::json!({});
         assert_eq!(effective_fullname(defaults, overlay), "rel-acme");
+    }
+}
+
+#[cfg(test)]
+mod factory_refusal_tests {
+    use super::factory_refusal;
+
+    fn overlay(bindings: serde_json::Value) -> String {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "config": {"schemaVersion": "0.9.0"},
+            "factory": {
+                "trackers": [
+                    {"name": "jira", "kind": "jira_cloud", "host": "example.atlassian.net"},
+                    {"name": "jira-site", "kind": "jira_cloud", "host": " Example.Atlassian.NET "},
+                ],
+                "bindings": bindings,
+            }
+        }))
+        .expect("overlay serializes")
+    }
+
+    #[test]
+    fn a_merged_overlay_with_two_bindings_on_one_scope_refuses_at_validate() {
+        let refusal = factory_refusal(&overlay(serde_json::json!([
+            {"name": "jira", "tracker": "jira", "trackerScopeId": "s"},
+            {"name": "example", "tracker": "jira-site", "trackerScopeId": "s"},
+        ])))
+        .expect("refused");
+        for needle in [
+            "jira and example",
+            "jira_cloud on example.atlassian.net",
+            "trackerScopeId s",
+        ] {
+            assert!(refusal.contains(needle), "{needle}: {refusal}");
+        }
+    }
+
+    #[test]
+    fn a_merged_overlay_with_one_binding_per_scope_passes() {
+        assert_eq!(
+            factory_refusal(&overlay(serde_json::json!([
+                {"name": "jira", "tracker": "jira", "trackerScopeId": "s"},
+                {"name": "example", "tracker": "jira-site", "trackerScopeId": "t"},
+            ]))),
+            None
+        );
+        assert_eq!(factory_refusal("{}"), None);
     }
 }

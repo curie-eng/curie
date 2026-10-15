@@ -506,7 +506,7 @@ def test_cli_only_diff_selects_cli_scope(
     output = _selection(tmp_path, *paths, omit_kind=omit_kind)
     assert output["pytest"] == "true"
     assert output["pytest_scope"] == "cli"
-    assert output["pytest_deselect"] == SELECTION_TESTS.SRE_RUNTIME
+    assert output["pytest_deselect"] == SELECTION_TESTS._expected_conditional_deselect(*paths)
     assert output["skill"] == "true"
     assert output["local"] == "true"
     assert output["local_release"] == "true"

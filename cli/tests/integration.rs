@@ -106,6 +106,7 @@ mod factory_quickstart_gitlab_fixture;
 mod factory_quickstart_jira;
 mod factory_quickstart_output;
 mod factory_toolchain;
+mod factory_tracker_scope;
 mod fake_tier_plumbing;
 mod forge_expiry;
 mod forge_fixture;
