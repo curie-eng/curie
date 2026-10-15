@@ -145,6 +145,10 @@ and `turn_canary_rotation`.
 - `TURN_CANARY_COVERAGE=1` reports agents with an active deployment that the
   monitor cannot observe through a turn candidate or a binding health URL
   (TURN-CANARY-13).
+- `TURN_CANARY_EXCLUDE_BINDING_KINDS` takes a comma-separated list of binding
+  kinds, for example `qualification`, that every observation ignores: such a
+  binding is never turned, checked, probed or compared, and an agent that has
+  only such bindings is not reported as uncovered (TURN-CANARY-15).
 - `TURN_CANARY_ROUTE_LABELS=split` replaces the JSON `route` label with
   `agent`, `kind`, `address` and `adapter` labels (TURN-CANARY-14).
 
