@@ -133,8 +133,10 @@ rerun behavior does not apply to it. Jira Cloud with GitHub uses GitHub CI.
 The default CI wait is 1200 seconds from the push, bounded by the remaining
 execution deadline. Unreadable checks, missing required evidence, and a wait
 that expires produce unverified or timed-out results. A merge conflict is
-reported for human resolution. On GitHub, zero checks complete only after the 120-second
-no-check grace, with no required check missing, and a mergeable or merged PR.
+reported for human resolution. Zero checks complete only after the 120-second
+no-check grace, with no required check missing, and a PR that the code host
+proves mergeable or merged; each code host supplies that proof its own way,
+Bitbucket Cloud through its pull request mergeability checks. An unknown mergeability answer never completes.
 That result carries a no-CI note; it is not evidence that tests passed.
 Required repository policies can impose stricter evidence. The detailed
 [factory operations reference](operations.md#admitting-a-labelled-github-issue)

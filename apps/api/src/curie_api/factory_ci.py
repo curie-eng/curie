@@ -155,7 +155,8 @@ class CiView:
     ``base_failing`` holds the keys of checks failing on the base branch head
     (#4105); it is empty when the base was not read, so every failure counts
     as caused by the change. ``conflicted`` and ``merged`` come from the
-    pull request read; both stay None when it was not read. ``reason`` is
+    pull request read; both stay None when it was not read, and ``conflicted``
+    also when the pull request's head is not ``head_sha``. ``reason`` is
     set, with nothing observed, when the code host could not answer; it is a
     fixed reason code and never carries a response body, header, URL or token.
     """
@@ -209,6 +210,9 @@ async def observe(
     current head read, so a failure the change did not cause is known (#4105).
     With ``pull_request``, that pull request is also read for whether it
     conflicts with its base (#4263); a failed read leaves that unknown.
+    Mergeability is kept only when the pull request's current head is
+    ``head_sha`` (#4624), since a proof for a moved head says nothing about
+    this one.
     """
 
     if not isinstance(head_sha, str) or not _SHA.fullmatch(head_sha):
@@ -234,7 +238,11 @@ async def observe(
     except ForgeError:
         # Mergeability stays unknown; the checks above still stand.
         return view
-    return replace(view, conflicted=pull.conflicted, merged=pull.state is PullRequestState.MERGED)
+    return replace(
+        view,
+        conflicted=pull.conflicted if pull.head_sha == head_sha else None,
+        merged=pull.state is PullRequestState.MERGED,
+    )
 
 
 def _stamp(moment: datetime | None) -> str | None:

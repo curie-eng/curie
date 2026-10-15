@@ -650,7 +650,9 @@ Each kind takes a static access token, never a username and password:
    it as a Bearer token, and git uses it as the password for the user
    `x-token-auth`. The entry's `host` is `bitbucket.org` and its `apiUrl` is
    `https://api.bitbucket.org/2.0`. A repository's `projectId` is its UUID,
-   braces included, and its `path` is `<workspace>/<repo slug>`.
+   braces included, and its `path` is `<workspace>/<repo slug>`. The
+   mergeability read uses the token's pull request read scope (covered by
+   `pullrequest:write`) and never merges.
 2. **Bitbucket Data Center** 9.4.0 or newer takes a project or repository HTTP
    access token with `REPO_WRITE`, sent as a Bearer token to the API and to
    git. An older server is refused. The entry's `host` is the server's
@@ -801,8 +803,11 @@ A cancelled run removes all four. Curie never changes your `curie-factory` label
 ## What a repository with no CI sees
 
 1. After publishing, Curie waits on the pull request's checks. With no checks
-   within 120 seconds of the push, no required check configured, and GitHub
-   reporting the PR mergeable or already merged, the run completes and the status comment says `Note: No CI checks appeared within 120 s.`
+   within 120 seconds of the push, no required check configured, and the code
+   host proving the PR mergeable or already merged, the run completes and the status comment says `Note: No CI checks appeared within 120 s.`
+   On GitHub that proof is its mergeable state, on Bitbucket Cloud it is the
+   `git_mergeability_check` of the pull request mergeability checks reporting
+   PASSED clean, and on Bitbucket Data Center it is the merge endpoint.
 2. Before the model starts, the runner runs checks declared in
    `.curie/verification.json`. With no declaration it records `not_declared`. <!-- doclint:ignore-line -->
    See [Repository toolchain in the managed sandbox](repository-toolchain-in-the-managed-sandbox.md).
