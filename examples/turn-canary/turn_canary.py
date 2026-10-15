@@ -879,6 +879,7 @@ class RuntimePlatform:
         quota_token: str | None = None,
         quota_resource: str = "count/pods",
         quota_min_free: int | str | Decimal = 1,
+        quota_token_file: str | None = None,
     ) -> None:
         if not re.fullmatch(r"[a-z_][a-z0-9_]*", schema):
             raise ValueError("invalid database schema")
@@ -897,7 +898,9 @@ class RuntimePlatform:
             if isinstance(quota_min_free, Decimal)
             else parse_quantity(quota_min_free)
         )
-        if quota_url and (not quota_token or min_free <= 0):
+        if quota_token and quota_token_file:
+            raise ValueError("quota check takes a static token or a token file, not both")
+        if quota_url and (not (quota_token or quota_token_file) or min_free <= 0):
             raise ValueError("quota check requires a token and positive minimum free capacity")
         import httpx
         import redis.asyncio as redis
@@ -918,6 +921,7 @@ class RuntimePlatform:
         self._qualified = read_only_qualified
         self._quota_url = quota_url
         self._quota_token = quota_token
+        self._quota_token_file = quota_token_file
         self._quota_resource = quota_resource
         self._quota_min_free = min_free
         self.cleanup_blocked = False
@@ -957,9 +961,12 @@ class RuntimePlatform:
         """Optional best-effort ResourceQuota observation. @spec TURN-CANARY-5"""
         if self._quota_url is None:
             return True
+        token = self._quota_bearer()
+        if token is None:
+            return None
         try:
             response = await self._quota_http.get(
-                self._quota_url, headers={"Authorization": "Bearer " + str(self._quota_token)}
+                self._quota_url, headers={"Authorization": "Bearer " + token}
             )
             if response.status_code != 200:
                 return None
@@ -976,6 +983,19 @@ class RuntimePlatform:
             return True
         except (KeyError, TypeError, ValueError, AttributeError):
             return None
+
+    def _quota_bearer(self) -> str | None:
+        """The static token, or the token file read afresh for this request.
+
+        @spec TURN-CANARY-5
+        """
+        if self._quota_token_file is None:
+            return self._quota_token
+        try:
+            token = Path(self._quota_token_file).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+        return token or None
 
     async def enqueue(self, turn: QueuedTurn) -> None:
         """Append exactly one complete queued wire payload. @spec TURN-CANARY-2"""
@@ -1284,6 +1304,7 @@ class Config:
     quota_resource: str
     quota_min_free: Decimal
     conversation_prefix: str = CONVERSATION_PREFIX
+    quota_token_file: str | None = None
 
 
 def _routes(raw: str, name: str) -> list[Route]:
@@ -1343,6 +1364,10 @@ def parse_config(environ: Mapping[str, str]) -> Config:
     raw_routes = environ.get("TURN_CANARY_ROUTES")
     if discover == bool(raw_routes):
         raise ValueError("set exactly one of TURN_CANARY_ROUTES or TURN_CANARY_DISCOVER=1")
+    if environ.get("TURN_CANARY_QUOTA_TOKEN") and environ.get("TURN_CANARY_QUOTA_TOKEN_FILE"):
+        raise ValueError(
+            "set at most one of TURN_CANARY_QUOTA_TOKEN or TURN_CANARY_QUOTA_TOKEN_FILE"
+        )
     state_path = environ.get("TURN_CANARY_STATE_PATH")
     if not state_path:
         raise ValueError("TURN_CANARY_STATE_PATH is required to retain cleanup hold across runs")
@@ -1378,7 +1403,8 @@ def parse_config(environ: Mapping[str, str]) -> Config:
         metric_prefix=_check_prefix(environ.get("TURN_CANARY_METRIC_PREFIX", "turn_canary")),
         metrics_path=environ.get("TURN_CANARY_METRICS_PATH") or None,
         quota_url=environ.get("TURN_CANARY_QUOTA_URL"),
-        quota_token=environ.get("TURN_CANARY_QUOTA_TOKEN"),
+        quota_token=environ.get("TURN_CANARY_QUOTA_TOKEN") or None,
+        quota_token_file=environ.get("TURN_CANARY_QUOTA_TOKEN_FILE") or None,
         quota_resource=environ.get("TURN_CANARY_QUOTA_RESOURCE", "count/pods"),
         quota_min_free=parse_quantity(environ.get("TURN_CANARY_QUOTA_MIN_FREE", "1")),
         conversation_prefix=_check_conversation_prefix(
@@ -1405,6 +1431,7 @@ async def main() -> int:
         read_only_qualified=config.read_only_qualified,
         quota_url=config.quota_url,
         quota_token=config.quota_token,
+        quota_token_file=config.quota_token_file,
         quota_resource=config.quota_resource,
         quota_min_free=config.quota_min_free,
     )
