@@ -51,7 +51,28 @@ def finalize_fixture(run: AdmittedKind) -> None:
     if errors:
         for error in errors:
             run.record_failure("owned fixture cleanup", RuntimeError(error))
-        raise RuntimeError("owned fixture cleanup failed; private diagnostics retained")
+        known_errors = {
+            "unrelated running containers disappeared during owned cleanup": (
+                "unrelated_container_disappearance"
+            ),
+            "a pre-existing shared candidate image tag changed": "preexisting_tag_change",
+            "a session-owned candidate image tag survived cleanup": (
+                "owned_candidate_tag_removal_failure"
+            ),
+        }
+        for command in ("docker ps", "docker images", "docker rm", "kind delete", "kind get"):
+            known_errors[
+                f"candidate infrastructure command {command} failed; "
+                "redacted details retained in the private fixture diagnostics database"
+            ] = "command_failure"
+        known_errors[
+            "candidate infrastructure command docker image failed; "
+            "redacted details retained in the private fixture diagnostics database"
+        ] = "image_tag_removal_command_failure"
+        categories = ", ".join(sorted({known_errors.get(error, "unknown") for error in errors}))
+        raise RuntimeError(
+            f"owned fixture cleanup failed ({categories}); private diagnostics retained"
+        )
     # A failed setup keeps its private diagnostic even when every resource was
     # successfully removed. The session fixture also preserves child records.
     for path in run.root.iterdir():
