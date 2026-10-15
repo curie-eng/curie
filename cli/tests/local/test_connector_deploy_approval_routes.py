@@ -434,6 +434,35 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
         _api(api_url, "GET", "/agents")
         yield LocalCase(tier, root, bundle, binary, api_url, env)
     finally:
+        try:
+            cli_down = _run(
+                [
+                    str(binary),
+                    "--json",
+                    "local",
+                    "down",
+                    "--project",
+                    project,
+                    "-f",
+                    str(base),
+                    "-f",
+                    str(override),
+                    "--wipe",
+                    "--yes",
+                ],
+                env=env,
+                timeout=300,
+            )
+            if cli_down.returncode:
+                teardown_errors.append(f"CLI teardown failed: {cli_down.stdout}\n{cli_down.stderr}")
+        except (OSError, subprocess.TimeoutExpired) as error:
+            teardown_errors.append(f"CLI teardown failed: {error}")
+        sandbox_filters = [
+            "--filter",
+            "label=curietech.ai/managed-by=curie-sandbox-substrate",
+            "--filter",
+            f"label=curietech.ai/stack={project}_runner",
+        ]
         connector_ids = _run(
             [
                 "docker",
@@ -449,17 +478,7 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
             removed = _run(["docker", "rm", "-f", *connector_ids])
             if removed.returncode:
                 teardown_errors.append(f"connector removal failed: {removed.stderr}")
-        runner_ids = _run(
-            [
-                "docker",
-                "ps",
-                "-aq",
-                "--filter",
-                "label=curietech.ai/managed-by=curie-sandbox-substrate",
-                "--filter",
-                f"network={project}_runner",
-            ]
-        ).stdout.split()
+        runner_ids = _run(["docker", "ps", "-aq", *sandbox_filters]).stdout.split()
         if runner_ids:
             removed = _run(["docker", "rm", "-f", *runner_ids])
             if removed.returncode:
@@ -515,6 +534,15 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
                 f"label=com.docker.compose.project={project}",
             ]
         ).stdout.split()
+        for resource, command in (
+            ("sandbox containers", ["docker", "ps", "-aq"]),
+            ("sandbox volumes", ["docker", "volume", "ls", "-q"]),
+        ):
+            inventory = _run([*command, *sandbox_filters])
+            if inventory.returncode:
+                teardown_errors.append(f"could not inventory owned {resource}: {inventory.stderr}")
+            elif inventory.stdout.split():
+                teardown_errors.append(f"owned {resource} survived: {inventory.stdout.split()}")
         if survivors or connector_survivors or networks or volumes:
             teardown_errors.append(
                 "owned resources survived: "
