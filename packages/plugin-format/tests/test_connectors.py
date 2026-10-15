@@ -1172,7 +1172,7 @@ def test_a_build_form_connector_may_declare_the_upstream_host() -> None:
             {
                 "connectors": {
                     "kubernetes": {
-                        "build": {"context": "connectors/kubernetes"},
+                        "build": {"context": "connectors/kubernetes", "platforms": ["linux/amd64"]},
                         "proxy_upstream_host": "localhost",
                     }
                 }

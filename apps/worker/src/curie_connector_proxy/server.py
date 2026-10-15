@@ -14,6 +14,7 @@ server serves, and a refused one reaches nothing.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import re
@@ -34,6 +35,7 @@ from .canonical import canonical_arguments
 
 LISTEN_PORT_ENV = "CURIE_CALLER_PROXY_PORT"
 UPSTREAM_PORT_ENV = "CURIE_CALLER_PROXY_UPSTREAM_PORT"
+UPSTREAM_HOST_ENV = "CURIE_CALLER_PROXY_UPSTREAM_HOST"
 PUBLIC_KEYS_ENV = "CURIE_CALLER_PROXY_PUBLIC_KEYS"
 ADMITS_ENV = "CURIE_CALLER_PROXY_ADMITS"
 GATED_TOOLS_ENV = "CURIE_CALLER_PROXY_GATED_TOOLS"
@@ -218,6 +220,9 @@ class ProxyConfig:
     gated_tools: tuple[str, ...] = ()
     connector: str = ""
     grant_store: _GrantSpender | None = None
+    # Draft ADR 0229: the Host presented on admitted requests. None forwards
+    # the caller's Host unchanged.
+    upstream_host: str | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> ProxyConfig:
@@ -249,6 +254,12 @@ class ProxyConfig:
         ):
             raise ValueError(f"{ADMITS_ENV} must be a JSON list of agent names")
         store_url = env.get(GRANT_STORE_ENV, "").strip()
+        upstream_host = env.get(UPSTREAM_HOST_ENV)
+        if upstream_host is not None and not _is_loopback_host(upstream_host):
+            raise ValueError(
+                f"{UPSTREAM_HOST_ENV} must be localhost, an IPv4 loopback address or ::1, "
+                f"got {upstream_host!r}"
+            )
         return cls(
             listen_port=port(LISTEN_PORT_ENV),
             upstream_port=port(UPSTREAM_PORT_ENV),
@@ -257,7 +268,21 @@ class ProxyConfig:
             gated_tools=_gated_tools(env),
             connector=env.get(CONNECTOR_ENV, ""),
             grant_store=_ValkeyGrantStore(store_url) if store_url else None,
+            upstream_host=upstream_host,
         )
+
+
+def _is_loopback_host(text: str) -> bool:
+    """``plugin_format.connectors.is_loopback_upstream_host``, which this
+    package cannot import: ``localhost`` or a canonical loopback address."""
+
+    if text == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    return address.is_loopback and str(address) == text
 
 
 def refusal_body(refusal: str) -> dict[str, object]:
@@ -463,6 +488,14 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
         encoded=True,
     )
     forwarded = _forwardable(request.headers)
+    # Draft ADR 0229. Only here, after every admission check: a refused request
+    # has already been answered, so the declared Host vouches only for callers
+    # the proxy verified.
+    if config.upstream_host is not None:
+        host = config.upstream_host
+        forwarded["Host"] = (
+            f"[{host}]:{config.upstream_port}" if ":" in host else f"{host}:{config.upstream_port}"
+        )
     # ADR 0178 decision 5. The token stays stripped. The connector sees the
     # verified claims as headers only this proxy can set.
     if decision.agent is not None:

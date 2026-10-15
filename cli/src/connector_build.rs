@@ -96,6 +96,11 @@ pub struct ConnectorSpecDecl {
     /// `plugin_format.validate_connectors` owns the rules.
     #[serde(default)]
     pub admits: Option<Vec<String>>,
+    /// The Host the caller proxy presents on admitted requests (Draft ADR
+    /// 0229). Carried as written; `plugin_format.validate_connectors` owns the
+    /// loopback rule.
+    #[serde(default)]
+    pub proxy_upstream_host: Option<String>,
 
     // -- remote form --
     pub url: Option<String>,
@@ -164,6 +169,7 @@ impl Default for ConnectorSpecDecl {
             port: default_port(),
             unhosted_url: None,
             admits: None,
+            proxy_upstream_host: None,
             url: None,
             headers: BTreeMap::new(),
             secrets: Vec::new(),

@@ -269,6 +269,18 @@
           "title": "Port",
           "type": "integer"
         },
+        "proxy_upstream_host": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Proxy Upstream Host"
+        },
         "sealed_secrets": {
           "additionalProperties": {
             "type": "string"

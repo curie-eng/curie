@@ -10,6 +10,7 @@
       "headers",
       "image",
       "port",
+      "proxy_upstream_host",
       "sealed_secrets",
       "secret_files",
       "secrets",
