@@ -12,9 +12,12 @@ follow progress, approve restricted actions, and inspect the result. The platfor
 is Apache-2.0 and runs in your infrastructure, with shared memory facilities,
 model configuration, and cost visibility.
 
-Start with a **Software Factory co-worker** that turns delegated GitHub, GitLab or
-Jira Cloud issues into reviewed pull requests or merge requests, or an **SRE
-co-worker** that investigates Kubernetes workloads from Slack. Then convert your existing agents into a co-worker with supported skills and tools onto the same platform.
+Start with a **Software Factory co-worker**. Use Codex, Claude Code, or another
+coding agent to help investigate and specify a bounded GitHub, GitLab, or Jira
+Cloud issue. Delegate the issue to Curie for implementation and review; it
+returns a pull request or merge request for your team to accept. You can also
+deploy an **SRE co-worker** for Kubernetes investigations, or adapt an existing
+agent's instructions and tools to the same platform.
 
 | Start here | First outcome |
 | --- | --- |
