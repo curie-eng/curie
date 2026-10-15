@@ -191,17 +191,16 @@ def _kernel_picked_ports(count: int) -> list[int]:
 
 def _write_override(path: pathlib.Path, api_image: str, host_ports: dict[str, int]) -> None:
     worker_database = (
-        "postgresql+asyncpg://postgres:postgres@127.0.0.1:"
-        "${CURIE_LOCAL_POSTGRES_PORT}/postgres"
+        "postgresql+asyncpg://postgres:postgres@127.0.0.1:${CURIE_LOCAL_POSTGRES_PORT}/postgres"
     )
     path.write_text(
         f"""services:
   postgres:
-    ports: !override [\"127.0.0.1:{host_ports['postgres']}:5432\"]
+    ports: !override [\"127.0.0.1:{host_ports["postgres"]}:5432\"]
   valkey:
-    ports: !override [\"127.0.0.1:{host_ports['valkey']}:6379\"]
+    ports: !override [\"127.0.0.1:{host_ports["valkey"]}:6379\"]
   rustfs:
-    ports: !override [\"127.0.0.1:{host_ports['rustfs']}:9000\", \"127.0.0.1::9001\"]
+    ports: !override [\"127.0.0.1:{host_ports["rustfs"]}:9000\", \"127.0.0.1::9001\"]
   curie-migrate:
     image: {api_image}
     pull_policy: never
@@ -217,7 +216,7 @@ def _write_override(path: pathlib.Path, api_image: str, host_ports: dict[str, in
       SLACK_BOT_TOKEN: \"\"
       OTEL_EXPORTER_OTLP_ENDPOINT: \"\"
       OTEL_EXPORTER_OTLP_PROTOCOL: \"\"
-    ports: !override [\"127.0.0.1:{host_ports['curie-api']}:8000\"]
+    ports: !override [\"127.0.0.1:{host_ports["curie-api"]}:8000\"]
   curie-worker:
     environment:
       DATABASE_URL: {worker_database}
@@ -482,13 +481,9 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
         if owned_source_tags:
             image_rm = _run(["docker", "image", "rm", "-f", *owned_source_tags])
             if image_rm.returncode:
-                teardown_errors.append(
-                    f"source image cleanup failed: {image_rm.stderr}"
-                )
+                teardown_errors.append(f"source image cleanup failed: {image_rm.stderr}")
         existing_tags = [
-            tag
-            for tag in tags
-            if _run(["docker", "image", "inspect", tag]).returncode == 0
+            tag for tag in tags if _run(["docker", "image", "inspect", tag]).returncode == 0
         ]
         if existing_tags:
             image_rm = _run(["docker", "image", "rm", "-f", *existing_tags])
@@ -818,12 +813,14 @@ def test_connector_local_deploy_binds_retained_routes_and_preserves_refusal_json
         "sre-approvals",
         EXISTING_ROUTE,
     }
-    assert seeded_agent["approval_routes"]["sre-approvals"] == before_approval_seed[
-        "approval_routes"
-    ]["sre-approvals"]
-    assert seeded_agent["approval_routes"][EXISTING_ROUTE] == before_approval_seed[
-        "approval_routes"
-    ][EXISTING_ROUTE]
+    assert (
+        seeded_agent["approval_routes"]["sre-approvals"]
+        == before_approval_seed["approval_routes"]["sre-approvals"]
+    )
+    assert (
+        seeded_agent["approval_routes"][EXISTING_ROUTE]
+        == before_approval_seed["approval_routes"][EXISTING_ROUTE]
+    )
     assert seeded_agent["approval_routes"]["e2e"] == {
         "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
         "notification": None,
@@ -856,8 +853,7 @@ def test_connector_local_deploy_binds_retained_routes_and_preserves_refusal_json
         notification_refused.stdout + notification_refused.stderr
     )
     assert (
-        _api(local_case.api_url, "GET", f"/agents/{agent_id}")["approval_routes"]
-        == seeded_routes
+        _api(local_case.api_url, "GET", f"/agents/{agent_id}")["approval_routes"] == seeded_routes
     )
 
     _add_second_route(local_case.bundle)
@@ -874,9 +870,7 @@ def test_connector_local_deploy_binds_retained_routes_and_preserves_refusal_json
         f"/deployments?agent_id={agent_id}",
     )
     assert len(guarded_versions) == 1
-    assert {row["id"] for row in guarded_deployments} == {
-        stock_receipt["deployment"]["id"]
-    }
+    assert {row["id"] for row in guarded_deployments} == {stock_receipt["deployment"]["id"]}
 
     safe_retained = {
         "resolution": retained_with_notification["resolution"],
@@ -968,10 +962,13 @@ def test_dedicated_approval_seed_prepares_and_resumes_an_owned_local_agent(
         parity_agent = _api(local_case.api_url, "GET", f"/agents/{parity_agent_id}")
         assert parity_agent["approval_routes"] == before_routes
         assert _api(local_case.api_url, "GET", f"/agents/{parity_agent_id}/versions") == []
-        assert _api(
-            local_case.api_url,
-            "GET",
-            f"/deployments?agent_id={parity_agent_id}",
-        ) == []
+        assert (
+            _api(
+                local_case.api_url,
+                "GET",
+                f"/deployments?agent_id={parity_agent_id}",
+            )
+            == []
+        )
     finally:
         _api(local_case.api_url, "DELETE", f"/agents/{parity_agent_id}")

@@ -390,11 +390,11 @@ def _env(*refs: AttachmentRef) -> dict[str, str]:
     return {**_BASE_ENV, ATTACHMENTS_REF_ENV: encode_attachment_refs(refs)}
 
 
-def _attachment_mount(client: _RecordingDocker) -> tuple[Path, str]:
+def _attachment_mount(client: _RecordingDocker) -> tuple[str, str]:
     expected = _runner_attachments_dir()
     mounts = _volume_mounts(client.runner_argv)
     assert expected in mounts, f"runner has no attachment volume at {expected!r}: {mounts}"
-    return _seed_source(client, expected), mounts[expected][1]
+    return mounts[expected]
 
 
 def _refused(client: _RecordingDocker, env: dict[str, str], *, because: str) -> Exception:
@@ -492,15 +492,17 @@ def test_attachments_are_materialized_and_seeded_into_read_only_volume(
         ),
     )
 
-    root, mode = _attachment_mount(client)
+    volume, mode = _attachment_mount(client)
     assert mode == "ro", f"the attachment mount is {mode!r}, not read-only"
     # Dot-entries are the init container's own bookkeeping and the runner
     # already ignores them (runner/tests/test_attachments_mount.py), so only the
     # visible entries are the person's files.
-    visible = sorted(entry.name for entry in root.iterdir() if not entry.name.startswith("."))
+    files = client.volume_files[volume]
+    visible = sorted(name for name in files if not name.startswith("."))
     assert visible == ["notes.txt", "report.csv"]
-    assert (root / "report.csv").read_bytes() == report
-    assert (root / "notes.txt").read_bytes() == notes
+    assert files["report.csv"] == report
+    assert files["notes.txt"] == notes
+    _left_nothing(staged)
     assert objects.requested == [report_url, notes_url]
 
 
@@ -607,9 +609,11 @@ def test_the_materialized_tree_is_readable_by_the_nonroot_runner(
         env=_env(_ref(url=url, name="report.csv", payload=payload)),
     )
 
-    root, _mode = _attachment_mount(client)
-    assert root.stat().st_mode & 0o005 == 0o005, "the mount root is not o+rx"
-    assert (root / "report.csv").stat().st_mode & 0o004 == 0o004, "report.csv is not o+r"
+    volume, _mode = _attachment_mount(client)
+    modes = client.volume_modes[volume]
+    assert modes["."] & 0o005 == 0o005, "the mount root is not o+rx"
+    assert modes["report.csv"] & 0o004 == 0o004, "report.csv is not o+r"
+    _left_nothing(staged)
 
 
 # --- the four refusals, each leaving nothing behind --------------------------
@@ -704,8 +708,8 @@ def test_a_file_just_under_the_cap_is_materialized_whole(
         env=_env(_ref(url=url, name="report.csv", payload=payload)),
     )
 
-    root, _mode = _attachment_mount(client)
-    assert (root / "report.csv").read_bytes() == payload
+    volume, _mode = _attachment_mount(client)
+    assert client.volume_files[volume]["report.csv"] == payload
 
 
 def test_a_file_over_the_cap_is_refused_and_materializes_nothing(
@@ -892,6 +896,7 @@ def test_the_docker_driver_matches_the_shared_init_outcome_vector(
     encoded, by_url = _vector_payload(case, objects)
     # The vector's per-file cap, the same number the chart script renders.
     client = _client(limits=_limits(max_file_bytes=_VECTOR["cap_bytes"]))
+    client.copy_checks.append(lambda root: _assert_nothing_outside(root, staged))
     env = {**_BASE_ENV, ATTACHMENTS_REF_ENV: encoded}
 
     if case["outcome"] == "fatal":
@@ -902,13 +907,12 @@ def test_the_docker_driver_matches_the_shared_init_outcome_vector(
         return
 
     client.create_claim("claim-attachments", pool="pool", env=env)
-    root, mode = _attachment_mount(client)
+    volume, mode = _attachment_mount(client)
     assert mode == "ro"
-    visible = {
-        entry.name: entry.read_bytes() for entry in root.iterdir() if not entry.name.startswith(".")
-    }
+    files = client.volume_files[volume]
+    visible = {name: content for name, content in files.items() if not name.startswith(".")}
     assert visible == {name: body.encode() for name, body in case["visible"].items()}
-    hidden = sorted(entry.name for entry in root.iterdir() if entry.name.startswith("."))
+    hidden = sorted(name for name in files if name.startswith("."))
     status_name = _VECTOR["status_file"]
     # A legacy payload (no "c") may or may not write the status file.
     allowed = [[status_name]] if case["status"] is not None else [[], [status_name]]
@@ -916,11 +920,12 @@ def test_the_docker_driver_matches_the_shared_init_outcome_vector(
         f"hidden entries {hidden} in the mount; expected one of {allowed} "
         "(written to a temp name and renamed into place)"
     )
-    _assert_nothing_outside(root, staged)
+    _left_nothing(staged)
     if case["status"] is not None:
-        status_path = root / status_name
-        assert status_path.stat().st_mode & 0o004, "the status file is not readable by the runner"
-        status = json.loads(status_path.read_text())
+        assert client.volume_modes[volume][status_name] & 0o004, (
+            "the status file is not readable by the runner"
+        )
+        status = json.loads(files[status_name])
         assert set(status) == {"v", "files"} and status["v"] == _VECTOR["status_version"], status
         assert all(set(row) == {"name", "status", "reason"} for row in status["files"]), status
         got = sorted(status["files"], key=lambda r: r["name"])
@@ -965,12 +970,7 @@ def test_the_attachment_manifest_is_forwarded_to_the_runner(
 def test_deleting_the_claim_removes_the_materialized_directory(
     objects: _FakeObjectStore, staged: list[Path]
 ) -> None:
-    """Same lifecycle as the bundle and workspace dirs: gone with the claim.
-
-    A per-claim host dir that outlives its container is a copy of a person's
-    upload sitting on the developer's laptop indefinitely, past every retention
-    window the lane bothered to define.
-    """
+    """Seeding releases local copies; deleting the claim releases daemon inputs."""
 
     payload = b"a,b\n"
     url = objects.add("https://objects.example.test/attachments/a/000.bin", payload)
@@ -980,12 +980,16 @@ def test_deleting_the_claim_removes_the_materialized_directory(
         pool="pool",
         env=_env(_ref(url=url, name="report.csv", payload=payload)),
     )
-    root, _mode = _attachment_mount(client)
-    assert root.exists()
+    volume, _mode = _attachment_mount(client)
+    root = _seed_source(client, _runner_attachments_dir())
+    assert client.volume_files[volume]["report.csv"] == payload
+    assert not root.exists(), "the local copy survived successful seeding"
 
     client.delete_claim("claim-attachments", request_timeout_seconds=1.0)
 
     assert not root.exists(), "the attachment dir outlived the claim it belonged to"
+    assert volume not in client.volumes
+    assert client.containers == {}
     assert 0 < client.timeouts[-1] <= 1.0
     _left_nothing(staged)
 
@@ -993,7 +997,7 @@ def test_deleting_the_claim_removes_the_materialized_directory(
 def test_a_failed_container_boot_removes_the_materialized_directory(
     objects: _FakeObjectStore, staged: list[Path]
 ) -> None:
-    """The bundle and workspace dirs are cleaned when ``docker run`` fails.
+    """The bundle and workspace dirs are cleaned when runner start fails.
 
     Without the same handling, every failed boot on a laptop -- a busy port, a
     stopped daemon -- leaves another copy of the upload behind, and the claim
@@ -1012,8 +1016,8 @@ def test_a_failed_container_boot_removes_the_materialized_directory(
             result = super()._docker(
                 args, request_timeout_seconds=request_timeout_seconds, check=check
             )
-            if args[0] == "run":
-                raise DockerError("docker run failed")
+            if args == ["start", self.container_ids.get("claim-attachments")]:
+                raise DockerError("docker start failed")
             return result
 
     payload = b"a,b\n"
