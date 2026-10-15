@@ -21,8 +21,13 @@ adapter is connected.
   An inventory read failure is a failed cycle, never an empty healthy cycle.
 
 - **TURN-CANARY-2: isolated request.** Each probe mints a fresh event ID,
-  `eval:`-prefixed conversation ID, canonical UUIDv4 relay reply ref, and random
-  nonce. Its prompt asks only for that nonce and explicitly forbids tools,
+  conversation ID, canonical UUIDv4 relay reply ref, and random nonce. The
+  conversation ID is a fixed canary prefix followed by a fresh UUIDv4, so an
+  operator's log filters can tell canary threads from every other eval
+  conversation. The prefix defaults to `eval:turn-canary-`; an operator may
+  replace it with any value matching `eval:[A-Za-z0-9._-]{0,48}`, which keeps
+  the worker's `eval:` isolate prefix that every conversation-ID check of this
+  example and the worker requires. Any other prefix refuses to start. Its prompt asks only for that nonce and explicitly forbids tools,
   actions, approval requests, and durable changes. It sets `tool_access` to
   `read-only`, `source` to `slack`, and empty attachments and hook run. The
   `ReplyHandle` retains the selected Slack address, uses the reserved
@@ -43,42 +48,93 @@ adapter is connected.
   timeout and error paths, the checker computes the worker thread key with
   `channel_protocol.scoped_conversation_id` and the selected binding identity.
   Before the stream enqueue can begin, it durably records the exact selected
-  agent ID and owned thread key in its persistent state. A crash or cancellation
-  leaves this intent in place; a fresh invocation refuses another enqueue until
-  an operator has confirmed the old route's release. The intent clears only
-  after the matching reset is confirmed, never merely after a reset request.
+  agent ID and owned thread key in its persistent state, under the selected
+  route's `(kind, address, adapter)` label in `pending_routes`. A crash or
+  cancellation leaves this intent in place. While a route has a pending
+  cleanup, no cycle turns that route; other routes keep turning. The intent
+  clears only after a matching reset confirms release as defined below, never
+  merely after a reset request.
   State updates use a separate stable process lock and an atomic replacement
   of a synced temporary file, followed by syncing the containing directory.
   An existing empty or corrupt state file fails closed; only a genuinely absent
   state file is a first-run empty state. An interrupted write cannot turn a
   recorded cleanup intent into a healthy empty state.
   `cleanup_blocked` must be a JSON boolean; numeric 0 or 1 is corrupt state,
-  even though Python compares them equal to false or true. A journaled cycle
-  honors a true cleanup hold directly, without relying on a caller to copy it
-  into the platform. Persisted capacity skips must be a nonnegative JSON
+  even though Python compares them equal to false or true. A true
+  `cleanup_blocked` holds every route. The checker never sets it; it is an
+  operator hold, or the companion of a single `pending` record written by an
+  earlier version of this checker. Such a legacy `pending` record names no
+  route, so it also holds every route until it clears, and when it clears the
+  checker sets `cleanup_blocked` to false with it. A journaled cycle honors
+  these holds directly, without relying on a caller to copy them into the
+  platform. `pending_routes` must be a JSON object from a route label to an
+  object with string `agent_id` and `thread_key` and an optional finite
+  positive `checked_at`. Persisted capacity skips must be a nonnegative JSON
   integer, and persisted success timestamps must be finite positive JSON
   numbers, never booleans. Invalid types or values fail before enqueue or
   metric export.
   It submits that key to `POST /agents/{agent_id}/threads/{thread_key}/reset`
   and polls the matching reset status endpoint until `requested` is false and
   `route_existed` is true. It never resets an unowned or guessed conversation.
-  A false or unknown `route_existed`, pending reset beyond the deadline, or any
-  unknown status leaves
-  cleanup unconfirmed. The cycle marks the target degraded and stops before
-  another probe. It does not treat absence of a route as proof of release.
+  Within the probe's own cycle, a false or unknown `route_existed`, a pending
+  reset beyond the deadline, or any unknown status leaves cleanup unconfirmed:
+  the absence of a route right after the turn is not proof of release, because
+  the queued turn may not have claimed its route yet. The cycle marks that
+  route's cleanup degraded, keeps its pending record, and continues with the
+  next selected route. Each route therefore holds at most one unconfirmed
+  probe at a time.
+
+  Each later cycle re-checks pending cleanups before selecting targets: at
+  most the configured maximum targets per cycle, least recently checked first.
+  A re-check submits the recorded key to the same reset endpoint and polls the
+  reset status within the cleanup deadline. The record clears when the reset
+  drains, that is `requested` is false, with `route_existed` true (the worker
+  released the route) or false (the worker found no route under the exact owned
+  key at a drain at least one cycle after the probe, so it holds nothing for
+  this probe). A pending reset beyond the deadline, an unknown `route_existed`,
+  or an error keeps the record and stamps `checked_at`. A cleared route is
+  turned again from the same cycle on.
 
 - **TURN-CANARY-5: bounded operation.** Probes run serially. Cycle interval,
   turn deadline, cleanup deadline, poll period, and maximum selected targets
   are positive, bounded settings with documented defaults. A cycle is also
-  bounded by those limits. A new cycle cannot begin while cleanup from the
-  preceding cycle is unconfirmed. An optional ResourceQuota headroom check is
-  an observation immediately before enqueue: insufficient or unreadable
-  headroom skips the turn with an explicit outcome. It is not an atomic
-  reservation and cannot promise a global sandbox cap.
+  bounded by those limits, including its pending-cleanup re-checks. No cycle
+  turns a route whose cleanup from an earlier probe is unconfirmed, and no
+  cycle turns any route while a hold on every route remains (TURN-CANARY-4).
+  An optional ResourceQuota headroom check is an observation immediately
+  before enqueue: insufficient or unreadable headroom skips the turn with an
+  explicit `capacity` outcome. Its bearer token comes from exactly one of a
+  static configured token or a configured token file path; configuring both,
+  or a quota URL with neither, refuses to start. There is no implicit token
+  path. A token file is read again for each quota request and its contents
+  are kept no longer than that request, so a rotated projected service
+  account token is used on the next request. A missing, unreadable, or blank
+  token file makes that observation unreadable, and the token never appears
+  in logs or metrics. A capacity skip is not a turn failure. It is
+  not an atomic reservation and cannot promise a global sandbox cap. Quota
+  `hard` and `used` values, and the configured minimum free amount, are read
+  as Kubernetes quantities: a plain integer or decimal, an optional exponent,
+  and an optional decimal suffix (`n`, `u`, `m`, `k` or `K`, `M`, `G`, `T`,
+  `P`, `E`) or binary suffix (`Ki`, `Mi`, `Gi`, `Ti`, `Pi`, `Ei`), so
+  `limits.cpu`, `limits.memory`, `count/pods`, and `pods` all compare
+  correctly. A value that is not a quantity makes the quota unreadable.
 
 - **TURN-CANARY-6: diagnostics.** Export a portable Prometheus target success
   gauge, last run and last success timestamps, cleanup degraded gauge, capacity
-  skip counter, cycle success gauge, and last cycle timestamp. Structured logs
+  skip counter, cycle success gauge, and last cycle timestamp. The target
+  success gauge is published only for a route whose turn was attempted: a
+  capacity-skipped route publishes no target success sample in that cycle, and
+  the exporter keeps the route's previous value. A per-route capacity skipped
+  gauge is 1 for a route skipped for capacity in the cycle and 0 for a route
+  turned in it. A per-route cleanup degraded gauge is 1 for every route with a
+  pending cleanup and 0 for a route whose cleanup was confirmed or cleared in
+  the cycle. The global cleanup degraded gauge is 1 while any route has a
+  pending cleanup or a hold on every route remains. Cycle success is 1 only
+  when the inventory read and admission succeed, no hold on every route
+  remains, at least one selected route was turned or skipped for capacity, no
+  turned route failed, and no cleanup in the cycle was left unconfirmed.
+  Capacity skips and routes held by an earlier pending cleanup therefore never
+  count as turn failures; a cycle whose every selected route is held fails. Structured logs
   record outcome codes and phase without credentials, prompts, reply text,
   nonces, raw exception strings, or full HTTP bodies. HTTP failures expose only
   status and error type. Metric labels are bounded to selected route identity
@@ -172,9 +228,10 @@ cleanup.
   `GET /metrics` with the last exposition in Prometheus text format and
   `GET /healthz`. Health reports the monitor itself, not the platform: 200
   while the last cycle finished within twice the interval plus the maximum
-  cycle duration (maximum targets times the sum of turn and cleanup
-  deadlines), counted from process start before the first cycle, and 503
-  otherwise. A failing platform therefore shows in the metrics without
+  cycle duration (maximum targets times the sum of the turn deadline and
+  twice the cleanup deadline: one cleanup for each probe and one for each
+  pending-cleanup re-check), counted from process start before the first
+  cycle, and 503 otherwise. A failing platform therefore shows in the metrics without
   restarting the monitor. Any other path is 404, any other method is 405, and
   a request head beyond a fixed size or read timeout is closed. Responses
   contain no configuration value. A metric name prefix matching
@@ -186,7 +243,8 @@ cleanup.
 
 Unit tests under `examples/tests` exercise the selected binding and
 `QueuedTurn` wire, relay completion, exact scoped reset key, failure and
-cleanup stop cases, limits, and safe diagnostics. They also exercise
+per-route cleanup holds and their recovery, capacity skips, Kubernetes
+quantity parsing, limits, and safe diagnostics. They also exercise
 deterministic discovery and rotation, the model-free binding outcomes, adapter
 probe outcomes against a local HTTP server, the exporter routes and
 non-overlapping loop, and the metric prefix, all with synthetic rows. Isolated runtime

@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol, TextIO
 from urllib.parse import urlsplit
@@ -42,10 +43,56 @@ Route = tuple[str, str, str]
 METRIC_PREFIX = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
 ADAPTER_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 MAX_ADAPTERS = 20
+CONVERSATION_PREFIX = "eval:turn-canary-"
+CONVERSATION_PREFIX_PATTERN = re.compile(r"eval:[A-Za-z0-9._-]{0,48}")
+QUANTITY = re.compile(r"([0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE]([+-]?[0-9]+))?([A-Za-z]{0,2})")
+QUANTITY_SUFFIXES = {
+    "": Decimal(1),
+    "n": Decimal("1e-9"),
+    "u": Decimal("1e-6"),
+    "m": Decimal("1e-3"),
+    "k": Decimal("1e3"),
+    "K": Decimal("1e3"),
+    "M": Decimal("1e6"),
+    "G": Decimal("1e9"),
+    "T": Decimal("1e12"),
+    "P": Decimal("1e15"),
+    "E": Decimal("1e18"),
+    "Ki": Decimal(2**10),
+    "Mi": Decimal(2**20),
+    "Gi": Decimal(2**30),
+    "Ti": Decimal(2**40),
+    "Pi": Decimal(2**50),
+    "Ei": Decimal(2**60),
+}
 
 
 def _route_label(row: Mapping[str, str]) -> str:
     return "|".join((row.get("kind", ""), row.get("address", ""), row.get("adapter", "")))
+
+
+def parse_quantity(value: object) -> Decimal:
+    """Read one Kubernetes quantity, such as 16, 1500m, or 512Mi. @spec TURN-CANARY-5"""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError("quantity must be a string or integer")
+    match = QUANTITY.fullmatch(str(value))
+    if match is None or match.group(3) not in QUANTITY_SUFFIXES:
+        raise ValueError("value is not a Kubernetes quantity")
+    if match.group(2) is not None and match.group(3):
+        raise ValueError("a quantity takes an exponent or a suffix, not both")
+    try:
+        number = Decimal(match.group(1))
+        if match.group(2) is not None:
+            number = number.scaleb(int(match.group(2)))
+    except InvalidOperation as exc:
+        raise ValueError("value is not a Kubernetes quantity") from exc
+    return number * QUANTITY_SUFFIXES[match.group(3)]
+
+
+def _check_conversation_prefix(prefix: str) -> str:
+    if not CONVERSATION_PREFIX_PATTERN.fullmatch(prefix):
+        raise ValueError("TURN_CANARY_CONVERSATION_PREFIX must match eval:[A-Za-z0-9._-]{0,48}")
+    return prefix
 
 
 def _check_prefix(prefix: str) -> str:
@@ -88,6 +135,8 @@ class CycleResult:
     cleanup_degraded: bool = False
     capacity_skips: int = 0
     target_success: dict[str, bool] = field(default_factory=dict)
+    target_capacity_skipped: dict[str, bool] = field(default_factory=dict)
+    target_cleanup_degraded: dict[str, bool] = field(default_factory=dict)
     target_last_run: dict[str, float] = field(default_factory=dict)
     target_last_success: dict[str, float] = field(default_factory=dict)
     logs: list[dict[str, str]] = field(default_factory=list)
@@ -131,9 +180,18 @@ class StateJournal:
             else:
                 data = {}
             pending = data.get("pending") if isinstance(data, dict) else None
+            routes = data.get("pending_routes", {}) if isinstance(data, dict) else None
 
             def valid_timestamp(value: Any) -> bool:
                 return type(value) in (int, float) and math.isfinite(value) and value > 0
+
+            def valid_record(record: Any) -> bool:
+                return (
+                    isinstance(record, dict)
+                    and isinstance(record.get("agent_id"), str)
+                    and isinstance(record.get("thread_key"), str)
+                    and ("checked_at" not in record or valid_timestamp(record["checked_at"]))
+                )
 
             if (
                 not isinstance(data, dict)
@@ -151,13 +209,11 @@ class StateJournal:
                 or type(data.get("cleanup_blocked", False)) is not bool
                 or type(data.get("rotation", 0)) is not int
                 or data.get("rotation", 0) < 0
-                or (
-                    pending is not None
-                    and (
-                        not isinstance(pending, dict)
-                        or not isinstance(pending.get("agent_id"), str)
-                        or not isinstance(pending.get("thread_key"), str)
-                    )
+                or (pending is not None and not valid_record(pending))
+                or not isinstance(routes, dict)
+                or not all(
+                    isinstance(route, str) and valid_record(record)
+                    for route, record in routes.items()
                 )
             ):
                 raise ValueError("invalid state fields")
@@ -174,8 +230,20 @@ class StateJournal:
             self._file = None
 
     @property
-    def pending(self) -> dict[str, str] | None:
+    def pending(self) -> dict[str, Any] | None:
+        """A single route-less record written by an earlier checker version."""
         return self.data.get("pending")
+
+    @property
+    def pending_routes(self) -> dict[str, dict[str, Any]]:
+        """Owned cleanups still unconfirmed, by route label. @spec TURN-CANARY-4"""
+        routes: dict[str, dict[str, Any]] = self.data.setdefault("pending_routes", {})
+        return routes
+
+    @property
+    def holds_every_route(self) -> bool:
+        """An operator hold or a legacy route-less record. @spec TURN-CANARY-4"""
+        return self.pending is not None or self.data.get("cleanup_blocked") is True
 
     @property
     def rotation(self) -> int:
@@ -201,17 +269,30 @@ class StateJournal:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    def record_intent(self, agent_id: str, thread_key: str) -> None:
-        if self.pending is not None:
+    def record_intent(self, agent_id: str, thread_key: str, *, route: str) -> None:
+        if self.pending is not None or route in self.pending_routes:
             raise RuntimeError("previous owned cleanup remains pending")
-        self.data["pending"] = {"agent_id": agent_id, "thread_key": thread_key}
+        self.pending_routes[route] = {"agent_id": agent_id, "thread_key": thread_key}
         self._write()
 
-    def clear_intent(self, agent_id: str, thread_key: str) -> None:
-        if self.pending != {"agent_id": agent_id, "thread_key": thread_key}:
+    def clear_intent(self, agent_id: str, thread_key: str, *, route: str) -> None:
+        record = self.pending_routes.get(route)
+        if record is None or (record["agent_id"], record["thread_key"]) != (agent_id, thread_key):
             raise RuntimeError("cleanup does not match the recorded owned route")
-        self.data["pending"] = None
+        del self.pending_routes[route]
         self._write()
+
+    def clear_legacy(self) -> None:
+        """Release the all-route hold that came with a legacy record. @spec TURN-CANARY-4"""
+        self.data["pending"] = None
+        self.data["cleanup_blocked"] = False
+        self._write()
+
+    def mark_checked(self, route: str | None, when: float) -> None:
+        record = self.pending if route is None else self.pending_routes.get(route)
+        if record is not None:
+            record["checked_at"] = when
+            self._write()
 
     def save_result(self, result: CycleResult) -> None:
         result.capacity_skips += self.data.get("capacity_skips_total", 0)
@@ -222,7 +303,6 @@ class StateJournal:
         }
         self.data.update(
             {
-                "cleanup_blocked": result.cleanup_degraded or self.pending is not None,
                 "capacity_skips_total": result.capacity_skips,
                 "last_success": result.last_success,
                 "target_last_success": result.target_last_success,
@@ -231,6 +311,16 @@ class StateJournal:
         if result.rotation is not None:
             self.data["rotation"] = result.rotation
         self._write()
+
+
+class _CycleJournal(StateJournal):
+    """In-memory holds for a cycle run without a state file. @spec TURN-CANARY-4"""
+
+    def __init__(self) -> None:
+        super().__init__(Path("unused"))
+
+    def _write(self) -> None:
+        pass
 
 
 def select_targets(
@@ -483,18 +573,64 @@ async def _await_relay(
     return False
 
 
-async def _await_cleanup(
+async def _await_reset(
     platform: Platform, agent_id: str, key: str, deadline: float, poll: float
-) -> bool:
+) -> dict[str, Any] | None:
+    """Poll until the reset drains; None while it is still pending. @spec TURN-CANARY-4"""
     end = time.monotonic() + deadline
     while time.monotonic() < end:
         state = await platform.reset_state(agent_id, key)
-        if cleanup_confirmed(state):
-            return True
+        if not isinstance(state, dict):
+            return None
         if state.get("requested") is False:
-            return False
+            return state
         await asyncio.sleep(min(poll, max(0, end - time.monotonic())))
-    return False
+    return None
+
+
+def _drained(state: dict[str, Any] | None) -> bool:
+    """A drained reset that recorded an outcome, released or no route. @spec TURN-CANARY-4"""
+    return (
+        state is not None
+        and state.get("requested") is False
+        and state.get("route_existed") in (True, False)
+    )
+
+
+async def _recheck_pending(
+    platform: Platform,
+    journal: StateJournal,
+    result: CycleResult,
+    *,
+    limit: int,
+    cleanup_deadline: float,
+    poll_period: float,
+) -> None:
+    """Re-request owned resets left unconfirmed by earlier cycles. @spec TURN-CANARY-4"""
+    entries: list[tuple[str | None, dict[str, Any]]] = sorted(
+        journal.pending_routes.items(),
+        key=lambda item: (item[1].get("checked_at", 0), item[0]),
+    )
+    if journal.pending is not None:
+        entries.insert(0, (None, journal.pending))
+    for route, record in entries[:limit]:
+        agent_id, key = record["agent_id"], record["thread_key"]
+        try:
+            await platform.reset(agent_id, key)
+            state = await _await_reset(platform, agent_id, key, cleanup_deadline, poll_period)
+        except Exception as exc:  # noqa: BLE001 - an unreadable re-check keeps the hold
+            result.record("cleanup", "recheck_failed", exc)
+            state = None
+        if _drained(state):
+            if route is None:
+                journal.clear_legacy()
+            else:
+                journal.clear_intent(agent_id, key, route=route)
+                result.target_cleanup_degraded[route] = False
+            result.record("cleanup", "recovered")
+        else:
+            journal.mark_checked(route, time.time())
+            result.record("cleanup", "still_unconfirmed")
 
 
 async def run_cycle(
@@ -511,28 +647,85 @@ async def run_cycle(
     binding_checks: bool = False,
     identity_kinds: Sequence[str] = ("slack",),
     adapters: Mapping[str, str] | None = None,
+    conversation_prefix: str = CONVERSATION_PREFIX,
 ) -> CycleResult:
-    """Probe serially; hold on uncertain cleanup. @spec TURN-CANARY-1 TURN-CANARY-10"""
+    """Probe serially; hold only routes with uncertain cleanup.
+
+    @spec TURN-CANARY-1 TURN-CANARY-10
+    """
     Limits(
         turn_deadline=turn_deadline,
         cleanup_deadline=cleanup_deadline,
         poll_period=poll_period,
         max_targets=max_targets,
     )
+    _check_conversation_prefix(conversation_prefix)
     if discover == (selected is not None):
         raise ValueError("configure exactly one of explicit routes or discovery")
+    if journal is None:
+        journal = _CycleJournal()
     result = CycleResult()
+    try:
+        await _run_cycle(
+            platform,
+            selected,
+            journal,
+            result,
+            turn_deadline=turn_deadline,
+            cleanup_deadline=cleanup_deadline,
+            poll_period=poll_period,
+            max_targets=max_targets,
+            exclude=exclude,
+            binding_checks=binding_checks,
+            identity_kinds=identity_kinds,
+            adapters=adapters,
+            conversation_prefix=conversation_prefix,
+        )
+    finally:
+        for route in journal.pending_routes:
+            result.target_cleanup_degraded[route] = True
+        result.cleanup_degraded = (
+            bool(journal.pending_routes)
+            or journal.holds_every_route
+            or getattr(platform, "cleanup_blocked", False) is True
+        )
+    if result.success:
+        result.last_success = time.time()
+    return result
+
+
+async def _run_cycle(
+    platform: Platform,
+    selected: list[tuple[str, str, str]] | None,
+    journal: StateJournal,
+    result: CycleResult,
+    *,
+    turn_deadline: float,
+    cleanup_deadline: float,
+    poll_period: float,
+    max_targets: int,
+    exclude: Iterable[Route],
+    binding_checks: bool,
+    identity_kinds: Sequence[str],
+    adapters: Mapping[str, str] | None,
+    conversation_prefix: str,
+) -> None:
     if adapters:
         await _probe_adapters(platform, adapters, result)
-    held = getattr(platform, "cleanup_blocked", False) or (
-        journal is not None
-        and (journal.pending is not None or journal.data.get("cleanup_blocked") is True)
-    )
+    if journal.pending is not None or journal.pending_routes:
+        await _recheck_pending(
+            platform,
+            journal,
+            result,
+            limit=max_targets,
+            cleanup_deadline=cleanup_deadline,
+            poll_period=poll_period,
+        )
+    held = getattr(platform, "cleanup_blocked", False) is True or journal.holds_every_route
     if held:
-        result.cleanup_degraded = True
         result.record("cleanup", "previous_unconfirmed")
         if not binding_checks:
-            return result
+            return
     if selected is not None and len(selected) > max_targets:
         raise ValueError("selected routes exceed maximum")
     try:
@@ -541,13 +734,13 @@ async def run_cycle(
             raise ValueError("malformed inventory")
     except Exception as exc:  # noqa: BLE001 - inventory failures fail the whole cycle
         result.record("inventory", "failed", exc)
-        return result
+        return
     result.inventory_labels = {_route_label(row) for row in rows}
     targets: list[dict[str, str]] = []
     if not held:
         try:
             if selected is None:
-                rotation = journal.rotation if journal is not None else 0
+                rotation = journal.rotation
                 targets, discovery_logs = discover_targets(
                     rows, rotation=rotation, max_targets=max_targets, exclude=exclude
                 )
@@ -566,28 +759,38 @@ async def run_cycle(
             targets = []
     if targets:
         await _turn_targets(
-            platform, targets, result, journal, turn_deadline, cleanup_deadline, poll_period
+            platform,
+            targets,
+            result,
+            journal,
+            turn_deadline,
+            cleanup_deadline,
+            poll_period,
+            conversation_prefix,
         )
     if binding_checks:
         await _check_bindings(platform, rows, set(result.target_last_run), identity_kinds, result)
-    if result.success:
-        result.last_success = time.time()
-    return result
 
 
 async def _turn_targets(
     platform: Platform,
     targets: list[dict[str, str]],
     result: CycleResult,
-    journal: StateJournal | None,
+    journal: StateJournal,
     turn_deadline: float,
     cleanup_deadline: float,
     poll_period: float,
+    conversation_prefix: str = CONVERSATION_PREFIX,
 ) -> None:
     """The owned, serial turn path of TURN-CANARY-2 to 4. @spec TURN-CANARY-4"""
     all_ok = True
+    attempted = False
     for binding in targets:
         target_label = _route_label(binding)
+        if target_label in journal.pending_routes:
+            result.record("cleanup", "route_held")
+            continue
+        attempted = True
         result.target_last_run[target_label] = time.time()
         try:
             headroom = await platform.quota_headroom()
@@ -596,10 +799,11 @@ async def _turn_targets(
             headroom = None
         if headroom is not True:
             result.capacity_skips += 1
+            result.target_capacity_skipped[target_label] = True
             result.record("capacity", "skipped")
-            all_ok = False
             continue
-        conversation_id = "eval:" + str(uuid.uuid4())
+        result.target_capacity_skipped[target_label] = False
+        conversation_id = conversation_prefix + str(uuid.uuid4())
         reply_ref = str(uuid.uuid4())
         nonce = secrets.token_urlsafe(24)
         turn = build_turn(
@@ -611,14 +815,14 @@ async def _turn_targets(
             received_at=datetime.now(UTC).isoformat(),
         )
         key = scoped_reset_key(binding, conversation_id)
-        if journal is not None:
-            journal.record_intent(binding["agent_id"], key)
+        journal.record_intent(binding["agent_id"], key, route=target_label)
         enqueued = False
         try:
             await platform.enqueue(turn)
             enqueued = True
         except Exception as exc:  # noqa: BLE001 - uncertain XADD still requires cleanup
             result.record("enqueue", "failed", exc)
+            result.target_success[target_label] = False
             all_ok = False
         if enqueued:
             try:
@@ -636,20 +840,23 @@ async def _turn_targets(
                 result.target_last_success[target_label] = time.time()
         try:
             await platform.reset(binding["agent_id"], key)
-            confirmed = await _await_cleanup(
+            state = await _await_reset(
                 platform, binding["agent_id"], key, cleanup_deadline, poll_period
             )
-            if confirmed and journal is not None:
-                journal.clear_intent(binding["agent_id"], key)
-        except Exception as exc:  # noqa: BLE001 - unknown reset state must stop the cycle
+            confirmed = state is not None and cleanup_confirmed(state)
+            if confirmed:
+                journal.clear_intent(binding["agent_id"], key, route=target_label)
+        except Exception as exc:  # noqa: BLE001 - unknown reset state keeps the route held
             result.record("cleanup", "failed", exc)
             confirmed = False
-        if not confirmed:
-            result.cleanup_degraded = True
-            platform.cleanup_blocked = True
+        if confirmed:
+            result.target_cleanup_degraded[target_label] = False
+        else:
+            all_ok = False
             result.record("cleanup", "unconfirmed")
-            break
-    result.success = all_ok and not result.cleanup_degraded
+    if not attempted:
+        result.record("cleanup", "every_route_held")
+    result.success = attempted and all_ok
 
 
 class RuntimePlatform:
@@ -671,7 +878,8 @@ class RuntimePlatform:
         quota_url: str | None = None,
         quota_token: str | None = None,
         quota_resource: str = "count/pods",
-        quota_min_free: int = 1,
+        quota_min_free: int | str | Decimal = 1,
+        quota_token_file: str | None = None,
     ) -> None:
         if not re.fullmatch(r"[a-z_][a-z0-9_]*", schema):
             raise ValueError("invalid database schema")
@@ -685,7 +893,14 @@ class RuntimePlatform:
             raise ValueError("API URL must be an HTTP(S) origin without query or fragment")
         if not all((database_url, valkey_url, api_key, stream)):
             raise ValueError("database, Valkey, API key, and stream must be explicit")
-        if quota_url and (not quota_token or quota_min_free < 1):
+        min_free = (
+            quota_min_free
+            if isinstance(quota_min_free, Decimal)
+            else parse_quantity(quota_min_free)
+        )
+        if quota_token and quota_token_file:
+            raise ValueError("quota check takes a static token or a token file, not both")
+        if quota_url and (not (quota_token or quota_token_file) or min_free <= 0):
             raise ValueError("quota check requires a token and positive minimum free capacity")
         import httpx
         import redis.asyncio as redis
@@ -706,8 +921,9 @@ class RuntimePlatform:
         self._qualified = read_only_qualified
         self._quota_url = quota_url
         self._quota_token = quota_token
+        self._quota_token_file = quota_token_file
         self._quota_resource = quota_resource
-        self._quota_min_free = quota_min_free
+        self._quota_min_free = min_free
         self.cleanup_blocked = False
 
     async def close(self) -> None:
@@ -745,9 +961,12 @@ class RuntimePlatform:
         """Optional best-effort ResourceQuota observation. @spec TURN-CANARY-5"""
         if self._quota_url is None:
             return True
+        token = self._quota_bearer()
+        if token is None:
+            return None
         try:
             response = await self._quota_http.get(
-                self._quota_url, headers={"Authorization": "Bearer " + str(self._quota_token)}
+                self._quota_url, headers={"Authorization": "Bearer " + token}
             )
             if response.status_code != 200:
                 return None
@@ -757,13 +976,26 @@ class RuntimePlatform:
                 return None
             for item in items:
                 status = item["status"]
-                hard = int(status["hard"][self._quota_resource])
-                used = int(status["used"][self._quota_resource])
+                hard = parse_quantity(status["hard"][self._quota_resource])
+                used = parse_quantity(status["used"][self._quota_resource])
                 if hard - used < self._quota_min_free:
                     return False
             return True
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, AttributeError):
             return None
+
+    def _quota_bearer(self) -> str | None:
+        """The static token, or the token file read afresh for this request.
+
+        @spec TURN-CANARY-5
+        """
+        if self._quota_token_file is None:
+            return self._quota_token
+        try:
+            token = Path(self._quota_token_file).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+        return token or None
 
     async def enqueue(self, turn: QueuedTurn) -> None:
         """Append exactly one complete queued wire payload. @spec TURN-CANARY-2"""
@@ -858,8 +1090,8 @@ def prometheus_text(result: CycleResult, prefix: str = "turn_canary") -> str:
         output.append(line("rotation", result.rotation))
     for route, last_run in sorted(result.target_last_run.items()):
         label = _labels(route=_route_value(route))
-        success = int(result.target_success.get(route, False))
-        output.append(line("target_success", success, label))
+        if route in result.target_success:
+            output.append(line("target_success", int(result.target_success[route]), label))
         output.append(line("target_last_run_timestamp_seconds", last_run, label))
         if route in result.target_last_success:
             output.append(
@@ -869,6 +1101,12 @@ def prometheus_text(result: CycleResult, prefix: str = "turn_canary") -> str:
                     label,
                 )
             )
+    for route, skipped in sorted(result.target_capacity_skipped.items()):
+        label = _labels(route=_route_value(route))
+        output.append(line("target_capacity_skipped", int(skipped), label))
+    for route, degraded in sorted(result.target_cleanup_degraded.items()):
+        label = _labels(route=_route_value(route))
+        output.append(line("target_cleanup_degraded", int(degraded), label))
     for route, outcome in sorted(result.binding_checks.items()):
         label = _labels(route=_route_value(route), outcome=outcome)
         output.append(line("binding_check_success", int(outcome == "ok"), label))
@@ -912,7 +1150,7 @@ class Monitor:
     @property
     def stale_after(self) -> float:
         limits = self._limits
-        cycle = limits.max_targets * (limits.turn_deadline + limits.cleanup_deadline)
+        cycle = limits.max_targets * (limits.turn_deadline + 2 * limits.cleanup_deadline)
         return 2 * limits.cycle_interval + cycle
 
     def healthy(self) -> bool:
@@ -933,6 +1171,8 @@ class Monitor:
             "target_success",
             "target_last_run",
             "target_last_success",
+            "target_capacity_skipped",
+            "target_cleanup_degraded",
             "binding_checks",
             "binding_check_last_run",
         )
@@ -945,6 +1185,8 @@ class Monitor:
             for name in per_route:
                 values = getattr(view, name)
                 for route in [route for route in values if route not in result.inventory_labels]:
+                    if name == "target_cleanup_degraded" and values[route]:
+                        continue  # a pending cleanup stays visible after its binding goes
                     del values[route]
         self._view = view
         self._last_finished = self._clock()
@@ -1060,7 +1302,9 @@ class Config:
     quota_url: str | None
     quota_token: str | None
     quota_resource: str
-    quota_min_free: int
+    quota_min_free: Decimal
+    conversation_prefix: str = CONVERSATION_PREFIX
+    quota_token_file: str | None = None
 
 
 def _routes(raw: str, name: str) -> list[Route]:
@@ -1120,6 +1364,10 @@ def parse_config(environ: Mapping[str, str]) -> Config:
     raw_routes = environ.get("TURN_CANARY_ROUTES")
     if discover == bool(raw_routes):
         raise ValueError("set exactly one of TURN_CANARY_ROUTES or TURN_CANARY_DISCOVER=1")
+    if environ.get("TURN_CANARY_QUOTA_TOKEN") and environ.get("TURN_CANARY_QUOTA_TOKEN_FILE"):
+        raise ValueError(
+            "set at most one of TURN_CANARY_QUOTA_TOKEN or TURN_CANARY_QUOTA_TOKEN_FILE"
+        )
     state_path = environ.get("TURN_CANARY_STATE_PATH")
     if not state_path:
         raise ValueError("TURN_CANARY_STATE_PATH is required to retain cleanup hold across runs")
@@ -1155,9 +1403,13 @@ def parse_config(environ: Mapping[str, str]) -> Config:
         metric_prefix=_check_prefix(environ.get("TURN_CANARY_METRIC_PREFIX", "turn_canary")),
         metrics_path=environ.get("TURN_CANARY_METRICS_PATH") or None,
         quota_url=environ.get("TURN_CANARY_QUOTA_URL"),
-        quota_token=environ.get("TURN_CANARY_QUOTA_TOKEN"),
+        quota_token=environ.get("TURN_CANARY_QUOTA_TOKEN") or None,
+        quota_token_file=environ.get("TURN_CANARY_QUOTA_TOKEN_FILE") or None,
         quota_resource=environ.get("TURN_CANARY_QUOTA_RESOURCE", "count/pods"),
-        quota_min_free=int(environ.get("TURN_CANARY_QUOTA_MIN_FREE", "1")),
+        quota_min_free=parse_quantity(environ.get("TURN_CANARY_QUOTA_MIN_FREE", "1")),
+        conversation_prefix=_check_conversation_prefix(
+            environ.get("TURN_CANARY_CONVERSATION_PREFIX", CONVERSATION_PREFIX)
+        ),
     )
 
 
@@ -1179,13 +1431,13 @@ async def main() -> int:
         read_only_qualified=config.read_only_qualified,
         quota_url=config.quota_url,
         quota_token=config.quota_token,
+        quota_token_file=config.quota_token_file,
         quota_resource=config.quota_resource,
         quota_min_free=config.quota_min_free,
     )
 
     async def one_cycle() -> CycleResult:
         with StateJournal(Path(config.state_path)) as journal:
-            platform.cleanup_blocked = journal.data.get("cleanup_blocked") is True
             result = await run_cycle(
                 platform,
                 config.routes,
@@ -1199,6 +1451,7 @@ async def main() -> int:
                 binding_checks=config.binding_checks,
                 identity_kinds=config.identity_kinds,
                 adapters=config.adapters,
+                conversation_prefix=config.conversation_prefix,
             )
             journal.save_result(result)
         return result
