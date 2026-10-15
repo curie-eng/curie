@@ -91,6 +91,14 @@ def parse_quantity(value: object) -> Decimal:
     return number * QUANTITY_SUFFIXES[match.group(3)]
 
 
+def _exclude_kinds(raw: str) -> tuple[str, ...]:
+    """Distinct nonblank binding kinds, comma-separated. @spec TURN-CANARY-15"""
+    kinds = tuple(kind.strip() for kind in raw.split(","))
+    if not all(kinds) or len(set(kinds)) != len(kinds):
+        raise ValueError("TURN_CANARY_EXCLUDE_BINDING_KINDS must list distinct binding kinds")
+    return kinds
+
+
 def _check_conversation_prefix(prefix: str) -> str:
     if not CONVERSATION_PREFIX_PATTERN.fullmatch(prefix):
         raise ValueError("TURN_CANARY_CONVERSATION_PREFIX must match eval:[A-Za-z0-9._-]{0,48}")
@@ -753,10 +761,11 @@ async def run_cycle(
     declared: Sequence[Route] | None = None,
     binding_health_path: str | None = None,
     coverage: bool = False,
+    exclude_kinds: Sequence[str] = (),
 ) -> CycleResult:
     """Probe serially; hold only routes with uncertain cleanup.
 
-    @spec TURN-CANARY-1 TURN-CANARY-13
+    @spec TURN-CANARY-1 TURN-CANARY-15
     """
     Limits(
         turn_deadline=turn_deadline,
@@ -788,6 +797,7 @@ async def run_cycle(
             declared=declared,
             binding_health_path=binding_health_path,
             coverage=coverage,
+            exclude_kinds=exclude_kinds,
         )
     finally:
         for route in journal.pending_routes:
@@ -820,6 +830,7 @@ async def _run_cycle(
     declared: Sequence[Route] | None,
     binding_health_path: str | None,
     coverage: bool,
+    exclude_kinds: Sequence[str],
 ) -> None:
     if adapters:
         await _probe_adapters(platform, adapters, result)
@@ -847,6 +858,13 @@ async def _run_cycle(
     except Exception as exc:  # noqa: BLE001 - inventory failures fail the whole cycle
         result.record("inventory", "failed", exc)
         return
+    if exclude_kinds:
+        # @spec TURN-CANARY-15: excluded kinds leave before every observation,
+        # on the declared side of drift as well as the live side.
+        excluded = set(exclude_kinds)
+        rows = [row for row in rows if row.get("kind") not in excluded]
+        if declared is not None:
+            declared = [route for route in declared if route[0] not in excluded]
     result.inventory_labels = {_route_label(row) for row in rows}
     for row in rows:
         result.route_agents.setdefault(_route_label(row), row.get("agent", ""))
@@ -1474,6 +1492,7 @@ class Config:
     binding_health_path: str | None = None
     coverage: bool = False
     route_labels: str = "route"
+    exclude_kinds: tuple[str, ...] = ()
 
 
 def _routes(raw: str, name: str) -> list[Route]:
@@ -1598,6 +1617,11 @@ def parse_config(environ: Mapping[str, str]) -> Config:
         ),
         coverage=environ.get("TURN_CANARY_COVERAGE") == "1",
         route_labels=_check_layout(environ.get("TURN_CANARY_ROUTE_LABELS", "route")),
+        exclude_kinds=(
+            _exclude_kinds(environ["TURN_CANARY_EXCLUDE_BINDING_KINDS"])
+            if environ.get("TURN_CANARY_EXCLUDE_BINDING_KINDS")
+            else ()
+        ),
     )
 
 
@@ -1643,6 +1667,7 @@ async def main() -> int:
                 declared=config.declared,
                 binding_health_path=config.binding_health_path,
                 coverage=config.coverage,
+                exclude_kinds=config.exclude_kinds,
             )
             journal.save_result(result)
         return result
