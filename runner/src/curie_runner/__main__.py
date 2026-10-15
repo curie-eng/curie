@@ -789,10 +789,10 @@ def build_runner(
     compiled = harness.compile_bundle(config.session.plugin_dir)
     system_prompt = compiled.system_prompt
     tool_manifest = _load_tool_manifest()
-    logger.info(
-        "runner tool manifest boot tool_count=%d",
-        tool_manifest.tool_count if tool_manifest is not None else 0,
-    )
+    if tool_manifest is not None:
+        logger.info("runner tool manifest loaded: %d tools", tool_manifest.tool_count)
+    else:
+        logger.info("runner tool manifest absent: tool_count=0")
     web_search_enabled = load_bundle_web_search_enabled(config.session.plugin_dir)
     final_answer = load_bundle_final_answer(config.session.plugin_dir)
     mounted_workspace = (

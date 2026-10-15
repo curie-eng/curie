@@ -512,7 +512,9 @@ def test_build_runner_boot_log_matches_factory_manifest_count_parser(
     monkeypatch.syspath_prepend(
         str(Path(__file__).resolve().parents[2] / "tools" / "factory-e2e")
     )
-    import repo_runner
+    import factory_e2e
+
+    repo_runner = factory_e2e.load_repo_runner()
 
     if manifest is not None:
         (tmp_path / "tool-manifest.json").write_text(manifest, encoding="utf-8")
