@@ -288,6 +288,7 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
     binary, api_image = source_artifacts
     source = LADDER.read_text()
     suffix = uuid.uuid4().hex[:10]
+    candidate_api_image = f"ghcr.io/curie-eng/curie-api:test-{suffix}"
     project = f"curie-2762-{tier.replace('-', '')}-{suffix}"
     plugin_name = f"acme-2762-{suffix}"
     root = tmp_path
@@ -303,7 +304,7 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
             strict=True,
         )
     )
-    _write_override(override, api_image, host_ports)
+    _write_override(override, candidate_api_image, host_ports)
     if tier == "local-release":
         generated = _run(["python3", "compose/generate_release_compose.py"])
         release.write_text(_require(generated, "generating release Compose"))
@@ -346,7 +347,15 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
         f"curie-connector-{project}-{plugin_name}-tempo:build",
     ]
     teardown_errors: list[str] = []
+    candidate_api_owned = False
     try:
+        if _run(["docker", "image", "inspect", candidate_api_image]).returncode == 0:
+            raise RuntimeError(f"owned API tag already exists: {candidate_api_image}")
+        _require(
+            _run(["docker", "tag", api_image, candidate_api_image]),
+            "tagging the source API for this test's candidate",
+        )
+        candidate_api_owned = True
         rendered_result = _run(compose + ["config", "--format", "json"], env=env)
         rendered = json.loads(_require(rendered_result, "rendering private Compose"))
         # The host-network worker dials each of these at 127.0.0.1:<host port>.
@@ -467,6 +476,7 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
         owned_source_tags = [
             tag
             for tag in local_source_tags
+            if tag != candidate_api_image or candidate_api_owned
             if _run(["docker", "image", "inspect", tag]).returncode == 0
         ]
         if owned_source_tags:
@@ -609,11 +619,7 @@ def _start_isolated_approval_seed_worker(case: LocalCase) -> None:
         timeout=1800,
     )
     _require(result, "starting the isolated local worker for the approval seed")
-    # The seed's `curie local message` enqueues through a one-shot container of
-    # the dispatcher image, which it takes from the running API's tag. This
-    # fixture runs a private API image, so no dispatcher exists at that tag and
-    # compose's own default applies: it must be the dispatcher `local up
-    # --build` just built, not whatever `curie-dispatcher:latest` is local.
+    # The one-shot dispatcher must use this test's source image tag.
     candidate = f"ghcr.io/curie-eng/curie-dispatcher:{case.env['CURIE_LOCAL_IMAGE_TAG']}"
     case.env["CURIE_DISPATCHER_IMAGE"] = candidate
     rendered = json.loads(
@@ -687,7 +693,7 @@ route = agent.get("approval_routes", {{}}).get("e2e")
 expected = {{
     "resolution": {{"kind": "slack", "address": channel}},
     "notification": None,
-    "approvers": {{"group": None, "users": ["U0EXAMPLE1"]}},
+    "approvers": {{"group": None, "users": ["U0EXAMPLE1"], "emails": None}},
 }}
 if agent.get("name", "").startswith("approval-seed-") is False:
     raise SystemExit("approval seed did not create an owned agent name")
@@ -821,7 +827,7 @@ def test_connector_local_deploy_binds_retained_routes_and_preserves_refusal_json
     assert seeded_agent["approval_routes"]["e2e"] == {
         "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
         "notification": None,
-        "approvers": {"group": None, "users": ["U0EXAMPLE1"]},
+        "approvers": {"group": None, "users": ["U0EXAMPLE1"], "emails": None},
     }
 
     existing = {"resolution": {"kind": "slack", "address": "C0EXAMPLE2"}}

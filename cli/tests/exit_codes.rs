@@ -25,6 +25,144 @@ const INVALID_API_URL: &str = "localhost:8000";
 const INVALID_RUNNER_URL: &str = "localhost:8787";
 const DOCKER_FAILURE_SENTINEL: &str = "curie-1655-docker-command-failure";
 
+const SNAPSHOT_DOCKER_FIXTURE: &str = r#"#!/usr/bin/python3
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import sqlite3
+import sys
+
+CONFLICT_NAME = None
+root = Path(os.environ.get("CURIE_TEST_DEMO_STATE", Path(__file__).parent))
+db = sqlite3.connect(root / "docker-state.sqlite3")
+db.execute("CREATE TABLE IF NOT EXISTS objects (kind TEXT, name TEXT, body TEXT, PRIMARY KEY (kind, name))")
+args = sys.argv[1:]
+kind = "container"
+if args[0] in ("container", "volume", "image"):
+    kind = args.pop(0)
+command = args.pop(0)
+
+def option(flag, default=None):
+    return args[args.index(flag) + 1] if flag in args else default
+
+def labels():
+    return dict(args[i + 1].split("=", 1) for i, arg in enumerate(args) if arg == "--label")
+
+def objects(object_kind):
+    return [(name, json.loads(body)) for name, body in db.execute("SELECT name, body FROM objects WHERE kind = ?", (object_kind,))]
+
+def save(object_kind, name, body):
+    db.execute("INSERT OR REPLACE INTO objects VALUES (?, ?, ?)", (object_kind, name, json.dumps(body)))
+    db.commit()
+
+def fail(message, code=93):
+    print(message, file=sys.stderr)
+    sys.exit(code)
+
+if kind == "image" and command == "inspect":
+    sys.exit(0)
+if command == "create":
+    name = args[-1] if kind == "volume" else option("--name")
+    body = {"Name": name, "Labels": labels()}
+    if kind == "container":
+        mount = dict(field.split("=", 1) for field in option("--mount").split(",") if "=" in field)
+        if mount.get("type") != "volume" or mount.get("source") not in dict(objects("volume")):
+            fail("seed container requires an existing named volume")
+        body = {"Id": name, "Name": "/" + name, "Config": {"Labels": labels(), "Env": []},
+                "Mounts": [{"Type": "volume", "Name": mount["source"], "Destination": mount["target"], "RW": True}]}
+    save(kind, name, body)
+    print(name)
+elif command == "cp":
+    source, destination = args[-2:]
+    container, target = destination.split(":", 1)
+    seed = dict(objects("container")).get(container)
+    if not Path(source).is_dir() or seed is None:
+        fail("copy requires a client directory and an existing seed container")
+    mount = next((mount for mount in seed["Mounts"] if mount["Destination"] == target), None)
+    if mount is None:
+        fail("copy destination must be the seed container's mounted input")
+    volume = dict(objects("volume"))[mount["Name"]]
+    volume["Seeded"] = True
+    save("volume", mount["Name"], volume)
+elif command == "run":
+    if CONFLICT_NAME is not None:
+        fail(f'docker: Error response from daemon: Conflict. The container name "/{CONFLICT_NAME}" is already in use by container "9f2c".', 125)
+    env = [args[i + 1] for i, arg in enumerate(args) if arg == "-e"]
+    session_id = next((value.split("=", 1)[1] for value in env if value.startswith("CURIE_SESSION_ID=")), "")
+    if not session_id:
+        fail("runner startup omitted its session identity")
+    name = option("--name")
+    volume, target, mode = option("-v").split(":")
+    if not dict(objects("volume")).get(volume, {}).get("Seeded"):
+        fail("runner requires its seeded snapshot volume")
+    save("container", name, {"Id": "fixture-runner-id", "Name": "/" + name,
+         "Config": {"Labels": labels(), "Env": env},
+         "Mounts": [{"Type": "volume", "Name": volume, "Destination": target, "RW": "ro" not in mode.split(",")}]})
+    (root / "started").write_text(session_id)
+    print("fixture-runner-id")
+elif command == "inspect":
+    name = args[-1]
+    body = next((body for key, body in objects(kind) if name in (key, body.get("Id"))), None)
+    if body is None:
+        fail(f"Error: No such {kind}: {name}", 1)
+    template = option("--format")
+    if template is None:
+        print(json.dumps([body]))
+    elif template == "{{json .}}":
+        print(json.dumps(body))
+    elif template == "{{json .Mounts}}":
+        print(json.dumps(body["Mounts"]))
+    elif template in ("{{json .Config.Labels}}", "{{json .Labels}}"):
+        print(json.dumps(body["Config"]["Labels"] if kind == "container" else body["Labels"]))
+    elif "Labels" in template:
+        values = body["Config"]["Labels"] if kind == "container" else body["Labels"]
+        keys = re.findall(r'index \.(?:Config\.)?Labels "([^"]+)"', template)
+        if "{{if eq" in template:
+            print(values.get(keys[-1], "") if values.get("curietech.ai/managed-by") == "curie-cli" else "")
+        else:
+            print(" ".join(values.get(key, "") for key in keys))
+    else:
+        fail(f"unsupported inspect template: {template}")
+elif command in ("ps", "ls"):
+    filters = [args[i + 1] for i, arg in enumerate(args) if arg == "--filter"]
+    for name, body in objects(kind):
+        values = body["Config"]["Labels"] if kind == "container" else body["Labels"]
+        if any(not re.search(value[5:], name) for value in filters if value.startswith("name=")):
+            continue
+        if any(values.get(value[6:].split("=", 1)[0]) != value[6:].split("=", 1)[1]
+               for value in filters if value.startswith("label=")):
+            continue
+        if kind == "volume" or "-q" in args:
+            print(body.get("Id", name))
+        else:
+            print(f'{name}\t{body["Id"]}\t{values.get("curietech.ai/managed-by", "")}')
+elif command == "rm":
+    for name in (arg for arg in args if not arg.startswith("-")):
+        entry = next(((key, body) for key, body in objects(kind) if name in (key, body.get("Id"))), None)
+        if entry is None:
+            fail(f"Error: No such {kind}: {name}", 1)
+        key, body = entry
+        if kind == "container" and body["Id"] == "fixture-runner-id":
+            session_id = (root / "started").read_text()
+            (root / "teardown-attempted").write_text(session_id)
+            if os.environ.get("CURIE_TEST_DEMO_MODE") == "teardown":
+                fail("fixture teardown failed", 37)
+            (root / "started").unlink()
+            if os.environ.get("CURIE_TEST_DEMO_MODE") == "remove":
+                for demo in Path(os.environ["TMPDIR"]).glob("curie-try-*"):
+                    shutil.rmtree(demo)
+                    demo.write_text("fixture prevents directory removal")
+        if kind == "volume" and any(mount.get("Name") == name for _, container in objects("container") for mount in container["Mounts"]):
+            fail(f"volume is in use: {name}", 1)
+        db.execute("DELETE FROM objects WHERE kind = ? AND name = ?", (kind, key))
+        db.commit()
+        print(name)
+else:
+    fail(f"unexpected Docker command: {sys.argv[1:]}")
+"#;
+
 fn streamed_reply(status: &str, include_final: bool) -> Response {
     let mut frames = vec![
         serde_json::json!({
@@ -142,68 +280,7 @@ fn run_demo(mode: &str, json: bool) -> Output {
     fs::create_dir(&bin).unwrap();
     fs::create_dir(&demos).unwrap();
     let docker = bin.join("docker");
-    fs::write(
-        &docker,
-        r#"#!/bin/sh
-case "$1" in
-  image) exit 0 ;;
-  ps)
-    case "$*" in
-      *'name=^curie-runner-local$'*)
-        if [ -f "$CURIE_TEST_DEMO_STATE/started" ]; then
-          printf 'curie-runner-local\tfixture-runner-id\tcurie-cli\n'
-        fi ;;
-    esac
-    exit 0 ;;
-  run)
-    session_id=""
-    for arg in "$@"; do
-      case "$arg" in
-        CURIE_SESSION_ID=*) session_id="${arg#CURIE_SESSION_ID=}" ;;
-      esac
-    done
-    if [ -z "$session_id" ]; then
-      printf 'runner startup omitted its session identity\n' >&2
-      exit 93
-    fi
-    printf '%s\n' "$session_id" > "$CURIE_TEST_DEMO_STATE/started"
-    printf 'fixture-runner-id\n'
-    exit 0 ;;
-  container)
-    case "$*" in
-      "container inspect --format {{if eq (index .Config.Labels \"curietech.ai/managed-by\") \"curie-cli\"}}{{with index .Config.Labels \"curietech.ai/snapshot-volume\"}}{{.}}{{end}}{{end}} fixture-runner-id")
-        # This local runner has a snapshot bind, without a volume label.
-        exit 0 ;;
-      *) printf 'unexpected docker command: %s\n' "$*" >&2; exit 93 ;;
-    esac ;;
-  volume)
-    IFS= read -r session_id < "$CURIE_TEST_DEMO_STATE/teardown-attempted"
-    case "$*" in
-      "volume ls -q --filter label=curietech.ai/managed-by=curie-cli --filter label=curietech.ai/component=skill-snapshot --filter label=curietech.ai/snapshot-owner=curie-runner-local:$session_id")
-        # The exact recorded session owns no remote snapshot volumes.
-        exit 0 ;;
-      *) printf 'unexpected docker command: %s\n' "$*" >&2; exit 93 ;;
-    esac ;;
-  rm)
-    IFS= read -r session_id < "$CURIE_TEST_DEMO_STATE/started"
-    printf '%s\n' "$session_id" > "$CURIE_TEST_DEMO_STATE/teardown-attempted"
-    if [ "$CURIE_TEST_DEMO_MODE" = teardown ]; then
-      printf 'fixture teardown failed\n' >&2
-      exit 37
-    fi
-    /bin/rm "$CURIE_TEST_DEMO_STATE/started"
-    if [ "$CURIE_TEST_DEMO_MODE" = remove ]; then
-      for demo in "$TMPDIR"/curie-try-*; do
-        /bin/rm -rf "$demo"
-        printf 'fixture prevents directory removal' > "$demo"
-      done
-    fi
-    exit 0 ;;
-  *) printf 'unexpected docker command: %s\n' "$*" >&2; exit 93 ;;
-esac
-"#,
-    )
-    .expect("write demo Docker fixture");
+    fs::write(&docker, SNAPSHOT_DOCKER_FIXTURE).expect("write demo Docker fixture");
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
     if json {
@@ -576,13 +653,9 @@ fn executable_docker_lost_race_stub(container_name: &str) -> tempfile::TempDir {
     let docker = dir.path().join("docker");
     fs::write(
         &docker,
-        format!(
-            "#!/bin/sh\n\
-             case \"$1\" in\n\
-               ps) exit 0 ;;\n\
-               run) printf '%s\\n' 'docker: Error response from daemon: Conflict. The container name \"/{container_name}\" is already in use by container \"9f2c\".' >&2; exit 125 ;;\n\
-               *) printf '%s\\n' 'unexpected docker command' >&2; exit 93 ;;\n\
-             esac\n"
+        SNAPSHOT_DOCKER_FIXTURE.replace(
+            "CONFLICT_NAME = None",
+            &format!("CONFLICT_NAME = {container_name:?}"),
         ),
     )
     .expect("write Docker race stub");
