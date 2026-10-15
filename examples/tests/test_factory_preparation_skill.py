@@ -52,7 +52,9 @@ def test_frontmatter_passes_portable_production_validation(tmp_path: Path) -> No
     assert result.valid, result.errors
 
 
-@pytest.mark.parametrize("provider_directory", [".agents/skills", ".claude/skills"])
+@pytest.mark.parametrize(
+    "provider_directory", [".agents/skills", ".claude/skills", ".github/skills"]
+)
 def test_folder_only_install_is_self_contained(tmp_path: Path, provider_directory: str) -> None:
     assert_self_contained(SKILL)
     destination = tmp_path / "client project café" / provider_directory / SKILL.name
