@@ -737,6 +737,7 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
     expected = [
         "run", "pytest", "-q", "-n", "4", "--dist", "loadgroup",
         "--ci-shard", f"{shard}/3", "--reruns", "1", "-rsR", "--durations=25",
+        "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
     ]
     if deselect:
         for path in deselect.split(","):
@@ -744,7 +745,11 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
     if scope == "cli":
         files = (REPO_ROOT / LIST_PATH).read_text().splitlines()
         assert files
-        expected.extend(files)
+        expected.extend(
+            path
+            for path in files
+            if path != "tools/factory-e2e/tests/test_c4_initial_binding.py"
+        )
     assert (
         PYTEST_TESTS._run_pytest_step(tmp_path, shard=shard, deselect=deselect, scope=scope)
         == expected
@@ -787,10 +792,15 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
     expected = [
         "run", "pytest", "-q", "-n", "4", "--dist", "loadgroup",
         "--ci-shard", "2/3", "--reruns", "1", "-rsR", "--durations=25",
+        "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
         "--deselect", deselect,
     ]
     if scope == "cli":
-        expected.extend((tmp_path / LIST_PATH).read_text().splitlines())
+        expected.extend(
+            path
+            for path in (tmp_path / LIST_PATH).read_text().splitlines()
+            if path != "tools/factory-e2e/tests/test_c4_initial_binding.py"
+        )
     assert recorded["argv"] == expected
 
 

@@ -53,6 +53,11 @@ RETRY_ALLOWLIST = frozenset(
         ("ci.yaml", "python-pytest", "Install uv"),
         ("ci.yaml", "turn-canary-contract", "Install uv"),
         ("fix-pin.yaml", "fix-pin", "Install uv"),
+        (
+            "fix-pin.yaml",
+            "fix-pin",
+            "Install kind and kubectl without creating a cluster",
+        ),
         ("ci.yaml", "e2e-ladder-cluster", "Create the kind cluster"),
         ("ci.yaml", "e2e-cluster-chart-regressions", "Create the kind cluster"),
         ("ci.yaml", "e2e-cluster-rollout-recovery", "Create the kind cluster"),
@@ -98,6 +103,7 @@ RETRY_ALLOWLIST = frozenset(
         ("ci.yaml", "e2e-cluster-upgrade-matrix", "Install Helm"),
         # Issue #4111: the scripted factory job acquires Helm, kind and kubectl
         # before the driver runs; the driver creates its own cluster.
+        ("ci.yaml", "e2e-scripted-factory", "Install uv"),
         ("ci.yaml", "e2e-scripted-factory", "Install Helm"),
         (
             "ci.yaml",

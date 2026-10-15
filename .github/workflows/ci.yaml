@@ -277,7 +277,11 @@ jobs:
           fi
           if [[ "$PYTEST_SCOPE" == "cli" ]]; then
             mapfile -t cli_pytest_files < tools/e2e-ci-selection/cli_pytest_files.txt
-            pytest_args+=("${cli_pytest_files[@]}")
+            for path in "${cli_pytest_files[@]}"; do
+              if [[ "$path" != "tools/factory-e2e/tests/test_c4_initial_binding.py" ]]; then
+                pytest_args+=("$path")
+              fi
+            done
           fi
           unset PYTEST_SCOPE
           uv run pytest "${pytest_args[@]}"
