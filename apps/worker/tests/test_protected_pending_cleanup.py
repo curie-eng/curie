@@ -161,11 +161,22 @@ def test_actual_registered_pending_cleanup_proof_and_refusal(owned_worker, tmp_p
                         if mode == "unknown":
                             await asyncio.wait_for(external.create_response_ready.wait(), 3)
                         else:
+                            # A 202 registers the sibling before the issuer has
+                            # created its Pod; retiring it then stays "retiring"
+                            # (fail-closed) and records no cleanup evidence.
+                            sibling_row = None
                             for _ in range(60):
                                 if len(client._owned) == 2:
-                                    break
+                                    sibling = list(client._owned.values())[-1]
+                                    sibling_row = server._registry.get(
+                                        "worker/example", sibling.capability.launch_id
+                                    )
+                                    if sibling_row.objects.pod_uid is not None:
+                                        break
                                 await asyncio.sleep(0.05)
                             assert len(client._owned) == 2
+                            assert sibling_row is not None
+                            assert sibling_row.objects.pod_uid is not None
                         assert not client.is_owned_retirement(proof, delivery=delivery)
                         assert client.owned_retirement_for_delivery(delivery) is None
                         other.cancel()
