@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.5.22";
+pub const PROTOCOL_VERSION: &str = "0.5.23";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -513,6 +513,8 @@ pub enum OutboundEvent {
         input_tokens: Option<i64>,
         #[serde(default)]
         output_tokens: Option<i64>,
+        #[serde(default)]
+        text_mode: Option<String>,
     },
     #[serde(rename = "error")]
     ErrorEvent {
@@ -561,6 +563,7 @@ mod tests {
             approval_display: None,
             input_tokens: None,
             output_tokens: None,
+            text_mode: None,
         };
         let encoded = serde_json::to_string(&event).unwrap();
         let decoded: OutboundEvent = serde_json::from_str(&encoded).unwrap();
@@ -581,6 +584,7 @@ mod tests {
             approval_display: None,
             input_tokens: None,
             output_tokens: None,
+            text_mode: None,
         };
         let encoded = serde_json::to_string(&event).unwrap();
         let decoded: OutboundEvent = serde_json::from_str(&encoded).unwrap();
@@ -743,13 +747,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.5.23","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.24","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.5.22","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.23","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

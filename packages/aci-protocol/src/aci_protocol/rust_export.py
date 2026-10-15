@@ -335,6 +335,7 @@ mod tests {
             approval_display: None,
             input_tokens: None,
             output_tokens: None,
+            text_mode: None,
         };
         let encoded = serde_json::to_string(&event).unwrap();
         let decoded: OutboundEvent = serde_json::from_str(&encoded).unwrap();
@@ -355,6 +356,7 @@ mod tests {
             approval_display: None,
             input_tokens: None,
             output_tokens: None,
+            text_mode: None,
         };
         let encoded = serde_json::to_string(&event).unwrap();
         let decoded: OutboundEvent = serde_json::from_str(&encoded).unwrap();

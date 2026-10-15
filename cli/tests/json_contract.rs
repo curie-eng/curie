@@ -1186,6 +1186,7 @@ fn skill_message_awaiting_approval_output_preserves_final_approval_fields() {
         approval_display: None,
         input_tokens: Some(10),
         output_tokens: Some(5),
+        text_mode: None,
     };
     let out = SkillMessageOutput::from_final("the answer is 42".to_string(), &final_frame)
         .expect("a final frame produces skill message output");
@@ -1220,6 +1221,7 @@ fn skill_message_awaiting_approval_output_is_not_finalized() {
         approval_display: None,
         input_tokens: None,
         output_tokens: None,
+        text_mode: None,
     };
     let out = SkillMessageOutput::from_final(
         "I need approval before continuing".to_string(),
@@ -1258,6 +1260,7 @@ fn skill_message_only_marks_awaiting_approval_as_not_finalized() {
             approval_display: None,
             input_tokens: None,
             output_tokens: None,
+            text_mode: None,
         };
         let out = SkillMessageOutput::from_final(String::new(), &final_frame)
             .expect("a final frame produces skill message output");
