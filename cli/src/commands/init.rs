@@ -96,7 +96,6 @@ pub fn check_outcome(report: &CheckReport) -> std::result::Result<(), crate::exi
 
 /// Run the offline MCP load check for a plugin bundle.
 pub async fn check(plugin_dir: PathBuf, image: String, timeout_s: u64) -> Result<()> {
-    let published_host = docker::published_host_setting()?;
     let requested_dir = plugin_dir.display().to_string();
     let plugin_dir = plugin_dir.canonicalize().map_err(|err| {
         crate::exit::CliError::usage(format!("plugin dir not found: {requested_dir}: {err}"))
@@ -105,24 +104,18 @@ pub async fn check(plugin_dir: PathBuf, image: String, timeout_s: u64) -> Result
         crate::exit::CliError::usage(format!("plugin dir is not a usable bundle: {err}"))
     })?;
 
-    let snapshot = if docker::remote_mode(published_host.as_deref()) {
-        Some(crate::bundle::snapshot_ephemeral(&plugin_dir)?)
-    } else {
-        None
-    };
+    let snapshot = crate::bundle::snapshot_ephemeral(&plugin_dir)?;
     let spec = CheckSpec {
         image,
-        plugin_dir: snapshot
-            .as_ref()
-            .map(|snapshot| &snapshot.dir)
-            .unwrap_or(&plugin_dir)
-            .display()
-            .to_string(),
+        plugin_dir: snapshot.dir.display().to_string(),
         timeout_s,
     };
-    let result = docker::run_check(&spec, published_host.as_deref()).await;
-    if let Some(snapshot) = snapshot {
-        crate::bundle::remove_snapshot(&snapshot.dir, &plugin_dir)?;
+    let result = docker::run_check(&spec).await;
+    if let Err(cleanup) = crate::bundle::remove_snapshot(&snapshot.dir, &plugin_dir) {
+        return Err(match result {
+            Ok(_) => cleanup.context("releasing the check snapshot"),
+            Err(err) => err.context(format!("check snapshot cleanup failed: {cleanup}")),
+        });
     }
     let (status, stdout, stderr) = result?;
     // A container that DID run and produced parseable JSON is data (a

@@ -247,4 +247,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0231 | [Remediation policy bind and arm need an authority the platform key cannot derive](0231-remediation-policy-bind-and-arm-need-an-authority-the-platform-key-cannot-derive.md) | Draft |
 | 0232 | [A contract migration ships one release after the code stops using what it drops](0232-a-contract-migration-ships-one-release-after-the-code-stops-using-what-it-drops.md) | Draft |
 | 0233 | [Factory publication recovery requires explicit operator adoption](0233-factory-publication-recovery-requires-explicit-operator-adoption.md) | Draft |
+| 0234 | [Factory-owned pull requests accept authorized feedback without a mention](0234-factory-owned-pull-requests-accept-authorized-feedback-without-a-mention.md) | Accepted |
 <!-- END GENERATED: adr-index -->

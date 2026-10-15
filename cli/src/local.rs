@@ -28,9 +28,6 @@ pub const COMPOSE_PROJECT: &str = "curie";
 /// `{project}_runner`.
 pub const DEFAULT_DOCKER_NETWORK: &str = "curie_runner";
 
-/// Default host:container staging path the host-network worker bind-mounts.
-pub const DEFAULT_STAGING_DIR: &str = "/tmp/curie-bundles";
-
 /// Default published Postgres host port in `compose.dev.yaml`.
 pub const DEFAULT_POSTGRES_PORT: u16 = 25432;
 
@@ -45,7 +42,6 @@ const ISOLATION_ENV: &[&str] = &[
     "CURIE_LOCAL_STUB_PORT",
     "CURIE_LOCAL_POSTGRES_HOST",
     "CURIE_LOCAL_POSTGRES_PORT",
-    "CURIE_LOCAL_STAGING_DIR",
     "CURIE_LOCAL_IMAGE_TAG",
 ];
 
@@ -62,7 +58,6 @@ pub struct LocalResources {
     pub s3_endpoint: String,
     pub docker_network: String,
     pub stub_port: u16,
-    pub staging_dir: String,
     pub image_tag: String,
 }
 
@@ -80,7 +75,6 @@ impl LocalResources {
             s3_endpoint: "http://localhost:29000".to_string(),
             docker_network: DEFAULT_DOCKER_NETWORK.to_string(),
             stub_port: crate::message::DEFAULT_LOCAL_STUB_PORT,
-            staging_dir: DEFAULT_STAGING_DIR.to_string(),
             image_tag: "dev".to_string(),
         }
     }
@@ -410,7 +404,7 @@ fn isolation_usage(missing: &[String]) -> anyhow::Error {
         "set COMPOSE_PROJECT_NAME with COMPOSE_FILE (base compose.dev.yaml then an override) \
          and the matching CURIE_API_URL, VALKEY_HOST, VALKEY_PORT, S3_ENDPOINT_URL, \
          CURIE_DOCKER_NETWORK, CURIE_LOCAL_STUB_PORT, CURIE_LOCAL_POSTGRES_HOST, \
-         CURIE_LOCAL_POSTGRES_PORT, CURIE_LOCAL_STAGING_DIR, and CURIE_LOCAL_IMAGE_TAG",
+         CURIE_LOCAL_POSTGRES_PORT and CURIE_LOCAL_IMAGE_TAG",
     )
     .into()
 }
@@ -538,7 +532,6 @@ pub fn resolve_local_resources(
         stub_port: get("CURIE_LOCAL_STUB_PORT").parse().map_err(|_| {
             crate::exit::CliError::usage("CURIE_LOCAL_STUB_PORT must be a TCP port")
         })?,
-        staging_dir: get("CURIE_LOCAL_STAGING_DIR"),
         image_tag: get("CURIE_LOCAL_IMAGE_TAG"),
     };
     validate_isolated_override(&resources, build)?;
@@ -627,7 +620,6 @@ fn validate_isolated_override(resources: &LocalResources, build: bool) -> Result
         ("S3_ENDPOINT_URL", resources.s3_endpoint.clone()),
         ("CURIE_API_URL", resources.api_url.clone()),
         ("CURIE_DOCKER_NETWORK", resources.docker_network.clone()),
-        ("TMPDIR", resources.staging_dir.clone()),
         ("SLACK_API_BASE_URL", format!(":{}", resources.stub_port)),
     ];
     for (key, needle) in required {
@@ -639,8 +631,7 @@ fn validate_isolated_override(resources: &LocalResources, build: bool) -> Result
             ))
             .with_fix(
                 "override curie-worker environment (DATABASE_URL, VALKEY_HOST, VALKEY_PORT, \
-                 S3_ENDPOINT_URL, CURIE_API_URL, SLACK_API_BASE_URL, TMPDIR, CURIE_DOCKER_NETWORK) \
-                 and the identical host:container staging mount",
+                 S3_ENDPOINT_URL, CURIE_API_URL, SLACK_API_BASE_URL, CURIE_DOCKER_NETWORK)",
             )
             .into());
         }
@@ -1871,40 +1862,19 @@ impl crate::ui::CliOutput for LocalDownOutput {
     }
 }
 
-/// The connector teardown `local down` runs, for a `down` invoked from `cwd`.
-///
-/// Container reaping stays label-scoped rather than file-scoped: `LocalDownOpts`
-/// carries no plugin directory, so a `down` run from anywhere must still reap
-/// what a `local deploy` started (ADR 0113, block B1-8). The staged credential
-/// tree can only be addressed by path, and the local tier records the deployed
-/// bundle's directory nowhere (`.curie/runner.json` is the skill tier's), so the
-/// honest resolution is the one `local deploy` itself defaults to: the current
-/// directory (`--plugin-dir .`). The wipe is added only when that directory
-/// actually holds a staged tree.
-///
-/// The limit that leaves: a `down` run from an unrelated directory, or after a
-/// deploy that pointed `--plugin-dir` elsewhere, still cannot find that bundle's
-/// tree. Accepted, because guessing at another bundle is worse than missing one
-/// -- the containers holding the credentials are reaped either way, and a `down`
-/// or `deploy` from the bundle's own directory clears the tree.
-pub fn connector_teardown_plan_for_down(
-    cwd: &Path,
-    project: &str,
-) -> Vec<docker::ConnectorTeardownStep> {
-    let staged = crate::connector_build::connector_secrets_root(cwd).is_dir();
-    docker::connector_teardown_plan(project, None, staged.then_some(cwd))
+/// Project-owned connectors and credential volumes are discoverable from any directory.
+pub fn connector_teardown_plan_for_down(project: &str) -> Vec<docker::ConnectorTeardownStep> {
+    docker::connector_teardown_plan(project, None)
 }
 
 pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
     let ui = crate::ui::ui();
     let cmd = down_command(&o);
-    let cwd = std::env::current_dir().context("resolving the current directory")?;
-    let teardown = connector_teardown_plan_for_down(&cwd, o.common.project());
+    let teardown = connector_teardown_plan_for_down(o.common.project());
     if o.common.dry_run {
-        let mut lines = vec![
-            cmd.display(),
+        let lines = vec![
             format!(
-                "docker rm -f $(docker ps -a --filter label={} --filter network={} -q)",
+                "docker rm -f -v $(docker ps -a --filter label={} --filter network={} -q)",
                 docker::SANDBOX_LABEL,
                 o.common.resources.docker_network
             ),
@@ -1913,13 +1883,14 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
                 docker::CONNECTOR_COMPONENT_LABEL,
                 docker::connector_project_label(o.common.project())
             ),
+            cmd.display(),
+            format!(
+                "reap claim input helpers and orphaned volumes with label={} and label={}={} after validating claim and attempt ownership",
+                docker::SANDBOX_LABEL,
+                docker::SANDBOX_STACK_LABEL_KEY,
+                o.common.resources.docker_network
+            ),
         ];
-        // A removal of files on disk must not be a surprise the plan omitted.
-        for step in &teardown {
-            if let docker::ConnectorTeardownStep::WipeSecrets(path) = step {
-                lines.push(format!("rm -rf {}", path.display()));
-            }
-        }
         return Ok(LocalDownOutput::DryRun(crate::ui::DryRunPlan { lines }));
     }
     if o.wipe {
@@ -1943,31 +1914,39 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
     } else {
         "stopping stack"
     };
-    run_step(&cl, label, "stopped", &cmd).await?;
-    // Containers first, then this bundle's staged credential tree when the
-    // directory `down` was run from holds one -- see
-    // `connector_teardown_plan_for_down` for what that resolution can and
-    // cannot reach.
-    for problem in docker::run_connector_teardown(&teardown).await {
-        ui.warn(&problem);
-    }
     let report = docker::reap_filtered(&[
         ("label", docker::SANDBOX_LABEL),
         ("network", o.common.resources.docker_network.as_str()),
     ])
     .await;
+    for problem in docker::run_connector_teardown(&teardown).await {
+        ui.warn(&problem);
+    }
+    let mut problems = Vec::new();
     if let Some(err) = report.error {
-        // The stack stopped, but the runner reap did not complete cleanly. Fail
-        // loudly rather than report success with orphaned containers still
-        // holding ports and credentials (#613).
         let still = if report.still_present.is_empty() {
             "unknown".to_string()
         } else {
             report.still_present.join(", ")
         };
+        problems.push(format!(
+            "reaping runner containers did not complete cleanly: {err}. Containers still present: {still}"
+        ));
+    }
+    match run_step(&cl, label, "stopped", &cmd).await {
+        Ok(_) => {
+            if let Err(err) =
+                docker::cleanup_stack_claim_inputs(&o.common.resources.docker_network).await
+            {
+                problems.push(err.to_string());
+            }
+        }
+        Err(err) => problems.push(format!("stack teardown failed: {err}")),
+    }
+    if !problems.is_empty() {
         bail!(
-            "dev stack stopped, but reaping runner containers did not complete cleanly: {err}. \
-             Still running: {still}. Remove them with `docker rm -f <id>` before restarting."
+            "local teardown did not complete cleanly: {}",
+            problems.join("; ")
         );
     }
     Ok(LocalDownOutput::Down {

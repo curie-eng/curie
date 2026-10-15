@@ -410,10 +410,17 @@ reads as a single forge configuration document:
    `factory.cardBaseUrl` and `factory.ciWaitSeconds` replace the matching
    `api.*` settings.
 
-The old `api.githubFactory*` keys are removed. A release that still sets one
-fails at render with a message naming `factory.*` and `curie cluster factory`.
-Move the values into `factory:` and rerun. See
-[factory settings](../operations.md#admitting-a-labelled-github-issue).
+The old `api.githubFactory*` keys are removed. For a v0.12.5 installation
+configured with `curie cluster factory`, the v0.13.0 refusal's suggested
+`cluster factory` remedy also fails, even with explicit label and mention.
+Until [#4628](https://github.com/curie-eng/curie/issues/4628) is fixed, follow the
+[verified manual migration](../operations.md#manual-factory-migration-from-v0125-to-v0130):
+prepare one values overlay with typed factory credentials, tracker and
+repository bindings, set all ten legacy keys to `null`, and pass the overlay
+to `curie cluster upgrade --to 0.13.0 --forward-only`. The upgrade retains its
+convergence, canary and known-good recording. See
+[factory settings](../operations.md#admitting-a-labelled-github-issue) for the
+current configuration model.
 
 `curie cluster status` and `curie doctor` print one line per forge credential,
 for example `credential tracker github (github_app): none`. The expiry reads

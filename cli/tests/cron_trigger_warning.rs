@@ -57,7 +57,31 @@ fn run_skill_check(manifest: Value, report: &str) -> Output {
     )
     .expect("write manifest");
 
-    let script = format!("#!/bin/sh\nprintf '%s\\n' '{report}'\n");
+    let script = format!(
+        r#"#!/bin/sh
+case "$1 $2" in
+  "volume create")
+    for volume in "$@"; do :; done
+    printf '%s\n' "$volume"
+    ;;
+  "volume inspect") printf '%s\n' 'curie-cli skill-snapshot' ;;
+  "volume rm"|"ps "*) ;;
+  *)
+    case "$1" in
+      create) printf '%s\n' 'fixture-seed-id' ;;
+      cp|rm) ;;
+      run)
+        case "$*" in
+          *"curie_runner.check") printf '%s\n' '{report}' ;;
+          *) printf 'unexpected Docker run: %s\n' "$*" >&2; exit 93 ;;
+        esac
+        ;;
+      *) printf 'unexpected Docker command: %s\n' "$*" >&2; exit 93 ;;
+    esac
+    ;;
+esac
+"#
+    );
     test_executable::install(&tools.join("docker"), &script);
 
     Command::new(env!("CARGO_BIN_EXE_curie"))
