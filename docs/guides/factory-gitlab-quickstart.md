@@ -59,6 +59,10 @@ Restrict the token file to your user:
 chmod 600 -- "$CURIE_GITLAB_TOKEN_FILE"
 ```
 
+Curie ignores spaces, tabs and line breaks around the token, so a file saved
+with a trailing newline works. A token with a line break or other control
+character inside it is refused at startup, naming the entry and the file.
+
 The URL is the web base, including any self-managed sub-path. For a private
 certificate, also follow [custom CA configuration](dark-factory-quickstart.md#self-managed-servers)
 and add the same `--ca-file` to every quickstart invocation below.

@@ -31,6 +31,7 @@ from urllib.parse import quote
 
 import httpx
 
+from curie_api.forges.config import header_safe
 from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
 from curie_api.forges.types import Actor
 
@@ -116,12 +117,15 @@ class GitLabTransport:
         self,
         client: httpx.AsyncClient,
         *,
+        entry: str,
         api_url: str,
         token: TokenSource,
         clock: Callable[[], float] = time.monotonic,
         wall: Callable[[], datetime] = _utc_now,
     ) -> None:
         self._client = client
+        # The configured entry's name, so a log line tells two entries apart.
+        self.entry = entry
         self.root = api_url.rstrip("/")
         self._token = token
         self._clock = clock
@@ -135,7 +139,7 @@ class GitLabTransport:
         self.server_date: datetime | None = None
 
     def __repr__(self) -> str:
-        return f"GitLabTransport(root={self.root!r})"
+        return f"GitLabTransport(entry={self.entry!r}, root={self.root!r})"
 
     # Gates ------------------------------------------------------------------
 
@@ -184,7 +188,15 @@ class GitLabTransport:
         self, method: str, path: str, *, params: Params | None, json: Any
     ) -> httpx.Response:
         self._check_rate()
-        headers = {"PRIVATE-TOKEN": await self._token(), "Accept": "application/json"}
+        token = await self._token()
+        if not header_safe(token):
+            # httpx would refuse the header and quote it in its own debug log.
+            logger.warning(
+                "GitLab %r %s at %s has a token unfit for a header", self.entry, method, self.root
+            )
+            raise Unavailable("transport")
+        headers = {"PRIVATE-TOKEN": token, "Accept": "application/json"}
+        response = None
         try:
             response = await self._client.request(
                 method,
@@ -199,11 +211,18 @@ class GitLabTransport:
             # A request that never connected was not sent; one that timed out
             # later may have been.
             sent = not isinstance(error, httpx.ConnectTimeout | httpx.PoolTimeout)
-            raise Unavailable("timeout" if sent else "transport") from None
-        except httpx.HTTPError:
-            raise Unavailable("transport") from None
+            reason, failure = "timeout" if sent else "transport", type(error).__name__
+        except httpx.HTTPError as error:
+            reason, failure = "transport", type(error).__name__
         finally:
             headers.clear()
+        if response is None:
+            # Raised outside the handler: the httpx error's text can quote the
+            # PRIVATE-TOKEN header, so neither it nor its traceback is kept.
+            logger.warning(
+                "GitLab %r %s at %s failed in transport: %s", self.entry, method, self.root, failure
+            )
+            raise Unavailable(reason)
         self._observe(response)
         if response.status_code == 429:
             wait = _seconds(response.headers.get("retry-after"))

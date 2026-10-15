@@ -326,6 +326,7 @@ def _transport(fake: GitLabAPI, clock: _Clock) -> Any:
 
     return GitLabTransport(
         httpx.AsyncClient(transport=httpx.MockTransport(fake.handle)),
+        entry="gitlab",
         api_url=API,
         token=_token(TOKEN),
         clock=clock,

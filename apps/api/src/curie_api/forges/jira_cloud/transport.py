@@ -3,9 +3,10 @@
 Every request carries HTTP basic auth with the bot's Atlassian account email
 and API token (https://developer.atlassian.com/cloud/jira/platform/basic-auth-for-rest-apis/).
 The header is built per request from the `SecretStr` and never stored, logged,
-or put in an exception: a transport failure is raised ``from None`` with only
-the name of the operation, so even an HTTP library that echoes the request's
-headers into its own error text leaks nothing.
+or put in an exception: a transport failure is raised outside the handler with
+only the name of the operation, so no cause or context keeps an HTTP library
+error that echoes the request's headers into its own text. The log names the
+API root, the operation and the error class only.
 
 Status map (decision 9, the port contract): 429 and 503 are `Unavailable` and
 are never slept on, whatever ``Retry-After`` says, so the poll pass keeps its
@@ -17,6 +18,7 @@ not JSON is `Unavailable`.
 from __future__ import annotations
 
 import base64
+import logging
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -24,6 +26,8 @@ import httpx
 from pydantic import SecretStr
 
 from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
+
+logger = logging.getLogger(__name__)
 
 API_PREFIX = "/rest/api/3"
 # A listing that has not ended after this many pages is not trusted to end.
@@ -42,17 +46,20 @@ class JiraTransport:
         self,
         client: httpx.AsyncClient,
         *,
+        entry: str,
         api_url: str,
         username: str,
         token: SecretStr,
     ) -> None:
         self._client = client
+        # The configured entry's name, so a log line tells two entries apart.
+        self.entry = entry
         self._api = api_url.rstrip("/") + API_PREFIX
         self._username = username
         self._token = token
 
     def __repr__(self) -> str:
-        return f"JiraTransport(api={self._api!r})"
+        return f"JiraTransport(entry={self.entry!r}, api={self._api!r})"
 
     def _authorization(self) -> str:
         pair = f"{self._username}:{self._token.get_secret_value()}".encode()
@@ -71,6 +78,7 @@ class JiraTransport:
         None for an empty 2xx body. ``what`` names the operation in errors."""
 
         headers = {"Accept": "application/json", "Authorization": self._authorization()}
+        response = None
         try:
             response = await self._client.request(
                 method,
@@ -80,19 +88,35 @@ class JiraTransport:
                 headers=headers,
                 follow_redirects=False,
             )
-        except httpx.HTTPError:
-            raise Unavailable(what) from None
+        except httpx.HTTPError as error:
+            failure = type(error).__name__
+        if response is None:
+            logger.warning(
+                "Jira %r %s %s at %s failed in transport: %s",
+                self.entry,
+                method,
+                what,
+                self._api,
+                failure,
+            )
+            raise Unavailable(what)
         return _answer(response, what)
 
     async def anonymous_get(self, url: str, *, what: str) -> Any:
         """GET an absolute URL with no credential (the site's ``tenant_info``)."""
 
+        response = None
         try:
             response = await self._client.get(
                 url, headers={"Accept": "application/json"}, follow_redirects=False
             )
-        except httpx.HTTPError:
-            raise Unavailable(what) from None
+        except httpx.HTTPError as error:
+            failure = type(error).__name__
+        if response is None:
+            logger.warning(
+                "Jira %r GET %s at %s failed in transport: %s", self.entry, what, self._api, failure
+            )
+            raise Unavailable(what)
         return _answer(response, what)
 
     async def get(self, path: str, *, what: str, params: Mapping[str, Any] | None = None) -> Any:

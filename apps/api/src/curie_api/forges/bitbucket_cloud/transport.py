@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from curie_api.forges.config import header_safe
 from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
 
 logger = logging.getLogger(__name__)
@@ -32,13 +33,15 @@ Params = Sequence[tuple[str, str]]
 class CloudTransport:
     """Requests to Bitbucket Cloud as one access token."""
 
-    def __init__(self, client: httpx.AsyncClient, *, api_url: str, token: str) -> None:
+    def __init__(self, client: httpx.AsyncClient, *, entry: str, api_url: str, token: str) -> None:
         self._client = client
+        # The configured entry's name, so a log line tells two entries apart.
+        self.entry = entry
         self.root = api_url.rstrip("/")
         self._token = token
 
     def __repr__(self) -> str:
-        return f"CloudTransport(root={self.root!r})"
+        return f"CloudTransport(entry={self.entry!r}, root={self.root!r})"
 
     async def request(
         self,
@@ -53,7 +56,18 @@ class CloudTransport:
         """One request to ``url`` (absolute, under `root`). A status in
         ``allow`` is returned to the caller; any other non-2xx answer raises."""
 
+        if not header_safe(self._token):
+            # httpx would refuse the header and quote it in its own debug log.
+            logger.warning(
+                "Bitbucket Cloud %r %s %s at %s has a token unfit for a header",
+                self.entry,
+                method,
+                what,
+                self.root,
+            )
+            raise Unavailable("transport")
         headers = {"Accept": "application/json", "Authorization": f"Bearer {self._token}"}
+        response = None
         try:
             response = await self._client.request(
                 method,
@@ -64,10 +78,22 @@ class CloudTransport:
                 timeout=TIMEOUT_S,
                 follow_redirects=False,
             )
-        except httpx.HTTPError:
-            raise Unavailable("transport") from None
+        except httpx.HTTPError as error:
+            failure = type(error).__name__
         finally:
             headers.clear()
+        if response is None:
+            # Raised outside the handler: the httpx error's text can quote the
+            # Authorization header, so neither it nor its traceback is kept.
+            logger.warning(
+                "Bitbucket Cloud %r %s %s at %s failed in transport: %s",
+                self.entry,
+                method,
+                what,
+                self.root,
+                failure,
+            )
+            raise Unavailable("transport")
         status = response.status_code
         if status in allow or 200 <= status < 300:
             return response

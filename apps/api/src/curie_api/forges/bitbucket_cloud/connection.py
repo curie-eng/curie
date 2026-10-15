@@ -86,6 +86,7 @@ class BitbucketCloudConnection:
 
         return BitbucketCloudCodeHost(
             client,
+            entry=self.config.name,
             api_url=self.config.api_url,
             token=self._token.get_secret_value(),
             credentials=self._provider,

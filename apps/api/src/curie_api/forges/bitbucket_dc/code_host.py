@@ -214,6 +214,7 @@ class BitbucketDcCodeHost:
         self,
         client: httpx.AsyncClient,
         *,
+        entry: str,
         api_url: str,
         host: str,
         token: str,
@@ -221,7 +222,7 @@ class BitbucketDcCodeHost:
         page_size: int = 100,
     ) -> None:
         self.host = host
-        self._http = DcTransport(client, api_url=api_url, token=token)
+        self._http = DcTransport(client, entry=entry, api_url=api_url, token=token)
         self._credentials = credentials
         self._page_size = page_size
         # The server's version as it reported it, and parsed.
