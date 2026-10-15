@@ -31,8 +31,17 @@ OUTPUT_KEYS = {
 KIND_TIERS = frozenset({"cluster", "released-upgrade"})
 # The kind-rung factory scenario runs only when one of these paths changes.
 FACTORY_PREFIXES = (
+    "cli/src/factory_quickstart",
+    "cli/src/factory_intake.rs",
+    "cli/src/api.rs",
+    "cli/src/api_requests.rs",
     "apps/api/src/curie_api/factory_",
+    "apps/api/src/curie_api/routers/agents.py",
     "apps/api/src/curie_api/routers/publications",
+    "apps/api/src/curie_api/schemas/agents.py",
+    "apps/api/src/curie_api/schemas/channels.py",
+    "apps/api/src/curie_api/crud/channels.py",
+    "apps/api/src/curie_api/forges/surfaces.py",
     "apps/worker/src/curie_worker/factory",
     "runner/src/curie_runner/verification.py",
     "runner/src/curie_runner/preflight",
@@ -342,7 +351,7 @@ def _matches_scenario(path: str, prefixes: tuple[str, ...]) -> bool:
     for prefix in prefixes:
         if path == prefix or path.startswith(f"{prefix}/"):
             return True
-        if not prefix.endswith((".py", ".sh")) and path.startswith(prefix):
+        if not prefix.endswith((".py", ".sh", ".rs")) and path.startswith(prefix):
             return True
     return False
 
@@ -822,6 +831,10 @@ def _run() -> None:
         # version, and leave pytest to the required job's release tests.
         selected = set(VERSION_ONLY_TIERS)
         pytest_needed = False
+
+    if factory_needed:
+        images_needed = True
+        cli_release_needed = True
 
     pytest_deselect = []
     if not args.push and paths and pytest_needed and all(

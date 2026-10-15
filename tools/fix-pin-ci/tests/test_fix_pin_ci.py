@@ -43,6 +43,10 @@ FACTORY_SELECTOR = (
     "tools/factory-e2e/tests/test_scripted_driver.py::"
     "test_scripted_driver_records_the_curie_bin_it_used"
 )
+INITIAL_BINDING_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_initial_binding.py::"
+    "test_second_factory_agent_uses_initial_tracker_binding"
+)
 LOCAL_SELECTOR = "cli/tests/local/test_deploy.py::test_deploy"
 LOCAL_LIVE_SELECTOR = "cli/tests/local/test_live.py::test_live"
 LIVE_SELECTOR = "runner/tests/test_live.py::test_example"
@@ -346,7 +350,16 @@ def _run_needs_curie(
 
 
 def _needed_output(tmp_path: Path) -> str:
-    return _github_output(tmp_path).read_text(encoding="utf-8")
+    outputs = _probe_outputs(tmp_path)
+    return f"needed={outputs['needed']}\n"
+
+
+def _probe_outputs(tmp_path: Path) -> dict[str, str]:
+    lines = _github_output(tmp_path).read_text(encoding="utf-8").splitlines()
+    outputs = dict(line.split("=", 1) for line in lines)
+    assert len(lines) == len(outputs)
+    assert set(outputs) == {"needed", "needs_stack", "needs_kind"}
+    return outputs
 
 
 def _is_fix_pin_gate(step: dict[str, Any]) -> bool:
@@ -1106,10 +1119,8 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         lambda step: "uv run alembic upgrade head" in _string(step, "run"),
         "shared database migration",
     )
-    # Matched on the prefix, not on equality. What this assertion is for is that
-    # the normal suite runs, unfiltered; reporting flags like --durations do not
-    # bear on that, and pinning the exact string made a profiling flag look like
-    # a contract change.
+    # Reporting flags may vary; the dedicated kind runtime module is the one
+    # required exclusion from the ordinary Python suite.
     pytest_index = _single_step_index(
         steps,
         lambda step: step.get("id") == "pytest",
@@ -1129,8 +1140,8 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         assert len(names) == 1, expression
         bindings[meaning] = names[0]
     # Run the unmodified Bash with a recording uv function at its command boundary.
-    # Keep reporting flags flexible; only the declared file may be added by
-    # conditional selection, after the unfiltered suite's distribution flags.
+    # Keep reporting flags flexible after checking the required exclusion and
+    # the declared file added by conditional selection.
     for shard in (1, 2, 3):
         for deselect in ("", "examples/tests/test_sre_bot_observability_runtime.py"):
             environment = {
@@ -1155,11 +1166,21 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
                 assert pytest_command[-2:] == ["--deselect", deselect]
                 pytest_command = pytest_command[:-2]
             distribution = [
-                "-n", "4", "--dist", "loadgroup", "--ci-shard", f"{shard}/3", "--reruns", "1",
+                "-n",
+                "4",
+                "--dist",
+                "loadgroup",
+                "--ci-shard",
+                f"{shard}/3",
+                "--reruns",
+                "1",
             ]
             extra = pytest_command[3:]
             assert extra[: len(distribution)] == distribution
             extra = extra[len(distribution) :]
+            runtime_exclusion = "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py"
+            assert extra.count(runtime_exclusion) == 1
+            extra.remove(runtime_exclusion)
             report_chars = set("fEsxXpPaAR")
             assert all(
                 argument.startswith("--durations")
@@ -1170,8 +1191,9 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
                 )
                 for argument in extra
             ), (
-                "the Python suite permits only reporting flags after its distribution block, "
-                f"plus the selected trailing deselect pair, got {pytest_command!r}"
+                "the Python suite requires one kind runtime exclusion and permits only "
+                "reporting flags plus the selected trailing deselect pair, "
+                f"got {pytest_command!r}"
             )
     assert stack_index < migration_index < pytest_index
 
@@ -1341,7 +1363,7 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
     assert sync_index < probe_index
     assert helm_index < stack_index < migration_index < gate_index
     for index in (stack_index, migration_index):
-        assert CARGO_NEEDED_GUARD in _string(steps[index], "if"), (
+        assert STACK_NEEDED_GUARD in _string(steps[index], "if"), (
             "a body with no live selector never reaches the verifier, so it "
             "must not pay for a compose stack either"
         )
@@ -1353,11 +1375,31 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
     )
     diagnostic_if = _string(steps[diagnostic_index], "if")
     assert "failure()" in diagnostic_if
-    assert CARGO_NEEDED_GUARD in diagnostic_if
+    assert STACK_NEEDED_GUARD in diagnostic_if
     assert gate_index < diagnostic_index
+
+    readiness_index = _single_step_index(
+        steps,
+        lambda step: _string(step, "run").strip() == "python3 scripts/wait-for-langfuse.py",
+        "dev stack readiness",
+    )
+    assert STACK_NEEDED_GUARD in _string(steps[readiness_index], "if")
+    assert stack_index < readiness_index < migration_index
+    kind_index = _single_step_index(
+        steps,
+        lambda step: (
+            _string(step, "uses").startswith("helm/kind-action@")
+            and _string(step, "if") == KIND_NEEDED_GUARD
+        ),
+        "kind tools installation for the isolated registration pin",
+    )
+    assert steps[kind_index]["with"]["install_only"] is True
+    assert probe_index < kind_index < gate_index
 
 
 CARGO_NEEDED_GUARD = "steps.fix-pin-curie.outputs.needed == 'true'"
+STACK_NEEDED_GUARD = "steps.fix-pin-curie.outputs.needs_stack == 'true'"
+KIND_NEEDED_GUARD = "steps.fix-pin-curie.outputs.needs_kind == 'true'"
 SUBSTRING_GUARD = "contains(github.event.pull_request.body, 'Fix pin:')"
 
 
@@ -1479,6 +1521,55 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
 
     assert completed.returncode != 0
     assert "GITHUB_OUTPUT" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("body", "needed", "stack", "kind"),
+    [
+        (f"Fix pin: {INITIAL_BINDING_SELECTOR}", True, False, True),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding.py::"
+            "test_quickstarts_are_idempotent_and_binding_guards_hold[gitlab]",
+            True,
+            False,
+            True,
+        ),
+        (f"Fix pin: {VALID_SELECTOR}", True, True, False),
+        (f"Fix pin: {FACTORY_SELECTOR}", True, True, False),
+        (f"Fix pin: {LOCAL_SELECTOR}", True, True, False),
+        (f"Fix pin: {CHART_SELECTOR}", True, True, False),
+        ("Fix pin: cli/tests/verify_fix_pin.rs::ci_gate_pins", True, True, False),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding_extra.py::test_example",
+            True,
+            True,
+            False,
+        ),
+        (None, False, False, False),
+        ("", False, False, False),
+        ("Fix pin: n/a - documentation only", False, False, False),
+        (f"<!-- Fix pin: {INITIAL_BINDING_SELECTOR} -->", False, False, False),
+        (f" Fix pin: {INITIAL_BINDING_SELECTOR}", False, False, False),
+        (f"Fix pin: {INITIAL_BINDING_SELECTOR}\nFix pin: {VALID_SELECTOR}", False, False, False),
+        ("Fix pin: --help", False, False, False),
+    ],
+)
+def test_probe_selects_infrastructure_from_the_parsed_pin(
+    tmp_path: Path,
+    body: str | None,
+    needed: bool,
+    stack: bool,
+    kind: bool,
+) -> None:
+    completed = _run_needs_curie(tmp_path, body)
+    assert completed.returncode == 0, completed.stderr
+    expected = {
+        "needed": str(needed).lower(),
+        "needs_stack": str(stack).lower(),
+        "needs_kind": str(kind).lower(),
+    }
+    assert _probe_outputs(tmp_path) == expected
+    assert dict(line.split("=", 1) for line in completed.stdout.splitlines()) == expected
 
 
 def test_pull_request_template_documents_the_required_declaration() -> None:
