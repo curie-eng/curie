@@ -2497,48 +2497,11 @@ def test_fresh_only_claim_refuses_a_docker_runner_that_restarted_after_lookup(
     and the same container back to ``running`` must not be adopted by a
     fresh-only claim."""
 
-    from curie_worker.sandbox.docker import DockerSandboxClient
-
-    from .conftest import _FakeBundleStore
+    from .conftest import _FakeBundleStore, _RecordingDocker
 
     route_changed = _route_changed_error()
 
-    class _RestartingDocker(DockerSandboxClient):
-        def __init__(self) -> None:
-            super().__init__(
-                image="curie-runner",
-                bundle_store=_FakeBundleStore(),
-            )
-            self.status = "running"
-            self.created: list[str] = []
-
-        def _docker(
-            self,
-            args: list[str],
-            *,
-            request_timeout_seconds: float,
-            check: bool = True,
-        ) -> str:
-            assert request_timeout_seconds > 0
-            raise AssertionError(f"unexpected docker call {args}")
-
-        def _inspect(
-            self, name: str, *, deadline: float
-        ) -> tuple[str, dict[str, str], datetime | None]:
-            assert deadline > time.monotonic()
-            return self.status, {}, None
-
-        def _dial_endpoint(
-            self, name: str, *, deadline: float
-        ) -> tuple[str, int] | None:
-            assert deadline > time.monotonic()
-            return ("127.0.0.1", 18080)
-
-        def create_claim(self, name: str, **_kwargs: object) -> None:
-            self.created.append(name)
-            raise AssertionError("a fresh-only claim created a container on a live route")
-
-    docker = _RestartingDocker()
+    docker = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     substrate = SandboxSubstrate(docker, affinity, config)
     old = SandboxHandle(
         thread_key="T2739-docker",
@@ -2549,11 +2512,23 @@ def test_fresh_only_claim_refuses_a_docker_runner_that_restarted_after_lookup(
         port=18080,
         session_id="thread-docker",
     )
+    # Docker inspect fields: https://docs.docker.com/reference/cli/docker/inspect/
+    docker.containers[old.sandbox_name] = {
+        "curietech.ai/managed-by": "curie-sandbox-substrate",
+        "curietech.ai/stack": "default",
+        "curietech.ai/claim": old.claim_name,
+        "curietech.ai/component": "claim-runner",
+        "curietech.ai/claim-attempt": "a" * 32,
+    }
+    docker.container_ids[old.sandbox_name] = "b" * 64
+    docker.container_created_at[old.sandbox_name] = datetime.now(UTC).isoformat()
+    docker.container_started_at[old.sandbox_name] = docker.container_created_at[old.sandbox_name]
+    docker.outputs["port"] = "127.0.0.1:18080\n"
     assert affinity.put_if_absent("T2739-docker", RouteRecord(handle=old), 60)
 
-    docker.status = "restarting"
+    docker.container_status[old.sandbox_name] = "restarting"
     assert substrate.lookup("T2739-docker") is None
-    docker.status = "running"
+    docker.container_status[old.sandbox_name] = "running"
     assert substrate.lookup("T2739-docker") == old
 
     with pytest.raises(route_changed):
@@ -2563,7 +2538,8 @@ def test_fresh_only_claim_refuses_a_docker_runner_that_restarted_after_lookup(
             fresh_only=True,  # type: ignore[call-arg]
         )
 
-    assert docker.created == []
+    assert all(args[0] not in {"create", "run"} for args in docker.calls)
+    assert all(timeout > 0 for timeout in docker.timeouts)
     assert affinity.get("T2739-docker") == RouteRecord(handle=old)
 
 
