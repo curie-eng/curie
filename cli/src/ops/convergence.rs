@@ -1309,7 +1309,7 @@ sys.exit(result.returncode)
 
     impl Drop for Process {
         fn drop(&mut self) {
-            let _ = self.stop();
+            drop(self.stop());
         }
     }
 
@@ -2007,7 +2007,7 @@ sys.exit(result.returncode)
     impl Drop for Permit {
         fn drop(&mut self) {
             if let Some(stream) = self.stream.take() {
-                let _ = acknowledge(stream);
+                drop(acknowledge(stream));
             }
         }
     }
