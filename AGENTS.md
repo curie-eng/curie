@@ -236,8 +236,10 @@ is an exception to the CLI entry point guidance in `CLAUDE.md`.
    worker needs explicit override entries for its database, Valkey, S3, API
    and worker OTel endpoints, plus `CURIE_DOCKER_NETWORK` matching the private
    runner network. Shell exports do not replace literal Compose environment
-   entries. Use private image tags and staging paths when building or running
-   workers; preserve the worker's identical host/container staging mount path.
+   entries. Use private image tags when building or running workers. The Docker
+   substrate copies validated bundle, workspace, and attachment inputs through
+   the Docker API into claim-owned named volumes. Workspaces and temporary
+   directories need no shared filesystem or matching daemon-host paths.
 4. Export the full isolated contract before the baseline. The baseline consumes
    `COMPOSE_PROJECT_NAME` and `COMPOSE_FILE`, keeps the default shared lock only
    when it selected the default project itself, and uses a project scoped lock
@@ -284,7 +286,6 @@ is an exception to the CLI entry point guidance in `CLAUDE.md`.
    export CURIE_DOCKER_NETWORK=curie-check-2780-a_runner
    export CURIE_LOCAL_STUB_PORT=18155
    export CURIE_LOCAL_POSTGRES_HOST=127.0.0.1 CURIE_LOCAL_POSTGRES_PORT=35432
-   export CURIE_LOCAL_STAGING_DIR=/tmp/curie-bundles-2780-a
    export CURIE_LOCAL_IMAGE_TAG=dev-2780-a
    export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:34318
    export CURIE_LOCAL_OTEL_METRICS_URL=http://127.0.0.1:38888/metrics

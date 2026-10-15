@@ -181,7 +181,6 @@ fn ordered_compose_files_and_project_reach_dry_run_argv() {
         .env("CURIE_LOCAL_STUB_PORT", "18155")
         .env("CURIE_LOCAL_POSTGRES_HOST", "127.0.0.1")
         .env("CURIE_LOCAL_POSTGRES_PORT", "35432")
-        .env("CURIE_LOCAL_STAGING_DIR", "/tmp/curie-bundles-2780-a")
         .env("CURIE_LOCAL_IMAGE_TAG", "dev-2780-a")
         .output()
         .expect("run isolated local up dry-run");

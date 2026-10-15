@@ -358,8 +358,9 @@ accept `--url`. Setting `skill up --model <id>` makes token usage attributable
 in Langfuse traces.
 
 `skill up` also packs the bundle into a content-addressed snapshot under
-`<bundle>/.curie/snapshots/<digest>/` and mounts that read-only, matching what
-the local and cluster tiers do with a deployed bundle. So editing a bundle file
+`<bundle>/.curie/snapshots/<digest>/`, copies it through the Docker API into a
+private named volume, and mounts the volume read only, matching the immutable
+bundle behavior of the local and cluster tiers. So editing a bundle file
 on the host does not reach the running runner: re-run `curie skill up` and
 confirm the new `bundle_digest` in `curie skill status --json`. A verified
 same-directory runner is replaced automatically; `--replace` still forces a
@@ -368,22 +369,26 @@ optional `evals/trajectory.json` sidecar are the exceptions. `skill eval` reads
 them live from source, so an eval edit needs no restart. `skill down` and a
 replacement `up` release the snapshot along with the container.
 
-For a Docker daemon whose filesystem is separate from the CLI host, set
-`DOCKER_PUBLISHED_HOST` to the hostname or IP where its published ports are
-reachable, without a URL scheme or port. Its presence selects remote snapshot
-transport even when it names `localhost`. The CLI copies the immutable snapshot
-through the Docker API into a private named volume and mounts it read only.
-`skill check`, `skill up`, `skill eval --model`, and `curie try` use this
-transport; runner requests use the configured address, including IPv6 addresses.
-`skill down`, replacement, and failed startup release the volume. Docker's
-connection settings such as `DOCKER_HOST` remain independent. With
-`DOCKER_PUBLISHED_HOST` unset, the existing bind mount and localhost endpoint
-are used.
+`skill check`, `skill up`, `skill eval --model`, and `curie try` always copy
+snapshot bytes through the Docker API into private named volumes, for local and
+remote daemons alike. The client workspace and `TMPDIR` need no matching paths
+on the daemon host. `skill down`, replacement, and failed startup release the
+owned volumes.
 
-Hosted connectors that declare `secret_files` need host-path mounts and are
-refused before startup when `DOCKER_PUBLISHED_HOST` is set. Hosted connectors
-with environment secrets remain supported, as do connectors using a remote
-`url` or `unhosted_url`.
+Set `DOCKER_PUBLISHED_HOST` to the hostname or IP where published ports are
+reachable, without a URL scheme or port. Runner requests use that address,
+including IPv6 addresses; the default is `localhost`. This setting only selects
+the published endpoint. Docker connection settings such as `DOCKER_HOST` select
+the daemon independently.
+
+Hosted connectors support `secret_files` with local and remote Docker. At
+startup, the CLI streams credentials from memory into a private named volume
+for each connector and run. Each file has mode `0400`, belongs to UID/GID
+`65532:65532`, and is mounted read only through a volume subpath at its exact
+declared destination. Credential values are not written to client staging files
+or passed in Docker argv. Connector teardown and failed startup release owned
+credential volumes. Environment secrets and connectors using a remote `url` or
+`unhosted_url` remain supported.
 
 #### `local` target
 
@@ -393,6 +398,14 @@ no Kubernetes. `curie local up` uses the `full` compose profile by default.
 `curie local up --minimal` uses the smaller `core` profile. The compose API is
 published on host port `28000`. Add `curie local up --slack` to also start
 the optional Slack dispatcher.
+
+The Docker worker fetches and validates bundle, workspace, and attachment inputs,
+then copies them through the Docker API into claim-owned named volumes. Bundle
+and attachment mounts are read only; the workspace is writable by UID `1000`.
+No shared staging directory or daemon-visible client workspace is required.
+The dev collector config travels in a small Docker build context, while the
+generated release Compose uses inline content configs. The worker's Docker
+socket mount refers to the daemon host's socket.
 
 | Command | What it does |
 |---|---|
