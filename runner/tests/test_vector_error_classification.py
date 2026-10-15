@@ -29,6 +29,7 @@ _PLATFORM = (
     "history-persistence-error",
     "max-turns",
     "model-unreachable",
+    "final-answer-validation",
 )
 
 

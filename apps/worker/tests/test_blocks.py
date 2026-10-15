@@ -406,15 +406,13 @@ def test_total_blocks_capped_at_50() -> None:
     assert len(to_blocks(reply)) <= 50
 
 
-def test_render_bounds_fallback_text_for_oversized_body() -> None:
-    # A complete structured reply whose BODY is far over Slack's chat.update
-    # text cap (~40000). render must still return blocks (it is a complete
-    # reply) AND bound the accessibility/fallback text, or the text-only retry
-    # in AsyncSlackSink.update re-raises and re-opens the unbounded paid loop.
+def test_render_preserves_fallback_text_for_lossless_delivery() -> None:
+    # The adapter partitions the complete rendered text into safe messages;
+    # truncating here would make continuation delivery irreversibly lossy.
     text = "```curie-reply\n" + json.dumps({"header": "H", "text": "x" * 60000}) + "\n```"
     rendered_text, blocks = render(text)
     assert blocks is not None
-    assert len(rendered_text) <= 40000
+    assert rendered_text == "x" * 60000
 
 
 def test_approval_card_shape_and_click_contract() -> None:

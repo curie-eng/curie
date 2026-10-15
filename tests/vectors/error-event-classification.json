@@ -17,7 +17,8 @@
     "publication-unrecorded",
     "history-persistence-error",
     "max-turns",
-    "model-unreachable"
+    "model-unreachable",
+    "final-answer-validation"
   ],
   "vectors": [
     {
@@ -139,6 +140,11 @@
       "name": "worker_local_channel_read_unenforced_is_not_vocabulary",
       "input": "channel-read-unenforced",
       "expected": "unclassified"
+    },
+    {
+      "name": "final_answer_validation_remains_terminal",
+      "input": "final-answer-validation",
+      "expected": "final-answer-validation"
     }
   ]
 }

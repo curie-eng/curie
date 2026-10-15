@@ -61,7 +61,7 @@ def test_targeted_cron_turn_posts_the_final_reply_once(
 
 
 def test_human_slack_turn_still_shows_booting_text(make_harness) -> None:
-    """A person's turn still shows the booting caption, then live edits."""
+    """A person's turn still shows the booting caption, then the terminal answer."""
 
     async def go() -> None:
         async with make_harness() as h:
@@ -78,8 +78,8 @@ def test_human_slack_turn_still_shows_booting_text(make_harness) -> None:
             partials = [text for text in texts if text not in {booting, "answer ready"}]
             assert booting in texts
             assert "answer ready" in texts
-            assert partials, "no streamed partial between the booting caption and the final"
-            assert texts.index(booting) < texts.index(partials[0]) < texts.index("answer ready")
+            assert partials == [], "provisional evidence narration reached the user"
+            assert texts.index(booting) < texts.index("answer ready")
 
     asyncio.run(go())
 
@@ -104,8 +104,8 @@ def test_webhook_job_still_posts_booting_then_edits(make_harness) -> None:
             partials = [text for text in texts if text not in {booting, "hook ready"}]
             assert booting in texts
             assert "hook ready" in texts
-            assert partials, "no streamed partial between the booting caption and the final"
-            assert texts.index(booting) < texts.index(partials[0]) < texts.index("hook ready")
+            assert partials == [], "provisional evidence narration reached the user"
+            assert texts.index(booting) < texts.index("hook ready")
             assert len(h.sink.text_posts) == 1, h.sink.text_posts
 
     asyncio.run(go())

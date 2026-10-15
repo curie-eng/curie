@@ -3,6 +3,10 @@
 use crate::support;
 
 use std::process::Command;
+use std::{
+    io::{BufRead, BufReader, Write},
+    net::TcpListener,
+};
 
 use curie::runner::RunnerClient;
 use curie_aci_protocol::{EventType, OutboundEvent, SessionStatus, PROTOCOL_VERSION};
@@ -108,7 +112,74 @@ async fn streams_a_full_turn_in_order() {
     assert_eq!(body["type"], "message");
     assert_eq!(body["text"], "hi there");
     assert_eq!(body["user"], "U-test");
+    assert_eq!(recorded[0].header("X-Curie-Final-Answer"), Some("1"));
     assert!(body["ts"].as_str().unwrap().contains('.'));
+}
+
+#[tokio::test]
+async fn rejects_unsupported_final_answer_response_before_stream_parsing() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        socket.write_all(b"HTTP/1.1 200 OK\r\nX-Curie-Final-Answer: 9\r\nContent-Type: application/x-ndjson\r\nContent-Length: 8\r\n\r\nnot-json").unwrap();
+    });
+    let client = RunnerClient::new(&base_url).unwrap();
+    let mut observed = Vec::new();
+    let error = client
+        .send_event(EventType::Message, "hi", "U", |event| {
+            observed.push(event.clone())
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported X-Curie-Final-Answer"),
+        "{error}"
+    );
+    assert!(observed.is_empty());
+}
+
+#[tokio::test]
+async fn rejects_duplicate_final_answer_response_headers_before_stream_parsing() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        socket.write_all(b"HTTP/1.1 200 OK\r\nX-Curie-Final-Answer: 1\r\nX-Curie-Final-Answer: 2\r\nContent-Type: application/x-ndjson\r\nContent-Length: 8\r\n\r\nnot-json").unwrap();
+    });
+    let client = RunnerClient::new(&base_url).unwrap();
+    let mut observed = Vec::new();
+    let error = client
+        .send_event(EventType::Message, "hi", "U", |event| {
+            observed.push(event.clone())
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported X-Curie-Final-Answer"),
+        "{error}"
+    );
+    assert!(observed.is_empty());
 }
 
 #[tokio::test]

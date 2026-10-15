@@ -139,9 +139,9 @@ async def snapshot_completion_outbox(
     """Read the pending set. Never mutate it."""
 
     observed_at = time.time() if now is None else now
-    count = int(await redis.scard(config.completions_pending_key()))
-    members = await markers.pending_completions(config.completion_sweep_batch)
-    stored = await markers.read_completions(sorted(members))
+    count = await markers.pending_completion_count()
+    members = await markers.pending_completion_entries(config.completion_sweep_batch)
+    stored = await markers.read_completion_entries(sorted(members))
     inflight = 0
     retry = 0
     oldest_retry = 0.0

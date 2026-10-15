@@ -184,7 +184,7 @@ docs = [doc for doc in yaml.safe_load_all(open(sys.argv[1])) if isinstance(doc, 
 workers = [doc for doc in docs if doc.get("kind") == "Deployment" and doc["metadata"]["name"] == "curie-worker"]
 assert len(workers) == 1, "retained values render omitted the worker Deployment"
 env = workers[0]["spec"]["template"]["spec"]["containers"][0]["env"]
-assert [entry["value"] for entry in env if entry["name"] == "CURIE_TURN_RECEIPT"] == ["all"]
+assert [entry["value"] for entry in env if entry["name"] == "CURIE_TURN_RECEIPT"] == ["off"]
 PYEOF
 
 # These options traverse workloads that a plain default render leaves out.

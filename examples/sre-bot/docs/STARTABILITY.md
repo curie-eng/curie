@@ -86,6 +86,8 @@ The command requires all of `--worker-namespace`, `--worker-deployment`,
 `--dispatcher-container`, `--sandbox-namespace`, `--runner-container`, and
 `--check-image`. Values are installation inputs, with no example-installation
 defaults. Empty inputs are configuration errors before external reads.
+The optional, repeatable `--exclude-binding-kind` argument is specified by
+STARTABILITY-9.
 The read-only database DSN comes from nonblank `DATABASE_URL`; accept
 `postgresql://` by selecting the asyncpg driver and accept
 `postgresql+asyncpg://` directly. Do not print the DSN.
@@ -114,8 +116,10 @@ without invoking this collector through the command.
 
 Keep the existing JSON-lines schema: one `agent_readiness: 'binding'` object
 with `agent`, `kind`, `address`, `identity`, integer `ready` (0 or 1), and
-`reason` per binding; then exactly one final `agent_readiness: 'total'` object
-with integer `bindings`, `not_ready`, and distinct bound `agents` counts.
+`reason` per judged binding; one `agent_readiness: 'excluded'` object per
+binding excluded under STARTABILITY-9; then exactly one final
+`agent_readiness: 'total'` object with integer `bindings`, `not_ready`, and
+distinct bound `agents` counts over judged bindings only.
 A successful collection exits 0 even when `not_ready` is nonzero. Do not emit
 secret-name lists or credential values. Buffer results until collection and
 judgment complete so an incomplete read cannot produce a success total.
@@ -148,7 +152,9 @@ reserved and connector-only withheld names, empty-list and dispatcher-invalid
 declarations, blank worker pool configuration, discovery of an existing
 unlisted per-agent pool and its selected template, multiple bindings, and zero
 bindings. Test error redaction
-with a recognizable dummy value in exception text and the DSN. These boundary
+with a recognizable dummy value in exception text and the DSN. Cover
+STARTABILITY-9 exclusion in the pure judge and through the command, including
+refused blank and malformed kinds and the unchanged output without the option. These boundary
 replays prove command wiring, not real Kubernetes/Postgres integration.
 
 ### STARTABILITY-8: Runtime evidence gate
@@ -163,6 +169,31 @@ substitute boundary replays for this evidence. No model call or Slack delivery
 is required because this observer makes neither. Image publication,
 installation, scheduling, metric ingestion, alert delivery, and production
 activation require separate evidence and are outside this contract.
+
+### STARTABILITY-9: Operator binding-kind exclusion
+
+An operator can keep bindings of a named channel kind, such as a qualification
+or test kind, out of the readiness verdict with the optional, repeatable
+`--exclude-binding-kind <kind>` argument. Without the argument, every binding
+is judged and the output is unchanged.
+
+Each supplied value must be a well-formed channel kind: the same lowercase slug
+shape the API enforces when a binding is written. Channel kinds are open-ended,
+so the observer does not check membership in a kind list. A blank or malformed
+value is a configuration error before external reads, under the STARTABILITY-6
+error contract. A repeated value is accepted once. A well-formed kind that no
+binding has excludes nothing; a mistyped kind therefore leaves its bindings
+judged, which fails toward paging rather than toward silence.
+
+A binding whose `kind` exactly equals an excluded kind is not judged: it causes
+no claim, pool, template, or credential judgment and cannot fail. It is still
+reported, in binding order, as one `agent_readiness: 'excluded'` object with
+`agent`, `kind`, `address`, `identity`, and a fixed `reason`, and no `ready`
+field. It counts toward neither `bindings`, `not_ready`, nor `agents` in the
+total; an agent with only excluded bindings is not counted. Excluding every
+binding produces a valid zero total. Exclusion selects which bindings the
+verdict covers; it does not change how an included binding is judged, and it
+does not skip any collection read or check.
 
 ## Operator inputs
 
@@ -180,6 +211,9 @@ python observer.py \
   --sandbox-namespace acme-sandboxes --runner-container runner \
   --check-image ghcr.io/acme-corp/worker@sha256:<immutable-digest>
 ```
+
+To keep bindings of a qualification kind out of the verdict, add for example
+`--exclude-binding-kind acme-qualification`; repeat the argument for more kinds.
 
 Grant only database SELECT and namespaced Kubernetes reads needed for the
 selected Deployments, referenced configuration, and sandbox pool/template

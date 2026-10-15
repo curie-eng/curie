@@ -87,7 +87,16 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   `secrets` is `list[str | SecretRef]`
   (`packages/plugin-format/src/plugin_format/connectors.py::SecretRef`, with
   `name` / `from_secret` / `key`) and `secret_files` is by NAME only; neither form
-  carries a value. Intake refuses any `sealed_secrets` declaration with
+  carries a value. A hosted connector may also list `config`, env-var names for per-agent
+  NON-secret settings (a folder path, a channel id) the operator stores beside the connector's
+  credentials. Each `config` name resolves from the same per-agent store as a plain `secrets`
+  name and renders the same `secretKeyRef` env var on the connector pod, but it is never a
+  credential: it never derives the Bearer header, never counts toward
+  `connectors.bearer_secret_required`, and is never bound into the sandbox. A `config` name obeys
+  the secret name shape and reserved fence (`connectors.config_name_invalid`,
+  `connectors.config_name_reserved`), may not repeat (`connectors.duplicate_config`), may not also
+  appear in `secrets`, `secret_files` or `sealed_secrets` (`connectors.config_is_secret`), and a
+  `url` connector cannot declare `config` (`connectors.remote_has_config`). Intake refuses any `sealed_secrets` declaration with
   `connectors.sealed_secrets_unsupported` until a decrypt path exists (see
   [sealed-credential](../sealed-credential/INTERFACE.md)). For a hosted (`image`/`build`) connector
   with `secrets:` declared, the rendered `.mcp.json` entry derives

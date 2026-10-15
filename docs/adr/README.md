@@ -245,5 +245,10 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0221 | [Cluster up reads the gVisor RuntimeClass for a fake-model install](0221-cluster-up-reads-the-gvisor-runtimeclass-for-a-fake-model-install.md) | Accepted |
 | 0222 | [Coworker bundles own workflow policy and Curie enforces execution](0222-coworker-bundles-own-workflow-policy-and-curie-enforces-execution.md) | Accepted |
 | 0224 | [Protected runtime commissioning precedes installation acceptance](0224-protected-runtime-commissioning-precedes-installation-acceptance.md) | Accepted |
+| 0225 | [Turn action receipts are opt-in](0225-turn-action-receipts-are-opt-in.md) | Accepted |
+| 0226 | [Persist terminal answers before channel delivery](0226-persist-terminal-answers-before-channel-delivery.md) | Accepted |
+| 0227 | [Opt-in final-answer publication validation](0227-opt-in-final-answer-publication-validation.md) | Accepted |
 | 0228 | [Mail services plug into one email adapter, which owns approvals by email](0228-mail-services-plug-into-one-email-adapter-which-owns-approvals-by-email.md) | Draft |
+| 0229 | [A hosted connector may declare the Host the caller proxy presents upstream](0229-a-hosted-connector-may-declare-the-host-the-caller-proxy-presents-upstream.md) | Accepted |
+| 0230 | [Cluster upgrade and rollback report outcomes from one lifecycle record checked against the cluster](0230-upgrade-and-rollback-report-from-one-lifecycle-record-checked-against-the-cluster.md) | Draft |
 <!-- END GENERATED: adr-index -->
