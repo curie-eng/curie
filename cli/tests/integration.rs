@@ -85,6 +85,7 @@ mod doctor_recovery;
 mod doctor_release_health;
 mod doctor_slack_ready;
 mod doctor_target;
+mod docker_no_host_binds;
 mod eval_case_selector;
 mod eval_concurrency;
 mod eval_empty_model;
