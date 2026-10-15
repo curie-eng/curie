@@ -819,6 +819,19 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     Ok(SreBotInstallResult::Installed(Box::new(deployed)))
 }
 
+/// Install only the factory-owned authoring skill; execution assets and image
+/// resolution are deliberately outside this local preparation path.
+pub fn install_factory_preparation(
+    options: crate::agent_skills::InstallOptions,
+) -> Result<Box<dyn CliOutput>> {
+    const PREFIX: &str = "preparation/skills/prepare-factory-ticket/";
+    let files: Vec<(&str, &[u8])> = DARK_FACTORY_BUNDLE_FILES
+        .iter()
+        .filter_map(|(name, bytes)| name.strip_prefix(PREFIX).map(|relative| (relative, *bytes)))
+        .collect();
+    crate::agent_skills::install("prepare-factory-ticket", &files, options)
+}
+
 /// Every tracked file of `examples/dark-factory`, embedded so a released
 /// binary can render the factory bundle without a source checkout (#3619).
 pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[

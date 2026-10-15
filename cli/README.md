@@ -22,12 +22,35 @@ extend the platform's own code.
     - [Bundle packing exclusions](#bundle-packing-exclusions)
     - [Artifact resolution](#artifact-resolution)
   - [Managing secrets](#managing-secrets)
+  - [Installing the factory preparation skill](#installing-the-factory-preparation-skill)
 - [For contributors](#for-contributors)
   - [`curie install`](#curie-install)
   - [`curie dev`](#curie-dev)
   - [Building the runner image from source](#building-the-runner-image-from-source)
   - [Prototyping agents in a source checkout](#prototyping-agents-in-a-source-checkout)
   - [Verify](#verify)
+
+## Installing the factory preparation skill
+
+Install the text-only factory preparation workflow into your coding agent:
+
+```bash
+curie factory prepare install --agent codex
+```
+
+Choose `codex`, `claude-code`, `copilot`, `gemini` (Gemini CLI), or `cursor`.
+By default the skill is installed in the current repository root; outside Git,
+the current directory is used. `--dir DIR` selects exactly an existing directory.
+`--global` installs in your personal skill directory and conflicts with `--dir`.
+`--dry-run` checks and reports the destination without writing; `--json` emits one
+result object. Identical copies are retained, and conflicting local files or
+symlinks are refused. Review and move an existing copy aside before upgrading.
+
+Installation uses the CLI's embedded files and needs no network, Python, Docker
+or Curie deployment. The result prints invocation and refresh instructions;
+client settings and activation consent still apply. See the
+[preparation guide](../docs/guides/factory-preparation.md) for client paths,
+manual installation and the draft-only workflow.
 
 ## Interactive mode
 

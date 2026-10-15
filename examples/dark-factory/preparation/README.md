@@ -1,8 +1,11 @@
 # Factory preparation resources
 
 The `skills/prepare-factory-ticket` folder contains the text-only preparation
-workflow for a developer's existing coding agent. Copy only that skill folder
-and its references when installing locally. It requires no Python interpreter,
+workflow for a developer's existing coding agent. Install it directly with
+`curie factory prepare install --agent codex` (or `claude-code`, `copilot`,
+`gemini`, `cursor`). Add `--global` for personal installation across projects.
+The installer copies only that skill folder and its references, offline.
+It requires no Python interpreter,
 parser installation, container runtime or reachable Curie deployment.
 
 The `src/curie_factory_preparation` library is the factory-owned structural

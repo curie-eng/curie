@@ -49,9 +49,11 @@ and writes a reviewed draft or proposed ticket set. It requires no host Python,
 parser installation, Curie service or container runtime. Repository-specific
 verification uses the repository's own prerequisites and records any missing ones.
 
-Render this bundle with a CLI release containing the skill, then copy only
-`preparation/skills/prepare-factory-ticket/` into your coding agent's skill
-location. The [preparation guide](../../docs/guides/factory-preparation.md)
+Install directly with `curie factory prepare install --agent codex`, or select
+`claude-code`, `copilot`, `gemini` or `cursor`. Add `--global` for personal use
+across repositories, or `--dir DIR` to choose an existing project directory.
+The command is offline and preserves existing local edits. The
+[preparation guide](../../docs/guides/factory-preparation.md)
 covers installation and invocation for supported clients and a plain-file
 fallback. A pre-existing CLI release will not gain new embedded files by selecting
 a newer deployment image; use a CLI built from this change or a release containing it.

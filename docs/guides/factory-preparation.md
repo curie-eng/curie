@@ -13,35 +13,66 @@ and explicit handoff are tracked in #4488 and #4490.
 
 ## Get the skill
 
-Use a Curie CLI built from this change, or a release that contains it. The existing
-compiled CLI renders the files without a Curie source checkout:
+Use a Curie CLI built from this change, or a release that contains it. From the
+repository you want to prepare work for, choose your coding agent:
 
 ```bash
-curie example dark-factory render --out ./dark-factory
+curie factory prepare install --agent codex
+# Or select claude-code, copilot, gemini, or cursor instead.
 ```
 
-The skill folder is `dark-factory/preparation/skills/prepare-factory-ticket/`.
-Copy that whole folder, including `references/`, to the location below for the
-client you use. The preparation skill itself is Markdown only. It requires no
-Python, parser package, Docker, running Curie service or model-specific dependency.
-The rendering command may contact the release registry to resolve the factory's
-runner image; it does not start that image. Once copied, the skill files can be
-used without a Curie deployment.
+Installation copies the bundled Markdown skill and its reference directly into
+the selected client's directory. It is offline and requires no source checkout,
+Python, parser package, Docker or running Curie service. The default destination
+is the nearest ancestor repository root, including Git worktrees; outside a
+repository it is the current directory. Use `--dir /path/to/project` to select
+exactly an existing directory, or `--global` to install for your user across
+repositories. `--dir` and `--global` cannot be combined.
+
+```bash
+curie factory prepare install --agent claude-code --global
+curie factory prepare install --agent cursor --dir /path/to/project --dry-run
+```
+
+Repeating an installation keeps an identical copy. An edited or incomplete copy
+is refused before writing any skill files. Review and move the existing folder
+aside before installing a different version. Symlinked client directories and
+skill files are refused. `--dry-run` checks the destination without creating it;
+`--json` returns one result object. Installation reports how to invoke or refresh
+the skill; it does not change agent settings, workspace trust or consent.
 
 | Local client | Repository skill destination | Invocation |
 | --- | --- | --- |
 | Codex | `.agents/skills/prepare-factory-ticket/` | `$prepare-factory-ticket` followed by your intent or ticket content |
 | Claude Code | `.claude/skills/prepare-factory-ticket/` | `/prepare-factory-ticket` followed by your intent or ticket content |
 | GitHub Copilot in a client supporting agent skills | `.github/skills/prepare-factory-ticket/` | Ask Copilot to use `prepare-factory-ticket` for your intent or ticket content |
+| Gemini CLI | `.gemini/skills/prepare-factory-ticket/` | Run `/skills reload`, then ask Gemini to use `prepare-factory-ticket` |
+| Cursor Agent | `.cursor/skills/prepare-factory-ticket/` | Ask Cursor to use `prepare-factory-ticket` for your intent or ticket content |
+
+Global installation uses the same directories under your home directory, except
+Copilot uses `~/.copilot/skills/`. Choose one client installation per workspace
+unless you need several: clients may also discover other clients' compatibility
+directories, so multiple copies can expose the same skill more than once.
 
 These paths follow the providers' published discovery conventions:
 [Codex](https://learn.chatgpt.com/docs/build-skills),
 [Claude Code](https://code.claude.com/docs/en/skills), and
-[GitHub Copilot](https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/customize-cloud-agent/add-skills).
+[GitHub Copilot](https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/customize-cloud-agent/add-skills),
+[Gemini CLI](https://geminicli.com/docs/cli/using-agent-skills/), and
+[Cursor](https://cursor.com/docs/skills).
 Client versions and workspace settings determine skill availability. Use the
-client's normal refresh or restart procedure if a newly copied skill is absent.
-This documents supported file layouts, not an end-to-end certification of every
-client or operating-system version.
+client's normal refresh or restart procedure if a newly installed skill is absent.
+Copilot CLI supports `/skills reload`; Gemini CLI also requires activation consent.
+Local installation does not automatically sync personal skills to cloud agents.
+Installer tests verify file layouts and behavior; they do not certify discovery
+or invocation in every native client or operating-system version.
+
+For manual installation, the same self-contained source folder is
+`examples/dark-factory/preparation/skills/prepare-factory-ticket/` in this repo.
+The full factory renderer also includes it at
+`dark-factory/preparation/skills/prepare-factory-ticket/` after
+`curie example dark-factory render --out ./dark-factory`; that separate renderer
+may contact the release registry to resolve the factory runner image.
 
 Install only the preparation skill folder. Do not register the entire factory
 execution plugin for preparation: its implementation hooks gate edits and
