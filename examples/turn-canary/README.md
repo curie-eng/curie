@@ -135,9 +135,16 @@ default prefix: `turn_canary_binding_check_success{route,outcome}`,
 and `turn_canary_rotation`.
 
 For an optional ResourceQuota observation, set `TURN_CANARY_QUOTA_URL` to the
-explicit Kubernetes quota list endpoint, `TURN_CANARY_QUOTA_TOKEN` to its bearer
-token, and optionally `TURN_CANARY_QUOTA_RESOURCE` and
-`TURN_CANARY_QUOTA_MIN_FREE`. The default resource is `count/pods` and the
+explicit Kubernetes quota list endpoint, its bearer token through exactly one of
+`TURN_CANARY_QUOTA_TOKEN` (a static token) or `TURN_CANARY_QUOTA_TOKEN_FILE` (a
+path to a file holding the token), and optionally `TURN_CANARY_QUOTA_RESOURCE`
+and `TURN_CANARY_QUOTA_MIN_FREE`. Setting both token options refuses to start.
+The checker reads the token file again for every quota request and keeps
+nothing past that request, so a token that the kubelet rotates is picked up on
+the next request. Inside a pod, the usual value is the projected service
+account token, `/var/run/secrets/kubernetes.io/serviceaccount/token`; it is
+not a default and must be set explicitly. A missing, unreadable, or blank token
+file makes the quota unreadable, and the token is never logged. The default resource is `count/pods` and the
 minimum free amount is 1. An unreadable quota skips enqueue, reported as a
 capacity skip rather than a turn failure. This check is a
 snapshot, not a reservation or a cluster wide sandbox limit.

@@ -103,7 +103,14 @@ adapter is connected.
   cycle turns any route while a hold on every route remains (TURN-CANARY-4).
   An optional ResourceQuota headroom check is an observation immediately
   before enqueue: insufficient or unreadable headroom skips the turn with an
-  explicit `capacity` outcome. A capacity skip is not a turn failure. It is
+  explicit `capacity` outcome. Its bearer token comes from exactly one of a
+  static configured token or a configured token file path; configuring both,
+  or a quota URL with neither, refuses to start. There is no implicit token
+  path. A token file is read again for each quota request and its contents
+  are kept no longer than that request, so a rotated projected service
+  account token is used on the next request. A missing, unreadable, or blank
+  token file makes that observation unreadable, and the token never appears
+  in logs or metrics. A capacity skip is not a turn failure. It is
   not an atomic reservation and cannot promise a global sandbox cap. Quota
   `hard` and `used` values, and the configured minimum free amount, are read
   as Kubernetes quantities: a plain integer or decimal, an optional exponent,
