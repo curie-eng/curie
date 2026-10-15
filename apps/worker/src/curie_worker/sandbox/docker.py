@@ -223,15 +223,22 @@ _STACK_LABEL = "curietech.ai/stack"
 _INPUT_COMPONENTS = ("claim-bundle", "claim-workspace", "claim-attachments")
 _INPUT_SEED_LIFETIME_S = 1800
 _SEED_WORKSPACE = """import os
+import stat
 def fail(error):
     raise error
+def prepare(path):
+    os.chown(path, 0, 0, follow_symlinks=False)
+    entry = os.lstat(path)
+    if not stat.S_ISLNK(entry.st_mode):
+        mode = 0o700 if stat.S_ISDIR(entry.st_mode) else 0o600
+        os.chmod(path, entry.st_mode | mode, follow_symlinks=False)
 paths = ['/curie-input']
-for root, directories, files in os.walk('/curie-input', onerror=fail):
-    paths.extend(os.path.join(root, name) for name in directories + files)
-for path in paths:
-    if not os.path.islink(path):
-        mode = 0o700 if os.path.isdir(path) else 0o600
-        os.chmod(path, os.stat(path).st_mode | mode)
+prepare('/curie-input')
+for root, directories, files in os.walk('/curie-input', topdown=True, onerror=fail):
+    for name in directories + files:
+        path = os.path.join(root, name)
+        prepare(path)
+        paths.append(path)
 for path in reversed(paths):
     os.chown(path, 1000, 1000, follow_symlinks=False)
 """

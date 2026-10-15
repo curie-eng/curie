@@ -164,9 +164,7 @@ class WorkerInputs:
             data=context.getvalue(),
             timeout=300,
         )
-        _docker(
-            "network", "create", "--label", f"{OWNER_LABEL}={self.owner}", self.network
-        )
+        _docker("network", "create", "--label", f"{OWNER_LABEL}={self.owner}", self.network)
         workspace = _workspace_archive()
         self.server = InputObjects({"/workspace.tar.gz": workspace, "/report.txt": ATTACHMENT})
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -224,33 +222,33 @@ class WorkerInputs:
                     self.server_thread.join(timeout=5)
                     if self.server_thread.is_alive():
                         errors.append("Input HTTP server thread survived shutdown")
-            except Exception as exc:
+            except (OSError, RuntimeError) as exc:
                 errors.append(f"Stopping input HTTP server failed: {exc}")
             finally:
                 try:
                     self.server.server_close()
-                except Exception as exc:
+                except (OSError, RuntimeError) as exc:
                     errors.append(f"Closing input HTTP server failed: {exc}")
         if not self.docker_ready:
             return
         for kind in ("container", "volume", "network", "image"):
             try:
                 resources = self.owned(kind)
-            except Exception as exc:
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                 errors.append(f"Listing owned {kind} resources failed: {exc}")
                 continue
             for resource in resources:
                 try:
                     args = ("rm", "-f") if kind == "container" else (kind, "rm")
                     _docker(*args, resource)
-                except Exception as exc:
+                except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                     errors.append(f"Removing owned {kind} {resource} failed: {exc}")
         for kind in ("container", "volume", "network", "image"):
             try:
                 remaining = self.owned(kind)
                 if remaining:
                     errors.append(f"Owned {kind} resources remain after cleanup: {remaining}")
-            except Exception as exc:
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                 errors.append(f"Verifying {kind} cleanup failed: {exc}")
         if errors:
             raise RuntimeError("\n".join(errors))
@@ -279,9 +277,7 @@ def test_create_claim_seeds_private_worker_inputs_without_host_binds(
     assert inspected["Config"]["User"] == "1000:1000"
     assert all(mount["Type"] in ("volume", "tmpfs") for mount in inspected["Mounts"])
     mounts = {
-        mount["Destination"]: mount
-        for mount in inspected["Mounts"]
-        if mount["Type"] == "volume"
+        mount["Destination"]: mount for mount in inspected["Mounts"] if mount["Type"] == "volume"
     }
     assert set(mounts) == {"/bundles/current", "/workspace", "/attachments"}
     assert {path: mount["RW"] for path, mount in mounts.items()} == {
@@ -357,19 +353,29 @@ print(json.dumps({
     )
     observed = json.loads(probe)
     assert (observed["uid"], observed["gid"]) == (1000, 1000)
-    assert observed["metadata"] == {
-        ".": [1000, 1000, 0o700],
-        "README.md": [1000, 1000, 0o600],
-        "README-hardlink.md": [1000, 1000, 0o600],
-        "private": [1000, 1000, 0o700],
-        "private/note.txt": [1000, 1000, 0o600],
+    metadata = observed["metadata"]
+    assert set(metadata) == {
+        ".",
+        "README.md",
+        "README-hardlink.md",
+        "private",
+        "private/note.txt",
     }
+    assert all(entry[:2] == [1000, 1000] for entry in metadata.values())
+    for name in ("README.md", "README-hardlink.md", "private/note.txt"):
+        assert metadata[name][2] == 0o600
+    # The data filter clears directory modes before extraction:
+    # https://docs.python.org/3.13/library/tarfile.html#tarfile.data_filter
+    for name in (".", "private"):
+        assert metadata[name][2] & 0o700 == 0o700
     assert observed["contents"] == {
         "readme": README.decode(),
         "hardlink": README.decode(),
         "note": NOTE.decode(),
         "manifest": MANIFEST.decode(),
-        "skill": "---\nname: probe\ndescription: Read the supplied inputs.\n---\nRead the inputs.\n",
+        "skill": (
+            "---\nname: probe\ndescription: Read the supplied inputs.\n---\nRead the inputs.\n"
+        ),
         "attachment": ATTACHMENT.decode(),
     }
     assert observed["same_inode"] is True
