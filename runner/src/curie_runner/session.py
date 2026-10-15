@@ -53,6 +53,12 @@ from .adapter import (
 )
 from .approval import ApprovalGate, is_mcp_tool, platform_tool_names
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
+from .final_answer import (
+    FINAL_ANSWER_CLASSIFICATION,
+    FINAL_ANSWER_DIAGNOSTIC,
+    FinalAnswerPolicy,
+    FinalAnswerValidation,
+)
 from .history import (
     ApprovalContext,
     ConversationMessage,
@@ -322,7 +328,9 @@ class SessionRunner:
         tool_access: TurnToolAccess | None = None,
         attachment_notice: str | None = None,
         channel_kind: str | None = None,
+        final_answer: FinalAnswerPolicy | None = None,
     ) -> None:
+        self._final_answer = final_answer
         self._factory = session_factory
         # The attachments this boot found, named on the first prompt sent
         # (#3691): the worker boots a sandbox for every turn that carries a
@@ -484,6 +492,11 @@ class SessionRunner:
         self._capacity_detail: str | None = None
         self._active_state: TurnState | None = None
         self._turn_ready = False
+
+    @property
+    def final_answer_required(self) -> bool:
+        """Immutable bundle policy used by HTTP admission negotiation."""
+        return self._final_answer is not None
 
     @property
     def status(self) -> SessionStatus:
@@ -891,6 +904,13 @@ class SessionRunner:
             # @spec RUNNER-TOOL-ACCESS-4: a restricted turn accepts no steer,
             # and a restricted steer joins no turn.
             return False
+        # Captured: cleanup must settle this turn's validation even if the
+        # turn ends or a later turn starts while the injection is pending.
+        validation = self._active_state.final_answer
+        with validation.suspended() if validation is not None else contextlib.nullcontext():
+            return await self._inject_steer(self._session, text, event)
+
+    async def _inject_steer(self, session: ModelSession, text: str, event: Event | None) -> bool:
         self._unrestricted_prompt_sent = True
         if event is not None and self._memory_turn is not None:
             self._memory_turn.begin(event)
@@ -905,7 +925,7 @@ class SessionRunner:
         # Same redaction as a turn start: the user text is the recorded size,
         # and an echo of the framed query does not reach the trace.
         self._tracer.remember_turn_prompt(text, framed)
-        await self._session.query(framed)
+        await session.query(framed)
         if self._active_state is not None:
             self._active_state.assistant_group = None
             self._active_state.history_messages.append(
@@ -1063,7 +1083,13 @@ class SessionRunner:
             # sent, so steer is refused and a stop is recorded without an SDK
             # interrupt that no query is there to receive.
             self._turn_ready = False
-            state = TurnState(tool_access=event.tool_access)
+            state = TurnState(
+                tool_access=event.tool_access,
+                final_answer=(
+                    FinalAnswerValidation(self._final_answer)
+                    if self._final_answer is not None else None
+                ),
+            )
             self._active_state = state
             if self._memory_turn is not None:
                 self._memory_turn.begin(event)
@@ -1770,6 +1796,7 @@ class SessionRunner:
                     # suspended at its yield. Re-apply its precedence immediately
                     # before publishing the terminal final.
                     final = self._reclassify(final)
+                    final, validation_failed = self._validate_publication(state, final)
                     capacity_failure = False
                     if final.status in {
                         SessionStatus.DONE,
@@ -1792,6 +1819,13 @@ class SessionRunner:
                         approval_paused=final.status is SessionStatus.AWAITING_APPROVAL,
                         completed_without_result=final.status is SessionStatus.AWAITING_APPROVAL,
                     )
+                    if validation_failed:
+                        yield to_ndjson_line(
+                            ErrorEvent(
+                                message=FINAL_ANSWER_DIAGNOSTIC,
+                                classification=FINAL_ANSWER_CLASSIFICATION,
+                            )
+                        )
                     if capacity_failure:
                         for line in _history_capacity_lines(self._capacity_detail):
                             yield line
@@ -1839,6 +1873,7 @@ class SessionRunner:
         for line in self._false_completion_lines(state, final):
             yield line
         final = self._reclassify(final)
+        final, validation_failed = self._validate_publication(state, final)
         capacity_failure = False
         if final.status is SessionStatus.AWAITING_APPROVAL:
             final, capacity_failure = await self._persist_terminal(
@@ -1858,6 +1893,13 @@ class SessionRunner:
             approval_paused=final.status is SessionStatus.AWAITING_APPROVAL,
             completed_without_result=final.status is SessionStatus.AWAITING_APPROVAL,
         )
+        if validation_failed:
+            yield to_ndjson_line(
+                ErrorEvent(
+                    message=FINAL_ANSWER_DIAGNOSTIC,
+                    classification=FINAL_ANSWER_CLASSIFICATION,
+                )
+            )
         if capacity_failure:
             for line in _history_capacity_lines(self._capacity_detail):
                 yield line
@@ -2462,6 +2504,31 @@ class SessionRunner:
             kept.add(failure)
         return tuple(failure for failure in prior if failure in kept)
 
+    def _validate_publication(self, state: TurnState, final: Final) -> tuple[Final, bool]:
+        """Last candidate check, after lifecycle overrides and before persistence."""
+        validation = state.final_answer
+        if validation is None or not validation.required:
+            return final, False
+        if self._timeout_requested:
+            return Final(text="run timed out", status=SessionStatus.CLASSIFIED_FAILURE), False
+        if final.status is SessionStatus.IDLE_AWAITING_INPUT:
+            return Final(text="run interrupted", status=final.status), False
+        if final.status is not SessionStatus.DONE:
+            return final, False
+        accepted = validation.accepts(final.text)
+        if accepted:
+            # Preserve the outbound security boundary. A candidate needing
+            # redaction cannot be published verbatim, and must not be persisted
+            # as a successful answer. No provisional deltas precede this final.
+            scrubbed = OutboundRedactor(self._held_secrets).push(to_ndjson_line(final))
+            clean = parse_ndjson_line(scrubbed[0])
+            accepted = isinstance(clean, Final) and clean.text == final.text
+        if accepted:
+            return final.model_copy(update={"text_mode": "verbatim"}), False
+        return Final(
+            text=FINAL_ANSWER_DIAGNOSTIC, status=SessionStatus.CLASSIFIED_FAILURE
+        ), True
+
     def _with_connector_notice(self, final: Final) -> Final:
         """Lead a DONE final's text with this turn's one-line connector notice.
 
@@ -2471,7 +2538,11 @@ class SessionRunner:
         """
 
         notice = self._connector_notice
-        if notice is None or final.status is not SessionStatus.DONE:
+        if (
+            notice is None
+            or final.status is not SessionStatus.DONE
+            or final.text_mode == "verbatim"
+        ):
             return final
         text = f"{notice}\n\n{final.text}" if final.text else notice
         return final.model_copy(update={"text": text})

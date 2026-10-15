@@ -1,4 +1,4 @@
-"""Behavioral contract for SRE-CREDS-1 through SRE-CREDS-8.
+"""Behavioral contract for SRE-CREDS-1 through SRE-CREDS-10.
 
 Only the external Kubernetes request boundary is replaced. Conditional PATCH
 semantics follow https://kubernetes.io/docs/reference/using-api/api-concepts/.
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -38,8 +39,18 @@ SAFE_KEYS = {
     "changed",
     "secretPatched",
     "workerRolled",
+    "retired",
     "error",
 }
+AT = "curietech.ai/adapter-credentials-at"
+MARKER = "curietech.ai/adapter-credentials-sha256"
+DESIRED = {"acme-mail": "mail-fixture-value", "acme-chat": "chat-fixture-value"}
+
+
+def marker(mapping: dict[str, str]) -> str:
+    """Independent SRE-CREDS-10 rollout marker for a decoded map."""
+    canonical = json.dumps(mapping, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(b"curie-adapter-credentials-v1\x00" + canonical.encode()).hexdigest()
 
 
 def encoded(text: str) -> str:
@@ -169,6 +180,7 @@ def invoke(
     raw: str | None = None,
     dry_run: bool = False,
     missing_file: bool = False,
+    flags: tuple[str, ...] = (),
 ) -> tuple[int, dict[str, Any]]:
     # Failure here is the intended RED signal until the public program exists.
     assert SCRIPT.is_file(), "SRE-CREDS reconciler is not implemented"
@@ -185,6 +197,7 @@ def invoke(
     argv = ["--config", str(config_path)]
     if dry_run:
         argv.append("--dry-run")
+    argv.extend(flags)
     exit_code = module.main(argv, request=api.request)
     output = capsys.readouterr()
     assert output.err == ""
@@ -193,7 +206,19 @@ def invoke(
     result = json.loads(lines[0])
     assert isinstance(result, dict)
     assert set(result) <= SAFE_KEYS
-    assert result.get("status") in {"updated", "unchanged", "would-change", "failed"}
+    assert result.get("status") in {
+        "updated",
+        "repaired",
+        "unchanged",
+        "would-change",
+        "would-repair",
+        "failed",
+    }
+    if "retired" in result:
+        assert "--prune" in flags
+        retired = result["retired"]
+        assert isinstance(retired, list) and all(isinstance(i, str) for i in retired)
+        assert retired == sorted(retired)
     for key, expected in {
         "namespace": NAMESPACE,
         "workerDeployment": "acme-worker",
@@ -268,8 +293,9 @@ def test_changed_map_updates_actual_custom_key_then_rolls_worker(
     assert set(rollout["spec"]) == {"template"}
     assert set(rollout["spec"]["template"]) == {"metadata"}
     annotations = rollout["spec"]["template"]["metadata"]["annotations"]
-    assert set(annotations) == {"curietech.ai/adapter-credentials-at"}
-    stamp = datetime.fromisoformat(annotations["curietech.ai/adapter-credentials-at"])
+    assert set(annotations) == {AT, MARKER}
+    assert annotations[MARKER] == marker(DESIRED)
+    stamp = datetime.fromisoformat(annotations[AT])
     assert stamp.utcoffset() is not None and stamp.utcoffset().total_seconds() == 0
     assert api.resources[WORKER]["spec"]["replicas"] == 1
     assert (
@@ -521,6 +547,7 @@ def test_missing_prior_identity_requires_separate_retirement(
     before = copy.deepcopy(api.resources)
     code, result = invoke(tmp_path, capsys, api, dry_run=dry_run)
     assert code != 0 and result["error"] == "inventory-shrinkage"
+    assert "retired" not in result
     assert api.writes() == [] and api.resources == before
 
 
@@ -567,3 +594,223 @@ def test_worker_patch_failure_reports_partial_change_without_rollback(
         "acme-mail": "mail-fixture-value",
         "acme-chat": "chat-fixture-value",
     }
+
+
+def stored_map(api: Kubernetes) -> dict[str, str]:
+    value = json.loads(base64.b64decode(api.resources[TARGET]["data"][MAP_KEY]))
+    assert isinstance(value, dict)
+    return value
+
+
+def template_annotations(api: Kubernetes) -> dict[str, str]:
+    annotations = api.resources[WORKER]["spec"]["template"]["metadata"].get("annotations", {})
+    assert isinstance(annotations, dict)
+    return annotations
+
+
+# @spec SRE-CREDS-9 SRE-CREDS-6 SRE-CREDS-7
+def test_prune_removes_exactly_unlisted_identities_and_reports_them(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    api = Kubernetes()
+    api.resources[TARGET]["data"][MAP_KEY] = encoded(
+        json.dumps(
+            {
+                "acme-zeta-retired": "old-zeta-fixture-value",
+                "acme-mail": "stale-mail",
+                "acme-alpha-retired": "old-alpha-fixture-value",
+            }
+        )
+    )
+    code, result = invoke(tmp_path, capsys, api, flags=("--prune",))
+    assert code == 0 and result["status"] == "updated"
+    assert result["retired"] == ["acme-alpha-retired", "acme-zeta-retired"]
+    assert result["changed"] and result["secretPatched"] and result["workerRolled"]
+    assert stored_map(api) == DESIRED
+    assert api.resources[TARGET]["data"]["unrelated"] == encoded("keep-fixture-value")
+    assert [call[:2] for call in api.writes()] == [("PATCH", TARGET), ("PATCH", WORKER)]
+    first_write = next(i for i, call in enumerate(api.calls) if call[0] == "PATCH")
+    assert {call[1] for call in api.calls[:first_write]} == {MAIL, CHAT, TARGET, WORKER}
+    assert template_annotations(api)[MARKER] == marker(DESIRED)
+
+
+# @spec SRE-CREDS-9 SRE-CREDS-7
+def test_prune_dry_run_reports_retirement_without_writes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    api = Kubernetes()
+    api.resources[TARGET]["data"][MAP_KEY] = encoded(
+        json.dumps({**DESIRED, "acme-retired": "old-fixture-value"})
+    )
+    before = copy.deepcopy(api.resources)
+    code, result = invoke(tmp_path, capsys, api, dry_run=True, flags=("--prune",))
+    assert code == 0 and result["status"] == "would-change"
+    assert result["retired"] == ["acme-retired"]
+    assert result["changed"] and not result["secretPatched"] and not result["workerRolled"]
+    assert api.writes() == [] and api.resources == before
+
+
+# @spec SRE-CREDS-9
+def test_prune_with_nothing_to_retire_reports_empty_list(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    api = Kubernetes()
+    api.resources[TARGET]["data"][MAP_KEY] = encoded(json.dumps(DESIRED))
+    code, result = invoke(tmp_path, capsys, api, flags=("--prune",))
+    assert code == 0 and result["status"] == "unchanged" and result["retired"] == []
+    assert api.writes() == []
+
+
+# @spec SRE-CREDS-9 SRE-CREDS-3
+def test_prune_still_requires_every_configured_source(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    api = Kubernetes()
+    api.resources[TARGET]["data"][MAP_KEY] = encoded('{"acme-retired":"old-fixture-value"}')
+    api.resources.pop(CHAT)
+    before = copy.deepcopy(api.resources)
+    code, result = invoke(tmp_path, capsys, api, flags=("--prune",))
+    assert code != 0 and result["error"] == "source-inspection"
+    assert result["retired"] == ["acme-retired"]
+    assert api.writes() == [] and api.resources == before
+
+
+# @spec SRE-CREDS-9 SRE-CREDS-5
+def test_prune_secret_conflict_writes_nothing_else(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    api = Kubernetes()
+    api.resources[TARGET]["data"][MAP_KEY] = encoded('{"acme-retired":"old-fixture-value"}')
+    api.faults["PATCH", TARGET] = api.failure(TARGET, 409)
+    before = copy.deepcopy(api.resources)
+    code, result = invoke(tmp_path, capsys, api, flags=("--prune",))
+    assert code != 0 and result["error"] == "secret-write"
+    assert result["retired"] == ["acme-retired"] and not result["workerRolled"]
+    assert api.resources == before
+
+
+# @spec SRE-CREDS-10 SRE-CREDS-6 SRE-CREDS-7
+def test_repair_rollout_rolls_worker_left_stale_by_failed_rollout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    api = Kubernetes()
+    api.faults["PATCH", WORKER] = api.failure(WORKER, 403)
+    code, result = invoke(tmp_path, capsys, api)
+    assert code != 0 and result["error"] == "worker-rollout" and result["secretPatched"]
+    del api.faults["PATCH", WORKER]
+    stale_worker = copy.deepcopy(api.resources[WORKER])
+
+    api.calls.clear()
+    code, result = invoke(tmp_path, capsys, api)
+    assert code == 0 and result["status"] == "unchanged" and not result["workerRolled"]
+    assert api.writes() == [] and api.resources[WORKER] == stale_worker
+
+    api.calls.clear()
+    secret_before = copy.deepcopy(api.resources[TARGET])
+    code, result = invoke(tmp_path, capsys, api, flags=("--repair-rollout",))
+    assert code == 0
+    assert result == {
+        "status": "repaired",
+        "namespace": NAMESPACE,
+        "workerDeployment": "acme-worker",
+        "workerContainer": "worker",
+        "targetSecret": "acme-worker-credentials",
+        "targetKey": MAP_KEY,
+        "adapterCount": 2,
+        "changed": False,
+        "secretPatched": False,
+        "workerRolled": True,
+    }
+    assert [call[:2] for call in api.writes()] == [("PATCH", WORKER)]
+    rollout = api.writes()[0][2]
+    assert rollout["metadata"] == {"resourceVersion": "17"}
+    annotations = rollout["spec"]["template"]["metadata"]["annotations"]
+    assert set(annotations) == {AT, MARKER} and annotations[MARKER] == marker(DESIRED)
+    assert api.resources[TARGET] == secret_before
+    assert template_annotations(api)["example.com/keep"] == "original"
+    assert api.resources[WORKER]["spec"]["replicas"] == 1
+
+    api.calls.clear()
+    code, result = invoke(tmp_path, capsys, api, flags=("--repair-rollout",))
+    assert code == 0 and result["status"] == "unchanged" and not result["workerRolled"]
+    assert api.writes() == []
+
+
+# @spec SRE-CREDS-10 SRE-CREDS-7
+def test_repair_rollout_dry_run_reports_without_writes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    api = Kubernetes()
+    api.resources[TARGET]["data"][MAP_KEY] = encoded(json.dumps(DESIRED))
+    before = copy.deepcopy(api.resources)
+    code, result = invoke(tmp_path, capsys, api, dry_run=True, flags=("--repair-rollout",))
+    assert code == 0 and result["status"] == "would-repair"
+    assert not result["changed"] and not result["secretPatched"] and not result["workerRolled"]
+    assert api.writes() == [] and api.resources == before
+
+
+# @spec SRE-CREDS-10
+@pytest.mark.parametrize("annotation", ["absent", "no-annotations", "malformed", "other-map"])
+def test_repair_rollout_treats_missing_or_mismatched_marker_as_stale(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], annotation: str
+) -> None:
+    api = Kubernetes()
+    api.resources[TARGET]["data"][MAP_KEY] = encoded(json.dumps(DESIRED))
+    template_metadata = api.resources[WORKER]["spec"]["template"]["metadata"]
+    if annotation == "no-annotations":
+        template_metadata.pop("annotations")
+    elif annotation == "malformed":
+        template_metadata["annotations"][MARKER] = "not-a-digest"
+    elif annotation == "other-map":
+        template_metadata["annotations"][MARKER] = marker({"acme-mail": "older-fixture"})
+    code, result = invoke(tmp_path, capsys, api, flags=("--repair-rollout",))
+    assert code == 0 and result["status"] == "repaired" and result["workerRolled"]
+    assert [call[:2] for call in api.writes()] == [("PATCH", WORKER)]
+    assert template_annotations(api)[MARKER] == marker(DESIRED)
+
+
+# @spec SRE-CREDS-10 SRE-CREDS-4
+def test_repair_rollout_marker_ignores_json_order_and_spacing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    api = Kubernetes()
+    api.resources[TARGET]["data"][MAP_KEY] = encoded(
+        '{ "acme-chat": "chat-fixture-value",  "acme-mail": "mail-fixture-value" }'
+    )
+    api.resources[WORKER]["spec"]["template"]["metadata"]["annotations"][MARKER] = marker(
+        {"acme-chat": "chat-fixture-value", "acme-mail": "mail-fixture-value"}
+    )
+    code, result = invoke(tmp_path, capsys, api, flags=("--repair-rollout",))
+    assert code == 0 and result["status"] == "unchanged"
+    assert api.writes() == []
+
+
+# @spec SRE-CREDS-10 SRE-CREDS-7
+@pytest.mark.parametrize("status", [409, 403])
+def test_repair_rollout_worker_failure_is_reported_without_secret_write(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], status: int
+) -> None:
+    api = Kubernetes()
+    api.resources[TARGET]["data"][MAP_KEY] = encoded(json.dumps(DESIRED))
+    api.faults["PATCH", WORKER] = api.failure(WORKER, status)
+    before = copy.deepcopy(api.resources)
+    code, result = invoke(tmp_path, capsys, api, flags=("--repair-rollout",))
+    assert code != 0 and result["error"] == "worker-rollout"
+    assert not result["changed"] and not result["secretPatched"] and not result["workerRolled"]
+    assert [call[:2] for call in api.writes()] == [("PATCH", WORKER)]
+    assert api.resources == before
+
+
+# @spec SRE-CREDS-10 SRE-CREDS-9
+def test_repair_rollout_and_prune_combine_on_a_changed_map(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    api = Kubernetes()
+    api.resources[TARGET]["data"][MAP_KEY] = encoded(
+        json.dumps({**DESIRED, "acme-retired": "old-fixture-value"})
+    )
+    code, result = invoke(tmp_path, capsys, api, flags=("--prune", "--repair-rollout"))
+    assert code == 0 and result["status"] == "updated" and result["retired"] == ["acme-retired"]
+    assert [call[:2] for call in api.writes()] == [("PATCH", TARGET), ("PATCH", WORKER)]
+    assert stored_map(api) == DESIRED
+    assert template_annotations(api)[MARKER] == marker(DESIRED)

@@ -200,6 +200,7 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
         "approval-not-acted",
         "false-completion",
         "publication-unrecorded",
+        "final-answer-validation",
         "history-persistence-error",
         # #3071: the SDK's turn cap ran out (``error_max_turns``). Not retryable:
         # a retry would spend the same budget and stop at the same place.

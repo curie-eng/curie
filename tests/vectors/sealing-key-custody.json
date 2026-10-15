@@ -136,6 +136,16 @@
       ]
     },
     {
+      "name": "config.SNAPSHOT_SEALING_KEY",
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    config:\n      - SNAPSHOT_SEALING_KEY\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.k8s.config)"
+        }
+      ]
+    },
+    {
       "name": "sealed_secrets.SNAPSHOT_SEALING_KEY",
       "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    sealed_secrets:\n      SNAPSHOT_SEALING_KEY: AgB-placeholder-blob\n",
       "refused": [
@@ -250,6 +260,16 @@
         {
           "name": "SNAPSHOT_SEALING_KEYS_RETAINED",
           "location": "connectors.yaml (connectors.k8s.secret_files)"
+        }
+      ]
+    },
+    {
+      "name": "config.SNAPSHOT_SEALING_KEYS_RETAINED",
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    config:\n      - SNAPSHOT_SEALING_KEYS_RETAINED\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEYS_RETAINED",
+          "location": "connectors.yaml (connectors.k8s.config)"
         }
       ]
     },

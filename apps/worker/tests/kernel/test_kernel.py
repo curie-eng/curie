@@ -2371,8 +2371,8 @@ def test_tool_notes_are_consumed_without_reaching_user_facing_updates(
             await h.kernel.process_event(event)
 
             texts = [text for _, _, text in h.sink.updates]
-            assert "Answer so far" in texts
-            assert "Answer so far and more" in texts
+            assert "Answer so far" not in texts
+            assert "Answer so far and more" not in texts
             assert h.sink.last_text == "Final answer"
             assert all("WebSearch" not in text for text in texts)
             assert all("searching..." not in text for text in texts)
@@ -2396,7 +2396,7 @@ def test_tool_notes_with_empty_or_absent_names_remain_internal(
             await h.kernel.process_event(qevent("research this"))
 
             texts = [text for _, _, text in h.sink.updates]
-            assert "Answer so far" in texts
+            assert "Answer so far" not in texts
             assert h.sink.last_text == "Final answer"
             assert all("empty name" not in text for text in texts)
             assert all("unnamed" not in text for text in texts)

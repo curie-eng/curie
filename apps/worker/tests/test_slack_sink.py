@@ -62,6 +62,16 @@ _STUB = "http://default:1/stub/"
 _ELSEWHERE = "https://slack.com/elsewhere/"
 
 
+@pytest.fixture(autouse=True)
+def _instant_synthetic_slack_delays(monkeypatch):
+    from curie_worker import slack_sink
+
+    async def sleep(_delay):
+        return None
+
+    monkeypatch.setattr(slack_sink, "_reply_sleep", sleep)
+
+
 def _target(
     *, channel: str = "C1", ts: str | None = "1.1", thread: str | None = None
 ) -> ReplyTarget:
@@ -368,9 +378,10 @@ def test_update_labels_a_429_retry_as_rate_limit(
     sink._client_for(None).chat_update = _fake_chat_update  # type: ignore[method-assign]
     text = '```curie-reply\n{"header": "Hi", "text": "body"}\n```'
 
-    asyncio.run(_update(sink, text=text))
+    with pytest.raises(SlackApiError):
+        asyncio.run(_update(sink, text=text))
 
-    assert calls == 2
+    assert calls == 3
     assert metrics == [
         {
             "service.name": "curie-worker",
@@ -378,35 +389,13 @@ def test_update_labels_a_429_retry_as_rate_limit(
             "role": "client",
             "retry_class": "rate-limit",
         }
-    ]
+    ] * 2
 
 
-def test_update_fallback_text_stays_within_slack_text_cap() -> None:
-    # Loop-closure: model Slack's real failure mode where chat.update rejects
-    # ANY call carrying blocks OR text longer than 40000 chars. A reply with a
-    # ~60000-char body must still complete: the with-blocks call is rejected,
-    # and the text-only retry must send bounded (<=40000) text so it succeeds
-    # instead of re-raising and re-opening the unbounded paid-retry loop.
-    sink = SlackReplyAdapter("xoxb-test")
-    calls: list[dict[str, object]] = []
-
-    async def _fake_chat_update(**kwargs: object) -> None:
-        text = kwargs.get("text")
-        if "blocks" in kwargs or (isinstance(text, str) and len(text) > 40000):
-            raise SlackApiError("too_long", {"ok": False, "error": "msg_too_long"})
-        calls.append(kwargs)  # only a within-cap text-only call is recorded
-
-    sink._client_for(None).chat_update = _fake_chat_update  # type: ignore[method-assign]
-
-    text = "```curie-reply\n" + json.dumps({"header": "H", "text": "x" * 60000}) + "\n```"
-    # Must not raise: the fallback text is bounded so the retry succeeds.
-    asyncio.run(_update(sink, text=text))
-
-    assert calls, "expected a successful text-only update"
-    final = calls[-1]
-    assert "blocks" not in final
-    assert isinstance(final["text"], str)
-    assert len(final["text"]) <= 40000
+def test_oversized_structured_answer_is_delivered_without_a_text_cut() -> None:
+    body = "x" * 60000
+    text = "```curie-reply\n" + json.dumps({"header": "H", "text": body}) + "\n```"
+    assert _captured_update(text) == body
 
 
 def test_update_does_not_retry_when_blocks_update_succeeds(
@@ -1087,79 +1076,43 @@ _EDIT_LIMIT_BYTES = 4000
 
 def _captured_update(text: str) -> str:
     sink = SlackReplyAdapter("xoxb-test")
-    captured: dict[str, str] = {}
+    captured: list[str] = []
 
-    async def _fake_chat_update(*, channel: str, ts: str, text: str) -> None:
-        captured["text"] = text
+    async def update(**body: object) -> dict[str, object]:
+        content = str(body["text"])
+        assert len(content.encode()) <= _EDIT_LIMIT_BYTES
+        captured.append(content)
+        return {"ok": True, "ts": "1.1"}
 
-    sink._client_for(None).chat_update = _fake_chat_update  # type: ignore[method-assign]
+    async def post(**body: object) -> dict[str, object]:
+        return await update(**body)
+
+    sink._client_for(None).chat_update = update  # type: ignore[method-assign]
+    sink._client_for(None).chat_postMessage = post  # type: ignore[method-assign]
     asyncio.run(_update(sink, text=text))
-    return captured["text"]
+    return "".join(captured)
 
 
-def test_an_edit_over_slacks_limit_is_cut_to_fit_and_says_so() -> None:
-    # Before #3064 the whole edit went out, Slack refused it, and the turn was
-    # lost and escalated as a worker restart. A cut reply still reaches the thread.
-    sent = _captured_update("A long report line.\n" * 600)
-
-    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
-    assert sent.startswith("A long report line.")
-    assert sent.rstrip().endswith("(Cut here: Slack refuses a longer edit.)_")
+def test_an_edit_over_slacks_limit_is_delivered_losslessly() -> None:
+    text = "A long report line.\n" * 600
+    assert _captured_update(text) == text
 
 
-def test_a_long_edit_keeps_the_action_receipt_with_the_answer() -> None:
+def test_a_long_answer_keeps_the_entire_opted_in_receipt() -> None:
     receipt = "_What I changed:_\n• 25 Bash calls; changes not described"
-    sent = _captured_update("A long report line.\n" * 600 + "\n\n" + receipt)
-
-    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
-    assert sent.startswith("A long report line.")
-    assert "(Cut here: Slack refuses a longer edit.)_" in sent
-    assert sent.endswith(receipt)
+    text = "A long report line.\n" * 600 + "\n\n" + receipt
+    assert _captured_update(text) == text
 
 
-def test_an_oversized_receipt_stays_in_the_long_edit_with_an_omission_notice() -> None:
+def test_an_oversized_receipt_is_not_omitted_during_delivery() -> None:
     receipt = "_What I changed:_\n" + ("• " + "é" * 300 + "\n") * 10
-    sent = _captured_update("A long answer.\n" * 400 + "\n\n" + receipt)
-
-    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
-    assert sent.startswith("A long answer.")
-    assert "_What I changed:_" in sent
-    assert sent.endswith("more receipt details omitted")
+    text = "A long answer.\n" * 400 + "\n\n" + receipt
+    assert _captured_update(text) == text
 
 
-def test_a_late_failed_action_is_kept_in_a_long_slack_reply() -> None:
-    from curie_worker.receipt import render_receipt
-
-    actions = [
-        {
-            "tool": f"tool_{i}",
-            "status": "succeeded" if i < 9 else "failed",
-            "undoable": False,
-            "result": {"summary": ("late failure " if i == 9 else f"action {i} ") + "é" * 160},
-            "detail": "é" * 160,
-        }
-        for i in range(10)
-    ]
-    receipt = render_receipt(actions)
-    assert receipt is not None
-
-    sent = _captured_update("A long answer.\n" * 400 + "\n\n" + receipt)
-
-    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
-    assert "_What I changed:_" in sent
-    assert "late failure" in sent
-    assert "failed" in sent
-    assert "more receipt details omitted" not in sent
-
-
-def test_multi_byte_text_is_cut_by_bytes_not_characters() -> None:
-    line = "• called `a_tool` — non-idempotent tool completed\n"
-    text = line * 78  # 3,900 characters: under the limit counted as characters
-    assert len(text) < _EDIT_LIMIT_BYTES < len(text.encode("utf-8"))
-
-    sent = _captured_update(text)
-
-    assert len(sent.encode("utf-8")) <= _EDIT_LIMIT_BYTES
+def test_multi_byte_answer_is_partitioned_without_losing_characters() -> None:
+    text = "• called a tool — completed\n" * 160
+    assert _captured_update(text) == text
 
 
 def test_an_edit_within_the_limit_is_sent_unchanged() -> None:

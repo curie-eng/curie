@@ -6,6 +6,7 @@
       "args",
       "bearer_secret",
       "build",
+      "config",
       "env",
       "headers",
       "image",

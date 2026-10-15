@@ -296,8 +296,8 @@ def test_an_ordinary_turn_records_no_gate(make_harness) -> None:
     asyncio.run(go())
 
 
-def test_a_turn_that_changed_the_world_says_so_in_its_reply(make_harness) -> None:
-    """ADR-0117 decision 7: the person who asked gets an account of what happened.
+def test_explicit_all_mode_adds_the_action_receipt(make_harness) -> None:
+    """ADR-0117 decision 7: an install can show what changed below the answer.
 
     Before this, the platform's entire account of an agent changing production
     was prose the model wrote about itself.
@@ -305,7 +305,7 @@ def test_a_turn_that_changed_the_world_says_so_in_its_reply(make_harness) -> Non
 
     async def go() -> None:
         recorder = FakeRecorder()
-        async with make_harness(actions=recorder) as h:
+        async with make_harness(actions=recorder, turn_receipt="all") as h:
             h.runner.default_script = [*_call("toolu_01"), Final(text="done", status=DONE)]
             await h.kernel.process_event(_qevent("scale it"))
 
@@ -389,12 +389,12 @@ def _succeeded_and_failed() -> list[object]:
     ]
 
 
-def test_all_mode_replies_exactly_as_the_default_install_does(make_harness) -> None:
-    """An explicit `all` is the default, byte for byte, on the same turn."""
+def test_default_mode_replies_exactly_as_explicit_off(make_harness) -> None:
+    """Without an install choice, neither successful nor failed calls append text."""
 
     async def go() -> None:
         replies: list[str | None] = []
-        for overrides in ({}, {"turn_receipt": "all"}):
+        for overrides in ({}, {"turn_receipt": "off"}):
             recorder = FakeRecorder()
             async with make_harness(actions=recorder, **overrides) as h:
                 h.runner.default_script = _succeeded_and_failed()
@@ -402,12 +402,7 @@ def test_all_mode_replies_exactly_as_the_default_install_does(make_harness) -> N
                 replies.append(h.sink.last_text)
 
         assert replies[0] == replies[1]
-        assert replies[0] == (
-            "done\n\n"
-            "_What I changed:_\n"
-            "• scale deployment — restore information recorded\n"
-            "• filed acme-invoice.pdf — failed — check before retrying"
-        )
+        assert replies[0] == "done"
 
     asyncio.run(go())
 
@@ -539,7 +534,7 @@ def test_a_transient_ledger_outage_delivers_with_a_durable_receipt(
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
             actions = ActionClient(api_base_url="http://api", api_key="example", client=http)
-            async with make_harness(actions=actions) as h:
+            async with make_harness(actions=actions, turn_receipt="all") as h:
                 h.runner.default_script = [*_call("tool-1"), Final(text="done", status=DONE)]
                 event = _qevent("scale it")
                 await h.kernel.process_event(event)

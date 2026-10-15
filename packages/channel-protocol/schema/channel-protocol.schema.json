@@ -681,10 +681,25 @@
           "default": null,
           "title": "Text"
         },
+        "text_mode": {
+          "anyOf": [
+            {
+              "const": "verbatim",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Reply wire 1.2. Preserve this text-only answer literally.",
+          "title": "Text Mode"
+        },
         "version": {
           "enum": [
             "1.0",
-            "1.1"
+            "1.1",
+            "1.2"
           ],
           "title": "Version",
           "type": "string"

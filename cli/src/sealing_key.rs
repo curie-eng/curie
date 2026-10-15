@@ -118,9 +118,9 @@ pub struct CustodyIssue {
 /// in the API's order and with its locations.
 ///
 /// A `plugin.json` `secrets` name, then per connector: a plain `secrets` name,
-/// an `env`, `secret_files` or `sealed_secrets` key, a `bearer_secret` that is
-/// or references the name, and a reference in `headers`, `url` or
-/// `unhosted_url`. Reads leniently like the API: a manifest or
+/// an `env`, `secret_files` or `sealed_secrets` key, a `config` name, a
+/// `bearer_secret` that is or references the name, and a reference in
+/// `headers`, `url` or `unhosted_url`. Reads leniently like the API: a manifest or
 /// `connectors.yaml` that does not parse adds nothing here, because the checks
 /// that own those files report it.
 pub fn custody_issues(bundle_dir: &Path) -> Result<Vec<CustodyIssue>> {
@@ -173,6 +173,11 @@ pub fn custody_issues(bundle_dir: &Path) -> Result<Vec<CustodyIssue>> {
                 if is_sealing_key_name(name) {
                     refuse(name, at(form));
                 }
+            }
+        }
+        for declared in sequence(spec, "config") {
+            if let Some(name) = declared.as_str().filter(|name| is_sealing_key_name(name)) {
+                refuse(name, at("config"));
             }
         }
         if let Some(bearer) = spec.get("bearer_secret").and_then(Value::as_str) {

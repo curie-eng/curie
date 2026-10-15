@@ -213,3 +213,23 @@ def test_json_status_reader_omits_run_and_session_identifiers(make_harness, capl
         asyncio.run(go())
     for record in caplog.records:
         assert "secret-event" not in record.getMessage()
+
+
+def test_answer_namespace_is_counted_by_the_real_outbox_observer(make_harness) -> None:
+    from channel_protocol.reply import PROGRESS_REPLY_WIRE_VERSION, ReplyUpdate
+
+    async def go() -> None:
+        _module, _observe, snapshot = _health()
+        async with make_harness(shimmer=False, completion_sweep_grace_s=0.0) as h:
+            record = _record("owed-answer-health", age_s=120)
+            record.answer = ReplyUpdate(
+                version=PROGRESS_REPLY_WIRE_VERSION, event="reply.update",
+                target=record.event.target, text="synthetic answer",
+                delivery_id="00000000-0000-4000-8000-000000000075",
+            )
+            await h.kernel._markers.mark_completion_pending(record.event_id, record)
+            result = await snapshot(h.kernel._markers, h.async_redis, h.config)
+            assert result.count == result.retry == 1
+            assert result.degraded and result.state == "retry"
+            assert result.oldest_age_s >= 120
+    asyncio.run(go())
