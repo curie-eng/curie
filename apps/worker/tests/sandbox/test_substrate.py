@@ -2538,7 +2538,7 @@ def test_fresh_only_claim_refuses_a_docker_runner_that_restarted_after_lookup(
             fresh_only=True,  # type: ignore[call-arg]
         )
 
-    assert all(args[0] not in {"create", "run"} for args in docker.calls)
+    assert {args[0] for args in docker.calls} <= {"inspect", "port"}
     assert all(timeout > 0 for timeout in docker.timeouts)
     assert affinity.get("T2739-docker") == RouteRecord(handle=old)
 
