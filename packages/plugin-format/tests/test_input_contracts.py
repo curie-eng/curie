@@ -193,7 +193,9 @@ def test_correctly_hashed_but_incompatible_input_is_rejected(changes: dict[str, 
         )
 
 
-def test_standalone_bundle_validation_does_not_claim_managed_input_enforcement(tmp_path: Path) -> None:
+def test_standalone_bundle_validation_does_not_claim_managed_input_enforcement(
+    tmp_path: Path,
+) -> None:
     root = bundle(tmp_path, {"inputContracts": declaration()})
     assert not validate_bundle(root).valid
     local = validate_bundle(root, input_contract_context="standalone")
