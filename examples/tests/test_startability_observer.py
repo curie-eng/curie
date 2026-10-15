@@ -800,3 +800,145 @@ def test_cli_discovered_pool_does_not_bypass_connector_secret_refusal(tmp_path: 
     rows, total = split([json.loads(line) for line in result.stdout.splitlines()])
     assert rows[0]["ready"] == 0 and total["not_ready"] == 1
     assert "worker refuses" in rows[0]["reason"]
+
+
+EXCLUDED_ROW_KEYS = {"agent_readiness", "agent", "kind", "address", "identity", "reason"}
+
+
+def test_excluded_kind_is_reported_but_never_judged() -> None:
+    """@spec STARTABILITY-9."""
+    observer = load_observer()
+    claimed: list[str] = []
+
+    def recording_claim(*args: Any) -> str:
+        claimed.append(args[2])
+        return claim_warm_pool(*args)
+
+    lines = observer.judge(
+        [
+            binding(),
+            binding("acme-qa", kind="acme-qualification", deployed=False),
+            binding("acme-bot", kind="acme-qualification", deployed=False),
+            binding("acme-dev", kind="acme-qualification-2", deployed=False),
+        ],
+        {"CURIE_WARM_POOL": "acme-runner-pool"},
+        {
+            "SLACK_APP_TOKEN": (True, "credential is nonblank"),
+            "SLACK_BOT_TOKEN": (True, "credential is nonblank"),
+        },
+        {"acme-runner-pool": "acme-runner"},
+        {"acme-runner": set()},
+        identity_lanes={"default": ("SLACK_APP_TOKEN", "SLACK_BOT_TOKEN")},
+        claim=recording_claim,
+        reserved=is_reserved_boot_env_name,
+        marker=BootEnv.env_key("connector_secret_keys"),
+        excluded_kinds=frozenset({"acme-qualification"}),
+    )
+    assert [line["agent_readiness"] for line in lines] == [
+        "binding",
+        "excluded",
+        "excluded",
+        "binding",
+        "total",
+    ]
+    excluded = [line for line in lines if line["agent_readiness"] == "excluded"]
+    assert all(set(line) == EXCLUDED_ROW_KEYS for line in excluded)
+    assert [line["agent"] for line in excluded] == ["acme-qa", "acme-bot"]
+    assert all(line["kind"] == "acme-qualification" for line in excluded)
+    assert "excluded" in excluded[0]["reason"]
+    # Exact match only: a longer kind sharing the prefix is still judged.
+    assert lines[3]["kind"] == "acme-qualification-2" and lines[3]["ready"] == 0
+    assert lines[-1] == {"agent_readiness": "total", "bindings": 2, "not_ready": 1, "agents": 2}
+    assert claimed == ["acme-bot"]
+
+
+def test_excluding_every_binding_is_a_zero_total() -> None:
+    """@spec STARTABILITY-9."""
+    observer = load_observer()
+    lines = judge(
+        observer,
+        [binding(kind="email", deployed=False), binding("acme-dev", deployed=False)],
+        excluded_kinds=frozenset({"email", "slack"}),
+    )
+    assert [line["agent_readiness"] for line in lines] == ["excluded", "excluded", "total"]
+    assert lines[-1] == {"agent_readiness": "total", "bindings": 0, "not_ready": 0, "agents": 0}
+
+
+def test_exclusion_kind_shape_matches_the_api_binding_contract() -> None:
+    """@spec STARTABILITY-9; the observer refuses what the API would never store."""
+    from curie_api.schemas.channels import CHANNEL_KIND
+
+    observer = load_observer()
+    assert observer.CHANNEL_KIND.pattern == CHANNEL_KIND.pattern
+
+
+def qualification_snapshot() -> dict[str, Any]:
+    """@spec STARTABILITY-9; one undeployed qualification binding that would fail."""
+    data = snapshot()
+    data["bindings"].append(binding("acme-qa", kind="acme-qualification", deployed=False))
+    return data
+
+
+def test_cli_without_exclusion_judges_every_binding(tmp_path: Path) -> None:
+    """@spec STARTABILITY-9."""
+    result, _ = run_cli(tmp_path, qualification_snapshot())
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    rows, total = split([json.loads(line) for line in result.stdout.splitlines()])
+    assert [row["ready"] for row in rows] == [1, 1, 1, 0]
+    assert total == {"agent_readiness": "total", "bindings": 4, "not_ready": 1, "agents": 3}
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--exclude-binding-kind", "acme-qualification"],
+        ["--exclude-binding-kind", "acme-qualification"] * 2,
+        ["--exclude-binding-kind", "acme-qualification", "--exclude-binding-kind", "acme-unused"],
+    ],
+)
+def test_cli_excluded_kind_is_reported_outside_the_verdict(
+    tmp_path: Path, extra: list[str]
+) -> None:
+    """@spec STARTABILITY-5 STARTABILITY-6 STARTABILITY-9."""
+    result, trace = run_cli(tmp_path, qualification_snapshot(), args=[*ARGS, *extra])
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    lines = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [line["agent_readiness"] for line in lines] == [
+        "binding",
+        "binding",
+        "binding",
+        "excluded",
+        "total",
+    ]
+    assert [line["ready"] for line in lines[:3]] == [1, 1, 1]
+    assert set(lines[3]) == EXCLUDED_ROW_KEYS
+    assert (lines[3]["agent"], lines[3]["kind"]) == ("acme-qa", "acme-qualification")
+    assert lines[-1] == {"agent_readiness": "total", "bindings": 3, "not_ready": 0, "agents": 2}
+    # Exclusion narrows the verdict, never the collection.
+    assert any(event["operation"] == "database" for event in trace)
+    assert {event["operation"] for event in trace} >= {"deployment", "secret", "custom"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", " ", "\n", "Acme-qualification", "acme-qualification ", "acme qualification", "acme--qa"],
+)
+def test_cli_blank_or_malformed_excluded_kind_is_refused_before_reads(
+    tmp_path: Path, value: str
+) -> None:
+    """@spec STARTABILITY-6 STARTABILITY-9."""
+    args = [*ARGS, "--exclude-binding-kind", "email", "--exclude-binding-kind", value]
+    result, trace = run_cli(tmp_path, qualification_snapshot(), args=args)
+    reason = assert_error(result)["reason"]
+    assert trace == []
+    if value.strip():
+        assert value.strip() not in reason
+
+
+def test_cli_exclude_binding_kind_requires_a_value(tmp_path: Path) -> None:
+    """@spec STARTABILITY-6 STARTABILITY-9."""
+    result, trace = run_cli(
+        tmp_path, qualification_snapshot(), args=[*ARGS, "--exclude-binding-kind"]
+    )
+    assert_error(result)
+    assert trace == []
