@@ -738,6 +738,7 @@ async def process_push(
                 # an over-cap legacy sibling is refused here and is not attached
                 # (ADR-0059 decision 3).
                 return _rejected(exc, agent.id)
+            version.input_contracts = sibling.input_contracts
             version = await crud_versions.attach_bundle(
                 session, version, str(sibling.bundle_ref), str(sibling.bundle_sha256)
             )

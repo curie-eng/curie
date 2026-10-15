@@ -730,3 +730,131 @@ def test_defer_stops_renewal_before_its_post_returns_or_raises(
                 await run.close()
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize("bound_identity", [False, True])
+def test_start_transports_resolved_runtime_identity_and_preserves_compatibility_refusal(
+    bound_identity: bool,
+) -> None:
+    deployment = uuid.UUID("22222222-2222-4222-8222-222222222222")
+    version = uuid.UUID("33333333-3333-4333-8333-333333333333")
+    seen: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == f"/v1/internal/work-items/requests/{REQUEST_ID}/start"
+        assert request.headers["X-Curie-Worker-Token"] == "example-token"
+        seen.append(json.loads(request.content))
+        return httpx.Response(409, json={"detail": {"code": "input_contract_mismatch"}})
+
+    async def go() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = WorkItemDispatchClient(
+                api_base_url="http://api.example", worker_token="example-token", client=http
+            )
+            run = _renewing_run(client)
+            if bound_identity:
+                run.runtime_deployment_id = deployment
+                run.runtime_version_id = version
+                run.runtime_bundle_sha256 = "a" * 64
+            try:
+                with pytest.raises(workitem_dispatch.WorkItemStartRefused) as caught:
+                    await run.start(claim_name="fixture-claim", sandbox_name="fixture-sandbox")
+                assert caught.value.code == "input_contract_mismatch"
+                assert not run.started
+                assert run.runtime_epoch is None
+            finally:
+                await run.close()
+
+    asyncio.run(go())
+    expected: dict[str, object] = {
+        "owner": "worker-1",
+        "generation": 1,
+        "claim_name": "fixture-claim",
+        "sandbox_name": "fixture-sandbox",
+    }
+    if bound_identity:
+        expected.update(
+            {
+                "runtime_deployment_id": str(deployment),
+                "runtime_version_id": str(version),
+                "runtime_bundle_sha256": "a" * 64,
+            }
+        )
+    assert seen == [expected]
+
+
+def test_acquire_transports_accepted_input_identity_to_the_run_record() -> None:
+    receipt = {
+        "interface": "curie/input-contracts@1",
+        "contract": "example.specification/v1",
+        "deployment_id": "22222222-2222-4222-8222-222222222222",
+        "version_id": "33333333-3333-4333-8333-333333333333",
+        "bundle_sha256": "a" * 64,
+        "body_sha256": "b" * 64,
+    }
+    grant = _acquire(
+        {**BASE, "repository_path": "example/repository", "input_contract_receipt": receipt}
+    )
+    assert grant.input_contract_receipt == receipt  # type: ignore[attr-defined]
+
+
+def test_worker_restart_adopts_original_input_receipt_and_pinned_runtime_identity() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from curie_worker.kernel.work_items import _adopt_resumed_work_item
+
+    receipt = {
+        "interface": "curie/input-contracts@1",
+        "contract": "example.specification/v1",
+        "deployment_id": "22222222-2222-4222-8222-222222222222",
+        "version_id": "33333333-3333-4333-8333-333333333333",
+        "bundle_sha256": "a" * 64,
+        "body_sha256": "b" * 64,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/internal/work-items/running"
+        assert request.url.params["conversation_id"] == "fixture-thread"
+        return httpx.Response(
+            200,
+            json={
+                "request_id": str(REQUEST_ID),
+                "work_item_id": str(WORK_ITEM_ID),
+                "runtime_epoch": 7,
+                "execution_deadline": "2099-01-01T00:00:00Z",
+                "input_contract_receipt": receipt,
+            },
+        )
+
+    async def go() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = WorkItemDispatchClient(
+                api_base_url="http://api.example", worker_token="example-token", client=http
+            )
+            kernel = SimpleNamespace(
+                _evict_expired_held_work_items=lambda: None,
+                _held_work_items={},
+                _work_items=client,
+                _config=SimpleNamespace(consumer_name="fixture-worker"),
+                _stop_owned_work_item=AsyncMock(),
+                _abandon_stale_work_item=AsyncMock(),
+                _work_item_runs={},
+                _factory_work_item_events=set(),
+            )
+            adopted = await _adopt_resumed_work_item(
+                kernel, "fixture-resume-event", "fixture-thread"
+            )
+            run = kernel._work_item_runs[adopted]
+            try:
+                assert adopted == REQUEST_ID
+                assert run.started and run.runtime_epoch == 7
+                assert run.input_contract_receipt == receipt
+                assert str(run.runtime_deployment_id) == receipt["deployment_id"]
+                assert str(run.runtime_version_id) == receipt["version_id"]
+                assert run.runtime_bundle_sha256 == receipt["bundle_sha256"]
+            finally:
+                await run.close()
+
+    asyncio.run(go())

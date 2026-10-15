@@ -678,6 +678,71 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
         Some(Command::Factory { action }) => match action {
             FactoryAction::Prepare {
                 action:
+                    FactoryPrepareAction::Compatibility {
+                        repo,
+                        api_url,
+                        api_key,
+                        dry_run,
+                    },
+            } => emit_boxed(
+                curie::managed_skills::compatibility(&repo, &api_url, &api_key, dry_run).await?,
+            ),
+            FactoryAction::Prepare {
+                action:
+                    FactoryPrepareAction::Update {
+                        agent,
+                        global,
+                        dir,
+                        source,
+                        release_url,
+                        check,
+                        rollback,
+                        dry_run,
+                    },
+            } => emit_boxed(
+                curie::managed_skills::update(curie::managed_skills::UpdateOptions {
+                    install: curie::agent_skills::InstallOptions {
+                        agent,
+                        global,
+                        dir,
+                        dry_run,
+                    },
+                    source,
+                    release_url,
+                    check,
+                    rollback,
+                })
+                .await?,
+            ),
+            FactoryAction::Prepare {
+                action:
+                    FactoryPrepareAction::Resolve {
+                        agent,
+                        global,
+                        dir,
+                        repo,
+                        source,
+                        offline,
+                    },
+            } => emit_boxed(
+                curie::managed_skills::resolve(curie::managed_skills::ResolveOptions {
+                    install: curie::agent_skills::InstallOptions {
+                        agent,
+                        global,
+                        dir,
+                        dry_run: false,
+                    },
+                    repo,
+                    source,
+                    offline,
+                })
+                .await?,
+            ),
+            FactoryAction::Prepare {
+                action: FactoryPrepareAction::Package { out },
+            } => emit_boxed(curie::examples::package_factory_preparation(&out)?),
+            FactoryAction::Prepare {
+                action:
                     FactoryPrepareAction::Install {
                         agent,
                         global,

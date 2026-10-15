@@ -47,7 +47,7 @@
       "id": "publish-only",
       "given": {
         "full_spec_reviewed": true,
-        "issue": "example/repo#21",
+        "issue": "https://github.com/example/repo/issues/21",
         "remote_unchanged": true,
         "factory_label": "curie-factory"
       },
@@ -70,7 +70,7 @@
       "id": "publish-and-start-custom-label",
       "given": {
         "full_spec_reviewed": true,
-        "issue": "example/repo#21",
+        "issue": "https://github.com/example/repo/issues/21",
         "remote_unchanged": true,
         "open": true,
         "prerequisites_merged": true,
@@ -219,12 +219,12 @@
       "given": {
         "full_spec_reviewed": true,
         "manual_issue_links": [
-          "example/repo#31"
+          "https://github.com/example/repo/issues/31"
         ],
         "exact_body_match": true,
         "start_consent": false
       },
-      "user_turn": "I published it here: example/repo#31.",
+      "user_turn": "I published it here: https://github.com/example/repo/issues/31.",
       "expected": {
         "tracker_effects": [
           "read supplied issue and verify repository/title/full body"
@@ -278,6 +278,88 @@
         "present old envelope as final resolved contract",
         "invent hash if tooling missing"
       ]
+    },
+    {
+      "id": "repository-pin-isolation",
+      "given": {
+        "global_entry_skill": "one discovered installation",
+        "repository_a": "cached preparation version 0.2.0 targeting contract A",
+        "repository_b": "cached preparation version 0.3.0 targeting contract B"
+      },
+      "user_turn": "Prepare this issue in repository B, then continue the separate draft in repository A.",
+      "expected": {
+        "local_effects": [
+          "resolve each current repository binding independently",
+          "load the matching cached instructions and reference for each draft",
+          "retain each draft target/version/contract evidence"
+        ],
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "change either repository pin through global entry upgrade",
+        "reuse repository B instructions or target in repository A"
+      ]
+    },
+    {
+      "id": "unknown-deployment-compatibility",
+      "given": {
+        "full_spec_reviewed": true,
+        "publication_and_start_consent": true,
+        "local_output_contract": "curie.factory-specification/v1",
+        "live_deployment_contracts": "endpoint unavailable or absent declaration"
+      },
+      "user_turn": "Publish and start it.",
+      "expected": {
+        "publication": "may publish reviewed content if its destination and exact bytes remain authorized",
+        "selection": "not selected; explain missing authoritative compatibility",
+        "tracker_effects": [
+          "authorized publication and readback only"
+        ]
+      },
+      "forbidden": [
+        "infer compatibility from installed CLI version",
+        "label while live contract is unknown",
+        "fabricate a binding or evaluator report"
+      ]
+    },
+    {
+      "id": "deployment-changed-after-review",
+      "given": {
+        "reviewed_binding": "deployment A and bundle digest X",
+        "live_deployment": "deployment A now reports bundle digest Y or is not effective"
+      },
+      "user_turn": "Start the reviewed issue.",
+      "expected": {
+        "tracker_effects": [],
+        "next": "resolve the changed target and return the entire migrated specification for review"
+      },
+      "forbidden": [
+        "silently rewrite the input prefix",
+        "apply factory label to stale binding"
+      ]
+    },
+    {
+      "id": "edited-skill-upgrade",
+      "given": {
+        "update_available": true,
+        "managed_file_edited": true,
+        "local_preferences_present": true
+      },
+      "user_turn": "Update the skill.",
+      "expected": {
+        "local_effects": [
+          "updater refuses edited managed file",
+          "preserve both edits and local preferences",
+          "explain manual reconciliation; retain current usable installation"
+        ],
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "overwrite edits",
+        "attempt three-way merge",
+        "modify repository pins"
+      ]
     }
-  ]
+  ],
+  "versioned_input_fixture": "For positive factory selection cases supply a repository pin and actual fake deployment contract response bound to its UUID/bundle digest, plus a valid curie-input@1 prefix whose digest is computed from the exact final canonical body. The local CLI product version is not compatibility evidence. All tracker/API effects remain fake."
 }

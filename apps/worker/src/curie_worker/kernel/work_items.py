@@ -311,6 +311,7 @@ async def _adopt_resumed_work_item(
                     conversation_id=thread_key,
                     wait_deadline="",
                     repository_path=None,
+                    input_contract_receipt=found.input_contract_receipt,
                 ),
                 event_id=event_id,
                 thread_key=thread_key,

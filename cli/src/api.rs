@@ -4889,6 +4889,29 @@ impl ApiClient {
             .context("decoding deployment list")
     }
 
+    /// Read generic input-contract enforcement metadata from an effective deployment.
+    pub async fn deployment_input_contracts(
+        &self,
+        deployment_id: &str,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/deployments/{deployment_id}/input-contracts",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /deployments/{id}/input-contracts",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading deployment input contracts")
+            .await?
+            .json()
+            .await
+            .context("decoding deployment input contracts")
+    }
+
     /// End the deployment: `DELETE /deployments/{id}` (204 No Content on success).
     pub async fn end_deployment(&self, deployment_id: &str) -> Result<()> {
         let resp = self

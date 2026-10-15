@@ -46,6 +46,7 @@ from plugin_format.connector_lock import (
 )
 from plugin_format.connectors import CONNECTORS_FILE, ConnectorsFile, validate_connectors
 from plugin_format.deploy_targets import DeployTargetsFile, validate_deploy_targets
+from plugin_format.input_contracts import INPUT_CONTRACT_ENFORCEMENT
 from plugin_format.validate import DEPLOY_FILE
 from plugin_format.yaml_loader import safe_load_unique
 
@@ -132,7 +133,11 @@ def extract_and_validate(
     # so it refuses to BOOT a policy-bearing bundle. The failure mode of an old
     # runner meeting a new bundle is "will not start", never "starts unfenced".
     root = bundle_root(dest)
-    result = validate_bundle(root, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    result = validate_bundle(
+        root,
+        enforces_tool_policy=TOOL_POLICY_ENFORCEMENT,
+        enforces_input_contracts=INPUT_CONTRACT_ENFORCEMENT,
+    )
     custody = sealing_key_custody_issues(root)
     if custody:
         result = ValidationResult(
@@ -404,9 +409,7 @@ def read_deploy_targets(root: Path) -> DeployTargetsFile | None:
     path = bundle_root(root) / DEPLOY_FILE
     if not path.is_file():
         return None
-    parsed, errors = validate_deploy_targets(
-        safe_load_unique(path.read_text(encoding="utf-8"))
-    )
+    parsed, errors = validate_deploy_targets(safe_load_unique(path.read_text(encoding="utf-8")))
     if errors or parsed is None:  # pragma: no cover -- validate_bundle gates this
         return None
     return parsed

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import plugin_format
+from plugin_format.input_contracts import INPUT_CONTRACT_ENFORCEMENT, read_input_contracts
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -184,9 +185,7 @@ def _bound_clause(bound: Iterable[str]) -> str:
     return f"bound routes are {_quoted(names)}" if names else "this agent binds no approval routes"
 
 
-def validate_archive(
-    data: bytes, settings: Settings | None = None
-) -> tuple[str, str]:
+def validate_archive(data: bytes, settings: Settings | None = None) -> tuple[str, str]:
     """Validate an archive's bytes. Returns (extension, content_type).
 
     Raises ``bundles.UnsupportedArchive`` if the bytes are not a zip/tar(.gz),
@@ -324,9 +323,7 @@ async def check_routes_from_bytes(
     _raise_if_routes_unbound(declared, routes, version_id)
 
 
-def _raise_if_routes_unbound(
-    declared: set[str] | None, routes: Any, version_id: uuid.UUID
-) -> None:
+def _raise_if_routes_unbound(declared: set[str] | None, routes: Any, version_id: uuid.UUID) -> None:
     """The pure decision: refuse unless every declared route has a binding.
 
     Comparison is VERBATIM and case-sensitive, because the two lookups this
@@ -406,6 +403,29 @@ async def store_bundle(
 
     key = f"bundles/{agent_id}/{version.id}{extension}"
     digest = hashlib.sha256(data).hexdigest()
+    with tempfile.TemporaryDirectory() as tmp:
+        destination = Path(tmp)
+        settings = get_settings()
+        bundles.extract_stored_bundle(
+            data,
+            destination,
+            max_uncompressed_bytes=settings.bundle_max_uncompressed_bytes,
+            max_compression_ratio=settings.bundle_max_compression_ratio,
+            max_members=settings.bundle_max_members,
+        )
+        declaration = read_input_contracts(
+            bundles.bundle_root(destination),
+            enforcements=frozenset({INPUT_CONTRACT_ENFORCEMENT}),
+        )
+    version.input_contracts = (
+        None
+        if declaration is None
+        else {
+            "interface": declaration.interface,
+            "accepts": list(declaration.accepts),
+            "required": declaration.required,
+        }
+    )
     await store.put(key, data, content_type)
     await crud_versions.attach_bundle(session, version, key, digest)
     return BundleOut(

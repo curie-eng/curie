@@ -490,6 +490,11 @@ class GitLabTracker:
 
     # Tickets and labels -----------------------------------------------------------
 
+    async def read_input_body(self, issue: TrackerIssueRef) -> str:
+        payload = await self._transport.get_object(self._issue_path(issue))
+        body = payload.get("description")
+        return body if isinstance(body, str) else ""
+
     async def read_ticket(self, issue: TrackerIssueRef) -> str:
         """Decision 12: title, description, then up to 100 non-system notes
         oldest first. GitLab markdown passes through unchanged."""

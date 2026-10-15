@@ -9272,6 +9272,219 @@ export const commandManifest = {
           "name": "prepare",
           "subcommands": [
             {
+              "about": "Verify that the selected live deployment enforces the repository's input contract",
+              "args": [
+                {
+                  "global": false,
+                  "id": "repo",
+                  "long": "repo",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Show the check without contacting the service",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "compatibility"
+            },
+            {
+              "about": "Check, update or roll back an unedited managed preparation skill",
+              "args": [
+                {
+                  "global": false,
+                  "id": "agent",
+                  "long": "agent",
+                  "positional": false,
+                  "possible_values": [
+                    "codex",
+                    "claude-code",
+                    "copilot",
+                    "gemini",
+                    "cursor"
+                  ],
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "id": "global",
+                  "long": "global",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "id": "dir",
+                  "long": "dir",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Local directory containing a self-contained release.json",
+                  "id": "source",
+                  "long": "source",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Trusted upstream HTTPS release asset URL",
+                  "id": "release_url",
+                  "long": "release-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Report availability without writing files",
+                  "id": "check",
+                  "long": "check",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restore the previous managed release",
+                  "id": "rollback",
+                  "long": "rollback",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Show the update decision without writing files",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "update"
+            },
+            {
+              "about": "Resolve the preparation release pinned by a repository's factory binding",
+              "args": [
+                {
+                  "global": false,
+                  "id": "agent",
+                  "long": "agent",
+                  "positional": false,
+                  "possible_values": [
+                    "codex",
+                    "claude-code",
+                    "copilot",
+                    "gemini",
+                    "cursor"
+                  ],
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "id": "global",
+                  "long": "global",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "id": "dir",
+                  "long": "dir",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Repository containing .curie-factory.json",
+                  "id": "repo",
+                  "long": "repo",
+                  "positional": false,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "id": "source",
+                  "long": "source",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Resolve only existing cached or explicit local release assets",
+                  "id": "offline",
+                  "long": "offline",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "resolve"
+            },
+            {
+              "about": "Write the bundled preparation release as a self-contained JSON asset",
+              "args": [
+                {
+                  "global": false,
+                  "id": "out",
+                  "long": "out",
+                  "positional": false,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "package"
+            },
+            {
               "about": "Install the bundled preparation skill offline, without a running Curie service",
               "args": [
                 {

@@ -193,6 +193,8 @@ fn start_spec_run_args_are_the_frozen_argv() {
         "-e",
         "CURIE_PLUGIN_DIR=/plugin",
         "-e",
+        "CURIE_INPUT_CONTRACT_CONTEXT=standalone",
+        "-e",
         "CURIE_SESSION_ID=local-1",
         "-e",
         "CURIE_SANDBOX_ID=local",
@@ -246,6 +248,7 @@ fn start_spec_run_args_are_the_frozen_argv() {
 fn every_emitted_env_name_is_a_declared_boot_env_key() {
     let declared = [
         env_keys::CURIE_PLUGIN_DIR,
+        env_keys::CURIE_INPUT_CONTRACT_CONTEXT,
         env_keys::CURIE_SESSION_ID,
         env_keys::CURIE_SANDBOX_ID,
         env_keys::CURIE_BUDGET,
@@ -308,4 +311,34 @@ fn start_spec_always_carries_the_tokenless_dev_flag() {
              got {pairs} in {args:?}"
         );
     }
+}
+
+#[test]
+fn local_runners_explicitly_declare_standalone_input_context() {
+    for candidate in [
+        spec(),
+        StartSpec {
+            fake_model: false,
+            ..spec()
+        },
+    ] {
+        let args = candidate.run_args();
+        assert!(
+            args.windows(2).any(|pair| pair[0] == "-e" && pair[1] == "CURIE_INPUT_CONTRACT_CONTEXT=standalone"),
+            "local skill/eval runner must explicitly declare its standalone context: {args:?}"
+        );
+    }
+}
+
+#[test]
+fn local_bundle_checks_explicitly_declare_standalone_input_context() {
+    let args = curie::docker::CheckSpec {
+        image: "curie-runner".into(),
+        plugin_dir: "/tmp/demo".into(),
+        timeout_s: 30,
+    }
+    .run_args();
+    assert!(args
+        .windows(2)
+        .any(|pair| pair[0] == "-e" && pair[1] == "CURIE_INPUT_CONTRACT_CONTEXT=standalone"));
 }

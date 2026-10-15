@@ -39,3 +39,12 @@ Publication behavior replay scenarios live in [evals/README.md](evals/README.md)
 They use synthetic tracker state to exercise approval, publication, selection and
 recovery without writing real issues. These are opt-in host-agent evaluations,
 not automated CI tests or proof of deployed factory intake.
+
+Managed installation supports update checks, unchanged-file upgrades and rollback.
+Repository bindings in `.curie-factory.json` select a preparation release and actual
+factory deployment; the global entry skill resolves each checkout independently.
+Local preferences remain outside managed assets. Compatibility compares opaque
+contract and immutable deployment identities, not the client's platform version.
+The factory retains ownership of specification semantics. See the
+[preparation guide](../../../docs/guides/factory-preparation.md#versions-and-upgrades)
+for the full version and customization workflow.

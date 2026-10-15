@@ -76,13 +76,19 @@ def test_execution_validation_does_not_discover_preparation_skill(tmp_path: Path
     shutil.copytree(BUNDLE, copy, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     execution = list((copy / "skills").rglob("SKILL.md"))
     assert [path.parent.name for path in execution] == ["implement-issue"]
-    before = validate_bundle(copy, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    before = validate_bundle(
+        copy, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT, input_contract_context="standalone"
+    )
     nested = copy / SKILL.relative_to(BUNDLE) / "SKILL.md"
     nested.write_text("---\nname: []\n---\n", encoding="utf-8")
-    after = validate_bundle(copy, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    after = validate_bundle(
+        copy, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT, input_contract_context="standalone"
+    )
     assert after == before
     execution[0].write_text("---\nname: []\n---\n", encoding="utf-8")
-    rejected = validate_bundle(copy, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    rejected = validate_bundle(
+        copy, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT, input_contract_context="standalone"
+    )
     assert any(
         issue.code == "skill.frontmatter_invalid"
         and issue.location == "skills/implement-issue/SKILL.md"

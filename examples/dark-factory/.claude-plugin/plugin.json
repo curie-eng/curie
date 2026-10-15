@@ -7,5 +7,10 @@
   "keywords": ["factory", "coding", "github", "issues", "pull-request"],
   "starterPrompts": [
     "https://github.com/acme-corp/acme-bot/issues/1"
-  ]
+  ],
+  "inputContracts": {
+    "interface": "curie/input-contracts@1",
+    "accepts": ["curie.factory-specification/v1"],
+    "required": true
+  }
 }

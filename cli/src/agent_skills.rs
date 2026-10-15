@@ -21,7 +21,7 @@ pub enum AgentClient {
 }
 
 impl AgentClient {
-    fn directory(self, global: bool) -> &'static str {
+    pub(crate) fn directory(self, global: bool) -> &'static str {
         match self {
             Self::Codex => ".agents/skills",
             Self::ClaudeCode => ".claude/skills",
@@ -43,6 +43,7 @@ impl AgentClient {
     }
 }
 
+#[derive(Clone)]
 pub struct InstallOptions {
     pub agent: AgentClient,
     pub global: bool,
@@ -80,7 +81,7 @@ fn refusal(path: &Path) -> anyhow::Error {
 
 /// Check only below the explicitly selected root. The root itself is resolved
 /// once (e.g. macOS /tmp); client directories and payloads must not be symlinks.
-fn check_path(root: &Path, relative: &Path) -> Result<()> {
+pub(crate) fn check_path(root: &Path, relative: &Path) -> Result<()> {
     let mut path = root.to_path_buf();
     for part in relative.components() {
         if !matches!(part, Component::Normal(_)) {
@@ -99,7 +100,7 @@ fn check_path(root: &Path, relative: &Path) -> Result<()> {
     Ok(())
 }
 
-fn selected_root(options: &InstallOptions) -> Result<PathBuf> {
+pub(crate) fn selected_root(options: &InstallOptions) -> Result<PathBuf> {
     if options.global && options.dir.is_some() {
         return Err(crate::exit::usage("--global and --dir cannot be combined"));
     }

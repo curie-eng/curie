@@ -338,6 +338,7 @@ SELECT a.id AS agent_id,
        v.id AS version_id,
        v.version_label AS version_label,
        v.bundle_ref AS bundle_ref,
+       v.bundle_sha256 AS bundle_sha256,
        c.kind AS kind,
        c.address AS address,
        c.endpoint AS endpoint,
@@ -374,6 +375,7 @@ SELECT a.id AS agent_id,
        v.id AS version_id,
        v.version_label AS version_label,
        v.bundle_ref AS bundle_ref,
+       v.bundle_sha256 AS bundle_sha256,
        NULL AS endpoint,
        NULL AS adapter
 FROM {schema}.agents a
@@ -434,6 +436,7 @@ class ResolvedDeployment(BaseModel):
     version_id: uuid.UUID
     version_label: str
     bundle_ref: str | None
+    bundle_sha256: str | None = None
     max_usd_per_day: float | None
     max_output_tokens_per_run: int | None
     # The agent's opt-in behavior packs (declarative JSON), or None for the
@@ -709,6 +712,27 @@ class BindingResolver:
         async with self._engine.connect() as conn:
             result = await conn.execute(
                 self._resolve_agent_sql, {"agent_id": agent_id, "tenant_id": self._tenant_id}
+            )
+            row = result.mappings().first()
+        return None if row is None else _deployment_from_row(dict(row))
+
+    async def resolve_deployment(
+        self, agent_id: uuid.UUID, deployment_id: uuid.UUID
+    ) -> ResolvedDeployment | None:
+        """Resolve a running request's immutable owner even after rollout.
+
+        This is not a fallback for fresh work: only an API-issued admitted
+        receipt may select an inactive deployment.
+        """
+        statement = text(
+            _RESOLVE_AGENT_SQL.replace("d.status = 'active'", "d.id = :deployment_id")
+            .format(schema=self._config.db_schema)
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(
+                statement,
+                {"agent_id": agent_id, "deployment_id": deployment_id,
+                 "tenant_id": self._tenant_id},
             )
             row = result.mappings().first()
         return None if row is None else _deployment_from_row(dict(row))
@@ -1136,6 +1160,7 @@ class BindingResolver:
         caller_run: str | None = None,
         caller_work_item: str | None = None,
         caller_exp_ceiling: int | None = None,
+        input_contract_enforcement: str | None = None,
         token_ttl_s: float | None = None,
     ) -> dict[str, str]:
         """The env injected into the sandbox claim for a bound run.
@@ -1289,6 +1314,10 @@ class BindingResolver:
             memory_ref=memory_ref,
             history_ref=history_ref,
             bundle_ref=resolved.bundle_ref,
+            input_contract_context=(
+                "tracked-implementation" if caller_work_item is not None else "standalone"
+            ),
+            input_contract_enforcement=input_contract_enforcement,
             # Agent-readable identity (#2174): the platform-tracked
             # version_label, not the RustFS object key. Blank is omitted.
             bundle_version=resolved.version_label or None,

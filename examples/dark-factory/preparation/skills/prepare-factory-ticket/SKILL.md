@@ -7,13 +7,50 @@ description: Prepare, review and publish Software Factory specifications from ex
 
 Turn the developer's intent and repository context into a reviewed specification,
 then offer to publish it and optionally start the configured factory.
-Read [references/specification.md](references/specification.md) before drafting;
-it defines the canonical format and the separate evidence report.
 
 This is a text-only preparation skill. Use the host agent's existing capabilities;
 no specific model, provider, Python, parser package, container runtime or Curie
 deployment is required. Repository tests may need that repository's own tools.
 Missing tools are evidence gaps, not instructions to install dependencies.
+
+## Resolve the repository workflow
+
+Before choosing a specification format, identify the actual checkout, coding
+client and installed skill scope. A global installation serves multiple
+repositories; never use the last repository's version or target for this one.
+
+For a managed installation with the current Curie CLI available, run
+`curie factory prepare resolve --agent CLIENT --repo REPO` with `--global` for a
+personal installation, or `--dir INSTALL_ROOT` for a project installation. Read
+that repository's `.curie-factory.json`, then load the returned `instructions_path`
+and its packaged reference. The resolver checks the exact preparation version,
+accepted output contract and cached file hashes. If those are this same workflow,
+continue without recursively invoking the skill. Otherwise use the resolved
+workflow for this draft. Freeze its version, contract, target deployment, bundle
+digest and instruction identity in the local report; refresh only through an
+explicit draft migration and full specification review.
+
+At most once per preparation session, perform a read-only upstream update check with
+`curie factory prepare update --check --agent CLIENT` and the same installation
+scope. Tell the developer what changed and whether it affects action permissions
+before applying an update. Preserve their chosen pin or update policy. Updating
+an entry skill does not change repository pins or an ongoing draft's workflow.
+A failed network check is not a reason to discard a compatible cached workflow.
+Never install or upgrade the CLI without authorization. Edited managed files
+require manual reconciliation; there is no automatic merge. Use the updater's
+backup and rollback, not ad hoc overwrites.
+
+Read the returned local preferences file when present. Preferences schema 1 uses
+`schema_version: 1` and a `preferences` object with optional `output_directory`,
+`review_style` and `repository_notes` strings. Preserve it across upgrades. Explain
+unknown, malformed or incompatible preferences and ask about the affected choice;
+do not rewrite it silently or let it override contract checks and action approval.
+
+If the CLI, binding or pinned release is unavailable, explain the exact gap. You
+may draft with the installed [reference](references/specification.md), clearly
+recording unresolved compatibility, but do not claim the target is compatible or
+select it for factory execution. When migrating an existing draft, reuse its
+recorded decisions and evidence and review the full changed specification.
 
 ## Establish the source
 
@@ -74,6 +111,7 @@ for parallel execution or selection.
 
 ## Save and review
 
+For this resolved contract, read [references/specification.md](references/specification.md).
 Write the seven-section canonical specification, or one per proposed child, and
 a separate local report using the reference. Do not add mandatory issue headings
 for provenance, traceability or preparation status. Every criterion needs a

@@ -52,6 +52,18 @@ client settings and activation consent still apply. See the
 [preparation guide](../docs/guides/factory-preparation.md) for client paths,
 manual installation, specification review, publication and factory selection.
 
+Managed installations record the original version and hashes outside the skill
+folder. `curie factory prepare update --agent codex --global --check` reports an
+upstream release without changing files. Omit `--check` after reviewing the update;
+use `--rollback` to restore the previous managed release. Edited managed files are
+refused and preserved; there is no automatic merge. Per-repository
+`.curie-factory.json` pins resolve with
+`curie factory prepare resolve --agent codex --global --repo DIR`. The same global
+skill can use different cached preparation versions for different repositories.
+`curie factory prepare compatibility --repo DIR` checks the actual selected
+deployment through the configured API connection; CLI version alone is not proof.
+See the guide for preferences, release locators, offline behavior and recovery.
+
 ## Interactive mode
 
 `curie interactive` is a menu-driven way to run the same commands documented

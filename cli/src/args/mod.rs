@@ -1512,6 +1512,64 @@ pub(crate) struct FactoryQuickstartArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum FactoryPrepareAction {
+    /// Verify that the selected live deployment enforces the repository's input contract.
+    Compatibility {
+        #[arg(long, value_name = "DIR")]
+        repo: PathBuf,
+        #[arg(long, env = "CURIE_API_URL")]
+        api_url: String,
+        #[arg(long, env = "CURIE_API_KEY", hide_env_values = true)]
+        api_key: String,
+        /// Show the check without contacting the service.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Check, update or roll back an unedited managed preparation skill.
+    Update {
+        #[arg(long, value_enum, value_name = "CLIENT")]
+        agent: curie::agent_skills::AgentClient,
+        #[arg(long, conflicts_with = "dir")]
+        global: bool,
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// Local directory containing a self-contained release.json.
+        #[arg(long, conflicts_with_all = ["release_url", "rollback"])]
+        source: Option<PathBuf>,
+        /// Trusted upstream HTTPS release asset URL.
+        #[arg(long, conflicts_with = "rollback")]
+        release_url: Option<String>,
+        /// Report availability without writing files.
+        #[arg(long, conflicts_with = "rollback")]
+        check: bool,
+        /// Restore the previous managed release.
+        #[arg(long)]
+        rollback: bool,
+        /// Show the update decision without writing files.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Resolve the preparation release pinned by a repository's factory binding.
+    Resolve {
+        #[arg(long, value_enum, value_name = "CLIENT")]
+        agent: curie::agent_skills::AgentClient,
+        #[arg(long, conflicts_with = "dir")]
+        global: bool,
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// Repository containing .curie-factory.json.
+        #[arg(long, value_name = "DIR")]
+        repo: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        source: Option<PathBuf>,
+        /// Resolve only existing cached or explicit local release assets.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Write the bundled preparation release as a self-contained JSON asset.
+    Package {
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
+    },
     /// Install the bundled preparation skill offline, without a running Curie service.
     Install {
         /// Coding agent that will discover the skill.

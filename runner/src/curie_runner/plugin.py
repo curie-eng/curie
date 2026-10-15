@@ -21,6 +21,7 @@ ref that is set while nothing was staged is diagnosed here, by name, before the
 frozen validator gets a chance to mis-attribute it.
 """
 
+import base64
 import json
 import logging
 import os
@@ -37,6 +38,7 @@ from plugin_format import (
     resolve_manifest,
     validate_bundle,
 )
+from plugin_format.input_contracts import INPUT_CONTRACT_ENFORCEMENT
 
 # The SDK's skill-name check is private, and the SDK is pinned only ``>=``, so a
 # later release may move or rename it. When it is gone, use the local copy below.
@@ -270,7 +272,35 @@ def load_plugins(
     # Naming the enforcement contract is a statement that this build applies a
     # declared toolPolicy. Older runners omit it and safely refuse policy-bearing
     # bundles rather than starting them unfenced.
-    result = validate_bundle(root, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    context = source.get(BootEnv.env_key("input_contract_context"))
+    enforcement = source.get(BootEnv.env_key("input_contract_enforcement"))
+    managed = any(
+        source.get(BootEnv.env_key(field))
+        for field in ("progress_token", "issue_read_token")
+    )
+    caller = source.get(BootEnv.env_key("connector_caller_token"))
+    if caller:
+        # This decode only narrows standalone applicability; it never grants
+        # authority or treats an unverified signature as an authorization.
+        try:
+            prefix, encoded, _signature = caller.split(".")
+            payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+            managed = managed or prefix != "cct" or not isinstance(payload, dict)
+            if isinstance(payload, dict):
+                managed = managed or "run" in payload or "work_item" in payload
+        except (ValueError, UnicodeError):
+            managed = True
+    standalone = context == "standalone" and not managed and not enforcement
+    result = validate_bundle(
+        root,
+        enforces_tool_policy=TOOL_POLICY_ENFORCEMENT,
+        input_contract_context="standalone" if standalone else "tracked-implementation",
+        enforces_input_contracts=(
+            INPUT_CONTRACT_ENFORCEMENT
+            if context == "tracked-implementation" and enforcement == INPUT_CONTRACT_ENFORCEMENT
+            else None
+        ),
+    )
     if not result.valid:
         detail = "; ".join(f"[{i.code}] {i.location}: {i.message}" for i in result.errors)
         raise PluginBundleError(f"invalid plugin bundle at {root}: {detail}")

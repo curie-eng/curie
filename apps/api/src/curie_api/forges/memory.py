@@ -433,6 +433,10 @@ class InMemoryTracker(_Declared):
         self._issue(issue)
         return actor.id in self._authorized and actor != self.identity
 
+    async def read_input_body(self, issue: TrackerIssueRef) -> str:
+        self._gate(Operation.READ_TICKET)
+        return self._issue(issue).body
+
     async def read_ticket(self, issue: TrackerIssueRef) -> str:
         self._gate(Operation.READ_TICKET)
         found = self._issue(issue)
