@@ -2343,6 +2343,60 @@ connectors:
         assert_eq!(hosted_env_secret_names(&decl), vec!["PAT".to_string()]);
     }
 
+    const CONFIGURED: &str = r#"
+connectors:
+  docs:
+    image: ghcr.io/example/docs-mcp:1
+    secrets:
+      - DOCS_TOKEN
+    config:
+      - DOCS_FOLDER_PATH
+      - CHAT_CHANNEL_ID
+"#;
+
+    #[test]
+    fn config_names_are_resolved_and_forwarded_like_plain_secrets() {
+        // `config` values come from the same per-agent store and reach the
+        // connector container the same way, so every resolve/forward seam
+        // must see them.
+        let decl = decl(CONFIGURED);
+        let spec = &decl.connectors["docs"];
+        assert_eq!(
+            declared_secret_names(spec),
+            vec!["DOCS_TOKEN", "DOCS_FOLDER_PATH", "CHAT_CHANNEL_ID"]
+        );
+        assert_eq!(
+            hosted_secret_names(&decl),
+            vec!["CHAT_CHANNEL_ID", "DOCS_FOLDER_PATH", "DOCS_TOKEN"]
+        );
+    }
+
+    #[test]
+    fn config_names_never_become_the_bearer_or_reach_the_sandbox() {
+        let configured = decl(CONFIGURED);
+        assert_eq!(
+            bearer_secret_name(&configured.connectors["docs"]).as_deref(),
+            Some("DOCS_TOKEN")
+        );
+        assert_eq!(
+            hosted_env_secret_names(&configured),
+            vec!["DOCS_TOKEN".to_string()]
+        );
+        let config_only = decl(
+            "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    config: [DOCS_FOLDER_PATH]\n",
+        );
+        assert_eq!(bearer_secret_name(&config_only.connectors["docs"]), None);
+        assert!(hosted_env_secret_names(&config_only).is_empty());
+    }
+
+    #[test]
+    fn a_reserved_config_name_is_refused_before_resolution() {
+        let decl = decl(
+            "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    config: [ANTHROPIC_API_KEY]\n",
+        );
+        assert!(refuse_reserved_secret_names(&decl).is_err());
+    }
+
     // @spec ADR-0168 d8
     #[test]
     fn restrict_to_keeps_only_the_allowlist() {
