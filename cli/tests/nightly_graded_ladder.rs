@@ -6254,17 +6254,41 @@ REPO_ROOT="$TEST_REPO_ROOT"
 COMPOSE_PROJECT=acme-private
 LOCAL_OTEL_SINK_NAME=acme-private-sink
 LOCAL_OTEL_SINK_OWNED=0
+LOCAL_OTEL_SINK_ACTIVE=0
+LOCAL_OTEL_SINK_IMAGE=""
+LOCAL_OTEL_IMAGE_OWNED=0
 LOCAL_OTEL_NETWORK_OWNED=0
 LOCAL_OTEL_NETWORK=""
 docker() {{
     printf '%s\n' "$*" >> "$TEST_DOCKER_LOG"
     if [[ "$1 $2" == 'network inspect' ]]; then
         [[ "$TEST_NETWORK_EXISTS" == 1 ]]
+    elif [[ "$1 $2" == 'container inspect' ]]; then
+        echo 'Error: No such container: acme-private-sink' >&2
+        return 1
+    elif [[ "$1" == build ]]; then
+        python3 -c 'import sys, tarfile
+with tarfile.open(fileobj=sys.stdin.buffer, mode="r|*") as archive:
+    entries = {{entry.name: (entry, archive.extractfile(entry).read() if entry.isfile() else None) for entry in archive}}
+assert set(entries) == {{"Dockerfile", "config.yaml", "output"}}, entries
+assert b"COPY config.yaml /etc/otelcol-contrib/config.yaml" in entries["Dockerfile"][1]
+assert b"COPY output/ /var/lib/otel-e2e/" in entries["Dockerfile"][1]
+assert b"service:" in entries["config.yaml"][1]
+assert entries["output"][0].isdir() and entries["output"][0].mode == 0o777
+' || return 1
+        touch "$TEST_WORKDIR/image-built"
+    elif [[ "$1 $2" == 'image inspect' ]]; then
+        [[ -f "$TEST_WORKDIR/image-built" ]]
+    elif [[ "$1 $2" == 'image rm' ]]; then
+        rm "$TEST_WORKDIR/image-built"
     elif [[ "$1" == run ]]; then
         echo 'intentional command-capture boundary; no container is started' >&2
         return 64
-    else
+    elif [[ "$1" == ps || "$1 $2" == 'network create' || "$1 $2" == 'network rm' ]]; then
         return 0
+    else
+        echo "unexpected Docker command: $*" >&2
+        return 93
     fi
 }}
 {}
@@ -6306,6 +6330,22 @@ stop_local_otel_sink
                 .any(|line| line.starts_with("run ")
                     && line.contains(&format!("--network {expected} "))),
             "{calls}"
+        );
+        let build = calls
+            .lines()
+            .find(|line| line.starts_with("build --tag "))
+            .expect("the sink configuration must cross Docker's build API");
+        let image = build.split_whitespace().nth(2).unwrap();
+        assert!(build.ends_with(" -"), "{calls}");
+        assert!(calls.contains(&format!("image rm {image}\n")), "{calls}");
+        assert!(!work.path().join("image-built").exists(), "{calls}");
+        let run = calls
+            .lines()
+            .find(|line| line.starts_with("run "))
+            .expect("the sink must attempt startup after copying its configuration");
+        assert!(run.contains(image), "{calls}");
+        crate::docker_no_host_binds::assert_no_client_host_binds(
+            &run.split_whitespace().map(String::from).collect::<Vec<_>>(),
         );
         if existing {
             assert!(

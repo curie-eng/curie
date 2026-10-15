@@ -11,8 +11,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -240,15 +242,28 @@ def _start_sink_with_stub_docker(
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     """Run the real start_local_otel_sink against a recording docker stub."""
 
-    function = _shell_function(LADDER_PATH.read_text(), "start_local_otel_sink")
+    source = LADDER_PATH.read_text()
+    functions = _function_body(
+        source,
+        "start_local_otel_sink",
+        "\nassert_local_otel_no_turn_pipeline_live() {",
+    )
     stubs = tmp_path / "bin"
     stubs.mkdir()
     runs = tmp_path / "docker-runs"
+    (tmp_path / "private-worktree-marker").write_text("private-worktree-marker")
     docker = stubs / "docker"
     docker.write_text(
         """#!/bin/bash
+printf '%s\\n' "$*" >> "$STUB_CALLS"
 case "$1 $2" in
-    "ps -q"|"rm -f"|"logs "*) exit 0 ;;
+    "ps -q"|"rm -f"|"logs "*|"cp "*|"stop "*|"image rm") exit 0 ;;
+    "container inspect")
+        echo "Error: No such container: $3" >&2
+        exit 1
+        ;;
+    "build --tag") cat > "$STUB_BUILD_CONTEXT"; exit 0 ;;
+    "image inspect") exit 0 ;;
     "network inspect")
         [[ "${4:-}" == "--format" ]] && echo 172.30.0.1
         exit 0
@@ -287,7 +302,16 @@ exit 97
 """
     )
     curl = stubs / "curl"
-    curl.write_text("#!/bin/sh\nexit 0\n")
+    curl.write_text(
+        "#!/bin/sh\n"
+        'case "$2" in\n'
+        "  */metrics)\n"
+        "    printf 'otelcol_receiver_accepted_metric_points 0\\n'\n"
+        "    printf 'otelcol_exporter_sent_metric_points 0\\n'\n"
+        "    ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
     for stub in (docker, curl):
         stub.chmod(0o700)
     script = f"""set -euo pipefail
@@ -297,12 +321,17 @@ WORKDIR="$2"
 COMPOSE_PROJECT=curie
 LOCAL_OTEL_SINK_NAME=curie-ladder-otel-sink-test
 LOCAL_OTEL_SINK_OWNED=0
+LOCAL_OTEL_SINK_IMAGE=""
+LOCAL_OTEL_IMAGE_OWNED=0
 LOCAL_OTEL_NETWORK_OWNED=0
+LOCAL_OTEL_NETWORK=""
 LOCAL_OTEL_SINK_ACTIVE=0
 LOCAL_OTEL_ENDPOINT=""
 LOCAL_OTEL_METRICS_ENDPOINT=""
-assert_local_otel_zero_export_control() {{ :; }}
-{function}
+PROMPT=example
+OTEL_E2E_SECRET_SENTINEL=example-private-sentinel
+LIVE=0
+{functions}
 start_local_otel_sink
 printf 'endpoint=%s\\n' "$LOCAL_OTEL_ENDPOINT"
 printf 'bridge=%s\\n' "$OTEL_EXPORTER_OTLP_ENDPOINT"
@@ -314,12 +343,15 @@ printf 'worker=%s\\n' "$CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT"
             **os.environ,
             "PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}",
             "STUB_RUNS": str(runs),
+            "STUB_CALLS": str(tmp_path / "docker-calls"),
+            "STUB_BUILD_CONTEXT": str(tmp_path / "sink-build-context.tar"),
             "STUB_TAKEN": str(tmp_path / "taken-port"),
             "STUB_FIRST_RUN_ERROR": first_run_error or "",
         },
         text=True,
         capture_output=True,
         check=False,
+        cwd=tmp_path,
     )
     return result, runs.read_text().splitlines() if runs.exists() else []
 
@@ -330,6 +362,26 @@ def _published_otlp_host_port(run: str) -> str:
     ]
     assert len(published) == 1, f"the sink must publish OTLP once: {run}"
     return published[0].split(":")[1]
+
+
+def _assert_fixture_build_context(
+    context: Path, *, files: set[str], directories: set[str]
+) -> dict[str, bytes]:
+    with tarfile.open(context) as archive:
+        members = archive.getmembers()
+        assert len(members) == len(files | directories)
+        assert {member.name for member in members} == files | directories
+        payloads = {}
+        for member in members:
+            if member.name in directories:
+                assert member.isdir()
+                continue
+            assert member.isfile()
+            stream = archive.extractfile(member)
+            assert stream is not None
+            payloads[member.name] = stream.read()
+    assert b"private-worktree-marker" not in context.read_bytes()
+    return payloads
 
 
 def test_local_sink_names_its_otlp_host_port(tmp_path: Path) -> None:
@@ -352,6 +404,25 @@ def test_local_sink_names_its_otlp_host_port(tmp_path: Path) -> None:
     assert f"endpoint={endpoint}" in result.stdout
     assert f"bridge={endpoint}" in result.stdout
     assert f"worker={endpoint}" in result.stdout
+    assert not re.search(r"(?:^|\s)(?:-v|--volume|--mount)(?:\s|=)", runs[0])
+    payloads = _assert_fixture_build_context(
+        tmp_path / "sink-build-context.tar",
+        files={"Dockerfile", "config.yaml"},
+        directories={"output"},
+    )
+    sink_config = tmp_path / "otel-e2e-sink-config.yaml"
+    assert payloads["config.yaml"] == sink_config.read_bytes()
+    config = yaml.safe_load(payloads["config.yaml"])
+    assert config["service"]["telemetry"]["metrics"]["address"] == "0.0.0.0:8888"
+    calls = (tmp_path / "docker-calls").read_text().splitlines()
+    build = next(call for call in calls if call.startswith("build "))
+    build_args = shlex.split(build)
+    assert build_args[-1] == "-"
+    image = shlex.split(runs[0])[-2]
+    assert image == build_args[build_args.index("--tag") + 1]
+    assert image.startswith("curie-ladder-otel-sink:")
+    dockerfile = payloads["Dockerfile"].decode()
+    assert "COPY config.yaml /etc/otelcol-contrib/config.yaml" in dockerfile
 
 
 @pytest.mark.parametrize(
@@ -376,6 +447,20 @@ def test_local_sink_retries_a_chosen_port_that_is_taken(
     )
     assert result.returncode == 0, result.stderr
     assert f"endpoint=http://172.30.0.1:{host_port}" in result.stdout
+
+
+def test_local_sink_does_not_retry_a_configuration_failure(tmp_path: Path) -> None:
+    result, runs = _start_sink_with_stub_docker(
+        tmp_path, first_run_error="invalid collector configuration"
+    )
+    assert result.returncode != 0
+    assert len(runs) == 1, result.stderr
+    assert "invalid collector configuration" in result.stderr
+    assert "command not found" not in result.stderr
+    image = shlex.split(runs[0])[-2]
+    calls = (tmp_path / "docker-calls").read_text().splitlines()
+    assert f"image rm {image}" in calls
+    assert not any(call.startswith("network rm ") for call in calls)
 
 
 def test_local_sink_assertion_proves_causality_correlation_and_bounded_metrics() -> None:
@@ -567,6 +652,7 @@ def _stub_docker_path(tmp_path: Path) -> tuple[Path, Path, Path]:
     docker.write_text(
         "#!/bin/sh\n"
         f'printf "%s\\n" "$*" >> "{log}"\n'
+        'if [ "$1" = "build" ]; then cat > "$STUB_BUILD_CONTEXT"; exit 0; fi\n'
         'if [ "$1" = "ps" ]; then printf "fake-sandbox\\n"; exit 0; fi\n'
         'if [ "$1" = "run" ]; then printf "owned-provider-id\\n"; exit 0; fi\n'
         'if [ "$1" = "exec" ]; then printf "{}\\n"; exit 0; fi\n'
@@ -629,6 +715,8 @@ WORKDIR="$2"
 LOCAL_MODEL_ERROR_PROVIDER_NAME=acme-model-error
 LOCAL_MODEL_ERROR_PROVIDER_ID=""
 LOCAL_MODEL_ERROR_PROVIDER_OWNED=0
+LOCAL_MODEL_ERROR_PROVIDER_IMAGE=""
+LOCAL_MODEL_ERROR_PROVIDER_IMAGE_OWNED=0
 LOCAL_OTEL_SINK_NAME=acme-private-sink
 RUNNER_IMAGE=acme-runner:example
 LOCAL_FAILURE_ENV_VALUES=()
@@ -640,9 +728,11 @@ inject_local_runner_failure
 restore_local_runner_health
 """
     bin_dir, log, env_dir = _stub_docker_path(tmp_path)
+    (tmp_path / "private-worktree-marker").write_text("private-worktree-marker")
     env = {
         **os.environ,
         "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+        "STUB_BUILD_CONTEXT": str(tmp_path / "provider-build-context.tar"),
         "CURIE_FAKE_MODEL": "0",
         "CURIE_CREDENTIALS": "sk-or-example",
         "ANTHROPIC_API_KEY": "sk-ant-example",
@@ -663,6 +753,7 @@ restore_local_runner_health
         text=True,
         capture_output=True,
         check=False,
+        cwd=tmp_path,
     )
     assert result.returncode == 0, result.stderr
     env_files = sorted(env_dir.glob("*.json"), key=lambda p: int(p.stem))
@@ -684,8 +775,28 @@ restore_local_runner_health
     assert "rm -f owned-provider-id" in docker_log
     assert "--network acme-private_runner" in docker_log
     assert "--label curietech.ai/e2e-owner=acme-private-sink" in docker_log
-    assert "terminal-provider-error.py:ro" in docker_log
-    assert "--entrypoint python3 acme-runner:example" in docker_log
+    build = next(line for line in docker_log.splitlines() if line.startswith("build "))
+    build_args = shlex.split(build)
+    assert build_args[-1] == "-"
+    assert build_args[build_args.index("--build-arg") + 1] == (
+        "BASE_IMAGE=acme-runner:example"
+    )
+    image = build_args[build_args.index("--tag") + 1]
+    assert image.startswith("curie-ladder-model-error:")
+    run = next(line for line in docker_log.splitlines() if line.startswith("run -d "))
+    assert f"--entrypoint python3 {image} /terminal-provider-error.py" in run
+    assert not re.search(r"(?:^|\s)(?:-v|--volume|--mount)(?:\s|=)", run)
+    assert f"image rm {image}" in docker_log
+    payloads = _assert_fixture_build_context(
+        tmp_path / "provider-build-context.tar",
+        files={"Dockerfile", "terminal-provider-error.py"},
+        directories=set(),
+    )
+    assert payloads["terminal-provider-error.py"] == (
+        REPO_ROOT / "cli/scripts/fixtures/terminal-provider-error.py"
+    ).read_bytes()
+    dockerfile = payloads["Dockerfile"].decode()
+    assert "COPY terminal-provider-error.py /terminal-provider-error.py" in dockerfile
     assert restored["CURIE_FAKE_MODEL"] == "0"
     assert restored["CURIE_MODEL_BASE_URL"] == "https://model.example.com"
     assert restored["CURIE_MODEL_API_BACKEND"] == "responses"
