@@ -750,10 +750,10 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
             for path in files
             if path != "tools/factory-e2e/tests/test_c4_initial_binding.py"
         )
-    assert (
-        PYTEST_TESTS._run_pytest_step(tmp_path, shard=shard, deselect=deselect, scope=scope)
-        == expected
+    arguments = PYTEST_TESTS._run_pytest_step(
+        tmp_path, shard=shard, deselect=deselect, scope=scope
     )
+    assert PYTEST_TESTS._without_admitted_agent_exclusion(arguments) == expected
 
 
 @pytest.mark.parametrize("scope", ["cli", "full"])
@@ -801,7 +801,7 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
             for path in (tmp_path / LIST_PATH).read_text().splitlines()
             if path != "tools/factory-e2e/tests/test_c4_initial_binding.py"
         )
-    assert recorded["argv"] == expected
+    assert PYTEST_TESTS._without_admitted_agent_exclusion(recorded["argv"]) == expected
 
 
 @pytest.mark.parametrize("scope", ["cli", "full"])

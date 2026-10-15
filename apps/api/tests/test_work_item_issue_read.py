@@ -29,6 +29,7 @@ from typing import Any
 
 import httpx
 import pytest
+from channel_protocol import scoped_conversation_id
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from curie_api.config import get_settings
@@ -112,7 +113,7 @@ def _insert_execution(
             "installation": INSTALLATION_ID,
             "agent": agent_id,
             "repo": repo,
-            "conversation": f"issue-read-{uuid.uuid4().hex}",
+            "conversation": scoped_conversation_id("github", repo, f"issue-{issue}"),
         },
     )
     started = status != "waiting"
@@ -120,9 +121,11 @@ def _insert_execution(
         "INSERT INTO curie.execution_requests "
         "(id, work_item_id, sequence, status, wait_deadline, started_at, "
         "execution_deadline, execution_attempts, runtime_owner, runtime_epoch, "
-        "runtime_heartbeat_expires_at) "
+        "runtime_heartbeat_expires_at, objective, requester, "
+        "reply_kind, reply_address, reply_conversation_id) "
         "VALUES (:id, :item, 1, :status, :wait, :started, :deadline, "
-        ":attempts, 'fixture-runner', 7, :lease)",
+        ":attempts, 'fixture-runner', 7, :lease, :objective, :requester, "
+        "'github', :repo, :conversation)",
         {
             "id": request_id,
             "item": work_item_id,
@@ -132,6 +135,10 @@ def _insert_execution(
             "deadline": now + deadline_in if started else None,
             "attempts": 1 if started else 0,
             "lease": now + timedelta(minutes=5),
+            "objective": f"https://github.com/{repo}/issues/{issue}",
+            "requester": "github:1:acme-reporter",
+            "repo": repo,
+            "conversation": f"issue-{issue}",
         },
     )
     return work_item_id, request_id
@@ -175,6 +182,11 @@ def issue_case(
     _execute(
         "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
         {"id": agent_id, "name": f"factory-{agent_id.hex[:8]}"},
+    )
+    _execute(
+        "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
+        "VALUES (:id, :agent, 'github', :repo)",
+        {"id": uuid.uuid4(), "agent": agent_id, "repo": REPO},
     )
     work_item_id, request_id = _insert_execution(agent_id)
     calls: list[httpx.Request] = []
@@ -413,7 +425,17 @@ def test_issue_read_reports_the_stored_execution_deadline_and_configured_duratio
     acquire = case["client"].post(
         f"{request_url}/acquire",
         headers=WORKER_HEADERS,
-        json={"owner": "fixture-runner", "generation": generation},
+        json={
+            "owner": "fixture-runner",
+            "generation": generation,
+            "wake": {
+                "kind": "github",
+                "address": REPO,
+                "adapter": None,
+                "conversation_id": f"issue-{ISSUE_NUMBER}",
+            },
+            "context": None,
+        },
     )
     assert acquire.status_code == 200, acquire.text
     started = case["client"].post(
@@ -424,6 +446,7 @@ def test_issue_read_reports_the_stored_execution_deadline_and_configured_duratio
             "generation": generation,
             "claim_name": "fixture-claim",
             "sandbox_name": "fixture-sandbox",
+            "context": acquire.json()["context"],
         },
     )
     assert started.status_code == 200, started.text

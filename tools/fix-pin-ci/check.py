@@ -326,7 +326,10 @@ def _pin_requirements(body: str) -> dict[str, bool]:
     except ValueError:
         selector = None
     needed = selector is not None
-    needs_kind = selector is not None and selector.split("::", 1)[0] == INITIAL_BINDING_MODULE
+    needs_kind = selector is not None and selector.split("::", 1)[0] in {
+        INITIAL_BINDING_MODULE,
+        "tools/factory-e2e/tests/test_c4_admitted_agent.py",
+    }
     return {
         "needed": needed,
         "needs_stack": needed and not needs_kind,

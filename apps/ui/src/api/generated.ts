@@ -3430,10 +3430,12 @@ export interface components {
     schemas: {
         /** AcquireBody */
         AcquireBody: {
+            context: components["schemas"]["FactoryContext"] | null;
             /** Generation */
             generation: number;
             /** Owner */
             owner: string;
+            wake: components["schemas"]["FactoryWake"];
         };
         /**
          * ActionAuditOut
@@ -5785,6 +5787,41 @@ export interface components {
             /** Value */
             value: unknown;
         };
+        /** FactoryContext */
+        FactoryContext: {
+            /** Adapter */
+            adapter: string | null;
+            /** Address */
+            address: string;
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /**
+             * Binding Id
+             * Format: uuid
+             */
+            binding_id: string;
+            /** Kind */
+            kind: string;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+        };
+        /** FactoryWake */
+        FactoryWake: {
+            /** Adapter */
+            adapter: string | null;
+            /** Address */
+            address: string;
+            /** Conversation Id */
+            conversation_id: string;
+            /** Kind */
+            kind: string;
+        };
         /** FinishBody */
         FinishBody: {
             /** Cause */
@@ -7903,10 +7940,26 @@ export interface components {
         /** RunningWorkItemRequest */
         RunningWorkItemRequest: {
             /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            context: components["schemas"]["FactoryContext"] | null;
+            /** Conversation Id */
+            conversation_id: string;
+            /**
              * Execution Deadline
              * Format: date-time
              */
             execution_deadline: string;
+            /** Generation */
+            generation: number;
+            /** Lease Held To Deadline */
+            lease_held_to_deadline: boolean;
+            /** Refusal */
+            refusal: ("not_found" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed") | null;
+            /** Repository Path */
+            repository_path: string;
             /**
              * Request Id
              * Format: uuid
@@ -7919,6 +7972,11 @@ export interface components {
              * @constant
              */
             status: "running";
+            /**
+             * Wait Deadline
+             * Format: date-time
+             */
+            wait_deadline: string;
             /**
              * Work Item Id
              * Format: uuid
@@ -8150,6 +8208,7 @@ export interface components {
         StartBody: {
             /** Claim Name */
             claim_name: string;
+            context: components["schemas"]["FactoryContext"];
             /** Generation */
             generation: number;
             /** Owner */
@@ -15711,6 +15770,10 @@ export interface operations {
         parameters: {
             query: {
                 conversation_id: string;
+                wake_kind: string;
+                wake_address: string;
+                wake_conversation_id: string;
+                wake_adapter: string | null;
             };
             header?: {
                 "X-Curie-Worker-Token"?: string | null;

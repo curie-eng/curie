@@ -27,6 +27,7 @@ import redis.asyncio as aioredis
 from _migration_support import IsolatedMigrationDb, alembic_config
 from aci_protocol import QueuedTurn
 from alembic import command
+from channel_protocol import scoped_conversation_id
 from curie_api import approval_principal
 from curie_api import sweeper as sweeper_module
 from curie_api.config import get_settings
@@ -1058,6 +1059,144 @@ def test_resolve_once_and_enqueue_resume_turn(
     assert "already resolved by U9" in second.json()["detail"]
     # And no second resume turn was enqueued.
     assert len(valkey.xrange(runs_stream)) == 1
+
+
+@pytest.mark.parametrize("reply_adapter", [None, "default"])
+def test_stored_factory_approval_resume_wake_adopts_the_same_running_request(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+    reply_adapter: str | None,
+) -> None:
+    worker = {"X-Curie-Worker-Token": "factory-approval-worker"}
+    monkeypatch.setenv("INTERNAL_WORKER_TOKEN", worker["X-Curie-Worker-Token"])
+    monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/*"]')
+    get_settings.cache_clear()
+    try:
+        address, conversation = "C0EXAMPLE1", "1700000000.000100"
+        repository = "acme-corp/widgets"
+        agent = approvals_client.post(
+            "/agents",
+            json={
+                "name": f"acme-factory-{uuid.uuid4().hex[:8]}",
+                "repo_full_name": repository,
+                "channel": {"kind": "slack", "address": address},
+            },
+            headers=auth_headers,
+        )
+        assert agent.status_code == 201, agent.text
+        request_id = str(uuid.uuid4())
+        admitted = approvals_client.post(
+            "/v1/internal/work-items/admissions",
+            json={
+                "agent_id": agent.json()["id"],
+                "kind": "slack", "address": address,
+                "reply_conversation_id": conversation,
+                "tracker": {
+                    "kind": "github", "host": "github.com",
+                    "scope_id": "101", "issue_id": "4619",
+                },
+                "repository": {
+                    "code_host_kind": "github", "host": "github.com",
+                    "project_id": "101", "path": repository,
+                },
+                "code_host_installation_id": 202,
+                "objective": "Implement the admitted work item",
+                "requester": "U1", "request_id": request_id,
+            },
+            headers=worker,
+        )
+        assert admitted.status_code == 200, admitted.text
+        path = f"/v1/internal/work-items/requests/{request_id}"
+        acquired = approvals_client.post(
+            f"{path}/acquire",
+            json={
+                "owner": "factory-worker", "generation": 1, "context": None,
+                "wake": {
+                    "kind": "slack", "address": address,
+                    "adapter": reply_adapter, "conversation_id": conversation,
+                },
+            },
+            headers=worker,
+        )
+        assert acquired.status_code == 200, acquired.text
+        started = approvals_client.post(
+            f"{path}/start",
+            json={
+                "owner": "factory-worker", "generation": 1,
+                "claim_name": "acme-factory-claim", "sandbox_name": "acme-factory-sandbox",
+                "context": acquired.json()["context"],
+            },
+            headers=worker,
+        )
+        assert started.status_code == 200, started.text
+        held = approvals_client.post(
+            f"{path}/hold-approval", json={"runtime_epoch": started.json()["runtime_epoch"]},
+            headers=worker,
+        )
+        assert held.status_code == 200, held.text
+        created = approvals_client.post(
+            "/approvals",
+            json=_payload(
+                agent_id=agent.json()["id"], conversation_id=conversation,
+                reply_kind="slack", reply_channel=address, reply_adapter=reply_adapter,
+                dedupe_key=f"work-item-{request_id}-execute-1",
+            ),
+            headers=auth_headers,
+        )
+        assert created.status_code == 201, created.text
+        approval_id = created.json()["id"]
+        resolved = approvals_client.post(
+            f"/approvals/{approval_id}/resolve",
+            json={"decision": "approved"},
+            headers=_chat_resolve_headers(approval_id, "U9", address, base=auth_headers),
+        )
+        assert resolved.status_code == 200, resolved.text
+        entries = valkey.xrange(runs_stream)
+        assert len(entries) == 1
+        turn = QueuedTurn.model_validate_json(entries[0][1]["payload"])
+        assert turn.event_id == f"approval-{approval_id}-resolved"
+        assert turn.conversation_id == conversation
+        handle = turn.reply_handle
+        assert handle is not None
+        assert (handle.kind, handle.channel, handle.adapter) == (
+            "slack", address, reply_adapter
+        )
+        params = {
+            "conversation_id": scoped_conversation_id(
+                handle.kind, handle.channel, turn.conversation_id
+            ),
+            "wake_kind": handle.kind, "wake_address": handle.channel,
+            "wake_adapter": handle.adapter or "",
+            "wake_conversation_id": turn.conversation_id,
+        }
+        wrong = approvals_client.get(
+            "/v1/internal/work-items/running",
+            params={**params, "wake_conversation_id": "1700000000.000999"}, headers=worker,
+        )
+        assert wrong.status_code == 409, wrong.text
+        assert wrong.json()["detail"]["code"] == "factory_wake_mismatch"
+        running = approvals_client.get(
+            "/v1/internal/work-items/running", params=params, headers=worker,
+        )
+        assert running.status_code == 200, running.text
+        result = running.json()
+        assert result["request_id"] == request_id
+        assert result["work_item_id"] == admitted.json()["work_item"]["id"]
+        assert result["agent_id"] == agent.json()["id"]
+        for field in (
+            "generation", "conversation_id", "wait_deadline", "repository_path", "context"
+        ):
+            assert result[field] == acquired.json()[field]
+        assert result["runtime_epoch"] == started.json()["runtime_epoch"]
+        assert result["execution_deadline"] == started.json()["execution_deadline"]
+        assert result["lease_held_to_deadline"] is True
+        assert result["refusal"] is None
+    finally:
+        get_settings.cache_clear()
 
 
 def test_concurrent_resolvers_yield_exactly_one_winner(

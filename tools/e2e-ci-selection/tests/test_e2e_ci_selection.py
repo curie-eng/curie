@@ -2955,6 +2955,69 @@ def test_approval_resume_job_runs_on_pull_requests_and_gates_e2e_required() -> N
 # #4111: factory replay has its own required result, independent of the other
 # kind scenarios. The selector's existing factory output owns this selection.
 SCRIPTED_FACTORY_JOB = "e2e-scripted-factory"
+ADMITTED_AGENT_RUNTIME = "tools/factory-e2e/tests/test_c4_admitted_agent.py"
+ADMITTED_AGENT_INPUTS = (
+    "apps/api/src/curie_api/workitem_dispatch.py",
+    "apps/api/src/curie_api/routers/work_items.py",
+    "apps/api/src/curie_api/forges/surfaces.py",
+    "apps/api/src/curie_api/forges/trackers.py",
+    "apps/api/src/curie_api/forges/registry.py",
+    "apps/api/src/curie_api/crud/channels.py",
+    "apps/api/src/curie_api/threadkeys.py",
+    "packages/aci-protocol/src/aci_protocol/turn.py",
+    "apps/worker/src/curie_worker/workitem_dispatch.py",
+    "apps/worker/src/curie_worker/binding.py",
+    "apps/worker/src/curie_worker/kernel/constants.py",
+    "apps/worker/src/curie_worker/kernel/lifecycle.py",
+    "apps/worker/src/curie_worker/kernel/work_items.py",
+    "apps/worker/src/curie_worker/kernel/claim.py",
+    ADMITTED_AGENT_RUNTIME,
+)
+
+
+@pytest.mark.parametrize("path", ADMITTED_AGENT_INPUTS)
+def test_admitted_agent_authority_paths_select_scripted_factory(tmp_path: Path, path: str) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    outputs = _outputs_of(output)
+    assert outputs["factory"] == "true", path
+    assert outputs["cluster"] == "true", path
+
+
+@pytest.mark.parametrize("path", ADMITTED_AGENT_INPUTS)
+def test_admitted_agent_factory_selection_respects_kind_omission(
+    tmp_path: Path, path: str
+) -> None:
+    completed, output = _invoke_selector(tmp_path, path, omit_kind=True)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert _outputs_of(output)["factory"] == "false"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "apps/api/src/curie_api/routers/state.py",
+        "apps/worker/src/curie_worker/state/config.py",
+        "apps/api/src/curie_api/workitem_dispatch.py.other",
+        "apps/api/src/curie_api/routers/work_items.py.other",
+        "apps/api/src/curie_api/forges/surfaces.py.other",
+        "apps/api/src/curie_api/forges/trackers.py.other",
+        "apps/api/src/curie_api/forges/registry.py.other",
+        "apps/api/src/curie_api/crud/channels.py.other",
+        "apps/api/src/curie_api/threadkeys.py.other",
+        "packages/aci-protocol/src/aci_protocol/turn.py.other",
+        "apps/worker/src/curie_worker/workitem_dispatch.py.other",
+        "apps/worker/src/curie_worker/binding.py.other",
+        "apps/worker/src/curie_worker/kernel/lifecycle.py.other",
+        "apps/worker/src/curie_worker/kernel/work_items.py.other",
+        "apps/worker/src/curie_worker/kernel/claim.py.other",
+        "docs/guides/getting-started.md",
+    ],
+)
+def test_unrelated_paths_do_not_select_admitted_agent_factory(tmp_path: Path, path: str) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert _outputs_of(output)["factory"] == "false", path
 
 
 @pytest.mark.parametrize("event_name", ["pull_request", "push", "workflow_dispatch"])

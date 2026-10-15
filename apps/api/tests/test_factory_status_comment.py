@@ -37,6 +37,7 @@ from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER, result_section, sync_status_comments
 from curie_api.github_app import GitHubAppError
 from curie_api.workitem_dispatch import DispatchConflict, acquire, defer
+from forge_fakes import factory_wake
 from forge_fakes.github import (
     LABEL,
     _issue_event,
@@ -1357,7 +1358,9 @@ def _defer_start(request_id: uuid.UUID, times: int) -> None:
                         {"id": request_id},
                     )
                     acquired = await acquire(
-                        session, request_id, owner="factory-owner", generation=generation
+                        session, request_id, owner="factory-owner", generation=generation,
+                        wake=await factory_wake(session, request_id),
+                        context=None,
                     )
                     assert not isinstance(acquired, DispatchConflict), acquired
                     deferred = await defer(

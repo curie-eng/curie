@@ -231,6 +231,10 @@ class _FactoryExecutionEnded(Exception):
     """The factory run already ended, so this approval must not resume it."""
 
 
+class _FactoryContinuationPending(Exception):
+    """Existing work must yield before bounded delivery reclaim retries the continuation."""
+
+
 class _WorkItemDeferred(Exception):
     """The execute wake was deferred in SQL; ACK it and start nothing."""
 

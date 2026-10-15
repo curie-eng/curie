@@ -47,6 +47,10 @@ INITIAL_BINDING_SELECTOR = (
     "tools/factory-e2e/tests/test_c4_initial_binding.py::"
     "test_second_factory_agent_uses_initial_tracker_binding"
 )
+ADMITTED_AGENT_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_admitted_agent.py::"
+    "test_labelled_agents_execute_as_admitted_agent"
+)
 LOCAL_SELECTOR = "cli/tests/local/test_deploy.py::test_deploy"
 LOCAL_LIVE_SELECTOR = "cli/tests/local/test_live.py::test_live"
 LIVE_SELECTOR = "runner/tests/test_live.py::test_example"
@@ -1119,8 +1123,8 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         lambda step: "uv run alembic upgrade head" in _string(step, "run"),
         "shared database migration",
     )
-    # Reporting flags may vary; the dedicated kind runtime module is the one
-    # required exclusion from the ordinary Python suite.
+    # Reporting flags may vary; both dedicated kind runtime modules must be
+    # excluded from the ordinary Python suite.
     pytest_index = _single_step_index(
         steps,
         lambda step: step.get("id") == "pytest",
@@ -1178,9 +1182,13 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
             extra = pytest_command[3:]
             assert extra[: len(distribution)] == distribution
             extra = extra[len(distribution) :]
-            runtime_exclusion = "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py"
-            assert extra.count(runtime_exclusion) == 1
-            extra.remove(runtime_exclusion)
+            runtime_exclusions = (
+                "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
+                "--deselect=tools/factory-e2e/tests/test_c4_admitted_agent.py",
+            )
+            for runtime_exclusion in runtime_exclusions:
+                assert extra.count(runtime_exclusion) == 1
+                extra.remove(runtime_exclusion)
             report_chars = set("fEsxXpPaAR")
             assert all(
                 argument.startswith("--durations")
@@ -1191,7 +1199,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
                 )
                 for argument in extra
             ), (
-                "the Python suite requires one kind runtime exclusion and permits only "
+                "the Python suite requires both kind runtime exclusions and permits only "
                 "reporting flags plus the selected trailing deselect pair, "
                 f"got {pytest_command!r}"
             )
@@ -1526,6 +1534,14 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("body", "needed", "stack", "kind"),
     [
+        (f"Fix pin: {ADMITTED_AGENT_SELECTOR}", True, False, True),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_admitted_agent.py::"
+            "test_execute_revalidates_current_authority[agent_tenant-factory_tenant_mismatch]",
+            True,
+            False,
+            True,
+        ),
         (f"Fix pin: {INITIAL_BINDING_SELECTOR}", True, False, True),
         (
             "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding.py::"
@@ -1545,11 +1561,26 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
             True,
             False,
         ),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_admitted_agent_extra.py::test_example",
+            True,
+            True,
+            False,
+        ),
         (None, False, False, False),
         ("", False, False, False),
         ("Fix pin: n/a - documentation only", False, False, False),
         (f"<!-- Fix pin: {INITIAL_BINDING_SELECTOR} -->", False, False, False),
+        (f"<!-- Fix pin: {ADMITTED_AGENT_SELECTOR} -->", False, False, False),
         (f" Fix pin: {INITIAL_BINDING_SELECTOR}", False, False, False),
+        (f" Fix pin: {ADMITTED_AGENT_SELECTOR}", False, False, False),
+        (f"Verified with Fix pin: {ADMITTED_AGENT_SELECTOR}", False, False, False),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_admitted_agent.py::",
+            False,
+            False,
+            False,
+        ),
         (f"Fix pin: {INITIAL_BINDING_SELECTOR}\nFix pin: {VALID_SELECTOR}", False, False, False),
         ("Fix pin: --help", False, False, False),
     ],

@@ -69,6 +69,7 @@ from curie_api.schemas.publications import PublicationLineageAdvance
 from curie_api.workitem_dispatch import DispatchConflict, acquire, start
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from fastapi.testclient import TestClient
+from forge_fakes import factory_wake
 from forge_fakes import jira as jira_fake
 from forge_fakes.github import (
     APP_ID,
@@ -441,7 +442,9 @@ def _start(request_id: uuid.UUID) -> int:
         try:
             async with AsyncSession(engine) as session:
                 acquired = await acquire(
-                    session, request_id, owner="jira-owner", generation=generation
+                    session, request_id, owner="jira-owner", generation=generation,
+                    wake=await factory_wake(session, request_id),
+                    context=None,
                 )
                 assert not isinstance(acquired, DispatchConflict), acquired
                 started = await start(
@@ -451,6 +454,7 @@ def _start(request_id: uuid.UUID) -> int:
                     generation=generation,
                     claim_name="claim-jira",
                     sandbox_name="sbx-jira",
+                    context=acquired.context,
                 )
                 assert not isinstance(started, DispatchConflict), started
                 return int(started.runtime_epoch)

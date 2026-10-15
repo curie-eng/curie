@@ -304,7 +304,7 @@ _REQUEST_STATUS_READ_TIMEOUT_S = 5.0
 # must survive the refusal. The passthrough set is defined by the API's
 # ``_map_start_conflict``; keep the two in sync.
 _WORK_ITEM_TERMINAL_START_REFUSALS = frozenset(
-    {"work_item_cancelled", "waiting_deadline_elapsed", "not_found"}
+    {"work_item_cancelled", "waiting_deadline_elapsed", "not_found", "factory_start_failed"}
 )
 
 # A factory execute turn that ends done or idle without calling publish_changes
