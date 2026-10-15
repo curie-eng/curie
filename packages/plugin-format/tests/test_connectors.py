@@ -1333,3 +1333,185 @@ def test_bundle_surfaces_a_refused_upstream_host(tmp_path: Path) -> None:
     result = validate_bundle(str(root))
     assert not result.valid
     assert [e.code for e in result.errors] == ["connectors.bad_proxy_upstream_host"]
+
+
+# --------------------------------------------------------------------------- #
+# `readiness_path`: an HTTP readiness check for the hosted server container.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("path", ["/healthz", "/", "/api/v1/health", "/ready-z_1.ok~"])
+def test_a_hosted_connector_may_declare_a_readiness_path(path: str) -> None:
+    parsed, errors = validate_connectors(
+        {"connectors": {"docs": {"image": "x:1", "readiness_path": path}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["docs"].readiness_path == path
+
+
+def test_a_build_form_connector_may_declare_a_readiness_path() -> None:
+    assert (
+        _codes(
+            {
+                "connectors": {
+                    "docs": {
+                        "build": {"context": "connectors/docs", "platforms": ["linux/amd64"]},
+                        "readiness_path": "/healthz",
+                    }
+                }
+            }
+        )
+        == []
+    )
+
+
+def test_the_readiness_path_and_resources_are_absent_by_default() -> None:
+    parsed, errors = validate_connectors({"connectors": {"docs": {"image": "x:1"}}})
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["docs"].readiness_path is None
+    assert parsed.connectors["docs"].resources is None
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "",
+        "healthz",
+        "./healthz",
+        "/health z",
+        "/health\tz",
+        "/healthz\r\nX-Injected: 1",
+        "/healthz?verbose=1",
+        "/healthz#top",
+        "/héalth",
+        "/health\x00",
+    ],
+)
+def test_a_malformed_readiness_path_is_refused(path: str) -> None:
+    assert _codes({"connectors": {"docs": {"image": "x:1", "readiness_path": path}}}) == [
+        "connectors.bad_readiness_path"
+    ]
+
+
+def test_a_readiness_path_on_a_remote_connector_is_refused() -> None:
+    assert _codes(
+        {"connectors": {"r": {"url": "https://mcp.example.com/mcp", "readiness_path": "/healthz"}}}
+    ) == ["connectors.remote_has_readiness_path"]
+
+
+def test_bundle_surfaces_a_refused_readiness_path(tmp_path: Path) -> None:
+    root = _bundle(tmp_path, "connectors:\n  docs:\n    image: x:1\n    readiness_path: healthz\n")
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert [e.code for e in result.errors] == ["connectors.bad_readiness_path"]
+
+
+# --------------------------------------------------------------------------- #
+# `resources`: requests and limits for the hosted server container.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "resources",
+    [
+        {"limits": {"memory": "1Gi"}},
+        {"requests": {"cpu": "100m"}},
+        {"requests": {"cpu": "250m", "memory": "128Mi"}, "limits": {"cpu": "1", "memory": "512Mi"}},
+        {"requests": {"memory": "256Mi"}, "limits": {"memory": "256Mi"}},
+        {"limits": {"cpu": "2.5", "memory": "1G"}},
+        {"limits": {"memory": "1e9"}},
+        {"requests": {}, "limits": {}},
+        {},
+    ],
+)
+def test_a_hosted_connector_may_declare_resources(resources: dict) -> None:
+    parsed, errors = validate_connectors(
+        {"connectors": {"docs": {"image": "x:1", "resources": resources}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["docs"].resources is not None
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        {"limits": {"memory": "lots"}},
+        {"limits": {"memory": "1 Gi"}},
+        {"limits": {"memory": "1GB"}},
+        {"limits": {"memory": "-1Gi"}},
+        {"limits": {"memory": "+1Gi"}},
+        {"limits": {"memory": "0"}},
+        {"limits": {"cpu": "0m"}},
+        {"limits": {"cpu": ""}},
+        {"limits": {"cpu": "1.2.3"}},
+        {"limits": {"cpu": ".5m"}},
+    ],
+)
+def test_a_malformed_quantity_is_refused(resources: dict) -> None:
+    assert _codes({"connectors": {"docs": {"image": "x:1", "resources": resources}}}) == [
+        "connectors.bad_resources"
+    ]
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        # Above the 256Mi default limit, with no limit declared.
+        {"requests": {"memory": "512Mi"}},
+        # Below the 64Mi default request, with no request declared.
+        {"limits": {"memory": "32Mi"}},
+        {"requests": {"cpu": "2"}, "limits": {"cpu": "1500m"}},
+        {"requests": {"memory": "1Gi"}, "limits": {"memory": "1000Mi"}},
+    ],
+)
+def test_a_request_above_its_merged_limit_is_refused(resources: dict) -> None:
+    assert _codes({"connectors": {"docs": {"image": "x:1", "resources": resources}}}) == [
+        "connectors.bad_resources"
+    ]
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        {"limits": {"gpu": "1"}},
+        {"limit": {"memory": "1Gi"}},
+        {"limits": {"memory": 1024}},
+    ],
+)
+def test_an_unknown_resource_key_or_a_non_string_quantity_is_refused(resources: dict) -> None:
+    assert _codes({"connectors": {"docs": {"image": "x:1", "resources": resources}}}) == [
+        "connectors.invalid"
+    ]
+
+
+def test_resources_on_a_remote_connector_are_refused() -> None:
+    assert _codes(
+        {
+            "connectors": {
+                "r": {
+                    "url": "https://mcp.example.com/mcp",
+                    "resources": {"limits": {"memory": "1Gi"}},
+                }
+            }
+        }
+    ) == ["connectors.remote_has_resources"]
+
+
+def test_bundle_surfaces_refused_resources(tmp_path: Path) -> None:
+    root = _bundle(
+        tmp_path,
+        "connectors:\n  docs:\n    image: x:1\n    resources:\n      limits:\n"
+        "        memory: 32Mi\n",
+    )
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert [e.code for e in result.errors] == ["connectors.bad_resources"]
+
+
+def test_the_resource_models_match_the_frozen_vector() -> None:
+    from plugin_format.connectors import ConnectorResourceQuantities, ConnectorResources
+
+    fields = _vector_file("connector-fields.json")["models"]
+    assert set(ConnectorResources.model_fields) == set(fields["ConnectorResources"])
+    assert set(ConnectorResourceQuantities.model_fields) == set(
+        fields["ConnectorResourceQuantities"]
+    )

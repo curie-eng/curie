@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from decimal import Decimal
 from pathlib import PurePosixPath
 from typing import Any, Final
 
@@ -131,6 +132,97 @@ def is_loopback_upstream_host(text: str) -> bool:
     return address.is_loopback and str(address) == text
 
 
+class ConnectorResourceQuantities(BaseModel):
+    """CPU and memory for one side (``requests`` or ``limits``) of ``resources``.
+
+    Strings, as Kubernetes writes them (``100m``, ``1Gi``). A key left out keeps
+    the server container's default for that key.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    cpu: str | None = None
+    memory: str | None = None
+
+
+class ConnectorResources(BaseModel):
+    """A hosted connector's server-container ``resources``, merged per key.
+
+    Each declared value replaces only its own key in
+    ``DEFAULT_SERVER_RESOURCES``, so ``limits: {memory: 1Gi}`` keeps the other
+    three defaults. The caller proxy's resources are not configurable here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    requests: ConnectorResourceQuantities | None = None
+    limits: ConnectorResourceQuantities | None = None
+
+
+# The server container's resources when a connector declares none. Owned here
+# rather than in the renderer so validation compares a declared request with
+# the limit it will actually run under.
+DEFAULT_SERVER_RESOURCES: Final[dict[str, dict[str, str]]] = {
+    "requests": {"cpu": "10m", "memory": "64Mi"},
+    "limits": {"cpu": "500m", "memory": "256Mi"},
+}
+
+# A positive Kubernetes quantity: digits with an optional fraction, then an
+# optional binary or decimal suffix or a decimal exponent. A subset of what
+# Kubernetes parses: no sign and no bare leading dot, which no connector needs.
+_QUANTITY_RE = re.compile(
+    r"(?P<number>[0-9]+(?:\.[0-9]+)?)"
+    r"(?:(?P<suffix>Ki|Mi|Gi|Ti|Pi|Ei|n|u|m|k|M|G|T|P|E)|[eE](?P<exponent>[+-]?[0-9]+))?"
+)
+_QUANTITY_SCALE: Final[dict[str, Decimal]] = {
+    "Ki": Decimal(2**10),
+    "Mi": Decimal(2**20),
+    "Gi": Decimal(2**30),
+    "Ti": Decimal(2**40),
+    "Pi": Decimal(2**50),
+    "Ei": Decimal(2**60),
+    "n": Decimal("1e-9"),
+    "u": Decimal("1e-6"),
+    "m": Decimal("1e-3"),
+    "k": Decimal("1e3"),
+    "M": Decimal("1e6"),
+    "G": Decimal("1e9"),
+    "T": Decimal("1e12"),
+    "P": Decimal("1e15"),
+    "E": Decimal("1e18"),
+}
+
+
+def parse_quantity(text: str) -> Decimal | None:
+    """The value of a positive Kubernetes quantity, or None when malformed."""
+
+    match = _QUANTITY_RE.fullmatch(text)
+    if match is None:
+        return None
+    if match["exponent"] is not None:
+        # Built from the string, not multiplied, so a large exponent cannot
+        # overflow the decimal context.
+        value = Decimal(f"{match['number']}e{match['exponent']}")
+    else:
+        value = Decimal(match["number"]) * _QUANTITY_SCALE.get(match["suffix"] or "", Decimal(1))
+    return value if value > 0 else None
+
+
+def is_valid_readiness_path(text: str) -> bool:
+    """Whether ``text`` may be ``readiness_path``.
+
+    An absolute HTTP path, printable ASCII with no whitespace, no query and no
+    fragment: the kubelet sends it as the request target verbatim.
+    """
+
+    return (
+        text.startswith("/")
+        and all("!" <= ch <= "~" for ch in text)
+        and "?" not in text
+        and "#" not in text
+    )
+
+
 class ConnectorSpec(BaseModel):
     """One declared connector. Exactly one of ``image``, ``build`` or ``url``.
 
@@ -182,6 +274,16 @@ class ConnectorSpec(BaseModel):
     # a non-loopback Host on a loopback connection, as the proxy's forward is.
     # Rendered into the proxy alone; direct requests keep their own Host.
     proxy_upstream_host: str | None = None
+
+    # An HTTP path the server answers once it can serve. Set, the server
+    # container's readiness probe is an `httpGet` on it instead of the default
+    # `tcpSocket` check; a probe carries exactly one handler. None keeps the
+    # `tcpSocket` probe. The caller proxy's probe never changes.
+    readiness_path: str | None = None
+
+    # The server container's requests and limits, merged per key over
+    # DEFAULT_SERVER_RESOURCES. None renders the defaults unchanged.
+    resources: ConnectorResources | None = None
 
     # -- remote form --
     url: str | None = None
@@ -306,6 +408,17 @@ class ConnectorSpec(BaseModel):
         # `config` values live in the same per-agent Secret and the renderer
         # points secretKeyRefs at them, so the deploy path must write them too.
         return named + list(self.secret_files) + list(self.config)
+
+    def server_resources(self) -> dict[str, dict[str, str]]:
+        """The server container's resources: the defaults, overridden per key."""
+
+        merged = {side: dict(values) for side, values in DEFAULT_SERVER_RESOURCES.items()}
+        if self.resources is not None:
+            for side in ("requests", "limits"):
+                declared = getattr(self.resources, side)
+                if declared is not None:
+                    merged[side].update(declared.model_dump(exclude_none=True))
+        return merged
 
     @property
     def is_hosted(self) -> bool:
@@ -456,6 +569,44 @@ def _escapes(path: str) -> bool:
         elif part != ".":
             depth += 1
     return False
+
+
+def _validate_resources(
+    where: str, spec: ConnectorSpec, resources: ConnectorResources, errors: list[tuple[str, str]]
+) -> None:
+    """Each declared quantity parses, and each merged request fits its limit."""
+
+    malformed = False
+    for side in ("requests", "limits"):
+        declared = getattr(resources, side)
+        if declared is None:
+            continue
+        for key, value in declared.model_dump(exclude_none=True).items():
+            if parse_quantity(value) is None:
+                malformed = True
+                errors.append(
+                    (
+                        "connectors.bad_resources",
+                        f"{where}: resources.{side}.{key} is {value!r}; it must be a "
+                        "positive Kubernetes quantity such as `250m`, `1` or `512Mi`",
+                    )
+                )
+    if malformed:
+        return
+    merged = spec.server_resources()
+    for key in ("cpu", "memory"):
+        request = parse_quantity(merged["requests"][key])
+        limit = parse_quantity(merged["limits"][key])
+        if request is not None and limit is not None and request > limit:
+            errors.append(
+                (
+                    "connectors.bad_resources",
+                    f"{where}: the {key} request {merged['requests'][key]} exceeds the "
+                    f"{key} limit {merged['limits'][key]} (an omitted value is the "
+                    f"default: requests {DEFAULT_SERVER_RESOURCES['requests'][key]}, "
+                    f"limits {DEFAULT_SERVER_RESOURCES['limits'][key]})",
+                )
+            )
 
 
 def _validate_build(
@@ -769,6 +920,36 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                         f"server's port), got {spec.proxy_upstream_host!r}",
                     )
                 )
+        if spec.readiness_path is not None:
+            if spec.url is not None:
+                errors.append(
+                    (
+                        "connectors.remote_has_readiness_path",
+                        f"{where}: `readiness_path` sets the readiness probe of a container "
+                        "Curie starts; a `url` connector is already running elsewhere, so it "
+                        "would probe nothing",
+                    )
+                )
+            elif not is_valid_readiness_path(spec.readiness_path):
+                errors.append(
+                    (
+                        "connectors.bad_readiness_path",
+                        f"{where}: `readiness_path` must start with `/` and be printable "
+                        "ASCII with no whitespace, `?` or `#`, got "
+                        f"{spec.readiness_path!r}",
+                    )
+                )
+        if spec.resources is not None:
+            if spec.url is not None:
+                errors.append(
+                    (
+                        "connectors.remote_has_resources",
+                        f"{where}: `resources` size a container Curie starts; a `url` "
+                        "connector is already running elsewhere, so they would size nothing",
+                    )
+                )
+            else:
+                _validate_resources(where, spec, spec.resources, errors)
         if spec.admits is not None and spec.url is not None:
             errors.append(
                 (

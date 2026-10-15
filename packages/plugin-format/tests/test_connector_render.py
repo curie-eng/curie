@@ -2207,3 +2207,142 @@ def test_config_never_becomes_the_bearer() -> None:
     assert _github_entry(_configured())["headers"] == {"Authorization": "Bearer ${DOCS_TOKEN}"}
     config_only = ConnectorSpec(image="ghcr.io/example/docs-mcp:1", config=["DOCS_FOLDER_PATH"])
     assert "headers" not in _github_entry(config_only)
+
+
+# --------------------------------------------------------------------------- #
+# `readiness_path` and `resources`: server-container tuning a bundle declares.
+# --------------------------------------------------------------------------- #
+_DEFAULT_SERVER_RESOURCES = {
+    "requests": {"cpu": "10m", "memory": "64Mi"},
+    "limits": {"cpu": "500m", "memory": "256Mi"},
+}
+
+
+def _tuned(**update: object) -> ConnectorSpec:
+    # Validated through the model, not model_copy, so a ConnectorSpec that
+    # predates the fields fails these tests alone.
+    return ConnectorSpec.model_validate({**HOSTED.model_dump(exclude_defaults=True), **update})
+
+
+def test_a_readiness_path_replaces_the_tcp_probe_with_http_get() -> None:
+    container = _server(_tuned(readiness_path="/healthz"))
+    assert container["readinessProbe"] == {
+        "httpGet": {"path": "/healthz", "port": "http"},
+        "initialDelaySeconds": 2,
+        "periodSeconds": 10,
+        "timeoutSeconds": 5,
+        "failureThreshold": 3,
+    }
+    # One handler only: the API server refuses a probe with two.
+    assert "tcpSocket" not in container["readinessProbe"]
+    assert "livenessProbe" not in container
+    assert "startupProbe" not in container
+
+
+def test_a_readiness_path_leaves_the_proxy_probe_alone() -> None:
+    tuned = _containers(_proxied(_tuned(readiness_path="/healthz")))
+    baseline = _containers(_proxied())
+    assert tuned[r.CALLER_PROXY_CONTAINER] == baseline[r.CALLER_PROXY_CONTAINER]
+    assert tuned["server"]["readinessProbe"]["httpGet"] == {"path": "/healthz", "port": "http"}
+
+
+def test_without_a_readiness_path_the_tcp_probe_is_unchanged() -> None:
+    assert _server(HOSTED)["readinessProbe"] == {
+        "tcpSocket": {"port": "http"},
+        "initialDelaySeconds": 2,
+        "periodSeconds": 10,
+        "timeoutSeconds": 3,
+        "failureThreshold": 3,
+    }
+
+
+def test_without_resources_the_server_keeps_the_defaults() -> None:
+    assert _server(HOSTED)["resources"] == _DEFAULT_SERVER_RESOURCES
+
+
+def test_declared_resources_merge_per_key_over_the_defaults() -> None:
+    only_memory_limit = _server(_tuned(resources={"limits": {"memory": "1Gi"}}))
+    assert only_memory_limit["resources"] == {
+        "requests": {"cpu": "10m", "memory": "64Mi"},
+        "limits": {"cpu": "500m", "memory": "1Gi"},
+    }
+    everything = _server(
+        _tuned(
+            resources={
+                "requests": {"cpu": "250m", "memory": "512Mi"},
+                "limits": {"cpu": "2", "memory": "2Gi"},
+            }
+        )
+    )
+    assert everything["resources"] == {
+        "requests": {"cpu": "250m", "memory": "512Mi"},
+        "limits": {"cpu": "2", "memory": "2Gi"},
+    }
+    only_cpu_request = _server(_tuned(resources={"requests": {"cpu": "100m"}}))
+    assert only_cpu_request["resources"] == {
+        "requests": {"cpu": "100m", "memory": "64Mi"},
+        "limits": {"cpu": "500m", "memory": "256Mi"},
+    }
+
+
+def test_declared_resources_leave_the_proxy_alone() -> None:
+    spec = _tuned(resources={"requests": {"memory": "1Gi"}, "limits": {"memory": "2Gi"}})
+    tuned = _containers(_proxied(spec))
+    baseline = _containers(_proxied())
+    assert tuned[r.CALLER_PROXY_CONTAINER] == baseline[r.CALLER_PROXY_CONTAINER]
+    assert tuned["server"]["resources"]["limits"]["memory"] == "2Gi"
+
+
+def test_the_fields_move_nothing_but_the_server_probe_and_resources() -> None:
+    spec = _tuned(readiness_path="/healthz", resources={"limits": {"memory": "1Gi"}})
+    tuned = _proxied(spec)
+    baseline = _proxied()
+    for key in ("Service", "Service/direct", "NetworkPolicy/Egress", "NetworkPolicy/Ingress"):
+        assert tuned[key] == baseline[key], key
+    server = dict(_containers(tuned)["server"])
+    base_server = dict(_containers(baseline)["server"])
+    for moved in ("readinessProbe", "resources"):
+        server.pop(moved)
+        base_server.pop(moved)
+    assert server == base_server
+
+
+# Every hosted connector in every shipped example, plus two synthetic
+# declarations covering the optional fields, as declared and rendered before
+# `readiness_path` and `resources` existed: each declaration plus the sha256
+# of its canonical JSON render. The declarations are recorded rather than
+# reread from examples/, so an example that later changes does not move this
+# baseline; what it pins is the renderer.
+_BASELINE = Path(__file__).resolve().parent / "fixtures" / "connector-render-baseline.json"
+
+
+def _baseline_render_digest(spec: ConnectorSpec, connector: str) -> str:
+    objs = r.render(
+        release="acme-rel",
+        agent="acme-bot",
+        namespace="acme-ns",
+        app_name="curie",
+        connector=connector,
+        spec=spec,
+        secret_name="conn-secrets",
+        proxy=_caller_proxy(),
+    )
+    canonical = json.dumps(objs, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def test_every_recorded_bundle_renders_byte_identically_without_the_fields() -> None:
+    cases = json.loads(_BASELINE.read_text(encoding="utf-8"))["cases"]
+    assert len(cases) >= 6
+    for case in cases:
+        spec = ConnectorSpec.model_validate(case["spec"])
+        assert _baseline_render_digest(spec, case["connector"]) == case["sha256"], case["name"]
+
+
+def test_the_new_fields_set_to_their_defaults_render_the_same_bytes() -> None:
+    cases = json.loads(_BASELINE.read_text(encoding="utf-8"))["cases"]
+    for case in cases:
+        explicit = ConnectorSpec.model_validate(
+            {**case["spec"], "readiness_path": None, "resources": None}
+        )
+        assert _baseline_render_digest(explicit, case["connector"]) == case["sha256"], case["name"]

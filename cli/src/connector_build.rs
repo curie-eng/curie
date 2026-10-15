@@ -101,6 +101,15 @@ pub struct ConnectorSpecDecl {
     /// loopback rule.
     #[serde(default)]
     pub proxy_upstream_host: Option<String>,
+    /// The HTTP path of the server container's readiness probe. Carried as
+    /// written; `plugin_format.validate_connectors` owns the path rule.
+    #[serde(default)]
+    pub readiness_path: Option<String>,
+    /// The server container's requests and limits, merged per key over the
+    /// platform defaults by `plugin_format.connector_render`. Carried as
+    /// written; the quantity and request-within-limit rules are Python's.
+    #[serde(default)]
+    pub resources: Option<ConnectorResourcesDecl>,
 
     // -- remote form --
     pub url: Option<String>,
@@ -124,6 +133,26 @@ pub struct ConnectorSpecDecl {
     /// sandbox. See [`declared_secret_names`] and [`bearer_secret_name`].
     #[serde(default)]
     pub config: Vec<String>,
+}
+
+/// `resources:` on a hosted connector: either side may be omitted.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorResourcesDecl {
+    #[serde(default)]
+    pub requests: Option<ConnectorResourceQuantitiesDecl>,
+    #[serde(default)]
+    pub limits: Option<ConnectorResourceQuantitiesDecl>,
+}
+
+/// One side of [`ConnectorResourcesDecl`]: Kubernetes quantity strings.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorResourceQuantitiesDecl {
+    #[serde(default)]
+    pub cpu: Option<String>,
+    #[serde(default)]
+    pub memory: Option<String>,
 }
 
 /// A declared secret: a bare env var name, or a reference to a Secret someone
@@ -175,6 +204,8 @@ impl Default for ConnectorSpecDecl {
             unhosted_url: None,
             admits: None,
             proxy_upstream_host: None,
+            readiness_path: None,
+            resources: None,
             url: None,
             headers: BTreeMap::new(),
             secrets: Vec::new(),

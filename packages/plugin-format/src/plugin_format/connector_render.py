@@ -448,8 +448,8 @@ def substitute(value: str, subs: dict[str, str]) -> str:
 def _readiness_probe(port: str = "http") -> dict[str, Any]:
     """``tcpSocket`` on the named container port.
 
-    The connector spec declares no health path today, so the probe checks the
-    one thing every MCP server must do: accept a connection on its port. That
+    Without a declared ``readiness_path`` the probe checks the one thing every
+    MCP server must do: accept a connection on its port. That
     catches a server that hangs before binding, fails to bind, or listens on
     the wrong port (#3058). The caller proxy gets the same probe on its own
     port, because with a proxy that is the port the Service targets.
@@ -460,6 +460,24 @@ def _readiness_probe(port: str = "http") -> dict[str, Any]:
         "initialDelaySeconds": 2,
         "periodSeconds": 10,
         "timeoutSeconds": 3,
+        "failureThreshold": 3,
+    }
+
+
+def _server_readiness_probe(spec: ConnectorSpec) -> dict[str, Any]:
+    """The server container's probe: ``httpGet`` on a declared path, else TCP.
+
+    Exactly one handler either way, because the API server refuses a probe
+    that carries two.
+    """
+
+    if spec.readiness_path is None:
+        return _readiness_probe()
+    return {
+        "httpGet": {"path": spec.readiness_path, "port": "http"},
+        "initialDelaySeconds": 2,
+        "periodSeconds": 10,
+        "timeoutSeconds": 5,
         "failureThreshold": 3,
     }
 
@@ -608,16 +626,13 @@ def render_deployment(
                             # CurieConnectorNotReady can never see it (#3058).
                             # Readiness only, never liveness: a slow upstream
                             # leaves the Service, it is not restarted in a loop.
-                            "readinessProbe": _readiness_probe(),
+                            "readinessProbe": _server_readiness_probe(spec),
                             "securityContext": {
                                 "allowPrivilegeEscalation": False,
                                 "readOnlyRootFilesystem": True,
                                 "capabilities": {"drop": ["ALL"]},
                             },
-                            "resources": {
-                                "requests": {"cpu": "10m", "memory": "64Mi"},
-                                "limits": {"cpu": "500m", "memory": "256Mi"},
-                            },
+                            "resources": spec.server_resources(),
                         },
                         *(
                             [

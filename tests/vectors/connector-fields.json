@@ -1,5 +1,5 @@
 {
-  "comment": "The exact field-name set of every connector model that exists in two languages. Python owns the models in packages/plugin-format/src/plugin_format/connectors.py and connector_lock.py; the Rust CLI hand mirrors them in cli/src/connector_build.rs.\n\nThis file was written when the ordinary field-parity gate could not see this seam, because schema_export.py exported no connector model. Since #1128 the committed schema carries these models, cli/plugin-format-mirrors.json declares the connector structs as mirrors, and `curie dev field-parity` compares them field by field.\n\nThe loop is closed in one direction by each half of the pair. packages/plugin-format/tests/test_connectors.py asserts set(Model.model_fields) equals the list here, so adding a Python field without editing this file fails the Python suite. cli/tests/connector_build_decl_vectors.rs asserts each mirror struct's serde field names equal the same list, so editing this file to make Python pass then fails the Rust suite until the mirror gains the field. Neither half can be satisfied by touching one language.\n\n`curie dev field-parity` now subsumes this file, so it can be deleted in a change of its own.\n\nNames are the model's own field names, not their serialized aliases; both lanes compare against the same list, so a rename in one language fails there. The list for each model is sorted.\n\nConnectorsFile / RunnerSpec / RunnerLockEntry carry the bundle's layered runner image (ADR 0173 decisions 1 and 2): an optional top-level `runner:` block in connectors.yaml and its resolved entry in connectors.lock.yaml.\n\nconnector_names exercises reserved platform names and legal prefixed names through Python connector validation and CLI sealing validation.",
+  "comment": "The exact field-name set of every connector model that exists in two languages. Python owns the models in packages/plugin-format/src/plugin_format/connectors.py and connector_lock.py; the Rust CLI hand mirrors them in cli/src/connector_build.rs.\n\nThis file was written when the ordinary field-parity gate could not see this seam, because schema_export.py exported no connector model. Since #1128 the committed schema carries these models, cli/plugin-format-mirrors.json declares the connector structs as mirrors, and `curie dev field-parity` compares them field by field.\n\nThe loop is closed in one direction by each half of the pair. packages/plugin-format/tests/test_connectors.py asserts set(Model.model_fields) equals the list here, so adding a Python field without editing this file fails the Python suite. cli/tests/connector_build_decl_vectors.rs asserts each mirror struct's serde field names equal the same list, so editing this file to make Python pass then fails the Rust suite until the mirror gains the field. Neither half can be satisfied by touching one language.\n\n`curie dev field-parity` now subsumes this file, so it can be deleted in a change of its own.\n\nNames are the model's own field names, not their serialized aliases; both lanes compare against the same list, so a rename in one language fails there. The list for each model is sorted.\n\nConnectorsFile / RunnerSpec / RunnerLockEntry carry the bundle's layered runner image (ADR 0173 decisions 1 and 2): an optional top-level `runner:` block in connectors.yaml and its resolved entry in connectors.lock.yaml.\n\nconnector_names exercises reserved platform names and legal prefixed names through Python connector validation and CLI sealing validation.\n\nConnectorResources / ConnectorResourceQuantities carry a hosted connector's optional server-container `resources:` block (requests and limits, each with cpu and memory).",
   "models": {
     "ConnectorSpec": [
       "admits",
@@ -12,6 +12,8 @@
       "image",
       "port",
       "proxy_upstream_host",
+      "readiness_path",
+      "resources",
       "sealed_secrets",
       "secret_files",
       "secrets",
@@ -22,6 +24,14 @@
       "context",
       "dockerfile",
       "platforms"
+    ],
+    "ConnectorResources": [
+      "limits",
+      "requests"
+    ],
+    "ConnectorResourceQuantities": [
+      "cpu",
+      "memory"
     ],
     "ConnectorLockFile": [
       "connectors",

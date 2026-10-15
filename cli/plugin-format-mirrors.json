@@ -73,6 +73,18 @@
       "omissions": []
     },
     {
+      "struct": "ConnectorResourcesDecl",
+      "file": "cli/src/connector_build.rs",
+      "schema": "ConnectorResources",
+      "omissions": []
+    },
+    {
+      "struct": "ConnectorResourceQuantitiesDecl",
+      "file": "cli/src/connector_build.rs",
+      "schema": "ConnectorResourceQuantities",
+      "omissions": []
+    },
+    {
       "struct": "RunnerSpecDecl",
       "file": "cli/src/connector_build.rs",
       "schema": "RunnerSpec",
