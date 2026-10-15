@@ -300,3 +300,84 @@ def test_monitor_takes_agent_names_from_the_latest_inventory_only():
         'agent="",kind="slack",address="C-EXAMPLE-2",adapter="default",side="declared_only"'
     ) in text
     assert "sample-2" not in text
+
+
+# TURN-CANARY-15: binding kind exclusion
+
+
+def _with_test_bindings():
+    return [
+        _row("1", "C-EXAMPLE-1"),
+        _row("2", "probe-2", kind="qualification", adapter="probe",
+             endpoint="https://probe.example.invalid/in"),
+        _row("3", "C-EXAMPLE-3"),
+        _row("3", "probe-3", kind="qualification", adapter="probe",
+             endpoint="https://probe.example.invalid/in"),
+    ]
+
+
+def test_excluded_kinds_are_never_probed_checked_compared_or_uncovered():
+    """@spec TURN-CANARY-15"""
+    canary = _canary()
+    platform = Platform(_with_test_bindings())
+    result = _run(
+        canary,
+        platform,
+        exclude_kinds=("qualification",),
+        binding_checks=True,
+        binding_health_path="/healthz",
+        coverage=True,
+        declared=[("slack", "C-EXAMPLE-1", "default"), ("qualification", "probe-9", "probe")],
+    )
+    assert platform.probed == []
+    assert result.uncovered_agents == []
+    assert not any(label.startswith("qualification|") for label in result.binding_checks)
+    assert not any(label.startswith("qualification|") for label in result.binding_adapter_health)
+    assert result.drift == {"slack|C-EXAMPLE-3|default": "live_only"}
+    assert all(not label.startswith("qualification|") for label in result.inventory_labels)
+    assert sorted(result.target_success) == [
+        "slack|C-EXAMPLE-1|default",
+        "slack|C-EXAMPLE-3|default",
+    ]
+    assert result.success is True
+
+
+def test_without_exclusion_test_bindings_are_observed_as_before():
+    """@spec TURN-CANARY-15"""
+    canary = _canary()
+    platform = Platform(_with_test_bindings())
+    result = _run(canary, platform, binding_health_path="/healthz", coverage=True)
+    assert platform.probed == ["https://probe.example.invalid/healthz"]
+    assert result.uncovered_agents == []
+    assert result.binding_adapter_health["qualification|probe-2|probe"] == "ok"
+
+
+def test_an_agent_with_only_excluded_bindings_is_not_uncovered():
+    """@spec TURN-CANARY-15"""
+    canary = _canary()
+    rows = [_row("1", "C-EXAMPLE-1"), _row("2", "probe-2", kind="qualification", adapter="")]
+    assert _run(canary, Platform(rows), coverage=True).uncovered_agents == ["sample-2"]
+    excluded = _run(canary, Platform(rows), coverage=True, exclude_kinds=("qualification",))
+    assert excluded.uncovered_agents == []
+
+
+def test_excluding_slack_turns_nothing_and_fails_discovery_visibly():
+    """@spec TURN-CANARY-7 TURN-CANARY-15"""
+    canary = _canary()
+    result = _run(canary, Platform([_row("1", "C-EXAMPLE-1")]), exclude_kinds=("slack",))
+    assert result.target_success == {}
+    assert result.success is False
+    assert {"phase": "discovery", "outcome": "empty"} in result.logs
+
+
+def test_exclusion_list_is_parsed_strictly():
+    """@spec TURN-CANARY-15"""
+    canary = _canary()
+    assert canary.parse_config(REQUIRED).exclude_kinds == ()
+    parsed = canary.parse_config(
+        {**REQUIRED, "TURN_CANARY_EXCLUDE_BINDING_KINDS": "qualification, webhook"}
+    )
+    assert parsed.exclude_kinds == ("qualification", "webhook")
+    for bad in (",", "qualification,", "qualification,qualification", " "):
+        with pytest.raises(ValueError):
+            canary.parse_config({**REQUIRED, "TURN_CANARY_EXCLUDE_BINDING_KINDS": bad})
