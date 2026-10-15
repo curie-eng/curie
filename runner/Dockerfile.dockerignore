@@ -4,7 +4,6 @@
 # COPY set needs -- uv.lock, the four packages, and runner/ stay; the heavy
 # non-Python trees plus developer checkout debris (.worktrees, .projects,
 # cli/target) are dropped.
-.git
 **/.venv
 **/__pycache__
 **/*.pyc
@@ -23,5 +22,21 @@ charts
 *.md
 **/*.md
 **/.env
-.worktrees
-.projects
+**/.env.*
+!**/.env.example
+!**/.env.sample
+!**/.env.template
+**/.ssh
+**/.aws
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+**/id_rsa
+**/id_dsa
+**/id_ecdsa
+**/id_ed25519
+**/.git
+**/.curie
+**/.projects
+**/.worktrees

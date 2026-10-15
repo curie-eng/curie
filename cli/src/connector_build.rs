@@ -1165,7 +1165,7 @@ const TAG_DIGEST_LEN: usize = 16;
 /// The uid every connector container runs as, mirroring `render_deployment`'s
 /// `runAsUser` so a staged credential is readable by the same identity on both
 /// tiers.
-const CONNECTOR_UID: u32 = 65532;
+pub(crate) const CONNECTOR_UID: u32 = 65532;
 
 /// One connector's resolved build: the inputs, the command's target, and the
 /// identity the lock will record.
@@ -1626,129 +1626,88 @@ pub fn connector_scope_env(scope: &ConnectorScope) -> Vec<(String, String)> {
     ]
 }
 
-// ─── Staged credentials ──────────────────────────────────────────────────────
+// ─── Runtime credential volumes ─────────────────────────────────────────────
 
-/// Where resolved connector credentials are staged for a local bring-up.
-///
-/// Deterministic, not a per-run tempdir: teardown is label-driven and a reap
-/// that never inspected a container cannot discover a random path, so the
-/// credential would survive every `down`. Under `.curie/`, which the packer
-/// excludes and the scaffold gitignores.
-pub fn connector_secrets_root(plugin_dir: &Path) -> PathBuf {
-    plugin_dir.join(".curie").join("connector-secrets")
+fn secret_file_name(declared_path: &str) -> String {
+    hex(Sha256::digest(declared_path.as_bytes()).as_slice())
 }
 
-/// The host path one declared `secret_files` entry is staged at.
-///
-/// The filename carries a digest of the WHOLE declared path, not just its
-/// basename: one connector may declare `/a/token` and `/b/token`, and a
-/// basename-only name stages the second over the first. Producer
-/// (`stage_secret_file`) and consumers (the `docker run` mounts, the compose
-/// overlay) all derive the path here, so the naming is theirs to share.
-///
-/// The basename is reduced to one path-free component because the declared path
-/// is the CONTAINER's: nothing constrains it to a shape the host can hold, and
-/// `..` or a drive-letter component would otherwise be joined verbatim.
-pub fn staged_secret_path(plugin_dir: &Path, connector: &str, declared_path: &str) -> PathBuf {
-    let basename = declared_path
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(declared_path);
-    let kept: String = basename
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(*c, '.' | '_' | '-'))
-        .collect();
-    // `..`, `.` and the empty basename all name a directory rather than a file.
-    let stem = if kept.trim_matches('.').is_empty() {
-        "secret"
-    } else {
-        kept.as_str()
-    };
-    let digest = hex(Sha256::digest(declared_path.as_bytes()).as_slice());
-    connector_secrets_root(plugin_dir)
-        .join(connector)
-        .join(format!("{stem}-{}", &digest[..DIGEST_LEN]))
+/// Private daemon volumes for one connector bring-up, shared by both emitters.
+#[derive(Debug, Clone)]
+pub struct ConnectorSecretVolumes {
+    pub run_id: String,
+    pub volumes: BTreeMap<String, String>,
 }
 
-/// Write one resolved credential where the container will find it.
-///
-/// The parent directories are `0700` because the file mode is not always
-/// enough: rootless Docker and Docker Desktop map uids differently, so the
-/// `chown` to the container's uid is not always permitted, and where it is not
-/// the file falls back to `0444` inside a private parent.
-pub fn stage_secret_file(
-    plugin_dir: &Path,
-    connector: &str,
-    declared_path: &str,
-    value: &str,
-) -> Result<PathBuf> {
-    let path = staged_secret_path(plugin_dir, connector, declared_path);
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("staged credential path has no parent"))?;
-    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    private_dir(&connector_secrets_root(plugin_dir))?;
-    private_dir(parent)?;
-    // Replace, never write over: hardening left any previous staging 0400 (or
-    // 0444 where the chown fell back), so a plain write onto it is EACCES and
-    // a redeploy or credential rotation would wedge until the tree is removed
-    // by hand.
-    if path.exists() {
-        std::fs::remove_file(&path)
-            .with_context(|| format!("replace previously staged {}", path.display()))?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorSecretMount {
+    pub volume: String,
+    pub subpath: String,
+    pub target: String,
+}
+
+impl ConnectorSecretMount {
+    pub fn docker_mount(&self) -> String {
+        format!(
+            "type=volume,source={},volume-subpath={},\"target={}\",readonly,volume-nocopy",
+            self.volume,
+            self.subpath,
+            self.target.replace('"', "\"\"")
+        )
     }
-    std::fs::write(&path, value).with_context(|| format!("write {}", path.display()))?;
-    harden_secret_file(&path)?;
-    Ok(path)
 }
 
-#[cfg(unix)]
-fn private_dir(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("restrict {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn private_dir(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn harden_secret_file(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))
-        .with_context(|| format!("restrict {}", path.display()))?;
-    // Where the CLI may not hand the file to the container's uid, the file must
-    // be world-readable instead -- the 0700 parent is what keeps it private.
-    if std::os::unix::fs::chown(path, Some(CONNECTOR_UID), Some(CONNECTOR_UID)).is_err() {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))
-            .with_context(|| format!("widen {} for the container's uid", path.display()))?;
+impl ConnectorSecretVolumes {
+    pub fn new(decl: &ConnectorsFileDecl) -> Self {
+        Self {
+            run_id: uuid::Uuid::new_v4().to_string(),
+            volumes: decl
+                .connectors
+                .iter()
+                .filter(|(_, spec)| is_hosted(spec) && !spec.secret_files.is_empty())
+                .map(|(name, _)| {
+                    (
+                        name.clone(),
+                        format!("curie-credentials-{}", uuid::Uuid::new_v4()),
+                    )
+                })
+                .collect(),
+        }
     }
-    Ok(())
-}
 
-#[cfg(not(unix))]
-fn harden_secret_file(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-/// Remove a staged credential tree. A no-op when it is already gone, so `down`
-/// after `down` does not error.
-///
-/// Addressed by the root rather than the bundle directory because teardown
-/// carries the root it recorded (`ConnectorTeardownStep::WipeSecrets`) while an
-/// aborting boot carries only the plugin dir; one implementation serves both.
-pub fn wipe_secrets_root(root: &Path) -> Result<()> {
-    if !root.exists() {
-        return Ok(());
+    pub fn mounts(
+        &self,
+        connector: &str,
+        spec: &ConnectorSpecDecl,
+    ) -> Result<Vec<ConnectorSecretMount>> {
+        spec.secret_files
+            .values()
+            .map(|target| {
+                let volume = self.volumes.get(connector).ok_or_else(|| {
+                    anyhow!("connector '{connector}' has no runtime credential volume")
+                })?;
+                Ok(ConnectorSecretMount {
+                    volume: volume.clone(),
+                    subpath: secret_file_name(target),
+                    target: target.clone(),
+                })
+            })
+            .collect()
     }
-    std::fs::remove_dir_all(root).with_context(|| format!("remove {}", root.display()))
-}
 
-/// The same wipe, addressed by the bundle directory a boot staged into.
-pub fn wipe_connector_secrets(plugin_dir: &Path) -> Result<()> {
-    wipe_secrets_root(&connector_secrets_root(plugin_dir))
+    pub fn labels(&self, connector: &str) -> Vec<(String, String)> {
+        let mut labels = vec![(
+            crate::docker::CONNECTOR_SECRET_RUN_LABEL_KEY.to_string(),
+            self.run_id.clone(),
+        )];
+        if let Some(volume) = self.volumes.get(connector) {
+            labels.push((
+                crate::docker::CONNECTOR_SECRET_VOLUME_LABEL_KEY.to_string(),
+                volume.clone(),
+            ));
+        }
+        labels
+    }
 }
 
 // ─── The compose overlay (the local tier's emitter) ──────────────────────────
@@ -1879,11 +1838,12 @@ pub fn compose_overlay(
     decl: &ConnectorsFileDecl,
     identity: &ConnectorScope,
     project: &str,
-    plugin_dir: &Path,
+    secret_volumes: &ConnectorSecretVolumes,
     caller_public_key: Option<&str>,
 ) -> Result<serde_json::Value> {
     let network = crate::local::current_resources()?.docker_network;
     let mut services = serde_json::Map::new();
+    let mut external_volumes = serde_json::Map::new();
     let hosts_one = decl.connectors.values().any(is_hosted);
     if hosts_one && caller_public_key.map(str::trim).unwrap_or("").is_empty() {
         anyhow::bail!(
@@ -1925,14 +1885,21 @@ pub fn compose_overlay(
             environment.insert(name, serde_json::Value::String(reference));
         }
 
-        let volumes: Vec<serde_json::Value> = spec
-            .secret_files
-            .values()
-            .map(|declared_path| {
-                serde_json::Value::String(format!(
-                    "{}:{declared_path}:ro",
-                    staged_secret_path(plugin_dir, connector, declared_path).display()
-                ))
+        let volumes: Vec<serde_json::Value> = secret_volumes
+            .mounts(connector, spec)?
+            .into_iter()
+            .map(|mount| {
+                external_volumes.insert(
+                    mount.volume.clone(),
+                    serde_json::json!({ "external": true, "name": mount.volume }),
+                );
+                serde_json::json!({
+                    "type": "volume",
+                    "source": mount.volume,
+                    "target": mount.target.replace('$', "$$"),
+                    "read_only": true,
+                    "volume": { "subpath": mount.subpath, "nocopy": true },
+                })
             })
             .collect();
 
@@ -1960,6 +1927,10 @@ pub fn compose_overlay(
         service.insert("networks".into(), serde_json::Value::Object(attachment));
         let mut labels = serde_json::Map::new();
         labels.insert(
+            "curietech.ai/managed-by".into(),
+            serde_json::Value::String("curie-cli".into()),
+        );
+        labels.insert(
             "curietech.ai/component".into(),
             serde_json::Value::String("connector".into()),
         );
@@ -1973,6 +1944,9 @@ pub fn compose_overlay(
         // (`docker::connectors_to_reap`). Emitted from the same pairs the skill
         // tier's `docker run` labels carry, so one reap selector covers both.
         for (key, value) in crate::docker::connector_identity_labels(&identity.agent, &name) {
+            labels.insert(key, serde_json::Value::String(value));
+        }
+        for (key, value) in secret_volumes.labels(connector) {
             labels.insert(key, serde_json::Value::String(value));
         }
         service.insert("labels".into(), serde_json::Value::Object(labels));
@@ -1997,6 +1971,7 @@ pub fn compose_overlay(
     Ok(serde_json::json!({
         "services": services,
         "networks": serde_json::Value::Object(networks),
+        "volumes": external_volumes,
     }))
 }
 

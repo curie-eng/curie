@@ -22,7 +22,8 @@ missing.
 Model mapping. Docker has no warm pool, no separate Sandbox object, and no init
 containers, so one container is simultaneously the "claim" and the "sandbox"
 (claim name == container name == sandbox name), and there is no bundle-fetch init
-pair -- the worker fetches the plugin bundle from RustFS and bind-mounts it. The
+pair -- the worker fetches the plugin bundle from RustFS and copies it into a
+claim-owned Docker volume. The
 host-process worker reaches each runner over a loopback-bound, Docker-assigned
 host port (``docker port <name> 8080``) -- but only when it can actually reach
 that host loopback. A worker running as a host-net *container* on Docker Desktop
@@ -51,6 +52,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -214,6 +216,23 @@ _DOCKER_CONTROL_TIMEOUT_S = 30.0
 _DOCKER_CREATE_TIMEOUT_S = 90.0
 _DOCKER_IMAGE_PULL_TIMEOUT_S = 300.0
 _LIST_INSPECTION_TIMEOUT_S = 30.0
+_CLAIM_LABEL = "curietech.ai/claim"
+_COMPONENT_LABEL = "curietech.ai/component"
+_ATTEMPT_LABEL = "curietech.ai/claim-attempt"
+_INPUT_COMPONENTS = ("claim-bundle", "claim-workspace", "claim-attachments")
+_SEED_WORKSPACE = """import os
+def fail(error):
+    raise error
+paths = ['/curie-input']
+for root, directories, files in os.walk('/curie-input', onerror=fail):
+    paths.extend(os.path.join(root, name) for name in directories + files)
+for path in paths:
+    if not os.path.islink(path):
+        mode = 0o700 if os.path.isdir(path) else 0o600
+        os.chmod(path, os.stat(path).st_mode | mode)
+for path in reversed(paths):
+    os.chown(path, 1000, 1000, follow_symlinks=False)
+"""
 
 # Declared boot keys this substrate produces. Docker is the OTel producer here
 # (the chart's env block is its Kubernetes counterpart), and the runner parses
@@ -505,14 +524,13 @@ class DockerSandboxClient:
         executor = executor_secret_names is not None
         if executor_secret_names is not None:
             env = _executor_claim_env(env, executor_secret_names)
+        attempt = uuid.uuid4().hex
         plugin_dir = env.get(PLUGIN_DIR_ENV, self._default_plugin_dir)
         args = [
             "run",
             "-d",
             "--name",
             name,
-            "--label",
-            f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}",
             "-p",
             f"{self._host}::{RUNNER_CONTAINER_PORT}",
         ]
@@ -534,47 +552,58 @@ class DockerSandboxClient:
             )
         for key, value in (labels or {}).items():
             args += ["--label", f"{key}={value}"]
+        args += [
+            "--label",
+            f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}",
+            "--label",
+            f"{_CLAIM_LABEL}={name}",
+            "--label",
+            f"{_COMPONENT_LABEL}=claim-runner",
+            "--label",
+            f"{_ATTEMPT_LABEL}={attempt}",
+        ]
         bundle_ref = env.get(BUNDLE_REF_ENV)
         if bundle_ref:
             args += ["--label", f"{BUNDLE_REF_LABEL}={bundle_ref}"]
         if self._network:
             args += ["--network", self._network]
 
-        # Bundle: no init containers here, so fetch + extract + bind-mount the
-        # plugin dir ourselves (fail-open only when there is no ref, e.g. a fake
-        # model run that never reads the plugin dir).
-        if env.get(BUNDLE_REF_ENV):
-            root = self._prepare_bundle(name, env[BUNDLE_REF_ENV])
-            args += ["-v", f"{root}:{plugin_dir}:ro"]
-        if env.get(WORKSPACE_REF_ENV):
-            try:
+        inputs: list[tuple[str, str, str, bool]] = []
+        try:
+            if env.get(BUNDLE_REF_ENV):
+                root = self._prepare_bundle(name, env[BUNDLE_REF_ENV])
+                inputs.append(("claim-bundle", root, plugin_dir, False))
+            if env.get(WORKSPACE_REF_ENV):
                 root = self._prepare_workspace(
                     name,
                     env[WORKSPACE_REF_ENV],
                     env.get(WORKSPACE_SHA256_ENV, ""),
                 )
-            except Exception:
-                self._cleanup_bundle(name)
-                raise
-            args += ["-v", f"{root}:{WORKSPACE_MOUNT_PATH}:rw"]
-        # Attachments: same reason as the bundle above -- no init containers
-        # here, so this driver redeems the signed reference itself. Kubernetes
-        # does this in `attachments-init`; without the equivalent, `curie local
-        # up` and `curie skill` would park the bytes and hand the agent nothing,
-        # which is a fabricated empty result at those tiers (ADR-0041) and the
-        # very silent loss #2567 exists to close. Read-only: an attachment is an
-        # input a person sent, not a scratch space.
-        if env.get(ATTACHMENTS_REF_ENV):
-            try:
-                root = self._prepare_attachments(name, env[ATTACHMENTS_REF_ENV])
-            except _NoAttachments:
-                pass
-            except Exception:
-                self._cleanup_workspace(name)
-                self._cleanup_bundle(name)
-                raise
-            else:
-                args += ["-v", f"{root}:{ATTACHMENTS_MOUNT_PATH}:ro"]
+                inputs.append(("claim-workspace", root, WORKSPACE_MOUNT_PATH, True))
+            if env.get(ATTACHMENTS_REF_ENV):
+                try:
+                    root = self._prepare_attachments(name, env[ATTACHMENTS_REF_ENV])
+                except _NoAttachments:
+                    pass
+                else:
+                    inputs.append(("claim-attachments", root, ATTACHMENTS_MOUNT_PATH, False))
+        except BaseException:
+            self._cleanup_staged_inputs(name)
+            raise
+        try:
+            for component, root, destination, writable in inputs:
+                volume = self._seed_input_volume(
+                    name, component, root, attempt=attempt, writable=writable
+                )
+                mode = "rw" if writable else "ro"
+                args += ["-v", f"{volume}:{destination}:{mode}"]
+        except BaseException:
+            self._cleanup_claim_inputs(
+                name,
+                request_timeout_seconds=_DOCKER_CREATE_TIMEOUT_S,
+                attempt=attempt,
+            )
+            raise
 
         args += [
             "-e",
@@ -639,11 +668,13 @@ class DockerSandboxClient:
                 args,
                 request_timeout_seconds=_DOCKER_CREATE_TIMEOUT_S,
             )
-        except DockerError:
-            # A failed boot must not leak staged claim data.
-            self._cleanup_bundle(name)
-            self._cleanup_workspace(name)
-            self._cleanup_attachments(name)
+        except BaseException:
+            self._cleanup_claim_inputs(
+                name,
+                request_timeout_seconds=_DOCKER_CREATE_TIMEOUT_S,
+                attempt=attempt,
+                include_runner=True,
+            )
             raise
 
     def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
@@ -652,6 +683,8 @@ class DockerSandboxClient:
         if inspected is None:
             return None
         status, labels, created = inspected
+        if labels.get(_COMPONENT_LABEL) in _INPUT_COMPONENTS:
+            return None
         ready = status == "running" and self._healthz_ok(name, deadline=deadline)
         return ClaimView(
             name=name,
@@ -670,15 +703,18 @@ class DockerSandboxClient:
         )
 
     def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        deadline = time.monotonic() + request_timeout_seconds
         # -f removes a running/paused container too; ignore "no such container".
-        self._docker(
-            ["rm", "-f", name],
-            request_timeout_seconds=request_timeout_seconds,
-            check=False,
-        )
-        self._cleanup_bundle(name)
-        self._cleanup_workspace(name)
-        self._cleanup_attachments(name)
+        try:
+            self._docker(
+                ["rm", "-f", name],
+                request_timeout_seconds=self._remaining_seconds(deadline),
+                check=False,
+            )
+        finally:
+            self._cleanup_claim_inputs(
+                name, request_timeout_seconds=max(0.0, deadline - time.monotonic())
+            )
 
     def list_claims(self, *, label_selector: str) -> list[ClaimView]:
         out = self._docker(
@@ -701,9 +737,67 @@ class DockerSandboxClient:
         return views
 
     def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
-        # Docker creates no claim-scoped templates; tokens ride the container env.
-        del keep, created_before
-        return []
+        removed: list[str] = []
+        removed_attempts: set[str] = set()
+        for component in _INPUT_COMPONENTS:
+            volumes = self._docker(
+                [
+                    "volume",
+                    "ls",
+                    "--filter",
+                    f"label={MANAGED_BY_LABEL}={MANAGED_BY_VALUE}",
+                    "--filter",
+                    f"label={_COMPONENT_LABEL}={component}",
+                    "--format",
+                    "{{.Name}}",
+                ],
+                request_timeout_seconds=_DOCKER_CONTROL_TIMEOUT_S,
+            )
+            for volume in volumes.splitlines():
+                if not volume.strip():
+                    continue
+                inspected = self._docker(
+                    [
+                        "volume",
+                        "inspect",
+                        "--format",
+                        "{{json .Labels}}\t{{.CreatedAt}}",
+                        volume.strip(),
+                    ],
+                    request_timeout_seconds=_DOCKER_CONTROL_TIMEOUT_S,
+                    check=False,
+                )
+                labels_json, _, created_raw = inspected.strip().partition("\t")
+                if not labels_json:
+                    continue
+                labels = json.loads(labels_json)
+                if not isinstance(labels, dict):
+                    continue
+                claim = labels.get(_CLAIM_LABEL)
+                attempt = labels.get(_ATTEMPT_LABEL)
+                created = _parse_created(created_raw)
+                if (
+                    labels.get(MANAGED_BY_LABEL) != MANAGED_BY_VALUE
+                    or labels.get(_COMPONENT_LABEL) != component
+                    or not isinstance(claim, str)
+                    or not claim
+                    or not isinstance(attempt, str)
+                    or not attempt
+                    or claim in keep
+                    or attempt in removed_attempts
+                    or created is None
+                    or created >= created_before
+                ):
+                    continue
+                self._cleanup_claim_inputs(
+                    claim,
+                    request_timeout_seconds=_DOCKER_CREATE_TIMEOUT_S,
+                    attempt=attempt,
+                )
+                removed_attempts.add(attempt)
+                if claim not in removed:
+                    removed.append(claim)
+        return removed
 
     # -- sandbox lifecycle ----------------------------------------------------
 
@@ -770,6 +864,136 @@ class DockerSandboxClient:
         )
 
     # -- helpers --------------------------------------------------------------
+
+    def _seed_input_volume(
+        self, name: str, component: str, root: str, *, attempt: str, writable: bool = False
+    ) -> str:
+        volume = f"curie-input-{uuid.uuid4().hex}"
+        helper = f"{volume}-seed"
+        labels = [
+            "--label",
+            f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}",
+            "--label",
+            f"{_CLAIM_LABEL}={name}",
+            "--label",
+            f"{_COMPONENT_LABEL}={component}",
+            "--label",
+            f"{_ATTEMPT_LABEL}={attempt}",
+        ]
+        try:
+            self._docker(
+                ["volume", "create", *labels, volume],
+                request_timeout_seconds=_DOCKER_CONTROL_TIMEOUT_S,
+            )
+            self._docker(
+                [
+                    "create",
+                    "--name",
+                    helper,
+                    *labels,
+                    "--network",
+                    "none",
+                    "--user",
+                    "0:0",
+                    "--read-only",
+                    "--cap-drop",
+                    "ALL",
+                    "--cap-add",
+                    "CHOWN",
+                    "--security-opt",
+                    "no-new-privileges",
+                    "--mount",
+                    f"type=volume,source={volume},target=/curie-input,volume-nocopy",
+                    "--entrypoint",
+                    "python",
+                    self._image,
+                    "-c",
+                    _SEED_WORKSPACE if writable else "pass",
+                ],
+                request_timeout_seconds=_DOCKER_CREATE_TIMEOUT_S,
+            )
+            self._docker(
+                ["cp", f"{root}/.", f"{helper}:/curie-input"],
+                request_timeout_seconds=_DOCKER_CREATE_TIMEOUT_S,
+            )
+            if writable:
+                self._docker(
+                    ["start", "-a", helper],
+                    request_timeout_seconds=_DOCKER_CREATE_TIMEOUT_S,
+                )
+            self._docker(
+                ["rm", "-f", helper],
+                request_timeout_seconds=_DOCKER_CONTROL_TIMEOUT_S,
+            )
+        except BaseException:
+            self._docker(
+                ["rm", "-f", helper],
+                request_timeout_seconds=_DOCKER_CONTROL_TIMEOUT_S,
+                check=False,
+            )
+            raise
+        return volume
+
+    def _cleanup_claim_inputs(
+        self,
+        name: str,
+        *,
+        request_timeout_seconds: float,
+        attempt: str | None = None,
+        include_runner: bool = False,
+    ) -> None:
+        deadline = time.monotonic() + request_timeout_seconds
+        failures: list[str] = []
+        try:
+            components = (("claim-runner",) if include_runner else ()) + _INPUT_COMPONENTS
+            for component in components:
+                filters = [
+                    "--filter",
+                    f"label={MANAGED_BY_LABEL}={MANAGED_BY_VALUE}",
+                    "--filter",
+                    f"label={_CLAIM_LABEL}={name}",
+                    "--filter",
+                    f"label={_COMPONENT_LABEL}={component}",
+                ]
+                if attempt is not None:
+                    filters += ["--filter", f"label={_ATTEMPT_LABEL}={attempt}"]
+                operations = [
+                    (["ps", "-a", *filters, "--format", "{{.ID}}"], ["rm", "-f"])
+                ]
+                if component != "claim-runner":
+                    operations.append(
+                        (
+                            ["volume", "ls", *filters, "--format", "{{.Name}}"],
+                            ["volume", "rm"],
+                        )
+                    )
+                for listing, removal in operations:
+                    try:
+                        resources = self._docker(
+                            listing, request_timeout_seconds=self._remaining_seconds(deadline)
+                        )
+                    except DockerError as exc:
+                        failures.append(str(exc))
+                        continue
+                    for resource in resources.splitlines():
+                        if not resource.strip():
+                            continue
+                        try:
+                            self._docker(
+                                [*removal, resource.strip()],
+                                request_timeout_seconds=self._remaining_seconds(deadline),
+                            )
+                        except DockerError as exc:
+                            failures.append(str(exc))
+        finally:
+            self._cleanup_staged_inputs(name)
+        if failures:
+            raise DockerError("claim input cleanup failed: " + "; ".join(failures))
+
+    def _cleanup_staged_inputs(self, name: str) -> None:
+        self._cleanup_bundle(name)
+        self._cleanup_workspace(name)
+        self._cleanup_attachments(name)
 
     def _prepare_bundle(self, name: str, ref: str) -> str:
         data = self._bundles.get(ref)
@@ -847,17 +1071,6 @@ class DockerSandboxClient:
             with tarfile.open(archive_path, mode="r:*") as archive:
                 archive.extractall(root, filter="data")
             archive_path.unlink(missing_ok=True)
-
-            # Local Docker may run under a host uid different from the runner's
-            # fixed uid 1000. The workspace is deliberately writable, so make
-            # the bind mount writable independent of that host uid.
-            os.chmod(root, 0o777)
-            for dirpath, dirnames, filenames in os.walk(root):
-                for dirname in dirnames:
-                    os.chmod(os.path.join(dirpath, dirname), 0o777)
-                for filename in filenames:
-                    path = os.path.join(dirpath, filename)
-                    os.chmod(path, os.stat(path).st_mode | 0o666)
         except Exception:
             shutil.rmtree(tmp, ignore_errors=True)
             raise

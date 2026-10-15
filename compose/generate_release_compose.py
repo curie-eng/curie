@@ -12,9 +12,9 @@ via three ordered text transforms:
 
   T2  Inline otel/collector-config.yaml as a top-level `configs:` block (a literal
       scalar, re-indented 6 spaces, with `${env:` escaped to `$${env:` so compose
-      does not try to interpolate the collector's own env references), and repoint
-      the otel-collector service from the host bind-mount to that config while
-      retaining its task-owned persistent-queue volume.
+      does not try to interpolate the collector's own env references), and
+      replace the dev collector build with the pinned upstream image and that
+      config while retaining its task-owned persistent-queue volume.
 
   T3  Pin every `ghcr.io/curie-eng/curie-*:latest` image tag to the release
       version (this also pins the worker-local image introduced by T1). Also
@@ -53,15 +53,17 @@ WORKER_IMAGE_LINE = "    image: ghcr.io/curie-eng/curie-worker-local:latest\n"
 
 CONFIGS_ANCHOR = "x-core-profiles: &core_profiles [core, full]"
 
-OTEL_VOLUME_BLOCK = """    volumes:
-      - ./otel/collector-config.yaml:/etc/otel/collector-config.yaml:ro
-      - otel_collector_storage:/var/lib/otelcol/storage
+OTEL_BUILD_BLOCK = """    image: curie-otel-collector:${CURIE_BASE_TAG:-latest}
+    build:
+      context: otel
+      dockerfile_inline: |
+        FROM otel/opentelemetry-collector-contrib:0.119.0
+        COPY collector-config.yaml /etc/otel/collector-config.yaml
 """
+OTEL_IMAGE_LINE = "    image: otel/opentelemetry-collector-contrib:0.119.0\n"
 OTEL_CONFIGS_REF = """    configs:
       - source: otel_collector_config
         target: /etc/otel/collector-config.yaml
-    volumes:
-      - otel_collector_storage:/var/lib/otelcol/storage
 """
 
 # Matches the plain `:latest` pin AND compose.dev.yaml's
@@ -112,12 +114,12 @@ def generate(dev_text: str, otel_text: str, version: str) -> str:
     configs_block = "configs:\n  otel_collector_config:\n    content: |\n" + body
     text = text.replace(CONFIGS_ANCHOR, configs_block + "\n" + CONFIGS_ANCHOR, 1)
 
-    # T2b: repoint otel-collector from the host bind-mount to the inlined config.
-    if OTEL_VOLUME_BLOCK not in text:
+    # T2b: release consumers need neither a build context nor a local image.
+    if OTEL_BUILD_BLOCK not in text:
         raise ValueError(
-            "T2: otel-collector host bind-mount block not found in compose.dev.yaml"
+            "T2: otel-collector build block not found in compose.dev.yaml"
         )
-    text = text.replace(OTEL_VOLUME_BLOCK, OTEL_CONFIGS_REF, 1)
+    text = text.replace(OTEL_BUILD_BLOCK, OTEL_IMAGE_LINE + OTEL_CONFIGS_REF, 1)
 
     # T3a: unwrap a defaulted whole-reference override to its plain ref, so T3b
     # pins it like any other and no `${...}` survives into the release asset.
