@@ -1190,8 +1190,13 @@ def _capture_diagnostics(run: HeldRun) -> None:
 
     if not run.cluster_attempted:
         return
+    # Diagnostics never raise: an error here must not replace a behavioral
+    # failure or keep an observation fault from becoming the teardown error.
     if "worker_terminate_log" not in run.report:
-        run.report["worker_terminate_log"] = run.worker_terminate_log()
+        try:
+            run.report["worker_terminate_log"] = run.worker_terminate_log()
+        except Exception as exc:  # noqa: BLE001 - diagnostics cannot replace the failure
+            run.report["worker_terminate_log"] = [f"unavailable ({type(exc).__name__})"]
     try:
         run.capture_failure_diagnostics()
     except Exception:  # noqa: BLE001 - diagnostics cannot replace the failure
@@ -1251,10 +1256,17 @@ def _observe(run: HeldRun, behavior: Callable[[Held], None]) -> bool:
     try:
         behavior(run.held)
     except OBSERVATION_FAULTS as exc:
-        _capture_diagnostics(run)
-        detail = fe.redact_agent_text(str(exc), run.secrets)[0] or ""
-        run.infra_error = f"{type(exc).__name__}: {detail}"[:2000]
+        # Record the fault before anything else can raise, so teardown
+        # always reports it as an error.
+        run.infra_error = type(exc).__name__
         run.report["infra_error"] = run.infra_error
+        try:
+            detail = fe.redact_agent_text(str(exc), run.secrets)[0] or ""
+            run.infra_error = f"{type(exc).__name__}: {detail}"[:2000]
+            run.report["infra_error"] = run.infra_error
+        except Exception:  # noqa: BLE001 - the class name alone still marks the fault
+            pass
+        _capture_diagnostics(run)
         return False
     except BaseException:
         _capture_diagnostics(run)
