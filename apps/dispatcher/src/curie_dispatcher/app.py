@@ -10,6 +10,8 @@ authorize to keep the dispatch path offline.
 import json
 import logging
 import threading
+import time
+from collections import deque
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -144,6 +146,8 @@ def build_app(
 # (slack_sdk's builtin ``Connection`` defaults it to 3 seconds) or a 0.2 second
 # idle sleep; past this, the daemon thread is left rather than hanging shutdown.
 _SESSION_RUNNER_JOIN_S = 5.0
+_SESSION_FAILURE_LIMIT = 3
+_SESSION_FAILURE_WINDOW_S = 300
 
 
 def _stop_session_runner(client: Any) -> None:
@@ -176,13 +180,17 @@ def _stop_session_runner(client: Any) -> None:
         thread.join(_SESSION_RUNNER_JOIN_S)
 
 
+class SocketSessionsFailing(RuntimeError):
+    """Repeated SDK session replacements require a fresh supervised connection."""
+
+
 class SocketModeConnection(Connection):
     """Adapts Bolt's SocketModeHandler to the supervisor's Connection protocol.
 
     ``run`` connects and then blocks on an internal event; the builtin client
-    reconnects transient websocket drops itself, so ``run`` returns only on
-    graceful ``close`` or if ``connect`` raises (which the supervisor treats as a
-    reconnect-with-backoff trigger).
+    reconnects transient websocket drops itself. Repeated replacements raise
+    ``SocketSessionsFailing`` so the supervisor builds a fresh connection with
+    backoff. An initial ``connect`` failure propagates unchanged.
 
     ``slack_identity`` names the identity this connection serves when several
     run in one process (ADR-0168 decision 2). Without it, its log lines are
@@ -200,12 +208,21 @@ class SocketModeConnection(Connection):
         logger: logging.Logger | None = None,
         slack_identity: str | None = None,
         presence: SocketPresence | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._handler = SocketModeHandler(app, app_token=app_token)
         self._logger = logger or logging.getLogger(__name__)
         self._slack_identity = slack_identity
         self._presence = presence
+        self._clock = clock
         self._closed = threading.Event()
+        self._wakeup = threading.Event()
+        self._session_condition = threading.Condition()
+        self._has_connected = False
+        self._session_failures: deque[float] = deque()
+        self._sessions_failing = False
+        self._connects_in_flight = 0
+        self._connect_finished_after_close = False
         # How many of this client's own sockets the current connection counts.
         self._own_sockets = 1
         self._hello_own_sockets: dict[int, int] = {}
@@ -229,8 +246,30 @@ class SocketModeConnection(Connection):
         sdk_enqueue_message = getattr(client, "enqueue_message", None)
 
         def connect() -> None:
-            self._own_sockets = 2 if client.is_connected() else 1
-            sdk_connect()
+            with self._session_condition:
+                if self._closed.is_set():
+                    return
+                if self._has_connected:
+                    now = self._clock()
+                    cutoff = now - _SESSION_FAILURE_WINDOW_S
+                    while self._session_failures and self._session_failures[0] < cutoff:
+                        self._session_failures.popleft()
+                    self._session_failures.append(now)
+                    if len(self._session_failures) >= _SESSION_FAILURE_LIMIT:
+                        self._sessions_failing = True
+                        self._wakeup.set()
+                self._connects_in_flight += 1
+            try:
+                self._own_sockets = 2 if client.is_connected() else 1
+                sdk_connect()
+                with self._session_condition:
+                    self._has_connected = True
+            finally:
+                with self._session_condition:
+                    self._connects_in_flight -= 1
+                    if self._closed.is_set():
+                        self._connect_finished_after_close = True
+                    self._session_condition.notify_all()
 
         def enqueue_message(raw_message: str) -> None:
             assert sdk_enqueue_message is not None
@@ -324,6 +363,8 @@ class SocketModeConnection(Connection):
         if self._closed.is_set():
             # A close landed while connect was in flight and tore down a
             # handler connect then brought back up; close what it opened.
+            with self._session_condition:
+                self._session_condition.wait_for(lambda: self._connects_in_flight == 0)
             self.close()
             return
         if self._slack_identity is None:
@@ -334,15 +375,39 @@ class SocketModeConnection(Connection):
                 release_identity(),
                 self._slack_identity,
             )
-        if presence is None:
-            self._closed.wait()
-            return
-        presence.record()
-        while not self._closed.wait(presence.sample_interval_s):
+        if presence is not None:
             presence.record()
+        while not self._wakeup.wait(None if presence is None else presence.sample_interval_s):
+            if presence is not None:
+                presence.record()
+        # SDK close joins its message workers. Let their connect calls finish
+        # before closing here, and prevent another from reopening the session.
+        with self._session_condition:
+            self._session_condition.wait_for(lambda: self._connects_in_flight == 0)
+            failing = self._sessions_failing and not self._closed.is_set()
+            close_again = self._connect_finished_after_close
+            if failing:
+                self._closed.set()
+        if failing:
+            self._logger.warning(
+                "socket mode sessions failing identity=%s slack_identity=%s "
+                "failures=%d window_s=%d",
+                release_identity(),
+                self._slack_identity if self._slack_identity is not None else "absent",
+                _SESSION_FAILURE_LIMIT,
+                _SESSION_FAILURE_WINDOW_S,
+            )
+        if failing or close_again:
+            self.close()
+        if failing:
+            raise SocketSessionsFailing(
+                f"Socket Mode sessions failed {_SESSION_FAILURE_LIMIT} times "
+                f"within {_SESSION_FAILURE_WINDOW_S} seconds"
+            )
 
     def close(self) -> None:
         self._closed.set()
+        self._wakeup.set()
         try:
             self._handler.close()  # type: ignore[no-untyped-call]
         except Exception:  # pragma: no cover - best-effort teardown
