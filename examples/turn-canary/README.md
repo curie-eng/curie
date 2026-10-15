@@ -44,11 +44,47 @@ The script does not resolve approval cards.
 `TURN_CANARY_CYCLE_INTERVAL`, `TURN_CANARY_TURN_DEADLINE`,
 `TURN_CANARY_CLEANUP_DEADLINE`, and `TURN_CANARY_POLL_PERIOD` are seconds,
 defaulting to 300, 90, 60, and 2. Schedule the one-shot command at the
-configured interval.
+configured interval, or use the exporter mode below.
 `TURN_CANARY_MAX_TARGETS` defaults to 5. All are positive and bounded.
 `TURN_CANARY_DB_SCHEMA` defaults to `curie`. `TURN_CANARY_METRICS_PATH` writes
 Prometheus exposition after each cycle. Logs contain only phase, outcome, HTTP
 status, and exception type.
+
+## Standing monitor options
+
+Each option below is off by default; [design.md](design.md) holds the contract
+(TURN-CANARY-7 through TURN-CANARY-10).
+
+- `TURN_CANARY_DISCOVER=1` replaces `TURN_CANARY_ROUTES`. Each cycle reads the
+  live bindings and turns one Slack route per agent, rotating deterministically
+  across cycles with a counter kept in the state file. At most
+  `TURN_CANARY_MAX_TARGETS` agents are turned per cycle, in a rotating window.
+  `TURN_CANARY_DISCOVER_EXCLUDE` takes a JSON list of exact triples that are
+  never turned. Setting both `TURN_CANARY_ROUTES` and discovery refuses to
+  start.
+- `TURN_CANARY_BINDING_CHECKS=1` gives every binding that this cycle does not
+  turn a model-free check through `GET /channel-identities`: an active
+  deployment and one active identity with a nonblank credential reference. It
+  needs the platform API key and never resolves the secret.
+  `TURN_CANARY_IDENTITY_KINDS` (a JSON list, default `["slack"]`) names the
+  binding kinds checked against channel identities; other kinds are checked
+  for an active deployment only.
+- `TURN_CANARY_ADAPTER_HEALTH` takes a JSON object from adapter name to
+  health URL, for example
+  `{"discord":"http://discord-adapter.example.invalid:8080/healthz"}`. Each
+  cycle sends one unauthenticated `GET` per adapter and reports 2xx as up.
+- `TURN_CANARY_LISTEN=0.0.0.0:9464` runs a long-lived exporter. It runs one
+  cycle per `TURN_CANARY_CYCLE_INTERVAL`, never overlapping, and serves
+  `/metrics` and `/healthz`. `/healthz` reports whether the monitor loop is
+  current, not whether the platform is healthy, so a platform outage shows in
+  the metrics without restarting the monitor.
+- `TURN_CANARY_METRIC_PREFIX` replaces the `turn_canary` metric name prefix in
+  both the metrics file and the exporter, to keep existing series names.
+
+The exporter adds these series beside the TURN-CANARY-6 set, shown with the
+default prefix: `turn_canary_binding_check_success{route,outcome}`,
+`turn_canary_adapter_up{adapter,outcome}`, `turn_canary_cycle_overruns_total`,
+and `turn_canary_rotation`.
 
 For an optional ResourceQuota observation, set `TURN_CANARY_QUOTA_URL` to the
 explicit Kubernetes quota list endpoint, `TURN_CANARY_QUOTA_TOKEN` to its bearer
