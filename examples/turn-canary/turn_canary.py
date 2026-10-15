@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol, TextIO
 from urllib.parse import urlsplit
@@ -42,6 +43,56 @@ Route = tuple[str, str, str]
 METRIC_PREFIX = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
 ADAPTER_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 MAX_ADAPTERS = 20
+MAX_BINDING_HEALTH = 100
+ROUTE_LABEL_LAYOUTS = ("route", "split")
+_QUANTITY = re.compile(r"(\d+(?:\.\d+)?|\.\d+)(m|k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?")
+_QUANTITY_SCALE = {
+    None: Decimal(1),
+    "m": Decimal("0.001"),
+    "k": Decimal(10) ** 3,
+    "M": Decimal(10) ** 6,
+    "G": Decimal(10) ** 9,
+    "T": Decimal(10) ** 12,
+    "P": Decimal(10) ** 15,
+    "E": Decimal(10) ** 18,
+    "Ki": Decimal(2) ** 10,
+    "Mi": Decimal(2) ** 20,
+    "Gi": Decimal(2) ** 30,
+    "Ti": Decimal(2) ** 40,
+    "Pi": Decimal(2) ** 50,
+    "Ei": Decimal(2) ** 60,
+}
+
+
+def _quantity(value: object) -> Decimal:
+    """A Kubernetes quantity, exactly. @spec TURN-CANARY-5"""
+    match = _QUANTITY.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        raise ValueError("not a Kubernetes quantity")
+    return Decimal(match.group(1)) * _QUANTITY_SCALE[match.group(2)]
+
+
+def parse_quantity(value: object) -> float:
+    """@spec TURN-CANARY-5"""
+    return float(_quantity(value))
+
+
+def quota_has_headroom(body: object, resource: str, min_free: str) -> bool | None:
+    """Every listed quota keeps at least ``min_free``; unreadable is None. @spec TURN-CANARY-5"""
+    try:
+        minimum = _quantity(min_free)
+        items = body.get("items") if isinstance(body, dict) else None
+        if not isinstance(items, list) or not items:
+            return None
+        for item in items:
+            status = item["status"]
+            hard = _quantity(status["hard"][resource])
+            used = _quantity(status["used"][resource])
+            if hard - used < minimum:
+                return False
+        return True
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
 
 
 def _route_label(row: Mapping[str, str]) -> str:
@@ -98,6 +149,10 @@ class CycleResult:
     adapter_health: dict[str, str] = field(default_factory=dict)
     inventory_labels: set[str] | None = None
     rotation: int | None = None
+    drift: dict[str, str] | None = None
+    binding_adapter_health: dict[str, str] = field(default_factory=dict)
+    uncovered_agents: list[str] | None = None
+    route_agents: dict[str, str] = field(default_factory=dict)
 
     def record(self, phase: str, outcome: str, error: BaseException | None = None) -> None:
         item = {"phase": phase, "outcome": outcome}
@@ -254,6 +309,75 @@ def select_targets(
     return result
 
 
+def _turn_candidates(
+    rows: list[dict[str, str]], excluded: set[tuple[str, ...]]
+) -> list[dict[str, str]]:
+    """Rows TURN-CANARY-7 accepts as turn candidates. @spec TURN-CANARY-7 TURN-CANARY-13"""
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[_route_label(row)] = counts.get(_route_label(row), 0) + 1
+    return [
+        row
+        for row in rows
+        if row.get("kind") == "slack"
+        and row.get("deployment_status") == "active"
+        and all(row.get(name) for name in ("agent_id", "address", "adapter"))
+        and counts[_route_label(row)] == 1
+        and (row.get("kind"), row.get("address"), row.get("adapter")) not in excluded
+    ]
+
+
+def binding_drift(rows: list[dict[str, str]], declared: Sequence[Route]) -> dict[str, str]:
+    """Declared against live triples, for declared kinds only. @spec TURN-CANARY-11"""
+    wanted = {tuple(route) for route in declared}
+    kinds = {route[0] for route in wanted}
+    live = {
+        (row.get("kind", ""), row.get("address", ""), row.get("adapter", ""))
+        for row in rows
+        if row.get("kind") in kinds
+    }
+    drift = {"|".join(route): "declared_only" for route in sorted(wanted - live)}
+    drift.update({"|".join(route): "live_only" for route in sorted(live - wanted)})
+    return drift
+
+
+def binding_health_url(endpoint: str, path: str) -> str | None:
+    """The endpoint origin plus the health path, or None when unusable. @spec TURN-CANARY-12"""
+    parsed = urlsplit(endpoint)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+
+def uncovered_agents(
+    rows: list[dict[str, str]], *, exclude: Iterable[Route], health_path: str | None
+) -> list[str]:
+    """Active agents with no turn candidate or binding health URL. @spec TURN-CANARY-13"""
+    active = {
+        row["agent_id"]: row.get("agent", "")
+        for row in rows
+        if row.get("deployment_status") == "active" and row.get("agent_id")
+    }
+    covered = {row["agent_id"] for row in _turn_candidates(rows, {tuple(r) for r in exclude})}
+    if health_path is not None:
+        covered |= {
+            row["agent_id"]
+            for row in rows
+            if row.get("deployment_status") == "active"
+            and row.get("agent_id")
+            and row.get("endpoint")
+            and binding_health_url(row["endpoint"], health_path) is not None
+        }
+    return sorted({name for agent_id, name in active.items() if agent_id not in covered})
+
+
 def discover_targets(
     rows: list[dict[str, str]],
     *,
@@ -273,16 +397,8 @@ def discover_targets(
     for label in sorted(label for label, count in counts.items() if count > 1):
         if label.startswith("slack|"):
             logs.append({"phase": "discovery", "outcome": "ambiguous"})
-    for row in rows:
-        key = (row.get("kind"), row.get("address"), row.get("adapter"))
-        if (
-            row.get("kind") == "slack"
-            and row.get("deployment_status") == "active"
-            and all(row.get(name) for name in ("agent_id", "address", "adapter"))
-            and counts[_route_label(row)] == 1
-            and key not in excluded
-        ):
-            groups.setdefault(row["agent_id"], []).append(row)
+    for row in _turn_candidates(rows, excluded):
+        groups.setdefault(row["agent_id"], []).append(row)
     agents = sorted(groups)
     if not agents:
         return [], logs
@@ -354,6 +470,41 @@ async def _probe_adapters(
         if status is not None:
             item["http_status"] = str(status)
         result.logs.append(item)
+
+
+async def _probe_binding_endpoints(
+    platform: Platform, rows: list[dict[str, str]], path: str, result: CycleResult
+) -> None:
+    """One GET per distinct derived URL; URLs stay out of output. @spec TURN-CANARY-12"""
+    urls: dict[str, list[str]] = {}
+    outcomes: dict[str, str] = {}
+    for row in rows:
+        endpoint = row.get("endpoint") or ""
+        if row.get("deployment_status") != "active" or not endpoint:
+            continue
+        label = _route_label(row)
+        url = binding_health_url(endpoint, path)
+        if url is None:
+            outcomes.setdefault(label, "endpoint_invalid")
+            continue
+        urls.setdefault(url, []).append(label)
+    ordered = sorted(urls)
+    if len(ordered) > MAX_BINDING_HEALTH:
+        result.record("binding_adapter", "limit")
+    for url in ordered[:MAX_BINDING_HEALTH]:
+        try:
+            outcome, status = await platform.adapter_health(url)
+        except Exception as exc:  # noqa: BLE001 - a probe failure is a down adapter
+            outcome, status = "unreachable", None
+            result.record("binding_adapter", "unreachable", exc)
+        item = {"phase": "binding_adapter", "outcome": outcome}
+        if status is not None:
+            item["http_status"] = str(status)
+        result.logs.append(item)
+        for label in urls[url]:
+            if outcomes.get(label, "ok") == "ok":
+                outcomes[label] = outcome
+    result.binding_adapter_health.update(outcomes)
 
 
 async def _check_bindings(
@@ -511,8 +662,11 @@ async def run_cycle(
     binding_checks: bool = False,
     identity_kinds: Sequence[str] = ("slack",),
     adapters: Mapping[str, str] | None = None,
+    declared: Sequence[Route] | None = None,
+    binding_health_path: str | None = None,
+    coverage: bool = False,
 ) -> CycleResult:
-    """Probe serially; hold on uncertain cleanup. @spec TURN-CANARY-1 TURN-CANARY-10"""
+    """Probe serially; hold on uncertain cleanup. @spec TURN-CANARY-1 TURN-CANARY-13"""
     Limits(
         turn_deadline=turn_deadline,
         cleanup_deadline=cleanup_deadline,
@@ -528,10 +682,11 @@ async def run_cycle(
         journal is not None
         and (journal.pending is not None or journal.data.get("cleanup_blocked") is True)
     )
+    observes = binding_checks or declared is not None or binding_health_path or coverage
     if held:
         result.cleanup_degraded = True
         result.record("cleanup", "previous_unconfirmed")
-        if not binding_checks:
+        if not observes:
             return result
     if selected is not None and len(selected) > max_targets:
         raise ValueError("selected routes exceed maximum")
@@ -543,6 +698,8 @@ async def run_cycle(
         result.record("inventory", "failed", exc)
         return result
     result.inventory_labels = {_route_label(row) for row in rows}
+    for row in rows:
+        result.route_agents.setdefault(_route_label(row), row.get("agent", ""))
     targets: list[dict[str, str]] = []
     if not held:
         try:
@@ -570,6 +727,14 @@ async def run_cycle(
         )
     if binding_checks:
         await _check_bindings(platform, rows, set(result.target_last_run), identity_kinds, result)
+    if declared is not None:
+        result.drift = binding_drift(rows, declared)
+    if binding_health_path is not None:
+        await _probe_binding_endpoints(platform, rows, binding_health_path, result)
+    if coverage:
+        result.uncovered_agents = uncovered_agents(
+            rows, exclude=exclude, health_path=binding_health_path
+        )
     if result.success:
         result.last_success = time.time()
     return result
@@ -671,7 +836,7 @@ class RuntimePlatform:
         quota_url: str | None = None,
         quota_token: str | None = None,
         quota_resource: str = "count/pods",
-        quota_min_free: int = 1,
+        quota_min_free: str = "1",
     ) -> None:
         if not re.fullmatch(r"[a-z_][a-z0-9_]*", schema):
             raise ValueError("invalid database schema")
@@ -685,7 +850,7 @@ class RuntimePlatform:
             raise ValueError("API URL must be an HTTP(S) origin without query or fragment")
         if not all((database_url, valkey_url, api_key, stream)):
             raise ValueError("database, Valkey, API key, and stream must be explicit")
-        if quota_url and (not quota_token or quota_min_free < 1):
+        if quota_url and (not quota_token or _quantity(quota_min_free) <= 0):
             raise ValueError("quota check requires a token and positive minimum free capacity")
         import httpx
         import redis.asyncio as redis
@@ -722,7 +887,7 @@ class RuntimePlatform:
         from sqlalchemy import text
 
         sql = text(f"""
-            SELECT a.id AS agent_id, a.name AS agent, c.kind, c.address, c.adapter,
+            SELECT a.id AS agent_id, a.name AS agent, c.kind, c.address, c.adapter, c.endpoint,
                    CASE WHEN EXISTS (
                        SELECT 1 FROM {self._schema}.deployments d
                        WHERE d.agent_id = a.id AND d.status = 'active'
@@ -751,18 +916,8 @@ class RuntimePlatform:
             )
             if response.status_code != 200:
                 return None
-            body = response.json()
-            items = body.get("items")
-            if not isinstance(items, list) or not items:
-                return None
-            for item in items:
-                status = item["status"]
-                hard = int(status["hard"][self._quota_resource])
-                used = int(status["used"][self._quota_resource])
-                if hard - used < self._quota_min_free:
-                    return False
-            return True
-        except (KeyError, TypeError, ValueError):
+            return quota_has_headroom(response.json(), self._quota_resource, self._quota_min_free)
+        except ValueError:
             return None
 
     async def enqueue(self, turn: QueuedTurn) -> None:
@@ -839,12 +994,28 @@ def _route_value(route: str) -> str:
     return json.dumps({"kind": kind, "address": address, "adapter": adapter}, sort_keys=True)
 
 
-def prometheus_text(result: CycleResult, prefix: str = "turn_canary") -> str:
-    """Portable bounded exposition of the last cycle. @spec TURN-CANARY-6 TURN-CANARY-10"""
+def _check_layout(labels: str) -> str:
+    if labels not in ROUTE_LABEL_LAYOUTS:
+        raise ValueError("route label layout must be route or split")
+    return labels
+
+
+def prometheus_text(
+    result: CycleResult, prefix: str = "turn_canary", labels: str = "route"
+) -> str:
+    """Portable bounded exposition of the last cycle. @spec TURN-CANARY-6 TURN-CANARY-14"""
     _check_prefix(prefix)
+    _check_layout(labels)
 
     def line(name: str, value: int | float, labels: str = "") -> str:
         return f"{prefix}_{name}{{{labels}}} {value}\n" if labels else f"{prefix}_{name} {value}\n"
+
+    def route_labels(route: str, **extra: str) -> str:
+        if labels == "route":
+            return _labels(route=_route_value(route), **extra)
+        kind, address, adapter = route.split("|", 2)
+        agent = result.route_agents.get(route, "")
+        return _labels(agent=agent, kind=kind, address=address, adapter=adapter, **extra)
 
     output = [
         line("cycle_success", int(result.success)),
@@ -857,7 +1028,7 @@ def prometheus_text(result: CycleResult, prefix: str = "turn_canary") -> str:
     if result.rotation is not None:
         output.append(line("rotation", result.rotation))
     for route, last_run in sorted(result.target_last_run.items()):
-        label = _labels(route=_route_value(route))
+        label = route_labels(route)
         success = int(result.target_success.get(route, False))
         output.append(line("target_success", success, label))
         output.append(line("target_last_run_timestamp_seconds", last_run, label))
@@ -870,20 +1041,32 @@ def prometheus_text(result: CycleResult, prefix: str = "turn_canary") -> str:
                 )
             )
     for route, outcome in sorted(result.binding_checks.items()):
-        label = _labels(route=_route_value(route), outcome=outcome)
+        label = route_labels(route, outcome=outcome)
         output.append(line("binding_check_success", int(outcome == "ok"), label))
         if route in result.binding_check_last_run:
             output.append(
                 line(
                     "binding_check_last_run_timestamp_seconds",
                     result.binding_check_last_run[route],
-                    _labels(route=_route_value(route)),
+                    route_labels(route),
                 )
             )
     for adapter, outcome in sorted(result.adapter_health.items()):
         output.append(
             line("adapter_up", int(outcome == "ok"), _labels(adapter=adapter, outcome=outcome))
         )
+    for route, outcome in sorted(result.binding_adapter_health.items()):
+        output.append(
+            line("binding_adapter_up", int(outcome == "ok"), route_labels(route, outcome=outcome))
+        )
+    if result.drift is not None:
+        for route, side in sorted(result.drift.items()):
+            output.append(line("binding_drift", 1, route_labels(route, side=side)))
+        output.append(line("binding_drift_total", len(result.drift)))
+    if result.uncovered_agents is not None:
+        for agent in result.uncovered_agents:
+            output.append(line("agent_uncovered", 1, _labels(agent=agent)))
+        output.append(line("uncovered_agents", len(result.uncovered_agents)))
     return "".join(output)
 
 
@@ -896,12 +1079,14 @@ class Monitor:
         limits: Limits,
         *,
         prefix: str = "turn_canary",
+        labels: str = "route",
         clock: Callable[[], float] = time.monotonic,
         log: Callable[[dict[str, str]], None] | None = None,
     ) -> None:
         self._run_once = run_once
         self._limits = limits
         self._prefix = _check_prefix(prefix)
+        self._labels = _check_layout(labels)
         self._clock = clock
         self._log = log
         self._started = clock()
@@ -929,12 +1114,18 @@ class Monitor:
         view.last_success = result.last_success or view.last_success
         view.rotation = result.rotation if result.rotation is not None else view.rotation
         view.adapter_health = dict(result.adapter_health)
+        if result.drift is not None:
+            view.drift = dict(result.drift)
+        if result.uncovered_agents is not None:
+            view.uncovered_agents = list(result.uncovered_agents)
+        view.route_agents.update(result.route_agents)
         per_route = (
             "target_success",
             "target_last_run",
             "target_last_success",
             "binding_checks",
             "binding_check_last_run",
+            "binding_adapter_health",
         )
         for name in per_route:
             getattr(view, name).update(getattr(result, name))
@@ -950,7 +1141,11 @@ class Monitor:
         self._last_finished = self._clock()
 
     def metrics_text(self) -> str:
-        body = prometheus_text(self._view, self._prefix) if self._view is not None else ""
+        body = (
+            prometheus_text(self._view, self._prefix, self._labels)
+            if self._view is not None
+            else ""
+        )
         return body + f"{self._prefix}_cycle_overruns_total {self.overruns}\n"
 
     async def run_forever(self, stop: asyncio.Event) -> None:
@@ -1060,7 +1255,11 @@ class Config:
     quota_url: str | None
     quota_token: str | None
     quota_resource: str
-    quota_min_free: int
+    quota_min_free: str
+    declared: list[Route] | None
+    binding_health_path: str | None
+    coverage: bool
+    route_labels: str
 
 
 def _routes(raw: str, name: str) -> list[Route]:
@@ -1091,6 +1290,18 @@ def _adapters(raw: str) -> dict[str, str]:
         ):
             raise ValueError("adapter health URLs must be HTTP(S) without user information")
     return dict(value)
+
+
+def _health_path(raw: str) -> str:
+    if not raw.startswith("/") or raw.startswith("//") or "?" in raw or "#" in raw:
+        raise ValueError("TURN_CANARY_BINDING_ADAPTER_HEALTH must be an absolute path")
+    return raw
+
+
+def _min_free(raw: str) -> str:
+    if _quantity(raw) <= 0:
+        raise ValueError("TURN_CANARY_QUOTA_MIN_FREE must be a positive quantity")
+    return raw
 
 
 def _listen(raw: str) -> tuple[str, int]:
@@ -1157,7 +1368,19 @@ def parse_config(environ: Mapping[str, str]) -> Config:
         quota_url=environ.get("TURN_CANARY_QUOTA_URL"),
         quota_token=environ.get("TURN_CANARY_QUOTA_TOKEN"),
         quota_resource=environ.get("TURN_CANARY_QUOTA_RESOURCE", "count/pods"),
-        quota_min_free=int(environ.get("TURN_CANARY_QUOTA_MIN_FREE", "1")),
+        quota_min_free=_min_free(environ.get("TURN_CANARY_QUOTA_MIN_FREE", "1")),
+        declared=(
+            _routes(environ["TURN_CANARY_DECLARED_BINDINGS"], "TURN_CANARY_DECLARED_BINDINGS")
+            if environ.get("TURN_CANARY_DECLARED_BINDINGS")
+            else None
+        ),
+        binding_health_path=(
+            _health_path(environ["TURN_CANARY_BINDING_ADAPTER_HEALTH"])
+            if environ.get("TURN_CANARY_BINDING_ADAPTER_HEALTH")
+            else None
+        ),
+        coverage=environ.get("TURN_CANARY_COVERAGE") == "1",
+        route_labels=_check_layout(environ.get("TURN_CANARY_ROUTE_LABELS", "route")),
     )
 
 
@@ -1199,6 +1422,9 @@ async def main() -> int:
                 binding_checks=config.binding_checks,
                 identity_kinds=config.identity_kinds,
                 adapters=config.adapters,
+                declared=config.declared,
+                binding_health_path=config.binding_health_path,
+                coverage=config.coverage,
             )
             journal.save_result(result)
         return result
@@ -1207,7 +1433,13 @@ async def main() -> int:
         if config.listen is not None:
             import signal
 
-            monitor = Monitor(one_cycle, limits, prefix=config.metric_prefix, log=_print_log)
+            monitor = Monitor(
+                one_cycle,
+                limits,
+                prefix=config.metric_prefix,
+                labels=config.route_labels,
+                log=_print_log,
+            )
             stop = asyncio.Event()
             loop = asyncio.get_running_loop()
             for signum in (signal.SIGINT, signal.SIGTERM):
@@ -1223,7 +1455,9 @@ async def main() -> int:
     finally:
         await platform.close()
     if config.metrics_path:
-        Path(config.metrics_path).write_text(prometheus_text(result, config.metric_prefix))
+        Path(config.metrics_path).write_text(
+            prometheus_text(result, config.metric_prefix, config.route_labels)
+        )
     for item in result.logs:
         _print_log(item)
     return 0 if result.success else 1
