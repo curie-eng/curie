@@ -45,7 +45,8 @@ does not enforce it, and a different bundle can choose differently.
 
 The factory bundle also distributes a text-only `prepare-factory-ticket` skill
 for your existing local coding agent. It inspects a repository, clarifies intent,
-and writes a reviewed draft or proposed ticket set. It requires no host Python,
+and prepares a reviewed specification or proposed ticket set, with optional
+approved publication and configured-label factory selection. It requires no host Python,
 parser installation, Curie service or container runtime. Repository-specific
 verification uses the repository's own prerequisites and records any missing ones.
 
@@ -64,10 +65,13 @@ The nested preparation skill is not registered as a factory execution skill.
 Its Markdown references stay inside the copied folder, so no Curie source checkout
 or Python package is needed to use it.
 
-This first release records deployment readiness as `unvalidated`, including after
-developer review. It does not invoke a parser or deployment validator, create
-tracker issues, apply factory labels, or implement the requested feature.
-Connected deployment validation and explicit handoff remain #4488 and #4490.
+Deployment readiness stays `unvalidated`, including after developer review,
+publication and selection. After presenting the complete specification, the skill
+asks whether to publish only, publish and start the factory, or retain local drafts.
+It uses existing authenticated tracker tools, verifies the published body, then
+adds the confirmed factory label only to explicitly selected eligible issues.
+The evidence report remains local. Connected deployment validation and validated
+handoff remain #4488 and #4490; the skill does not implement the requested feature.
 The adjacent Python library is for managed evaluation and contributor tests;
 it is not a client installation requirement.
 

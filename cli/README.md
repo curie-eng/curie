@@ -50,7 +50,7 @@ Installation uses the CLI's embedded files and needs no network, Python, Docker
 or Curie deployment. The result prints invocation and refresh instructions;
 client settings and activation consent still apply. See the
 [preparation guide](../docs/guides/factory-preparation.md) for client paths,
-manual installation and the draft-only workflow.
+manual installation, specification review, publication and factory selection.
 
 ## Interactive mode
 

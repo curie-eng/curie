@@ -105,5 +105,7 @@ bash scripts/check-docs.sh
 ```
 No deployed admission path consumes this parser yet. #4589 supplies the generic
 isolated evaluation boundary; #4487 and #4488 consume the factory evaluator
-through it. The first preparation release produces reviewed unvalidated drafts;
-it does not run deployment evaluation or select tracker work.
+through it. The [preparation skill](factory-preparation.md) produces reviewed
+unvalidated specifications and can publish and select them through the existing
+configured-label intake after explicit developer approval. It does not run
+deployment evaluation or claim a validated handoff.

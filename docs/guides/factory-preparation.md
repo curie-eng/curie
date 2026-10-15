@@ -1,15 +1,16 @@
-# Prepare a factory specification locally
+# Prepare, publish and select a factory specification
 
 Use the factory's `prepare-factory-ticket` skill in your existing coding agent to
 turn an existing ticket or new intent into a reviewed specification. For larger
 requests it can propose complete child specifications, coverage and dependency
-ordering. Preparation writes local artifacts and leaves the requested feature
-for the factory to implement.
+ordering. The skill writes local artifacts, presents the full specification for
+review, then offers to publish it and select eligible issues for the factory.
 
-This first release produces **unvalidated drafts**. It includes no connected
-deployment validator or tracker handoff. Developer review and local repository
-evidence do not prove that Curie can execute a specification. Connected validation
-and explicit handoff are tracked in #4488 and #4490.
+Specifications remain **deployment-unvalidated**, even after publication and
+selection. Developer review and local repository evidence do not prove that Curie
+can execute a specification. Publication uses your coding agent's existing tracker
+connection, and selection uses the deployment's configured issue label. Connected
+validation and validated handoff remain tracked in #4488 and #4490.
 
 ## Get the skill
 
@@ -122,10 +123,45 @@ fingerprints cannot be computed with existing tooling, the agent saves an
 incomplete mapping and names the gap rather than inventing a valid envelope or
 requiring a new client runtime.
 
-The report remains `unvalidated` after review. The agent must not claim that a
-deterministic parser, Curie deployment evaluator or tracker handoff ran. You can
-use the reviewed artifacts to continue planning; execution readiness requires the
-later connected validation and explicit handoff workflow.
+## Publish and start
+
+Once the questions are resolved, the skill presents the complete specification,
+not just its evidence report. Review each full title/body and destination. For a
+split, review all children, coverage and dependency ordering together. Corrections
+return to review before any publication.
+
+After you approve the spec, choose **publish only**, **publish and start the
+factory**, or **keep local drafts**. For example:
+
+> Publish this reviewed specification to the existing issue and start the factory
+> using the confirmed configured label.
+
+The agent asks for this choice with the actual repository, issue identities and
+factory label. A combined publish-and-start approval covers both operations;
+there is no second confirmation between them when the reviewed plan is unchanged.
+Spec approval alone does not authorize publication. Publish-only never selects
+work. The usual label is `curie-factory`, but the skill confirms your deployment's
+actual label and intended repository instead of assuming the default.
+
+With an existing authenticated tracker connection, the agent updates the original
+issue or creates the agreed new issues, then reads back their full content. It
+keeps `report.md` local and returns real tracker links. If you publish manually,
+give it the links so it can verify and reuse those issues. Missing tracker access
+leaves an actionable gap rather than a claim that local files were published.
+
+Before selection, the agent rechecks the approved content, open state and actual
+prerequisites. It adds the configured label only to the explicitly selected,
+eligible issues. Split children remain unselected until their prerequisites merge
+into their base; the parent epic is not automatically selected. Existing labels
+are preserved, and an already selected issue is not relabelled to restart it.
+Conflicting remote edits require another review. Partial or timed-out operations
+are reconciled against actual tracker state before retrying to avoid duplicates.
+
+The result distinguishes publication, observed selection and confirmed factory
+status. A verified label means selected for intake; queued or running requires an
+observed factory status. This workflow does not configure a deployment or establish
+execution readiness. The report stays `unvalidated`, and no parser or deployment
+evaluator result is invented.
 
 ## Scope of the first release
 

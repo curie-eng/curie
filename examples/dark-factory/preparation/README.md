@@ -27,6 +27,15 @@ Contributor checks run from the Curie source workspace:
 uv run pytest examples/tests/test_factory_specification.py -q
 ```
 
-The first local skill release writes reviewed drafts with deployment readiness
-unvalidated. Connected validation and explicit handoff remain #4488 and #4490.
+The skill presents complete drafts for review, then offers publication only,
+publication with factory selection, or keeping local drafts. Approved publication
+uses the host agent's existing authenticated tracker tools; the skill verifies
+published content before applying the confirmed factory label to eligible issues.
+No tracker connection is needed for drafting or installation. Readiness remains
+unvalidated. Connected validation and validated handoff remain #4488 and #4490.
 See the factory bundle README for rendering and provider-specific installation.
+
+Publication behavior replay scenarios live in [evals/README.md](evals/README.md).
+They use synthetic tracker state to exercise approval, publication, selection and
+recovery without writing real issues. These are opt-in host-agent evaluations,
+not automated CI tests or proof of deployed factory intake.

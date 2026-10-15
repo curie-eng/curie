@@ -101,7 +101,7 @@ envelope contains these fields:
 
 IDs begin with an ASCII letter and contain at most 64 ASCII letters, numbers,
 underscores or hyphens. Save a local ID-to-child-file mapping beside the envelope.
-IDs do not resolve to tracker issues during preparation. Keep external native
+IDs do not resolve to tracker issues during local drafting. Keep external native
 prerequisites visible in each child's Blocked by section.
 
 A child fingerprint is lowercase SHA256 of its exact UTF-8 Markdown bytes.
@@ -115,5 +115,108 @@ Review unknown references, duplicate IDs or edges, cycles, invalid criterion
 references, missing coverage/integration ownership and changed child bytes. This
 is manual preparation review in this release, not deterministic validation.
 Prerequisites must merge into the selected base before a dependent can be ready
-for later validation and explicit selection. No draft, mapping or graph grants
-permission to create issues, write native dependencies or start factory runs.
+for selection. No draft, mapping or graph itself grants permission to create
+issues, write native dependencies or start factory runs.
+
+
+## Publication and factory selection
+
+Use the host agent's existing authenticated tracker connector or CLI. The skill
+requires no particular tracker client or local programming runtime. For GitHub,
+issue create/update and label operations are enough; do not invent Curie validation
+or handoff commands. If access is missing, preserve the drafts and ask the developer
+to enable their normal tracker connection, or accept manually published issue
+links and verify them before selection. Never claim a missing write succeeded.
+
+### Review and authorization
+
+Present the full final title and canonical body for each issue, the target
+repository, existing issue identities, and proposed dependency mapping. Keep local
+preparation evidence and `report.md` out of the published issue unless specifically
+requested. Preserve original requirements and human edits in the reviewed body.
+Resolve behavioral questions before final intent review; real prerequisites and
+operator gaps may remain visible without pretending they are satisfied.
+
+After the developer approves that complete specification, offer these choices:
+
+- **Publish only:** create or update the reviewed issues without factory selection.
+- **Publish and start the factory:** publish, verify, then label the named eligible
+  issues for the identified factory. Explain that this starts implementation and
+  may use the deployment's model budget.
+- **Keep local drafts:** make no tracker changes.
+
+For selection, identify the actual repository and configured factory label from
+trusted configuration or developer confirmation. The usual default is
+`curie-factory`; do not assume every deployment uses it, use a status label such as
+`curie-factory:queued`, or create a missing label to simulate configured intake.
+Confirm that this is the repository the developer intends the factory to watch.
+Include the resolved label and selected issues in the authorization question.
+If that information is missing, publication-only can proceed when authorized;
+selection waits for the missing configuration and explicit consent. Existing
+approval carries forward while its exact content and action remain unchanged.
+
+### Publish and verify
+
+1. Re-read each existing issue immediately before updating it. Compare its title
+   and body with the source snapshot used for review. If it changed, preserve the
+   remote edits, reconcile the draft and return for review of the changed spec.
+   Read labels/state too: do not edit an already selected issue as part of a new
+   run, reopen a closed issue or remove/re-add its label without explicit direction
+   after inspecting existing work. These actions can replace or cancel a run.
+2. Update the original issue rather than creating a duplicate. For new work, create
+   only the reviewed issues, initially without the factory label. Persist actual
+   returned issue IDs and URLs in the local report as each succeeds. For splits,
+   obtain approval of mechanical substitutions of local child IDs with returned
+   issue links and the exact dependency relationships before creating children.
+   Resolve those links in topological order; make no unreviewed semantic changes.
+   Preserve the reviewed snapshots and save the exact resolved published bodies
+   separately with their real issue mapping. Link substitutions change body bytes:
+   refresh the corresponding child fingerprints and envelope with existing tools,
+   or explicitly mark the mapping incomplete and any prior envelope stale. Never
+   present pre-substitution fingerprints as identifying the published bodies.
+   Write native tracker dependency edges only if separately included in the
+   approved plan and supported by available tools. Retain canonical Blocked by
+   relationships even when native edges are unavailable, and report that limitation.
+3. Read each issue back and compare its title/body with the approved final content,
+   including approved ID-to-link substitutions. Do not select a different, partial,
+   or concurrently edited body. A changed body requires reconciliation and renewed
+   review, not overwriting the change or applying a label anyway. Ordinary issue
+   APIs may not offer an atomic compare-and-update; do not claim this check prevents
+   every concurrent edit. Recheck before selection and report observed conflicts.
+4. If the developer publishes manually, read the supplied links, verify repository
+   and full content against the reviewed spec, and reuse those issues. Do not create
+   replacements. Ask only for any still missing selection authorization.
+
+### Select eligible issues
+
+After verified publication and explicit start authorization, recheck the issue
+body, open state, current labels and prerequisites. Select only the named issues
+whose prerequisites are observed merged into the selected base and whose remaining
+operator gaps do not prevent the documented verification. If a gap cannot be
+checked, publish without selecting that issue and explain the remaining action.
+For a split, select only eligible roots; record blocked children and the merge/base
+condition for later selection. Do not label the parent epic or all children merely
+because the developer approved the ticket set. Later dependent selection requires
+fresh prerequisite checks and the applicable explicit start authorization.
+
+Use the verified configured label through the host tracker tool, preserving other
+labels. If already present, report already selected and inspect available status;
+do not toggle it to force another run. If absent, add it once, then read labels
+back. Report **selected** only when the label is observed. Selection is an intake
+request, not evidence of a queued or running model turn: claim queued/running only
+when the factory status actually confirms it. Leave readiness `unvalidated`.
+Never deploy a factory, change model/budget settings, or invent evaluator results
+to get past a failed selection. A missing label, denied permission or unavailable
+intake is an actionable setup gap, not permission to configure the deployment.
+
+### Partial completion and retries
+
+Record publication and selection separately per actual issue URL: unpublished,
+published and verified, selection pending, selected, or outcome unknown. On a
+failed or timed-out write, re-read tracker state and reconcile with the recorded
+operation before retrying. Never blindly repeat issue creation: search/reconcile
+against the reviewed repository/title/body and known links, and ask when identity
+remains ambiguous. Resume only missing operations whose authorization still
+applies. On partial split publication, preserve created issues and local mappings;
+create no duplicates, delete nothing and start no child whose dependency links
+are incomplete. Report exact completed actions and what needs intervention.
