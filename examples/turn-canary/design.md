@@ -278,6 +278,19 @@ cleanup.
   check, binding adapter and drift series, in both the file and HTTP outputs;
   adapter series of TURN-CANARY-9 keep their `adapter` label.
 
+- **TURN-CANARY-15: binding kind exclusion.** The operator may name binding
+  kinds the monitor ignores, as a comma-separated list of distinct nonblank
+  kinds, empty by default. After each inventory read, rows of an excluded kind
+  are removed before every per-binding observation: TURN-CANARY-1 selection,
+  TURN-CANARY-7 discovery, TURN-CANARY-8 binding checks, TURN-CANARY-11 drift,
+  TURN-CANARY-12 binding health and TURN-CANARY-13 coverage. An excluded
+  binding is therefore never turned, checked, probed or compared, and an agent
+  whose only bindings are of excluded kinds is not reported as uncovered. Its
+  earlier per-route series are dropped like those of any route the inventory no
+  longer lists. Exclusion matches the stored kind exactly; agent names,
+  addresses and adapters are never exclusion criteria. With the list empty,
+  every cycle behaves as before.
+
 ## Verification
 
 Unit tests under `examples/tests` exercise the selected binding and
@@ -287,7 +300,8 @@ quantity parsing, limits, and safe diagnostics. They also exercise
 deterministic discovery and rotation, the model-free binding outcomes, adapter
 probe outcomes against a local HTTP server, the exporter routes and
 non-overlapping loop, the metric prefix, quantity parsing, drift, binding
-adapter health, coverage and the split label layout, all with synthetic rows. Isolated runtime
+adapter health, coverage, the split label layout and binding kind
+exclusion, all with synthetic rows. Isolated runtime
 qualification uses a disposable agent and selected binding with a real model
 and protected read-only runner, verifies a delivered nonce, inspects the
 runner trace for no action or approval, confirms the reset result, and checks
