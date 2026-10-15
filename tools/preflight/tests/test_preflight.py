@@ -169,6 +169,39 @@ def load_tool() -> ModuleType:
     return module
 
 
+@pytest.mark.parametrize(
+    ("body", "needs_stack"),
+    [
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding.py::"
+            "test_second_factory_agent_uses_initial_tracker_binding",
+            False,
+        ),
+        ("Fix pin: apps/api/tests/test_agents.py::test_create_agent", True),
+        ("Fix pin: cli/tests/verify_fix_pin.rs::ci_gate_pins", True),
+        ("Fix pin: tools/factory-e2e/tests/test_scripted_driver.py::test_example", True),
+        ("Fix pin: tools/factory-e2e/tests/test_c4_initial_binding_extra.py::test_example", True),
+        ("Fix pin: n/a - documentation only", False),
+        ("Fix pin: --help", False),
+        ("<!-- Fix pin: apps/api/tests/test_agents.py::test_create_agent -->", False),
+        ("", False),
+    ],
+)
+def test_body_service_selection_uses_the_parsed_stack_requirement(
+    tmp_path: Path,
+    body: str,
+    needs_stack: bool,
+) -> None:
+    root = tmp_path / "checkout"
+    checker = root / "tools/fix-pin-ci/check.py"
+    checker.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "tools/fix-pin-ci/check.py", checker)
+    body_file = tmp_path / "body.md"
+    body_file.write_text(body)
+
+    assert load_tool().body_needs_services(root, body_file) is needs_stack
+
+
 def test_private_services_handoff_protected_source_resources() -> None:
     from urllib.parse import unquote, urlsplit
 

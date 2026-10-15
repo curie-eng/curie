@@ -14,6 +14,7 @@ use std::process::{Output, Stdio};
 
 use anyhow::Result;
 
+use crate::api_requests::ChannelBindingWrite;
 use crate::exit::CliError;
 use crate::factory_intake::{intake_values, FactoryIntakeOpts};
 use crate::ops::{require_on_path, CommonOpts};
@@ -1613,6 +1614,10 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                 chart,
             } => {
                 lines.push(bundle_line(bundle.as_deref(), runner_image.as_deref()));
+                lines.push(initial_agent_line(
+                    agent,
+                    &github::initial_binding(repos, jira_binding.as_deref(), label.as_deref()),
+                ));
                 let dir = match bundle {
                     None => bundle_dir(namespace, release, agent),
                     Some(dir) => dir.clone(),
@@ -1650,6 +1655,39 @@ pub fn describe(planned: &Planned) -> Vec<String> {
         }
     }
     lines
+}
+
+fn initial_agent_line(agent: &str, binding: &ChannelBindingWrite) -> String {
+    let label = match &binding.trigger_label {
+        Some(label) => format!("label {label}"),
+        None => "the tracker default label".to_string(),
+    };
+    format!(
+        "create agent {agent} only if absent, with initial surface {}={} and {label}; preserve an existing agent",
+        binding.kind, binding.address
+    )
+}
+
+async fn ensure_factory_agent(
+    common: &CommonOpts,
+    agent: &str,
+    binding: ChannelBindingWrite,
+    repo_full_name: Option<&str>,
+) -> Result<()> {
+    let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let (url, key, port_forward) = crate::commands::resolve_cluster_conn(
+        env("CURIE_API_URL"),
+        env("CURIE_API_KEY"),
+        &common.namespace,
+        &common.release,
+        false,
+    )
+    .await?;
+    let result = crate::api::ApiClient::new(&url, &key)?
+        .find_or_create_agent(agent, binding, repo_full_name)
+        .await;
+    drop(port_forward);
+    result.map(|_| ())
 }
 
 /// The plan line for enrolling `agent` for forge egress.
@@ -2801,6 +2839,7 @@ mod tests {
             "configure factory intake factory.intake=poll for acme/widgets with --app-id 12345 --private-key-file /keys/app.pem and no webhook secret; the same helm upgrade binds the dark factory runner image".to_string(),
             "configure agentSandbox.runnerEnv.dark-factory.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000 with helm upgrade --reuse-values unless the release already records that string; preserve sibling values".to_string(),
             "render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image".to_string(),
+            "create agent dark-factory only if absent, with initial surface github=acme/widgets and the tracker default label; preserve an existing agent".to_string(),
             format!("curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir {} --agent dark-factory --env prod --repo acme/widgets", dir.display()),
             "curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=acme/widgets".to_string(),
             "curie cluster overrides dark-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 10800".to_string(),

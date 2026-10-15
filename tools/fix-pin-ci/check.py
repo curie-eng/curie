@@ -59,6 +59,7 @@ SELECTOR = re.compile(
     r"|charts/curie/ci/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.sh"
     r")"
 )
+INITIAL_BINDING_MODULE = "tools/factory-e2e/tests/test_c4_initial_binding.py"
 BUG_LABEL = "bug"
 # Discovery surfaces and pin tiers share this order. A pin whose location maps
 # below the closed issue's found:* label fails unless the body also carries
@@ -104,7 +105,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--needs-curie",
         action="store_true",
-        help="report whether this body would invoke the curie binary",
+        help="report whether this body needs the curie binary, dev stack, or kind",
     )
     return parser
 
@@ -319,12 +320,18 @@ def _discovery_tier(labels: Sequence[str], body: str = "") -> str | None:
     return max(found, key=lambda tier: TIER_RANK[tier])
 
 
-def _needs_curie(body: str) -> bool:
-    """True iff ``main`` would invoke the curie binary for this body."""
+def _pin_requirements(body: str) -> dict[str, bool]:
     try:
-        return _declaration(body).selector is not None
+        selector = _declaration(body).selector
     except ValueError:
-        return False
+        selector = None
+    needed = selector is not None
+    needs_kind = selector is not None and selector.split("::", 1)[0] == INITIAL_BINDING_MODULE
+    return {
+        "needed": needed,
+        "needs_stack": needed and not needs_kind,
+        "needs_kind": needs_kind,
+    }
 
 
 def _report_needs_curie(event_path: Path) -> int:
@@ -334,19 +341,21 @@ def _report_needs_curie(event_path: Path) -> int:
         return 1
 
     try:
-        needed = _needs_curie(_body(_event(event_path)))
+        requirements = _pin_requirements(_body(_event(event_path)))
     except ValueError as error:
         print(f"Fix pin declaration error: {error}", file=sys.stderr)
         return 1
 
-    line = f"needed={'true' if needed else 'false'}\n"
+    lines = "".join(
+        f"{key}={'true' if value else 'false'}\n" for key, value in requirements.items()
+    )
     try:
         with Path(output_path).open("a", encoding="utf-8") as stream:
-            stream.write(line)
+            stream.write(lines)
     except OSError as error:
         print(f"Fix pin cargo guard error: could not write GITHUB_OUTPUT: {error}", file=sys.stderr)
         return 1
-    sys.stdout.write(line)
+    sys.stdout.write(lines)
     return 0
 
 

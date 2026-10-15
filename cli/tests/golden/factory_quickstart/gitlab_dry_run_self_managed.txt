@@ -14,6 +14,7 @@ write factory.enabled=true, factory.intake=poll, factory.codeHosts and factory.t
 forge egress for gitlab: 127.0.0.1/32 TCP <port>
 enroll dark-factory for forge egress: helm upgrade --reset-then-reuse-values --set factory.sandboxEgress.dark-factory=true unless the release already records it; the API does not roll
 render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image
+create agent dark-factory only if absent, with initial surface gitlab=factory-fixture/nested/widgets and the tracker default label; preserve an existing agent
 curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir <dir>/curie-factory-quickstart-curie-curie/dark-factory --agent dark-factory --env prod --chart <chart>
 curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add gitlab=factory-fixture/nested/widgets
 curie cluster overrides dark-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 10800
