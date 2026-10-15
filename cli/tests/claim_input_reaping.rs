@@ -145,10 +145,9 @@ fn docker(tools: &Path, database: &Path, args: &[&str]) -> Output {
 fn local_down(dir: &Path, case: &str) -> Output {
     let database = dir.join("docker.sqlite");
     crate::support::executable::install_in(dir, "docker", DOCKER);
-    let path = std::env::join_paths(
-        std::iter::once(dir.to_path_buf())
-            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
-    )
+    let path = std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
     .expect("stub PATH");
     let compose = dir.join("compose.yaml");
     std::fs::write(&compose, "services: {}\n").expect("fixture compose file");
@@ -214,7 +213,11 @@ fn local_down_wipe_reaps_only_exact_worker_claim_attempt_inputs() {
     );
     assert!(containers.status.success());
     assert!(containers.stdout.is_empty() || containers.stdout == b"\n");
-    assert_eq!(volume_names(dir.path()), preserved_volumes(), "{diagnostic}");
+    assert_eq!(
+        volume_names(dir.path()),
+        preserved_volumes(),
+        "{diagnostic}"
+    );
 }
 
 #[test]

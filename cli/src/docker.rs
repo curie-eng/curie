@@ -1543,9 +1543,166 @@ async fn container_connector_secret_volume(name_or_id: &str) -> Result<Option<St
     Ok((!volume.is_empty()).then_some(volume))
 }
 
+const CLAIM_LABEL_KEY: &str = "curietech.ai/claim";
+const CLAIM_ATTEMPT_LABEL_KEY: &str = "curietech.ai/claim-attempt";
+const COMPONENT_LABEL_KEY: &str = "curietech.ai/component";
+const CLAIM_INPUT_COMPONENTS: &[&str] = &["claim-bundle", "claim-workspace", "claim-attachments"];
+pub const SANDBOX_STACK_LABEL_KEY: &str = "curietech.ai/stack";
+
+struct ClaimInputOwner {
+    claim: String,
+    attempt: String,
+}
+
+impl ClaimInputOwner {
+    fn from_labels(labels: &serde_json::Value) -> Option<Self> {
+        let (managed_key, managed_value) = SANDBOX_LABEL.split_once('=')?;
+        if labels.get(managed_key)?.as_str()? != managed_value {
+            return None;
+        }
+        let claim = labels.get(CLAIM_LABEL_KEY)?.as_str()?;
+        let attempt = labels.get(CLAIM_ATTEMPT_LABEL_KEY)?.as_str()?;
+        if claim.trim().is_empty() || uuid::Uuid::parse_str(attempt).is_err() {
+            return None;
+        }
+        Some(Self {
+            claim: claim.to_string(),
+            attempt: attempt.to_string(),
+        })
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.claim == other.claim && self.attempt == other.attempt
+    }
+}
+
+struct ClaimContainerInputs {
+    labels: serde_json::Value,
+    volumes: Vec<String>,
+}
+
+fn named_volume(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+async fn container_claim_inputs(name_or_id: &str) -> Result<Option<ClaimContainerInputs>> {
+    let (status, metadata, stderr) = docker_capture(&[
+        "container".into(),
+        "inspect".into(),
+        "--format".into(),
+        "{{json .}}".into(),
+        name_or_id.into(),
+    ])
+    .await?;
+    if !status.success() {
+        if stderr.to_ascii_lowercase().contains("no such container") {
+            return Ok(None);
+        }
+        bail!("could not inspect container '{name_or_id}' before claim input cleanup: {stderr}");
+    }
+    let metadata: serde_json::Value =
+        serde_json::from_str(&metadata).context("invalid container claim input metadata")?;
+    let labels = metadata
+        .pointer("/Config/Labels")
+        .context("container inspect omitted ownership labels")?
+        .clone();
+    let mounts = metadata
+        .get("Mounts")
+        .and_then(serde_json::Value::as_array)
+        .context("container inspect omitted mount metadata")?;
+    let volumes = mounts
+        .iter()
+        .filter(|mount| mount.get("Type").and_then(serde_json::Value::as_str) == Some("volume"))
+        .filter_map(|mount| mount.get("Name").and_then(serde_json::Value::as_str))
+        .filter(|name| named_volume(name))
+        .map(str::to_string)
+        .collect();
+    Ok(Some(ClaimContainerInputs { labels, volumes }))
+}
+
+async fn claim_input_volume_labels(volume: &str) -> Result<Option<serde_json::Value>> {
+    let (status, labels, stderr) = docker_capture(&[
+        "volume".into(),
+        "inspect".into(),
+        "--format".into(),
+        "{{json .Labels}}".into(),
+        volume.into(),
+    ])
+    .await?;
+    if !status.success() {
+        if stderr.to_ascii_lowercase().contains("no such volume") {
+            return Ok(None);
+        }
+        bail!("could not inspect claim input volume '{volume}': {stderr}");
+    }
+    serde_json::from_str(&labels)
+        .context("invalid claim input volume ownership labels")
+        .map(Some)
+}
+
+async fn remove_claim_input_volume(
+    volume: &str,
+    owner: &ClaimInputOwner,
+    stack: Option<&str>,
+) -> Result<()> {
+    if !named_volume(volume) {
+        return Ok(());
+    }
+    let Some(labels) = claim_input_volume_labels(volume).await? else {
+        return Ok(());
+    };
+    let Some(actual) = ClaimInputOwner::from_labels(&labels) else {
+        return Ok(());
+    };
+    if !owner.matches(&actual)
+        || !labels
+            .get(COMPONENT_LABEL_KEY)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|component| CLAIM_INPUT_COMPONENTS.contains(&component))
+        || stack.is_some_and(|stack| {
+            labels
+                .get(SANDBOX_STACK_LABEL_KEY)
+                .and_then(serde_json::Value::as_str)
+                != Some(stack)
+        })
+    {
+        return Ok(());
+    }
+    docker(&["volume".into(), "rm".into(), volume.into()]).await?;
+    Ok(())
+}
+
+async fn remove_container_claim_inputs(inputs: ClaimContainerInputs) -> Result<()> {
+    if inputs
+        .labels
+        .get(COMPONENT_LABEL_KEY)
+        .and_then(serde_json::Value::as_str)
+        != Some("claim-runner")
+    {
+        return Ok(());
+    }
+    let Some(owner) = ClaimInputOwner::from_labels(&inputs.labels) else {
+        return Ok(());
+    };
+    let mut problems = Vec::new();
+    for volume in inputs.volumes {
+        if let Err(err) = remove_claim_input_volume(&volume, &owner, None).await {
+            problems.push(err.to_string());
+        }
+    }
+    if !problems.is_empty() {
+        bail!("claim input cleanup failed: {}", problems.join("; "));
+    }
+    Ok(())
+}
+
 pub async fn remove_container(name_or_id: &str) -> Result<()> {
     let volume = container_snapshot_volume(name_or_id).await?;
     let credentials = container_connector_secret_volume(name_or_id).await?;
+    let claim_inputs = container_claim_inputs(name_or_id).await?;
     docker(&[
         "rm".into(),
         "-f".into(),
@@ -1558,6 +1715,9 @@ pub async fn remove_container(name_or_id: &str) -> Result<()> {
     }
     if let Some(volume) = credentials {
         remove_connector_secret_volume(&volume).await?;
+    }
+    if let Some(inputs) = claim_inputs {
+        remove_container_claim_inputs(inputs).await?;
     }
     Ok(())
 }
@@ -1659,6 +1819,7 @@ pub async fn reap_filtered(filters: &[(&str, &str)]) -> ReapReport {
     let mut snapshot_volumes = Vec::new();
     let mut snapshot_problems = Vec::new();
     let mut credential_volumes = std::collections::BTreeSet::new();
+    let mut claim_inputs = Vec::new();
     for candidate in &candidates {
         match container_snapshot_volume(candidate).await {
             Ok(Some(volume)) => snapshot_volumes.push(volume),
@@ -1669,6 +1830,11 @@ pub async fn reap_filtered(filters: &[(&str, &str)]) -> ReapReport {
             Ok(Some(volume)) => {
                 credential_volumes.insert(volume);
             }
+            Ok(None) => {}
+            Err(err) => snapshot_problems.push(err.to_string()),
+        }
+        match container_claim_inputs(candidate).await {
+            Ok(Some(inputs)) => claim_inputs.push((candidate, inputs)),
             Ok(None) => {}
             Err(err) => snapshot_problems.push(err.to_string()),
         }
@@ -1712,14 +1878,114 @@ pub async fn reap_filtered(filters: &[(&str, &str)]) -> ReapReport {
             snapshot_problems.push(err.to_string());
         }
     }
+    for (candidate, inputs) in claim_inputs {
+        let removed = if rm_stdout
+            .lines()
+            .any(|removed| removed.trim() == candidate.as_str())
+        {
+            true
+        } else {
+            match container_claim_inputs(candidate).await {
+                Ok(None) => true,
+                Ok(Some(_)) => false,
+                Err(err) => {
+                    snapshot_problems.push(err.to_string());
+                    false
+                }
+            }
+        };
+        if removed {
+            if let Err(err) = remove_container_claim_inputs(inputs).await {
+                snapshot_problems.push(err.to_string());
+            }
+        }
+    }
     if !snapshot_problems.is_empty() {
         let problems = snapshot_problems.join("; ");
         report.error = Some(match report.error {
-            Some(err) => format!("{err}; snapshot cleanup: {problems}"),
-            None => format!("snapshot cleanup: {problems}"),
+            Some(err) => format!("{err}; container volume cleanup: {problems}"),
+            None => format!("container volume cleanup: {problems}"),
         });
     }
     report
+}
+
+/// Remove this stack's claim input helpers and orphaned named input volumes.
+pub async fn cleanup_stack_claim_inputs(stack: &str) -> Result<()> {
+    if stack.trim().is_empty() {
+        bail!("claim input orphan cleanup requires a nonempty stack identity");
+    }
+    let stack_label = format!("{SANDBOX_STACK_LABEL_KEY}={stack}");
+    let mut problems = Vec::new();
+    for component in CLAIM_INPUT_COMPONENTS {
+        let component_label = format!("{COMPONENT_LABEL_KEY}={component}");
+        let filters = [
+            ("label", SANDBOX_LABEL),
+            ("label", stack_label.as_str()),
+            ("label", component_label.as_str()),
+        ];
+        match labeled_container_ids_filtered(&filters).await {
+            Ok(helpers) => {
+                for helper in helpers {
+                    let inputs = match container_claim_inputs(&helper).await {
+                        Ok(Some(inputs)) => inputs,
+                        Ok(None) => continue,
+                        Err(err) => {
+                            problems.push(err.to_string());
+                            continue;
+                        }
+                    };
+                    if ClaimInputOwner::from_labels(&inputs.labels).is_none()
+                        || inputs
+                            .labels
+                            .get(COMPONENT_LABEL_KEY)
+                            .and_then(serde_json::Value::as_str)
+                            != Some(*component)
+                        || inputs
+                            .labels
+                            .get(SANDBOX_STACK_LABEL_KEY)
+                            .and_then(serde_json::Value::as_str)
+                            != Some(stack)
+                    {
+                        continue;
+                    }
+                    if let Err(err) = remove_container(&helper).await {
+                        problems.push(err.to_string());
+                    }
+                }
+            }
+            Err(err) => problems.push(err.to_string()),
+        }
+        let mut args = vec!["volume".into(), "ls".into(), "-q".into()];
+        for (key, value) in filters {
+            args.extend(["--filter".into(), format!("{key}={value}")]);
+        }
+        match docker(&args).await {
+            Ok(volumes) => {
+                for volume in volumes.lines().filter(|name| named_volume(name)) {
+                    let labels = match claim_input_volume_labels(volume).await {
+                        Ok(Some(labels)) => labels,
+                        Ok(None) => continue,
+                        Err(err) => {
+                            problems.push(err.to_string());
+                            continue;
+                        }
+                    };
+                    let Some(owner) = ClaimInputOwner::from_labels(&labels) else {
+                        continue;
+                    };
+                    if let Err(err) = remove_claim_input_volume(volume, &owner, Some(stack)).await {
+                        problems.push(err.to_string());
+                    }
+                }
+            }
+            Err(err) => problems.push(err.to_string()),
+        }
+    }
+    if !problems.is_empty() {
+        bail!("stack claim input cleanup failed: {}", problems.join("; "));
+    }
+    Ok(())
 }
 
 /// The number of containers `docker rm -f` confirmed removed: it echoes one

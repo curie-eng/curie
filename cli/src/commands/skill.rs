@@ -304,7 +304,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
     )
     .await?;
 
-    let session_id = format!("local-{}", unix_now());
+    let session_id = format!("local-{}", uuid::Uuid::new_v4());
     let mut network = opts.network.clone();
     let mut owned_network: Option<String> = None;
     let mut ollama_container: Option<String> = None;

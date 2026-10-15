@@ -1873,9 +1873,8 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
     let teardown = connector_teardown_plan_for_down(o.common.project());
     if o.common.dry_run {
         let lines = vec![
-            cmd.display(),
             format!(
-                "docker rm -f $(docker ps -a --filter label={} --filter network={} -q)",
+                "docker rm -f -v $(docker ps -a --filter label={} --filter network={} -q)",
                 docker::SANDBOX_LABEL,
                 o.common.resources.docker_network
             ),
@@ -1883,6 +1882,13 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
                 "docker rm -f $(docker ps -a -q --filter label={} --filter label={})",
                 docker::CONNECTOR_COMPONENT_LABEL,
                 docker::connector_project_label(o.common.project())
+            ),
+            cmd.display(),
+            format!(
+                "reap claim input helpers and orphaned volumes with label={} and label={}={} after validating claim and attempt ownership",
+                docker::SANDBOX_LABEL,
+                docker::SANDBOX_STACK_LABEL_KEY,
+                o.common.resources.docker_network
             ),
         ];
         return Ok(LocalDownOutput::DryRun(crate::ui::DryRunPlan { lines }));
@@ -1908,27 +1914,39 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
     } else {
         "stopping stack"
     };
-    run_step(&cl, label, "stopped", &cmd).await?;
-    for problem in docker::run_connector_teardown(&teardown).await {
-        ui.warn(&problem);
-    }
     let report = docker::reap_filtered(&[
         ("label", docker::SANDBOX_LABEL),
         ("network", o.common.resources.docker_network.as_str()),
     ])
     .await;
+    for problem in docker::run_connector_teardown(&teardown).await {
+        ui.warn(&problem);
+    }
+    let mut problems = Vec::new();
     if let Some(err) = report.error {
-        // The stack stopped, but the runner reap did not complete cleanly. Fail
-        // loudly rather than report success with orphaned containers still
-        // holding ports and credentials (#613).
         let still = if report.still_present.is_empty() {
             "unknown".to_string()
         } else {
             report.still_present.join(", ")
         };
+        problems.push(format!(
+            "reaping runner containers did not complete cleanly: {err}. Containers still present: {still}"
+        ));
+    }
+    match run_step(&cl, label, "stopped", &cmd).await {
+        Ok(_) => {
+            if let Err(err) =
+                docker::cleanup_stack_claim_inputs(&o.common.resources.docker_network).await
+            {
+                problems.push(err.to_string());
+            }
+        }
+        Err(err) => problems.push(format!("stack teardown failed: {err}")),
+    }
+    if !problems.is_empty() {
         bail!(
-            "dev stack stopped, but reaping runner containers did not complete cleanly: {err}. \
-             Still running: {still}. Remove them with `docker rm -f <id>` before restarting."
+            "local teardown did not complete cleanly: {}",
+            problems.join("; ")
         );
     }
     Ok(LocalDownOutput::Down {
