@@ -71,3 +71,11 @@ Before dependent implementation merges, prove:
 - raw tracker data is not retained in platform records/logs; idempotency, authorization, rollback and old-request owner pinning remain intact.
 
 Implementation sequencing: first review the frozen manifest declaration and prefix serialization in this proposal; then implement the declaration/schema/validation handshake in a separate contract change. Dependent deployment/admission/start code needs the nullable receipt migration above and must use existing unknown/backoff lifecycle rather than invent another scheduler. The declaration and prefix can be reviewed independently of that runtime implementation. This proposal does not authorize merging enforcement that omits the start recheck or claims a static match as readiness.
+
+## Managed launch enforcement capability
+
+The runner also validates a bundle before boot, including standalone local launches. It must not name input-contract enforcement unconditionally: a standalone launch has no authoritative tracker intake or start recheck.
+
+Add optional `BootEnv.input_contract_enforcement: str | None = None`, owned by the worker and rendered as `CURIE_INPUT_CONTRACT_ENFORCEMENT`. This is a generic platform boot capability, separate from the ACI `SessionConfig`. It is an additive optional ACI schema change and bumps the protocol patch from 0.5.22 to 0.5.23, with regenerated schema, Rust, TypeScript, env example and wire lock. Unknown opaque strings remain decodable but confer no enforcement capability on the runner.
+
+The authenticated API acquire grant carries the admitted opaque receipt. The worker compares the selected trusted deployment/version/bundle identities to that receipt before sandbox claim and emits the supported enforcement interface only for a matching managed request. The runner passes the input-contract validator handshake only when this launch field equals the supported interface. Standalone launches and old workers omit it and refuse declaration-bearing bundles. The API still rechecks input, selected target and actual worker runtime identities before any model planning. A boot capability does not replace the start fence or grant tracker/publication authority.
