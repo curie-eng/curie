@@ -17,7 +17,7 @@ This guide uses the latest released CLI and factory runner by default. See the
 | GitHub issues and GitHub pull requests | [GitHub walkthrough below](#what-you-need), starting with prerequisites and CLI installation |
 | GitLab issues and GitLab merge requests | [Complete GitLab walkthrough](factory-gitlab-quickstart.md), including local cluster, credentials and first issue |
 | Jira Cloud issues and GitHub pull requests | [Complete Jira Cloud and GitHub walkthrough](factory-jira-github-quickstart.md), including the GitHub App and start authority |
-| Jira Cloud issues and Bitbucket Cloud or Data Center pull requests | Combined quickstart is unavailable. [Adapter configuration reference](#bitbucket-cloud-and-data-center) describes the current limits; it is not a complete onboarding path. |
+| Jira Cloud issues and Bitbucket Cloud or Data Center pull requests | [Bitbucket quickstart](#run-quickstart-for-bitbucket), with the Jira factory account from [Jira Cloud](#jira-cloud) and the [Bitbucket configuration](#bitbucket-cloud-and-data-center) limits |
 
 The walkthrough on this page uses **GitHub issues and GitHub pull requests**.
 The [GitLab](#gitlab) and [Jira Cloud](#jira-cloud) sections farther down are
@@ -353,9 +353,9 @@ Quickstart writes the factory's forge settings for you. These flags select them:
    and where it takes issues. Both default to `github`. `--tracker jira-cloud`
    with `--code-host github` is installed; see [Jira Cloud](#jira-cloud).
    `--code-host gitlab --tracker gitlab` is installed; see [GitLab](#gitlab).
-   `bitbucket-cloud` and `bitbucket-dc` need `--tracker
-   jira-cloud`, and the command refuses that pairing until its quickstart
-   lands; see [Bitbucket Cloud and Data Center](#bitbucket-cloud-and-data-center).
+   `--code-host bitbucket-cloud` or `bitbucket-dc` with `--tracker
+   jira-cloud` is installed; see
+   [Bitbucket Cloud and Data Center](#bitbucket-cloud-and-data-center).
 2. `--forge-url`, `--token-file`, `--ca-file` and `--review-account` (repeatable)
    describe a non-GitHub forge: its base URL, a file holding its access token,
    a CA bundle for a private certificate, and the accounts whose reviews count.
@@ -364,6 +364,10 @@ Quickstart writes the factory's forge settings for you. These flags select them:
 3. `--forge-username`, `--start-account` (repeatable) and `--start-group` are
    the Jira Cloud flags: the email the token belongs to, and who may start
    work. Each is refused for `github`.
+4. `--tracker-url` and `--tracker-token-file` are the Jira site URL and token
+   file beside a Bitbucket code host, whose own URL and token are
+   `--forge-url` and `--token-file`. Beside GitHub, Jira takes `--forge-url`
+   and `--token-file` instead, and these two are refused.
 
 The chart holds the result in one top-level `factory:` block, which the API
 reads as a single forge configuration document:
@@ -610,10 +614,7 @@ the last poll and one read for each issue that is running.
 
 Bitbucket has no issue tracker the factory reads, so a Bitbucket code host
 pairs only with a Jira Cloud tracker. The ticket is a Jira issue, and the pull
-request, its build statuses and its review comments are on Bitbucket. The
-combined quickstart for this pairing is unavailable. The values below describe
-adapter configuration for operators; they do not install or verify the complete
-Jira and Bitbucket path. Use a supported pairing above for a first factory run.
+request, its build statuses and its review comments are on Bitbucket.
 
 Each kind takes a static access token, never a username and password:
 
@@ -639,7 +640,64 @@ approval or a "needs work" status with no text is not feedback. A Data Center
 server with a private certificate needs its CA through `--ca-file`, which
 lands in `codeHostTrust`.
 
-These values use example identifiers only. Replace them with your own:
+### Run quickstart for Bitbucket
+
+Quickstart installs Curie, then writes one Bitbucket code host named
+`bitbucket`, the Jira tracker and one Jira binding named `jira`, and binds the
+agent as `jira=jira`. It serves one repository. Prepare the Jira factory
+account and token as [Jira Cloud](#jira-cloud) describes, and pass them with
+`--tracker-url` and `--tracker-token-file`. The Bitbucket flags are
+`--token-file`, `--review-account` (repeatable), and on Data Center
+`--forge-url` and, for a private certificate, `--ca-file`. A Bitbucket install
+registers no GitHub App, so `--app-id`, `--private-key-file` and `--org` are
+refused. The identifiers below are examples:
+
+```bash
+# Bitbucket Cloud: --repo <workspace>/<repo slug>
+curie factory quickstart --repo example-workspace/example-repo \
+  --tracker jira-cloud --code-host bitbucket-cloud \
+  --token-file /path/to/bitbucket-token \
+  --review-account '712020:00000000-0000-0000-0000-000000000000' \
+  --tracker-url https://example.atlassian.net \
+  --tracker-token-file /path/to/jira-token \
+  --forge-username factory-bot@example.com \
+  --start-account 557058:00000000-0000-0000-0000-000000000000
+
+# Bitbucket Data Center: --repo <PROJECT KEY>/<repo slug>
+curie factory quickstart --repo FAC/demo \
+  --tracker jira-cloud --code-host bitbucket-dc \
+  --forge-url https://bitbucket.example.invalid \
+  --ca-file /path/to/ca.pem \
+  --token-file /path/to/bitbucket-dc-token \
+  --review-account 101 \
+  --tracker-url https://example.atlassian.net \
+  --tracker-token-file /path/to/jira-token \
+  --forge-username factory-bot@example.com \
+  --start-account 557058:00000000-0000-0000-0000-000000000000
+```
+
+Before writing anything, quickstart checks the Jira token and start authority
+as on GitHub, and reads the repository with the Bitbucket token: on Cloud its
+UUID, with Atlassian's published Bitbucket address ranges as the egress, and
+on Data Center the server version (9.4.0 or newer) and the numeric repository
+id, with the addresses the server's host resolves to as the egress. It then
+writes the two token Secrets (`curie-jira-token` and `curie-bitbucket-token`),
+the CA ConfigMap `curie-bitbucket-ca` when `--ca-file` is given, and the
+entries. A Bitbucket access token cannot read a person's account, so look up
+each review account once: on Cloud the `account_id` on a comment or pull
+request that person wrote, on Data Center the user's numeric `id` from
+`/rest/api/latest/users/<slug>`.
+
+To ask for a revision, a review account comments on the pull request and
+mentions the Jira tracker's `mention`, the factory account's `accountId`, as
+`@<accountId>`. The factory reads pull request comments on its poll interval
+and acts only on one that carries that mention.
+
+### Writing the values by hand
+
+Several Bitbucket repositories in one binding, or two Bitbucket code hosts,
+are not a quickstart run; write the `factory:` values yourself. These values
+use example identifiers only. Replace them with your own:
 
 ```yaml
 factory:

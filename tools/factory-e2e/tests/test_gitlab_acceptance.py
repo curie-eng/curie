@@ -124,7 +124,6 @@ def test_each_gitlab_entry_is_installed_for_its_target(key: str) -> None:
     assert pairing.target == TARGETS[key]
     assert pairing.key == key
     assert pairing.installed is True
-    assert pairing.refused is None
     assert acceptance.unset_fields(pairing) == []
 
 

@@ -17,10 +17,11 @@ network:
 5. What the drivers report passes `judge_github_loop`, the loop's judge, on a
    whole loop driven against a stubbed provider, and fails it when the
    factory never pushes the CI fix.
-6. `jira_cloud+bitbucket_cloud` and `jira_cloud+bitbucket_dc` are refused as
-   not installed, naming #4400 (the combined Jira Cloud and Bitbucket
-   quickstart), while a dry run still lists every step without constructing a
-   driver, and a real run launches nothing.
+6. `jira_cloud+bitbucket_cloud` and `jira_cloud+bitbucket_dc` are installed
+   through the combined Jira Cloud and Bitbucket quickstart, and a dry run
+   lists every step without constructing a driver.
+7. The review comment mentions the Jira factory account, the tracker's
+   `mention`, so the factory's review poll admits it.
 
 The HTTP seam is the HTTPS handler under each driver's opener: the stub
 replaces `urllib.request.HTTPSHandler`, so every request still passes through
@@ -74,6 +75,7 @@ CLOUD_VARS = (
     "CURIE_BITBUCKET_CLOUD_REPO",
     "CURIE_BITBUCKET_CLOUD_TOKEN_FILE",
     "CURIE_BITBUCKET_CLOUD_REVIEWER_TOKEN_FILE",
+    "CURIE_BITBUCKET_CLOUD_REVIEWER_ACCOUNT_ID",
     "CURIE_FACTORY_JIRA_ENV_FILE",
 )
 CLOUD_API = "https://api.bitbucket.org/2.0/repositories/example-workspace/example-repo"
@@ -249,12 +251,16 @@ def _basic(user: str, password: str) -> str:
 
 
 @pytest.mark.parametrize("name", sorted(DRIVERS))
-def test_each_bitbucket_entry_registers_its_driver_installed(name: str) -> None:
+def test_each_bitbucket_entry_registers_its_driver_and_quickstart_setup(name: str) -> None:
     module = _entry_module(name)
     entry = fe.FORGES[name]
     assert entry.name == name
     assert entry.installed is True
-    assert entry.driver is getattr(module, DRIVERS[name])
+    # The Data Center entry brings its fixture up before building the driver.
+    driver = getattr(module, DRIVERS[name]) if name == "bitbucket_cloud" else module._driver
+    assert entry.driver is driver
+    assert entry.setup is getattr(module, f"install_{name}")
+    assert entry.github_app is False
 
 
 @pytest.mark.parametrize("name", sorted(DRIVERS))
@@ -268,17 +274,36 @@ def test_each_bitbucket_driver_implements_every_protocol_method(name: str) -> No
 # --- Bitbucket Cloud: configuration ------------------------------------------------------
 
 
+JIRA_FACTORY_ACCOUNT = "example-factory-account"
+
+
+def _jira_env(tmp_path: Path) -> Path:
+    jira = tmp_path / "jira.env"
+    facts = {
+        "site": "example.atlassian.net",
+        "cloud_id": "example-cloud",
+        "project_key": "KAN",
+        "labeler_email": "labeler@example.invalid",
+        "labeler_token_file": "labeler-token",
+        "bot_email": "bot@example.invalid",
+        "bot_account_id": JIRA_FACTORY_ACCOUNT,
+        "bot_token_file": "bot-token",
+    }
+    jira.write_text("".join(f"{key}={value}\n" for key, value in facts.items()))
+    return jira
+
+
 def _cloud_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     factory = tmp_path / "factory-token"
     factory.write_text(FACTORY_TOKEN + "\n")
     reviewer = tmp_path / "reviewer-token"
     reviewer.write_text(REVIEWER_TOKEN + "\n")
-    jira = tmp_path / "jira.env"
-    jira.write_text("site=example.atlassian.net\n")
+    jira = _jira_env(tmp_path)
     values = {
         "CURIE_BITBUCKET_CLOUD_REPO": "example-workspace/example-repo",
         "CURIE_BITBUCKET_CLOUD_TOKEN_FILE": str(factory),
         "CURIE_BITBUCKET_CLOUD_REVIEWER_TOKEN_FILE": str(reviewer),
+        "CURIE_BITBUCKET_CLOUD_REVIEWER_ACCOUNT_ID": "example-reviewer-account",
         "CURIE_FACTORY_JIRA_ENV_FILE": str(jira),
     }
     for name, value in values.items():
@@ -354,7 +379,10 @@ def test_cloud_driver_delegates_ticket_operations_to_the_jira_driver(
     driver = _cloud_driver(tmp_path)
 
     assert driver.open_and_label_ticket("Title", "Body", 12.5) == "wi-1"
-    assert opened == [("Title", "Body", 12.5)]
+    assert driver.open_and_label_ticket(*fe.DEFAULT_LOOP_ISSUE, 13.0) == "wi-1"
+    # The default ticket is about the GitHub fixture's code; the README-only
+    # repository gets its own.
+    assert opened == [("Title", "Body", 12.5), (*fe.README_ONLY_LOOP_ISSUE, 13.0)]
 
 
 # --- Bitbucket Cloud: request shapes -----------------------------------------------------
@@ -427,6 +455,35 @@ def test_cloud_merge_is_posted_by_the_reviewer(
     assert post.url.startswith(f"{CLOUD_API}/pullrequests/7/merge")
     assert post.headers["authorization"] == f"Bearer {REVIEWER_TOKEN}"
     assert (result["status_code"], result["merged"]) == (200, True)
+
+
+def test_cloud_reset_declines_an_open_pull_request_without_declaring_a_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cloud_env(tmp_path, monkeypatch)
+
+    def answer(method: str, url: str) -> tuple[int, Any]:
+        if method == "GET" and url.startswith(f"{CLOUD_API}/pullrequests?state=OPEN"):
+            return 200, {"values": [{"id": 7}]}
+        if method == "POST" and url == f"{CLOUD_API}/pullrequests/7/decline":
+            # Bitbucket Cloud refuses a bodiless POST that declares a JSON body.
+            call = http.current.call
+            return (400, None) if "content-type" in call.headers else (200, {"state": "DECLINED"})
+        if method == "GET" and url.startswith(f"{CLOUD_API}/refs/branches?"):
+            return 200, {"values": [{"name": "curie/publication-x"}, {"name": "main"}]}
+        if method == "DELETE" and url == f"{CLOUD_API}/refs/branches/curie%2Fpublication-x":
+            return 204, None
+        return _ok(method, url)
+
+    http = _install(monkeypatch, answer)
+    driver = _cloud_driver(tmp_path)
+    http.calls.clear()
+
+    assert driver.reset_fixture() == {"declined": 1, "branches_deleted": 1}
+    decline, delete = http.writes()
+    assert decline.headers["authorization"] == f"Bearer {REVIEWER_TOKEN}"
+    assert "content-type" not in decline.headers
+    assert delete.method == "DELETE"
 
 
 @pytest.mark.parametrize(
@@ -824,6 +881,7 @@ def _driver_on(
         _cloud_env(tmp_path, monkeypatch)
     else:
         _dc_state(tmp_path, monkeypatch)
+        monkeypatch.setenv("CURIE_FACTORY_JIRA_ENV_FILE", str(_jira_env(tmp_path)))
     provider = _Provider(forge)
     http = _install(monkeypatch, lambda _m, _u: (200, None))
     http.answer = provider.answer(http)
@@ -898,9 +956,13 @@ def test_set_ci_red_before_the_change_is_read_refuses_and_writes_nothing(
 
 
 @pytest.mark.parametrize("forge", FORGES)
-def test_watcher_posts_green_once_on_the_first_new_head_and_never_on_the_red_one(
+def test_watcher_greens_each_new_head_once_and_never_the_red_one(
     forge: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Data Center greens only the CI fix head: its review head passes as a
+    repository without CI because Data Center reports mergeability. Cloud
+    reports none, so its watcher greens every later head, as CI would."""
+
     driver, provider, http = _driver_on(forge, tmp_path, monkeypatch)
     head, _ = driver.change_head(CHANGE)
     driver.set_ci_red(head)
@@ -912,14 +974,22 @@ def test_watcher_posts_green_once_on_the_first_new_head_and_never_on_the_red_one
     provider.push(GREEN)
     assert _until(lambda: driver.green_heads == [GREEN])
     provider.push(THIRD)
-    time.sleep(0.2)
+    greened = [GREEN, THIRD] if forge == "bitbucket_cloud" else [GREEN]
+    assert _until(lambda: driver.green_heads == greened)
+    if forge == "bitbucket_cloud":
+        # Many reads of a head already greened post nothing more.
+        reads = sum(c.method == "GET" for c in http.calls)
+        assert _until(lambda: sum(c.method == "GET" for c in http.calls) > reads + 20)
+    else:
+        time.sleep(0.2)
     driver.p.teardown.run()
 
-    assert _gate_posts(http, "SUCCESSFUL") == [_gate_url(forge, GREEN)]
+    assert _gate_posts(http, "SUCCESSFUL") == [_gate_url(forge, sha) for sha in greened]
     assert _gate_posts(http, "FAILED") == [_gate_url(forge, SHA)]
     assert driver.ci_state(GREEN)["state"] == "passing"
     assert driver.ci_state(SHA)["state"] == "failing"
-    assert driver.ci_state(THIRD)["state"] == "none"
+    third = "passing" if forge == "bitbucket_cloud" else "none"
+    assert driver.ci_state(THIRD)["state"] == third
 
 
 @pytest.mark.parametrize("forge", FORGES)
@@ -1072,6 +1142,9 @@ def test_review_is_a_top_level_comment_by_the_reviewer_proved_admitted(
         assert "anchor" not in post.body and "parent" not in post.body
         assert post.headers["authorization"] == _basic("reviewer", REVIEWER_PASSWORD)
     assert provider.comments and "Add a test." in provider.comments[0]
+    # The factory admits only feedback mentioning the Jira tracker's mention,
+    # the factory account's accountId, never the GitHub App slug.
+    assert provider.comments[0].startswith(f"@{JIRA_FACTORY_ACCOUNT} ")
     assert (review["status_code"], review["comment_id"]) == (201, 501)
     assert review["delivery_id"] == "req-2"
     assert review["delivery_status_code"] == 200
@@ -1230,21 +1303,19 @@ def _forbid_drivers(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("key", PAIRINGS)
-def test_bitbucket_pairing_dry_run_lists_every_step_and_is_refused_naming_4400(
+def test_bitbucket_pairing_dry_run_lists_every_step_and_is_installed(
     key: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _forbid_drivers(monkeypatch)
     pairing = acceptance.PAIRINGS[key]
-    assert pairing.installed is False
+    assert pairing.installed is True
     assert acceptance.unset_fields(pairing) == []
 
     out = io.StringIO()
-    assert acceptance.dry_run(key, out) == fe.EXIT_SCENARIO
+    assert acceptance.dry_run(key, out) == 0
 
     text = out.getvalue()
-    assert f"  {key} is not installed: " in text
-    assert "#4400" in text
-    assert "forge driver" not in text
+    assert "not installed" not in text
     assert "unset:" not in text
     tracker, code_host = key.split("+")
     assert f"tracker {tracker}, code host {code_host}" in text
@@ -1256,29 +1327,80 @@ def test_bitbucket_pairing_dry_run_lists_every_step_and_is_refused_naming_4400(
     ]
 
 
+def test_the_data_center_entry_asserts_its_fixture_is_removed() -> None:
+    step = acceptance.PAIRINGS["jira_cloud+bitbucket_dc"].steps[0]
+    removed = f"teardown_ok.{_entry_module('bitbucket_dc').FIXTURE_DOWN_STEP}"
+    assert (removed, True) in step.persisted_assertions
+    cloud = acceptance.PAIRINGS["jira_cloud+bitbucket_cloud"].steps[0]
+    assert not [f for f, _ in cloud.persisted_assertions if "fixture" in f and "Data" in f]
+
+
 @pytest.mark.parametrize("key", PAIRINGS)
-def test_main_dry_run_of_a_bitbucket_pairing_is_refused_naming_4400(
+def test_main_dry_run_of_a_bitbucket_pairing_launches_nothing(
     key: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _forbid_drivers(monkeypatch)
-    assert fe.main(["acceptance", "--pairing", key, "--dry-run"]) == fe.EXIT_SCENARIO
+    assert fe.main(["acceptance", "--pairing", key, "--dry-run"]) == 0
     out = capsys.readouterr().out
-    assert "not installed" in out and "#4400" in out
+    assert "not installed" not in out
     for step in acceptance.PAIRINGS[key].steps:
         assert step.name in out
-
-
-@pytest.mark.parametrize("key", PAIRINGS)
-def test_main_real_run_of_a_bitbucket_pairing_launches_nothing_naming_4400(
-    key: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    _forbid_drivers(monkeypatch)
-    monkeypatch.setattr(fe, "load_config", lambda *_a, **_k: pytest.fail("no config load"))
-    assert fe.main(["acceptance", "--pairing", key]) == fe.EXIT_SCENARIO
-    err = capsys.readouterr().err
-    assert "not installed" in err and "#4400" in err
 
 
 def test_the_bitbucket_self_pairings_are_gone() -> None:
     assert "bitbucket_cloud+bitbucket_cloud" not in acceptance.PAIRINGS
     assert "bitbucket_dc+bitbucket_dc" not in acceptance.PAIRINGS
+
+
+# --- the Data Center fixture the run brings up --------------------------------------------
+
+
+@pytest.mark.parametrize("wrote_state", [False, True])
+def test_a_fixture_that_refused_to_start_tears_down_clean(
+    wrote_state: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _entry_module("bitbucket_dc")
+    p = _preflight(tmp_path)
+    monkeypatch.setattr(_entry_module("gitlab"), "node_reachable_host", lambda _p: "192.0.2.10")
+    state_dirs: list[Path] = []
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        state_dir = Path(argv[argv.index("--state-dir") + 1])
+        if argv[3] == "up":
+            state_dirs.append(state_dir)
+            if wrote_state:
+                (state_dir / "state.json").write_text("{}")
+            return subprocess.CompletedProcess(argv, 1, "", "port 27443 is already in use")
+        if not (state_dir / "state.json").is_file():
+            # As the real fixture does: it never deletes a directory it did not make.
+            return subprocess.CompletedProcess(argv, 1, "", "has no state.json; refusing")
+        # `down` removes what `up` made, the state directory included.
+        for child in state_dir.iterdir():
+            child.unlink()
+        state_dir.rmdir()
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(fe.PreflightFailed, match="up exited 1"):
+        module.bring_up_fixture(p)
+    (result,) = p.teardown.run()
+
+    assert result["ok"] is True, result
+    assert result["step"] == module.FIXTURE_DOWN_STEP
+    assert not state_dirs[0].exists()
+    # An empty directory has nothing to bring down; a written state is brought down.
+    assert [argv[3] for argv in calls] == (["up", "down"] if wrote_state else ["up"])
+
+
+@pytest.mark.parametrize("name", sorted(DRIVERS))
+def test_the_default_ticket_and_review_become_the_readme_only_ones(name: str) -> None:
+    # Both Bitbucket repositories hold only a README, so the default loop
+    # ticket about the GitHub fixture's unitconv code cannot be done there.
+    _entry_module(name)
+    assert fe.readme_only_ticket(*fe.DEFAULT_LOOP_ISSUE) == fe.README_ONLY_LOOP_ISSUE
+    assert fe.readme_only_ticket("own", "ticket") == ("own", "ticket")
+    assert fe.readme_only_review(fe.DEFAULT_LOOP_REVIEW_TEXT) == fe.README_ONLY_LOOP_REVIEW_TEXT
+    assert fe.readme_only_review("own review") == "own review"

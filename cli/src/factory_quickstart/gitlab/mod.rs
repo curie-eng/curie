@@ -73,6 +73,8 @@ pub(super) fn check(forge: &ForgeFlags) -> Result<()> {
         ("--forge-username", forge.forge_username.is_some()),
         ("--start-account", !forge.start_accounts.is_empty()),
         ("--start-group", forge.start_group.is_some()),
+        ("--tracker-url", forge.tracker_url.is_some()),
+        ("--tracker-token-file", forge.tracker_token_file.is_some()),
     ];
     if let Some((flag, _)) = other.iter().find(|(_, set)| *set) {
         return Err(usage(

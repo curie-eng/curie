@@ -23,7 +23,9 @@ mod bitbucket_cloud;
 mod bitbucket_dc;
 mod github;
 mod gitlab;
+mod jira_bitbucket;
 mod jira_cloud;
+mod native;
 
 pub use github::{deploy_args, intake_args, registration_steps, RerunTarget};
 pub use gitlab::{gitlab_entries, gitlab_web_base, GitlabFacts, GITLAB_DEFAULT_URL};
@@ -240,6 +242,12 @@ pub struct ForgeFlags {
     pub start_accounts: Vec<String>,
     /// The Jira group allowed to start work (`--start-group`).
     pub start_group: Option<String>,
+    /// The Jira URL beside a Bitbucket code host (`--tracker-url`), whose
+    /// URL is `--forge-url`.
+    pub tracker_url: Option<String>,
+    /// The Jira token file beside a Bitbucket code host
+    /// (`--tracker-token-file`), whose token is `--token-file`.
+    pub tracker_token_file: Option<PathBuf>,
 }
 
 /// One port of a forge egress entry, as the chart's `egress[].ports` reads it.
@@ -374,14 +382,17 @@ pub(super) fn http_client(ca_file: Option<&Path>) -> Result<reqwest::Client> {
     })
 }
 
-/// Refuses `--candidate` on a GitLab quickstart. Pure, so it runs before the
-/// candidate's published images are resolved: the GitHub path installs those
-/// images, while a GitLab quickstart binds the release's own.
+/// Refuses `--candidate` on a non-GitHub code host. Pure, so it runs before
+/// the candidate's published images are resolved: the GitHub path installs
+/// those images, while a GitLab or Bitbucket quickstart binds the release's own.
 pub fn check_candidate_forge(forge: &ForgeFlags, candidate: Option<&str>) -> Result<()> {
-    if candidate.is_some() && forge.code_host == CodeHostKind::Gitlab {
-        return Err(CliError::usage(
-            "--candidate installs published images through the GitHub quickstart; --code-host gitlab binds the release's own images",
-        )
+    if candidate.is_some() && forge.code_host != CodeHostKind::Github {
+        let kind = clap::ValueEnum::to_possible_value(&forge.code_host)
+            .map(|value| value.get_name().to_string())
+            .unwrap_or_default();
+        return Err(CliError::usage(format!(
+            "--candidate installs published images through the GitHub quickstart; --code-host {kind} binds the release's own images"
+        ))
         .with_fix("drop --candidate, or install the candidate with `curie cluster up` before the quickstart")
         .into());
     }
@@ -402,6 +413,8 @@ pub fn select_forge(forge: &ForgeFlags) -> Result<()> {
                 ("--forge-username", forge.forge_username.is_some()),
                 ("--start-account", !forge.start_accounts.is_empty()),
                 ("--start-group", forge.start_group.is_some()),
+                ("--tracker-url", forge.tracker_url.is_some()),
+                ("--tracker-token-file", forge.tracker_token_file.is_some()),
             ];
             match shared.iter().find(|(_, set)| *set) {
                 Some((flag, _)) => Err(CliError::usage(format!(
@@ -416,7 +429,7 @@ pub fn select_forge(forge: &ForgeFlags) -> Result<()> {
         (CodeHostKind::Gitlab, _) | (CodeHostKind::Github, TrackerKind::Gitlab) => {
             gitlab::check(forge)
         }
-        // A reserved kind's not-installed error wins over any pairing rule.
+        // Bitbucket pairs only with Jira Cloud; each module refuses the rest.
         (CodeHostKind::BitbucketCloud, _) => bitbucket_cloud::check(forge),
         (CodeHostKind::BitbucketDc, _) => bitbucket_dc::check(forge),
         (CodeHostKind::Github, TrackerKind::JiraCloud) => jira_cloud::check(forge),
@@ -1997,15 +2010,18 @@ async fn release_matches_quickstart_target(
 }
 
 /// Runs the quickstart for the selected forge: GitLab as both code host and
-/// tracker, or GitHub with a GitHub or Jira Cloud tracker composed into the
-/// GitHub flow. The selection is checked again here so a caller that skipped
+/// tracker, a Bitbucket code host with the Jira Cloud tracker, or GitHub with
+/// a GitHub or Jira Cloud tracker composed into the GitHub flow. The selection is checked again here so a caller that skipped
 /// [`select_forge`] still cannot run the flow for a kind this build does not
 /// install.
 pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     select_forge(&opts.forge)?;
     match opts.forge.code_host {
         CodeHostKind::Gitlab => gitlab::quickstart(opts).await,
-        _ => github::quickstart(opts).await,
+        CodeHostKind::BitbucketCloud | CodeHostKind::BitbucketDc => {
+            jira_bitbucket::quickstart(opts).await
+        }
+        CodeHostKind::Github => github::quickstart(opts).await,
     }
 }
 

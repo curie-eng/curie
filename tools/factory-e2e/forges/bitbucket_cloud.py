@@ -11,8 +11,16 @@ workspace.
 
 Two repository access tokens, each in a file: the factory's, which the
 driver reads with, and the reviewer's, the test actor that sets CI, reviews,
-merges and resets. Every request goes through an opener that refuses every
-redirect, so a token is only ever sent to the URL the driver named.
+merges and resets. A repository access token cannot read its own account, so
+the reviewer's Atlassian account id comes from
+CURIE_BITBUCKET_CLOUD_REVIEWER_ACCOUNT_ID.
+
+The entry's setup, ``install_bitbucket_cloud``, installs the factory with
+`curie factory quickstart --tracker jira-cloud --code-host bitbucket-cloud`,
+with the factory's token and the reviewer as the review account.
+
+Every request goes through an opener that refuses every redirect, so a token
+is only ever sent to the URL the driver named.
 
 Red CI is set deliberately, as the GitHub driver does: the test actor posts a
 FAILED build status (LOOP_GATE_KEY) on the pull request's first head.
@@ -34,6 +42,7 @@ import base64
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -53,13 +62,23 @@ GIT_USER = "x-token-auth"
 REPO_VAR = "CURIE_BITBUCKET_CLOUD_REPO"
 TOKEN_FILE_VAR = "CURIE_BITBUCKET_CLOUD_TOKEN_FILE"
 REVIEWER_TOKEN_FILE_VAR = "CURIE_BITBUCKET_CLOUD_REVIEWER_TOKEN_FILE"
+REVIEWER_ACCOUNT_VAR = "CURIE_BITBUCKET_CLOUD_REVIEWER_ACCOUNT_ID"
 # What the Jira Cloud driver reads (forges/jira_cloud.py); checked here so the
 # run fails before anything is installed (#4401 decision 18.6).
 JIRA_VARS = ("CURIE_FACTORY_JIRA_ENV_FILE",)
-REQUIRED_VARS = (REPO_VAR, TOKEN_FILE_VAR, REVIEWER_TOKEN_FILE_VAR, *JIRA_VARS)
+REQUIRED_VARS = (
+    REPO_VAR,
+    TOKEN_FILE_VAR,
+    REVIEWER_TOKEN_FILE_VAR,
+    REVIEWER_ACCOUNT_VAR,
+    *JIRA_VARS,
+)
 
 LOOP_GATE_KEY = "factory-e2e-loop-gate"
-LOOP_GATE_NAME = "factory-e2e loop gate"
+# Bitbucket declares no CI diagnostics (ADR 0197 consequence 5), so the factory
+# shows the agent a failing build's name, state and link only, never its
+# description: the name carries the instruction the red gate asks for.
+LOOP_GATE_NAME = "factory-e2e loop gate: add a one line CHANGELOG.md entry for this change"
 LOOP_GATE_DESCRIPTION = (
     "Loop gate: add a one line entry for this change to CHANGELOG.md and push it to this branch."
 )
@@ -141,6 +160,8 @@ class BitbucketCloudDriver:
         self.p = p
         self.repo = repo
         self.api = f"{API_URL}/repositories/{workspace}/{slug}"
+        self.factory_token_file = Path(os.environ[TOKEN_FILE_VAR])
+        self.reviewer_account = os.environ[REVIEWER_ACCOUNT_VAR].strip()
         self.factory_token = _token(TOKEN_FILE_VAR)
         self.reviewer_token = _token(REVIEWER_TOKEN_FILE_VAR)
         self._opener = _opener()
@@ -175,15 +196,16 @@ class BitbucketCloudDriver:
         if (there.scheme, there.netloc) != (origin.scheme, origin.netloc):
             raise fe.PreflightFailed(f"refused a request off {origin.scheme}://{origin.netloc}")
         token = self.reviewer_token if as_reviewer else self.factory_token
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        # Bitbucket Cloud answers a bodiless POST that declares a JSON body
+        # with a bare 400, so only a request with a body names its type.
+        if body is not None:
+            headers["Content-Type"] = "application/json"
         request = urllib.request.Request(
             url,
             method=method,
             data=None if body is None else json.dumps(body).encode(),
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
         )
         try:
             with self._opener.open(request, timeout=timeout) as response:
@@ -218,6 +240,9 @@ class BitbucketCloudDriver:
         return self._jira
 
     def open_and_label_ticket(self, title: str, body: str, since: float) -> str:
+        # The repository holds only a README; the default ticket is about the
+        # GitHub fixture's code.
+        title, body = fe.readme_only_ticket(title, body)
         return str(self._tracker().open_and_label_ticket(title, body, since))
 
     def teardowns(self) -> tuple[tuple[str, Callable[[], Any]], ...]:
@@ -293,7 +318,12 @@ class BitbucketCloudDriver:
         )
 
     def set_ci_red(self, sha: str) -> dict[str, Any]:
-        """FAILED on ``sha``, then watch the change for the revision to turn green."""
+        """FAILED on ``sha``, then green every later head of the change, as CI would.
+
+        Bitbucket Cloud reports no mergeability, so the factory cannot read a
+        head without statuses as a repository without CI: a review revision
+        with no status would wait out the CI window and fail.
+        """
 
         change = self._change
         if change is None:
@@ -312,13 +342,14 @@ class BitbucketCloudDriver:
         deadline = time.monotonic() + WATCH_LIFETIME_SECONDS
 
         def watch() -> None:
+            done = [red]
             while not stop.wait(interval) and time.monotonic() < deadline:
                 short = self._short_head(change, WATCH_HTTP_TIMEOUT_SECONDS)
-                # Still the red head: no need to expand it.
-                if not short or red.startswith(short):
+                # A head already judged: no need to expand it.
+                if not short or any(sha.startswith(short) for sha in done):
                     continue
                 head = self._full_hash(short, WATCH_HTTP_TIMEOUT_SECONDS)
-                if not head or head == red:
+                if not head or head in done:
                     continue
                 # A stop that came during the read: write nothing after it.
                 if stop.is_set():
@@ -328,7 +359,7 @@ class BitbucketCloudDriver:
                 )
                 if status in (200, 201):
                     self.green_heads.append(head)
-                    return
+                    done.append(head)
 
         thread = threading.Thread(target=watch, name="bitbucket-cloud-green-gate", daemon=True)
         self._watch_stop, self._watch_thread = stop, thread
@@ -386,7 +417,9 @@ class BitbucketCloudDriver:
         if detail is None:
             raise fe.PreflightFailed("reading the WorkItem before the review failed")
         before = self._request_count(detail)
-        body = fe.revision_comment_text(text, self.p.config.mention)
+        fe.load_forge_entries()
+        mention = sys.modules["factory_e2e_forges.jira_cloud"].factory_mention(os.environ)
+        body = fe.revision_comment_text(fe.readme_only_review(text), mention)
         status, comment = self._call(
             "POST",
             f"/pullrequests/{change.number}/comments",
@@ -559,6 +592,30 @@ class BitbucketCloudDriver:
                     )
 
 
+def install_bitbucket_cloud(p: fe.Preflight) -> None:
+    """Install the factory with the combined Jira and Bitbucket Cloud quickstart."""
+
+    driver = p.loop_driver()
+    if not isinstance(driver, BitbucketCloudDriver):
+        raise fe.ConfigError("install_bitbucket_cloud needs the bitbucket_cloud forge driver")
+    fe.load_forge_entries()
+    sys.modules["factory_e2e_forges.jira_cloud"].install_jira_bitbucket(
+        p,
+        code_host="bitbucket-cloud",
+        repo=driver.repo,
+        token_file=driver.factory_token_file,
+        review_account=driver.reviewer_account,
+        secrets=[driver.factory_token, driver.reviewer_token],
+    )
+    p.evidence["bitbucket_cloud"] = {"repo": driver.repo}
+
+
 fe.register_forge(
-    fe.ForgeEntry(name="bitbucket_cloud", driver=BitbucketCloudDriver, installed=True)
+    fe.ForgeEntry(
+        name="bitbucket_cloud",
+        driver=BitbucketCloudDriver,
+        installed=True,
+        setup=install_bitbucket_cloud,
+        github_app=False,
+    )
 )

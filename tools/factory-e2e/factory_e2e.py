@@ -427,9 +427,7 @@ def scenario_opens_seed_issue(name: str | None) -> bool:
     through its forge driver.
     """
 
-    return (
-        name != "evaluation" and name not in LOOP_SCENARIOS and name not in WHOLE_FLOW_SCENARIOS
-    )
+    return name != "evaluation" and name not in LOOP_SCENARIOS and name not in WHOLE_FLOW_SCENARIOS
 
 
 # --------------------------------------------------------------------------
@@ -1922,9 +1920,7 @@ def resolve_curie_binary(binary: str) -> tuple[str, str]:
     except (OSError, subprocess.TimeoutExpired, UnicodeError):
         raise ConfigError(f"CURIE_BIN {curie_bin!r} could not run --version") from None
     if result.returncode:
-        raise ConfigError(
-            f"CURIE_BIN {curie_bin!r} failed --version (exit {result.returncode})"
-        )
+        raise ConfigError(f"CURIE_BIN {curie_bin!r} failed --version (exit {result.returncode})")
     lines = result.stdout.splitlines()
     version = lines[0] if lines else ""
     if not version.strip():
@@ -3103,7 +3099,12 @@ class Preflight:
             self._issue_token_minted = time.time()
         secrets = [token or None, self.api_key, self.config.model_api_key, self.worker_token]
         common = [
-            "--namespace", self.namespace, "--release", self.release, "--api-url", self.api_url
+            "--namespace",
+            self.namespace,
+            "--release",
+            self.release,
+            "--api-url",
+            self.api_url,
         ]
         log("curie cluster deploy (the default dark-factory bundle)")
         self._curie(
@@ -5940,6 +5941,32 @@ DEFAULT_LOOP_REVIEW_TEXT = (
     "Please make one follow-up change on this pull request: add a round trip unit test "
     "that converts 3.5 nautical miles to meters and back. Push it to this same branch."
 )
+# The loop ticket and review for a fixture repository that holds only a README
+# (the Bitbucket test repository and Data Center fixture), in place of the
+# defaults, which are about the GitHub fixture's code.
+README_ONLY_LOOP_ISSUE = (
+    "Add widget.sh with add() and its test",
+    "Add a POSIX shell script `widget.sh` that defines `add()`, printing the sum of its "
+    "two integer arguments, and a `test.sh` that sources it, checks that `add 2 3` "
+    "prints 5, exits non-zero on a mismatch and prints ok otherwise. Run `sh test.sh` "
+    "until it prints ok, then open the pull request.",
+)
+README_ONLY_LOOP_REVIEW_TEXT = (
+    "Please make one follow-up change on this pull request: add a check to test.sh that "
+    "`add 10 -4` prints 6. Push it to this same branch."
+)
+
+
+def readme_only_ticket(title: str, body: str) -> tuple[str, str]:
+    """The ticket to open on a README-only fixture: the default swapped, any other kept."""
+
+    return README_ONLY_LOOP_ISSUE if (title, body) == DEFAULT_LOOP_ISSUE else (title, body)
+
+
+def readme_only_review(text: str) -> str:
+    """The review to post on a README-only fixture: the default swapped, any other kept."""
+
+    return README_ONLY_LOOP_REVIEW_TEXT if text == DEFAULT_LOOP_REVIEW_TEXT else text
 
 
 @dataclasses.dataclass(frozen=True)
@@ -6195,6 +6222,14 @@ def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
     log("loop: waiting for the labelled run to open a pull request")
     change = driver.await_change(work_item_id)
     if change is None:
+        # Why no change came: the WorkItem's state and how its requests ended.
+        detail = p.work_item_detail(work_item_id) or {}
+        obs["no_change"] = {
+            "state": detail.get("state"),
+            "statuses": _ordered_statuses(detail),
+            "terminal_cause": (_latest_request(detail) or {}).get("terminal_cause"),
+        }
+        _timeline(obs, "request ended without a change", **obs["no_change"])
         obs["tracker"] = driver.tracker_evidence(None, work_item_id)
         _timeline(obs, "tracker evidence", **obs["tracker"])
         return _finish(p, obs, judge_github_loop(obs) + driver.judge_tracker(obs["tracker"]))
@@ -6349,7 +6384,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "preflight", parents=[common], help="install, deliver one labelled issue, assert admission"
     )
     scenario = sub.add_parser(
-        "run", parents=[common], help="preflight, then one scenario driver",
+        "run",
+        parents=[common],
+        help="preflight, then one scenario driver",
         description=(
             "repo-runner: k8 only, release factory-tools, local scripted model. "
             "Set CURIE_FACTORY_REPO_RUNNER_PLAN (full chart bindings and four turns) "

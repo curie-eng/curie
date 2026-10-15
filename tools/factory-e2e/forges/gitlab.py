@@ -1137,15 +1137,17 @@ def install_gitlab(p: fe.Preflight) -> None:
     p.evidence["gitlab"] = {"project": driver.project_path, "target": driver.target}
     p.step("factory agent bound to the GitLab project", agent=fe.FACTORY_AGENT)
     if driver.target == "fixture":
-        _allow_fixture_bridge(p, driver.state)
+        allow_fixture_bridge(p, driver.state.get("docker_subnets"), int(driver.state["port"]))
 
 
 def fixture_bridge_egress(
-    values: Mapping[str, Any], subnets: Sequence[str], port: int
+    values: Mapping[str, Any], subnets: Sequence[str], port: int, kind: str = "gitlab"
 ) -> dict[str, Any]:
     """The factory values that also admit the fixture's Docker bridge subnets.
 
-    The quickstart derives the GitLab egress entry from the advertised host.
+    ``kind`` is the forge kind whose entries get the subnets: ``gitlab``, or
+    ``bitbucket_dc`` for the Bitbucket Data Center fixture, which is shaped
+    the same way. The quickstart derives the egress entry from the advertised host.
     When the fixture runs on the Kubernetes node itself, Docker's DNAT rewrites
     a pod's connection to the container's bridge address before the
     NetworkPolicy decides, so the publication push is refused unless the
@@ -1163,20 +1165,21 @@ def fixture_bridge_egress(
         updated = []
         for entry in entries:
             entry = dict(entry)
-            if entry.get("kind") == "gitlab":
+            if entry.get("kind") == kind:
                 egress = list(entry.get("egress") or [])
                 if not egress:
-                    raise fe.PreflightFailed(f"factory.{key} gitlab entry has no egress")
+                    raise fe.PreflightFailed(f"factory.{key} {kind} entry has no egress")
                 entry["egress"] = egress + [e for e in extra if e not in egress]
             updated.append(entry)
         out[key] = updated
-    if not any(e.get("kind") == "gitlab" for e in out["codeHosts"]):
-        raise fe.PreflightFailed("the quickstart wrote no gitlab code host")
+    if not any(e.get("kind") == kind for e in out["codeHosts"]):
+        raise fe.PreflightFailed(f"the quickstart wrote no {kind} code host")
     return {"factory": out}
 
 
-def _allow_fixture_bridge(p: fe.Preflight, state: Mapping[str, Any]) -> None:
-    subnets = state.get("docker_subnets")
+def allow_fixture_bridge(p: fe.Preflight, subnets: Any, port: int, kind: str = "gitlab") -> None:
+    """Admit the fixture's Docker bridge ``subnets`` on ``port`` for ``kind``'s entries."""
+
     if not isinstance(subnets, list) or not subnets:
         raise fe.ConfigError("the fixture state names no docker_subnets; bring it up again")
     assert p.chart_dir is not None, "install() extracts the chart first"
@@ -1185,8 +1188,8 @@ def _allow_fixture_bridge(p: fe.Preflight, state: Mapping[str, Any]) -> None:
         ["helm", "--kube-context", context, "get", "values", p.release, "-n", p.namespace]
         + ["-o", "json"]
     )
-    values = fixture_bridge_egress(json.loads(raw), subnets, int(state["port"]))
-    values_file = p.workdir / "gitlab-fixture-egress.json"
+    values = fixture_bridge_egress(json.loads(raw), subnets, port, kind)
+    values_file = p.workdir / f"{kind}-fixture-egress.json"
     fd = os.open(str(values_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as handle:
         json.dump(values, handle)
@@ -1200,11 +1203,11 @@ def _allow_fixture_bridge(p: fe.Preflight, state: Mapping[str, Any]) -> None:
             timeout="20m",
         )
     )
-    for kind in ("deployment", "statefulset"):
-        for workload in p.kubectl("-n", p.namespace, "get", kind, "-o", "name").split():
+    for resource in ("deployment", "statefulset"):
+        for workload in p.kubectl("-n", p.namespace, "get", resource, "-o", "name").split():
             p.kubectl("-n", p.namespace, "rollout", "status", workload, "--timeout=15m")
     p.ensure_api()
-    p.step("fixture bridge subnets allowed for the GitLab code host", subnets=len(subnets))
+    p.step(f"fixture bridge subnets allowed for the {kind} code host", subnets=len(subnets))
 
 
 def _driver(p: fe.Preflight) -> GitLabDriver:

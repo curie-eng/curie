@@ -2,7 +2,7 @@
 //! validates the shared forge flags, parses `--repo`, probes the access token by
 //! reading the repository, and emits the `codeHosts` entry, the repository
 //! binding, the review allowlist and the egress CIDRs Atlassian publishes. The
-//! Jira tracker half and the combined run are #4358 and #4400.
+//! combined run with the Jira tracker is `jira_bitbucket`.
 
 use std::path::Path;
 
@@ -20,13 +20,13 @@ const REPO_SHAPE: &str = "<workspace>/<repo slug>";
 
 /// Refuses Bitbucket Cloud flags this build cannot run. Pure: it reads no file
 /// or network. Bitbucket pairs only with the Jira Cloud tracker, so a valid
-/// flag set reaches the combined Jira quickstart, not in this build until #4400.
+/// flag set goes on to the Jira tracker's own check.
 pub(super) fn check(forge: &ForgeFlags) -> Result<()> {
     if forge.tracker != TrackerKind::JiraCloud {
-        return Err(CliError::unsupported(
-            "code host 'bitbucket-cloud' pairs only with --tracker jira-cloud, and that pairing is not installed in this build",
+        return Err(CliError::usage(
+            "code host 'bitbucket-cloud' pairs only with --tracker jira-cloud",
         )
-        .with_fix("rerun with --code-host github")
+        .with_fix("pass --tracker jira-cloud with its --tracker-url, --tracker-token-file, --forge-username and --start-account or --start-group")
         .into());
     }
     if forge.forge_url.is_some() {
@@ -50,14 +50,11 @@ pub(super) fn check(forge: &ForgeFlags) -> Result<()> {
         .with_fix("pass --review-account <account id>")
         .into());
     }
-    Err(super::jira_cloud::code_host_not_installed(
-        "bitbucket-cloud",
-    ))
+    super::jira_cloud::check(forge)
 }
 
 /// A Bitbucket Cloud repository named by `--repo`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code, reason = "called by the combined Jira quickstart in #4400")]
 pub(super) struct RepoPath {
     pub workspace: String,
     pub slug: String,
@@ -65,7 +62,6 @@ pub(super) struct RepoPath {
 
 /// What the token probe learned about the repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code, reason = "called by the combined Jira quickstart in #4400")]
 pub(super) struct Probed {
     /// The repository UUID, braces included.
     pub project_id: String,
@@ -81,7 +77,6 @@ fn is_slug(segment: &str) -> bool {
 }
 
 /// Parses `--repo` as `<workspace>/<repo slug>`.
-#[allow(dead_code, reason = "called by the combined Jira quickstart in #4400")]
 pub(super) fn parse_repo(repo: &str) -> Result<RepoPath> {
     match repo.split('/').collect::<Vec<_>>()[..] {
         [workspace, slug] if is_slug(workspace) && is_slug(slug) => Ok(RepoPath {
@@ -99,7 +94,6 @@ pub(super) fn parse_repo(repo: &str) -> Result<RepoPath> {
 /// Probes the token by reading the repository at `api_base`
 /// (`https://api.bitbucket.org/2.0` outside tests). A 401 names the token
 /// file and a 403 names the scopes the token lacks.
-#[allow(dead_code, reason = "called by the combined Jira quickstart in #4400")]
 pub(super) async fn probe(
     api_base: &str,
     token_file: &Path,
@@ -160,7 +154,6 @@ pub(super) async fn probe(
 /// The values fragment for one Bitbucket Cloud code host named `name`: the
 /// `codeHosts` entry, the repository binding (alias = repository slug) and the
 /// review allowlist under the code host's name.
-#[allow(dead_code, reason = "called by the combined Jira quickstart in #4400")]
 pub(super) fn values(
     name: &str,
     probed: &Probed,
@@ -196,7 +189,6 @@ pub(super) fn values(
 /// The egress entries for Bitbucket Cloud: every range in Atlassian's
 /// published document whose `product` includes `bitbucket` and whose
 /// `direction` includes `ingress`, on TCP 443.
-#[allow(dead_code, reason = "called by the combined Jira quickstart in #4400")]
 pub(super) fn cloud_egress(doc: &Value) -> Result<Vec<EgressEntry>> {
     let items = doc["items"].as_array().ok_or_else(|| {
         CliError::failure(format!(
@@ -224,7 +216,6 @@ pub(super) fn cloud_egress(doc: &Value) -> Result<Vec<EgressEntry>> {
 }
 
 /// Fetches Atlassian's published IP range document.
-#[allow(dead_code, reason = "called by the combined Jira quickstart in #4400")]
 pub(super) async fn fetch_ip_ranges() -> Result<Value> {
     let response = http_client(None)?
         .get(IP_RANGES_URL)
@@ -245,7 +236,6 @@ pub(super) async fn fetch_ip_ranges() -> Result<Value> {
 
 /// The credential expiry line: a Bitbucket access token's expiry is not
 /// readable with the token itself.
-#[allow(dead_code, reason = "called by the combined Jira quickstart in #4400")]
 pub(super) fn expiry_line(name: &str) -> String {
     format!("credential code host {name} (static_token): unknown")
 }
@@ -293,20 +283,18 @@ mod tests {
             token_file: Some(PathBuf::from("bitbucket-token-that-is-never-read")),
             ca_file: None,
             review_accounts: vec!["example-account-1".into()],
+            tracker_url: Some("https://example.atlassian.net".into()),
+            tracker_token_file: Some(PathBuf::from("jira-token-that-is-never-read")),
+            forge_username: Some("factory@example.com".into()),
+            start_accounts: vec!["example-jira-account".into()],
             ..ForgeFlags::default()
         }
     }
 
-    /// The Bitbucket half accepted the flags and reached the combined Jira
-    /// quickstart, which is not in this build until #4400.
+    /// The Bitbucket half and the Jira half both accepted the flags.
     fn assert_reaches_the_jira_half(result: Result<()>, case: &str) {
         if let Err(error) = result {
-            assert_eq!(
-                error.to_string(),
-                crate::factory_quickstart::jira_cloud::code_host_not_installed("bitbucket-cloud")
-                    .to_string(),
-                "{case}: the Bitbucket half refused: {error:#}"
-            );
+            panic!("{case}: the full flag set was refused: {error:#}");
         }
     }
 
@@ -422,10 +410,10 @@ mod tests {
     }
 
     #[test]
-    fn check_refuses_non_jira_tracker_naming_not_installed() {
+    fn check_refuses_non_jira_tracker() {
         for tracker in [TrackerKind::Github, TrackerKind::Gitlab] {
-            // Bare `--code-host bitbucket-cloud` (the reserved-kind integration
-            // test's shape) and a full flag set both stop at the pairing.
+            // Bare `--code-host bitbucket-cloud` and a full flag set both stop at
+            // the pairing.
             for forge in [
                 ForgeFlags {
                     code_host: CodeHostKind::BitbucketCloud,
@@ -437,19 +425,19 @@ mod tests {
                 let error = check(&forge).expect_err("a non-Jira tracker is refused");
                 let cli = cli_error(&error);
                 assert_eq!(
-                    cli.message,
-                    "code host 'bitbucket-cloud' pairs only with --tracker jira-cloud, and that pairing is not installed in this build",
+                    cli.message, "code host 'bitbucket-cloud' pairs only with --tracker jira-cloud",
                     "{tracker:?}"
                 );
-                assert_eq!(cli.class, ExitClass::Unsupported, "{tracker:?}");
-                assert_eq!(
-                    cli.fix.as_deref(),
-                    Some("rerun with --code-host github"),
+                assert_eq!(cli.class, ExitClass::Usage, "{tracker:?}");
+                assert!(
+                    cli.fix
+                        .as_deref()
+                        .is_some_and(|fix| fix.contains("--tracker jira-cloud")),
                     "{tracker:?}"
                 );
             }
         }
-        // The dispatch reaches this module and keeps the reserved-kind text.
+        // The dispatch reaches this module.
         let error = select_forge(&ForgeFlags {
             code_host: CodeHostKind::BitbucketCloud,
             ..ForgeFlags::default()
@@ -457,7 +445,8 @@ mod tests {
         .expect_err("bitbucket-cloud with the github tracker is refused");
         let text = format!("{error:#}");
         assert!(
-            text.contains("not installed") && text.contains("bitbucket-cloud"),
+            text.contains("pairs only with --tracker jira-cloud")
+                && text.contains("bitbucket-cloud"),
             "{text}"
         );
         // Liveness: the Jira tracker passes the pairing.

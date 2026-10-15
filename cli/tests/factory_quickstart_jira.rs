@@ -280,6 +280,8 @@ fn flags(forge_url: &str, token_file: &Path) -> ForgeFlags {
         forge_username: Some(USERNAME.to_string()),
         start_accounts: vec![STARTER.to_string(), SECOND_STARTER.to_string()],
         start_group: None,
+        tracker_url: None,
+        tracker_token_file: None,
     }
 }
 

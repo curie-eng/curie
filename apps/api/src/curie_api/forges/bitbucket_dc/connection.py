@@ -3,8 +3,10 @@
 Built from one config entry: ``host`` is the server's hostname and ``api_url``
 its base URL, context path included (decision 5.2). The credential is a project
 or repository HTTP access token, sent as a Bearer header on API calls and git
-alike (decision 4.2); its clone origin is ``api_url``. The adapter module is
-imported when an adapter is built, so registering the kind does not import it.
+alike (decision 4.2). Its clone origin is ``<api_url>/scm``, so the clone URL
+every consumer derives as ``<origin>/<path>.git`` is the server's
+``<api_url>/scm/<KEY>/<slug>.git``. The adapter module is imported when an
+adapter is built, so registering the kind does not import it.
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ class BitbucketDcConnection:
         self._token = credential.token
         self._provider = StaticTokenProvider(
             credential.token.get_secret_value(),
-            origin=config.api_url,
+            origin=f"{config.api_url.rstrip('/')}/scm",
             header=CredentialHeader.AUTHORIZATION_BEARER,
             expires_at=credential.expires_at,
             never_expires=credential.never_expires,

@@ -1099,9 +1099,12 @@ def _int(value: str | None) -> int | None:
 
 
 def provider(token: str = FACTORY_TOKEN, *, base_url: str = API_URL) -> StaticTokenProvider:
-    """The Bearer credential provider the DC connection builds (decision 4.2)."""
+    """The Bearer credential provider the DC connection builds (decision 4.2),
+    on the clone origin ``<base_url>/scm``."""
 
-    return StaticTokenProvider(token, origin=base_url, header=CredentialHeader.AUTHORIZATION_BEARER)
+    return StaticTokenProvider(
+        token, origin=f"{base_url}/scm", header=CredentialHeader.AUTHORIZATION_BEARER
+    )
 
 
 def dc_adapter(

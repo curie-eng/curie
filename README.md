@@ -76,7 +76,7 @@ Choose where your issues and code live:
 | GitHub | GitHub pull request | Follow the GitHub steps below |
 | GitLab | GitLab merge request | [GitLab quickstart](docs/guides/factory-gitlab-quickstart.md), for gitlab.com or self-managed GitLab |
 | Jira Cloud | GitHub pull request | [Jira Cloud with GitHub quickstart](docs/guides/factory-jira-github-quickstart.md) |
-| Jira Cloud | Bitbucket Cloud or Data Center pull request | Adapters ship, but the combined quickstart is unavailable; see [current limits](docs/capabilities.md) |
+| Jira Cloud | Bitbucket Cloud or Data Center pull request | [Jira Cloud with Bitbucket quickstart](docs/guides/dark-factory-quickstart.md#run-quickstart-for-bitbucket), for Bitbucket Cloud or Data Center 9.4.0 or later |
 
 #### GitHub
 
