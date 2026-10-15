@@ -371,7 +371,7 @@ fn recorded_query<'a>(
 }
 
 #[test]
-fn remote_skill_refuses_hosted_connector_secret_files_as_a_usage_error() {
+fn hosted_connector_secret_files_use_daemon_volumes() {
     for source in [
         "image: ghcr.io/example/acme-connector:1",
         "build:\n      context: connectors/acme\n      platforms: [linux/amd64]",
@@ -380,33 +380,37 @@ fn remote_skill_refuses_hosted_connector_secret_files_as_a_usage_error() {
             "connectors:\n  acme-connector:\n    {source}\n    secret_files:\n      ACME_API_TOKEN: /run/secrets/acme-token\n"
         ))
         .expect("a hosted connector with secret files is a valid declaration");
-        let err =
-            super::skill::refuse_remote_connector_secret_files(&decl, Some("docker.example.com"))
-                .expect_err("remote skill startup must refuse client-side secret file binds");
-        assert_eq!(crate::exit::classify(&err).0, crate::exit::ExitClass::Usage);
-        let message = err.to_string();
-        for expected in ["acme-connector", "secret_files", "DOCKER_PUBLISHED_HOST"] {
-            assert!(message.contains(expected), "{message}");
-        }
-        assert!(
-            super::skill::refuse_remote_connector_secret_files(&decl, None).is_ok(),
-            "the same declaration must remain usable with local Docker"
-        );
+        let volumes = crate::connector_build::ConnectorSecretVolumes::new(&decl);
+        let mounts = volumes
+            .mounts("acme-connector", &decl.connectors["acme-connector"])
+            .expect("hosted secret files have a daemon volume");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].target, "/run/secrets/acme-token");
+        assert_eq!(mounts[0].volume, volumes.volumes["acme-connector"]);
+        assert!(mounts[0].docker_mount().starts_with("type=volume,"));
     }
 }
 
 #[test]
-fn remote_skill_accepts_hosted_connector_environment_secrets() {
+fn hosted_connector_environment_secrets_require_no_file_volume() {
     let decl = crate::connector_build::parse_connectors(
         "connectors:\n  acme-connector:\n    image: ghcr.io/example/acme-connector:1\n    env:\n      API_URL: https://api.example.com\n    secrets:\n      - ACME_API_TOKEN\n",
     )
     .expect("an env-only hosted connector is a valid declaration");
-    super::skill::refuse_remote_connector_secret_files(&decl, Some("docker.example.com"))
-        .expect("remote Docker must continue to support connector environment secrets");
+    let volumes = crate::connector_build::ConnectorSecretVolumes::new(&decl);
+    assert!(volumes.volumes.is_empty());
+    assert!(volumes
+        .mounts("acme-connector", &decl.connectors["acme-connector"])
+        .expect("environment secrets require no file mounts")
+        .is_empty());
+    assert_eq!(
+        crate::connector_build::declared_secret_names(&decl.connectors["acme-connector"]),
+        vec!["ACME_API_TOKEN".to_string()]
+    );
 }
 
 #[test]
-fn remote_skill_accepts_secret_files_for_connectors_it_does_not_host() {
+fn unhosted_connector_secret_files_allocate_no_daemon_volumes() {
     for source in [
         "url: https://mcp.example.com/sse",
         "image: ghcr.io/example/acme-connector:1\n    unhosted_url: https://mcp.example.com/sse",
@@ -415,8 +419,8 @@ fn remote_skill_accepts_secret_files_for_connectors_it_does_not_host() {
             "connectors:\n  acme-connector:\n    {source}\n    secret_files:\n      ACME_API_TOKEN: /run/secrets/acme-token\n"
         ))
         .expect("an existing connector endpoint is a valid declaration");
-        super::skill::refuse_remote_connector_secret_files(&decl, Some("docker.example.com"))
-            .expect("a connector at an existing URL does not require a secret file mount");
+        let volumes = crate::connector_build::ConnectorSecretVolumes::new(&decl);
+        assert!(volumes.volumes.is_empty());
     }
 }
 
@@ -2779,9 +2783,7 @@ fn recorded_runner(digest: Option<&str>, snapshot_dir: Option<&str>) -> RunnerSt
     }
 }
 
-/// The eval sweep's runner spec, mounting `dir`. Mirrors what
-/// `boot_eval_runner` builds, so these tests end where the user's Docker
-/// daemon does: in `run_args()`.
+/// The eval sweep's client snapshot is transferred into its Docker volume.
 fn sweep_spec(dir: &Path) -> StartSpec {
     StartSpec {
         image: "curie-runner".into(),
@@ -2802,7 +2804,7 @@ fn sweep_spec(dir: &Path) -> StartSpec {
 }
 
 fn mounts(spec: &StartSpec) -> Vec<String> {
-    spec.run_args()
+    spec.run_args("curie-snapshot-acme-eval")
         .windows(2)
         .filter(|pair| pair[0] == "-v")
         .map(|pair| pair[1].clone())
@@ -2866,7 +2868,7 @@ fn sweep_snapshot_reuses_the_recorded_runners_snapshot() {
     );
     assert_eq!(
         mounts(&sweep_spec(&dir)),
-        vec![format!("{RECORDED_SNAPSHOT}:/plugin:ro")],
+        vec!["curie-snapshot-acme-eval:/plugin:ro".to_string()],
         "the sweep's runner must boot on the recorded snapshot"
     );
 }
@@ -2920,7 +2922,7 @@ fn resolve_sweep_mount_returns_the_recorded_snapshot_when_one_exists() {
             assert_eq!(digest, RECORDED_DIGEST);
             assert_eq!(
                 mounts(&sweep_spec(&dir)),
-                vec![format!("{RECORDED_SNAPSHOT}:/plugin:ro")],
+                vec!["curie-snapshot-acme-eval:/plugin:ro".to_string()],
                 "the resolved mount is what the sweep's docker run receives"
             );
         }
@@ -2974,7 +2976,7 @@ fn bundle_source() -> (tempfile::TempDir, PathBuf) {
 /// The argv-terminating helper for the two `EvalBundle` tests: what
 /// `boot_eval_runner` would hand the Docker daemon for this bundle.
 fn eval_mounts(bundle: &EvalBundle) -> Vec<String> {
-    mounts(&eval_runner_spec(
+    let spec = eval_runner_spec(
         bundle,
         "curie-runner",
         7345,
@@ -2982,7 +2984,9 @@ fn eval_mounts(bundle: &EvalBundle) -> Vec<String> {
         "opus",
         vec![],
         vec![],
-    ))
+    );
+    assert_eq!(spec.plugin_dir, bundle.dir());
+    mounts(&spec)
 }
 
 /// #1087 AC2's wiring guard. The pure-resolver tests above prove
@@ -3027,7 +3031,7 @@ fn the_eval_bundle_packs_a_snapshot_and_never_mounts_the_mutable_source() {
     let mounts = eval_mounts(&bundle);
     assert_eq!(
         mounts,
-        vec![format!("{}:/plugin:ro", bundle.dir().display())],
+        vec!["curie-snapshot-acme-eval:/plugin:ro".to_string()],
         "the snapshot is what reaches the Docker daemon"
     );
     assert!(
@@ -3065,42 +3069,7 @@ fn the_eval_bundle_reuses_the_recorded_snapshot_and_its_digest() {
     );
     assert_eq!(
         eval_mounts(&bundle),
-        vec![format!("{}:/plugin:ro", bundle.dir().display())]
-    );
-}
-
-/// An aborted boot releases the credentials it staged, not just the
-/// containers. Deleting the wipe from `release_boot_scaffolding` fails here.
-///
-/// Nothing else will ever collect them: no state was recorded, so no `skill
-/// down` can find the bundle (#1087). Driven with no sidecar, no connector
-/// and no network so it reaches no Docker daemon -- what is under test is
-/// the release list, not the removals.
-#[tokio::test]
-async fn an_aborted_boot_releases_the_staged_credentials() {
-    let dir = tempfile::tempdir().unwrap();
-    crate::connector_build::stage_secret_file(
-        dir.path(),
-        "kubernetes",
-        "/secrets/kubeconfig",
-        "creds",
-    )
-    .unwrap();
-    let root = crate::connector_build::connector_secrets_root(dir.path());
-    assert!(root.exists());
-
-    super::release_boot_scaffolding(
-        None,
-        &[],
-        None,
-        &dir.path().join(".curie/snapshots/never-packed"),
-        dir.path(),
-    )
-    .await;
-
-    assert!(
-        !root.exists(),
-        "a resolved credential must not outlive the boot that staged it"
+        vec!["curie-snapshot-acme-eval:/plugin:ro".to_string()]
     );
 }
 

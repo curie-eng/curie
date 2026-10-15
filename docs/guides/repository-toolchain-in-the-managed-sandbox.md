@@ -59,7 +59,7 @@ pid, memory and CPU envelope. The writable paths are exactly three:
 |---|---|---|
 | `/tmp` | tmpfs | scratch; **mounted `noexec`** |
 | `/home/runner` | tmpfs | the runner's `HOME`; **mounted `noexec`** |
-| `/workspace` | bind mount | the repository checkout; read-write and exec-able |
+| `/workspace` | named volume | the repository checkout, copied through the Docker API; read-write, exec-able, owned by UID `1000` |
 
 Everything else, `/usr/local/lib` included, refuses writes with
 `Read-only file system`. That is deliberate: the image's own site-packages are
@@ -77,7 +77,7 @@ same virtualenv's `bin/python` still works, because that entry is a symlink onto
 the exec-able root filesystem — which is exactly what makes the failure
 confusing. You get a working `python` and a broken `pip` in the same directory.
 
-The identical virtualenv created under the bind-mounted `/workspace` works
+The identical virtualenv created under the named volume at `/workspace` works
 completely, console scripts included. So the recipe is: **make the virtualenv
 where the repository already is.**
 
@@ -94,9 +94,10 @@ location this guide documents.
 
 Read this before you have work worth losing.
 
-The recipe's writable paths are all `emptyDir` at cluster tier and tmpfs or a
-bind mount locally. None of them is storage. A restart that keeps the *pod* —
-the runner container dying and being restarted in place — preserves everything:
+The recipe's writable paths are all `emptyDir` at cluster tier and tmpfs or
+claim-owned named volumes locally. They are disposable runtime storage. A
+restart that keeps the *pod*, with the runner container dying and being
+restarted in place, preserves everything:
 the checkout, its history, the head, the origin, the virtualenv. A restart that
 replaces the **pod** preserves none of it.
 

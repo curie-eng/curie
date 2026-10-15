@@ -226,7 +226,6 @@ def _write_override(path: pathlib.Path, api_image: str, host_ports: dict[str, in
       S3_ENDPOINT_URL: ${{S3_ENDPOINT_URL}}
       CURIE_API_URL: ${{CURIE_API_URL}}
       SLACK_API_BASE_URL: http://127.0.0.1:${{CURIE_LOCAL_STUB_PORT}}/api/
-      TMPDIR: ${{CURIE_LOCAL_STAGING_DIR}}
       CURIE_DOCKER_NETWORK: ${{CURIE_DOCKER_NETWORK}}
     volumes: !override
       - /var/run/docker.sock:/var/run/docker.sock
@@ -313,8 +312,6 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
         base = REPO / "compose.dev.yaml"
 
     env = _clean_env()
-    staging = root / "staging"
-    staging.mkdir()
     env.update(
         {
             "COMPOSE_FILE": f"{base}:{override}",
@@ -325,7 +322,6 @@ def local_case(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_ar
             "CURIE_LOCAL_IMAGE_TAG": f"test-{suffix}",
             "CURIE_LOCAL_POSTGRES_HOST": "127.0.0.1",
             "CURIE_LOCAL_POSTGRES_PORT": str(host_ports["postgres"]),
-            "CURIE_LOCAL_STAGING_DIR": str(staging),
             "CURIE_LOCAL_STUB_PORT": "9",
             "S3_ENDPOINT_URL": f"http://127.0.0.1:{host_ports['rustfs']}",
             "VALKEY_HOST": "127.0.0.1",
