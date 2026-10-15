@@ -22,17 +22,15 @@ co-worker** that investigates Kubernetes workloads from Slack. Then convert your
 | [SRE co-worker](#sre-co-worker-on-your-laptop) | Ask about your local cluster in Slack; approve configured mutations. |
 | [Bring your existing agent](#make-your-existing-agent-a-co-worker) | Reuse its instructions and tools, then connect it to a workspace. |
 
-<picture>
-  <source media="(prefers-reduced-motion: reduce)" srcset="docs/demo/co-worker-factory-still.png">
-  <img src="docs/demo/co-worker-factory-loop.gif" width="960" alt="Two Curie paths: adapt skills and MCP tools into a Slack co-worker with configured controls; or delegate a supported issue to an isolated Factory run that can return a reviewable PR or MR for the team.">
-</picture>
+### See the Software Factory
 
-Adapt an existing agent's skills and tools into a supported bundle, then bind it
-to Slack with the approvals, scoped facts, and model you configure. In Software
-Factory, delegate a supported issue for isolated implementation and agent review.
-Curie reports a PR or MR and its CI status, or a reason the task could not
-finish; your team decides what to merge. See the [co-worker model](docs/co-workers.md)
-and [factory workflow](docs/software-factory.md) for the full behavior and limits.
+<a href="https://vimeo.com/1231115133/eadc6eb936">
+  <img src="https://i.vimeocdn.com/video/2206199274-0dcf4f345f0dfb2733cf53dfbdb85b3441e3f593dcd23cfdce0c45bb50d46146-d?f=webp&amp;region=us" width="720" alt="Watch the Curie Software Factory demo: GitHub issues to reviewed pull requests.">
+</a>
+
+[Watch the Software Factory demo](https://vimeo.com/1231115133/eadc6eb936), then
+follow the local quickstart below. The video features GitHub; the quickstarts
+also cover supported GitLab and Jira Cloud paths.
 
 ## Quickstart
 
@@ -206,6 +204,9 @@ kind delete cluster --name "$CURIE_SRE_CLUSTER"
 Keep your agent's useful instructions and tools. Curie provides workspace
 interaction, deployment, supervision, and operational controls around a
 supported bundle.
+
+[Watch how Curie turns an existing agent into a co-worker](https://vimeo.com/1230537103/2d607d04a5),
+then follow the steps below to adapt your own agent.
 
 1. **Adapt the package.** Put instructions into skills and declare tools through
    MCP. Existing deterministic code can remain behind a tool wrapper.
