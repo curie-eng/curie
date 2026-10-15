@@ -68,6 +68,11 @@ class _RecordingDocker(DockerSandboxClient):
         self.timeouts: list[float] = []
         self.outputs: dict[str, str] = {}
         self.copied_files: dict[str, dict[str, bytes]] = {}
+        self.volumes: dict[str, dict[str, str]] = {}
+
+    @property
+    def runner_argv(self) -> list[str]:
+        return next(argv for argv in reversed(self.calls) if argv[0] == "run")
 
     def _docker(
         self,
@@ -78,6 +83,29 @@ class _RecordingDocker(DockerSandboxClient):
     ) -> str:
         self.timeouts.append(request_timeout_seconds)
         self.calls.append(args)
+        if args[:2] == ["volume", "create"]:
+            self.volumes[args[-1]] = dict(
+                value.split("=", 1) for value in _flag_values(args, "--label")
+            )
+            return args[-1]
+        if args[:2] == ["volume", "ls"]:
+            selectors = [
+                value.removeprefix("label=")
+                for value in _flag_values(args, "--filter")
+                if value.startswith("label=")
+            ]
+            return "\n".join(
+                name
+                for name, labels in self.volumes.items()
+                if all(
+                    labels.get(key) == value if sep else key in labels
+                    for selector in selectors
+                    for key, sep, value in [selector.partition("=")]
+                )
+            )
+        if args[:2] == ["volume", "rm"]:
+            for name in args[2:]:
+                self.volumes.pop(name, None)
         if args[0] == "cp":
             source = Path(args[-2])
             if source.is_dir():
@@ -109,6 +137,21 @@ def _volume_mounts(argv: list[str]) -> dict[str, tuple[str, str]]:
         readonly = any(key in fields for key in ("readonly", "ro"))
         mounts[target] = (source, "ro" if readonly else "rw")
     return mounts
+
+
+def _seed_source(client: _RecordingDocker, target: str) -> Path:
+    volume, mode = _volume_mounts(client.runner_argv)[target]
+    helper = next(
+        argv
+        for argv in client.calls
+        if argv[0] == "create"
+        and volume in {source for source, mode in _volume_mounts(argv).values()}
+    )
+    name = _flag_values(helper, "--name")[0]
+    copied = next(
+        argv for argv in client.calls if argv[0] == "cp" and argv[-1].startswith(f"{name}:")
+    )
+    return Path(copied[-2])
 
 
 @pytest.fixture

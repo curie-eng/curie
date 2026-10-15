@@ -179,7 +179,6 @@ def stack(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_artifac
       OTEL_EXPORTER_OTLP_ENDPOINT: ""
     volumes: !override
       - /var/run/docker.sock:/var/run/docker.sock
-      - "${{CURIE_LOCAL_STAGING_DIR}}:${{CURIE_LOCAL_STAGING_DIR}}"
 networks:
   curie_runner:
     name: "{project}_runner"

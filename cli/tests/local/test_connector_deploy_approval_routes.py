@@ -230,7 +230,6 @@ def _write_override(path: pathlib.Path, api_image: str, host_ports: dict[str, in
       CURIE_DOCKER_NETWORK: ${{CURIE_DOCKER_NETWORK}}
     volumes: !override
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${{CURIE_LOCAL_STAGING_DIR}}:${{CURIE_LOCAL_STAGING_DIR}}
 networks:
   curie_runner:
     name: \"${{COMPOSE_PROJECT_NAME}}_runner\"

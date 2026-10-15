@@ -83,7 +83,13 @@ from curie_worker.attachments import (
 )
 from curie_worker.sandbox.docker import DockerError
 
-from .conftest import _FakeBundleStore, _flag_values, _RecordingDocker
+from .conftest import (
+    _FakeBundleStore,
+    _flag_values,
+    _RecordingDocker,
+    _seed_source,
+    _volume_mounts,
+)
 
 # Fake model everywhere: it suppresses the ambient-credential forwarding, so the
 # argv a test compares does not depend on whether the developer running it has
@@ -384,20 +390,11 @@ def _env(*refs: AttachmentRef) -> dict[str, str]:
     return {**_BASE_ENV, ATTACHMENTS_REF_ENV: encode_attachment_refs(refs)}
 
 
-def _attachment_mount(argv: list[str]) -> tuple[Path, str]:
-    """(host dir, mode) of the bind mount at the path the runner probes."""
-
+def _attachment_mount(client: _RecordingDocker) -> tuple[Path, str]:
     expected = _runner_attachments_dir()
-    mounts = _flag_values(argv, "-v")
-    for mount in mounts:
-        parts = mount.split(":")
-        if len(parts) >= 2 and parts[1] == expected:
-            return Path(parts[0]), parts[2] if len(parts) > 2 else ""
-    pytest.fail(
-        f"the docker driver bind-mounted nothing at {expected!r} (mounts: {mounts}). "
-        "The worker downloaded the file, parked the bytes and minted a signed "
-        "reference, and no container will ever see it."
-    )
+    mounts = _volume_mounts(client.runner_argv)
+    assert expected in mounts, f"runner has no attachment volume at {expected!r}: {mounts}"
+    return _seed_source(client, expected), mounts[expected][1]
 
 
 def _refused(client: _RecordingDocker, env: dict[str, str], *, because: str) -> Exception:
@@ -449,8 +446,8 @@ def test_a_turn_with_no_attachments_produces_todays_container_spec_exactly(
     client = _client()
     client.create_claim("claim-plain", pool="pool", env={**_BASE_ENV, **extra})
 
-    assert client.calls[0] == baseline.calls[0]
-    assert _flag_values(client.calls[0], "-v") == []
+    assert client.runner_argv == baseline.runner_argv
+    assert _flag_values(client.runner_argv, "-v") == []
     assert staged == []
     assert objects.requested == []
 
@@ -458,7 +455,7 @@ def test_a_turn_with_no_attachments_produces_todays_container_spec_exactly(
 # --- the working path --------------------------------------------------------
 
 
-def test_attachments_are_materialized_and_bind_mounted_read_only(
+def test_attachments_are_materialized_and_seeded_into_read_only_volume(
     objects: _FakeObjectStore, staged: list[Path]
 ) -> None:
     """The bug this file exists for: the files must actually arrive.
@@ -483,7 +480,7 @@ def test_attachments_are_materialized_and_bind_mounted_read_only(
         ),
     )
 
-    root, mode = _attachment_mount(client.calls[0])
+    root, mode = _attachment_mount(client)
     assert mode == "ro", f"the attachment mount is {mode!r}, not read-only"
     # Dot-entries are the init container's own bookkeeping and the runner
     # already ignores them (runner/tests/test_attachments_mount.py), so only the
@@ -527,9 +524,9 @@ def test_the_mount_path_agrees_with_the_runner_and_the_chart(
         env=_env(_ref(url=url, name="report.csv", payload=payload)),
     )
 
-    mounts = _flag_values(client.calls[0], "-v")
+    mounts = _volume_mounts(client.runner_argv)
     assert len(mounts) == 1, f"expected exactly the attachment mount, got {mounts}"
-    container_path = mounts[0].split(":")[1]
+    container_path = next(iter(mounts))
     assert container_path == runner_dir == chart_dir, (
         f"the docker driver mounts attachments at {container_path!r} while the "
         f"runner probes {runner_dir!r} and the chart mounts {chart_dir!r}"
@@ -567,7 +564,7 @@ def test_the_signed_reference_never_reaches_the_runner_container(
     client = _client()
     client.create_claim("claim-attachments", pool="pool", env=env)
 
-    argv = client.calls[0]
+    argv = client.runner_argv
     forwarded = [e for e in _flag_values(argv, "-e") if e.startswith(f"{ATTACHMENTS_REF_ENV}=")]
     assert forwarded == [], (
         f"{ATTACHMENTS_REF_ENV} was forwarded into the runner container: {forwarded}"
@@ -598,7 +595,7 @@ def test_the_materialized_tree_is_readable_by_the_nonroot_runner(
         env=_env(_ref(url=url, name="report.csv", payload=payload)),
     )
 
-    root, _mode = _attachment_mount(client.calls[0])
+    root, _mode = _attachment_mount(client)
     assert root.stat().st_mode & 0o005 == 0o005, "the mount root is not o+rx"
     assert (root / "report.csv").stat().st_mode & 0o004 == 0o004, "report.csv is not o+r"
 
@@ -695,7 +692,7 @@ def test_a_file_just_under_the_cap_is_materialized_whole(
         env=_env(_ref(url=url, name="report.csv", payload=payload)),
     )
 
-    root, _mode = _attachment_mount(client.calls[0])
+    root, _mode = _attachment_mount(client)
     assert (root / "report.csv").read_bytes() == payload
 
 
@@ -893,7 +890,7 @@ def test_the_docker_driver_matches_the_shared_init_outcome_vector(
         return
 
     client.create_claim("claim-attachments", pool="pool", env=env)
-    root, mode = _attachment_mount(client.calls[0])
+    root, mode = _attachment_mount(client)
     assert mode == "ro"
     visible = {
         entry.name: entry.read_bytes() for entry in root.iterdir() if not entry.name.startswith(".")
@@ -943,7 +940,7 @@ def test_the_attachment_manifest_is_forwarded_to_the_runner(
     client.create_claim("claim-attachments", pool="pool", env=env)
 
     forwarded = [
-        e for e in _flag_values(client.calls[0], "-e") if e.startswith(f"{_MANIFEST_ENV}=")
+        e for e in _flag_values(client.runner_argv, "-e") if e.startswith(f"{_MANIFEST_ENV}=")
     ]
     assert forwarded == [f"{_MANIFEST_ENV}={manifest}"], (
         f"{_MANIFEST_ENV} did not reach the runner container as given: {forwarded}"
@@ -971,7 +968,7 @@ def test_deleting_the_claim_removes_the_materialized_directory(
         pool="pool",
         env=_env(_ref(url=url, name="report.csv", payload=payload)),
     )
-    root, _mode = _attachment_mount(client.calls[0])
+    root, _mode = _attachment_mount(client)
     assert root.exists()
 
     client.delete_claim("claim-attachments", request_timeout_seconds=1.0)
@@ -1000,10 +997,12 @@ def test_a_failed_container_boot_removes_the_materialized_directory(
             check: bool = True,
         ) -> str:
             assert request_timeout_seconds > 0
-            self.calls.append(args)
+            result = super()._docker(
+                args, request_timeout_seconds=request_timeout_seconds, check=check
+            )
             if args[0] == "run":
                 raise DockerError("docker run failed")
-            return ""
+            return result
 
     payload = b"a,b\n"
     url = objects.add("https://objects.example.test/attachments/a/000.bin", payload)

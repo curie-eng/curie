@@ -38,7 +38,13 @@ from curie_worker.sandbox.docker import (
 from curie_worker.sandbox.types import RouteState
 from curie_worker.workspace import WorkspaceRef
 
-from .conftest import _FakeBundleStore, _flag_values, _RecordingDocker, _volume_mounts
+from .conftest import (
+    _FakeBundleStore,
+    _flag_values,
+    _RecordingDocker,
+    _seed_source,
+    _volume_mounts,
+)
 
 
 def _plugin_tar_gz(wrapper: str | None) -> bytes:
@@ -149,6 +155,79 @@ def test_create_claim_seeds_remote_volumes_before_starting_runner(
         assert client.calls.index(copied) < client.calls.index(runner)
 
 
+@pytest.mark.parametrize("failure", ["create", "cp", "run"])
+def test_failed_claim_removes_its_remote_volumes(
+    remote_claim_env: dict[str, str],
+    failure: str,
+) -> None:
+    class _FailedSeedDocker(_RecordingDocker):
+        def _docker(
+            self,
+            args: list[str],
+            *,
+            request_timeout_seconds: float,
+            check: bool = True,
+        ) -> str:
+            result = super()._docker(
+                args,
+                request_timeout_seconds=request_timeout_seconds,
+                check=check,
+            )
+            if args[0] == failure:
+                raise DockerError(f"docker {failure} failed")
+            return result
+
+    client = _FailedSeedDocker(
+        image="curie-runner",
+        bundle_store=_FakeBundleStore(_plugin_tar_gz(wrapper=None)),
+    )
+    client.volumes["unrelated-volume"] = {
+        "curietech.ai/managed-by": "another-component",
+    }
+    with pytest.raises(DockerError):
+        client.create_claim("claim-remote", pool="pool", env=remote_claim_env)
+
+    created = [argv[-1] for argv in client.calls if argv[:2] == ["volume", "create"]]
+    assert created, "failure cleanup must exercise allocated daemon volumes"
+    assert set(client.volumes) == {"unrelated-volume"}
+    if failure != "run":
+        assert not any(argv[0] == "run" for argv in client.calls)
+
+
+def test_fresh_client_deletes_only_volumes_owned_by_the_exact_claim(
+    remote_claim_env: dict[str, str],
+) -> None:
+    owner = _RecordingDocker(
+        image="curie-runner",
+        bundle_store=_FakeBundleStore(_plugin_tar_gz(wrapper=None)),
+    )
+    owner.create_claim("claim-remote", pool="pool", env=remote_claim_env)
+    owned = dict(owner.volumes)
+    assert len(owned) == 3
+    labels = next(iter(owned.values()))
+    assert labels["curietech.ai/managed-by"] == "curie-sandbox-substrate"
+    claim_key = next(key for key, value in labels.items() if value == "claim-remote")
+    component_key = next(key for key in labels if key.rsplit("/", 1)[-1] == "component")
+    foreign = {
+        "other-claim-volume": {**labels, claim_key: "claim-other"},
+        "unmanaged-volume": {**labels, "curietech.ai/managed-by": "another-component"},
+        "other-component-volume": {**labels, component_key: "another-component"},
+    }
+    owner.volumes.update(foreign)
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    client.volumes = owner.volumes
+    client.delete_claim("claim-remote", request_timeout_seconds=1.0)
+
+    assert client.volumes == foreign
+    removal_calls = [argv for argv in client.calls if argv[:2] == ["volume", "rm"]]
+    assert removal_calls
+    assert all(
+        client.calls.index(["rm", "-f", "claim-remote"]) < client.calls.index(argv)
+        for argv in removal_calls
+    )
+    assert all(0 < timeout <= 1.0 for timeout in client.timeouts)
+
+
 def test_docker_cannot_prove_kubernetes_quota_headroom() -> None:
     client = _RecordingDocker(
         image="curie-runner",
@@ -185,7 +264,7 @@ def test_create_claim_argv_carries_boot_env() -> None:
         },
         labels={"curietech.ai/thread-hash": "abc"},
     )
-    argv = client.calls[0]
+    argv = client.runner_argv
     joined = " ".join(argv)
     assert joined.startswith("run -d --name thread-abc")
     assert "127.0.0.1::8080" in _flag_values(argv, "-p")
@@ -222,7 +301,7 @@ def test_create_claim_forwards_the_claims_code_host_origin_and_no_github_url() -
         },
     )
 
-    envs = _flag_values(client.calls[0], "-e")
+    envs = _flag_values(client.runner_argv, "-e")
     assert "CURIE_REPO_ORIGIN=https://gitlab.example.com" in envs
     assert "CURIE_REPO_PATH=group/sub/project" in envs
     assert not any(item.startswith("CURIE_GITHUB_API_URL=") for item in envs)
@@ -257,7 +336,7 @@ def test_create_claim_excludes_host_credentials_from_child_env(
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     client.create_claim("thread-credentials", pool="pool", env=os.environ)
 
-    child_env_names = {entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")}
+    child_env_names = {entry.partition("=")[0] for entry in _flag_values(client.runner_argv, "-e")}
     assert denied_names.isdisjoint(child_env_names)
     assert "CURIE_BUDGET" in child_env_names
     assert "CURIE_CREDENTIALS" in child_env_names
@@ -275,7 +354,7 @@ def test_create_claim_forwards_the_caller_token_and_never_its_signing_key() -> N
             "CURIE_CONNECTOR_CALLER_SIGNING_KEY": "placeholder",
         },
     )
-    forwarded = _flag_values(client.calls[0], "-e")
+    forwarded = _flag_values(client.runner_argv, "-e")
     assert "CURIE_CONNECTOR_CALLER_TOKEN=cct.payload.signature" in forwarded
     assert not [e for e in forwarded if e.startswith("CURIE_CONNECTOR_CALLER_SIGNING_KEY=")]
 
@@ -291,7 +370,7 @@ def test_create_claim_preserves_declared_connector_secret() -> None:
         },
     )
 
-    child_env_names = {entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")}
+    child_env_names = {entry.partition("=")[0] for entry in _flag_values(client.runner_argv, "-e")}
     assert {"CURIE_CONNECTOR_SECRET_KEYS", "SLACK_BOT_TOKEN"} <= child_env_names
 
 
@@ -348,7 +427,7 @@ def test_local_substrate_claims_runner_with_connector_secret_without_a_warm_pool
 
     assert handle.sandbox_name == handle.claim_name
     assert pools == ["curie-runner-pool"]
-    child_env = _flag_values(client.calls[0], "-e")
+    child_env = _flag_values(client.runner_argv, "-e")
     assert "GRAFANA_SERVICE_ACCOUNT_TOKEN=placeholder" in child_env
 
 
@@ -363,7 +442,7 @@ def test_create_claim_connector_marker_cannot_readmit_reserved_curie_credential(
         },
     )
 
-    child_env_names = {entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")}
+    child_env_names = {entry.partition("=")[0] for entry in _flag_values(client.runner_argv, "-e")}
     assert "CURIE_CONNECTOR_SECRET_KEYS" in child_env_names
     assert "CURIE_SEALING_PRIVATE_KEY" not in child_env_names
 
@@ -391,7 +470,7 @@ def test_create_claim_excludes_every_slack_identity_token_from_child_env() -> No
         },
     )
 
-    child_env_names = {entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")}
+    child_env_names = {entry.partition("=")[0] for entry in _flag_values(client.runner_argv, "-e")}
     assert tokens.keys().isdisjoint(child_env_names)
     assert "CURIE_SLACK_IDENTITIES" in child_env_names
 
@@ -409,14 +488,13 @@ def test_create_claim_fetches_and_unwraps_bundle() -> None:
         },
     )
     assert store.requested == ["bundles/b.tar.gz"]  # the worker fetched the bundle
-    mounts = _flag_values(client.calls[0], "-v")
-    assert len(mounts) == 1
-    host_dir, container_dir, mode = mounts[0].split(":")
-    assert container_dir == "/bundles/current"
-    assert mode == "ro"
+    mounts = _volume_mounts(client.runner_argv)
+    assert set(mounts) == {"/bundles/current"}
+    assert mounts["/bundles/current"][1] == "ro"
+    host_dir = _seed_source(client, "/bundles/current")
     # Unwrapped: the manifest sits at the mount root, not under the wrapper dir.
     assert (Path(host_dir) / ".claude-plugin" / "plugin.json").is_file()
-    child_env = _flag_values(client.calls[0], "-e")
+    child_env = _flag_values(client.runner_argv, "-e")
     # The RustFS object key itself is not forwarded into the container env.
     # Updated deliberately (#2174): keep stripping the object key, and forward
     # the platform-tracked version_label so a sandboxed agent can name itself.
@@ -462,8 +540,9 @@ def test_create_claim_prefetches_workspace_without_forwarding_capability_env(
     )
 
     assert client.prepared == [("thread-workspace", workspace_ref, workspace_sha256)]
-    argv = client.calls[0]
-    assert f"{checkout}:/workspace:rw" in _flag_values(argv, "-v")
+    argv = client.runner_argv
+    assert _volume_mounts(argv)["/workspace"][1] == "rw"
+    assert _seed_source(client, "/workspace") == checkout
     child_env = _flag_values(argv, "-e")
     child_env_names = {entry.partition("=")[0] for entry in child_env}
     assert "CURIE_WORKSPACE_REF" not in child_env_names
@@ -475,7 +554,7 @@ def test_create_claim_prefetches_workspace_without_forwarding_capability_env(
 def test_create_claim_without_bundle_ref_mounts_nothing() -> None:
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     client.create_claim("t1", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
-    assert _flag_values(client.calls[0], "-v") == []
+    assert _flag_values(client.runner_argv, "-v") == []
 
 
 def test_sdk_credential_forwarded_by_name_only() -> None:
@@ -487,7 +566,7 @@ def test_sdk_credential_forwarded_by_name_only() -> None:
         environ={"CLAUDE_CODE_OAUTH_TOKEN": "sk-PLACEHOLDER-never-real"},
     )
     client.create_claim("t1", pool="pool", env={"CURIE_BUDGET": "{}"})
-    argv = client.calls[0]
+    argv = client.runner_argv
     envs = _flag_values(argv, "-e")
     assert "CLAUDE_CODE_OAUTH_TOKEN" in envs  # forwarded by name
     assert all("PLACEHOLDER" not in a for a in argv)  # the value never leaks in
@@ -496,7 +575,7 @@ def test_sdk_credential_forwarded_by_name_only() -> None:
 def test_sdk_credential_not_forwarded_when_absent() -> None:
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore(), environ={})
     client.create_claim("t1", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
-    envs = _flag_values(client.calls[0], "-e")
+    envs = _flag_values(client.runner_argv, "-e")
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in envs
     assert "ANTHROPIC_API_KEY" not in envs
 
@@ -512,7 +591,7 @@ def test_curie_credentials_forwarded_by_name_never_as_value() -> None:
     # The worker also hands it in the boot env (from config.credentials); it must
     # still never be emitted as a -e KEY=value pair.
     client.create_claim("t1", pool="pool", env={"CURIE_CREDENTIALS": "sk-ant-PLACEHOLDER-secret"})
-    argv = client.calls[0]
+    argv = client.runner_argv
     envs = _flag_values(argv, "-e")
     assert "CURIE_CREDENTIALS" in envs  # forwarded by name
     assert all("PLACEHOLDER-secret" not in a for a in argv)  # value never in argv
@@ -535,7 +614,7 @@ def test_ambient_sdk_creds_not_forwarded_when_curie_credentials_set() -> None:
         },
     )
     client.create_claim("t1", pool="pool", env={"CURIE_BUDGET": "{}"})
-    argv = client.calls[0]
+    argv = client.runner_argv
     envs = _flag_values(argv, "-e")
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in envs  # ambient OAuth token not forwarded by name
     assert "ANTHROPIC_API_KEY" not in envs  # ambient API key not forwarded by name
@@ -557,7 +636,7 @@ def test_ambient_sdk_creds_forwarded_when_curie_credentials_empty() -> None:
         },
     )
     client.create_claim("t1", pool="pool", env={"CURIE_BUDGET": "{}"})
-    argv = client.calls[0]
+    argv = client.runner_argv
     envs = _flag_values(argv, "-e")
     assert "CLAUDE_CODE_OAUTH_TOKEN" in envs  # ambient OAuth token forwarded by name
     assert all("PLACEHOLDER" not in a for a in argv)  # the value never leaks into argv
@@ -584,11 +663,11 @@ def test_no_credential_forwarded_under_fake_model() -> None:
         },
     )
     client.create_claim("t1", pool="pool", env={"CURIE_FAKE_MODEL": "1", "CURIE_BUDGET": "{}"})
-    envs = _flag_values(client.calls[0], "-e")
+    envs = _flag_values(client.runner_argv, "-e")
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in envs  # ambient SDK token not forwarded
     assert "ANTHROPIC_API_KEY" not in envs
     assert "CURIE_CREDENTIALS" not in envs  # BYO reference not forwarded either
-    assert all("PLACEHOLDER" not in a for a in client.calls[0])  # no value leaks
+    assert all("PLACEHOLDER" not in a for a in client.runner_argv)  # no value leaks
 
 
 def test_ambient_sdk_creds_not_forwarded_under_local_model() -> None:
@@ -605,10 +684,10 @@ def test_ambient_sdk_creds_not_forwarded_under_local_model() -> None:
         pool="pool",
         env={"ANTHROPIC_BASE_URL": "http://ollama:11434", "CURIE_BUDGET": "{}"},
     )
-    envs = _flag_values(client.calls[0], "-e")
+    envs = _flag_values(client.runner_argv, "-e")
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in envs  # ambient SDK token not forwarded
     assert "ANTHROPIC_API_KEY" not in envs
-    assert all("PLACEHOLDER" not in a for a in client.calls[0])  # no value leaks
+    assert all("PLACEHOLDER" not in a for a in client.runner_argv)  # no value leaks
 
 
 def test_explicit_credential_forwarded_under_base_url_override() -> None:
@@ -629,11 +708,11 @@ def test_explicit_credential_forwarded_under_base_url_override() -> None:
         pool="pool",
         env={"ANTHROPIC_BASE_URL": "https://openrouter.ai/api", "CURIE_BUDGET": "{}"},
     )
-    envs = _flag_values(client.calls[0], "-e")
+    envs = _flag_values(client.runner_argv, "-e")
     assert "CURIE_CREDENTIALS" in envs  # BYO OpenRouter key still forwarded by name
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in envs  # ambient SDK token still suppressed
     assert "ANTHROPIC_API_KEY" not in envs
-    assert all("PLACEHOLDER" not in a for a in client.calls[0])  # value never in argv
+    assert all("PLACEHOLDER" not in a for a in client.runner_argv)  # value never in argv
 
 
 def test_get_sandbox_reports_published_port_and_mode() -> None:
@@ -783,7 +862,7 @@ def test_runner_token_forwarded_as_docker_env() -> None:
         pool="pool",
         env={"CURIE_BUDGET": "{}", "CURIE_RUNNER_TOKEN": "tok-25"},
     )
-    envs = _flag_values(client.calls[0], "-e")
+    envs = _flag_values(client.runner_argv, "-e")
     assert "CURIE_RUNNER_TOKEN=tok-25" in envs
 
 
@@ -804,7 +883,7 @@ def test_runner_token_forwarded_even_when_credentials_selected() -> None:
             "CURIE_RUNNER_TOKEN": "tok-25b",
         },
     )
-    envs = _flag_values(client.calls[0], "-e")
+    envs = _flag_values(client.runner_argv, "-e")
     assert "CURIE_RUNNER_TOKEN=tok-25b" in envs
     assert "CURIE_CREDENTIALS" in envs  # still forwarded by name
     assert "CURIE_CREDENTIALS=sk-PLACEHOLDER-byo" not in envs  # never as a value
@@ -895,7 +974,7 @@ def test_create_claim_applies_container_hardening_by_default() -> None:
     # writable paths, all caps dropped, no-new-privileges, bounded pids/mem/cpu.
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     client.create_claim("t1", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
-    argv = client.calls[0]
+    argv = client.runner_argv
     assert "--read-only" in argv
     tmpfs = _flag_values(argv, "--tmpfs")
     assert "/tmp:rw,mode=1777" in tmpfs
@@ -918,7 +997,7 @@ def test_runner_never_receives_the_docker_socket() -> None:
         environ={"CLAUDE_CODE_OAUTH_TOKEN": "sk-PLACEHOLDER"},
     )
     client.create_claim("t1", pool="pool", env={"CURIE_BUDGET": "{}"})
-    assert all("docker.sock" not in m for m in _flag_values(client.calls[0], "-v"))
+    assert all("docker.sock" not in m for m in _flag_values(client.runner_argv, "-v"))
 
 
 def test_hardening_disabled_emits_no_hardening_flags() -> None:
@@ -930,7 +1009,7 @@ def test_hardening_disabled_emits_no_hardening_flags() -> None:
         hardening=RunnerHardening.from_env({"CURIE_RUNNER_HARDENING": "0"}),
     )
     client.create_claim("t1", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
-    argv = client.calls[0]
+    argv = client.runner_argv
     assert "--read-only" not in argv
     assert _flag_values(argv, "--cap-drop") == []
     assert _flag_values(argv, "--memory") == []
@@ -953,7 +1032,7 @@ def test_hardening_env_overrides_limits_and_paths() -> None:
         hardening=hardening,
     )
     client.create_claim("t1", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
-    argv = client.calls[0]
+    argv = client.runner_argv
     assert "2g" in _flag_values(argv, "--memory")
     assert "2" in _flag_values(argv, "--cpus")
     assert "1024" in _flag_values(argv, "--pids-limit")
@@ -971,7 +1050,7 @@ def test_hardening_read_only_opt_out_keeps_other_rails() -> None:
         hardening=RunnerHardening.from_env({"CURIE_RUNNER_READ_ONLY": "false"}),
     )
     client.create_claim("t1", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
-    argv = client.calls[0]
+    argv = client.runner_argv
     assert "--read-only" not in argv
     assert _flag_values(argv, "--tmpfs") == []  # no read-only -> no tmpfs needed
     assert "ALL" in _flag_values(argv, "--cap-drop")
