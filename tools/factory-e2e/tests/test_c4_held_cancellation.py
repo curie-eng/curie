@@ -551,18 +551,24 @@ class HeldRun(sk.ScriptedRun):
                 "--prefix",
                 timeout=30,
             )
-        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        # Diagnostics never raise, so they cannot replace a verdict or a fault.
+        except Exception as exc:  # noqa: BLE001 - diagnostics cannot replace the failure
             return [f"unavailable ({type(exc).__name__})"]
-        lines = [
-            line
-            for line in output.splitlines()
-            if "work-item terminate" in line or "record_termination" in line
-        ][-20:]
-        safe = []
-        for line in lines:
-            redacted = fe.record_agent_text(line, self.secrets)[0] or ""
-            safe.append(re.sub(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"<>]+", "<url>", redacted)[:400])
-        return safe
+        try:
+            lines = [
+                line
+                for line in output.splitlines()
+                if "work-item terminate" in line or "record_termination" in line
+            ][-20:]
+            safe = []
+            for line in lines:
+                redacted = fe.record_agent_text(line, self.secrets)[0] or ""
+                safe.append(
+                    re.sub(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"<>]+", "<url>", redacted)[:400]
+                )
+            return safe
+        except Exception as exc:  # noqa: BLE001 - diagnostics cannot replace the failure
+            return [f"unavailable ({type(exc).__name__})"]
 
     # 1. The held state.
 
@@ -953,13 +959,19 @@ class HeldRun(sk.ScriptedRun):
             output = self.kubectl(
                 "-n", self.namespace, "logs", pod, "--tail=1000", "--limit-bytes=262144", timeout=30
             )
-        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        # Diagnostics never raise, so they cannot replace a verdict or a fault.
+        except Exception as exc:  # noqa: BLE001 - diagnostics cannot replace the failure
             return [f"unavailable ({type(exc).__name__})"]
-        safe = []
-        for line in [line for line in output.splitlines() if request_id in line][-20:]:
-            redacted = fe.record_agent_text(line, self.secrets)[0] or ""
-            safe.append(re.sub(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"<>]+", "<url>", redacted)[:400])
-        return safe
+        try:
+            safe = []
+            for line in [line for line in output.splitlines() if request_id in line][-20:]:
+                redacted = fe.record_agent_text(line, self.secrets)[0] or ""
+                safe.append(
+                    re.sub(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"<>]+", "<url>", redacted)[:400]
+                )
+            return safe
+        except Exception as exc:  # noqa: BLE001 - diagnostics cannot replace the failure
+            return [f"unavailable ({type(exc).__name__})"]
 
     def require_recovered_continuation(self, held: Held) -> None:
         self.deadline = time.monotonic() + RECOVERY_BOUND_SECONDS + 600
