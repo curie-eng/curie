@@ -515,6 +515,22 @@ def render_deployment(
                     },
                 }
             )
+    # `config` names are per-agent settings from the same per-agent Secret.
+    # Same delivery as a plain secret; only the credential handling differs,
+    # and that lives in the Bearer derivation, not here.
+    for config_name in spec.config:
+        env.append(
+            {
+                "name": config_name,
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": secret_name,
+                        "key": config_name,
+                        "optional": False,
+                    }
+                },
+            }
+        )
     # secret_files project the SAME per-agent Secret as a file instead of an
     # env var, for servers that authenticate from disk (#1402). One volume per
     # file so each carries only its own key: a single volume with several items

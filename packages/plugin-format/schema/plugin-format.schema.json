@@ -238,6 +238,13 @@
           ],
           "default": null
         },
+        "config": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Config",
+          "type": "array"
+        },
         "env": {
           "additionalProperties": {
             "type": "string"

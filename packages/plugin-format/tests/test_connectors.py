@@ -1142,6 +1142,110 @@ def test_a_direct_suffix_that_renders_no_colliding_service_is_accepted(
     assert "connectors.direct_service_collision" not in _codes({"connectors": connectors})
 
 
+# `config`: per-agent NON-secret settings delivered like a plain secret but
+# never treated as a credential. Synthetic names only.
+
+
+def test_config_is_accepted_beside_a_single_bearer_secret() -> None:
+    # The motivating shape: one real credential plus per-agent settings. Under
+    # `secrets` this would trip bearer_secret_required and risk deriving the
+    # Authorization header from a folder path.
+    parsed, errors = validate_connectors(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "secrets": ["DOCS_TOKEN"],
+                    "config": ["DOCS_FOLDER_PATH", "CHAT_CHANNEL_ID"],
+                }
+            }
+        }
+    )
+    assert errors == []
+    assert parsed is not None
+    spec = parsed.connectors["docs"]
+    assert spec.config == ["DOCS_FOLDER_PATH", "CHAT_CHANNEL_ID"]
+    # Resolved from the same per-agent store, so the deploy path writes them.
+    assert spec.resolved_secrets() == ["DOCS_TOKEN", "DOCS_FOLDER_PATH", "CHAT_CHANNEL_ID"]
+    # But they are not credentials.
+    assert spec.secret_names() == ["DOCS_TOKEN"]
+
+
+def test_config_only_connector_is_valid() -> None:
+    assert _codes({"connectors": {"docs": {"image": "x:1", "config": ["DOCS_FOLDER_PATH"]}}}) == []
+
+
+def test_config_names_do_not_count_toward_bearer_secret_required() -> None:
+    codes = _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "x:1",
+                    "secrets": ["DOCS_TOKEN"],
+                    "config": ["A_SETTING", "B_SETTING"],
+                }
+            }
+        }
+    )
+    assert "connectors.bearer_secret_required" not in codes
+
+
+def test_bearer_secret_may_not_name_a_config_entry() -> None:
+    assert "connectors.bearer_secret_unknown" in _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "x:1",
+                    "secrets": ["DOCS_TOKEN"],
+                    "config": ["DOCS_FOLDER_PATH"],
+                    "bearer_secret": "DOCS_FOLDER_PATH",
+                }
+            }
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "secret_form",
+    [
+        {"secrets": ["SHARED_NAME"]},
+        {"secrets": [{"name": "SHARED_NAME", "from_secret": "s"}]},
+        {"secret_files": {"SHARED_NAME": "/secrets/shared"}},
+    ],
+    ids=["secrets", "secret_ref", "secret_files"],
+)
+def test_a_name_may_not_be_both_config_and_a_secret(secret_form: dict) -> None:
+    doc = {"connectors": {"docs": {"image": "x:1", "config": ["SHARED_NAME"], **secret_form}}}
+    assert "connectors.config_is_secret" in _codes(doc)
+
+
+def test_a_config_name_may_not_repeat() -> None:
+    assert "connectors.duplicate_config" in _codes(
+        {"connectors": {"docs": {"image": "x:1", "config": ["A_SETTING", "A_SETTING"]}}}
+    )
+
+
+def test_a_config_name_must_be_env_var_shaped() -> None:
+    assert "connectors.config_name_invalid" in _codes(
+        {"connectors": {"docs": {"image": "x:1", "config": ["folder-path"]}}}
+    )
+
+
+def test_a_config_name_obeys_the_reserved_fence() -> None:
+    # Same fence as a secret: otherwise moving ANTHROPIC_API_KEY from
+    # `secrets` to `config` would hand the operator's model credential to the
+    # bundle's own container.
+    assert "connectors.config_name_reserved" in _codes(
+        {"connectors": {"docs": {"image": "x:1", "config": ["ANTHROPIC_API_KEY"]}}}
+    )
+
+
+def test_a_remote_connector_cannot_declare_config() -> None:
+    assert "connectors.remote_has_config" in _codes(
+        {"connectors": {"r": {"url": "https://mcp.example.com/mcp", "config": ["A_SETTING"]}}}
+    )
+
+
 # --------------------------------------------------------------------------- #
 # `proxy_upstream_host`: the Host the caller proxy presents on admitted
 # requests (Draft ADR 0229)

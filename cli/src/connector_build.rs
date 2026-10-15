@@ -119,6 +119,11 @@ pub struct ConnectorSpecDecl {
     pub sealed_secrets: BTreeMap<String, String>,
     #[serde(default)]
     pub secret_files: BTreeMap<String, String>,
+    /// Per-agent NON-secret settings: resolved and forwarded like a plain
+    /// `secrets:` name, but never a Bearer candidate and never bound into the
+    /// sandbox. See [`declared_secret_names`] and [`bearer_secret_name`].
+    #[serde(default)]
+    pub config: Vec<String>,
 }
 
 /// A declared secret: a bare env var name, or a reference to a Secret someone
@@ -176,6 +181,7 @@ impl Default for ConnectorSpecDecl {
             bearer_secret: None,
             sealed_secrets: BTreeMap::new(),
             secret_files: BTreeMap::new(),
+            config: Vec::new(),
         }
     }
 }
@@ -2006,7 +2012,10 @@ pub fn compose_overlay(
     }))
 }
 
-/// The env-var names a declaration's `secrets:` list asks to be forwarded.
+/// The env-var names a declaration's `secrets:` and `config:` lists ask to be
+/// forwarded. `config` values come from the same store and reach the container
+/// the same way; only the Bearer derivation tells them apart, and that reads
+/// `secrets` alone.
 pub fn declared_secret_names(spec: &ConnectorSpecDecl) -> Vec<String> {
     spec.secrets
         .iter()
@@ -2014,6 +2023,7 @@ pub fn declared_secret_names(spec: &ConnectorSpecDecl) -> Vec<String> {
             SecretDecl::Name(name) => name.clone(),
             SecretDecl::Ref { name, .. } => name.clone(),
         })
+        .chain(spec.config.iter().cloned())
         .collect()
 }
 
@@ -2022,8 +2032,8 @@ pub fn declared_secret_names(spec: &ConnectorSpecDecl) -> Vec<String> {
 /// A connector carrying `url:` or `unhosted_url:` is not started here -- its
 /// secrets belong to the remote's client config and are expanded by the MCP
 /// client, so demanding them would refuse a bundle that works. Both channels a
-/// hosted connector resolves are covered: the `secrets:` list and the
-/// `secret_files:` keys. Names only; no value ever travels through this seam.
+/// hosted connector resolves are covered: the `secrets:` and `config:` lists
+/// and the `secret_files:` keys. Names only; no value ever travels through this seam.
 pub fn hosted_secret_names(decl: &ConnectorsFileDecl) -> Vec<String> {
     let mut names = std::collections::BTreeSet::new();
     for spec in decl.connectors.values() {
@@ -2372,6 +2382,60 @@ connectors:
 "#,
         );
         assert_eq!(hosted_env_secret_names(&decl), vec!["PAT".to_string()]);
+    }
+
+    const CONFIGURED: &str = r#"
+connectors:
+  docs:
+    image: ghcr.io/example/docs-mcp:1
+    secrets:
+      - DOCS_TOKEN
+    config:
+      - DOCS_FOLDER_PATH
+      - CHAT_CHANNEL_ID
+"#;
+
+    #[test]
+    fn config_names_are_resolved_and_forwarded_like_plain_secrets() {
+        // `config` values come from the same per-agent store and reach the
+        // connector container the same way, so every resolve/forward seam
+        // must see them.
+        let decl = decl(CONFIGURED);
+        let spec = &decl.connectors["docs"];
+        assert_eq!(
+            declared_secret_names(spec),
+            vec!["DOCS_TOKEN", "DOCS_FOLDER_PATH", "CHAT_CHANNEL_ID"]
+        );
+        assert_eq!(
+            hosted_secret_names(&decl),
+            vec!["CHAT_CHANNEL_ID", "DOCS_FOLDER_PATH", "DOCS_TOKEN"]
+        );
+    }
+
+    #[test]
+    fn config_names_never_become_the_bearer_or_reach_the_sandbox() {
+        let configured = decl(CONFIGURED);
+        assert_eq!(
+            bearer_secret_name(&configured.connectors["docs"]).as_deref(),
+            Some("DOCS_TOKEN")
+        );
+        assert_eq!(
+            hosted_env_secret_names(&configured),
+            vec!["DOCS_TOKEN".to_string()]
+        );
+        let config_only = decl(
+            "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    config: [DOCS_FOLDER_PATH]\n",
+        );
+        assert_eq!(bearer_secret_name(&config_only.connectors["docs"]), None);
+        assert!(hosted_env_secret_names(&config_only).is_empty());
+    }
+
+    #[test]
+    fn a_reserved_config_name_is_refused_before_resolution() {
+        let decl = decl(
+            "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    config: [ANTHROPIC_API_KEY]\n",
+        );
+        assert!(refuse_reserved_secret_names(&decl).is_err());
     }
 
     // @spec ADR-0168 d8
