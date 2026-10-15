@@ -248,4 +248,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0225 | [Turn action receipts are opt-in](0225-turn-action-receipts-are-opt-in.md) | Accepted |
 | 0226 | [Persist terminal answers before channel delivery](0226-persist-terminal-answers-before-channel-delivery.md) | Accepted |
 | 0227 | [Opt-in final-answer publication validation](0227-opt-in-final-answer-publication-validation.md) | Accepted |
+| 0230 | [Cluster upgrade and rollback report outcomes from one lifecycle record checked against the cluster](0230-upgrade-and-rollback-report-from-one-lifecycle-record-checked-against-the-cluster.md) | Draft |
 <!-- END GENERATED: adr-index -->
