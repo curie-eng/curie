@@ -26,7 +26,7 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast
 
-from pydantic import Field, TypeAdapter
+from pydantic import Field, TypeAdapter, field_validator
 
 from .events import _AciModel
 
@@ -313,6 +313,10 @@ class BootEnv(_AciModel):
     # object-store fetch key and is not the agent-facing identity.
     bundle_version: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_BUNDLE_VERSION", "worker")
+    )
+    input_contract_context: str | None = Field(
+        default=None, pattern=r"^(standalone|tracked-implementation)$",
+        json_schema_extra=_env("CURIE_INPUT_CONTRACT_CONTEXT", "worker")
     )
     # A trusted managed request's generic input compatibility enforcement.
     # Absence preserves standalone behavior; unknown IDs confer no capability.
@@ -676,6 +680,13 @@ class BootEnv(_AciModel):
             )
         return declared[field][0]
 
+    @field_validator("input_contract_context")
+    @classmethod
+    def _input_contract_context(cls, value: str | None) -> str | None:
+        if value is not None and value not in {"standalone", "tracked-implementation"}:
+            raise ValueError("unknown input contract context")
+        return value
+
     @classmethod
     def render_worker(
         cls,
@@ -688,6 +699,7 @@ class BootEnv(_AciModel):
         bundle_ref: str | None = None,
         bundle_version: str | None = None,
         input_contract_enforcement: str | None = None,
+        input_contract_context: str | None = None,
         runner_token: str | None = None,
         model: str | None = None,
         reviewer_model: str | None = None,
@@ -748,6 +760,8 @@ class BootEnv(_AciModel):
             env[cls.env_key("bundle_ref")] = bundle_ref
         if bundle_version:
             env[cls.env_key("bundle_version")] = bundle_version
+        if input_contract_context:
+            env[cls.env_key("input_contract_context")] = input_contract_context
         if input_contract_enforcement:
             env[cls.env_key("input_contract_enforcement")] = input_contract_enforcement
         if runner_token:
@@ -822,6 +836,8 @@ class BootEnv(_AciModel):
             env[self.env_key("bundle_ref")] = self.bundle_ref
         if self.bundle_version is not None:
             env[self.env_key("bundle_version")] = self.bundle_version
+        if self.input_contract_context is not None:
+            env[self.env_key("input_contract_context")] = self.input_contract_context
         if self.input_contract_enforcement is not None:
             env[self.env_key("input_contract_enforcement")] = self.input_contract_enforcement
         if self.runner_token is not None:
@@ -937,6 +953,7 @@ class BootEnv(_AciModel):
             bundle_ref=_str_or_none(env.get("CURIE_BUNDLE_REF")),
             bundle_version=_str_or_none(env.get("CURIE_BUNDLE_VERSION")),
             input_contract_enforcement=_str_or_none(env.get(cls.env_key("input_contract_enforcement"))),
+            input_contract_context=_str_or_none(env.get(cls.env_key("input_contract_context"))),
             runner_token=_str_or_none(env.get("CURIE_RUNNER_TOKEN")),
             model=_str_or_none(env.get("CURIE_MODEL")),
             reviewer_model=_str_or_none(env.get(cls.env_key("reviewer_model"))),

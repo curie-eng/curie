@@ -66,6 +66,7 @@ export type HistoryMaxBytes = number | null;
 export type HistoryMaxTurns = number | null;
 export type HistoryRef = string | null;
 export type HistoryToken = string | null;
+export type InputContractContext = string | null;
 export type InputContractEnforcement = string | null;
 export type IssueReadToken = string | null;
 export type IssueReadUrl = string | null;
@@ -439,6 +440,7 @@ export interface BootEnv {
   history_max_turns?: HistoryMaxTurns;
   history_ref?: HistoryRef;
   history_token?: HistoryToken;
+  input_contract_context?: InputContractContext;
   input_contract_enforcement?: InputContractEnforcement;
   issue_read_token?: IssueReadToken;
   issue_read_url?: IssueReadUrl;

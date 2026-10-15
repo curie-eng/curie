@@ -620,6 +620,23 @@
           ],
           "title": "History Token"
         },
+        "input_contract_context": {
+          "anyOf": [
+            {
+              "pattern": "^(standalone|tracked-implementation)$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_INPUT_CONTRACT_CONTEXT",
+          "producer": [
+            "worker"
+          ],
+          "title": "Input Contract Context"
+        },
         "input_contract_enforcement": {
           "anyOf": [
             {

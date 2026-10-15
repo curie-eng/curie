@@ -159,6 +159,8 @@ pub struct BootEnv {
     #[serde(default)]
     pub bundle_version: Option<String>,
     #[serde(default)]
+    pub input_contract_context: Option<String>,
+    #[serde(default)]
     pub input_contract_enforcement: Option<String>,
     #[serde(default)]
     pub runner_token: Option<String>,
@@ -275,6 +277,7 @@ pub mod env_keys {
     pub const CURIE_HISTORY_MAX_TURNS: &str = "CURIE_HISTORY_MAX_TURNS";
     pub const CURIE_HISTORY_REF: &str = "CURIE_HISTORY_REF";
     pub const CURIE_HISTORY_TOKEN: &str = "CURIE_HISTORY_TOKEN";
+    pub const CURIE_INPUT_CONTRACT_CONTEXT: &str = "CURIE_INPUT_CONTRACT_CONTEXT";
     pub const CURIE_INPUT_CONTRACT_ENFORCEMENT: &str = "CURIE_INPUT_CONTRACT_ENFORCEMENT";
     pub const CURIE_ISSUE_READ_TOKEN: &str = "CURIE_ISSUE_READ_TOKEN";
     pub const CURIE_ISSUE_READ_URL: &str = "CURIE_ISSUE_READ_URL";
