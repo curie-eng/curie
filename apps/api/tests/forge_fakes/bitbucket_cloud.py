@@ -88,6 +88,10 @@ MAX_PAGELEN = 100
 _SOURCE_BRANCH_Q = re.compile(r'\s*source\.branch\.name\s*=\s*"((?:[^"\\]|\\.)*)"\s*')
 _CREATED_ON_Q = re.compile(r'\s*created_on\s*>=\s*"?([0-9T:.+\-Z]+)"?\s*')
 _MARKER_LINE = re.compile(r"^\[//\]: # \(.*\)$")
+# The only two filters the mergeability checks endpoint accepts, joined by
+# ``AND`` in either order; anything else is a 400 (swagger, re-read 2026-10-15).
+_SKIP_GIT_Q = re.compile(r'\s*type\s*!=\s*"git_mergeability_check"\s*')
+_SKIP_BEHIND_Q = re.compile(r'\s*check\.kind\s*!=\s*"maximum_commits_behind"\s*')
 
 
 def _stamp(moment: datetime) -> str:
@@ -113,6 +117,36 @@ def _number(text: str) -> int:
     """A stable twelve-digit number for ``text``, for placeholder UUIDs."""
 
     return int(hashlib.sha1(text.encode()).hexdigest(), 16) % 10**12
+
+
+def _mergeability_skips(query: str | None) -> frozenset[str] | None:
+    """The checks a mergeability ``q`` excludes, or None when Bitbucket
+    refuses it: ``git`` for ``type!="git_mergeability_check"``, ``behind``
+    for ``check.kind!="maximum_commits_behind"``, each at most once."""
+
+    if query is None:
+        return frozenset()
+    skips: list[str] = []
+    for clause in re.split(r"\s+AND\s+", query):
+        if _SKIP_GIT_Q.fullmatch(clause):
+            skips.append("git")
+        elif _SKIP_BEHIND_Q.fullmatch(clause):
+            skips.append("behind")
+        else:
+            return None
+    return frozenset(skips) if len(skips) == len(set(skips)) else None
+
+
+def _skipped(check: dict[str, Any], skips: frozenset[str]) -> bool:
+    if "git" in skips and check.get("type") == "git_mergeability_check":
+        return True
+    kind = check.get("check")
+    return (
+        "behind" in skips
+        and check.get("type") == "standard_merge_check"
+        and isinstance(kind, dict)
+        and kind.get("kind") == "maximum_commits_behind"
+    )
 
 
 def _error(status: int, message: str) -> JSONResponse:
@@ -207,6 +241,10 @@ class BitbucketCloudFake:
     # request is accepted and before the checks are evaluated: a test pushes to
     # the source or destination branch here to move a head mid-read.
     on_mergeability_read: Callable[[int], None] | None = None
+    # Pull requests whose payload carries no source commit hash. Bitbucket is
+    # not known to answer this way; it is an unexpected shape, offered so a test
+    # can show the adapter proves nothing about a pull request it cannot pin.
+    hashless_sources: set[int] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.tokens.setdefault(FACTORY_TOKEN, self.factory)
@@ -546,7 +584,11 @@ class BitbucketCloudFake:
             # Bitbucket abbreviates both commit hashes to twelve characters.
             "source": {
                 "branch": {"name": pull.source},
-                "commit": {"type": "commit", "hash": self._head(pull)[:12]},
+                "commit": (
+                    {"type": "commit"}
+                    if pull.id in self.hashless_sources
+                    else {"type": "commit", "hash": self._head(pull)[:12]}
+                ),
                 "repository": self._repo_min(),
             },
             "destination": {
@@ -964,7 +1006,8 @@ class BitbucketCloudFake:
             return _error(404, "Pull request not found")
         # Only a limited BBQL subset is accepted here; the adapter sends none.
         query = request.query_params.get("q")
-        if query is not None:
+        skips = _mergeability_skips(query)
+        if skips is None:
             return _error(400, f"Unsupported query: {query}")
         if self.on_mergeability_read is not None:
             self.on_mergeability_read(pull.id)
@@ -973,7 +1016,7 @@ class BitbucketCloudFake:
             if isinstance(answer.body, (dict, list)):
                 return JSONResponse(answer.body, status_code=answer.status, headers=answer.headers)
             return Response(answer.body or "", status_code=answer.status, headers=answer.headers)
-        values = self._mergeability(pull)
+        values = [v for v in self._mergeability(pull) if not _skipped(v, skips)]
         return JSONResponse({"size": len(values), "values": values})
 
     async def _comments(self, request: Request) -> Response:
