@@ -2,7 +2,12 @@
 
 A factory specification describes one deliverable. Contract v1 follows
 [ADR 0199](../adr/0199-the-factory-admits-only-tickets-it-can-start-and-finish.md).
-The shared parser is `apps/api/src/curie_api/factory_specification.py`.
+[ADR 0222](../adr/0222-coworker-bundles-own-workflow-policy-and-curie-enforces-execution.md)
+assigns this contract to the factory bundle. Its structural library lives in
+`examples/dark-factory/preparation/src/curie_factory_preparation/` for managed
+runtime use and contributor verification. Platform applications do not import it.
+The [local preparation skill](factory-preparation.md) requires no client Python
+installation and does not execute this library on the developer's computer.
 Parsing establishes structure only. It does not establish that decisions are
 resolved, prerequisites are satisfied, commands work, coverage is substantive,
 or a deployment can finish the work. The deployment evaluator and validation
@@ -95,8 +100,10 @@ Run the contract fixtures, graph and injection tests and documentation
 validation from the repository root:
 
 ```bash
-uv run pytest apps/api/tests/test_factory_specification.py -q
+uv run pytest examples/tests/test_factory_specification.py -q
 bash scripts/check-docs.sh
 ```
- No deployed admission path consumes this parser
-yet; #4487 must reuse it rather than implement a competing interpretation.
+No deployed admission path consumes this parser yet. #4589 supplies the generic
+isolated evaluation boundary; #4487 and #4488 consume the factory evaluator
+through it. The first preparation release produces reviewed unvalidated drafts;
+it does not run deployment evaluation or select tracker work.

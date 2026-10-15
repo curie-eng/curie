@@ -879,6 +879,34 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../examples/dark-factory/skills/implement-issue/SKILL.md"),
     ),
     (
+        "preparation/README.md",
+        include_bytes!("../../examples/dark-factory/preparation/README.md"),
+    ),
+    (
+        "preparation/pyproject.toml",
+        include_bytes!("../../examples/dark-factory/preparation/pyproject.toml"),
+    ),
+    (
+        "preparation/src/curie_factory_preparation/__init__.py",
+        include_bytes!("../../examples/dark-factory/preparation/src/curie_factory_preparation/__init__.py"),
+    ),
+    (
+        "preparation/src/curie_factory_preparation/specification.py",
+        include_bytes!("../../examples/dark-factory/preparation/src/curie_factory_preparation/specification.py"),
+    ),
+    (
+        "preparation/src/curie_factory_preparation/ticket_set.py",
+        include_bytes!("../../examples/dark-factory/preparation/src/curie_factory_preparation/ticket_set.py"),
+    ),
+    (
+        "preparation/skills/prepare-factory-ticket/SKILL.md",
+        include_bytes!("../../examples/dark-factory/preparation/skills/prepare-factory-ticket/SKILL.md"),
+    ),
+    (
+        "preparation/skills/prepare-factory-ticket/references/specification.md",
+        include_bytes!("../../examples/dark-factory/preparation/skills/prepare-factory-ticket/references/specification.md"),
+    ),
+    (
         "verification/contract.md",
         include_bytes!("../../examples/dark-factory/verification/contract.md"),
     ),

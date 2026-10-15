@@ -42,6 +42,7 @@ members = [
     "apps/e2e-connector",
     "apps/worker",
     "runner",
+    "examples/dark-factory/preparation",
     "tools/doclint",
     "tools/wire-tolerance-gate",
 ]
@@ -63,11 +64,13 @@ curie-e2e-connector = { workspace = true }
 curie-worker = { workspace = true }
 curie-runner = { workspace = true }
 curie-telemetry = { workspace = true }
+curie-factory-preparation = { workspace = true }
 curie-doclint = { workspace = true }
 curie-wire-tolerance-gate = { workspace = true }
 
 [dependency-groups]
 dev = [
+    "curie-factory-preparation",
     "curie-doclint",
     "curie-wire-tolerance-gate",
     "curie-test-support",
@@ -88,6 +91,7 @@ dev = [
 # legacy runner SDK importers. Only the Claude harness package may add imports.
 # The platform, frozen contracts, harness port and approval gate stay SDK free.
 root_packages = [
+    "curie_factory_preparation",
     "curie_protected_hooks",
     "curie_api",
     "curie_internal",
@@ -112,6 +116,27 @@ root_packages = [
 include_external_packages = true
 
 # @spec PROTECTED-HOOK-LANE-1: internal transport has no application/SDK authority.
+[[tool.importlinter.contracts]]
+name = "Platform applications do not import factory preparation policy"
+type = "forbidden"
+source_modules = [
+    "curie_api", "curie_worker", "curie_runner", "curie_dispatcher",
+    "curie_discord_adapter", "curie_mail_adapter", "curie_e2e_connector",
+    "aci_protocol", "channel_protocol", "plugin_format", "curie_internal",
+]
+forbidden_modules = ["curie_factory_preparation"]
+
+[[tool.importlinter.contracts]]
+name = "Factory preparation is independent of platform execution"
+type = "forbidden"
+source_modules = ["curie_factory_preparation"]
+forbidden_modules = [
+    "curie_api", "curie_worker", "curie_runner", "curie_dispatcher",
+    "curie_discord_adapter", "curie_mail_adapter", "curie_e2e_connector",
+    "aci_protocol", "channel_protocol", "plugin_format", "curie_internal",
+    "claude_agent_sdk",
+]
+
 [[tool.importlinter.contracts]]
 name = "Protected hook primitives stay independent of applications and harnesses"
 type = "forbidden"
@@ -334,6 +359,7 @@ mypy_path = [
     "apps/e2e-connector/src",
     "apps/worker/src",
     "runner/src",
+    "examples/dark-factory/preparation/src",
     "tools/doclint/src",
     "tools/wire-tolerance-gate/src",
 ]
@@ -354,6 +380,7 @@ files = [
     "apps/e2e-connector/src",
     "apps/worker/src",
     "runner/src",
+    "examples/dark-factory/preparation/src",
     "tools/doclint/src",
     "tools/wire-tolerance-gate/src",
 ]

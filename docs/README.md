@@ -34,8 +34,10 @@ they are not substitutes for a supported quickstart.
   approvals, and the shared platform beneath the examples.
 - [First Slack agent](your-first-slack-agent.md): connect a supported bundle to a
   real Slack workspace.
+- [Prepare factory specifications](guides/factory-preparation.md): use your local
+  coding agent to clarify intent and save a reviewed draft without a new runtime.
 - [Factory specification contract](guides/factory-specification.md): canonical ticket
-  structure, local ticket sets and structural checks.
+  structure and the local ticket-set format.
 - [Factory outcomes and costs](guides/measuring-factory-outcomes.md): evaluate
   completed work, estimated spend, and human review effort.
 - [Behavior packs](behavior-packs.md): opt-in greetings, capability tips, and

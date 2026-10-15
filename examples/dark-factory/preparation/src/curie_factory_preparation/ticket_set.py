@@ -11,7 +11,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
-from .factory_specification import Diagnostic, Specification, parse_specification
+from .specification import Diagnostic, Specification, parse_specification
 
 LocalId = Annotated[str, StringConstraints(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")]
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]

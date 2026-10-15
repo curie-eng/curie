@@ -1,7 +1,8 @@
 """Transient, structural specification contract (#4484); never a readiness verdict.
 
 No command execution, persistence, environment probes or model calls belong here.
-The admission evaluator (#4487) and validation API (#4488) reuse this boundary.
+Connected evaluation (#4487/#4488) will use this factory-owned contract through
+the isolated policy boundary in ADR 0222, never a privileged platform import.
 """
 
 from __future__ import annotations

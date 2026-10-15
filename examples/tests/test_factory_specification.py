@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from curie_api.factory_specification import CONTRACT_VERSION, parse_specification
-from curie_api.factory_ticket_set import parse_ticket_set
+from curie_factory_preparation.specification import CONTRACT_VERSION, parse_specification
+from curie_factory_preparation.ticket_set import parse_ticket_set
 
-VECTORS = Path(__file__).resolve().parents[3] / "tests/vectors/factory-specification"
+VECTORS = Path(__file__).resolve().parents[2] / "tests/vectors/factory-specification"
 SECTIONS = (
     "Problem",
     "Base",

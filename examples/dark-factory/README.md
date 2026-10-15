@@ -41,6 +41,34 @@ text and repository files as untrusted data. The maximum execution duration is
 Running the repository's tests is an instruction in this skill. The platform
 does not enforce it, and a different bundle can choose differently.
 
+## Prepare a specification locally
+
+The factory bundle also distributes a text-only `prepare-factory-ticket` skill
+for your existing local coding agent. It inspects a repository, clarifies intent,
+and writes a reviewed draft or proposed ticket set. It requires no host Python,
+parser installation, Curie service or container runtime. Repository-specific
+verification uses the repository's own prerequisites and records any missing ones.
+
+Render this bundle with a CLI release containing the skill, then copy only
+`preparation/skills/prepare-factory-ticket/` into your coding agent's skill
+location. The [preparation guide](../../docs/guides/factory-preparation.md)
+covers installation and invocation for supported clients and a plain-file
+fallback. A pre-existing CLI release will not gain new embedded files by selecting
+a newer deployment image; use a CLI built from this change or a release containing it.
+
+Install the preparation folder on its own. The root factory plugin's execution
+hooks require an implementation plan and are unsuitable for local draft authoring.
+The nested preparation skill is not registered as a factory execution skill.
+Its Markdown references stay inside the copied folder, so no Curie source checkout
+or Python package is needed to use it.
+
+This first release records deployment readiness as `unvalidated`, including after
+developer review. It does not invoke a parser or deployment validator, create
+tracker issues, apply factory labels, or implement the requested feature.
+Connected deployment validation and explicit handoff remain #4488 and #4490.
+The adjacent Python library is for managed evaluation and contributor tests;
+it is not a client installation requirement.
+
 ## Review loops
 
 Each loop (`plan` and `plan_review`, `implement` and `review_diff`, and
