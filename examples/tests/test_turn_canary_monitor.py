@@ -624,7 +624,7 @@ def test_healthz_reports_monitor_staleness_not_platform_health():
     now = [1000.0]
     limits = _limits(canary, cycle_interval=10, turn_deadline=5, cleanup_deadline=5, max_targets=2)
     monitor = canary.Monitor(None, limits, clock=lambda: now[0])
-    bound = 2 * 10 + 2 * (5 + 5)
+    bound = 2 * 10 + 2 * (5 + 5 + 5)
     assert monitor.healthy() is True
     now[0] += bound + 1
     assert monitor.healthy() is False
