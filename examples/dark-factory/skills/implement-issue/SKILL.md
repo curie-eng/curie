@@ -360,15 +360,15 @@ README describes.
 
 Run every available check for the changed area. Record the exact command,
 exit status and result for each check you run, and update the verification
-table. Before treating a service as unavailable, use this run's authorized
-tools to start it as step 5 describes. If it cannot be provided, record which
-check it blocks, the missing service and why the authorized capabilities
-cannot provide it; the verification contract decides whether that check is
-delegated or blocks publication. Name each blocked or delegated check and its
-cause in the pull request body; never claim it passed. A real product check
-failure or an unmet criterion still
-requires a fix or a stated stop reason. Never fake a missing package, service
-or file with a stub, a mock presented as real, or a fixed result.
+table. Before treating Postgres or another service as unavailable, use this
+run's authorized tools to start it as step 5 describes. If it cannot be
+provided, record which check it blocks, the missing service and why the
+authorized capabilities cannot provide it; the verification contract decides
+whether that check is delegated or blocks publication. Name each blocked or
+delegated check and its cause in the pull request body; never claim it passed.
+A real product check failure or an unmet criterion still requires a fix or a
+stated stop reason. Never fake a missing package, service or file with a stub,
+a mock presented as real, or a fixed result.
 
 ## 7. Diff review (phase `review_diff`, same `round` as the implement pass)
 
