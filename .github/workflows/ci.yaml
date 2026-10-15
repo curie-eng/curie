@@ -2814,6 +2814,8 @@ jobs:
         id: install_uv
         continue-on-error: true
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
       - name: Back off before retrying Install uv
         if: steps.install_uv.outcome == 'failure'
         run: |
@@ -2822,6 +2824,8 @@ jobs:
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
       - name: Pull Docker Hub images through the mirror
         run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Download the curie binary built by the Rust job
@@ -2831,22 +2835,6 @@ jobs:
           path: cli/target/release
       - name: Make the binary executable
         run: chmod +x cli/target/release/curie
-      - name: Install uv
-        id: install_uv
-        continue-on-error: true
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          python-version: "3.13"
-      - name: Back off before retrying Install uv
-        if: steps.install_uv.outcome == 'failure'
-        run: |
-          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
-          sleep 15
-      - name: Install uv (retry)
-        if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          python-version: "3.13"
       - name: Install Helm
         id: install_helm
         continue-on-error: true
