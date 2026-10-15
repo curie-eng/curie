@@ -28,6 +28,7 @@ SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
 REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 INITIAL_BINDING_MODULE = "tools/factory-e2e/tests/test_c4_initial_binding.py"
+CLUSTER_UP_MODULE = "tools/factory-e2e/tests/test_c4_cluster_up.py"
 INITIAL_BINDING_INPUTS = (
     "cli/src/factory_quickstart/github.rs",
     "cli/src/factory_quickstart/gitlab/plan.rs",
@@ -3020,8 +3021,35 @@ def test_registration_seam_changes_select_the_factory_runtime(tmp_path: Path, pa
     assert outputs["cli_release"] == "true"
 
 
+@pytest.mark.parametrize("path", ("cli/src/ops/convergence.rs", CLUSTER_UP_MODULE))
+@pytest.mark.parametrize("omit_kind", (False, True))
+def test_convergence_changes_select_the_fresh_install_runtime(
+    tmp_path: Path, path: str, omit_kind: bool,
+) -> None:
+    completed, output = _invoke_selector(tmp_path, path, omit_kind=omit_kind)
+    assert completed.returncode == 0, completed.stderr
+    outputs = _outputs_of(output)
+    expected = "false" if omit_kind else "true"
+    assert outputs["factory"] == expected
+    assert outputs["cluster"] == expected
+    if omit_kind:
+        assert outputs["released_upgrade"] == "false"
+        if path.startswith("cli/"):
+            for key in ("skill", "local", "local_release", "cli_release"):
+                assert outputs[key] == "true", key
+    else:
+        assert outputs["images"] == "true"
+        assert outputs["cli_release"] == "true"
+
+
 @pytest.mark.parametrize(
-    "path", ("cli/src/output.rs", "apps/api/src/curie_api/routers/config.py", "docs/guide.md"),
+    "path",
+    (
+        "cli/src/output.rs",
+        "cli/src/ops/capacity.rs",
+        "apps/api/src/curie_api/routers/config.py",
+        "docs/guide.md",
+    ),
 )
 def test_unrelated_changes_do_not_select_the_factory_runtime(tmp_path: Path, path: str) -> None:
     completed, output = _invoke_selector(tmp_path, path)
@@ -3084,6 +3112,51 @@ def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_p
     assert INITIAL_BINDING_MODULE in argv
     assert not any(arg in argv for arg in ("-k", "-m", "--deselect"))
     assert not any(arg.startswith(INITIAL_BINDING_MODULE + "::") for arg in argv)
+
+
+@pytest.mark.parametrize("exit_code", (0, 17))
+def test_fresh_cluster_up_runtime_is_serial_and_propagates_failure(
+    tmp_path: Path, exit_code: int,
+) -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    job = jobs[SCRIPTED_FACTORY_JOB]
+    assert not job.get("continue-on-error")
+    assert SCRIPTED_FACTORY_JOB in jobs["e2e-required"]["needs"]
+    steps = job["steps"]
+    runtime_steps = [step for step in steps if CLUSTER_UP_MODULE in step.get("run", "")]
+    assert len(runtime_steps) == 1
+    runtime = runtime_steps[0]
+    registration = next(step for step in steps if INITIAL_BINDING_MODULE in step.get("run", ""))
+    assert steps.index(registration) < steps.index(runtime)
+    assert not runtime.get("if")
+    assert not runtime.get("continue-on-error")
+
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    log = tmp_path / "runtime-argv.json"
+    uv = binaries / "uv"
+    uv.write_text(
+        f"#!{sys.executable}\nimport json, os, sys\nfrom pathlib import Path\n"
+        "Path(os.environ['RUNTIME_ARGV']).write_text(json.dumps(sys.argv[1:]))\n"
+        f"sys.exit({exit_code})\n"
+    )
+    uv.chmod(0o755)
+    executed = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", runtime["run"]],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": f"{binaries}:{os.environ['PATH']}",
+             "RUNTIME_ARGV": str(log)},
+        capture_output=True, text=True, check=False,
+    )
+    assert executed.returncode == exit_code, executed.stdout + executed.stderr
+    argv = json.loads(log.read_text())
+    assert argv[:2] == ["run", "pytest"]
+    assert argv[argv.index("-n") + 1] == "0"
+    assert any(target in argv for target in (
+        CLUSTER_UP_MODULE,
+        CLUSTER_UP_MODULE + "::test_fresh_cluster_up_converges_without_rerun",
+    ))
+    assert not any(arg.startswith(("-k", "-m", "--deselect", "--ignore")) for arg in argv)
 
 
 def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> None:
