@@ -47,6 +47,10 @@ INITIAL_BINDING_SELECTOR = (
     "tools/factory-e2e/tests/test_c4_initial_binding.py::"
     "test_second_factory_agent_uses_initial_tracker_binding"
 )
+HELD_CANCELLATION_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_held_cancellation.py::"
+    "test_held_run_cancels_after_worker_replacement"
+)
 LOCAL_SELECTOR = "cli/tests/local/test_deploy.py::test_deploy"
 LOCAL_LIVE_SELECTOR = "cli/tests/local/test_live.py::test_live"
 LIVE_SELECTOR = "runner/tests/test_live.py::test_example"
@@ -1178,9 +1182,13 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
             extra = pytest_command[3:]
             assert extra[: len(distribution)] == distribution
             extra = extra[len(distribution) :]
-            runtime_exclusion = "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py"
-            assert extra.count(runtime_exclusion) == 1
-            extra.remove(runtime_exclusion)
+            runtime_exclusions = (
+                "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
+                "--ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py",
+            )
+            for runtime_exclusion in runtime_exclusions:
+                assert extra.count(runtime_exclusion) == 1
+                extra.remove(runtime_exclusion)
             report_chars = set("fEsxXpPaAR")
             assert all(
                 argument.startswith("--durations")
@@ -1395,6 +1403,13 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
     )
     assert steps[kind_index]["with"]["install_only"] is True
     assert probe_index < kind_index < gate_index
+    disk_index = _single_step_index(
+        steps,
+        lambda step: "/usr/local/lib/android" in _string(step, "run"),
+        "disk reclaim for the four candidate images",
+    )
+    assert _string(steps[disk_index], "if") == KIND_NEEDED_GUARD
+    assert probe_index < disk_index < kind_index
 
 
 CARGO_NEEDED_GUARD = "steps.fix-pin-curie.outputs.needed == 'true'"
@@ -1527,6 +1542,7 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
     ("body", "needed", "stack", "kind"),
     [
         (f"Fix pin: {INITIAL_BINDING_SELECTOR}", True, False, True),
+        (f"Fix pin: {HELD_CANCELLATION_SELECTOR}", True, False, True),
         (
             "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding.py::"
             "test_quickstarts_are_idempotent_and_binding_guards_hold[gitlab]",
@@ -1541,6 +1557,12 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
         ("Fix pin: cli/tests/verify_fix_pin.rs::ci_gate_pins", True, True, False),
         (
             "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding_extra.py::test_example",
+            True,
+            True,
+            False,
+        ),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_held_cancellation_extra.py::test_example",
             True,
             True,
             False,
