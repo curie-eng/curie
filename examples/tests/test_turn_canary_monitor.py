@@ -684,3 +684,54 @@ def test_listen_configuration_is_validated():
     for bad in ("9464", "host:", "host:70000", "host:port"):
         with pytest.raises(ValueError, match="LISTEN"):
             canary.parse_config(_env(TURN_CANARY_DISCOVER="1", TURN_CANARY_LISTEN=bad))
+
+
+def test_runtime_platform_reads_identities_and_probes_adapters_over_http(health_server):
+    """@spec TURN-CANARY-8 TURN-CANARY-9"""
+    canary = _canary()
+    base, seen = health_server
+    identities = [_identity()]
+
+    class Api(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib handler name
+            seen.append(("API", self.path, self.headers.get("X-API-Key")))
+            body = json.dumps(identities if "provider=slack" in self.path else {}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    api = ThreadingHTTPServer(("127.0.0.1", 0), Api)
+    threading.Thread(target=api.serve_forever, daemon=True).start()
+
+    async def scenario():
+        platform = canary.RuntimePlatform(
+            database_url="postgresql+asyncpg://canary@db.example.invalid/curie",
+            valkey_url="redis://valkey.example.invalid:6379/0",
+            api_url=f"http://127.0.0.1:{api.server_address[1]}",
+            api_key="example-key",
+            stream="curie:runs",
+            schema="curie",
+            read_only_qualified=False,
+        )
+        try:
+            read = await platform.channel_identities("slack")
+            with pytest.raises(ValueError, match="list"):
+                await platform.channel_identities("github")
+            probed = await platform.adapter_health(base + "/ok")
+        finally:
+            await platform.close()
+        return read, probed
+
+    try:
+        read, probed = asyncio.run(scenario())
+    finally:
+        api.shutdown()
+        api.server_close()
+    assert read == identities
+    assert probed == ("ok", 200)
+    assert ("API", "/channel-identities?provider=slack", "example-key") in seen
+    assert ("GET", "/ok", None) in seen
