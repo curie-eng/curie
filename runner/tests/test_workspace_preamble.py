@@ -467,11 +467,65 @@ def test_boot_tool_manifest_prompt_golden(
     records = [
         record.getMessage()
         for record in caplog.records
-        if record.getMessage().startswith("runner tool manifest boot")
+        if record.getMessage().startswith("runner tool manifest ")
     ]
-    assert records == [f"runner tool manifest boot tool_count={2 if has_manifest else 0}"]
+    assert records == [
+        "runner tool manifest loaded: 2 tools"
+        if has_manifest
+        else "runner tool manifest absent: tool_count=0"
+    ]
     assert "daemon.example.com" not in prompt
     assert "published.example.com" not in prompt
+
+
+@pytest.mark.parametrize(
+    ("manifest", "expected_log", "expected_counts"),
+    [
+        pytest.param(
+            None,
+            "runner tool manifest absent: tool_count=0",
+            [],
+            id="absent-is-not-loaded",
+        ),
+        pytest.param(
+            _TOOL_MANIFEST,
+            "runner tool manifest loaded: 2 tools",
+            ["2"],
+            id="populated",
+        ),
+        pytest.param(
+            '{"schema_version":1,"tools":[],"docker_cli":false}',
+            "runner tool manifest loaded: 0 tools",
+            ["0"],
+            id="empty-is-loaded",
+        ),
+    ],
+)
+def test_build_runner_boot_log_matches_factory_manifest_count_parser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    manifest: str | None,
+    expected_log: str,
+    expected_counts: list[str],
+) -> None:
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).resolve().parents[2] / "tools" / "factory-e2e")
+    )
+    import repo_runner
+
+    if manifest is not None:
+        (tmp_path / "tool-manifest.json").write_text(manifest, encoding="utf-8")
+    caplog.set_level(logging.INFO, logger="curie_runner")
+
+    build_runner(_plugin_config(tmp_path), fake_model=False)
+
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("runner tool manifest ")
+    ] == [expected_log]
+    assert repo_runner._MANIFEST_COUNT.findall(caplog.text) == expected_counts
 
 
 def test_tool_manifest_is_image_data_without_a_workspace(
@@ -496,6 +550,58 @@ def test_tool_manifest_is_image_data_without_a_workspace(
         '{"schema_version":1,"tools":[],"docker_cli":"false"}',
         '{"schema_version":1,"tools":[{"name":"uv"}],"docker_cli":false}',
         '{"schema_version":1,"tools":[],"docker_cli":false,"install":"arbitrary"}',
+        *[
+            pytest.param(
+                json.dumps(
+                    {
+                        key: value
+                        for key, value in json.loads(_TOOL_MANIFEST).items()
+                        if key != missing_key
+                    }
+                ),
+                id=f"missing-{missing_key}",
+            )
+            for missing_key in ("schema_version", "tools", "docker_cli")
+        ],
+        *[
+            pytest.param(
+                json.dumps({"schema_version": 1, "tools": tools, "docker_cli": False}),
+                id=f"tools-not-list-{type(tools).__name__}",
+            )
+            for tools in (None, {}, "uv")
+        ],
+        *[
+            pytest.param(
+                json.dumps({"schema_version": 1, "tools": [tool], "docker_cli": False}),
+                id=f"tool-not-object-{type(tool).__name__}",
+            )
+            for tool in (None, "uv", [])
+        ],
+        *[
+            pytest.param(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "tools": [{**json.loads(_TOOL_MANIFEST)["tools"][0], field: " \t"}],
+                        "docker_cli": False,
+                    }
+                ),
+                id=f"blank-{field}",
+            )
+            for field in ("name", "version", "path")
+        ],
+        pytest.param(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "tools": [
+                        {**json.loads(_TOOL_MANIFEST)["tools"][0], "source": "unknown"}
+                    ],
+                    "docker_cli": False,
+                }
+            ),
+            id="unknown-source",
+        ),
     ],
 )
 def test_invalid_tool_manifest_refuses_boot(
@@ -564,8 +670,8 @@ def test_empty_tool_inventory_is_declared_image_data(
     assert [
         record.getMessage()
         for record in caplog.records
-        if record.getMessage().startswith("runner tool manifest boot")
-    ] == ["runner tool manifest boot tool_count=0"]
+        if record.getMessage().startswith("runner tool manifest ")
+    ] == ["runner tool manifest loaded: 0 tools"]
 
 
 def test_invalid_utf8_tool_manifest_refuses_boot(
