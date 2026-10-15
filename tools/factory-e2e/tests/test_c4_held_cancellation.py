@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import http.client
 import json
 import os
 import re
@@ -367,6 +368,10 @@ class HeldRun(sk.ScriptedRun):
         self.gate_tool: str | None = None
         self.held: Held | None = None
         self.tolerate_model_errors = False
+        self.approval_principal: str | None = None
+        # An unresolved observation fault in a test body; the fixture teardown
+        # raises it so it is reported as an error, never as a test failure.
+        self.infra_error: str | None = None
         self.worker_token: str | None = None
         self.github: Any = None
         self.report: dict[str, Any] = {
@@ -886,14 +891,8 @@ class HeldRun(sk.ScriptedRun):
             timeout=300,
         )
 
-    def recover_pending_approval(self, held: Held) -> None:
-        """Reject the stranded Edit approval through break-glass recovery (#2753).
-
-        A GitHub-surfaced approval admits no verifiable approver, so the
-        ordinary resolve path cannot answer it. Recovery settles it as rejected
-        under the platform key, attributed to a minted operator principal, and
-        enqueues the ordinary approval resume turn for the same conversation.
-        """
+    def mint_operator_principal(self) -> None:
+        """Fixture setup: mint the operator principal recovery is attributed to."""
 
         minted = [
             line.strip()
@@ -904,9 +903,23 @@ class HeldRun(sk.ScriptedRun):
         ]
         if not minted or " " in minted[-1]:
             raise InfrastructureError("the operator principal mint returned no token")
-        token = minted[-1]
-        self.secrets.append(token)
-        self.env["CURIE_APPROVAL_PRINCIPAL_TOKEN"] = token
+        self.approval_principal = minted[-1]
+        self.secrets.append(self.approval_principal)
+        self.report["operator_principal_minted"] = True
+
+    def recover_pending_approval(self, held: Held) -> None:
+        """Reject the stranded Edit approval through break-glass recovery (#2753).
+
+        A GitHub-surfaced approval admits no verifiable approver, so the
+        ordinary resolve path cannot answer it. Recovery settles it as rejected
+        under the platform key, attributed to the operator principal minted in
+        setup, and enqueues the ordinary approval resume turn for the same
+        conversation.
+        """
+
+        if self.approval_principal is None:
+            raise InfrastructureError("no operator principal was minted in setup")
+        self.env["CURIE_APPROVAL_PRINCIPAL_TOKEN"] = self.approval_principal
         try:
             self.cluster_approvals(
                 "--recover",
@@ -919,6 +932,18 @@ class HeldRun(sk.ScriptedRun):
         finally:
             self.env.pop("CURIE_APPROVAL_PRINCIPAL_TOKEN", None)
         self.report["recovery"] = {"approval_id": held.approval_id, "recovered": True}
+
+    def model_requests(self) -> dict[str, int]:
+        """Model calls the in-process scripted model has received so far.
+
+        ``served`` counts transcript exchanges answered (``ModelScript._used``)
+        and ``refused`` the requests it answered as unexpected. Both are calls a
+        runner actually made; only a runner reaches this endpoint.
+        """
+
+        served = len(self.model._used)
+        refused = len(self.model.unexpected)
+        return {"served": served, "refused": refused, "total": served + refused}
 
     def worker_lines_for(self, pod: str, request_id: str) -> list[str]:
         """Bounded, redacted lines of one worker pod's log naming this request."""
@@ -937,9 +962,12 @@ class HeldRun(sk.ScriptedRun):
 
     def require_recovered_continuation(self, held: Held) -> None:
         self.deadline = time.monotonic() + RECOVERY_BOUND_SECONDS + 600
+        # The old pod is gone, so any model call after recovery comes from the
+        # resumed runner the replacement worker started for this request.
+        before = self.model_requests()
         self.recover_pending_approval(held)
-        # Model calls after the resume are not what this control proves; any
-        # the scripted model refuses are recorded, not failed on.
+        # The resumed conversation need not match the recorded transcript; the
+        # scripted model's refusals are recorded, not failed on.
         self.tolerate_model_errors = True
         started = time.monotonic()
         last: dict[str, Any] = {}
@@ -952,6 +980,7 @@ class HeldRun(sk.ScriptedRun):
             approval = next(
                 (item for item in observed["approvals"] if item["id"] == held.approval_id), None
             )
+            after = self.model_requests()
             status = view["status"]
             last = {
                 "approval_status": approval["status"] if approval else None,
@@ -965,8 +994,11 @@ class HeldRun(sk.ScriptedRun):
                 "heartbeat_remaining_seconds": (
                     stored["heartbeat_remaining_seconds"] if stored else None
                 ),
+                "model_requests_before": before,
+                "model_requests_after": after,
                 "seconds_since_recovery": round(time.monotonic() - started, 1),
             }
+            resumed_runner_called_model = after["total"] > before["total"]
             live_lease = (
                 status == "running"
                 and stored is not None
@@ -974,19 +1006,13 @@ class HeldRun(sk.ScriptedRun):
                 and stored["heartbeat_remaining_seconds"] is not None
                 and stored["heartbeat_remaining_seconds"] <= LIVE_LEASE_MAX_SECONDS
             )
-            # A terminal state reached through the same request also counts
-            # when the replacement worker ran the resumed turn for it. A
-            # terminal write leaves the lease untouched, so the parked column
-            # proves nothing here; the new pod's own log line for the request
-            # (its sandbox boot binds the issue read) shows who continued it.
+            # A terminal state reached through the same request also counts.
+            # A terminal write leaves the lease untouched, so the parked column
+            # proves nothing here; the resumed runner's model call does.
             same_request_terminal = (
                 status not in {"waiting", "running", "cancellation_requested"}
                 and stored is not None
                 and view["terminal_cause"] not in ORPHAN_CAUSES
-                and any(
-                    not line.startswith("unavailable (")
-                    for line in self.worker_lines_for(held.new_pod, held.request_id)
-                )
             )
             continued = (
                 approval is not None
@@ -994,6 +1020,7 @@ class HeldRun(sk.ScriptedRun):
                 and approval["resumed"]
                 and last["same_request"]
                 and view["runtime_epoch"] == held.epoch
+                and resumed_runner_called_model
                 and (live_lease or same_request_terminal)
             )
             completed = time.monotonic()
@@ -1004,8 +1031,8 @@ class HeldRun(sk.ScriptedRun):
                 break
             time.sleep(2)
         self.report["continuation"] = last
+        # Recorded support only: the new pod's log lines naming the request.
         self.report["new_worker_request_log"] = self.worker_lines_for(held.new_pod, held.request_id)
-        self.report["model_unexpected_requests"] = len(self.model.unexpected)
         if "continuation" not in last:
             pytest.fail(
                 f"recovered approval {held.approval_id} did not continue request "
@@ -1190,17 +1217,47 @@ def _prepare(run: HeldRun, scenario: str) -> HeldRun:
     return run
 
 
-def _observe(run: HeldRun, behavior: Callable[[Held], None]) -> Held:
-    """Test body: run only the behavior under test, with diagnostics on failure."""
+# Faults of the observation machinery itself: the API view, SQL through
+# kubectl, Kubernetes polls, the stub and the CLI. None of them is a verdict
+# on the behavior; pytest.fail (an OutcomeException) and AssertionError are
+# deliberately absent, so only behavioral assertions can fail a test.
+OBSERVATION_FAULTS: tuple[type[BaseException], ...] = (
+    InfrastructureError,
+    sk.ScriptedScenarioError,
+    fe.ConfigError,
+    subprocess.SubprocessError,
+    OSError,
+    http.client.HTTPException,
+    ValueError,
+    KeyError,
+    TypeError,
+    RuntimeError,
+)
+
+
+def _observe(run: HeldRun, behavior: Callable[[Held], None]) -> bool:
+    """Test body: run only the behavior under test.
+
+    An observation fault is stored on the run and the body returns without
+    asserting; the held_run teardown then raises it, so pytest reports a
+    teardown error and the reversed Fix pin run cannot count it as the pinned
+    failure. Behavioral failures propagate as test failures.
+    """
 
     assert run.held is not None
     try:
         behavior(run.held)
+    except OBSERVATION_FAULTS as exc:
+        _capture_diagnostics(run)
+        detail = fe.redact_agent_text(str(exc), run.secrets)[0] or ""
+        run.infra_error = f"{type(exc).__name__}: {detail}"[:2000]
+        run.report["infra_error"] = run.infra_error
+        return False
     except BaseException:
         _capture_diagnostics(run)
         raise
     run.report["verdict"] = "passed"
-    return run.held
+    return True
 
 
 @pytest.fixture
@@ -1245,9 +1302,13 @@ def held_run(
         run.report["cleanup_verified"] = not redacted
         evidence = ROOT / f"target/factory-e2e/c4-held-{candidate.run}.json"
         evidence.parent.mkdir(parents=True, exist_ok=True)
+        run.report["infra_error"] = run.infra_error
         evidence.write_text(json.dumps(run.report, indent=2, default=str) + "\n")
-        if redacted:
-            raise InfrastructureError("; ".join(redacted))
+        faults = list(redacted)
+        if run.infra_error is not None:
+            faults.append(f"observation fault in the test body: {run.infra_error}")
+        if faults:
+            raise InfrastructureError("; ".join(faults))
 
     request.addfinalizer(finish)
 
@@ -1276,7 +1337,13 @@ def held_for_cancel(held_run: HeldRun) -> HeldRun:
 
 @pytest.fixture
 def held_for_recovery(held_run: HeldRun) -> HeldRun:
-    return _prepare(held_run, "recover")
+    run = _prepare(held_run, "recover")
+    try:
+        run.mint_operator_principal()
+    except BaseException:
+        _capture_diagnostics(run)
+        raise
+    return run
 
 
 @pytest.fixture
@@ -1291,7 +1358,8 @@ def test_held_run_cancels_after_worker_replacement(held_for_cancel: HeldRun) -> 
     the worker replacement are fixture setup.
     """
 
-    _observe(held_for_cancel, held_for_cancel.cancel_and_require_settlement)
+    if not _observe(held_for_cancel, held_for_cancel.cancel_and_require_settlement):
+        return
     settlement = held_for_cancel.report["settlement"]
     assert settlement["status"] == "cancelled"
     assert settlement["observation_completed_seconds"] <= SETTLE_BOUND_SECONDS
@@ -1316,18 +1384,25 @@ def test_uncancelled_held_run_recovers_after_worker_replacement(
         run.require_hold_survives(held)
         run.require_recovered_continuation(held)
 
-    _observe(run, survive_then_continue)
+    if not _observe(run, survive_then_continue):
+        return
     survival = run.report["survival"]
     assert survival["seconds"] >= SURVIVE_SECONDS
     assert survival["status"] == "running" and survival["parked"]
     assert survival["claim_present"]
-    assert run.report["continuation"]["same_request"]
+    continuation = run.report["continuation"]
+    assert continuation["same_request"]
+    assert (
+        continuation["model_requests_after"]["total"]
+        > continuation["model_requests_before"]["total"]
+    )
 
 
 def test_pending_ci_settles_after_worker_replacement(pending_ci: HeldRun) -> None:
     """Control: with auto publication, pending CI survives replacement and then completes."""
 
-    _observe(pending_ci, pending_ci.require_ci_settles)
+    if not _observe(pending_ci, pending_ci.require_ci_settles):
+        return
     assert pending_ci.report["publication_policy"] == "auto"
     assert pending_ci.report["ci_survival"]["seconds"] >= SURVIVE_SECONDS
     completion = pending_ci.report["ci_completion"]
