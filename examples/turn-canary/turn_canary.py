@@ -1118,7 +1118,10 @@ class Monitor:
             view.drift = dict(result.drift)
         if result.uncovered_agents is not None:
             view.uncovered_agents = list(result.uncovered_agents)
-        view.route_agents.update(result.route_agents)
+        if result.inventory_labels is not None:
+            # Only the latest inventory names an agent; a route it no longer
+            # lists must not keep a stale name. @spec TURN-CANARY-14
+            view.route_agents = dict(result.route_agents)
         per_route = (
             "target_success",
             "target_last_run",
