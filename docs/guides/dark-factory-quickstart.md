@@ -17,7 +17,7 @@ This guide uses the latest released CLI and factory runner by default. See the
 | GitHub issues and GitHub pull requests | [GitHub walkthrough below](#what-you-need), starting with prerequisites and CLI installation |
 | GitLab issues and GitLab merge requests | [Complete GitLab walkthrough](factory-gitlab-quickstart.md), including local cluster, credentials and first issue |
 | Jira Cloud issues and GitHub pull requests | [Complete Jira Cloud and GitHub walkthrough](factory-jira-github-quickstart.md), including the GitHub App and start authority |
-| Jira Cloud issues and Bitbucket Cloud or Data Center pull requests | Combined quickstart is unavailable. [Adapter configuration reference](#bitbucket-cloud-and-data-center) describes the current limits; it is not a complete onboarding path. |
+| Jira Cloud issues and Bitbucket Cloud or Data Center pull requests | [Bitbucket quickstart](#run-quickstart-for-bitbucket), with the Jira factory account from [Jira Cloud](#jira-cloud) and the [Bitbucket configuration](#bitbucket-cloud-and-data-center) limits |
 
 The walkthrough on this page uses **GitHub issues and GitHub pull requests**.
 The [GitLab](#gitlab) and [Jira Cloud](#jira-cloud) sections farther down are
