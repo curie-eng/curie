@@ -53,8 +53,7 @@ WORKER_IMAGE_LINE = "    image: ghcr.io/curie-eng/curie-worker-local:latest\n"
 
 CONFIGS_ANCHOR = "x-core-profiles: &core_profiles [core, full]"
 
-OTEL_BUILD_BLOCK = """    image: curie-otel-collector:${CURIE_BASE_TAG:-latest}
-    build:
+OTEL_BUILD_BLOCK = """    build:
       context: otel
       dockerfile_inline: |
         FROM otel/opentelemetry-collector-contrib:0.119.0

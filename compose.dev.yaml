@@ -309,7 +309,6 @@ services:
     restart: "no"
 
   otel-collector:
-    image: curie-otel-collector:${CURIE_BASE_TAG:-latest}
     build:
       context: otel
       dockerfile_inline: |
