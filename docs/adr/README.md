@@ -244,4 +244,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0220 | [One identity provider decides who may invoke and approve, on every channel](0220-one-identity-provider-decides-who-may-invoke-and-approve-on-every-channel.md) | Accepted |
 | 0221 | [Cluster up reads the gVisor RuntimeClass for a fake-model install](0221-cluster-up-reads-the-gvisor-runtimeclass-for-a-fake-model-install.md) | Accepted |
 | 0224 | [Protected runtime commissioning precedes installation acceptance](0224-protected-runtime-commissioning-precedes-installation-acceptance.md) | Accepted |
+| 0232 | [A contract migration ships one release after the code stops using what it drops](0232-a-contract-migration-ships-one-release-after-the-code-stops-using-what-it-drops.md) | Draft |
 <!-- END GENERATED: adr-index -->
