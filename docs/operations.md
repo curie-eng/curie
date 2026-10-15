@@ -32,14 +32,14 @@ pod; if `cluster message` can't auto-detect a pod-reachable host, pass
 
 **On Apple Silicon (arm64)**, two caveats:
 
-- The AVX preflight is x86-only. `preflights.avxCheck` greps the node's
-  `/proc/cpuinfo` for the `avx` flag, which no arm64 CPU reports, so the
-  check fails on every arm64 node regardless of tool. Disable it with
-  `curie cluster up --set preflights.avxCheck.enabled=false`. The chart
-  README's other remedy for a failing AVX check -- pinning an SSE4.2-safe
-  ClickHouse tag -- is no better here: those tags predate the current
-  Langfuse migration set and cannot apply it (see
-  `charts/curie/README.md`).
+- The current chart keeps the AVX preflight enabled and detects native ARM64,
+  which does not require x86 AVX. It still checks AVX on x86 and rejects
+  unsupported architectures. Older released charts check only the x86 flag
+  and can reject a valid ARM64 node. For that specific failure, use the
+  [factory ARM recovery](guides/dark-factory-quickstart.md#apple-silicon-recovery-for-older-charts)
+  with the same trial kubeconfig and explicit context. Do not disable the check
+  on an x86 node or downgrade ClickHouse independently of Langfuse: older
+  SSE4.2-safe tags cannot apply the current migration set.
 - Prefer **kind** over **minikube** when the full stack matters. On
   minikube's docker driver, ClickHouse has been observed crash-looping
   (`std::terminate` in `MergeTreeData::loadOutdatedDataParts`, signal 5)
