@@ -378,3 +378,18 @@ def test_runtime_quota_read_honors_cpu_quantities():
         server.shutdown()
         server.server_close()
     assert seen == ["Bearer example-token", "Bearer example-token"]
+
+
+def test_monitor_takes_agent_names_from_the_latest_inventory_only():
+    """@spec TURN-CANARY-10 TURN-CANARY-14"""
+    canary = _canary()
+    monitor = canary.Monitor(None, canary.Limits(), prefix="turn_canary", labels="split")
+    declared = [("slack", "C-EXAMPLE-1", "default"), ("slack", "C-EXAMPLE-2", "default")]
+    both = [_row("1", "C-EXAMPLE-1"), _row("2", "C-EXAMPLE-2")]
+    monitor.observe(_run(canary, Platform(both), declared=declared))
+    monitor.observe(_run(canary, Platform([_row("1", "C-EXAMPLE-1")]), declared=declared))
+    text = monitor.metrics_text()
+    assert (
+        'agent="",kind="slack",address="C-EXAMPLE-2",adapter="default",side="declared_only"'
+    ) in text
+    assert "sample-2" not in text
