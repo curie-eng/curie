@@ -880,3 +880,131 @@ def test_runtime_quota_headroom_reads_kubernetes_quantities(
     finally:
         server.shutdown()
         server.server_close()
+
+
+def _recording_quota_server(seen):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Quota(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib handler name
+            seen.append(self.headers.get("Authorization"))
+            status = {"hard": {"count/pods": "16"}, "used": {"count/pods": "1"}}
+            body = json.dumps({"items": [{"status": status}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Quota)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def _token_file_platform(canary, server, token_file):
+    return canary.RuntimePlatform(
+        database_url="postgresql+asyncpg://canary@db.example.invalid/curie",
+        valkey_url="redis://valkey.example.invalid:6379/0",
+        api_url="https://platform.example.invalid",
+        api_key="example-key",
+        stream="curie:runs",
+        schema="curie",
+        read_only_qualified=False,
+        quota_url=f"http://127.0.0.1:{server.server_address[1]}/quotas",
+        quota_token_file=str(token_file),
+    )
+
+
+def test_quota_token_file_is_read_fresh_so_a_rotated_token_is_used(tmp_path):
+    """@spec TURN-CANARY-5"""
+    canary = _canary()
+    seen: list[str | None] = []
+    server = _recording_quota_server(seen)
+    token_file = tmp_path / "token"
+    token_file.write_text("example-token-one\n")
+
+    async def scenario():
+        platform = _token_file_platform(canary, server, token_file)
+        try:
+            first = await platform.quota_headroom()
+            token_file.write_text("example-token-two\n")
+            second = await platform.quota_headroom()
+            return first, second
+        finally:
+            await platform.close()
+
+    try:
+        assert asyncio.run(scenario()) == (True, True)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert seen == ["Bearer example-token-one", "Bearer example-token-two"]
+
+
+@pytest.mark.parametrize("contents", [None, "", "   \n"])
+def test_missing_or_blank_quota_token_file_is_unreadable_without_a_request(tmp_path, contents):
+    """@spec TURN-CANARY-5"""
+    canary = _canary()
+    seen: list[str | None] = []
+    server = _recording_quota_server(seen)
+    token_file = tmp_path / "token"
+    if contents is not None:
+        token_file.write_text(contents)
+
+    async def scenario():
+        platform = _token_file_platform(canary, server, token_file)
+        try:
+            return await platform.quota_headroom()
+        finally:
+            await platform.close()
+
+    try:
+        assert asyncio.run(scenario()) is None
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert seen == []
+
+
+def test_quota_token_and_token_file_are_mutually_exclusive():
+    """@spec TURN-CANARY-5"""
+    canary = _canary()
+    env = {
+        "TURN_CANARY_DATABASE_URL": "postgresql+asyncpg://canary@db.example.invalid/curie",
+        "TURN_CANARY_VALKEY_URL": "redis://valkey.example.invalid:6379/0",
+        "TURN_CANARY_API_URL": "https://platform.example.invalid",
+        "TURN_CANARY_API_KEY": "example-key",
+        "TURN_CANARY_STREAM": "curie:runs",
+        "TURN_CANARY_STATE_PATH": "/var/lib/turn-canary/state",
+        "TURN_CANARY_ROUTES": '[["slack","C-EXAMPLE-1","blue"]]',
+        "TURN_CANARY_QUOTA_URL": "https://kubernetes.example.invalid/api/v1/resourcequotas",
+    }
+    path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    config = canary.parse_config({**env, "TURN_CANARY_QUOTA_TOKEN_FILE": path})
+    assert config.quota_token_file == path
+    assert config.quota_token is None
+    assert canary.parse_config(env).quota_token_file is None
+    with pytest.raises(ValueError, match="TOKEN"):
+        canary.parse_config(
+            {
+                **env,
+                "TURN_CANARY_QUOTA_TOKEN": "example-token",
+                "TURN_CANARY_QUOTA_TOKEN_FILE": path,
+            }
+        )
+    with pytest.raises(ValueError, match="token"):
+        canary.RuntimePlatform(
+            database_url="postgresql+asyncpg://canary@db.example.invalid/curie",
+            valkey_url="redis://valkey.example.invalid:6379/0",
+            api_url="https://platform.example.invalid",
+            api_key="example-key",
+            stream="curie:runs",
+            schema="curie",
+            read_only_qualified=False,
+            quota_url=env["TURN_CANARY_QUOTA_URL"],
+            quota_token="example-token",
+            quota_token_file=path,
+        )
