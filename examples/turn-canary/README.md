@@ -88,9 +88,29 @@ default prefix: `turn_canary_binding_check_success{route,outcome}`,
 (exporter only),
 and `turn_canary_rotation`.
 
+- `TURN_CANARY_DECLARED_BINDINGS` takes a JSON list of the route triples the
+  installation is meant to have, for example
+  `[["slack","C-EXAMPLE-1","default"]]`. Each cycle reports declared triples
+  missing from the live bindings and live triples of a declared kind that are
+  not declared (TURN-CANARY-11).
+- `TURN_CANARY_BINDING_ADAPTER_HEALTH=/healthz` probes each binding's stored
+  endpoint origin at that path, once per distinct URL per cycle
+  (TURN-CANARY-12).
+- `TURN_CANARY_COVERAGE=1` reports agents with an active deployment that the
+  monitor cannot observe through a turn candidate or a binding health URL
+  (TURN-CANARY-13).
+- `TURN_CANARY_ROUTE_LABELS=split` replaces the JSON `route` label with
+  `agent`, `kind`, `address` and `adapter` labels (TURN-CANARY-14).
+
+These add `turn_canary_binding_drift{route,side}`,
+`turn_canary_binding_drift_total`, `turn_canary_binding_adapter_up{route,outcome}`,
+`turn_canary_agent_uncovered{agent}` and `turn_canary_uncovered_agents`.
+
 For an optional ResourceQuota observation, set `TURN_CANARY_QUOTA_URL` to the
 explicit Kubernetes quota list endpoint, `TURN_CANARY_QUOTA_TOKEN` to its bearer
 token, and optionally `TURN_CANARY_QUOTA_RESOURCE` and
 `TURN_CANARY_QUOTA_MIN_FREE`. The default resource is `count/pods` and the
-minimum free count is 1. An unreadable quota skips enqueue. This check is a
+minimum free amount is 1. Both are Kubernetes quantities, so
+`TURN_CANARY_QUOTA_RESOURCE=limits.cpu` with `TURN_CANARY_QUOTA_MIN_FREE=500m`
+keeps half a CPU free. An unreadable quota skips enqueue. This check is a
 snapshot, not a reservation or a cluster wide sandbox limit.
