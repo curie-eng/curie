@@ -114,6 +114,11 @@ pub struct ConnectorSpecDecl {
     pub sealed_secrets: BTreeMap<String, String>,
     #[serde(default)]
     pub secret_files: BTreeMap<String, String>,
+    /// Per-agent NON-secret settings: resolved and forwarded like a plain
+    /// `secrets:` name, but never a Bearer candidate and never bound into the
+    /// sandbox. See [`declared_secret_names`] and [`bearer_secret_name`].
+    #[serde(default)]
+    pub config: Vec<String>,
 }
 
 /// A declared secret: a bare env var name, or a reference to a Secret someone
@@ -170,6 +175,7 @@ impl Default for ConnectorSpecDecl {
             bearer_secret: None,
             sealed_secrets: BTreeMap::new(),
             secret_files: BTreeMap::new(),
+            config: Vec::new(),
         }
     }
 }
@@ -1975,7 +1981,10 @@ pub fn compose_overlay(
     }))
 }
 
-/// The env-var names a declaration's `secrets:` list asks to be forwarded.
+/// The env-var names a declaration's `secrets:` and `config:` lists ask to be
+/// forwarded. `config` values come from the same store and reach the container
+/// the same way; only the Bearer derivation tells them apart, and that reads
+/// `secrets` alone.
 pub fn declared_secret_names(spec: &ConnectorSpecDecl) -> Vec<String> {
     spec.secrets
         .iter()
@@ -1983,6 +1992,7 @@ pub fn declared_secret_names(spec: &ConnectorSpecDecl) -> Vec<String> {
             SecretDecl::Name(name) => name.clone(),
             SecretDecl::Ref { name, .. } => name.clone(),
         })
+        .chain(spec.config.iter().cloned())
         .collect()
 }
 
@@ -1991,8 +2001,8 @@ pub fn declared_secret_names(spec: &ConnectorSpecDecl) -> Vec<String> {
 /// A connector carrying `url:` or `unhosted_url:` is not started here -- its
 /// secrets belong to the remote's client config and are expanded by the MCP
 /// client, so demanding them would refuse a bundle that works. Both channels a
-/// hosted connector resolves are covered: the `secrets:` list and the
-/// `secret_files:` keys. Names only; no value ever travels through this seam.
+/// hosted connector resolves are covered: the `secrets:` and `config:` lists
+/// and the `secret_files:` keys. Names only; no value ever travels through this seam.
 pub fn hosted_secret_names(decl: &ConnectorsFileDecl) -> Vec<String> {
     let mut names = std::collections::BTreeSet::new();
     for spec in decl.connectors.values() {
