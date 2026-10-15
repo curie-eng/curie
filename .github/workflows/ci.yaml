@@ -4733,4 +4733,4 @@ jobs:
         with:
           python-version: "3.13"
       - run: uv sync --frozen
-      - run: uv run pytest -q examples/tests/test_turn_canary.py
+      - run: uv run pytest -q examples/tests/test_turn_canary.py examples/tests/test_turn_canary_monitor.py

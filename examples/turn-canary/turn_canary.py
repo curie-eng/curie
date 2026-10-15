@@ -1,18 +1,21 @@
-"""Opt-in, bounded synthetic turn checker. @spec TURN-CANARY-1 TURN-CANARY-6"""
+"""Opt-in, bounded synthetic turn checker. @spec TURN-CANARY-1 TURN-CANARY-10"""
 
 import asyncio
 import fcntl
 import json
 import math
 import os
+import re
 import secrets
 import tempfile
 import time
 import uuid
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, TextIO
+from urllib.parse import urlsplit
 
 from aci_protocol import READER_CONTEXT, QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.events import ToolAccess
@@ -31,6 +34,24 @@ class Platform(Protocol):
     async def replies(self, reply_ref: str, after: int) -> dict[str, Any]: ...
     async def reset(self, agent_id: str, thread_key: str) -> None: ...
     async def reset_state(self, agent_id: str, thread_key: str) -> dict[str, Any]: ...
+    async def channel_identities(self, kind: str) -> list[dict[str, Any]]: ...
+    async def adapter_health(self, url: str) -> tuple[str, int | None]: ...
+
+
+Route = tuple[str, str, str]
+METRIC_PREFIX = re.compile(r"[a-zA-Z_:][a-zA-Z0-9_:]*")
+ADAPTER_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+MAX_ADAPTERS = 20
+
+
+def _route_label(row: Mapping[str, str]) -> str:
+    return "|".join((row.get("kind", ""), row.get("address", ""), row.get("adapter", "")))
+
+
+def _check_prefix(prefix: str) -> str:
+    if not METRIC_PREFIX.fullmatch(prefix):
+        raise ValueError("metric prefix must be a valid Prometheus metric name")
+    return prefix
 
 
 @dataclass(frozen=True)
@@ -72,6 +93,11 @@ class CycleResult:
     logs: list[dict[str, str]] = field(default_factory=list)
     last_run: float = field(default_factory=time.time)
     last_success: float | None = None
+    binding_checks: dict[str, str] = field(default_factory=dict)
+    binding_check_last_run: dict[str, float] = field(default_factory=dict)
+    adapter_health: dict[str, str] = field(default_factory=dict)
+    inventory_labels: set[str] | None = None
+    rotation: int | None = None
 
     def record(self, phase: str, outcome: str, error: BaseException | None = None) -> None:
         item = {"phase": phase, "outcome": outcome}
@@ -123,6 +149,8 @@ class StateJournal:
                     and not valid_timestamp(data["last_success"])
                 )
                 or type(data.get("cleanup_blocked", False)) is not bool
+                or type(data.get("rotation", 0)) is not int
+                or data.get("rotation", 0) < 0
                 or (
                     pending is not None
                     and (
@@ -148,6 +176,11 @@ class StateJournal:
     @property
     def pending(self) -> dict[str, str] | None:
         return self.data.get("pending")
+
+    @property
+    def rotation(self) -> int:
+        """The persisted discovery walk position. @spec TURN-CANARY-7"""
+        return int(self.data.get("rotation", 0))
 
     def _write(self) -> None:
         if self._file is None:
@@ -195,6 +228,8 @@ class StateJournal:
                 "target_last_success": result.target_last_success,
             }
         )
+        if result.rotation is not None:
+            self.data["rotation"] = result.rotation
         self._write()
 
 
@@ -217,6 +252,136 @@ def select_targets(
             raise ValueError("selected route has no agent identity")
         result.append(matches[0])
     return result
+
+
+def discover_targets(
+    rows: list[dict[str, str]],
+    *,
+    rotation: int,
+    max_targets: int,
+    exclude: Iterable[Route] = (),
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """One rotating Slack route per agent from live rows. @spec TURN-CANARY-7"""
+    if type(rotation) is not int or rotation < 0 or not 0 < max_targets <= 100:
+        raise ValueError("discovery needs a nonnegative rotation and bounded targets")
+    excluded = {tuple(route) for route in exclude}
+    logs: list[dict[str, str]] = []
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[_route_label(row)] = counts.get(_route_label(row), 0) + 1
+    groups: dict[str, list[dict[str, str]]] = {}
+    for label in sorted(label for label, count in counts.items() if count > 1):
+        if label.startswith("slack|"):
+            logs.append({"phase": "discovery", "outcome": "ambiguous"})
+    for row in rows:
+        key = (row.get("kind"), row.get("address"), row.get("adapter"))
+        if (
+            row.get("kind") == "slack"
+            and row.get("deployment_status") == "active"
+            and all(row.get(name) for name in ("agent_id", "address", "adapter"))
+            and counts[_route_label(row)] == 1
+            and key not in excluded
+        ):
+            groups.setdefault(row["agent_id"], []).append(row)
+    agents = sorted(groups)
+    if not agents:
+        return [], logs
+    slots = min(max_targets, len(agents))
+    targets = []
+    for index in range(slots):
+        slot = rotation * slots + index
+        routes = sorted(
+            groups[agents[slot % len(agents)]],
+            key=lambda row: (row["kind"], row["address"], row["adapter"]),
+        )
+        targets.append(routes[(slot // len(agents)) % len(routes)])
+    return targets, logs
+
+
+def binding_check_outcome(
+    row: Mapping[str, str],
+    identities: list[dict[str, Any]] | None,
+    *,
+    identity_kinds: Sequence[str],
+) -> str:
+    """Model-free configuration check for one binding. @spec TURN-CANARY-8"""
+    if row.get("deployment_status") != "active":
+        return "deployment_inactive"
+    if row.get("kind") not in identity_kinds:
+        return "ok"
+    if identities is None:
+        return "read_failed"
+    adapter = row.get("adapter") or ""
+    matches = [item for item in identities if adapter and item.get("name") == adapter]
+    if not matches:
+        return "identity_missing"
+    if len(matches) > 1:
+        return "identity_ambiguous"
+    identity = matches[0]
+    if identity.get("status") != "active":
+        return "identity_inactive"
+    if identity.get("installation_mismatch") is not False:
+        return "installation_mismatch"
+    reference = identity.get("credential_ref")
+    if not isinstance(reference, str) or not reference.strip():
+        return "credential_missing"
+    return "ok"
+
+
+async def probe_adapter(client: Any, url: str) -> tuple[str, int | None]:
+    """One unauthenticated GET without redirects. @spec TURN-CANARY-9"""
+    import httpx
+
+    try:
+        response = await client.get(url, follow_redirects=False)
+    except httpx.HTTPError:
+        return "unreachable", None
+    status = response.status_code
+    return ("ok" if 200 <= status < 300 else "http_status"), status
+
+
+async def _probe_adapters(
+    platform: Platform, adapters: Mapping[str, str], result: CycleResult
+) -> None:
+    for name, url in sorted(adapters.items()):
+        try:
+            outcome, status = await platform.adapter_health(url)
+        except Exception as exc:  # noqa: BLE001 - an adapter probe failure is a down adapter
+            outcome, status = "unreachable", None
+            result.record("adapter", "unreachable", exc)
+        result.adapter_health[name] = outcome
+        item = {"phase": "adapter", "adapter": name, "outcome": outcome}
+        if status is not None:
+            item["http_status"] = str(status)
+        result.logs.append(item)
+
+
+async def _check_bindings(
+    platform: Platform,
+    rows: list[dict[str, str]],
+    turned: set[str],
+    identity_kinds: Sequence[str],
+    result: CycleResult,
+) -> None:
+    checked = [row for row in rows if _route_label(row) not in turned]
+    identities: dict[str, list[dict[str, Any]] | None] = {}
+    for kind in sorted({row.get("kind", "") for row in checked} & set(identity_kinds)):
+        try:
+            read = await platform.channel_identities(kind)
+            if not isinstance(read, list) or not all(isinstance(item, dict) for item in read):
+                raise ValueError("malformed channel identity read")
+            identities[kind] = read
+        except Exception as exc:  # noqa: BLE001 - a failed read is that kind's outcome
+            identities[kind] = None
+            result.record("binding_check", "read_failed", exc)
+    for row in checked:
+        label = _route_label(row)
+        outcome = binding_check_outcome(
+            row, identities.get(row.get("kind", "")), identity_kinds=identity_kinds
+        )
+        if result.binding_checks.get(label, "ok") == "ok":
+            result.binding_checks[label] = outcome
+        result.binding_check_last_run[label] = time.time()
 
 
 def build_turn(
@@ -334,42 +499,95 @@ async def _await_cleanup(
 
 async def run_cycle(
     platform: Platform,
-    selected: list[tuple[str, str, str]],
+    selected: list[tuple[str, str, str]] | None,
     *,
     journal: StateJournal | None = None,
     turn_deadline: float = 90.0,
     cleanup_deadline: float = 60.0,
     poll_period: float = 2.0,
     max_targets: int = 5,
+    discover: bool = False,
+    exclude: Iterable[Route] = (),
+    binding_checks: bool = False,
+    identity_kinds: Sequence[str] = ("slack",),
+    adapters: Mapping[str, str] | None = None,
 ) -> CycleResult:
-    """Probe serially; hold on uncertain cleanup. @spec TURN-CANARY-1 TURN-CANARY-6"""
+    """Probe serially; hold on uncertain cleanup. @spec TURN-CANARY-1 TURN-CANARY-10"""
     Limits(
         turn_deadline=turn_deadline,
         cleanup_deadline=cleanup_deadline,
         poll_period=poll_period,
         max_targets=max_targets,
     )
+    if discover == (selected is not None):
+        raise ValueError("configure exactly one of explicit routes or discovery")
     result = CycleResult()
-    if getattr(platform, "cleanup_blocked", False) or (
+    if adapters:
+        await _probe_adapters(platform, adapters, result)
+    held = getattr(platform, "cleanup_blocked", False) or (
         journal is not None
         and (journal.pending is not None or journal.data.get("cleanup_blocked") is True)
-    ):
+    )
+    if held:
         result.cleanup_degraded = True
         result.record("cleanup", "previous_unconfirmed")
-        return result
-    if len(selected) > max_targets:
+        if not binding_checks:
+            return result
+    if selected is not None and len(selected) > max_targets:
         raise ValueError("selected routes exceed maximum")
     try:
-        targets = select_targets(await platform.inventory(), selected)
-        if not await platform.read_only_supported():
-            result.record("admission", "read_only_unavailable")
-            return result
+        rows = await platform.inventory()
+        if not isinstance(rows, list):
+            raise ValueError("malformed inventory")
     except Exception as exc:  # noqa: BLE001 - inventory failures fail the whole cycle
         result.record("inventory", "failed", exc)
         return result
+    result.inventory_labels = {_route_label(row) for row in rows}
+    targets: list[dict[str, str]] = []
+    if not held:
+        try:
+            if selected is None:
+                rotation = journal.rotation if journal is not None else 0
+                targets, discovery_logs = discover_targets(
+                    rows, rotation=rotation, max_targets=max_targets, exclude=exclude
+                )
+                result.logs.extend(discovery_logs)
+                if targets:
+                    result.rotation = rotation + 1
+                else:
+                    result.record("discovery", "empty")
+            else:
+                targets = select_targets(rows, selected)
+            if targets and not await platform.read_only_supported():
+                result.record("admission", "read_only_unavailable")
+                targets = []
+        except Exception as exc:  # noqa: BLE001 - inventory failures fail the whole cycle
+            result.record("inventory", "failed", exc)
+            targets = []
+    if targets:
+        await _turn_targets(
+            platform, targets, result, journal, turn_deadline, cleanup_deadline, poll_period
+        )
+    if binding_checks:
+        await _check_bindings(platform, rows, set(result.target_last_run), identity_kinds, result)
+    if result.success:
+        result.last_success = time.time()
+    return result
+
+
+async def _turn_targets(
+    platform: Platform,
+    targets: list[dict[str, str]],
+    result: CycleResult,
+    journal: StateJournal | None,
+    turn_deadline: float,
+    cleanup_deadline: float,
+    poll_period: float,
+) -> None:
+    """The owned, serial turn path of TURN-CANARY-2 to 4. @spec TURN-CANARY-4"""
     all_ok = True
     for binding in targets:
-        target_label = "|".join((binding["kind"], binding["address"], binding["adapter"]))
+        target_label = _route_label(binding)
         result.target_last_run[target_label] = time.time()
         try:
             headroom = await platform.quota_headroom()
@@ -432,9 +650,6 @@ async def run_cycle(
             result.record("cleanup", "unconfirmed")
             break
     result.success = all_ok and not result.cleanup_degraded
-    if result.success:
-        result.last_success = time.time()
-    return result
 
 
 class RuntimePlatform:
@@ -458,9 +673,6 @@ class RuntimePlatform:
         quota_resource: str = "count/pods",
         quota_min_free: int = 1,
     ) -> None:
-        import re
-        from urllib.parse import urlsplit
-
         if not re.fullmatch(r"[a-z_][a-z0-9_]*", schema):
             raise ValueError("invalid database schema")
         parsed = urlsplit(api_url)
@@ -488,6 +700,7 @@ class RuntimePlatform:
             follow_redirects=False,
         )
         self._quota_http = httpx.AsyncClient(timeout=10.0, follow_redirects=False)
+        self._adapter_http = httpx.AsyncClient(timeout=5.0, follow_redirects=False)
         self._stream = stream
         self._schema = schema
         self._qualified = read_only_qualified
@@ -498,6 +711,7 @@ class RuntimePlatform:
         self.cleanup_blocked = False
 
     async def close(self) -> None:
+        await self._adapter_http.aclose()
         await self._quota_http.aclose()
         await self._http.aclose()
         await self._redis.aclose()
@@ -558,15 +772,29 @@ class RuntimePlatform:
         wire = QueuedTurn.model_validate_json(turn.model_dump_json(), context=READER_CONTEXT)
         await self._redis.xadd(self._stream, {STREAM_PAYLOAD_FIELD: wire.model_dump_json()})
 
-    async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+    async def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
         """Convert HTTP errors without URL, body, or credential text. @spec TURN-CANARY-6"""
         response = await self._http.request(method, path, **kwargs)
         if response.status_code >= 400:
             raise PlatformHttpError(response.status_code)
-        payload = response.json()
+        return response.json()
+
+    async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        payload = await self._request_json(method, path, **kwargs)
         if not isinstance(payload, dict):
             raise ValueError("platform response is not an object")
         return payload
+
+    async def channel_identities(self, kind: str) -> list[dict[str, Any]]:
+        """Read identity rows; never resolve a referenced secret. @spec TURN-CANARY-8"""
+        payload = await self._request_json("GET", "/channel-identities", params={"provider": kind})
+        if not isinstance(payload, list):
+            raise ValueError("channel identity read is not a list")
+        return payload
+
+    async def adapter_health(self, url: str) -> tuple[str, int | None]:
+        """Unauthenticated adapter health GET. @spec TURN-CANARY-9"""
+        return await probe_adapter(self._adapter_http, url)
 
     async def replies(self, reply_ref: str, after: int) -> dict[str, Any]:
         try:
@@ -602,11 +830,21 @@ class PlatformHttpError(RuntimeError):
         self.status_code = status_code
 
 
-def prometheus_text(result: CycleResult) -> str:
-    """Portable bounded exposition of the last cycle. @spec TURN-CANARY-6"""
+def _labels(**values: str) -> str:
+    return ",".join(f"{name}={json.dumps(value)}" for name, value in values.items())
 
-    def line(name: str, value: int | float) -> str:
-        return f"turn_canary_{name} {value}\n"
+
+def _route_value(route: str) -> str:
+    kind, address, adapter = route.split("|", 2)
+    return json.dumps({"kind": kind, "address": address, "adapter": adapter}, sort_keys=True)
+
+
+def prometheus_text(result: CycleResult, prefix: str = "turn_canary") -> str:
+    """Portable bounded exposition of the last cycle. @spec TURN-CANARY-6 TURN-CANARY-10"""
+    _check_prefix(prefix)
+
+    def line(name: str, value: int | float, labels: str = "") -> str:
+        return f"{prefix}_{name}{{{labels}}} {value}\n" if labels else f"{prefix}_{name} {value}\n"
 
     output = [
         line("cycle_success", int(result.success)),
@@ -616,84 +854,378 @@ def prometheus_text(result: CycleResult) -> str:
     ]
     if result.last_success is not None:
         output.append(line("last_success_timestamp_seconds", result.last_success))
+    if result.rotation is not None:
+        output.append(line("rotation", result.rotation))
     for route, last_run in sorted(result.target_last_run.items()):
-        kind, address, adapter = route.split("|", 2)
-        labels = json.dumps({"kind": kind, "address": address, "adapter": adapter}, sort_keys=True)
-        label = "route=" + json.dumps(labels)
+        label = _labels(route=_route_value(route))
         success = int(result.target_success.get(route, False))
-        output.append(f"turn_canary_target_success{{{label}}} {success}\n")
-        output.append(f"turn_canary_target_last_run_timestamp_seconds{{{label}}} {last_run}\n")
+        output.append(line("target_success", success, label))
+        output.append(line("target_last_run_timestamp_seconds", last_run, label))
         if route in result.target_last_success:
             output.append(
-                f"turn_canary_target_last_success_timestamp_seconds{{{label}}} "
-                f"{result.target_last_success[route]}\n"
+                line(
+                    "target_last_success_timestamp_seconds",
+                    result.target_last_success[route],
+                    label,
+                )
             )
+    for route, outcome in sorted(result.binding_checks.items()):
+        label = _labels(route=_route_value(route), outcome=outcome)
+        output.append(line("binding_check_success", int(outcome == "ok"), label))
+        if route in result.binding_check_last_run:
+            output.append(
+                line(
+                    "binding_check_last_run_timestamp_seconds",
+                    result.binding_check_last_run[route],
+                    _labels(route=_route_value(route)),
+                )
+            )
+    for adapter, outcome in sorted(result.adapter_health.items()):
+        output.append(
+            line("adapter_up", int(outcome == "ok"), _labels(adapter=adapter, outcome=outcome))
+        )
     return "".join(output)
 
 
-async def main() -> int:
-    """Run one opt-in cycle from explicit environment bindings. @spec TURN-CANARY-1 TURN-CANARY-6"""
-    import os
+class Monitor:
+    """Non-overlapping cycle loop and merged last observation. @spec TURN-CANARY-10"""
 
+    def __init__(
+        self,
+        run_once: Callable[[], Awaitable[CycleResult]] | None,
+        limits: Limits,
+        *,
+        prefix: str = "turn_canary",
+        clock: Callable[[], float] = time.monotonic,
+        log: Callable[[dict[str, str]], None] | None = None,
+    ) -> None:
+        self._run_once = run_once
+        self._limits = limits
+        self._prefix = _check_prefix(prefix)
+        self._clock = clock
+        self._log = log
+        self._started = clock()
+        self._last_finished: float | None = None
+        self._view: CycleResult | None = None
+        self.overruns = 0
+
+    @property
+    def stale_after(self) -> float:
+        limits = self._limits
+        cycle = limits.max_targets * (limits.turn_deadline + limits.cleanup_deadline)
+        return 2 * limits.cycle_interval + cycle
+
+    def healthy(self) -> bool:
+        reference = self._last_finished if self._last_finished is not None else self._started
+        return self._clock() - reference <= self.stale_after
+
+    def observe(self, result: CycleResult) -> None:
+        """Merge one cycle, keeping rotated routes until inventory drops them."""
+        view = self._view or CycleResult()
+        view.success = result.success
+        view.cleanup_degraded = result.cleanup_degraded
+        view.capacity_skips = result.capacity_skips
+        view.last_run = result.last_run
+        view.last_success = result.last_success or view.last_success
+        view.rotation = result.rotation if result.rotation is not None else view.rotation
+        view.adapter_health = dict(result.adapter_health)
+        per_route = (
+            "target_success",
+            "target_last_run",
+            "target_last_success",
+            "binding_checks",
+            "binding_check_last_run",
+        )
+        for name in per_route:
+            getattr(view, name).update(getattr(result, name))
+        for route in result.target_last_run:
+            view.binding_checks.pop(route, None)
+            view.binding_check_last_run.pop(route, None)
+        if result.inventory_labels is not None:
+            for name in per_route:
+                values = getattr(view, name)
+                for route in [route for route in values if route not in result.inventory_labels]:
+                    del values[route]
+        self._view = view
+        self._last_finished = self._clock()
+
+    def metrics_text(self) -> str:
+        body = prometheus_text(self._view, self._prefix) if self._view is not None else ""
+        return body + f"{self._prefix}_cycle_overruns_total {self.overruns}\n"
+
+    async def run_forever(self, stop: asyncio.Event) -> None:
+        """One cycle at a time, at most once per interval. @spec TURN-CANARY-10"""
+        if self._run_once is None:
+            raise ValueError("monitor has no cycle to run")
+        loop = asyncio.get_running_loop()
+        while not stop.is_set():
+            started = loop.time()
+            try:
+                result = await self._run_once()
+            except Exception as exc:  # noqa: BLE001 - a failed cycle is an observation
+                result = CycleResult()
+                result.record("cycle", "failed", exc)
+            self.observe(result)
+            if self._log is not None:
+                for item in result.logs:
+                    self._log(item)
+            remaining = self._limits.cycle_interval - (loop.time() - started)
+            if remaining <= 0:
+                self.overruns += 1
+                continue
+            try:
+                await asyncio.wait_for(stop.wait(), remaining)
+            except TimeoutError:
+                pass
+
+
+HTTP_HEAD_LIMIT = 8192
+HTTP_READ_TIMEOUT = 5.0
+
+
+async def serve_http(monitor: Monitor, host: str, port: int) -> asyncio.Server:
+    """Serve only GET /metrics and GET /healthz. @spec TURN-CANARY-10"""
+
+    async def respond(writer: asyncio.StreamWriter, status: str, body: str, kind: str) -> None:
+        payload = body.encode()
+        writer.write(
+            (
+                f"HTTP/1.1 {status}\r\nContent-Type: {kind}\r\n"
+                f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n"
+            ).encode()
+            + payload
+        )
+        await writer.drain()
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), HTTP_READ_TIMEOUT)
+            parts = head.split(b"\r\n", 1)[0].decode("ascii").split(" ")
+            if len(parts) != 3:
+                return
+            method, target, _version = parts
+            path = target.split("?", 1)[0]
+            plain = "text/plain; charset=utf-8"
+            if path not in {"/metrics", "/healthz"}:
+                await respond(writer, "404 Not Found", "not found\n", plain)
+            elif method != "GET":
+                await respond(writer, "405 Method Not Allowed", "method not allowed\n", plain)
+            elif path == "/metrics":
+                await respond(
+                    writer,
+                    "200 OK",
+                    monitor.metrics_text(),
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )
+            elif monitor.healthy():
+                await respond(writer, "200 OK", "ok\n", plain)
+            else:
+                await respond(writer, "503 Service Unavailable", "stale\n", plain)
+        except (
+            asyncio.IncompleteReadError,
+            asyncio.LimitOverrunError,
+            TimeoutError,
+            UnicodeDecodeError,
+            ConnectionError,
+        ):
+            pass
+        finally:
+            writer.close()
+
+    return await asyncio.start_server(handle, host, port, limit=HTTP_HEAD_LIMIT)
+
+
+@dataclass(frozen=True)
+class Config:
+    """Validated environment configuration. @spec TURN-CANARY-7 TURN-CANARY-10"""
+
+    database_url: str
+    valkey_url: str
+    api_url: str
+    api_key: str
+    stream: str
+    schema: str
+    state_path: str
+    read_only_qualified: bool
+    limits: Limits
+    routes: list[Route] | None
+    discover: bool
+    exclude: list[Route]
+    binding_checks: bool
+    identity_kinds: tuple[str, ...]
+    adapters: dict[str, str]
+    listen: tuple[str, int] | None
+    metric_prefix: str
+    metrics_path: str | None
+    quota_url: str | None
+    quota_token: str | None
+    quota_resource: str
+    quota_min_free: int
+
+
+def _routes(raw: str, name: str) -> list[Route]:
+    value = json.loads(raw)
+    if not isinstance(value, list) or not all(
+        isinstance(item, list) and len(item) == 3 and all(isinstance(part, str) for part in item)
+        for item in value
+    ):
+        raise ValueError(f"{name} must be a list of route triples")
+    return [(item[0], item[1], item[2]) for item in value]
+
+
+def _adapters(raw: str) -> dict[str, str]:
+    value = json.loads(raw)
+    if not isinstance(value, dict) or len(value) > MAX_ADAPTERS:
+        raise ValueError("adapter health must be an object of at most 20 adapters")
+    for name, url in value.items():
+        if not isinstance(name, str) or not ADAPTER_NAME.fullmatch(name):
+            raise ValueError("adapter health names must be short lowercase names")
+        parsed = urlsplit(url) if isinstance(url, str) else None
+        if (
+            parsed is None
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
+            raise ValueError("adapter health URLs must be HTTP(S) without user information")
+    return dict(value)
+
+
+def _listen(raw: str) -> tuple[str, int]:
+    host, separator, port = raw.rpartition(":")
+    host = host.strip("[]")
+    if not separator or not host or not port.isdigit() or not 0 < int(port) <= 65535:
+        raise ValueError("TURN_CANARY_LISTEN must be host:port")
+    return host, int(port)
+
+
+def parse_config(environ: Mapping[str, str]) -> Config:
+    """Read explicit installation settings; nothing is defaulted from a tenant.
+
+    @spec TURN-CANARY-7 TURN-CANARY-10
+    """
     required = (
         "TURN_CANARY_DATABASE_URL",
         "TURN_CANARY_VALKEY_URL",
         "TURN_CANARY_API_URL",
         "TURN_CANARY_API_KEY",
         "TURN_CANARY_STREAM",
-        "TURN_CANARY_ROUTES",
     )
-    missing = [name for name in required if not os.environ.get(name)]
+    missing = [name for name in required if not environ.get(name)]
     if missing:
         raise ValueError("missing required canary configuration: " + ", ".join(missing))
-    selected_raw = json.loads(os.environ["TURN_CANARY_ROUTES"])
-    if not isinstance(selected_raw, list):
-        raise ValueError("routes must be a list of triples")
-    selected = [tuple(item) for item in selected_raw]
-    state_path = os.environ.get("TURN_CANARY_STATE_PATH")
+    discover = environ.get("TURN_CANARY_DISCOVER") == "1"
+    raw_routes = environ.get("TURN_CANARY_ROUTES")
+    if discover == bool(raw_routes):
+        raise ValueError("set exactly one of TURN_CANARY_ROUTES or TURN_CANARY_DISCOVER=1")
+    state_path = environ.get("TURN_CANARY_STATE_PATH")
     if not state_path:
         raise ValueError("TURN_CANARY_STATE_PATH is required to retain cleanup hold across runs")
-    limits = Limits(
-        cycle_interval=float(os.environ.get("TURN_CANARY_CYCLE_INTERVAL", "300")),
-        turn_deadline=float(os.environ.get("TURN_CANARY_TURN_DEADLINE", "90")),
-        cleanup_deadline=float(os.environ.get("TURN_CANARY_CLEANUP_DEADLINE", "60")),
-        poll_period=float(os.environ.get("TURN_CANARY_POLL_PERIOD", "2")),
-        max_targets=int(os.environ.get("TURN_CANARY_MAX_TARGETS", "5")),
+    identity_kinds = json.loads(environ.get("TURN_CANARY_IDENTITY_KINDS", '["slack"]'))
+    if not isinstance(identity_kinds, list) or not all(
+        isinstance(kind, str) and kind for kind in identity_kinds
+    ):
+        raise ValueError("TURN_CANARY_IDENTITY_KINDS must be a list of binding kinds")
+    listen = environ.get("TURN_CANARY_LISTEN")
+    return Config(
+        database_url=environ["TURN_CANARY_DATABASE_URL"],
+        valkey_url=environ["TURN_CANARY_VALKEY_URL"],
+        api_url=environ["TURN_CANARY_API_URL"],
+        api_key=environ["TURN_CANARY_API_KEY"],
+        stream=environ["TURN_CANARY_STREAM"],
+        schema=environ.get("TURN_CANARY_DB_SCHEMA", "curie"),
+        state_path=state_path,
+        read_only_qualified=environ.get("TURN_CANARY_READ_ONLY_QUALIFIED") == "1",
+        limits=Limits(
+            cycle_interval=float(environ.get("TURN_CANARY_CYCLE_INTERVAL", "300")),
+            turn_deadline=float(environ.get("TURN_CANARY_TURN_DEADLINE", "90")),
+            cleanup_deadline=float(environ.get("TURN_CANARY_CLEANUP_DEADLINE", "60")),
+            poll_period=float(environ.get("TURN_CANARY_POLL_PERIOD", "2")),
+            max_targets=int(environ.get("TURN_CANARY_MAX_TARGETS", "5")),
+        ),
+        routes=_routes(raw_routes, "TURN_CANARY_ROUTES") if raw_routes else None,
+        discover=discover,
+        exclude=_routes(environ.get("TURN_CANARY_DISCOVER_EXCLUDE", "[]"), "exclusions"),
+        binding_checks=environ.get("TURN_CANARY_BINDING_CHECKS") == "1",
+        identity_kinds=tuple(identity_kinds),
+        adapters=_adapters(environ.get("TURN_CANARY_ADAPTER_HEALTH", "{}")),
+        listen=_listen(listen) if listen else None,
+        metric_prefix=_check_prefix(environ.get("TURN_CANARY_METRIC_PREFIX", "turn_canary")),
+        metrics_path=environ.get("TURN_CANARY_METRICS_PATH") or None,
+        quota_url=environ.get("TURN_CANARY_QUOTA_URL"),
+        quota_token=environ.get("TURN_CANARY_QUOTA_TOKEN"),
+        quota_resource=environ.get("TURN_CANARY_QUOTA_RESOURCE", "count/pods"),
+        quota_min_free=int(environ.get("TURN_CANARY_QUOTA_MIN_FREE", "1")),
     )
+
+
+def _print_log(item: dict[str, str]) -> None:
+    print(json.dumps(item, sort_keys=True), flush=True)
+
+
+async def main() -> int:
+    """Run one cycle, or the exporter, from explicit settings. @spec TURN-CANARY-1 TURN-CANARY-10"""
+    config = parse_config(os.environ)
+    limits = config.limits
     platform = RuntimePlatform(
-        database_url=os.environ["TURN_CANARY_DATABASE_URL"],
-        valkey_url=os.environ["TURN_CANARY_VALKEY_URL"],
-        api_url=os.environ["TURN_CANARY_API_URL"],
-        api_key=os.environ["TURN_CANARY_API_KEY"],
-        stream=os.environ["TURN_CANARY_STREAM"],
-        schema=os.environ.get("TURN_CANARY_DB_SCHEMA", "curie"),
-        read_only_qualified=os.environ.get("TURN_CANARY_READ_ONLY_QUALIFIED") == "1",
-        quota_url=os.environ.get("TURN_CANARY_QUOTA_URL"),
-        quota_token=os.environ.get("TURN_CANARY_QUOTA_TOKEN"),
-        quota_resource=os.environ.get("TURN_CANARY_QUOTA_RESOURCE", "count/pods"),
-        quota_min_free=int(os.environ.get("TURN_CANARY_QUOTA_MIN_FREE", "1")),
+        database_url=config.database_url,
+        valkey_url=config.valkey_url,
+        api_url=config.api_url,
+        api_key=config.api_key,
+        stream=config.stream,
+        schema=config.schema,
+        read_only_qualified=config.read_only_qualified,
+        quota_url=config.quota_url,
+        quota_token=config.quota_token,
+        quota_resource=config.quota_resource,
+        quota_min_free=config.quota_min_free,
     )
-    state_file = Path(state_path)
-    try:
-        with StateJournal(state_file) as journal:
+
+    async def one_cycle() -> CycleResult:
+        with StateJournal(Path(config.state_path)) as journal:
             platform.cleanup_blocked = journal.data.get("cleanup_blocked") is True
             result = await run_cycle(
                 platform,
-                selected,
+                config.routes,
                 journal=journal,
                 turn_deadline=limits.turn_deadline,
                 cleanup_deadline=limits.cleanup_deadline,
                 poll_period=limits.poll_period,
                 max_targets=limits.max_targets,
+                discover=config.discover,
+                exclude=config.exclude,
+                binding_checks=config.binding_checks,
+                identity_kinds=config.identity_kinds,
+                adapters=config.adapters,
             )
             journal.save_result(result)
+        return result
+
+    try:
+        if config.listen is not None:
+            import signal
+
+            monitor = Monitor(one_cycle, limits, prefix=config.metric_prefix, log=_print_log)
+            stop = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(signum, stop.set)
+            server = await serve_http(monitor, *config.listen)
+            try:
+                await monitor.run_forever(stop)
+            finally:
+                server.close()
+                await server.wait_closed()
+            return 0
+        result = await one_cycle()
     finally:
         await platform.close()
-    metrics_path = os.environ.get("TURN_CANARY_METRICS_PATH")
-    if metrics_path:
-        Path(metrics_path).write_text(prometheus_text(result))
+    if config.metrics_path:
+        Path(config.metrics_path).write_text(prometheus_text(result, config.metric_prefix))
     for item in result.logs:
-        print(json.dumps(item, sort_keys=True))
+        _print_log(item)
     return 0 if result.success else 1
 
 
