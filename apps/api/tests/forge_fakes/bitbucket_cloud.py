@@ -22,6 +22,14 @@ where they exist:
    https://developer.atlassian.com/cloud/bitbucket/rest/api-group-commit-statuses/
 5. Pull requests and their comments:
    https://developer.atlassian.com/cloud/bitbucket/rest/api-group-pullrequests/
+6. Pull request mergeability checks (#4624), re-read 2026-10-15 from the
+   reference page
+   https://developer.atlassian.com/cloud/bitbucket/rest/api-group-pullrequests/#api-repositories-workspace-repo-slug-pullrequests-pull-request-id-mergeability-checks-get
+   and the OpenAPI document
+   https://dac-static.atlassian.com/cloud/bitbucket/swagger.v3.json
+   (``pullrequest_mergeability_checks``, ``pullrequest_mergeability_check``,
+   ``git_mergeability_check``). These are the documented shapes, not
+   recordings: no recording of this endpoint exists yet.
 
 Seeding helpers change state directly and count no write; `writes` counts only
 mutating requests the app accepted, which is what the contract harness reports
@@ -34,6 +42,7 @@ import hashlib
 import html
 import itertools
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -79,6 +88,10 @@ MAX_PAGELEN = 100
 _SOURCE_BRANCH_Q = re.compile(r'\s*source\.branch\.name\s*=\s*"((?:[^"\\]|\\.)*)"\s*')
 _CREATED_ON_Q = re.compile(r'\s*created_on\s*>=\s*"?([0-9T:.+\-Z]+)"?\s*')
 _MARKER_LINE = re.compile(r"^\[//\]: # \(.*\)$")
+# The only two filters the mergeability checks endpoint accepts, joined by
+# ``AND`` in either order; anything else is a 400 (swagger, re-read 2026-10-15).
+_SKIP_GIT_Q = re.compile(r'\s*type\s*!=\s*"git_mergeability_check"\s*')
+_SKIP_BEHIND_Q = re.compile(r'\s*check\.kind\s*!=\s*"maximum_commits_behind"\s*')
 
 
 def _stamp(moment: datetime) -> str:
@@ -104,6 +117,36 @@ def _number(text: str) -> int:
     """A stable twelve-digit number for ``text``, for placeholder UUIDs."""
 
     return int(hashlib.sha1(text.encode()).hexdigest(), 16) % 10**12
+
+
+def _mergeability_skips(query: str | None) -> frozenset[str] | None:
+    """The checks a mergeability ``q`` excludes, or None when Bitbucket
+    refuses it: ``git`` for ``type!="git_mergeability_check"``, ``behind``
+    for ``check.kind!="maximum_commits_behind"``, each at most once."""
+
+    if query is None:
+        return frozenset()
+    skips: list[str] = []
+    for clause in re.split(r"\s+AND\s+", query):
+        if _SKIP_GIT_Q.fullmatch(clause):
+            skips.append("git")
+        elif _SKIP_BEHIND_Q.fullmatch(clause):
+            skips.append("behind")
+        else:
+            return None
+    return frozenset(skips) if len(skips) == len(set(skips)) else None
+
+
+def _skipped(check: dict[str, Any], skips: frozenset[str]) -> bool:
+    if "git" in skips and check.get("type") == "git_mergeability_check":
+        return True
+    kind = check.get("check")
+    return (
+        "behind" in skips
+        and check.get("type") == "standard_merge_check"
+        and isinstance(kind, dict)
+        and kind.get("kind") == "maximum_commits_behind"
+    )
 
 
 def _error(status: int, message: str) -> JSONResponse:
@@ -194,6 +237,14 @@ class BitbucketCloudFake:
     writers: set[str] = field(default_factory=set)
     writes: int = 0
     requests: list[Seen] = field(default_factory=list)
+    # Called with the pull request id inside every mergeability read, after the
+    # request is accepted and before the checks are evaluated: a test pushes to
+    # the source or destination branch here to move a head mid-read.
+    on_mergeability_read: Callable[[int], None] | None = None
+    # Pull requests whose payload carries no source commit hash. Bitbucket is
+    # not known to answer this way; it is an unexpected shape, offered so a test
+    # can show the adapter proves nothing about a pull request it cannot pin.
+    hashless_sources: set[int] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.tokens.setdefault(FACTORY_TOKEN, self.factory)
@@ -212,6 +263,11 @@ class BitbucketCloudFake:
         self._uuid_ids = itertools.count(100)
         self._page_countdown: int | None = None
         self._scripted: list[_Scripted] = []
+        # Per pull request: the seeded Git check, or a whole seeded check list.
+        self._git_checks: dict[int, tuple[str, str | None, bool]] = {}
+        self._mergeability_values: dict[int, list[dict[str, Any]]] = {}
+        # An answer every mergeability read gets instead of the checks.
+        self._mergeability_answer: _Scripted | None = None
         self.push(self.mainbranch, "Initial commit")
         prefix = urlsplit(self.api_url).path.rstrip("/")
         self.app = Starlette(routes=[Mount(prefix, routes=self._routes())])
@@ -322,6 +378,50 @@ class BitbucketCloudFake:
         """The next request, whatever it is, gets this answer instead."""
 
         self._scripted.append(_Scripted(status, dict(headers or {}), body))
+
+    def set_git_mergeability(
+        self, pull: int, status: str, reason: str | None, *, blocking: bool | None = None
+    ) -> None:
+        """The ``git_mergeability_check`` ``pull``'s mergeability read reports.
+
+        ``reason`` None omits the field, as Bitbucket does for ``UNKNOWN``.
+        ``blocking`` defaults to whether ``status`` is ``FAILED``; a blocking
+        check carries the ``links.details`` link to the pull request's
+        ``conflicts`` endpoint.
+        """
+
+        if pull not in self.pulls:
+            raise KeyError(pull)
+        self._git_checks[pull] = (
+            status,
+            reason,
+            status == "FAILED" if blocking is None else blocking,
+        )
+
+    def set_mergeability_checks(self, pull: int, values: list[dict[str, Any]] | None) -> None:
+        """Answer ``pull``'s mergeability read with exactly ``values``, for
+        shapes the default does not produce; None restores the default."""
+
+        if pull not in self.pulls:
+            raise KeyError(pull)
+        if values is None:
+            self._mergeability_values.pop(pull, None)
+        else:
+            self._mergeability_values[pull] = [dict(v) for v in values]
+
+    def answer_mergeability(
+        self,
+        status: int | None,
+        *,
+        headers: dict[str, str] | None = None,
+        body: Any = None,
+    ) -> None:
+        """Every mergeability read answers ``status`` (with ``body``) until
+        called with None. Other routes answer normally."""
+
+        self._mergeability_answer = (
+            None if status is None else _Scripted(status, dict(headers or {}), body)
+        )
 
     # State changes shared by seeding and the API ----------------------------
 
@@ -484,7 +584,11 @@ class BitbucketCloudFake:
             # Bitbucket abbreviates both commit hashes to twelve characters.
             "source": {
                 "branch": {"name": pull.source},
-                "commit": {"type": "commit", "hash": self._head(pull)[:12]},
+                "commit": (
+                    {"type": "commit"}
+                    if pull.id in self.hashless_sources
+                    else {"type": "commit", "hash": self._head(pull)[:12]}
+                ),
                 "repository": self._repo_min(),
             },
             "destination": {
@@ -550,6 +654,55 @@ class BitbucketCloudFake:
             }
         return payload
 
+    def _mergeability(self, pull: _Pull) -> list[dict[str, Any]]:
+        """The checks Bitbucket lists for ``pull``: state, permission and Git.
+
+        A pull request that is not OPEN fails the blocking state check and has
+        no Git check evaluated. No branch restriction, custom check or merge
+        queue is configured, so those checks are omitted, as Bitbucket omits
+        them.
+        """
+
+        seeded = self._mergeability_values.get(pull.id)
+        if seeded is not None:
+            return [dict(v) for v in seeded]
+        if pull.state != "OPEN":
+            return [
+                {
+                    "type": "pullrequest_state_check",
+                    "status": "FAILED",
+                    "required": True,
+                    "blocking": True,
+                }
+            ]
+        status, reason, blocking = self._git_checks.get(pull.id, ("PASSED", "clean", False))
+        git: dict[str, Any] = {
+            "type": "git_mergeability_check",
+            "status": status,
+            "required": True,
+            "blocking": blocking,
+        }
+        if reason is not None:
+            git["reason"] = reason
+        if blocking:
+            conflicts = f"{self._repo_api}/pullrequests/{pull.id}/conflicts"
+            git["links"] = {"details": {"href": conflicts}}
+        return [
+            {
+                "type": "pullrequest_state_check",
+                "status": "PASSED",
+                "required": True,
+                "blocking": False,
+            },
+            {
+                "type": "current_user_permission_check",
+                "status": "PASSED",
+                "required": True,
+                "blocking": False,
+            },
+            git,
+        ]
+
     def _status(self, sha: str, status: _Status) -> dict[str, Any]:
         return {
             "type": "build",
@@ -592,6 +745,11 @@ class BitbucketCloudFake:
             Route(repo + "/pullrequests/{id:int}", self._one_pull, methods=["GET", "PUT"]),
             Route(repo + "/pullrequests/{id:int}/decline", self._decline, methods=["POST"]),
             Route(repo + "/pullrequests/{id:int}/merge", self._merge, methods=["POST"]),
+            Route(
+                repo + "/pullrequests/{id:int}/mergeability/checks",
+                self._mergeability_checks,
+                methods=["GET"],
+            ),
             Route(
                 repo + "/pullrequests/{id:int}/comments", self._comments, methods=["GET", "POST"]
             ),
@@ -838,6 +996,28 @@ class BitbucketCloudFake:
 
     async def _merge(self, request: Request) -> Response:
         return await self._transition(request, "MERGED")
+
+    async def _mergeability_checks(self, request: Request) -> Response:
+        _, refused = await self._enter(request)
+        if refused is not None:
+            return refused
+        pull = self.pulls.get(request.path_params["id"])
+        if not self._repo_matches(request) or pull is None:
+            return _error(404, "Pull request not found")
+        # Only a limited BBQL subset is accepted here; the adapter sends none.
+        query = request.query_params.get("q")
+        skips = _mergeability_skips(query)
+        if skips is None:
+            return _error(400, f"Unsupported query: {query}")
+        if self.on_mergeability_read is not None:
+            self.on_mergeability_read(pull.id)
+        answer = self._mergeability_answer
+        if answer is not None:
+            if isinstance(answer.body, (dict, list)):
+                return JSONResponse(answer.body, status_code=answer.status, headers=answer.headers)
+            return Response(answer.body or "", status_code=answer.status, headers=answer.headers)
+        values = [v for v in self._mergeability(pull) if not _skipped(v, skips)]
+        return JSONResponse({"size": len(values), "values": values})
 
     async def _comments(self, request: Request) -> Response:
         actor, refused = await self._enter(request)
