@@ -57,7 +57,9 @@ The GitHub workflow is below. The GitLab and Jira Cloud quickstarts above
 provide the equivalent provider-specific steps.
 
 1. **Write a bounded GitHub issue.** Describe the behavior, acceptance criteria, and
-   how to verify it. Start with a small change. The sandbox receives the
+   how to verify it. Use Codex, Claude Code, or another coding agent to help
+   investigate and draft the issue if useful; Curie's factory runner takes over
+   after admission. Start with a small change. The sandbox receives the
    repository checkout and reads the issue and comments through a scoped
    platform tool; it holds no GitHub publication credential.
 2. **Add the configured label.** The default is `curie-factory`. A permitted
