@@ -36,6 +36,13 @@ installation across teams.
 
 ## Bind workspaces and credentials deliberately
 
+For factory intake, choose a supported
+[tracker and code-host pairing](guides/dark-factory-quickstart.md#choose-your-tracker-and-code-host).
+GitHub publication uses a GitHub App, including when Jira Cloud supplies the
+issues. GitLab uses its own access token. Jira Cloud also needs a dedicated
+factory account, API token and explicit start authority. Follow that pairing's
+credential instructions; a Slack connection does not configure factory intake.
+
 Follow [Slack setup](your-first-slack-agent.md) and
 [bundle deployment](operations.md#deploying-your-plugin-bundle-onto-the-curie-platform).
 A channel binds one agent; an agent may have multiple bindings. Only one release

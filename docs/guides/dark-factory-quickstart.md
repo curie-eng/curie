@@ -2,13 +2,26 @@
 
 <a id="dark-factory-quickstart"></a>
 
-Turn a labelled GitHub issue into a pull request you can review, using the
-Software Factory co-worker. `dark-factory` remains its implementation name.
+Turn a labelled issue into a pull request or merge request you can review,
+using the Software Factory co-worker. `dark-factory` remains its implementation name.
 See the [solution overview](../software-factory.md) for the delegation workflow,
 supported toolchains, review limits, and production differences.
 
 This guide uses the latest released CLI and factory runner by default. See the
 [capability reference](../capabilities.md) for supported integrations and limits.
+
+## Choose your tracker and code host
+
+| Your pairing | Start here |
+|---|---|
+| GitHub issues and GitHub pull requests | [GitHub walkthrough below](#what-you-need), starting with prerequisites and CLI installation |
+| GitLab issues and GitLab merge requests | [Complete GitLab walkthrough](factory-gitlab-quickstart.md), including local cluster, credentials and first issue |
+| Jira Cloud issues and GitHub pull requests | [Complete Jira Cloud and GitHub walkthrough](factory-jira-github-quickstart.md), including the GitHub App and start authority |
+| Jira Cloud issues and Bitbucket Cloud or Data Center pull requests | Combined quickstart is unavailable. [Adapter configuration reference](#bitbucket-cloud-and-data-center) describes the current limits; it is not a complete onboarding path. |
+
+The walkthrough on this page uses **GitHub issues and GitHub pull requests**.
+The [GitLab](#gitlab) and [Jira Cloud](#jira-cloud) sections farther down are
+advanced configuration references for those pairings.
 
 `curie factory quickstart` installs Curie on a local
 [kind](https://kind.sigs.k8s.io/) cluster or an explicitly selected existing
@@ -26,8 +39,8 @@ and [45 seconds for an intake polling interval](../../charts/curie/values.yaml).
 These are configured phase limits and an interval, not a measured total or a
 guarantee that the whole walkthrough finishes within the allowance.
 
-Polling is the intake. There is no webhook, no tunnel, and no personal access
-token. The platform reads the issue for the sandbox.
+For the GitHub walkthrough, polling is the intake. There is no webhook, no
+tunnel, and no personal access token. The platform reads the issue for the sandbox.
 
 Quickstart selects automatic initial PR publication and a 5 USD configured
 session ceiling. Despite the `max_usd_per_day` field name, the SDK applies this
@@ -281,9 +294,15 @@ default reviewer model. To pin another reviewer model for this agent, use the sa
 namespace and release as the quickstart:
 
 ```bash
+read -r -p "Reviewer model id for your provider: " CURIE_REVIEWER_MODEL
+```
+
+After answering, apply the override:
+
+```bash
 curie cluster overrides dark-factory --context "$CURIE_CONTEXT" \
   --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" \
-  --reviewer-model <provider-model-id>
+  --reviewer-model "$CURIE_REVIEWER_MODEL"
 ```
 
 Use `--clear-reviewer-model` in place of `--reviewer-model <provider-model-id>`
@@ -380,6 +399,10 @@ adds a rotation warning once the date is past or within 14 days. A token with no
 recorded expiry reads `unknown`.
 
 ## Jira Cloud
+
+For a complete local install through the first pull request, follow the
+[Jira Cloud and GitHub walkthrough](factory-jira-github-quickstart.md). The
+sections here explain credentials and the chart values quickstart writes.
 
 The factory can take its issues from Jira Cloud while it publishes to GitHub.
 Pull requests, CI, review feedback and merges stay on GitHub, and the GitHub
@@ -498,11 +521,16 @@ issue's workflow status.
 
 ## GitLab
 
+For a complete local install through the first merge request, follow the
+[GitLab walkthrough](factory-gitlab-quickstart.md). The sections here retain
+the advanced server, credential and chart configuration reference.
+
 The factory can take issues from GitLab and publish merge requests to it, on
 gitlab.com or a self-managed server. It labels the issue, opens a merge request
 whose description says `Closes #<iid>`, follows the pipeline, answers review
 discussions in the thread, and never merges or resolves a thread. The GitLab
-server must be version 17.0 or later; only 19.4.1 has been tested.
+server must be version 17.0 or later. See the
+[capability reference](../capabilities.md) for verification limits.
 
 ### The factory account and token
 
@@ -523,8 +551,8 @@ Secret that only the API mounts; it never prints the token or puts it in argv.
 
 ```bash
 curie factory quickstart --code-host gitlab --tracker gitlab \
-  --repo <group/.../project> --token-file <path> \
-  [--forge-url <web base>] [--ca-file <pem>] [--dry-run]
+  --repo "$CURIE_REPO" --token-file "$CURIE_GITLAB_TOKEN_FILE" \
+  --forge-url "$CURIE_GITLAB_URL"
 ```
 
 Without `--forge-url` the target is `https://gitlab.com`. `--repo` is the full
@@ -583,8 +611,9 @@ the last poll and one read for each issue that is running.
 Bitbucket has no issue tracker the factory reads, so a Bitbucket code host
 pairs only with a Jira Cloud tracker. The ticket is a Jira issue, and the pull
 request, its build statuses and its review comments are on Bitbucket. The
-combined quickstart for this pairing is tracked in #4400; until it lands, write
-the `factory:` values below yourself.
+combined quickstart for this pairing is unavailable. The values below describe
+adapter configuration for operators; they do not install or verify the complete
+Jira and Bitbucket path. Use a supported pairing above for a first factory run.
 
 Each kind takes a static access token, never a username and password:
 
@@ -702,7 +731,7 @@ own trigger label. On a release that already records factory intake, run
 quickstart with a new agent name and no App flags:
 
 ```bash
-curie factory quickstart --agent <name> --label <label> [--plugin-dir <dir>]
+curie factory quickstart --agent fast --label curie-factory-fast
 ```
 
 For example, `--agent fast --label dark-factory-fast` deploys an agent named
