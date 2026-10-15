@@ -9,11 +9,13 @@ a real turn through the SessionRunner with the fake model.
 
 import hashlib
 import json
+from pathlib import Path
 
 import anyio
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from curie_runner import __main__ as boot
 from curie_runner.adapter import ClaudeAgentSession, build_options, build_structured_resume
 from curie_runner.history import (
     HISTORY_APPEND_RESERVE_BYTES,
@@ -36,6 +38,17 @@ from runner_state_fake import CappedCasState
 
 _STATE_VALUE_MAX_BYTES = 65_536
 _TRANSCRIPT_CAP_HEADERS = {"X-Curie-Transcript-Max-Bytes": str(_STATE_VALUE_MAX_BYTES)}
+
+
+@pytest.fixture(autouse=True)
+def _isolated_boot_declarations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep host image and daemon declarations out of these prompt expectations."""
+
+    monkeypatch.setattr(
+        boot, "TOOL_MANIFEST_PATH", tmp_path / "tool-manifest.json", raising=False
+    )
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("DOCKER_PUBLISHED_HOST", raising=False)
 
 
 def _assert_digest_marker(value: object, original: str) -> None:

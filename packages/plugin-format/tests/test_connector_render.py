@@ -2156,3 +2156,34 @@ def test_a_proxied_connector_is_ready_only_when_its_proxy_accepts() -> None:
         assert "livenessProbe" not in proxy
         assert "startupProbe" not in proxy
         assert containers["server"]["readinessProbe"]["tcpSocket"] == {"port": "http"}
+
+
+# --------------------------------------------------------------------------- #
+# `config`: per-agent NON-secret settings from the same per-agent Secret.
+# --------------------------------------------------------------------------- #
+def _configured() -> ConnectorSpec:
+    # Built per test, not at import, so the rest of the module still collects
+    # on a ConnectorSpec that predates the field.
+    return ConnectorSpec(
+        image="ghcr.io/example/docs-mcp:1",
+        secrets=["DOCS_TOKEN"],
+        config=["DOCS_FOLDER_PATH"],
+    )
+
+
+def test_config_renders_a_secret_key_ref_into_the_per_agent_secret() -> None:
+    deployment = next(obj for obj in _objs(spec=_configured()) if obj["kind"] == "Deployment")
+    env = deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+    setting = next(item for item in env if item["name"] == "DOCS_FOLDER_PATH")
+    assert setting == {
+        "name": "DOCS_FOLDER_PATH",
+        "valueFrom": {
+            "secretKeyRef": {"name": "conn-secrets", "key": "DOCS_FOLDER_PATH", "optional": False}
+        },
+    }
+
+
+def test_config_never_becomes_the_bearer() -> None:
+    assert _github_entry(_configured())["headers"] == {"Authorization": "Bearer ${DOCS_TOKEN}"}
+    config_only = ConnectorSpec(image="ghcr.io/example/docs-mcp:1", config=["DOCS_FOLDER_PATH"])
+    assert "headers" not in _github_entry(config_only)

@@ -152,7 +152,8 @@ def sealing_key_custody_issues(root: Path) -> list[ValidationIssue]:
     the one accepted form is a ``SecretRef`` in ``connectors.yaml``. A plain
     ``secrets`` name (Curie resolves and owns the value), a literal ``env``
     value, a ``secret_files`` entry (the same per-agent Secret, as a file), a
-    ``sealed_secrets`` blob (the bundle carries the value) and a ``plugin.json``
+    ``sealed_secrets`` blob (the bundle carries the value), a ``config`` name
+    (the same per-agent Secret, as a setting) and a ``plugin.json``
     ``secrets`` name (a sandbox secret) are each refused, naming the key. So
     is naming the key for the sandbox to expand without declaring it: a
     ``bearer_secret`` (the derived ``Authorization: Bearer ${NAME}`` header), or
@@ -204,6 +205,7 @@ def sealing_key_custody_issues(root: Path) -> list[ValidationIssue]:
             ("env", spec.env),
             ("secret_files", spec.secret_files),
             ("sealed_secrets", spec.sealed_secrets),
+            ("config", spec.config),
         ):
             for name in names:
                 if is_sealing_key_name(name):

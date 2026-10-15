@@ -45,6 +45,17 @@ from curie_runner.config import RunnerConfig
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 
 
+@pytest.fixture(autouse=True)
+def _isolated_boot_declarations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep host image and daemon declarations out of these prompt expectations."""
+
+    monkeypatch.setattr(
+        boot, "TOOL_MANIFEST_PATH", tmp_path / "tool-manifest.json", raising=False
+    )
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("DOCKER_PUBLISHED_HOST", raising=False)
+
+
 def _attachments_dir() -> Path:
     """The compiled-in mount, resolved at call time rather than at import.
 
