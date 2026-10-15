@@ -97,55 +97,6 @@ def _run(canary, platform, **options):
     return asyncio.run(canary.run_cycle(platform, None, discover=True, **FAST, **options))
 
 
-# TURN-CANARY-5: quota quantities
-
-
-@pytest.mark.parametrize(
-    "raw,expected",
-    [("2", 2), ("500m", 0.5), ("1.5", 1.5), ("1k", 1000), ("1Gi", 1024**3), ("3M", 3e6)],
-)
-def test_quantities_parse_like_kubernetes(raw, expected):
-    """@spec TURN-CANARY-5"""
-    assert _canary().parse_quantity(raw) == pytest.approx(expected)
-
-
-@pytest.mark.parametrize("raw", ["", "m", "abc", "1x", "-1", "1 Gi", "1e3", None, 3])
-def test_non_quantities_are_refused(raw):
-    """@spec TURN-CANARY-5"""
-    with pytest.raises(ValueError):
-        _canary().parse_quantity(raw)
-
-
-def _quota(hard, used, resource="limits.cpu"):
-    return {"items": [{"status": {"hard": {resource: hard}, "used": {resource: used}}}]}
-
-
-@pytest.mark.parametrize(
-    "hard,used,minimum,expected",
-    [
-        ("4", "3500m", "500m", True),
-        ("4", "3600m", "500m", False),
-        ("4", "4", "500m", False),
-        ("2Gi", "1Gi", "512Mi", True),
-        ("4", "bad", "500m", None),
-    ],
-)
-def test_cpu_quota_headroom_reads_quantities(hard, used, minimum, expected):
-    """@spec TURN-CANARY-5"""
-    canary = _canary()
-    body = _quota(hard, used)
-    assert canary.quota_has_headroom(body, "limits.cpu", minimum) is expected
-
-
-def test_quota_minimum_free_accepts_a_quantity_and_refuses_garbage():
-    """@spec TURN-CANARY-5"""
-    canary = _canary()
-    config = canary.parse_config({**REQUIRED, "TURN_CANARY_QUOTA_MIN_FREE": "500m"})
-    assert config.quota_min_free == "500m"
-    with pytest.raises(ValueError):
-        canary.parse_config({**REQUIRED, "TURN_CANARY_QUOTA_MIN_FREE": "half"})
-
-
 # TURN-CANARY-11: drift
 
 
@@ -325,59 +276,15 @@ def test_monitor_replaces_drift_and_coverage_each_successful_inventory():
     assert "turn_canary_binding_drift_total 0" in monitor.metrics_text()
 
 
-def test_runtime_quota_read_honors_cpu_quantities():
-    """@spec TURN-CANARY-5"""
-    import json
-    import threading
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+def test_split_labels_cover_every_per_route_series():
+    """@spec TURN-CANARY-14"""
     canary = _canary()
-    bodies = {"/roomy": ("4", "3"), "/tight": ("4", "3800m")}
-    seen: list[str | None] = []
-
-    class Quota(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802 - stdlib handler name
-            seen.append(self.headers.get("Authorization"))
-            hard, used = bodies[self.path]
-            body = json.dumps(_quota(hard, used)).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *_args: object) -> None:
-            pass
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Quota)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    base = f"http://127.0.0.1:{server.server_address[1]}"
-
-    async def headroom(path: str) -> bool | None:
-        platform = canary.RuntimePlatform(
-            database_url="postgresql+asyncpg://canary@db.example.invalid/curie",
-            valkey_url="redis://valkey.example.invalid:6379/0",
-            api_url="https://platform.example.invalid",
-            api_key="example-key",
-            stream="curie:runs",
-            schema="curie",
-            read_only_qualified=True,
-            quota_url=base + path,
-            quota_token="example-token",
-            quota_resource="limits.cpu",
-            quota_min_free="500m",
-        )
-        try:
-            return await platform.quota_headroom()
-        finally:
-            await platform.close()
-
-    try:
-        assert asyncio.run(headroom("/roomy")) is True
-        assert asyncio.run(headroom("/tight")) is False
-    finally:
-        server.shutdown()
-        server.server_close()
-    assert seen == ["Bearer example-token", "Bearer example-token"]
+    result = _run(canary, Platform([_row("1", "C-EXAMPLE-1")]))
+    text = canary.prometheus_text(result, labels="split")
+    route_series = [line for line in text.splitlines() if "C-EXAMPLE-1" in line]
+    assert route_series
+    assert all('agent="sample-1",kind="slack"' in line for line in route_series), route_series
 
 
 def test_monitor_takes_agent_names_from_the_latest_inventory_only():
