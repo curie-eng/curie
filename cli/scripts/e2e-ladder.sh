@@ -388,6 +388,8 @@ adopt_stored_local_api_key() {
 # not pretend to be this runtime proof.
 LOCAL_OTEL_SINK_NAME="curie-ladder-otel-sink-$$"
 LOCAL_OTEL_SINK_OWNED=0
+LOCAL_OTEL_SINK_IMAGE=""
+LOCAL_OTEL_IMAGE_OWNED=0
 LOCAL_OTEL_NETWORK_OWNED=0
 LOCAL_OTEL_NETWORK=""
 LOCAL_OTEL_SINK_ACTIVE=0
@@ -403,6 +405,8 @@ LOCAL_FAILURE_ENV_PRESENT=()
 LOCAL_MODEL_ERROR_PROVIDER_NAME="curie-ladder-model-error-$$"
 LOCAL_MODEL_ERROR_PROVIDER_OWNED=0
 LOCAL_MODEL_ERROR_PROVIDER_ID=""
+LOCAL_MODEL_ERROR_PROVIDER_IMAGE=""
+LOCAL_MODEL_ERROR_PROVIDER_IMAGE_OWNED=0
 OTEL_E2E_SECRET_SENTINEL="xapp-"
 OTEL_E2E_SECRET_SENTINEL+="0-0000000000-0000000000-$$"
 
@@ -527,7 +531,10 @@ cleanup() {
             docker rm -f $orphans >/dev/null 2>&1
         fi
     fi
-    stop_local_otel_sink
+    if ! stop_local_otel_sink; then
+        echo "error: could not remove the owned OTel sink resources" >&2
+        [[ "$code" -ne 0 ]] || code=1
+    fi
     # Only the container THIS run created, matched by its exact unique name, so
     # the sweep can never reach a runner belonging to another session. Cleared by
     # the case itself once `skill down` has removed it.
@@ -3630,6 +3637,10 @@ start_local_otel_sink() {
         echo "fix: let the owning session run \`curie local down\`, then re-run CURIE_E2E_TIERS=local curie dev e2e-ladder." >&2
         return 1
     fi
+    if docker container inspect "$LOCAL_OTEL_SINK_NAME" >/dev/null 2>&1; then
+        echo "local: OTel sink name is already owned; refusing to replace it" >&2
+        return 1
+    fi
 
     local network="${CURIE_DOCKER_NETWORK:-curie_runner}"
     LOCAL_OTEL_NETWORK="$network"
@@ -3637,15 +3648,17 @@ start_local_otel_sink() {
         docker network create \
             --label "com.docker.compose.project=$COMPOSE_PROJECT" \
             --label com.docker.compose.network=curie_runner \
-            "$network" >/dev/null
+            "$network" >/dev/null || return 1
         LOCAL_OTEL_NETWORK_OWNED=1
     fi
 
     local output_dir="$WORKDIR/otel-sink"
-    mkdir -p "$output_dir"
-    chmod 0777 "$output_dir"
+    if ! mkdir -p "$output_dir"; then
+        stop_local_otel_sink
+        return 1
+    fi
     local sink_config="$WORKDIR/otel-e2e-sink-config.yaml"
-    awk '
+    if ! awk '
         { print }
         $0 == "service:" {
             print "  telemetry:"
@@ -3653,7 +3666,42 @@ start_local_otel_sink() {
             print "      level: detailed"
             print "      address: 0.0.0.0:8888"
         }
-    ' "$REPO_ROOT/cli/scripts/fixtures/otel-e2e-sink-config.yaml" > "$sink_config"
+    ' "$REPO_ROOT/cli/scripts/fixtures/otel-e2e-sink-config.yaml" > "$sink_config"; then
+        stop_local_otel_sink
+        return 1
+    fi
+    LOCAL_OTEL_SINK_IMAGE="curie-ladder-otel-sink:$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+    LOCAL_OTEL_IMAGE_OWNED=1
+    if ! python3 - "$sink_config" <<'PY' | docker build --tag "$LOCAL_OTEL_SINK_IMAGE" - >"$WORKDIR/otel-sink-build.log" 2>&1
+import io
+import pathlib
+import sys
+import tarfile
+
+with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as archive:
+    dockerfile = b"""FROM otel/opentelemetry-collector-contrib:0.119.0
+COPY config.yaml /etc/otelcol-contrib/config.yaml
+COPY output/ /var/lib/otel-e2e/
+"""
+    entry = tarfile.TarInfo("Dockerfile")
+    entry.size = len(dockerfile)
+    entry.mode = 0o644
+    archive.addfile(entry, io.BytesIO(dockerfile))
+    config = pathlib.Path(sys.argv[1]).read_bytes()
+    entry = tarfile.TarInfo("config.yaml")
+    entry.size = len(config)
+    entry.mode = 0o644
+    archive.addfile(entry, io.BytesIO(config))
+    directory = tarfile.TarInfo("output")
+    directory.type = tarfile.DIRTYPE
+    directory.mode = 0o777
+    archive.addfile(directory)
+PY
+    then
+        cat "$WORKDIR/otel-sink-build.log" >&2
+        stop_local_otel_sink
+        return 1
+    fi
     LOCAL_OTEL_SINK_OWNED=1
     local start_log="$WORKDIR/otel-sink-start.log" attempt started=0 otlp_host_port
     # Every stack container dials OTLP at gateway:host-port, so that host port
@@ -3675,15 +3723,14 @@ start_local_otel_sink() {
             -p "0.0.0.0:$otlp_host_port:4318" \
             -p 127.0.0.1::13133 \
             -p 127.0.0.1::8888 \
-            -v "$sink_config:/etc/otelcol-contrib/config.yaml:ro" \
-            -v "$output_dir:/var/lib/otel-e2e" \
-            otel/opentelemetry-collector-contrib:0.119.0 \
+            "$LOCAL_OTEL_SINK_IMAGE" \
             --config=/etc/otelcol-contrib/config.yaml >"$start_log" 2>&1; then
             started=1
             break
         fi
         if ! grep -Eq 'address already in use|port is already allocated' "$start_log"; then
             cat "$start_log" >&2
+            stop_local_otel_sink
             return 1
         fi
         docker rm -f "$LOCAL_OTEL_SINK_NAME" >/dev/null 2>&1 || true
@@ -3693,6 +3740,7 @@ start_local_otel_sink() {
     if (( ! started )); then
         cat "$start_log" >&2
         echo "local: Docker could not bind private sink ports after 5 attempts" >&2
+        stop_local_otel_sink
         return 1
     fi
 
@@ -3703,6 +3751,7 @@ start_local_otel_sink() {
     metrics_port="$(docker port "$LOCAL_OTEL_SINK_NAME" 8888/tcp | awk -F: 'END {print $NF}')"
     if [[ -z "$gateway" || -z "$otlp_port" || -z "$health_port" || -z "$metrics_port" ]]; then
         echo "local: task-owned OTel sink did not publish its gateway and ports" >&2
+        stop_local_otel_sink
         return 1
     fi
     LOCAL_OTEL_ENDPOINT="http://$gateway:$otlp_port"
@@ -3716,31 +3765,76 @@ start_local_otel_sink() {
         if curl -fsS "http://127.0.0.1:$health_port/" >/dev/null 2>&1; then
             LOCAL_OTEL_SINK_ACTIVE=1
             echo "local: task-owned OTel sink is healthy at $LOCAL_OTEL_ENDPOINT"
-            assert_local_otel_zero_export_control
+            if ! assert_local_otel_zero_export_control; then
+                stop_local_otel_sink
+                return 1
+            fi
             return 0
         fi
         sleep 1
     done
     docker logs "$LOCAL_OTEL_SINK_NAME" >&2 || true
     echo "local: task-owned OTel sink did not become healthy" >&2
+    stop_local_otel_sink
     return 1
 }
 
 stop_local_otel_sink() {
+    local code=0
     if (( LOCAL_OTEL_SINK_OWNED )); then
-        docker rm -f "$LOCAL_OTEL_SINK_NAME" >/dev/null 2>&1 || true
-        LOCAL_OTEL_SINK_OWNED=0
+        local owner inspect_error="$WORKDIR/otel-sink-inspect-error"
+        if owner="$(docker container inspect "$LOCAL_OTEL_SINK_NAME" \
+            --format '{{index .Config.Labels "curietech.ai/e2e-owner"}}' 2>"$inspect_error")"; then
+            if [[ "$owner" != "$LOCAL_OTEL_SINK_NAME" ]]; then
+                echo "local: OTel sink ownership changed; refusing to remove it" >&2
+                return 1
+            fi
+            if (( LOCAL_OTEL_SINK_ACTIVE )); then
+                docker stop "$LOCAL_OTEL_SINK_NAME" >/dev/null || code=1
+                copy_local_otel_output || code=1
+            fi
+            if docker rm -f "$LOCAL_OTEL_SINK_NAME" >/dev/null; then
+                LOCAL_OTEL_SINK_OWNED=0
+            else
+                code=1
+            fi
+        elif grep -Eq 'No such (object|container)' "$inspect_error"; then
+            LOCAL_OTEL_SINK_OWNED=0
+        else
+            cat "$inspect_error" >&2
+            code=1
+        fi
+    fi
+    if (( LOCAL_OTEL_IMAGE_OWNED )); then
+        if docker image inspect "$LOCAL_OTEL_SINK_IMAGE" >/dev/null 2>&1; then
+            if docker image rm "$LOCAL_OTEL_SINK_IMAGE" >/dev/null; then
+                LOCAL_OTEL_IMAGE_OWNED=0
+            else
+                code=1
+            fi
+        else
+            LOCAL_OTEL_IMAGE_OWNED=0
+        fi
     fi
     if (( LOCAL_OTEL_NETWORK_OWNED )); then
-        docker network rm "$LOCAL_OTEL_NETWORK" >/dev/null 2>&1 || true
-        LOCAL_OTEL_NETWORK_OWNED=0
+        if docker network rm "$LOCAL_OTEL_NETWORK" >/dev/null; then
+            LOCAL_OTEL_NETWORK_OWNED=0
+        else
+            code=1
+        fi
     fi
     LOCAL_OTEL_SINK_ACTIVE=0
     LOCAL_OTEL_METRICS_ENDPOINT=""
+    return "$code"
+}
+
+copy_local_otel_output() {
+    docker cp "$LOCAL_OTEL_SINK_NAME:/var/lib/otel-e2e/." "$WORKDIR/otel-sink/"
 }
 
 local_otel_query() {
     local mode="$1" baseline="${2:-}"
+    copy_local_otel_output || return 1
     python3 - "$mode" "$WORKDIR/otel-sink" "$baseline" "$PROMPT" \
         "$OTEL_E2E_SECRET_SENTINEL" "$REPO_ROOT" "$LIVE" <<'PY'
 import importlib.util
@@ -4165,9 +4259,9 @@ print(total)
 
 assert_local_otel_zero_export_control() {
     local accepted sent
-    local_otel_query no-turn
-    accepted="$(local_otel_self_metric_value otelcol_receiver_accepted_metric_points)"
-    sent="$(local_otel_self_metric_value otelcol_exporter_sent_metric_points)"
+    local_otel_query no-turn || return 1
+    accepted="$(local_otel_self_metric_value otelcol_receiver_accepted_metric_points)" || return 1
+    sent="$(local_otel_self_metric_value otelcol_exporter_sent_metric_points)" || return 1
     python3 -c '
 import sys
 raise SystemExit(0 if all(float(value) == 0 for value in sys.argv[1:]) else 1)
@@ -4262,13 +4356,43 @@ start_local_model_error_provider() {
         echo "local: model failure provider name is already owned; refusing to replace it" >&2
         return 1
     fi
+    LOCAL_MODEL_ERROR_PROVIDER_IMAGE="curie-ladder-model-error:$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+    LOCAL_MODEL_ERROR_PROVIDER_IMAGE_OWNED=1
+    if ! python3 - "$REPO_ROOT/cli/scripts/fixtures/terminal-provider-error.py" <<'PY' | docker build \
+        --build-arg "BASE_IMAGE=$image" --tag "$LOCAL_MODEL_ERROR_PROVIDER_IMAGE" - \
+        >"$WORKDIR/model-provider-build.log" 2>&1
+import io
+import pathlib
+import sys
+import tarfile
+
+with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as archive:
+    dockerfile = b"""ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+COPY terminal-provider-error.py /terminal-provider-error.py
+"""
+    entry = tarfile.TarInfo("Dockerfile")
+    entry.size = len(dockerfile)
+    entry.mode = 0o644
+    archive.addfile(entry, io.BytesIO(dockerfile))
+    fixture = pathlib.Path(sys.argv[1]).read_bytes()
+    entry = tarfile.TarInfo("terminal-provider-error.py")
+    entry.size = len(fixture)
+    entry.mode = 0o644
+    archive.addfile(entry, io.BytesIO(fixture))
+PY
+    then
+        cat "$WORKDIR/model-provider-build.log" >&2
+        stop_local_model_error_provider
+        return 1
+    fi
     LOCAL_MODEL_ERROR_PROVIDER_OWNED=1
     if ! LOCAL_MODEL_ERROR_PROVIDER_ID="$(docker run -d --name "$LOCAL_MODEL_ERROR_PROVIDER_NAME" \
         --label "curietech.ai/e2e-owner=$LOCAL_OTEL_SINK_NAME" \
         --network "$network" \
-        -v "$REPO_ROOT/cli/scripts/fixtures/terminal-provider-error.py:/terminal-provider-error.py:ro" \
-        --entrypoint python3 "$image" /terminal-provider-error.py --host 0.0.0.0 --port 8081 \
+        --entrypoint python3 "$LOCAL_MODEL_ERROR_PROVIDER_IMAGE" /terminal-provider-error.py --host 0.0.0.0 --port 8081 \
         )"; then
+        stop_local_model_error_provider
         return 1
     fi
     local attempt
@@ -4279,6 +4403,7 @@ start_local_model_error_provider() {
         sleep 1
     done
     echo "local: task-owned model failure provider did not become healthy" >&2
+    stop_local_model_error_provider
     return 1
 }
 
@@ -4303,17 +4428,23 @@ stop_local_model_error_provider() {
             fi
             LOCAL_MODEL_ERROR_PROVIDER_OWNED=0
             LOCAL_MODEL_ERROR_PROVIDER_ID=""
-            return 0
+        else
+            container="${identity%% *}"
+            owner="${identity#* }"
+            if [[ "$owner" != "$LOCAL_OTEL_SINK_NAME" ]]; then
+                echo "local: model failure provider ownership changed; refusing to remove it" >&2
+                return 1
+            fi
+            docker rm -f "$container" >/dev/null || return 1
+            LOCAL_MODEL_ERROR_PROVIDER_OWNED=0
+            LOCAL_MODEL_ERROR_PROVIDER_ID=""
         fi
-        container="${identity%% *}"
-        owner="${identity#* }"
-        if [[ "$owner" != "$LOCAL_OTEL_SINK_NAME" ]]; then
-            echo "local: model failure provider ownership changed; refusing to remove it" >&2
-            return 1
+    fi
+    if (( LOCAL_MODEL_ERROR_PROVIDER_IMAGE_OWNED )); then
+        if docker image inspect "$LOCAL_MODEL_ERROR_PROVIDER_IMAGE" >/dev/null 2>&1; then
+            docker image rm "$LOCAL_MODEL_ERROR_PROVIDER_IMAGE" >/dev/null || return 1
         fi
-        docker rm -f "$container" >/dev/null || return 1
-        LOCAL_MODEL_ERROR_PROVIDER_OWNED=0
-        LOCAL_MODEL_ERROR_PROVIDER_ID=""
+        LOCAL_MODEL_ERROR_PROVIDER_IMAGE_OWNED=0
     fi
 }
 
