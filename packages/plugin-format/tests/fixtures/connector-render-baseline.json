@@ -1,0 +1,200 @@
+{
+  "comment": "Every hosted connector declared in examples/*/connectors.yaml on next before ConnectorSpec gained readiness_path and resources, with the sha256 of the canonical JSON (sort_keys, compact separators) of plugin_format.connector_render.render for it. Two synthetic declarations (names starting `synthetic/`) cover the optional fields no example uses. A build-form connector is recorded with the placeholder image registry.example/<name>:0, the image its lock would resolve. test_connector_render.py renders each recorded declaration and compares the digest, so a render change that moves an existing bundle's objects fails there. Regenerate only for a deliberate render change, never to make an unrelated change pass.",
+  "cases": [
+    {
+      "name": "github-activity/github",
+      "connector": "github",
+      "spec": {
+        "image": "registry.example/github:0",
+        "env": {
+          "GITHUB_REPOSITORIES": ""
+        },
+        "unhosted_url": "${GITHUB_ACTIVITY_MCP_URL}",
+        "secrets": [
+          {
+            "name": "GITHUB_TOKEN",
+            "from_secret": "github-activity-token",
+            "key": "GITHUB_TOKEN"
+          }
+        ]
+      },
+      "sha256": "fa7df945a271e9af7482573e61e29355ac01c5b4e7f6a2d5e0bda064687f8647"
+    },
+    {
+      "name": "sre-bot/grafana",
+      "connector": "grafana",
+      "spec": {
+        "image": "docker.io/grafana/mcp-grafana@sha256:5efeafd01cd7e1aea9c4b0f03305951f2944db8f43e5ae290cce9578c977f241",
+        "args": [
+          "-t",
+          "streamable-http",
+          "-address",
+          "0.0.0.0:8000",
+          "-allowed-hosts",
+          "${CURIE_ALLOWED_HOSTS}",
+          "-enabled-tools",
+          "search,datasource,incident,prometheus,loki,alerting,dashboard,folder,oncall,asserts,sift,pyroscope,navigation,proxied,annotations,rendering,snapshot,plugin,api,config,provisioning,cloudwatch,runpanelquery,examples",
+          "-disable-write",
+          "-disable-api",
+          "-disable-plugin",
+          "-disable-provisioning",
+          "-disable-snapshot",
+          "-disable-admin",
+          "-disable-incident",
+          "-disable-proxied",
+          "-disable-rendering"
+        ],
+        "env": {
+          "GRAFANA_URL": "http://grafana.observability.svc.cluster.local"
+        },
+        "unhosted_url": "${GRAFANA_MCP_URL}",
+        "secrets": [
+          {
+            "name": "GRAFANA_SERVICE_ACCOUNT_TOKEN",
+            "from_secret": "curie-grafana-connector",
+            "key": "GRAFANA_SERVICE_ACCOUNT_TOKEN"
+          }
+        ]
+      },
+      "sha256": "bb23f75e38b3bc6883f801899a75ed9737cf1e105855665dd0c3b14f6183e6cd"
+    },
+    {
+      "name": "sre-bot/kubernetes",
+      "connector": "kubernetes",
+      "spec": {
+        "image": "ghcr.io/containers/kubernetes-mcp-server@sha256:6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423",
+        "args": [
+          "--port",
+          "8000",
+          "--bind-address",
+          "0.0.0.0",
+          "--toolsets",
+          "core",
+          "--disable-multi-cluster",
+          "--stateless",
+          "--kubeconfig",
+          "/secrets/kubeconfig"
+        ],
+        "unhosted_url": "${K8S_MCP_URL}",
+        "proxy_upstream_host": "localhost",
+        "secret_files": {
+          "K8S_KUBECONFIG": "/secrets/kubeconfig"
+        }
+      },
+      "sha256": "b4f1706f5b7078d149c0023e9d0c488e28d2082d0eff1c0ce7c3fa1769e5442c"
+    },
+    {
+      "name": "sre-bot/self-upgrade",
+      "connector": "self-upgrade",
+      "spec": {
+        "image": "registry.example/self-upgrade:0",
+        "env": {
+          "SELF_UPGRADE_CRONJOB": "sre-bot-self-upgrade",
+          "SELF_UPGRADE_NAMESPACE": "",
+          "SELF_UPGRADE_RELEASE_REPO": "curie-eng/curie",
+          "PLATFORM_UPGRADE_CRONJOB": ""
+        },
+        "secret_files": {
+          "SELF_UPGRADE_KUBECONFIG": "/secrets/kubeconfig"
+        }
+      },
+      "sha256": "191ecd5df8bddf1ee5ff8d088a4c2a1e55cc07c75911be627972016e8deb32df"
+    },
+    {
+      "name": "sre-bot/tempo",
+      "connector": "tempo",
+      "spec": {
+        "image": "registry.example/tempo:0",
+        "env": {
+          "GRAFANA_URL": "http://grafana.observability.svc.cluster.local"
+        },
+        "unhosted_url": "${TEMPO_MCP_URL}",
+        "secrets": [
+          {
+            "name": "GRAFANA_SERVICE_ACCOUNT_TOKEN",
+            "from_secret": "curie-grafana-connector",
+            "key": "GRAFANA_SERVICE_ACCOUNT_TOKEN"
+          }
+        ]
+      },
+      "sha256": "1f5357c82a6ee62739e103f61b25f9f72e0a7cc642df32e0c484e600e29b16c9"
+    },
+    {
+      "name": "weather/netpol-probe",
+      "connector": "netpol-probe",
+      "spec": {
+        "image": "grafana/mcp-grafana@sha256:d5b51db0c8eaafc6ed3fede5bfcc8d67b2384a40cf3d493086e378855ceba882",
+        "args": [
+          "-t",
+          "streamable-http",
+          "--address",
+          "0.0.0.0:8000",
+          "--endpoint-path",
+          "/mcp",
+          "--allowed-hosts",
+          "${CURIE_ALLOWED_HOSTS}",
+          "-disable-write"
+        ],
+        "env": {
+          "GRAFANA_URL": "http://grafana.example.com"
+        }
+      },
+      "sha256": "d8067fb7f3e7e8dc705fe556f7e498a782c3899e60b88699b6f3afaa157b5e57"
+    },
+    {
+      "name": "synthetic/hosted",
+      "connector": "grafana",
+      "spec": {
+        "image": "grafana/mcp-grafana:0.17.2",
+        "args": [
+          "-t",
+          "streamable-http",
+          "-disable-write"
+        ],
+        "env": {
+          "GRAFANA_URL": "https://g.example.com"
+        },
+        "secrets": [
+          "GRAFANA_TOKEN"
+        ]
+      },
+      "sha256": "2cf623fba578d3e82f3df9ce02d29807b0fa7fe9c84aa78eeb3bfc1458085a36"
+    },
+    {
+      "name": "synthetic/everything",
+      "connector": "docs",
+      "spec": {
+        "image": "ghcr.io/example/docs-mcp:1",
+        "args": [
+          "--port",
+          "${CURIE_PORT}"
+        ],
+        "env": {
+          "DOCS_MODE": "read"
+        },
+        "port": 9100,
+        "secrets": [
+          "DOCS_TOKEN",
+          {
+            "name": "DOCS_SIGNING_KEY",
+            "from_secret": "docs-signing",
+            "key": "key"
+          }
+        ],
+        "bearer_secret": "DOCS_TOKEN",
+        "secret_files": {
+          "DOCS_KUBECONFIG": "/secrets/kubeconfig"
+        },
+        "config": [
+          "DOCS_FOLDER_PATH"
+        ],
+        "admits": [
+          "self",
+          "acme-ops"
+        ],
+        "proxy_upstream_host": "localhost"
+      },
+      "sha256": "7a9107e648c546e359b49de73570c4777eaac832adc39043d184bb6b000fb008"
+    }
+  ]
+}

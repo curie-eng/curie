@@ -807,3 +807,56 @@ fn a_runner_lock_entry_is_read_with_both_digests() {
     );
     assert_eq!(runner.delivery, connector_build::Delivery::Registry);
 }
+
+#[test]
+fn the_mirror_carries_readiness_path_and_resources_as_written() {
+    // Optional hosted-form fields for the server container. The CLI carries
+    // them through; `plugin_format.validate_connectors` owns the rules. The
+    // nested resource blocks are strict too, and their field names are frozen
+    // beside the rest of the connector models.
+    let file = connector_build::parse_connectors(
+        "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    \
+         readiness_path: /healthz\n    resources:\n      requests:\n        cpu: 100m\n      \
+         limits:\n        memory: 1Gi\n",
+    )
+    .expect("readiness_path and resources are accepted");
+    let spec = serde_json::to_value(&file.connectors["docs"]).expect("serialize the mirror");
+    assert_eq!(spec["readiness_path"], "/healthz");
+    assert_eq!(spec["resources"]["requests"]["cpu"], "100m");
+    assert_eq!(spec["resources"]["limits"]["memory"], "1Gi");
+
+    let fields = vector_file("connector-fields.json");
+    let expect = |model: &str| -> BTreeSet<String> {
+        fields["models"][model]
+            .as_array()
+            .unwrap_or_else(|| panic!("{model} is listed in the vector"))
+            .iter()
+            .map(|v| v.as_str().expect("a field name").to_string())
+            .collect()
+    };
+    let keys = |value: &Value| -> BTreeSet<String> {
+        value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect()
+    };
+    assert_eq!(keys(&spec["resources"]), expect("ConnectorResources"));
+    assert_eq!(
+        keys(&spec["resources"]["requests"]),
+        expect("ConnectorResourceQuantities")
+    );
+    assert_eq!(
+        keys(&spec["resources"]["limits"]),
+        expect("ConnectorResourceQuantities")
+    );
+
+    assert!(
+        connector_build::parse_connectors(
+            "connectors:\n  docs:\n    image: x:1\n    resources:\n      limits:\n        gpu: '1'\n"
+        )
+        .is_err(),
+        "an unknown resources key must be refused"
+    );
+}
