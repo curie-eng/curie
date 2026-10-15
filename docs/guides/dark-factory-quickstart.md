@@ -723,8 +723,27 @@ and acts only on one that carries that mention.
 ### Writing the values by hand
 
 Several Bitbucket repositories in one binding, or two Bitbucket code hosts,
-are not a quickstart run; write the `factory:` values yourself. These values
-use example identifiers only. Replace them with your own:
+are not a quickstart run; write the `factory:` values yourself.
+
+One Jira site takes exactly one binding. Quickstart already wrote the binding
+`jira` for your site, so extend that binding rather than adding a second one:
+
+1. Add each further repository under the existing binding's `repos`, with an
+   alias no other repository in the binding uses.
+2. Keep the binding's `defaultRepo`, its `startAuthority` and its
+   `reviewFeedbackAllowlist` entries, adding an allowlist entry for each new
+   code host.
+3. On each Jira issue, pick the repository with one `repo:<alias>` label. An
+   issue without one runs against `defaultRepo`.
+
+A second binding with the same `trackerScopeId` on the same Jira site is
+refused when the chart renders, even when it names a second tracker entry for
+that site, so `helm upgrade` and `curie cluster upgrade` stop before anything
+rolls out. The refusal names both bindings and the site.
+
+The example below is the quickstart binding `jira`, still on the tracker
+`jira`, carrying a Bitbucket Cloud and a Bitbucket Data Center repository.
+These values use example identifiers only. Replace them with your own:
 
 ```yaml
 factory:
@@ -735,7 +754,7 @@ factory:
       apiUrl: https://api.bitbucket.org/2.0
       credential:
         type: static_token
-        existingSecret: factory-bitbucket
+        existingSecret: curie-bitbucket-token
         existingSecretKey: token
     - name: bitbucket-dc
       kind: bitbucket_dc
@@ -746,7 +765,7 @@ factory:
         existingSecret: factory-bitbucket-dc
         existingSecretKey: token
   bindings:
-    - name: example
+    - name: jira
       tracker: jira
       trackerScopeId: "<Jira site id>"
       repos:

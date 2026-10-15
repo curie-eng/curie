@@ -1831,7 +1831,7 @@ pub(crate) fn token_secret_manifest(namespace: &str, name: &str, token: &str) ->
 /// Applies `manifest` with `kubectl apply -f -` on stdin. kubectl's output is
 /// dropped: a failed apply can echo the manifest, which may hold a token.
 /// `what` names the object in the refusal.
-pub(super) async fn apply_manifest(
+pub(crate) async fn apply_manifest(
     namespace: &str,
     manifest: &serde_json::Value,
     what: &str,

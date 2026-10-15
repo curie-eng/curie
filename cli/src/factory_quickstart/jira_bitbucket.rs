@@ -25,8 +25,8 @@ use serde_json::{json, Value};
 use super::jira_cloud::{self, preflight_site, JiraSite};
 use super::native::{self, NativeInstall};
 use super::{
-    agent_settings, apply_manifest, bitbucket_cloud, bitbucket_dc, bundle_dir, bundle_line,
-    check_credit, check_prerequisites, cluster_agent, confirm_remote_context, credential_line,
+    agent_settings, bitbucket_cloud, bitbucket_dc, bundle_dir, bundle_line, check_credit,
+    check_prerequisites, cluster_agent, confirm_remote_context, credential_line,
     ensure_factory_agent, forge_egress_line, initial_agent_line, install_action_line, read_token,
     resolve_host, run_self, token_secret_manifest, unconfirmed_remote_context,
     validate_agent_flags, CodeHostKind, EgressEntry, QuickstartOpts, QuickstartOutput,
@@ -454,19 +454,17 @@ async fn execute(plan: &Plan, opts: &QuickstartOpts) -> Result<QuickstartOutput>
     )
     .await?;
     let jira_token = read_token(&plan.site.flags.token_file)?;
-    apply_manifest(
-        &plan.namespace,
-        &jira_cloud::secret_manifest(&plan.namespace, &jira_token),
-        &format!("Secret {}", jira_cloud::SECRET_NAME),
-    )
-    .await?;
     let token = read_token(&plan.token_file)?;
-    apply_manifest(
-        &plan.namespace,
-        &token_secret_manifest(&plan.namespace, CODE_HOST_SECRET, &token),
-        &format!("Secret {CODE_HOST_SECRET}"),
-    )
-    .await?;
+    let mut manifests = vec![
+        (
+            jira_cloud::secret_manifest(&plan.namespace, &jira_token),
+            format!("Secret {}", jira_cloud::SECRET_NAME),
+        ),
+        (
+            token_secret_manifest(&plan.namespace, CODE_HOST_SECRET, &token),
+            format!("Secret {CODE_HOST_SECRET}"),
+        ),
+    ];
     if let Some(ca) = &plan.ca_file {
         let pem = std::fs::read_to_string(ca).map_err(|error| {
             CliError::failure(format!(
@@ -474,12 +472,10 @@ async fn execute(plan: &Plan, opts: &QuickstartOpts) -> Result<QuickstartOutput>
                 ca.display()
             ))
         })?;
-        apply_manifest(
-            &plan.namespace,
-            &ca_manifest(&plan.namespace, &pem),
-            &format!("ConfigMap {CA_CONFIG_MAP}"),
-        )
-        .await?;
+        manifests.push((
+            ca_manifest(&plan.namespace, &pem),
+            format!("ConfigMap {CA_CONFIG_MAP}"),
+        ));
     }
     apply_forge_entries(
         &common,
@@ -488,6 +484,7 @@ async fn execute(plan: &Plan, opts: &QuickstartOpts) -> Result<QuickstartOutput>
             "the Bitbucket code host, the Jira tracker and binding `{}`",
             jira_cloud::BINDING_NAME
         ),
+        &manifests,
         |recorded| native_forge_values(recorded, &plan.entries),
     )
     .await?;

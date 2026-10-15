@@ -484,11 +484,17 @@ pub fn native_forge_values(
 
 /// Write forge entries on the release: the same helm upgrade and api rollout
 /// as the intake, over the document `values` builds from the recorded user
-/// values. `what` names the entries in the progress lines.
+/// values. The recorded values are read once and the planned factory
+/// document is checked before anything is written, so a refused document
+/// leaves the release and its namespace untouched. Only then are
+/// `manifests` (each a manifest and the name its progress line uses, such as
+/// a token Secret or CA ConfigMap) applied over stdin, followed by the
+/// upgrade and rollout. `what` names the entries in the progress lines.
 pub async fn apply_forge_entries(
     common: &CommonOpts,
     chart: &str,
     what: &str,
+    manifests: &[(serde_json::Value, String)],
     values: impl FnOnce(&serde_json::Value) -> serde_json::Value,
 ) -> Result<()> {
     require_on_path("helm")?;
@@ -497,6 +503,10 @@ pub async fn apply_forge_entries(
         .await?
         .unwrap_or(serde_json::Value::Null);
     let values = values(&recorded);
+    refuse_planned_factory(&recorded, &values)?;
+    for (manifest, name) in manifests {
+        crate::factory_quickstart::apply_manifest(&common.namespace, manifest, name).await?;
+    }
     let timeout = effective_helm_timeout(None, release_minimum_helm_timeout(common).await);
     let ui = crate::ui::ui();
     let cl = ui.checklist();
@@ -570,6 +580,122 @@ fn overlay(
         }
     }
     serde_json::Value::Object(merged)
+}
+
+/// A values list under `factory`; absent or null means empty.
+fn factory_list<'a>(values: &'a serde_json::Value, key: &str) -> &'a [serde_json::Value] {
+    values
+        .pointer(&format!("/factory/{key}"))
+        .and_then(serde_json::Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+/// A scalar field as the chart renders it into CURIE_FORGES: a string as
+/// is, a whole number (see [`whole_number`]) as plain decimal digits,
+/// anything else as its JSON text.
+fn factory_scalar(entry: &serde_json::Value, key: &str) -> String {
+    match entry.get(key) {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Number(number)) => {
+            whole_number(number).map_or_else(|| number.to_string(), |whole| whole.to_string())
+        }
+        Some(other) => other.to_string(),
+    }
+}
+
+/// A number Helm holds exactly and the chart renders as plain digits: Helm
+/// reads every values number as a float64, so only a whole number below 2^53
+/// in magnitude survives unrounded.
+fn whole_number(number: &serde_json::Number) -> Option<i64> {
+    // 2^53; every whole float64 strictly inside (-2^53, 2^53) is exact.
+    const LIMIT: f64 = 9_007_199_254_740_992.0;
+    let value = number.as_f64()?;
+    (value.is_finite() && value.fract() == 0.0 && value.abs() < LIMIT).then_some(value as i64)
+}
+
+/// A binding's trackerScopeId as the chart renders it, or `None` when the
+/// chart refuses it: a nonempty string as is (the runtime takes it as is), or
+/// a [`whole_number`].
+fn tracker_scope_id(binding: &serde_json::Value) -> Option<String> {
+    match binding.get("trackerScopeId") {
+        Some(serde_json::Value::String(text)) if !text.is_empty() => Some(text.clone()),
+        Some(serde_json::Value::Number(number)) => whole_number(number).map(|n| n.to_string()),
+        _ => None,
+    }
+}
+
+/// The API's forge reference rules (`ForgesConfig.check_references`) over an
+/// effective chart values document, so a CLI apply refuses before Helm or any
+/// rollout: tracker names unique, binding names unique, each binding names a
+/// configured tracker, and one binding per resolved tracker scope (tracker
+/// kind, host trimmed and lowercased, trackerScopeId; ADR 0197).
+pub fn check_factory_document(values: &serde_json::Value) -> std::result::Result<(), String> {
+    let trackers = factory_list(values, "trackers");
+    let bindings = factory_list(values, "bindings");
+    for (section, entries) in [("trackers", trackers), ("bindings", bindings)] {
+        let mut seen = BTreeSet::new();
+        let duplicated: BTreeSet<String> = entries
+            .iter()
+            .map(|entry| factory_scalar(entry, "name"))
+            .filter(|name| !seen.insert(name.clone()))
+            .collect();
+        if !duplicated.is_empty() {
+            let names: Vec<String> = duplicated.into_iter().collect();
+            return Err(format!(
+                "factory.{section} names are not unique: {}; give each entry its own name",
+                names.join(", ")
+            ));
+        }
+    }
+    let by_name: BTreeMap<String, &serde_json::Value> = trackers
+        .iter()
+        .map(|tracker| (factory_scalar(tracker, "name"), tracker))
+        .collect();
+    let mut scopes: BTreeMap<(String, String, String), String> = BTreeMap::new();
+    for (index, binding) in bindings.iter().enumerate() {
+        let name = factory_scalar(binding, "name");
+        let tracker_name = factory_scalar(binding, "tracker");
+        let Some(tracker) = by_name.get(&tracker_name) else {
+            return Err(format!(
+                "factory.bindings[{index}] ({name}) names unknown tracker {tracker_name}; \
+                 add it to factory.trackers or name an existing tracker"
+            ));
+        };
+        let kind = factory_scalar(tracker, "kind");
+        let host = factory_scalar(tracker, "host").trim().to_lowercase();
+        let Some(scope_id) = tracker_scope_id(binding) else {
+            return Err(format!(
+                "factory.bindings[{index}] ({name}) trackerScopeId must be a nonempty string \
+                 or a whole number; quote the tracker's scope id"
+            ));
+        };
+        let scope = (kind.clone(), host.clone(), scope_id.clone());
+        if let Some(first) = scopes.get(&scope) {
+            return Err(format!(
+                "factory.bindings {first} and {name} claim the same tracker scope \
+                 ({kind} on {host}, trackerScopeId {scope_id}); keep one binding per tracker \
+                 scope: add the other repositories to binding {first} repos and select one \
+                 with a repo:<alias> label"
+            ));
+        }
+        scopes.insert(scope, name);
+    }
+    Ok(())
+}
+
+/// The document Helm renders when `planned` is applied with `--reuse-values
+/// -f` over the `recorded` user values, reduced to the `factory` map: a
+/// planned key replaces the recorded one, and a planned list replaces the
+/// recorded list whole. Refuses before any mutation when that document breaks
+/// [`check_factory_document`].
+fn refuse_planned_factory(recorded: &serde_json::Value, planned: &serde_json::Value) -> Result<()> {
+    let effective = serde_json::json!({ "factory": overlay(recorded, planned, "factory") });
+    check_factory_document(&effective).map_err(|message| {
+        CliError::usage(message)
+            .with_fix("fix factory.trackers or factory.bindings; nothing was applied")
+            .into()
+    })
 }
 
 /// The GitHub tracker entry of a `factory` map, if one is configured.
@@ -1301,6 +1427,12 @@ async fn update_repositories(opts: FactoryIntakeOpts) -> Result<Box<dyn crate::u
         .await?
         .unwrap_or(serde_json::Value::Null);
     let (mut bindings, indices) = repository_update_bindings(&recorded, &updates)?;
+    // The update rewrites only runner and Docker fields of these bindings, so
+    // the scope the upgrade applies is decided here, before any build.
+    refuse_planned_factory(
+        &recorded,
+        &serde_json::json!({"factory": {"bindings": bindings}}),
+    )?;
     let computed = fetch_release_computed_values(&opts.common)
         .await?
         .ok_or_else(|| CliError::usage("repository updates require an existing Helm release"))?;
@@ -1540,6 +1672,7 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
             publication = None;
         }
         let planned = planned_values(&opts, &recorded, app_plan.as_ref());
+        refuse_planned_factory(&recorded, &planned)?;
         let offenders = intake_gate_offenders(&recorded, &planned);
         if !offenders.is_empty() {
             let fixes: Vec<String> = offenders
@@ -2298,5 +2431,167 @@ metadata:
             HELM_TIMEOUT_FLOOR_SECS
         );
         assert_eq!(effective_helm_timeout(Some(30000), Some(21900)), 30000);
+    }
+
+    fn jira_tracker(name: &str, host: &str) -> serde_json::Value {
+        serde_json::json!({"name": name, "kind": "jira_cloud", "host": host})
+    }
+
+    fn jira_binding(name: &str, tracker: &str, scope: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"name": name, "tracker": tracker, "trackerScopeId": scope})
+    }
+
+    #[test]
+    fn a_planned_binding_list_replaces_the_recorded_one_before_the_scope_check() {
+        let recorded = serde_json::json!({"factory": {
+            "trackers": [jira_tracker("jira", "example.atlassian.net")],
+            "bindings": [jira_binding("jira", "jira", serde_json::json!("scope-a"))],
+        }});
+        // Liveness: the recorded binding is replaced, not doubled.
+        let replaced = serde_json::json!({"factory": {"bindings": [
+            jira_binding("example", "jira", serde_json::json!("scope-a")),
+        ]}});
+        refuse_planned_factory(&recorded, &replaced).expect("one binding per scope");
+        // A planned list that keeps the recorded binding and adds a second on
+        // the same scope through another tracker name on the same site.
+        let duplicate = serde_json::json!({"factory": {
+            "trackers": [
+                jira_tracker("jira", "example.atlassian.net"),
+                jira_tracker("jira-site", " Example.Atlassian.NET "),
+            ],
+            "bindings": [
+                jira_binding("jira", "jira", serde_json::json!("scope-a")),
+                jira_binding("example", "jira-site", serde_json::json!("scope-a")),
+            ],
+        }});
+        let message = refuse_planned_factory(&recorded, &duplicate)
+            .expect_err("a duplicate scope is refused")
+            .to_string();
+        assert_eq!(
+            message,
+            "factory.bindings jira and example claim the same tracker scope (jira_cloud on \
+             example.atlassian.net, trackerScopeId scope-a); keep one binding per tracker \
+             scope: add the other repositories to binding jira repos and select one with a \
+             repo:<alias> label"
+        );
+        // A planned binding list with no trackers keeps the recorded trackers.
+        let unknown = serde_json::json!({"factory": {"bindings": [
+            jira_binding("example", "jira-cloud", serde_json::json!("scope-a")),
+        ]}});
+        let message = refuse_planned_factory(&recorded, &unknown)
+            .expect_err("a dangling tracker reference is refused")
+            .to_string();
+        assert_eq!(
+            message,
+            "factory.bindings[0] (example) names unknown tracker jira-cloud; add it to \
+             factory.trackers or name an existing tracker"
+        );
+    }
+
+    #[test]
+    fn scope_ids_compare_as_the_chart_renders_them_and_hosts_and_ids_separate_scopes() {
+        let trackers = serde_json::json!([
+            jira_tracker("jira", "example.atlassian.net"),
+            jira_tracker("other", "other.atlassian.net"),
+        ]);
+        let numeric = serde_json::json!({"factory": {"trackers": trackers, "bindings": [
+            jira_binding("a", "jira", serde_json::json!(10000)),
+            jira_binding("b", "jira", serde_json::json!("10000")),
+        ]}});
+        let message = check_factory_document(&numeric).expect_err("same rendered scope id");
+        assert!(message.contains("trackerScopeId 10000)"), "{message}");
+        let float = serde_json::json!({"factory": {"trackers": trackers, "bindings": [
+            jira_binding("a", "jira", serde_json::json!(12345.0)),
+            jira_binding("b", "jira", serde_json::json!("12345")),
+        ]}});
+        let message = check_factory_document(&float).expect_err("no exponent");
+        assert!(message.contains("trackerScopeId 12345)"), "{message}");
+        let distinct = serde_json::json!({"factory": {"trackers": trackers, "bindings": [
+            jira_binding("a", "jira", serde_json::json!("1")),
+            jira_binding("b", "jira", serde_json::json!("2")),
+            jira_binding("c", "other", serde_json::json!("1")),
+        ]}});
+        assert_eq!(check_factory_document(&distinct), Ok(()));
+        let null_lists = serde_json::json!({"factory": {"trackers": null, "bindings": null}});
+        assert_eq!(check_factory_document(&null_lists), Ok(()));
+    }
+
+    #[test]
+    fn scope_ids_must_be_nonempty_strings_or_whole_numbers_below_2_pow_53() {
+        let trackers = serde_json::json!([jira_tracker("jira", "example.atlassian.net")]);
+        let pair = |number: serde_json::Value, text: &str| {
+            serde_json::json!({"factory": {"trackers": trackers, "bindings": [
+                jira_binding("a", "jira", number),
+                jira_binding("b", "jira", serde_json::json!(text)),
+            ]}})
+        };
+        let large = pair(serde_json::json!(12345678901_i64), "12345678901");
+        let message = check_factory_document(&large).expect_err("no exponent");
+        assert!(message.contains("trackerScopeId 12345678901)"), "{message}");
+        let large_float = pair(serde_json::json!(12345678901.0), "12345678901");
+        assert!(check_factory_document(&large_float)
+            .expect_err("same id")
+            .contains("claim the same tracker scope"));
+        let largest = pair(serde_json::json!(9007199254740991_i64), "9007199254740991");
+        assert!(check_factory_document(&largest)
+            .expect_err("same id")
+            .contains("trackerScopeId 9007199254740991)"));
+        // Liveness: a string id and a zero UUID string pass.
+        let strings = serde_json::json!({"factory": {"trackers": trackers, "bindings": [
+            jira_binding("a", "jira", serde_json::json!("10000")),
+            jira_binding("b", "jira", serde_json::json!("00000000-0000-0000-0000-000000000000")),
+            jira_binding("c", "jira", serde_json::json!(" ")),
+        ]}});
+        assert_eq!(check_factory_document(&strings), Ok(()));
+        let refusal = "factory.bindings[0] (a) trackerScopeId must be a nonempty string or a \
+                       whole number; quote the tracker's scope id";
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!([1, 2]),
+            serde_json::json!({"id": 1}),
+            serde_json::json!(true),
+            serde_json::json!(-3.9),
+            serde_json::json!(1e20),
+            serde_json::json!(9007199254740992_u64),
+            serde_json::json!(9007199254740993_u64),
+            serde_json::json!(-9007199254740992_i64),
+        ] {
+            let document = pair(bad.clone(), "other");
+            assert_eq!(
+                check_factory_document(&document),
+                Err(refusal.to_string()),
+                "{bad}"
+            );
+        }
+        let missing = serde_json::json!({"factory": {"trackers": trackers, "bindings": [
+            {"name": "a", "tracker": "jira"},
+        ]}});
+        assert_eq!(check_factory_document(&missing), Err(refusal.to_string()));
+    }
+
+    #[test]
+    fn duplicate_tracker_and_binding_names_are_refused_first() {
+        let trackers = serde_json::json!({"factory": {"trackers": [
+            jira_tracker("jira", "a.atlassian.net"),
+            jira_tracker("jira", "b.atlassian.net"),
+        ], "bindings": [jira_binding("x", "missing", serde_json::json!("1"))]}});
+        let message = check_factory_document(&trackers).expect_err("duplicate tracker names");
+        assert!(
+            message.starts_with("factory.trackers names are not unique: jira"),
+            "{message}"
+        );
+        let bindings = serde_json::json!({"factory": {
+            "trackers": [jira_tracker("jira", "a.atlassian.net")],
+            "bindings": [
+                jira_binding("x", "jira", serde_json::json!("1")),
+                jira_binding("x", "jira", serde_json::json!("2")),
+            ],
+        }});
+        let message = check_factory_document(&bindings).expect_err("duplicate binding names");
+        assert!(
+            message.starts_with("factory.bindings names are not unique: x"),
+            "{message}"
+        );
     }
 }

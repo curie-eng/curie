@@ -30,6 +30,9 @@ REGISTRY = SELECTION_TESTS.REGISTRY
 REPO_ROOT = SELECTION_TESTS.REPO_ROOT
 SRE_RUNTIME = SELECTION_TESTS.SRE_RUNTIME
 SRE_RUNTIME_INPUTS = SELECTION_TESTS.SRE_RUNTIME_INPUTS
+C4_TRACKER_SCOPE = SELECTION_TESTS.C4_TRACKER_SCOPE
+CONDITIONAL_PYTEST_FILES = SELECTION_TESTS.CONDITIONAL_PYTEST_FILES
+ALL_CONDITIONAL = SELECTION_TESTS.ALL_CONDITIONAL
 _invoke_selector = SELECTION_TESTS._invoke_selector
 _load_selector_module = SELECTION_TESTS._load_selector_module
 _run_pytest_step = PYTEST_TESTS._run_pytest_step
@@ -56,7 +59,9 @@ def _selection(tmp_path: Path, *paths: str, **options: object) -> dict[str, str]
 def test_sre_runtime_deselected_for_unrelated_paths(tmp_path: Path, path: str) -> None:
     output = _selection(tmp_path, path)
     assert output["pytest"] == "true"
-    assert output["pytest_deselect"] == "examples/tests/test_sre_bot_observability_runtime.py"
+    assert "examples/tests/test_sre_bot_observability_runtime.py" in output[
+        "pytest_deselect"
+    ].split(",")
 
 
 @pytest.mark.parametrize(
@@ -81,7 +86,34 @@ def test_sre_runtime_deselected_for_unrelated_paths(tmp_path: Path, path: str) -
     ],
 )
 def test_sre_runtime_selected_when_an_input_changes(tmp_path: Path, paths: tuple[str, ...]) -> None:
-    assert _selection(tmp_path, *paths)["pytest_deselect"] == ""
+    assert SRE_RUNTIME not in _selection(tmp_path, *paths)["pytest_deselect"].split(",")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "apps/api/src/curie_api/main.py",
+        "apps/api/src/curie_api/forges-other/config.py",
+        "examples/sre-bot/observability/tempo.yaml",
+        "runner/Dockerfile",
+    ],
+)
+def test_c4_tracker_scope_deselected_for_unrelated_paths(tmp_path: Path, path: str) -> None:
+    assert C4_TRACKER_SCOPE in _selection(tmp_path, path)["pytest_deselect"].split(",")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "charts/curie/templates/_helpers.tpl",
+        "cli/src/factory_intake.rs",
+        "apps/api/src/curie_api/forges/config.py",
+        "tests/vectors/forge-tracker-scopes.json",
+        C4_TRACKER_SCOPE,
+    ],
+)
+def test_c4_tracker_scope_selected_when_an_input_changes(tmp_path: Path, path: str) -> None:
+    assert C4_TRACKER_SCOPE not in _selection(tmp_path, path)["pytest_deselect"].split(",")
 
 
 @pytest.mark.parametrize(
@@ -137,7 +169,7 @@ def test_classified_ignored_path_does_not_keep_an_unrelated_file(
 ) -> None:
     output = _selection(tmp_path, "apps/api/src/curie_api/main.py", ignored)
     assert output["pytest"] == "true"
-    assert output["pytest_deselect"] == SRE_RUNTIME
+    assert output["pytest_deselect"] == ALL_CONDITIONAL
 
 
 @pytest.mark.parametrize("path", ["examples/sre-bot-other/file.yaml", "runner-other/file.py"])
@@ -147,7 +179,7 @@ def test_conditional_inputs_respect_directory_boundaries(tmp_path: Path, path: s
     registry["rules"]["exact"][path] = ["local"]
     registry_path = tmp_path / "registry.yaml"
     registry_path.write_text(yaml.safe_dump(registry, sort_keys=False))
-    assert _selection(tmp_path, path, registry=registry_path)["pytest_deselect"] == SRE_RUNTIME
+    assert _selection(tmp_path, path, registry=registry_path)["pytest_deselect"] == ALL_CONDITIONAL
 
 
 def test_conditional_deselection_is_sorted_and_matches_exact_inputs(tmp_path: Path) -> None:
@@ -207,7 +239,7 @@ def _tracking_problems(entries: dict[str, list[str]], tracked: set[str]) -> list
 
 def test_conditional_inputs_are_tracked() -> None:
     entries = yaml.safe_load(REGISTRY.read_text())["conditional_pytest_files"]
-    assert entries == {SRE_RUNTIME: list(SRE_RUNTIME_INPUTS)}
+    assert entries == {name: list(inputs) for name, inputs in CONDITIONAL_PYTEST_FILES.items()}
     completed = subprocess.run(
         ["git", "ls-files", "-z"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
     )

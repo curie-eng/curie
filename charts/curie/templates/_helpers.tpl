@@ -2730,6 +2730,59 @@ true
 {{- fail (printf "%s credential appId %s differs from api.githubAppId %s; the factory and git-flow must use one GitHub App" $where (include "curie.factory.str" $own) $appId) -}}
 {{- end -}}
 {{- end -}}
+{{- /* One binding per tracker scope (#4622, ADR 0197), whether or not
+factory.enabled: CURIE_FORGES renders from these lists either way and the API's
+ForgesConfig.check_references refuses the same document at boot. The scope is
+(tracker kind, host stripped and lowercased, trackerScopeId), as the runtime
+resolves it, so two tracker entries for one site cannot hide a duplicate. */ -}}
+{{- $trackers := dict -}}
+{{- range $index, $tracker := (get $factory "trackers" | default list) -}}
+{{- $name := get $tracker "name" | default "" | toString -}}
+{{- if hasKey $trackers $name -}}
+{{- fail (printf "factory.trackers[%v] (%s) repeats a tracker name; tracker names must be unique" $index $name) -}}
+{{- end -}}
+{{- $_ := set $trackers $name $tracker -}}
+{{- end -}}
+{{- $bindings := dict -}}
+{{- $scopes := dict -}}
+{{- range $index, $binding := (get $factory "bindings" | default list) -}}
+{{- $name := get $binding "name" | default "" | toString -}}
+{{- if hasKey $bindings $name -}}
+{{- fail (printf "factory.bindings[%v] (%s) repeats a binding name; binding names must be unique" $index $name) -}}
+{{- end -}}
+{{- $_ := set $bindings $name true -}}
+{{- end -}}
+{{- range $index, $binding := (get $factory "bindings" | default list) -}}
+{{- $name := get $binding "name" | default "" | toString -}}
+{{- $trackerName := get $binding "tracker" | default "" | toString -}}
+{{- if not (hasKey $trackers $trackerName) -}}
+{{- fail (printf "factory.bindings[%v] (%s) names unknown tracker %s; add it to factory.trackers or name an existing tracker" $index $name $trackerName) -}}
+{{- end -}}
+{{- $tracker := get $trackers $trackerName -}}
+{{- $kind := get $tracker "kind" | default "" | toString -}}
+{{- $host := get $tracker "host" | default "" | toString | trim | lower -}}
+{{- /* A trackerScopeId is a nonempty string, taken as is like the runtime, or
+a whole number below 2^53 in magnitude, which Helm's float64 holds exactly and
+renders as plain decimal digits. Anything else (missing, null, empty, a list
+or map, a fraction, a larger number) is refused, as the CLI preflight does. */ -}}
+{{- $rawScope := get $binding "trackerScopeId" -}}
+{{- $validScope := false -}}
+{{- if kindIs "string" $rawScope }}{{ $validScope = ne $rawScope "" }}
+{{- else if or (kindIs "float64" $rawScope) (kindIs "int64" $rawScope) (kindIs "int" $rawScope) -}}
+{{- $f := float64 $rawScope -}}
+{{- $validScope = and (eq $f (floor $f)) (lt $f 9007199254740992.0) (gt $f -9007199254740992.0) -}}
+{{- end -}}
+{{- if not $validScope -}}
+{{- fail (printf "factory.bindings[%v] (%s) trackerScopeId must be a nonempty string or a whole number; quote the tracker's scope id" $index $name) -}}
+{{- end -}}
+{{- $scopeId := include "curie.factory.str" $rawScope -}}
+{{- $key := toJson (list $kind $host $scopeId) -}}
+{{- if hasKey $scopes $key -}}
+{{- $first := get $scopes $key -}}
+{{- fail (printf "factory.bindings %s and %s claim the same tracker scope (%s on %s, trackerScopeId %s); keep one binding per tracker scope: add the other repositories to binding %s repos and select one with a repo:<alias> label" $first $name $kind $host $scopeId $first) -}}
+{{- end -}}
+{{- $_ := set $scopes $key $name -}}
+{{- end -}}
 {{- /* factory.enabled needs a tracker and a code host of any installed kind (#4399).
 A GitHub entry in either list keeps GitHub's own pairing: a github tracker and a
 github code host together. */ -}}

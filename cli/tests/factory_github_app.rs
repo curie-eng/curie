@@ -581,6 +581,14 @@ impl Fixture {
             },
             {"name":"peer", "tracker":"jira", "trackerScopeId":"3", "agent":"acme-peer", "repos":[{"alias":"peer", "codeHost":"bitbucket", "path":"acme/peer", "base":"release"}]},
         ]);
+        // The peer binding's tracker: a binding naming no recorded tracker is
+        // refused before any upgrade (#4622).
+        let trackers = values["factory"]["trackers"]
+            .as_array_mut()
+            .expect("the recorded App writes factory.trackers");
+        trackers.push(serde_json::json!({
+            "name":"jira", "kind":"jira_cloud", "host":"example.atlassian.net",
+        }));
         values["factory"]["docker"] = serde_json::json!({
             "daemonImage":format!("registry.example.com/acme/daemon@sha256:{}", "f".repeat(64)),
         });
@@ -1200,7 +1208,9 @@ fn factory_runner_only_uses_installed_base_and_preserves_disabled_mixed_tracker_
     let mut before: serde_json::Value = serde_json::from_str(&fx.values).unwrap();
     before["factory"]["enabled"] = serde_json::json!(false);
     before["factory"]["bindings"][0]["repos"][0]["path"] = serde_json::json!("acme/projects/bot");
-    before["factory"]["trackers"].as_array_mut().unwrap().push(serde_json::json!({
+    let trackers = before["factory"]["trackers"].as_array_mut().unwrap();
+    trackers.retain(|tracker| tracker["name"] != "jira");
+    trackers.push(serde_json::json!({
         "name":"jira", "kind":"jira_cloud", "baseUrl":"https://tracker.example.com", "credential":{"existingSecret":"jira-key"},
     }));
     before["factory"]["codeHosts"] = serde_json::json!([{"name":"bitbucket", "kind":"bitbucket_cloud", "baseUrl":"https://api.bitbucket.org"}]);

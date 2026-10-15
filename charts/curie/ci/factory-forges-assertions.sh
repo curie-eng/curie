@@ -336,7 +336,7 @@ refused "an intake outside poll and webhook" "intake" \
 refused "ciWaitSeconds above 10800" "ciWaitSeconds" \
   render -f "$WORK/factory.yaml" --set 'factory.ciWaitSeconds=10801'
 echo "  ok: incomplete or inconsistent factory config is refused"
-render -f "$WORK/factory.yaml" --set 'factory.enabled=false' --set-json 'factory.trackers=[]' >/dev/null
+render -f "$WORK/factory.yaml" --set 'factory.enabled=false' --set-json 'factory.trackers=[]' --set-json 'factory.bindings=[]' >/dev/null
 echo "  ok: a disabled factory needs no tracker"
 
 # Negative control: the refusal comes from the guard file, not a hard-coded key.
