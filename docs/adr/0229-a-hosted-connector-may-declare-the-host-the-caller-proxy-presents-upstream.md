@@ -2,7 +2,10 @@
 
 Date: 2026-10-14
 
-Status: Draft
+Status: Accepted
+
+Accepted with explicit maintainer approval from Brian Conn in the pull request
+that published this status, before implementation.
 
 This ADR would amend [ADR-0178](0178-the-connector-caller-token-names-the-run-and-work-item.md)
 decision 5, which says the caller proxy "changes nothing else about the
