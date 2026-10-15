@@ -2378,6 +2378,7 @@ fn complete_up_opts_without_runner_egress(
     github_token: Option<&str>,
     clear_github_token: bool,
     overlay_live: bool,
+    factory: &crate::config_migrate::FactoryMigrationContext,
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
     refuse_half_a_caller_key_pair(&operator_sets)?;
@@ -2398,9 +2399,22 @@ fn complete_up_opts_without_runner_egress(
     opts.retained_mail_values = resolve_retained_mail_values(existing, &operator_sets)?;
     let migrated_owned;
     let existing = if let Some(values) = existing {
-        let outcome = crate::config_migrate::migrate_installed_config(values.clone(), None)?;
+        let outcome =
+            crate::config_migrate::migrate_installed_config(values.clone(), None, factory)?;
         stamp_config_schema(&mut opts, &outcome);
         overlay_migration_results(&mut opts, &outcome.values, &operator_sets);
+        if matches!(
+            factory,
+            crate::config_migrate::FactoryMigrationContext::LegacyGitHub { .. }
+        ) && opts.file_values.is_none()
+        {
+            overlay_leaf(
+                &mut opts,
+                &outcome.values,
+                "factory",
+                &std::collections::HashSet::new(),
+            );
+        }
         if overlay_live {
             overlay_live_operator_values(&mut opts, &outcome.values, &operator_sets)?;
         }
@@ -2733,12 +2747,204 @@ fn overlay_json(
 /// Finish an already validated up plan with the one live values read and, when
 /// requested, resolved provider addresses. This is kept separate from command
 /// execution so apply and diff can compare the same completed values.
+pub(crate) struct PreparedFactoryMigration {
+    pub opts: UpOpts,
+    pub existing: Option<serde_json::Value>,
+    pub effective: Option<serde_json::Value>,
+    pub context: crate::config_migrate::FactoryMigrationContext,
+}
+
+pub(crate) async fn prepare_factory_migration(
+    mut opts: UpOpts,
+    mut existing: Option<serde_json::Value>,
+    live: bool,
+    retain_all: bool,
+) -> Result<PreparedFactoryMigration> {
+    use crate::config_migrate::{
+        has_legacy_factory_input, legacy_factory_keys, FactoryMigrationContext,
+    };
+    let legacy_keys = legacy_factory_keys();
+    let operator_may_require = opts.set.iter().chain(&opts.set_string).any(|expression| {
+        operator_set_entries(std::slice::from_ref(expression))
+            .iter()
+            .any(|(key, value)| {
+                legacy_keys
+                    .iter()
+                    .any(|legacy| key_is_or_descends_from(key.trim(), legacy))
+                    || ((key.starts_with("api.extraEnv") || key.starts_with("worker.extraEnv"))
+                        && value.contains("GITHUB_FACTORY_"))
+            })
+    });
+    if !existing.as_ref().is_some_and(has_legacy_factory_input)
+        && !opts
+            .file_values
+            .as_ref()
+            .is_some_and(|values| has_legacy_factory_input(&values.0))
+        && !operator_may_require
+    {
+        return Ok(PreparedFactoryMigration {
+            opts,
+            effective: existing.clone(),
+            existing,
+            context: FactoryMigrationContext::NotRequired,
+        });
+    }
+    let mut explicit = opts
+        .file_values
+        .as_ref()
+        .map(|values| values.0.clone())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !live {
+        for (expressions, typed) in [(&opts.set, true), (&opts.set_string, false)] {
+            for (key, value) in operator_set_entries(expressions) {
+                let key = key.trim();
+                if key.starts_with("api.extraEnv") || key.starts_with("worker.extraEnv") {
+                    bail!("api.extraEnv factory settings require live factory.bindings resolution");
+                }
+                if !legacy_keys.iter().any(|old| key == old) {
+                    continue;
+                }
+                let parsed = if typed {
+                    serde_norway::from_str(value)
+                        .map_err(|_| anyhow::anyhow!("api.githubFactory settings are malformed"))?
+                } else {
+                    serde_json::json!(value)
+                };
+                crate::config_migrate::set_path(&mut explicit, key, parsed);
+            }
+        }
+    } else {
+        let arguments = file_set_args(&opts);
+        if !arguments.is_empty() {
+            explicit = super::lint_values::pending_set_values(&explicit, &arguments)
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "api.githubFactory settings could not parse the supplied overlay"
+                    )
+                })?;
+        }
+    }
+    let mut overlay = existing.clone().unwrap_or_else(|| serde_json::json!({}));
+    crate::config_migrate::clear_replaced_secret_refs(&mut overlay, &explicit);
+    super::lint_values::merge_values(&mut overlay, explicit.clone());
+    if !has_legacy_factory_input(&overlay) {
+        return Ok(PreparedFactoryMigration {
+            opts,
+            effective: existing.clone(),
+            existing,
+            context: FactoryMigrationContext::NotRequired,
+        });
+    }
+    let source = if live && existing.is_some() {
+        let (ok, output, _) = run_capture(&super::verbs::helm_history_cmd(&opts.common))
+            .await
+            .map_err(|_| anyhow::anyhow!("installed factory release history could not be read"))?;
+        if !ok {
+            bail!("installed factory release history could not be read");
+        }
+        let history = super::verbs::parse_helm_history(&output)
+            .map_err(|_| anyhow::anyhow!("installed factory release history is malformed"))?;
+        let latest = history
+            .into_iter()
+            .max_by_key(|row| row.revision)
+            .ok_or_else(|| {
+                anyhow::anyhow!("installed factory release history has no latest revision")
+            })?;
+        let source = crate::factory_config_migrate::read_installed_factory_source(
+            &opts.common,
+            latest.revision,
+            latest.chart,
+        )
+        .await?;
+        existing = Some(source.user_values.clone());
+        overlay = source.user_values.clone();
+        crate::config_migrate::clear_replaced_secret_refs(&mut overlay, &explicit);
+        super::lint_values::merge_values(&mut overlay, explicit.clone());
+        Some(source)
+    } else {
+        None
+    };
+    if !has_legacy_factory_input(&overlay) {
+        return Ok(PreparedFactoryMigration {
+            opts,
+            effective: existing.clone(),
+            existing,
+            context: FactoryMigrationContext::NotRequired,
+        });
+    }
+    let context = if live {
+        crate::factory_config_migrate::resolve_factory_migration_context(
+            &opts.common,
+            source.as_ref(),
+            &overlay,
+        )
+        .await?
+    } else {
+        let effective_legacy = crate::config_migrate::normalized_factory_input(&overlay)?;
+        if crate::config_migrate::LegacyFactory::parse(&effective_legacy)?.needs_identity() {
+            bail!("api.githubFactory settings require live factory.bindings resolution");
+        }
+        FactoryMigrationContext::LegacyGitHub {
+            effective_legacy,
+            repositories: Vec::new(),
+        }
+    };
+    let migrated = crate::config_migrate::migrate_installed_config(
+        overlay,
+        source.as_ref().map(|s| s.installed_chart.as_str()),
+        &context,
+    )?
+    .values;
+    let mut supplied_keys = BTreeMap::new();
+    flatten_file_values(&explicit, "", &mut supplied_keys);
+    let document = if retain_all {
+        migrated.clone()
+    } else {
+        let mut document = crate::config_migrate::normalized_factory_input(&explicit)?;
+        for key in legacy_factory_keys() {
+            crate::config_migrate::remove_path(&mut document, &key);
+        }
+        crate::config_migrate::remove_path(&mut document, "worker.publication.githubHttpsCidrs");
+        if let Some(factory) = migrated.get("factory") {
+            document["factory"] = factory.clone();
+        }
+        document
+    };
+    let mut flattened = BTreeMap::new();
+    flatten_file_values(&document, "", &mut flattened);
+    flattened.retain(|key, _| {
+        supplied_keys.contains_key(key) || key_is_or_descends_from(key, "factory")
+    });
+    opts.file_values = Some(PrivateHelmValues(document, flattened));
+    if live {
+        opts.set.clear();
+        opts.set_string.clear();
+    } else {
+        for expressions in [&mut opts.set, &mut opts.set_string] {
+            expressions.retain(|expression| {
+                !operator_set_entries(std::slice::from_ref(expression))
+                    .iter()
+                    .any(|(key, _)| legacy_keys.iter().any(|old| key.trim() == old))
+            });
+        }
+    }
+    let effective = existing.as_ref().map(|_| migrated);
+    Ok(PreparedFactoryMigration {
+        opts,
+        existing,
+        effective,
+        context,
+    })
+}
+
 pub(crate) fn complete_up_opts(
     opts: UpOpts,
     existing: Option<&serde_json::Value>,
     github_token: Option<&str>,
     clear_github_token: bool,
     resolve_provider_egress: bool,
+    factory: &crate::config_migrate::FactoryMigrationContext,
 ) -> Result<UpOpts> {
     let mut opts = complete_up_opts_without_runner_egress(
         opts,
@@ -2746,6 +2952,7 @@ pub(crate) fn complete_up_opts(
         github_token,
         clear_github_token,
         false,
+        factory,
     )?;
     let operator_sets = opts.operator_sets();
     resolve_preserved_runner_egress_values(&mut opts, existing, &operator_sets, false);
@@ -5398,8 +5605,12 @@ pub async fn up(
     } else {
         None
     };
+    let prepared = prepare_factory_migration(opts, existing, resolve_provider_egress, true).await?;
+    opts = prepared.opts;
+    let existing = prepared.existing;
+    let factory = prepared.context;
     // @spec CLUSTER-VALUES-FILES c3: preserve completion, with explicit files winning.
-    let mut effective_existing = existing.clone();
+    let mut effective_existing = prepared.effective;
     if let Some(values) = &opts.file_values {
         let supplied_keys: BTreeSet<String> = values.1.keys().cloned().collect();
         let merged = effective_existing.get_or_insert_with(|| serde_json::json!({}));
@@ -5410,7 +5621,8 @@ pub async fn up(
         opts.file_values = Some(PrivateHelmValues(merged.clone(), BTreeMap::new()));
         apply_flags_to_file_values(&mut opts, github_token.as_deref(), clear_github_token);
         let mut values = opts.file_values.take().expect("captured file snapshot");
-        values.0 = crate::config_migrate::migrate_installed_config(values.0, None)?.values;
+        values.0 =
+            crate::config_migrate::migrate_installed_config(values.0, None, &factory)?.values;
         flatten_file_values(&values.0, "", &mut values.1);
         values.1.retain(|key, _| supplied_keys.contains(key));
         *merged = values.0.clone();
@@ -5435,6 +5647,7 @@ pub async fn up(
         github_token.as_deref(),
         clear_github_token,
         true,
+        &factory,
     )?;
     // @spec CLUSTER-VALUES-FILES c3: an overlay is not an installed release.
     if existing.is_none() && opts.file_values.is_some() && !opts.dev {
@@ -6185,6 +6398,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap()
     }
@@ -6397,6 +6611,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap();
 
@@ -6441,6 +6656,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap();
 
@@ -6511,6 +6727,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap()
     }
@@ -6733,6 +6950,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap()
     }
@@ -6907,9 +7125,15 @@ mod tests {
                 }]
             }
         });
-        let opts =
-            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
-                .unwrap();
+        let opts = complete_up_opts_without_runner_egress(
+            opts(),
+            Some(&existing),
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap();
 
         assert_eq!(
             up_value_plan(&opts)
@@ -6948,9 +7172,15 @@ mod tests {
                 }
             }
         });
-        let opts =
-            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
-                .unwrap();
+        let opts = complete_up_opts_without_runner_egress(
+            opts(),
+            Some(&existing),
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap();
 
         let effective = up_value_plan(&opts).effective_values();
         assert_eq!(
@@ -7057,6 +7287,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap();
 
@@ -7092,9 +7323,15 @@ mod tests {
         let existing = serde_json::json!({
             "worker": { "slackTrustedOrigins": "http://host.docker.internal" }
         });
-        let opts =
-            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
-                .unwrap();
+        let opts = complete_up_opts_without_runner_egress(
+            opts(),
+            Some(&existing),
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap();
 
         let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
         let argv = materialized.argv().join(" ");
@@ -7125,6 +7362,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap();
 
@@ -7157,6 +7395,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap();
 
@@ -7181,9 +7420,15 @@ mod tests {
         let existing = serde_json::json!({
             "worker": { "slackTrustedOrigins": recorded }
         });
-        let opts =
-            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
-                .unwrap();
+        let opts = complete_up_opts_without_runner_egress(
+            opts(),
+            Some(&existing),
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap();
 
         assert_eq!(
             up_value_plan(&opts)
@@ -7222,6 +7467,7 @@ mod tests {
                 None,
                 false,
                 true,
+                &crate::config_migrate::FactoryMigrationContext::NotRequired,
             )
             .unwrap();
 
@@ -7341,6 +7587,7 @@ mod tests {
             None,
             false,
             overlay_live,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap()
     }
@@ -8187,6 +8434,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap()
     }
@@ -8291,7 +8539,15 @@ mod tests {
         opts.dev = false;
         opts.secrets = vec![];
         opts.set = set;
-        complete_up_opts_without_runner_egress(opts, existing, None, false, true).unwrap()
+        complete_up_opts_without_runner_egress(
+            opts,
+            existing,
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap()
     }
 
     /// ADR-0168 decision 7, through the wiring rather than the helper: a sealed
@@ -8369,6 +8625,7 @@ mod tests {
                     None,
                     false,
                     true,
+                    &crate::config_migrate::FactoryMigrationContext::NotRequired,
                 ) else {
                     panic!("half a caller key pair must be refused: {half} dev={dev}");
                 };

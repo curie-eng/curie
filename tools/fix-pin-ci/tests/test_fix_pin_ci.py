@@ -1119,8 +1119,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         lambda step: "uv run alembic upgrade head" in _string(step, "run"),
         "shared database migration",
     )
-    # Reporting flags may vary; the dedicated kind runtime module is the one
-    # required exclusion from the ordinary Python suite.
+    # The two dedicated kind runtime modules run through their own CI callers.
     pytest_index = _single_step_index(
         steps,
         lambda step: step.get("id") == "pytest",
@@ -1135,13 +1134,54 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     for meaning, expression in {
         "shard": "${{ matrix.shard }}",
         "deselect": "${{ steps.python-runtime.outputs.pytest_deselect }}",
+        "scope": "${{ steps.python-runtime.outputs.pytest_scope }}",
     }.items():
         names = [name for name, value in pytest_env.items() if value == expression]
         assert len(names) == 1, expression
         bindings[meaning] = names[0]
+    runtime_exclusions = {
+        "tools/factory-e2e/tests/test_c4_initial_binding.py",
+        "tools/factory-e2e/tests/test_c4_upgrade_migration.py",
+    }
+
+    def assert_full_suite(command: list[str], shard: int, deselect: str) -> None:
+        assert command[:3] == ["run", "pytest", "-q"]
+        if deselect:
+            assert command.count("--deselect") == 1
+            assert command[-2:] == ["--deselect", deselect]
+            command = command[:-2]
+        distribution = [
+            "-n", "4", "--dist", "loadgroup", "--ci-shard", f"{shard}/3", "--reruns", "1",
+        ]
+        extra = command[3:]
+        assert extra[: len(distribution)] == distribution
+        arguments = iter(extra[len(distribution):])
+        excluded = []
+        reporting = []
+        for argument in arguments:
+            if argument == "--ignore":
+                path = next(arguments, None)
+                assert path is not None, "--ignore requires a path"
+                excluded.append(path)
+            elif argument.startswith("--ignore="):
+                excluded.append(argument.split("=", 1)[1])
+            else:
+                reporting.append(argument)
+        assert len(excluded) == 2 and set(excluded) == runtime_exclusions, (
+            f"the Python suite must exclude exactly both kind runtime modules, got {excluded!r}"
+        )
+        report_chars = set("fEsxXpPaAR")
+        assert all(
+            argument.startswith("--durations")
+            or (
+                argument.startswith("-r")
+                and len(argument) > 2
+                and set(argument[2:]) <= report_chars
+            )
+            for argument in reporting
+        ), f"the full Python suite permits only reporting flags, got {command!r}"
+
     # Run the unmodified Bash with a recording uv function at its command boundary.
-    # Keep reporting flags flexible after checking the required exclusion and
-    # the declared file added by conditional selection.
     for shard in (1, 2, 3):
         for deselect in ("", "examples/tests/test_sre_bot_observability_runtime.py"):
             environment = {
@@ -1149,6 +1189,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
                 "BASH_FUNC_uv%%": "() { printf '%s\\0' \"$@\"; }",
                 bindings["shard"]: str(shard),
                 bindings["deselect"]: deselect,
+                bindings["scope"]: "full",
             }
             result = subprocess.run(
                 ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", pytest_script],
@@ -1160,41 +1201,30 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
             assert result.returncode == 0, result.stdout + result.stderr
             pytest_command = result.stdout.split("\0")
             assert pytest_command.pop() == ""
-            assert pytest_command[:3] == ["run", "pytest", "-q"]
-            if deselect:
-                assert pytest_command.count("--deselect") == 1
-                assert pytest_command[-2:] == ["--deselect", deselect]
-                pytest_command = pytest_command[:-2]
-            distribution = [
-                "-n",
-                "4",
-                "--dist",
-                "loadgroup",
-                "--ci-shard",
-                f"{shard}/3",
-                "--reruns",
-                "1",
-            ]
-            extra = pytest_command[3:]
-            assert extra[: len(distribution)] == distribution
-            extra = extra[len(distribution) :]
-            runtime_exclusion = "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py"
-            assert extra.count(runtime_exclusion) == 1
-            extra.remove(runtime_exclusion)
-            report_chars = set("fEsxXpPaAR")
-            assert all(
-                argument.startswith("--durations")
-                or (
-                    argument.startswith("-r")
-                    and len(argument) > 2
-                    and set(argument[2:]) <= report_chars
-                )
-                for argument in extra
-            ), (
-                "the Python suite requires one kind runtime exclusion and permits only "
-                "reporting flags plus the selected trailing deselect pair, "
-                f"got {pytest_command!r}"
-            )
+            assert_full_suite(pytest_command, shard, deselect)
+            if shard == 1 and not deselect:
+                for mutation in (
+                    ["--ignore", "apps/api/tests"],
+                    ["--ignore=apps/api/tests"],
+                    ["--ignore-glob=*"],
+                    ["--deselect=apps/api/tests"],
+                    ["apps/api/tests/test_config.py"],
+                    ["--ignore", *sorted(runtime_exclusions)[:1]],
+                ):
+                    with pytest.raises(AssertionError):
+                        assert_full_suite([*pytest_command, *mutation], shard, deselect)
+                for missing in runtime_exclusions:
+                    reduced = []
+                    arguments = iter(pytest_command)
+                    for argument in arguments:
+                        if argument == "--ignore":
+                            path = next(arguments)
+                            if path != missing:
+                                reduced.extend((argument, path))
+                        elif argument != f"--ignore={missing}":
+                            reduced.append(argument)
+                    with pytest.raises(AssertionError):
+                        assert_full_suite(reduced, shard, deselect)
     assert stack_index < migration_index < pytest_index
 
     # The half that keeps the win. Nothing about the gate may drift back into
