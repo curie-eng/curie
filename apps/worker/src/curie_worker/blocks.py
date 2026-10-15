@@ -304,7 +304,7 @@ def render(text: str, nav: NavPack | None = None) -> tuple[str, list[dict[str, A
     reply = parse_reply(text)
     if reply is not None:
         return (
-            _truncate(to_mrkdwn(reply.text) or "(reply)", _SLACK_TEXT_MAX),
+            to_mrkdwn(reply.text) or "(reply)",
             to_blocks(reply, nav),
         )
     open_at = text.find(_FENCE_OPEN)

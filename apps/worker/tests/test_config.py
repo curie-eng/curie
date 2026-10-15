@@ -356,9 +356,9 @@ _ENV_TABLE: list[_Row] = [
         "CURIE_TURN_RECEIPT",
         "failures",
         "failures",
-        "all",
+        "off",
         bare="TURN_RECEIPT",
-        bare_raw="off",
+        bare_raw="all",
     ),
     # --- inbound attachment lane envelope (#2567, S4) ---
     # Defaults are asserted AGAINST ``AttachmentLimits`` rather than literals:
@@ -1575,12 +1575,12 @@ def test_each_turn_receipt_mode_is_read_from_its_env(
     assert WorkerConfig().turn_receipt == mode
 
 
-def test_the_turn_receipt_defaults_to_all(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An install that sets nothing keeps ADR-0117's receipt as built."""
+def test_the_turn_receipt_defaults_to_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An install that sets nothing leaves the answer without an appended receipt."""
 
     _clear_all_config_env(monkeypatch)
 
-    assert WorkerConfig().turn_receipt == "all"
+    assert WorkerConfig().turn_receipt == "off"
 
 
 @pytest.mark.parametrize("raw", ["ALL", "Off", "none", "failure", "true", " off", ""])
@@ -1629,7 +1629,7 @@ def test_the_chart_offers_exactly_the_turn_receipt_modes_the_worker_accepts() ->
     assert offered["type"] == "string"
     assert sorted(offered["enum"]) == sorted(get_args(TurnReceiptMode))
     assert values["worker"]["turnReceipt"] == WorkerConfig.model_fields["turn_receipt"].default
-    assert values["worker"]["turnReceipt"] == "all"
+    assert values["worker"]["turnReceipt"] == "off"
 
 
 def test_the_chart_defaults_match_the_worker_defaults() -> None:

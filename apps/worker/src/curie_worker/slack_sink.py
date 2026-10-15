@@ -26,9 +26,12 @@ operator typed is trusted, a URL a turn carried is not.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 from urllib.parse import urlsplit
 
@@ -55,11 +58,14 @@ from .behaviorpacks import NavPack
 from .blocks import (
     approval_card,
     expired_approval_card,
+    parse_reply,
     progress_card,
     progress_milestone,
     render,
     resolved_approval_card,
+    to_blocks,
 )
+from .slack_text import split_answer, split_verbatim_answer
 from .slack_tokens import token_identity
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle: reply_sink builds this adapter
@@ -68,6 +74,39 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle: reply_sink builds this ada
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+_reply_sleep = asyncio.sleep
+
+
+async def _rate_limited_call[T](call: Callable[[], Awaitable[T]], operation: str) -> T:
+    # A 429 is a rejected request, unlike an ambiguous network response. Retry
+    # the same operation/key at most twice, honoring Slack's Retry-After:
+    # https://docs.slack.dev/apis/web-api/rate-limits/
+    for attempt in range(3):
+        try:
+            return await call()
+        except SlackApiError as exc:
+            if _slack_retry_class(exc) != "rate-limit" or attempt == 2:
+                raise
+            response = exc.response
+            headers = getattr(response, "headers", None)
+            if headers is None and isinstance(response, Mapping):
+                headers = response.get("headers", {})
+            retry_after = next(
+                (value for key, value in (headers or {}).items() if key.lower() == "retry-after"),
+                "1",
+            )
+            try:
+                delay = max(1.0, float(retry_after))
+            except (TypeError, ValueError):
+                raise exc from None
+            if not 1.0 <= delay <= 30.0:
+                # Keep the durable completion owed instead of holding a worker
+                # indefinitely on an unbounded or malformed provider delay.
+                raise
+            _record_reply_retry(operation, "rate-limit")
+            await _reply_sleep(delay)
+    raise AssertionError("unreachable retry budget")
 
 
 def _record_reply_retry(operation: str, retry_class: str) -> None:
@@ -101,6 +140,7 @@ def _slack_retry_class(exc: SlackApiError) -> str:
         if status_code == 429 or error in {"ratelimited", "rate_limited"}
         else "block-fallback"
     )
+
 
 # The SDK's own default base URL, which is the trusted origin when the worker
 # configures none. Kept as a literal so the trust check has a concrete origin to
@@ -219,43 +259,6 @@ def _configured_origins(origins: Sequence[str]) -> set[_TrustedOrigin]:
     return configured
 
 
-# chat.update refuses an edit over 4,000 bytes of UTF-8 with msg_too_long, while
-# chat.postMessage takes far more (measured, see test_slack_sink.py). A streamed
-# reply reaches Slack by editing its placeholder, so this is the limit it meets,
-# and a refused final edit used to lose the whole turn (#3064).
-_EDIT_MAX_BYTES = 4000
-_CUT_NOTE = "\n…\n_(Cut here: Slack refuses a longer edit.)_"
-_RECEIPT_HEADER = "\n\n_What I changed:_\n"
-_RECEIPT_EDIT_MAX_BYTES = 2500
-
-
-def _fit_edit(text: str) -> str:
-    """The edit Slack accepts: ``text`` cut to the limit, saying where it was cut.
-
-    Cut by bytes, not characters, because the limit is bytes. The cut falls on
-    the last line break when there is one in the second half, so a reader gets
-    whole lines.
-    """
-    if len(text.encode("utf-8")) <= _EDIT_MAX_BYTES:
-        return text
-    answer, separator, receipt = text.rpartition(_RECEIPT_HEADER)
-    suffix = separator + receipt if separator else ""
-    if not separator:
-        answer = text
-    if len(suffix.encode("utf-8")) > _RECEIPT_EDIT_MAX_BYTES:
-        marker = "\n• …more receipt details omitted"
-        allowed = _RECEIPT_EDIT_MAX_BYTES - len(marker.encode("utf-8"))
-        kept = suffix.encode("utf-8")[:allowed].decode("utf-8", "ignore")
-        line_end = kept.rfind("\n")
-        suffix = kept[:line_end] + marker
-    budget = _EDIT_MAX_BYTES - len(_CUT_NOTE.encode("utf-8")) - len(suffix.encode("utf-8"))
-    head = answer.encode("utf-8")[:budget].decode("utf-8", "ignore")
-    line_end = head.rfind("\n")
-    if line_end > len(head) // 2:
-        head = head[:line_end]
-    return head + _CUT_NOTE + suffix
-
-
 def _nav_pack(nav: NavAffordance | None) -> NavPack | None:
     """The wire affordance in the renderer's own vocabulary.
 
@@ -301,6 +304,7 @@ async def _post_with_block_fallback(
     blocks: list[dict[str, Any]] | None,
     thread_ts: str | None,
     client_msg_id: str | None = None,
+    allow_block_fallback: bool = True,
 ) -> AsyncSlackResponse:
     try:
         if blocks is not None:
@@ -317,8 +321,10 @@ async def _post_with_block_fallback(
             thread_ts=thread_ts,
             client_msg_id=client_msg_id,
         )
-    except SlackApiError:
-        if blocks is None:
+    except SlackApiError as exc:
+        if _slack_retry_class(exc) == "rate-limit":
+            raise
+        if blocks is None or not allow_block_fallback:
             raise
         logger.warning("chat_postMessage with blocks rejected; retrying text-only")
         return await client.chat_postMessage(
@@ -467,38 +473,13 @@ class SlackReplyAdapter:
                     identity=identity,
                 )
                 return ReplyAck(ref=target.reply_ref)
-            if target.reply_ref is None:
-                # No preposted message to edit (ADR-0079): a triggered turn has no
-                # ingress placeholder, so the reply has to create its own message.
-                # The minted ts goes back on the ack and the kernel adopts it, so
-                # only the FIRST event of the turn posts and the rest edit.
-                #
-                # This branch used to be unreachable because the kernel refused a
-                # null placeholder outright. It is reached now, and it must not be
-                # reduced to ``ts=target.reply_ref or ""``: chat.update with an
-                # empty ts is rejected by Slack, so the old coercion turned a
-                # placeholder-less turn into a silent delivery failure.
-                ref = await self._post_text(
-                    channel=target.address,
-                    thread_ts=_thread_ts(target.conversation_id),
-                    text=event.text or "",
-                    nav=event.nav,
-                    endpoint=endpoint,
-                    best_effort_unreachable=best_effort_unreachable,
-                    identity=identity,
-                    client_msg_id=event.delivery_id,
-                )
-                return ReplyAck(ref=ref)
-            await self._update(
-                channel=target.address,
-                ts=target.reply_ref,
-                text=event.text or "",
-                nav=event.nav,
+            ref = await self._deliver_answer(
+                event,
                 endpoint=endpoint,
-                best_effort_unreachable=best_effort_unreachable,
                 identity=identity,
+                best_effort_unreachable=best_effort_unreachable,
             )
-            return ReplyAck(ref=target.reply_ref)
+            return ReplyAck(ref=ref)
         if isinstance(event, ReplyPost):
             if event.progress is not None:
                 # A card's first revision or a milestone (ADR-0130): its own
@@ -540,9 +521,7 @@ class SlackReplyAdapter:
             None,
         ) in self._trusted_origins
 
-    def _client_for(
-        self, endpoint: str | None, identity: str = DEFAULT_IDENTITY
-    ) -> AsyncWebClient:
+    def _client_for(self, endpoint: str | None, identity: str = DEFAULT_IDENTITY) -> AsyncWebClient:
         """The cached client for this turn's endpoint, or the worker default.
 
         A per-turn ``endpoint`` overrides the default; ``None`` (or empty) uses the
@@ -636,7 +615,7 @@ class SlackReplyAdapter:
             endpoint and self._default_base_url and resolved != self._default_base_url
         )
         try:
-            return await op(primary)
+            return await _rate_limited_call(lambda: op(primary), operation)
         except _UNREACHABLE_ERRORS as exc:
             if has_distinct_default:
                 _record_reply_retry(operation, "transport-fallback")
@@ -647,7 +626,9 @@ class SlackReplyAdapter:
                     _redacted(endpoint),
                     exc,
                 )
-                return await op(self._client_for(None, identity))
+                return await _rate_limited_call(
+                    lambda: op(self._client_for(None, identity)), operation
+                )
             # The best-effort swallow (#708) fires ONLY in the pure-offline case
             # where there is genuinely NO configured default transport at all
             # (``self._default_base_url is None``). It must NOT key off
@@ -675,6 +656,111 @@ class SlackReplyAdapter:
                 return cast(_T, None)
             raise
 
+    async def _deliver_answer(
+        self,
+        event: ReplyUpdate,
+        *,
+        endpoint: str | None,
+        identity: str,
+        best_effort_unreachable: bool,
+    ) -> str | None:
+        """Ack only after sequential delivery; retries keep the same create keys."""
+        target = event.target
+        verbatim = event.text_mode == "verbatim"
+        if verbatim:
+            rendered = event.text or ""
+            blocks = None
+            parts = split_verbatim_answer(rendered)
+            structured = None
+        else:
+            rendered, blocks = render(event.text or "", _nav_pack(event.nav))
+            parts = split_answer(rendered)
+            structured = parse_reply(event.text or "")
+        ref = target.reply_ref
+        thread = _thread_ts(target.conversation_id) or ref
+        digest = hashlib.sha256(rendered.encode()).hexdigest()
+        # A wire 1.0 placeholder-less create retains its historical unkeyed
+        # behavior. Wire 1.1 uses the event's stable turn delivery identity.
+        seed = event.delivery_id or ref
+        for index, part in enumerate(parts):
+            payload = (part.text, blocks if len(parts) == 1 else None)
+            if verbatim:
+                payload = (
+                    part.content,
+                    [
+                        {
+                            "type": "section",
+                            "text": {"type": "plain_text", "text": part.content, "emoji": False},
+                        }
+                    ],
+                )
+            if structured is not None and len(parts) > 1:
+                last = index == len(parts) - 1
+                payload = (
+                    part.text,
+                    to_blocks(
+                        replace(
+                            structured,
+                            text=part.text,
+                            status=structured.status if index == 0 else None,
+                            header=structured.header if index == 0 else None,
+                            fields=structured.fields if index == 0 else [],
+                            footer=structured.footer if last else None,
+                            buttons=structured.buttons if last else [],
+                            links=structured.links if last else [],
+                            action_prompt=structured.action_prompt if last else None,
+                        ),
+                        _nav_pack(event.nav) if last else None,
+                    ),
+                )
+            if index == 0 and ref is not None:
+                await self._update(
+                    channel=target.address,
+                    ts=ref,
+                    text="",
+                    payload=payload,
+                    endpoint=endpoint,
+                    identity=identity,
+                    best_effort_unreachable=best_effort_unreachable,
+                    allow_block_fallback=not verbatim,
+                )
+                continue
+            key = (
+                event.delivery_id
+                if index == 0
+                else (
+                    str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"curie-answer:{identity}:{target.address}:{seed}:{digest}:{index}",
+                        )
+                    )
+                    if seed is not None
+                    else None
+                )
+            )
+            if index > 1 or (index == 1 and target.reply_ref is None):
+                # Slack generally admits one message per second per channel.
+                await _reply_sleep(1.0)
+            posted = await self._post_text(
+                channel=target.address,
+                thread_ts=thread,
+                text="",
+                payload=payload,
+                endpoint=endpoint,
+                identity=identity,
+                best_effort_unreachable=best_effort_unreachable,
+                client_msg_id=key,
+                allow_block_fallback=not verbatim,
+            )
+            if posted is None:
+                return ref  # The existing approval-resume best-effort exception.
+            if index == 0:
+                ref = posted
+                if thread is None:
+                    thread = posted
+        return ref
+
     async def _update(
         self,
         *,
@@ -685,6 +771,8 @@ class SlackReplyAdapter:
         endpoint: str | None = None,
         best_effort_unreachable: bool = False,
         identity: str = DEFAULT_IDENTITY,
+        payload: tuple[str, list[dict[str, Any]] | None] | None = None,
+        allow_block_fallback: bool = True,
     ) -> None:
         # The runner emits Markdown; Slack renders mrkdwn. ``render`` converts to
         # mrkdwn and, if the reply carries a complete ``curie-reply`` block,
@@ -693,11 +781,15 @@ class SlackReplyAdapter:
         # malformed block falls back to text, so partials never show raw JSON.
         # ``nav`` (the agent's hub-button pack, threaded from the kernel) appends
         # the no-dead-ends hub button to a structured reply; None leaves it be.
-        rendered_text, blocks = render(text, _nav_pack(nav))
-        rendered_text = _fit_edit(rendered_text)
+        rendered_text, blocks = payload if payload is not None else render(text, _nav_pack(nav))
 
         async def op(client: AsyncWebClient) -> None:
             if blocks is not None:
+                if not allow_block_fallback:
+                    await client.chat_update(
+                        channel=channel, ts=ts, text=rendered_text, blocks=blocks
+                    )
+                    return
                 # Slack rejects the whole message if a block exceeds a limit we did
                 # not clamp; fall back to a text-only update (on the SAME reachable
                 # client) so the turn still completes and the stream entry is acked
@@ -707,6 +799,8 @@ class SlackReplyAdapter:
                         channel=channel, ts=ts, text=rendered_text, blocks=blocks
                     )
                 except SlackApiError as exc:
+                    if _slack_retry_class(exc) == "rate-limit":
+                        raise
                     _record_reply_retry("update", _slack_retry_class(exc))
                     logger.warning(
                         "chat_update with blocks rejected for %s; retrying text-only", ts
@@ -735,6 +829,8 @@ class SlackReplyAdapter:
         best_effort_unreachable: bool = False,
         identity: str = DEFAULT_IDENTITY,
         client_msg_id: str | None = None,
+        payload: tuple[str, list[dict[str, Any]] | None] | None = None,
+        allow_block_fallback: bool = True,
     ) -> str | None:
         """Post this turn's reply as a NEW message and return its ts.
 
@@ -763,7 +859,7 @@ class SlackReplyAdapter:
         Returns:
             The ts of the posted message, or None when nothing was delivered.
         """
-        rendered_text, blocks = render(text, _nav_pack(nav))
+        rendered_text, blocks = payload if payload is not None else render(text, _nav_pack(nav))
 
         response = await self._with_transport_fallback(
             endpoint,
@@ -774,6 +870,7 @@ class SlackReplyAdapter:
                 blocks=blocks,
                 thread_ts=thread_ts,
                 client_msg_id=client_msg_id,
+                allow_block_fallback=allow_block_fallback,
             ),
             describe="chat_postMessage",
             operation="post",
@@ -902,6 +999,8 @@ class SlackReplyAdapter:
             try:
                 await client.chat_update(channel=channel, ts=ts, text=text, blocks=blocks)
             except SlackApiError as exc:
+                if _slack_retry_class(exc) == "rate-limit":
+                    raise
                 _record_reply_retry("update", _slack_retry_class(exc))
                 logger.warning(
                     "progress card chat_update with blocks rejected for %s; retrying text-only",
@@ -956,7 +1055,9 @@ class SlackReplyAdapter:
         async def op(client: AsyncWebClient) -> None:
             try:
                 await client.chat_update(channel=channel, ts=ts, text=text, blocks=blocks)
-            except SlackApiError:
+            except SlackApiError as exc:
+                if _slack_retry_class(exc) == "rate-limit":
+                    raise
                 logger.warning(
                     "card chat_update with blocks rejected for %s; retrying text-only",
                     ts,

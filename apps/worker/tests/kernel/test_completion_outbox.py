@@ -104,7 +104,7 @@ def _record(
 
 @pytest.mark.parametrize(
     "layer",
-    ["runner", "sink", "database", "cancelled"],
+    ["runner", "database", "cancelled"],
 )
 def test_a_retryable_failure_emits_no_completion_and_leaves_the_entry_pending(
     make_harness, monkeypatch: pytest.MonkeyPatch, layer: str
@@ -113,7 +113,7 @@ def test_a_retryable_failure_emits_no_completion_and_leaves_the_entry_pending(
     # revision 0 shipped was structural: an emit in the terminal ``finally``
     # fires for every exception, and the entry is still pending for XAUTOCLAIM.
     # The adapter would have sent the email and the turn would then run again.
-    # Mutation: move the emit into the ``finally`` and all four fail.
+    # Mutation: move the emit into the ``finally`` and all three fail.
     async def go() -> None:
         async with make_harness(shimmer=False, reclaim_min_idle_ms=5000) as h:
             h.runner.default_script = [Final(text="answer", status=DONE)]
@@ -125,9 +125,7 @@ def test_a_retryable_failure_emits_no_completion_and_leaves_the_entry_pending(
             )
             await consumer.ensure_group()
 
-            if layer == "sink":
-                h.sink.fail_events = {"reply.update"}
-            elif layer == "runner":
+            if layer == "runner":
 
                 async def runner_boom(*_a: object, **_k: object) -> object:
                     raise RuntimeError("runner layer failure")
@@ -153,9 +151,7 @@ def test_a_retryable_failure_emits_no_completion_and_leaves_the_entry_pending(
             summary: dict[str, object] = {}
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
-                summary = await h.async_redis.xpending(
-                    h.config.stream, h.config.consumer_group
-                )
+                summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
                 if summary["pending"]:
                     break
                 await asyncio.sleep(0.01)
@@ -235,8 +231,8 @@ def test_a_failed_emit_leaves_the_record_and_the_sweeper_delivers_it(
             assert await h.async_redis.exists(h.config.done_key("a1"))
             assert h.sink.completions == []
             # The record survived, so the completion is still owed.
-            assert await h.async_redis.exists(h.config.completion_key("a1"))
-            assert await h.async_redis.smembers(h.config.completions_pending_key()) == {"a1"}
+            assert await h.kernel._markers.read_completion("a1") is not None
+            assert await h.kernel._markers.pending_completions(10) == {"a1"}
 
             h.sink.fail_events = set()
             await h.kernel.sweep_pending_completions()
@@ -257,7 +253,7 @@ def test_the_record_is_cleared_only_after_a_confirmed_emit(make_harness) -> None
             h.runner.default_script = [Final(text="answer", status=DONE)]
             h.sink.fail_events = {"turn.completed"}
             await h.kernel.process_event(_qevent(thread="tA2", event_id="a2"))
-            assert await h.async_redis.exists(h.config.completion_key("a2"))
+            assert await h.kernel._markers.read_completion("a2") is not None
 
     asyncio.run(go())
 
@@ -566,9 +562,7 @@ def test_a_failed_terminal_send_recovers_to_exactly_one_user_visible_effect(
             shimmer=False, completion_sweep_grace_s=0.0, **_R6_LEASE_KNOBS
         ) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
             h.runner.default_script = [Final(text="answer", status=DONE)]
 
@@ -582,7 +576,7 @@ def test_a_failed_terminal_send_recovers_to_exactly_one_user_visible_effect(
             await _dispatch_and_settle(consumer, entry_1, fields_1)
 
             assert h.sink.completions == []
-            assert await h.async_redis.exists(h.config.completion_key("r6-1"))
+            assert await h.kernel._markers.read_completion("r6-1") is not None
             assert await store.peek(h.config.stream, h.config.consumer_group, entry_1) == {}, (
                 "the delivery state outlived a terminal ACK"
             )
@@ -649,9 +643,7 @@ def test_a_stale_generation_owner_writes_no_marker_clears_nothing_and_emits_noth
     async def go() -> None:
         async with make_harness(shimmer=False, **_R6_LEASE_KNOBS) as h:
             store = DeliveryLeaseStore(h.async_redis, h.config)
-            consumer = Consumer(
-                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store
-            )
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
             await consumer.ensure_group()
             h.runner.default_script = [Final(text="answer", status=DONE)]
 
@@ -667,7 +659,10 @@ def test_a_stale_generation_owner_writes_no_marker_clears_nothing_and_emits_noth
             )
             assert (
                 await store.release(
-                    h.config.stream, h.config.consumer_group, entry_id, owner=stale.owner,
+                    h.config.stream,
+                    h.config.consumer_group,
+                    entry_id,
+                    owner=stale.owner,
                     resume_event_id=None,
                 )
                 is True
@@ -685,9 +680,7 @@ def test_a_stale_generation_owner_writes_no_marker_clears_nothing_and_emits_noth
             await Markers(h.async_redis, h.config).mark_completion_pending(
                 "r6-stale", _record("r6-stale", thread="tR6s", done=False)
             )
-            assert await h.async_redis.smembers(h.config.completions_pending_key()) == {
-                "r6-stale"
-            }
+            assert await h.async_redis.smembers(h.config.completions_pending_key()) == {"r6-stale"}
 
             await h.kernel.process_event(qe, lease=stale)
 
@@ -698,17 +691,399 @@ def test_a_stale_generation_owner_writes_no_marker_clears_nothing_and_emits_noth
             assert await h.async_redis.exists(h.config.completion_key("r6-stale")), (
                 "a fenced-out owner cleared an outbox record it does not own"
             )
-            assert (
-                await h.async_redis.hget(h.config.completion_key("r6-stale"), "done") == "0"
-            ), "a fenced-out owner flagged another writer's record done"
+            assert await h.async_redis.hget(h.config.completion_key("r6-stale"), "done") == "0", (
+                "a fenced-out owner flagged another writer's record done"
+            )
 
             # POSITIVE CONTROL: the current owner settles and emits, so the
             # refusal above is the generation check and not a dead settle path.
-            await h.kernel.process_event(
-                _qevent(thread="tR6s", event_id="r6-stale"), lease=current
-            )
+            await h.kernel.process_event(_qevent(thread="tR6s", event_id="r6-stale"), lease=current)
             assert [c.event_id for c in h.sink.completions] == ["r6-stale"]
             assert await h.async_redis.exists(h.config.done_key("r6-stale"))
-            assert await h.async_redis.exists(h.config.completion_key("r6-stale")) == 0
+            # The current owner cleared its answer record, preserving the
+            # prior writer's nonterminal legacy record and generation.
+            assert await h.async_redis.exists(h.config.completion_key("r6-stale")) == 1
+            assert await h.async_redis.hget(h.config.completion_key("r6-stale"), "done") == "0"
+
+            await h.kernel.process_event(qe, lease=current)
+            assert len(h.sink.completions) == 1, "redelivery emitted a nonterminal legacy row"
+
+    asyncio.run(go())
+
+
+def test_failed_final_answer_is_durable_and_redelivery_never_reexecutes_model(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            shimmer=False, slack_no_edit_streaming=True, completion_sweep_grace_s=0.0
+        ) as h:
+            answer = "requested result\n" * 800
+            h.runner.default_script = [Final(text=answer, status=DONE)]
+            qe = _qevent(thread="answer-outbox", event_id="answer-outbox-event")
+            h.sink.fail_events = {"reply.update"}
+            try:
+                await h.kernel.process_event(qe)
+            except RuntimeError:
+                pass  # Old delivery fails before it can persist a completion.
+            assert await h.kernel._markers.read_completion(qe.event_id) is not None
+            assert await h.kernel._markers.is_terminal(qe.event_id)
+            opened = len(h.runner.opened)
+            h.sink.fail_events = set()
+            await h.kernel.process_event(qe)
+            await h.kernel.sweep_pending_completions()
+            assert len(h.runner.opened) == opened == 1
+            assert h.sink.last_text == answer
+            assert len(h.sink.completions) == 1
+            assert await h.async_redis.exists(h.config.completion_key(qe.event_id)) == 0
+
+    asyncio.run(go())
+
+
+def test_answer_record_is_invisible_to_legacy_completion_consumers(make_harness) -> None:
+    from channel_protocol.reply import PROGRESS_REPLY_WIRE_VERSION, ReplyUpdate
+
+    async def go() -> None:
+        async with make_harness(shimmer=False) as h:
+            record = _record("rolling-upgrade-answer")
+            record.answer = ReplyUpdate(
+                version=PROGRESS_REPLY_WIRE_VERSION,
+                event="reply.update",
+                target=record.event.target,
+                text="synthetic terminal answer",
+                delivery_id="00000000-0000-4000-8000-000000000073",
+            )
+            generation = await h.kernel._markers.mark_completion_pending(record.event_id, record)
+            await h.kernel._markers.mark_done(
+                record.event_id, marker_value="1", generation=generation
+            )
+            # These are exactly the hash and index the prior worker reads.
+            assert await h.async_redis.exists(h.config.completion_key(record.event_id)) == 0
+            assert record.event_id not in await h.async_redis.smembers(
+                h.config.completions_pending_key()
+            )
+            stored = await h.kernel._markers.read_completion(record.event_id)
+            assert stored is not None and stored.record.answer == record.answer
+            assert stored.done_flag
+            assert record.event_id in await h.kernel._markers.pending_completions(10)
+            assert (
+                await h.async_redis.ttl(h.config.done_key(record.event_id))
+                >= int(h.config.completion_max_retention_s) - 2
+            )
+            assert (
+                await h.kernel._markers.clear_completion(record.event_id, generation="stale")
+                is False
+            )
+            assert await h.kernel._markers.clear_completion(record.event_id, generation=generation)
+
+    asyncio.run(go())
+
+
+def test_both_completion_namespaces_are_sampled_without_starvation(make_harness) -> None:
+    from channel_protocol.reply import PROGRESS_REPLY_WIRE_VERSION, ReplyUpdate
+
+    async def go() -> None:
+        async with make_harness(shimmer=False, completion_sweep_grace_s=0.0) as h:
+            legacy = _record("legacy-owed")
+            modern = _record("modern-owed")
+            modern.answer = ReplyUpdate(
+                version=PROGRESS_REPLY_WIRE_VERSION,
+                event="reply.update",
+                target=modern.event.target,
+                text="modern answer",
+                delivery_id="00000000-0000-4000-8000-000000000074",
+            )
+            await h.kernel._markers.mark_completion_pending(legacy.event_id, legacy)
+            await h.kernel._markers.mark_completion_pending(modern.event_id, modern)
+            seen = set()
+            for _ in range(2):
+                batch = await h.kernel._markers.pending_completion_entries(1)
+                assert len(batch) == 1
+                seen.update(entry.event_id for entry in batch)
+            assert seen == {legacy.event_id, modern.event_id}
+            await h.kernel.sweep_pending_completions()
+            assert {c.event_id for c in h.sink.completions} == seen
+            assert await h.kernel._markers.read_completion(legacy.event_id) is None
+            assert await h.kernel._markers.read_completion(modern.event_id) is None
+
+    asyncio.run(go())
+
+
+def test_answer_key_cannot_collide_with_a_legacy_event_containing_delimiters(make_harness):
+    from channel_protocol.reply import PROGRESS_REPLY_WIRE_VERSION, ReplyUpdate
+
+    async def go():
+        async with make_harness(shimmer=False) as h:
+            modern = _record("opaque-event")
+            modern.answer = ReplyUpdate(
+                version=PROGRESS_REPLY_WIRE_VERSION,
+                event="reply.update",
+                target=modern.event.target,
+                text="new answer",
+                delivery_id="00000000-0000-4000-8000-000000000076",
+            )
+            markers = h.kernel._markers
+            await markers.mark_completion_pending(modern.event_id, modern)
+            legacy = _record("opaque-event:answer-v1")
+            await markers.mark_completion_pending(legacy.event_id, legacy)
+            stored = await markers.read_completion(modern.event_id)
+            assert stored is not None and stored.record.answer == modern.answer
+            legacy_stored = await markers.read_completion(legacy.event_id)
+            assert legacy_stored is not None
+            assert legacy_stored.record.event_id == legacy.event_id
+
+    asyncio.run(go())
+
+
+def test_leaseless_settlement_flags_only_its_selected_completion_namespace(make_harness):
+    from channel_protocol.reply import PROGRESS_REPLY_WIRE_VERSION, ReplyUpdate
+
+    async def go():
+        async with make_harness(shimmer=False) as h:
+            legacy = _record("selected-namespace", done=False)
+            modern = _record("selected-namespace", done=False)
+            modern.answer = ReplyUpdate(
+                version=PROGRESS_REPLY_WIRE_VERSION,
+                event="reply.update",
+                target=modern.event.target,
+                text="new answer",
+                delivery_id="00000000-0000-4000-8000-000000000077",
+            )
+            markers = h.kernel._markers
+            await markers.mark_completion_pending(legacy.event_id, legacy)
+            generation = await markers.mark_completion_pending(modern.event_id, modern)
+            await markers.mark_done(modern.event_id, marker_value="1", generation=generation)
+            assert await h.async_redis.hget(h.config.completion_key(legacy.event_id), "done") == "0"
+            assert (await markers.read_completion(modern.event_id)).done_flag
+            assert await markers.clear_completion(modern.event_id, generation=generation)
+
+    asyncio.run(go())
+
+
+def test_leaseless_done_refuses_a_stale_completion_generation(make_harness):
+    async def go():
+        async with make_harness(shimmer=False) as h:
+            markers = h.kernel._markers
+            record = _record("done-generation-conflict", done=False)
+            stale = await markers.mark_completion_pending(record.event_id, record)
+            current = await markers.mark_completion_pending(record.event_id, record)
+            with pytest.raises(RuntimeError, match="generation"):
+                await markers.mark_done(record.event_id, marker_value="1", generation=stale)
+            assert not await h.async_redis.exists(h.config.done_key(record.event_id))
+            assert not (await markers.read_completion(record.event_id)).done_flag
+            await markers.mark_done(record.event_id, marker_value="1", generation=current)
+            assert (await markers.read_completion(record.event_id)).done_flag
+
+    asyncio.run(go())
+
+
+def test_verbatim_outbox_is_isolated_from_older_answer_readers(make_harness):
+    from channel_protocol.reply import ReplyUpdate
+    from curie_worker.markers import CompletionIndexEntry
+
+    async def go():
+        async with make_harness(shimmer=False) as h:
+            record = _record("verbatim-upgrade-answer")
+            record.answer = ReplyUpdate(
+                version="1.2",
+                event="reply.update",
+                target=record.event.target,
+                text="```curie-reply\nnot json\n```\n",
+                text_mode="verbatim",
+                delivery_id="00000000-0000-4000-8000-000000000081",
+            )
+            generation = await h.kernel._markers.mark_completion_pending(record.event_id, record)
+            assert generation.startswith("answer-v2:")
+            assert not await h.async_redis.exists(
+                h.kernel._markers._completion_storage_key(record.event_id, answer=True)
+            )
+            assert record.event_id not in await h.async_redis.smembers(
+                h.kernel._markers._completion_pending_key(answer=True)
+            )
+            await h.kernel._markers.mark_done(
+                record.event_id, marker_value="1", generation=generation
+            )
+            stored = await h.kernel._markers.read_completion(record.event_id)
+            assert stored is not None and stored.done_flag and stored.record.answer == record.answer
+            assert await h.kernel._markers.pending_completion_entries(10) == {
+                CompletionIndexEntry(record.event_id, "verbatim")
+            }
+            assert await h.kernel._markers.pending_completion_count() == 1
+            assert (
+                await h.kernel._markers.clear_completion(
+                    record.event_id, generation="answer-v1:stale"
+                )
+                is False
+            )
+            assert await h.kernel._markers.clear_completion(record.event_id, generation=generation)
+            assert await h.kernel._markers.pending_completion_count() == 0
+
+    asyncio.run(go())
+
+
+def test_three_outbox_families_are_fair_even_with_one_item_samples(make_harness):
+    from channel_protocol.reply import ReplyUpdate
+
+    async def go():
+        async with make_harness(shimmer=False) as h:
+            for event_id, version in [("ordinary", None), ("answer", "1.1"), ("literal", "1.2")]:
+                record = _record(event_id)
+                if version:
+                    args = {"text_mode": "verbatim"} if version == "1.2" else {}
+                    record.answer = ReplyUpdate(
+                        version=version,
+                        event="reply.update",
+                        target=record.event.target,
+                        text=event_id,
+                        delivery_id="00000000-0000-4000-8000-000000000082",
+                        **args,
+                    )
+                await h.kernel._markers.mark_completion_pending(event_id, record)
+            seen = set()
+            for _ in range(3):
+                seen.update(
+                    entry.event_id
+                    for entry in await h.kernel._markers.pending_completion_entries(1)
+                )
+            assert seen == {"ordinary", "answer", "literal"}
+            assert await h.kernel._markers.pending_completion_count() == 3
+
+    asyncio.run(go())
+
+
+def test_verbatim_generation_and_health_stay_isolated_for_same_event(make_harness):
+    from channel_protocol.reply import ReplyUpdate
+    from curie_worker.completion_health import snapshot_completion_outbox
+
+    async def go():
+        async with make_harness(shimmer=False, completion_sweep_grace_s=0) as h:
+            generations = {}
+            for namespace, version in [(False, None), (True, "1.1"), ("verbatim", "1.2")]:
+                record = _record("same-event", done=False, age_s=5)
+                if version:
+                    args = {"text_mode": "verbatim"} if version == "1.2" else {}
+                    record.answer = ReplyUpdate(
+                        version=version,
+                        event="reply.update",
+                        target=record.event.target,
+                        text="approved",
+                        delivery_id="00000000-0000-4000-8000-000000000083",
+                        **args,
+                    )
+                generations[namespace] = await h.kernel._markers.mark_completion_pending(
+                    record.event_id, record
+                )
+            await h.kernel._markers.mark_done(
+                "same-event", marker_value="1", generation=generations["verbatim"]
+            )
+            entries = sorted(await h.kernel._markers.pending_completion_entries(10))
+            stored = await h.kernel._markers.read_completion_entries(entries)
+            assert len(stored) == 3
+            for entry, item in stored.items():
+                assert item is not None and item.done_flag == (entry.answer_namespace == "verbatim")
+            assert await h.kernel._markers.note_provider_egress_refusal(
+                "same-event", generation=generations["verbatim"]
+            )
+            modern = await h.kernel._markers.read_completion("same-event")
+            assert modern is not None and modern.cause == "provider egress refused"
+            assert await h.kernel._markers.clear_completion_cause(
+                "same-event", generation=generations["verbatim"]
+            )
+            assert await h.kernel._markers.clear_completion(
+                "same-event", generation=generations["verbatim"]
+            )
+            assert await h.kernel._markers.pending_completion_count() == 2
+            health = await snapshot_completion_outbox(h.kernel._markers, h.async_redis, h.config)
+            assert health.count == 2 and health.inflight == 2
+
+    asyncio.run(go())
+
+
+def test_invalid_answer_payload_does_not_abort_unrelated_completion_read(make_harness):
+    from curie_worker.markers import CompletionIndexEntry, MalformedCompletionError
+
+    async def go():
+        async with make_harness(shimmer=False) as h:
+            good = _record("valid-legacy")
+            await h.kernel._markers.mark_completion_pending(good.event_id, good)
+            await h.async_redis.hset(
+                h.kernel._markers._completion_storage_key("bad-verbatim", answer="verbatim"),
+                mapping={
+                    "record": '{"answer":{"version":"99"}}',
+                    "done": "1",
+                    "gen": "answer-v2:corrupt",
+                },
+            )
+            entries = [
+                CompletionIndexEntry(good.event_id),
+                CompletionIndexEntry("bad-verbatim", "verbatim"),
+            ]
+            result = await h.kernel._markers.read_completion_entries(entries)
+            assert result[entries[0]].record == good
+            bad = result[entries[1]]
+            assert isinstance(bad, MalformedCompletionError) and bad.answer_namespace == "verbatim"
+
+    asyncio.run(go())
+
+
+def test_verbatim_fenced_settlement_refuses_stale_owner_then_accepts_current(make_harness):
+    from channel_protocol.reply import ReplyUpdate
+
+    async def go():
+        async with make_harness(shimmer=False, **_R6_LEASE_KNOBS) as h:
+            store = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+            await consumer.ensure_group()
+            qe = _qevent(thread="verbatim-fence", event_id="verbatim-fence-event")
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(qe))
+            entry_id, _ = await _read_one(h, h.config.consumer_name)
+            stale = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry_id, consumer=h.config.consumer_name
+            )
+            assert await store.release(
+                h.config.stream,
+                h.config.consumer_group,
+                entry_id,
+                owner=stale.owner,
+                resume_event_id=None,
+            )
+            current = await store.acquire(
+                h.config.stream, h.config.consumer_group, entry_id, consumer=h.config.consumer_name
+            )
+            record = _record(qe.event_id, done=False)
+            record.answer = ReplyUpdate(
+                version="1.2",
+                event="reply.update",
+                target=record.event.target,
+                text="approved exact\n",
+                text_mode="verbatim",
+                delivery_id="00000000-0000-4000-8000-000000000085",
+            )
+            prior = await h.kernel._markers.mark_completion_pending(qe.event_id, record)
+
+            async def settle(lease):
+                return await h.kernel._markers.settle_fenced(
+                    qe.event_id,
+                    record,
+                    stream=h.config.stream,
+                    group=h.config.consumer_group,
+                    entry_id=entry_id,
+                    owner=lease.owner,
+                    generation=lease.generation,
+                    marker_value="1",
+                )
+
+            assert await settle(stale) is None
+            unchanged = await h.kernel._markers.read_completion(qe.event_id)
+            assert (
+                unchanged is not None and unchanged.generation == prior and not unchanged.done_flag
+            )
+            assert not await h.async_redis.exists(h.config.done_key(qe.event_id))
+            final = await settle(current)
+            assert final is not None and final.startswith("answer-v2:")
+            stored = await h.kernel._markers.read_completion(qe.event_id)
+            assert stored is not None and stored.done_flag and stored.record.answer == record.answer
+            assert not await h.kernel._markers.clear_completion(qe.event_id, generation=prior)
+            assert await h.kernel._markers.clear_completion(qe.event_id, generation=final)
 
     asyncio.run(go())

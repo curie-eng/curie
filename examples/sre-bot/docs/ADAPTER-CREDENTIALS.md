@@ -37,7 +37,13 @@ endpoint.
 ```sh
 python3 examples/sre-bot/observability/adapter-credentials/sync.py --config /config/adapters.json --dry-run
 python3 examples/sre-bot/observability/adapter-credentials/sync.py --config /config/adapters.json
+python3 examples/sre-bot/observability/adapter-credentials/sync.py --config /config/adapters.json --prune --dry-run
+python3 examples/sre-bot/observability/adapter-credentials/sync.py --config /config/adapters.json --repair-rollout
 ```
+
+`--prune` and `--repair-rollout` are separate opt-ins (SRE-CREDS-9 and
+SRE-CREDS-10). Without them the program keeps its default refusal and
+no-rollout behavior. Either combines with `--dry-run`.
 
 The namespace, worker Deployment, container, and every adapter source are
 explicit. This file contains names and keys only, never credential values.
@@ -83,9 +89,10 @@ abort the entire reconciliation before any PATCH. No partial map is written.
 Decode the worker target key as a JSON object of nonempty identity keys and
 nonblank string values. An absent key is an empty map; a present malformed
 value is an error. If an existing identity is absent from the configured
-inventory, abort without writing. Retirement requires a separate deliberate
-operation; this reconciler has no retirement override. Equality compares
-decoded maps, so JSON formatting or order alone never triggers a change.
+inventory, abort without writing unless the operator passed `--prune`
+(SRE-CREDS-9). Without that flag, retirement stays a separate deliberate
+operation. Equality compares decoded maps, so JSON formatting or order alone
+never triggers a change.
 
 ### SRE-CREDS-5: conditional update of one key
 
@@ -100,25 +107,30 @@ conditional PATCH and stale-version rejection in
 
 ### SRE-CREDS-6: rollout follows a successful map change
 
-After a successful target PATCH, PATCH only the worker pod template annotation
-`curietech.ai/adapter-credentials-at`, with a new UTC timestamp, using the
-Deployment's observed resource version. Preserve other annotations and
-Deployment fields. An unchanged map, dry run, or failed target write never
-rolls the worker. A Deployment write failure returns failure with
-`secretPatched: true` and `workerRolled: false`. This is a partial operation,
-not a successful rollout or an atomic transaction. The operator must complete
-the worker rollout separately before claiming runtime recovery. A later
-unchanged-map reconciliation does not claim to repair that partial rollout.
+After a successful target PATCH, PATCH only two worker pod template
+annotations, using the Deployment's observed resource version:
+`curietech.ai/adapter-credentials-at`, with a new UTC timestamp, and
+`curietech.ai/adapter-credentials-sha256`, the rollout marker defined in
+SRE-CREDS-10 for the map just written. Preserve other annotations and
+Deployment fields. A failed target write or dry run never rolls the worker.
+An unchanged map rolls the worker only under SRE-CREDS-10. A Deployment write
+failure returns failure with `secretPatched: true` and `workerRolled: false`.
+This is a partial operation, not a successful rollout or an atomic
+transaction. Without `--repair-rollout`, a later unchanged-map reconciliation
+does not repair that partial rollout, and the operator must complete it
+separately before claiming runtime recovery.
 
 ### SRE-CREDS-7: read-only dry run and safe structured results
 
 `--dry-run` performs the same complete reads and validation as an apply run,
-then returns `would-change` or `unchanged` with no PATCH. The ordinary command
-returns `updated`, `unchanged`, or `failed`. Emit one JSON result on stdout
-and no diagnostic body on stderr. Results may contain only status, namespace,
-worker Deployment and container names, target Secret name and key, adapter
-count, booleans `changed`, `secretPatched`, `workerRolled`, and a stable
-failure code. Never print Secret values, encoded values, request or response
+then returns `would-change`, `would-repair`, or `unchanged` with no PATCH.
+The ordinary command returns `updated`, `repaired`, `unchanged`, or `failed`.
+Emit one JSON result on stdout and no diagnostic body on stderr. Results may
+contain only status, namespace, worker Deployment and container names, target
+Secret name and key, adapter count, booleans `changed`, `secretPatched`,
+`workerRolled`, the sorted `retired` identity list defined in SRE-CREDS-9, and
+a stable failure code. Adapter identities are names from the inventory and
+the target map keys, never credential values. Never print Secret values, encoded values, request or response
 bodies, raw exceptions, ServiceAccount tokens, or tracebacks. Exit zero for a
 successful apply or dry run and nonzero for every failure. Failure codes
 distinguish configuration, worker inspection, target inspection, source
@@ -133,17 +145,62 @@ boundary; PATCH bodies are JSON merge patches. Production uses the
 ServiceAccount transport when `request` is absent. Tests use synthetic
 credentials and obvious placeholder names, and assert complete reads before
 writes, no-write refusal paths, semantic equality, preserved unrelated data,
-conditional version conflicts, and rollout failures.
+conditional version conflicts, rollout failures, explicit retirement, and
+rollout marker repair.
 
 Before describing runtime reconciliation as verified, run the standalone
 program with synthetic Secrets and a disposable worker in an isolated
 Kubernetes namespace. Demonstrate read-only dry run under read-only RBAC,
 actual Secret conflict rejection, unchanged-map no rollout, changed-map pod
 template advancement, preservation of unrelated keys, and a missing-source
-run that changes nothing. Record Kubernetes version, exact commands, candidate
+run that changes nothing. For the opt-ins, also demonstrate that a retired
+identity is refused by default and removed with `--prune`, and that after an
+injected worker PATCH denial, an unchanged-map `--repair-rollout` run advances
+the pod template while a second run is `unchanged`. Record Kubernetes version, exact commands, candidate
 commit, observed results, and owned-resource cleanup. Fake-boundary tests
 prove program decisions only; production credential reads and production
 mutations are not a test harness.
+
+### SRE-CREDS-9: explicit opt-in retirement
+
+`--prune` permits removing target identities that the configured inventory no
+longer lists. It removes exactly those identities: the desired map is the
+complete configured inventory, and every retained or added identity still
+comes from a validated source under SRE-CREDS-3. All validation in
+SRE-CREDS-1 through SRE-CREDS-5 still completes before any PATCH, and a
+nonempty inventory remains required, so pruning can never empty the map.
+Every result after the target map is decoded under `--prune`, including
+`unchanged`, `would-change`, `updated`, and later write failures, reports
+`retired`: the sorted list of removed identities, possibly empty. Dry run
+reports what would be retired and writes nothing. Without `--prune` the result
+has no `retired` field and shrinkage still fails with `inventory-shrinkage`.
+Retirement removes only the worker's copy of a credential. It does not revoke
+the adapter principal, delete source Secrets, or invalidate issued tokens.
+
+### SRE-CREDS-10: rollout marker and opt-in repair
+
+The rollout marker is the lowercase hexadecimal SHA-256 digest of the UTF-8
+bytes `curie-adapter-credentials-v1`, one NUL byte, and the desired map
+serialized as JSON with sorted keys, `(",", ":")` separators, and non-ASCII
+characters escaped. It depends only on the decoded map, so formatting and key
+order never change it. Every successful rollout under SRE-CREDS-6 writes it to
+`curietech.ai/adapter-credentials-sha256`. The marker is a fingerprint of
+credential material visible to anyone who can read the Deployment, as with the
+common checksum annotation pattern. It assumes high-entropy credentials and is
+never printed.
+
+When the decoded map is unchanged and `--repair-rollout` is set, read the
+marker from the worker's pod template annotations. If it equals the marker of
+the current map, return `unchanged`. If it is absent, malformed, or different,
+the worker template does not reflect the current map: dry run returns
+`would-repair` with no PATCH, and an apply run PATCHes the worker exactly as
+SRE-CREDS-6 does, without any Secret PATCH, and returns `repaired` with
+`changed: false`, `secretPatched: false`, and `workerRolled: true`. A worker
+PATCH failure returns `worker-rollout`. A worker last rolled before this
+marker existed is rolled once by its first repair run. Without
+`--repair-rollout`, an unchanged map never rolls the worker. The marker shows
+that the pod template advanced for this map; it does not prove that the new
+pods became ready or that the worker delivered a reply.
 
 ## Existing interface observation
 
@@ -156,7 +213,8 @@ are required.
 
 ## Build order
 
-Land this contract first. Commit the failing behavioral tests separately,
+Land this contract first. The retirement and rollout repair opt-ins followed
+the same order: contract update, failing behavioral tests, implementation. Commit the failing behavioral tests separately,
 then implement the standalone reconciler in a later commit. Required runtime
 proof is the isolated Kubernetes exercise above. Skill, local bundle,
 local-release, live-model, and external messaging tiers do not exercise this

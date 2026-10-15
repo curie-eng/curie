@@ -211,6 +211,11 @@ class EgressHandler(BaseHTTPRequestHandler):
                 422,
                 {"detail": "event target does not belong to this adapter"},
             )
+        if isinstance(event, ReplyUpdate) and event.text_mode == "verbatim":
+            return self._respond(
+                422,
+                {"detail": "reply wire 1.2 verbatim is not supported"},
+            )
         if isinstance(event, TurnCompleted) and not event.event_id:
             return self._respond(422, {"detail": "event_id must not be empty"})
         try:

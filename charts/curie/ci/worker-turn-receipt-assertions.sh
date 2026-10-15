@@ -7,8 +7,8 @@
 # `failures` and `off` at config load, so a value the chart let through would
 # install green and then crash-loop every worker. Six assertions:
 #
-#   (a) DEFAULT: the worker Deployment carries CURIE_TURN_RECEIPT=all exactly
-#       once, so an install that sets nothing keeps the ADR-0117 receipt.
+#   (a) DEFAULT: the worker Deployment carries CURIE_TURN_RECEIPT=off exactly
+#       once, so an install that sets nothing leaves the answer unchanged.
 #   (b) EACH MODE: failures, off and an explicit all reach the worker env
 #       verbatim.
 #   (c) NEGATIVE, schema: a mode outside the three (wrong case, a near miss,
@@ -113,7 +113,7 @@ assert_refused() {
 }
 
 # (a) + (f) The shipped default, on the worker container only.
-assert_mode a all
+assert_mode a off
 
 # (b) Every mode the worker accepts reaches it verbatim.
 for mode in all failures off; do
@@ -129,7 +129,7 @@ assert_refused c turnReceipt --set "worker.turnReceipt=1"
 assert_refused c turnReceipt --set "worker.turnReceipt=false"
 
 # (d) An explicit null is coalesced away and takes the upgrade-safe default.
-assert_mode d all --set "worker.turnReceipt=null"
+assert_mode d off --set "worker.turnReceipt=null"
 
 # (e) The name is chart owned, so extraEnv cannot shadow the value.
 assert_refused e CURIE_TURN_RECEIPT \

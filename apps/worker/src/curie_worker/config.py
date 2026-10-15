@@ -363,10 +363,10 @@ class WorkerConfig(BaseSettings):
     # would clear until Slack's own two-minute timeout.
     shimmer: Bool = Field(default=True, validation_alias=SHIMMER_ENV)
 
-    # When true, suppress intermediate placeholder edits while streaming so the
-    # placeholder gets exactly one chat.update (the final) -- rate-limit friendly
-    # and flicker-free; pair with the shimmer for liveness. Default false
-    # preserves live-edit streaming.
+    # Suppress nonterminal placeholder notices as well as provisional text.
+    # Assistant TextDelta frames are internal diagnostics in every mode; the
+    # terminal answer is delivered through the completion outbox. The default
+    # still permits the booting caption and other platform lifecycle notices.
     slack_no_edit_streaming: Bool = Field(
         default=False, validation_alias="CURIE_SLACK_NO_EDIT_STREAMING"
     )
@@ -386,7 +386,7 @@ class WorkerConfig(BaseSettings):
     # Any other value refuses boot rather than falling back to a mode nobody
     # chose. It changes only what the person is shown, never what the action
     # ledger records or what the no-retry rule reads.
-    turn_receipt: TurnReceiptMode = Field(default="all", validation_alias="CURIE_TURN_RECEIPT")
+    turn_receipt: TurnReceiptMode = Field(default="off", validation_alias="CURIE_TURN_RECEIPT")
 
     # Whether deliberate progress (ADR 0130) reaches an adapter. Temporary: it
     # exists until the rendering change lands, and the chart does not set it.

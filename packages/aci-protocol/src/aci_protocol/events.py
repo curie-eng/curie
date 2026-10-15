@@ -330,6 +330,12 @@ class Final(_OutboundBase):
     leaves it unknown rather than counting the turn as free. Additive optional
     scalars: a tolerant consumer decoding an older producer's ``final`` simply
     sees them absent.
+
+    ``text_mode`` is ``"verbatim"`` only on a ``done`` final whose text a
+    bundle-declared validator approved in this turn (ADR 0227). A caller that
+    negotiated exact output delivers that text literally, without receipts,
+    notices or Markdown rendering. ``None`` keeps the established rendering,
+    including for an older producer that predates the field.
     """
 
     type: Literal["final"] = "final"
@@ -343,6 +349,7 @@ class Final(_OutboundBase):
     approval_display: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    text_mode: Literal["verbatim"] | None = None
 
 
 class ErrorEvent(_OutboundBase):

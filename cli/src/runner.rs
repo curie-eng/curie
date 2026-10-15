@@ -123,12 +123,19 @@ impl RunnerClient {
         let resp = self
             .http
             .post(format!("{}/v1/event", self.base_url))
+            .header("X-Curie-Final-Answer", "1")
             .json(&frame)
             .send()
             .await
             .map_err(|error| {
                 self.request_error(error, format!("POST {}/v1/event", self.base_url))
             })?;
+        let mut versions = resp.headers().get_all("X-Curie-Final-Answer").iter();
+        if let Some(version) = versions.next() {
+            if version.to_str().ok() != Some("1") || versions.next().is_some() {
+                bail!("unsupported X-Curie-Final-Answer response version");
+            }
+        }
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
