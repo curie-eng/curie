@@ -61,6 +61,7 @@ class JiraTrackerConnection:
             raise ValueError(f"binding {binding.name!r} is not bound to {self.config.name!r}")
         transport = JiraTransport(
             client,
+            entry=self.config.name,
             api_url=self.config.api_url,
             username=self._username,
             token=self._credential.token,

@@ -2,11 +2,13 @@
 
 The env value is a `ForgesConfig` JSON document whose credentials name files
 (``private_key_file``, ``client_secret_file``, ``token_file``) the chart mounts
-from Secrets. Each file is read here and its content becomes the secret; a
-secret written inline in the env JSON is refused, so key material never sits in
-the environment. A GitHub entry must use a GitHub App, because the tracker's
-marked-comment identity is the App's. A kind this build does not install is
-refused at load. Every refusal names the entry and the file, never the secret.
+from Secrets. Each file is read here and its content becomes the secret: a
+static token without its surrounding ASCII whitespace, any other secret byte
+for byte. A secret written inline in the env JSON is refused, so key material
+never sits in the environment. A GitHub entry must use a GitHub App, because
+the tracker's marked-comment identity is the App's. A kind this build does not
+install is refused at load. Every refusal names the entry and the file, never
+the secret.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from curie_api.forges import types
-from curie_api.forges.config import ForgesConfig
+from curie_api.forges.config import ForgesConfig, StaticTokenRefused, normalize_static_token
 from curie_api.forges.registry import check_installed
 
 # Each credential secret field and the file field that must carry it.
@@ -38,7 +40,13 @@ def _read_secret(entry: str, field: str, path: Any) -> str:
         raise ValueError(f"{entry} credential {field} {path} cannot be read") from None
     if not content.strip():
         raise ValueError(f"{entry} credential {field} {path} is empty")
-    return content
+    if field != "token_file":
+        return content
+    try:
+        return normalize_static_token(content)
+    except StaticTokenRefused as refused:
+        problem = refused.problem
+    raise ValueError(f"{entry} credential {field} {path} {problem}")
 
 
 def _credential(entry: str, kind: Any, credential: Any) -> dict[str, Any]:

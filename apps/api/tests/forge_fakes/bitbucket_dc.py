@@ -1124,6 +1124,7 @@ def dc_adapter(
 
     return BitbucketDcCodeHost(
         client or fake.client(),
+        entry="bitbucket-dc",
         api_url=fake.base_url,
         host=HOST,
         token=token,

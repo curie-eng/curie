@@ -74,6 +74,7 @@ class BitbucketDcConnection:
 
         return BitbucketDcCodeHost(
             client,
+            entry=self.config.name,
             api_url=self.config.api_url,
             host=self.config.host,
             token=self._token.get_secret_value(),

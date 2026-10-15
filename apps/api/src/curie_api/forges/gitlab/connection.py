@@ -118,7 +118,10 @@ class GitLabTrackerConnection:
             (repo for repo in binding.repos if repo.project_id == project_id), binding.repos[0]
         )
         transport = GitLabTransport(
-            client, api_url=self.config.api_url, token=_token_source(self._token)
+            client,
+            entry=self.config.name,
+            api_url=self.config.api_url,
+            token=_token_source(self._token),
         )
         return GitLabTracker(
             transport,
@@ -182,7 +185,10 @@ class GitLabCodeHostConnection:
         from curie_api.forges.gitlab.code_host import GitLabCodeHost
 
         transport = GitLabTransport(
-            client, api_url=self.config.api_url, token=_token_source(self._token)
+            client,
+            entry=self.config.name,
+            api_url=self.config.api_url,
+            token=_token_source(self._token),
         )
         return GitLabCodeHost(
             transport,
