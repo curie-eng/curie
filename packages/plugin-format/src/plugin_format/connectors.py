@@ -37,6 +37,7 @@ a bundle stays safe to commit.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from pathlib import PurePosixPath
 from typing import Any, Final
@@ -113,6 +114,23 @@ class ConnectorBuild(BaseModel):
     platforms: list[str]
 
 
+def is_loopback_upstream_host(text: str) -> bool:
+    """Whether ``text`` may be ``proxy_upstream_host`` (ADR 0229).
+
+    ``localhost`` or a loopback address in its canonical spelling, with no port
+    or brackets. The proxy forwards to loopback only, so a loopback Host is the
+    only one that is true of the connection.
+    """
+
+    if text == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    return address.is_loopback and str(address) == text
+
+
 class ConnectorSpec(BaseModel):
     """One declared connector. Exactly one of ``image``, ``build`` or ``url``.
 
@@ -157,6 +175,13 @@ class ConnectorSpec(BaseModel):
     # a bundle that lists other agents and wants its own agent in lists
     # `self` too. Entries are carried as written; nothing resolves `self` here.
     admits: list[str] | None = None
+
+    # The Host the caller proxy presents to the server on requests it has
+    # admitted (ADR 0229). None forwards the caller's Host, which an
+    # allowed-hosts server needs. A loopback host is for a server that refuses
+    # a non-loopback Host on a loopback connection, as the proxy's forward is.
+    # Rendered into the proxy alone; direct requests keep their own Host.
+    proxy_upstream_host: str | None = None
 
     # -- remote form --
     url: str | None = None
@@ -725,6 +750,25 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     "connector with `env` and `args` instead",
                 )
             )
+        if spec.proxy_upstream_host is not None:
+            if spec.url is not None:
+                errors.append(
+                    (
+                        "connectors.remote_has_proxy_upstream_host",
+                        f"{where}: `proxy_upstream_host` is the Host Curie's caller proxy "
+                        "presents to a connector it hosts; a `url` connector has no such "
+                        "proxy",
+                    )
+                )
+            elif not is_loopback_upstream_host(spec.proxy_upstream_host):
+                errors.append(
+                    (
+                        "connectors.bad_proxy_upstream_host",
+                        f"{where}: `proxy_upstream_host` must be `localhost`, an IPv4 "
+                        "loopback address or `::1`, with no port (the proxy adds the "
+                        f"server's port), got {spec.proxy_upstream_host!r}",
+                    )
+                )
         if spec.admits is not None and spec.url is not None:
             errors.append(
                 (

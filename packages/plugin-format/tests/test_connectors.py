@@ -1244,3 +1244,92 @@ def test_a_remote_connector_cannot_declare_config() -> None:
     assert "connectors.remote_has_config" in _codes(
         {"connectors": {"r": {"url": "https://mcp.example.com/mcp", "config": ["A_SETTING"]}}}
     )
+
+
+# --------------------------------------------------------------------------- #
+# `proxy_upstream_host`: the Host the caller proxy presents on admitted
+# requests (ADR 0229)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "127.8.9.10", "::1"])
+def test_a_hosted_connector_may_declare_a_loopback_upstream_host(host: str) -> None:
+    # @spec ADR-0229 d1
+    parsed, errors = validate_connectors(
+        {"connectors": {"kubernetes": {"image": "x:1", "proxy_upstream_host": host}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["kubernetes"].proxy_upstream_host == host
+
+
+def test_the_upstream_host_is_absent_by_default() -> None:
+    # @spec ADR-0229 d1: omitted keeps today's behavior, the caller's Host.
+    parsed, errors = validate_connectors({"connectors": {"grafana": {"image": "x:1"}}})
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["grafana"].proxy_upstream_host is None
+
+
+def test_a_build_form_connector_may_declare_the_upstream_host() -> None:
+    # @spec ADR-0229 d1
+    assert (
+        _codes(
+            {
+                "connectors": {
+                    "kubernetes": {
+                        "build": {"context": "connectors/kubernetes", "platforms": ["linux/amd64"]},
+                        "proxy_upstream_host": "localhost",
+                    }
+                }
+            }
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "10.0.0.1",
+        "example.com",
+        "curie-sre-bot-kubernetes",
+        "localhost:8000",
+        "127.0.0.1:8000",
+        "[::1]",
+        "[::1]:8000",
+        "0.0.0.0",
+        "::",
+        "LOCALHOST",
+        "localhost\r\nX-Injected: 1",
+        "",
+    ],
+)
+def test_a_non_loopback_or_malformed_upstream_host_is_refused(host: str) -> None:
+    # @spec ADR-0229 d1: loopback host only, with no port; the proxy adds the
+    # server's port itself.
+    assert _codes(
+        {"connectors": {"kubernetes": {"image": "x:1", "proxy_upstream_host": host}}}
+    ) == ["connectors.bad_proxy_upstream_host"]
+
+
+def test_the_upstream_host_on_a_remote_connector_is_refused() -> None:
+    # @spec ADR-0229 d1: a `url` connector has no proxy Curie renders.
+    assert _codes(
+        {
+            "connectors": {
+                "internal": {
+                    "url": "https://mcp.example.com/mcp",
+                    "proxy_upstream_host": "localhost",
+                }
+            }
+        }
+    ) == ["connectors.remote_has_proxy_upstream_host"]
+
+
+def test_bundle_surfaces_a_refused_upstream_host(tmp_path: Path) -> None:
+    root = _bundle(
+        tmp_path,
+        "connectors:\n  kubernetes:\n    image: x:1\n    proxy_upstream_host: example.com\n",
+    )
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert [e.code for e in result.errors] == ["connectors.bad_proxy_upstream_host"]

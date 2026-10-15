@@ -188,7 +188,13 @@ verifies, that has not expired and that names a listed agent
 that passes the grant check below. It strips the header and forwards the
 request to the server over loopback with its `Host` unchanged and its body as
 sent
-(`apps/worker/src/curie_connector_proxy/server.py::make_app`). On that forward
+(`apps/worker/src/curie_connector_proxy/server.py::make_app`). A connector that
+declares `proxy_upstream_host` (ADR 0229) gets that loopback host and the
+server's port as `Host` instead, on admitted requests only
+(`apps/worker/src/curie_connector_proxy/server.py::ProxyConfig`). It is for a
+server that refuses a non-loopback `Host` on a loopback connection. A refused
+request never reaches the server, and a `-direct` caller keeps its own `Host`.
+On that forward
 it sets `X-Curie-Agent` from the verified token. When the token also carries
 `run` and `work_item` (ADR 0178), it sets `X-Curie-Run` and
 `X-Curie-Work-Item` from those claims. Inbound copies of the three headers
