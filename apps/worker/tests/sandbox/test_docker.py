@@ -14,12 +14,17 @@ import os
 import tarfile
 import time
 import urllib.request
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from curie_worker.attachments import AttachmentRef, encode_attachment_refs
+from curie_worker.attachments import (
+    AttachmentRef,
+    AttachmentResolutionError,
+    encode_attachment_refs,
+)
 from curie_worker.bundle_store import extract_bundle
 from curie_worker.sandbox import (
     AffinityStore,
@@ -36,7 +41,7 @@ from curie_worker.sandbox.docker import (
     RunnerHardening,
 )
 from curie_worker.sandbox.types import RouteState
-from curie_worker.workspace import WorkspaceRef
+from curie_worker.workspace import WorkspacePreparationError, WorkspaceRef
 
 from .conftest import (
     _FakeBundleStore,
@@ -118,6 +123,12 @@ def test_create_claim_seeds_remote_volumes_before_starting_runner(
     client.create_claim("claim-remote", pool="pool", env=remote_claim_env)
 
     runner = next(argv for argv in client.calls if argv[0] == "run")
+    runner_labels = dict(label.split("=", 1) for label in _flag_values(runner, "--label"))
+    attempt = runner_labels["curietech.ai/claim-attempt"]
+    assert uuid.UUID(attempt).hex == attempt
+    assert runner_labels["curietech.ai/claim"] == "claim-remote"
+    assert runner_labels["curietech.ai/component"] == "claim-runner"
+    assert runner_labels["curietech.ai/managed-by"] == "curie-sandbox-substrate"
     mounts = _volume_mounts(runner)
     assert set(mounts) == {"/bundles/current", "/workspace", "/attachments"}
     assert mounts["/bundles/current"][1] == "ro"
@@ -136,7 +147,20 @@ def test_create_claim_seeds_remote_volumes_before_starting_runner(
         created = next(
             argv for argv in client.calls if argv[:2] == ["volume", "create"] and argv[-1] == volume
         )
-        assert "curietech.ai/managed-by=curie-sandbox-substrate" in _flag_values(created, "--label")
+        expected_labels = {
+            "curietech.ai/managed-by": "curie-sandbox-substrate",
+            "curietech.ai/claim": "claim-remote",
+            "curietech.ai/component": {
+                "/bundles/current": "claim-bundle",
+                "/workspace": "claim-workspace",
+                "/attachments": "claim-attachments",
+            }[target],
+            "curietech.ai/claim-attempt": attempt,
+        }
+        assert (
+            dict(label.split("=", 1) for label in _flag_values(created, "--label"))
+            == expected_labels
+        )
         helper = next(
             argv
             for argv in client.calls
@@ -144,6 +168,10 @@ def test_create_claim_seeds_remote_volumes_before_starting_runner(
             and volume in {source for source, mode in _volume_mounts(argv).values()}
         )
         helper_name = _flag_values(helper, "--name")[0]
+        assert (
+            dict(label.split("=", 1) for label in _flag_values(helper, "--label"))
+            == expected_labels
+        )
         copied = next(
             argv
             for argv in client.calls
@@ -155,12 +183,107 @@ def test_create_claim_seeds_remote_volumes_before_starting_runner(
         assert client.calls.index(copied) < client.calls.index(runner)
 
 
-@pytest.mark.parametrize("failure", ["create", "cp", "run"])
-def test_failed_claim_removes_its_remote_volumes(
+def test_slow_input_seed_survives_orphan_sweep(
     remote_claim_env: dict[str, str],
-    failure: str,
 ) -> None:
-    class _FailedSeedDocker(_RecordingDocker):
+    cutoff = datetime.now(UTC) - timedelta(minutes=1)
+    old = (cutoff - timedelta(hours=1)).isoformat()
+
+    class _SlowSeedDocker(_RecordingDocker):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self.reaped: list[list[str]] = []
+            self.copy_states: list[dict[str, str]] = []
+            self.copy_helpers: list[str] = []
+            self.staged_sources: list[Path] = []
+
+        def _docker(
+            self,
+            args: list[str],
+            *,
+            request_timeout_seconds: float,
+            check: bool = True,
+        ) -> str:
+            if args[0] == "cp":
+                self.copy_helpers.append(args[-1].partition(":")[0])
+                self.staged_sources.append(Path(args[-2]))
+                self.copy_states.append(dict(self.container_status))
+                for volume in self.volumes:
+                    self.volume_created_at[volume] = old
+                observed = self.list_claims(
+                    label_selector="curietech.ai/managed-by=curie-sandbox-substrate"
+                )
+                self.reaped.append(
+                    self.reap_claim_templates(
+                        keep={claim.name for claim in observed}, created_before=cutoff
+                    )
+                )
+            return super()._docker(
+                args,
+                request_timeout_seconds=request_timeout_seconds,
+                check=check,
+            )
+
+    client = _SlowSeedDocker(
+        image="curie-runner",
+        bundle_store=_FakeBundleStore(_plugin_tar_gz(wrapper=None)),
+    )
+    error: DockerError | None = None
+    try:
+        try:
+            client.create_claim("claim-slow", pool="pool", env=remote_claim_env)
+        except DockerError as exc:
+            error = exc
+
+        assert client.reaped == [[], [], []], "a live seed attempt was swept as an old orphan"
+        assert error is None, f"the slow seed failed after reaping: {error}"
+        for helper, states in zip(client.copy_helpers, client.copy_states, strict=True):
+            assert states["claim-slow"] == "created"
+            assert states[helper] == "created"
+        assert set(client.containers) == {"claim-slow"}
+        assert client.container_status["claim-slow"] == "running"
+        assert client.started_containers.count("claim-slow") == 1
+        assert client.auto_created_volumes == []
+        mounts = client.container_mounts["claim-slow"]
+        assert set(mounts) == {"/bundles/current", "/workspace", "/attachments"}
+        expected = {
+            "/bundles/current": {
+                ".claude-plugin/plugin.json": b'{"name": "deal-desk", "version": "0.1.0"}'
+            },
+            "/workspace": {"README.md": b"workspace seed\n"},
+            "/attachments": {"report.txt": b"attachment seed\n"},
+        }
+        for target, (volume, mode) in mounts.items():
+            assert client.volume_files[volume] == expected[target]
+            assert client.volumes[volume]["curietech.ai/claim-attempt"] == client.containers[
+                "claim-slow"
+            ]["curietech.ai/claim-attempt"]
+        assert all(not source.exists() for source in client.staged_sources)
+    finally:
+        client.delete_claim("claim-slow", request_timeout_seconds=1.0)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing",
+        "curietech.ai/managed-by",
+        "curietech.ai/claim",
+        "curietech.ai/claim-attempt",
+        "curietech.ai/component",
+        "curietech.ai/stack",
+    ],
+)
+def test_damaged_input_volume_cannot_start_runner(
+    remote_claim_env: dict[str, str],
+    damage: str,
+) -> None:
+    class _DamagedInputDocker(_RecordingDocker):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)
+            self.copies = 0
+            self.damaged_volume: str | None = None
+
         def _docker(
             self,
             args: list[str],
@@ -173,7 +296,86 @@ def test_failed_claim_removes_its_remote_volumes(
                 request_timeout_seconds=request_timeout_seconds,
                 check=check,
             )
-            if args[0] == failure:
+            if args[0] == "cp":
+                self.copies += 1
+                if self.copies == 3:
+                    helper, _, target = args[-1].partition(":")
+                    volume, mode = self.container_mounts[helper][target]
+                    self.damaged_volume = volume
+                    if damage == "missing":
+                        self.volumes.pop(volume)
+                        self.volume_created_at.pop(volume)
+                        self.volume_files.pop(volume)
+                    else:
+                        self.volumes[volume] = {**self.volumes[volume], damage: "another-owner"}
+            return result
+
+    client = _DamagedInputDocker(
+        image="curie-runner",
+        network="seed-stack",
+        bundle_store=_FakeBundleStore(_plugin_tar_gz(wrapper=None)),
+    )
+    try:
+        with pytest.raises(DockerError):
+            client.create_claim("claim-damaged", pool="pool", env=remote_claim_env)
+
+        assert client.damaged_volume is not None, "the damaged-volume path was not reached"
+        assert "claim-damaged" not in client.started_containers
+        assert "claim-damaged" not in client.containers
+        assert client.auto_created_volumes == [], "a missing input was recreated without ownership"
+    finally:
+        client.delete_claim("claim-damaged", request_timeout_seconds=1.0)
+
+
+@pytest.mark.parametrize("invalid_input", ["workspace", "attachments"])
+def test_all_claim_inputs_are_validated_before_any_daemon_call(
+    remote_claim_env: dict[str, str],
+    invalid_input: str,
+) -> None:
+    client = _RecordingDocker(
+        image="curie-runner",
+        bundle_store=_FakeBundleStore(_plugin_tar_gz(wrapper=None)),
+    )
+    env = dict(remote_claim_env)
+    error: type[Exception]
+    if invalid_input == "workspace":
+        env["CURIE_WORKSPACE_SHA256"] = "0" * 64
+        error = WorkspacePreparationError
+    else:
+        env["CURIE_ATTACHMENTS_REF"] = "malformed"
+        error = AttachmentResolutionError
+
+    with pytest.raises(error):
+        client.create_claim("claim-invalid", pool="pool", env=env)
+
+    assert client.calls == []
+    assert client.volumes == {}
+    assert client.containers == {}
+
+
+@pytest.mark.parametrize("winner_exists", [False, True])
+@pytest.mark.parametrize("failure", ["create", "cp", "run"])
+def test_failed_claim_removes_its_remote_volumes(
+    remote_claim_env: dict[str, str],
+    failure: str,
+    winner_exists: bool,
+) -> None:
+    class _FailedSeedDocker(_RecordingDocker):
+        failure_enabled = False
+
+        def _docker(
+            self,
+            args: list[str],
+            *,
+            request_timeout_seconds: float,
+            check: bool = True,
+        ) -> str:
+            result = super()._docker(
+                args,
+                request_timeout_seconds=request_timeout_seconds,
+                check=check,
+            )
+            if self.failure_enabled and args[0] == failure:
                 raise DockerError(f"docker {failure} failed")
             return result
 
@@ -184,14 +386,22 @@ def test_failed_claim_removes_its_remote_volumes(
     client.volumes["unrelated-volume"] = {
         "curietech.ai/managed-by": "another-component",
     }
+    if winner_exists:
+        client.create_claim("claim-remote", pool="pool", env=remote_claim_env)
+    preserved_volumes = dict(client.volumes)
+    preserved_containers = dict(client.containers)
+    first_failure_call = len(client.calls)
+    client.failure_enabled = True
     with pytest.raises(DockerError):
         client.create_claim("claim-remote", pool="pool", env=remote_claim_env)
 
-    created = [argv[-1] for argv in client.calls if argv[:2] == ["volume", "create"]]
+    failure_calls = client.calls[first_failure_call:]
+    created = [argv[-1] for argv in failure_calls if argv[:2] == ["volume", "create"]]
     assert created, "failure cleanup must exercise allocated daemon volumes"
-    assert set(client.volumes) == {"unrelated-volume"}
+    assert client.volumes == preserved_volumes
+    assert client.containers == preserved_containers
     if failure != "run":
-        assert not any(argv[0] == "run" for argv in client.calls)
+        assert not any(argv[0] == "run" for argv in failure_calls)
 
 
 def test_fresh_client_deletes_only_volumes_owned_by_the_exact_claim(
@@ -226,6 +436,189 @@ def test_fresh_client_deletes_only_volumes_owned_by_the_exact_claim(
         for argv in removal_calls
     )
     assert all(0 < timeout <= 1.0 for timeout in client.timeouts)
+
+
+@pytest.mark.parametrize("winner_timing", ["already-running", "during-run"])
+def test_lost_claim_creation_preserves_the_winning_attempt(
+    remote_claim_env: dict[str, str],
+    winner_timing: str,
+) -> None:
+    winner = _RecordingDocker(
+        image="curie-runner",
+        bundle_store=_FakeBundleStore(_plugin_tar_gz(wrapper=None)),
+    )
+
+    class _RacingDocker(_RecordingDocker):
+        def _docker(
+            self,
+            args: list[str],
+            *,
+            request_timeout_seconds: float,
+            check: bool = True,
+        ) -> str:
+            if args[0] == "run" and winner_timing == "during-run":
+                winner.create_claim("claim-race", pool="pool", env=remote_claim_env)
+            return super()._docker(
+                args,
+                request_timeout_seconds=request_timeout_seconds,
+                check=check,
+            )
+
+    loser = _RacingDocker(
+        image="curie-runner",
+        bundle_store=_FakeBundleStore(_plugin_tar_gz(wrapper=None)),
+    )
+    winner.volumes = loser.volumes
+    winner.volume_created_at = loser.volume_created_at
+    winner.containers = loser.containers
+    winner.container_status = loser.container_status
+    winner.container_created_at = loser.container_created_at
+    if winner_timing == "already-running":
+        winner.create_claim("claim-race", pool="pool", env=remote_claim_env)
+
+    with pytest.raises(DockerError, match="already in use"):
+        loser.create_claim("claim-race", pool="pool", env=remote_claim_env)
+
+    winner_attempt = winner.containers["claim-race"]["curietech.ai/claim-attempt"]
+    loser_attempt = dict(
+        label.split("=", 1) for label in _flag_values(loser.runner_argv, "--label")
+    )["curietech.ai/claim-attempt"]
+    assert winner_attempt != loser_attempt
+    assert set(loser.containers) == {"claim-race"}
+    assert loser.container_status["claim-race"] == "running"
+    assert len(loser.volumes) == 3
+    assert all(
+        labels["curietech.ai/claim-attempt"] == winner_attempt
+        for labels in loser.volumes.values()
+    )
+    winner_volumes = {source for source, mode in _volume_mounts(winner.runner_argv).values()}
+    assert set(loser.volumes) == winner_volumes
+    loser_volumes = {source for source, mode in _volume_mounts(loser.runner_argv).values()}
+    assert winner_volumes.isdisjoint(loser_volumes)
+    assert not loser_volumes.intersection(loser.volumes)
+
+
+def test_orphan_input_sweep_preserves_kept_recent_and_other_attempt_resources() -> None:
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    cutoff = datetime(2026, 10, 1, 12, tzinfo=UTC)
+    old = (cutoff - timedelta(seconds=1)).isoformat()
+    recent = (cutoff + timedelta(seconds=1)).isoformat()
+    old_attempt = uuid.uuid4().hex
+
+    def add_input(
+        name: str,
+        claim: str,
+        created: str,
+        *,
+        attempt: str | None = None,
+        component: str = "claim-bundle",
+        managed_by: str = "curie-sandbox-substrate",
+    ) -> None:
+        labels = {
+            "curietech.ai/managed-by": managed_by,
+            "curietech.ai/claim": claim,
+            "curietech.ai/component": component,
+        }
+        if attempt is not None:
+            labels["curietech.ai/claim-attempt"] = attempt
+        label_args = [arg for key, value in labels.items() for arg in ("--label", f"{key}={value}")]
+        client._docker(["volume", "create", *label_args, name], request_timeout_seconds=1.0)
+        client.volume_created_at[name] = created
+        client._docker(
+            ["create", "--name", f"{name}-seed", *label_args, "curie-runner"],
+            request_timeout_seconds=1.0,
+        )
+
+    add_input("orphan-bundle", "claim-orphan", old, attempt=old_attempt)
+    add_input(
+        "orphan-workspace",
+        "claim-orphan",
+        old,
+        attempt=old_attempt,
+        component="claim-workspace",
+    )
+    add_input("same-claim-recent", "claim-orphan", recent, attempt=uuid.uuid4().hex)
+    add_input("kept", "claim-kept", old, attempt=uuid.uuid4().hex)
+    add_input("recent", "claim-recent", recent, attempt=uuid.uuid4().hex)
+    add_input("at-cutoff", "claim-cutoff", cutoff.isoformat(), attempt=uuid.uuid4().hex)
+    add_input("undated", "claim-undated", "", attempt=uuid.uuid4().hex)
+    add_input("malformed-date", "claim-malformed", "invalid", attempt=uuid.uuid4().hex)
+    add_input("no-attempt", "claim-no-attempt", old)
+    add_input(
+        "unmanaged",
+        "claim-unmanaged",
+        old,
+        attempt=uuid.uuid4().hex,
+        managed_by="another-component",
+    )
+    add_input(
+        "other-component",
+        "claim-other-component",
+        old,
+        attempt=uuid.uuid4().hex,
+        component="another-component",
+    )
+    client._docker(
+        [
+            "run",
+            "--name",
+            "claim-orphan",
+            "--label",
+            "curietech.ai/managed-by=curie-sandbox-substrate",
+            "--label",
+            "curietech.ai/claim=claim-orphan",
+            "--label",
+            "curietech.ai/component=claim-runner",
+            "--label",
+            f"curietech.ai/claim-attempt={uuid.uuid4().hex}",
+            "curie-runner",
+        ],
+        request_timeout_seconds=1.0,
+    )
+    removed_names = {"orphan-bundle", "orphan-workspace"}
+    preserved_volumes = {
+        name: labels for name, labels in client.volumes.items() if name not in removed_names
+    }
+    removed_helpers = {f"{name}-seed" for name in removed_names}
+    preserved_containers = {
+        name: labels for name, labels in client.containers.items() if name not in removed_helpers
+    }
+
+    removed = client.reap_claim_templates(keep={"claim-kept"}, created_before=cutoff)
+
+    assert removed == ["claim-orphan"]
+    assert client.volumes == preserved_volumes
+    assert client.containers == preserved_containers
+    assert client.reap_claim_templates(keep={"claim-kept"}, created_before=cutoff) == []
+
+
+@pytest.mark.parametrize("component", ["claim-bundle", "claim-workspace", "claim-attachments"])
+def test_input_copy_helpers_are_excluded_from_claim_views(component: str) -> None:
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    attempt = uuid.uuid4().hex
+    for name, resource_component in (("claim-view", "claim-runner"), ("copy-helper", component)):
+        client._docker(
+            [
+                "create",
+                "--name",
+                name,
+                "--label",
+                "curietech.ai/managed-by=curie-sandbox-substrate",
+                "--label",
+                "curietech.ai/claim=claim-view",
+                "--label",
+                f"curietech.ai/component={resource_component}",
+                "--label",
+                f"curietech.ai/claim-attempt={attempt}",
+                "curie-runner",
+            ],
+            request_timeout_seconds=1.0,
+        )
+
+    assert client.get_claim("copy-helper", request_timeout_seconds=1.0) is None
+    claims = client.list_claims(label_selector="curietech.ai/managed-by=curie-sandbox-substrate")
+    assert [claim.name for claim in claims] == ["claim-view"]
+    assert not claims[0].ready
 
 
 def test_docker_cannot_prove_kubernetes_quota_headroom() -> None:

@@ -403,6 +403,7 @@ def _refused(client: _RecordingDocker, env: dict[str, str], *, because: str) -> 
     try:
         client.create_claim("claim-attachments", pool="pool", env=env)
     except AttachmentResolutionError as exc:
+        assert client.calls == [], "invalid attachments must be rejected before any Docker call"
         return exc
     pytest.fail(
         f"the docker driver accepted {because}. The chart's attachments-init "
@@ -446,7 +447,18 @@ def test_a_turn_with_no_attachments_produces_todays_container_spec_exactly(
     client = _client()
     client.create_claim("claim-plain", pool="pool", env={**_BASE_ENV, **extra})
 
-    assert client.runner_argv == baseline.runner_argv
+    attempt_prefix = "curietech.ai/claim-attempt="
+    attempts = [
+        [label for label in _flag_values(argv, "--label") if label.startswith(attempt_prefix)]
+        for argv in (baseline.runner_argv, client.runner_argv)
+    ]
+    assert all(len(labels) == 1 and labels[0] != attempt_prefix for labels in attempts)
+    assert attempts[0] != attempts[1]
+    normalized = [
+        [attempt_prefix + "<attempt>" if arg == labels[0] else arg for arg in argv]
+        for argv, labels in zip((baseline.runner_argv, client.runner_argv), attempts, strict=True)
+    ]
+    assert normalized[0] == normalized[1]
     assert _flag_values(client.runner_argv, "-v") == []
     assert staged == []
     assert objects.requested == []
