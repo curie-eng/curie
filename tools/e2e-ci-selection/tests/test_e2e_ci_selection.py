@@ -293,6 +293,7 @@ def _expected_output(
     *selected: str,
     pytest_needed: bool = True,
     pytest_deselect: str = "",
+    pytest_scope: str = "full",
     images_needed: bool = False,
     cli_release_needed: bool = False,
     released_upgrade_full: bool = False,
@@ -309,6 +310,7 @@ def _expected_output(
     lines.append(f"skill_local_tiers={skill_local}")
     lines.append(f"pytest={'true' if pytest_needed else 'false'}")
     lines.append(f"pytest_deselect={pytest_deselect}")
+    lines.append(f"pytest_scope={pytest_scope}")
     lines.append(f"images={'true' if images_needed else 'false'}")
     lines.append(f"cli_release={'true' if cli_release_needed else 'false'}")
     lines.append(f"released_upgrade_full={'true' if released_upgrade_full else 'false'}")
@@ -337,6 +339,14 @@ def _assert_selection(
         *selected,
         pytest_needed=pytest_needed,
         pytest_deselect=_expected_conditional_deselect(path, pytest_needed=pytest_needed),
+        pytest_scope=(
+            "cli"
+            if pytest_needed
+            and path.startswith("cli/")
+            and not path.startswith("cli/scripts/")
+            and (not path.endswith(".py") or path.startswith("cli/tests/"))
+            else "full"
+        ),
         images_needed=_path_needs_images(path) if images_needed is None else images_needed,
         cli_release_needed=(
             _path_needs_cli_release(path) if cli_release_needed is None else cli_release_needed
@@ -1418,6 +1428,12 @@ def test_revision_mode_without_a_cargo_manifest_is_not_version_only(
 VALID_REGISTRY = """
 version: 1
 fallback: [skill, local, local-release, cluster]
+pytest_scopes:
+  cli:
+    prefixes: [cli]
+    excluded_prefixes: [cli/scripts]
+    python_prefixes: [cli/tests]
+    test_files: tools/e2e-ci-selection/cli_pytest_files.txt
 conditional_pytest_files: {}
 rules:
   exact:
@@ -1614,6 +1630,7 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         # #3858: python-pytest and rust-select read these two.
         "pytest": "${{ steps.filter.outputs.pytest }}",
         "pytest_deselect": "${{ steps.filter.outputs.pytest_deselect }}",
+        "pytest_scope": "${{ steps.filter.outputs.pytest_scope }}",
         "version_only": "${{ steps.filter.outputs.version_only }}",
         "factory": "${{ steps.filter.outputs.factory }}",
         "approval_resume": "${{ steps.filter.outputs.approval_resume }}",

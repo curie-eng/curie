@@ -266,6 +266,7 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
           PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
+          PYTEST_SCOPE: ${{ steps.python-runtime.outputs.pytest_scope }}
         run: |
           pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/3" --reruns 1 -rsR --durations=25)
           if [[ -n "$PYTEST_DESELECT" ]]; then
@@ -274,6 +275,11 @@ jobs:
               pytest_args+=(--deselect "$path")
             done
           fi
+          if [[ "$PYTEST_SCOPE" == "cli" ]]; then
+            mapfile -t cli_pytest_files < tools/e2e-ci-selection/cli_pytest_files.txt
+            pytest_args+=("${cli_pytest_files[@]}")
+          fi
+          unset PYTEST_SCOPE
           uv run pytest "${pytest_args[@]}"
       # Record what this shard decided and did, for the required job to check.
       # Written on every outcome, so a failed shard still reports.
@@ -285,11 +291,12 @@ jobs:
           PYTEST_RESULT: ${{ steps.pytest.outcome }}
           STACK_RESULT: ${{ steps.dev-stack.outcome }}
           PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
+          PYTEST_SCOPE: ${{ steps.python-runtime.outputs.pytest_scope }}
         run: |
           mkdir -p shard-result
-          printf 'shard=%s selected=%s pytest=%s stack=%s deselect=%s\n' \
+          printf 'shard=%s selected=%s pytest=%s stack=%s deselect=%s scope=%s\n' \
             "$SHARD" "${PYTEST_SELECTED:-}" "${PYTEST_RESULT:-}" "${STACK_RESULT:-}" \
-            "${PYTEST_DESELECT:-}" \
+            "${PYTEST_DESELECT:-}" "$PYTEST_SCOPE" \
             > "shard-result/shard-${SHARD}.txt"
           cat "shard-result/shard-${SHARD}.txt"
       - name: Upload shard result
@@ -519,10 +526,12 @@ jobs:
         env:
           PYTEST_SELECTED: ${{ steps.python-runtime.outputs.pytest }}
           PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
+          PYTEST_SCOPE: ${{ steps.python-runtime.outputs.pytest_scope }}
           SHARDS_RESULT: ${{ needs.python-pytest.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           CHANGES_PYTEST: ${{ needs.changes.outputs.pytest }}
           CHANGES_DESELECT: ${{ needs.changes.outputs.pytest_deselect }}
+          CHANGES_SCOPE: ${{ needs.changes.outputs.pytest_scope }}
           SHARD_COUNT: "3"
           SHARD_RESULTS_DIR: shard-results
         run: |
@@ -537,6 +546,10 @@ jobs:
           fi
           if [[ "$CHANGES_DESELECT" != "$PYTEST_DESELECT" ]]; then
             echo "changes job selected deselect=${CHANGES_DESELECT:-<empty>}, but this job selected ${PYTEST_DESELECT:-<empty>}" >&2
+            exit 1
+          fi
+          if [[ "$CHANGES_SCOPE" != "$PYTEST_SCOPE" ]]; then
+            echo "changes job selected scope=${CHANGES_SCOPE:-<empty>}, but this job selected ${PYTEST_SCOPE:-<empty>}" >&2
             exit 1
           fi
           if [[ "$PYTEST_SELECTED" == "false" ]]; then
@@ -567,7 +580,7 @@ jobs:
               echo "pytest shard $shard reported no result" >&2
               exit 1
             fi
-            want="shard=$shard selected=$PYTEST_SELECTED pytest=$expected stack=$expected deselect=$PYTEST_DESELECT"
+            want="shard=$shard selected=$PYTEST_SELECTED pytest=$expected stack=$expected deselect=$PYTEST_DESELECT scope=$PYTEST_SCOPE"
             got="$(cat "$record")"
             if [[ "$got" != "$want" ]]; then
               echo "pytest shard $shard: expected '$want', got '$got'" >&2
@@ -2380,6 +2393,7 @@ jobs:
       cli_release: ${{ steps.filter.outputs.cli_release }}
       pytest: ${{ steps.filter.outputs.pytest }}
       pytest_deselect: ${{ steps.filter.outputs.pytest_deselect }}
+      pytest_scope: ${{ steps.filter.outputs.pytest_scope }}
       version_only: ${{ steps.filter.outputs.version_only }}
       factory: ${{ steps.filter.outputs.factory }}
       approval_resume: ${{ steps.filter.outputs.approval_resume }}
