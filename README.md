@@ -103,6 +103,24 @@ App registration link. Open that link, create the App, generate its private key,
 and install it on the selected repository. Note the App ID and the absolute
 path of the downloaded key file.
 
+On Apple Silicon, an older released chart can stop here with an AVX preflight
+error. ARM64 does not use x86 AVX. Recover only that architecture-specific
+failure in this trial cluster, then rerun the quickstart command using the
+same variables. Do not repeat the cluster-name or kubeconfig initialization:
+
+```bash
+KUBECONFIG="$CURIE_FACTORY_KUBECONFIG" curie cluster up \
+  --context "kind-$CURIE_FACTORY_CLUSTER" --model "$CURIE_MODEL" \
+  --set preflights.avxCheck.enabled=false
+KUBECONFIG="$CURIE_FACTORY_KUBECONFIG" curie factory quickstart \
+  --repo "$CURIE_FACTORY_REPO" --kind-name "$CURIE_FACTORY_CLUSTER" \
+  --model "$CURIE_MODEL"
+```
+
+The current source chart detects native ARM64 with the preflight enabled.
+Keep the check enabled on x86. See the
+[ARM recovery details](docs/guides/dark-factory-quickstart.md#apple-silicon-recovery-for-older-charts).
+
 **2. Complete the setup with your App.**
 
 ```bash

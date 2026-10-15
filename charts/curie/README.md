@@ -7,7 +7,7 @@ toggles, the three preflights) plus the security rails as chart defaults.
 
 The chart is a direct port of the proven `compose.dev.yaml` dev stack: same
 images and the same headless-bootstrapped Langfuse dev project. The chart
-ClickHouse default is `:25.12.11.4` (AVX required, coupled to
+ClickHouse default is `:25.12.11.4` (AVX required on x86, coupled to
 `langfuse.image.tag`) while compose stays on `:24.8.14.39` so an SSE4.2-only
 developer host can still boot the local stack; both sides name a patch build
 rather than a moving `25.12` / `24.8` alias (#2319). Rather than vendoring the upstream Langfuse chart and its
@@ -529,7 +529,7 @@ pipeline and environment are applied on `helm upgrade`.
 | Langfuse web + worker | `langfuse/langfuse:3.225.5`, `langfuse/langfuse-worker:3.225.5` | Observability + eval backbone. Headless-bootstrapped dev org/project. Web and worker stay on one reviewed migration set; do not replace the version with floating `:3`. Both Deployments use Recreate, so a Langfuse image change is a brief outage while boot migrations run. |
 | Postgres | `postgres:16.15-alpine@sha256:cf78e766...` | Langfuse transactional store + app state. StatefulSet. Digest-pinned: PostgreSQL's version is two components, and `postgres.podSecurityContext.fsGroup` (70) is the `postgres` gid read out of those exact bytes. |
 | Valkey | `valkey/valkey:8.1.10-alpine` | Langfuse cache/queue + dispatcher Streams queue. Same pin as `compose.dev.yaml` and the CI rust job's Valkey service. |
-| ClickHouse | `clickhouse/clickhouse-server:25.12.11.4` | Langfuse OLAP store. Coupled to `langfuse.image.tag` 3.225.5; chart default requires AVX (see preflight). `compose.dev.yaml` deliberately stays on the SSE4.2-safe `24.8.14.39`. |
+| ClickHouse | `clickhouse/clickhouse-server:25.12.11.4` | Langfuse OLAP store. Coupled to `langfuse.image.tag` 3.225.5; chart default requires AVX on x86 (see preflight). Native ARM64 does not require x86 AVX. `compose.dev.yaml` deliberately stays on the SSE4.2-safe `24.8.14.39`. |
 | RustFS | `rustfs/rustfs:1.0.0-beta.12` plus `amazon/aws-cli:2.32.6` init | Langfuse object storage; BYO real S3 in prod. |
 | OTel Collector | `otel/opentelemetry-collector-contrib:0.119.0` | Bounded OTLP gateway (gRPC+HTTP), durable queue by default; traces -> Langfuse over HTTP, logs/metrics -> configured exporters. |
 | Mail adapter | `ghcr.io/curie-eng/curie-mail-adapter` | Off by default. One `Recreate` replica with durable SQLite on single-writer storage; no platform key/database credential or ServiceAccount token. The only first-party workload with its own egress NetworkPolicy, so its OTLP export needs an explicit peer (see below). |
@@ -1151,17 +1151,18 @@ All three are re-runnable via that same `helm test` command.
 **(a) CPU-AVX / ClickHouse-pin check** (`preflights.avxCheck`). A pre-install /
 pre-upgrade hook Job.
 
-- ClickHouse >= 25.x is compiled for AVX and SIGILLs with exit 132 on
-  SSE4.2-only CPUs -- a crash-looping pod is a confusing way to learn that.
-- Chart defaults require AVX: `clickhouse.image.tag` is `25.12.11.4` because
+- The x86 build of ClickHouse >= 25.x requires AVX and SIGILLs with exit 132 on
+  SSE4.2-only x86 CPUs. The native ARM64 build does not require x86 AVX.
+- Chart defaults require AVX on x86: `clickhouse.image.tag` is `25.12.11.4` because
   `langfuse.image.tag` 3.225.5's migration set from 39 onward cannot apply on
   24.8, and the 25.12 line is not in `clickhouse.sse42SafeTags`.
-- The Job reads the node's `/proc/cpuinfo`; if the node lacks AVX it FAILS
+- The default-on Job first detects the architecture. Native ARM64 passes;
+  unsupported architectures fail. On x86, it reads `/proc/cpuinfo`; if the node lacks AVX it FAILS
   the install unless the operator pins a tag in `clickhouse.sse42SafeTags`
   (`24.8`, `24.3`, `23.8`). That override cannot apply the current Langfuse
   migration set. Skipped when `clickhouse.deploy: false`.
-- Test knob `preflights.avxCheck.forceNoAvx: true` exercises the AVX-required
-  failure branch on an AVX-capable node when the default tag is set.
+- Test knob `preflights.avxCheck.forceNoAvx: true` simulates an x86 node without
+  AVX on either supported architecture, exercising the failure branch for the default tag.
 - Read the verdict: `kubectl logs -n <ns> job/<release>-preflight-avx`.
 
 **(b) NetworkPolicy-enforcement probe** (`preflights.networkPolicyProbe`). A

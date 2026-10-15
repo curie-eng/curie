@@ -198,6 +198,26 @@ Issues, Pull requests, Checks, Commit statuses, and Actions. Then:
 3. Under **Install App**, install it on the trial repository. This is a click
    in the website. The command does not install the App for you.
 
+### Apple Silicon recovery for older charts
+
+The current source chart detects native ARM64 and leaves the preflight enabled.
+Older released charts can reject ARM64 because they check an x86-only AVX flag.
+If the first quickstart command stops with that specific preflight failure on
+an ARM64 node, keep the same Bash session and trial kubeconfig, then run:
+
+```bash
+curie cluster up --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" \
+  --set preflights.avxCheck.enabled=false
+```
+
+Rerun the first quickstart command after the installation succeeds to obtain
+the App registration link. This recovery is only for the older architecture
+check on ARM64. On x86, keep the AVX check enabled; the pinned x86 ClickHouse
+build requires it. Do not downgrade ClickHouse separately from Langfuse.
+For the README recipe, use its `CURIE_FACTORY_KUBECONFIG` and explicit
+`kind-$CURIE_FACTORY_CLUSTER` context as shown there.
+
 ## Rerun with the App
 
 Run each prompt separately and answer it before copying the next block.
