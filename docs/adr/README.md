@@ -158,7 +158,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0126 | [Runtime repository selection is sticky authorized thread state](0126-runtime-repository-selection-is-sticky-authorized-thread-state.md) | Accepted |
 | 0127 | [An inbound ACP client admits any ACP harness behind the harness port](0127-an-inbound-acp-client-admits-any-acp-harness.md) | Draft |
 | 0128 | [An installation owns the model gateway and operator bindings select its aliases](0128-install-owned-model-gateway-and-agent-aliases.md) | Draft |
-| 0129 | [One release owns a cluster's shared singletons; every other release declares what it needs from them](0129-one-release-owns-a-clusters-shared-singletons.md) | Draft |
+| 0129 | [One release owns a cluster's shared singletons; every other release declares what it needs from them](0129-one-release-owns-a-clusters-shared-singletons.md) | Accepted |
 | 0130 | [Deliberate progress is bounded durable channel state, not answer streaming](0130-deliberate-progress-is-bounded-durable-channel-state.md) | Accepted |
 | 0131 | [A delivery has one deadline and one renewable fenced owner](0131-a-delivery-has-one-deadline-and-one-renewable-fenced-owner.md) | Accepted |
 | 0132 | [Gate evals on the worst cohort and require cross-family verifiers](0132-worst-cohort-eval-gates-and-cross-family-verifiers.md) | Draft |
@@ -244,5 +244,6 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0220 | [One identity provider decides who may invoke and approve, on every channel](0220-one-identity-provider-decides-who-may-invoke-and-approve-on-every-channel.md) | Accepted |
 | 0221 | [Cluster up reads the gVisor RuntimeClass for a fake-model install](0221-cluster-up-reads-the-gvisor-runtimeclass-for-a-fake-model-install.md) | Accepted |
 | 0224 | [Protected runtime commissioning precedes installation acceptance](0224-protected-runtime-commissioning-precedes-installation-acceptance.md) | Accepted |
+| 0231 | [Remediation policy bind and arm need an authority the platform key cannot derive](0231-remediation-policy-bind-and-arm-need-an-authority-the-platform-key-cannot-derive.md) | Draft |
 | 0232 | [A contract migration ships one release after the code stops using what it drops](0232-a-contract-migration-ships-one-release-after-the-code-stops-using-what-it-drops.md) | Draft |
 <!-- END GENERATED: adr-index -->

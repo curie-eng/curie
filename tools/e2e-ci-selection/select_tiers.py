@@ -121,6 +121,14 @@ class ChartScenarios:
 
 
 @dataclass(frozen=True)
+class PytestScope:
+    prefixes: tuple[str, ...]
+    excluded_prefixes: tuple[str, ...]
+    python_prefixes: tuple[str, ...]
+    test_files: str
+
+
+@dataclass(frozen=True)
 class Registry:
     fallback: tuple[str, ...]
     exact: dict[str, tuple[str, ...]]
@@ -129,6 +137,7 @@ class Registry:
     ignored_prefixes: tuple[str, ...]
     chart_scenarios: ChartScenarios
     conditional_pytest_files: dict[str, tuple[str, ...]]
+    pytest_scopes: dict[str, PytestScope]
 
 
 def _mapping(value: object, label: str) -> dict[str, object]:
@@ -204,6 +213,68 @@ def _chart_registry(value: object) -> ChartScenarios:
         step_names.add(step)
         scenarios[scenario_id] = ChartScenario(step, _inputs(entry["inputs"], f"{label}.inputs"))
     return ChartScenarios(CHART_JOB, shared_inputs, scenarios)
+
+
+def _scope_path(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
+        raise RegistryError(
+            f"{label} must be a repository-relative path without slashes at either end"
+        )
+    return value
+
+
+def _scope_prefixes(value: object, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        raise RegistryError(f"{label} must be a nonempty list of valid paths")
+    return tuple(_scope_path(path, label) for path in value)
+
+
+def _pytest_scopes(value: object) -> dict[str, PytestScope]:
+    scopes = _mapping(value, "pytest_scopes")
+    if set(scopes) != {"cli"}:
+        raise RegistryError("pytest_scopes must define exactly the cli scope")
+    label = "pytest_scopes.cli"
+    scope = _mapping(scopes["cli"], label)
+    if set(scope) != {"prefixes", "excluded_prefixes", "python_prefixes", "test_files"}:
+        raise RegistryError(
+            f"{label} must define prefixes, excluded_prefixes, python_prefixes, and test_files"
+        )
+    prefixes = _scope_prefixes(scope["prefixes"], f"{label}.prefixes")
+    excluded_prefixes = _scope_prefixes(scope["excluded_prefixes"], f"{label}.excluded_prefixes")
+    python_prefixes = _scope_prefixes(scope["python_prefixes"], f"{label}.python_prefixes")
+    test_files = _scope_path(scope["test_files"], f"{label}.test_files")
+    try:
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "-z", "--", test_files],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split("\0")
+        if test_files not in tracked:
+            raise RegistryError(f"{label}.test_files must name a tracked file: {test_files}")
+        (REPO_ROOT / test_files).read_text(encoding="utf-8")
+    except (OSError, UnicodeError, subprocess.CalledProcessError) as exc:
+        raise RegistryError(
+            f"{label}.test_files must name a readable tracked file: {test_files}"
+        ) from exc
+    return {"cli": PytestScope(prefixes, excluded_prefixes, python_prefixes, test_files)}
+
+
+def _matches_pytest_scope(scope: PytestScope, path: str) -> bool:
+    return (
+        any(path.startswith(f"{prefix}/") for prefix in scope.prefixes)
+        and not any(path.startswith(f"{prefix}/") for prefix in scope.excluded_prefixes)
+        and (
+            not path.endswith(".py")
+            or any(path.startswith(f"{prefix}/") for prefix in scope.python_prefixes)
+        )
+    )
 
 
 # Fail-closed pytest set. Ignore rules may skip compose+pytest, but never
@@ -360,6 +431,7 @@ def _load_registry(path: Path) -> Registry:
         tuple(ignored_prefixes),
         chart_scenarios,
         conditional_pytest_files,
+        _pytest_scopes(root.get("pytest_scopes")),
     )
 
 
@@ -646,6 +718,7 @@ def _render(
     selected: set[str],
     pytest_needed: bool,
     pytest_deselect: list[str],
+    pytest_scope: str,
     images_needed: bool,
     cli_release_needed: bool,
     released_upgrade_full: bool,
@@ -659,6 +732,7 @@ def _render(
     lines.append(f"skill_local_tiers={skill_local}")
     lines.append(f"pytest={'true' if pytest_needed else 'false'}")
     lines.append("pytest_deselect=" + ",".join(pytest_deselect))
+    lines.append(f"pytest_scope={pytest_scope}")
     lines.append(f"images={'true' if images_needed else 'false'}")
     lines.append(f"cli_release={'true' if cli_release_needed else 'false'}")
     lines.append(
@@ -767,6 +841,12 @@ def _run() -> None:
             )
         )
 
+    pytest_scope = "full"
+    if not args.push and paths and pytest_needed and all(
+        _matches_pytest_scope(registry.pytest_scopes["cli"], path) for path in paths
+    ):
+        pytest_scope = "cli"
+
     # Ordinary pull requests run one upgrade matrix smoke shard. A change to
     # the upgrade jobs themselves runs the full matrix and released chart jobs
     # before merge, as do pushes and dispatches (the nightly).
@@ -787,6 +867,7 @@ def _run() -> None:
                 selected,
                 pytest_needed,
                 pytest_deselect,
+                pytest_scope,
                 images_needed,
                 cli_release_needed,
                 released_upgrade_full,
