@@ -189,6 +189,68 @@
       "title": "ConnectorLockFile",
       "type": "object"
     },
+    "ConnectorResourceQuantities": {
+      "additionalProperties": false,
+      "description": "CPU and memory for one side (``requests`` or ``limits``) of ``resources``.\n\nStrings, as Kubernetes writes them (``100m``, ``1Gi``). A key left out keeps\nthe server container's default for that key.",
+      "properties": {
+        "cpu": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cpu"
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Memory"
+        }
+      },
+      "title": "ConnectorResourceQuantities",
+      "type": "object"
+    },
+    "ConnectorResources": {
+      "additionalProperties": false,
+      "description": "A hosted connector's server-container ``resources``, merged per key.\n\nEach declared value replaces only its own key in\n``DEFAULT_SERVER_RESOURCES``, so ``limits: {memory: 1Gi}`` keeps the other\nthree defaults. The caller proxy's resources are not configurable here.",
+      "properties": {
+        "limits": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConnectorResourceQuantities"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "requests": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConnectorResourceQuantities"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "ConnectorResources",
+      "type": "object"
+    },
     "ConnectorSpec": {
       "additionalProperties": false,
       "description": "One declared connector. Exactly one of ``image``, ``build`` or ``url``.\n\nStrict, unlike the rest of this package. The leniency mandate exists because\nreal Claude Code plugin bundles carry keys this MVP does not model, and\nrejecting them would reject valid bundles. ``connectors.yaml`` is not a\nClaude Code artifact -- it is Curie's own file with no external producer, so\nan unrecognised key is a typo, and silently ignoring it would mean a\nconnector that renders subtly wrong with no diagnostic.",
@@ -287,6 +349,29 @@
           ],
           "default": null,
           "title": "Proxy Upstream Host"
+        },
+        "readiness_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Readiness Path"
+        },
+        "resources": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConnectorResources"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "sealed_secrets": {
           "additionalProperties": {
