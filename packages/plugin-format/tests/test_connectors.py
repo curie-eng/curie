@@ -1248,7 +1248,7 @@ def test_a_remote_connector_cannot_declare_config() -> None:
 
 # --------------------------------------------------------------------------- #
 # `proxy_upstream_host`: the Host the caller proxy presents on admitted
-# requests (Draft ADR 0229)
+# requests (ADR 0229)
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "127.8.9.10", "::1"])
 def test_a_hosted_connector_may_declare_a_loopback_upstream_host(host: str) -> None:

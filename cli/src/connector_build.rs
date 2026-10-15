@@ -96,8 +96,8 @@ pub struct ConnectorSpecDecl {
     /// `plugin_format.validate_connectors` owns the rules.
     #[serde(default)]
     pub admits: Option<Vec<String>>,
-    /// The Host the caller proxy presents on admitted requests (Draft ADR
-    /// 0229). Carried as written; `plugin_format.validate_connectors` owns the
+    /// The Host the caller proxy presents on admitted requests (ADR 0229).
+    /// Carried as written; `plugin_format.validate_connectors` owns the
     /// loopback rule.
     #[serde(default)]
     pub proxy_upstream_host: Option<String>,

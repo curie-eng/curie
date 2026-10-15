@@ -115,7 +115,7 @@ class ConnectorBuild(BaseModel):
 
 
 def is_loopback_upstream_host(text: str) -> bool:
-    """Whether ``text`` may be ``proxy_upstream_host`` (Draft ADR 0229).
+    """Whether ``text`` may be ``proxy_upstream_host`` (ADR 0229).
 
     ``localhost`` or a loopback address in its canonical spelling, with no port
     or brackets. The proxy forwards to loopback only, so a loopback Host is the
@@ -177,7 +177,7 @@ class ConnectorSpec(BaseModel):
     admits: list[str] | None = None
 
     # The Host the caller proxy presents to the server on requests it has
-    # admitted (Draft ADR 0229). None forwards the caller's Host, which an
+    # admitted (ADR 0229). None forwards the caller's Host, which an
     # allowed-hosts server needs. A loopback host is for a server that refuses
     # a non-loopback Host on a loopback connection, as the proxy's forward is.
     # Rendered into the proxy alone; direct requests keep their own Host.

@@ -249,7 +249,7 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # sandbox, and nothing here reaches a boot env.
         "CURIE_CALLER_PROXY_PORT",
         "CURIE_CALLER_PROXY_UPSTREAM_PORT",
-        # Draft ADR 0229: the Host the proxy presents on admitted requests.
+        # ADR 0229: the Host the proxy presents on admitted requests.
         "CURIE_CALLER_PROXY_UPSTREAM_HOST",
         "CURIE_CALLER_PROXY_PUBLIC_KEYS",
         "CURIE_CALLER_PROXY_ADMITS",

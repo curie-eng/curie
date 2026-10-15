@@ -1,4 +1,4 @@
-"""The Host the caller proxy presents upstream (Draft ADR 0229).
+"""The Host the caller proxy presents upstream (ADR 0229).
 
 Driven over real sockets against a stand-in server that applies the MCP Go SDK
 rule the pinned kubernetes-mcp-server enforces: on a connection that arrived

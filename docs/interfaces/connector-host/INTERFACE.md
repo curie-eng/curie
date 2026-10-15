@@ -189,7 +189,7 @@ that passes the grant check below. It strips the header and forwards the
 request to the server over loopback with its `Host` unchanged and its body as
 sent
 (`apps/worker/src/curie_connector_proxy/server.py::make_app`). A connector that
-declares `proxy_upstream_host` (Draft ADR 0229) gets that loopback host and the
+declares `proxy_upstream_host` (ADR 0229) gets that loopback host and the
 server's port as `Host` instead, on admitted requests only
 (`apps/worker/src/curie_connector_proxy/server.py::ProxyConfig`). It is for a
 server that refuses a non-loopback `Host` on a loopback connection. A refused

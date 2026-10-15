@@ -220,7 +220,7 @@ class ProxyConfig:
     gated_tools: tuple[str, ...] = ()
     connector: str = ""
     grant_store: _GrantSpender | None = None
-    # Draft ADR 0229: the Host presented on admitted requests. None forwards
+    # ADR 0229: the Host presented on admitted requests. None forwards
     # the caller's Host unchanged.
     upstream_host: str | None = None
 
@@ -488,7 +488,7 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
         encoded=True,
     )
     forwarded = _forwardable(request.headers)
-    # Draft ADR 0229. Only here, after every admission check: a refused request
+    # ADR 0229. Only here, after every admission check: a refused request
     # has already been answered, so the declared Host vouches only for callers
     # the proxy verified.
     if config.upstream_host is not None:

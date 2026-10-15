@@ -682,7 +682,7 @@ def _proxy_container(
         )
     if grant_store_url:
         env.append({"name": "CURIE_CALLER_PROXY_GRANT_STORE", "value": grant_store_url})
-    # Draft ADR 0229: the Host presented on admitted requests only. The server
+    # ADR 0229: the Host presented on admitted requests only. The server
     # and both Services render unchanged, so a direct caller keeps its Host.
     if spec.proxy_upstream_host is not None:
         env.append(

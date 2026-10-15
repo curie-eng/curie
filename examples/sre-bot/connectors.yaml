@@ -119,7 +119,7 @@ connectors:
     secret_files:
       K8S_KUBECONFIG: /secrets/kubeconfig
     # The Host Curie's caller proxy presents on calls it has admitted (ADR
-    # 0229, Draft). This server refuses any Host but a loopback one on a
+    # 0229). This server refuses any Host but a loopback one on a
     # loopback connection, and the proxy forwards on 127.0.0.1, so without this
     # every proxied call answers `403 invalid Host header`. The pinned release
     # has no allowed-hosts option. Grafana below needs no such line: its
