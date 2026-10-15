@@ -67,6 +67,7 @@ class _RecordingDocker(DockerSandboxClient):
         self.calls: list[list[str]] = []
         self.timeouts: list[float] = []
         self.outputs: dict[str, str] = {}
+        self.copied_files: dict[str, dict[str, bytes]] = {}
 
     def _docker(
         self,
@@ -77,11 +78,37 @@ class _RecordingDocker(DockerSandboxClient):
     ) -> str:
         self.timeouts.append(request_timeout_seconds)
         self.calls.append(args)
+        if args[0] == "cp":
+            source = Path(args[-2])
+            if source.is_dir():
+                self.copied_files[args[-1]] = {
+                    str(path.relative_to(source)): path.read_bytes()
+                    for path in source.rglob("*")
+                    if path.is_file()
+                }
         return self.outputs.get(args[0], "")
 
 
 def _flag_values(argv: list[str], flag: str) -> list[str]:
     return [argv[i + 1] for i, a in enumerate(argv) if a == flag and i + 1 < len(argv)]
+
+
+def _volume_mounts(argv: list[str]) -> dict[str, tuple[str, str]]:
+    mounts: dict[str, tuple[str, str]] = {}
+    for value in _flag_values(argv, "-v") + _flag_values(argv, "--volume"):
+        source, target, *options = value.split(":")
+        assert source and not any(part in source for part in ("/", "\\")), value
+        mounts[target] = (source, "ro" if "ro" in options else "rw")
+    for value in _flag_values(argv, "--mount"):
+        fields = dict(part.partition("=")[::2] for part in value.split(","))
+        assert fields.get("type") == "volume", value
+        source = fields.get("source", fields.get("src", ""))
+        target = fields.get("target", fields.get("dst", fields.get("destination", "")))
+        assert source and target, value
+        assert not any(part in source for part in ("/", "\\")), value
+        readonly = any(key in fields for key in ("readonly", "ro"))
+        mounts[target] = (source, "ro" if readonly else "rw")
+    return mounts
 
 
 @pytest.fixture

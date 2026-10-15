@@ -7,15 +7,19 @@ parsing (port + operating mode) are exercised for real.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import os
 import tarfile
+import time
+import urllib.request
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from curie_worker.attachments import AttachmentRef, encode_attachment_refs
 from curie_worker.bundle_store import extract_bundle
 from curie_worker.sandbox import (
     AffinityStore,
@@ -32,8 +36,9 @@ from curie_worker.sandbox.docker import (
     RunnerHardening,
 )
 from curie_worker.sandbox.types import RouteState
+from curie_worker.workspace import WorkspaceRef
 
-from .conftest import _FakeBundleStore, _flag_values, _RecordingDocker
+from .conftest import _FakeBundleStore, _flag_values, _RecordingDocker, _volume_mounts
 
 
 def _plugin_tar_gz(wrapper: str | None) -> bytes:
@@ -47,6 +52,101 @@ def _plugin_tar_gz(wrapper: str | None) -> bytes:
         info.size = len(manifest)
         tf.addfile(info, io.BytesIO(manifest))
     return buf.getvalue()
+
+
+@pytest.fixture
+def remote_claim_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w:gz") as output:
+        content = b"workspace seed\n"
+        member = tarfile.TarInfo("README.md")
+        member.size = len(content)
+        output.addfile(member, io.BytesIO(content))
+    workspace = archive.getvalue()
+    attachment = b"attachment seed\n"
+    objects = {
+        "https://objects.example.com/workspace": workspace,
+        "https://objects.example.com/attachment": attachment,
+    }
+
+    def open_object(request: Any, **kwargs: Any) -> io.BytesIO:
+        return io.BytesIO(objects[str(request.full_url)])
+
+    def open_attachment(opener: Any, request: Any, **kwargs: Any) -> io.BytesIO:
+        return open_object(request, **kwargs)
+
+    monkeypatch.setattr(urllib.request, "urlopen", open_object)
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", open_attachment)
+    expires = int(time.time()) + 300
+    digest = hashlib.sha256(workspace).hexdigest()
+    return {
+        "CURIE_FAKE_MODEL": "1",
+        "CURIE_BUNDLE_REF": "bundles/b.tar.gz",
+        "CURIE_WORKSPACE_REF": WorkspaceRef(
+            url="https://objects.example.com/workspace",
+            sha256=digest,
+            expires_at_epoch=expires,
+        ).encode(),
+        "CURIE_WORKSPACE_SHA256": digest,
+        "CURIE_ATTACHMENTS_REF": encode_attachment_refs(
+            [
+                AttachmentRef(
+                    name="report.txt",
+                    url="https://objects.example.com/attachment",
+                    sha256=hashlib.sha256(attachment).hexdigest(),
+                    size_bytes=len(attachment),
+                    expires_at_epoch=expires,
+                )
+            ]
+        ),
+    }
+
+
+def test_create_claim_seeds_remote_volumes_before_starting_runner(
+    remote_claim_env: dict[str, str],
+) -> None:
+    client = _RecordingDocker(
+        image="curie-runner",
+        bundle_store=_FakeBundleStore(_plugin_tar_gz(wrapper="deal-desk")),
+    )
+    client.create_claim("claim-remote", pool="pool", env=remote_claim_env)
+
+    runner = next(argv for argv in client.calls if argv[0] == "run")
+    mounts = _volume_mounts(runner)
+    assert set(mounts) == {"/bundles/current", "/workspace", "/attachments"}
+    assert mounts["/bundles/current"][1] == "ro"
+    assert mounts["/workspace"][1] == "rw"
+    assert mounts["/attachments"][1] == "ro"
+    assert len({source for source, mode in mounts.values()}) == 3
+    expected = {
+        "/bundles/current": (
+            ".claude-plugin/plugin.json",
+            b'{"name": "deal-desk", "version": "0.1.0"}',
+        ),
+        "/workspace": ("README.md", b"workspace seed\n"),
+        "/attachments": ("report.txt", b"attachment seed\n"),
+    }
+    for target, (volume, mode) in mounts.items():
+        created = next(
+            argv for argv in client.calls if argv[:2] == ["volume", "create"] and argv[-1] == volume
+        )
+        assert "curietech.ai/managed-by=curie-sandbox-substrate" in _flag_values(created, "--label")
+        helper = next(
+            argv
+            for argv in client.calls
+            if argv[0] == "create"
+            and volume in {source for source, mode in _volume_mounts(argv).values()}
+        )
+        helper_name = _flag_values(helper, "--name")[0]
+        copied = next(
+            argv
+            for argv in client.calls
+            if argv[0] == "cp" and argv[-1].startswith(f"{helper_name}:")
+        )
+        filename, content = expected[target]
+        assert client.copied_files[copied[-1]][filename] == content
+        assert client.calls.index(created) < client.calls.index(helper) < client.calls.index(copied)
+        assert client.calls.index(copied) < client.calls.index(runner)
 
 
 def test_docker_cannot_prove_kubernetes_quota_headroom() -> None:
@@ -157,9 +257,7 @@ def test_create_claim_excludes_host_credentials_from_child_env(
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     client.create_claim("thread-credentials", pool="pool", env=os.environ)
 
-    child_env_names = {
-        entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")
-    }
+    child_env_names = {entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")}
     assert denied_names.isdisjoint(child_env_names)
     assert "CURIE_BUDGET" in child_env_names
     assert "CURIE_CREDENTIALS" in child_env_names
@@ -193,9 +291,7 @@ def test_create_claim_preserves_declared_connector_secret() -> None:
         },
     )
 
-    child_env_names = {
-        entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")
-    }
+    child_env_names = {entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")}
     assert {"CURIE_CONNECTOR_SECRET_KEYS", "SLACK_BOT_TOKEN"} <= child_env_names
 
 
@@ -267,9 +363,7 @@ def test_create_claim_connector_marker_cannot_readmit_reserved_curie_credential(
         },
     )
 
-    child_env_names = {
-        entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")
-    }
+    child_env_names = {entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")}
     assert "CURIE_CONNECTOR_SECRET_KEYS" in child_env_names
     assert "CURIE_SEALING_PRIVATE_KEY" not in child_env_names
 
@@ -297,9 +391,7 @@ def test_create_claim_excludes_every_slack_identity_token_from_child_env() -> No
         },
     )
 
-    child_env_names = {
-        entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")
-    }
+    child_env_names = {entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")}
     assert tokens.keys().isdisjoint(child_env_names)
     assert "CURIE_SLACK_IDENTITIES" in child_env_names
 
@@ -354,15 +446,11 @@ def test_create_claim_prefetches_workspace_without_forwarding_capability_env(
             super().__init__(**kwargs)
             self.prepared: list[tuple[str, str, str]] = []
 
-        def _prepare_workspace(
-            self, name: str, encoded_ref: str, expected_sha256: str
-        ) -> str:
+        def _prepare_workspace(self, name: str, encoded_ref: str, expected_sha256: str) -> str:
             self.prepared.append((name, encoded_ref, expected_sha256))
             return str(checkout)
 
-    client = _WorkspacePreparingDocker(
-        image="curie-runner", bundle_store=_FakeBundleStore()
-    )
+    client = _WorkspacePreparingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     client.create_claim(
         "thread-workspace",
         pool="pool",
@@ -373,9 +461,7 @@ def test_create_claim_prefetches_workspace_without_forwarding_capability_env(
         },
     )
 
-    assert client.prepared == [
-        ("thread-workspace", workspace_ref, workspace_sha256)
-    ]
+    assert client.prepared == [("thread-workspace", workspace_ref, workspace_sha256)]
     argv = client.calls[0]
     assert f"{checkout}:/workspace:rw" in _flag_values(argv, "-v")
     child_env = _flag_values(argv, "-e")
