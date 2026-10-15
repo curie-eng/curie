@@ -239,6 +239,45 @@ cleanup.
   leading `turn_canary` of every exported name in both the file and HTTP
   outputs, so an operator can keep existing series names.
 
+- **TURN-CANARY-11: binding drift.** The operator may declare the bindings an
+  installation is meant to have, as a JSON list of `(kind, address, adapter)`
+  triples. After each successful inventory read, every declared triple that no
+  inventory row carries is reported with side `declared_only`, and every
+  inventory triple of a declared kind that is not declared is reported with
+  side `live_only`. Kinds absent from the declaration are not compared. Drift
+  is reported per triple and as a total, separate from turn, binding and
+  adapter results, and does not change cycle success. A failed inventory read
+  reports no drift for that cycle; it never reports an empty drift as healthy.
+
+- **TURN-CANARY-12: binding adapter health.** The operator may name one health
+  path, beginning with `/`. Each cycle then derives one health URL per
+  inventory binding whose agent has an active deployment and whose stored
+  `endpoint` is an absolute HTTP(S) URL without user information, query or
+  fragment: the endpoint's scheme and authority followed by the configured
+  path. Each distinct URL is probed once per cycle under TURN-CANARY-9's rules,
+  at most 100 per cycle, and the outcome is reported for every binding that
+  shares it. A binding whose endpoint is present but not such a URL reports
+  `endpoint_invalid` without a request; a binding without an endpoint is not
+  reported. URLs never appear in logs or metrics. The result does not change
+  cycle success.
+
+- **TURN-CANARY-13: coverage.** When enabled, each successful inventory read
+  reports every agent that has an active deployment but neither a binding that
+  TURN-CANARY-7 would accept as a turn candidate nor, when TURN-CANARY-12 is
+  enabled, a binding with a derived health URL. Such an agent is reported as
+  uncovered by its agent name, with a count. Coverage describes what the
+  monitor can observe, not whether the agent works, and does not change cycle
+  success.
+
+- **TURN-CANARY-14: label layout.** By default each route series carries one
+  `route` label holding the JSON `(kind, address, adapter)` object. With the
+  split layout, route series instead carry separate `agent`, `kind`,
+  `address` and `adapter` labels, where `agent` is the agent name from the
+  inventory and is empty for a declared-only drift triple. The layout applies
+  to every per-route series, including target, cleanup, capacity, binding
+  check, binding adapter and drift series, in both the file and HTTP outputs;
+  adapter series of TURN-CANARY-9 keep their `adapter` label.
+
 ## Verification
 
 Unit tests under `examples/tests` exercise the selected binding and
@@ -247,7 +286,8 @@ per-route cleanup holds and their recovery, capacity skips, Kubernetes
 quantity parsing, limits, and safe diagnostics. They also exercise
 deterministic discovery and rotation, the model-free binding outcomes, adapter
 probe outcomes against a local HTTP server, the exporter routes and
-non-overlapping loop, and the metric prefix, all with synthetic rows. Isolated runtime
+non-overlapping loop, the metric prefix, quantity parsing, drift, binding
+adapter health, coverage and the split label layout, all with synthetic rows. Isolated runtime
 qualification uses a disposable agent and selected binding with a real model
 and protected read-only runner, verifies a delivered nonce, inspects the
 runner trace for no action or approval, confirms the reset result, and checks
