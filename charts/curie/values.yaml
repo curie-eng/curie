@@ -2364,17 +2364,17 @@ worker:
   # per-agent behavior-pack load line intact.
   statusText: "is working on your request..."
   # What the receipt beneath a turn's reply shows (ADR-0180), rendered as
-  # CURIE_TURN_RECEIPT. A turn that ran a tool outside the read-only allowlist
-  # ends its reply with a "What I changed:" list of those actions (ADR-0117).
+  # CURIE_TURN_RECEIPT. When enabled, a turn that ran a tool outside the
+  # read-only allowlist ends its reply with a "What I changed:" list (ADR-0117).
   #   all       every action, each saying whether restore information was
-  #             recorded (default)
+  #             recorded
   #   failures  only actions that reported failure, the ones a person must
   #             check before asking again; no receipt when nothing failed
-  #   off       no receipt at all, even when an action failed
+  #   off       no receipt at all, even when an action failed (default)
   # Only the reply changes: every action is still recorded, and a turn that
   # touched anything is still never retried automatically. The schema admits
   # these three values only, because the worker refuses any other at startup.
-  turnReceipt: all
+  turnReceipt: "off"
   # No-Slack egress routing. When non-empty, renders SLACK_API_BASE_URL on the
   # worker Deployment so its Slack sink uses that global base URL instead of real
   # Slack. Empty (the default) leaves the worker on real Slack. `curie cluster

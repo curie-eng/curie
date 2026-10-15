@@ -42,6 +42,8 @@ class DiscordReplyService:
         self._state = state
 
     async def deliver(self, event: ReplyEvent) -> ReplyAck:
+        if isinstance(event, ReplyUpdate) and event.text_mode == "verbatim":
+            raise ValueError("reply wire 1.2 verbatim is not supported")
         if event.target.kind != "discord":
             raise ValueError(f"Discord adapter cannot render kind {event.target.kind!r}")
         if isinstance(event, TurnStatus):

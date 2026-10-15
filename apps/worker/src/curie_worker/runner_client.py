@@ -52,6 +52,7 @@ _POST_FINAL_CLEANUP_TIMEOUT_S = 1.0
 _POST_FINAL_DISCARD_CHUNK_BYTES = 64 * 1024
 _TURN_EPOCH_HEADER = "X-Curie-Turn-Epoch"
 _CAPACITY_ADMISSION_HEADER = "X-Curie-Capacity-Admission"
+_FINAL_ANSWER_HEADER = "X-Curie-Final-Answer"
 _TURN_EPOCH_MIN_LENGTH = 32
 _TURN_EPOCH_MAX_LENGTH = 256
 _T = TypeVar("_T")
@@ -138,6 +139,10 @@ class RunnerError(Exception):
     """The runner returned an unexpected HTTP status or an unreadable stream."""
 
 
+class FinalAnswerProtocolError(RunnerError):
+    """Unsupported publication negotiation; retry cannot establish integrity."""
+
+
 class ExecuteRefused(RunnerError):
     """An executor route call ended without a usable phase response.
 
@@ -218,9 +223,12 @@ class TurnStream:
         deadline: float,
         turn_epoch: str | None,
         timeout_callback: Callable[[], Awaitable[TimeoutResult]] | None = None,
+        *,
+        verbatim_answer: bool = False,
     ) -> None:
         self._response = response
         self.turn_epoch = turn_epoch
+        self.verbatim_answer = verbatim_answer
         self._saw_final = False
         # The streaming budget this stream is running under, carried from the
         # client so the stream can NAME the budget it blew (#2011).
@@ -258,9 +266,7 @@ class TurnStream:
             # straight through -- do not broaden this clause.
             raise await self._normalize_stream_timeout(cause) from cause
 
-    async def _normalize_stream_timeout(
-        self, cause: BaseException
-    ) -> RunnerStreamTimeout:
+    async def _normalize_stream_timeout(self, cause: BaseException) -> RunnerStreamTimeout:
         terminal = self._stream_timeout_error
         if terminal is None:
             terminal = RunnerStreamTimeout(self._timeout_reason(cause), "unconfirmed")
@@ -337,9 +343,7 @@ class TurnStream:
         try:
             async with asyncio.timeout(_POST_FINAL_CLEANUP_TIMEOUT_S):
                 while not self._response.content.at_eof():
-                    chunk = await self._response.content.read(
-                        _POST_FINAL_DISCARD_CHUNK_BYTES
-                    )
+                    chunk = await self._response.content.read(_POST_FINAL_DISCARD_CHUNK_BYTES)
                     if not chunk:
                         break
         except TimeoutError:
@@ -424,9 +428,7 @@ class RunnerClient:
         # just fenced.
         self._interrupt_timeout = aiohttp.ClientTimeout(total=interrupt_timeout_s)
         self._snapshot_patch_max_bytes = snapshot_patch_max_bytes
-        self._snapshot_body_max_bytes = (
-            4 * ((snapshot_patch_max_bytes + 2) // 3) + 131_072
-        )
+        self._snapshot_body_max_bytes = 4 * ((snapshot_patch_max_bytes + 2) // 3) + 131_072
 
     def turn_deadline_s(self, remaining_s: float | None) -> float:
         """How long a turn opened now may stream: ``_request_timeout``'s bound.
@@ -530,9 +532,7 @@ class RunnerClient:
         """
         request_timeout = self._request_timeout(remaining_s)
         stream_timeout_s = (
-            self._total_timeout_s
-            if request_timeout is sentinel
-            else request_timeout.total
+            self._total_timeout_s if request_timeout is sentinel else request_timeout.total
         )
         if remaining_s is not None:
             logger.info(
@@ -545,6 +545,7 @@ class RunnerClient:
             assert stream_timeout_s is not None
             deadline = asyncio.get_running_loop().time() + stream_timeout_s
             request_headers = dict(headers or {})
+            request_headers[_FINAL_ANSWER_HEADER] = "1"
             if capacity_admission:
                 request_headers[_CAPACITY_ADMISSION_HEADER] = "wait"
             if progress:
@@ -561,6 +562,10 @@ class RunnerClient:
                 finally:
                     resp.release()
                 raise _rejected_frame("/v1/event", resp.status, body)
+            final_answer_modes = resp.headers.getall(_FINAL_ANSWER_HEADER, [])
+            if final_answer_modes not in ([], ["1"]):
+                resp.release()
+                raise FinalAnswerProtocolError("unsupported final-answer delivery mode")
             turn_epoch = resp.headers.get(_TURN_EPOCH_HEADER)
             if capacity_admission and not _valid_turn_epoch(turn_epoch):
                 resp.release()
@@ -576,7 +581,14 @@ class RunnerClient:
 
                 timeout_callback = notify_timeout
             return (
-                TurnStream(resp, stream_timeout_s, deadline, turn_epoch, timeout_callback),
+                TurnStream(
+                    resp,
+                    stream_timeout_s,
+                    deadline,
+                    turn_epoch,
+                    timeout_callback,
+                    verbatim_answer=final_answer_modes == ["1"],
+                ),
                 "success",
             )
 
@@ -690,6 +702,7 @@ class RunnerClient:
         never be live at reset time -- a 409 here is a real ordering bug, not a
         condition to swallow.
         """
+
         async def request(headers: dict[str, str] | None) -> tuple[None, str]:
             async with self._session.post(
                 f"{base_url}/v1/reset",
@@ -742,9 +755,7 @@ class RunnerClient:
                     raise TypeError("patch_base64 is not a string")
                 patch = base64.b64decode(encoded, validate=True)
                 if len(patch) > self._snapshot_patch_max_bytes:
-                    raise ValueError(
-                        f"patch exceeds {self._snapshot_patch_max_bytes} raw bytes"
-                    )
+                    raise ValueError(f"patch exceeds {self._snapshot_patch_max_bytes} raw bytes")
                 declared_size = body.get("patch_size_bytes")
                 if declared_size != len(patch):
                     raise ValueError("patch size does not match decoded payload")
