@@ -134,6 +134,7 @@ impl Fixture {
         fs::write(self.root.join("tools/preflight/always.txt"), "").unwrap();
         for relative in [
             "tools/e2e-ci-selection/select_tiers.py",
+            "tools/e2e-ci-selection/cli_pytest_files.txt",
             ".github/e2e-selection.yaml",
             "release/atlas.py",
             "cli/Cargo.toml",

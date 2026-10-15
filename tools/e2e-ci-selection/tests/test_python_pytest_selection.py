@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -88,14 +89,17 @@ GATED_RUNTIME_STEPS = (
 PYTEST_AGGREGATE_EXPRESSIONS = {
     "pytest_selected": "${{ steps.python-runtime.outputs.pytest }}",
     "pytest_deselect": "${{ steps.python-runtime.outputs.pytest_deselect }}",
+    "pytest_scope": "${{ steps.python-runtime.outputs.pytest_scope }}",
     "shards_result": "${{ needs.python-pytest.result }}",
     "changes_result": "${{ needs.changes.result }}",
     "changes_pytest": "${{ needs.changes.outputs.pytest }}",
     "changes_deselect": "${{ needs.changes.outputs.pytest_deselect }}",
+    "changes_scope": "${{ needs.changes.outputs.pytest_scope }}",
 }
 PYTEST_STEP_EXPRESSIONS = {
     "shard": "${{ matrix.shard }}",
     "pytest_deselect": "${{ steps.python-runtime.outputs.pytest_deselect }}",
+    "pytest_scope": "${{ steps.python-runtime.outputs.pytest_scope }}",
 }
 SHARD_RECORD_EXPRESSIONS = {
     "shard": "${{ matrix.shard }}",
@@ -103,6 +107,7 @@ SHARD_RECORD_EXPRESSIONS = {
     "pytest_result": "${{ steps.pytest.outcome }}",
     "stack_result": "${{ steps.dev-stack.outcome }}",
     "pytest_deselect": "${{ steps.python-runtime.outputs.pytest_deselect }}",
+    "pytest_scope": "${{ steps.python-runtime.outputs.pytest_scope }}",
 }
 
 
@@ -438,7 +443,9 @@ def _run_bash(
     )
 
 
-def _run_pytest_step(tmp_path: Path, *, shard: int, deselect: str) -> list[str]:
+def _run_pytest_step(
+    tmp_path: Path, *, shard: int, deselect: str, scope: str = "full"
+) -> list[str]:
     """Execute the real workflow Bash and record each argument at the uv boundary."""
     step = _named_steps("python-pytest")["Pytest"]
     script = _string(step, "run")
@@ -450,7 +457,12 @@ def _run_pytest_step(tmp_path: Path, *, shard: int, deselect: str) -> list[str]:
     stub = bin_dir / "uv"
     stub.write_text('#!/usr/bin/env bash\nprintf "%s\\0" "$@" >> "$UV_ARGV_LOG"\n')
     stub.chmod(0o755)
-    state = {"shard": str(shard), "pytest_deselect": deselect}
+    if scope == "cli":
+        relative = "tools/e2e-ci-selection/cli_pytest_files.txt"
+        destination = tmp_path / relative
+        destination.parent.mkdir(parents=True)
+        shutil.copyfile(REPO_ROOT / relative, destination)
+    state = {"shard": str(shard), "pytest_deselect": deselect, "pytest_scope": scope}
     result = _run_bash(
         script,
         {
@@ -468,7 +480,7 @@ def _run_pytest_step(tmp_path: Path, *, shard: int, deselect: str) -> list[str]:
 
 
 def _record_shard(
-    tmp_path: Path, shard: int, selected: str, outcome: str, stack: str, deselect: str
+    tmp_path: Path, shard: int, selected: str, outcome: str, stack: str, deselect: str, scope: str
 ) -> None:
     """Run the shard job's real record step, as the shard would."""
     step = _named_steps("python-pytest")["Record shard result"]
@@ -480,6 +492,7 @@ def _record_shard(
         "pytest_result": outcome,
         "stack_result": stack,
         "pytest_deselect": deselect,
+        "pytest_scope": scope,
     }
     workdir = tmp_path / f"shard-{shard}"
     workdir.mkdir()
@@ -498,22 +511,25 @@ def _run_pytest_aggregate(
     tmp_path: Path,
     *,
     selected: str,
-    shards: dict[int, tuple[str, str, str, str]] | None = None,
+    shards: dict[int, tuple[str, str, str, str, str]] | None = None,
     shards_result: str = "success",
     results_dir: bool = True,
     changes_result: str = "success",
     changes_pytest: str | None = None,
     deselect: str = "",
     changes_deselect: str | None = None,
+    scope: str = "full",
+    changes_scope: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Record each shard, then run the required job's real aggregate step.
 
-    ``shards`` maps a shard index to (selected, pytest, stack, deselect) as that shard
+    ``shards`` maps a shard index to (selected, pytest, stack, deselect, scope) as that shard
     saw them; an index left out never reported. ``results_dir=False`` leaves
     the download directory absent, as it is when the download step is skipped
     (#3858). ``changes_result`` and ``changes_pytest`` are the ``changes`` job's
     result and pytest output; the latter defaults to ``selected`` (agreement).
     ``changes_deselect`` defaults to this job's ``deselect`` output.
+    ``changes_scope`` defaults to this job's ``scope`` output.
     """
     step = _named_steps()["Require pytest outcome to match selection"]
     assert _string(step, "if") == "success()"
@@ -523,8 +539,10 @@ def _run_pytest_aggregate(
     tmp_path.mkdir(parents=True, exist_ok=True)
     if results_dir or shards:
         (tmp_path / download["with"]["path"]).mkdir(parents=True)
-    for shard, (shard_selected, outcome, stack, shard_deselect) in (shards or {}).items():
-        _record_shard(tmp_path, shard, shard_selected, outcome, stack, shard_deselect)
+    for shard, (shard_selected, outcome, stack, shard_deselect, shard_scope) in (
+        shards or {}
+    ).items():
+        _record_shard(tmp_path, shard, shard_selected, outcome, stack, shard_deselect, shard_scope)
     bindings = _bindings(step, PYTEST_AGGREGATE_EXPRESSIONS)
     state = {
         "pytest_selected": selected,
@@ -533,6 +551,8 @@ def _run_pytest_aggregate(
         "changes_pytest": selected if changes_pytest is None else changes_pytest,
         "pytest_deselect": deselect,
         "changes_deselect": deselect if changes_deselect is None else changes_deselect,
+        "pytest_scope": scope,
+        "changes_scope": scope if changes_scope is None else changes_scope,
     }
     literals = {k: v for k, v in step["env"].items() if "${{" not in v}
     environment = literals | {bindings[k]: v for k, v in state.items()}
@@ -540,9 +560,12 @@ def _run_pytest_aggregate(
 
 
 def _all_shards(
-    selected: str, outcome: str, deselect: str = ""
-) -> dict[int, tuple[str, str, str, str]]:
-    return {shard: (selected, outcome, outcome, deselect) for shard in range(1, SHARD_COUNT + 1)}
+    selected: str, outcome: str, deselect: str = "", scope: str = "full"
+) -> dict[int, tuple[str, str, str, str, str]]:
+    return {
+        shard: (selected, outcome, outcome, deselect, scope)
+        for shard in range(1, SHARD_COUNT + 1)
+    }
 
 
 def test_pytest_aggregator_accepts_matching_deselect(tmp_path: Path) -> None:
@@ -577,7 +600,7 @@ def test_pytest_aggregator_rejects_changes_deselect_disagreement(
 def test_pytest_aggregator_rejects_shard_deselect_disagreement(tmp_path: Path) -> None:
     deselect = "examples/tests/test_sre_bot_observability_runtime.py"
     shards = _all_shards("true", "success", deselect)
-    shards[2] = ("true", "success", "success", "")
+    shards[2] = ("true", "success", "success", "", "full")
     result = _run_pytest_aggregate(tmp_path, selected="true", deselect=deselect, shards=shards)
     assert result.returncode == 1, result.stdout + result.stderr
     assert "shard 2" in result.stderr
@@ -634,7 +657,7 @@ def test_pytest_aggregator_rejects_an_unselected_skip_with_a_stray_record(
     result = _run_pytest_aggregate(
         tmp_path,
         selected="false",
-        shards={1: ("false", "skipped", "skipped", "")},
+        shards={1: ("false", "skipped", "skipped", "", "full")},
         shards_result="skipped",
     )
     assert result.returncode != 0
@@ -888,7 +911,7 @@ def test_pytest_aggregator_rejects_unselected_success(tmp_path: Path) -> None:
 
 def test_pytest_aggregator_rejects_a_failed_shard(tmp_path: Path) -> None:
     shards = _all_shards("true", "success")
-    shards[2] = ("true", "failure", "success", "")
+    shards[2] = ("true", "failure", "success", "", "full")
     result = _run_pytest_aggregate(
         tmp_path, selected="true", shards=shards, shards_result="failure"
     )
@@ -919,7 +942,7 @@ def test_pytest_aggregator_rejects_a_shard_that_never_reported(tmp_path: Path) -
 
 def test_pytest_aggregator_rejects_a_shard_that_selected_differently(tmp_path: Path) -> None:
     shards = _all_shards("true", "success")
-    shards[1] = ("false", "skipped", "skipped", "")
+    shards[1] = ("false", "skipped", "skipped", "", "full")
     result = _run_pytest_aggregate(tmp_path, selected="true", shards=shards)
     assert result.returncode != 0
 

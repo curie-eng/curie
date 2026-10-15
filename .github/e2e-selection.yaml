@@ -1,5 +1,11 @@
 version: 1
 fallback: [skill, local, local-release, cluster]
+pytest_scopes:
+  cli:
+    prefixes: [cli]
+    excluded_prefixes: [cli/scripts]
+    python_prefixes: [cli/tests]
+    test_files: tools/e2e-ci-selection/cli_pytest_files.txt
 conditional_pytest_files:
   examples/tests/test_sre_bot_observability_runtime.py:
     - examples/sre-bot
