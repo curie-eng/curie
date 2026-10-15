@@ -763,12 +763,33 @@ def test_exporter_keeps_previous_target_success_across_a_capacity_skip():
     )
 
 
+def test_exporter_publishes_no_failure_for_a_never_turned_skipped_route():
+    """@spec TURN-CANARY-6 TURN-CANARY-10"""
+    canary = _canary()
+    platform = RoutePlatform(headroom=[False])
+    monitor = canary.Monitor(None, canary.Limits())
+    result = asyncio.run(
+        canary.run_cycle(
+            platform, _routes()[:1], turn_deadline=0.05, cleanup_deadline=0.02, poll_period=0.005
+        )
+    )
+    monitor.observe(result)
+    lines = monitor.metrics_text().splitlines()
+    assert not any(line.startswith("turn_canary_target_success{") for line in lines)
+    assert "turn_canary_cycle_success 1" in lines
+    assert any(
+        line.startswith("turn_canary_target_capacity_skipped{") and line.endswith(" 1")
+        for line in lines
+    )
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
         ("16", "16"),
         (16, "16"),
         ("1500m", "1.5"),
+        ("13500m", "13.5"),
         ("0.5", "0.5"),
         ("512Mi", str(512 * 2**20)),
         ("2Gi", str(2 * 2**30)),
