@@ -561,7 +561,7 @@ def install_jira(p: fe.Preflight) -> None:
             p.config.kube_context,
             "get",
             "values",
-            fe.RELEASE,
+            p.release,
             "-n",
             p.namespace,
             "-o",
@@ -574,7 +574,7 @@ def install_jira(p: fe.Preflight) -> None:
         raise fe.PreflightFailed("helm get values did not print JSON") from exc
     if _recorded_code_host_secret(values) is None:
         raise fe.PreflightFailed(
-            f"release {fe.RELEASE} records no factory intake: the github factory.codeHosts "
+            f"release {p.release} records no factory intake: the github factory.codeHosts "
             "credential has no existingSecret, so the quickstart would install, not add an agent"
         )
     if p.config.label != QUICKSTART_LABEL:
@@ -595,7 +595,7 @@ def install_jira(p: fe.Preflight) -> None:
         "--namespace",
         p.namespace,
         "--release",
-        fe.RELEASE,
+        p.release,
         "--agent",
         fe.FACTORY_AGENT,
         "--plugin-dir",

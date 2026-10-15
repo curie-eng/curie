@@ -1,5 +1,10 @@
 See [AGENTS.md](AGENTS.md) - the agent instructions for this repo live there.
 
+Curie turns agents into co-workers in the user's infrastructure. Start with the
+[Software Factory](docs/software-factory.md); the
+[co-worker overview](docs/co-workers.md) explains the shared platform and the
+[capability reference](docs/capabilities.md) bounds support claims.
+
 Never publish real customer or downstream deployment information in files,
 commit messages, branch or tag names, PRs, issues, comments, releases, or CI
 logs and artifacts. Anonymize live-test evidence and provenance before

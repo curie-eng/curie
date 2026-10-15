@@ -148,6 +148,10 @@ _CAUSE_TEXT = {
         "the request to open the pull request expired before anyone approved it."
     ),
     "publication_failed": "the pull request could not be opened.",
+    "publication_unrecorded": (
+        "the agent tried to publish its change, but no valid publication was recorded. "
+        "The Details line below gives the reason; the pull request, if any, is unchanged."
+    ),
     "ci_failed": (
         "the pull request's checks still failed after 3 rounds of fixes. The pull "
         "request stays open for a person."
@@ -180,6 +184,7 @@ _DETAIL_CAUSES = frozenset(
         "ci_unverified",
         "merge_conflict",
         "approval_create_failed",
+        "publication_unrecorded",
     }
 )
 # A run that ended without publishing carries the agent's own last message

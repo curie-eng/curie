@@ -198,9 +198,13 @@ def test_trigger_label_migration_key_admits_two_labels_and_refuses_two_nulls(
 
 
 def test_trigger_label_migration_downgrade_refuses_while_a_location_holds_two_bindings(
-    upgraded: tuple[str, str],
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    revision, down = upgraded
+    revision, down = _label_revision()
+    # Start exactly at this migration. Downgrading a later merge head can
+    # legitimately unwind other revisions before reaching this refusal.
+    isolated_migration_db.at(revision)
+    assert stamped_revision() == revision
     _bind(_agent(), "github", REPO)
     labelled = _bind(_agent(), "github", REPO, trigger_label=FAST)
 

@@ -121,9 +121,14 @@ regex = '''(?i)\b[A-Za-z][A-Za-z0-9-]*/[A-Za-z0-9._-]+#[0-9]+\b'''
 tags = ["identifier", "repo"]
 
   [rules.allowlist]
-  description = "This repo's own issues, written in the qualified form"
+  description = "This repo's own issues and the Slack setup Markdown heading link"
   regexTarget = "match"
-  regexes = ['''(?i)^curie-eng/(curie|agentos)#[0-9]+$''']
+  regexes = [
+    '''(?i)^curie-eng/(curie|agentos)#[0-9]+$''',
+    # The README's local heading link is matched only through its numeric prefix.
+    # Exempt that exact match for this rule; every file and other rule stays scanned.
+    '''^docs/your-first-slack-agent\.md#2$''',
+  ]
 
 [allowlist]
 description = "Placeholder values this repo uses deliberately, plus generated artifacts"
@@ -152,6 +157,10 @@ regexes = [
   # Historical redaction regression input. Every token component is a repeated
   # zero or the literal FAKE marker, so it cannot identify a real Slack app.
   '''\bxapp-0-0000000000-0000000000-FAKEFAKEFAKEFAKE\b''',
+  # This is a fixed, public validator name in the protected delivery schema,
+  # not an authentication credential. Keep the exception scoped to its schema,
+  # test, and spec occurrences.
+  '''fresh-owned-launch-v1''',
 ]
 
 paths = [
@@ -173,6 +182,10 @@ paths = [
   '''(^|/)packages/[^/]+/generated/''',
   # This file names the patterns it forbids.
   '''^\.gitleaks\.toml$''',
+  '''^packages/protected-hooks/src/curie_protected_hooks/artifact_measurement\.py$''',
+  '''^packages/protected-hooks/tests/test_artifact_measurement\.py$''',
+  '''^apps/worker/tests/test_protected_kubernetes_projection\.py$''',
+  '''^docs/superpowers/specs/2026-10-02-protected-hook-lane\.md$''',
 ]
 
 # Gitleaks stopwords are case insensitive substring matches, so an entry

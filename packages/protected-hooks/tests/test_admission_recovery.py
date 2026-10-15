@@ -50,6 +50,7 @@ def deny_next(broker, owned, command, key=None):
         for n in ("intent", "state", "binding", "recovery", "commit")
         if not (command == "set" and owned[n] == key)
     ]
+    setters.append(owned["binding"].replace(":binding:", ":event:"))
     rules += ("(+set " + " ".join("%W~" + name for name in setters) + ")",)
     for write, name in (
         ("del", "recovery"),

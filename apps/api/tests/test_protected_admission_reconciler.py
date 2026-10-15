@@ -629,6 +629,7 @@ def test_a_connection_lost_during_recover_ends_the_tick(
     def counted(self: Any, identity: Any) -> Any:
         """@spec PROTECTED-HOOK-LANE-4."""
         calls.append(1)
+        broker.command("CLIENT", "PAUSE", "4000", "WRITE")
         entered.set()
         return original(self, identity)
 
@@ -637,11 +638,10 @@ def test_a_connection_lost_during_recover_ends_the_tick(
     async def scenario() -> None:
         """@spec PROTECTED-HOOK-LANE-4."""
         reconciler = ProtectedAdmissionReconciler(lambda: str(directory))
-        broker.command("CLIENT", "PAUSE", "4000", "WRITE")
         try:
             async with captured_logs() as logs:
                 tick = asyncio.create_task(reconciler.tick())
-                await asyncio.to_thread(entered.wait, 3)
+                assert await asyncio.to_thread(entered.wait, 3), "recover fault point not reached"
                 await asyncio.sleep(0.5)
                 broker.command("CLIENT", "KILL", "USER", broker.enqueue.username)
                 result = await asyncio.wait_for(tick, 10)

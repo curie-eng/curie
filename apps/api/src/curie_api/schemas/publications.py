@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
+from aci_protocol.slack_identities import IDENTITY_NAME_MAX_LENGTH, IDENTITY_NAME_PATTERN
 from aci_protocol.turn import SLACK_KIND, route_identity
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -32,6 +33,9 @@ class PublicationCreate(BaseModel):
     reply_placeholder: str | None = None
     reply_endpoint: str | None = None
     reply_adapter: str | None = None
+    reply_identity: str | None = Field(
+        default=None, pattern=IDENTITY_NAME_PATTERN, max_length=IDENTITY_NAME_MAX_LENGTH
+    )
     dedupe_key: str = Field(min_length=1)
     review_origin_key: str | None = Field(default=None, min_length=1, max_length=180)
     route: str | None = None

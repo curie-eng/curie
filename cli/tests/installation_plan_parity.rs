@@ -5676,6 +5676,42 @@ fn diff_answers_the_same_against_an_explicitly_passed_chart() {
     );
 }
 
+fn assert_fake_model_is_only_set_by_gvisor_counterfactual(calls: &str) {
+    for call in calls.lines().filter(|call| call.contains("fakeModel")) {
+        assert!(
+            call.starts_with("HELM_CALL: template "),
+            "only the gVisor counterfactual render may set fakeModel:\n{call}"
+        );
+        let arguments: Vec<_> = call.split_whitespace().collect();
+        let templates: Vec<_> = arguments
+            .windows(2)
+            .filter(|pair| pair[0] == "--show-only")
+            .map(|pair| pair[1])
+            .collect();
+        assert_eq!(
+            templates,
+            ["templates/preflight-gvisor.yaml"],
+            "fakeModel may only override the gVisor preflight render:\n{call}"
+        );
+        let fake_model_arguments: Vec<_> = arguments
+            .iter()
+            .copied()
+            .filter(|argument| argument.contains("fakeModel"))
+            .collect();
+        assert_eq!(
+            fake_model_arguments,
+            ["agentSandbox.runner.fakeModel=false"],
+            "the counterfactual may only set fakeModel to false:\n{call}"
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--set", "agentSandbox.runner.fakeModel=false"]),
+            "the counterfactual fakeModel override must use --set:\n{call}"
+        );
+    }
+}
+
 /// #2459: `--fake-model` must IGNORE a recorded BYO credential reference, not
 /// erase it.
 ///
@@ -5731,12 +5767,12 @@ fn fake_model_up_preserves_a_recorded_byo_credential_reference() {
         "the key travels with the name; half a reference is not one:\n{supplied}"
     );
 
-    // Preserving it must not turn the fake model back into the real one. The
-    // CLI only ever pins this key to `false`, so its absence is the assertion.
-    let visible = format!("{}\n{supplied}", fixture.calls());
+    // The gVisor counterfactual may render real-model admission requirements,
+    // but preserving the reference must not change the applied model mode.
+    assert_fake_model_is_only_set_by_gvisor_counterfactual(&fixture.calls());
     assert!(
-        !visible.contains("fakeModel"),
-        "--fake-model must not select the real model off the value it preserved:\n{visible}"
+        !supplied.contains("fakeModel"),
+        "--fake-model must not select the real model off the value it preserved:\n{supplied}"
     );
 }
 
@@ -5795,12 +5831,12 @@ fn fake_model_up_preserves_a_recorded_model_and_inline_credential() {
         "--fake-model must re-supply the recorded model id:\n{calls}"
     );
 
-    // The CLI only ever pins this key to `false`, so its absence is the
-    // assertion that the effective runner is still fake.
-    let visible = format!("{calls}\n{supplied}");
+    // Only the gVisor counterfactual render may override fakeModel. The applied
+    // values must still preserve fake mode.
+    assert_fake_model_is_only_set_by_gvisor_counterfactual(&calls);
     assert!(
-        !visible.contains("fakeModel"),
-        "--fake-model must not select the real model off the values it preserved:\n{visible}"
+        !supplied.contains("fakeModel"),
+        "--fake-model must not select the real model off the values it preserved:\n{supplied}"
     );
 }
 
@@ -5891,10 +5927,7 @@ fn plain_up_preserves_a_recorded_local_model_install() {
         calls.contains("inference.persistence.size=40Gi"),
         "a recorded PVC size must not shrink back to the chart default:\n{calls}"
     );
-    assert!(
-        !calls.contains("agentSandbox.runner.fakeModel=false"),
-        "inference is the model source; do not pin fakeModel off a blank credential:\n{calls}"
-    );
+    assert_fake_model_is_only_set_by_gvisor_counterfactual(&calls);
 }
 
 /// #2510: `CURIE_CREDENTIALS` after `--local-model` replaces the inference

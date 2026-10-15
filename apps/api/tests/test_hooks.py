@@ -28,6 +28,7 @@ from aci_protocol import QueuedTurn, TurnSource
 from curie_api import hook_signing
 from curie_api.config import get_settings
 from curie_api.hook_signing import derive
+from curie_api.main import create_app
 from curie_api.routers import hooks as hooks_router
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
 from curie_telemetry.tracing import configure_tracer_provider
@@ -441,6 +442,59 @@ def test_hook_ingress_producer_injects_the_http_parent_through_owned_enqueue(
     transported = trace.get_current_span(extract_trace_context(fields)).get_span_context()
     assert transported.trace_id == producer.context.trace_id
     assert transported.span_id == producer.context.span_id
+
+
+@pytest.fixture
+def ambient_otlp_hooks_client(
+    monkeypatch: pytest.MonkeyPatch, _disposable_db: Any, runs_stream: str
+) -> Iterator[TestClient]:
+    # FastAPI reads the variable at lifespan startup, so set it before the app
+    # is built and entered.
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4317")
+    with TestClient(create_app()) as test_client:
+        yield test_client
+
+
+def test_ambient_otlp_endpoint_keeps_the_api_http_parent(
+    ambient_otlp_hooks_client: TestClient,
+    auth_headers: dict[str, str],
+    valkey: redis.Redis,
+    runs_stream: str,
+    clean_db: None,
+) -> None:
+    """An inherited OTLP endpoint must not let FastAPI's own telemetry take over
+    the request span (#4410). The test sets the variable itself, so it fails on
+    the unfixed base in any environment."""
+
+    client = ambient_otlp_hooks_client
+    agent_id = _bind(client, auth_headers, name="ambientotlpagent")
+    secret = _secret_for(agent_id)
+
+    with _captured_spans() as exporter:
+        accepted = _post(
+            client,
+            agent_id,
+            "issues",
+            b'{"issue": 43}',
+            secret=secret,
+            delivery_id="ambient-otlp-delivery",
+            traceparent=_TRACEPARENT,
+        )
+
+    assert accepted.status_code == 200, accepted.text
+
+    spans = exporter.get_finished_spans()
+    accepted_server = next(
+        span
+        for span in spans
+        if span.name == "http.server.request" and span.context.trace_id == _TRACE_ID
+    )
+    producers = [span for span in spans if span.name == "curie.queue.enqueue"]
+    assert len(producers) == 1
+    producer = producers[0]
+    assert producer.context.trace_id == accepted_server.context.trace_id
+    assert producer.parent is not None
+    assert producer.parent.span_id == accepted_server.context.span_id
 
 
 def test_instruction_shaped_payload_is_delimited_as_untrusted_content(

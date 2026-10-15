@@ -9,27 +9,29 @@ citing a live test, or recording provenance. Review the exact outgoing content
 before committing, pushing, or posting; a green secret scan is not clearance.
 See "This repo is PUBLIC" below for the full rule.
 
-Agent instructions for this repo. Start with [`README.md`](README.md) for what
-the product is and how to run it, and [`ARCHITECTURE.md`](ARCHITECTURE.md) for
-the component diagram, the message-flow sequence (Slack mention -> dispatcher ->
-worker -> sandbox -> runner -> Slack reply), and the deploy-flow sequence (git
-push -> webhook -> bundle pipeline -> deployment). The one-line version: a Slack
-message is answered by a versioned plugin running in an isolated Kubernetes
-sandbox, traced through Langfuse and steerable mid-turn; a git push deploys that
-plugin under a bot identity via the API's git-flow engine. Relay is the project
-codename; `curie` is the product-surface name (bot handle, CLI binary). Read
-`ARCHITECTURE.md` before touching a cross-component seam. If you are a coding
-agent orienting in this repo, [`llms.txt`](llms.txt) is the curated machine map
-of these docs, organized around the parity ladder. This file is for an agent
-working **on** this repository; an agent **driving** Curie (a released binary,
-someone else's bundle) wants [`docs/agents.md`](docs/agents.md), the
-verification contract that names the exact command proving each outcome. The two questions this repo
-exists to answer are
-[why did my agent work locally but break once deployed?](README.md#why-did-my-agent-work-locally-but-break-once-deployed)
-and
-[how do I test an agent the same way locally and on Kubernetes?](README.md#how-do-i-test-an-agent-the-same-way-locally-and-on-kubernetes) —
-the same immutable bundle and the same `evals/cases.json` across `skill`,
-`local`, and `cluster` is the answer to both.
+Agent instructions for this repo. Curie turns agents into co-workers that run
+in the user's infrastructure. The [Software Factory](docs/software-factory.md)
+is the first developer adoption path; the [SRE example](examples/sre-bot/README.md)
+and [supported custom bundles](docs/bring-your-agent.md) use the same platform.
+Read [`README.md`](README.md) for the product entry points,
+[`docs/co-workers.md`](docs/co-workers.md) for the shared collaboration model,
+and [`docs/capabilities.md`](docs/capabilities.md) before making support claims.
+
+Read [`ARCHITECTURE.md`](ARCHITECTURE.md) before touching a cross-component
+seam. It maps the message flow (Slack mention -> dispatcher -> worker -> sandbox
+-> runner -> Slack reply) and deployment flow (git push -> webhook -> bundle
+pipeline -> deployment). Relay is the project codename; `curie` is the product
+surface name (bot handle, CLI binary). [`llms.txt`](llms.txt) is the curated
+machine map. This file is for an agent working **on** this repository; an agent
+**driving** Curie (a released binary or someone else's bundle) wants
+[`docs/agents.md`](docs/agents.md), the verification contract that names the exact
+command proving each outcome.
+
+The same immutable bundle and `evals/cases.json` across `skill`, `local`, and
+`cluster` support the developer's test and deployment loop. Environment parity
+helps expose deployment differences; it cannot guarantee model behavior under
+production traffic. The [architecture's parity reference](ARCHITECTURE.md#local-to-production-parity)
+retains the technical rationale behind that commitment.
 
 ## Directory map
 
@@ -360,7 +362,7 @@ path and Python symbol resolves, that each graded seam's `grade:` agrees with th
 `docs/adr/` claim the same number prefix, and that every `curie ...` command named in
 `docs/agents.md` resolves against `cli/command-manifest.json`. Run it after editing any interface-catalog doc
 and commit the regenerated files; CI runs the same check (`scripts/check-docs.sh`) in the
-`python` job. To exempt a genuinely illustrative example path, put
+`python-static` job. To exempt a genuinely illustrative example path, put
 `<!-- doclint:ignore-line -->` on that line (or the line before it).
 
 Test discipline: test-first for behavior-bearing code; mock ONLY external

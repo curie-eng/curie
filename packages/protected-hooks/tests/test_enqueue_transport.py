@@ -627,7 +627,8 @@ def test_invalid_coordinates_refuse_before_any_command(owned):
 
 # -- the measured enqueue recipe ------------------------------------------------------------
 
-# @spec PROTECTED-HOOK-ADMISSION-6: the recipe changes from the base only by ZRANGE on the quota.
+# @spec PROTECTED-HOOK-ADMISSION-6 PROTECTED-HOOK-LANE-3: ZRANGE stays quota-only.
+# The accepted-settlement specification also grants the enqueue event-index writes.
 BASE_RECIPE = (
     "-@all",
     "resetkeys",
@@ -647,19 +648,20 @@ BASE_RECIPE = (
     "+eval",
     "(+get +type +set +del %RW~protected:admission:intent:* %RW~protected:admission:state:* "
     "%RW~protected:admission:commit:* %RW~protected:admission:recovery:* "
-    "%RW~protected:admission:binding:*)",
+    "%RW~protected:admission:binding:* %RW~protected:admission:event:*)",
     None,  # the quota selector, compared as a token set below
     "(+type +xinfo|stream +xrange +xadd %RW~curie:runs)",
     "(+eval %RW~protected:source:* %RW~protected:control:* %RW~protected:admission:intent:* "
     "%RW~protected:admission:state:* %RW~protected:admission:commit:* "
     "%RW~protected:admission:recovery:* %RW~protected:admission:binding:* "
+    "%RW~protected:admission:event:* "
     "%RW~protected:admission:quota %RW~curie:runs)",
 )
 QUOTA_SELECTOR = {"+type", "+zadd", "+zcard", "+zrem", "+zscore", "+zrange", "%RW~" + QUOTA}
 
 
 def test_the_recipe_adds_zrange_on_exactly_the_quota_selector():
-    """ZRANGE joins the quota selector, nothing else changes, @spec PROTECTED-HOOK-ADMISSION-6."""
+    """Keep the explicit metadata recipe and quota-only ZRANGE, @spec PROTECTED-HOOK-ADMISSION-6."""
     rules = admission_acl_rules("enqueue")
     assert len(rules) == len(BASE_RECIPE)
     for actual, expected in zip(rules, BASE_RECIPE, strict=True):

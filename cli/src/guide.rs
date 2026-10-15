@@ -423,7 +423,7 @@ pub fn primer() -> Primer {
             },
             Landmine {
                 title: "Missing gVisor is inferred from a NotFound lookup, or from admission when that lookup is forbidden",
-                detail: "Direct `curie cluster up` looks up the configured RuntimeClass before the first install. A GET that returns NotFound applies security.gvisor.mode=off before the first install and prints the same inference. When that lookup is Forbidden, the chart default stays, `curie-preflight-gvisor` may report that RuntimeClass gvisor is not found, the attempt shows as retrying, the override is applied, and direct `curie cluster up` retries once. Other failures remain closed. Explicit auto or require modes contradict the detected result and are errors.",
+                detail: "Direct `curie cluster up` looks up the configured RuntimeClass before the first install. A GET that returns NotFound applies security.gvisor.mode=off before the first install and prints the same inference. When that lookup is Forbidden, the chart default stays, `curie-preflight-gvisor` may report that RuntimeClass gvisor is not found, the attempt shows as retrying, the override is applied, and direct `curie cluster up` retries once. Other failures remain closed. Explicit auto or require modes contradict the detected result and are errors. A present RuntimeClass whose nodeSelector matches no node also infers security.gvisor.mode=off before the first install, including fake-model auto installs with the preflight enabled; explicit auto is an error, while explicit require keeps the preflight gate for clusters that provision sandbox nodes on demand.",
             },
         ],
         recovery: vec![

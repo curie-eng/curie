@@ -82,7 +82,7 @@
 {{- toJson $normalized -}}
 {{- end -}}
 
-{{/* The render refusals. Included from secrets.yaml, which renders on every
+{{/* The render refusals. Included from curie.secretContent.init, which renders on every
      install, upgrade and template, with the chart managed Secret's existing
      data so a secret retained from an earlier render is judged as the value
      the services will actually read. */}}

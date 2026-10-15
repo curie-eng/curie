@@ -720,6 +720,10 @@ class _AdmissionCommands:
         """@spec PROTECTED-HOOK-ADMISSION-5 @spec PROTECTED-HOOK-ADMISSION-6."""
         return self._call("ZRANGE", key, start, end)
 
+    def sismember(self, key: str, member: str) -> Any:
+        """Read only owed-repair membership, @spec PROTECTED-HOOK-LANE-6."""
+        return self._call("SISMEMBER", key, member)
+
     def zcard(self, key: str) -> Any:
         """@spec PROTECTED-HOOK-LANE-4."""
         return self._call("ZCARD", key)

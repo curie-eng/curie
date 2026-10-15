@@ -773,7 +773,7 @@ spec:
               # Namespaced checks (no cluster RBAC). Read each runner SandboxTemplate
               # class first; an empty class is a mismatch, not a skip. Then schedule
               # a throwaway pod under the runtimeclass: admission tells us if it
-              # exists, and the kernel string tells us if it is enforced.
+              # exists, and the sentry kernel version tells us if it is enforced.
               check_runner_sandbox_template_class() {
                 if [ -z "${REQUIRED_RUNTIME_CLASS:-}" ]; then
                   return 0
@@ -798,7 +798,7 @@ spec:
                 kubectl delete pod "$gpod" -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
                 admit=$(kubectl run "$gpod" -n "$NS" --image="$BUSYBOX" --restart=Never \
                   --overrides="{\"spec\":{\"runtimeClassName\":\"${RC}\"}}" \
-                  --command -- sh -c 'uname -a; sleep 3' 2>&1 || true)
+                  --command -- sh -c 'uname -v; sleep 3' 2>&1 || true)
                 if echo "$admit" | grep -qi 'not found'; then
                   echo "NOT-TESTABLE: RuntimeClass '${RC}' absent on this cluster (admission: RuntimeClass"
                   echo "  not found). Reported, not faked (PT-3 discipline). gVisor kernel isolation was"
@@ -807,8 +807,9 @@ spec:
                   kubectl wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$gpod" -n "$NS" --timeout=30s >/dev/null 2>&1 || \
                     kubectl wait --for=condition=Ready "pod/$gpod" -n "$NS" --timeout=30s >/dev/null 2>&1 || true
                   gkernel=$(kubectl logs "$gpod" -n "$NS" 2>/dev/null || true)
+                  gkernel="${gkernel%"${gkernel##*[![:space:]]}"}"
                   kubectl delete pod "$gpod" -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
-                  if echo "$gkernel" | grep -qi gvisor; then
+                  if [ "$gkernel" = {{ include "curie.gvisor.sentryKernelVersion" . | quote }} ]; then
                     echo "PASS: pod under RuntimeClass '${RC}' reports a gVisor kernel: ${gkernel}"
                   else
                     echo "FAIL: RuntimeClass '${RC}' exists but the pod kernel is NOT gVisor (downgraded"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Render-assertion test for issue #3558.
+# Render and execution assertions for issues #3558 and #4420.
 #
 # security.gvisor.mode=auto currently stamps runtimeClassName only when Helm
 # lookup finds the RuntimeClass. helm template lookup is empty, so a real
@@ -31,6 +31,11 @@
 #      bad-template line (FAIL and curie-runner)
 #      and SECURITY PROBE: FAIL. With the class set to gvisor it exits 0,
 #      prints SECURITY PROBE: PASS, and does not print FAIL: SandboxTemplate.
+#   8. Both rendered kernel checks reject runc, including a gvisor-looking
+#      release and pod hostname, and accept current and older gVisor kernels.
+#      The probe executes its actual kubectl run command before reading logs.
+#   9. Neither rendered script uses uname -a, and the sentry version constant
+#      appears only in the shared chart helper.
 #
 # Runnable locally and from CI. Fails loudly.
 set -euo pipefail
@@ -413,6 +418,22 @@ PY
 
 STUB_BIN="$TMP/bin"
 mkdir -p "$STUB_BIN"
+cat >"$STUB_BIN/uname" <<'EOF'
+#!/usr/bin/env sh
+set -eu
+case "${1:-}" in
+  -a) printf 'Linux %s %s %s x86_64 GNU/Linux\n' "$FIXTURE_UNAME_NODENAME" "$FIXTURE_UNAME_RELEASE" "$FIXTURE_UNAME_VERSION" ;;
+  -n) printf '%s\n' "$FIXTURE_UNAME_NODENAME" ;;
+  -r) printf '%s\n' "$FIXTURE_UNAME_RELEASE" ;;
+  -v) printf '%s\n' "$FIXTURE_UNAME_VERSION" ;;
+  -s) printf '%s\n' Linux ;;
+  *) printf 'unexpected uname argument: %s\n' "$*" >&2; exit 1 ;;
+esac
+EOF
+cat >"$STUB_BIN/sleep" <<'EOF'
+#!/usr/bin/env sh
+exit 0
+EOF
 cat >"$STUB_BIN/kubectl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -454,7 +475,27 @@ if match_runtime_class_get; then
   exit 0
 fi
 if [[ "${args[0]:-}" == run ]] && { contains_substr sp-gvisor-check || contains_substr runtimeClassName; }; then
-  printf '%s\n' 'Error from server (NotFound): runtimeclasses.node.k8s.io "gvisor" not found'
+  case "$FIXTURE_POD_MODE" in
+    not-found)
+      printf '%s\n' 'Error from server (NotFound): runtimeclasses.node.k8s.io "gvisor" not found'
+      exit 0
+      ;;
+    scheduled)
+      for (( i = 0; i < len; i++ )); do
+        if [[ "${args[$i]}" == -- && $((i + 1)) -lt len ]]; then
+          "${args[@]:$((i + 1))}" >"$FIXTURE_POD_LOG"
+          printf '%s\n' 'pod/sp-gvisor-check created'
+          exit 0
+        fi
+      done
+      ;;
+  esac
+fi
+if [[ "${args[0]:-}" == wait ]] && contains_substr sp-gvisor-check; then
+  exit 0
+fi
+if [[ "${args[0]:-}" == logs ]] && contains_substr sp-gvisor-check; then
+  cat "$FIXTURE_POD_LOG"
   exit 0
 fi
 if [[ "${args[0]:-}" == delete ]] && contains_substr sp-gvisor-check; then
@@ -463,14 +504,17 @@ fi
 printf 'unexpected Claim 4 kubectl invocation: %s\n' "$*" >&2
 exit 1
 EOF
-chmod 0755 "$STUB_BIN/kubectl"
+chmod 0755 "$STUB_BIN/kubectl" "$STUB_BIN/uname" "$STUB_BIN/sleep"
 
 run_rendered_probe() {
   local fixture_class="$1"
   local log="$2"
+  local pod_mode="$3"
   set +e
   PATH="${STUB_BIN}:${PATH}" \
     FIXTURE_RUNTIME_CLASS="$fixture_class" \
+    FIXTURE_POD_MODE="$pod_mode" \
+    FIXTURE_UNAME_NODENAME=sp-gvisor-check \
     bash --noprofile --norc -c '
 set -euo pipefail
 set -a
@@ -486,7 +530,7 @@ bash -c "$script"
 }
 
 EMPTY_LOG="$TMP/probe-empty.log"
-EMPTY_RC="$(run_rendered_probe "" "$EMPTY_LOG")"
+EMPTY_RC="$(run_rendered_probe "" "$EMPTY_LOG" not-found)"
 if [[ "$EMPTY_RC" -eq 0 ]]; then
   fail "empty SandboxTemplate class: rendered probe exited 0; log: $(cat "$EMPTY_LOG")"
 fi
@@ -499,7 +543,7 @@ fi
 echo "  ok: empty class: rendered probe exits non-zero and reports FAIL for curie-runner"
 
 GVISOR_LOG="$TMP/probe-gvisor.log"
-GVISOR_RC="$(run_rendered_probe gvisor "$GVISOR_LOG")"
+GVISOR_RC="$(run_rendered_probe gvisor "$GVISOR_LOG" not-found)"
 if [[ "$GVISOR_RC" -ne 0 ]]; then
   fail "gvisor SandboxTemplate class: rendered probe exited ${GVISOR_RC}; log: $(cat "$GVISOR_LOG")"
 fi
@@ -511,4 +555,104 @@ if grep -F 'FAIL: SandboxTemplate' "$GVISOR_LOG" >/dev/null; then
 fi
 echo "  ok: gvisor class: rendered probe exits 0 with SECURITY PROBE: PASS"
 
-echo "PASS: real-model auto with empty lookup stamps gvisor on every runner SandboxTemplate, fake-model and mode off omit it, the admission expression follows that class, and the rendered security probe fails when curie-runner lacks gvisor and passes when the class is gvisor"
+for log in "$EMPTY_LOG" "$GVISOR_LOG"; do
+  grep -F "NOT-TESTABLE: RuntimeClass 'gvisor' absent" "$log" >/dev/null || \
+    fail "NotFound fixture lost its NOT-TESTABLE report: $(cat "$log")"
+done
+
+echo "=== Assertion 8: both rendered scripts identify the sentry independently of names ==="
+PREFLIGHT_RENDER="$(render_chart preflight \
+  --show-only templates/preflight-gvisor.yaml \
+  --set agentSandbox.runner.fakeModel=false)"
+PREFLIGHT_SCRIPT="$TMP/preflight-script.sh"
+python3 - "$PREFLIGHT_RENDER" "$PREFLIGHT_SCRIPT" <<'PY'
+import pathlib
+import sys
+
+import yaml
+
+path, script_out = sys.argv[1:]
+docs = [doc for doc in yaml.safe_load_all(pathlib.Path(path).read_text()) if doc]
+jobs = [doc for doc in docs if doc.get("kind") == "Job"]
+if len(jobs) != 1:
+    raise SystemExit(f"{path}: expected exactly one preflight Job, found {len(jobs)}")
+command = jobs[0]["spec"]["template"]["spec"]["containers"][0]["command"]
+if len(command) != 3 or command[:2] != ["/bin/sh", "-c"] or not isinstance(command[2], str):
+    raise SystemExit(f"{path}: preflight command is not [/bin/sh, -c, script]")
+pathlib.Path(script_out).write_text(command[2])
+PY
+
+# gVisor LinuxVersion: pkg/sentry/kernel/version/version.go, also present in
+# https://github.com/google/gvisor/blob/release-20230102.0/pkg/sentry/syscalls/linux/linux64.go
+# https://github.com/google/gvisor/blob/master/pkg/sentry/kernel/version/version.go
+SENTRY_KERNEL_VERSION='#1 SMP Sun Jan 10 15:06:54 PST 2016'
+RUNC_KERNEL_VERSION='#146-Ubuntu SMP PREEMPT_DYNAMIC Thu Sep  3 16:12:30 UTC 2026'
+fixture_failures=0
+for fixture in runc runc-lookalike current-gvisor older-gvisor; do
+  case "$fixture" in
+    runc) release=6.8.0-146-generic; version="$RUNC_KERNEL_VERSION"; expected=FAIL ;;
+    runc-lookalike) release=6.8.0-gvisor-lookalike; version="$RUNC_KERNEL_VERSION"; expected=FAIL ;;
+    current-gvisor) release=4.19.0-gvisor; version="$SENTRY_KERNEL_VERSION"; expected=PASS ;;
+    older-gvisor) release=4.4.0; version="$SENTRY_KERNEL_VERSION"; expected=PASS ;;
+  esac
+  export FIXTURE_UNAME_RELEASE="$release" FIXTURE_UNAME_VERSION="$version"
+  preflight_log="$TMP/preflight-${fixture}.log"
+  if PATH="${STUB_BIN}:${PATH}" FIXTURE_UNAME_NODENAME=curie-preflight-gvisor-x7k2p \
+    sh "$PREFLIGHT_SCRIPT" >"$preflight_log" 2>&1; then
+    preflight_rc=0
+  else
+    preflight_rc=$?
+  fi
+  export FIXTURE_POD_LOG="$TMP/pod-${fixture}.log"
+  probe_log="$TMP/probe-${fixture}.log"
+  probe_rc="$(run_rendered_probe gvisor "$probe_log" scheduled)"
+  [[ -s "$FIXTURE_POD_LOG" ]] || fail "$fixture: kubectl run did not save pod command stdout"
+  for check in preflight probe; do
+    if [[ "$check" == preflight ]]; then
+      rc="$preflight_rc"; log="$preflight_log"; summary="RESULT: ${expected}"
+      detail="$summary"
+    else
+      rc="$probe_rc"; log="$probe_log"; summary="SECURITY PROBE: ${expected}"
+      if [[ "$expected" == PASS ]]; then
+        detail='PASS: pod under RuntimeClass'
+      else
+        detail='NOT gVisor'
+      fi
+    fi
+    if { [[ "$expected" == PASS && "$rc" -eq 0 ]] || [[ "$expected" == FAIL && "$rc" -ne 0 ]]; } \
+      && grep -F "$summary" "$log" >/dev/null \
+      && grep -F "$detail" "$log" >/dev/null; then
+      echo "  ok: $check $fixture: $expected"
+    else
+      echo "FAIL: $check $fixture: wanted $expected, exit=$rc; log: $(cat "$log")" >&2
+      fixture_failures=$((fixture_failures + 1))
+    fi
+  done
+done
+[[ "$fixture_failures" -eq 0 ]] || fail "$fixture_failures kernel fixture checks failed"
+
+echo "=== Assertion 9: rendered scripts exclude nodenames and share the source constant ==="
+if grep -F 'uname -a' "$PREFLIGHT_SCRIPT" "$PROBE_SCRIPT"; then
+  fail "rendered kernel check still uses uname -a"
+fi
+python3 - "$CHART/templates" "$SENTRY_KERNEL_VERSION" <<'PY'
+import pathlib
+import re
+import sys
+
+templates = pathlib.Path(sys.argv[1])
+constant = sys.argv[2]
+matches = [path for path in templates.rglob("*") if path.is_file() and constant in path.read_text()]
+helper = templates / "_helpers.tpl"
+if matches != [helper] or helper.read_text().count(constant) != 1:
+    raise SystemExit("sentry version must appear exactly once in templates/_helpers.tpl")
+definition = re.search(
+    r'{{-?\s*define "curie\.gvisor\.sentryKernelVersion".*?{{-?\s*end\s*-?}}',
+    helper.read_text(),
+    re.DOTALL,
+)
+if definition is None or constant not in definition.group(0):
+    raise SystemExit("sentry version must belong to curie.gvisor.sentryKernelVersion")
+PY
+
+echo "PASS: runtime classes and admission match the model mode, the probe reports absent classes, and both kernel checks reject runc and accept current and older gVisor independently of pod names"

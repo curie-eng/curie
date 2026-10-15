@@ -1098,7 +1098,7 @@ def install_gitlab(p: fe.Preflight) -> None:
         "--namespace",
         p.namespace,
         "--release",
-        fe.RELEASE,
+        p.release,
         "--agent",
         fe.FACTORY_AGENT,
         "--plugin-dir",
@@ -1182,7 +1182,7 @@ def _allow_fixture_bridge(p: fe.Preflight, state: Mapping[str, Any]) -> None:
     assert p.chart_dir is not None, "install() extracts the chart first"
     context = p.config.kube_context
     raw = fe.run(
-        ["helm", "--kube-context", context, "get", "values", fe.RELEASE, "-n", p.namespace]
+        ["helm", "--kube-context", context, "get", "values", p.release, "-n", p.namespace]
         + ["-o", "json"]
     )
     values = fixture_bridge_egress(json.loads(raw), subnets, int(state["port"]))
@@ -1193,7 +1193,7 @@ def _allow_fixture_bridge(p: fe.Preflight, state: Mapping[str, Any]) -> None:
     fe.run(
         fe.helm_upgrade_command(
             context=context,
-            release=fe.RELEASE,
+            release=p.release,
             chart=str(p.chart_dir),
             namespace=p.namespace,
             values_file=str(values_file),

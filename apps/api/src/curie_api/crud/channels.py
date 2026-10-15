@@ -3,15 +3,29 @@
 import hashlib
 import uuid
 
-from aci_protocol.turn import SLACK_KIND, matching_routes, route_identity
+from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, matching_routes, route_identity
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.forges.registry import ForgeRegistry
 from curie_api.forges.surfaces import TRACKER_SURFACE_KINDS, effective_trigger_label
-from curie_api.schemas.channels import ChannelBindingPatch, ChannelBindingWrite
+from curie_api.schemas.channels import (
+    BUILTIN_CLUSTER_MESSAGE_ADAPTER,
+    ChannelBindingPatch,
+    ChannelBindingWrite,
+)
 
 from ..models import Agent, AgentChannel
+
+
+def normalized_reply_identity(
+    kind: str, adapter: str | None, identity: str | None
+) -> str | None:
+    """Persist a named Slack relay selector independently of its egress adapter."""
+
+    if kind == SLACK_KIND and adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER:
+        return None if identity == DEFAULT_IDENTITY else identity
+    return None
 
 
 class AmbiguousRoute(RuntimeError):

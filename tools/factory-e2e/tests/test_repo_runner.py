@@ -1318,8 +1318,10 @@ def test_preflight_release_assignment_selects_the_publication_namespace(tmp_path
         admission_timeout=1,
     )
     try:
-        assert preflight.release == fe.RELEASE
-        assert preflight.publication_namespace() == f"test-factory-tools-{fe.RELEASE}-publication"
+        assert preflight.release == fe.release_name(preflight.namespace)
+        assert preflight.publication_namespace() == (
+            f"test-factory-tools-{preflight.release}-publication"
+        )
         preflight.release = "factory-tools"
         assert preflight.publication_namespace() == "test-factory-tools-factory-tools-publication"
     finally:

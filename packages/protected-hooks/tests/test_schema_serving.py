@@ -56,7 +56,7 @@ def graph_payload() -> dict[str, Any]:
         ("0101", False),
         ("0102", False),
         ("0103", False),
-        ("0105", True),
+        ("0108", True),
         ("0000", True),
         ("future-expand", True),
     ],

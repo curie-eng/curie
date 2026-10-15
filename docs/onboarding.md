@@ -1,5 +1,11 @@
 # Local Dev Onboarding
 
+This is the **contributor** path for engineers working on Curie. To use a
+released co-worker, start with [Software Factory](software-factory.md),
+[bring your agent](bring-your-agent.md), or the
+[quickstart chooser](../QUICKSTART.md#choose-your-starting-point). Installing a
+release does not require cloning Curie or building its contributor toolchains.
+
 Use this walkthrough to go from a fresh clone to a verified local turn. Stay on
 the `skill` and `local` targets for onboarding. They need no Slack workspace and
 no Kubernetes cluster.
@@ -41,7 +47,7 @@ run, so only source builds need this.
 ## Pick a Target
 
 The three targets (`skill`, `local`, `cluster`) and when to reach for each are
-described in the [README target guide](../README.md#which-target-do-i-want).
+described in the [CLI target guide](../cli/README.md#using-different-tiers).
 For onboarding, `skill` names the runner only tier; an authored bundle skill is
 the artifact at `skills/<name>/SKILL.md`. Start with `skill` for the fastest
 proof a bundle answers, then move
@@ -65,7 +71,7 @@ directly with `curie skill down --name <container>`.
 Bringing up the full compose platform and driving a turn through it —
 `local up` / `local deploy` / `local message`, plus `--minimal` for low-RAM
 machines — is covered in the
-[README](../README.md#how-do-i-test-an-agent-the-same-way-locally-and-on-kubernetes).
+[CLI local walkthrough](../cli/README.md#local-target).
 `curie local up` flips to live automatically when a credential
 (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`) is present, so there is no
 manual `CURIE_FAKE_MODEL=0` step.

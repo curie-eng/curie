@@ -314,6 +314,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         environ=os.environ,
         level=settings.log_level.upper(),
     )
+    # Keep access and error records at INFO on the shared telemetry handlers.
+    configure_service_logging(
+        logging.getLogger("uvicorn"),
+        service_name="curie-api",
+        logger_provider=telemetry.logger_provider,
+        level=logging.INFO,
+    )
     app.state.telemetry = telemetry
     for limit in ("value", "namespace"):
         record_metric(
@@ -501,7 +508,21 @@ def create_app() -> FastAPI:
     log_credential_path(get_settings())
     # And whether an enabled OIDC login admits everyone its IdP signs in.
     oidc.log_admission_policy(get_settings())
-    app = FastAPI(title="Curie API", version="0.1.0", lifespan=lifespan)
+    # Curie owns the redacted, closed-vocabulary HTTP telemetry below. FastAPI's
+    # native telemetry otherwise inserts a second server/operation span and
+    # configures independent exporters around that boundary (#4410).
+    app = FastAPI(
+        title="Curie API",
+        version="0.1.0",
+        lifespan=lifespan,
+        telemetry={
+            "tracing": False,
+            "metrics": False,
+            "logs": False,
+            "operation_spans": False,
+            "auto_configure": False,
+        },
+    )
 
     @app.get("/health", tags=["health"])
     async def health() -> dict[str, str]:

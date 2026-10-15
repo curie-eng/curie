@@ -4,6 +4,12 @@ Date: 2026-09-25
 
 Status: Accepted
 
+**Superseded in part by [ADR 0220](0220-one-identity-provider-decides-who-may-invoke-and-approve-on-every-channel.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+for an agent that names an approver team, approver-team membership replaces
+amendment A1 to A3's `approvers.emails` list and its "no list, nobody" rule.
+Everything else in this ADR stands.
+
 Accepted with explicit maintainer approval from Brian Conn in the review of
 [#3252](https://github.com/curie-eng/curie/pull/3252), the pull request that
 published this status, before implementation.

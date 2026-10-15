@@ -49,6 +49,7 @@ RETRY_ALLOWLIST = frozenset(
     {
         ("ci.yaml", "adapter-credential-reconciliation", "Install uv"),
         ("ci.yaml", "python", "Install uv"),
+        ("ci.yaml", "python-static", "Install uv"),
         ("ci.yaml", "python-pytest", "Install uv"),
         ("ci.yaml", "turn-canary-contract", "Install uv"),
         ("fix-pin.yaml", "fix-pin", "Install uv"),
@@ -61,6 +62,7 @@ RETRY_ALLOWLIST = frozenset(
         # ci.yaml and helm-ci.yaml steps that were still a single attempt.
         ("ci.yaml", "action-pins", "Install uv"),
         ("ci.yaml", "rust-lint", "Install uv"),
+        ("ci.yaml", "runtime-assertion-registration", "Install uv for the runtime assertion gate"),
         ("ci.yaml", "rust-test", "Install uv"),
         ("ci.yaml", "rust-test", "Install Helm for CLI consumer render tests"),
         # Like the UI job, this acquires pnpm before repository code runs.
@@ -151,7 +153,7 @@ RETRY_ALLOWLIST = frozenset(
 PROTECTED_STEPS = frozenset(
     {
         ("ci.yaml", "python-pytest", "Pytest"),
-        ("ci.yaml", "python", "Docs gate (catalog drift + agent contract + citations)"),
+        ("ci.yaml", "python-static", "Docs gate (catalog drift + agent contract + citations)"),
         ("ci.yaml", "rust-test", "Test"),
         ("ci.yaml", "ui", "Lint"),
         ("ci.yaml", "ui", "Command manifest is current"),

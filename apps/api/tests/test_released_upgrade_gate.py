@@ -201,14 +201,26 @@ def sibling_postgres(
     isolated_released_upgrade_resources: Any,
     tmp_path: Path,
 ) -> Any:
+    project = f"curie2751sibling{uuid.uuid4().hex[:8]}"
+    preflight = _load_script(
+        "released_upgrade_preflight_networks",
+        REPO_ROOT / "tools" / "preflight" / "preflight.py",
+    )
+    occupied = preflight.docker_network_subnets(REPO_ROOT, dict(os.environ))
+    subnet, _ = preflight.private_network_subnets(project, occupied)
     override = tmp_path / "sibling.yaml"
     override.write_text(
         "services:\n"
         "  postgres:\n"
-        "    ports: !override [\"127.0.0.1::5432\"]\n",
+        "    ports: !override [\"127.0.0.1::5432\"]\n"
+        "networks:\n"
+        "  default:\n"
+        f"    name: {project}_default\n"
+        "    ipam:\n"
+        "      config:\n"
+        f"        - subnet: {subnet}\n",
         encoding="utf-8",
     )
-    project = f"curie2751sibling{uuid.uuid4().hex[:8]}"
     scope = gate.ReleaseUpgradeResources(
         compose_project=project,
         compose_files=(gate.COMPOSE_FILE, override),
