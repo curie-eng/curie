@@ -1227,13 +1227,202 @@ Once wired, a push to the agent's dev branch builds and deploys under its
 dev bot identity; a push or merge to its prod branch promotes that same
 built artifact without rebuilding.
 
+### Manual factory migration from v0.12.5 to v0.13.0
+
+This is the manual workaround for
+[#4628](https://github.com/curie-eng/curie/issues/4628) until the supported
+upgrade flow migrates the legacy factory automatically. It was executed with
+the released v0.12.5 and v0.13.0 CLIs and charts, a GitHub App, one repository,
+polling intake, an explicit label and mention, and non-default polling
+interval, card URL, CI wait, branch and CI policies. The upgrade completed convergence and its canary, recorded
+v0.13.0 as known-good, and served healthy API endpoints with the typed factory
+configuration loaded. No separate Helm upgrade is needed.
+
+1. Keep the existing App Secret in the installation namespace. Use the
+   v0.13.0 CLI for the upgrade below. Set `CONTEXT`, `NAMESPACE` and `RELEASE`
+   to the existing installation. Save its values privately for reference:
+
+   ```bash
+   umask 077
+   helm get values "$RELEASE" --kube-context "$CONTEXT" \
+     --namespace "$NAMESPACE" --output yaml > installed-values.yaml
+   ```
+
+   Do not publish this file or paste its contents into a terminal transcript.
+   Retain the existing `api.githubAppId`, `api.githubAppExistingSecret`,
+   `api.githubAppExistingSecretKey`, `api.githubRepoAllowlist`, webhook secret,
+   agent surfaces and unrelated configuration. `cluster upgrade` retains these
+   automatically; the migration overlay below only changes factory settings.
+   Read the existing App ID and Secret reference from the saved file. Obtain
+   each repository's numeric ID with `gh api repos/acme-corp/acme-bot --jq .id`
+   using an identity that can read that repository.
+
+2. Create one `factory-migration.yaml` overlay. The example uses placeholder
+   identity and repository values. JSON is valid YAML. Replace the placeholders
+   with the installed values,
+   preserving the label and mention exactly, including a mention without `@`.
+   Both credential entries reference the same existing Secret; do not put its
+   private key in the overlay. Use the same repository ID for `trackerScopeId`
+   and `projectId`. This example covers one repository.
+
+   ```json
+   {
+     "api": {
+       "githubFactoryIngressEnabled": null,
+       "githubFactoryIntake": null,
+       "githubFactoryPollIntervalSeconds": null,
+       "githubFactoryLabel": null,
+       "githubFactoryMention": null,
+       "githubFactoryCardBaseUrl": null,
+       "githubFactoryCiWaitSeconds": null,
+       "githubFactoryPythonCi": null,
+       "githubFactoryBases": null,
+       "githubFactoryMetadataCi": null
+     },
+     "factory": {
+       "enabled": true,
+       "intake": "poll",
+       "cardBaseUrl": "",
+       "ciWaitSeconds": 1200,
+       "codeHosts": [
+         {
+           "name": "github",
+           "kind": "github",
+           "host": "github.com",
+           "apiUrl": "https://api.github.com",
+           "credential": {
+             "type": "github_app",
+             "appId": "<APP_ID>",
+             "existingSecret": "curie-github-app",
+             "existingSecretKey": "privateKey"
+           }
+         }
+       ],
+       "trackers": [
+         {
+           "name": "github",
+           "kind": "github",
+           "host": "github.com",
+           "apiUrl": "https://api.github.com",
+           "credential": {
+             "type": "github_app",
+             "appId": "<APP_ID>",
+             "existingSecret": "curie-github-app",
+             "existingSecretKey": "privateKey"
+           },
+           "label": "<EXISTING_LABEL>",
+           "mention": "<EXISTING_APP_SLUG>",
+           "pollIntervalSeconds": 45
+         }
+       ],
+       "bindings": [
+         {
+           "name": "repo",
+           "tracker": "github",
+           "trackerScopeId": "<REPOSITORY_ID>",
+           "defaultRepo": "repo",
+           "repos": [
+             {
+               "alias": "repo",
+               "codeHost": "github",
+               "projectId": "<REPOSITORY_ID>",
+               "path": "acme-corp/acme-bot"
+             }
+           ]
+         }
+       ]
+     }
+   }
+   ```
+
+   Set every old factory key to `null`, including
+   `api.githubFactoryIngressEnabled`. Merely omitting the keys from this
+   overlay leaves the installed values in place and the upgrade still refuses.
+   Copy the installed enablement, intake, card URL and CI wait into
+   `factory.enabled`, `factory.intake`, `factory.cardBaseUrl` and
+   `factory.ciWaitSeconds`. Copy the old polling interval, label and mention
+   into the GitHub tracker. The defaults above are examples, not replacement
+   policy. For non-default repository policies, add the following fields to
+   that binding's `repos` entry in the same overlay:
+
+   | Old per-repository setting | New repository field |
+   |---|---|
+   | `api.githubFactoryBases[repo].bases` | `bases` |
+   | `api.githubFactoryBases[repo].default_base` | `defaultBase` |
+   | `api.githubFactoryPythonCi[repo].check` | `ci.required.key` |
+   | `api.githubFactoryPythonCi[repo].paths` | `ci.required.paths` |
+   | `api.githubFactoryPythonCi[repo].pendingCheckPrefix` | `ci.required.pendingKeyPrefix` |
+   | `api.githubFactoryMetadataCi[repo].checks` | `ci.metadataRerunKeys`, keeping each check name |
+   | `api.githubFactoryMetadataCi[repo].statuses` | The same `ci.metadataRerunKeys` list, with `status:` prepended to each context |
+
+3. Back up the database before accepting a forward-only schema migration.
+   The executed upgrade first refused a pending contract migration without
+   `--forward-only`; adding the flag allowed it to proceed. This accepts the
+   loss of the patch rollback window described in
+   [cluster upgrade](#curie-cluster-upgrade). Run the v0.13.0 CLI with the one
+   overlay through the normal upgrade lifecycle:
+
+   ```bash
+   curie cluster upgrade --context "$CONTEXT" \
+     --namespace "$NAMESPACE" --release "$RELEASE" \
+     --to 0.13.0 --values-file factory-migration.yaml --forward-only --yes
+   ```
+
+   Require a successful exit, convergence and a passed canary, with v0.13.0
+   recorded as known-good. Do not use the v0.13.0 `cluster factory` command as
+   an intermediate chart upgrade.
+
+4. Check the installed factory settings without displaying values or Secrets:
+
+   ```bash
+   helm get values "$RELEASE" --kube-context "$CONTEXT" \
+     --namespace "$NAMESPACE" --output json | python3 -c '
+   import json, sys
+   values = json.load(sys.stdin)
+   assert not any(v is not None for k, v in values.get("api", {}).items()
+                  if k.startswith("githubFactory"))
+   factory = values["factory"]
+   assert factory["enabled"] and factory["codeHosts"] and factory["bindings"]
+   assert all(t["label"] and t["mention"] for t in factory["trackers"])
+   assert all(r["path"] and r["projectId"]
+              for b in factory["bindings"] for r in b["repos"])
+   print("Typed factory settings present; legacy keys cleared")'
+   ```
+
+   Set `API_DEPLOYMENT` to the installation's API Deployment name and check
+   the running API without displaying credentials:
+
+   ```bash
+   kubectl --context "$CONTEXT" --namespace "$NAMESPACE" \
+     exec -i "deployment/$API_DEPLOYMENT" -c api -- python3 - <<'PY'
+   import urllib.request
+   from curie_api.config import Settings
+   settings = Settings()
+   assert settings.factory_enabled and settings.forges.trackers
+   assert settings.forges.bindings
+   for path in ("/health", "/ready"):
+       assert urllib.request.urlopen("http://127.0.0.1:8000" + path).status == 200
+   print("Typed factory configuration loaded; API health and readiness passed")
+   PY
+   ```
+
+   Compare the loaded tracker and repository configuration privately with the
+   settings saved before the upgrade. The executed migration verified the
+   expected label, mention, repository, polling interval, card URL, CI wait,
+   branch policy and CI policy. This verifies configuration migration and API
+   health; it does not establish a factory work item's outcome.
+
 ### Admitting a labelled GitHub issue
 
 Factory intake polls GitHub by default. It is off until `factory.enabled` is
 true (environment `FACTORY_ENABLED=true`). `factory.intake` (`FACTORY_INTAKE`)
 is `poll` or `webhook`, and `poll` is the default. The `factory:` block replaces
-the removed `api.githubFactory*` keys; a release that still sets one is refused
-at render with a message naming `factory.*` and `curie cluster factory`.
+the removed `api.githubFactory*` keys. For a v0.12.5 installation configured
+with `curie cluster factory`, follow the
+[manual v0.13.0 migration](#manual-factory-migration-from-v0125-to-v0130)
+above until [#4628](https://github.com/curie-eng/curie/issues/4628) is fixed.
+The v0.13.0 render refusal suggests `curie cluster factory`, but that command
+also fails on these legacy releases, even with explicit label and mention.
 Poll mode accepts a blank webhook secret, which disables signed deliveries.
 A configured secret permits signed deliveries in either intake mode. The
 published development secret is refused whenever factory intake is enabled.
