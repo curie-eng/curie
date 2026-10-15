@@ -81,9 +81,11 @@ Each option below is off by default; [design.md](design.md) holds the contract
 - `TURN_CANARY_METRIC_PREFIX` replaces the `turn_canary` metric name prefix in
   both the metrics file and the exporter, to keep existing series names.
 
-The exporter adds these series beside the TURN-CANARY-6 set, shown with the
+In exporter mode `TURN_CANARY_METRICS_PATH` is not written; scrape `/metrics`
+instead. These options add series beside the TURN-CANARY-6 set, shown with the
 default prefix: `turn_canary_binding_check_success{route,outcome}`,
-`turn_canary_adapter_up{adapter,outcome}`, `turn_canary_cycle_overruns_total`,
+`turn_canary_adapter_up{adapter,outcome}`, `turn_canary_cycle_overruns_total`
+(exporter only),
 and `turn_canary_rotation`.
 
 For an optional ResourceQuota observation, set `TURN_CANARY_QUOTA_URL` to the
