@@ -428,7 +428,6 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         }
         _ => (false, model),
     };
-    let install_label = recorded.as_ref().map(|r| r.install_label.clone());
     // The add agent path authenticates as the recorded App. A Jira agent
     // needs it now, for the repository ids its binding records.
     if let (true, true, None, Some(recorded)) = (jira_tracker, add_agent, &jira, &recorded) {
@@ -436,6 +435,16 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         jira = Some(jira_cloud::preflight(&opts.forge, &opts.repos, &recorded_app).await?);
         app = Some(recorded_app);
     }
+    let install_label = if jira_tracker {
+        jira.as_ref()
+            .and_then(|jira| jira.tracker.get("label"))
+            .and_then(|label| label.as_str())
+            .map(str::to_string)
+    } else {
+        recorded
+            .as_ref()
+            .map(|recorded| recorded.install_label.clone())
+    };
     let mut planned = quickstart_plan(&PlanInput {
         repos: opts.repos.clone(),
         app_id: opts.app_id.clone(),
@@ -605,6 +614,21 @@ fn app_str(app: &serde_json::Value, key: &str) -> String {
 
 fn app_bool(app: &serde_json::Value, key: &str) -> bool {
     app.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+pub(super) fn initial_binding(
+    repos: &[String],
+    jira_binding: Option<&str>,
+    label: Option<&str>,
+) -> ChannelBindingWrite {
+    let (kind, address) = match jira_binding {
+        Some(binding) => ("jira", binding),
+        None => (
+            "github",
+            repos.first().map(String::as_str).unwrap_or_default(),
+        ),
+    };
+    crate::api::add_channel_body(kind, address, None, None, label)
 }
 
 async fn execute(
@@ -786,6 +810,17 @@ async fn execute(
                         (bundle_dir(namespace, release, agent), Some(image))
                     }
                 };
+                ensure_factory_agent(
+                    &CommonOpts {
+                        namespace: namespace.clone(),
+                        release: release.clone(),
+                        dry_run: false,
+                    },
+                    agent,
+                    initial_binding(repos, jira_binding.as_deref(), label.as_deref()),
+                    repos.first().map(String::as_str),
+                )
+                .await?;
                 // `deploy_args` puts the deploy first, then the Jira binding or
                 // one GitHub binding per repository.
                 for (index, args) in deploy_args(
@@ -848,7 +883,7 @@ async fn execute(
                     .get("github_app")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let install_label = app_str(&github_app, "label");
+                let github_label = app_str(&github_app, "label");
                 return Ok(QuickstartOutput::Ready {
                     context: context.clone(),
                     repo: repos.join(","),
@@ -866,8 +901,11 @@ async fn execute(
                                 .collect()
                         })
                         .unwrap_or_default(),
-                    effective_label: label.clone().unwrap_or_else(|| install_label.clone()),
-                    label: install_label,
+                    effective_label: label
+                        .clone()
+                        .or_else(|| jira_binding.as_ref().and(install_label))
+                        .unwrap_or_else(|| github_label.clone()),
+                    label: github_label,
                     label_inferred: app_bool(&github_app, "label_inferred"),
                     runner_image: image,
                     agent: agent.clone(),

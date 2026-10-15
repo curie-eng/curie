@@ -27,9 +27,10 @@ use super::native::{self, NativeInstall};
 use super::{
     agent_settings, apply_manifest, bitbucket_cloud, bitbucket_dc, bundle_dir, bundle_line,
     check_credit, check_prerequisites, cluster_agent, confirm_remote_context, credential_line,
-    forge_egress_line, install_action_line, read_token, resolve_host, run_self,
-    token_secret_manifest, unconfirmed_remote_context, validate_agent_flags, CodeHostKind,
-    EgressEntry, QuickstartOpts, QuickstartOutput, DEFAULT_AGENT, SKIPPED_CLUSTER_UP_LINE,
+    ensure_factory_agent, forge_egress_line, initial_agent_line, install_action_line, read_token,
+    resolve_host, run_self, token_secret_manifest, unconfirmed_remote_context,
+    validate_agent_flags, CodeHostKind, EgressEntry, QuickstartOpts, QuickstartOutput,
+    DEFAULT_AGENT, SKIPPED_CLUSTER_UP_LINE,
 };
 use crate::exit::CliError;
 use crate::factory_intake::{apply_forge_entries, native_forge_values, NativeForgeEntries};
@@ -325,6 +326,16 @@ fn describe(plan: &Plan) -> Vec<String> {
         plan.bundle.as_deref(),
         plan.runner_image.as_deref(),
     ));
+    lines.push(initial_agent_line(
+        &plan.agent,
+        &crate::api::add_channel_body(
+            "jira",
+            jira_cloud::BINDING_NAME,
+            None,
+            None,
+            plan.label.as_deref(),
+        ),
+    ));
     for args in deploy_argvs(plan, &bundle_path(plan)) {
         lines.push(format!("curie {}", args.join(" ")));
     }
@@ -486,6 +497,19 @@ async fn execute(plan: &Plan, opts: &QuickstartOpts) -> Result<QuickstartOutput>
     })
     .await?;
     let credit_remaining_usd = check_credit(release_has_real_model).await;
+    ensure_factory_agent(
+        &common,
+        &plan.agent,
+        crate::api::add_channel_body(
+            "jira",
+            jira_cloud::BINDING_NAME,
+            None,
+            None,
+            plan.label.as_deref(),
+        ),
+        None,
+    )
+    .await?;
     for (index, args) in deploy_argvs(plan, &dir).into_iter().enumerate() {
         let step = match (index, plan.agent == DEFAULT_AGENT) {
             (0, true) => "Deploying dark factory".to_string(),
@@ -502,10 +526,12 @@ async fn execute(plan: &Plan, opts: &QuickstartOpts) -> Result<QuickstartOutput>
         agent: plan.agent.clone(),
         repos: vec![plan.code_host.path.clone()],
         trigger_label: plan.label.clone(),
-        effective_label: plan.entries.tracker["label"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string(),
+        effective_label: plan.label.clone().unwrap_or_else(|| {
+            plan.entries.tracker["label"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        }),
         bundle: match &plan.bundle {
             Some(dir) => dir.display().to_string(),
             None => "published".to_string(),

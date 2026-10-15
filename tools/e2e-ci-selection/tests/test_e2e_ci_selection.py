@@ -27,6 +27,21 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
 REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+INITIAL_BINDING_MODULE = "tools/factory-e2e/tests/test_c4_initial_binding.py"
+INITIAL_BINDING_INPUTS = (
+    "cli/src/factory_quickstart/github.rs",
+    "cli/src/factory_quickstart/gitlab/plan.rs",
+    "cli/src/factory_quickstart/jira_bitbucket.rs",
+    "cli/src/factory_intake.rs",
+    "cli/src/api.rs",
+    "cli/src/api_requests.rs",
+    "apps/api/src/curie_api/routers/agents.py",
+    "apps/api/src/curie_api/schemas/agents.py",
+    "apps/api/src/curie_api/schemas/channels.py",
+    "apps/api/src/curie_api/crud/channels.py",
+    "apps/api/src/curie_api/forges/surfaces.py",
+    INITIAL_BINDING_MODULE,
+)
 SRE_RUNTIME = "examples/tests/test_sre_bot_observability_runtime.py"
 SRE_RUNTIME_INPUTS = (
     "examples/sre-bot",
@@ -96,7 +111,13 @@ CHART_SHARED_INPUTS = (
     "cli/scripts/ensure-kind-registry.sh",
 )
 CHART_IMAGE_INPUTS = (
-    "apps/api", "apps/worker", "runner", "cli", "packages", "pyproject.toml", "uv.lock"
+    "apps/api",
+    "apps/worker",
+    "runner",
+    "cli",
+    "packages",
+    "pyproject.toml",
+    "uv.lock",
 )
 CHART_SCENARIOS = {
     "installation-identity": {
@@ -139,7 +160,9 @@ CHART_SCENARIOS = {
     "controller-preflight": {
         "step": "Controller preflight accepts a serving upgrade and refuses broken RBAC",
         "inputs": [
-            "charts/curie/ci/scenarios/controller-preflight-kind.sh", "pyproject.toml", "uv.lock"
+            "charts/curie/ci/scenarios/controller-preflight-kind.sh",
+            "pyproject.toml",
+            "uv.lock",
         ],
     },
     "workspace-diagnostic": {
@@ -152,7 +175,8 @@ CHART_SCENARIOS = {
     "quota-progress": {
         "step": "Quota progress regression",
         "inputs": [
-            "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh", *CHART_IMAGE_INPUTS
+            "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",
+            *CHART_IMAGE_INPUTS,
         ],
     },
 }
@@ -2028,7 +2052,6 @@ fi"""
     assert named_steps["Tear down the disposable upgrade cluster"]["if"] == "always()"
 
 
-
 def test_upgrade_mutants_change_only_their_target_helpers(tmp_path: Path) -> None:
     """The managed secret mutant must keep every later helper (#4466 added
     curie.secretChecksum after it), or the candidate fails to render and the
@@ -2050,6 +2073,7 @@ def test_upgrade_mutants_change_only_their_target_helpers(tmp_path: Path) -> Non
     assert managed.read_text() != helpers.read_text()
     assert "{{- else if hasKey .existingData .key -}}" in managed.read_text()
     assert placement.read_text() != helpers.read_text()
+
 
 def test_released_upgrade_candidate_images_opt_into_forward_only_migrations() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
@@ -2986,7 +3010,26 @@ def test_negative_control_covers_scripted_factory_result(selected: str, result: 
     assert "Selected and skipped negative control failed for FACTORY_RESULT" in output
 
 
-def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required() -> None:
+@pytest.mark.parametrize("path", INITIAL_BINDING_INPUTS)
+def test_registration_seam_changes_select_the_factory_runtime(tmp_path: Path, path: str) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    outputs = _outputs_of(output)
+    assert outputs["factory"] == "true"
+    assert outputs["images"] == "true"
+    assert outputs["cli_release"] == "true"
+
+
+@pytest.mark.parametrize(
+    "path", ("cli/src/output.rs", "apps/api/src/curie_api/routers/config.py", "docs/guide.md"),
+)
+def test_unrelated_changes_do_not_select_the_factory_runtime(tmp_path: Path, path: str) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    assert _outputs_of(output)["factory"] == "false"
+
+
+def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_path: Path) -> None:
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     job = jobs[SCRIPTED_FACTORY_JOB]
     assert job["name"] == "E2E scripted factory scenario (kind, scripted model)"
@@ -3007,6 +3050,40 @@ def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required() -> 
     }
     assert "if" not in scenario[0]
     assert "continue-on-error" not in scenario[0]
+
+    steps = job["steps"]
+    registrations = [step for step in steps if INITIAL_BINDING_MODULE in step.get("run", "")]
+    assert len(registrations) == 1
+    registration = registrations[0]
+    assert steps.index(scenario[0]) < steps.index(registration)
+    assert not registration.get("if")
+    assert not registration.get("continue-on-error")
+    assert any(
+        step.get("uses", "").startswith("astral-sh/setup-uv@")
+        for step in steps[:steps.index(registration)]
+    )
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    log = tmp_path / "registration-argv.json"
+    uv = binaries / "uv"
+    uv.write_text(
+        f"#!{sys.executable}\nimport json, os, sys\nfrom pathlib import Path\n"
+        "Path(os.environ['REGISTRATION_ARGV']).write_text(json.dumps(sys.argv[1:]))\n"
+    )
+    uv.chmod(0o755)
+    executed = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", registration["run"]],
+        cwd=tmp_path,
+        env={**os.environ, "PATH": f"{binaries}:{os.environ['PATH']}",
+             "REGISTRATION_ARGV": str(log)},
+        capture_output=True, text=True, check=False,
+    )
+    assert executed.returncode == 0, executed.stdout + executed.stderr
+    argv = json.loads(log.read_text())
+    assert argv[:2] == ["run", "pytest"]
+    assert INITIAL_BINDING_MODULE in argv
+    assert not any(arg in argv for arg in ("-k", "-m", "--deselect"))
+    assert not any(arg.startswith(INITIAL_BINDING_MODULE + "::") for arg in argv)
 
 
 def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> None:
@@ -3106,7 +3183,9 @@ def test_chart_scenario_union_is_sorted_and_deduplicated(tmp_path: Path) -> None
     assert forward.returncode == reverse.returncode == 0, forward.stderr + reverse.stderr
     assert output == reversed_output
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == [
-        "connector-readiness", "quota-progress", "workspace-diagnostic"
+        "connector-readiness",
+        "quota-progress",
+        "workspace-diagnostic",
     ]
 
 
@@ -3192,7 +3271,9 @@ def test_chart_scenario_registry_rejects_malformed_entries(tmp_path: Path, mutat
         section["shared_inputs"] = section["shared_inputs"][0]
     else:
         values = {
-            "empty-path": "", "absolute-path": "/charts/curie", "trailing-slash": "charts/curie/"
+            "empty-path": "",
+            "absolute-path": "/charts/curie",
+            "trailing-slash": "charts/curie/",
         }
         key = mutation.removeprefix("shared-")
         if mutation.startswith("shared-"):
@@ -3232,8 +3313,8 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
         paths = ("apps/api/src/curie_api/main.py",)
     completed, output = _invoke_selector(tmp_path, *paths, **options)
     assert completed.returncode == 0, completed.stderr
-    expected = CHART_IDS if mode in {"push", "revisions"} else (
-        "quota-progress", "workspace-diagnostic"
+    expected = (
+        CHART_IDS if mode in {"push", "revisions"} else ("quota-progress", "workspace-diagnostic")
     )
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == sorted((*expected, "unregistered"))
     docs, docs_output = _invoke_selector(tmp_path, "docs/example.md", cwd=repository)

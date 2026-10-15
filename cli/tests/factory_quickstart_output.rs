@@ -257,19 +257,32 @@ sys.exit(64)
 "#;
 
 fn agent() -> Value {
-    json!({"id":"agent-fixture","name":"dark-factory","channels":[{"kind":"slack","address":"C0EXAMPLE1"}],"created_at":"2026-10-04T00:00:00Z","memory":false,"memory_writes":true,"publication_policy":"auto","execution_deadline_seconds":3600})
+    json!({"id":"agent-fixture","name":"dark-factory","channels":[],"created_at":"2026-10-04T00:00:00Z","memory":false,"memory_writes":true,"publication_policy":"auto","execution_deadline_seconds":3600})
 }
 
 fn platform(req: &Request, state: &std::sync::Mutex<Value>) -> Response {
     let path = req.path.split('?').next().unwrap();
     let mut saved = state.lock().unwrap();
     let result = match (req.method.as_str(), path) {
+        ("GET", "/agents") if saved.is_null() => json!([]),
         ("GET", "/agents") => json!([saved.clone()]),
         ("POST", "/agents") => {
             let created: Value = serde_json::from_slice(&req.body).unwrap();
+            assert!(
+                saved.is_null(),
+                "the fixture agent must be created only once"
+            );
+            assert!(
+                created["channel"].is_object(),
+                "AgentCreate needs an initial binding"
+            );
+            *saved = agent();
             saved["name"] = created["name"].clone();
-            saved["channels"] = json!([]);
-            saved.clone()
+            saved["channels"] = json!([created["channel"].clone()]);
+            if let Some(repo) = created.get("repo_full_name") {
+                saved["repo_full_name"] = repo.clone();
+            }
+            return Response::json(201, &saved.to_string());
         }
         ("GET", "/agents/agent-fixture") => saved.clone(),
         ("PATCH", "/agents/agent-fixture") => {
@@ -282,7 +295,19 @@ fn platform(req: &Request, state: &std::sync::Mutex<Value>) -> Response {
         }
         ("POST", "/agents/agent-fixture/channels") => {
             let binding: Value = serde_json::from_slice(&req.body).unwrap();
-            saved["channels"].as_array_mut().unwrap().push(binding);
+            let channels = saved["channels"].as_array_mut().unwrap();
+            if let Some(held) = channels.iter().find(|held| {
+                held["kind"] == binding["kind"] && held["address"] == binding["address"]
+            }) {
+                if held["trigger_label"] != binding["trigger_label"] {
+                    return Response::json(
+                        409,
+                        r#"{"detail":"surface already has another label"}"#,
+                    );
+                }
+            } else {
+                channels.push(binding);
+            }
             saved.clone()
         }
         ("POST", "/agents/agent-fixture/versions") => {
@@ -450,7 +475,7 @@ impl Fixture {
             }
             Response::json(404, "{}")
         });
-        let agent_state = std::sync::Mutex::new(agent());
+        let agent_state = std::sync::Mutex::new(Value::Null);
         Self {
             dir,
             github,
@@ -1462,9 +1487,9 @@ fn both_default_passes_stay_within_the_line_budget_against_a_fake_cluster() {
     for (method, path, field, value) in [
         (
             "POST",
-            "/agents/agent-fixture/channels",
-            "address",
-            json!("acme/widgets"),
+            "/agents",
+            "channel",
+            json!({"kind":"github","address":"acme/widgets"}),
         ),
         (
             "PATCH",
@@ -1494,6 +1519,20 @@ fn both_default_passes_stay_within_the_line_budget_against_a_fake_cluster() {
             "the ready path did not apply {field}"
         );
     }
+    let creations: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == "POST" && request.path == "/agents")
+        .collect();
+    assert_eq!(creations.len(), 1);
+    let create_index = requests
+        .iter()
+        .position(|request| request.method == "POST" && request.path == "/agents")
+        .unwrap();
+    let deployment_index = requests
+        .iter()
+        .position(|request| request.method == "POST" && request.path == "/deployments")
+        .unwrap();
+    assert!(create_index < deployment_index);
     let upgrades = helm_upgrade_calls(&fixture);
     assert_eq!(
         upgrades.len(),

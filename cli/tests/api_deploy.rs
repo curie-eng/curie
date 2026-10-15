@@ -4,6 +4,7 @@
 use crate::support;
 
 use curie::api::{ApiClient, ChannelOutcome, DeployOutcome, WorkspaceIntent};
+use curie::api_requests::ChannelBindingWrite;
 use curie::bundle::pack_tar_gz;
 use curie::commands::{self, DeployOpts};
 use curie::scaffold::scaffold;
@@ -458,11 +459,123 @@ async fn reuses_an_existing_agent_instead_of_creating() {
     });
     let client = ApiClient::new(&server.base_url, "k").unwrap();
     let agent = client
-        .find_or_create_agent("deal-desk", "#local-dev")
+        .find_or_create_agent(
+            "deal-desk",
+            ChannelBindingWrite {
+                kind: "slack".into(),
+                address: "C0EXAMPLE1".into(),
+                adapter: None,
+                endpoint: None,
+                trigger_label: None,
+            },
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(agent.id, AGENT_ID);
     assert_eq!(server.recorded().len(), 1);
+}
+
+#[tokio::test]
+async fn create_agent_sends_the_initial_tracker_binding_without_slack() {
+    for (kind, address) in [
+        ("github", "acme-corp/acme-bot"),
+        ("gitlab", "acme-corp/platform/acme-bot"),
+        ("jira", "acme-jira"),
+    ] {
+        for label in [None, Some("acme-work")] {
+            let server = serve(|req| {
+                assert_eq!(
+                    (req.method.as_str(), req.path.as_str()),
+                    ("POST", "/agents")
+                );
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                Response::json(
+                    201,
+                    &serde_json::json!({
+                        "id": AGENT_ID,
+                        "name": body["name"],
+                        "channels": [body["channel"]],
+                        "repo_full_name": body["repo_full_name"],
+                        "created_at": "2026-07-05T00:00:00Z",
+                        "memory": false,
+                    })
+                    .to_string(),
+                )
+            });
+            let binding = ChannelBindingWrite {
+                kind: kind.into(),
+                address: address.into(),
+                adapter: None,
+                endpoint: None,
+                trigger_label: label.map(str::to_string),
+            };
+            let agent = ApiClient::new(&server.base_url, "k")
+                .unwrap()
+                .create_agent("acme-bot", binding, Some("acme-corp/acme-bot"))
+                .await
+                .unwrap();
+            assert_eq!(agent.channels.len(), 1);
+            assert_eq!(agent.channels[0].kind, kind);
+            assert_eq!(agent.channels[0].address, address);
+            assert_eq!(agent.channels[0].trigger_label.as_deref(), label);
+            let requests = server.recorded();
+            assert_eq!(requests.len(), 1);
+            let actual: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            let mut channel = serde_json::json!({"kind": kind, "address": address});
+            if let Some(label) = label {
+                channel["trigger_label"] = label.into();
+            }
+            assert_eq!(
+                actual,
+                serde_json::json!({
+                    "name": "acme-bot", "channel": channel,
+                    "repo_full_name": "acme-corp/acme-bot",
+                })
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn create_agent_preserves_named_slack_identity_refusal() {
+    let server = serve(|_req| {
+        Response::json(
+            422,
+            r#"{"detail":"Slack identity acme-reviewer is not declared"}"#,
+        )
+    });
+    let result = ApiClient::new(&server.base_url, "k")
+        .unwrap()
+        .create_agent(
+            "acme-bot",
+            ChannelBindingWrite {
+                kind: "slack".into(),
+                address: "C0EXAMPLE1".into(),
+                adapter: Some("acme-reviewer".into()),
+                endpoint: None,
+                trigger_label: None,
+            },
+            None,
+        )
+        .await;
+    let error = result.expect_err("an undeclared Slack identity must stay refused");
+    let typed = error.downcast_ref::<curie::exit::CliError>().unwrap();
+    assert_eq!(typed.class, curie::exit::ExitClass::Usage);
+    let shown = error.to_string();
+    assert!(shown.contains("slack binding on C0EXAMPLE1"), "{shown}");
+    assert!(shown.contains("acme-reviewer"), "{shown}");
+    assert!(shown.contains("not declared"), "{shown}");
+    let requests = server.recorded();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body["channel"],
+        serde_json::json!({
+            "kind": "slack", "address": "C0EXAMPLE1", "adapter": "acme-reviewer",
+        })
+    );
+    assert!(body.get("repo_full_name").is_none());
 }
 
 /// The version/bundle/deployment tail of the deploy flow, shared by the

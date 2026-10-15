@@ -463,6 +463,23 @@ impl Cli {
         Self { dir }
     }
 
+    fn serve_release_snapshot(&self) {
+        fs::write(
+            self.dir.path().join("bin/helm"),
+            r#"#!/bin/sh
+echo "helm $*" >> "$SHIM_LOG"
+case "$1 $2" in
+  "show chart") echo '{"name":"curie","version":"0.0.0"}'; exit 0 ;;
+  "get values") echo '{}'; exit 0 ;;
+  "get metadata") echo '{"chart":"curie-0.0.0"}'; exit 0 ;;
+  history\ *) echo '[{"revision":1,"status":"deployed"}]'; exit 0 ;;
+esac
+exit 1
+"#,
+        )
+        .unwrap();
+    }
+
     /// A token file holding `token` with the newline an editor leaves.
     fn token_file(&self, token: &str) -> String {
         let path = self
@@ -1129,17 +1146,22 @@ fn factory_quickstart_gitlab_refuses_before_any_cluster_call() {
 }
 
 /// Step f: the first run creates the trigger label and every state label, a
-/// second run creates none, and a label that exists is left alone. The cluster
-/// tools answer 1, so each run stops at its first cluster step after f.
+/// second run creates none, and a label that exists is left alone. Helm serves
+/// the existing release snapshot; cluster writes fail after the labels.
 #[test]
 fn factory_quickstart_gitlab_creates_every_label_on_the_first_run_and_none_on_the_second() {
     let cli = Cli::new(1);
+    cli.serve_release_snapshot();
     let labels = Labels::with(&["bug"]);
     let server = gitlab("19.4.1-ce.0", labels.clone());
     let args = gitlab_args(PROJECT_PATH, &cli.token_file(BOT_TOKEN), &server.base_url);
 
     let first = cli.run(&refs(&args));
     let text = first.all();
+    assert_ne!(
+        first.code, 0,
+        "the later cluster step must still fail: {text}"
+    );
     let posted: Vec<String> = label_posts(&server)
         .iter()
         .map(|body| body["name"].as_str().unwrap_or_default().to_string())
@@ -1173,6 +1195,12 @@ fn factory_quickstart_gitlab_creates_every_label_on_the_first_run_and_none_on_th
 
     let before = label_posts(&server).len();
     let second = cli.run(&refs(&args));
+    assert_ne!(
+        second.code,
+        0,
+        "the later cluster step must still fail: {}",
+        second.all()
+    );
     assert_eq!(
         label_posts(&server).len(),
         before,
@@ -1183,10 +1211,17 @@ fn factory_quickstart_gitlab_creates_every_label_on_the_first_run_and_none_on_th
 
     // A project that already holds two of them gets only the missing three.
     let cli = Cli::new(1);
+    cli.serve_release_snapshot();
     let labels = Labels::with(&[TRIGGER_LABEL, "curie-factory:running"]);
     let server = gitlab("19.4.1-ce.0", labels.clone());
     let args = gitlab_args(PROJECT_PATH, &cli.token_file(BOT_TOKEN), &server.base_url);
     let run = cli.run(&refs(&args));
+    assert_ne!(
+        run.code,
+        0,
+        "the later cluster step must still fail: {}",
+        run.all()
+    );
     let mut posted: Vec<String> = label_posts(&server)
         .iter()
         .map(|body| body["name"].as_str().unwrap_or_default().to_string())

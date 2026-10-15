@@ -74,10 +74,8 @@ jobs:
           python-version: "3.13"
       - name: Sync workspace
         run: uv sync
-      # Everything below the probe is gated on it, so a pull request that
-      # declares nothing, or declares `n/a`, still costs only the probe. That
-      # is #2228's win, preserved: the parser does not reach the binary for
-      # those, so no build, no Helm, and no compose stack is paid for them.
+      # Setup follows the parsed requirements. Verification always runs so
+      # malformed or missing declarations still reach the policy gate.
       - name: Decide whether the current curie binary is needed
         id: fix-pin-curie
         run: >-
@@ -100,19 +98,44 @@ jobs:
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.16.4
+      - name: Ensure kind-registry exists
+        if: steps.fix-pin-curie.outputs.needs_kind == 'true'
+        run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Install kind and kubectl without creating a cluster
+        if: steps.fix-pin-curie.outputs.needs_kind == 'true'
+        id: install_kind
+        continue-on-error: true
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          install_only: true
+      - name: Back off before retrying Install kind and kubectl without creating a cluster
+        if: steps.fix-pin-curie.outputs.needs_kind == 'true' && steps.install_kind.outcome == 'failure'
+        run: |
+          echo "Install kind and kubectl without creating a cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          bash cli/scripts/ensure-kind-registry.sh
+          sleep 15
+      - name: Install kind and kubectl without creating a cluster (retry)
+        if: steps.fix-pin-curie.outputs.needs_kind == 'true' && steps.install_kind.outcome == 'failure'
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          install_only: true
       # Use the same migration, authenticated read and worker readiness gate
       # as the Python job before executing any pinned integration selector.
       - name: Start dev stack
-        if: steps.fix-pin-curie.outputs.needed == 'true'
+        if: steps.fix-pin-curie.outputs.needs_stack == 'true'
         run: python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480
       - name: Wait for Langfuse to serve
-        if: steps.fix-pin-curie.outputs.needed == 'true'
+        if: steps.fix-pin-curie.outputs.needs_stack == 'true'
         run: python3 scripts/wait-for-langfuse.py
       # A pinned worker binding test dials the shared default database and
       # assumes the curie schema exists, exactly as it does under the Python
       # job, so the same migration runs here.
       - name: Migrate the shared database
-        if: steps.fix-pin-curie.outputs.needed == 'true'
+        if: steps.fix-pin-curie.outputs.needs_stack == 'true'
         working-directory: apps/api
         run: uv run alembic upgrade head
       - name: Require declared fixes to be pinned by a changed test
@@ -128,5 +151,5 @@ jobs:
       # --profile full, `docker compose logs` matches no service and prints
       # nothing, so a real outage gets diagnosed with no container logs at all.
       - name: Dump dev stack logs on failure
-        if: ${{ failure() && steps.fix-pin-curie.outputs.needed == 'true' }}
+        if: ${{ failure() && steps.fix-pin-curie.outputs.needs_stack == 'true' }}
         run: docker compose --profile full -f compose.dev.yaml logs --no-color --tail=200

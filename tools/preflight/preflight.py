@@ -716,7 +716,7 @@ def open_waiver_issues(root: Path, repository: str, body: str) -> list[int]:
     return opened
 
 
-def fix_pin_needs_curie(root: Path, event: Path, directory: Path) -> bool:
+def fix_pin_requirements(root: Path, event: Path, directory: Path) -> dict[str, bool]:
     output = directory / "fix-pin-output"
     check = run_check(
         root,
@@ -726,7 +726,16 @@ def fix_pin_needs_curie(root: Path, event: Path, directory: Path) -> bool:
     )
     if check["status"] == "failed":
         raise ValueError(check["detail"])
-    return "needed=true" in output.read_text().splitlines()
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    if set(values) != {"needed", "needs_stack", "needs_kind"} or any(
+        value not in {"true", "false"} for value in values.values()
+    ):
+        raise ValueError("Fix pin build selection returned invalid infrastructure requirements")
+    return {key: value == "true" for key, value in values.items()}
+
+
+def fix_pin_needs_curie(root: Path, event: Path, directory: Path) -> bool:
+    return fix_pin_requirements(root, event, directory)["needed"]
 
 
 def check_pr_body(
@@ -925,7 +934,9 @@ def private_network_subnets(project: str, occupied: Sequence[str]) -> tuple[str,
     seed = int(hashlib.sha256(project.encode()).hexdigest(), 16)
     selected: list[str] = []
     for pool_index, pool in enumerate(pools):
-        candidates = list(pool.subnets(new_prefix=24))
+        candidates: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = list(
+            pool.subnets(new_prefix=24)
+        )
         start = (seed + pool_index) % len(candidates)
         for offset in range(len(candidates)):
             candidate = candidates[(start + offset) % len(candidates)]
@@ -1288,7 +1299,7 @@ def body_needs_services(root: Path, body_file: Path) -> bool:
         event = Path(directory) / "event.json"
         event.write_text(json.dumps({"pull_request": {"body": body_file.read_text()}}))
         event.chmod(0o600)
-        return fix_pin_needs_curie(root, event, Path(directory))
+        return fix_pin_requirements(root, event, Path(directory))["needs_stack"]
 
 
 def execute_full(

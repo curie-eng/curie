@@ -16,10 +16,11 @@ use crate::exit::CliError;
 use crate::factory_intake::{apply_forge_entries, native_forge_values, NativeForgeEntries};
 use crate::factory_quickstart::{
     agent_settings, apply_manifest, bundle_dir, bundle_line, check_credit, check_prerequisites,
-    cluster_agent, confirm_remote_context, credential_line, forge_egress_line, install_action_line,
-    native, read_token, run_self, token_secret_manifest, unconfirmed_remote_context,
-    validate_agent_flags, CredentialDecision, InstallSteps, QuickstartOpts, QuickstartOutput,
-    DEFAULT_AGENT, SKIPPED_CLUSTER_UP_LINE,
+    cluster_agent, confirm_remote_context, credential_line, deployed_release_snapshot,
+    ensure_factory_agent, forge_egress_line, initial_agent_line, install_action_line, native,
+    read_token, run_self, token_secret_manifest, unconfirmed_remote_context, validate_agent_flags,
+    Action, CredentialDecision, InstallSteps, QuickstartOpts, QuickstartOutput, DEFAULT_AGENT,
+    SKIPPED_CLUSTER_UP_LINE,
 };
 use crate::ops::CommonOpts;
 use crate::ui::DryRunPlan;
@@ -40,6 +41,7 @@ struct GitlabPlan {
     /// The agent's own binding label (`--label`); `None` lets the tracker
     /// label serve the binding.
     label: Option<String>,
+    effective_label: String,
     /// The operator bundle; `None` renders the published dark factory.
     bundle: Option<PathBuf>,
     /// The operator bundle's locked runner image.
@@ -186,7 +188,7 @@ fn describe(plan: &GitlabPlan) -> Vec<String> {
         ),
         format!(
             "ensure labels {} on project {}, creating only the missing ones, before any cluster step",
-            wanted_labels(&facts.label)
+            wanted_labels(&plan.effective_label)
                 .into_iter()
                 .map(|(name, _)| name)
                 .collect::<Vec<_>>()
@@ -232,6 +234,16 @@ fn describe(plan: &GitlabPlan) -> Vec<String> {
     lines.push(bundle_line(
         plan.bundle.as_deref(),
         plan.runner_image.as_deref(),
+    ));
+    lines.push(initial_agent_line(
+        &plan.agent,
+        &crate::api::add_channel_body(
+            "gitlab",
+            &plan.facts.path,
+            None,
+            None,
+            plan.label.as_deref(),
+        ),
     ));
     for args in deploy_argvs(plan, &bundle_path(plan)) {
         lines.push(format!("curie {}", args.join(" ")));
@@ -286,10 +298,69 @@ pub(in crate::factory_quickstart) async fn quickstart(
         found.expires_at.as_deref(),
         time::OffsetDateTime::now_utc().date(),
     )?;
-    let label = opts
-        .label
-        .clone()
+    let real_interactive = std::io::stdin().is_terminal();
+    if !opts.dry_run {
+        crate::ui::ui().note(&expiry);
+        if let Some(name) = unconfirmed_remote_context(opts.context.as_deref(), current.as_deref())
+        {
+            confirm_remote_context(name, real_interactive)?;
+        }
+    }
+    let planned = native::plan_install(&opts, current.as_deref(), real_interactive).await?;
+    let creates_kind = planned.install.actions.iter().any(|action| {
+        matches!(action, Action::External { program, args }
+            if program == "kind" && args.first().is_some_and(|arg| arg == "create"))
+    });
+    let common = CommonOpts {
+        namespace: opts.namespace.clone(),
+        release: opts.release.clone(),
+        dry_run: false,
+    };
+    let mut assumed = None;
+    let snapshot = if opts.dry_run {
+        match opts.context.as_deref() {
+            None => {
+                assumed = Some("no --context was passed, so the release was not read; planned as if it records no GitLab tracker".to_string());
+                None
+            }
+            Some(context) => {
+                let read = match crate::kube_context::pin_for_cluster_command(Some(context)) {
+                    Ok(_) => deployed_release_snapshot(&common).await,
+                    Err(error) => Err(error),
+                };
+                match read {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        assumed = Some(format!(
+                            "the release could not be read ({error:#}); planned as if it records no GitLab tracker"
+                        ));
+                        None
+                    }
+                }
+            }
+        }
+    } else if !creates_kind {
+        crate::kube_context::pin_for_cluster_command(Some(&planned.install.context))?;
+        deployed_release_snapshot(&common).await?
+    } else {
+        None
+    };
+    let label = snapshot
+        .as_ref()
+        .and_then(|(values, _)| values.pointer("/factory/trackers"))
+        .and_then(|trackers| trackers.as_array())
+        .and_then(|trackers| {
+            trackers.iter().find(|tracker| {
+                tracker.get("name").and_then(|name| name.as_str()) == Some(ENTRY_NAME)
+                    && tracker.get("kind").and_then(|kind| kind.as_str()) == Some("gitlab")
+            })
+        })
+        .and_then(|tracker| tracker.get("label"))
+        .and_then(|label| label.as_str())
+        .map(str::to_string)
+        .or_else(|| opts.label.clone())
         .unwrap_or_else(|| crate::factory_app::DEFAULT_LABEL.to_string());
+    let effective_label = opts.label.clone().unwrap_or_else(|| label.clone());
     let facts = GitlabFacts {
         egress: web_egress(&web_base)?,
         web_base,
@@ -306,24 +377,15 @@ pub(in crate::factory_quickstart) async fn quickstart(
     };
     let entries = gitlab_entries(&facts);
 
-    // Confirm before any write. A non-terminal refusal here mutates nothing.
-    let real_interactive = std::io::stdin().is_terminal();
     if !opts.dry_run {
-        crate::ui::ui().note(&expiry);
-        if let Some(name) = unconfirmed_remote_context(opts.context.as_deref(), current.as_deref())
-        {
-            confirm_remote_context(name, real_interactive)?;
-        }
-        // Step f, the last step before any cluster call.
         crate::ui::ui().note("Ensuring the GitLab labels");
         let created =
-            api::ensure_labels(&gitlab, found.project_id, &wanted_labels(&facts.label)).await?;
+            api::ensure_labels(&gitlab, found.project_id, &wanted_labels(&effective_label)).await?;
         if !created.is_empty() {
             crate::ui::ui().note(&format!("Created labels {}", created.join(", ")));
         }
     }
 
-    let planned = native::plan_install(&opts, current.as_deref(), real_interactive).await?;
     let release_has_real_model = planned.release_has_real_model;
     let plan = GitlabPlan {
         install: planned.install,
@@ -338,6 +400,7 @@ pub(in crate::factory_quickstart) async fn quickstart(
         release: opts.release.clone(),
         agent: opts.agent.clone(),
         label: opts.label.clone(),
+        effective_label,
         bundle: opts.plugin_dir.clone(),
         runner_image,
         deploy_chart: opts.chart_explicit.then(|| opts.chart.clone()),
@@ -345,9 +408,11 @@ pub(in crate::factory_quickstart) async fn quickstart(
         budget_usd: opts.budget_usd,
     };
     if opts.dry_run {
-        return Ok(QuickstartOutput::DryRun(DryRunPlan {
-            lines: describe(&plan),
-        }));
+        let mut lines = describe(&plan);
+        if let Some(note) = assumed {
+            lines.insert(2, note);
+        }
+        return Ok(QuickstartOutput::DryRun(DryRunPlan { lines }));
     }
     native::refuse_without_credential(&plan.credential)?;
     execute(&plan, &opts, release_has_real_model).await
@@ -409,6 +474,19 @@ async fn execute(
     })
     .await?;
     let credit_remaining_usd = check_credit(release_has_real_model).await;
+    ensure_factory_agent(
+        &common,
+        &plan.agent,
+        crate::api::add_channel_body(
+            "gitlab",
+            &plan.facts.path,
+            None,
+            None,
+            plan.label.as_deref(),
+        ),
+        None,
+    )
+    .await?;
     for (index, args) in deploy_argvs(plan, &dir).into_iter().enumerate() {
         let step = match (index, plan.agent == DEFAULT_AGENT) {
             (0, true) => "Deploying dark factory".to_string(),
@@ -425,7 +503,7 @@ async fn execute(
         agent: plan.agent.clone(),
         repos: vec![plan.facts.path.clone()],
         trigger_label: plan.label.clone(),
-        effective_label: plan.facts.label.clone(),
+        effective_label: plan.effective_label.clone(),
         bundle: match &plan.bundle {
             Some(dir) => dir.display().to_string(),
             None => "published".to_string(),
