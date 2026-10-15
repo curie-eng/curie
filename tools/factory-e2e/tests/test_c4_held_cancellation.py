@@ -63,6 +63,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -1228,6 +1229,8 @@ OBSERVATION_FAULTS: tuple[type[BaseException], ...] = (
     subprocess.SubprocessError,
     OSError,
     http.client.HTTPException,
+    # The in-process GitHub stub keeps its state in SQLite.
+    sqlite3.Error,
     ValueError,
     KeyError,
     TypeError,
