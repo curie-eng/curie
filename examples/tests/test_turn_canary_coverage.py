@@ -323,3 +323,58 @@ def test_monitor_replaces_drift_and_coverage_each_successful_inventory():
                   declared=[("slack", "C-EXAMPLE-1", "default")])
     monitor.observe(failed)
     assert "turn_canary_binding_drift_total 0" in monitor.metrics_text()
+
+
+def test_runtime_quota_read_honors_cpu_quantities():
+    """@spec TURN-CANARY-5"""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    canary = _canary()
+    bodies = {"/roomy": ("4", "3"), "/tight": ("4", "3800m")}
+    seen: list[str | None] = []
+
+    class Quota(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib handler name
+            seen.append(self.headers.get("Authorization"))
+            hard, used = bodies[self.path]
+            body = json.dumps(_quota(hard, used)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Quota)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    async def headroom(path: str) -> bool | None:
+        platform = canary.RuntimePlatform(
+            database_url="postgresql+asyncpg://canary@db.example.invalid/curie",
+            valkey_url="redis://valkey.example.invalid:6379/0",
+            api_url="https://platform.example.invalid",
+            api_key="example-key",
+            stream="curie:runs",
+            schema="curie",
+            read_only_qualified=True,
+            quota_url=base + path,
+            quota_token="example-token",
+            quota_resource="limits.cpu",
+            quota_min_free="500m",
+        )
+        try:
+            return await platform.quota_headroom()
+        finally:
+            await platform.close()
+
+    try:
+        assert asyncio.run(headroom("/roomy")) is True
+        assert asyncio.run(headroom("/tight")) is False
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert seen == ["Bearer example-token", "Bearer example-token"]
