@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import redis
@@ -41,6 +42,9 @@ DIGESTS = (INDEX, AMD64, ARM64)
 REPO = "acme-corp/api"
 POOL = "acme-api-runner"
 BASE_POOL = "curie-runner-pool"
+DAEMON = json.loads(
+    (Path(__file__).resolve().parents[4] / "tests/vectors/daemon-config.json").read_text()
+)["daemon"]
 
 
 def _entry(
@@ -51,7 +55,13 @@ def _entry(
     docker: bool = False,
 ) -> RepoRunnerPool:
     return RepoRunnerPool.model_validate(
-        {"pool": pool, "digests": list(digests), "base": base, "docker": docker}
+        {
+            "pool": pool,
+            "digests": list(digests),
+            "base": base,
+            "docker": docker,
+            **({"daemon": DAEMON} if docker else {}),
+        }
     )
 
 
