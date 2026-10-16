@@ -270,6 +270,7 @@ jobs:
         run: |
           pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/3" --reruns 1 -rsR --durations=25 --ignore=tools/factory-e2e/tests/test_c4_initial_binding.py --ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py --ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py)
           pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_upgrade_migration.py)
+          pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_cluster_up.py)
           if [[ -n "$PYTEST_DESELECT" ]]; then
             IFS=, read -r -a deselect_files <<< "$PYTEST_DESELECT"
             for path in "${deselect_files[@]}"; do
@@ -279,7 +280,7 @@ jobs:
           if [[ "$PYTEST_SCOPE" == "cli" ]]; then
             mapfile -t cli_pytest_files < tools/e2e-ci-selection/cli_pytest_files.txt
             for path in "${cli_pytest_files[@]}"; do
-              if [[ "$path" != "tools/factory-e2e/tests/test_c4_initial_binding.py" && "$path" != "tools/factory-e2e/tests/test_c4_static_token_rotation.py" && "$path" != "tools/factory-e2e/tests/test_c4_upgrade_migration.py" && "$path" != "tools/factory-e2e/tests/test_c4_held_cancellation.py" ]]; then
+              if [[ "$path" != "tools/factory-e2e/tests/test_c4_initial_binding.py" && "$path" != "tools/factory-e2e/tests/test_c4_static_token_rotation.py" && "$path" != "tools/factory-e2e/tests/test_c4_upgrade_migration.py" && "$path" != "tools/factory-e2e/tests/test_c4_held_cancellation.py" && "$path" != "tools/factory-e2e/tests/test_c4_cluster_up.py" ]]; then
                 pytest_args+=("$path")
               fi
             done
@@ -848,23 +849,106 @@ jobs:
           --archive-file "$RUNNER_TEMP/nextest/nextest-archive.tar.zst"
           --workspace-remap . --extract-to .
           --profile ci --partition count:${{ matrix.partition }}/3
+          -E 'not test(/^ops::convergence::tests::/)'
+
+  # The kind + Helm convergence regressions in the CLI lib create and delete
+  # their own kind clusters, so they run on their own runner. The Docker Hub
+  # mirror script restarts the Docker daemon, which would stop rust-test's
+  # Valkey service container; this job has no services for that reason.
+  rust-convergence:
+    name: Rust convergence regressions (kind)
+    runs-on: ubuntu-latest
+    needs: [rust-select, rust-test-build]
+    if: ${{ needs.rust-select.outputs.tests == 'true' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
+      - name: Toolchain
+        working-directory: cli
+        run: rustc --version
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-nextest@0.9.146
+      - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v3.16.4
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v3.16.4
+      # The tests create and delete their own clusters. The action only installs
+      # kind and kubectl; its post step still removes kind-registry, so that
+      # container must exist.
+      - name: Ensure kind-registry exists
+        run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Install kind and kubectl without creating a cluster
+        id: install_kind
+        continue-on-error: true
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+          install_only: true
+      - name: Back off before retrying Install kind and kubectl without creating a cluster
+        if: steps.install_kind.outcome == 'failure'
+        run: |
+          echo "Install kind and kubectl without creating a cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          bash cli/scripts/ensure-kind-registry.sh
+          sleep 15
+      - name: Install kind and kubectl without creating a cluster (retry)
+        if: steps.install_kind.outcome == 'failure'
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+          install_only: true
+      - name: Download the test archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive-${{ github.sha }}
+          path: ${{ runner.temp }}/nextest
+      # Same extraction as rust-test: --extract-to . restores cli/target, the
+      # compile-time env!("CARGO_BIN_EXE_curie") path.
+      - name: Test
+        working-directory: cli
+        run: >-
+          cargo nextest run
+          --archive-file "$RUNNER_TEMP/nextest/nextest-archive.tar.zst"
+          --workspace-remap . --extract-to .
+          --profile ci
+          -E 'test(/^ops::convergence::tests::/)'
 
   rust:
     name: Rust (fmt + clippy + test)
     runs-on: ubuntu-latest
-    needs: [rust-lint, rust-select, rust-test-build, rust-test]
+    needs: [rust-lint, rust-select, rust-test-build, rust-test, rust-convergence]
     if: ${{ always() }}
     steps:
-      - name: Require lint, the test build, and the selected test partitions to pass
+      - name: Require lint, the test build, the selected test partitions, and the convergence regressions to pass
         env:
           LINT: ${{ needs.rust-lint.result }}
           SELECT: ${{ needs.rust-select.result }}
           SELECTED: ${{ needs.rust-select.outputs.tests }}
           BUILD: ${{ needs.rust-test-build.result }}
           TESTS: ${{ needs.rust-test.result }}
+          CONVERGENCE: ${{ needs.rust-convergence.result }}
         run: |
           set -euo pipefail
-          echo "lint=$LINT select=$SELECT selected=${SELECTED:-<empty>} build=$BUILD tests=$TESTS"
+          echo "lint=$LINT select=$SELECT selected=${SELECTED:-<empty>} build=$BUILD tests=$TESTS convergence=$CONVERGENCE"
           if [ "$LINT" != success ]; then
             echo "Rust fmt + clippy did not pass" >&2
             exit 1
@@ -884,6 +968,10 @@ jobs:
           fi
           if [ "$TESTS" != "$expected" ]; then
             echo "Rust test partitions: expected $expected, got $TESTS" >&2
+            exit 1
+          fi
+          if [ "$CONVERGENCE" != "$expected" ]; then
+            echo "Rust convergence regressions: expected $expected, got $CONVERGENCE" >&2
             exit 1
           fi
           echo "Rust gate passed (tests $expected)"
@@ -2905,6 +2993,8 @@ jobs:
         run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_initial_binding.py
       - name: Run the static token rotation regression
         run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_static_token_rotation.py
+      - name: Run the fresh cluster install regression
+        run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_cluster_up.py::test_fresh_cluster_up_converges_without_rerun
       - name: Upload scripted factory evidence
         if: always()
         uses: actions/upload-artifact@v7

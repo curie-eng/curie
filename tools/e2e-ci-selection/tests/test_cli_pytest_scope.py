@@ -36,6 +36,7 @@ KIND_MODULES = (
     "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
     "tools/factory-e2e/tests/test_c4_held_cancellation.py",
     SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
+    SELECTION_TESTS.CLUSTER_UP_MODULE,
 )
 SELECTOR_PATH = "tools/e2e-ci-selection/select_tiers.py"
 REGENERATE = "uv run python tools/e2e-ci-selection/cli_pytest_files.py --write"
@@ -810,6 +811,7 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
         "--ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py",
         "--ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py",
         "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
+        "--ignore", SELECTION_TESTS.CLUSTER_UP_MODULE,
     ]
     if deselect:
         for path in deselect.split(","):
@@ -841,7 +843,9 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
         "}))\n"
     )
     recorder.chmod(0o755)
-    _write(tmp_path, LIST_PATH, (REPO_ROOT / LIST_PATH).read_text())
+    files = (REPO_ROOT / LIST_PATH).read_text().splitlines()
+    files.append("tools/factory-e2e/tests/test_c4_cluster_up.py")
+    _write(tmp_path, LIST_PATH, "\n".join(sorted(set(files))) + "\n")
     deselect = SELECTION_TESTS.SRE_RUNTIME
     state = {"shard": "2", "pytest_deselect": deselect, "pytest_scope": scope}
     result = PYTEST_TESTS._run_bash(
@@ -875,6 +879,7 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
         "--ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py",
         "--ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py",
         "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
+        "--ignore", SELECTION_TESTS.CLUSTER_UP_MODULE,
         "--deselect", deselect,
     ]
     if scope == "cli":

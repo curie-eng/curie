@@ -253,6 +253,7 @@ def test_pytest_step_appends_deselect_only_when_selected(
         "--ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py",
         "--ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py",
         "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
+        "--ignore", SELECTION_TESTS.CLUSTER_UP_MODULE,
     ]
     if deselect:
         expected += ["--deselect", "examples/tests/test_sre_bot_observability_runtime.py"]
