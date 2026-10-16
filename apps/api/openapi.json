@@ -19648,6 +19648,66 @@
         ]
       }
     },
+    "/approvals/principals/remediation-operator": {
+      "post": {
+        "description": "Mint a remediation operator credential (#4228).\n\nThe token carries the ``remediation.administer`` scope, which remediation\npolicy and qualification writes require; it never resolves an approval,\nand an approval operator token never writes remediation policy.  Returned\nonce and marked non-cacheable, as the approval operator mint is.",
+        "operationId": "mint_remediation_operator_principal_approvals_principals_remediation_operator_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalPrincipalMint"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalPrincipalOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mint Remediation Operator Principal",
+        "tags": [
+          "approvals"
+        ]
+      }
+    },
     "/approvals/{approval_id}": {
       "get": {
         "operationId": "get_approval_approvals__approval_id__get",

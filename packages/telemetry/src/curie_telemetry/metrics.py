@@ -351,6 +351,7 @@ _HTTP_OPERATIONS = [
     "/approvals/principals/adapter",
     "/approvals/principals/adapter/rotate",
     "/approvals/principals/operator",
+    "/approvals/principals/remediation-operator",
     "/approvals/{approval_id}",
     "/approvals/{approval_id}/audit",
     "/approvals/{approval_id}/resolve",

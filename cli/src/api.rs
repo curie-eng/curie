@@ -4767,6 +4767,43 @@ impl ApiClient {
         })
     }
 
+    /// Mint a reusable remediation-operator principal (scope
+    /// `remediation.administer`) under the platform key. One-time delivery,
+    /// never cached by the CLI.
+    pub async fn mint_remediation_principal(
+        &self,
+        subject: &str,
+    ) -> Result<OperatorPrincipalDelivery> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/approvals/principals/remediation-operator",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<ApprovalPrincipalMint>(&ApprovalPrincipalMint {
+                        subject: subject.to_string(),
+                    }),
+                "POST /approvals/principals/remediation-operator",
+            )
+            .await?;
+        let body: serde_json::Value = Self::expect_ok(resp, "minting remediation principal")
+            .await?
+            .json()
+            .await
+            .context("decoding remediation principal delivery")?;
+        Ok(OperatorPrincipalDelivery {
+            token: required_response_string(&body, "token", "remediation principal delivery")?,
+            subject: required_response_string(&body, "subject", "remediation principal delivery")?,
+            expires_at: required_response_string(
+                &body,
+                "expires_at",
+                "remediation principal delivery",
+            )?,
+        })
+    }
+
     /// Mint a subject-bound, single-use console login code under the platform
     /// key. The plaintext code is returned once and is never cached by the CLI.
     pub async fn mint_console_login_code(&self, subject: &str) -> Result<ConsoleLoginCodeDelivery> {

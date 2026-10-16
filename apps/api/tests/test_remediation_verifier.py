@@ -1589,11 +1589,15 @@ def test_no_receipt_or_log_carries_a_sampled_value(
 
 
 def _operator() -> dict[str, str]:
+    """A remediation operator principal, minted as
+    ``POST /approvals/principals/remediation-operator`` does.
+    """
+
     token = approval_principal.mint(
         get_settings().api_key,
         subject=OPERATOR,
         kind="operator",
-        scope=approval_principal.APPROVE_SCOPE,
+        scope=approval_principal.REMEDIATION_ADMIN_SCOPE,
         exp=int(time.time()) + 300,
     )
     return {PRINCIPAL_HEADER: token}

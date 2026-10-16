@@ -50,6 +50,12 @@ as decided text:
 * **Administrative principal.** Policy writes and breaker closes require an
   ADR 0106 operator principal in addition to the administrative credential, and
   that principal is recorded as the actor (AUTOMATED-REMEDIATION-3, -11, -14).
+  The principal carries the `remediation.administer` scope, minted by
+  `POST /approvals/principals/remediation-operator` or the CLI's
+  `--mint-remediation-principal`, not the approval resolution scope
+  (maintainer ruling 2026-10-07, #4228). An `approval.resolve` operator token is
+  refused `operator_principal_required`, so a principal minted to settle
+  approvals cannot also bind or arm automatic remediation.
   This contract applies the ruling to qualification writes and verifier runs as
   well, because a qualification record enables automatic execution
   (AUTOMATED-REMEDIATION-22).
@@ -345,10 +351,13 @@ Routes under `/agents/{agent_id}/hooks/{hook}/remediation-policy` (`GET`, `PUT`,
 use the same dependency as the source policy routes,
 `require_api_key` (REMEDIATION-13: "the same trust model as ADR 0190 source
 policy"). Every write (`PUT`, `DELETE`, arm, disarm and breaker close) also
-requires an ADR 0106 operator principal, verified as the approval resolve path
-verifies one, and records that principal as the actor on the generation or the
-breaker row (maintainer ruling, 2026-10-07); a write with the administrative
-credential and no principal is refused `operator_principal_required`. Reads need
+requires an ADR 0106 operator principal carrying the `remediation.administer`
+scope (signed by the platform key in the same token format as an approval
+operator principal, minted by `POST /approvals/principals/remediation-operator`
+or `--mint-remediation-principal`), and records that principal as the actor on
+the generation or the breaker row (maintainer ruling, 2026-10-07); a write with
+the administrative credential and no principal, or with an `approval.resolve`
+operator token, is refused `operator_principal_required`. Reads need
 no principal. Responses carry `Cache-Control: no-store`. The hook ingress, its
 scoped key, the support probe, the delivery body and the nomination submission
 route have no write path to these tables; a request to the policy routes signed
@@ -358,9 +367,10 @@ mirrored in a new `remediation-policy` verb group under `curie local` and
 `--json`, ADR-0021 exit codes and `{"error","fix"}` errors, following the CLI
 and API validation convention.
 
-Acceptance: a policy write with the platform key and an operator principal
-creates a generation naming that principal as `bound_by`; the same write without
-a principal is refused `operator_principal_required` and creates nothing; the same
+Acceptance: a policy write with the platform key and a `remediation.administer`
+operator principal creates a generation naming that principal as `bound_by`; the
+same write without a principal, or with an `approval.resolve` operator token, is
+refused `operator_principal_required` and creates nothing; the same
 write carrying only a valid hook source signature returns `401` and creates
 nothing; a delivery body or nomination containing a policy document changes no
 policy row; every CLI verb emits one JSON object under `--json`, refusals

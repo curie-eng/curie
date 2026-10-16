@@ -9,10 +9,12 @@ the hook's scoped key never authenticates, so the hook ingress, the support
 probe and the delivery body have no path to these tables.
 
 Every write also requires an ADR 0106 operator principal in
-``X-Curie-Approval-Principal``, verified as the approval resolver verifies an
-operator token (signed by the platform key, approval scope), and records its
-subject as ``bound_by`` on the generation it writes. A write without one is
-refused ``operator_principal_required``. Reads need no principal.
+``X-Curie-Approval-Principal``, signed by the platform key with the
+``remediation.administer`` scope (minted by
+``POST /approvals/principals/remediation-operator``), and records its subject as
+``bound_by`` on the generation it writes. A write without one, including one
+carrying an ``approval.resolve`` operator token, is refused
+``operator_principal_required``. Reads need no principal.
 
 Every handler response, refusals included, carries ``Cache-Control: no-store``,
 and every refusal is ``{"detail": {"code": ...}}``. The routes stay readable and
@@ -88,11 +90,12 @@ async def require_operator_principal(
         str | None, Header(alias=APPROVAL_PRINCIPAL_HEADER)
     ] = None,
 ) -> str:
-    """The subject of a valid ADR 0106 operator principal, else a refusal.
+    """The subject of a valid remediation operator principal, else a refusal.
 
-    Verified as the approval resolver verifies an operator token: signed by the
-    platform key with the approval scope and unexpired. A chat attestation, an
-    adapter credential or no principal at all is ``operator_principal_required``.
+    An ADR 0106 operator token signed by the platform key with the
+    ``remediation.administer`` scope and unexpired (#4228). An
+    ``approval.resolve`` operator token, a chat attestation, an adapter
+    credential or no principal at all is ``operator_principal_required``.
     \f
     @spec AUTOMATED-REMEDIATION-3.
     """
@@ -100,7 +103,7 @@ async def require_operator_principal(
     token = x_curie_approval_principal
     if token is not None and approval_principal.unverified_kind(token) == "operator":
         claims = approval_principal.verify_claims(
-            token, get_settings().api_key, scope=approval_principal.APPROVE_SCOPE
+            token, get_settings().api_key, scope=approval_principal.REMEDIATION_ADMIN_SCOPE
         )
     if claims is None or claims.kind != "operator":
         raise HTTPException(
@@ -108,7 +111,10 @@ async def require_operator_principal(
             detail={
                 "code": "operator_principal_required",
                 "message": (
-                    f"policy writes need an operator principal in {APPROVAL_PRINCIPAL_HEADER}"
+                    "policy writes need a remediation operator principal "
+                    "(curie <local|cluster> approvals <AGENT> "
+                    "--mint-remediation-principal <SUBJECT>) "
+                    f"in {APPROVAL_PRINCIPAL_HEADER}"
                 ),
             },
             headers=_NO_STORE,

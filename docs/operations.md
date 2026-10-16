@@ -2733,11 +2733,15 @@ section is the administrator's.
   approve. A user group set accepts chat and console principals but not an
   operator principal, so a route you drive from the CLI needs `approvers.users`.
 - Policy writes, arming, disarming, removal, breaker close, qualification
-  records and verifier runs need an ADR 0106 operator principal in addition to
-  the administrative credential, and record it as the actor. Mint one as
-  [Driving it from the CLI](approvals.md#driving-it-from-the-cli) shows and
-  export it as `CURIE_APPROVAL_PRINCIPAL_TOKEN`. Over HTTP it is the
-  `X-Curie-Approval-Principal` header. A write without one is refused
+  records and verifier runs need a remediation operator principal (the
+  `remediation.administer` scope) in addition to the administrative credential,
+  and record it as the actor. Mint one with
+  `curie cluster approvals <agent> --mint-remediation-principal <subject>`
+  (`curie local` at the local tier; over HTTP,
+  `POST /approvals/principals/remediation-operator`) and export it as
+  `CURIE_APPROVAL_PRINCIPAL_TOKEN`. Over HTTP it is the
+  `X-Curie-Approval-Principal` header. A write without one, or with a token from
+  `--mint-operator-principal` (which only resolves approvals), is refused
   `operator_principal_required`. Reads need none.
 - The protected worker is deployed. The capture of a nomination block from a
   protected turn is its runner client wrapper (AUTOMATED-REMEDIATION-6); without

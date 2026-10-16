@@ -77,6 +77,9 @@ fn pending_fields(out: &ApprovalsOutput) -> (usize, bool) {
         ApprovalsOutput::OperatorPrincipal { .. } => {
             panic!("expected the pending list, not an operator-principal mint")
         }
+        ApprovalsOutput::RemediationPrincipal { .. } => {
+            panic!("unexpected remediation-principal mint output")
+        }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the pending list, not a console login-code mint")
         }
@@ -215,6 +218,9 @@ async fn dry_run_plan_reports_the_same_limit_as_the_real_request() {
         }
         ApprovalsOutput::OperatorPrincipal { .. } => {
             panic!("expected a dry-run plan, not an operator-principal mint")
+        }
+        ApprovalsOutput::RemediationPrincipal { .. } => {
+            panic!("unexpected remediation-principal mint output")
         }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected a dry-run plan, not a console login-code mint")

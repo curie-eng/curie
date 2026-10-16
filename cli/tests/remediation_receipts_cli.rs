@@ -825,6 +825,12 @@ fn the_writes_without_a_principal_are_refused_before_any_request() {
                     value.to_string().contains("CURIE_APPROVAL_PRINCIPAL_TOKEN"),
                     "{what}: the error names the env var: {value}"
                 );
+                // #4228: the fix names the remediation principal mint.
+                assert!(
+                    value.to_string().contains("--mint-remediation-principal")
+                        && !value.to_string().contains("--mint-operator-principal"),
+                    "{what}: the fix names the remediation principal mint: {value}"
+                );
                 assert!(server.recorded().is_empty(), "{what}: no request at all");
             }
         }
