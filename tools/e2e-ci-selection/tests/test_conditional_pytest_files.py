@@ -224,9 +224,10 @@ def test_conditional_deselection_is_sorted_and_matches_exact_inputs(tmp_path: Pa
     assert _selection(tmp_path, "runner/Dockerfile", registry=registry_path)["pytest_deselect"] == (
         "examples/tests/test_a.py"
     )
-    assert _selection(
-        tmp_path, "runner/Dockerfile.other", registry=registry_path
-    )["pytest_deselect"] == "examples/tests/test_a.py,examples/tests/test_z.py"
+    assert (
+        _selection(tmp_path, "runner/Dockerfile.other", registry=registry_path)["pytest_deselect"]
+        == "examples/tests/test_a.py,examples/tests/test_z.py"
+    )
 
 
 @pytest.mark.parametrize("shard", [1, 2, 3])
@@ -235,9 +236,21 @@ def test_pytest_step_appends_deselect_only_when_selected(
     tmp_path: Path, shard: int, deselect: str
 ) -> None:
     expected = [
-        "run", "pytest", "-q", "-n", "4", "--dist", "loadgroup",
-        "--ci-shard", f"{shard}/3", "--reruns", "1", "-rsR", "--durations=25",
+        "run",
+        "pytest",
+        "-q",
+        "-n",
+        "4",
+        "--dist",
+        "loadgroup",
+        "--ci-shard",
+        f"{shard}/3",
+        "--reruns",
+        "1",
+        "-rsR",
+        "--durations=25",
         "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
+        "--ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py",
         "--ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py",
         "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
         "--ignore", SELECTION_TESTS.CLUSTER_UP_MODULE,
@@ -350,11 +363,13 @@ def test_repo_read_coverage_resolves_constants_and_rejects_missing_input() -> No
     source = (
         'CONFIG_DIR = REPO_ROOT / "examples" / "acme-bot"\n'
         'CONFIG_FILE = CONFIG_DIR / "config.yaml"\n'
-        'content = CONFIG_FILE.read_text()\n'
+        "content = CONFIG_FILE.read_text()\n"
         'other = (REPO_ROOT / "otel" / "collector-config.yaml").read_text()\n'
     )
     assert _repo_paths(source) == {
-        "examples/acme-bot", "examples/acme-bot/config.yaml", "otel/collector-config.yaml"
+        "examples/acme-bot",
+        "examples/acme-bot/config.yaml",
+        "otel/collector-config.yaml",
     }
     assert _uncovered_repo_paths(source, ["examples/acme-bot"]) == ["otel/collector-config.yaml"]
     assert not _uncovered_repo_paths(source, ["examples/acme-bot", "otel/collector-config.yaml"])
@@ -377,9 +392,17 @@ def test_repo_read_coverage_resolves_constants_and_rejects_missing_input() -> No
         {1: ["runner"]},
     ],
     ids=[
-        "not-mapping", "empty-inputs", "duplicate-input", "not-input-list",
-        "empty-input", "absolute-input", "slash-terminated-input", "not-string-input",
-        "empty-test-path", "absolute-test-path", "slash-terminated-test-path",
+        "not-mapping",
+        "empty-inputs",
+        "duplicate-input",
+        "not-input-list",
+        "empty-input",
+        "absolute-input",
+        "slash-terminated-input",
+        "not-string-input",
+        "empty-test-path",
+        "absolute-test-path",
+        "slash-terminated-test-path",
         "not-string-test-path",
     ],
 )

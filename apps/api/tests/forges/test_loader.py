@@ -190,7 +190,7 @@ def test_a_jira_static_token_entry_loads_its_token_from_the_file(tmp_path: Path)
     (loaded,) = config.trackers
     assert loaded.kind == "jira_cloud"
     assert loaded.credential.username == "factory-bot@example.com"
-    assert loaded.credential.token.get_secret_value().strip() == "jira-token-from-file"
+    assert loaded.credential.current_token() == "jira-token-from-file"
 
 
 def test_a_key_file_and_a_client_secret_file_load_byte_for_byte(tmp_path: Path) -> None:
@@ -214,4 +214,4 @@ def test_a_token_file_newline_is_not_part_of_the_token(tmp_path: Path) -> None:
     entry["credential"].pop("token")
     entry["credential"]["token_file"] = str(_key_file(tmp_path, "glpat-fixture\r\n", "token"))
     (code_host,) = load_forges_json(json.dumps({"code_hosts": [entry]})).code_hosts
-    assert code_host.credential.token.get_secret_value() == "glpat-fixture"
+    assert code_host.credential.current_token() == "glpat-fixture"

@@ -85,7 +85,7 @@
       "result": "ClusterStatusOutput",
       "kind": "CliOutput",
       "schema": "cluster-status.schema.json",
-      "version": "1.5"
+      "version": "1.6"
     },
     {
       "result": "ClusterUpOutput",
