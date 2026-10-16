@@ -429,6 +429,63 @@ reads `none`. A static token with a recorded expiry reads `known`, and the line
 adds a rotation warning once the date is past or within 14 days. A token with no
 recorded expiry reads `unknown`.
 
+Each credential line also carries its authentication state from a live read
+through the API: `accepted`, `rejected` or `unknown`, with a reason. This is
+separate from expiry. See [Replace a static token](#replace-a-static-token).
+
+## Replace a static token
+
+This applies to a GitLab, Bitbucket Cloud, Bitbucket Data Center or Jira Cloud
+static token. Curie never mints or rotates a static token. The operator
+replaces it, and the running API picks the new value up without a restart.
+GitHub App keys and OAuth client secrets are not covered by this procedure.
+
+1. Save the new token in a local file outside the repository using your
+   editor. Keep it out of command arguments, commits and chat. Look up the
+   Secret name and key the install recorded for that credential in the
+   release's `existingSecret` and `existingSecretKey` values.
+2. Replace only that key of the existing Secret, reading the value from the
+   file. A merge patch touches the selected key and leaves every other key in
+   the Secret alone, and the token never appears in command arguments:
+
+   ```bash
+   printf '{"data":{"<key>":"%s"}}' "$(base64 -w0 < <token-file>)" > <patch-file>
+   kubectl --context <ctx> -n <ns> patch secret <secret> \
+     --type merge --patch-file <patch-file>
+   rm <patch-file>
+   ```
+
+   Use the same Secret name and key. A different key or Secret needs a Helm
+   upgrade, because the release references the one it recorded.
+3. Wait. The credentials are a projected Secret volume at `/etc/curie/forges`,
+   and the kubelet refreshes the projected file, typically within about a
+   minute. The API rereads the file at its next forge call or git credential
+   use. No pod restart, Helm upgrade or reload is needed.
+4. Run `curie cluster status`. The replaced credential should read
+   `authentication accepted`.
+
+Curie never falls back to an older token. A rejected, missing, empty or
+malformed file stops intake for that entry only, and other entries keep
+working. Intake resumes by itself once a valid value is in place.
+
+`curie cluster status`, in human form and with `--json`, shows each code host
+and tracker credential's authentication state from a live read through the
+API, separately from expiry (`known`, `unknown` or `none`).
+
+1. `accepted` means the forge accepted the current token on a read.
+2. `rejected` means the forge refused it. A rejected credential marks the
+   cluster unhealthy and the command exits nonzero.
+3. `unknown` means Curie could not tell: the API is unreachable, there is no
+   binding to probe, the file is unreadable or the forge is unavailable.
+   Unknown never reads as accepted.
+
+Each `credentials[]` item in the JSON adds `authentication`,
+`authentication_reason` and `observed_at` beside the existing expiry fields.
+
+When intake is deferred because a credential was rejected or its file is
+unreadable, the API logs a WARNING that names the tracker, binding and label.
+It never logs the token.
+
 ## Jira Cloud
 
 For a complete local install through the first pull request, follow the
@@ -627,8 +684,9 @@ and `tracker_scope_id`.
 ### Token expiry
 
 Quickstart prints `Token expires <YYYY-MM-DD> (<n> days)`, or `Token has no
-expiry`, and records the date in the credential. The factory does not rotate
-tokens; replace the token before that date.
+expiry`, and records the date in the credential. Curie never mints or rotates
+a static token; replace it before that date as described in
+[Replace a static token](#replace-a-static-token).
 
 ### Polling cost
 

@@ -6,6 +6,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from curie_api.forges.config import StaticTokenCredentialConfig
 from curie_api.forges.credential_providers import (
     ExpiryReport,
     MintedToken,
@@ -140,11 +141,9 @@ async def test_a_static_token_reports_known_unknown_or_no_expiry(
     expires_at: datetime | None, never_expires: bool, expiry: CredentialExpiry
 ) -> None:
     provider = StaticTokenProvider(
-        "glpat-secret",
+        _static("glpat-secret", expires_at=expires_at, never_expires=never_expires),
         origin="https://gitlab.example",
         header=CredentialHeader.PRIVATE_TOKEN,
-        expires_at=expires_at,
-        never_expires=never_expires,
     )
     report = provider.expiry()
     assert (report.expiry, report.expires_at, report.remints) == (expiry, expires_at, False)
@@ -155,31 +154,27 @@ async def test_a_static_token_reports_known_unknown_or_no_expiry(
     assert "glpat-secret" not in repr(credential)
 
 
+def _static(token: str, **fields: object) -> StaticTokenCredentialConfig:
+    return StaticTokenCredentialConfig.model_validate({"token": token, **fields})
+
+
 def test_a_static_token_with_two_expiry_declarations_is_refused() -> None:
+    # The provider takes its expiry from the config, which refuses both.
     with pytest.raises(ValueError, match="not both"):
-        StaticTokenProvider(
-            "t",
-            origin="https://gitlab.example",
-            header=CredentialHeader.PRIVATE_TOKEN,
-            expires_at=NOW,
-            never_expires=True,
-        )
-    with pytest.raises(ValueError, match="timezone-aware"):
-        StaticTokenProvider(
-            "t",
-            origin="https://gitlab.example",
-            header=CredentialHeader.PRIVATE_TOKEN,
-            expires_at=datetime(2027, 1, 1),
-        )
+        _static("t", expires_at=NOW, never_expires=True)
+    with pytest.raises(ValueError, match="timezone"):
+        _static("t", expires_at=datetime(2027, 1, 1))
 
 
 def test_a_static_basic_token_needs_its_username() -> None:
     with pytest.raises(ValueError, match="username"):
         StaticTokenProvider(
-            "t", origin="https://bitbucket.example", header=CredentialHeader.AUTHORIZATION_BASIC
+            _static("t"),
+            origin="https://bitbucket.example",
+            header=CredentialHeader.AUTHORIZATION_BASIC,
         )
     StaticTokenProvider(
-        "t",
+        _static("t"),
         origin="https://bitbucket.example",
         header=CredentialHeader.AUTHORIZATION_BASIC,
         username="x-token-auth",

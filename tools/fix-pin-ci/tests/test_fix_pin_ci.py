@@ -47,6 +47,14 @@ INITIAL_BINDING_SELECTOR = (
     "tools/factory-e2e/tests/test_c4_initial_binding.py::"
     "test_second_factory_agent_uses_initial_tracker_binding"
 )
+STATIC_TOKEN_ROTATION_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_static_token_rotation.py::"
+    "test_secret_replacement_reports_rejection_and_recovers"
+)
+KIND_MODULES = (
+    "tools/factory-e2e/tests/test_c4_initial_binding.py",
+    "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
+)
 LOCAL_SELECTOR = "cli/tests/local/test_deploy.py::test_deploy"
 LOCAL_LIVE_SELECTOR = "cli/tests/local/test_live.py::test_live"
 LIVE_SELECTOR = "runner/tests/test_live.py::test_example"
@@ -1178,9 +1186,10 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
             extra = pytest_command[3:]
             assert extra[: len(distribution)] == distribution
             extra = extra[len(distribution) :]
-            runtime_exclusion = "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py"
-            assert extra.count(runtime_exclusion) == 1
-            extra.remove(runtime_exclusion)
+            for module in KIND_MODULES:
+                runtime_exclusion = f"--ignore={module}"
+                assert extra.count(runtime_exclusion) == 1
+                extra.remove(runtime_exclusion)
             report_chars = set("fEsxXpPaAR")
             assert all(
                 argument.startswith("--durations")
@@ -1191,7 +1200,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
                 )
                 for argument in extra
             ), (
-                "the Python suite requires one kind runtime exclusion and permits only "
+                "the Python suite requires one exclusion per kind runtime module and permits only "
                 "reporting flags plus the selected trailing deselect pair, "
                 f"got {pytest_command!r}"
             )
@@ -1527,6 +1536,7 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
     ("body", "needed", "stack", "kind"),
     [
         (f"Fix pin: {INITIAL_BINDING_SELECTOR}", True, False, True),
+        (f"Fix pin: {STATIC_TOKEN_ROTATION_SELECTOR}", True, False, True),
         (
             "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding.py::"
             "test_quickstarts_are_idempotent_and_binding_guards_hold[gitlab]",
@@ -1541,6 +1551,13 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
         ("Fix pin: cli/tests/verify_fix_pin.rs::ci_gate_pins", True, True, False),
         (
             "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding_extra.py::test_example",
+            True,
+            True,
+            False,
+        ),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_static_token_rotation_extra.py::"
+            "test_example",
             True,
             True,
             False,

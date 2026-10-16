@@ -2,10 +2,13 @@
 
 The env value is a `ForgesConfig` JSON document whose credentials name files
 (``private_key_file``, ``client_secret_file``, ``token_file``) the chart mounts
-from Secrets. Each file is read here and its content becomes the secret: a
-static token without its surrounding ASCII whitespace, any other secret byte
-for byte. A secret written inline in the env JSON is refused, so key material
-never sits in the environment. A GitHub entry must use a GitHub App, because
+from Secrets. A GitHub App key or OAuth client secret file is read here, once,
+and its content becomes the secret byte for byte. A static token file is read
+here only to refuse a bad one at load; the config keeps the path, and every
+operation reads the file again (`StaticTokenCredentialConfig.current_token`),
+so a rotated Secret takes effect with no restart (#4630). A secret written
+inline in the env JSON is refused, so key material never sits in the
+environment. A GitHub entry must use a GitHub App, because
 the tracker's marked-comment identity is the App's. A kind this build does not
 install is refused at load. Every refusal names the entry and the file, never
 the secret.
@@ -20,7 +23,8 @@ from typing import Any
 from pydantic import ValidationError
 
 from curie_api.forges import types
-from curie_api.forges.config import ForgesConfig, StaticTokenRefused, normalize_static_token
+from curie_api.forges.config import ForgesConfig, read_static_token
+from curie_api.forges.errors import CredentialUnreadable
 from curie_api.forges.registry import check_installed
 
 # Each credential secret field and the file field that must carry it.
@@ -31,22 +35,32 @@ _SECRET_FILES = {
 }
 
 
-def _read_secret(entry: str, field: str, path: Any) -> str:
+def _path(entry: str, field: str, path: Any) -> str:
     if not isinstance(path, str) or not path:
         raise ValueError(f"{entry} credential {field} must be a file path")
+    return path
+
+
+def _read_secret(entry: str, field: str, path: str) -> str:
     try:
         content = Path(path).read_text()
     except OSError:
         raise ValueError(f"{entry} credential {field} {path} cannot be read") from None
     if not content.strip():
         raise ValueError(f"{entry} credential {field} {path} is empty")
-    if field != "token_file":
-        return content
+    return content
+
+
+def _check_token_file(entry: str, path: str) -> None:
+    """Refuse at load a token file no operation could send; the value is discarded."""
+
     try:
-        return normalize_static_token(content)
-    except StaticTokenRefused as refused:
+        read_static_token(path)
+    except CredentialUnreadable as refused:
         problem = refused.problem
-    raise ValueError(f"{entry} credential {field} {path} {problem}")
+    else:
+        return
+    raise ValueError(f"{entry} credential token_file {path} {problem}")
 
 
 def _credential(entry: str, kind: Any, credential: Any) -> dict[str, Any]:
@@ -62,7 +76,13 @@ def _credential(entry: str, kind: Any, credential: Any) -> dict[str, Any]:
     if kind == types.GITHUB and loaded.get("type") != "github_app":
         raise ValueError(f"{entry} is a github entry and must use a github_app credential")
     for secret, file_field in _SECRET_FILES.items():
-        if file_field in loaded:
+        if file_field not in loaded:
+            continue
+        path = _path(entry, file_field, loaded[file_field])
+        if file_field == "token_file":
+            # Kept as a path: each operation reads the current file.
+            _check_token_file(entry, path)
+        else:
             loaded[secret] = _read_secret(entry, file_field, loaded.pop(file_field))
     return loaded
 

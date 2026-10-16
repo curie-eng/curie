@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Collection, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import httpx
 
 from curie_api.forges.config import header_safe
 from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
+
+if TYPE_CHECKING:
+    from curie_api.forges.credential_providers import TokenSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +36,9 @@ Params = Sequence[tuple[str, str]]
 class CloudTransport:
     """Requests to Bitbucket Cloud as one access token."""
 
-    def __init__(self, client: httpx.AsyncClient, *, entry: str, api_url: str, token: str) -> None:
+    def __init__(
+        self, client: httpx.AsyncClient, *, entry: str, api_url: str, token: TokenSnapshot
+    ) -> None:
         self._client = client
         # The configured entry's name, so a log line tells two entries apart.
         self.entry = entry
@@ -56,7 +61,11 @@ class CloudTransport:
         """One request to ``url`` (absolute, under `root`). A status in
         ``allow`` is returned to the caller; any other non-2xx answer raises."""
 
-        if not header_safe(self._token):
+        # Read at the first request of the operation and held for the rest of
+        # it; a file that cannot be sent raises `CredentialUnreadable` here,
+        # before any request (#4630).
+        token = self._token.value()
+        if not header_safe(token):
             # httpx would refuse the header and quote it in its own debug log.
             logger.warning(
                 "Bitbucket Cloud %r %s %s at %s has a token unfit for a header",
@@ -66,7 +75,7 @@ class CloudTransport:
                 self.root,
             )
             raise Unavailable("transport")
-        headers = {"Accept": "application/json", "Authorization": f"Bearer {self._token}"}
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
         response = None
         try:
             response = await self._client.request(

@@ -201,6 +201,13 @@ class GitLabTracker:
     def marked_comments(self) -> GitLabMarkedComments:
         return self._comments
 
+    async def verify_credential(self) -> None:
+        """Read-only credential check for health reporting (#4630): the version
+        gate, then the token's own user (``GET /user``). Writes nothing."""
+
+        await self._transport.ensure_ready()
+        await self._transport.own_user()
+
     # References ---------------------------------------------------------------
 
     def _ref(self, iid: int) -> TrackerIssueRef:

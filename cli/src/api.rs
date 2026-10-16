@@ -761,6 +761,28 @@ pub struct AgentSchedules {
     pub hooks: Vec<ScheduleHook>,
 }
 
+/// One forge credential's authentication probe (`ForgeCredentialHealth`, #4630).
+/// No field carries credential bytes.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ForgeCredentialHealth {
+    /// `code_host` or `tracker`.
+    pub section: String,
+    pub name: String,
+    pub kind: String,
+    pub credential_type: String,
+    /// `accepted`, `rejected` or `unknown`.
+    pub authentication: String,
+    pub reason: Option<String>,
+    pub observed_at: String,
+}
+
+/// `GET /forges/credentials/health` (`ForgeCredentialHealthReport`, #4630).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ForgeCredentialHealthReport {
+    pub observed_at: String,
+    pub entries: Vec<ForgeCredentialHealth>,
+}
+
 /// `GET /schedules` (`ScheduleListOut`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScheduleList {
@@ -3585,6 +3607,29 @@ impl ApiClient {
             .json()
             .await
             .context("decoding connector manifests")
+    }
+
+    /// Read-only authentication probe of every recorded forge credential
+    /// (`GET /forges/credentials/health`, #4630). The request is bounded by
+    /// `timeout`; the response carries no credential bytes.
+    pub async fn forge_credential_health(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<ForgeCredentialHealthReport> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/forges/credentials/health", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .timeout(timeout),
+                "GET /forges/credentials/health",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading forge credential health")
+            .await?
+            .json()
+            .await
+            .context("decoding forge credential health")
     }
 
     pub async fn list_versions(&self, agent_id: &str) -> Result<Vec<Version>> {

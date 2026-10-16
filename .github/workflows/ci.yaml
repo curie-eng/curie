@@ -268,7 +268,7 @@ jobs:
           PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
           PYTEST_SCOPE: ${{ steps.python-runtime.outputs.pytest_scope }}
         run: |
-          pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/3" --reruns 1 -rsR --durations=25 --ignore=tools/factory-e2e/tests/test_c4_initial_binding.py)
+          pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/3" --reruns 1 -rsR --durations=25 --ignore=tools/factory-e2e/tests/test_c4_initial_binding.py --ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py)
           if [[ -n "$PYTEST_DESELECT" ]]; then
             IFS=, read -r -a deselect_files <<< "$PYTEST_DESELECT"
             for path in "${deselect_files[@]}"; do
@@ -278,7 +278,7 @@ jobs:
           if [[ "$PYTEST_SCOPE" == "cli" ]]; then
             mapfile -t cli_pytest_files < tools/e2e-ci-selection/cli_pytest_files.txt
             for path in "${cli_pytest_files[@]}"; do
-              if [[ "$path" != "tools/factory-e2e/tests/test_c4_initial_binding.py" ]]; then
+              if [[ "$path" != "tools/factory-e2e/tests/test_c4_initial_binding.py" && "$path" != "tools/factory-e2e/tests/test_c4_static_token_rotation.py" ]]; then
                 pytest_args+=("$path")
               fi
             done
@@ -2902,6 +2902,8 @@ jobs:
         run: python3 tools/factory-e2e/factory_e2e.py scripted
       - name: Run the initial tracker binding regressions
         run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_initial_binding.py
+      - name: Run the static token rotation regression
+        run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_static_token_rotation.py
       - name: Upload scripted factory evidence
         if: always()
         uses: actions/upload-artifact@v7

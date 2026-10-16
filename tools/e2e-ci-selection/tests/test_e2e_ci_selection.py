@@ -42,6 +42,7 @@ INITIAL_BINDING_INPUTS = (
     "apps/api/src/curie_api/forges/surfaces.py",
     INITIAL_BINDING_MODULE,
 )
+STATIC_TOKEN_ROTATION_MODULE = "tools/factory-e2e/tests/test_c4_static_token_rotation.py"
 SRE_RUNTIME = "examples/tests/test_sre_bot_observability_runtime.py"
 SRE_RUNTIME_INPUTS = (
     "examples/sre-bot",
@@ -334,9 +335,7 @@ def _expected_conditional_deselect(*paths: str, pytest_needed: bool = True) -> s
             test_file
             for test_file, inputs in CONDITIONAL_PYTEST_FILES.items()
             if not any(
-                path == value or path.startswith(value + "/")
-                for path in paths
-                for value in inputs
+                path == value or path.startswith(value + "/") for path in paths for value in inputs
             )
         )
     )
@@ -371,9 +370,10 @@ def _expected_output(
     lines.append(f"factory={'true' if factory else 'false'}")
     lines.append(f"approval_resume={'true' if approval_resume else 'false'}")
     scenarios = CHART_IDS if chart_scenarios is None else chart_scenarios
-    lines.append("chart_scenarios=" + json.dumps(
-        list(scenarios) if "cluster" in selected_tiers else [], separators=(",", ":")
-    ))
+    lines.append(
+        "chart_scenarios="
+        + json.dumps(list(scenarios) if "cluster" in selected_tiers else [], separators=(",", ":"))
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -1161,7 +1161,9 @@ def test_mixed_root_documentation_and_runtime_diff_selects_runtime_tiers(
     completed, output = _invoke_selector(tmp_path, "ARCHITECTURE.md", "apps/api/main.py")
     assert completed.returncode == 0, completed.stderr
     assert output == _expected_output(
-        "local", "local-release", "cluster",
+        "local",
+        "local-release",
+        "cluster",
         pytest_deselect=ALL_CONDITIONAL,
         chart_scenarios=("quota-progress", "workspace-diagnostic"),
     )
@@ -1501,13 +1503,16 @@ rules:
     README.md: []
   ignored_prefixes:
     docs: []
-""" + yaml.safe_dump({
-    "chart_scenarios": {
-        "job": CHART_JOB,
-        "shared_inputs": list(CHART_SHARED_INPUTS),
-        "scenarios": CHART_SCENARIOS,
-    }
-}, sort_keys=False)
+""" + yaml.safe_dump(
+    {
+        "chart_scenarios": {
+            "job": CHART_JOB,
+            "shared_inputs": list(CHART_SHARED_INPUTS),
+            "scenarios": CHART_SCENARIOS,
+        }
+    },
+    sort_keys=False,
+)
 
 
 def test_exact_path_under_ignored_prefix_is_selected(tmp_path: Path) -> None:
@@ -1598,7 +1603,9 @@ def test_exact_ignore_under_selected_prefix_does_not_hide_siblings(tmp_path: Pat
     assert ignored.returncode == sibling.returncode == 0
     assert ignored_output == _expected_output(pytest_needed=False)
     assert sibling_output == _expected_output(
-        "cluster", "released-upgrade", chart_scenarios=(),
+        "cluster",
+        "released-upgrade",
+        chart_scenarios=(),
     )
 
 
@@ -3052,7 +3059,26 @@ def test_registration_seam_changes_select_the_factory_runtime(tmp_path: Path, pa
 
 
 @pytest.mark.parametrize(
-    "path", ("cli/src/output.rs", "apps/api/src/curie_api/routers/config.py", "docs/guide.md"),
+    "path",
+    (
+        "apps/api/src/curie_api/forges/gitlab/connection.py",
+        "apps/api/src/curie_api/forges/credential_providers.py",
+        "apps/api/src/curie_api/forge_credential_health.py",
+        "apps/api/src/curie_api/routers/forge_credential_health.py",
+        "cli/src/forge_expiry.rs",
+        "apps/api/tests/forge_fakes/gitlab.py",
+        STATIC_TOKEN_ROTATION_MODULE,
+    ),
+)
+def test_static_token_rotation_inputs_select_the_factory_runtime(tmp_path: Path, path: str) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    assert _outputs_of(output)["factory"] == "true"
+
+
+@pytest.mark.parametrize(
+    "path",
+    ("cli/src/output.rs", "apps/api/src/curie_api/routers/config.py", "docs/guide.md"),
 )
 def test_unrelated_changes_do_not_select_the_factory_runtime(tmp_path: Path, path: str) -> None:
     completed, output = _invoke_selector(tmp_path, path)
@@ -3087,11 +3113,18 @@ def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_p
     assert len(registrations) == 1
     registration = registrations[0]
     assert steps.index(scenario[0]) < steps.index(registration)
+    rotations = [step for step in steps if STATIC_TOKEN_ROTATION_MODULE in step.get("run", "")]
+    assert len(rotations) == 1
+    rotation = rotations[0]
+    assert steps.index(registration) < steps.index(rotation)
+    assert rotation["run"] == f"uv run pytest -q -n 0 {STATIC_TOKEN_ROTATION_MODULE}"
+    assert not rotation.get("if")
+    assert not rotation.get("continue-on-error")
     assert not registration.get("if")
     assert not registration.get("continue-on-error")
     assert any(
         step.get("uses", "").startswith("astral-sh/setup-uv@")
-        for step in steps[:steps.index(registration)]
+        for step in steps[: steps.index(registration)]
     )
     binaries = tmp_path / "bin"
     binaries.mkdir()
@@ -3105,9 +3138,14 @@ def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_p
     executed = subprocess.run(
         ["bash", "-e", "-o", "pipefail", "-c", registration["run"]],
         cwd=tmp_path,
-        env={**os.environ, "PATH": f"{binaries}:{os.environ['PATH']}",
-             "REGISTRATION_ARGV": str(log)},
-        capture_output=True, text=True, check=False,
+        env={
+            **os.environ,
+            "PATH": f"{binaries}:{os.environ['PATH']}",
+            "REGISTRATION_ARGV": str(log),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
     )
     assert executed.returncode == 0, executed.stdout + executed.stderr
     argv = json.loads(log.read_text())
@@ -3136,34 +3174,71 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
 @pytest.mark.parametrize(
     ("paths", "push", "omit_kind", "expected"),
     [
-        (("apps/api/src/curie_api/main.py",), False, False,
-         ("quota-progress", "workspace-diagnostic")),
+        (
+            ("apps/api/src/curie_api/main.py",),
+            False,
+            False,
+            ("quota-progress", "workspace-diagnostic"),
+        ),
         (("charts/curie/templates/agent-sandbox.yaml",), False, False, CHART_IDS),
-        (("charts/curie/ci/runtime/connector-readiness-runtime.sh",), False, False,
-         ("connector-readiness",)),
-        (("charts/curie/ci/scenarios/controller-preflight-kind.sh",), False, False,
-         ("controller-preflight",)),
-        (("packages/plugin-format/src/plugin_format/connector_render.py",), False, False,
-         ("connector-readiness", "quota-progress", "workspace-diagnostic")),
-        (("apps/worker/src/curie_worker/connector_k8s.py",), False, False,
-         ("connector-readiness", "quota-progress", "workspace-diagnostic")),
+        (
+            ("charts/curie/ci/runtime/connector-readiness-runtime.sh",),
+            False,
+            False,
+            ("connector-readiness",),
+        ),
+        (
+            ("charts/curie/ci/scenarios/controller-preflight-kind.sh",),
+            False,
+            False,
+            ("controller-preflight",),
+        ),
+        (
+            ("packages/plugin-format/src/plugin_format/connector_render.py",),
+            False,
+            False,
+            ("connector-readiness", "quota-progress", "workspace-diagnostic"),
+        ),
+        (
+            ("apps/worker/src/curie_worker/connector_k8s.py",),
+            False,
+            False,
+            ("connector-readiness", "quota-progress", "workspace-diagnostic"),
+        ),
         (("docs/adr/AGENTS.md",), False, False, ()),
         (("newtoplevel/file.txt",), False, False, CHART_IDS),
         ((), True, False, CHART_IDS),
         ((), True, True, ()),
         (("apps/api/src/curie_api/main.py",), False, True, ()),
-        (("charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh",), False, True,
-         ("langfuse-postgres-readiness",)),
+        (
+            ("charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh",),
+            False,
+            True,
+            ("langfuse-postgres-readiness",),
+        ),
         (_version_only_paths(_repo_version()), False, False, ()),
     ],
     ids=(
-        "api", "shared-template", "connector-script", "controller-script", "plugin-format",
-        "worker-connector", "docs", "fallback", "push", "next-push", "next-api",
-        "next-runtime-assertion", "version-only",
+        "api",
+        "shared-template",
+        "connector-script",
+        "controller-script",
+        "plugin-format",
+        "worker-connector",
+        "docs",
+        "fallback",
+        "push",
+        "next-push",
+        "next-api",
+        "next-runtime-assertion",
+        "version-only",
     ),
 )
 def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
-    tmp_path: Path, paths: tuple[str, ...], push: bool, omit_kind: bool,
+    tmp_path: Path,
+    paths: tuple[str, ...],
+    push: bool,
+    omit_kind: bool,
     expected: tuple[str, ...],
 ) -> None:
     completed, output = _invoke_selector(tmp_path, *paths, push=push, omit_kind=omit_kind)
@@ -3178,17 +3253,17 @@ def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
 
 @pytest.mark.parametrize(
     ("path", "expected"),
-    [
-        (entry["inputs"][0], (scenario,)) for scenario, entry in CHART_SCENARIOS.items()
-    ] + [
+    [(entry["inputs"][0], (scenario,)) for scenario, entry in CHART_SCENARIOS.items()]
+    + [
         ("charts/curie/values.yaml", CHART_IDS),
         ("charts/curie/values-dev.yaml", CHART_IDS),
         ("charts/curie/values.schema.json", CHART_IDS),
         ("charts/curie/values-custom.yaml", CHART_IDS),
-        ("charts/curie/ci/postgres-readiness-delay.Dockerfile",
-         ("langfuse-postgres-readiness",)),
-        ("apps/worker/src/curie_worker/connector_k8s.py.bak",
-         ("quota-progress", "workspace-diagnostic")),
+        ("charts/curie/ci/postgres-readiness-delay.Dockerfile", ("langfuse-postgres-readiness",)),
+        (
+            "apps/worker/src/curie_worker/connector_k8s.py.bak",
+            ("quota-progress", "workspace-diagnostic"),
+        ),
         ("charts/curie/ci/runtime/connector-readiness-runtime.sh.bak", ()),
         ("charts/curie/ci/runtime/connector-readiness-runtime.sh/child", ("connector-readiness",)),
         ("examples/weather/skills/weather/SKILL.md", ()),
@@ -3196,7 +3271,9 @@ def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
     ],
 )
 def test_chart_scenario_input_matching_keeps_the_existing_prefix_rules(
-    tmp_path: Path, path: str, expected: tuple[str, ...],
+    tmp_path: Path,
+    path: str,
+    expected: tuple[str, ...],
 ) -> None:
     completed, output = _invoke_selector(tmp_path, path)
     assert completed.returncode == 0, completed.stderr
@@ -3276,9 +3353,22 @@ def test_chart_consistency_check_rejects_workflow_drift(mutation: str) -> None:
 
 @pytest.mark.parametrize(
     "mutation",
-    ["section-key", "entry-key", "duplicate-step", "empty-inputs", "empty-shared-inputs",
-     "empty-path", "absolute-path", "trailing-slash", "shared-empty-path", "shared-absolute-path",
-     "shared-trailing-slash", "nonstring-key", "inputs-string", "shared-inputs-string"],
+    [
+        "section-key",
+        "entry-key",
+        "duplicate-step",
+        "empty-inputs",
+        "empty-shared-inputs",
+        "empty-path",
+        "absolute-path",
+        "trailing-slash",
+        "shared-empty-path",
+        "shared-absolute-path",
+        "shared-trailing-slash",
+        "nonstring-key",
+        "inputs-string",
+        "shared-inputs-string",
+    ],
 )
 def test_chart_scenario_registry_rejects_malformed_entries(tmp_path: Path, mutation: str) -> None:
     registry = yaml.safe_load(VALID_REGISTRY)
@@ -3319,19 +3409,26 @@ def test_chart_scenario_registry_rejects_malformed_entries(tmp_path: Path, mutat
 
 @pytest.mark.parametrize("mode", ["paths", "push", "revisions"])
 def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
-    tmp_path: Path, mode: str,
+    tmp_path: Path,
+    mode: str,
 ) -> None:
     repository = _new_repository(tmp_path)
     base = _commit_files(repository, {"README.md": "base\n"}, "base")
     workflow = yaml.safe_load(WORKFLOW.read_text())
-    workflow["jobs"][CHART_JOB]["steps"].append({
-        "name": "Unregistered chart assertion",
-        "run": "bash charts/curie/ci/runtime/unregistered-example-runtime.sh",
-    })
-    head = _commit_files(repository, {
-        ".github/workflows/ci.yaml": yaml.safe_dump(workflow, sort_keys=False),
-        "apps/api/src/curie_api/main.py": "# candidate\n",
-    }, "add an unregistered chart assertion")
+    workflow["jobs"][CHART_JOB]["steps"].append(
+        {
+            "name": "Unregistered chart assertion",
+            "run": "bash charts/curie/ci/runtime/unregistered-example-runtime.sh",
+        }
+    )
+    head = _commit_files(
+        repository,
+        {
+            ".github/workflows/ci.yaml": yaml.safe_dump(workflow, sort_keys=False),
+            "apps/api/src/curie_api/main.py": "# candidate\n",
+        },
+        "add an unregistered chart assertion",
+    )
     options: dict[str, Any] = {"cwd": repository}
     paths: tuple[str, ...] = ()
     if mode == "revisions":
@@ -3355,22 +3452,32 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
 
 @pytest.mark.parametrize(
     ("chart_scenarios", "chart_result", "expected_code"),
-    [("[]", "skipped", 0), ('["workspace-diagnostic"]', "success", 0),
-     ('["workspace-diagnostic"]', "skipped", 1), ("[]", "success", 1)],
+    [
+        ("[]", "skipped", 0),
+        ('["workspace-diagnostic"]', "success", 0),
+        ('["workspace-diagnostic"]', "skipped", 1),
+        ("[]", "success", 1),
+    ],
 )
 def test_e2e_required_uses_chart_scenarios_for_the_chart_result(
-    chart_scenarios: str, chart_result: str, expected_code: int,
+    chart_scenarios: str,
+    chart_result: str,
+    expected_code: int,
 ) -> None:
     completed = _run_aggregate(
-        event_name="pull_request", cluster_selected="true", cluster_result="success",
-        chart_scenarios=chart_scenarios, cluster_chart_result=chart_result,
+        event_name="pull_request",
+        cluster_selected="true",
+        cluster_result="success",
+        chart_scenarios=chart_scenarios,
+        cluster_chart_result=chart_result,
     )
     assert (completed.returncode == 0) == (expected_code == 0), completed.stdout + completed.stderr
 
 
 def test_e2e_required_rejects_chart_scenarios_without_cluster() -> None:
     completed = _run_aggregate(
-        chart_scenarios='["workspace-diagnostic"]', cluster_chart_result="success",
+        chart_scenarios='["workspace-diagnostic"]',
+        cluster_chart_result="success",
     )
     assert completed.returncode != 0, completed.stdout + completed.stderr
 
@@ -3378,16 +3485,22 @@ def test_e2e_required_rejects_chart_scenarios_without_cluster() -> None:
 @pytest.mark.parametrize("chart_scenarios", ["", "true", "[", "]", '["workspace-diagnostic"'])
 def test_e2e_required_rejects_chart_scenarios_without_list_delimiters(chart_scenarios: str) -> None:
     completed = _run_aggregate(
-        chart_scenarios=chart_scenarios, cluster_selected="true", cluster_result="success",
-        cluster_chart_result="success", event_name="pull_request",
+        chart_scenarios=chart_scenarios,
+        cluster_selected="true",
+        cluster_result="success",
+        cluster_chart_result="success",
+        event_name="pull_request",
     )
     assert completed.returncode != 0, completed.stdout + completed.stderr
 
 
 def test_negative_control_still_covers_the_chart_job_result() -> None:
     state = {
-        "event_name": "pull_request", "cluster_selected": "true", "cluster_result": "success",
-        "chart_scenarios": '["workspace-diagnostic"]', "cluster_chart_result": "success",
+        "event_name": "pull_request",
+        "cluster_selected": "true",
+        "cluster_result": "success",
+        "chart_scenarios": '["workspace-diagnostic"]',
+        "cluster_chart_result": "success",
     }
     unmutated = _run_aggregate(**state)
     assert unmutated.returncode == 0, unmutated.stdout + unmutated.stderr

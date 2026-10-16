@@ -7,7 +7,9 @@ its ``static_token`` credential (the bot's Atlassian account email as
 ``username`` and its API token), label and ``mention`` (the bot's accountId).
 It is binding scoped (plan D13): `for_binding` yields the tracker for one
 binding's cloudId and start authority. The identity it verifies (decision 3)
-is cached here, so it is read once per connection rather than per tracker.
+is cached here, so it is read once per connection and credential rather than
+per tracker. Each tracker's transport takes a fresh `TokenSnapshot`, so a
+replaced token file is used by the next operation with no restart (#4630).
 """
 
 from __future__ import annotations
@@ -16,11 +18,16 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from curie_api.code_host_trust import verify_for_bundle
 from curie_api.forges.config import BindingConfig, StaticTokenCredentialConfig, TrackerConfig
+from curie_api.forges.credential_providers import TokenSnapshot
 from curie_api.forges.jira_cloud.identity import IdentityCache
 from curie_api.forges.jira_cloud.tracker import JiraTracker, browse_url
 from curie_api.forges.jira_cloud.transport import JiraTransport
 from curie_api.forges.types import TrackerIssueRef
+
+# The timeout of a client `JiraTrackerConnection.client` builds.
+TIMEOUT_S = 15.0
 
 
 def site_origin(api_url: str, host: str) -> str:
@@ -37,7 +44,7 @@ class JiraTrackerConnection:
 
     def __init__(self, config: TrackerConfig, *, ca_bundle: str = "") -> None:
         # ``ca_bundle`` is the install's code host CA; the caller's HTTP client
-        # carries TLS settings, so a Jira connection reads nothing from it.
+        # carries TLS settings, and `client` trusts it beside the public roots.
         credential = config.credential
         if not isinstance(credential, StaticTokenCredentialConfig):
             raise ValueError("jira_cloud supports static_token credentials only")
@@ -47,10 +54,23 @@ class JiraTrackerConnection:
                 " the bot's Atlassian account email, sent with the API token as basic auth"
             )
         self.config = config
+        self._ca_bundle = ca_bundle
         self._credential = credential
         self._username = credential.username
         self.site_origin = site_origin(config.api_url, config.host)
         self._identity = IdentityCache()
+
+    def __repr__(self) -> str:
+        return f"JiraTrackerConnection(name={self.config.name!r}, host={self.config.host!r})"
+
+    def client(self) -> httpx.AsyncClient:
+        """A client trusting the configured CA bundle, with the 15 second timeout."""
+
+        return httpx.AsyncClient(
+            verify=verify_for_bundle(self._ca_bundle),
+            timeout=httpx.Timeout(TIMEOUT_S),
+            follow_redirects=False,
+        )
 
     def for_binding(
         self, client: httpx.AsyncClient, binding: BindingConfig, *, label: str | None = None
@@ -64,7 +84,7 @@ class JiraTrackerConnection:
             entry=self.config.name,
             api_url=self.config.api_url,
             username=self._username,
-            token=self._credential.token,
+            token=TokenSnapshot(self._credential),
         )
         return JiraTracker(
             transport,

@@ -33,7 +33,7 @@ from curie_api.forges.bitbucket_dc.comments import BitbucketDcMarkedComments
 from curie_api.forges.bitbucket_dc.transport import BUILD_STATUS_API, DcTransport, object_of
 from curie_api.forges.bitbucket_dc.version import MINIMUM, ServerTooOld, parse_version
 from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Support
-from curie_api.forges.credential_providers import StaticTokenProvider
+from curie_api.forges.credential_providers import StaticTokenProvider, TokenSnapshot
 from curie_api.forges.errors import Ambiguous, NotFound, Unavailable, Unsupported
 from curie_api.forges.paths import valid_repository_path
 from curie_api.forges.types import (
@@ -217,12 +217,13 @@ class BitbucketDcCodeHost:
         entry: str,
         api_url: str,
         host: str,
-        token: str,
+        token: TokenSnapshot,
         credentials: StaticTokenProvider,
         page_size: int = 100,
     ) -> None:
         self.host = host
         self._http = DcTransport(client, entry=entry, api_url=api_url, token=token)
+        self._token = token
         self._credentials = credentials
         self._page_size = page_size
         # The server's version as it reported it, and parsed.
@@ -317,7 +318,8 @@ class BitbucketDcCodeHost:
         self.repo_path(repository)
         if await self._path_of(repository.project_id) != repository.path:
             raise NotFound("repository_renamed")
-        return await self._credentials.get(scope)
+        # The token this adapter's requests sent, not a fresh read (#4630).
+        return self._credentials.credential(self._token, scope)
 
     async def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:
         await self.ensure_version(Operation.BRANCH_HEAD)

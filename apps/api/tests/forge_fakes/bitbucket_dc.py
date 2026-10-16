@@ -35,7 +35,8 @@ from urllib.parse import parse_qsl
 
 import httpx
 from curie_api.forges import types
-from curie_api.forges.credential_providers import StaticTokenProvider
+from curie_api.forges.config import StaticTokenCredentialConfig
+from curie_api.forges.credential_providers import StaticTokenProvider, TokenSnapshot
 from curie_api.forges.types import Actor, CredentialHeader, RepositoryRef
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -1103,8 +1104,16 @@ def provider(token: str = FACTORY_TOKEN, *, base_url: str = API_URL) -> StaticTo
     on the clone origin ``<base_url>/scm``."""
 
     return StaticTokenProvider(
-        token, origin=f"{base_url}/scm", header=CredentialHeader.AUTHORIZATION_BEARER
+        inline_token(token),
+        origin=f"{base_url}/scm",
+        header=CredentialHeader.AUTHORIZATION_BEARER,
     )
+
+
+def inline_token(token: str) -> StaticTokenCredentialConfig:
+    """A static token credential holding ``token`` inline."""
+
+    return StaticTokenCredentialConfig.model_validate({"token": token})
 
 
 def dc_adapter(
@@ -1127,7 +1136,7 @@ def dc_adapter(
         entry="bitbucket-dc",
         api_url=fake.base_url,
         host=HOST,
-        token=token,
+        token=TokenSnapshot(inline_token(token)),
         credentials=provider(token, base_url=fake.base_url),
         page_size=page_size,
     )

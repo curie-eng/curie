@@ -73,6 +73,7 @@ from .routers import (
     deployments,
     evals,
     factory_status,
+    forge_credential_health,
     gitflow_routing,
     github,
     github_reviews,
@@ -155,9 +156,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.deploy_notice_reconciler_task = (
         asyncio.create_task(
-            app.state.deploy_notice_queue.run_forever(
-                settings.deploy_notice_reconciler_interval_s
-            )
+            app.state.deploy_notice_queue.run_forever(settings.deploy_notice_reconciler_interval_s)
         )
         if settings.deploy_notice_reconciler_enabled
         else None
@@ -589,6 +588,7 @@ def create_app() -> FastAPI:
     app.include_router(channel_read.internal_router)
     app.include_router(work_items.router)
     app.include_router(factory_status.router)
+    app.include_router(forge_credential_health.router)
     app.include_router(turn_progress.router)
     app.include_router(work_item_outcomes.router)
     app.include_router(cluster_message_replies.router)

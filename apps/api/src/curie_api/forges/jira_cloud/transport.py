@@ -2,11 +2,13 @@
 
 Every request carries HTTP basic auth with the bot's Atlassian account email
 and API token (https://developer.atlassian.com/cloud/jira/platform/basic-auth-for-rest-apis/).
-The header is built per request from the `SecretStr` and never stored, logged,
-or put in an exception: a transport failure is raised outside the handler with
-only the name of the operation, so no cause or context keeps an HTTP library
-error that echoes the request's headers into its own text. The log names the
-API root, the operation and the error class only.
+The header is built per request from the operation's `TokenSnapshot` (read at
+the first request, so a replaced token file is used by the next operation,
+#4630) and never stored, logged, or put in an exception: a transport failure
+is raised outside the handler with only the name of the operation, so no cause
+or context keeps an HTTP library error that echoes the request's headers into
+its own text. The log names the API root, the operation and the error class
+only.
 
 Status map (decision 9, the port contract): 429 and 503 are `Unavailable` and
 are never slept on, whatever ``Retry-After`` says, so the poll pass keeps its
@@ -18,20 +20,27 @@ not JSON is `Unavailable`.
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import logging
+import secrets
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
-from pydantic import SecretStr
 
 from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
+
+if TYPE_CHECKING:
+    from curie_api.forges.credential_providers import TokenSnapshot
 
 logger = logging.getLogger(__name__)
 
 API_PREFIX = "/rest/api/3"
 # A listing that has not ended after this many pages is not trusted to end.
 MAX_PAGES = 1000
+# Keys `JiraTransport.credential_fingerprint`; never leaves the process.
+_FINGERPRINT_KEY = secrets.token_bytes(32)
 
 
 class Forbidden(Unauthorized):
@@ -49,7 +58,7 @@ class JiraTransport:
         entry: str,
         api_url: str,
         username: str,
-        token: SecretStr,
+        token: TokenSnapshot,
     ) -> None:
         self._client = client
         # The configured entry's name, so a log line tells two entries apart.
@@ -62,8 +71,17 @@ class JiraTransport:
         return f"JiraTransport(entry={self.entry!r}, api={self._api!r})"
 
     def _authorization(self) -> str:
-        pair = f"{self._username}:{self._token.get_secret_value()}".encode()
+        pair = f"{self._username}:{self._token.value()}".encode()
         return "Basic " + base64.b64encode(pair).decode()
+
+    def credential_fingerprint(self) -> str:
+        """A keyed digest of this operation's credential, so a cached identity
+        can tell the token it was verified with from a replacement. The key is
+        random per process, so the digest names no token outside it."""
+
+        return hmac.new(
+            _FINGERPRINT_KEY, self._authorization().encode(), hashlib.sha256
+        ).hexdigest()
 
     async def request(
         self,

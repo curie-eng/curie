@@ -32,7 +32,7 @@ from curie_api.forges.bitbucket_cloud.comments import BitbucketCloudMarkedCommen
 from curie_api.forges.bitbucket_cloud.connection import HOST
 from curie_api.forges.bitbucket_cloud.transport import CloudTransport
 from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Support
-from curie_api.forges.credential_providers import StaticTokenProvider
+from curie_api.forges.credential_providers import StaticTokenProvider, TokenSnapshot
 from curie_api.forges.errors import Ambiguous, ForgeError, NotFound, Unavailable, Unsupported
 from curie_api.forges.paths import valid_repository_path
 from curie_api.forges.types import (
@@ -233,11 +233,12 @@ class BitbucketCloudCodeHost:
         *,
         entry: str,
         api_url: str,
-        token: str,
+        token: TokenSnapshot,
         credentials: StaticTokenProvider,
         page_size: int = 100,
     ) -> None:
         self._http = CloudTransport(client, entry=entry, api_url=api_url, token=token)
+        self._token = token
         self._credentials = credentials
         self._page_size = page_size
         # Abbreviated hash -> full hash, per repository; a commit never changes.
@@ -299,7 +300,8 @@ class BitbucketCloudCodeHost:
         current = await self.resolve_repository(repository.project_id)
         if current.path != repository.path:
             raise NotFound("repository_renamed")
-        return await self._credentials.get(scope)
+        # The token this adapter's requests sent, not a fresh read (#4630).
+        return self._credentials.credential(self._token, scope)
 
     async def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:
         url = f"{self.repo_url(repository)}/refs/branches/{quote(branch, safe='')}"
