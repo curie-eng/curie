@@ -2,7 +2,7 @@
 
 Date: 2026-10-15
 
-Status: Draft
+Status: Accepted
 
 Extends decision 4 of
 [ADR 0142](0142-database-compatibility-windows-and-a-single-upgrade-phase.md).
