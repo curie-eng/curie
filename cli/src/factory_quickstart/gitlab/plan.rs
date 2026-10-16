@@ -15,11 +15,11 @@ use super::{
 use crate::exit::CliError;
 use crate::factory_intake::{apply_forge_entries, native_forge_values, NativeForgeEntries};
 use crate::factory_quickstart::{
-    agent_settings, apply_manifest, bundle_dir, bundle_line, check_credit, check_prerequisites,
-    cluster_agent, confirm_remote_context, credential_line, deployed_release_snapshot,
-    ensure_factory_agent, forge_egress_line, initial_agent_line, install_action_line, native,
-    read_token, run_self, token_secret_manifest, unconfirmed_remote_context, validate_agent_flags,
-    Action, CredentialDecision, InstallSteps, QuickstartOpts, QuickstartOutput, DEFAULT_AGENT,
+    agent_settings, bundle_dir, bundle_line, check_credit, check_prerequisites, cluster_agent,
+    confirm_remote_context, credential_line, deployed_release_snapshot, ensure_factory_agent,
+    forge_egress_line, initial_agent_line, install_action_line, native, read_token, run_self,
+    token_secret_manifest, unconfirmed_remote_context, validate_agent_flags, Action,
+    CredentialDecision, InstallSteps, QuickstartOpts, QuickstartOutput, DEFAULT_AGENT,
     SKIPPED_CLUSTER_UP_LINE,
 };
 use crate::ops::CommonOpts;
@@ -444,12 +444,10 @@ async fn execute(
     )
     .await?;
     let token = read_token(&plan.token_file)?;
-    apply_manifest(
-        &plan.namespace,
-        &token_secret_manifest(&plan.namespace, SECRET_NAME, &token),
-        &format!("Secret {SECRET_NAME}"),
-    )
-    .await?;
+    let mut manifests = vec![(
+        token_secret_manifest(&plan.namespace, SECRET_NAME, &token),
+        format!("Secret {SECRET_NAME}"),
+    )];
     if let Some(ca) = &plan.ca_file {
         let pem = std::fs::read_to_string(ca).map_err(|error| {
             CliError::failure(format!(
@@ -457,16 +455,18 @@ async fn execute(
                 ca.display()
             ))
         })?;
-        apply_manifest(
-            &plan.namespace,
-            &ca_manifest(&plan.namespace, &pem),
-            &format!("ConfigMap {CA_CONFIG_MAP}"),
-        )
-        .await?;
+        manifests.push((
+            ca_manifest(&plan.namespace, &pem),
+            format!("ConfigMap {CA_CONFIG_MAP}"),
+        ));
     }
-    apply_forge_entries(&common, &opts.chart, &entries_what(plan), |recorded| {
-        native_forge_values(recorded, &plan.entries)
-    })
+    apply_forge_entries(
+        &common,
+        &opts.chart,
+        &entries_what(plan),
+        &manifests,
+        |recorded| native_forge_values(recorded, &plan.entries),
+    )
     .await?;
     let chart = opts.chart.clone();
     crate::cluster_secrets::bind_forge_egress(common.clone(), plan.agent.clone(), async move {

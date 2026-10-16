@@ -61,6 +61,31 @@ SRE_RUNTIME_INPUTS = (
     ".github/e2e-selection.yaml",
     "tools/e2e-ci-selection",
 )
+C4_TRACKER_SCOPE = "tools/factory-e2e/tests/test_c4_tracker_scope.py"
+C4_TRACKER_SCOPE_INPUTS = (
+    "charts/curie",
+    "cli/src",
+    "cli/Cargo.toml",
+    "cli/Cargo.lock",
+    "apps/api/src/curie_api/forges",
+    "apps/api/Dockerfile",
+    "tests/vectors/forge-tracker-scopes.json",
+    C4_TRACKER_SCOPE,
+    "tools/factory-e2e/tests/conftest.py",
+    "uv.lock",
+    "pyproject.toml",
+    "conftest.py",
+    ".github/workflows/ci.yaml",
+    ".github/e2e-selection.yaml",
+    "tools/e2e-ci-selection",
+)
+# Every conditional_pytest_files entry of the registry, with its inputs.
+CONDITIONAL_PYTEST_FILES = {
+    SRE_RUNTIME: SRE_RUNTIME_INPUTS,
+    C4_TRACKER_SCOPE: C4_TRACKER_SCOPE_INPUTS,
+}
+# What a fully classified diff touching no conditional input deselects.
+ALL_CONDITIONAL = ",".join(sorted(CONDITIONAL_PYTEST_FILES))
 UPGRADE_MUTANT_BUILDER = REPO_ROOT / "charts" / "curie" / "ci" / "make-upgrade-mutants.py"
 UPGRADE_MATRIX = REPO_ROOT / "cli" / "scripts" / "cluster-upgrade-matrix.sh"
 # Directories the upgrade matrix reads whole, each with the subdirectories it
@@ -292,12 +317,6 @@ def _path_needs_cli_release(path: str) -> bool:
 def _expected_conditional_deselect(*paths: str, pytest_needed: bool = True) -> str:
     if not pytest_needed or not paths:
         return ""
-    if any(
-        path == value or path.startswith(value + "/")
-        for path in paths
-        for value in SRE_RUNTIME_INPUTS
-    ):
-        return ""
     rules = yaml.safe_load(REGISTRY.read_text())["rules"]
     if any(
         path not in rules["exact"]
@@ -310,7 +329,17 @@ def _expected_conditional_deselect(*paths: str, pytest_needed: bool = True) -> s
         for path in paths
     ):
         return ""
-    return SRE_RUNTIME
+    return ",".join(
+        sorted(
+            test_file
+            for test_file, inputs in CONDITIONAL_PYTEST_FILES.items()
+            if not any(
+                path == value or path.startswith(value + "/")
+                for path in paths
+                for value in inputs
+            )
+        )
+    )
 
 
 def _expected_output(
@@ -1133,7 +1162,7 @@ def test_mixed_root_documentation_and_runtime_diff_selects_runtime_tiers(
     assert completed.returncode == 0, completed.stderr
     assert output == _expected_output(
         "local", "local-release", "cluster",
-        pytest_deselect=SRE_RUNTIME,
+        pytest_deselect=ALL_CONDITIONAL,
         chart_scenarios=("quota-progress", "workspace-diagnostic"),
     )
 
@@ -1271,7 +1300,7 @@ def test_revisions_select_changed_paths_and_unknown_fallback(tmp_path: Path) -> 
         cwd=repository,
     )
     assert known.returncode == 0, known.stderr
-    assert known_output == _expected_output("local", pytest_deselect=SRE_RUNTIME)
+    assert known_output == _expected_output("local", pytest_deselect=ALL_CONDITIONAL)
 
     (repository / "new-surface.txt").write_text("new\n")
     subprocess.run(["git", "add", "."], cwd=repository, check=True)
@@ -1321,7 +1350,9 @@ VERSION_ONLY_SELECTION = _expected_output(
 # What the same five paths selected before #3858, and still select whenever
 # the delta is not version-only.
 FULL_PREP_SELECTION = _expected_output(
-    *TIERS, pytest_deselect=SRE_RUNTIME, cli_release_needed=True
+    *TIERS,
+    pytest_deselect=_expected_conditional_deselect(*_version_only_paths(_repo_version())),
+    cli_release_needed=True,
 )
 
 

@@ -1029,9 +1029,9 @@ pub fn deploy_args(
     argvs
 }
 
-/// Apply the Jira token Secret, then write the Jira tracker and binding
-/// entries on the release. The token is read from its file here and goes
-/// only to `kubectl apply` on stdin.
+/// Write the Jira token Secret and the Jira tracker and binding entries on
+/// the release, once the planned entries pass the factory check. The token
+/// is read from its file here and goes only to `kubectl apply` on stdin.
 async fn apply_jira_tracker(opts: &QuickstartOpts, jira: &JiraPlan) -> Result<()> {
     let common = CommonOpts {
         namespace: opts.namespace.clone(),
@@ -1039,16 +1039,15 @@ async fn apply_jira_tracker(opts: &QuickstartOpts, jira: &JiraPlan) -> Result<()
         dry_run: false,
     };
     let token = jira_cloud::read_token(&jira.token_file)?;
-    apply_manifest(
-        &common.namespace,
-        &jira_cloud::secret_manifest(&common.namespace, &token),
-        &format!("Secret {}", jira.secret_name),
-    )
-    .await?;
+    let manifests = [(
+        jira_cloud::secret_manifest(&common.namespace, &token),
+        format!("Secret {}", jira.secret_name),
+    )];
     crate::factory_intake::apply_forge_entries(
         &common,
         &opts.chart,
         &format!("the Jira tracker and binding `{}`", jira.binding_name),
+        &manifests,
         |recorded| crate::factory_intake::forge_entries_values(recorded, jira),
     )
     .await
