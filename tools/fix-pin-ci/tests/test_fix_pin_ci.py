@@ -8,6 +8,7 @@ is never called cannot protect a merge.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -50,6 +51,14 @@ INITIAL_BINDING_SELECTOR = (
 ADMITTED_AGENT_SELECTOR = (
     "tools/factory-e2e/tests/test_c4_admitted_agent.py::"
     "test_labelled_agents_execute_as_admitted_agent"
+)
+FACTORY_UPGRADE_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_upgrade_migration.py::"
+    "test_v0125_factory_upgrade_uses_supported_flow"
+)
+FACTORY_UPGRADE_NEAR_MISS_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_upgrade_migration_extra.py::"
+    "test_v0125_factory_upgrade_uses_supported_flow"
 )
 LOCAL_SELECTOR = "cli/tests/local/test_deploy.py::test_deploy"
 LOCAL_LIVE_SELECTOR = "cli/tests/local/test_live.py::test_live"
@@ -362,7 +371,7 @@ def _probe_outputs(tmp_path: Path) -> dict[str, str]:
     lines = _github_output(tmp_path).read_text(encoding="utf-8").splitlines()
     outputs = dict(line.split("=", 1) for line in lines)
     assert len(lines) == len(outputs)
-    assert set(outputs) == {"needed", "needs_stack", "needs_kind"}
+    assert set(outputs) == {"needed", "needs_stack", "needs_kind", "needs_factory_upgrade"}
     return outputs
 
 
@@ -407,15 +416,26 @@ def test_exact_declaration_calls_the_verifier_with_one_argv_selector(tmp_path: P
     ]
 
 
-def test_factory_python_selector_calls_the_verifier_at_the_ci_boundary(tmp_path: Path) -> None:
-    completed, call_log = _run_checker(tmp_path, f"Fix pin: {FACTORY_SELECTOR}\n")
+@pytest.mark.parametrize(
+    "selector",
+    [
+        FACTORY_SELECTOR,
+        INITIAL_BINDING_SELECTOR,
+        FACTORY_UPGRADE_SELECTOR,
+        FACTORY_UPGRADE_NEAR_MISS_SELECTOR,
+    ],
+)
+def test_factory_python_selector_calls_the_verifier_at_the_ci_boundary(
+    tmp_path: Path, selector: str
+) -> None:
+    completed, call_log = _run_checker(tmp_path, f"Fix pin: {selector}\n")
 
     assert completed.returncode == 0, completed.stderr
     assert json.loads(call_log.read_text(encoding="utf-8")) == [
         "dev",
         "verify-fix-pin",
         "HEAD",
-        FACTORY_SELECTOR,
+        selector,
     ]
 
 
@@ -1123,8 +1143,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         lambda step: "uv run alembic upgrade head" in _string(step, "run"),
         "shared database migration",
     )
-    # Reporting flags may vary; both dedicated kind runtime modules must be
-    # excluded from the ordinary Python suite.
+    # Dedicated kind runtime modules run through their own CI callers.
     pytest_index = _single_step_index(
         steps,
         lambda step: step.get("id") == "pytest",
@@ -1139,13 +1158,57 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     for meaning, expression in {
         "shard": "${{ matrix.shard }}",
         "deselect": "${{ steps.python-runtime.outputs.pytest_deselect }}",
+        "scope": "${{ steps.python-runtime.outputs.pytest_scope }}",
     }.items():
         names = [name for name, value in pytest_env.items() if value == expression]
         assert len(names) == 1, expression
         bindings[meaning] = names[0]
+    runtime_exclusions = {
+        ("--ignore", "tools/factory-e2e/tests/test_c4_initial_binding.py"),
+        ("--ignore", "tools/factory-e2e/tests/test_c4_upgrade_migration.py"),
+        ("--deselect", "tools/factory-e2e/tests/test_c4_admitted_agent.py"),
+    }
+
+    def assert_full_suite(command: list[str], shard: int, deselect: str) -> None:
+        assert command[:3] == ["run", "pytest", "-q"]
+        if deselect:
+            assert command.count("--deselect") == 1
+            assert command[-2:] == ["--deselect", deselect]
+            command = command[:-2]
+        distribution = [
+            "-n", "4", "--dist", "loadgroup", "--ci-shard", f"{shard}/3", "--reruns", "1",
+        ]
+        extra = command[3:]
+        assert extra[: len(distribution)] == distribution
+        arguments = iter(extra[len(distribution):])
+        excluded = []
+        reporting = []
+        for argument in arguments:
+            if argument in {"--ignore", "--deselect"}:
+                path = next(arguments, None)
+                assert path is not None, f"{argument} requires a path"
+                excluded.append((argument, path))
+            elif argument.startswith(("--ignore=", "--deselect=")):
+                option, path = argument.split("=", 1)
+                excluded.append((option, path))
+            else:
+                reporting.append(argument)
+        assert len(excluded) == 3 and set(excluded) == runtime_exclusions, (
+            "the Python suite must use exactly the required kind runtime exclusions, "
+            f"got {excluded!r}"
+        )
+        report_chars = set("fEsxXpPaAR")
+        assert all(
+            argument.startswith("--durations")
+            or (
+                argument.startswith("-r")
+                and len(argument) > 2
+                and set(argument[2:]) <= report_chars
+            )
+            for argument in reporting
+        ), f"the full Python suite permits only reporting flags, got {command!r}"
+
     # Run the unmodified Bash with a recording uv function at its command boundary.
-    # Keep reporting flags flexible after checking the required exclusion and
-    # the declared file added by conditional selection.
     for shard in (1, 2, 3):
         for deselect in ("", "examples/tests/test_sre_bot_observability_runtime.py"):
             environment = {
@@ -1153,6 +1216,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
                 "BASH_FUNC_uv%%": "() { printf '%s\\0' \"$@\"; }",
                 bindings["shard"]: str(shard),
                 bindings["deselect"]: deselect,
+                bindings["scope"]: "full",
             }
             result = subprocess.run(
                 ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", pytest_script],
@@ -1164,45 +1228,37 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
             assert result.returncode == 0, result.stdout + result.stderr
             pytest_command = result.stdout.split("\0")
             assert pytest_command.pop() == ""
-            assert pytest_command[:3] == ["run", "pytest", "-q"]
-            if deselect:
-                assert pytest_command.count("--deselect") == 1
-                assert pytest_command[-2:] == ["--deselect", deselect]
-                pytest_command = pytest_command[:-2]
-            distribution = [
-                "-n",
-                "4",
-                "--dist",
-                "loadgroup",
-                "--ci-shard",
-                f"{shard}/3",
-                "--reruns",
-                "1",
-            ]
-            extra = pytest_command[3:]
-            assert extra[: len(distribution)] == distribution
-            extra = extra[len(distribution) :]
-            runtime_exclusions = (
-                "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
-                "--deselect=tools/factory-e2e/tests/test_c4_admitted_agent.py",
-            )
-            for runtime_exclusion in runtime_exclusions:
-                assert extra.count(runtime_exclusion) == 1
-                extra.remove(runtime_exclusion)
-            report_chars = set("fEsxXpPaAR")
-            assert all(
-                argument.startswith("--durations")
-                or (
-                    argument.startswith("-r")
-                    and len(argument) > 2
-                    and set(argument[2:]) <= report_chars
-                )
-                for argument in extra
-            ), (
-                "the Python suite requires both kind runtime exclusions and permits only "
-                "reporting flags plus the selected trailing deselect pair, "
-                f"got {pytest_command!r}"
-            )
+            assert_full_suite(pytest_command, shard, deselect)
+            if shard == 1 and not deselect:
+                for mutation in (
+                    ["--ignore", "apps/api/tests"],
+                    ["--ignore=apps/api/tests"],
+                    ["--ignore-glob=*"],
+                    ["--deselect=apps/api/tests"],
+                    ["apps/api/tests/test_config.py"],
+                    list(sorted(runtime_exclusions)[0]),
+                ):
+                    with pytest.raises(AssertionError):
+                        assert_full_suite([*pytest_command, *mutation], shard, deselect)
+                for missing_option, missing_path in runtime_exclusions:
+                    reduced = []
+                    arguments = iter(pytest_command)
+                    for argument in arguments:
+                        if argument in {"--ignore", "--deselect"}:
+                            path = next(arguments)
+                            if (argument, path) != (missing_option, missing_path):
+                                reduced.extend((argument, path))
+                        elif argument != f"{missing_option}={missing_path}":
+                            reduced.append(argument)
+                    with pytest.raises(AssertionError):
+                        assert_full_suite(reduced, shard, deselect)
+                    replaced = [
+                        *reduced,
+                        "--ignore" if missing_option == "--deselect" else "--deselect",
+                        missing_path,
+                    ]
+                    with pytest.raises(AssertionError):
+                        assert_full_suite(replaced, shard, deselect)
     assert stack_index < migration_index < pytest_index
 
     # The half that keeps the win. Nothing about the gate may drift back into
@@ -1408,7 +1464,190 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
 CARGO_NEEDED_GUARD = "steps.fix-pin-curie.outputs.needed == 'true'"
 STACK_NEEDED_GUARD = "steps.fix-pin-curie.outputs.needs_stack == 'true'"
 KIND_NEEDED_GUARD = "steps.fix-pin-curie.outputs.needs_kind == 'true'"
+FACTORY_UPGRADE_NEEDED_GUARD = "steps.fix-pin-curie.outputs.needs_factory_upgrade == 'true'"
 SUBSTRING_GUARD = "contains(github.event.pull_request.body, 'Fix pin:')"
+
+
+def _factory_upgrade_setup_steps() -> tuple[list[dict[str, Any]], int, int]:
+    _, steps = _fix_pin_job()
+    prepare_index = _single_step_index(
+        steps,
+        lambda step: (
+            "TMPDIR=" in _string(step, "run")
+            and "CURIE_C4_RELEASE_ASSETS=" in _string(step, "run")
+        ),
+        "source-local factory upgrade preparation",
+    )
+    download_index = _single_step_index(
+        steps,
+        lambda step: "releases/download/v0.12.5" in _string(step, "run"),
+        "released factory upgrade asset download",
+    )
+    return steps, prepare_index, download_index
+
+
+def _run_factory_upgrade_setup_step(
+    step: dict[str, Any], environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", _string(step, "run")],
+        cwd=environment["GITHUB_WORKSPACE"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+
+def _prepare_factory_upgrade_environment(tmp_path: Path) -> dict[str, str]:
+    workspace = tmp_path / "source checkout"
+    workspace.mkdir()
+    runner_temp = tmp_path / "runner temp"
+    runner_temp.mkdir()
+    github_env = runner_temp / "github-env"
+    github_env.touch()
+    environment = {
+        **os.environ,
+        "GITHUB_WORKSPACE": str(workspace),
+        "GITHUB_ENV": str(github_env),
+        "RUNNER_TEMP": str(runner_temp),
+    }
+    for name in ("TMPDIR", "CURIE_C4_RELEASE_ASSETS"):
+        environment.pop(name, None)
+    steps, prepare_index, _ = _factory_upgrade_setup_steps()
+    completed = _run_factory_upgrade_setup_step(steps[prepare_index], environment)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    exported = dict(
+        line.split("=", 1) for line in github_env.read_text(encoding="utf-8").splitlines()
+    )
+    assert {"TMPDIR", "CURIE_C4_RELEASE_ASSETS"} <= exported.keys()
+    return {**environment, **exported}
+
+
+def test_factory_upgrade_workflow_prepares_assets_before_verification() -> None:
+    steps, prepare_index, download_index = _factory_upgrade_setup_steps()
+    probe_index = _single_step_index(steps, _is_fix_pin_probe, "fix pin requirements probe")
+    gate_index = _single_step_index(steps, _is_fix_pin_gate, "fix pin verification")
+    assert probe_index < prepare_index < download_index < gate_index
+    for index in (prepare_index, download_index):
+        step = steps[index]
+        assert _string(step, "if") == FACTORY_UPGRADE_NEEDED_GUARD
+        assert step.get("continue-on-error", False) is False
+    assert not _string(steps[gate_index], "if"), "every declaration must reach the policy gate"
+
+
+def test_factory_upgrade_setup_exports_source_local_paths(tmp_path: Path) -> None:
+    environment = _prepare_factory_upgrade_environment(tmp_path)
+    workspace = Path(environment["GITHUB_WORKSPACE"]).resolve()
+    for name in ("TMPDIR", "CURIE_C4_RELEASE_ASSETS"):
+        directory = Path(environment[name])
+        assert directory.is_absolute()
+        assert directory.is_dir(), f"{name} must exist before verification"
+        assert directory.resolve().is_relative_to(workspace / ".projects"), name
+
+    completed = subprocess.run(
+        ["mktemp", "-d"],
+        cwd=workspace,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    temporary_root = Path(completed.stdout.strip()).resolve()
+    assert temporary_root.is_dir()
+    assert temporary_root.parent == Path(environment["TMPDIR"]).resolve()
+    assert (temporary_root / "worktree").is_relative_to(workspace / ".projects")
+
+
+@pytest.mark.parametrize(
+    ("corrupt_asset", "manifest_entries"),
+    [
+        pytest.param(None, "complete", id="verified-assets"),
+        pytest.param("curie-0.12.5.tgz", "complete", id="corrupt-chart"),
+        pytest.param("curie-x86_64-unknown-linux-gnu", "complete", id="corrupt-cli"),
+        pytest.param(None, "missing-cli", id="missing-checksum"),
+        pytest.param(None, "duplicate-cli", id="duplicate-checksum"),
+    ],
+)
+def test_factory_upgrade_downloads_only_verified_release_assets(
+    tmp_path: Path, corrupt_asset: str | None, manifest_entries: str
+) -> None:
+    environment = _prepare_factory_upgrade_environment(tmp_path)
+    release_url = "https://github.com/curie-eng/curie/releases/download/v0.12.5"
+    assets = {
+        "curie-0.12.5.tgz": "released chart fixture\n",
+        "curie-x86_64-unknown-linux-gnu": "released CLI fixture\n",
+    }
+    checksum_lines = [
+        f"{hashlib.sha256(content.encode()).hexdigest()}  {name}\n"
+        for name, content in assets.items()
+    ]
+    if manifest_entries == "missing-cli":
+        checksum_lines.pop()
+    elif manifest_entries == "duplicate-cli":
+        checksum_lines.append(checksum_lines[-1])
+    responses = {f"{release_url}/{name}": content for name, content in assets.items()}
+    responses[f"{release_url}/checksums.txt"] = "".join(checksum_lines)
+    if corrupt_asset is not None:
+        responses[f"{release_url}/{corrupt_asset}"] += "corrupted download\n"
+
+    # The public release serves these assets and their sha256sum manifest:
+    # https://github.com/curie-eng/curie/releases/tag/v0.12.5
+    # Replace GitHub responses while running the workflow's real checksum tools.
+    download_boundary = "\n".join(
+        [
+            "import json, os, sys",
+            "from pathlib import Path",
+            "arguments = sys.argv[1:]",
+            "urls = [value for value in arguments if value.startswith('https://')]",
+            "assert len(urls) == 1, arguments",
+            "url = urls[0]",
+            "output_flag = '-o' if '-o' in arguments else '--output'",
+            "destination = Path(arguments[arguments.index(output_flag) + 1])",
+            "responses = json.loads(os.environ['FIX_PIN_RELEASE_RESPONSES'])",
+            "assert url in responses, url",
+            "print('FIX_PIN_DOWNLOAD ' + json.dumps("
+            "{'url': url, 'destination': str(destination)}))",
+            "destination.write_text(responses[url], encoding='utf-8')",
+        ]
+    )
+    environment.update(
+        {
+            "FIX_PIN_RELEASE_RESPONSES": json.dumps(responses),
+            "BASH_FUNC_curl%%": (
+                f"() {{ {shlex.quote(sys.executable)} -c "
+                f"{shlex.quote(download_boundary)} \"$@\"; }}"
+            ),
+        }
+    )
+    steps, _, download_index = _factory_upgrade_setup_steps()
+    completed = _run_factory_upgrade_setup_step(steps[download_index], environment)
+    calls = [
+        json.loads(line.removeprefix("FIX_PIN_DOWNLOAD "))
+        for line in completed.stdout.splitlines()
+        if line.startswith("FIX_PIN_DOWNLOAD ")
+    ]
+    assert calls, completed.stdout + completed.stderr
+    assert calls[0]["url"] == f"{release_url}/checksums.txt"
+    asset_directory = Path(environment["CURIE_C4_RELEASE_ASSETS"])
+    for call in calls:
+        filename = call["url"].rsplit("/", 1)[-1]
+        assert Path(call["destination"]).resolve() == (asset_directory / filename).resolve()
+
+    if corrupt_asset is not None or manifest_entries != "complete":
+        assert completed.returncode != 0, completed.stdout + completed.stderr
+        if corrupt_asset is not None:
+            assert f"{corrupt_asset}: FAILED" in completed.stdout + completed.stderr
+        return
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert len(calls) == 3
+    assert {call["url"] for call in calls} == set(responses)
+    for name, content in assets.items():
+        assert (asset_directory / name).read_text(encoding="utf-8") == content
 
 
 def test_selector_tooling_builds_only_when_the_parser_would_invoke_curie() -> None:
@@ -1532,33 +1771,46 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("body", "needed", "stack", "kind"),
+    ("body", "needed", "stack", "kind", "factory_upgrade"),
     [
-        (f"Fix pin: {ADMITTED_AGENT_SELECTOR}", True, False, True),
+        (f"Fix pin: {ADMITTED_AGENT_SELECTOR}", True, False, True, False),
         (
             "Fix pin: tools/factory-e2e/tests/test_c4_admitted_agent.py::"
             "test_execute_revalidates_current_authority[agent_tenant-factory_tenant_mismatch]",
             True,
             False,
             True,
+            False,
         ),
-        (f"Fix pin: {INITIAL_BINDING_SELECTOR}", True, False, True),
+        (f"Fix pin: {INITIAL_BINDING_SELECTOR}", True, False, True, False),
         (
             "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding.py::"
             "test_quickstarts_are_idempotent_and_binding_guards_hold[gitlab]",
             True,
             False,
             True,
+            False,
         ),
-        (f"Fix pin: {VALID_SELECTOR}", True, True, False),
-        (f"Fix pin: {FACTORY_SELECTOR}", True, True, False),
-        (f"Fix pin: {LOCAL_SELECTOR}", True, True, False),
-        (f"Fix pin: {CHART_SELECTOR}", True, True, False),
-        ("Fix pin: cli/tests/verify_fix_pin.rs::ci_gate_pins", True, True, False),
+        (f"Fix pin: {FACTORY_UPGRADE_SELECTOR}", True, False, True, True),
+        (f"Fix pin: {FACTORY_UPGRADE_SELECTOR}[secondary]", True, False, True, True),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_upgrade_migration.py::"
+            "TestUpgrade::test_secondary_path",
+            True,
+            False,
+            True,
+            True,
+        ),
+        (f"Fix pin: {VALID_SELECTOR}", True, True, False, False),
+        (f"Fix pin: {FACTORY_SELECTOR}", True, True, False, False),
+        (f"Fix pin: {LOCAL_SELECTOR}", True, True, False, False),
+        (f"Fix pin: {CHART_SELECTOR}", True, True, False, False),
+        ("Fix pin: cli/tests/verify_fix_pin.rs::ci_gate_pins", True, True, False, False),
         (
             "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding_extra.py::test_example",
             True,
             True,
+            False,
             False,
         ),
         (
@@ -1566,23 +1818,48 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
             True,
             True,
             False,
+            False,
         ),
-        (None, False, False, False),
-        ("", False, False, False),
-        ("Fix pin: n/a - documentation only", False, False, False),
-        (f"<!-- Fix pin: {INITIAL_BINDING_SELECTOR} -->", False, False, False),
-        (f"<!-- Fix pin: {ADMITTED_AGENT_SELECTOR} -->", False, False, False),
-        (f" Fix pin: {INITIAL_BINDING_SELECTOR}", False, False, False),
-        (f" Fix pin: {ADMITTED_AGENT_SELECTOR}", False, False, False),
-        (f"Verified with Fix pin: {ADMITTED_AGENT_SELECTOR}", False, False, False),
+        (f"Fix pin: {FACTORY_UPGRADE_NEAR_MISS_SELECTOR}", True, True, False, False),
+        (
+            "Fix pin: tools/factory-e2e/tests/nested/test_c4_upgrade_migration.py::test_example",
+            True,
+            True,
+            False,
+            False,
+        ),
+        (None, False, False, False, False),
+        ("", False, False, False, False),
+        ("Fix pin: n/a - documentation only", False, False, False, False),
+        (f"<!-- Fix pin: {ADMITTED_AGENT_SELECTOR} -->", False, False, False, False),
+        (f" Fix pin: {ADMITTED_AGENT_SELECTOR}", False, False, False, False),
+        (f"Verified with Fix pin: {ADMITTED_AGENT_SELECTOR}", False, False, False, False),
         (
             "Fix pin: tools/factory-e2e/tests/test_c4_admitted_agent.py::",
             False,
             False,
             False,
+            False,
         ),
-        (f"Fix pin: {INITIAL_BINDING_SELECTOR}\nFix pin: {VALID_SELECTOR}", False, False, False),
-        ("Fix pin: --help", False, False, False),
+        (f"<!-- Fix pin: {INITIAL_BINDING_SELECTOR} -->", False, False, False, False),
+        (f"<!-- Fix pin: {FACTORY_UPGRADE_SELECTOR} -->", False, False, False, False),
+        (f" Fix pin: {INITIAL_BINDING_SELECTOR}", False, False, False, False),
+        (f" Fix pin: {FACTORY_UPGRADE_SELECTOR}", False, False, False, False),
+        (
+            f"Fix pin: {INITIAL_BINDING_SELECTOR}\nFix pin: {VALID_SELECTOR}",
+            False,
+            False,
+            False,
+            False,
+        ),
+        (
+            f"Fix pin: {FACTORY_UPGRADE_SELECTOR}\nFix pin: {VALID_SELECTOR}",
+            False,
+            False,
+            False,
+            False,
+        ),
+        ("Fix pin: --help", False, False, False, False),
     ],
 )
 def test_probe_selects_infrastructure_from_the_parsed_pin(
@@ -1591,6 +1868,7 @@ def test_probe_selects_infrastructure_from_the_parsed_pin(
     needed: bool,
     stack: bool,
     kind: bool,
+    factory_upgrade: bool,
 ) -> None:
     completed = _run_needs_curie(tmp_path, body)
     assert completed.returncode == 0, completed.stderr
@@ -1598,6 +1876,7 @@ def test_probe_selects_infrastructure_from_the_parsed_pin(
         "needed": str(needed).lower(),
         "needs_stack": str(stack).lower(),
         "needs_kind": str(kind).lower(),
+        "needs_factory_upgrade": str(factory_upgrade).lower(),
     }
     assert _probe_outputs(tmp_path) == expected
     assert dict(line.split("=", 1) for line in completed.stdout.splitlines()) == expected

@@ -149,8 +149,16 @@ async def _recover(
     resolved = base or (await resolve_stored(host, repository)).default_branch
     assert resolved is not None
     return await adopt_or_open(
-        host, repository, _contract(base=resolved, draft=draft), expected_head_sha=REVISION_HEAD
+        host,
+        repository,
+        _contract(base=resolved, draft=draft),
+        expected_head_sha=REVISION_HEAD,
+        before_open=_open_clear,
     )
+
+
+async def _open_clear() -> None:
+    """A publish-time check that finds no other publication."""
 
 
 def _repo_payload() -> dict[str, Any]:
@@ -975,9 +983,7 @@ def test_rerun_failed_reruns_each_failing_actions_workflow_once(
 
 
 def test_a_refused_rerun_records_its_reason(ci_credentials: _CiCredentials) -> None:
-    job = types.RerunJob(
-        "9001", "unit", f"https://github.com/{REPO}/actions/runs/77/job/9001"
-    )
+    job = types.RerunJob("9001", "unit", f"https://github.com/{REPO}/actions/runs/77/job/9001")
 
     record = _with_ci_host(
         ci_credentials,
@@ -1030,9 +1036,7 @@ def test_a_lost_rerun_answer_is_unconfirmed_and_ends_the_pass(
         ci_credentials, handler, lambda host: host.rerun_failed(_repository(), jobs)
     )
 
-    assert record.attempts == (
-        types.RerunAttempt("11", types.RerunOutcome.UNCONFIRMED, "timeout"),
-    )
+    assert record.attempts == (types.RerunAttempt("11", types.RerunOutcome.UNCONFIRMED, "timeout"),)
     assert posts == [f"/repos/{REPO}/actions/runs/11/rerun-failed-jobs"]
 
 

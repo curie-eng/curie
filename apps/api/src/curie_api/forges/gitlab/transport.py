@@ -297,11 +297,13 @@ class GitLabTransport:
         return found
 
     async def pages(
-        self, path: str, params: Params | None = None
+        self, path: str, params: Params | None = None, *, strict: bool = False
     ) -> AsyncIterator[list[dict[str, Any]]]:
         """The pages of one listing in order, asking `PER_PAGE` items each and
         following ``x-next-page``. A failed page, or more than `MAX_PAGES`,
-        raises `Unavailable`, so no caller decides on a partial listing."""
+        raises `Unavailable`, so no caller decides on a partial listing.
+        An item that is not an object is skipped, or with ``strict`` raises
+        `Unavailable`, for a caller that must not decide without it."""
 
         page = 1
         for _ in range(MAX_PAGES):
@@ -315,6 +317,8 @@ class GitLabTransport:
             values = decode(response)
             if not isinstance(values, list):
                 raise Unavailable("pagination")
+            if strict and not all(isinstance(value, dict) for value in values):
+                raise Unavailable("malformed")
             yield [value for value in values if isinstance(value, dict)]
             following = response.headers.get("x-next-page", "").strip()
             if not following:
@@ -324,9 +328,11 @@ class GitLabTransport:
             page = int(following)
         raise Unavailable("pagination")
 
-    async def list_all(self, path: str, params: Params | None = None) -> list[dict[str, Any]]:
+    async def list_all(
+        self, path: str, params: Params | None = None, *, strict: bool = False
+    ) -> list[dict[str, Any]]:
         values: list[dict[str, Any]] = []
-        async for page in self.pages(path, params):
+        async for page in self.pages(path, params, strict=strict):
             values.extend(page)
         return values
 

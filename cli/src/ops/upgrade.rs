@@ -3225,6 +3225,19 @@ impl LiveHost {
         let revision =
             crate::cluster_secrets::serving_revision(&history, &self.opts.common.release)
                 .map_err(anyhow::Error::msg)?;
+        let chart = history
+            .as_array()
+            .and_then(|rows| {
+                rows.iter().find(|row| {
+                    row["revision"]
+                        .as_u64()
+                        .or_else(|| row["revision"].as_str()?.parse().ok())
+                        == Some(u64::from(revision))
+                })
+            })
+            .and_then(|row| row["chart"].as_str())
+            .unwrap_or_default()
+            .to_string();
         let values_cmd =
             crate::cluster_secrets::helm_get_json(&self.opts.common, "values", false, revision);
         let (ok, out, err) = self.run(&values_cmd)?;
@@ -3239,28 +3252,30 @@ impl LiveHost {
                 bail!("could not read retained helm values: {}", err.trim());
             }
             return if self.opts.file_values.is_some() {
-                self.migrate_effective_overlay(serde_json::json!({}))
+                self.migrate_effective_overlay(serde_json::json!({}), None)
             } else {
                 Ok(None)
             };
         }
         if out.trim().is_empty() {
             return if self.opts.file_values.is_some() {
-                self.migrate_effective_overlay(serde_json::json!({}))
+                self.migrate_effective_overlay(serde_json::json!({}), Some((revision, chart)))
             } else {
                 Ok(None)
             };
         }
-        let values: serde_json::Value =
-            serde_norway::from_str(&out).context("retained helm values are malformed")?;
-        self.migrate_effective_overlay(values)
+        let values: serde_json::Value = serde_norway::from_str(&out)
+            .map_err(|_| anyhow::anyhow!("retained helm values are malformed"))?;
+        self.migrate_effective_overlay(values, Some((revision, chart)))
     }
 
     /// @spec CLUSTER-VALUES-FILES c3: admit the final merged input once.
     fn migrate_effective_overlay(
         &self,
         mut values: serde_json::Value,
+        installed: Option<(u32, String)>,
     ) -> Result<Option<(String, Vec<String>)>> {
+        let user_values = values.clone();
         if let Some(files) = &self.opts.file_values {
             crate::config_migrate::clear_replaced_secret_refs(&mut values, &files.0);
             super::lint_values::merge_values(&mut values, files.0.clone());
@@ -3268,8 +3283,49 @@ impl LiveHost {
         // Unlike `up.rs`, the installed chart version is known here, so
         // `infer_schema_version` is not guessing when the overlay predates
         // `config.schemaVersion`.
-        let outcome =
-            crate::config_migrate::migrate_installed_config(values, self.current.as_deref())?;
+        let factory = if crate::config_migrate::has_legacy_factory_input(&values) {
+            let source = if let Some((revision, installed_chart)) = installed {
+                let command = crate::cluster_secrets::helm_get_json(
+                    &self.opts.common,
+                    "values",
+                    true,
+                    revision,
+                );
+                let (ok, out, _) = self.run(&command).map_err(|_| {
+                    anyhow::anyhow!("installed factory computed values could not be read")
+                })?;
+                if !ok {
+                    bail!("installed factory computed values could not be read");
+                }
+                let computed_values = serde_json::from_str(&out).map_err(|_| {
+                    anyhow::anyhow!("installed factory computed values are malformed")
+                })?;
+                Some(crate::factory_config_migrate::InstalledFactorySource {
+                    revision,
+                    installed_chart,
+                    user_values,
+                    computed_values,
+                })
+            } else {
+                None
+            };
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(
+                    crate::factory_config_migrate::resolve_factory_migration_context(
+                        &self.opts.common,
+                        source.as_ref(),
+                        &values,
+                    ),
+                )
+            })?
+        } else {
+            crate::config_migrate::FactoryMigrationContext::NotRequired
+        };
+        let outcome = crate::config_migrate::migrate_installed_config(
+            values,
+            self.current.as_deref(),
+            &factory,
+        )?;
         // Every line, not just the schema line: the change lines carry names
         // only, and redaction is `redacted_upgrade_plan`'s contract (#4322).
         let schema_plan = crate::config_migrate::redacted_upgrade_plan(&outcome);

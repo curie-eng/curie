@@ -270,6 +270,7 @@ jobs:
         run: |
           pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/3" --reruns 1 -rsR --durations=25 --ignore=tools/factory-e2e/tests/test_c4_initial_binding.py)
           pytest_args+=(--deselect=tools/factory-e2e/tests/test_c4_admitted_agent.py)
+          pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_upgrade_migration.py)
           if [[ -n "$PYTEST_DESELECT" ]]; then
             IFS=, read -r -a deselect_files <<< "$PYTEST_DESELECT"
             for path in "${deselect_files[@]}"; do
@@ -279,7 +280,7 @@ jobs:
           if [[ "$PYTEST_SCOPE" == "cli" ]]; then
             mapfile -t cli_pytest_files < tools/e2e-ci-selection/cli_pytest_files.txt
             for path in "${cli_pytest_files[@]}"; do
-              if [[ "$path" != "tools/factory-e2e/tests/test_c4_initial_binding.py" ]]; then
+              if [[ "$path" != "tools/factory-e2e/tests/test_c4_initial_binding.py" && "$path" != "tools/factory-e2e/tests/test_c4_upgrade_migration.py" ]]; then
                 pytest_args+=("$path")
               fi
             done
@@ -3726,6 +3727,52 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - name: Prepare source-local factory upgrade artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.projects/4628/tmp" \
+            "$GITHUB_WORKSPACE/.projects/4628/cargo-target" \
+            "$GITHUB_WORKSPACE/.projects/4628/assets"
+          echo "TMPDIR=$GITHUB_WORKSPACE/.projects/4628/tmp" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/.projects/4628/cargo-target" >> "$GITHUB_ENV"
+          echo "CURIE_C4_RELEASE_ASSETS=$GITHUB_WORKSPACE/.projects/4628/assets" >> "$GITHUB_ENV"
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Sync workspace
+        run: uv sync
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Download and verify the exact public v0.12.5 factory upgrade assets
+        run: |
+          set -euo pipefail
+          release_url=https://github.com/curie-eng/curie/releases/download/v0.12.5
+          curl -fsSL --retry 3 --retry-all-errors --retry-delay 5 \
+            -o "$CURIE_C4_RELEASE_ASSETS/checksums.txt" "$release_url/checksums.txt"
+          for asset in curie-0.12.5.tgz curie-x86_64-unknown-linux-gnu; do
+            curl -fsSL --retry 3 --retry-all-errors --retry-delay 5 \
+              -o "$CURIE_C4_RELEASE_ASSETS/$asset" "$release_url/$asset"
+            awk -v asset="$asset" '$2 == asset {print; count++} END {if (count != 1) exit 1}' \
+              "$CURIE_C4_RELEASE_ASSETS/checksums.txt" | (
+                cd "$CURIE_C4_RELEASE_ASSETS"
+                sha256sum --check --strict
+              )
+          done
       - name: Pull Docker Hub images through the mirror
         run: bash cli/scripts/configure-docker-hub-mirror.sh
       - name: Download the candidate curie binary
@@ -4122,6 +4169,22 @@ jobs:
           kubectl rollout status deploy/curie-ui -n curie --timeout=600s
           kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=600s
           bash cli/scripts/e2e-ladder.sh
+      - name: Delete the historical upgrade cluster before factory migration
+        run: |
+          set -euo pipefail
+          kind delete cluster --name curie-upgrade
+          clusters="$(kind get clusters)"
+          if grep -Fxq curie-upgrade <<< "$clusters"; then
+            echo "Historical upgrade cluster still exists" >&2
+            exit 1
+          fi
+          nodes="$(docker ps -aq --filter label=io.x-k8s.kind.cluster=curie-upgrade)"
+          if [[ -n "$nodes" ]]; then
+            echo "Historical upgrade cluster node containers still exist" >&2
+            exit 1
+          fi
+      - name: Upgrade the released factory through the supported CLI flow
+        run: uv run pytest tools/factory-e2e/tests/test_c4_upgrade_migration.py -q
       - name: Dump released upgrade diagnostics on failure
         if: failure()
         run: |

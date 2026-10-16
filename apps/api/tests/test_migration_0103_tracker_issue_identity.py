@@ -215,6 +215,7 @@ def _replay_label_notice() -> tuple[str, int, int]:
         ISSUE_NUMBER,
         SENDER_ID,
         SENDER,
+        label_event_at=None,
         label="factory",
         label_event_id=LABEL_EVENT_ID,
     )
@@ -373,6 +374,7 @@ def test_0103_keeps_ids_backfills_the_tracker_identity_and_a_replay_dedupes(
             str(LABEL_EVENT_ID),
             Disposition.ADMIT,
             cursor="1",
+            occurred_at=None,
         )
         assert notice_request_id(replayed_notice) == GOLDEN_LABEL_EVENT_REQUEST
 

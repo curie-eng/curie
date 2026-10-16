@@ -60,6 +60,7 @@ import uvicorn
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
+from curie_api.factory_rediscovery import issue_marker
 from curie_api.forges import types
 from curie_api.forges.config import ForgesConfig
 from curie_api.forges.registry import build_registry
@@ -684,7 +685,9 @@ def test_jira_github_lifecycle(install: Install) -> None:
     request_row = {**_requests(item["id"])[0], "runtime_epoch": epoch}
     publication = _publish(install, item, request_row)
     reference = f"Jira: {key} {install.browse(key)}"
-    assert publication["body"].endswith(f"\n\n{reference}")
+    # The reference, then the canonical marker naming the issue (#4629).
+    marker = issue_marker(install.issue_ref(issue))
+    assert publication["body"].endswith(f"\n\n{reference}\n\n{marker}")
     assert publication["body"].count(reference) == 1
     _approve(publication["id"])
     head = github.push_head(publication["branch"])
@@ -697,7 +700,7 @@ def test_jira_github_lifecycle(install: Install) -> None:
     pull = recovered.json()
     [(pr, opened)] = list(github.pulls.items())
     assert pull["number"] == pr
-    assert opened["body"].endswith(reference)
+    assert opened["body"].endswith(f"{reference}\n\n{marker}")
     assert jira.issue(issue.id).remote_links == []
     _record_pull_request(install, publication, {**pull, "head_sha": head})
 

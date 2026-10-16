@@ -513,12 +513,12 @@ def test_admission_retains_issue_lock_until_caller_commit(
                 caller_pid = await session.scalar(text("SELECT pg_backend_pid()"))
                 await lock_issue(
                     session,
-                    github_issue_ref(
-                        get_settings(), repository_id=REPO_ID, issue_number=number
-                    ),
+                    github_issue_ref(get_settings(), repository_id=REPO_ID, issue_number=number),
                 )
                 verified = await verify_current(notice, settings=get_settings(), client=github)
-                admitted = await admit_notice(session, notice, get_settings(), verified)
+                admitted = await admit_notice(
+                    session, notice, get_settings(), verified, client=github
+                )
                 assert admitted.status == "factory_admitted", admitted
                 assert not await observer.scalar(
                     text(

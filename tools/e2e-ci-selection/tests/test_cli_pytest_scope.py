@@ -738,6 +738,7 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
         "run", "pytest", "-q", "-n", "4", "--dist", "loadgroup",
         "--ci-shard", f"{shard}/3", "--reruns", "1", "-rsR", "--durations=25",
         "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
+        "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
     ]
     if deselect:
         for path in deselect.split(","):
@@ -748,7 +749,10 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
         expected.extend(
             path
             for path in files
-            if path != "tools/factory-e2e/tests/test_c4_initial_binding.py"
+            if path not in {
+                "tools/factory-e2e/tests/test_c4_initial_binding.py",
+                SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
+            }
         )
     arguments = PYTEST_TESTS._run_pytest_step(
         tmp_path, shard=shard, deselect=deselect, scope=scope
@@ -793,13 +797,17 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
         "run", "pytest", "-q", "-n", "4", "--dist", "loadgroup",
         "--ci-shard", "2/3", "--reruns", "1", "-rsR", "--durations=25",
         "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
+        "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
         "--deselect", deselect,
     ]
     if scope == "cli":
         expected.extend(
             path
             for path in (tmp_path / LIST_PATH).read_text().splitlines()
-            if path != "tools/factory-e2e/tests/test_c4_initial_binding.py"
+            if path not in {
+                "tools/factory-e2e/tests/test_c4_initial_binding.py",
+                SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
+            }
         )
     assert PYTEST_TESTS._without_admitted_agent_exclusion(recorded["argv"]) == expected
 

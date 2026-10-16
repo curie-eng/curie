@@ -245,6 +245,13 @@ class BitbucketCloudFake:
     # not known to answer this way; it is an unexpected shape, offered so a test
     # can show the adapter proves nothing about a pull request it cannot pin.
     hashless_sources: set[int] = field(default_factory=set)
+    # Pull requests whose source branch lives in a fork: their payload's
+    # ``source.repository`` names another repository, as a cross-repository
+    # pull request does (api-group-pullrequests, ``source.repository``).
+    fork_sources: set[int] = field(default_factory=set)
+    # Rewrites the pull request listing's values before paging, so a test can
+    # put an unexpected item shape on a page.
+    mangle_pull_listing: Callable[[list[dict[str, Any]]], list[Any]] | None = None
 
     def __post_init__(self) -> None:
         self.tokens.setdefault(FACTORY_TOKEN, self.factory)
@@ -337,6 +344,38 @@ class BitbucketCloudFake:
 
         found = self.comments[comment_id]
         found.deleted, found.raw, found.updated_on = True, "", self.now()
+
+    def open_pull(
+        self,
+        source: str,
+        *,
+        author: Actor | None = None,
+        title: str = "Change",
+        description: str = "",
+        destination: str | None = None,
+    ) -> int:
+        """A pull request ``author`` (the factory by default) opened outside the
+        adapter from ``source``, pushed first when it does not exist yet."""
+
+        if source not in self.branches:
+            self.push(source, f"work on {source}")
+        actor = author or self.factory
+        self.users.setdefault(actor.id, actor)
+        moment = self.now()
+        pull = _Pull(
+            id=max(self.pulls, default=0) + 1,
+            title=title,
+            description=description,
+            source=source,
+            destination=destination or self.mainbranch,
+            author=actor,
+            draft=False,
+            close_source_branch=False,
+            created_on=moment,
+            updated_on=moment,
+        )
+        self.pulls[pull.id] = pull
+        return pull.id
 
     def set_state(self, pull: int, state: str) -> None:
         """Someone else merges or declines ``pull``."""
@@ -495,6 +534,18 @@ class BitbucketCloudFake:
             "links": {"html": {"href": f"{HTML_BASE}/{self.full_name}"}},
         }
 
+    def _fork_min(self) -> dict[str, Any]:
+        """A fork of the repository under another workspace (placeholder names)."""
+
+        full_name = f"example-fork-workspace/{self.slug}"
+        return {
+            "type": "repository",
+            "full_name": full_name,
+            "name": self.slug,
+            "uuid": "{00000000-0000-4000-8000-000000000009}",
+            "links": {"html": {"href": f"{HTML_BASE}/{full_name}"}},
+        }
+
     def _repository(self) -> dict[str, Any]:
         avatar = f"{HTML_BASE}/workspaces/{self.workspace}/avatar/?ts=1760000000"
         return {
@@ -589,7 +640,9 @@ class BitbucketCloudFake:
                     if pull.id in self.hashless_sources
                     else {"type": "commit", "hash": self._head(pull)[:12]}
                 ),
-                "repository": self._repo_min(),
+                "repository": (
+                    self._fork_min() if pull.id in self.fork_sources else self._repo_min()
+                ),
             },
             "destination": {
                 "branch": {"name": pull.destination},
@@ -932,7 +985,10 @@ class BitbucketCloudFake:
                 return _error(400, f"Unsupported query: {query}")
             branch = re.sub(r"\\(.)", r"\1", matched[1])
             listed = [p for p in listed if p.source == branch]
-        return self._page(request, [self._pull(p) for p in sorted(listed, key=lambda p: p.id)])
+        values = [self._pull(p) for p in sorted(listed, key=lambda p: p.id)]
+        if self.mangle_pull_listing is not None:
+            values = self.mangle_pull_listing(values)
+        return self._page(request, values)
 
     async def _open(self, request: Request, actor: Actor) -> Response:
         body = await request.json()
