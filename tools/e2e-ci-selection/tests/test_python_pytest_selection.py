@@ -663,9 +663,12 @@ def test_ordinary_python_shards_exclude_the_owned_kind_registration_module(
     tmp_path: Path, scope: str, deselect: str,
 ) -> None:
     argv = _run_pytest_step(tmp_path, shard=1, deselect=deselect, scope=scope)
-    module = "tools/factory-e2e/tests/test_c4_initial_binding.py"
-    assert f"--ignore={module}" in argv
-    assert module not in argv
+    for module in (
+        "tools/factory-e2e/tests/test_c4_initial_binding.py",
+        "tools/factory-e2e/tests/test_c4_held_cancellation.py",
+    ):
+        assert f"--ignore={module}" in argv
+        assert module not in argv
     assert argv[argv.index("--ci-shard") + 1] == f"1/{SHARD_COUNT}"
 
 

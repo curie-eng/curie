@@ -61,6 +61,7 @@ SELECTOR = re.compile(
 )
 INITIAL_BINDING_MODULE = "tools/factory-e2e/tests/test_c4_initial_binding.py"
 FACTORY_UPGRADE_MODULE = "tools/factory-e2e/tests/test_c4_upgrade_migration.py"
+HELD_CANCELLATION_MODULE = "tools/factory-e2e/tests/test_c4_held_cancellation.py"
 BUG_LABEL = "bug"
 # Discovery surfaces and pin tiers share this order. A pin whose location maps
 # below the closed issue's found:* label fails unless the body also carries
@@ -162,9 +163,7 @@ def _effective_train(event: dict[str, object]) -> str:
     if base_ref in {"main", "next"}:
         return base_ref
     if not base_ref.startswith("task/"):
-        raise ValueError(
-            f"pull request base {base_ref!r} is not main, next, or a task branch"
-        )
+        raise ValueError(f"pull request base {base_ref!r} is not main, next, or a task branch")
 
     pull_request = event.get("pull_request")
     if not isinstance(pull_request, dict):
@@ -252,9 +251,7 @@ def _effective_train(event: dict[str, object]) -> str:
 
 def _declaration(body: str) -> Declaration:
     uncommented = COMMENT.sub("", body)
-    attempts = [
-        line for line in uncommented.splitlines() if DECLARATION_ATTEMPT.search(line)
-    ]
+    attempts = [line for line in uncommented.splitlines() if DECLARATION_ATTEMPT.search(line)]
     if not attempts:
         return Declaration()
 
@@ -265,9 +262,7 @@ def _declaration(body: str) -> Declaration:
         rest = NOT_APPLICABLE_REASON.fullmatch(excused.group("rest"))
         reason = rest.group("reason").strip() if rest is not None else ""
         if not reason:
-            raise ValueError(
-                "Fix pin: n/a must state why, as `Fix pin: n/a - <reason>`"
-            )
+            raise ValueError("Fix pin: n/a must state why, as `Fix pin: n/a - <reason>`")
         return Declaration(not_applicable=reason)
 
     if (match := DECLARATION.fullmatch(attempts[0])) is None:
@@ -333,6 +328,7 @@ def _pin_requirements(body: str) -> dict[str, bool]:
         INITIAL_BINDING_MODULE,
         "tools/factory-e2e/tests/test_c4_admitted_agent.py",
         FACTORY_UPGRADE_MODULE,
+        HELD_CANCELLATION_MODULE,
     }
     return {
         "needed": needed,
@@ -365,7 +361,6 @@ def _report_needs_curie(event_path: Path) -> int:
         return 1
     sys.stdout.write(lines)
     return 0
-
 
 
 def _closed_issues(body: str) -> list[int]:
@@ -424,9 +419,7 @@ def _issue_record(repository: str | None, issue: int) -> IssueRecord:
     )
 
 
-def _closed_issue_records(
-    event: dict[str, object], body: str
-) -> list[tuple[int, IssueRecord]]:
+def _closed_issue_records(event: dict[str, object], body: str) -> list[tuple[int, IssueRecord]]:
     issues = _closed_issues(body)
     if not issues:
         return []
@@ -436,15 +429,11 @@ def _closed_issue_records(
 
 def _closed_bugs(event: dict[str, object], body: str) -> list[int]:
     return [
-        issue
-        for issue, record in _closed_issue_records(event, body)
-        if BUG_LABEL in record.labels
+        issue for issue, record in _closed_issue_records(event, body) if BUG_LABEL in record.labels
     ]
 
 
-def _required_discovery(
-    event: dict[str, object], body: str
-) -> str | None:
+def _required_discovery(event: dict[str, object], body: str) -> str | None:
     """Highest found:* label or body field among closed bug issues."""
     found: list[str] = []
     for _issue, record in _closed_issue_records(event, body):

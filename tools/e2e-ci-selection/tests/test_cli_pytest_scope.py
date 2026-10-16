@@ -31,6 +31,11 @@ PYTEST_TESTS = _load_test_module("test_python_pytest_selection")
 REPO_ROOT = SELECTION_TESTS.REPO_ROOT
 GENERATOR_PATH = "tools/e2e-ci-selection/cli_pytest_files.py"
 LIST_PATH = "tools/e2e-ci-selection/cli_pytest_files.txt"
+KIND_RUNTIME_MODULES = (
+    "tools/factory-e2e/tests/test_c4_initial_binding.py",
+    "tools/factory-e2e/tests/test_c4_held_cancellation.py",
+    SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
+)
 SELECTOR_PATH = "tools/e2e-ci-selection/select_tiers.py"
 REGENERATE = "uv run python tools/e2e-ci-selection/cli_pytest_files.py --write"
 CLI_SCOPE = {
@@ -738,6 +743,7 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
         "run", "pytest", "-q", "-n", "4", "--dist", "loadgroup",
         "--ci-shard", f"{shard}/3", "--reruns", "1", "-rsR", "--durations=25",
         "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
+        "--ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py",
         "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
     ]
     if deselect:
@@ -749,10 +755,7 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
         expected.extend(
             path
             for path in files
-            if path not in {
-                "tools/factory-e2e/tests/test_c4_initial_binding.py",
-                SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
-            }
+            if path not in KIND_RUNTIME_MODULES
         )
     arguments = PYTEST_TESTS._run_pytest_step(
         tmp_path, shard=shard, deselect=deselect, scope=scope
@@ -797,6 +800,7 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
         "run", "pytest", "-q", "-n", "4", "--dist", "loadgroup",
         "--ci-shard", "2/3", "--reruns", "1", "-rsR", "--durations=25",
         "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
+        "--ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py",
         "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
         "--deselect", deselect,
     ]
@@ -804,10 +808,7 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
         expected.extend(
             path
             for path in (tmp_path / LIST_PATH).read_text().splitlines()
-            if path not in {
-                "tools/factory-e2e/tests/test_c4_initial_binding.py",
-                SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
-            }
+            if path not in KIND_RUNTIME_MODULES
         )
     assert PYTEST_TESTS._without_admitted_agent_exclusion(recorded["argv"]) == expected
 

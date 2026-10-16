@@ -52,6 +52,10 @@ ADMITTED_AGENT_SELECTOR = (
     "tools/factory-e2e/tests/test_c4_admitted_agent.py::"
     "test_labelled_agents_execute_as_admitted_agent"
 )
+HELD_CANCELLATION_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_held_cancellation.py::"
+    "test_held_run_cancels_after_worker_replacement"
+)
 FACTORY_UPGRADE_SELECTOR = (
     "tools/factory-e2e/tests/test_c4_upgrade_migration.py::"
     "test_v0125_factory_upgrade_uses_supported_flow"
@@ -1166,6 +1170,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     runtime_exclusions = {
         ("--ignore", "tools/factory-e2e/tests/test_c4_initial_binding.py"),
         ("--ignore", "tools/factory-e2e/tests/test_c4_upgrade_migration.py"),
+        ("--ignore", "tools/factory-e2e/tests/test_c4_held_cancellation.py"),
         ("--deselect", "tools/factory-e2e/tests/test_c4_admitted_agent.py"),
     }
 
@@ -1176,11 +1181,18 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
             assert command[-2:] == ["--deselect", deselect]
             command = command[:-2]
         distribution = [
-            "-n", "4", "--dist", "loadgroup", "--ci-shard", f"{shard}/3", "--reruns", "1",
+            "-n",
+            "4",
+            "--dist",
+            "loadgroup",
+            "--ci-shard",
+            f"{shard}/3",
+            "--reruns",
+            "1",
         ]
         extra = command[3:]
         assert extra[: len(distribution)] == distribution
-        arguments = iter(extra[len(distribution):])
+        arguments = iter(extra[len(distribution) :])
         excluded = []
         reporting = []
         for argument in arguments:
@@ -1193,7 +1205,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
                 excluded.append((option, path))
             else:
                 reporting.append(argument)
-        assert len(excluded) == 3 and set(excluded) == runtime_exclusions, (
+        assert len(excluded) == 4 and set(excluded) == runtime_exclusions, (
             "the Python suite must use exactly the required kind runtime exclusions, "
             f"got {excluded!r}"
         )
@@ -1459,6 +1471,13 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
     )
     assert steps[kind_index]["with"]["install_only"] is True
     assert probe_index < kind_index < gate_index
+    disk_index = _single_step_index(
+        steps,
+        lambda step: "/usr/local/lib/android" in _string(step, "run"),
+        "disk reclaim for the four candidate images",
+    )
+    assert _string(steps[disk_index], "if") == KIND_NEEDED_GUARD
+    assert probe_index < disk_index < kind_index
 
 
 CARGO_NEEDED_GUARD = "steps.fix-pin-curie.outputs.needed == 'true'"
@@ -1473,8 +1492,7 @@ def _factory_upgrade_setup_steps() -> tuple[list[dict[str, Any]], int, int]:
     prepare_index = _single_step_index(
         steps,
         lambda step: (
-            "TMPDIR=" in _string(step, "run")
-            and "CURIE_C4_RELEASE_ASSETS=" in _string(step, "run")
+            "TMPDIR=" in _string(step, "run") and "CURIE_C4_RELEASE_ASSETS=" in _string(step, "run")
         ),
         "source-local factory upgrade preparation",
     )
@@ -1618,8 +1636,7 @@ def test_factory_upgrade_downloads_only_verified_release_assets(
         {
             "FIX_PIN_RELEASE_RESPONSES": json.dumps(responses),
             "BASH_FUNC_curl%%": (
-                f"() {{ {shlex.quote(sys.executable)} -c "
-                f"{shlex.quote(download_boundary)} \"$@\"; }}"
+                f'() {{ {shlex.quote(sys.executable)} -c {shlex.quote(download_boundary)} "$@"; }}'
             ),
         }
     )
@@ -1783,6 +1800,7 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
             False,
         ),
         (f"Fix pin: {INITIAL_BINDING_SELECTOR}", True, False, True, False),
+        (f"Fix pin: {HELD_CANCELLATION_SELECTOR}", True, False, True, False),
         (
             "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding.py::"
             "test_quickstarts_are_idempotent_and_binding_guards_hold[gitlab]",
@@ -1815,6 +1833,13 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
         ),
         (
             "Fix pin: tools/factory-e2e/tests/test_c4_admitted_agent_extra.py::test_example",
+            True,
+            True,
+            False,
+            False,
+        ),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_held_cancellation_extra.py::test_example",
             True,
             True,
             False,
