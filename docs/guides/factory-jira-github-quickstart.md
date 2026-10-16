@@ -204,6 +204,8 @@ account can browse, with this description:
 > Do not add dependencies or change the CI configuration.
 
 As the human whose `accountId` you allowed, add `curie-factory` to the ticket.
+An initial `curie-factory` label is supported and attributed to the creator,
+not the reporter; a later label addition uses its author.
 Another person's label does not grant start authority. Polling runs every
 45 seconds by default. Wait for the factory account's status comment rather
 than repeatedly relabelling. The comment is edited in place as work moves
