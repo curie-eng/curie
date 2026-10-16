@@ -26,23 +26,55 @@
         }
       }
     },
+    "unconfigured": "acme-corp/repo-u",
+    "worker_pools": {
+      "acme-corp/repo-x": {
+        "pool": "factory-tools-agent-factory-e2e-img-aaaaaaaaaaaa-runner-pool",
+        "digests": [
+          "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        ],
+        "base": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "docker": false,
+        "egress": []
+      },
+      "acme-corp/repo-y": {
+        "pool": "factory-tools-agent-factory-e2e-img-dddddddddddd-runner-pool",
+        "digests": [
+          "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        ],
+        "base": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "docker": false,
+        "egress": []
+      }
+    },
     "turns": [
       {
         "repository": "acme-corp/repo-x",
-        "thread": "fixture-thread",
-        "sandbox": "fixture-sandbox-x",
-        "pod_uid": "00000000-0000-4000-8000-000000000001",
-        "image_id": "docker-pullable://registry.example.com/acme-runner-x@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "spec_image": "registry.example.com/acme-runner-x@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "claim": "fixture-claim-x",
-        "retired_claims": [],
-        "boot_log": "tool manifest loaded: 2 tools\n",
-        "manifest_output": "{\"schema_version\":1,\"tools\":[{\"name\":\"uv\",\"version\":\"0.8.0\",\"path\":\"/usr/local/bin/uv\",\"source\":\"catalog\"},{\"name\":\"rust\",\"version\":\"1.90.0\",\"path\":\"/usr/local/bin/rustc\",\"source\":\"catalog\"}],\"docker_cli\":false}",
+        "thread": "fixture-thread-x",
+        "expect": "completed",
         "status": "completed",
         "reason": null,
+        "sandbox": "fixture-sandbox-x",
+        "claim": "fixture-claim-x",
+        "pod_uid": "00000000-0000-4000-8000-000000000001",
+        "spec_image": "registry.example.com/acme-runner-x@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "image_id": "docker-pullable://registry.example.com/acme-runner-x@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "warm_pool": "factory-tools-agent-factory-e2e-img-aaaaaaaaaaaa-runner-pool",
+        "runner_env": {
+          "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "16000",
+          "CURIE_REPO_PATH": "acme-corp/repo-x"
+        },
+        "boot_log": "runner tool manifest loaded: 2 tools\n",
+        "manifest_output": "{\"schema_version\":1,\"tools\":[{\"name\":\"uv\",\"version\":\"0.8.0\",\"path\":\"/usr/local/bin/uv\",\"source\":\"catalog\"},{\"name\":\"rust\",\"version\":\"1.90.0\",\"path\":\"/usr/local/bin/rustc\",\"source\":\"catalog\"}],\"docker_cli\":false}",
+        "retired_claims": [],
+        "tool_use_id": "toolu_manifest_fixture1",
         "model_requests": 2,
         "new_claims": [
-          "fixture-sandbox-x"
+          "fixture-claim-x"
         ],
         "errors": [],
         "capture_error": null,
@@ -55,22 +87,27 @@
       },
       {
         "repository": "acme-corp/repo-y",
-        "thread": "fixture-thread",
-        "sandbox": "fixture-sandbox-y",
-        "pod_uid": "00000000-0000-4000-8000-000000000002",
-        "image_id": "containerd://sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "spec_image": "registry.example.com/acme-runner-y@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-        "claim": "fixture-claim-y",
-        "retired_claims": [
-          "fixture-claim-x"
-        ],
-        "boot_log": "tool manifest loaded: 1 tools\n",
-        "manifest_output": "{\"schema_version\":1,\"tools\":[{\"name\":\"pnpm\",\"version\":\"10.0.0\",\"path\":\"/usr/local/bin/pnpm\",\"source\":\"catalog\"}],\"docker_cli\":false}",
+        "thread": "fixture-thread-y",
+        "expect": "completed",
         "status": "completed",
         "reason": null,
+        "sandbox": "fixture-sandbox-y",
+        "claim": "fixture-claim-y",
+        "pod_uid": "00000000-0000-4000-8000-000000000002",
+        "spec_image": "registry.example.com/acme-runner-y@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "image_id": "containerd://sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "warm_pool": "factory-tools-agent-factory-e2e-img-dddddddddddd-runner-pool",
+        "runner_env": {
+          "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "16000",
+          "CURIE_REPO_PATH": "acme-corp/repo-y"
+        },
+        "boot_log": "runner tool manifest loaded: 1 tools\n",
+        "manifest_output": "{\"schema_version\":1,\"tools\":[{\"name\":\"pnpm\",\"version\":\"10.0.0\",\"path\":\"/usr/local/bin/pnpm\",\"source\":\"catalog\"}],\"docker_cli\":false}",
+        "retired_claims": [],
+        "tool_use_id": "toolu_manifest_fixture2",
         "model_requests": 2,
         "new_claims": [
-          "fixture-sandbox-y"
+          "fixture-claim-y"
         ],
         "errors": [],
         "capture_error": null,
@@ -82,37 +119,159 @@
         "observed_repository": "acme-corp/repo-y"
       },
       {
-        "repository": "acme-corp/repo-x",
-        "thread": "fixture-missing-pool-thread",
+        "repository": "acme-corp/repo-u",
+        "thread": "fixture-thread-u",
+        "expect": "agent_image",
+        "status": "completed",
+        "reason": null,
+        "sandbox": "fixture-sandbox-u",
+        "claim": "fixture-claim-u",
+        "pod_uid": "00000000-0000-4000-8000-000000000003",
+        "spec_image": "registry.example.com/curie-runner@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "image_id": "containerd://sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "warm_pool": "factory-tools-agent-factory-e2e-runner-pool",
+        "runner_env": {
+          "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "16000",
+          "CURIE_REPO_PATH": "acme-corp/repo-u"
+        },
+        "boot_log": "runner tool manifest absent: tool_count=0\n",
+        "manifest_output": "curie-no-tool-manifest",
+        "retired_claims": [],
+        "tool_use_id": "toolu_manifest_fixture3",
+        "model_requests": 2,
+        "new_claims": [
+          "fixture-claim-u"
+        ],
+        "errors": [],
+        "capture_error": null,
+        "cli_exit_code": 0,
+        "runner_status": {
+          "status": "done",
+          "turn_active": false
+        },
+        "observed_repository": "acme-corp/repo-u",
+        "agent_image": {
+          "spec_image": "registry.example.com/curie-runner@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "digests": [
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+          ]
+        }
+      },
+      {
+        "repository": "acme-corp/repo-y",
+        "thread": "fixture-thread-x",
+        "expect": "workspace.selection_conflict",
+        "status": "refused",
+        "reason": "workspace.selection_conflict",
         "sandbox": null,
+        "claim": null,
         "pod_uid": null,
+        "spec_image": null,
         "image_id": null,
+        "warm_pool": null,
+        "runner_env": {},
         "boot_log": "",
         "manifest_output": "",
-        "status": "refused",
-        "reason": "repo_runner_pool_missing",
-        "missing_pool_absent": true,
+        "retired_claims": [],
+        "tool_use_id": null,
         "model_requests": 0,
         "new_claims": [],
         "errors": [],
-        "capture_error": null
+        "capture_error": null,
+        "cli_exit_code": 1,
+        "runner_status": null,
+        "observed_repository": null
+      },
+      {
+        "repository": "acme-corp/repo-x",
+        "thread": "fixture-thread-x",
+        "expect": "runner_changed",
+        "status": "completed",
+        "reason": null,
+        "sandbox": "fixture-sandbox-x-changed",
+        "claim": "fixture-claim-x-changed",
+        "pod_uid": "00000000-0000-4000-8000-000000000005",
+        "spec_image": "registry.example.com/acme-runner-y@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "image_id": "containerd://sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "warm_pool": "factory-tools-agent-factory-e2e-img-dddddddddddd-runner-pool",
+        "runner_env": {
+          "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "16000",
+          "CURIE_REPO_PATH": "acme-corp/repo-x"
+        },
+        "boot_log": "runner tool manifest loaded: 1 tools\n",
+        "manifest_output": "{\"schema_version\":1,\"tools\":[{\"name\":\"pnpm\",\"version\":\"10.0.0\",\"path\":\"/usr/local/bin/pnpm\",\"source\":\"catalog\"}],\"docker_cli\":false}",
+        "retired_claims": [
+          "fixture-claim-x"
+        ],
+        "tool_use_id": "toolu_manifest_fixture5",
+        "model_requests": 2,
+        "new_claims": [
+          "fixture-claim-x-changed"
+        ],
+        "errors": [],
+        "capture_error": null,
+        "cli_exit_code": 0,
+        "runner_status": {
+          "status": "done",
+          "turn_active": false
+        },
+        "observed_repository": "acme-corp/repo-x",
+        "prior_claim_present": true
+      },
+      {
+        "repository": "acme-corp/repo-x",
+        "thread": "fixture-missing-pool-thread",
+        "expect": "repo_runner_pool_missing",
+        "status": "refused",
+        "reason": "repo_runner_pool_missing",
+        "sandbox": null,
+        "claim": null,
+        "pod_uid": null,
+        "spec_image": null,
+        "image_id": null,
+        "warm_pool": null,
+        "runner_env": {},
+        "boot_log": "",
+        "manifest_output": "",
+        "retired_claims": [],
+        "tool_use_id": null,
+        "model_requests": 0,
+        "new_claims": [],
+        "errors": [],
+        "capture_error": null,
+        "cli_exit_code": 1,
+        "runner_status": null,
+        "observed_repository": null,
+        "missing_pool_absent": true
       },
       {
         "repository": "acme-corp/repo-x",
         "thread": "fixture-stale-base-thread",
-        "sandbox": null,
-        "pod_uid": null,
-        "image_id": null,
-        "boot_log": "",
-        "manifest_output": "",
+        "expect": "repo_runner_base_mismatch",
         "status": "refused",
         "reason": "repo_runner_base_mismatch",
-        "installed_base": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        "configured_base": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "sandbox": null,
+        "claim": null,
+        "pod_uid": null,
+        "spec_image": null,
+        "image_id": null,
+        "warm_pool": null,
+        "runner_env": {},
+        "boot_log": "",
+        "manifest_output": "",
+        "retired_claims": [],
+        "tool_use_id": null,
         "model_requests": 0,
         "new_claims": [],
         "errors": [],
-        "capture_error": null
+        "capture_error": null,
+        "cli_exit_code": 1,
+        "runner_status": null,
+        "observed_repository": null,
+        "installed_base": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "configured_base": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
       }
     ]
   }
