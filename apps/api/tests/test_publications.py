@@ -46,6 +46,8 @@ from curie_api.crud import (
 from curie_api.crud import (
     publications as crud_publications,
 )
+from curie_api.factory_rediscovery import issue_marker
+from curie_api.forges.types import TrackerIssueRef
 from curie_api.github_app import _RESOLVERS
 from curie_api.main import create_app
 from curie_api.resumequeue import ResumeQueue
@@ -397,20 +399,22 @@ def test_relay_publication_preserves_binding_identity_and_refuses_changed_replay
 
     monkeypatch.setenv(
         "CURIE_SLACK_IDENTITIES",
-        json.dumps([
-            {
-                "name": "default",
-                "app_token_env": "SLACK_APP_TOKEN",
-                "bot_token_env": "SLACK_BOT_TOKEN",
-                "signing_secret_env": "SLACK_SIGNING_SECRET",
-            },
-            {
-                "name": "acme-named",
-                "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
-                "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0",
-                "signing_secret_env": None,
-            },
-        ]),
+        json.dumps(
+            [
+                {
+                    "name": "default",
+                    "app_token_env": "SLACK_APP_TOKEN",
+                    "bot_token_env": "SLACK_BOT_TOKEN",
+                    "signing_secret_env": "SLACK_SIGNING_SECRET",
+                },
+                {
+                    "name": "acme-named",
+                    "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+                    "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0",
+                    "signing_secret_env": None,
+                },
+            ]
+        ),
     )
     get_settings.cache_clear()
     client, runs_stream = publication_stack
@@ -423,9 +427,7 @@ def test_relay_publication_preserves_binding_identity_and_refuses_changed_replay
     assert named_binding.status_code == 201, named_binding.text
     thread = "1700000000.000100"
     binding_identity = (
-        reply_identity or "default"
-        if reply_adapter == CLUSTER_MESSAGE_ADAPTER
-        else reply_adapter
+        reply_identity or "default" if reply_adapter == CLUSTER_MESSAGE_ADAPTER else reply_adapter
     )
     scoped_thread = channel_protocol.scoped_conversation_id(
         "slack", "C0EXAMPLE1", thread, identity=binding_identity
@@ -449,15 +451,17 @@ def test_relay_publication_preserves_binding_identity_and_refuses_changed_replay
         "JOIN curie.thread_publication_lineages l ON l.id = p.lineage_id "
         "LEFT JOIN curie.agent_channels c ON c.id = l.binding_id WHERE p.id = :id",
         {"id": publication["id"]},
-    ) == [{
-        "publication_identity": reply_identity,
-        "approval_identity": reply_identity,
-        "publication_adapter": reply_adapter,
-        "approval_adapter": reply_adapter,
-        "binding_identity": binding_identity,
-        "binding_endpoint": None,
-        "current": True,
-    }]
+    ) == [
+        {
+            "publication_identity": reply_identity,
+            "approval_identity": reply_identity,
+            "publication_adapter": reply_adapter,
+            "approval_adapter": reply_adapter,
+            "binding_identity": binding_identity,
+            "binding_endpoint": None,
+            "current": True,
+        }
+    ]
     replay = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
     assert replay.status_code == 200, replay.text
     assert replay.json()["id"] == publication["id"]
@@ -7146,14 +7150,14 @@ def _configure_python_ci(
 
 @pytest.fixture
 def _conversion_python_ci(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, admitted: Any  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    admitted: Any,  # noqa: F811
 ) -> Iterator[None]:
     """Configure the foreign unit conversion repository's own CI layout."""
 
     client, _github, _comments = admitted
-    _configure_python_ci(
-        monkeypatch, tmp_path, client, {FACTORY_REPO: CONVERSION_PYTHON_CI_POLICY}
-    )
+    _configure_python_ci(monkeypatch, tmp_path, client, {FACTORY_REPO: CONVERSION_PYTHON_CI_POLICY})
     yield
     get_settings.cache_clear()
 
@@ -7259,6 +7263,25 @@ _PENDING_PROOF_STAMP = (
 )
 
 
+def _factory_issue_marker(request_id: uuid.UUID) -> str:
+    """The canonical marker line naming the request's WorkItem issue (#4629)."""
+
+    (row,) = _factory_rows(
+        "SELECT w.tracker_kind, w.tracker_host, w.tracker_scope_id, w.tracker_issue_id "
+        "FROM curie.work_items w JOIN curie.execution_requests r ON r.work_item_id = w.id "
+        "WHERE r.id = :request",
+        {"request": request_id},
+    )
+    return issue_marker(
+        TrackerIssueRef(
+            row["tracker_kind"],
+            row["tracker_host"],
+            row["tracker_scope_id"],
+            row["tracker_issue_id"],
+        )
+    )
+
+
 def _factory_publication_body(publication_id: str) -> str:
     return str(
         _factory_rows(
@@ -7322,9 +7345,12 @@ def test_factory_python_publication_with_a_passed_python_check_adds_no_stamp(
     created = _post_factory_publication(client, payload)
 
     assert created.status_code == 201, created.text
-    # No stamp: the only addition is the closing reference (#4358 plan D7).
+    # No stamp: the only additions are the closing reference (#4358 plan D7)
+    # and the canonical issue marker (#4629).
     number = payload["reply_conversation_id"].removeprefix("issue-")
-    assert created.json()["body"] == f"{payload['body']}\n\nCloses #{number}"
+    assert created.json()["body"] == (
+        f"{payload['body']}\n\nCloses #{number}\n\n{_factory_issue_marker(request_id)}"
+    )
 
 
 def test_factory_python_publication_uses_the_python_check_among_several(
@@ -7562,9 +7588,11 @@ def test_factory_non_python_publication_keeps_its_existing_body_without_python_c
 
     assert created.status_code == 201, created.text
     # No python claim is added; only the tracker's closing reference, which the
-    # body lacked, is appended (#4358 plan D7).
+    # body lacked (#4358 plan D7), and the canonical issue marker (#4629).
     issue_number = int(payload["reply_conversation_id"].removeprefix("issue-"))
-    assert created.json()["body"] == f"{payload['body']}\n\nCloses #{issue_number}"
+    assert created.json()["body"] == (
+        f"{payload['body']}\n\nCloses #{issue_number}\n\n{_factory_issue_marker(request_id)}"
+    )
 
 
 def test_later_non_python_publication_keeps_prior_python_proof_pending(

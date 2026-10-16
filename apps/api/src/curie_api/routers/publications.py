@@ -46,11 +46,18 @@ from ..auth import (
 )
 from ..config import get_settings
 from ..deps import SessionDep
+from ..factory_rediscovery import issue_marker
 from ..forges.config import RepositoryBindingConfig
 from ..forges.errors import ForgeError, NotFound, Unauthorized, Unavailable
 from ..forges.hosts import code_host_for, forge_code_host, pull_request_url
 from ..forges.trackers import tracker_for_work_item, work_item_policy
-from ..forges.types import GITHUB, CredentialScope, PullRequestRef, RepositoryRef
+from ..forges.types import (
+    GITHUB,
+    CredentialScope,
+    PullRequestRef,
+    RepositoryRef,
+    TrackerIssueRef,
+)
 from ..models import (
     ExecutionRequest,
     Publication,
@@ -90,8 +97,9 @@ logger = logging.getLogger(__name__)
 
 async def _closing_reference(
     session: AsyncSession, request: Request, execution_request_id: uuid.UUID
-) -> str | None:
-    """The WorkItem tracker's closing reference for the request's issue.
+) -> tuple[str, TrackerIssueRef] | None:
+    """The WorkItem tracker's closing reference for the request's issue, and
+    that issue.
 
     None when the request or its WorkItem is unknown (creation refuses it), or
     for a GitHub WorkItem on an install with no GitHub tracker (a WorkItem the
@@ -143,7 +151,7 @@ async def _closing_reference(
         reference: str = await tracker.closing_reference(item.tracker_issue, item.repository)
     except ForgeError:
         raise unavailable from None
-    return reference
+    return reference, item.tracker_issue
 
 
 async def _work_item_policy(
@@ -551,10 +559,19 @@ async def create_publication(
                 data = data.model_copy(update={"body": body})
         # Every factory pull request body references its ticket (#4358 plan D7),
         # in the tracker's own form; a body that already carries it is kept.
-        reference = await _closing_reference(session, request, work_item_request_id)
-        if reference is not None and reference not in (data.body or ""):
-            body = f"{data.body}\n\n{reference}" if data.body else reference
-            data = data.model_copy(update={"body": body})
+        # Beside it goes the canonical marker naming the issue by its immutable
+        # identity, which rediscovery matches after a loss of storage (#4629).
+        closing = await _closing_reference(session, request, work_item_request_id)
+        if closing is not None:
+            reference, issue = closing
+            body = data.body or ""
+            if reference not in body:
+                body = f"{body}\n\n{reference}" if body else reference
+            marker = issue_marker(issue)
+            if marker not in (line.strip() for line in body.splitlines()):
+                body = f"{body.rstrip()}\n\n{marker}"
+            if body != data.body:
+                data = data.model_copy(update={"body": body})
 
     async def metadata_check() -> None:
         if patch:

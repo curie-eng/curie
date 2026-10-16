@@ -46,7 +46,9 @@ marked and described:
    (admit, cancel or mention) plus the next cursor, and re-reads the WorkItems
    already running so a marker removed before the cursor still cancels. A
    listing that cannot be read to its end raises `Unavailable` and yields no
-   cursor. Events by the adapter's own identity are never notices.
+   cursor. Events by the adapter's own identity are never notices. Each notice
+   carries `occurred_at`, the event time the tracker reported, or None when it
+   reported none; admission treats None as unknown.
 2. `verify_current` says whether a notice still describes the issue.
 3. `marking_actor` names who applied the marker that is on the issue now.
 4. `may_start` decides whether that actor may start a run. A native tracker
@@ -59,7 +61,12 @@ marked and described:
    Nothing is stored.
 7. `set_state_label` applies the factory state label and drops others.
 8. `closing_reference` produces the text a pull request body carries.
-9. Optional: `link_pull_request` and `dependencies`.
+9. `publication_references` returns every scope-qualified text by which an
+   earlier factory publication body in a repository names exactly this issue:
+   GitHub's closing reference, GitLab's `Closes #<iid>` only in the issue's own
+   project, and Jira's reference for the current key and every key the issue
+   held before a move. An unreadable answer raises `Unavailable`.
+10. Optional: `link_pull_request` and `dependencies`.
 
 ### CodeHost
 
@@ -67,9 +74,20 @@ marked and described:
 pull requests, CI and review live: `resolve_repository` from an immutable id;
 `credential` for clone or push scope; `branch_head` and `read_commit`;
 `find_pull_request`, `open_pull_request`, `update_pull_request` and
-`read_pull_request`; `observe_ci` on an exact head; `list_review_feedback`
-since a cursor and `verify_feedback`. Optional: `ci_diagnostics`,
-`rerun_failed` and `user_can_write`.
+`read_pull_request`; `list_factory_publications`; `observe_ci` on an exact
+head; `list_review_feedback` since a cursor and `verify_feedback`. Optional:
+`ci_diagnostics`, `rerun_failed` and `user_can_write`.
+
+`list_factory_publications` returns, as `FactoryPublication` values, every pull
+request in any state that the adapter's own identity opened in the repository
+from a branch of that repository (never a fork) whose last path component is
+`publication-<32 hex>`. The whole listing is read: a failed page, an item it
+cannot read, or an own identity it cannot read raises `Unavailable`. Bitbucket
+Cloud cannot read its own account, so it lists every such pull request of the
+repository with `owner_verified` False, as does Bitbucket Data Center when its
+answers omit the `X-AUSERID` header. Such publications are not evidence:
+rediscovery drops them before matching. Every other adapter lists only its
+own, with `owner_verified` True.
 
 `observe_ci` returns a `CiRollup`
 (`apps/api/src/curie_api/forges/types.py::CiRollup`) built by

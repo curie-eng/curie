@@ -1,10 +1,14 @@
 """Build the code host a caller talks to (ADR 0197, "Two ports").
 
-Two named constructors, and neither falls back to the other (#4397).
+Named constructors, and none falls back to another (#4397).
 ``factory_code_host`` is the factory's: the GitHub code host entry of the forge
-registry, minting with that entry's App. ``code_host_for`` is the non-factory
-publication and workspace paths': the install's own GitHub settings, so
-publication works with no factory config at all.
+registry, minting with that entry's App. ``code_host_for`` is the install's own
+GitHub settings, so publication works with no factory config at all: the
+publication and workspace paths use it for a GitHub repository, and so does
+factory rediscovery (#4629), because the identity that lists an issue's
+earlier publications must be the one that opened them.
+``forge_code_host`` is the forge registry entry a non-GitHub repository names,
+which the same publication and rediscovery paths use for those repositories.
 """
 
 from __future__ import annotations
@@ -31,8 +35,9 @@ def code_host_for(
     *,
     installations: Mapping[str, int] | None = None,
 ) -> CodeHost:
-    """The install's own GitHub as a code host, for the non-factory publication
-    and workspace paths. It mints with the install's GitHub settings.
+    """The install's own GitHub as a code host, for the publication and
+    workspace paths and factory rediscovery on a GitHub repository. It mints
+    with the install's GitHub settings.
 
     ``installations`` maps a repository path to the App installation stored for
     it, which fences the reads that mint for that repository.

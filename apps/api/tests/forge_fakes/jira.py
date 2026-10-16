@@ -485,6 +485,40 @@ class JiraFake:
         issue.old_keys.append(issue.key)
         issue.key = new_key
 
+    def move_issue_logged(self, ref: TrackerIssueRef | int, new_key: str, by: JiraUser) -> str:
+        """Move the issue as Jira records a move: a new key, the same id, and one
+        changelog history whose items name the old and new key and project.
+
+        The ``Key`` item is how the changelog reports a key change
+        (https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-issueidorkey-changelog-get,
+        ``ChangeDetails``: ``field``, ``fieldtype``, ``from``, ``fromString``,
+        ``to``, ``toString``). Returns the history id.
+        """
+
+        issue = self.issue(ref)
+        old_key = issue.key
+        items = [
+            {
+                "field": "project",
+                "fieldtype": "jira",
+                "fieldId": "project",
+                "from": None,
+                "fromString": old_key.split("-")[0],
+                "to": None,
+                "toString": new_key.split("-")[0],
+            },
+            {
+                "field": "Key",
+                "fieldtype": "jira",
+                "from": None,
+                "fromString": old_key,
+                "to": None,
+                "toString": new_key,
+            },
+        ]
+        self.move_issue(issue.id, new_key)
+        return self._change(issue, by, items, None)
+
     def delete_issue(self, ref: TrackerIssueRef | int) -> None:
         del self.issues[int(self.issue(ref).id)]
 

@@ -41,15 +41,16 @@ import httpx
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from . import factory_base, workitem_dispatch
+from . import factory_base, factory_rediscovery, workitem_dispatch
 from .config import Settings
 from .factory_admission import LABEL_REFUSAL_MARKER, cancel_work_item, label_refusal
 from .forges.authority import may_start_with
 from .forges.config import BindingConfig, RepositoryBindingConfig, TrackerConfig
+from .forges.connections import CodeHostConnection
 from .forges.errors import ForgeError, NotFound, Unauthorized, Unavailable
 from .forges.hosts import resolve_stored
 from .forges.identity import notice_request_id
-from .forges.ports import Tracker
+from .forges.ports import CodeHost, Tracker
 from .forges.registry import ForgeRegistry, forges_registry
 from .forges.resolution import REFUSAL_MARKER as REPO_REFUSAL_MARKER
 from .forges.resolution import Refusal, refusal_body, resolve_repository
@@ -494,8 +495,21 @@ async def _admit(
     if isinstance(chosen, Refusal):
         await _comment(tracker, issue, REPO_REFUSAL_MARKER, refusal_body(chosen))
         return
+    connection, code_host, repository = await _chosen_repository(scope, chosen)
+    if existing is None and await _rediscovered(scope, tracker, notice, repository):
+        return
     admission = await _admission(
-        session, scope, tracker, label, notice, surface.agent_id, chosen, existing, ticket
+        tracker,
+        scope,
+        label,
+        notice,
+        surface.agent_id,
+        chosen,
+        connection,
+        code_host,
+        repository,
+        existing is not None and await _has_open_pr(session, existing),
+        ticket,
     )
     if admission is None:
         return
@@ -508,30 +522,76 @@ async def _admit(
     _log_dispatch(scope, result)
 
 
-async def _admission(
-    session: AsyncSession,
-    scope: _Scope,
-    tracker: Tracker,
-    label: str,
-    notice: MarkedNotice,
-    agent_id: uuid.UUID,
-    repo: RepositoryBindingConfig,
-    existing: WorkItem | None,
-    ticket: TicketLabels,
-) -> Admission | None:
-    """The admission facts on the chosen repository, or None after a base refusal."""
+async def _chosen_repository(
+    scope: _Scope, repo: RepositoryBindingConfig
+) -> tuple[CodeHostConnection, CodeHost, RepositoryRef]:
+    """The chosen repository's code host entry, its adapter, and the repository
+    read now by its configured path; the answer's immutable id must be the
+    configured one, or the repository is refused as moved."""
 
     connection = scope.registry.code_host(repo.code_host)
     code_host = connection.adapter(scope.client)
-    # Read by its configured path; the answer's immutable id must be the
-    # configured one, or the repository is refused as moved.
     repository = await resolve_stored(
         code_host,
         RepositoryRef(connection.config.kind, connection.config.host, repo.project_id, repo.path),
     )
+    return connection, code_host, repository
+
+
+async def _rediscovered(
+    scope: _Scope, tracker: Tracker, notice: MarkedNotice, repository: RepositoryRef
+) -> bool:
+    """True when the code host already has this issue's factory publication,
+    so an admission with no local WorkItem is refused (#4629).
+
+    An open or ambiguous one is named on the issue; a completed one
+    whose trigger this notice replays is only logged. Evidence that cannot be
+    read completely defers (one of ``_DEFERRED``), so the cursor stays. A
+    `NotFound` from the listing defers too: the repository was just resolved, so
+    a missing answer is incomplete evidence, not a missing issue.
+    """
+
+    code_host = factory_rediscovery.publishing_code_host(scope.settings, scope.client, repository)
+    try:
+        found = await factory_rediscovery.rediscover(
+            tracker, code_host, notice.issue, repository, event_at=notice.occurred_at
+        )
+    except (Unavailable, Unauthorized):
+        raise
+    except ForgeError as exc:
+        raise Unavailable("publication_listing") from exc
+    if found.verdict == "clear":
+        return False
+    try:
+        await factory_rediscovery.report(tracker, notice.issue, found)
+    except ForgeError:
+        raise FeedbackUnavailable("publication_report_unavailable") from None
+    logger.info(
+        "tracker intake for binding %s refused an admission: publication_exists (%s)",
+        scope.binding.name,
+        found.verdict,
+    )
+    return True
+
+
+async def _admission(
+    tracker: Tracker,
+    scope: _Scope,
+    label: str,
+    notice: MarkedNotice,
+    agent_id: uuid.UUID,
+    repo: RepositoryBindingConfig,
+    connection: CodeHostConnection,
+    code_host: CodeHost,
+    repository: RepositoryRef,
+    has_open_pr: bool,
+    ticket: TicketLabels,
+) -> Admission | None:
+    """The admission facts on the chosen repository, or None after a base refusal."""
+
     installation = await connection.installation_for(repository)
     base: factory_base.ResolvedBase | None = None
-    if existing is None or not await _has_open_pr(session, existing):
+    if not has_open_pr:
         resolved = await factory_base.resolve_base(
             policy=repo,
             labels=set(ticket.labels),

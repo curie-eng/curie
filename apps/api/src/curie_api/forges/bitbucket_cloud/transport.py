@@ -121,10 +121,14 @@ class CloudTransport:
         response = await self.request(method, url, what=what, params=params, json=json)
         return object_of(response, what)
 
-    async def pages(self, url: str, *, what: str, params: Params) -> list[dict[str, Any]]:
+    async def pages(
+        self, url: str, *, what: str, params: Params, strict: bool = False
+    ) -> list[dict[str, Any]]:
         """Every value of a paged listing, following the absolute ``next``
         link for at most `MAX_PAGES` pages. A failed page, a ``next`` off this
-        API, or a listing longer than `MAX_PAGES` raises `Unavailable`."""
+        API, or a listing longer than `MAX_PAGES` raises `Unavailable`. A value
+        that is not an object is skipped, or with ``strict`` raises
+        `Unavailable`, for a caller that must not decide without it."""
 
         values: list[dict[str, Any]] = []
         following: str | None = url
@@ -145,6 +149,8 @@ class CloudTransport:
             listed = page.get("values")
             if not isinstance(listed, list):
                 raise Unavailable("pagination")
+            if strict and not all(isinstance(value, dict) for value in listed):
+                raise Unavailable(what)
             values.extend(value for value in listed if isinstance(value, dict))
             following = page.get("next")
             if following is None:

@@ -326,6 +326,7 @@ def _admit_id(intake: Intake, issue: jira_fake.JiraIssue, event_id: str) -> uuid
             event_id=event_id,
             disposition=Disposition.ADMIT,
             cursor="",
+            occurred_at=None,
         )
     )
 
