@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from ipaddress import ip_network
 from typing import Annotated, Any, Literal
 
@@ -23,7 +24,10 @@ from pydantic import (
     TypeAdapter,
     ValidationError,
     field_validator,
+    model_validator,
 )
+
+from .sandbox.daemon_config import ToolDaemonConfig
 
 REPO_RUNNER_POOLS_ENV = "CURIE_REPO_RUNNER_POOLS"
 _IMAGE_DIGEST = re.compile(r"@(sha256:[0-9a-f]{64})$")
@@ -39,7 +43,7 @@ PoolName = Annotated[
 
 
 class _Model(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
 
 class EgressPort(_Model):
@@ -65,17 +69,36 @@ class EgressRule(_Model):
 class RepoRunnerPool(_Model):
     """An opaque pool with index, amd64 and arm64 image identities in order."""
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "if": {"properties": {"docker": {"const": True}}},
+            "then": {"required": ["daemon"], "properties": {"daemon": {"type": "object"}}},
+            "else": {"not": {"required": ["daemon"]}},
+        }
+    )
+
     pool: PoolName
     digests: tuple[Digest, Digest, Digest]
     base: Digest
     docker: StrictBool
     egress: tuple[EgressRule, ...] = ()
+    daemon: ToolDaemonConfig | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_daemon_presence(cls, value: Any) -> Any:
+        if isinstance(value, Mapping):
+            if value.get("docker") is True and value.get("daemon") is None:
+                raise ValueError("Docker-enabled pools require a daemon object")
+            if value.get("docker") is False and "daemon" in value:
+                raise ValueError("Docker-disabled pools forbid daemon configuration")
+        return value
 
 
 class RepoRunnerPools(RootModel[dict[RepositoryPath, RepoRunnerPool]]):
     """The repository binding paths carried by worker repository names."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, hide_input_in_errors=True)
 
 
 def parse_repo_runner_pools(raw: str | None) -> RepoRunnerPools:
@@ -86,10 +109,11 @@ def parse_repo_runner_pools(raw: str | None) -> RepoRunnerPools:
     try:
         return RepoRunnerPools.model_validate_json(raw)
     except ValidationError as exc:
-        first = exc.errors()[0]
+        first = exc.errors(include_input=False, include_context=False, include_url=False)[0]
+        category = "invalid JSON" if first["type"] == "json_invalid" else "invalid configuration"
         raise ValueError(
             f"{REPO_RUNNER_POOLS_ENV} is not a valid repository runner pool map: "
-            f"{exc.error_count()} error(s), first at {first['loc']}: {first['msg']}"
+            f"{exc.error_count()} error(s), {category}"
         ) from None
 
 

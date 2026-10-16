@@ -2770,6 +2770,59 @@ github code host together. */ -}}
 {{- toJson $out -}}
 {{- end -}}
 
+{{/* ADR 0217: resolve and validate the worker's daemon handoff at the root. */}}
+{{- define "curie.factory.dockerConfig" -}}
+{{- $factory := .Values.factory | default dict -}}
+{{- $docker := get $factory "docker" -}}
+{{- if or (not (hasKey $factory "docker")) (kindIs "invalid" $docker) }}{{ $docker = dict }}{{ end -}}
+{{- if not (kindIs "map" $docker) }}{{ fail "factory.docker must be a map" }}{{ end -}}
+{{- $image := get $docker "daemonImage" -}}
+{{- if not (and (kindIs "string" $image) (regexMatch "^[A-Za-z0-9][A-Za-z0-9._/:-]*@sha256:[0-9a-f]{64}$" $image)) }}{{ fail "factory.docker.daemonImage must be a CEL-safe digest-pinned image reference when a repository enables docker" }}{{ end -}}
+{{- $portRaw := "2376" -}}
+{{- if hasKey $docker "port" }}{{ $portRaw = get $docker "port" | toString }}{{ end -}}
+{{- if not (regexMatch "^[0-9]{1,5}$" $portRaw) }}{{ fail "factory.docker.port must be an integer from 1 through 65535" }}{{ end -}}
+{{- $port := int $portRaw -}}
+{{- if or (lt $port 1) (gt $port 65535) }}{{ fail "factory.docker.port must be an integer from 1 through 65535" }}{{ end -}}
+{{- $namespaceRaw := get $docker "namespace" -}}
+{{- if and (not (kindIs "invalid" $namespaceRaw)) (not (kindIs "string" $namespaceRaw)) }}{{ fail "factory.docker.namespace must be a string" }}{{ end -}}
+{{- $namespace := include "curie.factory.dockerNamespace" . -}}
+{{- if or (gt (len $namespace) 63) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $namespace)) }}{{ fail "factory.docker.namespace must resolve to a Kubernetes namespace DNS label" }}{{ end -}}
+{{- $selector := include "curie.selectorLabels" (dict "root" . "component" "docker-daemon") | fromYaml -}}
+{{- range $value := $selector -}}
+{{- if not (and (kindIs "string" $value) (le (len $value) 63) (regexMatch "^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$" $value)) }}{{ fail "factory.docker selector labels must be nonempty Kubernetes label values of at most 63 characters" }}{{ end -}}
+{{- end -}}
+{{- $resources := get $docker "resources" -}}
+{{- if or (not (hasKey $docker "resources")) (kindIs "invalid" $resources) }}{{ $resources = dict }}{{ end -}}
+{{- if not (kindIs "map" $resources) }}{{ fail "factory.docker.resources must be a map" }}{{ end -}}
+{{- if omit $resources "requests" "limits" }}{{ fail "factory.docker.resources accepts only requests and limits" }}{{ end -}}
+{{- $resolved := dict -}}
+{{- range $kind, $defaults := dict "requests" (dict "cpu" "500m" "memory" "1Gi" "ephemeral-storage" "10Gi") "limits" (dict "cpu" "2" "memory" "4Gi" "ephemeral-storage" "20Gi") -}}
+{{- $supplied := get $resources $kind -}}
+{{- if or (not (hasKey $resources $kind)) (kindIs "invalid" $supplied) }}{{ $supplied = dict }}{{ end -}}
+{{- if not (kindIs "map" $supplied) }}{{ fail (printf "factory.docker.resources.%s must be a map" $kind) }}{{ end -}}
+{{- if omit $supplied "cpu" "memory" "ephemeral-storage" }}{{ fail "factory.docker resources accept only cpu, memory and ephemeral-storage" }}{{ end -}}
+{{- $group := dict -}}
+{{- range $key, $fallback := $defaults -}}
+{{- $value := get $supplied $key -}}
+{{- if or (not (hasKey $supplied $key)) (kindIs "invalid" $value) }}{{ $value = $fallback }}{{ end -}}
+{{- $_ := set $group $key $value -}}
+{{- end -}}
+{{- $_ := set $resolved $kind $group -}}
+{{- end -}}
+{{- $out := dict "namespace" $namespace "image" $image "port" $port "selectorLabels" $selector "resources" $resolved -}}
+{{- range $key, $fallback := dict "storageSizeLimit" "20Gi" "maxClaimLifetimeSeconds" 86400 "pingTimeoutSeconds" 2 -}}
+{{- $value := get $docker $key -}}
+{{- if or (not (hasKey $docker $key)) (kindIs "invalid" $value) }}{{ $value = $fallback }}{{ end -}}
+{{- if and (ne $key "storageSizeLimit") (not (regexMatch "^[1-9][0-9]*$" (toJson $value))) }}{{ fail (printf "factory.docker.%s must be a positive integer" $key) }}{{ end -}}
+{{- $_ := set $out $key $value -}}
+{{- end -}}
+{{- $quantity := "^\\+?(?:[0-9]*[1-9][0-9]*(?:\\.[0-9]*)?|[0-9]*\\.[0-9]*[1-9][0-9]*)(?:[eE][+-]?[0-9]{1,3}|[numkMGTPE]|[KMGTPE]i)?$" -}}
+{{- range $value := concat (values $resolved.requests) (values $resolved.limits) (list $out.storageSizeLimit) -}}
+{{- if not (and (kindIs "string" $value) (le (len $value) 128) (not (regexMatch "\\s" $value)) (regexMatch $quantity $value)) }}{{ fail "factory.docker resources and storageSizeLimit must be positive Kubernetes quantity strings of at most 128 characters" }}{{ end -}}
+{{- end -}}
+{{- toJson $out -}}
+{{- end -}}
+
 {{/* ADR 0216: one descriptor per repository, sharing pools by index digest. */}}
 {{- define "curie.factory.repoRunnerDescriptors" -}}
 {{- $root := . -}}
@@ -2841,7 +2894,11 @@ github code host together. */ -}}
 {{- $egress = append $egress (set (deepCopy .) "ports" $ports) -}}
 {{- end -}}
 {{- end -}}
-{{- $_ := set $descriptors $path (dict "path" $path "agent" $agent "prefix" $prefix "template" $template "pool" $pool "image" $image "digests" (list $index $amd64 $arm64) "base" $base "docker" $dockerOn "egress" $egress "source" $source) -}}
+{{- $descriptor := dict "path" $path "agent" $agent "prefix" $prefix "template" $template "pool" $pool "image" $image "digests" (list $index $amd64 $arm64) "base" $base "docker" $dockerOn "egress" $egress "source" $source -}}
+{{- if and $dockerOn $root.Values.worker.deploy -}}
+{{- $_ := set $descriptor "daemon" (include "curie.factory.dockerConfig" $root | fromJson) -}}
+{{- end -}}
+{{- $_ := set $descriptors $path $descriptor -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -2853,7 +2910,7 @@ github code host together. */ -}}
 {{- define "curie.factory.repoRunnerPoolsJson" -}}
 {{- $out := dict -}}
 {{- range . -}}
-{{- $_ := set $out .path (pick . "pool" "digests" "base" "docker" "egress") -}}
+{{- $_ := set $out .path (pick . "pool" "digests" "base" "docker" "egress" "daemon") -}}
 {{- end -}}
 {{- toJson $out -}}
 {{- end -}}

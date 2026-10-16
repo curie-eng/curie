@@ -26,25 +26,10 @@ ADR accepts (decisions 4 and 5). Nothing renders without a Docker repository.
 {{- $labels := include "curie.labels" . }}
 {{- $daemonSelector := include "curie.selectorLabels" (dict "root" . "component" "docker-daemon") }}
 {{- $workerUser := printf "system:serviceaccount:%s:%s-worker" .Release.Namespace $fullname }}
-{{- $image := get $docker "daemonImage" | default "" | toString }}
-{{- /* Decisions 4 and 5: one digest pins the daemon and the authorization
-       plugin it ships, and it is embedded in CEL as a single-quoted literal. */}}
-{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._/:-]*@sha256:[0-9a-f]{64}$" $image) }}
-{{- fail (printf "factory.docker.daemonImage must be a digest-pinned image reference (name@sha256:<64 hex>) when a repository enables docker; got %q" $image) }}
-{{- end }}
-{{- /* hasKey, not default: an explicit 0 must be refused, not defaulted. */}}
-{{- $portRaw := "2376" }}
-{{- if hasKey $docker "port" }}
-{{- $portRaw = get $docker "port" | toString }}
-{{- end }}
-{{- if not (regexMatch "^[0-9]{1,5}$" $portRaw) }}
-{{- fail (printf "factory.docker.port must be an integer from 1 through 65535; got %q" $portRaw) }}
-{{- end }}
-{{- $port := int $portRaw }}
-{{- if or (lt $port 1) (gt $port 65535) }}
-{{- fail (printf "factory.docker.port must be an integer from 1 through 65535; got %d" $port) }}
-{{- end }}
-{{- $namespace := include "curie.factory.dockerNamespace" . }}
+{{- $daemon := (first $dockerRepos).daemon }}
+{{- $image := $daemon.image }}
+{{- $port := int $daemon.port }}
+{{- $namespace := $daemon.namespace }}
 {{- $createNamespace := true }}
 {{- if hasKey $docker "createNamespace" }}
 {{- $createNamespace = get $docker "createNamespace" }}
@@ -383,16 +368,12 @@ spec:
       message: the dockerd container must not override the image command
     - expression: {{ printf "%s.containers.all(c, !has(c.env) && !has(c.envFrom))" $s | quote }}
       message: the dockerd container must not set env or envFrom, since a caller environment could redirect the entrypoint (PATH into a mounted Secret)
-    {{- /* The two flags must sit right after dockerd: a value-taking caller
-           flag such as --label could otherwise consume them; the image
-           entrypoint also injects them first. */}}
     - expression: >-
-        {{ $s }}.containers.all(c, has(c.args) && size(c.args) >= 3 &&
-        c.args[0] == 'dockerd' &&
-        c.args[1] == '--userns-remap=default' &&
-        c.args[2] == '--authorization-plugin=curie-authz' &&
-        c.args.all(a, !a.startsWith('--userns-remap') || a == '--userns-remap=default'))
-      message: dockerd must run with --userns-remap=default and --authorization-plugin=curie-authz immediately after dockerd
+        {{ $s }}.containers.all(c, has(c.args) && c.args == [
+        'dockerd', '--userns-remap=default', '--authorization-plugin=curie-authz',
+        '--host=tcp://0.0.0.0:{{ $port }}', '--tlsverify', '--tlscacert=/certs/ca.pem',
+        '--tlscert=/certs/server-cert.pem', '--tlskey=/certs/server-key.pem'])
+      message: dockerd must use the exact ordered userns, authorization and mutual TLS arguments
     - expression: >-
         {{ $s }}.containers.all(c, !has(c.securityContext) || !has(c.securityContext.capabilities) ||
         !has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0)

@@ -1396,8 +1396,15 @@ Worker repository routing remains deferred.
 **Factory Docker daemons (ADR 0217).** When a repository runner sets
 `docker.enabled: true` and `worker.deploy` is true,
 `templates/docker-daemon.yaml` renders the fixed boundary for per-run Docker
-daemons. The worker creates each run's daemon pod, Service, certificate Secret
-and ingress NetworkPolicy inside it. With no Docker repository nothing renders.
+daemons and includes a `daemon` object in each Docker repository's
+`CURIE_REPO_RUNNER_POOLS` entry. It carries the resolved namespace, pinned image,
+integer port, release selector labels and individual Pod settings. Resource
+requests default to `500m` CPU, `1Gi` memory and `10Gi` ephemeral storage; limits
+default to `2`, `4Gi` and `20Gi`. `factory.docker.storageSizeLimit` defaults to
+`20Gi`, `maxClaimLifetimeSeconds` to `86400` and `pingTimeoutSeconds` to `2`.
+Missing new leaves on retained releases receive these defaults. Namespace quota
+and LimitRange remain separate. This handoff configures future worker creation;
+daemon lifecycle and certificate issuance are not implemented here.
 
 1. A daemon namespace, `factory.docker.namespace` or
    `<release-namespace>-<fullname>-docker` by default. The chart creates it
@@ -1428,8 +1435,11 @@ and ingress NetworkPolicy inside it. With no Docker repository nothing renders.
    Kubernetes 1.30 or newer:
    `<fullname>-docker-daemon-pods` admits only a worker-created pod with one
    `dockerd` container on `factory.docker.daemonImage` (digest required), the
-   `--userns-remap=default` and `--authorization-plugin=curie-authz` flags
-   immediately after `dockerd`, the
+   exact ordered arguments `dockerd`, `--userns-remap=default`,
+   `--authorization-plugin=curie-authz`,
+   `--host=tcp://0.0.0.0:<factory.docker.port>`, `--tlsverify`,
+   `--tlscacert=/certs/ca.pem`, `--tlscert=/certs/server-cert.pem`,
+   `--tlskey=/certs/server-key.pem`, the
    claim, managed-by, selector and egress-class labels, no added
    capabilities on dockerd, no init or ephemeral containers (it also matches
    `pods/ephemeralcontainers`), no lifecycle hooks or exec probes, mounts only
