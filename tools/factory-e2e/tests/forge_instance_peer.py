@@ -453,6 +453,7 @@ def serve(config_path: Path, state_dir: Path) -> None:
     server = ThreadingHTTPServer(("0.0.0.0", peer.config["port"]), Handler)
     if peer.config.get("tls"):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(peer.config["certificate"], peer.config["private_key"])
         server.socket = context.wrap_socket(server.socket, server_side=True)
     server.serve_forever()
