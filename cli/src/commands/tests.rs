@@ -3164,3 +3164,176 @@ async fn prepare_deploy_refuses_a_plain_sealing_key_on_both_tiers() {
         );
     }
 }
+
+// --- Docker subpath minimums at the real bring-up entry points (4671) ---
+
+struct SubpathEnvRestore {
+    path: Option<std::ffi::OsString>,
+    token: Option<std::ffi::OsString>,
+}
+
+impl Drop for SubpathEnvRestore {
+    fn drop(&mut self) {
+        match self.path.take() {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        match self.token.take() {
+            Some(value) => std::env::set_var("ACME_API_TOKEN", value),
+            None => std::env::remove_var("ACME_API_TOKEN"),
+        }
+    }
+}
+
+fn install_subpath_docker_stub(
+    bin: &Path,
+    log: &Path,
+    engine_api: &str,
+    compose_version: &str,
+) -> SubpathEnvRestore {
+    use std::os::unix::fs::PermissionsExt;
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$*\" in\n  \"version --format {{{{.Server.APIVersion}}}}\") printf '%s\\n' '{engine_api}' ;;\n  \"compose version --short\") printf '%s\\n' '{compose_version}' ;;\n  *) printf 'unexpected docker invocation: %s\\n' \"$*\" >&2; exit 64 ;;\nesac\n",
+        log = log.display()
+    );
+    let docker_path = bin.join("docker");
+    std::fs::write(&docker_path, script).expect("write docker stub");
+    std::fs::set_permissions(&docker_path, std::fs::Permissions::from_mode(0o755))
+        .expect("make docker stub executable");
+    let restore = SubpathEnvRestore {
+        path: std::env::var_os("PATH"),
+        token: std::env::var_os("ACME_API_TOKEN"),
+    };
+    let mut paths = vec![bin.to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::env::set_var("PATH", std::env::join_paths(paths).expect("join test PATH"));
+    std::env::set_var("ACME_API_TOKEN", "test-token-value");
+    restore
+}
+
+fn subpath_scope() -> crate::connector_build::ConnectorScope {
+    crate::connector_build::ConnectorScope {
+        release: "curie".to_string(),
+        agent: "acme-bot".to_string(),
+        namespace: "default".to_string(),
+    }
+}
+
+fn subpath_decl(secret_files: bool) -> crate::connector_build::ConnectorsFileDecl {
+    let secret_block = if secret_files {
+        "    secret_files:\n      ACME_API_TOKEN: /run/secrets/acme-token\n"
+    } else {
+        ""
+    };
+    crate::connector_build::parse_connectors(&format!(
+        "connectors:\n  acme-connector:\n    image: ghcr.io/example/acme-connector:1\n{secret_block}"
+    ))
+    .expect("a hosted connector declaration")
+}
+
+#[tokio::test]
+async fn docker_subpath_preflight_skill_bring_up_refuses_old_engine_before_any_volume() {
+    let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+    let bin = tempfile::tempdir().expect("bin dir");
+    let plugin = tempfile::tempdir().expect("plugin dir");
+    let log = bin.path().join("docker.log");
+    let _restore = install_subpath_docker_stub(bin.path(), &log, "1.44", "v2.26.0");
+    let decl = subpath_decl(true);
+    let result = super::start_skill_connectors(
+        plugin.path(),
+        &decl,
+        &subpath_scope(),
+        "test-net",
+        "test-project",
+    )
+    .await;
+    let err = result.expect_err("Engine API 1.44 must refuse the skill bring-up");
+    let text = format!("{err:#}");
+    for needle in ["Docker Engine 26.0", "1.45", "1.44", "acme-connector"] {
+        assert!(
+            text.contains(needle),
+            "{needle} missing from refusal: {text}"
+        );
+    }
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        log_text.trim(),
+        "version --format {{.Server.APIVersion}}",
+        "the version check is the only docker call before the refusal: {log_text}"
+    );
+}
+
+#[tokio::test]
+async fn docker_subpath_preflight_local_bring_up_refuses_old_compose_before_any_volume() {
+    let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+    let bin = tempfile::tempdir().expect("bin dir");
+    let plugin = tempfile::tempdir().expect("plugin dir");
+    let log = bin.path().join("docker.log");
+    let _restore = install_subpath_docker_stub(bin.path(), &log, "1.56", "v2.25.0");
+    let decl = subpath_decl(true);
+    let lock = crate::connector_build::ConnectorLockFileDecl {
+        version: crate::connector_build::LOCK_VERSION,
+        connectors: std::collections::BTreeMap::new(),
+        runner: None,
+    };
+    let result = super::bring_up_local(
+        plugin.path(),
+        &decl,
+        &lock,
+        &subpath_scope(),
+        "test-project",
+    )
+    .await;
+    let err = result.expect_err("Compose v2.25.0 must refuse the local bring-up");
+    let text = format!("{err:#}");
+    for needle in ["Docker Compose 2.26.0", "2.25.0", "acme-connector"] {
+        assert!(
+            text.contains(needle),
+            "{needle} missing from refusal: {text}"
+        );
+    }
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        log_text.trim(),
+        "version --format {{.Server.APIVersion}}\ncompose version --short",
+        "only the two version checks run before the refusal: {log_text}"
+    );
+}
+
+#[tokio::test]
+async fn docker_subpath_preflight_bring_ups_skip_version_checks_without_secret_files() {
+    let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+    let bin = tempfile::tempdir().expect("bin dir");
+    let plugin = tempfile::tempdir().expect("plugin dir");
+    let log = bin.path().join("docker.log");
+    let _restore = install_subpath_docker_stub(bin.path(), &log, "1.44", "v2.25.0");
+    let decl = subpath_decl(false);
+    let lock = crate::connector_build::ConnectorLockFileDecl {
+        version: crate::connector_build::LOCK_VERSION,
+        connectors: std::collections::BTreeMap::new(),
+        runner: None,
+    };
+    let _ = super::start_skill_connectors(
+        plugin.path(),
+        &decl,
+        &subpath_scope(),
+        "test-net",
+        "test-project",
+    )
+    .await;
+    let _ = super::bring_up_local(
+        plugin.path(),
+        &decl,
+        &lock,
+        &subpath_scope(),
+        "test-project",
+    )
+    .await;
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !log_text.contains("version --format") && !log_text.contains("compose version"),
+        "no version check may run without secret_files: {log_text}"
+    );
+}
