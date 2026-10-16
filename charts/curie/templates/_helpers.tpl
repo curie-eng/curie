@@ -1231,6 +1231,11 @@ credentials and the derived collector header cannot disagree. */}}
 {{- $_ := set $content "apiKey" ((include "curie.managedSecret" (dict "root" . "key" "apiKey" "value" .Values.api.apiKey "default" "curie-dev-key" "hex" false "existingData" $existingSecretData)) | toString) -}}
 {{- $_ := set $content "approvalChatAttesterSecret" ((include "curie.managedSecret" (dict "root" . "key" "approvalChatAttesterSecret" "value" .Values.api.approvalChatAttesterSecret "default" "curie-dev-approval-chat-attester" "hex" false "existingData" $existingSecretData)) | toString) -}}
 {{- $_ := set $content "remediationAuthorityKey" ((include "curie.managedSecret" (dict "root" . "key" "remediationAuthorityKey" "value" .Values.api.remediationAuthorityKey "default" "curie-dev-remediation-authority" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{/* The values check above cannot see a credential the managed Secret retained
+     from an earlier install; compare what the Secret will actually hold. */}}
+{{- if eq (index $content "remediationAuthorityKey") (index $content "apiKey") -}}
+{{- fail "api.remediationAuthorityKey and api.apiKey resolve to the same retained credential. Set api.remediationAuthorityKey to an independent value (ADR 0231); neither value is printed because both are live credentials." -}}
+{{- end -}}
 {{- $_ := set $content "internalWorkerToken" ((include "curie.managedSecret" (dict "root" . "key" "internalWorkerToken" "value" .Values.worker.internalWorkerToken "default" "curie-dev-worker-token" "hex" false "existingData" $existingSecretData)) | toString) -}}
 {{- $_ := set $content "githubWebhookSecret" ((include "curie.managedSecret" (dict "root" . "key" "githubWebhookSecret" "value" .Values.api.githubWebhookSecret "default" "dev-webhook-secret" "hex" false "existingData" $existingSecretData)) | toString) -}}
 {{- $_ := set $content "githubToken" ((.Values.api.githubToken | default "") | toString) -}}
