@@ -16,6 +16,17 @@ Every write also requires an ADR 0106 operator principal in
 carrying an ``approval.resolve`` operator token, is refused
 ``operator_principal_required``. Reads need no principal.
 
+Binding (``PUT``) and arming additionally require the ADR 0231 remediation
+authority in ``X-Curie-Remediation-Authority``: a key the API holds as
+``CURIE_REMEDIATION_AUTHORITY_KEY``, independent of the platform key, so a
+platform-key holder (every worker) cannot authorize automatic remediation. A
+missing or wrong value, or an API with the key unset, is refused
+``remediation_authority_required`` before the body is read, so an unauthorized
+caller learns nothing about the body schema. The operator principal stays
+required on both for ``bound_by`` attribution; the authority never stands in for
+it. ``DELETE``, disarm and breaker close only reduce what runs automatically and
+need no authority.
+
 Every handler response, refusals included, carries ``Cache-Control: no-store``,
 and every refusal is ``{"detail": {"code": ...}}``. The routes stay readable and
 writable with ``CURIE_REMEDIATION_ENABLED`` off so a policy can be staged before
@@ -24,11 +35,14 @@ activation (AUTOMATED-REMEDIATION-1).
 
 from __future__ import annotations
 
+import hmac
 import uuid
+from collections.abc import Callable, Coroutine
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request, Response
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from sqlalchemy import select
 
 from .. import approval_principal
@@ -52,11 +66,88 @@ from ..schemas.remediation_policy import (
     RemediationPolicyWrite,
 )
 
-router = APIRouter(
-    prefix="/agents", tags=["remediation-policy"], dependencies=[Depends(require_api_key)]
-)
-
 _NO_STORE = {"Cache-Control": "no-store"}
+
+REMEDIATION_AUTHORITY_HEADER = "X-Curie-Remediation-Authority"
+
+
+def _authority_refusal(presented: str | None) -> HTTPException | None:
+    """The ``remediation_authority_required`` refusal, unless ``presented`` is the key.
+
+    Fails closed: with ``CURIE_REMEDIATION_AUTHORITY_KEY`` unset no value,
+    the empty string included, matches. Constant-time over the bytes.
+    """
+    key = get_settings().remediation_authority_key
+    if key and presented is not None and hmac.compare_digest(presented.encode(), key.encode()):
+        return None
+    return HTTPException(
+        status_code=403,
+        detail={
+            "code": "remediation_authority_required",
+            "message": (
+                "binding or arming a remediation policy needs the remediation authority "
+                f"(CURIE_REMEDIATION_AUTHORITY_KEY) in {REMEDIATION_AUTHORITY_HEADER}"
+            ),
+        },
+        headers=_NO_STORE,
+    )
+
+
+async def require_remediation_authority(
+    x_curie_remediation_authority: Annotated[
+        str | None, Header(alias=REMEDIATION_AUTHORITY_HEADER)
+    ] = None,
+) -> None:
+    """Refuse a bind or arm without the ADR 0231 remediation authority.
+
+    The platform key and a ``remediation.administer`` operator principal are
+    both derivable from the platform key every worker holds; this key is not.
+    \f
+    @spec AUTOMATED-REMEDIATION-3 (ADR 0231).
+    """
+    refusal = _authority_refusal(x_curie_remediation_authority)
+    if refusal is not None:
+        raise refusal
+
+
+class _AuthorityFirstRoute(APIRoute):
+    """Puts the remediation authority ahead of body decoding on the routes that need it.
+
+    FastAPI reads and decodes the body before it resolves dependencies, so a
+    body that does not decode would be answered ``400``/``422`` ahead of a
+    missing authority. On a route carrying ``require_remediation_authority``
+    the wrapper therefore checks the authority before the handler runs, so no
+    body is read. Precedence: ``401`` unauthenticated (``require_api_key``, run
+    here first for a caller refused for authority), then ``403``
+    ``remediation_authority_required``, then body ``400``/``422``, then
+    ``operator_principal_required`` and the rest.
+    """
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+        if not any(
+            dependency.call is require_remediation_authority
+            for dependency in self.dependant.dependencies
+        ):
+            return handler
+
+        async def guarded(request: Request) -> Response:
+            refusal = _authority_refusal(request.headers.get(REMEDIATION_AUTHORITY_HEADER))
+            if refusal is not None:
+                await require_api_key(request, request.headers.get("x-api-key"))
+                raise refusal
+            return await handler(request)
+
+        return guarded
+
+
+router = APIRouter(
+    prefix="/agents",
+    tags=["remediation-policy"],
+    dependencies=[Depends(require_api_key)],
+    route_class=_AuthorityFirstRoute,
+)
+_AUTHORITY = [Depends(require_remediation_authority)]
 _BASE = "/{agent_id}/hooks/{hook}/remediation-policy"
 
 AgentPath = Annotated[SourceUuid, Path()]
@@ -194,7 +285,12 @@ async def get_remediation_policy(
     return _ok(policy)
 
 
-@router.put(_BASE, response_model=RemediationPolicyOut, responses=_WRITE_REFUSALS)
+@router.put(
+    _BASE,
+    response_model=RemediationPolicyOut,
+    responses=_WRITE_REFUSALS,
+    dependencies=_AUTHORITY,
+)
 async def put_remediation_policy(
     agent_id: AgentPath,
     hook: HookPath,
@@ -206,7 +302,9 @@ async def put_remediation_policy(
     """Bind, tighten or widen a protected hook's remediation policy.
 
     A new binding starts disarmed; a later write keeps the armed flag. Each
-    write creates a generation recorded with the operator principal.
+    write creates a generation recorded with the operator principal. Needs the
+    remediation authority in ``X-Curie-Remediation-Authority`` (ADR 0231), else
+    ``remediation_authority_required``; the operator principal is attribution.
     \f
     @spec AUTOMATED-REMEDIATION-1 @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3.
     @spec AUTOMATED-REMEDIATION-17: every verifier is independent of its acting
@@ -268,7 +366,12 @@ async def delete_remediation_policy(
     return await _write(session, agent_id, hook, "remove", cas, principal)
 
 
-@router.post(f"{_BASE}/arm", response_model=RemediationPolicyOut, responses=_WRITE_REFUSALS)
+@router.post(
+    f"{_BASE}/arm",
+    response_model=RemediationPolicyOut,
+    responses=_WRITE_REFUSALS,
+    dependencies=_AUTHORITY,
+)
 async def arm_remediation_policy(
     agent_id: AgentPath,
     hook: HookPath,
@@ -278,6 +381,9 @@ async def arm_remediation_policy(
 ) -> JSONResponse:
     """Arm the current policy as a new generation.
 
+    Needs the remediation authority in ``X-Curie-Remediation-Authority``
+    (ADR 0231), else ``remediation_authority_required``; the operator principal
+    is attribution.
     \f
     @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3.
     """

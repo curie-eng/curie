@@ -95,7 +95,7 @@
 {{- fail "testInstallation.enabled=true but api.environment is prod. A test installation admits a listed bot's actions and approval replies, so the chart refuses it on an installation that says it is production (ADR 0202). Turn testInstallation.enabled off, or deploy the test installation separately." -}}
 {{- end -}}
 {{- $offenders := list -}}
-{{- range $secret := list (list "apiKey" "api.apiKey" $root.Values.api.apiKey "curie-dev-key") (list "internalWorkerToken" "worker.internalWorkerToken" $root.Values.worker.internalWorkerToken "curie-dev-worker-token") (list "approvalChatAttesterSecret" "api.approvalChatAttesterSecret" $root.Values.api.approvalChatAttesterSecret "curie-dev-approval-chat-attester") -}}
+{{- range $secret := list (list "apiKey" "api.apiKey" $root.Values.api.apiKey "curie-dev-key") (list "internalWorkerToken" "worker.internalWorkerToken" $root.Values.worker.internalWorkerToken "curie-dev-worker-token") (list "approvalChatAttesterSecret" "api.approvalChatAttesterSecret" $root.Values.api.approvalChatAttesterSecret "curie-dev-approval-chat-attester") (list "remediationAuthorityKey" "api.remediationAuthorityKey" $root.Values.api.remediationAuthorityKey "curie-dev-remediation-authority") -}}
 {{- $default := index $secret 3 -}}
 {{- $resolved := include "curie.managedSecret" (dict "root" $root "key" (index $secret 0) "value" (index $secret 2) "default" $default "hex" false "existingData" $.existingData) -}}
 {{- if eq $resolved $default -}}

@@ -15284,7 +15284,7 @@
         ]
       },
       "put": {
-        "description": "Bind, tighten or widen a protected hook's remediation policy.\n\nA new binding starts disarmed; a later write keeps the armed flag. Each\nwrite creates a generation recorded with the operator principal.",
+        "description": "Bind, tighten or widen a protected hook's remediation policy.\n\nA new binding starts disarmed; a later write keeps the armed flag. Each\nwrite creates a generation recorded with the operator principal. Needs the\nremediation authority in ``X-Curie-Remediation-Authority`` (ADR 0231), else\n``remediation_authority_required``; the operator principal is attribution.",
         "operationId": "put_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_put",
         "parameters": [
           {
@@ -15319,6 +15319,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Remediation-Authority",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Remediation-Authority"
             }
           },
           {
@@ -15415,7 +15431,7 @@
     },
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm": {
       "post": {
-        "description": "Arm the current policy as a new generation.",
+        "description": "Arm the current policy as a new generation.\n\nNeeds the remediation authority in ``X-Curie-Remediation-Authority``\n(ADR 0231), else ``remediation_authority_required``; the operator principal\nis attribution.",
         "operationId": "arm_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_arm_post",
         "parameters": [
           {
@@ -15450,6 +15466,22 @@
                 }
               ],
               "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Remediation-Authority",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Remediation-Authority"
             }
           },
           {

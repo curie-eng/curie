@@ -116,6 +116,7 @@ USERS_ROUTE = "sre-oncall"
 CHANNELS = [f"C0EXAMPLE{digit}" for digit in range(10)]
 OPERATOR = "U0EXAMPLE7"
 PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
+AUTHORITY_HEADER = "X-Curie-Remediation-Authority"
 
 TARGET = "example-api"
 FORWARD_ARGUMENTS: dict[str, Any] = {
@@ -319,6 +320,12 @@ def _admin(headers: dict[str, str]) -> dict[str, str]:
     return {**headers, **_operator()}
 
 
+def _authority() -> dict[str, str]:
+    """The ADR 0231 remediation authority a policy bind needs."""
+
+    return {AUTHORITY_HEADER: get_settings().remediation_authority_key}
+
+
 def _current_generation(agent_id: str) -> str:
     rows = sql_dicts(
         "SELECT generation FROM curie.remediation_policies WHERE agent_id = :a AND hook = :h",
@@ -337,7 +344,7 @@ def _put_policy(
             "operation_id": str(uuid.uuid4()),
             "policy": document,
         },
-        headers=_admin(headers),
+        headers={**_admin(headers), **_authority()},
     )
 
 

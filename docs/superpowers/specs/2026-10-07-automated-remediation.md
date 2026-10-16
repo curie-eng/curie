@@ -50,6 +50,9 @@ as decided text:
 * **Administrative principal.** Policy writes and breaker closes require an
   ADR 0106 operator principal in addition to the administrative credential, and
   that principal is recorded as the actor (AUTOMATED-REMEDIATION-3, -11, -14).
+  Binding and arming a policy additionally need the separate remediation
+  authority key, which the platform key cannot derive (ADR 0231, superseding
+  REMEDIATION-13); the principal is attribution, not that authority.
   The principal carries the `remediation.administer` scope, minted by
   `POST /approvals/principals/remediation-operator` or the CLI's
   `--mint-remediation-principal`, not the approval resolution scope
@@ -348,9 +351,16 @@ positive generation with `active` false.
 **AUTOMATED-REMEDIATION-3. Administration, and the source cannot write it.**
 Routes under `/agents/{agent_id}/hooks/{hook}/remediation-policy` (`GET`, `PUT`,
 `DELETE`, and `POST .../arm`, `POST .../disarm`, `POST .../breakers/{breaker_id}/close`)
-use the same dependency as the source policy routes,
-`require_api_key` (REMEDIATION-13: "the same trust model as ADR 0190 source
-policy"). Every write (`PUT`, `DELETE`, arm, disarm and breaker close) also
+use `require_api_key`, as the source policy routes do, for reads, `DELETE`,
+disarm and breaker close. `PUT` and `POST .../arm` are the exception: ADR 0231
+supersedes REMEDIATION-13 ("the same trust model as ADR 0190 source policy") for
+them, and they require the `X-Curie-Remediation-Authority` header to equal the
+independent `CURIE_REMEDIATION_AUTHORITY_KEY` (compared with
+`hmac.compare_digest`, checked before the body is validated), a secret mounted
+into the API Deployment only. A missing or wrong header, or a key unset in the
+API, is `403 remediation_authority_required` and creates no generation. Settings
+refuse a blank key, one equal to `API_KEY`, and in `ENVIRONMENT=prod` an unset
+key or the dev default. Every write (`PUT`, `DELETE`, arm, disarm and breaker close) also
 requires an ADR 0106 operator principal carrying the `remediation.administer`
 scope (signed by the platform key in the same token format as an approval
 operator principal, minted by `POST /approvals/principals/remediation-operator`
@@ -367,8 +377,12 @@ mirrored in a new `remediation-policy` verb group under `curie local` and
 `--json`, ADR-0021 exit codes and `{"error","fix"}` errors, following the CLI
 and API validation convention.
 
-Acceptance: a policy write with the platform key and a `remediation.administer`
-operator principal creates a generation naming that principal as `bound_by`; the
+Acceptance: a `PUT` or arm with the platform key, a `remediation.administer`
+operator principal and the remediation authority header creates a generation
+naming that principal as `bound_by`; the same request with the header missing or
+wrong, or the key unset in the API, is refused `403 remediation_authority_required`
+and creates no generation, and the principal does not stand in for the key
+(ADR 0231); the
 same write without a principal, or with an `approval.resolve` operator token, is
 refused `operator_principal_required` and creates nothing; the same
 write carrying only a valid hook source signature returns `401` and creates
