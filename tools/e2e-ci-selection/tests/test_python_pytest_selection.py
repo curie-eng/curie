@@ -481,11 +481,14 @@ def _run_pytest_step(
 
 @pytest.mark.parametrize("scope", ("full", "cli"))
 @pytest.mark.parametrize("deselect", ("", "examples/tests/test_sre_bot_observability_runtime.py"))
+@pytest.mark.parametrize("module", (
+    "tools/factory-e2e/tests/test_c4_initial_binding.py",
+    "tools/factory-e2e/tests/test_c4_cluster_up.py",
+))
 def test_ordinary_python_shards_exclude_the_owned_kind_registration_module(
-    tmp_path: Path, scope: str, deselect: str,
+    tmp_path: Path, scope: str, deselect: str, module: str,
 ) -> None:
     argv = _run_pytest_step(tmp_path, shard=1, deselect=deselect, scope=scope)
-    module = "tools/factory-e2e/tests/test_c4_initial_binding.py"
     assert f"--ignore={module}" in argv
     assert module not in argv
     assert argv[argv.index("--ci-shard") + 1] == f"1/{SHARD_COUNT}"

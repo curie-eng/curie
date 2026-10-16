@@ -98,6 +98,7 @@ tools/factory-e2e/tests/test_acceptance.py
 tools/factory-e2e/tests/test_bitbucket_dc_fixture_tool.py
 tools/factory-e2e/tests/test_bitbucket_dc_live.py
 tools/factory-e2e/tests/test_bitbucket_drivers.py
+tools/factory-e2e/tests/test_c4_cluster_up.py
 tools/factory-e2e/tests/test_c4_initial_binding.py
 tools/factory-e2e/tests/test_c4_tracker_scope.py
 tools/factory-e2e/tests/test_factory_e2e.py
