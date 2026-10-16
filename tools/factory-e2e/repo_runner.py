@@ -146,7 +146,8 @@ def _schema_failures(
         "type", "properties", "required", "additionalProperties", "propertyNames", "items",
         "additionalItems", "prefixItems", "minItems", "maxItems", "uniqueItems", "minLength",
         "maxLength", "pattern", "minimum", "maximum", "enum", "const", "minProperties",
-        "maxProperties", "patternProperties",
+        "maxProperties", "patternProperties", "not", "anyOf", "if", "then", "else",
+        "exclusiveMinimum",
     }
     unknown = set(schema) - supported
     if unknown:
@@ -163,10 +164,22 @@ def _schema_failures(
         "string": isinstance(value, str),
         "integer": type(value) is int,
         "boolean": type(value) is bool,
+        "null": value is None,
     }
     if kind is not None and not valid.get(kind, False):
         return [f"{path}: expected {kind}"]
     failures: list[str] = []
+    # Applicators the pool schema uses for its conditional daemon contract.
+    if "not" in schema and not _schema_failures(value, schema["not"], authority, path):
+        failures.append(f"{path}: value matches a forbidden canonical shape")
+    if "anyOf" in schema and all(
+        _schema_failures(value, rule, authority, path) for rule in schema["anyOf"]
+    ):
+        failures.append(f"{path}: value matches no canonical alternative")
+    if "if" in schema:
+        branch = "else" if _schema_failures(value, schema["if"], authority, path) else "then"
+        if branch in schema:
+            failures.extend(_schema_failures(value, schema[branch], authority, path))
     if "enum" in schema and value not in schema["enum"]:
         failures.append(f"{path}: value is outside the canonical enum")
     if "const" in schema and value != schema["const"]:
@@ -231,6 +244,8 @@ def _schema_failures(
             failures.append(f"{path}: below the canonical minimum")
         if "maximum" in schema and value > schema["maximum"]:
             failures.append(f"{path}: above the canonical maximum")
+        if "exclusiveMinimum" in schema and value <= schema["exclusiveMinimum"]:
+            failures.append(f"{path}: not above the canonical exclusive minimum")
     return failures
 
 

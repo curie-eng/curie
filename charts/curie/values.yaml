@@ -1310,6 +1310,13 @@ factory:
     # The daemon's mutual TLS port. The Rail 1 sandbox allow opens only this
     # port toward the daemon namespace.
     port: 2376
+    # Individual daemon Pod sizing, separate from namespace quota and limits.
+    resources:
+      requests: { cpu: "500m", memory: "1Gi", ephemeral-storage: "10Gi" }
+      limits: { cpu: "2", memory: "4Gi", ephemeral-storage: "20Gi" }
+    storageSizeLimit: "20Gi"
+    maxClaimLifetimeSeconds: 86400
+    pingTimeoutSeconds: 2
     # ResourceQuota spec.hard for the daemon namespace, the ceiling on every
     # concurrent run's daemon. Required when docker is enabled. Persistent
     # volumes, LoadBalancers and NodePorts stay at zero.

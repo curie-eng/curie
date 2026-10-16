@@ -1,5 +1,69 @@
 {
   "$defs": {
+    "DaemonResourceQuantities": {
+      "additionalProperties": false,
+      "description": "Required resource quantities for one request or limit envelope.",
+      "properties": {
+        "cpu": {
+          "$ref": "#/$defs/PositiveQuantity"
+        },
+        "ephemeral-storage": {
+          "$ref": "#/$defs/PositiveQuantity"
+        },
+        "memory": {
+          "$ref": "#/$defs/PositiveQuantity"
+        }
+      },
+      "required": [
+        "cpu",
+        "memory",
+        "ephemeral-storage"
+      ],
+      "title": "DaemonResourceQuantities",
+      "type": "object"
+    },
+    "DaemonResources": {
+      "additionalProperties": false,
+      "description": "The daemon's explicit request and limit envelopes.",
+      "properties": {
+        "limits": {
+          "$ref": "#/$defs/DaemonResourceQuantities"
+        },
+        "requests": {
+          "$ref": "#/$defs/DaemonResourceQuantities"
+        }
+      },
+      "required": [
+        "requests",
+        "limits"
+      ],
+      "title": "DaemonResources",
+      "type": "object"
+    },
+    "DaemonSelectorLabels": {
+      "additionalProperties": false,
+      "description": "The complete chart selector for a daemon.",
+      "properties": {
+        "app.kubernetes.io/component": {
+          "const": "docker-daemon",
+          "title": "App.Kubernetes.Io/Component",
+          "type": "string"
+        },
+        "app.kubernetes.io/instance": {
+          "$ref": "#/$defs/LabelValue"
+        },
+        "app.kubernetes.io/name": {
+          "$ref": "#/$defs/LabelValue"
+        }
+      },
+      "required": [
+        "app.kubernetes.io/name",
+        "app.kubernetes.io/instance",
+        "app.kubernetes.io/component"
+      ],
+      "title": "DaemonSelectorLabels",
+      "type": "object"
+    },
     "EgressPort": {
       "additionalProperties": false,
       "description": "One TCP destination port, matching the chart's existing egress shape.",
@@ -48,14 +112,55 @@
       "title": "EgressRule",
       "type": "object"
     },
+    "LabelValue": {
+      "maxLength": 63,
+      "not": {
+        "pattern": "\\s"
+      },
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?$",
+      "type": "string"
+    },
+    "PositiveQuantity": {
+      "maxLength": 128,
+      "not": {
+        "pattern": "\\s"
+      },
+      "pattern": "^\\+?(?:[0-9]*[1-9][0-9]*(?:\\.[0-9]*)?|[0-9]*\\.[0-9]*[1-9][0-9]*)(?:[eE][+-]?[0-9]{1,3}|[numkMGTPE]|[KMGTPE]i)?$",
+      "type": "string"
+    },
     "RepoRunnerPool": {
       "additionalProperties": false,
       "description": "An opaque pool with index, amd64 and arm64 image identities in order.",
+      "else": {
+        "not": {
+          "required": [
+            "daemon"
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "docker": {
+            "const": true
+          }
+        }
+      },
       "properties": {
         "base": {
           "pattern": "^sha256:[0-9a-f]{64}$",
           "title": "Base",
           "type": "string"
+        },
+        "daemon": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolDaemonConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "digests": {
           "maxItems": 3,
@@ -102,7 +207,77 @@
         "base",
         "docker"
       ],
+      "then": {
+        "properties": {
+          "daemon": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "daemon"
+        ]
+      },
       "title": "RepoRunnerPool",
+      "type": "object"
+    },
+    "ToolDaemonConfig": {
+      "additionalProperties": false,
+      "description": "Complete daemon configuration handed off by the chart, without defaults.",
+      "properties": {
+        "image": {
+          "not": {
+            "pattern": "\\s"
+          },
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/:\\-]*@sha256:[0-9a-f]{64}$",
+          "title": "Image",
+          "type": "string"
+        },
+        "maxClaimLifetimeSeconds": {
+          "exclusiveMinimum": 0,
+          "title": "Maxclaimlifetimeseconds",
+          "type": "integer"
+        },
+        "namespace": {
+          "maxLength": 63,
+          "not": {
+            "pattern": "\\s"
+          },
+          "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$",
+          "title": "Namespace",
+          "type": "string"
+        },
+        "pingTimeoutSeconds": {
+          "exclusiveMinimum": 0,
+          "title": "Pingtimeoutseconds",
+          "type": "integer"
+        },
+        "port": {
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Port",
+          "type": "integer"
+        },
+        "resources": {
+          "$ref": "#/$defs/DaemonResources"
+        },
+        "selectorLabels": {
+          "$ref": "#/$defs/DaemonSelectorLabels"
+        },
+        "storageSizeLimit": {
+          "$ref": "#/$defs/PositiveQuantity"
+        }
+      },
+      "required": [
+        "namespace",
+        "image",
+        "port",
+        "selectorLabels",
+        "resources",
+        "storageSizeLimit",
+        "maxClaimLifetimeSeconds",
+        "pingTimeoutSeconds"
+      ],
+      "title": "ToolDaemonConfig",
       "type": "object"
     }
   },

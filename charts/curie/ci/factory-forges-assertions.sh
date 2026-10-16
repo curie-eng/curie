@@ -16,6 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART="$(cd "$SCRIPT_DIR/.." && pwd)"
 GUARD="$CHART/files/legacy-factory-keys.yaml"
+DAEMON_VECTOR="$CHART/../../tests/vectors/daemon-config.json"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -116,6 +117,13 @@ for doc in docs:
                 fail("repository runner blocks must render CURIE_REPO_RUNNER_POOLS")
             if mode != "tools" and repo_pools:
                 fail("repositories without runner blocks must not render CURIE_REPO_RUNNER_POOLS")
+            if mode == "tools":
+                pools = json.loads(repo_pools[0]["value"])
+                expected_daemon = json.load(open(sys.argv[3]))["daemon"]
+                expected_daemon["namespace"] = "default-rel-curie-docker"
+                expected_daemon["selectorLabels"]["app.kubernetes.io/instance"] = "rel"
+                if pools["acme-corp/api"].get("daemon") != expected_daemon:
+                    fail("Docker repository runner must receive the complete daemon handoff")
         stale = [e["name"] for e in c.get("env", []) or [] if e["name"].startswith(OLD_ENV_PREFIX)]
         if stale:
             fail("%s/%s still renders %s" % (doc["metadata"]["name"], c["name"], stale))
@@ -226,7 +234,7 @@ for entry in (code_host, tracker):
     if projected.get(path) != ("curie-factory-app", "privateKey"):
         fail(f"{path} is not projected from curie-factory-app/privateKey: {projected}")
 print("  ok: factory block renders FACTORY_* env, CURIE_FORGES and a read-only credential mount")
-' "$1" "$GUARD"
+' "$1" "$GUARD" "$DAEMON_VECTOR"
 }
 
 refused() {

@@ -7,12 +7,20 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from curie_worker.repo_runner_pools import RepoRunnerPools, build_schema, render_schema
+from curie_worker.repo_runner_pools import (
+    RepoRunnerPools,
+    build_schema,
+    parse_repo_runner_pools,
+    render_schema,
+)
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as SchemaValidationError
 from pydantic import ValidationError
 
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "schema" / "repo-runner-pools.schema.json"
+DAEMON = json.loads(
+    (Path(__file__).resolve().parents[3] / "tests/vectors/daemon-config.json").read_text()
+)["daemon"]
 INDEX, AMD64, ARM64, BASE = ("sha256:" + c * 64 for c in "abcd")
 
 
@@ -42,10 +50,57 @@ def test_valid_repository_pool_loads(path: str, docker: bool) -> None:
             egress=[
                 {"cidr": "203.0.113.0/24", "ports": [{"protocol": "TCP", "port": 443}]},
             ],
+            **({"daemon": DAEMON} if docker else {}),
         )
     }
     assert RepoRunnerPools.model_validate(document).model_dump(mode="json") == document
     Draft202012Validator(build_schema()).validate(document)
+
+
+@pytest.mark.parametrize(
+    ("docker", "daemon", "valid"),
+    [
+        (True, {}, False),
+        (True, {"daemon": None}, False),
+        (True, {"daemon": DAEMON}, True),
+        (False, {}, True),
+        (False, {"daemon": None}, False),
+        (False, {"daemon": DAEMON}, False),
+    ],
+    ids=[
+        "enabled-missing",
+        "enabled-null",
+        "enabled-object",
+        "disabled",
+        "disabled-null",
+        "disabled-object",
+    ],
+)
+def test_model_and_schema_enforce_conditional_daemon_presence(
+    docker: bool, daemon: dict[str, Any], valid: bool
+) -> None:
+    document = {"acme-corp/api": _entry(docker=docker, **daemon)}
+    validator = Draft202012Validator(build_schema())
+    if valid:
+        assert RepoRunnerPools.model_validate(document).root["acme-corp/api"].docker is docker
+        assert parse_repo_runner_pools(json.dumps(document)).root["acme-corp/api"].docker is docker
+        validator.validate(document)
+    else:
+        with pytest.raises(ValidationError):
+            RepoRunnerPools.model_validate(document)
+        with pytest.raises(ValueError, match="CURIE_REPO_RUNNER_POOLS"):
+            parse_repo_runner_pools(json.dumps(document))
+        with pytest.raises(SchemaValidationError):
+            validator.validate(document)
+
+
+@pytest.mark.parametrize("docker", [None, "true", "false", 0, 1, [], {}])
+def test_daemon_presence_does_not_coerce_the_docker_gate(docker: Any) -> None:
+    document = {"acme-corp/api": _entry(docker=docker, daemon=DAEMON)}
+    with pytest.raises(ValidationError):
+        RepoRunnerPools.model_validate(document)
+    with pytest.raises(SchemaValidationError):
+        Draft202012Validator(build_schema()).validate(document)
 
 
 def test_empty_map_and_entry_without_egress_load() -> None:
