@@ -4782,7 +4782,7 @@ case_local_otel_runner_failure() {
     # model-credential-rejected is terminal and the kernel does not retry it.
     local failure_before="$WORKDIR/otel-before-failure.json"
     local restored_before="$WORKDIR/otel-before-restored.json"
-    local failure_out failure_code=0 restored_out
+    local failure_out failure_code=0 restored_out restored_marker="curie-restored-healthy-$$-$RANDOM"
     wait_for_local_otel_metric_settle
     local_otel_write_snapshot "$failure_before"
     inject_local_runner_failure
@@ -4816,7 +4816,7 @@ assert json.load(sys.stdin)["requests"] >= 1, "actual SDK never reached the mode
     restore_local_runner_health
 
     local_otel_write_snapshot "$restored_before"
-    restored_out="$("$BIN" --json local message --channel C0LOCALDEV "restored healthy control" || true)"
+    restored_out="$("$BIN" --json local message --channel C0LOCALDEV "Reply with exactly: $restored_marker. Do not call tools or investigate anything." || true)"
     printf '%s\n' "$restored_out"
     assert_finalized_reply "local" "$restored_out"
     assert_local_otel_healthy_turn "$restored_before"
