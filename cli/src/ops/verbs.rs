@@ -1014,7 +1014,7 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                     url.render(ui);
                 }
                 for line in &s.credentials {
-                    ui.payload(&line.summary());
+                    ui.payload(&line.status_line());
                 }
                 ui.payload(&format!(
                     "upgrade {} · phase {} · known-good {}",
@@ -1096,6 +1096,113 @@ fn unresolved_context_error(
             "rerun with an explicit context: `curie cluster --context <name> status`; available contexts: {names}"
         )),
     )
+}
+
+/// Port-forward readiness budget for the credential health read; matches
+/// `message::start_port_forward`'s own readiness deadline.
+const HEALTH_PORT_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Request budget for `GET /forges/credentials/health`.
+const HEALTH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Overall budget for the whole credential health read: key discovery
+/// (kubectl and helm), the port-forward and the request.
+const HEALTH_READ_OVERALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// The overall budget. Debug builds only: `CURIE_TEST_HEALTH_READ_DEADLINE_MS`
+/// shortens it (never lengthens it) so a test can prove a hung discovery.
+fn health_read_overall_timeout() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(raw) = std::env::var("CURIE_TEST_HEALTH_READ_DEADLINE_MS") {
+        if let Ok(milliseconds) = raw.parse::<u64>() {
+            if (1..=HEALTH_READ_OVERALL_TIMEOUT.as_millis() as u64).contains(&milliseconds) {
+                return std::time::Duration::from_millis(milliseconds);
+            }
+        }
+    }
+    HEALTH_READ_OVERALL_TIMEOUT
+}
+
+/// Why the credential health report could not be read. Only the class is ever
+/// shown: no error text, URL with a key, or response body reaches output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HealthReadFailure {
+    ApiKey,
+    PortForward,
+    Timeout,
+    Request,
+}
+
+impl HealthReadFailure {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            HealthReadFailure::ApiKey => "the release API key could not be discovered",
+            HealthReadFailure::PortForward => "the API port-forward did not open",
+            HealthReadFailure::Timeout => {
+                "the API did not answer GET /forges/credentials/health in time"
+            }
+            HealthReadFailure::Request => "GET /forges/credentials/health failed",
+        }
+    }
+}
+
+/// Read the API's forge credential health report over a short-lived
+/// port-forward (#4630). The discovered key goes only into the `X-API-Key`
+/// header; a failure is reported by class alone.
+async fn read_forge_credential_health(
+    opts: &CommonOpts,
+    fullname: &ReleaseFullname,
+) -> std::result::Result<crate::api::ForgeCredentialHealthReport, HealthReadFailure> {
+    // One deadline over every step. Dropping the future on timeout kills the
+    // kubectl/helm children (`kill_on_drop` in run_capture and the port-forward).
+    tokio::time::timeout(
+        health_read_overall_timeout(),
+        read_forge_credential_health_steps(opts, fullname),
+    )
+    .await
+    .map_err(|_| HealthReadFailure::Timeout)?
+}
+
+async fn read_forge_credential_health_steps(
+    opts: &CommonOpts,
+    fullname: &ReleaseFullname,
+) -> std::result::Result<crate::api::ForgeCredentialHealthReport, HealthReadFailure> {
+    let api_key = discover_api_key(&opts.namespace, &opts.release)
+        .await
+        .map_err(|_| HealthReadFailure::ApiKey)?;
+    let forward = crate::message::port_forward_command(
+        &opts.namespace,
+        fullname,
+        "api",
+        0,
+        crate::message::API_REMOTE_PORT,
+    );
+    let (_child, port) = tokio::time::timeout(
+        HEALTH_PORT_FORWARD_TIMEOUT + std::time::Duration::from_secs(1),
+        crate::message::start_port_forward(&forward, 0, "credential health api"),
+    )
+    .await
+    .map_err(|_| HealthReadFailure::PortForward)?
+    .map_err(|_| HealthReadFailure::PortForward)?;
+    let client =
+        crate::api::ApiClient::with_resolved_key(&format!("http://127.0.0.1:{port}"), &api_key)
+            .map_err(|_| HealthReadFailure::Request)?;
+    tokio::time::timeout(
+        HEALTH_REQUEST_TIMEOUT,
+        client.forge_credential_health(HEALTH_REQUEST_TIMEOUT),
+    )
+    .await
+    .map_err(|_| HealthReadFailure::Timeout)?
+    .map_err(|error| {
+        if error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+            .any(reqwest::Error::is_timeout)
+        {
+            HealthReadFailure::Timeout
+        } else {
+            HealthReadFailure::Request
+        }
+    })
 }
 
 pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterStatusOutput> {
@@ -1202,7 +1309,13 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
         unhealthy.push("could not list release pods".to_string());
     }
 
-    let (ui_url, langfuse_url, worker_claims, delivery) = tokio::join!(
+    let mut credentials = match &computed {
+        Ok(Some(values)) => crate::forge_expiry::report(values, time::OffsetDateTime::now_utc()),
+        _ => Vec::new(),
+    };
+    let read_health = !credentials.is_empty() && helm_ok;
+
+    let (ui_url, langfuse_url, worker_claims, delivery, health) = tokio::join!(
         resolve_service_url(&opts, &fullname, "ui", "UI", &host, true),
         resolve_service_url(&opts, &fullname, "langfuse-web", "Langfuse", &host, false),
         worker_claim_probe.observe(),
@@ -1218,6 +1331,13 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
                         .await
                 }
                 Err(_) => None,
+            }
+        },
+        async {
+            if read_health {
+                Some(read_forge_credential_health(&opts, &fullname).await)
+            } else {
+                None
             }
         },
     );
@@ -1254,14 +1374,21 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
         None => crate::completion_outbox::Report::unknown(),
     };
 
-    let credentials = match &computed {
-        Ok(Some(values)) => crate::forge_expiry::report(values, time::OffsetDateTime::now_utc()),
-        _ => Vec::new(),
-    };
     for line in &credentials {
         if let Some(warning) = &line.warning {
             warnings.push(format!("{}: {warning}", line.summary()));
         }
+    }
+    if let Some(health) = health {
+        let (entries, read_failure) = match &health {
+            Ok(report) => (Some(report.entries.as_slice()), None),
+            Err(failure) => (None, Some(failure.describe())),
+        };
+        crate::forge_expiry::merge_authentication(&mut credentials, entries);
+        let (rejected, unknown) =
+            crate::forge_expiry::authentication_diagnoses(&credentials, read_failure);
+        unhealthy.extend(rejected);
+        warnings.extend(unknown);
     }
 
     if upgrade.known_good_version.is_none() && helm_ok {

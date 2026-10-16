@@ -2069,6 +2069,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/forges/credentials/health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Forge Credential Health */
+        get: operations["get_forge_credential_health_forges_credentials_health_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/git-flow/routing-check": {
         parameters: {
             query?: never;
@@ -5800,6 +5817,48 @@ export interface components {
             outcome: "completed" | "failed";
             /** Runtime Epoch */
             runtime_epoch: number;
+        };
+        /**
+         * ForgeCredentialHealth
+         * @description One configured entry's credential, as its forge answered a read now.
+         */
+        ForgeCredentialHealth: {
+            /**
+             * Authentication
+             * @enum {string}
+             */
+            authentication: "accepted" | "rejected" | "unknown";
+            /** Credential Type */
+            credential_type: string;
+            /** Kind */
+            kind: string;
+            /** Name */
+            name: string;
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /** Reason */
+            reason: string | null;
+            /**
+             * Section
+             * @enum {string}
+             */
+            section: "code_host" | "tracker";
+        };
+        /**
+         * ForgeCredentialHealthReport
+         * @description ``GET /forges/credentials/health``: every configured entry's probe.
+         */
+        ForgeCredentialHealthReport: {
+            /** Entries */
+            entries: components["schemas"]["ForgeCredentialHealth"][];
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
         };
         /**
          * GateKind
@@ -13434,6 +13493,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["EvalTriggerResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_forge_credential_health_forges_credentials_health_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ForgeCredentialHealthReport"];
                 };
             };
             /** @description Validation Error */

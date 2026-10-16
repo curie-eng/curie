@@ -34,6 +34,8 @@ it can browse; there is no separate project allowlist. Save its token in a
 local file outside the repository using your editor. Keep the token out of
 command arguments, commits and chat. Quickstart stores it in the API's
 Kubernetes Secret.
+Curie never mints or rotates this token; to replace it, follow
+[Replace a static token](dark-factory-quickstart.md#replace-a-static-token).
 
 Choose a separate human who can authorize trial work. Get that person's
 immutable Jira `accountId` from your Jira administrator; an email address is

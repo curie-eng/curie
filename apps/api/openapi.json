@@ -5705,6 +5705,90 @@
         "title": "FinishBody",
         "type": "object"
       },
+      "ForgeCredentialHealth": {
+        "description": "One configured entry's credential, as its forge answered a read now.",
+        "properties": {
+          "authentication": {
+            "enum": [
+              "accepted",
+              "rejected",
+              "unknown"
+            ],
+            "title": "Authentication",
+            "type": "string"
+          },
+          "credential_type": {
+            "title": "Credential Type",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "section": {
+            "enum": [
+              "code_host",
+              "tracker"
+            ],
+            "title": "Section",
+            "type": "string"
+          }
+        },
+        "required": [
+          "section",
+          "name",
+          "kind",
+          "credential_type",
+          "authentication",
+          "reason",
+          "observed_at"
+        ],
+        "title": "ForgeCredentialHealth",
+        "type": "object"
+      },
+      "ForgeCredentialHealthReport": {
+        "description": "``GET /forges/credentials/health``: every configured entry's probe.",
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/ForgeCredentialHealth"
+            },
+            "title": "Entries",
+            "type": "array"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "observed_at",
+          "entries"
+        ],
+        "title": "ForgeCredentialHealthReport",
+        "type": "object"
+      },
       "GateKind": {
         "description": "Which gate raised an approval: a permission gate or a policy gate.\n\nA ``StrEnum`` rather than a ``Literal`` for two reasons. It is what the Rust\ngenerator can express (a multi-valued ``Literal`` raises; the ``Enum`` branch\nis the sanctioned path, exactly as ``SessionStatus`` uses). And the field is\nauthority-bearing per #544/ADR-0046, so the value domain is a named, exported\npart of the contract rather than an inline annotation.",
         "enum": [
@@ -21663,6 +21747,55 @@
         "summary": "Trigger Eval",
         "tags": [
           "evals"
+        ]
+      }
+    },
+    "/forges/credentials/health": {
+      "get": {
+        "operationId": "get_forge_credential_health_forges_credentials_health_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForgeCredentialHealthReport"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Forge Credential Health",
+        "tags": [
+          "forges"
         ]
       }
     },

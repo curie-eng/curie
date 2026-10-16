@@ -30,7 +30,9 @@ factory token needs `api` and `write_repository` scopes and a user with the
 Developer role or higher on the project. On gitlab.com Free, use a dedicated
 bot user's personal access token. A self-managed server can also use a service
 account, project access token or group access token. Record its expiry and
-plan to replace it before expiration; Curie does not rotate tokens.
+plan to replace it before expiration. Curie never mints or rotates static
+tokens; replace it as described in
+[Replace a static token](dark-factory-quickstart.md#replace-a-static-token).
 
 Save the token in a local file outside the repository using your editor. Do not
 put it in a command, commit or chat. Quickstart reads the file into a Kubernetes

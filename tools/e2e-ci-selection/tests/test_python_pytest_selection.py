@@ -489,12 +489,15 @@ def _run_pytest_step(
 
 @pytest.mark.parametrize("scope", ("full", "cli"))
 @pytest.mark.parametrize("deselect", ("", "examples/tests/test_sre_bot_observability_runtime.py"))
-def test_ordinary_python_shards_exclude_the_owned_kind_registration_module(
-    tmp_path: Path, scope: str, deselect: str,
+def test_ordinary_python_shards_exclude_the_owned_kind_modules(
+    tmp_path: Path,
+    scope: str,
+    deselect: str,
 ) -> None:
     argv = _run_pytest_step(tmp_path, shard=1, deselect=deselect, scope=scope)
     for module in (
         "tools/factory-e2e/tests/test_c4_initial_binding.py",
+        "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
         "tools/factory-e2e/tests/test_c4_held_cancellation.py",
     ):
         assert f"--ignore={module}" in argv
@@ -586,8 +589,7 @@ def _all_shards(
     selected: str, outcome: str, deselect: str = "", scope: str = "full"
 ) -> dict[int, tuple[str, str, str, str, str]]:
     return {
-        shard: (selected, outcome, outcome, deselect, scope)
-        for shard in range(1, SHARD_COUNT + 1)
+        shard: (selected, outcome, outcome, deselect, scope) for shard in range(1, SHARD_COUNT + 1)
     }
 
 
@@ -854,9 +856,7 @@ def test_decision_steps_select_everything_for_every_non_pull_request_event(
 
 
 @pytest.mark.parametrize("job_id", ["python", "python-pytest"])
-def test_decision_steps_diff_against_the_base_on_pull_request(
-    tmp_path: Path, job_id: str
-) -> None:
+def test_decision_steps_diff_against_the_base_on_pull_request(tmp_path: Path, job_id: str) -> None:
     calls = _run_decision_step(tmp_path, job_id, "pull_request")
     uv_calls = [call for call in calls if call.startswith("uv ")]
     assert len(uv_calls) == 1, calls
@@ -865,9 +865,7 @@ def test_decision_steps_diff_against_the_base_on_pull_request(
 
 
 def _rust_select_step() -> dict[str, Any]:
-    return next(
-        step for step in _python_job("rust-select")["steps"] if step.get("id") == "select"
-    )
+    return next(step for step in _python_job("rust-select")["steps"] if step.get("id") == "select")
 
 
 def test_rust_select_waits_for_the_version_only_selection() -> None:

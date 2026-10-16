@@ -48,6 +48,7 @@ from curie_api.forges.config import (
     StaticTokenCredentialConfig,
     TrackerConfig,
 )
+from curie_api.forges.credential_providers import TokenSnapshot
 from curie_api.forges.errors import ForgeError, Unavailable
 from curie_api.forges.gitlab.transport import GitLabTransport
 from curie_api.forges.jira_cloud.transport import JiraTransport
@@ -595,7 +596,7 @@ def test_a_standalone_static_token_strips_surrounding_ascii_whitespace(
     sentinel: str, raw: str
 ) -> None:
     credential = StaticTokenCredentialConfig.model_validate({"token": raw.format(s=sentinel)})
-    assert credential.token.get_secret_value() == f"tok-{sentinel}"
+    assert credential.current_token() == f"tok-{sentinel}"
 
 
 # C. Liveness -----------------------------------------------------------------
@@ -621,6 +622,13 @@ async def test_an_opaque_token_with_punctuation_reaches_the_server_unchanged(
 # D. Transport failures carry no httpx error ----------------------------------
 
 
+def _snapshot(token: str) -> TokenSnapshot:
+    """``token`` exactly as given, unnormalized, so the transport's own header
+    guard is what refuses an unsafe value."""
+
+    return TokenSnapshot(StaticTokenCredentialConfig.model_construct(token=SecretStr(token)))
+
+
 async def _gitlab(client: httpx.AsyncClient, origin: str, token: str) -> None:
     async def source() -> str:
         return token
@@ -635,7 +643,7 @@ async def _jira(client: httpx.AsyncClient, origin: str, token: str) -> None:
         client,
         api_url=origin,
         username=JIRA_USER,
-        token=SecretStr(token),
+        token=_snapshot(token),
         entry=NAMES["jira_cloud"],
     )
     await transport.get("/myself", what="myself")
@@ -643,14 +651,14 @@ async def _jira(client: httpx.AsyncClient, origin: str, token: str) -> None:
 
 async def _cloud(client: httpx.AsyncClient, origin: str, token: str) -> None:
     await CloudTransport(
-        client, api_url=origin, token=token, entry=NAMES["bitbucket_cloud"]
+        client, api_url=origin, token=_snapshot(token), entry=NAMES["bitbucket_cloud"]
     ).request("GET", f"{origin}/user", what="user")
 
 
 async def _dc(client: httpx.AsyncClient, origin: str, token: str) -> None:
-    await DcTransport(client, api_url=origin, token=token, entry=NAMES["bitbucket_dc"]).json(
-        "GET", "/application-properties", what="version"
-    )
+    await DcTransport(
+        client, api_url=origin, token=_snapshot(token), entry=NAMES["bitbucket_dc"]
+    ).json("GET", "/application-properties", what="version")
 
 
 # (call, reason, path appended to the origin that the log must name)

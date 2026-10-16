@@ -38,13 +38,11 @@ class BitbucketDcConnection:
             raise ValueError("bitbucket_dc uses an access token; remove username")
         self.config = config
         self._ca_bundle = ca_bundle
-        self._token = credential.token
+        self._credential = credential
         self._provider = StaticTokenProvider(
-            credential.token.get_secret_value(),
+            credential,
             origin=f"{config.api_url.rstrip('/')}/scm",
             header=CredentialHeader.AUTHORIZATION_BEARER,
-            expires_at=credential.expires_at,
-            never_expires=credential.never_expires,
         )
 
     def __repr__(self) -> str:
@@ -77,7 +75,10 @@ class BitbucketDcConnection:
             entry=self.config.name,
             api_url=self.config.api_url,
             host=self.config.host,
-            token=self._token.get_secret_value(),
+            # A fresh snapshot per adapter: one operation's requests and git
+            # credential carry one token, and the next operation reads the
+            # current file (#4630).
+            token=self._provider.snapshot(),
             credentials=self._provider,
         )
 

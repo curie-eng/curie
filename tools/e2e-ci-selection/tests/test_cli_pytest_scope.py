@@ -31,8 +31,9 @@ PYTEST_TESTS = _load_test_module("test_python_pytest_selection")
 REPO_ROOT = SELECTION_TESTS.REPO_ROOT
 GENERATOR_PATH = "tools/e2e-ci-selection/cli_pytest_files.py"
 LIST_PATH = "tools/e2e-ci-selection/cli_pytest_files.txt"
-KIND_RUNTIME_MODULES = (
+KIND_MODULES = (
     "tools/factory-e2e/tests/test_c4_initial_binding.py",
+    "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
     "tools/factory-e2e/tests/test_c4_held_cancellation.py",
     SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
 )
@@ -205,55 +206,88 @@ def test_pattern_selects_test_file(tmp_path: Path, contents: str) -> None:
     ("helper", "consumer", "contents", "extra"),
     [
         pytest.param(
-            "tests/conftest.py", "tests/nested/test_consumer.py", "pass\n", {},
+            "tests/conftest.py",
+            "tests/nested/test_consumer.py",
+            "pass\n",
+            {},
             id="ancestor-conftest",
         ),
         pytest.param(
-            "tests/nested/conftest.py", "tests/nested/test_consumer.py", "pass\n", {},
+            "tests/nested/conftest.py",
+            "tests/nested/test_consumer.py",
+            "pass\n",
+            {},
             id="same-directory-conftest",
         ),
         pytest.param(
-            "scripts/nested/check.sh", "tests/test_consumer.py",
-            "# scripts/nested/check.sh\n", {"unscanned/check.sh": ""},
+            "scripts/nested/check.sh",
+            "tests/test_consumer.py",
+            "# scripts/nested/check.sh\n",
+            {"unscanned/check.sh": ""},
             id="repository-relative-path",
         ),
         pytest.param(
-            "scripts/nested/check.sh", "tests/test_consumer.py",
-            "# nested/check.sh\n", {"unscanned/check.sh": ""},
+            "scripts/nested/check.sh",
+            "tests/test_consumer.py",
+            "# nested/check.sh\n",
+            {"unscanned/check.sh": ""},
             id="last-two-segments",
         ),
         pytest.param(
-            "scripts/nested/unique_check.sh", "tests/test_consumer.py",
-            "# unique_check.sh\n", {}, id="unique-basename",
+            "scripts/nested/unique_check.sh",
+            "tests/test_consumer.py",
+            "# unique_check.sh\n",
+            {},
+            id="unique-basename",
         ),
         pytest.param(
-            "scripts/nested/unique_driver.py", "tests/test_consumer.py",
-            "import unique_driver\n", {}, id="module-import",
+            "scripts/nested/unique_driver.py",
+            "tests/test_consumer.py",
+            "import unique_driver\n",
+            {},
+            id="module-import",
         ),
         pytest.param(
-            "scripts/nested/unique_driver.py", "tests/test_consumer.py",
-            "from unique_driver import run\n", {}, id="module-from-import",
+            "scripts/nested/unique_driver.py",
+            "tests/test_consumer.py",
+            "from unique_driver import run\n",
+            {},
+            id="module-from-import",
         ),
         pytest.param(
-            "scripts/nested/unique_driver.py", "tests/test_consumer.py",
-            "from package.unique_driver import run\n", {}, id="qualified-from-import",
+            "scripts/nested/unique_driver.py",
+            "tests/test_consumer.py",
+            "from package.unique_driver import run\n",
+            {},
+            id="qualified-from-import",
         ),
         pytest.param(
-            "scripts/nested/unique_driver.py", "tests/test_consumer.py",
-            "from ...unique_driver import run\n", {}, id="relative-from-import",
+            "scripts/nested/unique_driver.py",
+            "tests/test_consumer.py",
+            "from ...unique_driver import run\n",
+            {},
+            id="relative-from-import",
         ),
         pytest.param(
-            "packages/test-support/src/acme_helpers/__init__.py", "tests/test_consumer.py",
-            "import acme_helpers\n", {"unscanned/__init__.py": ""}, id="package-import",
+            "packages/test-support/src/acme_helpers/__init__.py",
+            "tests/test_consumer.py",
+            "import acme_helpers\n",
+            {"unscanned/__init__.py": ""},
+            id="package-import",
         ),
         pytest.param(
-            "packages/test-support/src/acme_helpers/__init__.py", "tests/test_consumer.py",
-            "from package.acme_helpers import run\n", {"unscanned/__init__.py": ""},
+            "packages/test-support/src/acme_helpers/__init__.py",
+            "tests/test_consumer.py",
+            "from package.acme_helpers import run\n",
+            {"unscanned/__init__.py": ""},
             id="package-from-import",
         ),
         pytest.param(
-            "tools/sample/check.py", "tools/sample/tests/test_consumer.py",
-            "pass\n", {}, id="tools-directory-suite",
+            "tools/sample/check.py",
+            "tools/sample/tests/test_consumer.py",
+            "pass\n",
+            {},
+            id="tools-directory-suite",
         ),
     ],
 )
@@ -340,9 +374,7 @@ def test_unrelated_text_is_not_selected(tmp_path: Path, contents: str) -> None:
 
 @pytest.mark.parametrize("duplicate", ["unscanned/check.py", "cli/src/check.py"])
 @pytest.mark.parametrize("reference", ["# check.py\n", "import check\n", "from check import run\n"])
-def test_ambiguous_basename_is_not_linked(
-    tmp_path: Path, duplicate: str, reference: str
-) -> None:
+def test_ambiguous_basename_is_not_linked(tmp_path: Path, duplicate: str, reference: str) -> None:
     root = _generator_repository(
         tmp_path,
         {
@@ -468,7 +500,7 @@ def test_generator_fails_visibly_on_required_input_errors(tmp_path: Path, failur
     elif failure == "bad-testpaths":
         _write(root, "pyproject.toml", '[tool.pytest.ini_options]\ntestpaths = "tests"\n')
     elif failure == "bad-testpath-entry":
-        _write(root, "pyproject.toml", '[tool.pytest.ini_options]\ntestpaths = [true]\n')
+        _write(root, "pyproject.toml", "[tool.pytest.ini_options]\ntestpaths = [true]\n")
     elif failure in {"missing-tracked-file", "unreadable-tracked-file"}:
         (root / "tests/test_control.py").unlink()
         if failure == "unreadable-tracked-file":
@@ -564,7 +596,7 @@ def test_revision_scope_uses_all_changed_paths_and_nonempty_diff(
     assert empty["pytest"] == "true"
     assert empty["pytest_scope"] == "full"
     assert empty["pytest_deselect"] == ""
-    _write(root, "cli/src/ops/up.rs", "fn main() { println!(\"changed\"); }\n")
+    _write(root, "cli/src/ops/up.rs", 'fn main() { println!("changed"); }\n')
     _git(root, "commit", "-qam", "Change CLI fixture")
     head = _git(root, "rev-parse", "HEAD")
     cli = _selection(tmp_path, base=base, head=head, cwd=root, omit_kind=omit_kind)
@@ -599,9 +631,12 @@ def _run_fixture_selector(
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
-            sys.executable, str(root / SELECTOR_PATH),
-            "--registry", str(registry or root / ".github/e2e-selection.yaml"),
-            "--path", "cli/src/main.rs",
+            sys.executable,
+            str(root / SELECTOR_PATH),
+            "--registry",
+            str(registry or root / ".github/e2e-selection.yaml"),
+            "--path",
+            "cli/src/main.rs",
         ],
         cwd=cwd or root,
         env={**os.environ, "GITHUB_OUTPUT": str(root / "github-output")},
@@ -649,8 +684,18 @@ def test_selector_rejects_invalid_scope_schema(tmp_path: Path, scopes: object) -
 @pytest.mark.parametrize(
     "value",
     [
-        "cli", None, True, {}, [True], [7], [None], [""], ["/cli"], ["cli/"],
-        ["../cli"], ["cli/../tests"],
+        "cli",
+        None,
+        True,
+        {},
+        [True],
+        [7],
+        [None],
+        [""],
+        ["/cli"],
+        ["cli/"],
+        ["../cli"],
+        ["cli/../tests"],
     ],
 )
 def test_selector_rejects_invalid_scope_prefixes(tmp_path: Path, key: str, value: object) -> None:
@@ -667,7 +712,15 @@ def test_selector_rejects_invalid_scope_prefixes(tmp_path: Path, key: str, value
 @pytest.mark.parametrize(
     "value",
     [
-        None, True, 7, [], {}, "", "/scope.txt", "scope.txt/", "../scope.txt",
+        None,
+        True,
+        7,
+        [],
+        {},
+        "",
+        "/scope.txt",
+        "scope.txt/",
+        "../scope.txt",
         "tools/../scope.txt",
     ],
 )
@@ -740,9 +793,21 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
     tmp_path: Path, scope: str, shard: int, deselect: str
 ) -> None:
     expected = [
-        "run", "pytest", "-q", "-n", "4", "--dist", "loadgroup",
-        "--ci-shard", f"{shard}/3", "--reruns", "1", "-rsR", "--durations=25",
+        "run",
+        "pytest",
+        "-q",
+        "-n",
+        "4",
+        "--dist",
+        "loadgroup",
+        "--ci-shard",
+        f"{shard}/3",
+        "--reruns",
+        "1",
+        "-rsR",
+        "--durations=25",
         "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
+        "--ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py",
         "--ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py",
         "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
     ]
@@ -752,11 +817,7 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
     if scope == "cli":
         files = (REPO_ROOT / LIST_PATH).read_text().splitlines()
         assert files
-        expected.extend(
-            path
-            for path in files
-            if path not in KIND_RUNTIME_MODULES
-        )
+        expected.extend(path for path in files if path not in KIND_MODULES)
     assert (
         PYTEST_TESTS._run_pytest_step(tmp_path, shard=shard, deselect=deselect, scope=scope)
         == expected
@@ -797,9 +858,21 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
     recorded = json.loads(log.read_text())
     assert recorded["scope"] is None, "PYTEST_SCOPE leaked into the pytest child environment"
     expected = [
-        "run", "pytest", "-q", "-n", "4", "--dist", "loadgroup",
-        "--ci-shard", "2/3", "--reruns", "1", "-rsR", "--durations=25",
+        "run",
+        "pytest",
+        "-q",
+        "-n",
+        "4",
+        "--dist",
+        "loadgroup",
+        "--ci-shard",
+        "2/3",
+        "--reruns",
+        "1",
+        "-rsR",
+        "--durations=25",
         "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
+        "--ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py",
         "--ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py",
         "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
         "--deselect", deselect,
@@ -808,7 +881,7 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
         expected.extend(
             path
             for path in (tmp_path / LIST_PATH).read_text().splitlines()
-            if path not in KIND_RUNTIME_MODULES
+            if path not in KIND_MODULES
         )
     assert recorded["argv"] == expected
 
@@ -846,8 +919,7 @@ def test_pytest_aggregator_rejects_changes_scope_disagreement(
         scope=scope,
         changes_scope=other,
         shards=(
-            PYTEST_TESTS._all_shards("true", "success", scope=scope)
-            if selected == "true" else None
+            PYTEST_TESTS._all_shards("true", "success", scope=scope) if selected == "true" else None
         ),
         shards_result="success" if selected == "true" else "skipped",
         results_dir=results_dir,

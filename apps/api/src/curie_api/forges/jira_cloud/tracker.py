@@ -395,6 +395,19 @@ class JiraTracker:
             mention=self._mention,
         )
 
+    async def verify_credential(self) -> None:
+        """Read-only credential check for health reporting (#4630): the identity
+        read of decision 3 with an empty cache, so it always asks the site and
+        the token now, never an identity verified earlier. Writes nothing."""
+
+        await verify_identity(
+            self._transport,
+            IdentityCache(),
+            site_origin=self._site_origin,
+            scope_id=self._scope_id,
+            mention=self._mention,
+        )
+
     # Tracker port -------------------------------------------------------
 
     def _jql(self, start: Cursor | None, zone: ZoneInfo) -> str:

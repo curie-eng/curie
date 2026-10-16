@@ -48,6 +48,10 @@ INITIAL_BINDING_SELECTOR = (
     "tools/factory-e2e/tests/test_c4_initial_binding.py::"
     "test_second_factory_agent_uses_initial_tracker_binding"
 )
+STATIC_TOKEN_ROTATION_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_static_token_rotation.py::"
+    "test_secret_replacement_reports_rejection_and_recovers"
+)
 HELD_CANCELLATION_SELECTOR = (
     "tools/factory-e2e/tests/test_c4_held_cancellation.py::"
     "test_held_run_cancels_after_worker_replacement"
@@ -59,6 +63,12 @@ FACTORY_UPGRADE_SELECTOR = (
 FACTORY_UPGRADE_NEAR_MISS_SELECTOR = (
     "tools/factory-e2e/tests/test_c4_upgrade_migration_extra.py::"
     "test_v0125_factory_upgrade_uses_supported_flow"
+)
+KIND_MODULES = (
+    "tools/factory-e2e/tests/test_c4_initial_binding.py",
+    "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
+    "tools/factory-e2e/tests/test_c4_upgrade_migration.py",
+    "tools/factory-e2e/tests/test_c4_held_cancellation.py",
 )
 LOCAL_SELECTOR = "cli/tests/local/test_deploy.py::test_deploy"
 LOCAL_LIVE_SELECTOR = "cli/tests/local/test_live.py::test_live"
@@ -1143,7 +1153,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         lambda step: "uv run alembic upgrade head" in _string(step, "run"),
         "shared database migration",
     )
-    # The two dedicated kind runtime modules run through their own CI callers.
+    # The dedicated kind runtime modules run through their own CI callers.
     pytest_index = _single_step_index(
         steps,
         lambda step: step.get("id") == "pytest",
@@ -1163,11 +1173,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         names = [name for name, value in pytest_env.items() if value == expression]
         assert len(names) == 1, expression
         bindings[meaning] = names[0]
-    runtime_exclusions = {
-        "tools/factory-e2e/tests/test_c4_initial_binding.py",
-        "tools/factory-e2e/tests/test_c4_upgrade_migration.py",
-        "tools/factory-e2e/tests/test_c4_held_cancellation.py",
-    }
+    runtime_exclusions = set(KIND_MODULES)
 
     def assert_full_suite(command: list[str], shard: int, deselect: str) -> None:
         assert command[:3] == ["run", "pytest", "-q"]
@@ -1192,7 +1198,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
                 excluded.append(argument.split("=", 1)[1])
             else:
                 reporting.append(argument)
-        assert len(excluded) == 3 and set(excluded) == runtime_exclusions, (
+        assert len(excluded) == len(runtime_exclusions) and set(excluded) == runtime_exclusions, (
             f"the Python suite must exclude exactly the kind runtime modules, got {excluded!r}"
         )
         report_chars = set("fEsxXpPaAR")
@@ -1772,6 +1778,7 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
     ("body", "needed", "stack", "kind", "factory_upgrade"),
     [
         (f"Fix pin: {INITIAL_BINDING_SELECTOR}", True, False, True, False),
+        (f"Fix pin: {STATIC_TOKEN_ROTATION_SELECTOR}", True, False, True, False),
         (f"Fix pin: {HELD_CANCELLATION_SELECTOR}", True, False, True, False),
         (
             "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding.py::"
@@ -1798,6 +1805,14 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
         ("Fix pin: cli/tests/verify_fix_pin.rs::ci_gate_pins", True, True, False, False),
         (
             "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding_extra.py::test_example",
+            True,
+            True,
+            False,
+            False,
+        ),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_static_token_rotation_extra.py::"
+            "test_example",
             True,
             True,
             False,

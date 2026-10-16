@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Annotated, Literal, Self
 from urllib.parse import urlsplit
 
@@ -38,7 +39,7 @@ from pydantic_core import InitErrorDetails, PydanticCustomError
 from curie_api.branches import valid_base_branch
 from curie_api.forges import types
 from curie_api.forges.capabilities import NATIVE_FORGES, mandatory_capabilities
-from curie_api.forges.errors import InvalidPairing
+from curie_api.forges.errors import CredentialUnreadable, InvalidPairing
 from curie_api.forges.paths import valid_repository_path
 from curie_api.forges.runner_config import DockerConfig, RunnerConfig
 from curie_api.github_review_events import valid_github_login
@@ -148,6 +149,32 @@ def normalize_static_token(value: str) -> str:
     return token
 
 
+def read_static_token(path: str) -> str:
+    """The static token in the file at ``path`` now, normalized.
+
+    Read on every call, so a replaced file (a Kubernetes Secret volume's
+    ``..data`` swap included) is what the next caller gets; nothing is cached.
+    `CredentialUnreadable` when the file is missing, unreadable, empty or
+    malformed; its text is fixed and never carries the content (#4630).
+    """
+
+    problem: str | None = None
+    content = ""
+    try:
+        content = Path(path).read_text()
+    except (OSError, UnicodeDecodeError):
+        # Decided outside the handler: a decode error holds the file's bytes.
+        problem = "cannot be read"
+    if problem is None and not content.strip():
+        problem = "is empty"
+    if problem is None:
+        try:
+            return normalize_static_token(content)
+        except StaticTokenRefused as refused:
+            problem = refused.problem
+    raise CredentialUnreadable(problem)
+
+
 def _masked(refused: ValidationError, *, entry: str | None) -> ValidationError:
     """``refused`` rebuilt with every error's input masked.
 
@@ -246,27 +273,52 @@ class OAuthClientCredentialConfig(_Model):
 class StaticTokenCredentialConfig(_Model):
     """A long-lived token an operator rotates.
 
+    Exactly one source: ``token_file``, the file the chart mounts from a Secret
+    and the only source ``CURIE_FORGES`` accepts, or ``token``, an inline value
+    for programmatic use. The file is read again by every `current_token` call,
+    so a rotated Secret is used at the next operation with no restart (#4630).
+
     ``expires_at`` set: a known expiry. ``never_expires``: the token was issued
     without one. Neither: the forge does not report it, so the expiry is unknown.
     ``username`` is set for forges whose git credential is basic auth.
     """
 
     type: Literal["static_token"] = "static_token"
-    token: SecretStr
+    token: SecretStr | None = None
+    token_file: str | None = Field(default=None, min_length=1)
     username: str | None = Field(default=None, min_length=1)
     expires_at: AwareDatetime | None = None
     never_expires: bool = False
 
     @field_validator("token")
     @classmethod
-    def check_token(cls, value: SecretStr) -> SecretStr:
+    def check_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
         return SecretStr(normalize_static_token(value.get_secret_value()))
+
+    @model_validator(mode="after")
+    def check_source(self) -> Self:
+        if (self.token is None) == (self.token_file is None):
+            raise StaticTokenRefused("names exactly one of token or token_file")
+        return self
 
     @model_validator(mode="after")
     def check_expiry(self) -> Self:
         if self.expires_at is not None and self.never_expires:
             raise StaticTokenRefused("has an expires_at or never_expires, not both")
         return self
+
+    def current_token(self) -> str:
+        """The token to send now: the inline value, or the file read again now.
+
+        `CredentialUnreadable` when the file cannot be sent; never an earlier value.
+        """
+
+        if self.token is not None:
+            return self.token.get_secret_value()
+        assert self.token_file is not None
+        return read_static_token(self.token_file)
 
     # Declared last, so it wraps every check above (see `_masking`).
     @model_validator(mode="wrap")
