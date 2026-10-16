@@ -490,12 +490,64 @@ def factory_deferral(
 
 
 @pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("reply_address", "acme-corp/other-bot"),
+        ("reply_conversation_id", "acme-other-thread"),
+    ],
+    ids=["request_route", "request_conversation"],
+)
+def test_execution_snapshot_is_write_once(
+    paused_factory: AdmittedKind, column: str, value: str
+) -> None:
+    """Database snapshot refusal, not worker factory_surface_mismatch evidence."""
+    run = paused_factory
+    ticket, row, _ = waiting_ticket(run)
+    comments = run.comments(ticket)
+    frozen = request_state(run, row["id"])
+    # Migration 0092's live trigger rejects either already-written snapshot field.
+    refusal = run.check_violation(
+        f"UPDATE curie.execution_requests SET {column}='{value}' "
+        f"WHERE id='{uuid.UUID(row['id'])}'"
+    )
+    assert refusal == {"code": "23514", "reason": "execution request snapshot is write once"}
+    assert request_state(run, row["id"]) == frozen
+    no_execution_effects(run, ticket, row)
+    run.worker_replicas(1)
+    progress_neighbor(run)
+    assert request_state(run, row["id"]) == frozen
+    no_execution_effects(run, ticket, row)
+    assert run.comments(ticket) == comments
+
+
+def revoke_github_tracker(run: AdmittedKind, row: dict[str, Any]) -> None:
+    query = (
+        "SELECT json_build_object('kind', tracker_kind, 'host', tracker_host, "
+        "'scope_id', tracker_scope_id, 'issue_id', tracker_issue_id) FROM curie.work_items "
+        f"WHERE id='{uuid.UUID(row['work_item_id'])}'"
+    )
+    before = run.sql(query)
+
+    def remove_tracker(configuration: dict[str, Any]) -> None:
+        removed = {
+            tracker["name"] for tracker in configuration["trackers"] if tracker["kind"] == "github"
+        }
+        configuration["bindings"] = [
+            binding for binding in configuration["bindings"] if binding["tracker"] not in removed
+        ]
+        configuration["trackers"] = [
+            tracker for tracker in configuration["trackers"] if tracker["kind"] != "github"
+        ]
+
+    run.change_forges(remove_tracker)
+    assert run.sql(query) == before, "tracker revocation changed the admitted tracker identity"
+
+
+@pytest.mark.parametrize(
     ("change", "reason"),
     [
         ("agent_tenant", "factory_tenant_mismatch"),
         ("binding_tenant", "factory_tenant_mismatch"),
-        ("request_route", "factory_surface_mismatch"),
-        ("request_conversation", "factory_surface_mismatch"),
         ("tracker_surface", "factory_surface_mismatch"),
         ("removed_binding", "factory_binding_missing"),
         ("moved_binding", "factory_binding_missing"),
@@ -520,23 +572,8 @@ def test_execute_revalidates_current_authority(
             f"VALUES ('{tenant}','acme-other','active'); "
             f"UPDATE curie.{table} SET tenant_id='{tenant}' WHERE {where}"
         )
-    elif change == "request_route":
-        run.write_sql(
-            "UPDATE curie.execution_requests SET reply_address='acme-corp/other-bot' "
-            f"WHERE id='{uuid.UUID(before['id'])}'"
-        )
-        wake["reply_handle"]["channel"] = "acme-corp/other-bot"
-    elif change == "request_conversation":
-        run.write_sql(
-            "UPDATE curie.execution_requests SET reply_conversation_id='acme-other-thread' "
-            f"WHERE id='{uuid.UUID(before['id'])}'"
-        )
-        wake["conversation_id"] = "acme-other-thread"
     elif change == "tracker_surface":
-        run.write_sql(
-            "UPDATE curie.work_items SET tracker_scope_id='999999' "
-            f"WHERE id='{uuid.UUID(before['work_item_id'])}'"
-        )
+        revoke_github_tracker(run, before)
     elif change == "removed_binding":
         run.api(
             "DELETE", query_path(f"/agents/{agent_id}/channels", kind="github", address=REPOSITORY),
@@ -642,8 +679,10 @@ def test_existing_acquire_fences_remain_read_only(
     run.worker_replicas(1)
     assert observe_until(
         lambda: any(
-            wake["event_id"] in line and line.rstrip().endswith(": " + reason)
+            json.loads(line)["message"]
+            == f"work-item acquire refused for {wake['event_id']}: {reason}"
             for line in run.worker_logs().splitlines()
+            if line.startswith("{")
         )
     ), f"existing {control} fence did not name its refusal for this event"
     progress_neighbor(run)
@@ -956,10 +995,7 @@ def invalidate_continuation_authority(
         )
     else:
         assert change == "tracker_surface"
-        run.write_sql(
-            "UPDATE curie.work_items SET tracker_scope_id='999999' "
-            f"WHERE id='{uuid.UUID(row['work_item_id'])}'"
-        )
+        revoke_github_tracker(run, row)
 
 
 def ci_delivery(row: dict[str, Any], wake: dict[str, Any]) -> dict[str, Any]:

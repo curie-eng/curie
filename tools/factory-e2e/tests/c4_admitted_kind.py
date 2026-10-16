@@ -922,6 +922,25 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             "-v", "ON_ERROR_STOP=1", "-c", "BEGIN; " + query + "; COMMIT;",
         )
 
+    def check_violation(self, query: str) -> Any:
+        output = self.kubectl(
+            "-n", self.namespace, "exec", "statefulset/curie-postgres", "--",
+            "psql", "-U", "postgres", "-d", "postgres", "-qAt",
+            "-v", "ON_ERROR_STOP=1", "-c",
+            "BEGIN; CREATE TEMP TABLE c4_refusal (code text, reason text) ON COMMIT DROP; "
+            "DO $c4$ BEGIN " + query + "; "
+            "EXCEPTION WHEN check_violation THEN "
+            "INSERT INTO c4_refusal VALUES (SQLSTATE, SQLERRM); END; $c4$; "
+            "SELECT coalesce((SELECT row_to_json(r) FROM c4_refusal r), 'null'::json); ROLLBACK;",
+        )
+        try:
+            return json.loads(output)
+        except json.JSONDecodeError as exc:
+            self.record_failure("database refusal observation", exc)
+            raise RuntimeError(
+                "database refusal observation returned invalid JSON; private diagnostics retained"
+            ) from None
+
     def valkey(self, *args: str) -> Any:
         # Valkey 8.1.10 CLI help documents REDISCLI_AUTH and -e:
         # https://github.com/valkey-io/valkey/blob/8.1.10/src/valkey-cli.c
