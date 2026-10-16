@@ -13,6 +13,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import uuid
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
@@ -199,6 +200,12 @@ class FakeCluster:
             if any(a.startswith("name=") for a in argv) or "--format" in argv:
                 return ""
             return self.unfiltered[kind]
+        if argv[:2] == ["git", "archive"]:
+            # A candidate snapshot holding only what setup reads: the vendored CRDs.
+            with tarfile.open(argv[3], "w") as archive:
+                for crd in sorted((REPO / "charts/curie/crds").glob("*.yaml")):
+                    archive.add(crd, arcname=str(crd.relative_to(REPO)))
+            return ""
         if argv[:2] == ["git", "rev-parse"]:
             return "a" * 40 + "\n"
         if argv[:5] == [*NODE_CTR.split(), "-n", "k8s.io"][:5] and argv[-2:] == ["images", "list"]:
@@ -560,10 +567,24 @@ def test_substrate_precheck_refuses_a_bad_existing_substrate_without_mutating(
     assert fake.mutations == []
 
 
-def test_setup_runs_the_substrate_precheck_before_creating_namespaces() -> None:
-    source = MODULE_PATH.read_text()
-    setup = source[source.index("    def setup(self)") : source.index("    def images(self)")]
-    assert setup.index("self.substrate_precheck()") < setup.index("self.namespace(")
+@pytest.mark.parametrize(
+    ("defect", "category"),
+    [("two-controllers", "ambiguous_substrate"), ("incompatible-crd", "incompatible_crd")],
+)
+def test_setup_refuses_a_bad_existing_substrate_before_any_create(
+    make: Callable[..., Any], fake: FakeCluster, defect: str, category: str
+) -> None:
+    seed_crds(fake)
+    seed_controller(fake)
+    if defect == "two-controllers":
+        seed_controller(fake, "second-system")
+    else:
+        fake.objects[SANDBOXES]["spec"]["scope"] = "Cluster"
+    fixture = make(prime=False)
+    with pytest.raises(RuntimeError, match=f"^{category}$"):
+        fixture.setup()
+    assert fake.mutations == []
+    assert not any(f"/namespaces/{fixture.args.namespace}" in path for path in fake.objects)
 
 
 @pytest.mark.parametrize("which", ["namespace", "daemon_namespace", "controller_namespace"])
