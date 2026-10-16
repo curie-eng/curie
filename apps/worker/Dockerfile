@@ -10,7 +10,7 @@
 #
 # Third-party dependencies install in their own layer ahead of the sources; see
 # the dependency-layer comment in the builder.
-FROM python:3.13.15-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285 AS builder
+FROM python:3.14.8-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170 AS builder
 RUN pip install --no-cache-dir uv==0.10.7
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 \
@@ -47,7 +47,7 @@ RUN uv sync --frozen --no-dev --no-editable --no-install-workspace --package cur
 COPY . .
 RUN uv sync --frozen --no-dev --no-editable --package curie-worker
 
-FROM python:3.13.15-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285
+FROM python:3.14.8-slim@sha256:a2b82f3c48559aa0a8446d9af49826b6e2b2016f4cd2afabfe6013ec53729170
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
