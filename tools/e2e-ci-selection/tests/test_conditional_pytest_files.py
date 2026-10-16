@@ -251,6 +251,7 @@ def test_pytest_step_appends_deselect_only_when_selected(
         "--durations=25",
         "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
         "--ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py",
+        "--ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py",
         "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
     ]
     if deselect:

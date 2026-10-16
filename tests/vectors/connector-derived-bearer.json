@@ -69,6 +69,33 @@
         }
       },
       "expected_name": null
+    },
+    {
+      "name": "config-is-never-the-bearer",
+      "why": "a config name is a per-agent setting, not a credential, so one plain string secret beside it is still the Bearer name",
+      "document": {
+        "connectors": {
+          "gh": {
+            "image": "ghcr.io/example/gh:1",
+            "secrets": ["PAT"],
+            "config": ["FOLDER_PATH", "CHANNEL_ID"]
+          }
+        }
+      },
+      "expected_name": "PAT"
+    },
+    {
+      "name": "config-only-derives-no-header",
+      "why": "a connector with only config names has no credential to send",
+      "document": {
+        "connectors": {
+          "gh": {
+            "image": "ghcr.io/example/gh:1",
+            "config": ["FOLDER_PATH"]
+          }
+        }
+      },
+      "expected_name": null
     }
   ]
 }

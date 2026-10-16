@@ -498,6 +498,7 @@ def test_ordinary_python_shards_exclude_the_owned_kind_modules(
     for module in (
         "tools/factory-e2e/tests/test_c4_initial_binding.py",
         "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
+        "tools/factory-e2e/tests/test_c4_held_cancellation.py",
     ):
         assert f"--ignore={module}" in argv
         assert module not in argv
