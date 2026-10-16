@@ -665,13 +665,22 @@ def test_ordinary_python_shards_exclude_the_owned_kind_modules(
     deselect: str,
 ) -> None:
     argv = _run_pytest_step(tmp_path, shard=1, deselect=deselect, scope=scope)
+    separate = [index + 1 for index, argument in enumerate(argv) if argument == "--ignore"]
     for module in (
         "tools/factory-e2e/tests/test_c4_initial_binding.py",
         "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
+        "tools/factory-e2e/tests/test_c4_upgrade_migration.py",
         "tools/factory-e2e/tests/test_c4_held_cancellation.py",
+        "tools/factory-e2e/tests/test_c4_cluster_up.py",
     ):
-        assert f"--ignore={module}" in argv
-        assert module not in argv
+        ignored = [
+            argument.split("=", 1)[1] for argument in argv if argument.startswith("--ignore=")
+        ]
+        ignored += [argv[index] for index in separate]
+        assert ignored.count(module) == 1, module
+        assert all(
+            index in separate for index, argument in enumerate(argv) if argument == module
+        ), f"{module} must not be selected as a positional pytest file"
     assert argv[argv.index("--ci-shard") + 1] == f"1/{SHARD_COUNT}"
 
 

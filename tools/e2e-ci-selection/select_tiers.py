@@ -35,6 +35,7 @@ FACTORY_PREFIXES = (
     "cli/src/factory_intake.rs",
     "cli/src/api.rs",
     "cli/src/api_requests.rs",
+    "cli/src/ops/convergence.rs",
     "apps/api/src/curie_api/factory_",
     "apps/api/src/curie_api/routers/agents.py",
     "apps/api/src/curie_api/routers/publications",

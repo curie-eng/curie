@@ -73,6 +73,7 @@ KIND_MODULES = (
     "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
     "tools/factory-e2e/tests/test_c4_upgrade_migration.py",
     "tools/factory-e2e/tests/test_c4_held_cancellation.py",
+    "tools/factory-e2e/tests/test_c4_cluster_up.py",
 )
 LOCAL_SELECTOR = "cli/tests/local/test_deploy.py::test_deploy"
 LOCAL_LIVE_SELECTOR = "cli/tests/local/test_live.py::test_live"
