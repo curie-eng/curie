@@ -1227,14 +1227,81 @@ Once wired, a push to the agent's dev branch builds and deploys under its
 dev bot identity; a push or merge to its prod branch promotes that same
 built artifact without rebuilding.
 
+### Automatic migration of a legacy GitHub factory
+
+Use a CLI containing the fix for
+[#4628](https://github.com/curie-eng/curie/issues/4628) to upgrade a v0.12.5
+GitHub factory through the normal `curie cluster upgrade --to <target-version>`
+flow. It translates retained `api.githubFactory*` settings into `factory.*`
+before validating the candidate and removes the legacy keys from the migrated
+values. The operation stays within the upgrade lifecycle, including drain,
+checkpoint, convergence, canary and known-good recording. Do not run
+`curie cluster factory` as an intermediate chart upgrade.
+
+The migration preserves effective enablement, intake, polling interval, label,
+mention, card URL, CI wait, repository routing, bases and CI policies. Existing
+credential references, repository allowlist, agent surfaces and unrelated
+retained settings are preserved. Identity migration requires explicit
+`owner/repository` entries in `api.githubRepoAllowlist` and a retained App
+Secret reference through `api.githubAppExistingSecret` and
+`api.githubAppExistingSecretKey`. An `owner/*` allowlist or an inline-only
+`api.githubAppPrivateKey` refuses.
+
+The CLI machine must reach the retained `api.githubApiUrl` for identity
+resolution. Live `curie cluster up`, `curie apply`, `curie diff` and
+`curie cluster upgrade`, including upgrade `--dry-run`, may mint external
+GitHub App installation tokens; issuance can appear in GitHub's audit log.
+`curie diff` and upgrade `--dry-run` leave installed product configuration
+unchanged. The local previews `curie cluster up --dry-run` and
+`curie apply --dry-run` refuse legacy settings that require live repository
+identity resolution.
+
+For a private CA, pass an upgrade `--values-file` overlay setting
+`codeHostTrust.caBundle.configMapRef.name` and `.key` to an existing ConfigMap
+in the installation namespace containing the PEM CA certificate. The CLI and
+candidate workloads use this trust reference. The same origin and trust must
+be available to the other live migration commands.
+
+For GitHub Enterprise Server, provide explicit CIDRs and TCP ports in the
+matching `factory.codeHosts[].egress` and `factory.trackers[].egress` entries.
+Retained `worker.publication.githubHttpsCidrs` supplies only the code-host
+route. A missing route can be inferred from an unambiguous retained
+`agentSandbox.connectorEgress` list only when its TCP ports match the API port
+and either its grants equal the publication route or every CIDR contains the
+origin's literal IP without excluding it. Otherwise supply explicit code-host
+and tracker egress. A port match alone is insufficient; do not substitute the
+public github.com CIDR set.
+
+On GHES, if no factory agent is already enrolled, migration may enroll an
+otherwise unlisted agent whose retained connector grant covers the complete
+egress union of the configured forges. This also adds the agent to the chart's
+per-agent SandboxTemplate and warm-pool set. The github.com migration path
+does not infer agent enrollment.
+
+Preview the upgrade with `--dry-run --json`. The dry run changes no installed
+configuration. Migration plan lines and migration refusals name settings
+without printing their values. Conflicting typed and legacy settings,
+ambiguous bindings and malformed legacy input refuse before any Helm mutation,
+leaving the old release serving. Normal
+[schema compatibility and forward-only requirements](#curie-cluster-upgrade)
+still apply.
+
+The released v0.13.0 CLI does not contain this migration fix. Its limitation
+and historical manual procedure are documented below; automatic migration
+requires a CLI containing the fix.
+
 ### Manual factory migration from v0.12.5 to v0.13.0
 
-This is the manual workaround for
-[#4628](https://github.com/curie-eng/curie/issues/4628) until the supported
-upgrade flow migrates the legacy factory automatically. It was executed with
-the released v0.12.5 and v0.13.0 CLIs and charts, a GitHub App, one repository,
-polling intake, an explicit label and mention, and non-default polling
-interval, card URL, CI wait, branch and CI policies. The upgrade completed convergence and its canary, recorded
+This historical workaround applies to the released v0.13.0 CLI. That CLI
+cannot migrate the retained factory automatically, and its suggested
+`cluster factory` rewrite also fails on these legacy releases. Prefer the
+[automatic migration](#automatic-migration-of-a-legacy-github-factory) with a
+CLI containing the fix.
+
+The following procedure was executed with the released v0.12.5 and v0.13.0
+CLIs and charts, a GitHub App, one repository, polling intake, an explicit
+label and mention, and non-default polling interval, card URL, CI wait, branch
+and CI policies. The upgrade completed convergence and its canary, recorded
 v0.13.0 as known-good, and served healthy API endpoints with the typed factory
 configuration loaded. No separate Helm upgrade is needed.
 
@@ -1418,11 +1485,11 @@ Factory intake polls GitHub by default. It is off until `factory.enabled` is
 true (environment `FACTORY_ENABLED=true`). `factory.intake` (`FACTORY_INTAKE`)
 is `poll` or `webhook`, and `poll` is the default. The `factory:` block replaces
 the removed `api.githubFactory*` keys. For a v0.12.5 installation configured
-with `curie cluster factory`, follow the
-[manual v0.13.0 migration](#manual-factory-migration-from-v0125-to-v0130)
-above until [#4628](https://github.com/curie-eng/curie/issues/4628) is fixed.
-The v0.13.0 render refusal suggests `curie cluster factory`, but that command
-also fails on these legacy releases, even with explicit label and mention.
+with `curie cluster factory`, use the
+[automatic retained migration](#automatic-migration-of-a-legacy-github-factory)
+through `curie cluster upgrade` with a CLI containing the #4628 fix. If using
+the released v0.13.0 CLI, follow the historical
+[manual migration](#manual-factory-migration-from-v0125-to-v0130) above.
 Poll mode accepts a blank webhook secret, which disables signed deliveries.
 A configured secret permits signed deliveries in either intake mode. The
 published development secret is refused whenever factory intake is enabled.

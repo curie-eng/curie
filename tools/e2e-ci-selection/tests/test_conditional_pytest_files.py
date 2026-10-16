@@ -238,6 +238,7 @@ def test_pytest_step_appends_deselect_only_when_selected(
         "run", "pytest", "-q", "-n", "4", "--dist", "loadgroup",
         "--ci-shard", f"{shard}/3", "--reruns", "1", "-rsR", "--durations=25",
         "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
+        "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
     ]
     if deselect:
         expected += ["--deselect", "examples/tests/test_sre_bot_observability_runtime.py"]

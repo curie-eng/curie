@@ -1,11 +1,10 @@
-"""#4397 AC 2: no factory code path reads a removed factory setting.
+"""#4397 AC 2: factory runtime never reads a removed factory setting.
 
 The factory is configured only through ``CURIE_FORGES`` and the ``factory_*``
-settings, so the old ``github_factory_*`` settings, their ``GITHUB_FACTORY_*``
-env names and the ``api.githubFactory*`` chart keys must appear nowhere in
-the shipped surfaces. The one exemption is the chart's legacy-key guard file,
-which the chart refusal and the CLI's null-writes both read so neither has to
-spell a removed name.
+settings. The chart's two legacy guard registries may name removed settings.
+The one-time CLI migration in #4628, its refusal diagnostics and its exact
+released-upgrade fixture may name only the tokens enumerated for their files.
+Those allowances do not extend to runtime readers or snake-case settings.
 
 A second gate keeps the install-wide GitHub credential out of the factory:
 ``credentials_for(`` and the four ``settings.github_*`` credential fields are
@@ -90,6 +89,31 @@ BASE_CHART_KEYS = frozenset(
     )
 )
 
+MIGRATION_CHART_NAMES = frozenset(key.removeprefix("api.") for key in BASE_CHART_KEYS)
+MIGRATION_ENV_NAMES = frozenset(
+    {
+        "GITHUB_FACTORY_INGRESS_ENABLED",
+        "GITHUB_FACTORY_INTAKE",
+        "GITHUB_FACTORY_POLL_INTERVAL_S",
+        "GITHUB_FACTORY_LABEL",
+        "GITHUB_FACTORY_MENTION",
+        "GITHUB_FACTORY_CARD_BASE_URL",
+        "GITHUB_FACTORY_CI_WAIT_S",
+        "GITHUB_FACTORY_PYTHON_CI",
+        "GITHUB_FACTORY_BASES",
+        "GITHUB_FACTORY_METADATA_CI",
+    }
+)
+MIGRATION_LEGACY_NAMES: dict[str, frozenset[str]] = {
+    "cli/src/config_migrate.rs": (
+        MIGRATION_CHART_NAMES | MIGRATION_ENV_NAMES | {"githubFactory"}
+    ),
+    "cli/src/ops/up.rs": frozenset({"githubFactory"}),
+    "tools/factory-e2e/tests/test_c4_upgrade_migration.py": (
+        MIGRATION_CHART_NAMES | {"githubFactory"}
+    ),
+}
+
 _SKIP_DIRS = frozenset({"__pycache__", "node_modules", "target", ".pytest_cache", ".venv"})
 
 
@@ -121,7 +145,8 @@ def scan_removed_names(root: Path = REPO_ROOT) -> dict[str, list[str]]:
                 text = path.read_text()
             except UnicodeDecodeError:
                 continue
-            hits = removed_name_hits(text)
+            permitted = MIGRATION_LEGACY_NAMES.get(relative, frozenset())
+            hits = [(line, name) for line, name in removed_name_hits(text) if name not in permitted]
             if hits:
                 offenders[relative] = [f"{line}: {name}" for line, name in hits]
     return offenders
@@ -129,14 +154,34 @@ def scan_removed_names(root: Path = REPO_ROOT) -> dict[str, list[str]]:
 
 def test_no_shipped_surface_reads_a_removed_factory_setting() -> None:
     assert scan_removed_names() == {}, (
-        "configure the factory through factory.* / CURIE_FORGES (#4397); "
-        f"only {GUARD_FILE} and {ENV_GUARD_FILE} may name the removed keys"
+        "configure factory runtime through factory.* / CURIE_FORGES (#4397); "
+        f"only {GUARD_FILE}, {ENV_GUARD_FILE} and the exact file/name allowances "
+        "for one-time CLI migration and its regression may name removed keys (#4628)"
     )
 
 
 def test_the_exemption_is_exactly_the_guard_files() -> None:
     assert EXEMPT == {GUARD_FILE, ENV_GUARD_FILE}
     assert all((REPO_ROOT / path).is_file() for path in EXEMPT)
+
+
+def test_migration_allowances_name_only_the_approved_files_and_tokens() -> None:
+    chart_names = frozenset(key.removeprefix("api.") for key in BASE_CHART_KEYS)
+    env_names = frozenset(
+        field.upper()
+        for field in REMOVED_FIELDS
+        if field not in {"github_factory_reconcile_interval_s", "github_factory_reconcile_grace_s"}
+    )
+    assert MIGRATION_LEGACY_NAMES == {
+        "cli/src/config_migrate.rs": chart_names | env_names | {"githubFactory"},
+        "cli/src/ops/up.rs": {"githubFactory"},
+        "tools/factory-e2e/tests/test_c4_upgrade_migration.py": chart_names | {"githubFactory"},
+    }
+    assert not EXEMPT.intersection(MIGRATION_LEGACY_NAMES)
+    for relative, permitted in MIGRATION_LEGACY_NAMES.items():
+        path = REPO_ROOT / relative
+        assert path.is_file(), relative
+        assert {name for _, name in removed_name_hits(path.read_text())} == permitted, relative
 
 
 def test_the_guard_file_lists_every_removed_chart_key() -> None:
@@ -158,6 +203,89 @@ def test_every_scanned_surface_exists() -> None:
 
 
 # Mutation self-tests: the scanner is live -------------------------------------------
+
+
+@pytest.mark.parametrize("relative", sorted(MIGRATION_LEGACY_NAMES))
+def test_migration_scanner_accepts_each_permitted_token(tmp_path: Path, relative: str) -> None:
+    names = sorted(MIGRATION_LEGACY_NAMES[relative])
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    target.write_text("\n".join(f'retained["{name}"]' for name in names) + "\n")
+
+    assert scan_removed_names(tmp_path) == {}
+
+
+@pytest.mark.parametrize("relative", sorted(MIGRATION_LEGACY_NAMES))
+@pytest.mark.parametrize(
+    "name",
+    [
+        *REMOVED_FIELDS,
+        "GITHUB_FACTORY_RECONCILE_INTERVAL_S",
+        "GITHUB_FACTORY_RECONCILE_GRACE_S",
+        "GITHUB_FACTORY_NEW_RUNTIME_FLAG",
+        "githubFactoryNewRuntimeFlag",
+    ],
+)
+def test_migration_allowances_reject_runtime_and_unlisted_names(
+    tmp_path: Path, relative: str, name: str
+) -> None:
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    target.write_text(f'retained["{name}"]\n')
+
+    assert scan_removed_names(tmp_path) == {relative: [f"1: {name}"]}
+
+
+@pytest.mark.parametrize(
+    ("relative", "name"),
+    [
+        ("cli/src/ops/up.rs", "githubFactoryLabel"),
+        ("cli/src/ops/up.rs", "GITHUB_FACTORY_LABEL"),
+        ("tools/factory-e2e/tests/test_c4_upgrade_migration.py", "GITHUB_FACTORY_LABEL"),
+    ],
+)
+def test_migration_tokens_are_not_shared_between_allowances(
+    tmp_path: Path, relative: str, name: str
+) -> None:
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    target.write_text(f'retained["{name}"]\n')
+
+    assert scan_removed_names(tmp_path) == {relative: [f"1: {name}"]}
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "apps/api/src/curie_api/factory_poll_intake.py",
+        "apps/api/src/curie_api/forges/registry.py",
+        "apps/worker/src/curie_worker/config.py",
+        "charts/curie/templates/api.yaml",
+        "charts/curie/files/other-legacy-factory-keys.yaml",
+        "charts/curie/values.yaml",
+        "charts/curie/values.schema.json",
+        "compose.dev.yaml",
+        "cli/src/factory_intake.rs",
+        "cli/src/factory_config_migrate.rs",
+        "cli/src/config_migrate_other.rs",
+        "cli/src/config_migrate.rs.bak",
+        "cli/src/ops/up_other.rs",
+        "tools/factory-e2e/factory_e2e.py",
+        "tools/factory-e2e/tests/test_c4_upgrade_migration_other.py",
+        "tools/factory-e2e/tests/test_c4_upgrade_migration.py.bak",
+    ],
+)
+def test_migration_allowances_do_not_extend_to_runtime_or_neighboring_files(
+    tmp_path: Path, relative: str
+) -> None:
+    names = sorted(MIGRATION_CHART_NAMES | MIGRATION_ENV_NAMES | {"githubFactory"})
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(f'retained["{name}"]' for name in names) + "\n")
+
+    assert scan_removed_names(tmp_path) == {
+        relative: [f"{line}: {name}" for line, name in enumerate(names, start=1)]
+    }
 
 
 def test_a_removed_name_pasted_into_the_api_template_fails_the_gate(tmp_path: Path) -> None:
