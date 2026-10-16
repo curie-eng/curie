@@ -28,6 +28,7 @@ from curie_internal.driver_declaration import (
     PUBLISHED_DEFAULT_API_KEY,
     PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET,
     PUBLISHED_DEFAULT_INTERNAL_WORKER_TOKEN,
+    PUBLISHED_DEFAULT_REMEDIATION_AUTHORITY_KEY,
     TEST_INSTALLATION_DRIVERS_ENV,
     TEST_INSTALLATION_ENABLED_ENV,
     DeclaredDriver,
@@ -51,6 +52,7 @@ _DEV_DEFAULT_API_KEY = PUBLISHED_DEFAULT_API_KEY
 _DEV_DEFAULT_WEBHOOK_SECRET = "dev-webhook-secret"
 _DEV_DEFAULT_INTERNAL_WORKER_TOKEN = PUBLISHED_DEFAULT_INTERNAL_WORKER_TOKEN
 _DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET
+_DEV_DEFAULT_REMEDIATION_AUTHORITY_KEY = PUBLISHED_DEFAULT_REMEDIATION_AUTHORITY_KEY
 
 
 class Settings(BaseSettings):
@@ -80,6 +82,18 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices(
             "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "approval_chat_attester_secret"
+        ),
+    )
+    # Independent key that binding and arming a remediation policy require in
+    # X-Curie-Remediation-Authority (ADR 0231). It has no built-in value and must
+    # never equal the platform key: every worker holds the platform key and can
+    # mint a remediation operator principal from it, so only a key the platform
+    # key cannot derive keeps a compromised worker from authorizing automatic
+    # remediation. Unset refuses every bind and arm.
+    remediation_authority_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "CURIE_REMEDIATION_AUTHORITY_KEY", "remediation_authority_key"
         ),
     )
     # Break-glass approval recovery (#2753). OFF by default, and it is NOT a
@@ -1230,6 +1244,7 @@ class Settings(BaseSettings):
                 "API_KEY": self.api_key,
                 "CURIE_INTERNAL_WORKER_TOKEN": self.internal_worker_token,
                 "CURIE_APPROVAL_CHAT_ATTESTER_SECRET": self.approval_chat_attester_secret,
+                "CURIE_REMEDIATION_AUTHORITY_KEY": self.remediation_authority_key,
             },
         )
         return self
@@ -1247,6 +1262,11 @@ class Settings(BaseSettings):
             raise ValueError("CURIE_APPROVAL_CHAT_ATTESTER_SECRET must be non-blank")
         if attester_secret and attester_secret == self.api_key:
             raise ValueError("CURIE_APPROVAL_CHAT_ATTESTER_SECRET must be distinct from API_KEY")
+        authority_key = self.remediation_authority_key
+        if authority_key and not authority_key.strip():
+            raise ValueError("CURIE_REMEDIATION_AUTHORITY_KEY must be non-blank")
+        if authority_key and authority_key == self.api_key:
+            raise ValueError("CURIE_REMEDIATION_AUTHORITY_KEY must be distinct from API_KEY")
         if self.environment.strip().lower() != "prod":
             return self
         offenders = []
@@ -1265,6 +1285,8 @@ class Settings(BaseSettings):
             offenders.append("CURIE_INTERNAL_WORKER_TOKEN")
         if attester_secret in ("", _DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET):
             offenders.append("CURIE_APPROVAL_CHAT_ATTESTER_SECRET")
+        if authority_key in ("", _DEV_DEFAULT_REMEDIATION_AUTHORITY_KEY):
+            offenders.append("CURIE_REMEDIATION_AUTHORITY_KEY")
         if offenders:
             raise ValueError(
                 "ENVIRONMENT=prod but these secrets are unset or still the dev "

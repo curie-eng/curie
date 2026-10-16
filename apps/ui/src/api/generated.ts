@@ -565,7 +565,9 @@ export interface paths {
          * @description Bind, tighten or widen a protected hook's remediation policy.
          *
          *     A new binding starts disarmed; a later write keeps the armed flag. Each
-         *     write creates a generation recorded with the operator principal.
+         *     write creates a generation recorded with the operator principal. Needs the
+         *     remediation authority in ``X-Curie-Remediation-Authority`` (ADR 0231), else
+         *     ``remediation_authority_required``; the operator principal is attribution.
          */
         put: operations["put_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_put"];
         post?: never;
@@ -591,6 +593,10 @@ export interface paths {
         /**
          * Arm Remediation Policy
          * @description Arm the current policy as a new generation.
+         *
+         *     Needs the remediation authority in ``X-Curie-Remediation-Authority``
+         *     (ADR 0231), else ``remediation_authority_required``; the operator principal
+         *     is attribution.
          */
         post: operations["arm_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_arm_post"];
         delete?: never;
@@ -10117,6 +10123,7 @@ export interface operations {
             query?: never;
             header?: {
                 "x-api-key"?: string | null;
+                "X-Curie-Remediation-Authority"?: string | null;
                 "X-Curie-Approval-Principal"?: string | null;
             };
             path: {
@@ -10248,6 +10255,7 @@ export interface operations {
             query?: never;
             header?: {
                 "x-api-key"?: string | null;
+                "X-Curie-Remediation-Authority"?: string | null;
                 "X-Curie-Approval-Principal"?: string | null;
             };
             path: {

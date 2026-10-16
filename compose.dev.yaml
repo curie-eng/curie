@@ -423,6 +423,10 @@ services:
       # the authenticated Slack identity/channel evidence accepted by the API.
       # Only the API verifier and dispatcher producer receive it.
       CURIE_APPROVAL_CHAT_ATTESTER_SECRET: ${CURIE_APPROVAL_CHAT_ATTESTER_SECRET:-curie-dev-approval-chat-attester}
+      # Remediation authority (ADR 0231): binding and arming a remediation
+      # policy need it in X-Curie-Remediation-Authority. It is independent from
+      # API_KEY, which every worker holds, so only the API receives it.
+      CURIE_REMEDIATION_AUTHORITY_KEY: ${CURIE_REMEDIATION_AUTHORITY_KEY:-curie-dev-remediation-authority}
       CURIE_INTERNAL_WORKER_TOKEN: curie-dev-worker-token
       # The action executor switch (ACTION-EXECUTOR-1). curie-worker reads the
       # same interpolation, so one CURIE_ACTION_EXECUTOR_ENABLED in the
