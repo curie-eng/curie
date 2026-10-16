@@ -44,6 +44,7 @@ INITIAL_BINDING_INPUTS = (
 )
 STATIC_TOKEN_ROTATION_MODULE = "tools/factory-e2e/tests/test_c4_static_token_rotation.py"
 SRE_RUNTIME = "examples/tests/test_sre_bot_observability_runtime.py"
+FACTORY_UPGRADE_RUNTIME = "tools/factory-e2e/tests/test_c4_upgrade_migration.py"
 SRE_RUNTIME_INPUTS = (
     "examples/sre-bot",
     SRE_RUNTIME,
@@ -80,20 +81,39 @@ C4_TRACKER_SCOPE_INPUTS = (
     ".github/e2e-selection.yaml",
     "tools/e2e-ci-selection",
 )
+C4_DRY_RUN = "tools/factory-e2e/tests/test_c4_dry_run.py"
+C4_DRY_RUN_INPUTS = (
+    "charts/curie",
+    "cli/src",
+    "cli/Cargo.toml",
+    "cli/Cargo.lock",
+    "apps/api/Dockerfile",
+    C4_DRY_RUN,
+    "tools/factory-e2e/tests/conftest.py",
+    "uv.lock",
+    "pyproject.toml",
+    "conftest.py",
+    ".github/workflows/ci.yaml",
+    ".github/e2e-selection.yaml",
+    "tools/e2e-ci-selection",
+)
 # Every conditional_pytest_files entry of the registry, with its inputs.
 CONDITIONAL_PYTEST_FILES = {
     SRE_RUNTIME: SRE_RUNTIME_INPUTS,
     C4_TRACKER_SCOPE: C4_TRACKER_SCOPE_INPUTS,
+    C4_DRY_RUN: C4_DRY_RUN_INPUTS,
 }
 # What a fully classified diff touching no conditional input deselects.
 ALL_CONDITIONAL = ",".join(sorted(CONDITIONAL_PYTEST_FILES))
 UPGRADE_MUTANT_BUILDER = REPO_ROOT / "charts" / "curie" / "ci" / "make-upgrade-mutants.py"
 UPGRADE_MATRIX = REPO_ROOT / "cli" / "scripts" / "cluster-upgrade-matrix.sh"
-# Directories the upgrade matrix reads whole, each with the subdirectories it
-# leaves out. The matrix runs `helm package` on charts/curie, and .helmignore
-# drops charts/curie/ci from that package.
+# Directories the upgrade jobs and their helpers read whole, with excluded
+# subdirectories. The chart package leaves out its helmignored CI scripts.
 UPGRADE_MATRIX_DIRECTORY_INPUTS = {
     "charts/curie": ("charts/curie/ci",),
+    "charts/curie/crds": (),
+    "examples/dark-factory": (),
+    "tools/factory-e2e/fixtures/unitconv": (),
 }
 
 TIERS = ("skill", "local", "local-release", "cluster", "released-upgrade")
@@ -404,6 +424,7 @@ def _assert_selection(
         cli_release_needed=(
             _path_needs_cli_release(path) if cli_release_needed is None else cli_release_needed
         ),
+        released_upgrade_full=path == "cli/src/ops/upgrade.rs",
         chart_scenarios=_expected_chart_for_path(path),
     )
 
@@ -579,17 +600,116 @@ def _tracked_repo_paths(root: Path) -> frozenset[str]:
     )
 
 
-def _without_python_module_docstring(source: str) -> str:
+def _python_input_source(source: str) -> str:
     module = ast.parse(source)
-    if not module.body or not isinstance(module.body[0], ast.Expr):
-        return source
-    docstring = module.body[0]
-    if not isinstance(docstring.value, ast.Constant) or not isinstance(docstring.value.value, str):
-        return source
-    lines = source.splitlines(keepends=True)
-    for index in range(docstring.lineno - 1, docstring.end_lineno):
-        lines[index] = "\n"
-    return "".join(lines)
+    parents = {
+        child: parent
+        for parent in ast.walk(module)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def scope(node: ast.AST) -> ast.AST:
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+                return node
+        return module
+
+    def names(node: ast.AST) -> set[str]:
+        return {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
+
+    consumed: dict[ast.AST, set[str]] = {}
+    assignments: list[tuple[ast.AST, set[str], set[str]]] = []
+    for node in ast.walk(module):
+        if isinstance(node, ast.Call | ast.BinOp):
+            consumed.setdefault(scope(node), set()).update(names(node))
+        elif isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            assignments.append((
+                scope(node),
+                {name for target in targets for name in names(target)},
+                names(node.value),
+            ))
+    changed = True
+    while changed:
+        changed = False
+        for owner, targets, values in assignments:
+            used = consumed.setdefault(owner, set())
+            if targets & used and not values <= used:
+                used.update(values)
+                changed = True
+
+    non_inputs: list[ast.expr | ast.stmt] = []
+    if module.body and isinstance(module.body[0], ast.Expr):
+        docstring = module.body[0]
+        if isinstance(docstring.value, ast.Constant) and isinstance(docstring.value.value, str):
+            non_inputs.append(docstring)
+
+    def literal_strings(node: ast.AST) -> list[ast.expr]:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return [node]
+        if isinstance(node, ast.Dict):
+            children = [child for child in (*node.keys, *node.values) if child is not None]
+        elif isinstance(node, ast.List | ast.Tuple | ast.Set):
+            children = list(node.elts)
+        else:
+            return []
+        return [literal for child in children for literal in literal_strings(child)]
+
+    def output_path_strings(node: ast.AST) -> list[ast.expr]:
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            return output_path_strings(node.left) + output_path_strings(node.right)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "Path"
+        ):
+            return [literal for argument in node.args for literal in literal_strings(argument)]
+        return literal_strings(node)
+
+    for node in ast.walk(module):
+        # Literal route comparisons and HTTP response data do not read files.
+        # Calls and path expressions inside either still belong to the scan.
+        if isinstance(node, ast.Compare):
+            # Keep compared names that reach calls, including assignment aliases.
+            compared_names = {
+                name
+                for operand in (node.left, *node.comparators)
+                if isinstance(operand, ast.Name | ast.Attribute | ast.Subscript)
+                for name in names(operand)
+            }
+            if not compared_names & consumed.get(scope(node), set()):
+                for operand in (node.left, *node.comparators):
+                    non_inputs.extend(literal_strings(operand))
+        elif (
+            isinstance(node, ast.Return)
+            and isinstance(node.value, ast.Tuple)
+            and len(node.value.elts) == 2
+            and isinstance(node.value.elts[0], ast.Constant)
+            and isinstance(node.value.elts[0].value, int)
+            and 100 <= node.value.elts[0].value < 600
+        ):
+            non_inputs.extend(literal_strings(node.value.elts[1]))
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"write_text", "write_bytes", "touch", "mkdir"}
+        ):
+            non_inputs.extend(output_path_strings(node.func.value))
+
+    encoded = source.encode("utf-8")
+    line_offsets = []
+    offset = 0
+    for line in encoded.splitlines(keepends=True):
+        line_offsets.append(offset)
+        offset += len(line)
+    result = bytearray(encoded)
+    for node in non_inputs:
+        assert node.end_lineno is not None and node.end_col_offset is not None
+        start = line_offsets[node.lineno - 1] + node.col_offset
+        end = line_offsets[node.end_lineno - 1] + node.end_col_offset
+        result[start:end] = re.sub(rb"[^\n]", b" ", result[start:end])
+    return result.decode("utf-8")
 
 
 def _unselected_helper_inputs(reference: str, seen: set[str]) -> list[str]:
@@ -601,7 +721,7 @@ def _unselected_helper_inputs(reference: str, seen: set[str]) -> list[str]:
         return []
     source = helper.read_text()
     if helper.suffix == ".py":
-        source = _without_python_module_docstring(source)
+        source = _python_input_source(source)
     problems = _unselected_matrix_inputs(source)
     for child in _repo_root_references(source):
         problems.extend(_unselected_helper_inputs(child, seen))
@@ -716,6 +836,39 @@ def test_matrix_input_guard_checks_every_packaged_chart_file(tmp_path: Path) -> 
     registry.write_text(text.replace(anchor, f"{anchor}    charts/curie/files/agent-sandbox: []\n"))
     assert _unselected_matrix_inputs('helm package "$REPO_ROOT/charts/curie"\n', registry) == [
         "charts/curie/files/agent-sandbox/controller.yaml: does not select released-upgrade",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("directory", "dropped"),
+    [
+        ("charts/curie/crds", "charts/curie/crds/crd-sandboxclaims.yaml"),
+        ("examples/dark-factory", "examples/dark-factory/connectors.yaml"),
+        (
+            "tools/factory-e2e/fixtures/unitconv",
+            "tools/factory-e2e/fixtures/unitconv/unitconv/convert.py",
+        ),
+    ],
+)
+def test_helper_directory_guard_checks_each_input_file(
+    tmp_path: Path, directory: str, dropped: str
+) -> None:
+    registry = yaml.safe_load(REGISTRY.read_text())
+    files = _directory_files(directory, ())
+    assert dropped in files
+    for path in files:
+        registry["rules"]["exact"][path] = ["released-upgrade"]
+    selected = tmp_path / "selected.yaml"
+    selected.write_text(yaml.safe_dump(registry, sort_keys=False))
+    script = f'copytree(REPO_ROOT / "{directory}", destination)\n'
+    assert _unselected_matrix_inputs(script, selected) == []
+
+    del registry["rules"]["exact"][dropped]
+    registry["rules"]["ignored_exact"][dropped] = []
+    refused = tmp_path / "refused.yaml"
+    refused.write_text(yaml.safe_dump(registry, sort_keys=False))
+    assert _unselected_matrix_inputs(script, refused) == [
+        f"{dropped}: does not select released-upgrade"
     ]
 
 
@@ -946,6 +1099,111 @@ def test_inline_upgrade_guard_scans_a_called_helpers_own_reads(
     input_file = tmp_path / "cli/src/main.rs"
     input_file.parent.mkdir(parents=True)
     input_file.write_text("// fixture\n")
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+
+    assert _unselected_helper_inputs("charts/curie/ci/live_manifest_parity.py", set()) == [
+        "cli/src/main.rs: does not select released-upgrade"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source", "problems"),
+    [
+        (
+            'def fixture(relative):\n'
+            '    if relative == ".github/workflows":\n'
+            '        return 404, {"message": "Not Found"}\n'
+            '    if relative == "README.md":\n'
+            '        return 200, [{"path": "README.md", "name": "README.md"}]\n',
+            [],
+        ),
+        (
+            'def fixture(relative):\n'
+            '    if relative in {".github/workflows", "README.md"}:\n'
+            '        return 200, {"path": relative}\n',
+            [],
+        ),
+        (
+            'if Path(".github/workflows").is_dir():\n    pass\n',
+            [".github/workflows: unlisted directory"],
+        ),
+        (
+            'if Path("cli/src/main.rs").read_text() == "README.md":\n    pass\n',
+            ["cli/src/main.rs: does not select released-upgrade"],
+        ),
+        (
+            'def fixture():\n'
+            '    return 200, {"content": Path("cli/src/main.rs").read_text()}\n',
+            ["cli/src/main.rs: does not select released-upgrade"],
+        ),
+        (
+            'input_file = "cli/src/main.rs"\nPath(input_file).read_text()\n',
+            ["cli/src/main.rs: does not select released-upgrade"],
+        ),
+        (
+            'def read(candidate):\n'
+            '    if candidate == "cli/src/main.rs":\n'
+            '        Path(candidate).read_text()\n',
+            ["cli/src/main.rs: does not select released-upgrade"],
+        ),
+        (
+            'def read(candidate):\n'
+            '    if candidate == ".github/workflows":\n'
+            '        selected = candidate\n'
+            '        Path(selected).is_dir()\n',
+            [".github/workflows: unlisted directory"],
+        ),
+        ('(seed / "README.md").write_text("Example fixture repository")\n', []),
+        (
+            '(seed / "README.md").write_text(Path("cli/src/main.rs").read_text())\n',
+            ["cli/src/main.rs: does not select released-upgrade"],
+        ),
+    ],
+    ids=[
+        "remote-route-and-response", "remote-route-membership", "local-directory",
+        "local-read-in-comparison", "local-read-in-response", "local-path-variable",
+        "compared-local-path", "compared-local-path-alias", "generated-fixture-output",
+        "checkout-read-into-output",
+    ],
+)
+def test_python_helper_guard_distinguishes_remote_data_from_checkout_inputs(
+    source: str, problems: list[str]
+) -> None:
+    assert _unselected_matrix_inputs(_python_input_source(source)) == problems
+
+
+@pytest.mark.parametrize("python_helper", [False, True], ids=["workflow", "python-helper"])
+def test_upgrade_guard_keeps_the_explicit_pytest_input(python_helper: bool) -> None:
+    source = (
+        f'subprocess.run(["uv", "run", "pytest", "{FACTORY_UPGRADE_RUNTIME}", "-q"])\n'
+        if python_helper else f"uv run pytest {FACTORY_UPGRADE_RUNTIME} -q\n"
+    )
+    if python_helper:
+        source = _python_input_source(source)
+    assert _repo_root_references(source) == [FACTORY_UPGRADE_RUNTIME]
+
+
+def test_remote_fixture_data_does_not_hide_a_transitive_checkout_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    sources = {
+        "charts/curie/ci/live_manifest_parity.py": (
+            'def fixture(relative):\n'
+            '    if relative == ".github/workflows":\n'
+            '        return 200, {"path": "README.md"}\n'
+            'helper = Path("charts/curie/ci/make-upgrade-mutants.py")\n'
+        ),
+        "charts/curie/ci/make-upgrade-mutants.py": 'Path("cli/src/main.rs").read_text()\n',
+        "cli/src/main.rs": "// fixture\n",
+        ".github/workflows/ci.yaml": "name: Example\n",
+        "README.md": "Example\n",
+    }
+    for relative, source in sources.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
     monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
 
     assert _unselected_helper_inputs("charts/curie/ci/live_manifest_parity.py", set()) == [
@@ -1216,8 +1474,7 @@ def test_push_selects_every_tier_without_a_repository(tmp_path: Path) -> None:
 def test_pull_request_released_upgrade_runs_the_smoke_shard_only(
     tmp_path: Path,
 ) -> None:
-    # A pull request path selection never asks for the full upgrade matrix or
-    # the released chart upgrade jobs. Push and dispatch (the nightly) do.
+    # Chart-only pull requests retain the upgrade matrix smoke shard.
     outputs = _selector_outputs(tmp_path, "charts/curie/values.yaml")
     assert outputs["released_upgrade"] == "true"
     assert outputs["released_upgrade_full"] == "false"

@@ -59,11 +59,13 @@ SELECTOR = re.compile(
     r"|charts/curie/ci/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.sh"
     r")"
 )
+FACTORY_UPGRADE_MODULE = "tools/factory-e2e/tests/test_c4_upgrade_migration.py"
 # Pins in these modules run against an owned kind cluster, not the dev stack.
 KIND_MODULES = frozenset(
     {
         "tools/factory-e2e/tests/test_c4_initial_binding.py",
         "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
+        FACTORY_UPGRADE_MODULE,
     }
 )
 BUG_LABEL = "bug"
@@ -332,11 +334,14 @@ def _pin_requirements(body: str) -> dict[str, bool]:
     except ValueError:
         selector = None
     needed = selector is not None
-    needs_kind = selector is not None and selector.split("::", 1)[0] in KIND_MODULES
+    module = selector.split("::", 1)[0] if selector is not None else None
+    needs_factory_upgrade = module == FACTORY_UPGRADE_MODULE
+    needs_kind = module in KIND_MODULES
     return {
         "needed": needed,
         "needs_stack": needed and not needs_kind,
         "needs_kind": needs_kind,
+        "needs_factory_upgrade": needs_factory_upgrade,
     }
 
 

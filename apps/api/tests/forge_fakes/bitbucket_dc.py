@@ -179,7 +179,21 @@ class _Recorder(httpx.AsyncBaseTransport):
                 return httpx.Response(
                     answer.status, headers=answer.headers, json=answer.body, request=request
                 )
-        return await self._inner.handle_async_request(request)
+        response = await self._inner.handle_async_request(request)
+        # An authenticated answer names its user in ``X-AUSERID`` and
+        # ``X-AUSERNAME``, as Atlassian's server products answer.
+        header = request.headers.get("authorization", "")
+        uid = (
+            fake.tokens.get(header.removeprefix("Bearer "))
+            if header.startswith("Bearer ")
+            else None
+        )
+        if uid is not None and response.status_code < 400 and fake.send_auser_headers:
+            response.headers["X-AUSERID"] = (
+                str(uid) if fake.auserid_override is None else fake.auserid_override
+            )
+            response.headers["X-AUSERNAME"] = fake.users[uid]["slug"]
+        return response
 
 
 class BitbucketDcFake:
@@ -205,6 +219,11 @@ class BitbucketDcFake:
         # When set, an authentication failure quotes the presented token, so a
         # test proves the adapter never repeats response text.
         self.echo_token_in_errors = False
+        # ``X-AUSERID``/``X-AUSERNAME`` on authenticated answers: False drops
+        # both (a deployment or proxy that does not pass them on);
+        # ``auserid_override`` sends that text as ``X-AUSERID`` instead.
+        self.send_auser_headers = True
+        self.auserid_override: str | None = None
         self.users: dict[int, dict[str, Any]] = {}
         self.tokens: dict[str, int] = {}
         self.permissions: dict[int, str] = {}

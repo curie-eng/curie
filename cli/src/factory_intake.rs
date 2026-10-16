@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use crate::config_migrate::legacy_factory_keys;
 use crate::exit::CliError;
 use crate::ops::{
     fetch_release_computed_values, fetch_release_values, plain, require_on_path, run_capture,
@@ -200,15 +201,6 @@ pub fn resolve_webhook_secret(file: Option<&Path>) -> Result<Option<String>> {
             .into());
     }
     Ok(Some(value))
-}
-
-/// The chart's removed `api.*` factory keys (#4397), from the one file that
-/// names them. Each is written as null so a `--reuse-values` upgrade sheds it.
-fn legacy_factory_keys() -> Vec<String> {
-    serde_norway::from_str(include_str!(
-        "../../charts/curie/files/legacy-factory-keys.yaml"
-    ))
-    .expect("charts/curie/files/legacy-factory-keys.yaml is a list of dotted chart keys")
 }
 
 /// The name of the one GitHub entry this command writes in
@@ -614,13 +606,13 @@ fn whole_number(number: &serde_json::Number) -> Option<i64> {
     (value.is_finite() && value.fract() == 0.0 && value.abs() < LIMIT).then_some(value as i64)
 }
 
-/// A binding's trackerScopeId as the chart renders it, or `None` when the
-/// chart refuses it: a nonempty string as is (the runtime takes it as is), or
-/// a [`whole_number`].
-fn tracker_scope_id(binding: &serde_json::Value) -> Option<String> {
-    match binding.get("trackerScopeId") {
-        Some(serde_json::Value::String(text)) if !text.is_empty() => Some(text.clone()),
-        Some(serde_json::Value::Number(number)) => whole_number(number).map(|n| n.to_string()),
+/// An identifier value as the chart renders it, or `None` when the chart
+/// refuses it: a nonempty string as is (the runtime takes it as is), or a
+/// [`whole_number`].
+pub(crate) fn normalize_identifier_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) if !text.is_empty() => Some(text.clone()),
+        serde_json::Value::Number(number) => whole_number(number).map(|n| n.to_string()),
         _ => None,
     }
 }
@@ -664,7 +656,7 @@ pub fn check_factory_document(values: &serde_json::Value) -> std::result::Result
         };
         let kind = factory_scalar(tracker, "kind");
         let host = factory_scalar(tracker, "host").trim().to_lowercase();
-        let Some(scope_id) = tracker_scope_id(binding) else {
+        let Some(scope_id) = normalize_identifier_value(&binding["trackerScopeId"]) else {
             return Err(format!(
                 "factory.bindings[{index}] ({name}) trackerScopeId must be a nonempty string \
                  or a whole number; quote the tracker's scope id"
@@ -1630,9 +1622,12 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
         }
         if let (None, Some(slug)) = (&preflight, &opts.mention) {
             publication = Some(
-                crate::factory_app::GithubApi::new()?
-                    .bot_publication_identity(slug)
-                    .await?,
+                crate::factory_app::GithubApi::new(
+                    &crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE),
+                    None,
+                )?
+                .bot_publication_identity(slug)
+                .await?,
             );
         }
         recorded = fetch_release_values(&opts.common)

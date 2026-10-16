@@ -76,6 +76,23 @@ UPGRADE_WORKFLOW_JOBS = frozenset(
         "e2e-cluster-upgrade-matrix",
     }
 )
+FACTORY_UPGRADE_PATHS = frozenset(
+    {
+        "charts/curie/files/legacy-factory-keys.yaml",
+        "charts/curie/files/legacy-factory-env.yaml",
+        "cli/src/config_migrate.rs",
+        "cli/src/factory_app.rs",
+        "cli/src/factory_config_migrate.rs",
+        "cli/src/github_app.rs",
+        "cli/src/ops/up.rs",
+        "cli/src/ops/upgrade.rs",
+        "tools/factory-e2e/factory_e2e.py",
+        "tools/factory-e2e/scripted_kind.py",
+        "tools/factory-e2e/scripted_scenario.py",
+        "tools/factory-e2e/tests/test_c4_upgrade_migration.py",
+        "tools/github-stub/github_stub.py",
+    }
+)
 WORKFLOW_PATH = ".github/workflows/ci.yaml"
 CHART_JOB = "e2e-cluster-chart-regressions"
 SCENARIO_SCRIPT = re.compile(r"^(?:charts/curie/ci|scripts)/[^\s]+\.sh(?:$|[;|&])")
@@ -862,11 +879,13 @@ def _run() -> None:
     ):
         pytest_scope = "cli"
 
-    # Ordinary pull requests run one upgrade matrix smoke shard. A change to
-    # the upgrade jobs themselves runs the full matrix and released chart jobs
-    # before merge, as do pushes and dispatches (the nightly).
+    # Ordinary pull requests run one upgrade matrix smoke shard. Factory
+    # migration paths and upgrade job changes run the full matrix and released
+    # chart jobs before merge, as do pushes and dispatches (the nightly).
     released_upgrade_full = (
-        args.push or workflow_upgrade_changed
+        args.push
+        or workflow_upgrade_changed
+        or any(path in FACTORY_UPGRADE_PATHS for path in paths)
     ) and "released-upgrade" in selected
     chart_scenarios = _select_chart_scenarios(
         registry, paths, selected, args.push, args.head if not args.path else None

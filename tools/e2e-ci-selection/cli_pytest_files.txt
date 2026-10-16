@@ -90,6 +90,7 @@ tools/doclint/tests/test_symbols.py
 tools/e2e-ci-selection/tests/test_cli_pytest_scope.py
 tools/e2e-ci-selection/tests/test_conditional_pytest_files.py
 tools/e2e-ci-selection/tests/test_e2e_ci_selection.py
+tools/e2e-ci-selection/tests/test_factory_upgrade_selection.py
 tools/e2e-ci-selection/tests/test_live_manifest_parity.py
 tools/e2e-ci-selection/tests/test_python_pytest_selection.py
 tools/e2e-ci-selection/tests/test_upgrade_matrix_budget.py
@@ -98,9 +99,12 @@ tools/factory-e2e/tests/test_acceptance.py
 tools/factory-e2e/tests/test_bitbucket_dc_fixture_tool.py
 tools/factory-e2e/tests/test_bitbucket_dc_live.py
 tools/factory-e2e/tests/test_bitbucket_drivers.py
+tools/factory-e2e/tests/test_c4_dry_run.py
 tools/factory-e2e/tests/test_c4_initial_binding.py
+tools/factory-e2e/tests/test_c4_reinstall_publication.py
 tools/factory-e2e/tests/test_c4_static_token_rotation.py
 tools/factory-e2e/tests/test_c4_tracker_scope.py
+tools/factory-e2e/tests/test_c4_upgrade_migration.py
 tools/factory-e2e/tests/test_factory_e2e.py
 tools/factory-e2e/tests/test_factory_e2e_loop.py
 tools/factory-e2e/tests/test_gitlab_acceptance.py

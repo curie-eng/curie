@@ -2700,7 +2700,7 @@ true
 {{- range $workload := list "api" "worker" -}}
 {{- range (get (get $.Values $workload | default dict) "extraEnv" | default list) -}}
 {{- if eq (get . "name") $name -}}
-{{- fail (printf "%s.extraEnv %s is no longer read; configure the factory under factory.* (repository CI and bases under factory.bindings[].repos[]) and remove the entry" $workload $name) -}}
+{{- fail (printf "%s.extraEnv %s is no longer read; use `curie cluster upgrade` to migrate retained factory settings to factory.* (repository CI and bases under factory.bindings[].repos[]), or remove unsupported raw entries" $workload $name) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -2709,7 +2709,7 @@ true
 {{- $node := $.Values -}}
 {{- range splitList "." $key }}{{ $node = and (kindIs "map" $node) (get $node .) }}{{ end -}}
 {{- if and $node (not (has (include "curie.factory.str" $node) (list "poll" "45" "1200"))) -}}
-{{- fail (printf "%s is no longer read; configure the factory under factory.* (run `curie cluster factory` to rewrite it, which also sets %s to null)" $key $key) -}}
+{{- fail (printf "%s is no longer read; use `curie cluster upgrade` to migrate retained factory settings to factory.* (repository CI and bases under factory.bindings[].repos[]), or remove unsupported raw values" $key) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

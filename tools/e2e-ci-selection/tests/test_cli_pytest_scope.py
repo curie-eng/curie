@@ -34,6 +34,7 @@ LIST_PATH = "tools/e2e-ci-selection/cli_pytest_files.txt"
 KIND_MODULES = (
     "tools/factory-e2e/tests/test_c4_initial_binding.py",
     "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
+    SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
 )
 SELECTOR_PATH = "tools/e2e-ci-selection/select_tiers.py"
 REGENERATE = "uv run python tools/e2e-ci-selection/cli_pytest_files.py --write"
@@ -806,6 +807,7 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
         "--durations=25",
         "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
         "--ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py",
+        "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
     ]
     if deselect:
         for path in deselect.split(","):
@@ -869,8 +871,8 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
         "--durations=25",
         "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
         "--ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py",
-        "--deselect",
-        deselect,
+        "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
+        "--deselect", deselect,
     ]
     if scope == "cli":
         expected.extend(

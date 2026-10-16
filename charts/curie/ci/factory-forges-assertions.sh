@@ -8,7 +8,7 @@
 # key material. The removed api.* factory keys are named only by
 # files/legacy-factory-keys.yaml: this script reads them from there and spells
 # none of them, and a release that still sets one is refused with a message
-# that names factory.* and `curie cluster factory`.
+# that names factory.* and `curie cluster upgrade`.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly.
 set -euo pipefail
@@ -313,10 +313,10 @@ nondefault() {
 nulls=()
 for key in "${LEGACY[@]}"; do
   refused "legacy key $key set" "factory." render -f "$WORK/factory.yaml" --set-json "$key=$(nondefault "${key##*.}")"
-  refused "legacy key $key set" "curie cluster factory" render --set-json "$key=$(nondefault "${key##*.}")"
+  refused "legacy key $key set" "curie cluster upgrade" render --set-json "$key=$(nondefault "${key##*.}")"
   nulls+=(--set-json "$key=null")
 done
-echo "  ok: each of ${#LEGACY[@]} legacy keys set to a non-default value is refused naming factory.* and curie cluster factory"
+echo "  ok: each of ${#LEGACY[@]} legacy keys set to a non-default value is refused naming factory.* and curie cluster upgrade"
 
 # What `curie cluster factory` writes: every legacy key null, beside the block.
 render -f "$WORK/factory.yaml" "${nulls[@]}" | check factory

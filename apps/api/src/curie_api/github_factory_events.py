@@ -8,6 +8,7 @@ import re
 import uuid
 from collections.abc import Collection
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from .github_review_events import (
@@ -41,6 +42,10 @@ class FactoryNotice:
     issue_number: int
     sender_id: int
     sender_login: str
+    # When the admitting label event happened, as GitHub's timeline reports it
+    # (#4629). None when unknown, or for a notice that is not a label
+    # admission; rediscovery treats unknown as an old trigger replay.
+    label_event_at: datetime | None
     label: str | None = None
     comment_id: int | None = None
     comment_body: str | None = None
@@ -186,6 +191,7 @@ def parse_factory_event(
                 issue_number,
                 sender_id,
                 sender_login,
+                label_event_at=None,
                 label=name,
             )
         if action == "closed":
@@ -200,6 +206,7 @@ def parse_factory_event(
                 issue_number,
                 sender_id,
                 sender_login,
+                label_event_at=None,
             )
         raise FactoryRefused("unsupported_action")
 
@@ -235,6 +242,7 @@ def parse_factory_event(
         issue_number,
         sender_id,
         sender_login,
+        label_event_at=None,
         comment_id=comment_id,
         comment_body=body,
     )

@@ -458,9 +458,8 @@ pub struct PlanInput {
     /// `--chart` was passed; `cluster deploy` then gets it as well.
     pub chart_explicit: bool,
     pub interactive: bool,
-    /// The release is already the chart and the quickstart values, so this
-    /// plan must not invoke `cluster up`.
-    pub release_at_target: bool,
+    /// What the plan knows about the release `cluster up` would install.
+    pub release_read: ReleaseRead,
     /// The agent to deploy.
     pub agent: String,
     /// The trigger label for this agent's bindings; `None` is the install label.
@@ -478,6 +477,33 @@ pub struct PlanInput {
     /// The Jira tracker this agent is bound through (`--tracker jira-cloud`);
     /// `None` binds each repository's GitHub surface.
     pub jira: Option<JiraPlan>,
+}
+
+/// What the plan knows about the release `cluster up` would install (#4626).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseRead {
+    /// The release was read and already runs the target chart and values.
+    AtTarget,
+    /// The release was read and differs, or nothing is targeted yet.
+    NotAtTarget,
+    /// `--dry-run` did not read the release. `recorded_model_kept`: no
+    /// `--model` and no explicit credential, so a release recording a real
+    /// model keeps that model instead of the planned one.
+    Unread { recorded_model_kept: bool },
+}
+
+/// Whether the plan runs `cluster up` (#4626).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterUpStep {
+    /// The add agent path runs no `cluster up`.
+    NotPlanned,
+    /// The release is already at the target, so `cluster up` is left out.
+    Skipped,
+    /// `cluster up` runs.
+    Run,
+    /// `--dry-run` did not read the release: a live run skips `cluster up`
+    /// when the release is at the target and runs it otherwise.
+    UnlessAtTarget { recorded_model_kept: bool },
 }
 
 /// Which run this is (#4362 decision 2).
@@ -573,11 +599,13 @@ pub struct Planned {
     pub kind_cluster: Option<String>,
     pub credential: CredentialDecision,
     pub actions: Vec<Action>,
-    /// `cluster up` was left out because the release is already at the target.
-    pub skipped_cluster_up: bool,
+    /// Whether the plan runs `cluster up`.
+    pub cluster_up: ClusterUpStep,
     pub path: QuickstartPath,
     pub agent: String,
     pub release: String,
+    /// The release's namespace, named by the conditional `cluster up` lines.
+    pub namespace: String,
 }
 
 #[derive(Debug)]
@@ -1189,7 +1217,7 @@ pub(super) struct InstallTarget<'a> {
     pub release: &'a str,
     pub model: &'a str,
     pub chart: &'a str,
-    pub release_at_target: bool,
+    pub release_read: ReleaseRead,
     /// The add agent path never touches the cluster underneath the release.
     pub add_agent: bool,
 }
@@ -1202,8 +1230,8 @@ pub(super) struct InstallSteps {
     pub context_reason: String,
     pub kind_cluster: Option<String>,
     pub actions: Vec<Action>,
-    /// `cluster up` was left out because the release is already at the target.
-    pub skipped_cluster_up: bool,
+    /// Whether the plan runs `cluster up`.
+    pub cluster_up: ClusterUpStep,
 }
 
 pub(super) fn install_steps(target: &InstallTarget<'_>) -> InstallSteps {
@@ -1276,9 +1304,25 @@ pub(super) fn install_steps(target: &InstallTarget<'_>) -> InstallSteps {
     }
     // ADR 0114 and ADR 0193 keep install-fact inference inside `cluster up`.
     // The skip stays here: quickstart does not invoke `cluster up` when the
-    // release is already that chart and these values.
-    let skipped_cluster_up = target.release_at_target && !target.add_agent;
-    if !target.release_at_target && !target.add_agent {
+    // release is already that chart and these values. An unread release
+    // (`--dry-run`, #4626) keeps the action as the `otherwise` branch.
+    let cluster_up = if target.add_agent {
+        ClusterUpStep::NotPlanned
+    } else {
+        match target.release_read {
+            ReleaseRead::AtTarget => ClusterUpStep::Skipped,
+            ReleaseRead::NotAtTarget => ClusterUpStep::Run,
+            ReleaseRead::Unread {
+                recorded_model_kept,
+            } => ClusterUpStep::UnlessAtTarget {
+                recorded_model_kept,
+            },
+        }
+    };
+    if matches!(
+        cluster_up,
+        ClusterUpStep::Run | ClusterUpStep::UnlessAtTarget { .. }
+    ) {
         actions.push(Action::Cluster { args: up });
     }
     let context_reason = context_reason(
@@ -1293,7 +1337,7 @@ pub(super) fn install_steps(target: &InstallTarget<'_>) -> InstallSteps {
         context_reason,
         kind_cluster,
         actions,
-        skipped_cluster_up,
+        cluster_up,
     }
 }
 
@@ -1380,7 +1424,7 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         context_reason,
         kind_cluster,
         mut actions,
-        skipped_cluster_up,
+        cluster_up,
     } = install_steps(&InstallTarget {
         explicit_context: input.explicit_context.as_deref(),
         current_context: input.current_context.as_deref(),
@@ -1390,7 +1434,7 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         release: &input.release,
         model: &input.model,
         chart: &input.chart,
-        release_at_target: input.release_at_target,
+        release_read: input.release_read,
         add_agent,
     });
 
@@ -1483,10 +1527,11 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
             )
         },
         actions,
-        skipped_cluster_up,
+        cluster_up,
         path,
         agent: input.agent.clone(),
         release: input.release.clone(),
+        namespace: input.namespace.clone(),
     })
 }
 
@@ -1527,14 +1572,19 @@ pub fn describe(planned: &Planned) -> Vec<String> {
             planned.agent, planned.release
         ));
     }
-    lines.push(credential_line(&planned.credential).to_string());
-    if planned.skipped_cluster_up {
+    lines.push(credential_line(&planned.credential, planned.cluster_up));
+    if planned.cluster_up == ClusterUpStep::Skipped {
         lines.push(SKIPPED_CLUSTER_UP_LINE.to_string());
     }
     for action in &planned.actions {
         match action {
             Action::External { .. } | Action::Cluster { .. } => {
-                lines.extend(install_action_line(action));
+                lines.extend(install_action_lines(
+                    action,
+                    planned.cluster_up,
+                    &planned.release,
+                    &planned.namespace,
+                ));
             }
             Action::Register {
                 org,
@@ -1758,32 +1808,104 @@ fn agent_settings(
 const SKIPPED_CLUSTER_UP_LINE: &str =
     "skip cluster up: the release is already at the target chart and values";
 
-/// The plan line for the model credential decision.
-fn credential_line(decision: &CredentialDecision) -> &'static str {
+/// The plan line for the model credential decision. An unread release
+/// (`--dry-run`, #4626) may record a real model, so a prompt or a refusal is
+/// stated as conditional on it.
+fn credential_line(decision: &CredentialDecision, cluster_up: ClusterUpStep) -> String {
+    let clause = credential_decision_clause(decision);
+    match (cluster_up, decision) {
+        (
+            ClusterUpStep::UnlessAtTarget { .. },
+            CredentialDecision::PromptOnce | CredentialDecision::RefuseNonInteractive,
+        ) => format!(
+            "model credential: if the release records a real model, keep it (no prompt); otherwise {clause}"
+        ),
+        _ => format!("model credential: {clause}"),
+    }
+}
+
+/// The clause after `model credential: ` for a credential decision.
+fn credential_decision_clause(decision: &CredentialDecision) -> &'static str {
     match decision {
-        CredentialDecision::UseEnv => "model credential: use CURIE_CREDENTIALS (no prompt)",
+        CredentialDecision::UseEnv => "use CURIE_CREDENTIALS (no prompt)",
         CredentialDecision::PreserveRecorded => {
-            "model credential: keep the real model already recorded on the release (no prompt)"
+            "keep the real model already recorded on the release (no prompt)"
         }
         CredentialDecision::PromptOnce => {
-            "model credential: prompt once for an Anthropic API key (sk-ant-) or OpenRouter key (sk-or-) before cluster up"
+            "prompt once for an Anthropic API key (sk-ant-) or OpenRouter key (sk-or-) before cluster up"
         }
         CredentialDecision::RefuseNonInteractive => {
-            "model credential: refuse because CURIE_CREDENTIALS is unset, the release has no real model, and stdin is not a terminal"
+            "refuse because CURIE_CREDENTIALS is unset, the release has no real model, and stdin is not a terminal"
         }
         CredentialDecision::NotNeeded => {
-            "model credential: not needed; the release keeps the model it records (no prompt)"
+            "not needed; the release keeps the model it records (no prompt)"
         }
     }
 }
 
-/// The plan line for a kind, kubectl or `cluster up` step; `None` for any
-/// other action.
-fn install_action_line(action: &Action) -> Option<String> {
+/// Index of the `--model` value in a quickstart `cluster up` argv.
+fn cluster_up_model_index(args: &[String]) -> usize {
+    args.iter()
+        .position(|arg| arg == "--model")
+        .expect("quickstart cluster up always specifies its model")
+        + 1
+}
+
+/// The plan lines for the install steps: the skipped `cluster up` line when
+/// the release is already at the target, then each install action.
+fn install_plan_lines(
+    cluster_up: ClusterUpStep,
+    actions: &[Action],
+    release: &str,
+    namespace: &str,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if cluster_up == ClusterUpStep::Skipped {
+        lines.push(SKIPPED_CLUSTER_UP_LINE.to_string());
+    }
+    lines.extend(
+        actions
+            .iter()
+            .flat_map(|action| install_action_lines(action, cluster_up, release, namespace)),
+    );
+    lines
+}
+
+/// The plan lines for a kind, kubectl or `cluster up` step; empty for any
+/// other action. Under an unread release (`--dry-run`, #4626) `cluster up` is
+/// the `otherwise` branch of the decision a live run makes after reading
+/// release `release` in namespace `namespace`.
+fn install_action_lines(
+    action: &Action,
+    cluster_up: ClusterUpStep,
+    release: &str,
+    namespace: &str,
+) -> Vec<String> {
     match action {
-        Action::External { program, args } => Some(format!("{program} {}", args.join(" "))),
-        Action::Cluster { args } => Some(format!("curie {}", args.join(" "))),
-        _ => None,
+        Action::External { program, args } => vec![format!("{program} {}", args.join(" "))],
+        Action::Cluster { args } => match cluster_up {
+            ClusterUpStep::UnlessAtTarget {
+                recorded_model_kept,
+            } => {
+                let keep = if recorded_model_kept {
+                    " and keep the model the release records"
+                } else {
+                    ""
+                };
+                let mut lines = vec![
+                    format!("release {release} in namespace {namespace} was not read under --dry-run; a live run reads it and decides whether cluster up runs"),
+                    format!("if the release already runs the target chart and values: skip cluster up{keep}"),
+                ];
+                if recorded_model_kept {
+                    let model = &args[cluster_up_model_index(args)];
+                    lines.push(format!("if the release records a real model, cluster up keeps that model and its credential in place of --model {model}"));
+                }
+                lines.push(format!("otherwise: curie {}", args.join(" ")));
+                lines
+            }
+            _ => vec![format!("curie {}", args.join(" "))],
+        },
+        _ => Vec::new(),
     }
 }
 
@@ -1804,11 +1926,8 @@ async fn run_install_action(action: &Action, prompted_model: Option<&String>) ->
             // this action. Resolve again so an omitted model follows that key.
             let mut args = args.clone();
             if let Some(model) = prompted_model {
-                let model_index = args
-                    .iter()
-                    .position(|arg| arg == "--model")
-                    .expect("quickstart cluster up always specifies its model");
-                args[model_index + 1] = model.clone();
+                let model_index = cluster_up_model_index(&args);
+                args[model_index] = model.clone();
             }
             run_self(&args, "Installing Curie").await.map(|_| ())
         }
@@ -1987,6 +2106,47 @@ async fn deployed_release_snapshot(
         (Some(values), Some(metadata)) => Some((values, metadata)),
         _ => None,
     })
+}
+
+/// Reads the release for the planners (#4626). `add_agent` plans no cluster
+/// up, so it reads nothing. A dry run does not read the release, so the plan
+/// states the live skip decision as a condition; a live run with a target
+/// reads it. `preserve_recorded_model` and `explicit_credential_absent` come
+/// from one read of the credential environment by the caller.
+async fn read_release(
+    opts: &QuickstartOpts,
+    targeted: Option<&str>,
+    add_agent: bool,
+    model: String,
+    preserve_recorded_model: bool,
+    explicit_credential_absent: bool,
+) -> Result<(ReleaseRead, String)> {
+    match targeted {
+        Some(_) if opts.dry_run && !add_agent => Ok((
+            ReleaseRead::Unread {
+                recorded_model_kept: opts.model.is_none() && explicit_credential_absent,
+            },
+            model,
+        )),
+        Some(context) if !opts.dry_run && !add_agent => {
+            let (at_target, model) = release_matches_quickstart_target(
+                opts,
+                &model,
+                preserve_recorded_model,
+                is_kind_context(context),
+            )
+            .await?;
+            Ok((
+                if at_target {
+                    ReleaseRead::AtTarget
+                } else {
+                    ReleaseRead::NotAtTarget
+                },
+                model,
+            ))
+        }
+        _ => Ok((ReleaseRead::NotAtTarget, model)),
+    }
 }
 
 async fn release_matches_quickstart_target(
@@ -2414,7 +2574,7 @@ mod tests {
             release_has_real_model: false,
             chart_explicit: false,
             interactive: true,
-            release_at_target: false,
+            release_read: ReleaseRead::NotAtTarget,
             agent: DEFAULT_AGENT.into(),
             label: None,
             plugin_dir: None,
@@ -2471,7 +2631,7 @@ mod tests {
             false
         ));
         let mut input = base();
-        input.release_at_target = true;
+        input.release_read = ReleaseRead::AtTarget;
         input.current_context = Some("kind-curie-factory".into());
         let lines = describe(&quickstart_plan(&input).unwrap());
         let text = lines.join("\n");

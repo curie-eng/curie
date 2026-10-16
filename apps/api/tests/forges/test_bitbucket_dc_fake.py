@@ -117,6 +117,7 @@ def _port_calls(
             pull, title="t", body=None
         ),
         Operation.READ_PULL_REQUEST: lambda: adapter.read_pull_request(pull),
+        Operation.LIST_FACTORY_PUBLICATIONS: lambda: adapter.list_factory_publications(repo),
         Operation.OBSERVE_CI: lambda: adapter.observe_ci(repo, sha),
         Operation.LIST_REVIEW_FEEDBACK: lambda: adapter.list_review_feedback(pull, None),
         Operation.VERIFY_FEEDBACK: lambda: adapter.verify_feedback(feedback),

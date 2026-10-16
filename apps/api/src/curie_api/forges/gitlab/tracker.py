@@ -318,6 +318,7 @@ class GitLabTracker:
                     event_id=item.event_id,
                     disposition=item.disposition,
                     cursor=page_cursor,
+                    occurred_at=item.at,
                 )
                 for item in pending
             ),
@@ -570,6 +571,22 @@ class GitLabTracker:
 
         self._issue_path(issue)
         return f"Closes #{issue.issue_id}"
+
+    async def publication_references(
+        self, issue: TrackerIssueRef, repository: RepositoryRef
+    ) -> tuple[str, ...]:
+        """``Closes #<iid>`` only when ``repository`` is the issue's own project
+        (same kind, host and project id). In any other project a bare ``#<iid>``
+        names that project's own issue, so it is never a reference to this one."""
+
+        self._issue_path(issue)
+        if (
+            repository.kind != types.GITLAB
+            or repository.host != issue.host
+            or repository.project_id != issue.scope_id
+        ):
+            return ()
+        return (await self.closing_reference(issue, repository),)
 
     async def link_pull_request(self, issue: TrackerIssueRef, pull_request: PullRequest) -> None:
         """No-op: the merge request's ``Closes #<iid>`` already links it."""

@@ -178,10 +178,14 @@ class JiraTransport:
             token = next_token
         raise Unavailable("search")
 
-    async def changelog(self, issue_id: str, *, page_size: int) -> list[dict[str, Any]]:
+    async def changelog(
+        self, issue_id: str, *, page_size: int, strict: bool = False
+    ) -> list[dict[str, Any]]:
         """The issue's whole changelog, oldest first, across every page.
 
         https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-issueidorkey-changelog-get
+        A history that is not an object is skipped, or with ``strict`` raises
+        `Unavailable`, for a caller that must not decide without it.
         """
 
         histories: list[dict[str, Any]] = []
@@ -194,6 +198,8 @@ class JiraTransport:
             )
             values = page.get("values") if isinstance(page, dict) else None
             if not isinstance(values, list):
+                raise Unavailable("changelog")
+            if strict and not all(isinstance(value, dict) for value in values):
                 raise Unavailable("changelog")
             histories.extend(value for value in values if isinstance(value, dict))
             if page.get("isLast") is True:

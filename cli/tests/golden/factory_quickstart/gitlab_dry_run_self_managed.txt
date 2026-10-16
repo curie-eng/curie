@@ -7,7 +7,9 @@ project factory-fixture/nested/widgets has id 1234, default branch main, and iss
 factory-bot has access level 30 (Developer) on factory-fixture/nested/widgets
 ensure labels curie-factory, curie-factory:queued, curie-factory:running, curie-factory:pr-open, curie-factory:needs-human on project 1234, creating only the missing ones, before any cluster step
 kubectl --context kind-curie-factory -n kube-system scale deployment/coredns --replicas=1
-curie cluster up --context kind-curie-factory --namespace curie --release curie --model z-ai/glm-5.3-flash --chart <chart> --set security.gvisor.mode=off
+release curie in namespace curie was not read under --dry-run; a live run reads it and decides whether cluster up runs
+if the release already runs the target chart and values: skip cluster up
+otherwise: curie cluster up --context kind-curie-factory --namespace curie --release curie --model z-ai/glm-5.3-flash --chart <chart> --set security.gvisor.mode=off
 write Secret curie-gitlab-token key token in namespace curie from --token-file <dir>/token-7c1e (the token is never printed)
 write ConfigMap curie-gitlab-ca key ca.crt in namespace curie from --ca-file <ca-file> and set codeHostTrust.caBundle.configMapRef.name=curie-gitlab-ca
 write factory.enabled=true, factory.intake=poll, factory.codeHosts and factory.trackers entry gitlab (apiUrl http://<forge-host>/api/v4, label curie-factory, mention factory-bot, credential expiresAt <expires>T00:00:00Z) and factory.bindings entry gitlab-1234 (project_id and tracker_scope_id 1234, path factory-fixture/nested/widgets): helm upgrade --reuse-values of release curie, then roll the API
