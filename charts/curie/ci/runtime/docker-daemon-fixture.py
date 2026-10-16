@@ -309,8 +309,7 @@ class Fixture:
             if item["metadata"]["name"] == "agent-sandbox-controller"
         ]
 
-    def substrate(self) -> None:
-        deadline = time.monotonic() + 300
+    def vendored_crds(self) -> list[Json]:
         crds: list[Json] = list(
             yaml.safe_load_all(
                 "\n---\n".join(
@@ -320,6 +319,31 @@ class Fixture:
             )
         )
         require(len(crds) == 4, "vendored_crd_inventory")
+        return crds
+
+    @staticmethod
+    def require_compatible(current: Json, doc: Json) -> None:
+        require(
+            current["spec"]["group"] == doc["spec"]["group"]
+            and current["spec"]["names"] == doc["spec"]["names"]
+            and current["spec"]["scope"] == "Namespaced"
+            and {v["name"] for v in doc["spec"]["versions"] if v.get("served")}.issubset(
+                {v["name"] for v in current["spec"]["versions"] if v.get("served")}
+            ),
+            "incompatible_crd",
+        )
+
+    def substrate_precheck(self) -> None:
+        """Refuse an ambiguous or incompatible existing substrate before the first create."""
+        require(len(self.controllers()) <= 1, "ambiguous_substrate")
+        for doc in self.vendored_crds():
+            current = self.get(object_path(doc))
+            if current:
+                self.require_compatible(current, doc)
+
+    def substrate(self) -> None:
+        deadline = time.monotonic() + 300
+        crds = self.vendored_crds()
         existing = [self.get(object_path(doc)) for doc in crds]
         controllers = self.controllers()
         require(len(controllers) <= 1, "ambiguous_substrate")
@@ -342,15 +366,7 @@ class Fixture:
                 )
                 current = self.create(doc, race=True)
             if current:
-                require(
-                    current["spec"]["group"] == doc["spec"]["group"]
-                    and current["spec"]["names"] == doc["spec"]["names"]
-                    and current["spec"]["scope"] == "Namespaced"
-                    and {v["name"] for v in doc["spec"]["versions"] if v.get("served")}.issubset(
-                        {v["name"] for v in current["spec"]["versions"] if v.get("served")}
-                    ),
-                    "incompatible_crd",
-                )
+                self.require_compatible(current, doc)
                 self.borrow(current)
         # A raced CRD means another installer is active: never start a second controller.
         bootstrap = bootstrap and all(self.owned(object_path(d)) for d in crds)
@@ -559,6 +575,7 @@ class Fixture:
         with tarfile.open(archive) as source:
             source.extractall(self.snapshot, filter="data")
         archive.unlink()
+        self.substrate_precheck()
         self.namespace(self.args.namespace, "restricted")
         self.namespace(self.args.daemon_namespace, "privileged")
         self.substrate()

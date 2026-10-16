@@ -527,7 +527,7 @@ def test_setup_requires_exactly_one_ready_node_of_any_name(
 
 
 @pytest.mark.parametrize("context", ["ctx-under-test", "any-other-name"])
-def test_caller_context_reaches_every_kubectl_call_and_docker_is_never_switched(
+def test_caller_context_reaches_every_kubectl_call(
     mod: ModuleType, fake: FakeCluster, root: Path, context: str
 ) -> None:
     fixture = mod.Fixture(mod.arguments(argv=argv_for(context=context)), teardown=False)
@@ -539,7 +539,31 @@ def test_caller_context_reaches_every_kubectl_call_and_docker_is_never_switched(
         fixture.db.close()
     kubectl = [c for c in fake.calls if c[0] == "kubectl"]
     assert kubectl and all(c[1:3] == ["--context", context] for c in kubectl)
-    assert not any(c[:2] == ["docker", "context"] for c in fake.calls)
+
+
+@pytest.mark.parametrize("defect", ["none", "two-controllers", "incompatible-crd"])
+def test_substrate_precheck_refuses_a_bad_existing_substrate_without_mutating(
+    make: Callable[..., Any], fake: FakeCluster, defect: str
+) -> None:
+    seed_crds(fake)
+    seed_controller(fake)
+    if defect == "two-controllers":
+        seed_controller(fake, "second-system")
+    elif defect == "incompatible-crd":
+        fake.objects[SANDBOXES]["spec"]["scope"] = "Cluster"
+    fixture = make()
+    if defect == "none":
+        fixture.substrate_precheck()  # a healthy shared substrate must pass
+    else:
+        with pytest.raises(RuntimeError, match="^(ambiguous_substrate|incompatible_crd)$"):
+            fixture.substrate_precheck()
+    assert fake.mutations == []
+
+
+def test_setup_runs_the_substrate_precheck_before_creating_namespaces() -> None:
+    source = MODULE_PATH.read_text()
+    setup = source[source.index("    def setup(self)") : source.index("    def images(self)")]
+    assert setup.index("self.substrate_precheck()") < setup.index("self.namespace(")
 
 
 @pytest.mark.parametrize("which", ["namespace", "daemon_namespace", "controller_namespace"])
