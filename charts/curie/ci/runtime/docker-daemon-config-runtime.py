@@ -143,6 +143,8 @@ def render(f: FixtureAPI, images: Json) -> tuple[list[Json], Json]:
             "platform": {"create": False, "name": ""},
             "sandbox": {"create": False, "name": ""},
         },
+        # The tenant quota is scoped to a sandbox PriorityClass, disabled above.
+        "resourceQuota": {"enabled": False},
         "agentSandbox": {
             "controller": {"deploy": False},
             "warmPool": {"replicas": 0},
