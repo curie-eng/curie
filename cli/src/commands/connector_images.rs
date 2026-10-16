@@ -1014,6 +1014,9 @@ pub async fn bring_up_local(
     // are serving.
     refuse_missing_connector_secrets(decl)?;
 
+    let secret_volumes = cb::ConnectorSecretVolumes::new(decl);
+    cb::docker_subpath_preflight(&secret_volumes, true).await?;
+
     // Reconcile before starting: compose only ADDS the services the overlay
     // names, so a connector this bundle version dropped or renamed would keep
     // running -- serving the runner an MCP endpoint the bundle no longer
@@ -1049,7 +1052,6 @@ pub async fn bring_up_local(
 
     let previous_volumes =
         docker::connector_secret_volumes_for_agent(project, &identity.agent).await?;
-    let secret_volumes = cb::ConnectorSecretVolumes::new(decl);
     let result = async {
         let mut secret_values = std::collections::BTreeMap::new();
         for (connector, spec) in &hosted {
@@ -1277,6 +1279,7 @@ pub(super) async fn start_skill_connectors(
     });
     let plan = skill_connector_plan(decl, &lock)?;
     let secret_volumes = cb::ConnectorSecretVolumes::new(decl);
+    cb::docker_subpath_preflight(&secret_volumes, false).await?;
     let result = async {
         let mut started = Vec::new();
         let mut readiness_targets = Vec::new();

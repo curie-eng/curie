@@ -377,6 +377,11 @@ jobs:
           uv run python scripts/check-alembic-revisions.py --other-train-ref "origin/$other_train"
       - name: Schema window gate
         run: uv run python scripts/check-schema-window.py
+      # ADR 0232 (#4610): a contract migration may not drop or rename what the
+      # previous release tag's code still names. Relies on this job's
+      # fetch-depth: 0 checkout so the release tags are present.
+      - name: Contract migration timing gate
+        run: uv run python scripts/check-contract-migration-timing.py
       - name: Ruff
         run: uv run ruff check .
       - name: Mypy

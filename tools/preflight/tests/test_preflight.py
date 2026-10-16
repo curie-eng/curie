@@ -28,6 +28,7 @@ PYTHON = {
         "Lockfile is up to date",
         "Alembic revision gate",
         "Schema window gate",
+        "Contract migration timing gate",
         "Ruff",
         "Mypy",
         "Import boundaries (harness SDK containment)",

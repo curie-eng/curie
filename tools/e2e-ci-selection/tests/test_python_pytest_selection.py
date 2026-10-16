@@ -392,7 +392,10 @@ def test_static_job_holds_exactly_the_moved_gates_in_order() -> None:
         "Install uv (retry)",
         "Lockfile is up to date",
         "Sync workspace",
-        *MOVED_STATIC_STEPS[1:],
+        *MOVED_STATIC_STEPS[1:4],
+        # ADR 0232 (#4610) added this gate after the move.
+        "Contract migration timing gate",
+        *MOVED_STATIC_STEPS[4:],
     ]
     assert static_names == expected
 

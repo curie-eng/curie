@@ -82,6 +82,7 @@ mod deploy_environment;
 mod deploy_transport;
 mod dev_model_credit;
 mod docker_no_host_binds;
+mod docker_subpath_preflight;
 mod doctor_api;
 mod doctor_recovery;
 mod doctor_release_health;
