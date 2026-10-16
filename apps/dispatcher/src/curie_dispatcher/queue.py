@@ -22,13 +22,12 @@ dedupe because it is O(1), TTL-bounded (no unbounded dedupe set to prune), and
 does not require scanning the Stream.
 
 The claim also has a release path, ``release_event`` (``DEL <dedupe_key>``,
-#2006), and it is deliberately asymmetric. A failure between claiming and
-posting the placeholder has produced no user-visible side effect yet, so
-releasing is safe and lets a genuine Slack redelivery retry cleanly. A failure
-between a *successful* placeholder post and the ``XADD``, by contrast, must
-NOT release: the placeholder is already visible in the channel, and a
-redelivery that re-claims would post a second one. The asymmetry is the point,
-not an inconsistency to "clean up" later.
+#2006). The Slack mint path no longer calls it on a failed placeholder: a
+failed placeholder now still enqueues the turn with no placeholder, so the
+claim must be held against a redelivery (``handlers._post_placeholder``). A
+failure between a *successful* placeholder post and the ``XADD`` must not
+release either: the placeholder is already visible in the channel, and a
+redelivery that re-claims would post a second one.
 """
 
 import logging
@@ -119,10 +118,12 @@ def release_event(
 ) -> None:
     """Release the dedupe claim on ``event_id`` so a Slack redelivery can retry.
 
-    Legitimate to call only when nothing user-visible has happened yet -- i.e.
-    before the placeholder post has succeeded. Once a placeholder has been
-    posted, do NOT call this: a redelivery would re-claim and post a second
-    placeholder (see the module docstring's Dedupe paragraph and #2006).
+    The Slack mint path no longer calls this: a failed placeholder still
+    enqueues the turn, so its claim must be held (see the module docstring's
+    Dedupe paragraph). It stays part of the documented queue seam
+    (docs/interfaces/queue-stream). Legitimate to call only when nothing
+    user-visible has happened and nothing has been enqueued for the event; a
+    redelivery after a posted placeholder or a queued turn would duplicate it.
 
     Caveat: under Socket Mode, Bolt acks the envelope before running the
     listener body, so a Slack redelivery triggered by a failure inside the

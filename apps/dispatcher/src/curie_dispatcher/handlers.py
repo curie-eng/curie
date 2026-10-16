@@ -97,7 +97,7 @@ from .identity import IdentityResolver, build_identity_client, principal_observe
 from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text
 from .marked_actions import MARK, REFUSAL, declared_driver, reserve_turn
-from .queue import claim_event, enqueue, release_event
+from .queue import claim_event, enqueue
 from .relevance import DropReason, Lane, classify, drop, missing_envelope_fields
 from .thread_context import SlackThreadContext
 
@@ -154,68 +154,74 @@ def _is_unambiguous_rejection(error: SlackApiError) -> bool:
 def _post_placeholder(
     *,
     web_client: WebClient,
-    redis_client: "Redis",
     config: DispatcherConfig,
     log: logging.Logger,
     slack_event_id: str,
     channel: str,
     thread_ts: str,
-) -> Any:
-    """Post the in-thread placeholder, releasing the dedupe claim if it fails (#2006).
+) -> str | None:
+    """Post the in-thread placeholder and return its ts, or None if that failed.
 
-    ``claim_event`` runs before this call, and Bolt acks an Events API envelope
-    before running the listener body and then catches the body's exception in its
-    executor. So a raising ``chat_postMessage`` used to leave the key claimed with
-    no work done: any later delivery of that event id hit the claim and was
-    refused, and the message was lost for good with only a framework log line --
-    exactly the silent-loss class this ticket closes.
+    THE PLACEHOLDER IS A COURTESY, THE REQUEST IS NOT. A failed placeholder must
+    never cost the person their request. ``claim_event`` runs before this call,
+    and Bolt acks an Events API envelope before running the listener body, so
+    Slack has already been told "received" and will not normally redeliver. A
+    raising post used to abort the turn there: #2006 then released the claim on
+    an unambiguous refusal so a redelivery *could* retry, but no redelivery
+    normally comes, so the request was still lost with no reply. A burst test
+    lost 7 of 100 mentions that way when Slack refused connections.
 
-    HONEST BOUND on what this buys. Because Bolt already acked, a Slack
-    redelivery of the failed event is rare; it is not the normal consequence of
-    the body raising. Releasing restores idempotency *correctness* -- the adapter
-    stops holding a claim for work it never did, so a retry, a replay or an
-    operator re-send can still be processed. It does not guarantee that every
-    failed placeholder is recovered.
+    So every failure returns None and the caller enqueues the turn with no
+    placeholder: the worker then posts the answer, or its failure notice, as a
+    fresh reply in the thread. The claim is never released here, because the
+    turn is about to be queued and a redelivery must be refused as a duplicate.
 
-    THE ASYMMETRY IS DELIBERATE, do not "fix" it for consistency: only a failure
-    *before* the placeholder releases. Once the placeholder is in the channel
-    something user-visible has happened, so a failing ``enqueue`` after it keeps
-    the claim -- releasing there would let a redelivery post a SECOND placeholder
-    into the same thread, trading an invisible failure for a visible, confusing
-    one. Before the placeholder nothing user-visible has occurred, so releasing
-    is free.
+    Whether the post may have landed still matters, but only for the log.
+    A ``SlackApiError`` with Slack's own error code (other than ``fatal_error``)
+    means Slack answered and refused, so no placeholder exists. Anything else (a
+    dropped connection, a timeout, ``fatal_error``, an unrecognised exception)
+    may have failed after Slack accepted the post, so a placeholder may already
+    be in the thread and the answer will arrive as a separate reply below it.
+    That stale "On it" is the accepted cost of never losing the request.
 
-    ONLY AN UNAMBIGUOUS REFUSAL RELEASES. "The call raised" is not the same
-    claim as "nothing was posted". A ``SlackApiError`` carrying Slack's own
-    error code means Slack answered and refused, so no placeholder exists and a
-    later retry is clean -- release. Everything else (a timeout, a dropped
-    connection, ``SlackRequestError``, ``fatal_error``, an exception type we do
-    not recognise) may have failed *after* Slack accepted the post, so a
-    placeholder may already be sitting in the thread; releasing there would let
-    a replay post a SECOND one, which is precisely the duplicate the
-    claim-before-placeholder ordering exists to prevent. Both outcomes are
-    imperfect and we pick the quieter one: keep the claim, and log at ERROR that
-    it is being kept deliberately so the retained key is never mistaken for the
-    silent-loss bug this function fixes. Either way the exception is re-raised.
+    A response that carries no ``ts`` is treated the same way: the post landed
+    but there is nothing to edit, so the reply is posted fresh.
+
+    Returns:
+        The placeholder's ts, or None when the post failed or returned no ts.
     """
     try:
-        return web_client.chat_postMessage(
+        response = web_client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
             text=config.placeholder_text,
         )
-    except BaseException as error:
+        ts = response.get("ts")
+    except Exception as error:  # noqa: BLE001 - no failure may cost the request
         if isinstance(error, SlackApiError) and _is_unambiguous_rejection(error):
-            release_event(redis_client, config, slack_event_id)
-            raise
-        log.error(
-            "placeholder for slack delivery %r failed with an ambiguous outcome (%s); "
-            "keeping the idempotency claim because a placeholder may already be in the "
-            "thread and a retry could post a second one",
+            outcome = "Slack refused it, so no placeholder was posted"
+        else:
+            outcome = "the outcome is ambiguous, so a placeholder may already be in the thread"
+        response_obj = getattr(error, "response", None)
+        code = response_obj.get("error") if response_obj is not None else None
+        log.warning(
+            "placeholder for slack delivery %r failed (%s%s); %s. Enqueuing the turn without "
+            "a placeholder so the reply is posted fresh, and keeping the idempotency claim",
             slack_event_id,
             type(error).__name__,
+            f" {code}" if code else "",
+            outcome,
+            exc_info=True,
         )
-        raise
+        return None
+    if not isinstance(ts, str) or not ts:
+        log.warning(
+            "placeholder for slack delivery %r returned no ts; enqueuing the turn without "
+            "a placeholder so the reply is posted fresh",
+            slack_event_id,
+        )
+        return None
+    return ts
 
 
 def _event_callers(event: dict[str, Any]) -> list[str]:
@@ -300,10 +306,10 @@ def _mint_turn(
     ``kind`` and explicit ``adapter``) are asserted here once rather than once
     per lane, and a field added at the next protocol bump has one site to touch.
 
-    The caller MUST have taken the dedupe claim already: ``_post_placeholder``
-    owns the release-only-on-an-unambiguous-refusal rule (#2006) and is called
-    from here, so the claim -> placeholder -> ``XADD`` ordering and the release
-    asymmetry are the same on both lanes by construction.
+    The caller MUST have taken the dedupe claim already. ``_post_placeholder`` is
+    called from here and never raises, so the claim -> placeholder -> ``XADD``
+    ordering, and the rule that a failed placeholder still queues the turn, are
+    the same on both lanes by construction.
 
     ``delivery_kind`` names what arrived ("slack event", "block action") for the
     enqueue log line -- the one thing that still differs downstream of here.
@@ -318,16 +324,16 @@ def _mint_turn(
     stated by the caller for the same reason. It is never read from the
     delivery.
     """
-    placeholder = _post_placeholder(
+    # None when the post failed: the turn is still queued, and the worker posts
+    # a fresh reply because there is no placeholder to edit.
+    placeholder_ts = _post_placeholder(
         web_client=web_client,
-        redis_client=redis_client,
         config=config,
         log=log,
         slack_event_id=slack_event_id,
         channel=channel,
         thread_ts=thread_ts,
     )
-    placeholder_ts = placeholder["ts"]
 
     # Nothing else goes between the placeholder and the XADD below. The Slack
     # assistant-thread status ("shimmer") used to sit right here, and it was the
