@@ -370,6 +370,7 @@ async def _admit_labeled(
                 number,
                 sender_id,
                 sender_login,
+                label_event_at=parse_time(event.get("created_at")),
                 label=label,
                 label_event_id=event["id"],
             )
@@ -455,6 +456,7 @@ async def _cancel_stale(
                 number,
                 sender_id,
                 sender_login,
+                label_event_at=None,
                 label=label,
             )
             await _apply_notice(sessionmaker, settings, client, notice, tracker, repository)
@@ -561,6 +563,7 @@ async def _admit_mentions(
             number,
             sender_id,
             sender_login,
+            label_event_at=None,
             comment_id=comment_id,
             comment_body=body,
         )
@@ -598,7 +601,9 @@ async def _apply_notice(
             elif notice.disposition == "base_label":
                 await github_factory.record_base_label_notice(session, notice, verified, settings)
             else:
-                await github_factory.admit_notice(session, notice, settings, verified)
+                await github_factory.admit_notice(
+                    session, notice, settings, verified, client=client
+                )
         except FeedbackUnavailable:
             await session.rollback()
             raise

@@ -1469,6 +1469,40 @@ never admits an issue that already has a work item, so it does not duplicate a
 delivery that arrived. A manual redelivery of the lost label after that
 backstop admitted the issue counts as a relabel and starts a second run.
 
+A reinstall, or any other loss of factory storage, leaves labelled issues with
+no work item. Before admitting such an issue, every intake path (polling, a
+webhook delivery, the missed-label backstop, and the GitLab and Jira trackers)
+asks the code host for the pull or merge requests the publishing identity
+opened from a factory publication branch of that same repository, and keeps
+the ones whose body names the issue. A tracker state label is never used as
+evidence. The outcome is decided in this order:
+
+1. One open match: the issue is not run again, and its one status comment
+   links that pull request.
+2. More than one open match: the issue is refused, and the status comment
+   lists each of them. Close all but one to continue.
+3. A pull request whose author the code host cannot confirm is never
+   evidence and is ignored, with one info log line per check. Bitbucket Cloud
+   cannot read its own identity, and Bitbucket Data Center cannot when its
+   answers omit the `X-AUSERID` header, so on those hosts ownership cannot be
+   verified, rediscovery does not suppress, and a reinstall can still open one
+   duplicate pull request. When nothing matches, the issue is admitted
+   normally.
+4. Only closed or merged matches: the old label is a replay of a run that
+   already finished, so it is logged and nothing runs. A label added after the
+   most recent close or merge is an intentional rerun and is admitted. When
+   the label time or the close time is unknown, the label counts as a replay.
+5. Evidence that cannot be read completely defers the issue: a failed or
+   missing page, an unreadable item, body or author, an own identity that
+   cannot be read, or a pull request URL that is not on the configured code
+   host. Polling does not advance its cursor, a webhook delivery is retryable,
+   and the issue is decided again on the next pass.
+
+The publication step repeats the check right before it opens a new pull
+request, leaving out its own branch. If another open factory pull request for
+the issue appeared in the meantime, it refuses with `publication_exists`
+instead of opening a second one.
+
 When intake is webhook, subscribe the App webhook to **Issues** and **Issue
 comments** in addition to the review subscriptions when both gates are on. Give
 the App **Issues: Read and write**

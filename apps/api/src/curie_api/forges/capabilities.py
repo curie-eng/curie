@@ -38,6 +38,7 @@ class Operation(enum.StrEnum):
     DEPENDENCIES = "tracker.dependencies"
     GROUP_MEMBERSHIP = "tracker.group_membership"
     TICKET_LABELS = "tracker.ticket_labels"
+    PUBLICATION_REFERENCES = "tracker.publication_references"
     # CodeHost
     RESOLVE_REPOSITORY = "code_host.resolve_repository"
     CREDENTIAL = "code_host.credential"
@@ -53,6 +54,7 @@ class Operation(enum.StrEnum):
     CI_DIAGNOSTICS = "code_host.ci_diagnostics"
     RERUN_FAILED = "code_host.rerun_failed"
     USER_CAN_WRITE = "code_host.user_can_write"
+    LIST_FACTORY_PUBLICATIONS = "code_host.list_factory_publications"
     # MarkedComments, exposed by both ports
     FIND_MARKED = "marked_comments.find_marked"
     UPSERT_MARKED = "marked_comments.upsert_marked"

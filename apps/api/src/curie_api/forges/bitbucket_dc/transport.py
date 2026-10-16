@@ -148,12 +148,15 @@ class DcTransport:
         limit: int,
         params: Mapping[str, str] | None = None,
         api: str = REST_API,
+        strict: bool = False,
     ) -> list[dict[str, Any]]:
         """Every value of a paged listing, following ``isLastPage`` and
         ``nextPageStart`` for at most `MAX_PAGES` pages."""
 
         values: list[dict[str, Any]] = []
-        async for page in self.iter_pages(path, what=what, limit=limit, params=params, api=api):
+        async for page in self.iter_pages(
+            path, what=what, limit=limit, params=params, api=api, strict=strict
+        ):
             values.extend(page)
         return values
 
@@ -165,9 +168,12 @@ class DcTransport:
         limit: int,
         params: Mapping[str, str] | None = None,
         api: str = REST_API,
+        strict: bool = False,
     ) -> AsyncIterator[list[dict[str, Any]]]:
         """The pages of one listing in order, so a caller may stop early. A
-        failed page, or a listing longer than `MAX_PAGES`, raises `Unavailable`."""
+        failed page, or a listing longer than `MAX_PAGES`, raises `Unavailable`.
+        A value that is not an object is skipped, or with ``strict`` raises
+        `Unavailable`, for a caller that must not decide without it."""
 
         start = 0
         for _ in range(MAX_PAGES):
@@ -187,6 +193,8 @@ class DcTransport:
             values = page.get("values")
             if not isinstance(values, list):
                 raise Unavailable("pagination")
+            if strict and not all(isinstance(value, dict) for value in values):
+                raise Unavailable(what)
             yield [value for value in values if isinstance(value, dict)]
             if page.get("isLastPage") is True:
                 return

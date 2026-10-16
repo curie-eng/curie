@@ -44,6 +44,7 @@ from curie_api.forges.types import (
     Commit,
     Credential,
     CredentialScope,
+    FactoryPublication,
     FeedbackKind,
     FeedbackPage,
     NormalizedCheck,
@@ -55,8 +56,11 @@ from curie_api.forges.types import (
     RerunObserver,
     RerunRecord,
     ReviewFeedback,
+    publication_body,
+    publication_url,
     status_key,
 )
+from curie_api.publication_policy import is_publication_branch
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +76,8 @@ OVERLAP = timedelta(seconds=120)
 # Bitbucket Cloud's page length ceiling on pull request listings; most others allow 100.
 _PULL_PAGELEN = 50
 _FULL_HASH = 40
+# Where Bitbucket Cloud's pull request pages live; a listed URL must be on it.
+_WEB_BASE = f"https://{HOST}"
 
 _PULL_STATES = {
     "OPEN": PullRequestState.OPEN,
@@ -408,6 +414,81 @@ class BitbucketCloudCodeHost:
         if len(matches) > 1:
             raise Ambiguous("pull_request")
         return await self._pull(repository, matches[0], conflicted=None)
+
+    async def list_factory_publications(
+        self, repository: RepositoryRef
+    ) -> tuple[FactoryPublication, ...]:
+        """Every pull request from a publication branch of ``repository``
+        itself, in any state, each with ``owner_verified=False`` (#4629).
+
+        Bounded limitation: an access token cannot read its own account
+        (``GET /2.0/user`` answers 403, see `bitbucket_cloud.comments`), so
+        ownership cannot be checked here. Every same-repository pull request
+        whose branch is publication shaped is listed, a writer's lookalike
+        included, and rediscovery drops every unverified publication, so it never treats one
+        as evidence and does not suppress a reinstall on Bitbucket Cloud.
+
+        ``GET /repositories/{workspace}/{slug}/pullrequests`` with every
+        ``state`` (https://developer.atlassian.com/cloud/bitbucket/rest/api-group-pullrequests/#api-repositories-workspace-repo-slug-pullrequests-get)
+        read to its last page. A pull request counts when its source and
+        destination repository are this one (by UUID). An item, branch, state,
+        description or URL that cannot be read fails the listing; a null
+        description is an empty body, and the ``links.html.href`` must be on
+        ``https://bitbucket.org`` (`types.publication_url`). Bitbucket Cloud reports
+        no close time, so ``closed_at`` of a merged or declined one is its
+        ``updated_on``: never earlier than the real close.
+        """
+
+        listed = await self._http.pages(
+            f"{self.repo_url(repository)}/pullrequests",
+            what="pull_request",
+            params=[
+                *(("state", state) for state in _PULL_STATES),
+                ("pagelen", self.pagelen(_PULL_PAGELEN)),
+            ],
+            strict=True,
+        )
+        found: list[FactoryPublication] = []
+        for item in listed:
+            number, state = item.get("id"), item.get("state")
+            source, target = item.get("source"), item.get("destination")
+            if (
+                type(number) is not int
+                or not isinstance(state, str)
+                or state not in _PULL_STATES
+                or not isinstance(source, dict)
+                or not isinstance(target, dict)
+            ):
+                raise Unavailable("pull_request")
+            branch = _dict(source.get("branch")).get("name")
+            if not isinstance(branch, str) or not branch:
+                raise Unavailable("pull_request")
+            if not is_publication_branch(branch):
+                continue
+            if not all(
+                _dict(side.get("repository")).get("uuid") == repository.project_id
+                for side in (source, target)
+            ):
+                # A fork's branch is never ours.
+                continue
+            url = _dict(_dict(item.get("links")).get("html")).get("href")
+            pull_state = _PULL_STATES[state]
+            found.append(
+                FactoryPublication(
+                    ref=PullRequestRef(repository, str(number)),
+                    url=publication_url(url, _WEB_BASE),
+                    head_ref=branch,
+                    state=pull_state,
+                    body=publication_body(item, "description"),
+                    closed_at=(
+                        None
+                        if pull_state is PullRequestState.OPEN
+                        else _time(item.get("updated_on"))
+                    ),
+                    owner_verified=False,
+                )
+            )
+        return tuple(found)
 
     async def open_pull_request(
         self,
