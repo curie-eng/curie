@@ -231,16 +231,19 @@ def startup(f: FixtureAPI, docs: list[Json], expected: Json) -> Json:
     require(parsed == expected, "startup_config_mismatch")
     pools = json.loads(raw)
     require("daemon" not in pools["acme-corp/ui"], "non_docker_daemon_present")
-    pools["acme-corp/api"].pop("daemon")
-    pools["acme-corp/api"]["HOSTILE_RUNTIME_MARKER"] = "HOSTILE_RUNTIME_MARKER"
-    env["CURIE_REPO_RUNNER_POOLS"] = json.dumps(pools)
-    negative = run([*command, "invalid"], cwd=f.snapshot, data=json.dumps(env), check=False)
-    require(
-        negative.returncode == 0
-        and "HOSTILE_RUNTIME_MARKER" not in negative.stdout + negative.stderr
-        and negative.stdout.strip() == "refused",
-        "startup_refusal_or_redaction_failed",
-    )
+    missing = json.loads(raw)
+    missing["acme-corp/api"].pop("daemon")
+    hostile = json.loads(raw)
+    hostile["acme-corp/api"]["daemon"]["storageSizeLimit"] = "HOSTILE_RUNTIME_MARKER"
+    for probe in (missing, hostile):
+        env["CURIE_REPO_RUNNER_POOLS"] = json.dumps(probe)
+        negative = run([*command, "invalid"], cwd=f.snapshot, data=json.dumps(env), check=False)
+        require(
+            negative.returncode == 0
+            and "HOSTILE_RUNTIME_MARKER" not in negative.stdout + negative.stderr
+            and negative.stdout.strip() == "refused",
+            "startup_refusal_or_redaction_failed",
+        )
     f.note("startup_and_schema", True)
     f.note("local_worker_lifecycle_executed", False)
     return parsed

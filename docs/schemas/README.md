@@ -27,7 +27,11 @@ The worker owns the `CURIE_REPO_RUNNER_POOLS` contract in
 `build_schema()` and `render_schema()` in
 `apps/worker/src/curie_worker/repo_runner_pools.py`. It maps each bound repository
 path to one opaque Kubernetes pool name, three digests in index, amd64, arm64
-order, the base digest, the Docker flag and optional egress. The worker reads
+order, the base digest, the Docker flag and optional egress. An entry with
+the Docker flag true must carry a `daemon` object: namespace, digest-pinned
+image, port, release selector labels, resource requests and limits,
+`storageSizeLimit`, `maxClaimLifetimeSeconds` and `pingTimeoutSeconds`, with no
+secret material. An entry with the Docker flag false must not carry one. The worker reads
 it at startup with `parse_repo_runner_pools()` and fails closed on invalid
 input. The chart renders it on the worker beside one pool per agent and
 digest. The Kubernetes sandbox substrate claims a bound repository's pool,
