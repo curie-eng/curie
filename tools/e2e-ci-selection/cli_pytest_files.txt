@@ -100,6 +100,7 @@ tools/factory-e2e/tests/test_bitbucket_dc_fixture_tool.py
 tools/factory-e2e/tests/test_bitbucket_dc_live.py
 tools/factory-e2e/tests/test_bitbucket_drivers.py
 tools/factory-e2e/tests/test_c4_dry_run.py
+tools/factory-e2e/tests/test_c4_held_cancellation.py
 tools/factory-e2e/tests/test_c4_initial_binding.py
 tools/factory-e2e/tests/test_c4_reinstall_publication.py
 tools/factory-e2e/tests/test_c4_tracker_scope.py
