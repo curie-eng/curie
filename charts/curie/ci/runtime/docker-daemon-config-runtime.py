@@ -56,6 +56,7 @@ TEMPLATES = (
     "runner-resources-admission",
     "runner-token",
     "security-networkpolicy",
+    "security-rbac",
 )
 ERRORS = (
     RuntimeError,
