@@ -52,6 +52,10 @@ ADMITTED_AGENT_SELECTOR = (
     "tools/factory-e2e/tests/test_c4_admitted_agent.py::"
     "test_labelled_agents_execute_as_admitted_agent"
 )
+STATIC_TOKEN_ROTATION_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_static_token_rotation.py::"
+    "test_secret_replacement_reports_rejection_and_recovers"
+)
 HELD_CANCELLATION_SELECTOR = (
     "tools/factory-e2e/tests/test_c4_held_cancellation.py::"
     "test_held_run_cancels_after_worker_replacement"
@@ -63,6 +67,12 @@ FACTORY_UPGRADE_SELECTOR = (
 FACTORY_UPGRADE_NEAR_MISS_SELECTOR = (
     "tools/factory-e2e/tests/test_c4_upgrade_migration_extra.py::"
     "test_v0125_factory_upgrade_uses_supported_flow"
+)
+KIND_MODULES = (
+    "tools/factory-e2e/tests/test_c4_initial_binding.py",
+    "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
+    "tools/factory-e2e/tests/test_c4_upgrade_migration.py",
+    "tools/factory-e2e/tests/test_c4_held_cancellation.py",
 )
 LOCAL_SELECTOR = "cli/tests/local/test_deploy.py::test_deploy"
 LOCAL_LIVE_SELECTOR = "cli/tests/local/test_live.py::test_live"
@@ -1167,11 +1177,8 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         names = [name for name, value in pytest_env.items() if value == expression]
         assert len(names) == 1, expression
         bindings[meaning] = names[0]
-    runtime_exclusions = {
-        ("--ignore", "tools/factory-e2e/tests/test_c4_initial_binding.py"),
-        ("--ignore", "tools/factory-e2e/tests/test_c4_upgrade_migration.py"),
-        ("--ignore", "tools/factory-e2e/tests/test_c4_held_cancellation.py"),
-        ("--deselect", "tools/factory-e2e/tests/test_c4_admitted_agent.py"),
+    runtime_exclusions = {("--ignore", module) for module in KIND_MODULES} | {
+        ("--deselect", ADMITTED_AGENT_SELECTOR.split("::", 1)[0]),
     }
 
     def assert_full_suite(command: list[str], shard: int, deselect: str) -> None:
@@ -1205,7 +1212,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
                 excluded.append((option, path))
             else:
                 reporting.append(argument)
-        assert len(excluded) == 4 and set(excluded) == runtime_exclusions, (
+        assert len(excluded) == len(runtime_exclusions) and set(excluded) == runtime_exclusions, (
             "the Python suite must use exactly the required kind runtime exclusions, "
             f"got {excluded!r}"
         )
@@ -1800,6 +1807,7 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
             False,
         ),
         (f"Fix pin: {INITIAL_BINDING_SELECTOR}", True, False, True, False),
+        (f"Fix pin: {STATIC_TOKEN_ROTATION_SELECTOR}", True, False, True, False),
         (f"Fix pin: {HELD_CANCELLATION_SELECTOR}", True, False, True, False),
         (
             "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding.py::"
@@ -1833,6 +1841,13 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
         ),
         (
             "Fix pin: tools/factory-e2e/tests/test_c4_admitted_agent_extra.py::test_example",
+            True,
+            True,
+            False,
+            False,
+        ),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_static_token_rotation_extra.py::test_example",
             True,
             True,
             False,

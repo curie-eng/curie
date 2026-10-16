@@ -51,7 +51,7 @@ from .factory_admission import LABEL_REFUSAL_MARKER, cancel_work_item, label_ref
 from .forges.authority import may_start_with
 from .forges.config import BindingConfig, RepositoryBindingConfig, TrackerConfig
 from .forges.connections import CodeHostConnection
-from .forges.errors import ForgeError, NotFound, Unauthorized, Unavailable
+from .forges.errors import CredentialUnreadable, ForgeError, NotFound, Unauthorized, Unavailable
 from .forges.hosts import resolve_stored
 from .forges.identity import notice_request_id
 from .forges.ports import CodeHost, Tracker
@@ -303,6 +303,27 @@ async def _poll_binding(
 
 
 def _deferred(scope: _Scope, label: str, what: str, exc: Exception) -> None:
+    """Log a deferred pass. A refused or unreadable credential is a WARNING with
+    a fixed classification and never the exception's text (#4630), so an
+    operator sees a rotation gone wrong; any other deferral stays INFO."""
+
+    classification = (
+        "credential unreadable"
+        if isinstance(exc, CredentialUnreadable)
+        else "authentication rejected"
+        if isinstance(exc, Unauthorized)
+        else None
+    )
+    if classification is not None:
+        logger.warning(
+            "tracker intake %s for tracker %s binding %s label %r deferred: %s",
+            what,
+            scope.tracker.name,
+            scope.binding.name,
+            label,
+            classification,
+        )
+        return
     # A port error carries only its code, never forge text (ADR 0197).
     logger.info(
         "tracker intake %s for tracker %s binding %s label %r deferred: %s %s",

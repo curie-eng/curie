@@ -6,7 +6,9 @@ v4 root, which must end in ``/api/v4`` (a sub-path install such as
 without that suffix. The credential is a ``static_token`` without a
 ``username``: GitLab's git username is ``oauth2`` for every token type. Both
 are checked here, when the registry builds the connection, so a bad entry
-fails at config load.
+fails at config load. The token is read when an adapter is built, one
+`TokenSnapshot` per tracker or code host adapter, so a replaced file is used at
+the next operation and no startup value is kept (#4630).
 
 The tracker is binding scoped (#4358 plan D13): `GitLabTrackerConnection.
 for_binding` yields the tracker on one binding's project. Adapter modules are
@@ -19,7 +21,6 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import httpx
-from pydantic import SecretStr
 
 from curie_api.code_host_trust import verify_for_bundle
 from curie_api.forges.config import (
@@ -28,7 +29,7 @@ from curie_api.forges.config import (
     StaticTokenCredentialConfig,
     TrackerConfig,
 )
-from curie_api.forges.credential_providers import StaticTokenProvider
+from curie_api.forges.credential_providers import StaticTokenProvider, TokenSnapshot
 from curie_api.forges.errors import Unavailable
 from curie_api.forges.gitlab.transport import TIMEOUT_S, GitLabTransport, TokenSource
 from curie_api.forges.types import CredentialHeader, RepositoryRef, TrackerIssueRef
@@ -56,17 +57,19 @@ def web_base(api_url: str) -> str:
     return trimmed.removesuffix(API_SUFFIX)
 
 
-def _token(name: str, credential: object) -> SecretStr:
+def _static(name: str, credential: object) -> StaticTokenCredentialConfig:
     if not isinstance(credential, StaticTokenCredentialConfig):
         raise GitLabConfigError(f"gitlab entry {name!r} must use a static_token credential")
     if credential.username is not None:
         raise GitLabConfigError(USERNAME_REFUSAL)
-    return credential.token
+    return credential
 
 
-def _token_source(token: SecretStr) -> TokenSource:
+def _token_source(snapshot: TokenSnapshot) -> TokenSource:
+    """One operation's token: ``snapshot``, read at the first request."""
+
     async def source() -> str:
-        return token.get_secret_value()
+        return snapshot.value()
 
     return source
 
@@ -91,7 +94,7 @@ class GitLabTrackerConnection:
 
     def __init__(self, config: TrackerConfig, *, ca_bundle: str = "") -> None:
         self.config = config
-        self._token = _token(config.name, config.credential)
+        self._credential = _static(config.name, config.credential)
         self.web_base = web_base(config.api_url)
         self._ca_bundle = ca_bundle
         _check_label(config.label)
@@ -121,7 +124,7 @@ class GitLabTrackerConnection:
             client,
             entry=self.config.name,
             api_url=self.config.api_url,
-            token=_token_source(self._token),
+            token=_token_source(TokenSnapshot(self._credential)),
         )
         return GitLabTracker(
             transport,
@@ -147,19 +150,14 @@ class GitLabCodeHostConnection:
 
     def __init__(self, config: CodeHostConfig, *, ca_bundle: str = "") -> None:
         self.config = config
-        token = _token(config.name, config.credential)
-        credential = config.credential
-        assert isinstance(credential, StaticTokenCredentialConfig)
+        self._credential = _static(config.name, config.credential)
         self.web_base = web_base(config.api_url)
         self._ca_bundle = ca_bundle
-        self._token = token
         self._provider = StaticTokenProvider(
-            token.get_secret_value(),
+            self._credential,
             origin=self.web_base,
             header=CredentialHeader.AUTHORIZATION_BASIC,
             username=GIT_USERNAME,
-            expires_at=credential.expires_at,
-            never_expires=credential.never_expires,
         )
 
     def __repr__(self) -> str:
@@ -184,16 +182,20 @@ class GitLabCodeHostConnection:
         # A static token has no App installations to choose between.
         from curie_api.forges.gitlab.code_host import GitLabCodeHost
 
+        # One snapshot for the adapter's requests and its git credential, so
+        # one operation carries one token (#4630).
+        snapshot = self._provider.snapshot()
         transport = GitLabTransport(
             client,
             entry=self.config.name,
             api_url=self.config.api_url,
-            token=_token_source(self._token),
+            token=_token_source(snapshot),
         )
         return GitLabCodeHost(
             transport,
             host=self.config.host,
             web_base=self.web_base,
+            token=snapshot,
             credentials=self._provider,
             repository=repository,
         )

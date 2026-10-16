@@ -5,14 +5,14 @@ served by uvicorn on 127.0.0.1 on an ephemeral port, and a GitHub REST fake
 (`forge_fakes.github.GitHubRepositoryFake`, served the same way) stands in for
 GitHub. The install's `ForgesConfig` names a ``jira_cloud`` tracker whose
 ``api_url`` is that port, the GitHub code host and tracker on the GitHub fake,
-and one binding with an account allowlist; it is validated and built by the
-production builder before the app boots on it.
+and one binding with an account allowlist or group; it is validated and built
+by the production builder before the app boots on it.
 
 Then the real passes run, through `WorkItemReconciler.run_once` (whose
 ``poll_trackers`` step is the Jira intake) and the status comment sync:
 
-1. an allowlisted account labels a Jira issue and one WorkItem is admitted on
-   the bound repository, replying on the ``jira`` surface;
+1. an authorized account creates a labelled Jira issue or labels it later;
+   one WorkItem is admitted on the bound repository, replying on the ``jira`` surface;
 2. one status comment is posted on the Jira issue and edited in place as the
    run's phases advance, and the state label moves through the tracker port;
 3. the publication for the request is created through
@@ -23,7 +23,7 @@ Then the real passes run, through `WorkItemReconciler.run_once` (whose
 6. a review comment by a GitHub writer (signed webhook) admits a revision
    whose reply route is still the ``jira`` surface;
 7. removing the label cancels the WorkItem;
-8. a label applied by an account outside the allowlist admits nothing.
+8. an unauthorized initial creator or later label author admits nothing.
 
 Two test-level shortcuts, both outside the factory core: the publication's
 approval is recorded directly (the approval and publication Job path is not
@@ -50,6 +50,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,7 @@ from curie_api.factory_comment_text import marker_for
 from curie_api.factory_rediscovery import issue_marker
 from curie_api.forges import types
 from curie_api.forges.config import ForgesConfig
+from curie_api.forges.identity import notice_request_id
 from curie_api.forges.registry import build_registry
 from curie_api.main import create_app
 from curie_api.publication_authority import VerifiedPublicationIdentity
@@ -299,8 +301,15 @@ def _document(jira_url: str, jira_host: str, github_url: str) -> dict[str, Any]:
     return document
 
 
+@pytest.fixture(params=["allowlist", "group"])
+def authority_kind(request: pytest.FixtureRequest) -> str:
+    return str(request.param)
+
+
 @pytest.fixture
-def install(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Install]:
+def install(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, authority_kind: str
+) -> Iterator[Install]:
     jira = jira_fake.JiraFake()
     github = _GitHub()
     served_jira = _serve(jira.app)
@@ -310,6 +319,11 @@ def install(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Install
     # The fake answers tenant_info only on its site host, which is this address.
     monkeypatch.setattr(jira_fake, "SITE_HOST", "127.0.0.1")
     document = _document(served_jira.url, jira_host, served_github.url)
+    if authority_kind == "group":
+        document["bindings"][-1]["start_authority"] = {
+            "type": "group",
+            "group_id": jira_fake.STARTERS,
+        }
     # Validated and built by the production builder before the app boots on it.
     registry = build_registry(ForgesConfig.model_validate(copy.deepcopy(document)))
     assert registry.binding_tracker(TRACKER).config.api_url == served_jira.url
@@ -348,6 +362,7 @@ def install(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Install
     )
     starter = jira.add_user(STARTER_ID, "Ada Starter")
     outsider = jira.add_user(OUTSIDER_ID, "Oscar Outsider")
+    jira.set_group_member(jira_fake.STARTERS, starter.account_id, True)
     github.permissions[SENDER] = (SENDER_ID, "write")
     try:
         with TestClient(create_app()) as client:
@@ -443,7 +458,10 @@ def _start(request_id: uuid.UUID) -> int:
         try:
             async with AsyncSession(engine) as session:
                 acquired = await acquire(
-                    session, request_id, owner="jira-owner", generation=generation,
+                    session,
+                    request_id,
+                    owner="jira-owner",
+                    generation=generation,
                     wake=await factory_wake(session, request_id),
                     context=None,
                 )
@@ -626,16 +644,33 @@ def _review(install: Install, pr: int) -> httpx.Response:
 # --- the test -------------------------------------------------------------------------------
 
 
-def test_jira_github_lifecycle(install: Install) -> None:
+@pytest.mark.parametrize("initial_label", [False, True], ids=["label_add", "initial_label"])
+def test_jira_github_lifecycle(install: Install, initial_label: bool) -> None:
     jira, github = install.jira, install.github
+    denied = jira.seed_issue(
+        "Unauthorized initial creation",
+        creator=install.outsider,
+        reporter=install.starter,
+        labels=[LABEL],
+    )
     issue = jira.seed_issue(
-        "Widget parser drops the last field", "Parsing a three-field line yields two fields."
+        "Widget parser drops the last field",
+        "Parsing a three-field line yields two fields.",
+        creator=install.starter,
+        reporter=install.outsider,
+        labels=[LABEL] if initial_label else (),
     )
     key = issue.key
 
-    # 1. An allowlisted account labels the issue; the real poll pass admits one
+    # 1. An authorized account creates or labels the issue; the real poll pass admits one
     #    WorkItem on the bound repository, replying on the jira surface.
-    label_event = jira.add_label(issue.id, LABEL, install.starter)
+    label_event = (
+        f"creation:{issue.id}:{issue.created_ms}"
+        if initial_label
+        else jira.add_label(issue.id, LABEL, install.starter)
+    )
+    if initial_label:
+        assert issue.history == []
     _reconcile()
     [item] = _work_items(issue.id)
     assert (
@@ -661,7 +696,19 @@ def test_jira_github_lifecycle(install: Install) -> None:
     )
     assert first["requester"] == f"{types.JIRA_CLOUD}:{STARTER_ID}:{install.starter.display_name}"
     assert first["status"] == "waiting"
-    assert label_event  # the admission's identity is that label event (ADR 0187)
+    expected_notice = types.MarkedNotice(
+        issue=install.issue_ref(issue),
+        marker=LABEL,
+        actor=install.starter.actor,
+        event_id=label_event,
+        disposition=types.Disposition.ADMIT,
+        cursor="",
+        occurred_at=datetime.fromtimestamp(issue.created_ms / 1000, UTC),
+    )
+    assert first["id"] == notice_request_id(expected_notice)
+    assert _work_items(denied.id) == []
+    assert _status_comments(install, denied) == []
+    assert _state_labels(install, denied) == set()
     # The execute wake is published and the live status comment posted.
     assert [t for t in _turns() if str(first["id"]) in t["event_id"]]
     [comment] = _status_comments(install, issue)
@@ -669,6 +716,26 @@ def test_jira_github_lifecycle(install: Install) -> None:
     assert marker_for(first["id"]) not in _comment_text(comment)  # never visible text
     assert _state_labels(install, issue) == {"curie-factory:queued"}
     posted_body = copy.deepcopy(comment.body)
+
+    searches_before = len(jira.requests_of("search"))
+    _reconcile()
+    assert any(
+        r.json["jql"] == 'labels = "factory" AND statusCategory != Done ORDER BY updated ASC'
+        for r in jira.requests_of("search")[searches_before:]
+    )
+    assert [w["id"] for w in _work_items(issue.id)] == [item["id"]]
+    assert [r["id"] for r in _requests(item["id"])] == [first["id"]]
+
+    jira.advance(30)
+    jira.edit_summary(issue.id, "Widget parser still drops the last field", install.outsider)
+    jira.edit_reporter(issue.id, install.starter, install.outsider)
+    _reconcile()
+    assert [w["id"] for w in _work_items(issue.id)] == [item["id"]]
+    assert [r["id"] for r in _requests(item["id"])] == [first["id"]]
+    assert _requests(item["id"])[0]["requester"] == first["requester"]
+    assert _work_items(denied.id) == []
+    assert _status_comments(install, denied) == []
+    assert _state_labels(install, denied) == set()
 
     # 2. The run starts: the same comment is edited in place.
     epoch = _start(first["id"])

@@ -59,9 +59,18 @@ SELECTOR = re.compile(
     r"|charts/curie/ci/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.sh"
     r")"
 )
-INITIAL_BINDING_MODULE = "tools/factory-e2e/tests/test_c4_initial_binding.py"
 FACTORY_UPGRADE_MODULE = "tools/factory-e2e/tests/test_c4_upgrade_migration.py"
 HELD_CANCELLATION_MODULE = "tools/factory-e2e/tests/test_c4_held_cancellation.py"
+# Pins in these modules run against an owned kind cluster, not the dev stack.
+KIND_MODULES = frozenset(
+    {
+        "tools/factory-e2e/tests/test_c4_initial_binding.py",
+        "tools/factory-e2e/tests/test_c4_admitted_agent.py",
+        "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
+        FACTORY_UPGRADE_MODULE,
+        HELD_CANCELLATION_MODULE,
+    }
+)
 BUG_LABEL = "bug"
 # Discovery surfaces and pin tiers share this order. A pin whose location maps
 # below the closed issue's found:* label fails unless the body also carries
@@ -324,12 +333,7 @@ def _pin_requirements(body: str) -> dict[str, bool]:
     needed = selector is not None
     module = selector.split("::", 1)[0] if selector is not None else None
     needs_factory_upgrade = module == FACTORY_UPGRADE_MODULE
-    needs_kind = module in {
-        INITIAL_BINDING_MODULE,
-        "tools/factory-e2e/tests/test_c4_admitted_agent.py",
-        FACTORY_UPGRADE_MODULE,
-        HELD_CANCELLATION_MODULE,
-    }
+    needs_kind = module in KIND_MODULES
     return {
         "needed": needed,
         "needs_stack": needed and not needs_kind,

@@ -14,6 +14,16 @@
       "omissions": []
     },
     {
+      "struct": "ForgeCredentialHealthReport",
+      "schema": "ForgeCredentialHealthReport",
+      "omissions": []
+    },
+    {
+      "struct": "ForgeCredentialHealth",
+      "schema": "ForgeCredentialHealth",
+      "omissions": []
+    },
+    {
       "struct": "ScheduleList",
       "schema": "ScheduleListOut",
       "omissions": []

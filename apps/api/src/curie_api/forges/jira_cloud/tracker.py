@@ -20,10 +20,11 @@ Polling (decisions 6 to 12, plan D2). The cursor is opaque to the core and is
 zone, so each window starts 120 seconds before ``T`` and overlaps the last;
 the id set keeps the overlap from delivering an event twice. History ids and
 comment ids are separate Jira sequences that share numbers, so each id is
-stored with its namespace (``h`` for a changelog history, ``c`` for a comment).
-``None`` is the first poll: only the latest label add of each labelled issue
-is a notice. A redelivery that still happens (an event that left both window
-and set) is absorbed by the ``event_id`` keyed request id (ADR 0187).
+stored with its namespace (``h`` for a changelog history, ``c`` for a comment,
+``i`` for an issue's creation). ``None`` is the first poll: only the latest
+label add of each labelled issue, or its creation when no add exists, is a
+notice. A redelivery that still happens (an event that left both window and
+set) is absorbed by the ``event_id`` keyed request id (ADR 0187).
 """
 
 from __future__ import annotations
@@ -59,12 +60,13 @@ logger = logging.getLogger(__name__)
 
 # The overlap between windows: JQL `updated` has minute precision (decision 7).
 WINDOW_MS = 120_000
-SEARCH_FIELDS = ["labels", "status", "components", "updated", "summary"]
+SEARCH_FIELDS = ["labels", "status", "components", "updated", "summary", "creator", "created"]
 TICKET_COMMENT_LIMIT = 100
 LATER_COMMENTS = "_Later comments were not read._"
 _HISTORY = "h"
 _COMMENT = "c"
-_ID_TOKEN = re.compile(rf"[{_HISTORY}{_COMMENT}][0-9]+")
+_CREATION = "i"
+_ID_TOKEN = re.compile(rf"(?:[{_HISTORY}{_COMMENT}][0-9]+|{_CREATION}[0-9]+:[0-9]+)")
 _COMMENT_SELF = re.compile(r"/issue/([0-9]+)/comment/")
 
 
@@ -315,6 +317,30 @@ class JiraTracker:
         actor = _actor(user)
         return None if actor is None or actor.id == self._mention else actor
 
+    def _creation_notice(
+        self,
+        ref: TrackerIssueRef,
+        fields: Mapping[str, Any],
+        histories: Sequence[Mapping[str, Any]],
+        marker: str,
+    ) -> _Pending | None:
+        if any(adds_label(history, marker) for history in histories):
+            return None
+        if (
+            marker not in _labels(fields)
+            or _done(fields)
+            or not ref.issue_id.isascii()
+            or not ref.issue_id.isdigit()
+        ):
+            return None
+        created = jira_ms(fields.get("created"))
+        actor = self._human(fields.get("creator"))
+        if created is None or created < 0 or actor is None:
+            return None
+        return _Pending(
+            ref, actor, f"creation:{ref.issue_id}:{created}", Disposition.ADMIT, created
+        )
+
     # Reads ----------------------------------------------------------------
 
     async def _read_issue(self, issue_id: str, fields: str) -> Mapping[str, Any]:
@@ -327,7 +353,27 @@ class JiraTracker:
         return issue
 
     async def _changelog(self, issue_id: str) -> list[dict[str, Any]]:
-        return await self._transport.changelog(issue_id, page_size=self._page_size)
+        histories = await self._transport.changelog(
+            issue_id, page_size=self._page_size, strict=True
+        )
+        for history in histories:
+            items = history.get("items")
+            if not isinstance(items, list):
+                raise Unavailable("changelog")
+            for item in items:
+                if not isinstance(item, dict) or not any(
+                    isinstance(item.get(key), str) and item[key].strip()
+                    for key in ("field", "fieldId")
+                ):
+                    raise Unavailable("changelog")
+                if item.get("field") != "labels" and item.get("fieldId") != "labels":
+                    continue
+                for key in ("fromString", "toString"):
+                    if key not in item or (
+                        item[key] is not None and not isinstance(item[key], str)
+                    ):
+                        raise Unavailable("changelog")
+        return histories
 
     def _latest(
         self, histories: Sequence[Mapping[str, Any]], matches: Callable[[Mapping[str, Any]], bool]
@@ -344,6 +390,19 @@ class JiraTracker:
         return await verify_identity(
             self._transport,
             self._identity,
+            site_origin=self._site_origin,
+            scope_id=self._scope_id,
+            mention=self._mention,
+        )
+
+    async def verify_credential(self) -> None:
+        """Read-only credential check for health reporting (#4630): the identity
+        read of decision 3 with an empty cache, so it always asks the site and
+        the token now, never an identity verified earlier. Writes nothing."""
+
+        await verify_identity(
+            self._transport,
+            IdentityCache(),
             site_origin=self._site_origin,
             scope_id=self._scope_id,
             mention=self._mention,
@@ -374,16 +433,17 @@ class JiraTracker:
         found = await self._transport.search_jql(
             self._jql(start, zone), SEARCH_FIELDS, page_size=self._page_size
         )
-        issues: dict[str, tuple[TrackerIssueRef, int]] = {}
+        issues: dict[str, tuple[TrackerIssueRef, int, Mapping[str, Any]]] = {}
         for issue in found:
             ref = self._ref(issue)
-            updated = jira_ms(_fields(issue).get("updated"))
+            fields = _fields(issue)
+            updated = jira_ms(fields.get("updated"))
             if ref is None or updated is None:
                 raise Unavailable("search")
             issues.pop(ref.issue_id, None)
-            issues[ref.issue_id] = (ref, updated)
+            issues[ref.issue_id] = (ref, updated, fields)
         previous = 0 if start is None else start.time_ms
-        latest = max([previous, *(updated for _, updated in issues.values())])
+        latest = max([previous, *(updated for _, updated, _issue_fields in issues.values())])
         # Candidates are events at or after the window start; with no window
         # (a first poll, or nothing seen yet) every event is one.
         window = previous - WINDOW_MS if start is not None and previous > 0 else None
@@ -396,9 +456,11 @@ class JiraTracker:
             comments[issue_id] = await self._recent_comments(issue_id, read_back)
         considered: dict[str, int] = {}
         pending: list[_Pending] = []
-        for issue_id, (ref, _updated) in issues.items():
+        for issue_id, (ref, _updated, fields) in issues.items():
             pending.extend(
-                self._label_notices(ref, histories[issue_id], start, window, known, considered)
+                self._label_notices(
+                    ref, fields, histories[issue_id], start, window, known, considered
+                )
             )
             pending.extend(
                 self._mention_notices(ref, comments[issue_id], start, window, known, considered)
@@ -444,12 +506,20 @@ class JiraTracker:
     def _label_notices(
         self,
         ref: TrackerIssueRef,
+        fields: Mapping[str, Any],
         histories: Sequence[Mapping[str, Any]],
         start: Cursor | None,
         window: int | None,
         known: frozenset[str],
         considered: dict[str, int],
     ) -> list[_Pending]:
+        creation = self._creation_notice(ref, fields, histories, self.label)
+        if creation is not None and creation.at is not None:
+            if window is not None and creation.at < window:
+                return []
+            token = f"{_CREATION}{ref.issue_id}:{creation.at}"
+            considered[token] = creation.at
+            return [] if token in known else [creation]
         adds: list[tuple[str, int, Actor]] = []
         for history in histories:
             history_id = history.get("id")
@@ -545,7 +615,7 @@ class JiraTracker:
 
         issue_id = self._issue_id(notice.issue)
         try:
-            fields = _fields(await self._read_issue(issue_id, "labels,status"))
+            fields = _fields(await self._read_issue(issue_id, "labels,status,creator,created"))
         except NotFound:
             return notice.disposition is Disposition.CANCEL
         labelled = notice.marker in _labels(fields)
@@ -556,10 +626,16 @@ class JiraTracker:
             return False
         if notice.disposition is Disposition.MENTION:
             return await self._mention_current(issue_id, notice)
-        latest = self._latest(
-            await self._changelog(issue_id), lambda h: adds_label(h, notice.marker)
+        histories = await self._changelog(issue_id)
+        latest = self._latest(histories, lambda h: adds_label(h, notice.marker))
+        if latest is not None:
+            return str(latest.get("id")) == notice.event_id
+        creation = self._creation_notice(notice.issue, fields, histories, notice.marker)
+        return (
+            creation is not None
+            and creation.event_id == notice.event_id
+            and creation.actor == notice.actor
         )
-        return latest is not None and str(latest.get("id")) == notice.event_id
 
     async def _mention_current(self, issue_id: str, notice: MarkedNotice) -> bool:
         if not notice.event_id.isdigit():
@@ -586,11 +662,15 @@ class JiraTracker:
 
     async def marking_actor(self, issue: TrackerIssueRef, marker: str) -> Actor | None:
         issue_id = self._issue_id(issue)
-        fields = _fields(await self._read_issue(issue_id, "labels"))
+        fields = _fields(await self._read_issue(issue_id, "labels,status,creator,created"))
         if marker not in _labels(fields):
             return None
-        latest = self._latest(await self._changelog(issue_id), lambda h: adds_label(h, marker))
-        return None if latest is None else _actor(latest.get("author"))
+        histories = await self._changelog(issue_id)
+        latest = self._latest(histories, lambda h: adds_label(h, marker))
+        if latest is not None:
+            return _actor(latest.get("author"))
+        creation = self._creation_notice(issue, fields, histories, marker)
+        return None if creation is None else creation.actor
 
     async def may_start(self, issue: TrackerIssueRef, actor: Actor) -> bool:
         """The binding's start authority (decision 13): an allowlisted account id,

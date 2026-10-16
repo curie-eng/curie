@@ -41,12 +41,14 @@ FACTORY_PREFIXES = (
     "apps/api/src/curie_api/schemas/agents.py",
     "apps/api/src/curie_api/schemas/channels.py",
     "apps/api/src/curie_api/crud/channels.py",
-    "apps/api/src/curie_api/forges/surfaces.py",
     "apps/api/src/curie_api/workitem_dispatch.py",
     "apps/api/src/curie_api/routers/work_items.py",
-    "apps/api/src/curie_api/forges/trackers.py",
-    "apps/api/src/curie_api/forges/registry.py",
     "apps/api/src/curie_api/threadkeys.py",
+    "apps/api/src/curie_api/forges/",
+    "apps/api/src/curie_api/forge_credential_health.py",
+    "apps/api/src/curie_api/routers/forge_credential_health.py",
+    "cli/src/forge_expiry.rs",
+    "apps/api/tests/forge_fakes/gitlab.py",
     "apps/worker/src/curie_worker/factory",
     "apps/worker/src/curie_worker/workitem_dispatch.py",
     "apps/worker/src/curie_worker/binding.py",
@@ -216,9 +218,13 @@ def _matches_prefix(path: str, prefix: str) -> bool:
 
 
 def _inputs(value: object, label: str) -> tuple[str, ...]:
-    if not isinstance(value, list) or not value or any(
-        not isinstance(path, str) or not path or path.startswith("/") or path.endswith("/")
-        for path in value
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(
+            not isinstance(path, str) or not path or path.startswith("/") or path.endswith("/")
+            for path in value
+        )
     ):
         raise RegistryError(f"{label} must be a nonempty list of valid paths")
     return tuple(value)
@@ -449,9 +455,7 @@ def _load_registry(path: Path) -> Registry:
             raise RegistryError(f"ignored prefix overlaps a selected rule: {ignored}")
 
     chart_scenarios = _chart_registry(root.get("chart_scenarios"))
-    conditional_entries = _mapping(
-        root.get("conditional_pytest_files"), "conditional_pytest_files"
-    )
+    conditional_entries = _mapping(root.get("conditional_pytest_files"), "conditional_pytest_files")
     conditional_pytest_files: dict[str, tuple[str, ...]] = {}
     for test_file, value in conditional_entries.items():
         if not test_file or test_file.startswith("/") or test_file.endswith("/"):
@@ -558,8 +562,7 @@ def _select_chart_scenarios(
             scenario_id
             for scenario_id, scenario in chart.scenarios.items()
             if any(
-                _matches_scenario(path, (*chart.shared_inputs, *scenario.inputs))
-                for path in paths
+                _matches_scenario(path, (*chart.shared_inputs, *scenario.inputs)) for path in paths
             )
         }
     registered_steps = {scenario.step for scenario in chart.scenarios.values()}
@@ -641,9 +644,7 @@ def _workflow_job_spans(content: str) -> dict[str, tuple[int, int]]:
             if isinstance(event, yaml.events.AliasEvent) and event.start_mark is not None
         )
         if any(
-            beginning <= line < end
-            for line in alias_lines
-            for beginning, end in spans.values()
+            beginning <= line < end for line in alias_lines for beginning, end in spans.values()
         ):
             raise RegistryError("released-upgrade job uses a YAML alias")
     except yaml.YAMLError as exc:
@@ -694,8 +695,7 @@ def _changes_upgrade_workflow_jobs(base: str, head: str) -> bool:
             (int(new_start), int(new_count or "1"), new_spans),
         ):
             if count and any(
-                start < end and start + count > beginning
-                for beginning, end in spans.values()
+                start < end and start + count > beginning for beginning, end in spans.values()
             ):
                 return True
     return False
@@ -773,14 +773,10 @@ def _render(
     lines.append(f"pytest_scope={pytest_scope}")
     lines.append(f"images={'true' if images_needed else 'false'}")
     lines.append(f"cli_release={'true' if cli_release_needed else 'false'}")
-    lines.append(
-        f"released_upgrade_full={'true' if released_upgrade_full else 'false'}"
-    )
+    lines.append(f"released_upgrade_full={'true' if released_upgrade_full else 'false'}")
     lines.append(f"version_only={'true' if version_only else 'false'}")
     lines.append(f"factory={'true' if factory_needed else 'false'}")
-    lines.append(
-        f"approval_resume={'true' if approval_resume_needed else 'false'}"
-    )
+    lines.append(f"approval_resume={'true' if approval_resume_needed else 'false'}")
     lines.append("chart_scenarios=" + json.dumps(chart_scenarios, separators=(",", ":")))
     return "\n".join(lines) + "\n"
 
@@ -826,9 +822,7 @@ def _run() -> None:
         elif args.base and args.head:
             paths = _changed_paths(args.base, args.head)
             if WORKFLOW_PATH in paths:
-                workflow_upgrade_changed = _changes_upgrade_workflow_jobs(
-                    args.base, args.head
-                )
+                workflow_upgrade_changed = _changes_upgrade_workflow_jobs(args.base, args.head)
         else:
             raise RegistryError("provide paths, push, or both base and head revisions")
         selected = set().union(*(_select_path(registry, path) for path in paths))
@@ -866,26 +860,32 @@ def _run() -> None:
         cli_release_needed = True
 
     pytest_deselect = []
-    if not args.push and paths and pytest_needed and all(
-        path in registry.exact
-        or path in registry.ignored_exact
-        or any(
-            _matches_prefix(path, prefix)
-            for prefix in (*registry.prefixes, *registry.ignored_prefixes)
+    if (
+        not args.push
+        and paths
+        and pytest_needed
+        and all(
+            path in registry.exact
+            or path in registry.ignored_exact
+            or any(
+                _matches_prefix(path, prefix)
+                for prefix in (*registry.prefixes, *registry.ignored_prefixes)
+            )
+            for path in paths
         )
-        for path in paths
     ):
         pytest_deselect = sorted(
             test_file
             for test_file, inputs in registry.conditional_pytest_files.items()
-            if not any(
-                _matches_prefix(path, prefix) for path in paths for prefix in inputs
-            )
+            if not any(_matches_prefix(path, prefix) for path in paths for prefix in inputs)
         )
 
     pytest_scope = "full"
-    if not args.push and paths and pytest_needed and all(
-        _matches_pytest_scope(registry.pytest_scopes["cli"], path) for path in paths
+    if (
+        not args.push
+        and paths
+        and pytest_needed
+        and all(_matches_pytest_scope(registry.pytest_scopes["cli"], path) for path in paths)
     ):
         pytest_scope = "cli"
 

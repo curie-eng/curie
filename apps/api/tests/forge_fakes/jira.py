@@ -227,6 +227,7 @@ class JiraIssue:
     summary: str
     description: dict[str, Any] | None
     reporter: JiraUser
+    creator: JiraUser
     created_ms: int
     updated_ms: int
     labels: list[str] = field(default_factory=list)
@@ -297,6 +298,7 @@ class JiraFake:
         )
         self._credentials: dict[str, JiraUser] = {basic(BOT_EMAIL, token): self.bot}
         self.reporter = self.add_user("5b10a0000000000000000001", "Mia Krystof")
+        self.creator = self.add_user("5b10a0000000000000000002", "Ada Creator")
         self._issue_ids = itertools.count(10001)
         self._history_ids = itertools.count(10100)
         self._comment_ids = itertools.count(10100)
@@ -354,6 +356,9 @@ class JiraFake:
         description: str | dict[str, Any] | None = None,
         *,
         project: str = "PROJ",
+        creator: JiraUser | None = None,
+        reporter: JiraUser | None = None,
+        labels: Iterable[str] = (),
         components: Iterable[str] = (),
         status: str = "To Do",
         indexed: bool = True,
@@ -365,9 +370,11 @@ class JiraFake:
             key=f"{project}-{next(counter)}",
             summary=summary,
             description=adf_text(description) if isinstance(description, str) else description,
-            reporter=self.reporter,
+            reporter=self.reporter if reporter is None else reporter,
+            creator=self.creator if creator is None else creator,
             created_ms=created,
             updated_ms=created,
+            labels=list(labels),
             components=list(components),
             status=status,
             indexed=indexed,
@@ -450,6 +457,22 @@ class JiraFake:
             "toString": summary,
         }
         issue.summary = summary
+        return self._change(issue, by, [item], None)
+
+    def edit_reporter(self, ref: TrackerIssueRef | int, reporter: JiraUser, by: JiraUser) -> str:
+        # IssueBean exposes creator and reporter independently; reporter is editable.
+        # https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-issueidorkey-put
+        issue = self.issue(ref)
+        item = {
+            "field": "reporter",
+            "fieldtype": "jira",
+            "fieldId": "reporter",
+            "from": issue.reporter.account_id,
+            "fromString": issue.reporter.display_name,
+            "to": reporter.account_id,
+            "toString": reporter.display_name,
+        }
+        issue.reporter = reporter
         return self._change(issue, by, [item], None)
 
     def add_comment(
@@ -608,7 +631,7 @@ class JiraFake:
                 "updated": self._time(issue.updated_ms),
                 "created": self._time(issue.created_ms),
                 "reporter": issue.reporter.bean(),
-                "creator": issue.reporter.bean(),
+                "creator": issue.creator.bean(),
             }
         )
         values["project"].update({"key": project, "name": f"{project} project"})
