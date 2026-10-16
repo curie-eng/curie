@@ -31,6 +31,7 @@ The Docker engine is whatever the environment configures.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -518,7 +519,6 @@ class Installation:
             {
                 "KUBECONFIG": str(directory / "kubeconfig"),
                 "CURIE_BIN": str(candidate.binary),
-                "CURIE_API_KEY": "fixture-api-" + uuid.uuid4().hex,
                 "CURIE_CONFIG_DIR": str(self.config_dir),
                 "XDG_CONFIG_HOME": str(directory / "config"),
             }
@@ -528,8 +528,10 @@ class Installation:
         # Only `cluster up` sees the model credential; quickstart runs without
         # one so the release's recorded model decides.
         self.up_env = dict(self.env, CURIE_CREDENTIALS=self.model_credentials)
-        self.secrets = (
-            self.env["CURIE_API_KEY"],
+        # The chart generates the API key; `read_api_key` adds it here after
+        # the live install. CURIE_API_KEY stays unset so the CLI discovers it
+        # from the release Secret, and the key is never written to disk.
+        self.secrets: tuple[str, ...] = (
             self.forge.token,
             self.model_credentials,
         )
@@ -740,7 +742,6 @@ class Installation:
                     "digest": "",
                     "pullPolicy": "Never",
                 },
-                "apiKey": self.env["CURIE_API_KEY"],
                 "commitPollIntervalSeconds": 0,
                 "service": {"type": "NodePort", "port": 8000, "nodePort": 30080},
                 "resources": {
@@ -818,9 +819,10 @@ class Installation:
         )
         if result.returncode:
             return result
+        api_key = self.read_api_key()
         self.http = httpx.Client(
             base_url=self.env["CURIE_API_URL"],
-            headers={"X-API-Key": self.env["CURIE_API_KEY"]},
+            headers={"X-API-Key": api_key},
             timeout=30,
             trust_env=False,
         )
@@ -836,6 +838,37 @@ class Installation:
                 raise InfrastructureError("candidate API did not become ready through kind")
             time.sleep(0.25)
         return result
+
+    def read_api_key(self) -> str:
+        """The chart-generated API key, held in memory only and redacted."""
+        name = self.kubectl(
+            "-n",
+            self.namespace,
+            "get",
+            "deployment",
+            f"{self.fullname}-api",
+            "-o",
+            "jsonpath={.spec.template.spec.containers[*].env[?(@.name=='API_KEY')]"
+            ".valueFrom.secretKeyRef.name}",
+        ).stdout.strip()
+        if not name:
+            raise InfrastructureError("the API Deployment names no API_KEY Secret")
+        encoded = self.kubectl(
+            "-n",
+            self.namespace,
+            "get",
+            "secret",
+            name,
+            "-o",
+            "jsonpath={.data.apiKey}",
+        ).stdout.strip()
+        if not encoded:
+            raise InfrastructureError("the API key Secret has no apiKey entry")
+        api_key = base64.b64decode(encoded).decode()
+        if not api_key:
+            raise InfrastructureError("the API key Secret holds an empty apiKey")
+        self.secrets = (*self.secrets, api_key)
+        return api_key
 
     def quickstart_argv(self, *extra: str, json_output: bool = False) -> list[str]:
         prefix = [str(self.candidate.binary)] + (["--json"] if json_output else [])
@@ -1106,6 +1139,7 @@ def test_offline_plan_does_not_claim_unobserved_live_actions(install: Installati
 
     live = install.live_cluster_up()
     assert live.returncode == 0, _shown(live, secrets)
+    secrets = install.secrets
     assert not _leaks(live, secrets), "the live run printed a fixture credential"
     after = install.controller_metadata()
     deployment = after["deployment"]
@@ -1175,6 +1209,7 @@ def test_explicit_model_plans_conditional_install_without_keeping_recorded_model
     secrets = install.secrets
     live = install.live_cluster_up()
     assert live.returncode == 0, _shown(live, secrets)
+    secrets = install.secrets
     revisions = install.history_length()
     result = install.quickstart("--model", EXPLICIT_MODEL, "--dry-run", json_output=True)
     assert result.returncode == 0, _shown(result, secrets)
@@ -1292,7 +1327,6 @@ def test_cluster_up_dry_run_is_offline_and_honors_disabled_controller(
     tmp_path: Path, source_candidate: Candidate, recorder: ConnectionRecorder
 ) -> None:
     context = f"{PREFIX}-offline"
-    user_token = "fixture-kube-" + uuid.uuid4().hex
     kubeconfig = tmp_path / "kubeconfig"
     kubeconfig.write_text(
         yaml.safe_dump(
@@ -1314,7 +1348,9 @@ def test_cluster_up_dry_run_is_offline_and_honors_disabled_controller(
                         "context": {"cluster": context, "user": context, "namespace": "default"},
                     }
                 ],
-                "users": [{"name": context, "user": {"token": user_token}}],
+                # No credential: the endpoint only counts connections, and a
+                # kubeconfig on disk must not hold a secret.
+                "users": [{"name": context, "user": {}}],
                 "current-context": context,
             }
         )
@@ -1331,7 +1367,7 @@ def test_cluster_up_dry_run_is_offline_and_honors_disabled_controller(
             "CURIE_CREDENTIALS": credential,
         }
     )
-    secrets = (credential, user_token)
+    secrets = (credential,)
 
     def plan_for(*extra: str) -> list[str]:
         result = _command(
