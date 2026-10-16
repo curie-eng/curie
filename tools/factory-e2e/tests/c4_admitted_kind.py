@@ -923,10 +923,21 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         )
 
     def valkey(self, *args: str) -> Any:
-        return json.loads(self.kubectl(
-            "-n", self.namespace, "exec", "statefulset/curie-valkey", "--",
-            "valkey-cli", "--json", *args,
-        ))
+        # Valkey 8.1.10 CLI help documents REDISCLI_AUTH and -e:
+        # https://github.com/valkey-io/valkey/blob/8.1.10/src/valkey-cli.c
+        raw = self.kubectl(
+            "-n", self.namespace, "exec", "statefulset/curie-valkey", "-c", "valkey", "--",
+            "sh", "-ec",
+            'export REDISCLI_AUTH="${VALKEY_PASSWORD:?}"; exec valkey-cli -e --json "$@"',
+            "sh", *args,
+        )
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            self.record_failure("Valkey JSON response", exc)
+            raise RuntimeError(
+                "Valkey command returned invalid JSON; private diagnostics retained"
+            ) from None
 
     def worker_replicas(self, count: int) -> None:
         self.kubectl(

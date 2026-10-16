@@ -132,6 +132,8 @@ def kind_factory(
     request.addfinalizer(cleanup)
     configure_harness(monkeypatch, run)
     run.execute()
+    if run.valkey("PING") != "PONG":
+        raise RuntimeError("the authenticated fixture Valkey did not answer PING")
     deployments = json.loads(run.kubectl("-n", run.namespace, "get", "deployments", "-o", "json"))
     for deployment in deployments["items"]:
         run.kubectl(
