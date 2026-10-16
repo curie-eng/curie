@@ -1429,6 +1429,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/approvals/principals/remediation-operator": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mint Remediation Operator Principal
+         * @description Mint a remediation operator credential (#4228).
+         *
+         *     The token carries the ``remediation.administer`` scope, which remediation
+         *     policy and qualification writes require; it never resolves an approval,
+         *     and an approval operator token never writes remediation policy.  Returned
+         *     once and marked non-cacheable, as the approval operator mint is.
+         */
+        post: operations["mint_remediation_operator_principal_approvals_principals_remediation_operator_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/approvals/{approval_id}": {
         parameters: {
             query?: never;
@@ -12259,6 +12284,41 @@ export interface operations {
         };
     };
     mint_operator_principal_approvals_principals_operator_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApprovalPrincipalMint"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApprovalPrincipalOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    mint_remediation_operator_principal_approvals_principals_remediation_operator_post: {
         parameters: {
             query?: never;
             header?: {

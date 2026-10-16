@@ -14,8 +14,9 @@ No route here, or anywhere, lets an administrator request a forward write:
 forward evidence comes only from ordinary remediation approvals.
 
 Authentication is ``require_api_key``; both writes also need an ADR 0106
-operator principal in ``X-Curie-Approval-Principal``, verified exactly as the
-policy writes verify it (``remediation_policy.require_operator_principal``) and
+operator principal in ``X-Curie-Approval-Principal`` carrying the
+``remediation.administer`` scope, verified exactly as the policy writes verify
+it (``remediation_policy.require_operator_principal``) and
 recorded as the actor, because a record enables automatic execution (the
 2026-10-07 principal ruling). Every handler response carries
 ``Cache-Control: no-store`` and every refusal is ``{"detail": {"code": ...}}``.

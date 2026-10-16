@@ -258,13 +258,13 @@ def test_a_console_session_cannot_cross_the_platform_boundary(
     minted = client.post("/console/login-codes", json={"subject": SUBJECT}, headers=headers)
     assert minted.status_code == 401, minted.text
     assert minted.json()["detail"] == PLATFORM_KEY_DETAIL
-    operator = client.post(
+    for endpoint in (
         "/approvals/principals/operator",
-        json={"subject": "operator-example"},
-        headers=headers,
-    )
-    assert operator.status_code == 401, operator.text
-    assert operator.json()["detail"] == PLATFORM_KEY_DETAIL
+        "/approvals/principals/remediation-operator",
+    ):
+        operator = client.post(endpoint, json={"subject": "operator-example"}, headers=headers)
+        assert operator.status_code == 401, (endpoint, operator.text)
+        assert operator.json()["detail"] == PLATFORM_KEY_DETAIL
 
 
 def test_the_legacy_cookie_name_does_not_authorize_agents(

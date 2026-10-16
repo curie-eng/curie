@@ -3977,3 +3977,84 @@ def test_plain_approval_display_round_trips_without_rewriting_grant_data(
         assert record["granted_tool"] == tool and record["status"] == "pending"
         assert "granted_arguments" not in record
     assert _read_provenance(uuid.UUID(body["id"])) == ("permission", tool)
+
+
+_REMEDIATION_MINT = "/approvals/principals/remediation-operator"
+
+
+def test_remediation_operator_mint_issues_a_remediation_scoped_operator_token(
+    approvals_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """#4228: the remediation mint answers 201, no-store, the subject echoed, and
+    a token that verifies only under ``remediation.administer``, never under the
+    approval resolution scope."""
+
+    minted = approvals_client.post(
+        _REMEDIATION_MINT, json={"subject": "U0EXAMPLE1"}, headers=auth_headers
+    )
+
+    assert minted.status_code == 201, minted.text
+    assert minted.headers["cache-control"] == "no-store"
+    body = minted.json()
+    assert body["subject"] == "U0EXAMPLE1"
+    assert body["expires_at"]
+    api_key = get_settings().api_key
+    token = body["token"]
+    claims = approval_principal.verify_claims(
+        token, api_key, scope=approval_principal.REMEDIATION_ADMIN_SCOPE
+    )
+    assert claims is not None
+    assert claims.kind == "operator"
+    assert claims.subject == "U0EXAMPLE1"
+    assert claims.approval_id is None
+    assert (
+        approval_principal.verify_claims(token, api_key, scope=approval_principal.APPROVE_SCOPE)
+        is None
+    )
+
+
+def test_approval_operator_mint_token_does_not_carry_the_remediation_scope(
+    approvals_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """#4228: the scopes separate both ways; an ``approval.resolve`` operator token
+    is not a remediation administrator."""
+
+    minted = approvals_client.post(
+        "/approvals/principals/operator", json={"subject": "U0EXAMPLE1"}, headers=auth_headers
+    )
+
+    assert minted.status_code == 201, minted.text
+    api_key = get_settings().api_key
+    token = minted.json()["token"]
+    assert (
+        approval_principal.verify_claims(token, api_key, scope=approval_principal.APPROVE_SCOPE)
+        is not None
+    )
+    assert (
+        approval_principal.verify_claims(
+            token, api_key, scope=approval_principal.REMEDIATION_ADMIN_SCOPE
+        )
+        is None
+    )
+
+
+def test_remediation_operator_mint_needs_the_platform_key_as_the_operator_mint_does(
+    approvals_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """#4228: the remediation mint is refused exactly as the operator mint is,
+    for a missing, blank or wrong platform key, and refuses a blank subject."""
+
+    for headers in ({}, {"X-API-Key": ""}, {"X-API-Key": "   "}, {"X-API-Key": "wrong"}):
+        operator = approvals_client.post(
+            "/approvals/principals/operator", json={"subject": "U0EXAMPLE1"}, headers=headers
+        )
+        remediation = approvals_client.post(
+            _REMEDIATION_MINT, json={"subject": "U0EXAMPLE1"}, headers=headers
+        )
+        assert operator.status_code == 401, operator.text
+        assert remediation.status_code == operator.status_code, remediation.text
+        assert remediation.json() == operator.json()
+        assert "token" not in remediation.json()
+
+    blank = approvals_client.post(_REMEDIATION_MINT, json={"subject": "   "}, headers=auth_headers)
+    assert blank.status_code == 422, blank.text

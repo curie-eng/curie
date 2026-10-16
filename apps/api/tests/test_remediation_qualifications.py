@@ -286,6 +286,25 @@ def _agent(client: Any, headers: dict[str, str], tmp_path: Path) -> str:
 
 
 def _operator() -> dict[str, str]:
+    """A remediation operator principal, minted as
+    ``POST /approvals/principals/remediation-operator`` does.
+    """
+
+    token = approval_principal.mint(
+        get_settings().api_key,
+        subject=OPERATOR,
+        kind="operator",
+        scope=approval_principal.REMEDIATION_ADMIN_SCOPE,
+        exp=int(time.time()) + 300,
+    )
+    return {PRINCIPAL_HEADER: token}
+
+
+def _approval_scope_operator() -> dict[str, str]:
+    """An ADR 0106 approval resolution operator principal: valid, but not a
+    remediation administrator.
+    """
+
     token = approval_principal.mint(
         get_settings().api_key,
         subject=OPERATOR,
@@ -1100,6 +1119,23 @@ def test_a_record_write_without_an_operator_principal_is_refused(drill: Drill) -
     assert _records() == []
 
 
+def test_a_record_write_with_an_approval_scope_principal_is_refused(drill: Drill) -> None:
+    """@spec AUTOMATED-REMEDIATION-22 @spec AUTOMATED-REMEDIATION-3: a valid
+    ``approval.resolve`` operator principal is not a remediation administrator,
+    so the record write is refused ``operator_principal_required`` and stores nothing.
+    """
+
+    response = drill.client.put(
+        _record_url(drill.agent_id, drill.qualification_id),
+        json=drill.body,
+        headers={**drill.headers, **_approval_scope_operator()},
+    )
+
+    assert response.status_code == 403, response.text
+    assert _refusal_code(response) == "operator_principal_required"
+    assert _records() == []
+
+
 def test_a_record_write_without_the_administrative_credential_is_401(
     client: Any, drill: Drill
 ) -> None:
@@ -1128,6 +1164,28 @@ def test_a_verifier_run_without_an_operator_principal_is_refused(
         _runs_url(agent_id, str(uuid.uuid4())),
         json={"hook": HOOK, "action": ACTION_NAME, "target": TARGET},
         headers=auth_headers,
+    )
+
+    assert response.status_code == 403, response.text
+    assert _refusal_code(response) == "operator_principal_required"
+    assert _executions() == []
+
+
+def test_a_verifier_run_with_an_approval_scope_principal_is_refused(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-22 @spec AUTOMATED-REMEDIATION-3: a valid
+    ``approval.resolve`` operator principal is refused ``operator_principal_required``
+    and creates no execution.
+    """
+
+    agent_id = _agent(client, auth_headers, tmp_path)
+    _bind(client, auth_headers, agent_id, _document())
+
+    response = client.post(
+        _runs_url(agent_id, str(uuid.uuid4())),
+        json={"hook": HOOK, "action": ACTION_NAME, "target": TARGET},
+        headers={**auth_headers, **_approval_scope_operator()},
     )
 
     assert response.status_code == 403, response.text

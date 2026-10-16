@@ -7,8 +7,9 @@ real routes and real Postgres:
 * ``/agents/{agent_id}/hooks/{hook}/remediation-policy`` ``GET``, ``PUT`` and
   ``DELETE``, and ``POST .../arm`` and ``POST .../disarm``, under
   ``require_api_key`` (AUTOMATED-REMEDIATION-3);
-* every write also needs an ADR 0106 operator principal, recorded as
-  ``bound_by`` on the generation; without one it is refused
+* every write also needs an ADR 0106 operator principal carrying the
+  ``remediation.administer`` scope, recorded as ``bound_by`` on the generation;
+  without one, or with an ``approval.resolve`` operator token, it is refused
   ``operator_principal_required``; a hook-key-signed request is ``401``;
 * generations follow the source policy rule: compare and swap on
   ``expected_generation`` (``stale_policy_generation``), idempotent on
@@ -254,7 +255,22 @@ def remediation_off() -> Iterator[None]:
 
 
 def _operator(subject: str = OPERATOR) -> dict[str, str]:
-    """An ADR 0106 operator principal, minted as ``POST /approvals/principals/operator`` does."""
+    """A remediation operator principal, minted as
+    ``POST /approvals/principals/remediation-operator`` does.
+    """
+
+    token = approval_principal.mint(
+        get_settings().api_key,
+        subject=subject,
+        kind="operator",
+        scope=approval_principal.REMEDIATION_ADMIN_SCOPE,
+        exp=int(time.time()) + 300,
+    )
+    return {PRINCIPAL_HEADER: token}
+
+
+def _approval_operator(subject: str = OPERATOR) -> dict[str, str]:
+    """A valid ADR 0106 approval resolution operator principal (``approval.resolve``)."""
 
     token = approval_principal.mint(
         get_settings().api_key,
@@ -458,6 +474,68 @@ def test_a_write_without_an_operator_principal_is_refused_and_creates_nothing(
     assert _generation_rows(agent_id) == before_rows
     if verb == "put":
         assert _policy_row(agent_id) is None
+
+
+def _write(
+    client: TestClient, agent: str, verb: str, headers: dict[str, str], generation: int
+) -> Any:
+    """One policy write; ``generation`` is the current one (``0`` when unbound)."""
+
+    if verb == "put":
+        return _put(client, agent, headers, expected=str(generation))
+    if verb == "delete":
+        return _delete(client, agent, headers, expected=str(generation))
+    return _post(client, agent, verb, headers, expected=str(generation))
+
+
+@pytest.mark.usefixtures("remediation_off")
+@pytest.mark.parametrize("verb", ["put", "delete", "arm", "disarm"])
+def test_an_approval_resolve_operator_token_cannot_write_remediation_policy(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3
+
+    A valid, unexpired operator principal minted with the approval resolution
+    scope carries no authority over remediation policy: with the platform key,
+    a correct ``expected_generation`` and remediation off, ``PUT``, ``DELETE``,
+    arm and disarm are each refused ``operator_principal_required`` and create
+    no generation.
+    """
+
+    assert get_settings().remediation_enabled is False
+    generation = 0 if verb == "put" else _bind(client, agent_id, auth_headers)
+    before_rows = _generation_rows(agent_id)
+    before_policy = _policy_row(agent_id)
+
+    response = _write(client, agent_id, verb, {**auth_headers, **_approval_operator()}, generation)
+
+    assert response.status_code == 403, response.text
+    assert _code(response) == "operator_principal_required"
+    assert response.headers.get("cache-control") == "no-store"
+    assert _generation_rows(agent_id) == before_rows
+    assert _policy_row(agent_id) == before_policy
+
+
+@pytest.mark.usefixtures("remediation_off")
+@pytest.mark.parametrize("verb", ["put", "delete", "arm", "disarm"])
+def test_a_remediation_operator_token_writes_remediation_policy_bound_by_it(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3
+
+    The liveness side of the scope refusal: the same four writes, under the
+    same preconditions, with a ``remediation.administer`` operator principal,
+    each create a generation recorded with that principal's subject.
+    """
+
+    generation = 0 if verb == "put" else _bind(client, agent_id, auth_headers)
+
+    response = _write(client, agent_id, verb, _admin(auth_headers, OTHER_OPERATOR), generation)
+
+    assert response.status_code == 200, response.text
+    assert _generation(response) > generation
+    assert response.json()["bound_by"] == OTHER_OPERATOR
+    assert _generation_rows(agent_id)[-1]["bound_by"] == OTHER_OPERATOR
 
 
 def test_a_principal_without_the_administrative_credential_is_401(

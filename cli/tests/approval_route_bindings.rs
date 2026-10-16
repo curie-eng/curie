@@ -169,6 +169,9 @@ fn assert_routes_cleared(out: ApprovalsOutput, context: &str) {
         ApprovalsOutput::OperatorPrincipal { .. } => {
             panic!("expected the Routes output, not an operator-principal mint")
         }
+        ApprovalsOutput::RemediationPrincipal { .. } => {
+            panic!("unexpected remediation-principal mint output")
+        }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
         }
@@ -341,6 +344,9 @@ async fn routes_from_builds_the_strict_split_route_shape() {
         ApprovalsOutput::OperatorPrincipal { .. } => {
             panic!("expected the Routes output, not an operator-principal mint")
         }
+        ApprovalsOutput::RemediationPrincipal { .. } => {
+            panic!("unexpected remediation-principal mint output")
+        }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
         }
@@ -446,6 +452,9 @@ async fn route_approvers_narrows_who_without_moving_where() {
         ApprovalsOutput::OperatorPrincipal { .. } => {
             panic!("expected the Routes output, not an operator-principal mint")
         }
+        ApprovalsOutput::RemediationPrincipal { .. } => {
+            panic!("unexpected remediation-principal mint output")
+        }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
         }
@@ -513,6 +522,9 @@ async fn list_routes_reads_without_writing() {
         ApprovalsOutput::Resolved { .. } => panic!("expected the Routes output, not a resolution"),
         ApprovalsOutput::OperatorPrincipal { .. } => {
             panic!("expected the Routes output, not an operator-principal mint")
+        }
+        ApprovalsOutput::RemediationPrincipal { .. } => {
+            panic!("unexpected remediation-principal mint output")
         }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")
@@ -674,6 +686,9 @@ async fn the_dry_run_plan_names_the_payload_the_real_clear_sends() {
             }
             ApprovalsOutput::OperatorPrincipal { .. } => {
                 panic!("expected the DryRun output, not an operator-principal mint")
+            }
+            ApprovalsOutput::RemediationPrincipal { .. } => {
+                panic!("unexpected remediation-principal mint output")
             }
             ApprovalsOutput::ConsoleLoginCode { .. } => {
                 panic!("expected the DryRun output, not a console login-code mint")
@@ -1120,6 +1135,9 @@ async fn an_api_response_tolerates_a_field_the_cli_does_not_model() {
         ApprovalsOutput::Resolved { .. } => panic!("expected the Routes output, not a resolution"),
         ApprovalsOutput::OperatorPrincipal { .. } => {
             panic!("expected the Routes output, not an operator-principal mint")
+        }
+        ApprovalsOutput::RemediationPrincipal { .. } => {
+            panic!("unexpected remediation-principal mint output")
         }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the Routes output, not a console login-code mint")

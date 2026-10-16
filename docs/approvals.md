@@ -402,6 +402,9 @@ curie local approvals my-agent --resolve <id> --reject --note "discount too deep
 # create the Console's single-use, subject-bound login code instead
 curie local approvals my-agent --mint-console-login-code U0EXAMPLE1
 
+# mint a remediation operator principal for remediation policy writes instead
+curie local approvals my-agent --mint-remediation-principal U0EXAMPLE1
+
 # which tools are gated behind approval
 curie local approvals my-agent
 ```
@@ -417,6 +420,15 @@ route-bound resolution address when one was configured, not the requesting-chann
 so a human knows where that authenticated card lives. A null or empty `card_channel` is
 from an older row or a direct API write that omitted the field; for that compatibility
 case, the requesting channel is the card location.
+
+The two operator mints carry different scopes and neither stands in for the other.
+`--mint-operator-principal` (`POST /approvals/principals/operator`) carries
+`approval.resolve` and settles approvals. `--mint-remediation-principal`
+(`POST /approvals/principals/remediation-operator`) carries
+`remediation.administer` and is what remediation policy, breaker and qualification
+writes require; it resolves no approval, and an approval operator token on a
+remediation write is refused `operator_principal_required`. Both are sent as
+`CURIE_APPROVAL_PRINCIPAL_TOKEN` (header `X-Curie-Approval-Principal`).
 
 A single operator does not need a second person to settle a card. An authenticated
 member of the approver set may approve their own request, including the person who

@@ -194,7 +194,25 @@ def worker_headers() -> dict[str, str]:
 
 
 def admin_headers() -> dict[str, str]:
-    """Platform key plus an ADR 0106 operator principal: a valid policy writer."""
+    """Platform key plus a remediation operator principal, minted as
+    ``POST /approvals/principals/remediation-operator`` does: a valid policy,
+    breaker and qualification writer.
+    """
+
+    token = approval_principal.mint(
+        get_settings().api_key,
+        subject=OPERATOR,
+        kind="operator",
+        scope=approval_principal.REMEDIATION_ADMIN_SCOPE,
+        exp=int(time.time()) + 300,
+    )
+    return {"X-API-Key": get_settings().api_key, PRINCIPAL_HEADER: token}
+
+
+def approver_headers() -> dict[str, str]:
+    """Platform key plus an ADR 0106 approval resolution operator principal, minted
+    as ``POST /approvals/principals/operator`` does: resolves approvals only.
+    """
 
     token = approval_principal.mint(
         get_settings().api_key,
