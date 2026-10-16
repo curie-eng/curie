@@ -233,6 +233,18 @@ class ConnectorSpec(BaseModel):
     # place for a credential and an emptyDir there would shadow the mount.
     secret_files: dict[str, str] = Field(default_factory=dict)
 
+    #   config: [FOLDER_PATH, CHANNEL_ID]     Per-agent NON-secret settings.
+    #
+    # Some servers need a per-agent value that is not a credential -- a folder
+    # path, a channel id. `env` is static per bundle, so before this the only
+    # per-agent channel was `secrets:`, and a setting declared there counted
+    # toward `bearer_secret_required` and could become the derived
+    # Authorization header. A `config` name resolves from the same per-agent
+    # store and renders the same secretKeyRef on the connector pod, but it is
+    # never a credential: it never derives the Bearer, never reaches the
+    # sandbox, and stays out of `secret_names()`. Hosted form only.
+    config: list[str] = Field(default_factory=list)
+
     def secret_names(self) -> list[str]:
         """Env var names this connector needs, any form."""
 
@@ -266,7 +278,9 @@ class ConnectorSpec(BaseModel):
         """
 
         named = [s for s in self.secrets if isinstance(s, str)]
-        return named + list(self.secret_files)
+        # `config` values live in the same per-agent Secret and the renderer
+        # points secretKeyRefs at them, so the deploy path must write them too.
+        return named + list(self.secret_files) + list(self.config)
 
     @property
     def is_hosted(self) -> bool:
@@ -653,6 +667,56 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     "the places it can leak from for no benefit",
                 )
             )
+        if spec.url and spec.config:
+            errors.append(
+                (
+                    "connectors.remote_has_config",
+                    f"{where}: `config` is delivered to a container Curie starts; a `url` "
+                    "connector is already running elsewhere, so the setting would go nowhere",
+                )
+            )
+        credential_names = set(spec.secret_names())
+        seen_config: set[str] = set()
+        for config_name in spec.config:
+            if config_name in seen_config:
+                errors.append(
+                    (
+                        "connectors.duplicate_config",
+                        f"{where}: config lists `{config_name}` more than once",
+                    )
+                )
+                continue
+            seen_config.add(config_name)
+            if config_name in credential_names:
+                errors.append(
+                    (
+                        "connectors.config_is_secret",
+                        f"{where}: {config_name} is declared in both `config` and a secret "
+                        "form. Pick one: a credential must not lose its credential handling, "
+                        "and a setting must not become a Bearer candidate",
+                    )
+                )
+            # The same shape and reserved fence a secret name gets, for the same
+            # reason: the value is resolved from the operator's store and handed
+            # to the bundle's own container.
+            if not SECRET_NAME_RE.match(config_name):
+                errors.append(
+                    (
+                        "connectors.config_name_invalid",
+                        f"{where}: config name {config_name!r} must be an env-var-style "
+                        "name (uppercase letters, digits, underscore; not starting with a "
+                        "digit) -- it is delivered as an environment variable",
+                    )
+                )
+            elif is_reserved_boot_env_name(config_name):
+                errors.append(
+                    (
+                        "connectors.config_name_reserved",
+                        f"{where}: config name {config_name!r} is reserved: it is a "
+                        "platform boot-env, model-credential, or redirect/capture-capable "
+                        "key and cannot be used for connector config",
+                    )
+                )
         if spec.is_hosted and spec.headers:
             errors.append(
                 (
