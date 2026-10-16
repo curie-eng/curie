@@ -316,8 +316,27 @@ The port is a real `Protocol`, and the values crossing it are Kubernetes:
   renderer (`packages/plugin-format/src/plugin_format/connector_render.py::_derived_headers`)
   and the CLI (`cli/src/connector_build.rs`) both accept an explicit
   `bearer_secret` or one plain-string secret and exclude an implicit `SecretRef`.
-  Unlike `OWNER_LABEL`, the four cases are frozen in
-  `tests/vectors/connector-derived-bearer.json`.
+  Unlike `OWNER_LABEL`, the cases are frozen in
+  `tests/vectors/connector-derived-bearer.json`, which the API's independence check
+  (`apps/api/src/curie_api/remediation_verifier.py::header_secret_names`) reads as a third copy of
+  the same rule. A hosted connector may also declare `no_client_auth: <reason>` beside
+  `bearer_secret`, stating why its server authenticates no client. Every copy then derives no
+  `Authorization` header, including for the single plain-secret shape, and the CLI binds no secret
+  name into the sandbox, while every declared secret keeps its pod-side `secretKeyRef` delivery
+  and the rendered Deployment, Service and NetworkPolicy stay byte-identical because the reason is
+  never rendered. The reason must be non-empty, it cannot sit beside `bearer_secret`, and a `url`
+  connector cannot declare it. For example:
+
+  ```yaml
+  connectors:
+    docs:
+      image: ghcr.io/example/docs-mcp:1
+      port: 8000
+      secrets: [UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET]
+      no_client_auth: >-
+        In-cluster MCP server reached over the pod network; it authenticates no
+        client and the boundary is its ingress NetworkPolicy.
+  ```
 - **The Docker dev-tier host enforces no caller.** Its connector containers share
   one network with no policy and no caller proxy, so any container on it can
   reach a connector's port, the trade ADR-0009 makes for the local substrate.

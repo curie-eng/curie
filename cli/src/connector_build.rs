@@ -110,6 +110,11 @@ pub struct ConnectorSpecDecl {
     /// A lone [`SecretDecl::Ref`] is not. See [`bearer_secret_name`].
     #[serde(default)]
     pub bearer_secret: Option<String>,
+    /// Reviewer-facing reason the hosted server authenticates no client.
+    /// When set, no Authorization header is derived and no secret name is
+    /// bound into the sandbox. Never rendered. See [`bearer_secret_name`].
+    #[serde(default)]
+    pub no_client_auth: Option<String>,
     #[serde(default)]
     pub sealed_secrets: BTreeMap<String, String>,
     #[serde(default)]
@@ -173,6 +178,7 @@ impl Default for ConnectorSpecDecl {
             headers: BTreeMap::new(),
             secrets: Vec::new(),
             bearer_secret: None,
+            no_client_auth: None,
             sealed_secrets: BTreeMap::new(),
             secret_files: BTreeMap::new(),
             config: Vec::new(),
@@ -643,6 +649,27 @@ fn check_spec(name: &str, spec: &ConnectorSpecDecl) -> Result<()> {
             "connectors.{name}: `headers` apply to a remote endpoint; configure a hosted \
              connector with `env` and `args` instead"
         );
+    }
+    if let Some(reason) = &spec.no_client_auth {
+        if reason.trim().is_empty() {
+            bail!(
+                "connectors.bad_no_client_auth: connectors.{name}: `no_client_auth` must \
+                 state a non-empty reason"
+            );
+        }
+        if spec.url.is_some() {
+            bail!(
+                "connectors.remote_has_no_client_auth: connectors.{name}: `no_client_auth` \
+                 applies to a connector Curie hosts; a `url` connector derives no \
+                 Authorization header"
+            );
+        }
+        if spec.bearer_secret.is_some() {
+            bail!(
+                "connectors.no_client_auth_with_bearer_secret: connectors.{name}: \
+                 `no_client_auth` and `bearer_secret` contradict each other; set exactly one"
+            );
+        }
     }
     if let Some(build) = &spec.build {
         check_build(&format!("connectors.{name}"), build)?;
@@ -2025,6 +2052,9 @@ pub fn hosted_secret_names(decl: &ConnectorsFileDecl) -> Vec<String> {
 /// secrets without an explicit name is None (the Python validator refuses that
 /// document rather than picking `secrets[0]`).
 pub fn bearer_secret_name(spec: &ConnectorSpecDecl) -> Option<String> {
+    if spec.no_client_auth.is_some() {
+        return None;
+    }
     if let Some(name) = &spec.bearer_secret {
         return Some(name.clone());
     }
@@ -2405,6 +2435,78 @@ connectors:
             "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    config: [ANTHROPIC_API_KEY]\n",
         );
         assert!(refuse_reserved_secret_names(&decl).is_err());
+    }
+
+    const NO_CLIENT_AUTH: &str = r#"
+connectors:
+  docs:
+    image: ghcr.io/example/docs-mcp:1
+    port: 8000
+    secrets: [UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET]
+    no_client_auth: >-
+      In-cluster MCP server reached over the pod network; it authenticates no
+      client and the boundary is its ingress NetworkPolicy.
+"#;
+
+    #[test]
+    fn no_client_auth_parses_and_binds_no_secret_into_the_sandbox() {
+        let decl = decl(NO_CLIENT_AUTH);
+        let spec = &decl.connectors["docs"];
+        assert!(spec.no_client_auth.is_some());
+        assert_eq!(bearer_secret_name(spec), None);
+        assert!(hosted_env_secret_names(&decl).is_empty());
+        // Pod-side delivery is unchanged: both names still resolve.
+        assert_eq!(
+            hosted_secret_names(&decl),
+            vec!["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"]
+        );
+    }
+
+    #[test]
+    fn no_client_auth_single_plain_secret_binds_nothing() {
+        let decl = decl(
+            "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    secrets: [UPSTREAM_TOKEN]\n    no_client_auth: In-cluster server; the boundary is its ingress NetworkPolicy.\n",
+        );
+        assert_eq!(bearer_secret_name(&decl.connectors["docs"]), None);
+        assert!(hosted_env_secret_names(&decl).is_empty());
+    }
+
+    #[test]
+    fn no_client_auth_with_bearer_secret_is_refused() {
+        let err = parse_connectors(
+            "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    secrets: [UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET]\n    bearer_secret: UPSTREAM_CLIENT_SECRET\n    no_client_auth: In-cluster server; the boundary is its ingress NetworkPolicy.\n",
+        )
+        .expect_err("no_client_auth with bearer_secret must be refused");
+        assert!(
+            err.to_string()
+                .contains("connectors.no_client_auth_with_bearer_secret"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn no_client_auth_on_a_remote_connector_is_refused() {
+        let err = parse_connectors(
+            "connectors:\n  r:\n    url: https://mcp.example.com/mcp\n    no_client_auth: In-cluster server; the boundary is its ingress NetworkPolicy.\n",
+        )
+        .expect_err("no_client_auth on a url connector must be refused");
+        assert!(
+            err.to_string()
+                .contains("connectors.remote_has_no_client_auth"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn no_client_auth_blank_reason_is_refused() {
+        let err = parse_connectors(
+            "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    secrets: [UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET]\n    no_client_auth: '   '\n",
+        )
+        .expect_err("a blank no_client_auth reason must be refused");
+        assert!(
+            err.to_string().contains("connectors.bad_no_client_auth"),
+            "{err}"
+        );
     }
 
     // @spec ADR-0168 d8

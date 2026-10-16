@@ -111,7 +111,31 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   with no `--secret`, so the `unhosted_url` fallback derives the same header (#2518). A hosted
   connector with several
   secrets, any of them a plain string, and no `bearer_secret` is `connectors.bearer_secret_required`;
-  one whose secrets are all `SecretRef`s is valid and derives no header (#3057). A hosted connector may
+  one whose secrets are all `SecretRef`s is valid and derives no header (#3057). A hosted connector
+  whose server authenticates no client may instead declare `no_client_auth: <reason>`, beside
+  `bearer_secret`: an optional string stating why no client credential exists. When it is set, no
+  `Authorization` header is derived in the hosted or `unhosted_url` entry, including the single
+  plain-secret shape, no secret name is bound into the sandbox, and
+  `connectors.bearer_secret_required` is not raised. Every declared secret keeps its pod-side
+  `secretKeyRef` delivery, and the rendered Deployment, Service and NetworkPolicy are unchanged,
+  because the reason text is never rendered. The reason must be non-empty after stripping
+  whitespace (`connectors.bad_no_client_auth`), it contradicts an explicit `bearer_secret`
+  (`connectors.no_client_auth_with_bearer_secret`), and a `url` connector cannot declare it
+  (`connectors.remote_has_no_client_auth`). The reachability boundary for such a server stays its
+  ingress NetworkPolicy (ADR-0086). For example:
+
+  ```yaml
+  connectors:
+    docs:
+      image: ghcr.io/example/docs-mcp:1
+      port: 8000
+      secrets: [UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET]
+      no_client_auth: >-
+        In-cluster MCP server reached over the pod network; it authenticates no
+        client and the boundary is its ingress NetworkPolicy.
+  ```
+
+  A hosted connector may
   declare `admits`, the agent names whose sandboxes may call it (ADR-0168 decision 7): a missing
   list admits the deploying agent alone, `[]` refuses everyone, and a list is exact, so it does
   not add the deploying agent. An entry is either the reserved name `self`, meaning the agent the

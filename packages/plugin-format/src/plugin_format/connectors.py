@@ -194,6 +194,17 @@ class ConnectorSpec(BaseModel):
     #                                         using secrets[0] (#2559).
     bearer_secret: str | None = None
 
+    #   no_client_auth: <reason>              The server authenticates no
+    #                                         client, so Curie derives no
+    #                                         Authorization header and binds
+    #                                         no secret name into the sandbox.
+    #                                         Hosted form only. The text is a
+    #                                         reviewer-facing reason, must be
+    #                                         non-empty, and is never rendered.
+    #                                         Declared secrets keep their
+    #                                         pod-side secretKeyRef delivery.
+    no_client_auth: str | None = None
+
     #   sealed_secrets:                       The bundle CARRIES the credential,
     #     TOKEN: AgBv3n2K...                  encrypted to the cluster that will
     #                                         run it (ADR-0094).
@@ -675,6 +686,33 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     "connector is already running elsewhere, so the setting would go nowhere",
                 )
             )
+        if spec.no_client_auth is not None and not spec.no_client_auth.strip():
+            errors.append(
+                (
+                    "connectors.bad_no_client_auth",
+                    f"{where}: `no_client_auth` must state a non-empty reason. The "
+                    "reason is what a reviewer reads to judge why no client credential "
+                    "is derived, so a blank declaration carries no justification",
+                )
+            )
+        if spec.url and spec.no_client_auth is not None:
+            errors.append(
+                (
+                    "connectors.remote_has_no_client_auth",
+                    f"{where}: `no_client_auth` applies to a connector Curie hosts; a "
+                    "`url` connector is already running elsewhere and Curie derives no "
+                    "Authorization header for it, so the declaration would change nothing",
+                )
+            )
+        if spec.no_client_auth is not None and spec.bearer_secret:
+            errors.append(
+                (
+                    "connectors.no_client_auth_with_bearer_secret",
+                    f"{where}: `no_client_auth` and `bearer_secret` contradict each "
+                    "other: one says no Authorization header is derived, the other "
+                    "names the secret that header expands. Set exactly one",
+                )
+            )
         credential_names = set(spec.secret_names())
         seen_config: set[str] = set()
         for config_name in spec.config:
@@ -841,7 +879,11 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                             "would expand empty.",
                         )
                     )
-            elif len(secret_env_names) > 1 and any(isinstance(s, str) for s in spec.secrets):
+            elif (
+                spec.no_client_auth is None
+                and len(secret_env_names) > 1
+                and any(isinstance(s, str) for s in spec.secrets)
+            ):
                 # All-`SecretRef` connectors are exempt (#3057): a `SecretRef` is
                 # the server's own upstream credential, delivered only to the pod
                 # under ADR-0090, so it implies no client auth and there is no
