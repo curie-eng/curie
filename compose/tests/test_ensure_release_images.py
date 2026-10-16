@@ -204,3 +204,23 @@ class TestWorkflowsInvokeTheHelper:
         body = text[start : start + 4000]
         assert "ensure_release_images.py" in body
         assert "--profile slack config --images" not in body
+
+
+def test_every_image_build_ignore_file_excludes_projects() -> None:
+    # Security pin for #4562: root-context builds run COPY . . in their
+    # builder stages, so a per-Dockerfile ignore file without **/.projects
+    # would bake private worktree fixtures into builder layers.
+    missing = []
+    for name, build in ensure.IMAGE_BUILDS.items():
+        ignore = REPO_ROOT / (build.dockerfile + ".dockerignore")
+        patterns = [
+            line.strip()
+            for line in ignore.read_text().splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        if "**/.projects" not in patterns:
+            missing.append(f"{name}: {ignore.relative_to(REPO_ROOT)}")
+    assert missing == [], (
+        "image build ignore files must exclude **/.projects so private "
+        f"worktree fixtures never enter builder layers: {missing}"
+    )
