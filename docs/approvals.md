@@ -426,7 +426,8 @@ The two operator mints carry different scopes and neither stands in for the othe
 `approval.resolve` and settles approvals. `--mint-remediation-principal`
 (`POST /approvals/principals/remediation-operator`) carries
 `remediation.administer` and is what remediation policy, breaker and qualification
-writes require; it resolves no approval, and an approval operator token on a
+writes require as attribution (binding and arming also need the separate
+remediation authority key, ADR 0231); it resolves no approval, and an approval operator token on a
 remediation write is refused `operator_principal_required`. Both are sent as
 `CURIE_APPROVAL_PRINCIPAL_TOKEN` (header `X-Curie-Approval-Principal`).
 

@@ -536,6 +536,39 @@ def test_approval_chat_attester_secret_is_independent_and_minimally_distributed(
             )
 
 
+def test_remediation_authority_key_is_set_on_the_api_only():
+    """ADR 0231 (#4231): binding and arming a remediation policy need a key the
+    platform API key cannot derive. It is independent only if no platform-key
+    holder receives it, so on both compose forms ``curie-api`` alone carries
+    ``CURIE_REMEDIATION_AUTHORITY_KEY``, its no-override value is nonblank and
+    differs from ``API_KEY``, and no other service names the variable or holds
+    that value under another name.
+    """
+    env_name = "CURIE_REMEDIATION_AUTHORITY_KEY"
+    for label, doc in compose_docs():
+        services = doc["services"]
+        api = env_map(services["curie-api"])
+
+        assert env_name in api, f"{label}: curie-api has no {env_name}"
+        authority = resolve_shell_default(api[env_name])
+        assert authority and authority.strip(), f"{label}: curie-api {env_name} is blank"
+        assert authority != resolve_shell_default(api["API_KEY"]), (
+            f"{label}: the remediation authority reuses the platform API key"
+        )
+        for service_name, spec in services.items():
+            if service_name == "curie-api":
+                continue
+            env = env_map(spec)
+            assert env_name not in env, f"{label}: {service_name} must not receive {env_name}"
+            assert env_name not in yaml.safe_dump(spec), f"{label}: {service_name} names {env_name}"
+            leaked = [
+                key for key, value in env.items() if resolve_shell_default(value) == authority
+            ]
+            assert not leaked, (
+                f"{label}: {service_name} holds the remediation authority as {leaked}"
+            )
+
+
 def test_dispatcher_depends_on_api_healthy():
     """The dispatcher waits for the API to be healthy before it starts.
 

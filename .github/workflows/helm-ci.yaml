@@ -773,6 +773,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/approval-principal-wiring-assertions.sh
 
+      # Prove the remediation authority key (ADR 0231, #4231) reaches the API
+      # Deployment only: generated on sealed installs, never equal to apiKey,
+      # never blank, and absent from every other workload, so no platform-key
+      # holder (worker, dispatcher, sandbox) can bind or arm a policy.
+      - name: helm render assertions (remediation authority)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/remediation-authority-assertions.sh
+
       # Prove the inbound-attachment handoff (#2567). The first script pins the
       # shape: an attachments-init container that runs before the runner, mounts
       # the shared volume with a sizeLimit, receives CURIE_ATTACHMENTS_REF, and

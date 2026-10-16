@@ -2743,6 +2743,17 @@ section is the administrator's.
   `X-Curie-Approval-Principal` header. A write without one, or with a token from
   `--mint-operator-principal` (which only resolves approvals), is refused
   `operator_principal_required`. Reads need none.
+- Binding (`PUT`) and arming (`POST .../arm`) a policy additionally need the
+  remediation authority key (ADR 0231): header `X-Curie-Remediation-Authority`
+  equal to `CURIE_REMEDIATION_AUTHORITY_KEY` (chart value
+  `api.remediationAuthorityKey`, generated and retained when unset, never equal
+  to `api.apiKey`, mounted into the API Deployment only). A missing or wrong
+  header, or a key unset in the API, is `403 remediation_authority_required` and
+  creates no generation. The platform key plus the operator principal is no
+  longer enough; the principal is attribution only. Delete, disarm and breaker
+  close keep the platform key plus the principal. The CLI `apply` and `arm`
+  verbs do not yet send the header (follow-up to #4225), so until then bind and
+  arm over the API with the header.
 - The protected worker is deployed. The capture of a nomination block from a
   protected turn is its runner client wrapper (AUTOMATED-REMEDIATION-6); without
   it no turn can submit a block, though the policy and qualification routes
