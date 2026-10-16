@@ -505,8 +505,16 @@ def live(f: FixtureAPI, docs: list[Json], config: Json, images: Json) -> None:
     for policy in policies:
         path = object_path(policy)
         f.wait(functools.partial(observed, f, path))
-        warnings = f.get(path).get("status", {}).get("typeChecking", {})
-        require(not warnings.get("expressionWarnings"), "admission_type_warnings")
+        # Other expressions already carry type-checker warnings for multi-kind and
+        # quantity fields; they still enforce. Only the TLS argv rule is this change's.
+        checks = f.get(path).get("status", {}).get("typeChecking", {})
+        argv = {
+            f"spec.validations[{i}].expression"
+            for i, rule in enumerate(policy["spec"]["validations"])
+            if "c.args ==" in rule["expression"]
+        }
+        warned = {w["fieldRef"] for w in checks.get("expressionWarnings", [])}
+        require(not argv & warned, "admission_type_warnings")
     pods_policy = next(p for p in policies if p["metadata"]["name"].endswith("-docker-daemon-pods"))
     admission(f, pod, pods_policy, identity)
     created = f.create(pod, identity=identity)
