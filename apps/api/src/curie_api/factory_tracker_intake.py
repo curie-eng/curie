@@ -18,11 +18,15 @@ cancelled through a tracker, so each poll of that tracker cancels it.
 
 The opaque ``poll_marked`` cursor is kept per label in the tracker scope's
 ``factory_poll_cursors`` row, under ``etags["marked:<label>"]``, and saved only
-after every notice of a page was applied or deliberately refused. A refused
-admission is not held: every ``factory_reconcile_interval_s`` a sweep re-reads
-the latest label add of every labelled issue and applies it again under the
-original event's request id, so a repaired ticket admits and an admitted one
-replays.
+after every notice of a page was applied or deliberately refused. A notice
+whose tracker or code host could not answer holds only its own issue (#4621):
+the issue's later notices in the page wait behind it, it gets one marked hold
+comment, the cursor stays, and every other issue in the page is still applied.
+The next poll replays the page, and an already applied notice replays under
+its request id. A refused admission is not held: every
+``factory_reconcile_interval_s`` a sweep re-reads the latest label add of every
+labelled issue and applies it again under the original event's request id, so
+a repaired ticket admits and an admitted one replays.
 
 The pass holds ``pg_try_advisory_lock(3745, 197)`` on one connection, so only
 one replica polls. A tracker's credential and responses stay in the API: logs
@@ -83,9 +87,16 @@ _LOCK = text("SELECT pg_try_advisory_lock(CAST(:classid AS integer), CAST(:objid
 _UNLOCK = text("SELECT pg_advisory_unlock(CAST(:classid AS integer), CAST(:objid AS integer))")
 _LOCK_ARGS = {"classid": 3745, "objid": 197}
 
-# A pass over one label stops at these and keeps its cursor: the tracker or a
-# code host could not answer now, or refused the credential.
+# The tracker or a code host could not answer now, or refused the credential.
+# On a page read the label's pass stops; on one notice only its issue is held.
+# Either way the label's cursor stays.
 _DEFERRED = (Unavailable, Unauthorized, FeedbackUnavailable)
+
+HOLD_MARKER = "curie-factory-intake-hold"
+_HOLD_BODY = (
+    "Curie could not start this issue yet: a tracker or code host it needs did not "
+    "answer. Curie retries on its next poll; nothing is needed unless this persists."
+)
 
 
 @dataclass(frozen=True)
@@ -280,13 +291,15 @@ async def _poll_binding(
                 scope.tracker.name,
             )
             return
-        # A label whose poll was deferred is not swept in the same pass: the
-        # tracker could not answer it now.
+        # A label whose page could not be read is not swept in the same pass:
+        # the tracker could not answer it now. A held issue does not stop the
+        # sweep, which skips that issue until the next pass.
+        held: set[TrackerIssueRef] = set()
         polled = not polling or await _poll_label(
-            sessionmaker, scope, tracker, label, running.get(label, [])
+            sessionmaker, scope, tracker, label, running.get(label, []), held
         )
         if polled and label in sweeps:
-            await _sweep_label(sessionmaker, scope, tracker, label)
+            await _sweep_label(sessionmaker, scope, tracker, label, held)
 
 
 def _deferred(scope: _Scope, label: str, what: str, exc: Exception) -> None:
@@ -311,6 +324,7 @@ def _deferred(scope: _Scope, label: str, what: str, exc: Exception) -> None:
             classification,
         )
         return
+    # A port error carries only its code, never forge text (ADR 0197).
     logger.info(
         "tracker intake %s for tracker %s binding %s label %r deferred: %s %s",
         what,
@@ -322,21 +336,44 @@ def _deferred(scope: _Scope, label: str, what: str, exc: Exception) -> None:
     )
 
 
+async def _hold(
+    scope: _Scope, tracker: Tracker, label: str, issue: TrackerIssueRef, exc: Exception
+) -> None:
+    """Log one issue's deferral and say so on the issue once (upserted)."""
+
+    _deferred(scope, label, "notice", exc)
+    try:
+        await tracker.marked_comments.upsert_marked(
+            ReplyTarget.on_issue(issue), HOLD_MARKER, _HOLD_BODY
+        )
+    except ForgeError as failed:
+        # The retained cursor is the retry authority; the hold is a courtesy.
+        logger.info(
+            "tracker intake for binding %s could not post a hold: %s",
+            scope.binding.name,
+            type(failed).__name__,
+        )
+
+
 async def _poll_label(
     sessionmaker: async_sessionmaker[AsyncSession],
     scope: _Scope,
     tracker: Tracker,
     label: str,
     running: list[TrackerIssueRef],
+    held: set[TrackerIssueRef],
 ) -> bool:
-    """Poll one label from its stored cursor; False when the poll was deferred."""
+    """Poll one label from its stored cursor; False when the page was not read.
+
+    A deferred notice adds its issue to ``held``: that issue's later notices
+    wait, the others are applied, and the cursor stays for the next poll to
+    replay.
+    """
 
     key = f"marked:{label}"
     stored = await _load_cursor(sessionmaker, scope, key)
     try:
         page = await tracker.poll_marked(stored, running=tuple(running))
-        for notice in page.notices:
-            await _apply(sessionmaker, scope, tracker, label, notice)
     except _DEFERRED as exc:
         _deferred(scope, label, "poll", exc)
         return False
@@ -350,7 +387,16 @@ async def _poll_label(
             label,
         )
         return False
-    await _save_cursor(sessionmaker, scope, key, page.cursor)
+    for notice in page.notices:
+        if notice.issue in held:
+            continue
+        try:
+            await _apply(sessionmaker, scope, tracker, label, notice)
+        except _DEFERRED as exc:
+            held.add(notice.issue)
+            await _hold(scope, tracker, label, notice.issue, exc)
+    if not held:
+        await _save_cursor(sessionmaker, scope, key, page.cursor)
     return True
 
 
@@ -359,20 +405,28 @@ async def _sweep_label(
     scope: _Scope,
     tracker: Tracker,
     label: str,
+    held: set[TrackerIssueRef],
 ) -> None:
     """Apply the latest label add of every labelled issue again (plan D2).
 
     No cursor is read or written. An admitted issue replays under its request
-    id; a refused one is judged again on its current ticket.
+    id; a refused one is judged again on its current ticket. An issue in
+    ``held`` is skipped, and one that defers here is held.
     """
 
     try:
         page = await tracker.poll_marked(None, running=())
-        for notice in page.notices:
-            if notice.disposition is Disposition.ADMIT:
-                await _apply(sessionmaker, scope, tracker, label, notice)
     except _DEFERRED as exc:
         _deferred(scope, label, "sweep", exc)
+        return
+    for notice in page.notices:
+        if notice.disposition is not Disposition.ADMIT or notice.issue in held:
+            continue
+        try:
+            await _apply(sessionmaker, scope, tracker, label, notice)
+        except _DEFERRED as exc:
+            held.add(notice.issue)
+            await _hold(scope, tracker, label, notice.issue, exc)
 
 
 async def _load_cursor(
@@ -422,7 +476,7 @@ async def _apply(
     """Apply one notice under its issue lock, committing what it decided.
 
     A deliberate refusal returns; a deferral raises one of ``_DEFERRED`` so the
-    label's cursor stays.
+    notice's issue is held and the label's cursor stays.
     """
 
     async with sessionmaker() as session:

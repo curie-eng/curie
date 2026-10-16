@@ -12,7 +12,8 @@ under the original label event's request id.
 Here the tracker is the real Jira Cloud adapter, built by the production
 registry from the install's `ForgesConfig`, over the Jira fake
 (`forge_fakes/jira.py`) through ASGI; the code host is the real GitHub adapter
-over `GitHubRepositoryFake`. The pass gets that one HTTP client, Postgres is
+over `GitHubRepositoryFake`, and a second code host is the real Bitbucket Data
+Center adapter over `BitbucketDcFake`. The pass gets that one HTTP client, Postgres is
 real, and the App's installation mint is `fake_installation_tokens`.
 Placeholder identifiers only.
 """
@@ -38,6 +39,7 @@ from curie_api.forges.registry import ForgeRegistry
 from curie_api.forges.types import Disposition, MarkedNotice, TrackerIssueRef
 from curie_api.main import create_app
 from fastapi.testclient import TestClient
+from forge_fakes import bitbucket_dc
 from forge_fakes import jira as jira_fake
 from forge_fakes.github import (
     INSTALLATION_ID,
@@ -63,6 +65,15 @@ OUTSIDER_ID = "5b10a0000000000000000a22"
 STARTERS_GROUP = "f1e2d3c4-0000-4000-8000-0000000000aa"
 SWEEP = 300.0
 LABEL_REFUSAL_MARKER = "curie-factory-label-refusal"
+HOLD_MARKER = "curie-factory-intake-hold"
+# What the DC outage answers: a body echoing the token, so a leak is visible.
+DC_SENTINEL = f"upstream echoed {bitbucket_dc.FACTORY_TOKEN}"
+DC_REPO = {
+    "alias": "dc",
+    "code_host": bitbucket_dc.CODE_HOST_NAME,
+    "project_id": str(bitbucket_dc.REPO_ID),
+    "path": bitbucket_dc.REPO_PATH,
+}
 
 
 # --- the install ------------------------------------------------------------------
@@ -82,15 +93,34 @@ class _GitHub(GitHubRepositoryFake):
 
 
 class _ByHost(httpx.AsyncBaseTransport):
-    """The Jira site to the Jira fake, every other host to the GitHub fake."""
+    """The Jira site to the Jira fake, the DC host to the DC fake, every other
+    host to the GitHub fake. With ``dc_down`` every DC request answers
+    ``dc_status`` (503 unless set)."""
 
-    def __init__(self, jira: jira_fake.JiraFake, github: _GitHub) -> None:
+    def __init__(
+        self,
+        jira: jira_fake.JiraFake,
+        github: _GitHub,
+        dc: bitbucket_dc.BitbucketDcFake,
+        *,
+        dc_down: bool,
+        dc_status: int = 503,
+    ) -> None:
         self._jira = httpx.ASGITransport(app=jira.app)
         self._github = httpx.MockTransport(github.handle)
+        self._dc = dc.transport()
+        self._dc_down = dc_down
+        self._dc_status = dc_status
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.url.host == jira_fake.SITE_HOST:
             return await self._jira.handle_async_request(request)
+        if request.url.host == bitbucket_dc.HOST:
+            if self._dc_down:
+                return httpx.Response(
+                    self._dc_status, json={"errors": [{"message": DC_SENTINEL}]}, request=request
+                )
+            return await self._dc.handle_async_request(request)
         return await self._github.handle_async_request(request)
 
 
@@ -131,6 +161,20 @@ def _document(
     return document
 
 
+def _dc_document(
+    *, poll_interval_s: float | None = None, repos: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """`_document` plus the DC code host and its ``dc`` alias on the Jira binding,
+    then any further ``repos``."""
+
+    document = _document(jira_binding=_jira_binding(repos=[dict(DC_REPO), *(repos or [])]))
+    document["code_hosts"].append(bitbucket_dc.code_host_entry())
+    if poll_interval_s is not None:
+        [tracker] = [t for t in document["trackers"] if t["name"] == TRACKER]
+        tracker["poll_interval_s"] = poll_interval_s
+    return document
+
+
 @dataclass
 class Intake:
     client: TestClient
@@ -140,6 +184,9 @@ class Intake:
     outsider: jira_fake.JiraUser
     key_dir: Path
     monkeypatch: pytest.MonkeyPatch
+    dc: bitbucket_dc.BitbucketDcFake = field(default_factory=bitbucket_dc.BitbucketDcFake)
+    dc_down: bool = False
+    dc_status: int = 503
     due: dict[str, float] = field(default_factory=dict)
     clock: float = 10_000.0
 
@@ -175,7 +222,10 @@ class Intake:
             engine = create_async_engine(get_settings().database_url)
             try:
                 maker = async_sessionmaker(engine, expire_on_commit=False)
-                async with httpx.AsyncClient(transport=_ByHost(self.jira, self.github)) as client:
+                transport = _ByHost(
+                    self.jira, self.github, self.dc, dc_down=self.dc_down, dc_status=self.dc_status
+                )
+                async with httpx.AsyncClient(transport=transport) as client:
                     await factory_tracker_intake.poll_trackers(
                         maker, get_settings(), client, due=self.due, clock=self.clock
                     )
@@ -788,7 +838,9 @@ def test_code_host_and_reply_route_follow_the_bound_repository(
     intake.poll()
     assert _work_items(issue) == []
     assert _cursor() is None
-    assert _bot_comments(intake, issue) == []
+    # The held issue says so once (decision 3).
+    [hold] = _bot_comments(intake, issue)
+    assert _marker(hold) == HOLD_MARKER
 
     monkeypatch.setattr(ForgeRegistry, "code_host", original)
     asked: list[str] = []
@@ -815,3 +867,277 @@ def test_the_github_poll_never_reads_a_jira_binding(intake: Intake) -> None:
     intake.configure(copy.deepcopy(forges_document()))
     intake.poll()
     assert intake.jira.requests == []
+
+
+# --- one issue's deferral holds only that issue (#4621) ---------------------------------
+
+
+def _held_tickets(intake: Intake) -> tuple[jira_fake.JiraIssue, jira_fake.JiraIssue, str]:
+    """A ticket on the DC repository labelled first, then one on the GitHub
+    default; returns both and the healthy ticket's label event."""
+
+    intake.agent()
+    dc_issue = _issue(intake, "Widget exporter drops the header row")
+    healthy = _issue(intake)
+    intake.jira.add_label(dc_issue.id, "repo:dc", intake.starter)
+    intake.jira.add_label(dc_issue.id, LABEL, intake.starter)
+    intake.jira.advance(5)
+    event = intake.jira.add_label(healthy.id, LABEL, intake.starter)
+    return dc_issue, healthy, event
+
+
+def _assert_admitted_once(intake: Intake, issue: jira_fake.JiraIssue, event: str) -> None:
+    [item] = _work_items(issue)
+    assert item["cancelled_at"] is None
+    assert [r["id"] for r in _requests(item["id"])] == [_admit_id(intake, issue, event)]
+
+
+def _assert_held(intake: Intake, issue: jira_fake.JiraIssue) -> None:
+    assert _work_items(issue) == []
+    [hold] = _bot_comments(intake, issue)
+    assert _marker(hold) == HOLD_MARKER
+    text = jira_fake.flatten(hold.body)
+    assert text.strip()
+    for leaked in (DC_SENTINEL, bitbucket_dc.FACTORY_TOKEN, jira_fake.TOKEN, "503", "401"):
+        assert leaked not in text
+
+
+def _assert_on_dc(issue: jira_fake.JiraIssue) -> None:
+    [item] = _work_items(issue)
+    assert (
+        item["code_host_kind"],
+        item["code_host_host"],
+        item["repository_project_id"],
+        item["repository_path"],
+    ) == (types.BITBUCKET_DC, bitbucket_dc.HOST, str(bitbucket_dc.REPO_ID), bitbucket_dc.REPO_PATH)
+    assert item["cancelled_at"] is None
+
+
+def test_unavailable_notice_does_not_starve_other_repositories(
+    make_intake: Callable[[dict[str, Any]], Intake], caplog: pytest.LogCaptureFixture
+) -> None:
+    intake = make_intake(_dc_document())
+    dc_issue, healthy, event = _held_tickets(intake)
+    intake.dc_down = True
+
+    with caplog.at_level(logging.DEBUG):
+        intake.poll()
+
+    _assert_admitted_once(intake, healthy, event)
+    _assert_held(intake, dc_issue)
+    assert _bot_comments(intake, healthy) == []
+    # The held notice keeps the label's cursor where it was.
+    assert _cursor() is None
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert DC_SENTINEL not in logged
+    assert bitbucket_dc.FACTORY_TOKEN not in logged
+
+    intake.dc_down = False
+    intake.poll()
+
+    _assert_on_dc(dc_issue)
+    _assert_admitted_once(intake, healthy, event)
+    assert _cursor() is not None
+
+
+def test_a_held_issue_replays_across_polls_and_a_restart_without_duplicates(
+    make_intake: Callable[[dict[str, Any]], Intake],
+) -> None:
+    intake = make_intake(_dc_document())
+    dc_issue, healthy, event = _held_tickets(intake)
+    intake.dc_down = True
+
+    intake.poll()
+    intake.poll()
+    # A restart: the in-memory schedule starts empty, every key due.
+    intake.due = {}
+    intake.poll()
+
+    _assert_admitted_once(intake, healthy, event)
+    # The hold is upserted, never repeated.
+    _assert_held(intake, dc_issue)
+    assert _cursor() is None
+
+    intake.dc_down = False
+    intake.poll()
+    _assert_on_dc(dc_issue)
+    _assert_admitted_once(intake, healthy, event)
+    assert _cursor() is not None
+
+    # A later removal on the repaired issue is applied in order.
+    intake.jira.advance(5)
+    intake.jira.remove_label(dc_issue.id, LABEL, intake.starter)
+    intake.poll()
+    [cancelled] = _work_items(dc_issue)
+    assert cancelled["cancelled_at"] is not None
+    _assert_admitted_once(intake, healthy, event)
+
+
+def test_a_sweep_only_pass_holds_one_issue_and_admits_the_other(
+    make_intake: Callable[[dict[str, Any]], Intake],
+) -> None:
+    # The poll interval outlasts the sweep's, so the second pass only sweeps.
+    intake = make_intake(_dc_document(poll_interval_s=100_000.0))
+    intake.agent()
+    intake.poll()
+    polled = _cursor()
+
+    dc_issue = _issue(intake, "Widget exporter drops the header row")
+    healthy = _issue(intake)
+    intake.jira.add_label(dc_issue.id, "repo:dc", intake.starter)
+    intake.jira.add_label(dc_issue.id, LABEL, intake.starter)
+    intake.jira.advance(5)
+    event = intake.jira.add_label(healthy.id, LABEL, intake.starter)
+    intake.dc_down = True
+    searches = len(intake.jira.requests_of("search"))
+
+    intake.sweep()
+
+    # Only the sweep read the label: no cursor moved.
+    assert len(intake.jira.requests_of("search")) > searches
+    assert _cursor() == polled
+    _assert_admitted_once(intake, healthy, event)
+    _assert_held(intake, dc_issue)
+
+
+def test_a_sweep_after_a_held_poll_still_runs(
+    make_intake: Callable[[dict[str, Any]], Intake],
+) -> None:
+    web = {"alias": "web", "code_host": "github", "project_id": "4402", "path": "acme-corp/web"}
+    intake = make_intake(_dc_document(repos=[web]))
+    intake.agent()
+    # Refused while the DC is healthy; the cursor saves past the refused add.
+    healthy = _issue(intake)
+    intake.jira.add_label(healthy.id, "repo:bot", intake.starter)
+    intake.jira.add_label(healthy.id, "repo:web", intake.starter)
+    event = intake.jira.add_label(healthy.id, LABEL, intake.starter)
+    intake.poll()
+    assert _work_items(healthy) == []
+    assert _cursor() is not None
+
+    # Repaired: a poll alone does not re-read the add behind the cursor.
+    intake.jira.remove_label(healthy.id, "repo:web", intake.starter)
+    intake.poll()
+    assert _work_items(healthy) == []
+    saved = _cursor()
+    assert saved is not None
+
+    dc_issue = _issue(intake, "Widget exporter drops the header row")
+    intake.jira.advance(5)
+    intake.jira.add_label(dc_issue.id, "repo:dc", intake.starter)
+    intake.jira.add_label(dc_issue.id, LABEL, intake.starter)
+    intake.dc_down = True
+
+    # The poll and the sweep are both due. The poll reads only the DC ticket's
+    # add and holds it, so only the sweep can admit the repaired ticket.
+    intake.sweep()
+
+    _assert_admitted_once(intake, healthy, event)
+    _assert_held(intake, dc_issue)
+    assert _cursor() == saved
+
+
+def test_a_held_issues_later_notices_wait_in_order(
+    make_intake: Callable[[dict[str, Any]], Intake],
+) -> None:
+    intake = make_intake(_dc_document())
+    intake.agent()
+    # A first poll saves a cursor, so the next poll delivers mentions.
+    intake.poll()
+    saved = _cursor()
+    assert saved is not None
+
+    dc_issue = _issue(intake, "Widget exporter drops the header row")
+    healthy = _issue(intake)
+    intake.jira.add_label(dc_issue.id, "repo:dc", intake.starter)
+    dc_event = intake.jira.add_label(dc_issue.id, LABEL, intake.starter)
+    comment_id = intake.jira.add_comment(
+        dc_issue.id,
+        intake.starter,
+        jira_fake.adf_mention(
+            jira_fake.BOT_ACCOUNT_ID, jira_fake.BOT_NAME, after=" please also handle tabs"
+        ),
+    )
+    intake.jira.advance(5)
+    event = intake.jira.add_label(healthy.id, LABEL, intake.starter)
+    intake.dc_down = True
+
+    def mention_checks() -> int:
+        return sum(
+            1
+            for r in intake.jira.requests_of("comment_list")
+            if int(comment_id) in ((r.json or {}).get("ids") or [])
+        )
+
+    # One page carries [admit, mention] for the DC ticket: the admission is
+    # held, so the mention is not even verified.
+    intake.poll()
+
+    _assert_admitted_once(intake, healthy, event)
+    _assert_held(intake, dc_issue)
+    assert mention_checks() == 0
+    assert _cursor() == saved
+
+    intake.dc_down = False
+    intake.poll()
+
+    # Replayed in order: the admission first, then the mention revises it.
+    _assert_on_dc(dc_issue)
+    [item] = _work_items(dc_issue)
+    rows = _requests(item["id"])
+    assert len(rows) == 2
+    assert rows[0]["id"] == _admit_id(intake, dc_issue, dc_event)
+    assert rows[1]["objective"].splitlines()[0].endswith(f"?focusedCommentId={comment_id}")
+    assert mention_checks() >= 1
+    _assert_admitted_once(intake, healthy, event)
+    assert _cursor() not in (None, saved)
+
+
+def test_an_unauthorized_dc_notice_holds_only_its_issue(
+    make_intake: Callable[[dict[str, Any]], Intake], caplog: pytest.LogCaptureFixture
+) -> None:
+    intake = make_intake(_dc_document())
+    dc_issue, healthy, event = _held_tickets(intake)
+    intake.dc_down = True
+    # A refused credential, its error body echoing the token.
+    intake.dc_status = 401
+
+    with caplog.at_level(logging.DEBUG):
+        intake.poll()
+
+    _assert_admitted_once(intake, healthy, event)
+    _assert_held(intake, dc_issue)
+    assert _cursor() is None
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert DC_SENTINEL not in logged
+    assert bitbucket_dc.FACTORY_TOKEN not in logged
+    assert "Unauthorized" in logged
+
+    intake.dc_down = False
+    intake.poll()
+
+    _assert_on_dc(dc_issue)
+    _assert_admitted_once(intake, healthy, event)
+    assert _cursor() is not None
+
+
+def test_a_failed_hold_comment_does_not_starve_other_issues(
+    make_intake: Callable[[dict[str, Any]], Intake],
+) -> None:
+    intake = make_intake(_dc_document())
+    dc_issue, healthy, event = _held_tickets(intake)
+    intake.dc_down = True
+    intake.jira.fail_next("comment_create", status=503)
+
+    intake.poll()
+
+    _assert_admitted_once(intake, healthy, event)
+    assert _work_items(dc_issue) == []
+    assert _bot_comments(intake, dc_issue) == []
+    assert _cursor() is None
+
+    intake.poll()
+
+    _assert_held(intake, dc_issue)
+    _assert_admitted_once(intake, healthy, event)
+    assert _cursor() is None
