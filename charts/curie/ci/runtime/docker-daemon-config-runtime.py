@@ -397,13 +397,21 @@ def ping(cert=None, plain=False):
         conn.request('GET', '/_ping')
         response = conn.getresponse()
         return response.status == 200 and response.read() == b'OK'
-    except (OSError, http.client.HTTPException):
+    except (OSError, http.client.HTTPException) as exc:
+        errors[cert or ('plain' if plain else 'none')] = type(exc).__name__ + ':' + str(exc)[:160]
         return False
     finally:
         conn.close()
+errors = {}
+def cli(*argv):
+    command = ['docker', f'--host=tcp://{host}:{port}', *tls, *argv]
+    return subprocess.run(command, capture_output=True, text=True, timeout=timeout * 10)
 def check(step, ok):
     if not ok:
-        print(json.dumps({'failed': step}))
+        probe = cli('version', '--format', '{{.Server.Version}}')
+        detail = {'cli_rc': probe.returncode, 'cli_err': probe.stderr.strip()[-200:]}
+        detail |= {'python_errors': errors, 'openssl': ssl.OPENSSL_VERSION}
+        print(json.dumps({'failed': step, 'detail': detail}))
         sys.exit(1)
 deadline = time.monotonic() + 120  # dockerd binds its listener after the pod is ready
 while not ping('client') and time.monotonic() < deadline:
@@ -412,8 +420,7 @@ check('authenticated_ping', ping('client'))
 check('no_client_cert_refused', not ping())
 check('foreign_ca_refused', not ping('foreign'))
 check('plaintext_refused', not ping(plain=True))
-docker = ['docker', f'--host=tcp://{host}:{port}', *tls, 'info', '--format', '{{json .}}']
-result = subprocess.run(docker, capture_output=True, text=True, timeout=timeout * 10)
+result = cli('info', '--format', '{{json .}}')
 check('docker_info', result.returncode == 0)
 info = json.loads(result.stdout)
 plugins = (info.get('Plugins') or {}).get('Authorization') or []
