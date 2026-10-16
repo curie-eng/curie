@@ -79,10 +79,27 @@ C4_TRACKER_SCOPE_INPUTS = (
     ".github/e2e-selection.yaml",
     "tools/e2e-ci-selection",
 )
+C4_DRY_RUN = "tools/factory-e2e/tests/test_c4_dry_run.py"
+C4_DRY_RUN_INPUTS = (
+    "charts/curie",
+    "cli/src",
+    "cli/Cargo.toml",
+    "cli/Cargo.lock",
+    "apps/api/Dockerfile",
+    C4_DRY_RUN,
+    "tools/factory-e2e/tests/conftest.py",
+    "uv.lock",
+    "pyproject.toml",
+    "conftest.py",
+    ".github/workflows/ci.yaml",
+    ".github/e2e-selection.yaml",
+    "tools/e2e-ci-selection",
+)
 # Every conditional_pytest_files entry of the registry, with its inputs.
 CONDITIONAL_PYTEST_FILES = {
     SRE_RUNTIME: SRE_RUNTIME_INPUTS,
     C4_TRACKER_SCOPE: C4_TRACKER_SCOPE_INPUTS,
+    C4_DRY_RUN: C4_DRY_RUN_INPUTS,
 }
 # What a fully classified diff touching no conditional input deselects.
 ALL_CONDITIONAL = ",".join(sorted(CONDITIONAL_PYTEST_FILES))
