@@ -491,6 +491,7 @@ def _run_pytest_step(
 @pytest.mark.parametrize("deselect", ("", "examples/tests/test_sre_bot_observability_runtime.py"))
 @pytest.mark.parametrize("module", (
     "tools/factory-e2e/tests/test_c4_initial_binding.py",
+    "tools/factory-e2e/tests/test_c4_held_cancellation.py",
     "tools/factory-e2e/tests/test_c4_cluster_up.py",
 ))
 def test_ordinary_python_shards_exclude_the_owned_kind_registration_module(

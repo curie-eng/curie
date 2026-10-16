@@ -106,6 +106,15 @@ jobs:
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.16.4
+      # The kind runtime pins build four candidate images (api, worker, ui,
+      # runner) and the scripted driver requires 30 GB free. Remove only the
+      # preinstalled .NET, Haskell and Android trees, which are unused here.
+      - name: Free disk for the disposable factory cluster
+        if: steps.fix-pin-curie.outputs.needs_kind == 'true'
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
       - name: Ensure kind-registry exists
         if: steps.fix-pin-curie.outputs.needs_kind == 'true'
         run: bash cli/scripts/ensure-kind-registry.sh

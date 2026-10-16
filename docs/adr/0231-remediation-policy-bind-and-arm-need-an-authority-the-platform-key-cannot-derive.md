@@ -2,7 +2,7 @@
 
 Date: 2026-10-15
 
-Status: Draft
+Status: Accepted
 
 Supersedes in part [ADR 0203](0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md) REMEDIATION-13 only. Nothing else in ADR 0203 changes. ADR 0203 stays Accepted. Per [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md), ADR 0203 gains a superseded-in-part back-link only once this ADR is Accepted. This Draft does not authorize implementation.
 
