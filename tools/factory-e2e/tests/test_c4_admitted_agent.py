@@ -403,12 +403,32 @@ def paused_factory(kind_factory: AdmittedKind) -> AdmittedKind:
     return kind_factory
 
 
+def await_admission_status(run: AdmittedKind, ticket: Ticket, request_id: str) -> None:
+    notice = observe_until(
+        lambda: n if (n := notice_state(run, request_id))
+        and n["posted_at"] is not None
+        and n["comment_id"] is not None
+        and n["rendered_digest"] is not None else None
+    )
+    if notice is None:
+        failure = RuntimeError(
+            "admission status outbox did not finish posting the fixture comment"
+        )
+        run.record_failure("admission status readiness", failure)
+        raise failure
+    assert_status_on_original_tracker(run, ticket, request_id)
+    assert len(run.comments(ticket)) == 1, (
+        "admission must produce exactly one tracker status comment"
+    )
+
+
 def waiting_ticket(
     run: AdmittedKind, kind: str = "github"
 ) -> tuple[Ticket, dict[str, Any], dict[str, Any]]:
     ticket = run.seed(kind, run.agents[0])
     row = run.await_admission(ticket)
     wake = run.take_execute_wake(row)
+    await_admission_status(run, ticket, row["id"])
     current = run.request(ticket)
     assert current is not None
     return ticket, current, wake
@@ -488,6 +508,7 @@ def test_execute_revalidates_current_authority(
 ) -> None:
     run = paused_factory
     ticket, before, wake = waiting_ticket(run)
+    comments = run.comments(ticket)
     agent_id = uuid.UUID(ticket.agent.id)
     binding = f"agent_id='{agent_id}' AND kind='github'"
     if change in {"agent_tenant", "binding_tenant"}:
@@ -537,7 +558,6 @@ def test_execute_revalidates_current_authority(
             "SELECT count(*) FROM curie.deployments "
             f"WHERE agent_id='{uuid.UUID(run.agents[1].id)}' AND status='active'"
         ) == 1
-    comments = run.comments(ticket)
     waiting = request_state(run, before["id"])
     run.worker_replicas(1)
     assert request_state(run, before["id"]) == waiting, (
@@ -561,6 +581,7 @@ def test_foreign_wake_claims_are_read_only(paused_factory: AdmittedKind, change:
         other = run.seed("github", run.agents[1])
         other_row = run.await_admission(other)
         run.take_execute_wake(other_row)
+        await_admission_status(run, other, other_row["id"])
         wake["event_id"] = f"work-item-{other_row['id']}-execute-{other_row['dispatch_generation']}"
         current = run.request(other)
         assert current is not None
@@ -600,6 +621,7 @@ def test_existing_acquire_fences_remain_read_only(
     """Existing generation/owner controls, not evidence of the new authority guard."""
     run = paused_factory
     ticket, row, wake = waiting_ticket(run)
+    comments = run.comments(ticket)
     if control == "stale_generation":
         run.write_sql(
             "UPDATE curie.execution_requests SET dispatch_generation=dispatch_generation+1, "
@@ -616,7 +638,6 @@ def test_existing_acquire_fences_remain_read_only(
             f"WHERE id='{uuid.UUID(row['id'])}'"
         )
     frozen = request_state(run, row["id"])
-    comments = run.comments(ticket)
     run.enqueue(wake)
     run.worker_replicas(1)
     assert observe_until(
@@ -1441,6 +1462,8 @@ def test_removed_tracker_keeps_existing_status_outbox_retrying(
 ) -> None:
     run = paused_factory
     ticket, before, wake = waiting_ticket(run, "jira")
+    notice_before = notice_state(run, before["id"])
+    comments_before = run.comments(ticket)
 
     def remove_tracker(configuration: dict[str, Any]) -> None:
         removed = {t["name"] for t in configuration["trackers"] if t["kind"] == "jira_cloud"}
@@ -1452,8 +1475,6 @@ def test_removed_tracker_keeps_existing_status_outbox_retrying(
         ]
 
     run.change_forges(remove_tracker)
-    notice_before = notice_state(run, before["id"])
-    comments_before = run.comments(ticket)
     run.enqueue(wake)
     run.worker_replicas(1)
     final = observe_until(
