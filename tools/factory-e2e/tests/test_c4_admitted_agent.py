@@ -538,8 +538,12 @@ def test_execute_revalidates_current_authority(
             f"WHERE agent_id='{uuid.UUID(run.agents[1].id)}' AND status='active'"
         ) == 1
     comments = run.comments(ticket)
-    run.enqueue(wake)
+    waiting = request_state(run, before["id"])
     run.worker_replicas(1)
+    assert request_state(run, before["id"]) == waiting, (
+        "captured execute request changed before replay during worker startup"
+    )
+    run.enqueue(wake)
     factory_deferral(run, ticket, before, reason)
     frozen = request_state(run, before["id"])
     progress_neighbor(run)
@@ -707,8 +711,12 @@ def test_acquired_killswitch_uses_existing_interrupted_deferral(
     run = paused_factory
     ticket, before, wake = waiting_ticket(run)
     assert run.api("POST", f"/agents/{ticket.agent.id}/kill")["killed"] is True
-    run.enqueue(wake)
+    waiting = request_state(run, before["id"])
     run.worker_replicas(1)
+    assert request_state(run, before["id"]) == waiting, (
+        "captured execute request changed before replay during worker startup"
+    )
+    run.enqueue(wake)
     factory_deferral(run, ticket, before, "interrupted")
     frozen = request_state(run, before["id"])
     progress_neighbor(run)
