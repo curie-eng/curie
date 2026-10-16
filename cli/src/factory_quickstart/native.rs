@@ -8,9 +8,9 @@ use std::path::Path;
 use anyhow::Result;
 
 use super::{
-    credential_decision, credit_check_key, ensure_credential, install_steps, is_kind_context,
-    kind_clusters, quickstart_model, release_matches_quickstart_target, release_model_recorded,
-    run_install_action, Action, CredentialDecision, InstallSteps, InstallTarget, QuickstartOpts,
+    credential_decision, credit_check_key, ensure_credential, install_steps, kind_clusters,
+    quickstart_model, read_release, release_model_recorded, run_install_action, Action,
+    ClusterUpStep, CredentialDecision, InstallSteps, InstallTarget, QuickstartOpts,
 };
 use crate::exit::CliError;
 use crate::ops::CommonOpts;
@@ -55,24 +55,24 @@ pub(super) async fn plan_install(
     } else {
         release_model_recorded(opts).await?
     };
+    // Read once: a second read can print the deprecation warning twice.
+    let explicit_credential = crate::ops::explicit_model_credential_env();
+    let explicit_credential_absent = explicit_credential.is_none();
     let effective_credential = credit_check_key(
-        crate::ops::explicit_model_credential_env(),
+        explicit_credential,
         crate::ops::saved_model_credential(),
         release_has_real_model,
     );
     let model = quickstart_model(opts.model.as_deref(), effective_credential.as_deref());
-    let (release_at_target, model) = match targeted {
-        Some(context) if !opts.dry_run => {
-            release_matches_quickstart_target(
-                opts,
-                &model,
-                opts.model.is_none() && effective_credential.is_none() && release_has_real_model,
-                is_kind_context(context),
-            )
-            .await?
-        }
-        _ => (false, model),
-    };
+    let (release_read, model) = read_release(
+        opts,
+        targeted,
+        false,
+        model,
+        opts.model.is_none() && effective_credential.is_none() && release_has_real_model,
+        explicit_credential_absent,
+    )
+    .await?;
     let install = install_steps(&InstallTarget {
         explicit_context: opts.context.as_deref(),
         current_context: current,
@@ -82,7 +82,7 @@ pub(super) async fn plan_install(
         release: &opts.release,
         model: &model,
         chart: &opts.chart,
-        release_at_target,
+        release_read,
         add_agent: false,
     });
     Ok(NativeInstall {
@@ -121,7 +121,7 @@ pub(super) async fn run_install(
 ) -> Result<bool> {
     let ui = crate::ui::ui();
     ui.note(&format!("Kubernetes context: {}", install.context));
-    if install.skipped_cluster_up {
+    if install.cluster_up == ClusterUpStep::Skipped {
         ui.note("release already at the target chart and values; skipping cluster up");
     }
     let mut prompted_model = None;

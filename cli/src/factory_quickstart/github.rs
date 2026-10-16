@@ -410,24 +410,24 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
     } else {
         release_model_recorded(&opts).await?
     };
+    // Read once: a second read can print the deprecation warning twice.
+    let explicit_credential = crate::ops::explicit_model_credential_env();
+    let explicit_credential_absent = explicit_credential.is_none();
     let effective_credential = credit_check_key(
-        crate::ops::explicit_model_credential_env(),
+        explicit_credential,
         crate::ops::saved_model_credential(),
         release_has_real_model,
     );
     let model = quickstart_model(opts.model.as_deref(), effective_credential.as_deref());
-    let (release_at_target, model) = match &targeted {
-        Some(context) if !opts.dry_run && !add_agent => {
-            release_matches_quickstart_target(
-                &opts,
-                &model,
-                opts.model.is_none() && effective_credential.is_none() && release_has_real_model,
-                is_kind_context(context),
-            )
-            .await?
-        }
-        _ => (false, model),
-    };
+    let (release_read, model) = read_release(
+        &opts,
+        targeted.as_deref(),
+        add_agent,
+        model,
+        opts.model.is_none() && effective_credential.is_none() && release_has_real_model,
+        explicit_credential_absent,
+    )
+    .await?;
     // The add agent path authenticates as the recorded App. A Jira agent
     // needs it now, for the repository ids its binding records.
     if let (true, true, None, Some(recorded)) = (jira_tracker, add_agent, &jira, &recorded) {
@@ -468,7 +468,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         chart_explicit: opts.chart_explicit,
         // Dry-run reports a non-kind current context instead of refusing it.
         interactive: opts.dry_run || real_interactive,
-        release_at_target,
+        release_read,
         agent: opts.agent.clone(),
         label: opts.label.clone(),
         plugin_dir: opts.plugin_dir.clone(),
@@ -641,7 +641,7 @@ async fn execute(
     published_candidate: Option<&crate::examples::PublishedStockRunner>,
 ) -> Result<QuickstartOutput> {
     crate::ui::ui().note(&format!("Kubernetes context: {}", planned.context));
-    if planned.skipped_cluster_up {
+    if planned.cluster_up == ClusterUpStep::Skipped {
         crate::ui::ui().note("release already at the target chart and values; skipping cluster up");
     }
     let mut prompted = false;

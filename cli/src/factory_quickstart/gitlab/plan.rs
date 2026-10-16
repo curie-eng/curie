@@ -17,10 +17,9 @@ use crate::factory_intake::{apply_forge_entries, native_forge_values, NativeForg
 use crate::factory_quickstart::{
     agent_settings, bundle_dir, bundle_line, check_credit, check_prerequisites, cluster_agent,
     confirm_remote_context, credential_line, deployed_release_snapshot, ensure_factory_agent,
-    forge_egress_line, initial_agent_line, install_action_line, native, read_token, run_self,
+    forge_egress_line, initial_agent_line, install_plan_lines, native, read_token, run_self,
     token_secret_manifest, unconfirmed_remote_context, validate_agent_flags, Action,
     CredentialDecision, InstallSteps, QuickstartOpts, QuickstartOutput, DEFAULT_AGENT,
-    SKIPPED_CLUSTER_UP_LINE,
 };
 use crate::ops::CommonOpts;
 use crate::ui::DryRunPlan;
@@ -166,7 +165,7 @@ fn describe(plan: &GitlabPlan) -> Vec<String> {
     let facts = &plan.facts;
     let mut lines = vec![
         plan.install.context_reason.clone(),
-        credential_line(&plan.credential).to_string(),
+        credential_line(&plan.credential, plan.install.cluster_up),
         format!("GitLab {} at {}: 17.0 or later", found.version, facts.web_base),
         plan.expiry.clone(),
         format!(
@@ -196,10 +195,12 @@ fn describe(plan: &GitlabPlan) -> Vec<String> {
             found.project_id
         ),
     ];
-    if plan.install.skipped_cluster_up {
-        lines.push(SKIPPED_CLUSTER_UP_LINE.to_string());
-    }
-    lines.extend(plan.install.actions.iter().filter_map(install_action_line));
+    lines.extend(install_plan_lines(
+        plan.install.cluster_up,
+        &plan.install.actions,
+        &plan.release,
+        &plan.namespace,
+    ));
     lines.push(format!(
         "write Secret {SECRET_NAME} key token in namespace {} from --token-file {} (the token is never printed)",
         plan.namespace,

@@ -5498,6 +5498,73 @@ pub(crate) async fn up_prepared(
     .await
 }
 
+/// What an offline plan states about an existing shared controller (#4626).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedControllerPlan {
+    /// No explicit controller value: a live run infers reuse of a foreign or
+    /// unowned controller.
+    Reuse,
+    /// `agentSandbox.controller.deploy=true` was set: a live run refuses a
+    /// controller this release does not own.
+    RefuseExplicitDeploy,
+    /// Another explicit value, or fact detection is off: nothing to state.
+    Unstated,
+}
+
+/// The conditional ownership plan `--dry-run` prints in place of stamp
+/// commands (#4626). A dry run reads neither namespace nor the controller, so
+/// each live decision is a comment line naming its condition. `shared` is
+/// `Some` only when the chart deploys the controller and the primary namespace
+/// is not the shared one.
+fn dry_run_ownership_lines(
+    common: &CommonOpts,
+    shared: Option<SharedControllerPlan>,
+) -> Vec<String> {
+    let namespace = &common.namespace;
+    let release = &common.release;
+    let created = format!("{CREATED_BY_LABEL}={release} {CREATED_IN_LABEL}={namespace}");
+    let mut lines = vec![
+        format!("# not read under --dry-run: whether namespace {namespace} exists and which release owns it; a live run checks it before helm runs"),
+        format!("#   if namespace {namespace} does not exist: create it with labels {created}"),
+        format!("#   if namespace {namespace} is not terminating and already has this release's created-by and created-in labels, or its adopted-by and adopted-in labels: use it and leave its labels unchanged"),
+    ];
+    if namespace != CONTROLLER_DEPLOYMENT_NAMESPACE {
+        lines.push(format!("#   if namespace {namespace} is not terminating and exists with no ownership or foreign labels and only its default objects: add labels {created}"));
+    }
+    lines.push(format!(
+        "#   otherwise: refuse to install into namespace {namespace}"
+    ));
+    let Some(shared) = shared else {
+        return lines;
+    };
+    let stamp = ownership_label_commands(
+        &ns_common(common, CONTROLLER_DEPLOYMENT_NAMESPACE, true),
+        namespace,
+        false,
+    )
+    .into_iter()
+    .next()
+    .expect("the create-only controller stamp has one command")
+    .display();
+    if shared == SharedControllerPlan::Unstated {
+        lines.push(format!("# not read under --dry-run: whether namespace {CONTROLLER_DEPLOYMENT_NAMESPACE} already exists; a live run checks it before helm runs"));
+    } else {
+        lines.push(format!("# not read under --dry-run: whether namespace {CONTROLLER_DEPLOYMENT_NAMESPACE} and Deployment {CONTROLLER_DEPLOYMENT_NAME} already exist; a live run checks them before helm runs"));
+    }
+    lines.push(format!("#   if namespace {CONTROLLER_DEPLOYMENT_NAMESPACE} does not exist before helm runs and exists after: {stamp}"));
+    lines.push(format!("#   if namespace {CONTROLLER_DEPLOYMENT_NAMESPACE} already exists: use it and leave its labels unchanged"));
+    match shared {
+        SharedControllerPlan::Reuse => {
+            lines.push(format!("#   if Deployment {CONTROLLER_DEPLOYMENT_NAME} already runs there and another release or no Helm release owns it: reuse it with {CONTROLLER_DEPLOY_KEY}=false and leave its ownership metadata unchanged; an unowned controller that is unhealthy or runs an incompatible image is refused"));
+        }
+        SharedControllerPlan::RefuseExplicitDeploy => {
+            lines.push(format!("#   if Deployment {CONTROLLER_DEPLOYMENT_NAME} already runs there and this release does not own it: refuse, because {CONTROLLER_DEPLOY_KEY}=true was set"));
+        }
+        SharedControllerPlan::Unstated => {}
+    }
+    lines
+}
+
 async fn run_prepared_up(
     opts: UpOpts,
     mut value_plan: UpValuePlan,
@@ -5729,37 +5796,23 @@ async fn run_prepared_up(
     // label namespace <missing>`. Mirror the resolve_generated_secrets
     // existing/fresh split: both runtime probes live here in the executor, the
     // argv stays in the pure `ownership_label_commands` builder. `--dry-run`
-    // stays offline and previews the fresh-install stamp for the primary
-    // namespace and, when controller deployment is enabled, the shared namespace
-    // (existed == false), never touching the cluster or running the post-install
-    // probe.
-    let mut owned_namespaces = vec![opts.common.namespace.clone()];
-    if opts.common.namespace != "agent-sandbox-system" {
-        owned_namespaces.push("agent-sandbox-system".to_string());
-    }
+    // stays offline: it reads neither namespace nor the shared controller, so it
+    // prints the conditional ownership plan a live run decides (see
+    // `dry_run_ownership_lines`, #4626) instead of any stamp command, never
+    // touching the cluster or running the post-install probe, so
+    // `ownership_candidates` stays empty on a dry run.
+    let mut ownership_candidates: Vec<(String, bool)> = Vec::new();
     if !opts.common.dry_run {
+        let mut owned_namespaces = vec![opts.common.namespace.clone()];
+        if opts.common.namespace != "agent-sandbox-system" {
+            owned_namespaces.push("agent-sandbox-system".to_string());
+        }
         require_on_path("kubectl")?;
         establish_primary_namespace_ownership(&opts.common, opts.adopt).await?;
-    }
-    let mut ownership_candidates: Vec<(String, bool)> = Vec::new();
-    for ns in owned_namespaces {
-        let existed_before = if opts.common.dry_run {
-            false
-        } else {
-            namespace_exists(&ns).await?
-        };
-        if opts.common.dry_run
-            && (ns == opts.common.namespace || controller_deploy_enabled(&value_plan))
-        {
-            // existed_before is provably false on this branch (set above).
-            let common = ns_common(&opts.common, &ns, true);
-            cmds.extend(ownership_label_commands(
-                &common,
-                &opts.common.namespace,
-                false,
-            ));
+        for ns in owned_namespaces {
+            let existed_before = namespace_exists(&ns).await?;
+            ownership_candidates.push((ns, existed_before));
         }
-        ownership_candidates.push((ns, existed_before));
     }
 
     // Count named provider intent on both live and dry runs, plus egress
@@ -5799,6 +5852,20 @@ async fn run_prepared_up(
     }
     if opts.common.dry_run {
         let mut lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
+        let controller = match (
+            detect_facts,
+            final_operator_value(&opts, CONTROLLER_DEPLOY_KEY),
+        ) {
+            (true, None) => SharedControllerPlan::Reuse,
+            (true, Some("true")) => SharedControllerPlan::RefuseExplicitDeploy,
+            _ => SharedControllerPlan::Unstated,
+        };
+        let shared_namespace = controller_deploy_enabled(&value_plan)
+            && opts.common.namespace != CONTROLLER_DEPLOYMENT_NAMESPACE;
+        lines.extend(dry_run_ownership_lines(
+            &opts.common,
+            shared_namespace.then_some(controller),
+        ));
         if opts.adopt {
             lines.push(format!(
                 "# --adopt: a live run may adopt a pre-existing primary namespace with foreign labels or non-default contents, stamp {ADOPTED_BY_LABEL}={}/{ADOPTED_IN_LABEL}={} with an audit record, and retain it on cluster down. The shared controller and terminating namespaces remain ineligible.",

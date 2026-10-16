@@ -32,8 +32,8 @@ use std::process::{Command, Stdio};
 use curie::factory_intake::forge_entries_values;
 use curie::factory_quickstart::{
     deploy_args, describe, jira_preflight, quickstart_plan, Action, CodeHostKind, EgressEntry,
-    EgressPort, ForgeFlags, JiraPlan, PlanInput, RecordedIntake, TrackerKind, DEFAULT_AGENT,
-    DEFAULT_BUDGET_USD, DEFAULT_DEADLINE_SECONDS, DEFAULT_KIND_NAME, DEFAULT_MODEL,
+    EgressPort, ForgeFlags, JiraPlan, PlanInput, RecordedIntake, ReleaseRead, TrackerKind,
+    DEFAULT_AGENT, DEFAULT_BUDGET_USD, DEFAULT_DEADLINE_SECONDS, DEFAULT_KIND_NAME, DEFAULT_MODEL,
 };
 use curie::factory_toolchain::{preflight, preflight_with_pem, AppPreflight};
 use serde_json::{json, Value};
@@ -707,7 +707,7 @@ fn input() -> PlanInput {
         release_has_real_model: false,
         chart_explicit: false,
         interactive: true,
-        release_at_target: false,
+        release_read: ReleaseRead::NotAtTarget,
         agent: DEFAULT_AGENT.into(),
         label: None,
         plugin_dir: None,

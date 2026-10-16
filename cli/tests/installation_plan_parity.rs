@@ -6025,3 +6025,43 @@ fn fresh_cluster_up_does_not_invent_inference() {
         "a fresh install without a model source stays fake:\n{calls}"
     );
 }
+
+/// #4626: `curie apply` does not detect cluster facts, so its dry run has no
+/// controller decision to state. The shared namespace header must not mention
+/// the controller Deployment, and the stamp stays conditional.
+#[test]
+fn apply_dry_run_plans_the_shared_namespace_without_a_controller_decision() {
+    let fixture = HelmFixture::new(
+        "version: 1\ninstall:\n  namespace: parity\n  release: parity\n",
+        HelmValuesResponse::Absent,
+    );
+    let apply = plan(fixture.apply_dry_run(&[]));
+    let lines: Vec<&str> = apply.lines().collect();
+    let header = "# not read under --dry-run: whether namespace agent-sandbox-system already exists; a live run checks it before helm runs";
+    let stamp = "#   if namespace agent-sandbox-system does not exist before helm runs and exists after: kubectl label namespace agent-sandbox-system curietech.ai/created-by=parity curietech.ai/created-in=parity --overwrite";
+    for expected in [header, stamp] {
+        assert_eq!(
+            lines.iter().filter(|line| **line == expected).count(),
+            1,
+            "apply must plan {expected:?} exactly once: {apply}"
+        );
+    }
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("and Deployment agent-sandbox-controller already exist")),
+        "apply detects no controller facts, so it must not name the Deployment: {apply}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("reuse it with agentSandbox.controller.deploy=false")),
+        "apply must not plan a controller reuse it never decides: {apply}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("kubectl label namespace")),
+        "apply must not plan an unconditional namespace stamp: {apply}"
+    );
+}
