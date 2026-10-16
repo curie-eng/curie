@@ -1101,10 +1101,12 @@ def two_worker_ci(
     continuation_stream = RUNS_STREAM_DEFAULT + ":c4-holder"
     deployment_name = "c4-held-worker"
     component = "c4-held-worker"
+    ingress_name = "c4-held-worker-runner-ingress"
 
     def cleanup() -> None:
         run.kubectl(
-            "-n", run.namespace, "delete", "deployment", deployment_name,
+            "-n", run.namespace, "delete", "deployment/" + deployment_name,
+            "networkpolicy/" + ingress_name,
             "--ignore-not-found", "--wait=true",
         )
         run.kubectl(
@@ -1119,8 +1121,12 @@ def two_worker_ci(
             "-n", run.namespace, "get", "pods", "-o", "json",
             "-l", "app.kubernetes.io/component=" + component,
         ))["items"]
-        if remaining or pods:
-            failure = RuntimeError("the additional owned worker survived cleanup")
+        remaining_ingress = run.kubectl(
+            "-n", run.namespace, "get", "networkpolicy", ingress_name,
+            "--ignore-not-found", "-o", "name",
+        ).strip()
+        if remaining or pods or remaining_ingress:
+            failure = RuntimeError("the additional owned worker or its ingress survived cleanup")
             run.record_failure("two-worker CI fixture cleanup", failure)
             raise failure
 
@@ -1148,10 +1154,31 @@ def two_worker_ci(
         "metadata": {"name": deployment_name, "namespace": run.namespace},
         "spec": spec,
     }
+    runner_ingress = json.loads(run.kubectl(
+        "-n", run.namespace, "get", "networkpolicy", "curie-runner-ingress", "-o", "json",
+    ))["spec"]
+    rules = runner_ingress["ingress"]
+    if len(rules) != 1 or not rules[0].get("ports"):
+        raise RuntimeError("the candidate runner ingress has no unique restricted port rule")
+    # The clone's distinct component is excluded by the release's worker peer.
+    # Reuse the deployed runner selector and ACI ports for this peer alone.
+    clone_ingress = {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {"name": ingress_name, "namespace": run.namespace},
+        "spec": {
+            "podSelector": runner_ingress["podSelector"],
+            "policyTypes": ["Ingress"],
+            "ingress": [{
+                "from": [{"podSelector": copy.deepcopy(spec["selector"])}],
+                "ports": rules[0]["ports"],
+            }],
+        },
+    }
     path = run.root / "held-worker.json"
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w") as stream:
-        json.dump(manifest, stream)
+        json.dump({"apiVersion": "v1", "kind": "List", "items": [clone_ingress, manifest]}, stream)
     run.kubectl("-n", run.namespace, "apply", "-f", str(path))
     run.worker_replicas(1)
     run.kubectl(
