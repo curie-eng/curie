@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -531,7 +532,10 @@ def test_new_chart_values_reject_explicit_bad_inputs_instead_of_defaulting(
     for skip_schema in (False, True):
         result = _render(values, skip_schema=skip_schema)
         assert result.returncode != 0
-        assert "factory.docker" in result.stderr
+        # Schema validation names the key as a JSON pointer (Helm v3.20:
+        # "- at '/factory/docker/maxClaimLifetimeSeconds': minimum: got 0, want 1");
+        # the template's own fail() with schema skipped says "factory.docker...".
+        assert re.search(r"factory[./]docker", result.stderr)
 
 
 def test_values_schema_only_adds_constraints_to_new_keys() -> None:
