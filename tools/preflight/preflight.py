@@ -225,6 +225,13 @@ CHECKS = (
         ".",
         "python",
     ),
+    exact(
+        "python-static",
+        "Contract migration timing gate",
+        "uv run python scripts/check-contract-migration-timing.py",
+        ".",
+        "python",
+    ),
     exact("python-static", "Ruff", "uv run ruff check .", ".", "python"),
     exact("python-static", "Mypy", "uv run mypy", ".", "python"),
     exact(
