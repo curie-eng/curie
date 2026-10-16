@@ -32,7 +32,7 @@ import logging
 import re
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -195,12 +195,45 @@ def browse_url(site_origin: str, issue: TrackerIssueRef, *, host: str) -> str:
     return f"{site_origin}/browse/{issue.display_key}"
 
 
+def _from_ms(value: int | None) -> datetime | None:
+    return None if value is None else datetime.fromtimestamp(value / 1000, UTC)
+
+
+def _key_moves(histories: Sequence[Any]) -> list[str]:
+    """Every key the issue was moved away from, oldest first, read strictly.
+
+    A key change is a changelog item whose ``field`` is ``Key`` with the old
+    key in ``fromString``
+    (https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-issueidorkey-changelog-get,
+    ``ChangeDetails``). A history or item list that cannot be read, or a key
+    change without its old key, raises `Unavailable`.
+    """
+
+    keys: list[str] = []
+    for history in histories:
+        items = history.get("items") if isinstance(history, dict) else None
+        if not isinstance(items, list):
+            raise Unavailable("changelog")
+        for item in items:
+            if not isinstance(item, dict):
+                raise Unavailable("changelog")
+            if item.get("field") != "Key" and item.get("fieldId") != "key":
+                continue
+            old = item.get("fromString")
+            if not isinstance(old, str) or not old.strip() or any(c.isspace() for c in old):
+                raise Unavailable("changelog")
+            keys.append(old)
+    return keys
+
+
 @dataclass(frozen=True)
 class _Pending:
     issue: TrackerIssueRef
     actor: Actor
     event_id: str
     disposition: Disposition
+    # When Jira says the event happened (epoch ms), or None when it said nothing usable.
+    at: int | None
 
 
 class JiraTracker:
@@ -389,6 +422,7 @@ class JiraTracker:
                     event_id=item.event_id,
                     disposition=item.disposition,
                     cursor=page_cursor,
+                    occurred_at=_from_ms(item.at),
                 )
                 for item in pending
             ),
@@ -441,7 +475,7 @@ class JiraTracker:
             considered[token] = created
             if token in known:
                 continue
-            notices.append(_Pending(ref, actor, history_id, Disposition.ADMIT))
+            notices.append(_Pending(ref, actor, history_id, Disposition.ADMIT, created))
         return notices
 
     def _mention_notices(
@@ -475,7 +509,7 @@ class JiraTracker:
                 continue
             considered[token] = created
             if token not in known:
-                notices.append(_Pending(ref, actor, str(comment_id), Disposition.MENTION))
+                notices.append(_Pending(ref, actor, str(comment_id), Disposition.MENTION, created))
         return notices
 
     async def _cancellation(self, ref: TrackerIssueRef) -> _Pending | None:
@@ -494,11 +528,15 @@ class JiraTracker:
             event = self._latest(histories, lambda h: removes_label(h, self.label))
         else:
             event = self._latest(histories, changes_status)
-        actor = None if event is None else _actor(event.get("author"))
-        event_id = None if event is None else event.get("id")
+        if event is None:
+            return None
+        actor = _actor(event.get("author"))
+        event_id = event.get("id")
         if actor is None or not isinstance(event_id, str | int) or not str(event_id):
             return None
-        return _Pending(ref, actor, str(event_id), Disposition.CANCEL)
+        return _Pending(
+            ref, actor, str(event_id), Disposition.CANCEL, jira_ms(event.get("created"))
+        )
 
     async def verify_current(self, notice: MarkedNotice) -> bool:
         """Re-reads the issue every time (decision 12). An admission or a
@@ -664,6 +702,28 @@ class JiraTracker:
         key = (await self._read_issue(issue_id, "summary")).get("key")
         if not isinstance(key, str) or not key:
             raise Unavailable("issue")
+        return self._reference(key)
+
+    async def publication_references(
+        self, issue: TrackerIssueRef, repository: RepositoryRef
+    ) -> tuple[str, ...]:
+        """``Jira: <KEY> <site>/browse/<KEY>`` (the closing reference) for the
+        current key and for every key the issue held before a move, read by its
+        immutable id. A Jira key names one issue on the site whatever the
+        repository, so each is scope-qualified. Any part of the issue or its
+        changelog that cannot be read raises `Unavailable`."""
+
+        issue_id = self._issue_id(issue)
+        current = (await self._read_issue(issue_id, "summary")).get("key")
+        if not isinstance(current, str) or not current:
+            raise Unavailable("issue")
+        histories = await self._transport.changelog(
+            issue_id, page_size=self._page_size, strict=True
+        )
+        keys = dict.fromkeys([current, *reversed(_key_moves(histories))])
+        return tuple(self._reference(key) for key in keys)
+
+    def _reference(self, key: str) -> str:
         return f"Jira: {key} {self._site_origin}/browse/{key}"
 
     async def link_pull_request(self, issue: TrackerIssueRef, pull_request: PullRequest) -> None:

@@ -83,6 +83,17 @@ provide the equivalent provider-specific steps.
    is observed; an existing PR remains open and linked. After resolving a
    failure or answering clarification, re-add the label or send an authorized
    mention. Relabelling replaces the current run; inspect existing work first.
+   After a reinstall or lost factory storage, a still-labelled issue whose
+   factory pull request is open is not run again; its status comment links
+   that pull request, and several open ones are refused until one remains. A
+   closed or merged one stops the old label from running again, while a label
+   added after it finished starts a new run. On Bitbucket Cloud, and on
+   Bitbucket Data Center when the authenticated-user header is absent,
+   ownership cannot be verified, so this does not suppress there and a
+   reinstall can still open one duplicate pull request. When the code host cannot be read
+   completely, admission waits for the next pass. The
+   [operations reference](operations.md#admitting-a-labelled-github-issue)
+   has the full order.
 
 For operator inspection, `curie cluster work-items --agent dark-factory`
 shows work item outcomes; supply an item ID for detail. This is distinct from

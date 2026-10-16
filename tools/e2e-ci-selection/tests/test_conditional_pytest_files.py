@@ -31,6 +31,7 @@ REPO_ROOT = SELECTION_TESTS.REPO_ROOT
 SRE_RUNTIME = SELECTION_TESTS.SRE_RUNTIME
 SRE_RUNTIME_INPUTS = SELECTION_TESTS.SRE_RUNTIME_INPUTS
 C4_TRACKER_SCOPE = SELECTION_TESTS.C4_TRACKER_SCOPE
+C4_DRY_RUN = SELECTION_TESTS.C4_DRY_RUN
 CONDITIONAL_PYTEST_FILES = SELECTION_TESTS.CONDITIONAL_PYTEST_FILES
 ALL_CONDITIONAL = SELECTION_TESTS.ALL_CONDITIONAL
 _invoke_selector = SELECTION_TESTS._invoke_selector
@@ -114,6 +115,33 @@ def test_c4_tracker_scope_deselected_for_unrelated_paths(tmp_path: Path, path: s
 )
 def test_c4_tracker_scope_selected_when_an_input_changes(tmp_path: Path, path: str) -> None:
     assert C4_TRACKER_SCOPE not in _selection(tmp_path, path)["pytest_deselect"].split(",")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "apps/api/src/curie_api/main.py",
+        "apps/worker/src/curie_worker/main.py",
+        "examples/sre-bot/observability/tempo.yaml",
+        "runner/Dockerfile",
+    ],
+)
+def test_c4_dry_run_deselected_for_unrelated_paths(tmp_path: Path, path: str) -> None:
+    assert C4_DRY_RUN in _selection(tmp_path, path)["pytest_deselect"].split(",")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "cli/src/ops/up.rs",
+        "cli/src/factory_quickstart/native.rs",
+        "charts/curie/files/agent-sandbox/controller.yaml",
+        "apps/api/Dockerfile",
+        C4_DRY_RUN,
+    ],
+)
+def test_c4_dry_run_selected_when_an_input_changes(tmp_path: Path, path: str) -> None:
+    assert C4_DRY_RUN not in _selection(tmp_path, path)["pytest_deselect"].split(",")
 
 
 @pytest.mark.parametrize(
@@ -210,7 +238,8 @@ def test_pytest_step_appends_deselect_only_when_selected(
         "run", "pytest", "-q", "-n", "4", "--dist", "loadgroup",
         "--ci-shard", f"{shard}/3", "--reruns", "1", "-rsR", "--durations=25",
         "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
-        "--ignore=tools/factory-e2e/tests/test_c4_cluster_up.py",
+        "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
+        "--ignore", SELECTION_TESTS.CLUSTER_UP_MODULE,
     ]
     if deselect:
         expected += ["--deselect", "examples/tests/test_sre_bot_observability_runtime.py"]

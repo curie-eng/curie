@@ -96,6 +96,8 @@ RETRY_ALLOWLIST = frozenset(
         ),
         ("ci.yaml", "e2e-cluster-rollout-recovery", "Install Helm"),
         ("ci.yaml", "e2e-cluster-approval-resume-restarts", "Install Helm"),
+        # Issue #4628: the pinned setup action acquires uv before workspace sync.
+        ("ci.yaml", "e2e-released-upgrade", "Install uv"),
         ("ci.yaml", "e2e-released-upgrade", "Install Helm"),
         ("ci.yaml", "e2e-released-upgrade", "Create the disposable kind cluster"),
         ("ci.yaml", "e2e-released-upgrade-negative", "Install Helm"),

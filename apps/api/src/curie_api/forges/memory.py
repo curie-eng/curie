@@ -41,6 +41,7 @@ from curie_api.forges.types import (
     CredentialHeader,
     CredentialScope,
     Disposition,
+    FactoryPublication,
     FeedbackKind,
     FeedbackPage,
     MarkedComment,
@@ -62,6 +63,7 @@ from curie_api.forges.types import (
     TrackerIssueRef,
     UpsertResult,
 )
+from curie_api.publication_policy import is_publication_branch
 
 BOT = Actor(id="1000", login="curie-bot")
 
@@ -229,6 +231,7 @@ class _TimelineEvent:
     disposition: Disposition
     marker: str
     actor: Actor
+    at: datetime
 
 
 class InMemoryTracker(_Declared):
@@ -314,6 +317,7 @@ class InMemoryTracker(_Declared):
             disposition=disposition,
             marker=marker,
             actor=actor,
+            at=datetime.now(UTC),
         )
         self._timeline.append(event)
         return event.event_id
@@ -352,6 +356,7 @@ class InMemoryTracker(_Declared):
             event_id=event.event_id,
             disposition=event.disposition,
             cursor=str(event.position),
+            occurred_at=event.at,
         )
 
     def _marks(self, event: _TimelineEvent) -> bool:
@@ -464,6 +469,27 @@ class InMemoryTracker(_Declared):
         found = self._issue(issue)
         return f"Closes {found.ref.display_key or '#' + found.ref.issue_id}"
 
+    async def publication_references(
+        self, issue: TrackerIssueRef, repository: RepositoryRef
+    ) -> tuple[str, ...]:
+        """The closing reference in the issue's own scope (a repository of
+        this tracker's kind and host whose id is the issue's scope); elsewhere
+        a bare ``#n`` would name that repository's own issue, so the reference
+        names the scope: ``Closes <scope>#<n>``."""
+
+        self._gate(Operation.PUBLICATION_REFERENCES)
+        found = self._issue(issue)
+        if found.ref.display_key:
+            return (f"Closes {found.ref.display_key}",)
+        own = (repository.kind, repository.host, repository.project_id) == (
+            issue.kind,
+            issue.host,
+            issue.scope_id,
+        )
+        if own:
+            return (f"Closes #{issue.issue_id}",)
+        return (f"Closes {issue.scope_id}#{issue.issue_id}",)
+
     async def link_pull_request(self, issue: TrackerIssueRef, pull_request: PullRequest) -> None:
         if not self._gate(Operation.LINK_PULL_REQUEST):
             return
@@ -494,6 +520,8 @@ class _PullRequest:
     body: str
     draft: bool = False
     updated_at: datetime | None = None
+    author: Actor = BOT
+    closed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -622,8 +650,22 @@ class InMemoryCodeHost(_Declared):
             item for item in items if item.feedback.id != feedback.id
         ]
 
-    def set_state(self, pull_request: PullRequestRef, state: PullRequestState) -> None:
-        self._pull(pull_request).state = state
+    def set_state(
+        self,
+        pull_request: PullRequestRef,
+        state: PullRequestState,
+        *,
+        closed_at: datetime | None = None,
+    ) -> None:
+        """Move the pull request to ``state``; a merge or close is stamped
+        ``closed_at``, now when not given."""
+
+        pull = self._pull(pull_request)
+        pull.state = state
+        if state is PullRequestState.OPEN:
+            pull.closed_at = None
+        else:
+            pull.closed_at = closed_at or datetime.now(UTC)
 
     def check_states(self, sha: str) -> dict[str, CheckState]:
         return {key: check.state for key, check in self._checks.get(sha, {}).items()}
@@ -720,10 +762,40 @@ class InMemoryCodeHost(_Declared):
             raise NotFound("branch")
         ref = PullRequestRef(repository, str(len(self._pulls) + 1))
         self._pulls[ref] = _PullRequest(
-            ref, head_ref, base_ref, PullRequestState.OPEN, title, body, draft
+            ref, head_ref, base_ref, PullRequestState.OPEN, title, body, draft, author=self.identity
         )
         self.ledger.record()
         return self._view(self._pulls[ref])
+
+    async def list_factory_publications(
+        self, repository: RepositoryRef
+    ) -> tuple[FactoryPublication, ...]:
+        """Every pull request this identity opened from a publication branch
+        of ``repository``, in any state, read a page at a time so an injected
+        page failure fails the whole listing."""
+
+        self._gate(Operation.LIST_FACTORY_PUBLICATIONS)
+        self._repository(repository)
+        pulls = [pull for pull in self._pulls.values() if pull.ref.repository == repository]
+        found: list[FactoryPublication] = []
+        for start in range(0, max(len(pulls), 1), self._page_size):
+            self.faults.read_page("pull_requests")
+            for pull in pulls[start : start + self._page_size]:
+                if pull.author != self.identity or not is_publication_branch(pull.head_ref):
+                    continue
+                view = self._view(pull)
+                found.append(
+                    FactoryPublication(
+                        ref=pull.ref,
+                        url=view.url,
+                        head_ref=pull.head_ref,
+                        state=pull.state,
+                        body=pull.body,
+                        closed_at=pull.closed_at,
+                        owner_verified=True,
+                    )
+                )
+        return tuple(found)
 
     async def update_pull_request(
         self, pull_request: PullRequestRef, *, title: str | None, body: str | None

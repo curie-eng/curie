@@ -177,10 +177,30 @@ def load_tool() -> ModuleType:
             "test_second_factory_agent_uses_initial_tracker_binding",
             False,
         ),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_upgrade_migration.py::"
+            "test_v0125_factory_upgrade_uses_supported_flow",
+            False,
+        ),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_upgrade_migration.py::"
+            "test_v0125_factory_upgrade_uses_supported_flow[secondary]",
+            False,
+        ),
         ("Fix pin: apps/api/tests/test_agents.py::test_create_agent", True),
         ("Fix pin: cli/tests/verify_fix_pin.rs::ci_gate_pins", True),
         ("Fix pin: tools/factory-e2e/tests/test_scripted_driver.py::test_example", True),
         ("Fix pin: tools/factory-e2e/tests/test_c4_initial_binding_extra.py::test_example", True),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_upgrade_migration_extra.py::"
+            "test_v0125_factory_upgrade_uses_supported_flow",
+            True,
+        ),
+        (
+            "<!-- Fix pin: tools/factory-e2e/tests/test_c4_upgrade_migration.py::"
+            "test_v0125_factory_upgrade_uses_supported_flow -->",
+            False,
+        ),
         ("Fix pin: n/a - documentation only", False),
         ("Fix pin: --help", False),
         ("<!-- Fix pin: apps/api/tests/test_agents.py::test_create_agent -->", False),

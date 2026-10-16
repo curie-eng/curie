@@ -37,6 +37,7 @@ from curie_api.forges.types import (
     Commit,
     Credential,
     CredentialScope,
+    FactoryPublication,
     FeedbackPage,
     PullRequest,
     PullRequestRef,
@@ -46,7 +47,10 @@ from curie_api.forges.types import (
     RerunObserver,
     RerunRecord,
     ReviewFeedback,
+    publication_body,
+    publication_url,
 )
+from curie_api.publication_policy import is_publication_branch
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +247,66 @@ class GitLabCodeHost:
         if len(matches) > 1:
             raise Ambiguous("merge_requests")
         return self._pull(repository, matches[0])
+
+    async def list_factory_publications(
+        self, repository: RepositoryRef
+    ) -> tuple[FactoryPublication, ...]:
+        """Every merge request the token's own user opened from a publication
+        branch of the project itself, in any state (#4629).
+
+        The own user is ``GET /user``
+        (https://docs.gitlab.com/api/users/#get-the-current-user), read before
+        the listing. The listing is ``GET
+        /projects/:id/merge_requests?state=all&author_id=<own id>``
+        (https://docs.gitlab.com/api/merge_requests/#list-project-merge-requests),
+        every page read; each item's ``author.id`` and ``source_project_id``
+        are checked again, so a listing that ignored the filter is still
+        filtered. An item, author, branch, state, description or URL that
+        cannot be read fails the listing; a null description is an empty body,
+        and the ``web_url`` must be on the configured web base
+        (`types.publication_url`).
+        """
+
+        path = f"{self._project(repository)}/merge_requests"
+        own = await self._transport.own_user()
+        listed = await self._transport.list_all(
+            path, {"state": "all", "author_id": own.id}, strict=True
+        )
+        project = int(repository.project_id)
+        found: list[FactoryPublication] = []
+        for item in listed:
+            author, branch, state = item.get("author"), item.get("source_branch"), item.get("state")
+            source = item.get("source_project_id")
+            if (
+                not isinstance(author, dict)
+                or type(author.get("id")) is not int
+                or not isinstance(branch, str)
+                or not branch
+                or not isinstance(state, str)
+                or state not in _STATES
+                or type(source) is not int
+                or type(item.get("iid")) is not int
+            ):
+                raise Unavailable("merge_request")
+            if (
+                str(author["id"]) != own.id
+                or source != project
+                or not is_publication_branch(branch)
+            ):
+                continue
+            found.append(
+                FactoryPublication(
+                    ref=PullRequestRef(repository, str(item["iid"])),
+                    url=publication_url(item.get("web_url"), self._web_base),
+                    head_ref=branch,
+                    state=_STATES[state],
+                    body=publication_body(item, "description"),
+                    closed_at=parse_time(item.get("merged_at"))
+                    or parse_time(item.get("closed_at")),
+                    owner_verified=True,
+                )
+            )
+        return tuple(found)
 
     async def open_pull_request(
         self,

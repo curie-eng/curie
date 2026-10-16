@@ -27,10 +27,10 @@ use super::native::{self, NativeInstall};
 use super::{
     agent_settings, bitbucket_cloud, bitbucket_dc, bundle_dir, bundle_line, check_credit,
     check_prerequisites, cluster_agent, confirm_remote_context, credential_line,
-    ensure_factory_agent, forge_egress_line, initial_agent_line, install_action_line, read_token,
+    ensure_factory_agent, forge_egress_line, initial_agent_line, install_plan_lines, read_token,
     resolve_host, run_self, token_secret_manifest, unconfirmed_remote_context,
     validate_agent_flags, CodeHostKind, EgressEntry, QuickstartOpts, QuickstartOutput,
-    DEFAULT_AGENT, SKIPPED_CLUSTER_UP_LINE,
+    DEFAULT_AGENT,
 };
 use crate::exit::CliError;
 use crate::factory_intake::{apply_forge_entries, native_forge_values, NativeForgeEntries};
@@ -264,23 +264,19 @@ fn describe(plan: &Plan) -> Vec<String> {
     let flags = &site.flags;
     let mut lines = vec![
         plan.native.install.context_reason.clone(),
-        credential_line(&plan.native.credential).to_string(),
+        credential_line(&plan.native.credential, plan.native.install.cluster_up),
         format!(
             "Jira site {} has cloud id {}; the factory account is {} ({})",
             site.host, site.cloud_id, flags.username, site.mention
         ),
     ];
     lines.extend(plan.code_host.found.iter().cloned());
-    if plan.native.install.skipped_cluster_up {
-        lines.push(SKIPPED_CLUSTER_UP_LINE.to_string());
-    }
-    lines.extend(
-        plan.native
-            .install
-            .actions
-            .iter()
-            .filter_map(install_action_line),
-    );
+    lines.extend(install_plan_lines(
+        plan.native.install.cluster_up,
+        &plan.native.install.actions,
+        &plan.release,
+        &plan.namespace,
+    ));
     lines.push(format!(
         "write Secret {} key {} in namespace {} from {} {} (the token is never printed)",
         jira_cloud::SECRET_NAME,

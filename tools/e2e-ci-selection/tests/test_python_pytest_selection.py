@@ -444,7 +444,12 @@ def _run_bash(
 
 
 def _run_pytest_step(
-    tmp_path: Path, *, shard: int, deselect: str, scope: str = "full"
+    tmp_path: Path,
+    *,
+    shard: int,
+    deselect: str,
+    scope: str = "full",
+    cli_files: tuple[str, ...] | None = None,
 ) -> list[str]:
     """Execute the real workflow Bash and record each argument at the uv boundary."""
     step = _named_steps("python-pytest")["Pytest"]
@@ -461,7 +466,10 @@ def _run_pytest_step(
         relative = "tools/e2e-ci-selection/cli_pytest_files.txt"
         destination = tmp_path / relative
         destination.parent.mkdir(parents=True)
-        shutil.copyfile(REPO_ROOT / relative, destination)
+        if cli_files is None:
+            shutil.copyfile(REPO_ROOT / relative, destination)
+        else:
+            destination.write_text("\n".join(cli_files) + "\n")
     state = {"shard": str(shard), "pytest_deselect": deselect, "pytest_scope": scope}
     result = _run_bash(
         script,
@@ -489,8 +497,13 @@ def test_ordinary_python_shards_exclude_the_owned_kind_registration_module(
     tmp_path: Path, scope: str, deselect: str, module: str,
 ) -> None:
     argv = _run_pytest_step(tmp_path, shard=1, deselect=deselect, scope=scope)
-    assert f"--ignore={module}" in argv
-    assert module not in argv
+    ignored = [argument.split("=", 1)[1] for argument in argv if argument.startswith("--ignore=")]
+    ignored += [argv[index + 1] for index, argument in enumerate(argv) if argument == "--ignore"]
+    assert ignored.count(module) == 1
+    separate = [index + 1 for index, argument in enumerate(argv) if argument == "--ignore"]
+    assert all(
+        index in separate for index, argument in enumerate(argv) if argument == module
+    ), f"{module} must not be selected as a positional pytest file"
     assert argv[argv.index("--ci-shard") + 1] == f"1/{SHARD_COUNT}"
 
 
