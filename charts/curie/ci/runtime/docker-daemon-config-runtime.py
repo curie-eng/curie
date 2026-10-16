@@ -272,6 +272,30 @@ def certificates(f: FixtureAPI, dns: str) -> tuple[dict[str, str], dict[str, str
             .add_extension(
                 x509.BasicConstraints(ca=issuer is None, path_length=None), critical=True
             )
+            # Python 3.13 verifies strictly by default: key identifiers and key usage.
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False
+            )
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=issuer is not None,
+                    content_commitment=False,
+                    key_encipherment=issuer is not None,
+                    data_encipherment=False,
+                    key_agreement=False,
+                    key_cert_sign=issuer is None,
+                    crl_sign=issuer is None,
+                    encipher_only=False,
+                    decipher_only=False,
+                ),
+                critical=True,
+            )
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                    (issuer[0] if issuer else key).public_key()
+                ),
+                critical=False,
+            )
         )
         if issuer:
             usage = ExtendedKeyUsageOID.SERVER_AUTH if server else ExtendedKeyUsageOID.CLIENT_AUTH
