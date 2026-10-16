@@ -330,10 +330,19 @@ def _chart_values() -> dict[str, Any]:
         "factory": {
             "docker": {"daemonImage": DAEMON["image"]},
             "sandboxEgress": {"factory": True},
-            "bindings": [{"name": "acme", "repos": [
-                {"path": REPO, "runner": copy.deepcopy(runner), "docker": {"enabled": True}},
-                {"path": "acme-corp/ui", "runner": copy.deepcopy(runner)},
-            ]}],
+            "bindings": [
+                {
+                    "name": "acme",
+                    "repos": [
+                        {
+                            "path": REPO,
+                            "runner": copy.deepcopy(runner),
+                            "docker": {"enabled": True},
+                        },
+                        {"path": "acme-corp/ui", "runner": copy.deepcopy(runner)},
+                    ],
+                }
+            ],
         }
     }
 
@@ -374,10 +383,7 @@ def _worker_document(rendered: str) -> dict[str, Any]:
         if container["name"] == "worker"
     ]
     assert len(containers) == 1, "expected exactly one application worker container"
-    env = {
-        entry["name"]: entry.get("value")
-        for entry in containers[0].get("env", [])
-    }
+    env = {entry["name"]: entry.get("value") for entry in containers[0].get("env", [])}
     return json.loads(env["CURIE_REPO_RUNNER_POOLS"])
 
 
@@ -589,3 +595,71 @@ def test_disabled_worker_skips_enabled_daemon_validation_and_preserves_runner_do
         plain_parts = [part for part in plain.stdout.split("---\n") if part.startswith(marker)]
         assert enabled_parts, source
         assert enabled_parts == plain_parts, source
+
+
+_NAMESPACE_FAIL = "factory.docker.namespace must resolve to a Kubernetes namespace DNS label"
+_SELECTOR_FAIL = "factory.docker selector labels must be nonempty Kubernetes label values"
+
+
+def _selector_override(value: str) -> dict[str, Any]:
+    values = _chart_values()
+    values["factory"]["docker"]["namespace"] = "acme-docker"
+    values["nameOverride"] = value
+    return values
+
+
+def _namespace_override(value: Any) -> dict[str, Any]:
+    values = _chart_values()
+    values["factory"]["docker"]["namespace"] = value
+    return values
+
+
+def _resources_override(group: str | None, key: str) -> dict[str, Any]:
+    values = _chart_values()
+    resources: dict[str, Any] = {key: "1"} if group is None else {group: {key: "1"}}
+    values["factory"]["docker"]["resources"] = resources
+    return values
+
+
+@pytest.mark.parametrize(
+    ("values", "message", "schema_rejects"),
+    [
+        (_namespace_override("Acme_Docker"), _NAMESPACE_FAIL, False),
+        # The helper truncates to 63 characters, so a 64-character value alone resolves
+        # validly; truncation leaving a doubled trailing dash is what must be refused.
+        (_namespace_override("a" * 61 + "--b"), _NAMESPACE_FAIL, False),
+        (_namespace_override(["acme-docker"]), "factory.docker.namespace must be a string", False),
+        (_selector_override("-bad"), _SELECTOR_FAIL, False),
+        (
+            _resources_override(None, "extra"),
+            "factory.docker.resources accepts only requests and limits",
+            True,
+        ),
+        (
+            _resources_override("requests", "gpu"),
+            "factory.docker resources accept only cpu, memory and ephemeral-storage",
+            True,
+        ),
+    ],
+)
+def test_chart_docker_config_refuses_with_its_own_message(
+    values: dict[str, Any], message: str, schema_rejects: bool
+) -> None:
+    # The schema is deliberately permissive for namespace and selector inputs, so those
+    # reach the template; resource keys are also rejected at schema time.
+    if schema_rejects:
+        with pytest.raises(SchemaValidationError):
+            _values_validator().validate(values)
+    else:
+        _values_validator().validate(values)
+    result = _render(values, skip_schema=schema_rejects)
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+def test_chart_docker_config_accepts_a_valid_custom_namespace() -> None:
+    # test_chart_root_and_every_daemon_override_reach_actual_startup covers the full
+    # override set; this is the liveness neighbor of the namespace refusals above.
+    result = _render(_namespace_override("acme-docker-1"))
+    assert result.returncode == 0, result.stderr
+    assert _worker_document(result.stdout)[REPO]["daemon"]["namespace"] == "acme-docker-1"
