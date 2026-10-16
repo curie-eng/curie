@@ -15,8 +15,8 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{
-    binding_value, flags, read_token, secure_scheme, tracker_value, JiraFlags, JiraPlan,
-    StartAuthority, BINDING_NAME, SECRET_NAME,
+    binding_value, flags, new_jira_plan, read_token, secure_scheme, tracker_value, JiraFlags,
+    JiraPlan, StartAuthority,
 };
 use crate::exit::CliError;
 use crate::factory_quickstart::{forge_egress_entries, resolve_host, EgressEntry, ForgeFlags};
@@ -137,9 +137,11 @@ pub(in crate::factory_quickstart) struct JiraSite {
 }
 
 impl JiraSite {
-    /// The `factory.trackers[]` entry.
-    pub fn tracker(&self) -> Value {
+    /// The `factory.trackers[]` entry of this site as a new instance on
+    /// `release`.
+    pub fn tracker(&self, release: &str) -> Value {
         tracker_value(
+            release,
             &self.host,
             &self.flags.url.api_url,
             &self.flags.username,
@@ -151,11 +153,14 @@ impl JiraSite {
 
 /// Validates the Jira flags and token against the site, then reads each
 /// `--repo`'s GitHub id with `app`'s installation token. Runs after the
-/// GitHub App preflight and before any cluster call.
+/// GitHub App preflight and before any cluster call. The plan names the site
+/// as a new instance on `release`; the run resolves it against the recorded
+/// values before planning (see `super::resolve_jira_site`).
 pub async fn preflight(
     forge: &ForgeFlags,
     repos: &[String],
     app: &AppPreflight,
+    release: &str,
 ) -> Result<JiraPlan> {
     let site = preflight_site(flags(forge)?).await?;
     let mut ids = Vec::with_capacity(repos.len());
@@ -163,14 +168,23 @@ pub async fn preflight(
         let id = app.api.repository_id(&app.app, repo).await?;
         ids.push((repo.clone(), id.to_string()));
     }
-    Ok(JiraPlan {
-        tracker: site.tracker(),
-        binding: binding_value(&site.cloud_id, "github", &ids, &site.flags.start),
-        egress: site.egress,
-        secret_name: SECRET_NAME.to_string(),
-        token_file: site.flags.token_file,
-        binding_name: BINDING_NAME.to_string(),
-    })
+    let tracker = site.tracker(release);
+    let name = tracker["name"].as_str().unwrap_or_default().to_string();
+    // The release's GitHub code host is found by identity when the run
+    // resolves the site (`super::bind_github_code_host`).
+    let binding = binding_value(
+        &name,
+        &site.cloud_id,
+        crate::factory_intake::GITHUB_ENTRY,
+        &ids,
+        &site.flags.start,
+    );
+    Ok(new_jira_plan(
+        tracker,
+        binding,
+        site.egress,
+        site.flags.token_file,
+    ))
 }
 
 /// Validates the Jira flags and token against the site: its base URL and

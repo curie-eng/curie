@@ -24,13 +24,41 @@ mod bitbucket_cloud;
 mod bitbucket_dc;
 mod github;
 mod gitlab;
+mod instance;
 mod jira_bitbucket;
 mod jira_cloud;
 mod native;
 
 pub use github::{deploy_args, intake_args, registration_steps, RerunTarget};
 pub use gitlab::{gitlab_entries, gitlab_web_base, GitlabFacts, GITLAB_DEFAULT_URL};
+pub use instance::{
+    code_host_trust_name, forge_binding_name, forge_entry_name, forge_secret_name,
+    normalized_api_url, ObjectWrite, Observation, SecretUse, MANAGED_BY, MANAGED_BY_LABEL,
+    RELEASE_LABEL,
+};
 pub use jira_cloud::{preflight as jira_preflight, JiraPlan};
+
+/// `list` of the recorded values with `entry` put in by identity (#4620):
+/// the same-named entry of the same identity is replaced, a new name is
+/// appended, and a name or identity the release changed since the run
+/// resolved its entries refuses.
+pub fn put_forge_entry(
+    recorded: &serde_json::Value,
+    list: &str,
+    entry: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    instance::put_entry(recorded, list, entry)
+}
+
+/// The recorded `list` entry with `planned`'s identity (kind and host for a
+/// forge entry), whatever its name (#4620).
+pub fn recorded_forge_entry<'a>(
+    recorded: &'a serde_json::Value,
+    list: &str,
+    planned: &serde_json::Value,
+) -> Option<&'a serde_json::Value> {
+    instance::recorded_identity(recorded, list, planned)
+}
 
 pub const DEFAULT_KIND_NAME: &str = "curie-factory";
 pub const DEFAULT_MODEL: &str = "z-ai/glm-5.3-flash";
@@ -134,10 +162,6 @@ pub struct RecordedIntake {
     /// The Secret and data key holding the App private key.
     pub pem_secret: String,
     pub pem_secret_key: String,
-    /// The `jira` entries of `factory.trackers` and `factory.bindings`, which
-    /// a Jira quickstart wrote and every Jira agent on the release serves.
-    pub jira_tracker: Option<serde_json::Value>,
-    pub jira_binding: Option<serde_json::Value>,
 }
 
 /// One agent's GitHub binding on the serving release, as the API lists it.
@@ -191,19 +215,12 @@ pub fn recorded_intake(values: &serde_json::Value) -> Option<RecordedIntake> {
                 .collect()
         })
         .unwrap_or_default();
-    let named = |list: &str| {
-        factory.get(list)?.as_array()?.iter().find(|entry| {
-            entry.get("name").and_then(|v| v.as_str()) == Some(jira_cloud::BINDING_NAME)
-        })
-    };
     Some(RecordedIntake {
         app_id,
         install_label,
         repo_allowlist,
         pem_secret,
         pem_secret_key,
-        jira_tracker: named("trackers").cloned(),
-        jira_binding: named("bindings").cloned(),
     })
 }
 
@@ -1393,21 +1410,18 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         (false, Some(_)) => QuickstartPath::AddAgent,
         (false, None) => QuickstartPath::Register,
     };
+    // A recorded Jira tracker and binding serve every Jira agent on their
+    // site, so on either path one that differs from this run is refused
+    // before any mutation (#4620), and the entries are written only when the
+    // release lacks one.
+    let write_jira = match &input.jira {
+        Some(jira) => jira_cloud::check_recorded(jira, &input.release)?,
+        None => false,
+    };
     // #4362 decision 5, in order, before any mutation.
-    // The `jira` tracker and binding serve every Jira agent on the release,
-    // so the add agent path writes them only when the release has none.
-    let mut write_jira = input.jira.is_some();
     if let (QuickstartPath::AddAgent, Some(recorded)) = (path, &input.recorded) {
         refuse_install_flags(input.model_explicit, input.org.as_deref())?;
         check_recorded_allowlist(input, recorded)?;
-        if let Some(jira) = &input.jira {
-            write_jira = jira_cloud::check_recorded(
-                jira,
-                recorded.jira_tracker.as_ref(),
-                recorded.jira_binding.as_ref(),
-                &input.release,
-            )?;
-        }
     }
     // A Jira agent holds no GitHub surface, so the GitHub binding rules do
     // not apply to it.
@@ -1723,7 +1737,7 @@ async fn ensure_factory_agent(
     agent: &str,
     binding: ChannelBindingWrite,
     repo_full_name: Option<&str>,
-) -> Result<()> {
+) -> Result<crate::api::Agent> {
     let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
     let (url, key, port_forward) = crate::commands::resolve_cluster_conn(
         env("CURIE_API_URL"),
@@ -1737,7 +1751,47 @@ async fn ensure_factory_agent(
         .find_or_create_agent(agent, binding, repo_full_name)
         .await;
     drop(port_forward);
-    result.map(|_| ())
+    result
+}
+
+/// The trigger label stored on the surface `agent` already holds on
+/// `kind=address`: `None` when it holds no such surface, `Some(None)` when it
+/// holds one that stores no label (the tracker label serves it). A rerun
+/// without `--label` keeps such a surface as it is (#4620).
+fn held_surface_label(
+    agent: &crate::api::Agent,
+    kind: &str,
+    address: &str,
+) -> Option<Option<String>> {
+    agent
+        .channels
+        .iter()
+        .find(|channel| channel.kind == kind && channel.address == address)
+        .map(|channel| channel.trigger_label.clone())
+}
+
+/// The stored label of the surface a rerun keeps: `Some` only when no `--label`
+/// was passed and `agent` already holds `kind=address`.
+fn surface_to_keep(
+    agent: &crate::api::Agent,
+    kind: &str,
+    address: &str,
+    label: Option<&str>,
+) -> Option<Option<String>> {
+    match label {
+        None => held_surface_label(agent, kind, address),
+        Some(_) => None,
+    }
+}
+
+/// The dry-run plan line for the surfaces step a label-less rerun skips.
+fn keep_surface_plan_line(kind: &str, address: &str) -> String {
+    format!("without --label, skip the {kind}={address} surfaces step when the agent already holds that surface, and keep its stored trigger label")
+}
+
+/// The progress note for a surface a rerun keeps instead of adding again.
+fn kept_surface_line(agent: &str, kind: &str, address: &str) -> String {
+    format!("keeping the {kind}={address} surface agent {agent} already holds, with its stored trigger label")
 }
 
 /// The plan line for enrolling `agent` for forge egress.
@@ -1911,7 +1965,14 @@ fn install_action_lines(
 
 /// Runs one kind, kubectl or `cluster up` step. `prompted_model` replaces the
 /// `cluster up` model when the credential was prompted for.
-async fn run_install_action(action: &Action, prompted_model: Option<&String>) -> Result<()> {
+/// Runs one install step. `mark` is the release write mark a `cluster up`
+/// child records on its Helm write, so the caller adopts exactly that
+/// write's revision.
+async fn run_install_action(
+    action: &Action,
+    prompted_model: Option<&String>,
+    mark: Option<&instance::ReleaseWriteMark>,
+) -> Result<()> {
     match action {
         Action::External { program, args } => {
             let step = if program == "kind" {
@@ -1929,49 +1990,12 @@ async fn run_install_action(action: &Action, prompted_model: Option<&String>) ->
                 let model_index = cluster_up_model_index(&args);
                 args[model_index] = model.clone();
             }
-            run_self(&args, "Installing Curie").await.map(|_| ())
+            run_self(&args, "Installing Curie", None, mark)
+                .await
+                .map(|_| ())
         }
         _ => Err(CliError::failure("not an install step").into()),
     }
-}
-
-/// The Opaque Secret holding a forge token under the data key `token`.
-pub(crate) fn token_secret_manifest(namespace: &str, name: &str, token: &str) -> serde_json::Value {
-    use base64::Engine;
-    serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "type": "Opaque",
-        "metadata": {"name": name, "namespace": namespace},
-        "data": {"token": base64::engine::general_purpose::STANDARD.encode(token.as_bytes())},
-    })
-}
-
-/// Applies `manifest` with `kubectl apply -f -` on stdin. kubectl's output is
-/// dropped: a failed apply can echo the manifest, which may hold a token.
-/// `what` names the object in the refusal.
-pub(crate) async fn apply_manifest(
-    namespace: &str,
-    manifest: &serde_json::Value,
-    what: &str,
-) -> Result<()> {
-    crate::ui::ui().note(&format!("Writing {what}"));
-    let body = serde_json::to_vec(manifest)?;
-    let (ok, _, _) = crate::ops::run_capture_with_stdin(
-        &crate::factory_app::secret_apply_command(namespace),
-        &body,
-    )
-    .await?;
-    if !ok {
-        return Err(CliError::failure(format!(
-            "writing {what} in namespace {namespace} failed; the forge entries were not written"
-        ))
-        .with_fix(format!(
-            "check access with `kubectl -n {namespace} auth can-i create secrets` and rerun"
-        ))
-        .into());
-    }
-    Ok(())
 }
 
 /// The plan line for the Jira tracker action.
@@ -2081,12 +2105,17 @@ async fn capture_helm_json(cmd: &crate::ops::OpsCommand) -> Result<Option<serde_
     Ok(serde_json::from_str(&stdout).ok())
 }
 
+/// The revision a release is serving, with its user values and metadata.
+pub(super) struct ReleaseSnapshot {
+    pub values: serde_json::Value,
+    pub metadata: serde_json::Value,
+    pub revision: u32,
+}
+
 /// Values and metadata of the revision the release is serving. `None` when
 /// helm has no `deployed` revision: a failed install can still carry the
 /// target chart and values, and that must not count as installed (#3934).
-async fn deployed_release_snapshot(
-    common: &CommonOpts,
-) -> Result<Option<(serde_json::Value, serde_json::Value)>> {
+async fn deployed_release_snapshot(common: &CommonOpts) -> Result<Option<ReleaseSnapshot>> {
     let Some(history) = capture_helm_json(&crate::ops::helm_history_cmd(common)).await? else {
         return Ok(None);
     };
@@ -2103,7 +2132,11 @@ async fn deployed_release_snapshot(
     ))
     .await?;
     Ok(match (values, metadata) {
-        (Some(values), Some(metadata)) => Some((values, metadata)),
+        (Some(values), Some(metadata)) => Some(ReleaseSnapshot {
+            values,
+            metadata,
+            revision,
+        }),
         _ => None,
     })
 }
@@ -2161,7 +2194,10 @@ async fn release_matches_quickstart_target(
         dry_run: false,
     };
     let chart_version = crate::ops::chart_version(&opts.chart).await?;
-    let Some((values, metadata)) = deployed_release_snapshot(&common).await? else {
+    let Some(ReleaseSnapshot {
+        values, metadata, ..
+    }) = deployed_release_snapshot(&common).await?
+    else {
         return Ok((false, model.to_string()));
     };
     // With no local credential the release keeps its recorded key. Keep its
@@ -2386,7 +2422,14 @@ async fn kind_clusters() -> Result<Vec<String>> {
         .collect())
 }
 
-async fn run_self(args: &[String], step: &str) -> Result<serde_json::Value> {
+/// Runs this binary as a child. `fence` is the observation a GitHub intake
+/// child fences its Secret writes and Helm upgrade on (#4620).
+async fn run_self(
+    args: &[String],
+    step: &str,
+    fence: Option<&Observation>,
+    mark: Option<&instance::ReleaseWriteMark>,
+) -> Result<serde_json::Value> {
     let program = std::env::current_exe().map_err(|err| {
         CliError::failure(format!("cannot locate the curie binary to continue: {err}"))
     })?;
@@ -2400,7 +2443,7 @@ async fn run_self(args: &[String], step: &str) -> Result<serde_json::Value> {
         "--color".into(),
         "never".into(),
     ]);
-    let output = run_command(&program, &args, step).await?;
+    let output = run_command(&program, &args, step, fence, mark).await?;
     serde_json::from_slice(&output.stdout).map_err(|error| {
         step_error(
             &program,
@@ -2414,7 +2457,7 @@ async fn run_self(args: &[String], step: &str) -> Result<serde_json::Value> {
 
 async fn run_program(program: &str, args: &[String], step: &str) -> Result<()> {
     require_on_path(program)?;
-    run_command(Path::new(program), args, step).await?;
+    run_command(Path::new(program), args, step, None, None).await?;
     Ok(())
 }
 
@@ -2462,17 +2505,33 @@ fn step_error(
     crate::exit::operator_context(source, message, Some(fix))
 }
 
-async fn run_command(program: &Path, args: &[String], step: &str) -> Result<Output> {
+async fn run_command(
+    program: &Path,
+    args: &[String],
+    step: &str,
+    fence: Option<&Observation>,
+    mark: Option<&instance::ReleaseWriteMark>,
+) -> Result<Output> {
     let ui = crate::ui::ui();
     ui.note(step);
     ui.plumbing(&format!("+ {} {}", program.display(), args.join(" ")));
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Only the mark this run hands over names a child's release write.
+    cmd.env_remove(crate::ops::QUICKSTART_RELEASE_WRITE_ENV);
+    if let Some(mark) = mark {
+        cmd.env(crate::ops::QUICKSTART_RELEASE_WRITE_ENV, mark.as_str());
+    }
     if args.first().map(String::as_str) == Some("cluster")
         && args.get(1).map(String::as_str) == Some("factory")
     {
         // Poll quickstart has no webhook secret, just as its in-process plan.
         cmd.env_remove(crate::factory_intake::WEBHOOK_SECRET_ENV);
+        // Only the observation this run hands over fences the intake child.
+        cmd.env_remove(instance::INTAKE_FENCE_ENV);
+        if let Some(fence) = fence {
+            cmd.env(instance::INTAKE_FENCE_ENV, fence.intake_fence_json());
+        }
     }
     if args.first().map(String::as_str) == Some("cluster")
         && args.get(1).map(String::as_str) == Some("up")
@@ -2553,6 +2612,48 @@ async fn run_command(program: &Path, args: &[String], step: &str) -> Result<Outp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn agent_holding(kind: &str, address: &str, label: Option<&str>) -> crate::api::Agent {
+        serde_json::from_value(serde_json::json!({
+            "id": "agent-1",
+            "name": "acme-second",
+            "memory": false,
+            "channels": [{"kind": kind, "address": address, "trigger_label": label}],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_label_less_rerun_keeps_a_held_labelled_surface() {
+        let agent = agent_holding("gitlab", "grp/proj", Some("second-agent-only"));
+        assert_eq!(
+            surface_to_keep(&agent, "gitlab", "grp/proj", None),
+            Some(Some("second-agent-only".to_string()))
+        );
+        let unlabelled = agent_holding("gitlab", "grp/proj", None);
+        assert_eq!(
+            surface_to_keep(&unlabelled, "gitlab", "grp/proj", None),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn a_case_only_address_difference_is_not_a_held_surface() {
+        let agent = agent_holding("gitlab", "grp/proj", Some("second-agent-only"));
+        assert_eq!(surface_to_keep(&agent, "gitlab", "Grp/Proj", None), None);
+        assert_eq!(surface_to_keep(&agent, "GitLab", "grp/proj", None), None);
+    }
+
+    #[test]
+    fn an_explicit_label_or_a_missing_surface_still_adds() {
+        let agent = agent_holding("gitlab", "grp/proj", Some("second-agent-only"));
+        assert_eq!(
+            surface_to_keep(&agent, "gitlab", "grp/proj", Some("second-agent-only")),
+            None
+        );
+        assert_eq!(surface_to_keep(&agent, "gitlab", "grp/other", None), None);
+        assert_eq!(surface_to_keep(&agent, "jira", "grp/proj", None), None);
+    }
 
     fn base() -> PlanInput {
         PlanInput {
@@ -3336,8 +3437,6 @@ mod tests {
             repo_allowlist: vec!["acme/widgets".into()],
             pem_secret: "factory-app".into(),
             pem_secret_key: "private-key.pem".into(),
-            jira_tracker: None,
-            jira_binding: None,
         }
     }
 

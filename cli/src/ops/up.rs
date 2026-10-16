@@ -1234,6 +1234,36 @@ const ADOPT_HINT: &str =
 /// Set only on the `cluster up` child that `factory quickstart` spawns.
 /// Quickstart has no `--adopt`, so that child names a working remedy instead.
 pub(crate) const QUICKSTART_NAMESPACE_HINT_ENV: &str = "CURIE_QUICKSTART_NAMESPACE_HINT";
+/// Set only on a child `factory quickstart` spawns to write the release
+/// (`cluster up`, the GitHub intake): the mark that child's Helm write
+/// records as its `--description`, so the parent adopts exactly the
+/// revisions that write produced and no other (#4620).
+pub(crate) const QUICKSTART_RELEASE_WRITE_ENV: &str = "CURIE_QUICKSTART_RELEASE_WRITE";
+/// Every release write mark starts with this.
+pub(crate) const QUICKSTART_RELEASE_WRITE_PREFIX: &str = "curie-quickstart-write-";
+
+/// `cmd`, a Helm install or upgrade of the release, with `--description`
+/// naming the release write mark a quickstart parent handed this process in
+/// [`QUICKSTART_RELEASE_WRITE_ENV`]; unchanged when it handed none.
+pub(crate) fn quickstart_marked_release_write(cmd: &OpsCommand) -> OpsCommand {
+    release_write_with_mark(
+        cmd,
+        std::env::var(QUICKSTART_RELEASE_WRITE_ENV).ok().as_deref(),
+    )
+}
+
+/// `cmd` with `--description <mark>` when `mark` is a release write mark.
+fn release_write_with_mark(cmd: &OpsCommand, mark: Option<&str>) -> OpsCommand {
+    let mut marked = cmd.clone();
+    let valid = mark.filter(|mark| {
+        mark.strip_prefix(QUICKSTART_RELEASE_WRITE_PREFIX)
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+    });
+    if let Some(mark) = valid {
+        marked.args.extend([plain("--description"), plain(mark)]);
+    }
+    marked
+}
 const METADATA_NAME_LABEL: &str = "kubernetes.io/metadata.name";
 
 /// Emitted alongside [`MODEL_CREDENTIAL_KEY`], and only when a credential is
@@ -5247,6 +5277,8 @@ async fn run_install_with_observers(
 ) -> Result<InstallOutcome> {
     let ui = crate::ui::ui();
     let namespace = &common.namespace;
+    let marked = quickstart_marked_release_write(cmd);
+    let cmd = &marked;
     ui.plumbing(&format!("+ {}", cmd.display()));
     let step = cl.step(label);
     let namespace_existed_before_install = namespace_states
@@ -5637,7 +5669,7 @@ pub async fn up(
         if let Some(values) = &opts.file_values {
             crate::factory_intake::check_factory_document(&values.0).map_err(|message| {
                 crate::exit::CliError::usage(message)
-                    .with_fix("fix factory.trackers or factory.bindings; nothing was applied")
+                    .with_fix("fix factory.codeHosts, factory.trackers or factory.bindings; nothing was applied")
             })?;
         }
     }
@@ -6405,6 +6437,25 @@ mod tests {
     use super::*;
 
     use crate::ops::testsupport::*;
+
+    #[test]
+    fn a_quickstart_release_write_records_only_a_well_formed_mark() {
+        let cmd = OpsCommand::new("helm", vec![plain("upgrade"), plain("r")]);
+        let mark = format!("{QUICKSTART_RELEASE_WRITE_PREFIX}0a1b");
+        assert_eq!(
+            release_write_with_mark(&cmd, Some(&mark)).argv(),
+            ["upgrade", "r", "--description", mark.as_str()]
+        );
+        assert_eq!(release_write_with_mark(&cmd, None), cmd);
+        for forged in [
+            "",
+            QUICKSTART_RELEASE_WRITE_PREFIX,
+            "operator note",
+            "curie-quickstart-write-a b",
+        ] {
+            assert_eq!(release_write_with_mark(&cmd, Some(forged)), cmd, "{forged}");
+        }
+    }
 
     #[test]
     fn file_set_capture_masks_credential_values_in_command_diagnostics() {

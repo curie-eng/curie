@@ -11,6 +11,12 @@
 //! `factory.bindings` entries and the token Secret, while the agent binds
 //! `jira=<binding>` instead of one `github=<repo>` per repository.
 //!
+//! A site is a tracker instance: its identity is (`jira_cloud`, site host)
+//! (#4620). [`resolve_jira_site`] finds a recorded site by that identity, whatever its
+//! name, and keeps its entry, binding and credential Secret as recorded;
+//! [`verify_secret`] checks that Secret holds this run's token. A new site
+//! gets derived names (`super::forge_entry_name`) and its own Secret.
+//!
 //! The token is read from `--token-file` and goes only into the Secret and the
 //! Authorization header of the preflight reads. It never reaches values, the
 //! plan, argv, or any message.
@@ -27,28 +33,39 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use super::instance::{self, ObjectWrite, Observation, SecretUse};
 use super::{CodeHostKind, EgressEntry, ForgeFlags};
 use crate::exit::CliError;
+use crate::ops::CommonOpts;
 
-/// The name of the tracker entry and the binding this module writes.
-pub const BINDING_NAME: &str = "jira";
-/// The Secret holding the Jira API token, and its data key.
-pub const SECRET_NAME: &str = "curie-jira-token";
-pub const SECRET_KEY: &str = "token";
+/// The tracker kind this module writes.
+pub const TRACKER_KIND: &str = "jira_cloud";
 
 /// What the Jira half of a quickstart writes. Carries no token: the token is
-/// read again from `token_file` when the Secret is applied.
+/// read again from `token_file` when the Secret is created.
 #[derive(Debug, Clone)]
 pub struct JiraPlan {
-    /// The `factory.trackers[]` entry.
+    /// The `factory.trackers[]` entry this run would write. For a recorded
+    /// site it carries the recorded name, credential Secret and label, so it
+    /// compares field by field with `recorded_tracker`.
     pub tracker: Value,
-    /// The `factory.bindings[]` entry.
+    /// The `factory.bindings[]` entry, likewise.
     pub binding: Value,
     /// The tracker's egress, also carried inside `tracker`.
     pub egress: Vec<EgressEntry>,
+    /// The Secret and data key the tracker credential names.
     pub secret_name: String,
+    pub secret_key: String,
     pub token_file: PathBuf,
     pub binding_name: String,
+    /// The tracker and binding the release records for this site and scope,
+    /// found by identity and written back as recorded.
+    pub recorded_tracker: Option<Value>,
+    pub recorded_binding: Option<Value>,
+    /// Whether the run creates the Secret or reuses it as it is.
+    pub secret: SecretUse,
+    /// What the run read before its first write, read again before it.
+    pub observation: Observation,
 }
 
 /// The two `--forge-url` forms: a site root, or the scoped API gateway that
@@ -316,8 +333,10 @@ fn aliases(repos: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The `factory.bindings[]` entry for `repos` and their ids on `code_host`.
+/// The `factory.bindings[]` entry of `tracker` for `repos` and their ids on
+/// `code_host`, under its derived name.
 pub(super) fn binding_value(
+    tracker: &str,
     cloud_id: &str,
     code_host: &str,
     repos: &[(String, String)],
@@ -333,8 +352,8 @@ pub(super) fn binding_value(
         })
         .collect();
     json!({
-        "name": BINDING_NAME,
-        "tracker": BINDING_NAME,
+        "name": super::forge_binding_name(tracker, cloud_id),
+        "tracker": tracker,
         "trackerScopeId": cloud_id,
         "repos": entries,
         "defaultRepo": aliases.first(),
@@ -342,17 +361,21 @@ pub(super) fn binding_value(
     })
 }
 
-/// The `factory.trackers[]` entry. `mention` is the bot's account id.
+/// The `factory.trackers[]` entry of a new site, under its derived name with
+/// the default label and the release's Secret for it. `mention` is the bot's
+/// account id.
 pub(super) fn tracker_value(
+    release: &str,
     host: &str,
     api_url: &str,
     username: &str,
     mention: &str,
     egress: &[EgressEntry],
 ) -> Value {
+    let name = super::forge_entry_name(TRACKER_KIND, api_url);
     json!({
-        "name": BINDING_NAME,
-        "kind": "jira_cloud",
+        "name": name,
+        "kind": TRACKER_KIND,
         "host": host,
         "apiUrl": api_url,
         "label": crate::factory_app::DEFAULT_LABEL,
@@ -360,16 +383,169 @@ pub(super) fn tracker_value(
         "credential": {
             "type": "static_token",
             "username": username,
-            "existingSecret": SECRET_NAME,
-            "existingSecretKey": SECRET_KEY,
+            "existingSecret": super::forge_secret_name(release, &name),
+            "existingSecretKey": instance::TOKEN_KEY,
         },
         "egress": egress,
     })
 }
 
+/// The plan for a new site's `tracker` and `binding`, before [`resolve_jira_site`].
+pub(super) fn new_jira_plan(
+    tracker: Value,
+    binding: Value,
+    egress: Vec<EgressEntry>,
+    token_file: PathBuf,
+) -> JiraPlan {
+    let (secret_name, secret_key) = instance::credential_ref(&tracker);
+    let binding_name = binding["name"].as_str().unwrap_or_default().to_string();
+    JiraPlan {
+        tracker,
+        binding,
+        egress,
+        secret_name,
+        secret_key,
+        token_file,
+        binding_name,
+        recorded_tracker: None,
+        recorded_binding: None,
+        secret: SecretUse::Create,
+        observation: Observation::default(),
+    }
+}
+
+/// Resolves `plan` against the release's recorded `values` (#4620). The
+/// recorded tracker with this site's identity, whatever its name, is kept:
+/// the plan takes its name, credential Secret and key, and label, and keeps
+/// it as `recorded_tracker`; one on this host under another API base URL
+/// (a site root against its API gateway) refuses. The binding is found by
+/// (tracker, cloud id) likewise. A new site or binding keeps its derived
+/// name, refused when another identity holds it. A `--dry-run` plan (see
+/// [`described`]) whose site host is still a placeholder has no identity to
+/// find or to conflict with, so it is described as planned and never
+/// refused. Pure.
+pub(super) fn resolve_jira_site(
+    mut plan: JiraPlan,
+    values: &Value,
+    url_flag: &str,
+    release: &str,
+) -> Result<JiraPlan> {
+    let host = plan.tracker["host"].as_str().unwrap_or_default();
+    if host.starts_with('<') && host.ends_with('>') {
+        return Ok(plan);
+    }
+    let tracker =
+        instance::resolve_instance(values, "trackers", plan.tracker.clone(), url_flag, release)?;
+    match tracker.recorded() {
+        Some(recorded) => {
+            let mut planned = plan.tracker.clone();
+            planned["name"] = recorded["name"].clone();
+            let (secret, key) = instance::credential_ref(recorded);
+            instance::set_credential_ref(&mut planned, &secret, &key);
+            match (recorded.get("label"), planned.as_object_mut()) {
+                (Some(label), _) => planned["label"] = label.clone(),
+                (None, Some(map)) => {
+                    map.remove("label");
+                }
+                (None, None) => {}
+            }
+            plan.tracker = planned;
+            plan.recorded_tracker = Some(recorded.clone());
+        }
+        None => plan.tracker = tracker.into_entry(),
+    }
+    (plan.secret_name, plan.secret_key) = instance::credential_ref(&plan.tracker);
+    plan.binding["tracker"] = plan.tracker["name"].clone();
+    let binding = instance::resolve_binding(values, plan.binding.clone(), release)?;
+    match binding.recorded() {
+        Some(recorded) => {
+            plan.binding["name"] = recorded["name"].clone();
+            plan.recorded_binding = Some(recorded.clone());
+        }
+        None => plan.binding = binding.into_entry(),
+    }
+    // A `--dry-run` that read no cloud id keeps its placeholder in the name.
+    let scope = instance::scope_text(&plan.binding);
+    if scope.starts_with('<') && scope.ends_with('>') {
+        let tracker = plan.tracker["name"].as_str().unwrap_or_default();
+        plan.binding["name"] = json!(format!("{tracker}-{scope}"));
+    }
+    plan.binding_name = plan.binding["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    Ok(plan)
+}
+
+/// Points every repository of a Jira binding beside GitHub at the
+/// release's GitHub code host (#4620): the recorded entry of that identity
+/// (kind `github` and its host) under its recorded name, whatever it is, or
+/// the entry the GitHub intake plans when none is recorded. Run before
+/// [`resolve_jira_site`], so an equivalent recorded binding compares equal
+/// and every refusal stays before any write.
+pub(super) fn bind_github_code_host(mut plan: JiraPlan, values: &Value) -> JiraPlan {
+    let code_host = crate::factory_intake::github_code_host_name(values);
+    if let Some(repos) = plan.binding.get_mut("repos").and_then(Value::as_array_mut) {
+        for repo in repos {
+            repo["codeHost"] = json!(code_host);
+        }
+    }
+    plan
+}
+
+/// Checks the Secret the plan's tracker names against the token in
+/// `token_file` (#4620): a recorded site's Secret must hold it and is never
+/// rewritten; a new site's Secret is created, or reused when this release's
+/// quickstart left it with the same token. What it read is added to
+/// `observation`, which becomes the plan's.
+pub(super) async fn verify_secret(
+    mut plan: JiraPlan,
+    common: &CommonOpts,
+    token_flag: &str,
+    mut observation: Observation,
+) -> Result<JiraPlan> {
+    let token = read_token(&plan.token_file)?;
+    let entry = plan.tracker["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    plan.secret = if plan.recorded_tracker.is_some() {
+        observation.push(
+            instance::verify_recorded_secret(
+                common,
+                &entry,
+                &plan.secret_name,
+                &plan.secret_key,
+                &token,
+                token_flag,
+            )
+            .await?,
+        );
+        SecretUse::Reuse
+    } else {
+        let (use_, read) = instance::plan_new_secret(
+            &common.namespace,
+            &common.release,
+            &plan.secret_name,
+            &plan.secret_key,
+            &token,
+            token_flag,
+        )
+        .await?;
+        observation.push(read);
+        use_
+    };
+    plan.observation = observation;
+    Ok(plan)
+}
+
 /// A `--dry-run` stand-in for the plan: what can be known without a read,
 /// plus the lines describing the reads [`preflight`] would make.
-pub(super) fn described(forge: &ForgeFlags, repos: &[String]) -> Result<(JiraPlan, Vec<String>)> {
+pub(super) fn described(
+    forge: &ForgeFlags,
+    repos: &[String],
+    release: &str,
+) -> Result<(JiraPlan, Vec<String>)> {
     let flags = flags(forge)?;
     let api = &flags.url.api_url;
     let mut reads = vec![
@@ -405,16 +581,30 @@ pub(super) fn described(forge: &ForgeFlags, repos: &[String]) -> Result<(JiraPla
         .iter()
         .map(|repo| (repo.clone(), "<repository id>".to_string()))
         .collect();
+    let tracker = tracker_value(
+        release,
+        "<site>",
+        api,
+        &flags.username,
+        "<factory account id>",
+        &[],
+    );
+    let name = tracker["name"].as_str().unwrap_or_default().to_string();
     let cloud_id = flags.url.cloud_id.as_deref().unwrap_or("<cloud id>");
-    let plan = JiraPlan {
-        tracker: tracker_value("<site>", api, &flags.username, "<factory account id>", &[]),
-        binding: binding_value(cloud_id, "github", &ids, &flags.start),
-        egress: Vec::new(),
-        secret_name: SECRET_NAME.to_string(),
-        token_file: flags.token_file,
-        binding_name: BINDING_NAME.to_string(),
-    };
-    Ok((plan, reads))
+    let mut binding = binding_value(
+        &name,
+        cloud_id,
+        crate::factory_intake::GITHUB_ENTRY,
+        &ids,
+        &flags.start,
+    );
+    if flags.url.cloud_id.is_none() {
+        binding["name"] = json!(format!("{name}-{cloud_id}"));
+    }
+    Ok((
+        new_jira_plan(tracker, binding, Vec::new(), flags.token_file),
+        reads,
+    ))
 }
 
 /// The token in `path`, trimmed. Refused when unreadable or empty; the
@@ -436,9 +626,20 @@ pub(crate) fn read_token(path: &Path) -> Result<String> {
     Ok(token.to_string())
 }
 
-/// The Opaque Secret holding the Jira token under [`SECRET_KEY`].
-pub(crate) fn secret_manifest(namespace: &str, token: &str) -> Value {
-    super::token_secret_manifest(namespace, SECRET_NAME, token)
+/// The Secret the plan creates, `None` when it reuses one. The token is read
+/// from its file here and goes only into the manifest.
+pub(super) fn secret_write(plan: &JiraPlan, common: &CommonOpts) -> Result<Option<ObjectWrite>> {
+    if plan.secret == SecretUse::Reuse {
+        return Ok(None);
+    }
+    let token = read_token(&plan.token_file)?;
+    Ok(Some(ObjectWrite::create(instance::token_secret(
+        &common.namespace,
+        &common.release,
+        &plan.secret_name,
+        &plan.secret_key,
+        &token,
+    ))))
 }
 
 #[cfg(test)]
@@ -482,10 +683,179 @@ mod tests {
         .is_err());
     }
 
+    fn recorded_jira_site_fixture(name: &str, api: &str) -> Value {
+        json!({"name": name, "kind": TRACKER_KIND, "host": "acme.atlassian.net", "apiUrl": api,
+               "label": "operator-label", "mention": "bot",
+               "credential": {"type": "static_token", "username": "bot@example.com",
+                              "existingSecret": "curie-jira-token", "existingSecretKey": "operator-key"}})
+    }
+
+    fn planned_jira_site_fixture() -> JiraPlan {
+        let tracker = tracker_value(
+            "acme",
+            "acme.atlassian.net",
+            "https://acme.atlassian.net",
+            "bot@example.com",
+            "bot",
+            &[],
+        );
+        let name = tracker["name"].as_str().unwrap().to_string();
+        let start = StartAuthority::Accounts(vec!["starter".into()]);
+        let binding = binding_value(
+            &name,
+            "cloud-1",
+            crate::factory_intake::GITHUB_ENTRY,
+            &[("acme/widgets".into(), "7".into())],
+            &start,
+        );
+        new_jira_plan(tracker, binding, Vec::new(), PathBuf::from("/never-read"))
+    }
+
     #[test]
-    fn the_secret_manifest_carries_the_token_only_base64_encoded() {
-        let manifest = secret_manifest("curie", "secret-token-value");
-        assert_eq!(manifest["metadata"]["name"], SECRET_NAME);
-        assert!(!manifest.to_string().contains("secret-token-value"));
+    fn a_new_site_takes_derived_names() {
+        let plan = resolve_jira_site(
+            planned_jira_site_fixture(),
+            &Value::Null,
+            "--forge-url",
+            "acme",
+        )
+        .unwrap();
+        let name = super::super::forge_entry_name(TRACKER_KIND, "https://acme.atlassian.net");
+        assert_eq!(plan.tracker["name"], json!(name));
+        assert_eq!(
+            plan.secret_name,
+            super::super::forge_secret_name("acme", &name)
+        );
+        assert_eq!(plan.binding_name, format!("{name}-cloud-1"));
+        assert_eq!(plan.binding["tracker"], json!(name));
+        assert!(plan.recorded_tracker.is_none() && plan.recorded_binding.is_none());
+    }
+
+    #[test]
+    fn a_recorded_site_is_found_by_identity_and_keeps_its_names() {
+        let recorded =
+            recorded_jira_site_fixture("operator-jira-site", "https://acme.atlassian.net/");
+        let binding = json!({"name": "operator-jira-binding", "tracker": "operator-jira-site", "trackerScopeId": "cloud-1"});
+        let values = json!({"factory": {"trackers": [recorded], "bindings": [binding]}});
+        let plan =
+            resolve_jira_site(planned_jira_site_fixture(), &values, "--forge-url", "acme").unwrap();
+        assert_eq!(plan.tracker["name"], json!("operator-jira-site"));
+        assert_eq!(plan.tracker["label"], json!("operator-label"));
+        assert_eq!(
+            (plan.secret_name.as_str(), plan.secret_key.as_str()),
+            ("curie-jira-token", "operator-key")
+        );
+        assert_eq!(plan.binding_name, "operator-jira-binding");
+        assert_eq!(plan.recorded_tracker, Some(recorded));
+        assert_eq!(plan.recorded_binding, Some(binding));
+    }
+
+    fn binding_code_hosts(plan: &JiraPlan) -> Vec<Value> {
+        plan.binding["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|repo| repo["codeHost"].clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_jira_binding_names_the_recorded_github_code_host_and_reruns_equivalently() {
+        let github = json!({"name": "operator-github", "kind": "github", "host": "github.com",
+                            "apiUrl": "https://api.github.com"});
+        let values = json!({"factory": {"codeHosts": [github]}});
+        assert_eq!(
+            crate::factory_intake::github_code_host_name(&values),
+            "operator-github"
+        );
+        // A new site binds its repositories to the recorded GitHub entry.
+        let first = resolve_jira_site(
+            bind_github_code_host(planned_jira_site_fixture(), &values),
+            &values,
+            "--forge-url",
+            "acme",
+        )
+        .unwrap();
+        assert!(first.recorded_binding.is_none());
+        assert_eq!(binding_code_hosts(&first), [json!("operator-github")]);
+        // A rerun against what the first run wrote is equivalent: the
+        // recorded binding is found and the recorded guard passes.
+        let written = json!({"factory": {
+            "codeHosts": [values["factory"]["codeHosts"][0].clone()],
+            "trackers": [first.tracker.clone()],
+            "bindings": [first.binding.clone()],
+        }});
+        let rerun = resolve_jira_site(
+            bind_github_code_host(planned_jira_site_fixture(), &written),
+            &written,
+            "--forge-url",
+            "acme",
+        )
+        .unwrap();
+        assert_eq!(rerun.recorded_binding.as_ref(), Some(&first.binding));
+        assert_eq!(binding_code_hosts(&rerun), [json!("operator-github")]);
+        check_recorded(&rerun, "acme").unwrap();
+        // The planned name in place of the recorded one would be refused.
+        let unbound =
+            resolve_jira_site(planned_jira_site_fixture(), &written, "--forge-url", "acme")
+                .unwrap();
+        let text = format!("{:#}", check_recorded(&unbound, "acme").unwrap_err());
+        assert!(text.contains("repos"), "{text}");
+    }
+
+    #[test]
+    fn without_a_recorded_github_code_host_the_planned_entry_is_bound() {
+        let gitlab = json!({"name": "operator-github", "kind": "gitlab", "host": "github.com"});
+        let values = json!({"factory": {"codeHosts": [gitlab]}});
+        let plan = bind_github_code_host(planned_jira_site_fixture(), &values);
+        assert_eq!(
+            binding_code_hosts(&plan),
+            [json!(crate::factory_intake::GITHUB_ENTRY)]
+        );
+    }
+
+    #[test]
+    fn a_dry_run_against_a_release_recording_the_real_site_is_described_not_refused() {
+        let forge = ForgeFlags {
+            tracker: super::super::TrackerKind::JiraCloud,
+            forge_url: Some("https://acme.atlassian.net".into()),
+            forge_username: Some("bot@example.com".into()),
+            token_file: Some(PathBuf::from("/never-read")),
+            start_accounts: vec!["starter".into()],
+            ..ForgeFlags::default()
+        };
+        let (planned, _) = described(&forge, &["acme/widgets".to_string()], "acme").unwrap();
+        // The release records the real site under the name a new site at
+        // this API URL would derive, so a placeholder identity would collide.
+        let name = super::super::forge_entry_name(TRACKER_KIND, "https://acme.atlassian.net");
+        let values = json!({"factory": {"trackers": [
+            recorded_jira_site_fixture(&name, "https://acme.atlassian.net"),
+        ]}});
+        let described_tracker = planned.tracker.clone();
+        let plan = resolve_jira_site(
+            bind_github_code_host(planned, &values),
+            &values,
+            "--forge-url",
+            "acme",
+        )
+        .expect("a dry run never refuses on its placeholder site");
+        assert_eq!(plan.tracker, described_tracker);
+        assert_eq!(plan.tracker["host"], json!("<site>"));
+        assert!(plan.recorded_tracker.is_none());
+    }
+
+    #[test]
+    fn a_gateway_url_for_a_recorded_site_root_is_an_identity_conflict() {
+        let values = json!({"factory": {"trackers": [recorded_jira_site_fixture("jira", "https://acme.atlassian.net")]}});
+        let mut plan = planned_jira_site_fixture();
+        plan.tracker["apiUrl"] = json!("https://acme.atlassian.net/ex/jira/cloud-1");
+        let text = format!(
+            "{:#}",
+            resolve_jira_site(plan, &values, "--forge-url", "acme").unwrap_err()
+        );
+        assert!(
+            text.contains("api identity") && text.contains("--forge-url"),
+            "{text}"
+        );
     }
 }

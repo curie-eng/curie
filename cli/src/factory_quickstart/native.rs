@@ -7,6 +7,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use super::instance::{Observation, ReleaseWriteMark};
 use super::{
     credential_decision, credit_check_key, ensure_credential, install_steps, kind_clusters,
     quickstart_model, read_release, release_model_recorded, run_install_action, Action,
@@ -113,11 +114,17 @@ pub(super) fn refuse_without_credential(credential: &CredentialDecision) -> Resu
 /// Runs the planned install actions, asking for the model credential once
 /// before `cluster up` when the plan says so. Returns whether the release
 /// runs a real model afterwards.
+///
+/// `cluster up` writes the release, so when the plan runs it the run's
+/// observation is read again immediately before it, after the credential
+/// prompt, refusing a concurrent change, and the revision it leaves is
+/// adopted right after it as the one the forge entries' upgrade fences on.
 pub(super) async fn run_install(
     install: &InstallSteps,
     credential: &CredentialDecision,
     mut release_has_real_model: bool,
     opts: &QuickstartOpts,
+    observation: &mut Observation,
 ) -> Result<bool> {
     let ui = crate::ui::ui();
     ui.note(&format!("Kubernetes context: {}", install.context));
@@ -143,7 +150,14 @@ pub(super) async fn run_install(
                 ));
             }
         }
-        run_install_action(action, prompted_model.as_ref()).await?;
+        let mark = matches!(action, Action::Cluster { .. }).then(ReleaseWriteMark::fresh);
+        if mark.is_some() {
+            observation.recheck().await?;
+        }
+        run_install_action(action, prompted_model.as_ref(), mark.as_ref()).await?;
+        if let Some(mark) = &mark {
+            observation.adopt_own_release_write(mark).await?;
+        }
     }
     Ok(release_has_real_model)
 }

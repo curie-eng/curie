@@ -188,6 +188,12 @@ def load_tool() -> ModuleType:
             "test_v0125_factory_upgrade_uses_supported_flow[secondary]",
             False,
         ),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_forge_instances.py::"
+            "test_forge_instances_survive_upgrade",
+            False,
+        ),
+        ("Fix pin: tools/factory-e2e/tests/test_c4_forge_instances_extra.py::test_example", True),
         ("Fix pin: apps/api/tests/test_agents.py::test_create_agent", True),
         ("Fix pin: cli/tests/verify_fix_pin.rs::ci_gate_pins", True),
         ("Fix pin: tools/factory-e2e/tests/test_scripted_driver.py::test_example", True),
