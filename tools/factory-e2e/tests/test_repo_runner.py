@@ -2957,3 +2957,40 @@ def test_public_factory_judge_command_exits_with_the_sample_verdict(sample: str,
         check=False,
     )
     assert result.returncode == code, result.stdout + result.stderr
+
+
+# --------------------------------------------------------------------------
+# The canonical pool schema's conditional daemon contract (ADR 0217)
+# --------------------------------------------------------------------------
+
+_DAEMON = json.loads(
+    (Path(__file__).resolve().parents[3] / "tests/vectors/daemon-config.json").read_text()
+)["daemon"]
+
+
+@pytest.mark.parametrize(
+    ("docker", "daemon", "valid"),
+    [
+        (False, None, True),
+        (True, _DAEMON, True),
+        (True, None, False),
+        (False, _DAEMON, False),
+        (True, {**_DAEMON, "maxClaimLifetimeSeconds": 0}, False),
+    ],
+    ids=["plain", "docker-with-daemon", "docker-missing-daemon", "plain-with-daemon", "zero-life"],
+)
+def test_harness_schema_interpreter_matches_the_conditional_daemon_contract(
+    docker: bool, daemon: dict[str, Any] | None, valid: bool
+) -> None:
+    schema = repo_runner._schema_resource("apps/worker/schema/repo-runner-pools.schema.json")
+    entry: dict[str, Any] = {
+        "pool": "acme-api-runner",
+        "digests": ["sha256:" + c * 64 for c in "abc"],
+        "base": "sha256:" + "d" * 64,
+        "docker": docker,
+        "egress": [],
+    }
+    if daemon is not None:
+        entry["daemon"] = daemon
+    failures = repo_runner._schema_failures({REPO_X: entry}, schema, schema, "pools")
+    assert (failures == []) is valid, failures
