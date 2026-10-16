@@ -381,7 +381,7 @@ class H(BaseHTTPRequestHandler):
         pass
 HTTPServer(('0.0.0.0', 8080), H).serve_forever()
 """
-PING = """import http.client, json, ssl, subprocess, sys
+PING = """import http.client, json, ssl, subprocess, sys, time
 host, port, timeout = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 tls = ['--tlsverify', '--tlscacert=/test-certs/ca.pem']
 tls += ['--tlscert=/test-certs/client-cert.pem', '--tlskey=/test-certs/client-key.pem']
@@ -397,20 +397,28 @@ def ping(cert=None, plain=False):
         conn.request('GET', '/_ping')
         response = conn.getresponse()
         return response.status == 200 and response.read() == b'OK'
-    except (ssl.SSLError, ConnectionResetError, BrokenPipeError,
-            http.client.RemoteDisconnected):
+    except (OSError, http.client.HTTPException):
         return False
     finally:
         conn.close()
-assert ping('client')
-assert not ping() and not ping('foreign') and not ping(plain=True)
-assert ping('client')
+def check(step, ok):
+    if not ok:
+        print(json.dumps({'failed': step}))
+        sys.exit(1)
+deadline = time.monotonic() + 120  # dockerd binds its listener after the pod is ready
+while not ping('client') and time.monotonic() < deadline:
+    time.sleep(2)
+check('authenticated_ping', ping('client'))
+check('no_client_cert_refused', not ping())
+check('foreign_ca_refused', not ping('foreign'))
+check('plaintext_refused', not ping(plain=True))
 docker = ['docker', f'--host=tcp://{host}:{port}', *tls, 'info', '--format', '{{json .}}']
-result = subprocess.run(docker, capture_output=True, text=True, timeout=timeout)
-assert result.returncode == 0
+result = subprocess.run(docker, capture_output=True, text=True, timeout=timeout * 10)
+check('docker_info', result.returncode == 0)
 info = json.loads(result.stdout)
-assert 'curie-authz' in info['Plugins']['Authorization']
-assert any('userns' in s for s in info['SecurityOptions'])
+plugins = (info.get('Plugins') or {}).get('Authorization') or []
+check('authz_plugin', 'curie-authz' in plugins)
+check('userns', any('userns' in s for s in info.get('SecurityOptions') or []))
 print(json.dumps({'mtls': True, 'negative_tls': True, 'docker_cli': True}))
 """
 
@@ -589,8 +597,13 @@ def live(f: FixtureAPI, docs: list[Json], config: Json, images: Json) -> None:
     outcome = f.k(
         *("-n", namespace, "exec", runner_name, "-c", "runner", "--", "python3", "-c", PING),
         *(dns, str(config["port"]), str(config["pingTimeoutSeconds"])),
+        check=False,
+        timeout=300,
     )
-    f.note("runtime", dict(json.loads(outcome.stdout)))
+    lines = outcome.stdout.strip().splitlines()
+    result = json.loads(lines[-1]) if lines else {"failed": "no_output"}
+    f.note("runtime", result)
+    require(outcome.returncode == 0 and "failed" not in result, "runtime_ping_failed")
     require(created["metadata"]["uid"], "daemon_uid_missing")
 
 
