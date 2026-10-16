@@ -388,7 +388,12 @@ for each connector and run. Each file has mode `0400`, belongs to UID/GID
 declared destination. Credential values are not written to client staging files
 or passed in Docker argv. Connector teardown and failed startup release owned
 credential volumes. Environment secrets and connectors using a remote `url` or
-`unhosted_url` remain supported.
+`unhosted_url` remain supported. That subpath mount needs Docker Engine 26.0
+or later (Engine API 1.45) and, on the local tier, Docker Compose v2.26.0 or
+later. `curie skill up` and `curie local up` connector bring-up refuse before
+creating any volume or container when a hosted connector declares
+`secret_files` on an older Docker, and bundles without `secret_files` are not
+checked.
 
 #### `local` target
 
@@ -397,7 +402,10 @@ queue -> worker -> sandboxed runner -> reply path on one machine, no Slack and
 no Kubernetes. `curie local up` uses the `full` compose profile by default.
 `curie local up --minimal` uses the smaller `core` profile. The compose API is
 published on host port `28000`. Add `curie local up --slack` to also start
-the optional Slack dispatcher.
+the optional Slack dispatcher. A bundle whose hosted connector declares
+`secret_files` needs Docker Engine 26.0 or later (Engine API 1.45) and Docker
+Compose v2.26.0 or later on this tier, as the `secret_files` note under the
+skill target explains; the local connector bring-up refuses on older versions.
 
 The Docker worker fetches and validates bundle, workspace, and attachment inputs,
 then copies them through the Docker API into claim-owned named volumes. Bundle
