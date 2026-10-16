@@ -110,6 +110,14 @@ RETRY_ALLOWLIST = frozenset(
             "e2e-scripted-factory",
             "Install kind and kubectl without creating a cluster",
         ),
+        # The CLI convergence regressions acquire Helm, kind and kubectl; each
+        # test creates its own cluster.
+        ("ci.yaml", "rust-convergence", "Install Helm"),
+        (
+            "ci.yaml",
+            "rust-convergence",
+            "Install kind and kubectl without creating a cluster",
+        ),
         ("ci.yaml", "e2e-required", "Install uv for the runtime assertion gate"),
         ("helm-ci.yaml", "chart-lint-and-assertions-1", "Install Helm"),
         ("helm-ci.yaml", "chart-assertions-2", "Install Helm"),
@@ -161,6 +169,7 @@ PROTECTED_STEPS = frozenset(
         ("ci.yaml", "python-pytest", "Pytest"),
         ("ci.yaml", "python-static", "Docs gate (catalog drift + agent contract + citations)"),
         ("ci.yaml", "rust-test", "Test"),
+        ("ci.yaml", "rust-convergence", "Test"),
         ("ci.yaml", "ui", "Lint"),
         ("ci.yaml", "ui", "Command manifest is current"),
         ("ci.yaml", "commit-messages", "Check the PR's commit messages"),

@@ -1178,9 +1178,13 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
             extra = pytest_command[3:]
             assert extra[: len(distribution)] == distribution
             extra = extra[len(distribution) :]
-            runtime_exclusion = "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py"
-            assert extra.count(runtime_exclusion) == 1
-            extra.remove(runtime_exclusion)
+            # Kind-backed regressions run in the scripted factory job instead.
+            for runtime_exclusion in (
+                "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
+                "--ignore=tools/factory-e2e/tests/test_c4_cluster_up.py",
+            ):
+                assert extra.count(runtime_exclusion) == 1
+                extra.remove(runtime_exclusion)
             report_chars = set("fEsxXpPaAR")
             assert all(
                 argument.startswith("--durations")
@@ -1191,7 +1195,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
                 )
                 for argument in extra
             ), (
-                "the Python suite requires one kind runtime exclusion and permits only "
+                "the Python suite requires both kind runtime exclusions and permits only "
                 "reporting flags plus the selected trailing deselect pair, "
                 f"got {pytest_command!r}"
             )
