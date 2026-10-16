@@ -849,7 +849,10 @@ pub async fn preflight_with_pem(
     requested: &[String],
     all_installed: bool,
 ) -> Result<AppPreflight> {
-    let api = GithubApi::new()?;
+    let api = GithubApi::new(
+        &crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE),
+        None,
+    )?;
     let app = crate::factory_app::inspect_app(&api, app_id, &pem).await?;
     let repos = crate::factory_app::resolve_allowlist(requested, &app, all_installed)?;
     let reports = announce(&api, &app, &repos).await?;

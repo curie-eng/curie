@@ -444,7 +444,12 @@ def _run_bash(
 
 
 def _run_pytest_step(
-    tmp_path: Path, *, shard: int, deselect: str, scope: str = "full"
+    tmp_path: Path,
+    *,
+    shard: int,
+    deselect: str,
+    scope: str = "full",
+    cli_files: tuple[str, ...] | None = None,
 ) -> list[str]:
     """Execute the real workflow Bash and record each argument at the uv boundary."""
     step = _named_steps("python-pytest")["Pytest"]
@@ -461,7 +466,10 @@ def _run_pytest_step(
         relative = "tools/e2e-ci-selection/cli_pytest_files.txt"
         destination = tmp_path / relative
         destination.parent.mkdir(parents=True)
-        shutil.copyfile(REPO_ROOT / relative, destination)
+        if cli_files is None:
+            shutil.copyfile(REPO_ROOT / relative, destination)
+        else:
+            destination.write_text("\n".join(cli_files) + "\n")
     state = {"shard": str(shard), "pytest_deselect": deselect, "pytest_scope": scope}
     result = _run_bash(
         script,

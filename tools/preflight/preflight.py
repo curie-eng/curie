@@ -727,7 +727,7 @@ def fix_pin_requirements(root: Path, event: Path, directory: Path) -> dict[str, 
     if check["status"] == "failed":
         raise ValueError(check["detail"])
     values = dict(line.split("=", 1) for line in output.read_text().splitlines())
-    if set(values) != {"needed", "needs_stack", "needs_kind"} or any(
+    if set(values) != {"needed", "needs_stack", "needs_kind", "needs_factory_upgrade"} or any(
         value not in {"true", "false"} for value in values.values()
     ):
         raise ValueError("Fix pin build selection returned invalid infrastructure requirements")

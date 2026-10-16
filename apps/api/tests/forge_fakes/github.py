@@ -44,6 +44,10 @@ BASE_SHA = "0" * 39 + "1"
 # The factory's GitHub App. A placeholder, never a real key: tests that mint
 # for real pass their own generated PEM.
 APP_ID = "51"
+# The fixture App's slug (`GitHubCredentials.app_slug`); what an installation
+# token writes is authored by its bot user, ``<slug>[bot]`` (#4629).
+APP_SLUG = "curie-fixture"
+APP_BOT_USER = {"id": 1001, "login": f"{APP_SLUG}[bot]", "type": "Bot"}
 PRIVATE_KEY = "example-private-key"
 GITHUB_API = "https://api.github.com"
 
@@ -234,6 +238,7 @@ def fake_installation_tokens(monkeypatch: Any, credentials: Any = None) -> None:
         return installation, fake.token_for_verified_installation(repo, installation)
 
     monkeypatch.setattr(GitHubCredentials, "fresh_installation_token", fresh_installation_token)
+    monkeypatch.setattr(GitHubCredentials, "app_slug", lambda _self: APP_SLUG)
 
 
 class GitHubAPI:
@@ -271,6 +276,10 @@ class GitHubAPI:
                 200,
                 json={"id": self.repository_id, "full_name": REPO, "default_branch": "main"},
             )
+        if path == f"/repos/{REPO}/pulls" and request.method == "GET":
+            # The repository-wide listing rediscovery reads (#4629): no factory
+            # publication exists in this stand-in.
+            return httpx.Response(200, json=[])
         if path.startswith(f"/repos/{REPO}/git/ref/heads/"):
             # Admission resolves the base and reads its commit through the
             # code host (#3095).
@@ -702,6 +711,8 @@ class GitHubRepositoryFake:
         return {
             "number": number,
             "html_url": f"https://github.com/{REPO}/pull/{number}",
+            # The App's installation token opened it.
+            "user": dict(APP_BOT_USER),
             "state": pull["state"],
             "merged_at": pull["merged_at"],
             "title": pull["title"],
@@ -767,8 +778,12 @@ class GitHubRepositoryFake:
                 return httpx.Response(404, json={"message": "Not Found"})
             return httpx.Response(200, json=commit)
         if path == f"{repo}/pulls":
+            assert request.url.params.get("state") == "all"
+            if "head" not in request.url.params:
+                # Every pull request, one page (rediscovery's listing, #4629).
+                return httpx.Response(200, json=[self._pull_payload(n) for n in self.pulls])
             owner, _, branch = request.url.params.get("head", "").partition(":")
-            assert owner == REPO.split("/")[0] and request.url.params.get("state") == "all"
+            assert owner == REPO.split("/")[0]
             found = [self._pull_payload(n) for n, p in self.pulls.items() if p["head"] == branch]
             return httpx.Response(200, json=found)
         matched = re.fullmatch(rf"{repo}/pulls/(\d+)(/comments|/reviews)?(?:/(\d+))?", path)

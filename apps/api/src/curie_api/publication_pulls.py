@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from curie_api.forges.errors import Ambiguous, ForgeError
@@ -95,6 +96,7 @@ async def adopt_or_open(
     contract: PullRequestContract,
     *,
     expected_head_sha: str,
+    before_open: Callable[[], Awaitable[None]],
 ) -> PullRequest | None:
     """The branch's pull request, adopted or opened; None when the branch is absent.
 
@@ -105,6 +107,10 @@ async def adopt_or_open(
     request is adopted and never doubled; the open's failure is raised only
     when that read finds nothing. More than one pull request from the branch
     is refused, never resolved by picking one.
+
+    ``before_open`` runs only when a new pull request is about to be opened:
+    the branch has none and holds ``expected_head_sha``. It refuses by raising
+    (`PullRequestRefused`), and then nothing is opened (#4629).
     """
 
     existing = await _find(code_host, repository, contract.branch)
@@ -117,6 +123,7 @@ async def adopt_or_open(
         raise PullRequestRefused(
             "branch_moved", "the publication branch no longer matches the expected commit"
         )
+    await before_open()
     try:
         opened = await code_host.open_pull_request(
             repository,

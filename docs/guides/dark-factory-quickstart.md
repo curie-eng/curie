@@ -410,15 +410,46 @@ reads as a single forge configuration document:
    `factory.cardBaseUrl` and `factory.ciWaitSeconds` replace the matching
    `api.*` settings.
 
-The old `api.githubFactory*` keys are removed. For a v0.12.5 installation
-configured with `curie cluster factory`, the v0.13.0 refusal's suggested
-`cluster factory` remedy also fails, even with explicit label and mention.
-Until [#4628](https://github.com/curie-eng/curie/issues/4628) is fixed, follow the
-[verified manual migration](../operations.md#manual-factory-migration-from-v0125-to-v0130):
-prepare one values overlay with typed factory credentials, tracker and
-repository bindings, set all ten legacy keys to `null`, and pass the overlay
-to `curie cluster upgrade --to 0.13.0 --forward-only`. The upgrade retains its
-convergence, canary and known-good recording. See
+The old `api.githubFactory*` keys are removed. To upgrade a v0.12.5
+installation configured with `curie cluster factory`, use a CLI containing
+the fix for [#4628](https://github.com/curie-eng/curie/issues/4628) and run the
+normal `curie cluster upgrade --to <target-version>` flow. It automatically
+migrates retained factory settings before candidate validation, preserving
+labels, mention, intake, repository routing, bases, CI policies, credential
+references and unrelated settings. The same upgrade performs drain,
+checkpoint, convergence, canary and known-good recording.
+
+Preview with `--dry-run --json`; migration plan lines and refusals name
+settings without printing their values. Conflicting or malformed legacy
+configuration and ambiguous bindings refuse before any Helm mutation, leaving
+the old release serving.
+
+Identity migration requires explicit repositories in `api.githubRepoAllowlist`
+and a retained `api.githubAppExistingSecret` reference; `owner/*` and
+inline-only App keys refuse. The CLI machine must reach the retained
+`api.githubApiUrl` during live `curie cluster up`, `curie apply`, `curie diff`
+and `curie cluster upgrade`, including upgrade `--dry-run`. Each migration
+consumer may mint external App installation tokens and create audit entries.
+Local `curie cluster up --dry-run` and `curie apply --dry-run` refuse legacy
+settings needing live identity resolution. For a private CA, supply
+`codeHostTrust.caBundle` with a namespace ConfigMap reference in the upgrade
+values overlay.
+
+For GHES, supply explicit typed code-host and tracker egress. Retained
+publication CIDRs alone supply only the code-host route. Tracker inference
+requires an unambiguous retained connector list with matching API ports and
+either the same publication grants or every CIDR covering the literal origin
+IP without excluding it. GHES migration may enroll an otherwise unlisted
+agent when no factory agent is enrolled and its retained grant covers the
+full forge egress union; this also adds per-agent sandbox and warm-pool
+membership. The github.com path does not infer enrollment. See
+[automatic migration](../operations.md#automatic-migration-of-a-legacy-github-factory)
+for the precise trust/egress prerequisites and schema compatibility rules.
+
+The released v0.13.0 CLI lacks this automatic migration, and its suggested
+`cluster factory` remedy also fails on legacy installations. The
+[historical manual procedure](../operations.md#manual-factory-migration-from-v0125-to-v0130)
+applies when using that CLI. See
 [factory settings](../operations.md#admitting-a-labelled-github-issue) for the
 current configuration model.
 

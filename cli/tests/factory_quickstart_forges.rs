@@ -6,7 +6,7 @@
 //! comparing. Fixture updates require review of the full current plan.
 
 use curie::factory_quickstart::{
-    describe, quickstart_plan, PlanInput, DEFAULT_AGENT, DEFAULT_BUDGET_USD,
+    describe, quickstart_plan, PlanInput, ReleaseRead, DEFAULT_AGENT, DEFAULT_BUDGET_USD,
     DEFAULT_DEADLINE_SECONDS, DEFAULT_KIND_NAME, DEFAULT_MODEL,
 };
 use std::path::{Path, PathBuf};
@@ -40,7 +40,7 @@ fn base() -> PlanInput {
         release_has_real_model: false,
         chart_explicit: false,
         interactive: true,
-        release_at_target: false,
+        release_read: ReleaseRead::NotAtTarget,
         agent: DEFAULT_AGENT.into(),
         label: None,
         plugin_dir: None,

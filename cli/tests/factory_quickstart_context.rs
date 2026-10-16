@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use curie::exit::{classify, ExitClass};
 use curie::factory_quickstart::{
-    describe, quickstart_plan, PlanInput, DEFAULT_AGENT, DEFAULT_BUDGET_USD,
+    describe, quickstart_plan, PlanInput, ReleaseRead, DEFAULT_AGENT, DEFAULT_BUDGET_USD,
     DEFAULT_DEADLINE_SECONDS, DEFAULT_KIND_NAME, DEFAULT_MODEL,
 };
 
@@ -41,7 +41,7 @@ fn plan_input() -> PlanInput {
         release_has_real_model: false,
         chart_explicit: false,
         interactive: false,
-        release_at_target: false,
+        release_read: ReleaseRead::NotAtTarget,
         agent: DEFAULT_AGENT.into(),
         label: None,
         plugin_dir: None,
@@ -488,4 +488,119 @@ fn the_cli_terminal_accepts_yes_and_reaches_helm_and_no_stops_first() {
         tools.log()
     );
     drop(dir);
+}
+
+/// #4626: a dry run with a targeted context does not read the release, so it
+/// must not claim an unconditional `cluster up` or that the release has no real
+/// model. The plan states the live decision as conditional lines, identically
+/// in human and JSON output.
+#[test]
+fn the_cli_targeted_dry_run_plans_cluster_up_conditionally() {
+    let run = |json: bool| {
+        let tools = ToolDir::new();
+        let (dir, config) = kubeconfig("work-cluster");
+        let config_dir = tools.root.join("curie-config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let mut args = vec!["--context", "chosen", "--dry-run"];
+        if json {
+            args.push("--json");
+        }
+        let output = command(&tools, &config, &args)
+            .env("CURIE_CONFIG_DIR", &config_dir)
+            .env("XDG_CONFIG_HOME", tools.root.join("config"))
+            .env_remove("CURIE_MODEL")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let shown = format!("{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(output.status.code(), Some(0), "json={json}: {shown}");
+        let log = tools.log();
+        assert!(
+            log.lines().all(|line| line != "kind"),
+            "json={json}: a targeted dry run never runs kind: {log}"
+        );
+        drop(dir);
+        (stdout, shown)
+    };
+
+    let (human, human_shown) = run(false);
+    let (json, json_shown) = run(true);
+    let human_lines: Vec<String> = human
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_owned)
+        .collect();
+    let body: serde_json::Value = serde_json::from_str(&json)
+        .unwrap_or_else(|error| panic!("one plan object ({error}): {json_shown}"));
+    assert_eq!(body["dry_run"], true, "{body}");
+    let plan: Vec<String> = body["plan"]
+        .as_array()
+        .unwrap_or_else(|| panic!("plan lines: {body}"))
+        .iter()
+        .map(|line| line.as_str().expect("plan line is a string").to_owned())
+        .collect();
+    assert_eq!(
+        human_lines, plan,
+        "human and JSON dry runs must carry the same lines:\n{human_shown}\n{json_shown}"
+    );
+
+    let expected = [
+        "release curie in namespace curie was not read under --dry-run; a live run reads it and decides whether cluster up runs".to_owned(),
+        "if the release already runs the target chart and values: skip cluster up and keep the model the release records".to_owned(),
+        format!("if the release records a real model, cluster up keeps that model and its credential in place of --model {DEFAULT_MODEL}"),
+    ];
+    let mut positions = Vec::new();
+    for line in &expected {
+        let found: Vec<usize> = plan
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| *candidate == line)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(found.len(), 1, "exactly one {line:?}: {plan:#?}");
+        positions.push(found[0]);
+    }
+    let otherwise: Vec<usize> = plan
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("otherwise: curie cluster up "))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(otherwise.len(), 1, "one conditional cluster up: {plan:#?}");
+    positions.push(otherwise[0]);
+    assert!(
+        positions.windows(2).all(|pair| pair[0] + 1 == pair[1]),
+        "the conditional lines must be consecutive and in order: {plan:#?}"
+    );
+    let up = &plan[otherwise[0]];
+    assert!(
+        up.starts_with(
+            "otherwise: curie cluster up --context chosen --namespace curie --release curie "
+        ),
+        "{up}"
+    );
+    assert!(up.contains(&format!("--model {DEFAULT_MODEL}")), "{up}");
+    assert!(
+        plan.iter()
+            .filter(|line| line.contains("curie cluster up"))
+            .all(|line| line.starts_with("otherwise: curie cluster up ")),
+        "no unconditional cluster up may be planned: {plan:#?}"
+    );
+    assert!(
+        !plan
+            .iter()
+            .any(|line| line
+                == "skip cluster up: the release is already at the target chart and values"),
+        "an unread release must not be claimed at target: {plan:#?}"
+    );
+    let credential: Vec<&String> = plan
+        .iter()
+        .filter(|line| line.starts_with("model credential: "))
+        .collect();
+    assert_eq!(
+        credential,
+        vec!["model credential: if the release records a real model, keep it (no prompt); otherwise refuse because CURIE_CREDENTIALS is unset, the release has no real model, and stdin is not a terminal"],
+        "{plan:#?}"
+    );
 }
