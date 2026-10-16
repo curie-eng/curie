@@ -186,6 +186,7 @@ def _tune_action(**overrides: Any) -> dict[str, Any]:
     action.update(overrides)
     return action
 
+
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
 # ---------------------------------------------------------------------------
@@ -761,6 +762,92 @@ def test_the_remediation_authority_is_checked_before_the_body_is_validated(
         assert _policy_row(agent_id) is None
 
 
+def _raw_request(
+    client: TestClient, agent: str, verb: str, headers: dict[str, str], body: bytes
+) -> Any:
+    return client.request(
+        "PUT" if verb == "put" else "POST",
+        _url(agent) if verb == "put" else _url(agent, suffix="/arm"),
+        content=body,
+        headers={**headers, "Content-Type": "application/json"},
+    )
+
+
+@pytest.mark.parametrize("verb", ["put", "arm"])
+def test_an_undecodable_body_without_the_remediation_authority_is_403_not_a_body_error(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3 (ADR 0231): the authority is checked before
+    the body is decoded, so bytes that are not UTF-8 leak no body error.
+    """
+
+    if verb == "arm":
+        _bind(client, agent_id, auth_headers)
+    before_rows = _generation_rows(agent_id)
+
+    response = _raw_request(client, agent_id, verb, _reducer(auth_headers), b"\xff")
+
+    _assert_authority_refused(response)
+    assert _generation_rows(agent_id) == before_rows
+
+
+@pytest.mark.parametrize("verb", ["put", "arm"])
+@pytest.mark.parametrize("body", [b"\xff", b"not json", b"{}"])
+@pytest.mark.parametrize("with_principal", [False, True])
+def test_an_unauthenticated_caller_is_401_before_any_authority_or_body_error(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    agent_id: str,
+    verb: str,
+    body: bytes,
+    with_principal: bool,
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3 (ADR 0231): precedence is 401 (no platform
+    key, no console session), then 403 ``remediation_authority_required``, then
+    body errors. An unauthenticated caller never sees the 403 or a body error.
+    """
+
+    if verb == "arm":
+        _bind(client, agent_id, auth_headers)
+    before_rows = _generation_rows(agent_id)
+
+    headers = _operator() if with_principal else {}
+    response = _raw_request(client, agent_id, verb, headers, body)
+
+    assert response.status_code == 401, response.text
+    assert "remediation_authority_required" not in response.text
+    assert _generation_rows(agent_id) == before_rows
+
+
+@pytest.mark.parametrize("verb", ["put", "arm"])
+@pytest.mark.parametrize(
+    "body, status",
+    [(b"not json", 422), (b"\xff", 400)],
+)
+def test_an_authorized_undecodable_or_non_json_body_is_a_body_error_not_an_authority_refusal(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    agent_id: str,
+    verb: str,
+    body: bytes,
+    status: int,
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3 (ADR 0231): the liveness side. With the
+    platform key, a principal and the correct authority the authority gate
+    passes, so the body is what is refused, and nothing is written.
+    """
+
+    if verb == "arm":
+        _bind(client, agent_id, auth_headers)
+    before_rows = _generation_rows(agent_id)
+
+    response = _raw_request(client, agent_id, verb, _admin(auth_headers), body)
+
+    assert response.status_code == status, response.text
+    assert "remediation_authority_required" not in response.text
+    assert _generation_rows(agent_id) == before_rows
+
+
 @pytest.mark.parametrize("verb", ["put", "arm"])
 def test_a_malformed_body_with_the_remediation_authority_is_still_a_validation_error(
     client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str
@@ -823,9 +910,7 @@ def test_the_remediation_authority_without_the_platform_key_is_401(
     generation = 0 if verb == "put" else _bind(client, agent_id, auth_headers)
     before_rows = _generation_rows(agent_id)
 
-    response = _bind_or_arm(
-        client, agent_id, verb, {**_operator(), **_authority()}, generation
-    )
+    response = _bind_or_arm(client, agent_id, verb, {**_operator(), **_authority()}, generation)
 
     assert response.status_code == 401, response.text
     assert _generation_rows(agent_id) == before_rows
@@ -843,9 +928,7 @@ def test_the_remediation_authority_without_an_operator_principal_is_refused(
     generation = 0 if verb == "put" else _bind(client, agent_id, auth_headers)
     before_rows = _generation_rows(agent_id)
 
-    response = _bind_or_arm(
-        client, agent_id, verb, {**auth_headers, **_authority()}, generation
-    )
+    response = _bind_or_arm(client, agent_id, verb, {**auth_headers, **_authority()}, generation)
 
     assert response.status_code == 403, response.text
     assert _code(response) == "operator_principal_required"
@@ -1359,9 +1442,7 @@ VALID: list[Any] = [
         id="tightened-limits",
     ),
     pytest.param(_policy(actions=[_action(kind="prevent")]), id="prevent-not-automatic"),
-    pytest.param(
-        _policy(actions=[_action(reversibility="idempotent")]), id="idempotent-action"
-    ),
+    pytest.param(_policy(actions=[_action(reversibility="idempotent")]), id="idempotent-action"),
 ]
 
 
@@ -1465,9 +1546,7 @@ NON_FINITE: list[Any] = [
     pytest.param(
         _policy(
             actions=[
-                _action(
-                    verifier={**VERIFIER, "arguments": {"query": "up", "step": float("inf")}}
-                )
+                _action(verifier={**VERIFIER, "arguments": {"query": "up", "step": float("inf")}})
             ]
         ),
         id="read-arguments-infinity",

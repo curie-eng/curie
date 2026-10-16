@@ -41,7 +41,6 @@ from collections.abc import Callable, Coroutine
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request, Response
-from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from sqlalchemy import select
@@ -114,11 +113,14 @@ async def require_remediation_authority(
 class _AuthorityFirstRoute(APIRoute):
     """Puts the remediation authority ahead of body decoding on the routes that need it.
 
-    FastAPI resolves route dependencies before it validates the body, so a
-    missing authority already wins over an ill-typed body. It decodes JSON
-    before either, though; on a route carrying ``require_remediation_authority``
-    a body that does not decode is answered with the authority refusal when the
-    authority is missing, so an unauthorized caller never sees a ``422``.
+    FastAPI reads and decodes the body before it resolves dependencies, so a
+    body that does not decode would be answered ``400``/``422`` ahead of a
+    missing authority. On a route carrying ``require_remediation_authority``
+    the wrapper therefore checks the authority before the handler runs, so no
+    body is read. Precedence: ``401`` unauthenticated (``require_api_key``, run
+    here first for a caller refused for authority), then ``403``
+    ``remediation_authority_required``, then body ``400``/``422``, then
+    ``operator_principal_required`` and the rest.
     """
 
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
@@ -130,13 +132,11 @@ class _AuthorityFirstRoute(APIRoute):
             return handler
 
         async def guarded(request: Request) -> Response:
-            try:
-                return await handler(request)
-            except RequestValidationError:
-                refusal = _authority_refusal(request.headers.get(REMEDIATION_AUTHORITY_HEADER))
-                if refusal is not None:
-                    raise refusal from None
-                raise
+            refusal = _authority_refusal(request.headers.get(REMEDIATION_AUTHORITY_HEADER))
+            if refusal is not None:
+                await require_api_key(request, request.headers.get("x-api-key"))
+                raise refusal
+            return await handler(request)
 
         return guarded
 

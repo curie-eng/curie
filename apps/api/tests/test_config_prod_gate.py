@@ -147,12 +147,32 @@ def test_the_remediation_authority_is_unset_by_default(monkeypatch: pytest.Monke
 
 
 @pytest.mark.parametrize("environment", ["prod", "dev", "test", "staging", "unknown", "PROD"])
-@pytest.mark.parametrize("key", [" ", "   ", "\t\r\n"])
+@pytest.mark.parametrize("key", ["", " ", "   ", "\t\r\n"])
 def test_a_blank_remediation_authority_is_refused_in_every_environment(
     environment: str, key: str
 ) -> None:
     with pytest.raises(ValidationError) as exc:
         _settings(environment=environment, remediation_authority_key=key)
+    assert REMEDIATION_AUTHORITY_ENV in str(exc.value)
+
+
+@pytest.mark.parametrize("environment", ["prod", "dev", "test", "staging", "unknown", "PROD"])
+@pytest.mark.parametrize("key", ["", " ", "   ", "\t\r\n"])
+def test_a_blank_remediation_authority_from_the_environment_is_refused_in_every_environment(
+    environment: str, key: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The variable is provided but blank (including the empty string): refused,
+    # unlike an omitted variable, which the tests below cover.
+    monkeypatch.setenv(REMEDIATION_AUTHORITY_ENV, key)
+    with pytest.raises(ValidationError) as exc:
+        Settings(
+            _env_file=None,
+            environment=environment,
+            api_key="a-real-key",
+            approval_chat_attester_secret="a-real-chat-attester-secret",
+            github_webhook_secret="a-real-secret",
+            internal_worker_token="a-real-worker-token",
+        )
     assert REMEDIATION_AUTHORITY_ENV in str(exc.value)
 
 
@@ -180,9 +200,10 @@ def test_prod_refuses_an_unset_or_dev_default_remediation_authority(key: str) ->
     with pytest.raises(ValidationError) as exc:
         _settings(remediation_authority_key=key)
     message = str(exc.value)
-    assert "ENVIRONMENT=prod" in message
     assert REMEDIATION_AUTHORITY_ENV in message
     if key:
+        # The dev default is a prod-only refusal; a blank key is refused everywhere.
+        assert "ENVIRONMENT=prod" in message
         assert key not in message
 
 
@@ -210,12 +231,18 @@ def test_prod_boots_with_a_distinct_non_default_remediation_authority() -> None:
 
 
 @pytest.mark.parametrize("environment", ["dev", "test", "staging", "unknown"])
-def test_outside_prod_the_dev_default_and_unset_remediation_authority_boot(
-    environment: str,
+def test_outside_prod_the_dev_default_and_omitted_remediation_authority_boot(
+    environment: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    for key in ("", DEV_DEFAULT_REMEDIATION_AUTHORITY):
-        settings = _settings(environment=environment, remediation_authority_key=key)
-        assert settings.remediation_authority_key == key
+    settings = _settings(
+        environment=environment, remediation_authority_key=DEV_DEFAULT_REMEDIATION_AUTHORITY
+    )
+    assert settings.remediation_authority_key == DEV_DEFAULT_REMEDIATION_AUTHORITY
+
+    # Omitted: neither the init kwarg nor the environment variable is provided.
+    monkeypatch.delenv(REMEDIATION_AUTHORITY_ENV, raising=False)
+    omitted = Settings(_env_file=None, environment=environment, api_key="a-real-key")
+    assert omitted.remediation_authority_key == ""
 
 
 def test_the_remediation_authority_preserves_its_nonblank_bytes() -> None:

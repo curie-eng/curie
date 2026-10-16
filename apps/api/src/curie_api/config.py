@@ -1263,7 +1263,7 @@ class Settings(BaseSettings):
         if attester_secret and attester_secret == self.api_key:
             raise ValueError("CURIE_APPROVAL_CHAT_ATTESTER_SECRET must be distinct from API_KEY")
         authority_key = self.remediation_authority_key
-        if authority_key and not authority_key.strip():
+        if "remediation_authority_key" in self.model_fields_set and not authority_key.strip():
             raise ValueError("CURIE_REMEDIATION_AUTHORITY_KEY must be non-blank")
         if authority_key and authority_key == self.api_key:
             raise ValueError("CURIE_REMEDIATION_AUTHORITY_KEY must be distinct from API_KEY")
