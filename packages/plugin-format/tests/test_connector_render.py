@@ -2187,3 +2187,67 @@ def test_config_never_becomes_the_bearer() -> None:
     assert _github_entry(_configured())["headers"] == {"Authorization": "Bearer ${DOCS_TOKEN}"}
     config_only = ConnectorSpec(image="ghcr.io/example/docs-mcp:1", config=["DOCS_FOLDER_PATH"])
     assert "headers" not in _github_entry(config_only)
+
+
+# --------------------------------------------------------------------------- #
+# `no_client_auth`: no Authorization header is derived, and the rendered
+# objects do not change (#4669).
+# --------------------------------------------------------------------------- #
+def _no_client_auth_spec(**overrides: object) -> ConnectorSpec:
+    fields: dict = {
+        "image": "ghcr.io/example/docs-mcp:1",
+        "port": 8000,
+        "secrets": ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+        "no_client_auth": (
+            "In-cluster MCP server reached over the pod network; it authenticates no "
+            "client and the boundary is its ingress NetworkPolicy."
+        ),
+    }
+    fields.update(overrides)
+    return ConnectorSpec(**fields)
+
+
+def test_no_client_auth_hosted_entry_has_no_authorization_header() -> None:
+    assert "headers" not in _github_entry(_no_client_auth_spec())
+
+
+def test_no_client_auth_single_plain_secret_derives_no_header() -> None:
+    assert "headers" not in _github_entry(_no_client_auth_spec(secrets=["UPSTREAM_TOKEN"]))
+
+
+def test_no_client_auth_unhosted_entry_has_no_authorization_header() -> None:
+    spec = _no_client_auth_spec(
+        secrets=["UPSTREAM_TOKEN"], unhosted_url="http://127.0.0.1:9000/mcp"
+    )
+    entry = r.unhosted_mcp_entry(spec)
+    assert entry is not None
+    assert "headers" not in entry
+
+
+def test_no_client_auth_rendered_objects_equal_the_same_declaration_without_it() -> None:
+    with_key = _objs(spec=_no_client_auth_spec())
+    without_key = _objs(
+        spec=ConnectorSpec(
+            image="ghcr.io/example/docs-mcp:1",
+            port=8000,
+            secrets=["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+        )
+    )
+    assert with_key == without_key
+    kinds = {obj["kind"] for obj in with_key}
+    assert {"Deployment", "Service", "NetworkPolicy"} <= kinds
+
+
+def test_no_client_auth_secrets_keep_pod_side_delivery() -> None:
+    deployment = next(
+        obj for obj in _objs(spec=_no_client_auth_spec()) if obj["kind"] == "Deployment"
+    )
+    env = deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+    by_name = {item["name"]: item for item in env}
+    for name in ("UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"):
+        assert by_name[name] == {
+            "name": name,
+            "valueFrom": {
+                "secretKeyRef": {"name": "conn-secrets", "key": name, "optional": False}
+            },
+        }
