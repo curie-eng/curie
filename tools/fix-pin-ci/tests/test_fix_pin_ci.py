@@ -79,6 +79,7 @@ LOCAL_SELECTOR = "cli/tests/local/test_deploy.py::test_deploy"
 LOCAL_LIVE_SELECTOR = "cli/tests/local/test_live.py::test_live"
 LIVE_SELECTOR = "runner/tests/test_live.py::test_example"
 CHART_SELECTOR = "charts/curie/ci/render-assertions.sh"
+NOTES_RELEASE_TARGET_SELECTOR = "charts/curie/ci/notes-release-target-assertions.sh"
 REPOSITORY = "curie-eng/curie"
 STACK_BRANCH = "task/local-deployment-fix-pin"
 BASE_SHA = "a" * 40
@@ -1815,6 +1816,21 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
         (f"Fix pin: {FACTORY_SELECTOR}", True, True, False, False),
         (f"Fix pin: {LOCAL_SELECTOR}", True, True, False, False),
         (f"Fix pin: {CHART_SELECTOR}", True, True, False, False),
+        (f"Fix pin: {NOTES_RELEASE_TARGET_SELECTOR}", True, False, True, False),
+        (
+            "Fix pin: charts/curie/ci/notes-release-target-extra-assertions.sh",
+            True,
+            True,
+            False,
+            False,
+        ),
+        (
+            "Fix pin: charts/curie/ci/runtime/notes-release-target-assertions.sh",
+            True,
+            True,
+            False,
+            False,
+        ),
         ("Fix pin: cli/tests/verify_fix_pin.rs::ci_gate_pins", True, True, False, False),
         (
             "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding_extra.py::test_example",

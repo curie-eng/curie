@@ -65,6 +65,7 @@ FORGE_INSTANCES_MODULE = "tools/factory-e2e/tests/test_c4_forge_instances.py"
 # Pins in these modules run against an owned kind cluster, not the dev stack.
 KIND_MODULES = frozenset(
     {
+        "charts/curie/ci/notes-release-target-assertions.sh",
         "tools/factory-e2e/tests/test_c4_initial_binding.py",
         "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
         FACTORY_UPGRADE_MODULE,
