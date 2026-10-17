@@ -52,11 +52,18 @@ as ``factory-tools-agent-factory-e2e-img-<first 12 index hex digits>-runner-pool
 The missing name must be absent, and the stale base must differ from the
 actual installed platform index digest. Both facts are checked before sending.
 
-The install sets ``agentSandbox.runnerEnv`` for the factory agent to
+The install pins ``agentSandbox.runner.digest`` to the platform runner's
+index digest, because the worker refuses every repository runner as
+``stale_base`` on an installation whose runner image carries only a tag. It
+sets ``agentSandbox.runnerEnv`` for the factory agent to
 ``CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000``, and the judge reads that value back
 from each completed turn's runner container. The scripted model runs one Bash
 manifest probe per turn; on U it must report ``curie-no-tool-manifest`` and the
-runner boot log must say the manifest is absent.
+runner boot log must say the manifest is absent. The probe output may be
+followed only by whole ``<system-reminder>`` blocks, which the harness appends
+to tool results. Each turn records the CLI outcome's ``failure_class`` and
+``reply``. The worker delivers the three refusals as ordinary replies, so a
+refusal is read from its documented reply text, not from ``failed``.
 
 Only the new namespace and its worker Deployment are mutated. The namespace
 carries ``owner=factory-tools`` alongside the harness ownership marker. The
@@ -100,11 +107,36 @@ RUNNER_ENV = {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "16000"}
 SELECTION_CONFLICT = "workspace.selection_conflict"
 FAULT_REASONS = frozenset({"repo_runner_pool_missing", "repo_runner_base_mismatch"})
 REFUSAL_REASONS = FAULT_REASONS | {SELECTION_CONFLICT}
+# apps/worker/src/curie_worker/workspace.py maps workspace.selection_conflict
+# to this exact public reply.
+SELECTION_CONFLICT_REPLY = "This thread is already bound to a different repository."
+# The kernel answers a RepoRunnerPoolRefused once, as a plain reply with no
+# turn-failure marker: "This agent cannot start: {exc}. ..."
+# (apps/worker/src/curie_worker/kernel/attempt.py). The message names the
+# repository and ends its reason in "(missing_pool)" or "(stale_base)"
+# (RepoRunnerPoolRefused in apps/worker/src/curie_worker/sandbox/types.py).
+_POOL_REFUSAL_REPLY = re.compile(
+    r"This agent cannot start: repository (?P<repository>\S+) .*?"
+    r"\((?P<reason>missing_pool|stale_base)\); ",
+    re.S,
+)
+_POOL_REFUSAL_REASONS = {
+    "missing_pool": "repo_runner_pool_missing", "stale_base": "repo_runner_base_mismatch",
+}
 SCRIPTED_KEY = "scripted-no-upstream"
+# The chart's default agentSandbox.runner.image.
+PLATFORM_RUNNER = f"{fe.GHCR.removeprefix('https://')}/{fe.IMAGE_OWNER}/{fe.RUNNER_IMAGE}"
 TEST_RELEASE = "factory-tools"
 ROOT = Path(__file__).resolve().parents[2]
 _REPOSITORY = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._~-]*/[A-Za-z0-9_][A-Za-z0-9._~-]*\Z")
 _MANIFEST_COUNT = re.compile(r"\btool[ _-]manifest\b[^\n]*?\b([0-9]+)\s+tools\b", re.I)
+# Claude Code appends budget notices to a Bash tool result as whole
+# <system-reminder> blocks (run 4919 recorded a token and a USD block after
+# the probe's own output). Only a tail made of nothing but such blocks is
+# removed from what the probe printed.
+_REMINDER_TAIL = re.compile(
+    r"(?:\s*<system-reminder>(?:(?!</?system-reminder>).)*</system-reminder>)+\s*\Z", re.S
+)
 
 
 def scenario_values(base: Mapping[str, Any], bindings: list[dict[str, Any]]) -> dict[str, Any]:
@@ -284,9 +316,28 @@ def _exact_digest(value: object) -> bool:
     return isinstance(value, str) and re.fullmatch(pattern, value) is not None
 
 
+def _probe_output(output: object) -> str | None:
+    """What the manifest probe printed, without the appended reminder blocks.
+
+    None when the result is not text, or when anything other than whole
+    ``<system-reminder>`` blocks follows the first one.
+    """
+
+    if not isinstance(output, str):
+        return None
+    start = output.find("<system-reminder>")
+    if start < 0:
+        return output
+    if _REMINDER_TAIL.fullmatch(output, start) is None:
+        return None
+    return output[:start]
+
+
 def _manifest_failures(turn: Mapping[str, Any], runner: Mapping[str, Any]) -> list[str]:
-    output = turn.get("manifest_output")
-    if not isinstance(output, str) or not output.strip():
+    output = _probe_output(turn.get("manifest_output"))
+    if output is None:
+        return ["the tool result has text other than system-reminder blocks after the probe"]
+    if not output.strip():
         return ["no manifest output was captured from the tool result"]
     try:
         manifest = json.loads(output)
@@ -400,8 +451,8 @@ def _agent_image_failures(
     forbidden = set().union(*map(_allowed_digests, bindings.values()))
     if actual in forbidden or forbidden.intersection(digests):
         failures.append("agent image turn ran on a repository runner image")
-    output = turn.get("manifest_output")
-    if not isinstance(output, str) or output.strip() != NO_MANIFEST_OUTPUT:
+    output = _probe_output(turn.get("manifest_output"))
+    if output is None or output.rstrip() != NO_MANIFEST_OUTPUT:
         failures.append(f"the manifest probe did not report {NO_MANIFEST_OUTPUT}")
     log = turn.get("boot_log")
     if not isinstance(log, str) or MANIFEST_ABSENT_LINE not in log or _MANIFEST_COUNT.search(log):
@@ -620,6 +671,28 @@ def judge_repo_runner(observation: object) -> list[str]:
         if count != 1:
             failures.append(f"expected exactly one {kind} turn, observed {count}")
     return failures
+
+
+def refusal_reason(outcome: Mapping[str, Any], repository: str) -> str | None:
+    """The documented refusal a CLI message outcome reports, or None.
+
+    The worker delivers each of these refusals as an ordinary reply, so the
+    outcome's ``failed`` flag is not part of the evidence. A runner pool
+    refusal counts only when it names this turn's repository.
+    """
+
+    failure_class = outcome.get("failure_class")
+    reply = outcome.get("reply")
+    reply = reply if isinstance(reply, str) else ""
+    for reason in sorted(REFUSAL_REASONS):
+        if failure_class == reason or re.search(r"\b" + re.escape(reason) + r"\b", reply):
+            return reason
+    if SELECTION_CONFLICT_REPLY in reply:
+        return SELECTION_CONFLICT
+    match = _POOL_REFUSAL_REPLY.match(reply)
+    if match and match.group("repository").casefold() == repository.casefold():
+        return _POOL_REFUSAL_REASONS[match.group("reason")]
+    return None
 
 
 def _plan_repositories(plan: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1068,6 +1141,12 @@ class RepoRunnerRun:
         values["agentSandbox"]["runner"]["workspace"] = {"enabled": True}
         values["agentSandbox"].setdefault("runnerEnv", {})[fe.FACTORY_AGENT] = dict(RUNNER_ENV)
         values["api"]["githubRepoAllowlist"] = list(self.repositories)
+        # The worker reads this installation's platform runner digest from
+        # the runner image it renders, and refuses every repository runner as
+        # stale_base when that image has only a tag (ADR 0216 decision 6).
+        runner = values["agentSandbox"]["runner"]
+        image = runner.get("image") or PLATFORM_RUNNER
+        runner["digest"] = resolve_image(f"{image}:{runner['tag']}")[0]
         return values
 
     def _agent_image(self, warm_pool: object) -> dict[str, Any]:
@@ -1251,7 +1330,7 @@ class RepoRunnerRun:
             "status": "failed", "reason": None, "sandbox": None, "claim": None,
             "pod_uid": None, "spec_image": None, "image_id": None, "boot_log": "",
             "retired_claims": [], "capture_error": None, "runner_env": {}, "warm_pool": None,
-            "expect": planned["expect"],
+            "expect": planned["expect"], "cli_failure_class": None, "cli_reply": None,
         }
         earlier = self.obs["turns"][:]
         self.obs["turns"].append(turn)
@@ -1334,18 +1413,14 @@ class RepoRunnerRun:
                 continue
             if isinstance(candidate, dict):
                 outcome = candidate
-        turn.update(cli_exit_code=process.returncode, new_claims=sorted(new_claims))
-        turn.update(self.model.snapshot())
         failure_class = outcome.get("failure_class")
-        reply = str(outcome.get("reply") or "")
-        reason = next(
-            (reason for reason in sorted(REFUSAL_REASONS)
-             if failure_class == reason or re.search(r"\b" + reason + r"\b", reply)), None
+        turn.update(
+            cli_exit_code=process.returncode, new_claims=sorted(new_claims),
+            cli_failure_class=failure_class, cli_reply=outcome.get("reply"),
         )
-        if reason is None and "This thread is already bound to a different repository." in reply:
-            # workspace.py maps this exact API code to this exact public reply.
-            reason = SELECTION_CONFLICT
-        if outcome.get("failed") and reason:
+        turn.update(self.model.snapshot())
+        reason = refusal_reason(outcome, planned["repository"])
+        if reason:
             turn.update(status="refused", reason=reason)
         else:
             probe = turn.get("runner_status")
