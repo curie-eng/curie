@@ -45,7 +45,13 @@ connector action for the worker's executor. Two GETs sit alongside them and stay
 unauthenticated, `GET /healthz` and `GET /status`, because the chart's readiness probe
 sends no auth header. The eighth authenticated control route, `GET /v1/status`, returns
 the credential-free boot attestation (`session_id`, `sandbox_id`, `managed_workspace`,
-`cwd`) plus `history_durable` for the worker's replacement-authority check. `POST /v1/execute` is an optional, runner-private,
+`cwd`) plus `history_durable` for the worker's replacement-authority check,
+`turn_epoch` for the active turn, and `capacity_admission: true`. When the request
+supplies a valid `X-Curie-Turn-Epoch` header, it also returns that epoch's
+`capacity_admission_result`: `pending`, `granted`, `denied` or `unknown`
+(`runner/src/curie_runner/server.py::_status`,
+`runner/src/curie_runner/session.py::SessionRunner.admission_result`).
+`POST /v1/execute` is an optional, runner-private,
 bearer-authenticated route served only by a runner booted with `CURIE_RUNNER_MODE=execute`
 (ACTION-EXECUTOR-6, -24): it runs one connector action's `list`, `observe`, `call` and `read` phases
 for the worker's executor, carries no ACI frame (like `/v1/turn-admit`) and changes no frozen
@@ -191,8 +197,8 @@ keys are rejected at construction), while a consumer tolerates unknown fields an
 
 ## Cross-links
 
-- **Guide:** [implementing-an-aci-server.md](./implementing-an-aci-server.md) — stand up a conformant second ACI server, driven from the conformance suite (#256).
-- **Epic(s):** [#25](https://github.com/curie-eng/curie/issues/25) — write the "implement an ACI server" guide from the conformance suite so the port is documented, not just enforced
-- **Epic(s):** [#47](https://github.com/curie-eng/curie/issues/47) — telemetry as part of the ACI (OTEL carried in `SessionConfig`)
-- **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 1 (Harness / runtime), grade A-
-- **ADR(s):** [ADR-0005](../../adr/0005-claude-agent-sdk-adapter-and-frozen-aci.md) — claude-agent-sdk adapter behind a frozen ACI session contract
+1. **Guide:** [implementing-an-aci-server.md](./implementing-an-aci-server.md): stand up a conformant second ACI server, driven from the conformance suite (#256).
+2. **Epic(s):** [#25](https://github.com/curie-eng/curie/issues/25) tracks a second harness implementation. The ACI server guide is #256.
+3. **Epic(s):** [#47](https://github.com/curie-eng/curie/issues/47): telemetry as part of the ACI (OTEL carried in `SessionConfig`)
+4. **Vision doc:** [architecture-vision.md](../../architecture-vision.md): Job 1 (Harness / runtime), grade A-
+5. **ADR(s):** [ADR-0005](../../adr/0005-claude-agent-sdk-adapter-and-frozen-aci.md): claude-agent-sdk adapter behind a frozen ACI session contract
