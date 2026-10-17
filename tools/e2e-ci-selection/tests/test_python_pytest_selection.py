@@ -505,6 +505,7 @@ def test_ordinary_python_shards_exclude_the_owned_kind_modules(
         "tools/factory-e2e/tests/test_c4_upgrade_migration.py",
         "tools/factory-e2e/tests/test_c4_held_cancellation.py",
         "tools/factory-e2e/tests/test_c4_cluster_up.py",
+        "tools/factory-e2e/tests/test_c4_forge_instances.py",
     ):
         ignored = [
             argument.split("=", 1)[1] for argument in argv if argument.startswith("--ignore=")

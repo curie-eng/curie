@@ -151,11 +151,13 @@ pub(super) async fn probe(
     })
 }
 
-/// The values fragment for one Bitbucket Cloud code host named `name`: the
+/// The values fragment for one Bitbucket Cloud code host named `name`, its
+/// credential in Secret `secret` under the key `token`: the
 /// `codeHosts` entry, the repository binding (alias = repository slug) and the
 /// review allowlist under the code host's name.
 pub(super) fn values(
     name: &str,
+    secret: &str,
     probed: &Probed,
     base: &str,
     host: &str,
@@ -171,7 +173,7 @@ pub(super) fn values(
             "apiUrl": base,
             "credential": {
                 "type": "static_token",
-                "existingSecret": format!("curie-{name}-token"),
+                "existingSecret": secret,
                 "existingSecretKey": "token",
             },
             "egress": egress,
@@ -592,6 +594,7 @@ mod tests {
         let egress = cloud_egress(&data_json("ip-ranges.json")).unwrap();
         let emitted = values(
             "bitbucket",
+            "curie-bitbucket-token",
             &probed,
             CLOUD_API,
             "bitbucket.org",
