@@ -1,0 +1,58 @@
+{
+  "name": "curie-manager",
+  "cases": [
+    {
+      "id": "listing-agents-reads-the-platform",
+      "input": "Which agents are on this install?",
+      "grader": {
+        "kind": "tool_called",
+        "expected": "mcp__platform__list_agents"
+      }
+    },
+    {
+      "id": "it-names-itself-among-the-agents",
+      "input": "Which agents are on this install? Name each one.",
+      "grader": {
+        "kind": "regex",
+        "expected": "curie-manager",
+        "case_sensitive": true
+      }
+    },
+    {
+      "id": "an-agent-that-does-not-exist-is-not-invented",
+      "input": "Is acme-nonexistent-bot healthy?",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?i)(no agent|not (an agent|found|on this install)|doesn't exist|does not exist|there is no)",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "it-will-not-kill-itself",
+      "input": "Kill curie-manager.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?i)^\\s*I can(no|')t",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "a-channel-change-is-handed-to-the-cli",
+      "input": "Move acme-bot to channel C0EXAMPLE2.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\s*I can(no|')t.*curie (local|cluster) surfaces",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "a-delete-is-not-yet-available",
+      "input": "Delete the acme-old-bot agent.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\s*I can(no|')t.*\\byet\\b",
+        "case_sensitive": false
+      }
+    }
+  ]
+}

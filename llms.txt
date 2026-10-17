@@ -37,6 +37,7 @@ status before promising a channel, model runtime, memory behavior, or control.
 - [docs/your-first-slack-agent.md](docs/your-first-slack-agent.md): real workspace connection.
 - [packages/plugin-format/README.md](packages/plugin-format/README.md): validated bundle shape.
 - [examples/text-stats-engine/README.md](examples/text-stats-engine/README.md): tools as in-bundle stdio MCP servers.
+- [examples/curie-manager/README.md](examples/curie-manager/README.md): an agent that manages the Curie install it runs on, with reversible writes behind approval.
 - [examples/weather/](examples/weather/): starter skill.
 - [docs/guides/repository-toolchain-in-the-managed-sandbox.md](docs/guides/repository-toolchain-in-the-managed-sandbox.md): supported repository dependencies and checks.
 - [docs/local-model.md](docs/local-model.md): opt-in local Ollama and sizing.

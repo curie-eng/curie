@@ -1532,6 +1532,10 @@ jobs:
             context: examples/github-activity/connectors/github
             dockerfile: examples/github-activity/connectors/github/Dockerfile
             platforms: linux/amd64,linux/arm64
+          - name: curie-manager-platform
+            context: examples/curie-manager/connectors/platform
+            dockerfile: examples/curie-manager/connectors/platform/Dockerfile
+            platforms: linux/amd64,linux/arm64
     steps:
       - uses: actions/checkout@v7
         with:

@@ -116,7 +116,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-self-upgrade, github-activity-github, docker-daemon]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-self-upgrade, github-activity-github, docker-daemon, curie-manager-platform]
         platform: [linux/amd64, linux/arm64]
         include:
           - name: runner
@@ -156,6 +156,11 @@ jobs:
           - name: docker-daemon
             context: apps/docker-daemon
             dockerfile: apps/docker-daemon/Dockerfile
+          # The curie-manager bundle's only connector: the platform API as MCP
+          # tools. Unpublished, a cluster install of that bundle has no tools.
+          - name: curie-manager-platform
+            context: examples/curie-manager/connectors/platform
+            dockerfile: examples/curie-manager/connectors/platform/Dockerfile
           - platform: linux/amd64
             runner: ubuntu-latest
             arch: amd64
@@ -278,7 +283,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-self-upgrade, github-activity-github, docker-daemon]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-self-upgrade, github-activity-github, docker-daemon, curie-manager-platform]
     steps:
       - name: Download digests
         id: download_digests

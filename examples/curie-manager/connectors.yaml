@@ -1,0 +1,27 @@
+# The one connector this agent uses: the Curie platform API as MCP tools.
+#
+# It holds the platform key. That key is all or nothing (one key reads, changes
+# and deletes every agent, and can mint logins and approval principals), so it
+# stays in this container and never reaches the agent's sandbox. The sandbox
+# gets MANAGER_MCP_TOKEN instead, which only opens this connector, and this
+# connector only offers the tools listed in .claude-plugin/plugin.json.
+connectors:
+  platform:
+    build:
+      context: connectors/platform
+      platforms: [linux/amd64, linux/arm64]
+    env:
+      # Where the platform API is from inside the connector. `curie-api:8000`
+      # on the local tier. On a cluster it is `http://<release>-api.<namespace>:8000`.
+      PLATFORM_API_URL: http://curie-api:8000
+      # The agent this connector serves. It will not kill or delete that one.
+      MANAGER_SELF_AGENT: curie-manager
+    # NAMES only. Values come from your environment or `curie secrets set`.
+    secrets:
+      # A random token the sandbox sends as `Authorization: Bearer`. The server
+      # checks it on every request, because on the local tier nothing else does.
+      - MANAGER_MCP_TOKEN
+      # The platform API key. Connector only: it is not the bearer, so Curie
+      # never puts it in the sandbox.
+      - MANAGER_PLATFORM_KEY
+    bearer_secret: MANAGER_MCP_TOKEN
