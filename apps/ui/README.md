@@ -162,7 +162,10 @@ five metrics with no Prometheus, so the wired view keeps the card-grid +
 hero-chart layout but drops the PromQL bar (replaced by an honest `langfuse {...}`
 descriptor) and shows only the five API-backed metrics. The per-agent filter is a
 trace-name substring server-side, so it is presented as a plain "name contains"
-filter, not exact matching.
+filter, not exact matching. Runs, latency p95 and error rate count agent runs
+only (traces named `curie-run:...`), so the platform's own request and
+background traces never show up as runs; tokens and cost sum every model call
+outside eval traces.
 
 **Not wired yet (honest stubs, no demo data):** Usage and Settings
 render a `ComingSoon` placeholder (`src/views/wired/WiredStubs.tsx`). These state
