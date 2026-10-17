@@ -38,6 +38,7 @@ from curie_api.github_factory_events import parse_factory_event
 from curie_api.main import create_app
 from curie_api.workitem_dispatch import DispatchConflict, acquire, start
 from fastapi.testclient import TestClient
+from forge_fakes import factory_wake
 from forge_fakes.github import (
     INSTALLATION_ID,
     LABEL,
@@ -777,7 +778,14 @@ def _mark_running(request_id: uuid.UUID) -> None:
         engine = create_async_engine(get_settings().database_url)
         try:
             async with AsyncSession(engine) as session:
-                acquired = await acquire(session, request_id, owner="factory-owner", generation=1)
+                acquired = await acquire(
+                    session,
+                    request_id,
+                    owner="factory-owner",
+                    generation=1,
+                    wake=await factory_wake(session, request_id),
+                    context=None,
+                )
                 assert not isinstance(acquired, DispatchConflict), acquired
                 started = await start(
                     session,
@@ -786,6 +794,7 @@ def _mark_running(request_id: uuid.UUID) -> None:
                     generation=1,
                     claim_name="claim-factory",
                     sandbox_name="sbx-factory",
+                    context=acquired.context,
                 )
                 assert not isinstance(started, DispatchConflict), started
         finally:

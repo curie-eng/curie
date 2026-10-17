@@ -700,11 +700,23 @@ class Install:
     async def _run_turn(self, turn: QueuedTurn, parsed: Any) -> str:
         request_id, generation = parsed.request_id, parsed.number
         owner = f"c4-worker-{uuid.uuid4().hex[:8]}"
+        handle = turn.reply_handle
+        assert handle is not None
         async with self._api() as http:
             acquired = await http.post(
                 f"/v1/internal/work-items/requests/{request_id}/acquire",
                 headers=WORKER,
-                json={"owner": owner, "generation": generation},
+                json={
+                    "owner": owner,
+                    "generation": generation,
+                    "wake": {
+                        "kind": handle.kind,
+                        "address": handle.channel,
+                        "adapter": handle.adapter,
+                        "conversation_id": turn.conversation_id,
+                    },
+                    "context": None,
+                },
             )
             assert acquired.status_code == 200, acquired.text
             work = acquired.json()
@@ -716,11 +728,11 @@ class Install:
                     "generation": generation,
                     "claim_name": f"curie-thread-{request_id.hex[:12]}",
                     "sandbox_name": f"sbx-{request_id.hex[:12]}",
+                    "context": work["context"],
                 },
             )
             assert started.status_code == 200, started.text
             epoch = started.json()["runtime_epoch"]
-            handle = turn.reply_handle
             deployment_id = self.deployments[(handle.kind, handle.channel)]
             selected = await http.post(
                 f"/v1/internal/workspaces/{deployment_id}/selection",

@@ -34,6 +34,7 @@ from aci_protocol import (
 from channel_protocol import work_item_events
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.binding import FactoryContext, FactoryWake
 from curie_worker.delivery_lease import DeliveryLease, DeliveryLeaseStore
 from curie_worker.kernel import routing as kernel_routing
 from curie_worker.sandbox import MissingAgentPoolError, QuotaRejection
@@ -45,6 +46,8 @@ from curie_worker.workitem_dispatch import (
     WorkItemStartGrant,
     parse_work_item_event_id,
 )
+
+from apps.worker.tests.queue_fixtures import factory_context
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 DEPLOYMENT_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
@@ -98,7 +101,7 @@ def _ci_text(round_: int = 2) -> str:
 
 
 class _Binding:
-    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
+    def _deployment(self) -> object:
         return SimpleNamespace(
             agent_id=AGENT_ID,
             agent_name="acme-bot",
@@ -113,6 +116,13 @@ class _Binding:
             adapter=None,
             approval_routes=None,
         )
+
+    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
+        return self._deployment()
+
+    async def resolve_factory(self, context: FactoryContext) -> object:
+        assert context.agent_id == AGENT_ID
+        return self._deployment()
 
     def boot_env(self, _resolved: object, thread_key: str, **_: object) -> dict[str, str]:
         return {
@@ -156,11 +166,16 @@ class _WorkItems:
     def __init__(self, running: uuid.UUID | None, *, ended: bool = False) -> None:
         self.running = running
         self.ended = ended
+        self.authority_refusal: str | None = None
+        self.execution_deadline = datetime.now(UTC) + timedelta(minutes=20)
+        self.runtime_heartbeat_expires_at = self.execution_deadline
         self.calls: list[str] = []
         self.lookups: list[str] = []
         self.finishes: list[tuple[uuid.UUID, dict[str, object]]] = []
 
-    async def running_for_conversation(self, conversation_id: str) -> WorkItemRunning | None:
+    async def running_for_conversation(
+        self, conversation_id: str, *, wake: FactoryWake
+    ) -> WorkItemRunning | None:
         self.calls.append("running_for_conversation")
         self.lookups.append(conversation_id)
         if self.ended:
@@ -170,17 +185,38 @@ class _WorkItems:
         return WorkItemRunning(
             work_item_id=self.running,
             request_id=self.running,
+            agent_id=AGENT_ID,
+            generation=1,
+            conversation_id=conversation_id,
+            wait_deadline=datetime.now(UTC) + timedelta(hours=1),
+            repository_path=WORK_ITEM_REPO,
+            context=(
+                factory_context(AGENT_ID, wake) if self.authority_refusal is None else None
+            ),
+            refusal=self.authority_refusal,
             runtime_epoch=EPOCH,
-            execution_deadline=datetime.now(UTC) + timedelta(minutes=20),
+            execution_deadline=self.execution_deadline,
+            lease_held_to_deadline=(
+                self.runtime_heartbeat_expires_at == self.execution_deadline
+                and self.execution_deadline > datetime.now(UTC)
+            ),
         )
 
     async def acquire(
-        self, request_id: uuid.UUID, *, owner: str, generation: int
+        self,
+        request_id: uuid.UUID,
+        *,
+        owner: str,
+        generation: int,
+        wake: FactoryWake,
+        context: FactoryContext | None,
     ) -> WorkItemAcquireGrant:
         self.calls.append("acquire")
         raise AssertionError("a CI continuation never acquires a request")
 
-    async def start(self, request_id: uuid.UUID, **_: object) -> WorkItemStartGrant:
+    async def start(
+        self, request_id: uuid.UUID, *, context: FactoryContext, **_: object
+    ) -> WorkItemStartGrant:
         self.calls.append("start")
         raise AssertionError("a CI continuation never starts a request")
 
@@ -725,5 +761,58 @@ def test_a_continuation_for_an_ended_execution_runs_no_turn(make_harness, state:
             assert work_items.finishes == []
             assert "acquire" not in work_items.calls
             assert await h.kernel._markers.is_terminal(turn.event_id)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["factory_binding_missing", "factory_tenant_mismatch", "factory_surface_mismatch"],
+)
+def test_refused_continuation_finishes_its_epoch_and_valid_neighbor_runs(
+    make_harness, caplog: pytest.LogCaptureFixture, code: str,
+) -> None:
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+        ) as h:
+            refused_id = uuid.uuid4()
+            refused = _WorkItems(running=refused_id)
+            refused.authority_refusal = code
+            h.kernel._work_items = refused
+            event = _ci_turn(refused_id)
+            with caplog.at_level(logging.INFO, logger="curie_worker.kernel"):
+                await h.kernel.process_event(event)
+            assert refused.finishes == [(
+                refused_id,
+                {
+                    "runtime_epoch": EPOCH,
+                    "outcome": "failed",
+                    "cause": "runner_escalated",
+                    "detail": "Factory execution authority is no longer valid.",
+                    "ci_fix_round": None,
+                    "budget_s": 120.0,
+                },
+            )]
+            assert any(code in record.getMessage() for record in caplog.records)
+            assert not any("AmbiguousRoute" in record.getMessage() for record in caplog.records)
+            assert not any(
+                "not_started:interrupted" in record.getMessage() for record in caplog.records
+            )
+            assert h.runner.opened == []
+            assert h.fake_k8s.claims == {}
+            assert h.kernel._workspace.selections == []
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            neighbor_id = uuid.uuid4()
+            neighbor = _WorkItems(running=neighbor_id)
+            h.kernel._work_items = neighbor
+            h.runner.default_script = [Final(text="No fix published", status=SessionStatus.DONE)]
+            await h.kernel.process_event(_ci_turn(neighbor_id))
+            assert h.runner.opened == [_ci_text(2)]
+            assert neighbor.finishes[0][0] == neighbor_id
+            assert neighbor.finishes[0][1]["runtime_epoch"] == EPOCH
+            assert neighbor.finishes[0][1]["cause"] == "ci_fix_unpublished"
+            assert h.kernel._workspace.selections == [WORK_ITEM_REPO]
 
     asyncio.run(exercise())

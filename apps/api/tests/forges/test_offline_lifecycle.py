@@ -18,8 +18,8 @@ The ``jira_cloud+github`` pair uses the in-memory adapters in
 functions on ``TrackerIssueRef`` and ``RepositoryRef``, the real reconciler and
 CI gate read the in-memory code host, and status replies go through the real
 port branch of ``factory_notices._sync_one`` (#4358 plan D6). The install boots
-with only a GitHub code host entry and the factory off, so the seams that
-would build a real adapter are replaced at test level:
+with a GitHub code host and a Jira tracker binding, with factory polling off.
+The seams that would build a real adapter are replaced at test level:
 
 1. ``factory_code_host`` and ``code_host_for`` (``curie_api.forges.hosts``)
    build the GitHub adapter for the paths that still take the install's
@@ -70,7 +70,6 @@ from curie_api.forges.capabilities import (
     Support,
     validate_pairing,
 )
-from curie_api.forges.config import WriteCheck
 from curie_api.forges.hosts import github_host
 from curie_api.forges.identity import issue_lock_keys, notice_request_id, revision_request_id
 from curie_api.forges.memory import InMemoryCodeHost, InMemoryTracker, all_supported
@@ -89,6 +88,7 @@ from curie_api.workitem_dispatch import Admission, DispatchConflict, acquire, st
 from curie_api.workitems.lifecycle import WorkItemOutcome
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from fastapi.testclient import TestClient
+from forge_fakes import factory_wake
 from forge_fakes.github import (
     INSTALLATION_ID,
     LABEL,
@@ -129,6 +129,7 @@ STATE_LABELS = frozenset(factory_notices.STATE_LABELS)
 JIRA_HOST = "example.atlassian.net"
 JIRA_SCOPE = "10000"
 JIRA_KEY = "PROJ-1"
+JIRA_BINDING = "jira-factory"
 MARKING_USER = Actor("6601", "acme-dev")
 REVIEWER = Actor("6602", "acme-reviewer")
 REVIEW_BODY = f"@{MENTION} please rename the helper before merge"
@@ -269,7 +270,9 @@ def _start(request_id: uuid.UUID) -> None:
         try:
             async with AsyncSession(engine) as session:
                 acquired = await acquire(
-                    session, request_id, owner="factory-owner", generation=generation
+                    session, request_id, owner="factory-owner", generation=generation,
+                    wake=await factory_wake(session, request_id),
+                    context=None,
                 )
                 assert not isinstance(acquired, DispatchConflict), acquired
                 started = await start(
@@ -279,6 +282,7 @@ def _start(request_id: uuid.UUID) -> None:
                     generation=generation,
                     claim_name="claim-factory",
                     sandbox_name="sbx-factory",
+                    context=acquired.context,
                 )
                 assert not isinstance(started, DispatchConflict), started
         finally:
@@ -325,14 +329,14 @@ def _agent_id() -> uuid.UUID:
     return rows[0]["id"]
 
 
-def _create_agent(client: TestClient) -> None:
+def _create_agent(client: TestClient, *, kind: str, address: str) -> None:
     created = client.post(
         "/agents",
         headers={"X-API-Key": get_settings().api_key},
         json={
             "name": f"acme-factory-{uuid.uuid4().hex[:8]}",
             "repo_full_name": REPO,
-            "channel": {"kind": "github", "address": REPO},
+            "channel": {"kind": kind, "address": address},
         },
     )
     assert created.status_code == 201, created.text
@@ -619,7 +623,7 @@ def _github_pair(monkeypatch: pytest.MonkeyPatch, sink: _CommentServer) -> Itera
     with TestClient(create_app()) as client:
         external = httpx.AsyncClient(transport=httpx.MockTransport(api.handle))
         client.app.state.http_client = external
-        _create_agent(client)
+        _create_agent(client, kind="github", address=REPO)
         try:
             yield _GitHubPair(client, api, sink)
         finally:
@@ -658,6 +662,7 @@ class _JiraPair:
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         settings = get_settings()
+        self.binding = forges_registry(settings).binding(JIRA_BINDING)
         self.tracker = InMemoryTracker(
             kind=types.JIRA_CLOUD, host=JIRA_HOST, scope_id=JIRA_SCOPE, label=LABEL, mention=MENTION
         )
@@ -685,7 +690,7 @@ class _JiraPair:
         self.cursor: str | None = None
         self.feedback_cursor: str | None = None
         self.pull: PullRequest | None = None
-        self.conversation = f"{types.JIRA_CLOUD}-issue-{self.issue.issue_id}"
+        self.conversation = f"issue-{self.issue.issue_id}"
         self.log: list[_Logged] = []
         self._patch(monkeypatch)
 
@@ -772,10 +777,14 @@ class _JiraPair:
             assert await self.tracker.verify_current(notice)
             actor = await self.tracker.marking_actor(self.issue, LABEL)
             assert actor == notice.actor == MARKING_USER
-            assert await may_start_with(WriteCheck(), self.issue, actor, tracker=self.tracker)
+            assert await may_start_with(
+                self.binding.start_authority, self.issue, actor, tracker=self.tracker
+            )
             self.cursor = page.cursor
             base = await factory_base.resolve_base(
-                policy=forges_registry(get_settings()).github_repository_policy(REPO),
+                policy=forges_registry(get_settings()).binding_repository_policy(
+                    self.binding, self.repository
+                ),
                 labels=set(),
                 default_branch="main",
                 code_host=self.code_host,
@@ -785,8 +794,8 @@ class _JiraPair:
             return await self._dispatch(
                 Admission(
                     agent_id=agent_id,
-                    kind="github",
-                    address=REPO,
+                    kind="jira",
+                    address=self.binding.name,
                     reply_conversation_id=self.conversation,
                     issue=self.issue,
                     repository=self.repository,
@@ -866,8 +875,8 @@ class _JiraPair:
             return await self._dispatch(
                 Admission(
                     agent_id=agent_id,
-                    kind="github",
-                    address=REPO,
+                    kind="jira",
+                    address=self.binding.name,
                     reply_conversation_id=self.conversation,
                     issue=self.issue,
                     repository=self.repository,
@@ -934,6 +943,39 @@ class _JiraPair:
 
 
 def _jira_pair(monkeypatch: pytest.MonkeyPatch, key_dir: Path) -> Iterator[Pair]:
+    document = forges_document()
+    document["trackers"].append(
+        {
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": JIRA_HOST,
+            "api_url": f"https://{JIRA_HOST}",
+            "credential": {
+                "type": "static_token",
+                "username": "acme-bot@example.com",
+                "token": "fixture-jira-token",
+            },
+            "label": LABEL,
+            "mention": MENTION,
+        }
+    )
+    document["bindings"].append(
+        {
+            "name": JIRA_BINDING,
+            "tracker": "jira",
+            "tracker_scope_id": JIRA_SCOPE,
+            "repos": [
+                {
+                    "alias": "bot",
+                    "code_host": "github",
+                    "project_id": str(REPO_ID),
+                    "path": REPO,
+                }
+            ],
+            "default_repo": "bot",
+            "start_authority": {"type": "allowlist", "accounts": [MARKING_USER.id]},
+        }
+    )
     for key, value in {
         "CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS": "30",
         "CURIE_WORK_ITEM_RECONCILER_ENABLED": "false",
@@ -942,7 +984,7 @@ def _jira_pair(monkeypatch: pytest.MonkeyPatch, key_dir: Path) -> Iterator[Pair]
         "DEAD_LETTER_WATCH_INTERVAL_S": "0",
         # No GitHub intake: the reconciler must not poll a GitHub tracker.
         "FACTORY_ENABLED": "false",
-        "CURIE_FORGES": forges_env_json(forges_document(), key_dir),
+        "CURIE_FORGES": forges_env_json(document, key_dir),
         "GITHUB_REVIEW_INGRESS_ENABLED": "false",
         "GITHUB_REPO_ALLOWLIST": '["acme-corp/*"]',
         "GITHUB_TOKEN": "",
@@ -954,7 +996,7 @@ def _jira_pair(monkeypatch: pytest.MonkeyPatch, key_dir: Path) -> Iterator[Pair]
     get_settings.cache_clear()
     try:
         with TestClient(create_app()) as client:
-            _create_agent(client)
+            _create_agent(client, kind="jira", address=JIRA_BINDING)
             try:
                 yield _JiraPair(monkeypatch)
             finally:

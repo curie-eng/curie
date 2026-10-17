@@ -28,7 +28,7 @@ from aci_protocol import Final, OutboundEvent, QueuedTurn, SessionStatus, TextDe
 from curie_internal.sandbox_token import verify
 from curie_worker import binding as binding_module
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.binding import BindingResolver, ResolvedDeployment
+from curie_worker.binding import BindingResolver, FactoryContext, ResolvedDeployment
 from curie_worker.config import WorkerConfig
 
 # importlib import mode does not add the test root to sys.path.
@@ -61,7 +61,7 @@ class _MemoryBinding:
         self._real = BindingResolver.__new__(BindingResolver)
         self._real._config = WorkerConfig()  # type: ignore[attr-defined]
 
-    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
+    def _deployment(self) -> ResolvedDeployment:
         return ResolvedDeployment(
             agent_id=AGENT_ID,
             agent_name="acme-bot",
@@ -72,6 +72,14 @@ class _MemoryBinding:
             max_usd_per_day=None,
             max_output_tokens_per_run=None,
         )
+
+    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
+        return self._deployment()
+
+    async def resolve_factory(self, context: FactoryContext) -> ResolvedDeployment:
+        assert context.agent_id == AGENT_ID
+        assert context.tenant_id == binding_module.DEFAULT_TENANT_ID
+        return self._deployment()
 
     async def memory_writes_for(self, _agent_id: uuid.UUID) -> bool:
         return self.memory_writes

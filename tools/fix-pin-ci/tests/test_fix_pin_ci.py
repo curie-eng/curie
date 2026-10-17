@@ -48,6 +48,10 @@ INITIAL_BINDING_SELECTOR = (
     "tools/factory-e2e/tests/test_c4_initial_binding.py::"
     "test_second_factory_agent_uses_initial_tracker_binding"
 )
+ADMITTED_AGENT_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_admitted_agent.py::"
+    "test_labelled_agents_execute_as_admitted_agent"
+)
 STATIC_TOKEN_ROTATION_SELECTOR = (
     "tools/factory-e2e/tests/test_c4_static_token_rotation.py::"
     "test_secret_replacement_reports_rejection_and_recovers"
@@ -1158,7 +1162,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         lambda step: "uv run alembic upgrade head" in _string(step, "run"),
         "shared database migration",
     )
-    # The dedicated kind runtime modules run through their own CI callers.
+    # Dedicated kind runtime modules run through their own CI callers.
     pytest_index = _single_step_index(
         steps,
         lambda step: step.get("id") == "pytest",
@@ -1178,7 +1182,9 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         names = [name for name, value in pytest_env.items() if value == expression]
         assert len(names) == 1, expression
         bindings[meaning] = names[0]
-    runtime_exclusions = set(KIND_MODULES)
+    runtime_exclusions = {("--ignore", module) for module in KIND_MODULES} | {
+        ("--deselect", ADMITTED_AGENT_SELECTOR.split("::", 1)[0]),
+    }
 
     def assert_full_suite(command: list[str], shard: int, deselect: str) -> None:
         assert command[:3] == ["run", "pytest", "-q"]
@@ -1187,24 +1193,33 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
             assert command[-2:] == ["--deselect", deselect]
             command = command[:-2]
         distribution = [
-            "-n", "4", "--dist", "loadgroup", "--ci-shard", f"{shard}/3", "--reruns", "1",
+            "-n",
+            "4",
+            "--dist",
+            "loadgroup",
+            "--ci-shard",
+            f"{shard}/3",
+            "--reruns",
+            "1",
         ]
         extra = command[3:]
         assert extra[: len(distribution)] == distribution
-        arguments = iter(extra[len(distribution):])
+        arguments = iter(extra[len(distribution) :])
         excluded = []
         reporting = []
         for argument in arguments:
-            if argument == "--ignore":
+            if argument in {"--ignore", "--deselect"}:
                 path = next(arguments, None)
-                assert path is not None, "--ignore requires a path"
-                excluded.append(path)
-            elif argument.startswith("--ignore="):
-                excluded.append(argument.split("=", 1)[1])
+                assert path is not None, f"{argument} requires a path"
+                excluded.append((argument, path))
+            elif argument.startswith(("--ignore=", "--deselect=")):
+                option, path = argument.split("=", 1)
+                excluded.append((option, path))
             else:
                 reporting.append(argument)
         assert len(excluded) == len(runtime_exclusions) and set(excluded) == runtime_exclusions, (
-            f"the Python suite must exclude exactly the kind runtime modules, got {excluded!r}"
+            "the Python suite must use exactly the required kind runtime exclusions, "
+            f"got {excluded!r}"
         )
         report_chars = set("fEsxXpPaAR")
         assert all(
@@ -1245,22 +1260,29 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
                     ["--ignore-glob=*"],
                     ["--deselect=apps/api/tests"],
                     ["apps/api/tests/test_config.py"],
-                    ["--ignore", *sorted(runtime_exclusions)[:1]],
+                    list(sorted(runtime_exclusions)[0]),
                 ):
                     with pytest.raises(AssertionError):
                         assert_full_suite([*pytest_command, *mutation], shard, deselect)
-                for missing in runtime_exclusions:
+                for missing_option, missing_path in runtime_exclusions:
                     reduced = []
                     arguments = iter(pytest_command)
                     for argument in arguments:
-                        if argument == "--ignore":
+                        if argument in {"--ignore", "--deselect"}:
                             path = next(arguments)
-                            if path != missing:
+                            if (argument, path) != (missing_option, missing_path):
                                 reduced.extend((argument, path))
-                        elif argument != f"--ignore={missing}":
+                        elif argument != f"{missing_option}={missing_path}":
                             reduced.append(argument)
                     with pytest.raises(AssertionError):
                         assert_full_suite(reduced, shard, deselect)
+                    replaced = [
+                        *reduced,
+                        "--ignore" if missing_option == "--deselect" else "--deselect",
+                        missing_path,
+                    ]
+                    with pytest.raises(AssertionError):
+                        assert_full_suite(replaced, shard, deselect)
     assert stack_index < migration_index < pytest_index
 
     # The half that keeps the win. Nothing about the gate may drift back into
@@ -1482,8 +1504,7 @@ def _factory_upgrade_setup_steps() -> tuple[list[dict[str, Any]], int, int]:
     prepare_index = _single_step_index(
         steps,
         lambda step: (
-            "TMPDIR=" in _string(step, "run")
-            and "CURIE_C4_RELEASE_ASSETS=" in _string(step, "run")
+            "TMPDIR=" in _string(step, "run") and "CURIE_C4_RELEASE_ASSETS=" in _string(step, "run")
         ),
         "source-local factory upgrade preparation",
     )
@@ -1627,8 +1648,7 @@ def test_factory_upgrade_downloads_only_verified_release_assets(
         {
             "FIX_PIN_RELEASE_RESPONSES": json.dumps(responses),
             "BASH_FUNC_curl%%": (
-                f"() {{ {shlex.quote(sys.executable)} -c "
-                f"{shlex.quote(download_boundary)} \"$@\"; }}"
+                f'() {{ {shlex.quote(sys.executable)} -c {shlex.quote(download_boundary)} "$@"; }}'
             ),
         }
     )
@@ -1782,6 +1802,15 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("body", "needed", "stack", "kind", "factory_upgrade"),
     [
+        (f"Fix pin: {ADMITTED_AGENT_SELECTOR}", True, False, True, False),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_admitted_agent.py::"
+            "test_execute_revalidates_current_authority[agent_tenant-factory_tenant_mismatch]",
+            True,
+            False,
+            True,
+            False,
+        ),
         (f"Fix pin: {INITIAL_BINDING_SELECTOR}", True, False, True, False),
         (f"Fix pin: {STATIC_TOKEN_ROTATION_SELECTOR}", True, False, True, False),
         (f"Fix pin: {HELD_CANCELLATION_SELECTOR}", True, False, True, False),
@@ -1824,8 +1853,14 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
             False,
         ),
         (
-            "Fix pin: tools/factory-e2e/tests/test_c4_static_token_rotation_extra.py::"
-            "test_example",
+            "Fix pin: tools/factory-e2e/tests/test_c4_admitted_agent_extra.py::test_example",
+            True,
+            True,
+            False,
+            False,
+        ),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_static_token_rotation_extra.py::test_example",
             True,
             True,
             False,
@@ -1849,6 +1884,16 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
         (None, False, False, False, False),
         ("", False, False, False, False),
         ("Fix pin: n/a - documentation only", False, False, False, False),
+        (f"<!-- Fix pin: {ADMITTED_AGENT_SELECTOR} -->", False, False, False, False),
+        (f" Fix pin: {ADMITTED_AGENT_SELECTOR}", False, False, False, False),
+        (f"Verified with Fix pin: {ADMITTED_AGENT_SELECTOR}", False, False, False, False),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_admitted_agent.py::",
+            False,
+            False,
+            False,
+            False,
+        ),
         (f"<!-- Fix pin: {INITIAL_BINDING_SELECTOR} -->", False, False, False, False),
         (f"<!-- Fix pin: {FACTORY_UPGRADE_SELECTOR} -->", False, False, False, False),
         (f" Fix pin: {INITIAL_BINDING_SELECTOR}", False, False, False, False),
