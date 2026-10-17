@@ -787,6 +787,13 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
             raise RuntimeError(
                 "factory configuration missing; private diagnostics retained"
             ) from None
+        selector = ",".join(
+            f"{key}={value}"
+            for key, value in sorted(deployment["spec"]["selector"]["matchLabels"].items())
+        )
+        previous = json.loads(self.kubectl(
+            "-n", self.namespace, "get", "pods", "-l", selector, "-o", "json"
+        ))["items"]
         self.kubectl(
             "-n", self.namespace, "set", "env", "deployment/curie-api",
             "CURIE_FORGES=" + json.dumps(configuration),
@@ -794,6 +801,14 @@ except (httpx.HTTPError, OSError, ValueError, TypeError, KeyError) as exc:
         self.kubectl(
             "-n", self.namespace, "rollout", "status", "deployment/curie-api", "--timeout=300s"
         )
+        # Rollout status returns once the new pod is ready, while a replaced
+        # pod can still answer a worker's open connection with the previous
+        # configuration. The change is in effect only when those pods are gone.
+        if previous:
+            self.kubectl(
+                "-n", self.namespace, "wait", "--for=delete", "--timeout=180s",
+                *(f"pod/{pod['metadata']['name']}" for pod in previous),
+            )
         self.forward_api()
 
     def worker_identity(self) -> list[tuple[str, str, int]]:
