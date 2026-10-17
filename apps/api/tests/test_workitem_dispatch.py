@@ -1981,6 +1981,32 @@ def test_factory_wake_mismatch_leaves_authority_untouched_and_valid_delivery_sta
     with_session(body)
 
 
+# Tenants this module inserts carry this deployment_id prefix so the
+# owned_tenants fixture can remove exactly them from the shared database.
+OWNED_TENANT_MARK = "test-workitem-dispatch-tenant-"
+
+
+async def _delete_owned_tenants(session: AsyncSession) -> int:
+    owned = "SELECT id FROM curie.tenants WHERE deployment_id LIKE :mark"
+    mark = {"mark": f"{OWNED_TENANT_MARK}%"}
+    await session.execute(
+        text(f"DELETE FROM curie.agent_channels WHERE tenant_id IN ({owned})"), mark
+    )
+    await session.execute(text("DELETE FROM curie.tenants WHERE deployment_id LIKE :mark"), mark)
+    await session.commit()
+    remaining = await session.execute(
+        text("SELECT count(*) FROM curie.tenants WHERE deployment_id LIKE :mark"), mark
+    )
+    return int(remaining.scalar_one())
+
+
+@pytest.fixture
+def owned_tenants() -> Iterator[None]:
+    assert with_session(_delete_owned_tenants) == 0
+    yield
+    assert with_session(_delete_owned_tenants) == 0, "an owned tenant survived cleanup"
+
+
 async def _invalidate_factory_binding(
     session: AsyncSession, agent_id: uuid.UUID, mutation: str
 ) -> None:
@@ -1991,7 +2017,7 @@ async def _invalidate_factory_binding(
                 "INSERT INTO curie.tenants (id, deployment_id, status) "
                 "VALUES (:id, :deployment, 'active')"
             ),
-            {"id": tenant_id, "deployment": str(uuid.uuid4())},
+            {"id": tenant_id, "deployment": f"{OWNED_TENANT_MARK}{uuid.uuid4()}"},
         )
         await session.execute(
             text("UPDATE curie.agent_channels SET tenant_id = :tenant WHERE agent_id = :agent"),
@@ -2026,7 +2052,7 @@ async def _invalidate_factory_binding(
     ],
 )
 def test_invalid_factory_authority_defers_without_starting_while_neighbor_progresses(
-    clean_db: None, allowlisted: None, phase: str, mutation: str, code: str
+    clean_db: None, allowlisted: None, owned_tenants: None, phase: str, mutation: str, code: str
 ) -> None:
     async def body(session: AsyncSession) -> None:
         agent_id = await _agent_with_channel(session)
