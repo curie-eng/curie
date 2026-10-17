@@ -36,7 +36,8 @@
 //!    `Token has no expiry`; a `cluster surfaces ... --add gitlab=<path>` line
 //!    and no `github=` line; a line naming every label (f) would ensure; the
 //!    project id; the egress CIDR; and with `--ca-file`, a line naming
-//!    `codeHostTrust` and the ConfigMap `curie-gitlab-ca`.
+//!    `codeHostTrust` and the release's CA bundle ConfigMap
+//!    `<release>-code-host-trust` (#4620).
 //! 4. A real run prints the same expiry line (stdout or stderr).
 //! 5. Pairing: gitlab pairs only with gitlab. `--code-host gitlab` with another
 //!    tracker, or `--tracker gitlab` with another code host, is refused with a
@@ -48,18 +49,22 @@
 //! 1. `curie::factory_quickstart::GITLAB_DEFAULT_URL` (`"https://gitlab.com"`).
 //! 2. `curie::factory_quickstart::gitlab_web_base(&ForgeFlags) -> anyhow::Result<String>`:
 //!    the web base without a trailing `/`, the default when `forge_url` is `None`.
-//! 3. `curie::factory_quickstart::GitlabFacts` with pub fields `web_base`,
-//!    `username`, `expires_at: Option<String>` (the token's `YYYY-MM-DD`; `None`
-//!    is no expiry), `project_id: u64`, `path`, `label`, `egress:
-//!    Vec<EgressEntry>`, `ca_config_map: Option<String>`; and
-//!    `curie::factory_quickstart::gitlab_entries(&GitlabFacts) -> NativeForgeEntries`.
+//! 3. `curie::factory_quickstart::GitlabFacts` with pub fields `release`,
+//!    `web_base`, `username`, `expires_at: Option<String>` (the token's
+//!    `YYYY-MM-DD`; `None` is no expiry), `project_id: u64`, `path`, `label`,
+//!    `egress: Vec<EgressEntry>`, `ca_config_map: Option<String>`; and
+//!    `curie::factory_quickstart::gitlab_entries(&GitlabFacts) -> NativeForgeEntries`,
+//!    the entries of a new instance named by `forge_entry_name` of the API base
+//!    URL, its Secret `forge_secret_name` and its binding `forge_binding_name`.
 //! 4. `curie::factory_intake::NativeForgeEntries` with pub fields `code_host`,
 //!    `tracker`, `binding` (`serde_json::Value`) and `ca_config_map:
 //!    Option<String>`; and `curie::factory_intake::native_forge_values(recorded:
-//!    &Value, entries: &NativeForgeEntries) -> Value`, the forge-neutral writer
-//!    beside `forge_entries_values`: it replaces the same-named entry of
-//!    `factory.codeHosts`, `factory.trackers` and `factory.bindings` (keeping the
-//!    others) and sets `codeHostTrust.caBundle.configMapRef` when a CA is given.
+//!    &Value, entries: &NativeForgeEntries) -> Result<Value>`, the forge-neutral
+//!    writer beside `forge_entries_values`: it puts each entry into
+//!    `factory.codeHosts`, `factory.trackers` and `factory.bindings` by identity
+//!    (keeping the others, refusing a same-named entry of another identity) and
+//!    sets `codeHostTrust.caBundle.configMapRef` when this run creates the CA
+//!    bundle.
 //!
 //! The GitHub quickstart golden is pinned by `factory_quickstart_forges.rs`,
 //! which this change leaves untouched.
@@ -83,7 +88,8 @@ use std::sync::{Arc, Mutex};
 
 use curie::factory_intake::{native_forge_values, NativeForgeEntries};
 use curie::factory_quickstart::{
-    forge_egress_entries, gitlab_entries, gitlab_web_base, CodeHostKind, ForgeFlags, GitlabFacts,
+    code_host_trust_name, forge_binding_name, forge_egress_entries, forge_entry_name,
+    forge_secret_name, gitlab_entries, gitlab_web_base, CodeHostKind, ForgeFlags, GitlabFacts,
     TrackerKind, GITLAB_DEFAULT_URL,
 };
 use serde_json::{json, Value};
@@ -126,7 +132,12 @@ const ALL_TOKENS: [&str; 7] = [
     UNKNOWN_TOKEN,
 ];
 
-const CA_CONFIG_MAP: &str = "curie-gitlab-ca";
+/// The release every run here targets, and its CA bundle ConfigMap.
+const RELEASE: &str = "curie";
+
+fn ca_config_map() -> String {
+    code_host_trust_name(RELEASE)
+}
 
 fn today() -> time::Date {
     time::OffsetDateTime::now_utc().date()
@@ -463,7 +474,17 @@ impl Cli {
         Self { dir }
     }
 
+    /// Helm serves an existing release snapshot, and kubectl answers reads
+    /// (the Secret and CA bundle checks before step f) with nothing while
+    /// every kubectl write still fails.
     fn serve_release_snapshot(&self) {
+        let kubectl = self.dir.path().join("bin/kubectl");
+        fs::write(
+            &kubectl,
+            "#!/bin/sh\necho \"kubectl $*\" >> \"$SHIM_LOG\"\ncase \" $* \" in *\" get \"*) exit 0 ;; esac\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&kubectl, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(
             self.dir.path().join("bin/helm"),
             r#"#!/bin/sh
@@ -661,7 +682,10 @@ fn gitlab_com_egress() -> Vec<curie::factory_quickstart::EgressEntry> {
 
 #[test]
 fn gitlab_values_golden_for_gitlab_com() {
+    let name = forge_entry_name("gitlab", "https://gitlab.com/api/v4");
+    assert!(name.starts_with("gitlab-"), "{name}");
     let entries = gitlab_entries(&GitlabFacts {
+        release: RELEASE.to_string(),
         web_base: GITLAB_DEFAULT_URL.to_string(),
         username: BOT_USERNAME.to_string(),
         expires_at: Some("2026-11-12".to_string()),
@@ -671,7 +695,7 @@ fn gitlab_values_golden_for_gitlab_com() {
         egress: gitlab_com_egress(),
         ca_config_map: None,
     });
-    let values = native_forge_values(&Value::Null, &entries);
+    let values = native_forge_values(&Value::Null, &entries).unwrap();
 
     let egress = json!([{
         "cidr": "172.65.251.78/32",
@@ -680,12 +704,12 @@ fn gitlab_values_golden_for_gitlab_com() {
     }]);
     let credential = json!({
         "type": "static_token",
-        "existingSecret": "curie-gitlab-token",
+        "existingSecret": forge_secret_name(RELEASE, &name),
         "existingSecretKey": "token",
         "expiresAt": "2026-11-12T00:00:00Z",
     });
     let code_host = json!({
-        "name": "gitlab",
+        "name": name,
         "kind": "gitlab",
         "host": "gitlab.com",
         "apiUrl": "https://gitlab.com/api/v4",
@@ -696,12 +720,12 @@ fn gitlab_values_golden_for_gitlab_com() {
     tracker["label"] = json!(TRIGGER_LABEL);
     tracker["mention"] = json!(BOT_USERNAME);
     let binding = json!({
-        "name": "gitlab-1234",
-        "tracker": "gitlab",
+        "name": forge_binding_name(&name, "1234"),
+        "tracker": name,
         "trackerScopeId": "1234",
         "repos": [{
             "alias": "widgets",
-            "codeHost": "gitlab",
+            "codeHost": name,
             "projectId": "1234",
             "path": "acme/platform/widgets",
         }],
@@ -730,7 +754,9 @@ fn gitlab_values_golden_for_gitlab_com() {
 #[test]
 fn gitlab_values_golden_for_self_managed_with_a_ca_and_no_expiry() {
     let egress = forge_egress_entries("203.0.113.7", &[8443], |_| unreachable!()).unwrap();
+    let name = forge_entry_name("gitlab", "https://gitlab.example.test:8443/gitlab/api/v4");
     let entries = gitlab_entries(&GitlabFacts {
+        release: RELEASE.to_string(),
         web_base: "https://gitlab.example.test:8443/gitlab".to_string(),
         username: BOT_USERNAME.to_string(),
         expires_at: None,
@@ -738,19 +764,19 @@ fn gitlab_values_golden_for_self_managed_with_a_ca_and_no_expiry() {
         path: PROJECT_PATH.to_string(),
         label: "factory-fast".to_string(),
         egress,
-        ca_config_map: Some(CA_CONFIG_MAP.to_string()),
+        ca_config_map: Some(ca_config_map()),
     });
-    let values = native_forge_values(&Value::Null, &entries);
+    let values = native_forge_values(&Value::Null, &entries).unwrap();
 
     let egress = json!([{"cidr": "203.0.113.7/32", "ports": [{"protocol": "TCP", "port": 8443}]}]);
     let code_host = json!({
-        "name": "gitlab",
+        "name": name,
         "kind": "gitlab",
         "host": "gitlab.example.test:8443",
         "apiUrl": "https://gitlab.example.test:8443/gitlab/api/v4",
         "credential": {
             "type": "static_token",
-            "existingSecret": "curie-gitlab-token",
+            "existingSecret": forge_secret_name(RELEASE, &name),
             "existingSecretKey": "token",
             "neverExpires": true,
         },
@@ -760,12 +786,12 @@ fn gitlab_values_golden_for_self_managed_with_a_ca_and_no_expiry() {
     tracker["label"] = json!("factory-fast");
     tracker["mention"] = json!(BOT_USERNAME);
     let binding = json!({
-        "name": "gitlab-1234",
-        "tracker": "gitlab",
+        "name": forge_binding_name(&name, "1234"),
+        "tracker": name,
         "trackerScopeId": "1234",
         "repos": [{
             "alias": "widgets",
-            "codeHost": "gitlab",
+            "codeHost": name,
             "projectId": "1234",
             "path": PROJECT_PATH,
         }],
@@ -778,7 +804,7 @@ fn gitlab_values_golden_for_self_managed_with_a_ca_and_no_expiry() {
     assert_eq!(values.pointer("/factory/bindings"), Some(&json!([binding])));
     assert_eq!(
         values.pointer("/codeHostTrust"),
-        Some(&json!({"caBundle": {"configMapRef": {"name": CA_CONFIG_MAP, "key": "ca.crt"}}})),
+        Some(&json!({"caBundle": {"configMapRef": {"name": ca_config_map(), "key": "ca.crt"}}})),
         "{values}"
     );
 }
@@ -796,7 +822,7 @@ fn gitlab_values_enable_the_factory_with_poll_intake() {
     };
     let recorded = json!({"factory": {"enabled": false, "intake": "webhook"}});
     for recorded in [Value::Null, recorded] {
-        let values = native_forge_values(&recorded, &entries);
+        let values = native_forge_values(&recorded, &entries).unwrap();
         assert_eq!(
             values.pointer("/factory/enabled"),
             Some(&json!(true)),
@@ -818,31 +844,50 @@ fn gitlab_values_enable_the_factory_with_poll_intake() {
 #[test]
 fn gitlab_values_keep_the_other_recorded_entries() {
     let entries = NativeForgeEntries {
-        code_host: json!({"name": "gitlab", "kind": "gitlab", "host": "gitlab.com"}),
-        tracker: json!({"name": "gitlab", "kind": "gitlab", "label": "curie-factory"}),
-        binding: json!({"name": "gitlab-1234", "tracker": "gitlab"}),
+        code_host: json!({"name": "gitlab-b", "kind": "gitlab", "host": "gitlab.com"}),
+        tracker: json!({"name": "gitlab-b", "kind": "gitlab", "host": "gitlab.com", "label": "curie-factory"}),
+        binding: json!({"name": "gitlab-b-1234", "tracker": "gitlab-b", "trackerScopeId": "1234"}),
         ca_config_map: None,
     };
     let github = json!({"name": "github", "kind": "github", "host": "github.com"});
-    let jira = json!({"name": "jira", "kind": "jira_cloud"});
+    let jira = json!({"name": "jira", "kind": "jira_cloud", "host": "acme.atlassian.net"});
+    // A second GitLab instance on another host coexists (#4620).
+    let other = json!({"name": "gitlab-a", "kind": "gitlab", "host": "gitlab.example.test"});
+    let other_binding =
+        json!({"name": "gitlab-a-1234", "tracker": "gitlab-a", "trackerScopeId": "1234"});
     let recorded = json!({"factory": {
-        "codeHosts": [github, {"name": "gitlab", "kind": "gitlab", "host": "stale"}],
-        "trackers": [github, jira],
-        "bindings": [{"name": "jira", "tracker": "jira"}, {"name": "gitlab-1234", "tracker": "old"}],
+        "codeHosts": [github, other],
+        "trackers": [github, jira, other],
+        "bindings": [{"name": "jira", "tracker": "jira"}, other_binding],
     }});
-    let values = native_forge_values(&recorded, &entries);
+    let values = native_forge_values(&recorded, &entries).unwrap();
     assert_eq!(
         values.pointer("/factory/codeHosts"),
-        Some(&json!([github, entries.code_host]))
+        Some(&json!([github, other, entries.code_host]))
     );
     assert_eq!(
         values.pointer("/factory/trackers"),
-        Some(&json!([github, jira, entries.tracker]))
+        Some(&json!([github, jira, other, entries.tracker]))
     );
     assert_eq!(
         values.pointer("/factory/bindings"),
-        Some(&json!([{"name": "jira", "tracker": "jira"}, entries.binding]))
+        Some(&json!([{"name": "jira", "tracker": "jira"}, other_binding, entries.binding]))
     );
+    // An entry of the same identity is replaced in place.
+    let mut same = recorded.clone();
+    same["factory"]["codeHosts"] =
+        json!([{"name": "gitlab-b", "kind": "gitlab", "host": "gitlab.com", "egress": []}, github]);
+    let values = native_forge_values(&same, &entries).unwrap();
+    assert_eq!(
+        values.pointer("/factory/codeHosts"),
+        Some(&json!([entries.code_host, github]))
+    );
+    // A same-named entry of another identity is never replaced.
+    let mut stale = recorded.clone();
+    stale["factory"]["codeHosts"] =
+        json!([github, {"name": "gitlab-b", "kind": "gitlab", "host": "stale"}]);
+    let error = native_forge_values(&stale, &entries).expect_err("a different identity is refused");
+    assert!(format!("{error:#}").contains("gitlab-b"), "{error:#}");
 }
 
 // ---------------------------------------------------------------------------
@@ -936,11 +981,12 @@ fn factory_quickstart_gitlab_dry_run_matches_the_self_managed_golden() {
     let text = run.all();
     assert_eq!(run.code, 0, "{text}");
     let lines = run.plan();
+    let ca_config_map = ca_config_map();
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("codeHostTrust") && line.contains(CA_CONFIG_MAP)),
-        "the CA goes into codeHostTrust.caBundle through ConfigMap {CA_CONFIG_MAP}: {lines:#?}"
+            .any(|line| line.contains("codeHostTrust") && line.contains(&ca_config_map)),
+        "the CA goes into codeHostTrust.caBundle through ConfigMap {ca_config_map}: {lines:#?}"
     );
     assert!(non_get(&server).is_empty(), "{:?}", non_get(&server));
     assert_no_token(&text, "the dry run");
@@ -949,10 +995,13 @@ fn factory_quickstart_gitlab_dry_run_matches_the_self_managed_golden() {
     let port_word = regex::Regex::new(&format!(r"\b{port}\b")).unwrap();
     let dir = cli.dir.path().display().to_string();
     let chart = Cli::chart().display().to_string();
+    // The entry name is derived from the stub's API URL, whose port varies.
+    let entry = forge_entry_name("gitlab", &format!("{}/api/v4", server.base_url));
     let normalized: String = lines
         .iter()
         .map(|line| {
             let line = line
+                .replace(&entry, "<entry>")
                 .replace(&chart, "<chart>")
                 .replace(&ca, "<ca-file>")
                 .replace(&dir, "<dir>")

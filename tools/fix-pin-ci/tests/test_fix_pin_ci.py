@@ -74,6 +74,10 @@ KIND_MODULES = (
     "tools/factory-e2e/tests/test_c4_upgrade_migration.py",
     "tools/factory-e2e/tests/test_c4_held_cancellation.py",
     "tools/factory-e2e/tests/test_c4_cluster_up.py",
+    "tools/factory-e2e/tests/test_c4_forge_instances.py",
+)
+FORGE_INSTANCES_SELECTOR = (
+    "tools/factory-e2e/tests/test_c4_forge_instances.py::test_forge_instances_survive_upgrade"
 )
 LOCAL_SELECTOR = "cli/tests/local/test_deploy.py::test_deploy"
 LOCAL_LIVE_SELECTOR = "cli/tests/local/test_live.py::test_live"
@@ -1816,6 +1820,14 @@ def test_needs_curie_fails_closed_without_github_output(tmp_path: Path) -> None:
             True,
             False,
             True,
+            False,
+        ),
+        (f"Fix pin: {FORGE_INSTANCES_SELECTOR}", True, False, True, False),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_forge_instances_extra.py::test_example",
+            True,
+            True,
+            False,
             False,
         ),
         (f"Fix pin: {FACTORY_UPGRADE_SELECTOR}", True, False, True, True),

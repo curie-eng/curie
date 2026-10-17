@@ -44,6 +44,8 @@ INITIAL_BINDING_INPUTS = (
     INITIAL_BINDING_MODULE,
 )
 STATIC_TOKEN_ROTATION_MODULE = "tools/factory-e2e/tests/test_c4_static_token_rotation.py"
+FORGE_INSTANCE_JOB = "forge-instance-regression"
+FORGE_INSTANCE_MODULE = "tools/factory-e2e/tests/test_c4_forge_instances.py"
 SRE_RUNTIME = "examples/tests/test_sre_bot_observability_runtime.py"
 FACTORY_UPGRADE_RUNTIME = "tools/factory-e2e/tests/test_c4_upgrade_migration.py"
 SRE_RUNTIME_INPUTS = (
@@ -1908,6 +1910,7 @@ AGGREGATE_EXPRESSIONS = {
     "rollout_recovery_result": "${{ needs.e2e-cluster-rollout-recovery.result }}",
     "approval_resume_result": ("${{ needs.e2e-cluster-approval-resume-restarts.result }}"),
     "factory_result": "${{ needs.e2e-scripted-factory.result }}",
+    "forge_instance_result": "${{ needs.forge-instance-regression.result }}",
     "released_upgrade_result": "${{ needs.e2e-released-upgrade.result }}",
     "released_upgrade_negative_result": ("${{ needs.e2e-released-upgrade-negative.result }}"),
     "upgrade_matrix_shards_result": ("${{ needs.e2e-cluster-upgrade-matrix-shards.result }}"),
@@ -2521,6 +2524,7 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
         "e2e-cluster-rollout-recovery",
         "e2e-cluster-approval-resume-restarts",
         "e2e-scripted-factory",
+        "forge-instance-regression",
         "e2e-released-upgrade",
         "e2e-released-upgrade-negative",
         "e2e-cluster-upgrade-matrix-shards",
@@ -2581,6 +2585,10 @@ def _run_aggregate(
         "upgrade_matrix_result": "skipped",
     }
     state.update(overrides)
+    # The forge instance job is gated exactly like the scripted factory job, so
+    # it follows the scripted result unless a test overrides it.
+    if "forge_instance_result" not in overrides:
+        state["forge_instance_result"] = state["factory_result"]
     if "chart_scenarios" not in overrides and state["cluster_selected"] == "true":
         state["chart_scenarios"] = '["workspace-diagnostic"]'
     environment = os.environ.copy()
@@ -3344,6 +3352,40 @@ def test_aggregate_requires_scripted_factory_skip_when_not_selected(
     assert rejected.returncode != 0, rejected.stdout + rejected.stderr
 
 
+@pytest.mark.parametrize("event_name", ["pull_request", "push", "workflow_dispatch"])
+@pytest.mark.parametrize("selected", ["true", "false"])
+def test_aggregate_requires_forge_instance_result_to_follow_factory_selection(
+    event_name: str, selected: str
+) -> None:
+    expected, wrong = ("success", "skipped") if selected == "true" else ("skipped", "success")
+    state = {"event_name": event_name, "factory_selected": selected, "factory_result": expected}
+    ok = _run_aggregate(**state, forge_instance_result=expected)
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    for result in (wrong, "failure", "cancelled", ""):
+        rejected = _run_aggregate(**state, forge_instance_result=result)
+        assert rejected.returncode != 0, rejected.stdout + rejected.stderr
+
+
+@pytest.mark.parametrize(("selected", "result"), [("true", "success"), ("false", "skipped")])
+def test_negative_control_covers_forge_instance_result(selected: str, result: str) -> None:
+    state = {
+        "event_name": "pull_request",
+        "factory_selected": selected,
+        "factory_result": result,
+        "forge_instance_result": result,
+    }
+    check = '"$FORGE_INSTANCE_RESULT" != "$factory_expected" ||'
+
+    def accept_drift(script: str) -> str:
+        assert script.count(check) == 1
+        return script.replace(check, "", 1)
+
+    completed = _run_aggregate(script_transform=accept_drift, **state)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, output
+    assert "Selected and skipped negative control failed for FORGE_INSTANCE_RESULT" in output
+
+
 @pytest.mark.parametrize("selected", ["", "yes"])
 def test_aggregate_rejects_malformed_scripted_factory_selection(selected: str) -> None:
     completed = _run_aggregate(factory_selected=selected)
@@ -3551,6 +3593,36 @@ def test_fresh_cluster_up_runtime_is_serial_and_propagates_failure(
         CLUSTER_UP_MODULE + "::test_fresh_cluster_up_converges_without_rerun",
     ))
     assert not any(arg.startswith(("-k", "-m", "--deselect", "--ignore")) for arg in argv)
+
+
+def test_forge_instance_job_is_gated_like_the_scripted_factory_and_required() -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    job = jobs[FORGE_INSTANCE_JOB]
+    assert job["name"] == "Forge instance regression (kind)"
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["timeout-minutes"] == 165
+    assert job["if"] == jobs[SCRIPTED_FACTORY_JOB]["if"]
+    assert "needs.changes.outputs.factory == 'true'" in job["if"]
+    assert "changes" in job["needs"]
+    assert FORGE_INSTANCE_JOB in jobs["e2e-required"]["needs"]
+    steps = job["steps"]
+    runs = [step for step in steps if FORGE_INSTANCE_MODULE in step.get("run", "")]
+    assert len(runs) == 1
+    run = runs[0]
+    assert run["run"] == f"uv run pytest -q -n 0 {FORGE_INSTANCE_MODULE}"
+    assert not run.get("if")
+    assert not run.get("continue-on-error")
+    before = steps[: steps.index(run)]
+    for action in ("astral-sh/setup-uv@", "azure/setup-helm@", "helm/kind-action@"):
+        assert any(step.get("uses", "").startswith(action) for step in before), action
+    assert any("/usr/share/dotnet" in step.get("run", "") for step in before)
+    required = jobs["e2e-required"]["steps"][0]
+    assert required["env"]["FORGE_INSTANCE_RESULT"] == (
+        "${{ needs.forge-instance-regression.result }}"
+    )
+    script = required["run"]
+    assert '"$FORGE_INSTANCE_RESULT" != "$factory_expected"' in script
+    assert "FACTORY_RESULT FORGE_INSTANCE_RESULT" in script
 
 
 def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> None:

@@ -534,9 +534,9 @@ carries `Jira: <KEY> <issue URL>`.
 
 Create a dedicated Atlassian account for the factory and an API token for it
 at <https://id.atlassian.com/manage-profile/security/api-tokens>. Write the
-token to a file; quickstart reads it from there and stores it in the Secret
-`curie-jira-token`, which only the API mounts. Give the account these
-permissions:
+token to a file; quickstart reads it from there and stores it in a Secret
+that only the API mounts (see [Names and reruns](#names-and-reruns)). Give the
+account these permissions:
 
 1. Browse Projects, on the projects the factory should serve and no others.
 2. Add Comments.
@@ -587,7 +587,36 @@ the site's cloud id and the factory account's `accountId`, confirms each start
 account is a person (or reads the group), and reads each repository's id with
 the App. It then writes the token Secret, the `trackers` and `bindings`
 entries below and the Jira egress, and binds the agent to the binding as
-`jira=jira` instead of one GitHub surface per repository.
+`jira=<binding>` instead of one GitHub surface per repository.
+
+### Names and reruns
+
+Quickstart names what it creates after the instance, so several GitLab, Jira
+and Bitbucket instances coexist on one release:
+
+1. A new tracker or code host entry is named for its kind and the first 8 hex
+   digits of the SHA-256 of its `apiUrl`, for example `jira-cloud-b6a8e8d4`.
+2. A new binding is named `<tracker>-<trackerScopeId>`.
+3. A new entry's token goes in the Secret `<release>-<entry>-token`, key
+   `token`, labelled `app.kubernetes.io/managed-by=curie-quickstart` and
+   `curie.dev/release=<release>`.
+4. A CA bundle goes in the ConfigMap `<release>-code-host-trust`, key
+   `ca.crt`, unless `codeHostTrust.caBundle` already names one. Quickstart adds
+   only certificates that bundle lacks, and writes nothing when none are new.
+
+A rerun finds recorded entries by identity, the kind and host for an instance
+and the tracker and scope for a binding, whatever they are named, and keeps
+their names, Secrets and trigger label. A new tracker always gets the label
+`curie-factory`; `--label` names the agent's label, and quickstart prints the
+label each tracker actually uses. An equivalent rerun writes no Secret or
+ConfigMap.
+
+Quickstart never rotates a token. When a recorded entry's Secret holds a
+different token, or a Secret it would create already exists with other
+content or belongs to someone else, it refuses before any write and names the
+Secret: update or remove that Secret yourself, then rerun. It also refuses a
+conflicting URL, an occupied name, a missing referenced CA ConfigMap, and a
+Secret, ConfigMap or Helm revision that changed while it ran.
 
 ### The chart values it writes
 
@@ -598,7 +627,7 @@ and each repository's `projectId` is its GitHub repository id.
 ```yaml
 factory:
   trackers:
-    - name: jira
+    - name: jira-cloud-b6a8e8d4
       kind: jira_cloud
       host: example.atlassian.net
       apiUrl: https://example.atlassian.net
@@ -607,15 +636,15 @@ factory:
       credential:
         type: static_token
         username: factory-bot@example.com
-        existingSecret: curie-jira-token
+        existingSecret: curie-jira-cloud-b6a8e8d4-token
         existingSecretKey: token
       egress:
         - cidr: 192.0.2.10/32
           ports: [{protocol: TCP, port: 443}]
           host: example.atlassian.net
   bindings:
-    - name: jira
-      tracker: jira
+    - name: jira-cloud-b6a8e8d4-00000000-0000-0000-0000-000000000000
+      tracker: jira-cloud-b6a8e8d4
       trackerScopeId: 00000000-0000-0000-0000-000000000000
       repos:
         - alias: widgets
@@ -694,8 +723,9 @@ Before changing the cluster, quickstart:
 1. **Sub-path installs.** `--forge-url` is the web base, for example
    `https://host/gitlab`. Quickstart derives the API URL by appending
    `/api/v4`, so the tracker's `apiUrl` is `https://host/gitlab/api/v4`.
-2. **Custom CA.** `--ca-file <pem>` is written to a ConfigMap and referenced
-   from `codeHostTrust.caBundle`, so the API trusts a private certificate.
+2. **Custom CA.** `--ca-file <pem>` must hold only PEM certificates. They are
+   merged into the release's one `codeHostTrust.caBundle` ConfigMap, so the
+   API trusts a private certificate. See [Names and reruns](#names-and-reruns).
 3. **Plain http.** Only `localhost` and `127.0.0.1` are accepted without TLS.
 
 ### Labels
@@ -799,9 +829,9 @@ as on GitHub, and reads the repository with the Bitbucket token: on Cloud its
 UUID, with Atlassian's published Bitbucket address ranges as the egress, and
 on Data Center the server version (9.4.0 or newer) and the numeric repository
 id, with the addresses the server's host resolves to as the egress. It then
-writes the two token Secrets (`curie-jira-token` and `curie-bitbucket-token`),
-the CA ConfigMap `curie-bitbucket-ca` when `--ca-file` is given, and the
-entries. A Bitbucket access token cannot read a person's account, so look up
+writes the Jira and Bitbucket token Secrets, merges `--ca-file` into the
+release's CA bundle ConfigMap, and writes the entries, named as in
+[Names and reruns](#names-and-reruns). A Bitbucket access token cannot read a person's account, so look up
 each review account once: on Cloud the `account_id` on a comment or pull
 request that person wrote, on Data Center the user's numeric `id` from
 `/rest/api/latest/users/<slug>`.
@@ -816,8 +846,8 @@ and acts only on one that carries that mention.
 Several Bitbucket repositories in one binding, or two Bitbucket code hosts,
 are not a quickstart run; write the `factory:` values yourself.
 
-One Jira site takes exactly one binding. Quickstart already wrote the binding
-`jira` for your site, so extend that binding rather than adding a second one:
+One Jira site takes exactly one binding. Quickstart already wrote a binding
+for your site, so extend that binding rather than adding a second one:
 
 1. Add each further repository under the existing binding's `repos`, with an
    alias no other repository in the binding uses.
@@ -832,20 +862,20 @@ refused when the chart renders, even when it names a second tracker entry for
 that site, so `helm upgrade` and `curie cluster upgrade` stop before anything
 rolls out. The refusal names both bindings and the site.
 
-The example below is the quickstart binding `jira`, still on the tracker
-`jira`, carrying a Bitbucket Cloud and a Bitbucket Data Center repository.
+The example below extends a quickstart binding on the tracker
+`jira-cloud-b6a8e8d4`, carrying a Bitbucket Cloud and a Bitbucket Data Center repository.
 These values use example identifiers only. Replace them with your own:
 
 ```yaml
 factory:
   codeHosts:
-    - name: bitbucket
+    - name: bitbucket-cloud-7b02dee3
       kind: bitbucket_cloud
       host: bitbucket.org
       apiUrl: https://api.bitbucket.org/2.0
       credential:
         type: static_token
-        existingSecret: curie-bitbucket-token
+        existingSecret: curie-bitbucket-cloud-7b02dee3-token
         existingSecretKey: token
     - name: bitbucket-dc
       kind: bitbucket_dc
@@ -856,12 +886,12 @@ factory:
         existingSecret: factory-bitbucket-dc
         existingSecretKey: token
   bindings:
-    - name: jira
-      tracker: jira
+    - name: jira-cloud-b6a8e8d4-<Jira site id>
+      tracker: jira-cloud-b6a8e8d4
       trackerScopeId: "<Jira site id>"
       repos:
         - alias: example-repo
-          codeHost: bitbucket
+          codeHost: bitbucket-cloud-7b02dee3
           projectId: "{00000000-0000-4000-8000-000000000001}"
           path: example-workspace/example-repo
         - alias: demo
@@ -873,14 +903,14 @@ factory:
         type: allowlist
         accounts: ["<Jira account id>"]
       reviewFeedbackAllowlist:
-        bitbucket: ["<Atlassian account_id>"]
+        bitbucket-cloud-7b02dee3: ["<Atlassian account_id>"]
         bitbucket-dc: ["<numeric user id>"]
 ```
 
 A Jira binding must name a `defaultRepo`, the alias a ticket runs against when
 nothing picks another, and a `startAuthority` of type `allowlist` (Jira
 account ids) or `group` (a Jira `groupId`): Jira cannot report repository
-write access, so the default write check is refused. The `jira` tracker entry
+write access, so the default write check is refused. The tracker entry
 under `factory.trackers` is the Jira Cloud half of the pairing, as
 [Jira Cloud](#jira-cloud) shows it. Each code host also needs its `egress` entries: the Bitbucket
 Cloud ranges from `https://ip-ranges.atlassian.com/` on port 443, or the

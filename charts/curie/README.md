@@ -857,11 +857,13 @@ those migrations against a store that is still recovering — the crash-loop
 class this gate exists to prevent.
 
 Secrets: all credentials are written to one `<release>-secrets` Secret. A sealed
-`helm install` (the default) generates strong random values for all thirteen
+`helm install` (the default) generates strong random values for all fourteen
 chart owned credentials: the backing store passwords, Langfuse
 salt/encryptionKey/nextauthSecret, the two Langfuse init credentials, the
-api/webhook keys, `worker.internalWorkerToken`, and
-`api.approvalChatAttesterSecret`. Set `security.allowDevDefaults: true`
+api/webhook keys, `worker.internalWorkerToken`,
+`api.approvalChatAttesterSecret`, and `api.remediationAuthorityKey` (mounted
+into the API Deployment only, and refused at render when it equals
+`api.apiKey`). Set `security.allowDevDefaults: true`
 (values-dev.yaml, i.e. `curie cluster up --dev`) to keep the deterministic
 published defaults for dev/CI.
 

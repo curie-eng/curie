@@ -227,11 +227,13 @@ pub(super) async fn probe(
     })
 }
 
-/// The values fragment for one Bitbucket Data Center code host named `name`:
+/// The values fragment for one Bitbucket Data Center code host named `name`,
+/// its credential in Secret `secret` under the key `token`:
 /// the `codeHosts` entry, the repository binding (alias = repository slug) and
 /// the review allowlist under the code host's name.
 pub(super) fn values(
     name: &str,
+    secret: &str,
     probed: &Probed,
     base: &str,
     host: &str,
@@ -247,7 +249,7 @@ pub(super) fn values(
             "apiUrl": base,
             "credential": {
                 "type": "static_token",
-                "existingSecret": format!("curie-{name}-token"),
+                "existingSecret": secret,
                 "existingSecretKey": "token",
             },
             "egress": egress,
@@ -752,6 +754,7 @@ mod tests {
         let egress = dc_egress(SERVER, fake_resolve).unwrap();
         let emitted = values(
             "bitbucket-dc",
+            "curie-bitbucket-dc-token",
             &probed,
             SERVER,
             "bbdc.example.invalid",

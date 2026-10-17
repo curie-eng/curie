@@ -117,6 +117,7 @@ USERS_ROUTE = "sre-oncall"
 CHANNEL = "C0EXAMPLE9"
 OPERATOR = "U0EXAMPLE9"
 PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
+AUTHORITY_HEADER = "X-Curie-Remediation-Authority"
 
 NOMINATED: dict[str, Any] = {"namespace": "example-ns", "deployment": "example-api", "replicas": 4}
 # A sampled value distinctive enough to find in any body or log that leaked it.
@@ -1589,11 +1590,15 @@ def test_no_receipt_or_log_carries_a_sampled_value(
 
 
 def _operator() -> dict[str, str]:
+    """A remediation operator principal, minted as
+    ``POST /approvals/principals/remediation-operator`` does.
+    """
+
     token = approval_principal.mint(
         get_settings().api_key,
         subject=OPERATOR,
         kind="operator",
-        scope=approval_principal.APPROVE_SCOPE,
+        scope=approval_principal.REMEDIATION_ADMIN_SCOPE,
         exp=int(time.time()) + 300,
     )
     return {PRINCIPAL_HEADER: token}
@@ -1615,7 +1620,11 @@ def _put_policy(
             "operation_id": str(uuid.uuid4()),
             "policy": document,
         },
-        headers={**headers, **_operator()},
+        headers={
+            **headers,
+            **_operator(),
+            AUTHORITY_HEADER: get_settings().remediation_authority_key,
+        },
     )
 
 

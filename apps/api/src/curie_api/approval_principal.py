@@ -1,7 +1,9 @@
 """Authenticated principals for approval resolution (ADR-0106, #1531).
 
-An approval principal is a short-lived HMAC credential accepted only by the
-approval resolver.  Its subject and proof kind are claims in the credential,
+An approval principal is a short-lived HMAC credential accepted by the
+approval resolver; an ``operator`` principal minted with the
+``remediation.administer`` scope is accepted instead by the remediation policy
+writes (#4228).  Its subject and proof kind are claims in the credential,
 never values supplied in a resolution body.  ``chat`` principals are signed by
 the dispatcher's dedicated attester secret and bind the channel Slack delivered
 to one approval.  ``operator`` principals are signed by the platform key and
@@ -24,6 +26,9 @@ from curie_internal.sandbox_token import b64url, b64url_decode, signature
 
 _PREFIX = "apr"
 APPROVE_SCOPE = "approval.resolve"
+# A distinct scope for remediation policy administration (#4228): same token
+# format and platform key as APPROVE_SCOPE, but neither scope verifies the other.
+REMEDIATION_ADMIN_SCOPE = "remediation.administer"
 OPERATOR_TOKEN_TTL_SECONDS = 12 * 60 * 60
 PrincipalKind = Literal["chat", "operator", "test_driver"]
 

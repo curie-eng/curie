@@ -29,6 +29,7 @@ REAL_SECRETS = {
     "api_key": "a-real-key",
     "approval_chat_attester_secret": "a-real-chat-attester-secret",
     "internal_worker_token": "a-real-worker-token",
+    "remediation_authority_key": "a-real-remediation-authority-key",
 }
 
 
@@ -68,6 +69,10 @@ def test_on_with_real_secrets_boots_and_receives_the_drivers() -> None:
             {"approval_chat_attester_secret": "curie-dev-approval-chat-attester"},
             "CURIE_APPROVAL_CHAT_ATTESTER_SECRET",
         ),
+        (
+            {"remediation_authority_key": "curie-dev-remediation-authority"},
+            "CURIE_REMEDIATION_AUTHORITY_KEY",
+        ),
     ],
 )
 def test_on_refuses_each_published_default_secret(
@@ -87,6 +92,7 @@ def test_off_keeps_the_published_defaults_bootable() -> None:
         api_key="curie-dev-key",
         internal_worker_token="curie-dev-worker-token",
         approval_chat_attester_secret="curie-dev-approval-chat-attester",
+        remediation_authority_key="curie-dev-remediation-authority",
     )
     assert settings.test_installation_enabled is False
 

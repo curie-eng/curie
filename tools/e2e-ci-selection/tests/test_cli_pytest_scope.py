@@ -35,6 +35,7 @@ KIND_MODULES = (
     "tools/factory-e2e/tests/test_c4_initial_binding.py",
     "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
     "tools/factory-e2e/tests/test_c4_held_cancellation.py",
+    "tools/factory-e2e/tests/test_c4_forge_instances.py",
     SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
     SELECTION_TESTS.CLUSTER_UP_MODULE,
 )
@@ -810,11 +811,10 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
         "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
         "--ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py",
         "--ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py",
+        "--ignore=tools/factory-e2e/tests/test_c4_forge_instances.py",
         "--deselect=tools/factory-e2e/tests/test_c4_admitted_agent.py",
-        "--ignore",
-        SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
-        "--ignore",
-        SELECTION_TESTS.CLUSTER_UP_MODULE,
+        "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
+        "--ignore", SELECTION_TESTS.CLUSTER_UP_MODULE,
     ]
     if deselect:
         for path in deselect.split(","):
@@ -879,13 +879,11 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
         "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
         "--ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py",
         "--ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py",
+        "--ignore=tools/factory-e2e/tests/test_c4_forge_instances.py",
         "--deselect=tools/factory-e2e/tests/test_c4_admitted_agent.py",
-        "--ignore",
-        SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
-        "--ignore",
-        SELECTION_TESTS.CLUSTER_UP_MODULE,
-        "--deselect",
-        deselect,
+        "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
+        "--ignore", SELECTION_TESTS.CLUSTER_UP_MODULE,
+        "--deselect", deselect,
     ]
     if scope == "cli":
         expected.extend(

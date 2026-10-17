@@ -3,10 +3,18 @@
 //!
 //! [`check`] refuses an unusable flag set before any read. The run then reads
 //! the server version, the token, its user, the project and the user's access
-//! level on it (steps a to e, also under `--dry-run`), ensures the trigger and
-//! state labels (step f), and writes the `gitlab` code host, tracker and
-//! binding entries, the token Secret, the CA ConfigMap and the forge egress
-//! before deploying the agent bound through `gitlab=<path>`.
+//! level on it (steps a to e, also under `--dry-run`), checks the release's
+//! recorded instances, Secrets and CA bundle, ensures the trigger and state
+//! labels (step f), and writes the GitLab code host, tracker and binding
+//! entries, the token Secret, the CA bundle and the forge egress before
+//! deploying the agent bound through `gitlab=<path>`.
+//!
+//! A GitLab server is one instance, identified by its host authority
+//! (#4620). A recorded instance is found by that identity, whatever its
+//! entry names, and kept as recorded; a new one gets names derived from its
+//! API base URL. A second server therefore coexists with the first, and a
+//! conflicting credential or URL for a recorded one refuses before any
+//! write.
 //!
 //! The token is read from `--token-file`. It goes only into the
 //! `PRIVATE-TOKEN` header of the preflight requests and into the Secret the
@@ -20,18 +28,15 @@ pub(super) use plan::quickstart;
 use anyhow::Result;
 use serde_json::{json, Value};
 
+use super::instance::{self, Resolved};
 use super::{CodeHostKind, EgressEntry, ForgeFlags, TrackerKind};
 use crate::exit::CliError;
 use crate::factory_intake::NativeForgeEntries;
 
 /// The web base an absent `--forge-url` means.
 pub const GITLAB_DEFAULT_URL: &str = "https://gitlab.com";
-/// The name of the code host and tracker entries this module writes.
-const ENTRY_NAME: &str = "gitlab";
-/// The Secret holding the token, under the data key `token`.
-const SECRET_NAME: &str = "curie-gitlab-token";
-/// The ConfigMap holding `--ca-file`, under the data key `ca.crt`.
-const CA_CONFIG_MAP: &str = "curie-gitlab-ca";
+/// The kind of the code host and tracker entries this module writes.
+const KIND: &str = "gitlab";
 /// The state labels the factory moves on an issue, with their colors.
 const STATE_LABELS: [(&str, &str); 4] = [
     ("curie-factory:queued", "#fbca04"),
@@ -153,6 +158,8 @@ fn project_path(repos: &[String]) -> Result<String> {
 /// What the preflight learned, and what the entries are written from.
 #[derive(Debug, Clone)]
 pub struct GitlabFacts {
+    /// The release the entries and their Secret are named for.
+    pub release: String,
     /// The web base, as [`gitlab_web_base`] returns it.
     pub web_base: String,
     /// The token user's username, the tracker's mention.
@@ -162,10 +169,11 @@ pub struct GitlabFacts {
     pub project_id: u64,
     /// The project's path with its namespace.
     pub path: String,
-    /// The trigger label.
+    /// The tracker label of a new instance.
     pub label: String,
     pub egress: Vec<EgressEntry>,
-    /// The ConfigMap holding the CA bundle, when the server needs one.
+    /// The CA bundle ConfigMap this run creates, when the release references
+    /// none yet.
     pub ca_config_map: Option<String>,
 }
 
@@ -188,25 +196,29 @@ fn alias(path: &str) -> String {
     trim(&trim(&name).chars().take(64).collect::<String>())
 }
 
-/// The `gitlab` code host and tracker entries and the `gitlab-<project id>`
-/// binding for `facts`. The tracker is the code host entry with the label and
-/// mention added: one token serves both. The project id is both the
-/// repository's `projectId` and the binding's `trackerScopeId`.
+/// The code host and tracker entries and the binding for `facts` as a new
+/// instance: the entries named by [`super::forge_entry_name`] of the API
+/// base URL, their credential the release's Secret for that name, and the
+/// binding `<entry>-<project id>`. The tracker is the code host entry with
+/// the label and mention added: one token serves both. The project id is
+/// both the repository's `projectId` and the binding's `trackerScopeId`.
 pub fn gitlab_entries(facts: &GitlabFacts) -> NativeForgeEntries {
+    let api_url = format!("{}/api/v4", facts.web_base);
+    let name = super::forge_entry_name(KIND, &api_url);
     let mut credential = json!({
         "type": "static_token",
-        "existingSecret": SECRET_NAME,
-        "existingSecretKey": "token",
+        "existingSecret": super::forge_secret_name(&facts.release, &name),
+        "existingSecretKey": instance::TOKEN_KEY,
     });
     match &facts.expires_at {
         Some(date) => credential["expiresAt"] = json!(format!("{date}T00:00:00Z")),
         None => credential["neverExpires"] = json!(true),
     }
     let code_host = json!({
-        "name": ENTRY_NAME,
-        "kind": "gitlab",
+        "name": name,
+        "kind": KIND,
         "host": authority(&facts.web_base),
-        "apiUrl": format!("{}/api/v4", facts.web_base),
+        "apiUrl": api_url,
         "credential": credential,
         "egress": facts.egress,
     });
@@ -215,12 +227,12 @@ pub fn gitlab_entries(facts: &GitlabFacts) -> NativeForgeEntries {
     tracker["mention"] = json!(facts.username);
     let id = facts.project_id.to_string();
     let binding = json!({
-        "name": binding_name(facts.project_id),
-        "tracker": ENTRY_NAME,
+        "name": super::forge_binding_name(&name, &id),
+        "tracker": name,
         "trackerScopeId": id,
         "repos": [{
             "alias": alias(&facts.path),
-            "codeHost": ENTRY_NAME,
+            "codeHost": name,
             "projectId": id,
             "path": facts.path,
         }],
@@ -233,8 +245,97 @@ pub fn gitlab_entries(facts: &GitlabFacts) -> NativeForgeEntries {
     }
 }
 
-fn binding_name(project_id: u64) -> String {
-    format!("{ENTRY_NAME}-{project_id}")
+/// One credential Secret the resolved entries name, and whether a recorded
+/// entry names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CredentialRef {
+    entry: String,
+    secret: String,
+    key: String,
+    recorded: bool,
+}
+
+/// `planned` (from [`gitlab_entries`]) resolved against the release.
+#[derive(Debug, Clone, PartialEq)]
+struct Resolution {
+    entries: NativeForgeEntries,
+    /// The tracker label: a recorded tracker's own, else the default.
+    label: String,
+    credentials: Vec<CredentialRef>,
+    /// Each entry is the release's own, kept as recorded.
+    recorded: [bool; 3],
+}
+
+/// Resolves the planned entries against the release's recorded `values`
+/// (#4620): the code host and tracker by (gitlab, host), kept as recorded,
+/// or refused when the recorded API base URL is another; the binding by
+/// (tracker, project id). A new code host or tracker beside a recorded one
+/// names the recorded one's Secret, since one token serves both. Pure.
+fn resolve_gitlab_instance(
+    values: &Value,
+    planned: NativeForgeEntries,
+    release: &str,
+) -> Result<Resolution> {
+    let flag = "--forge-url";
+    let code_host =
+        instance::resolve_instance(values, "codeHosts", planned.code_host, flag, release)?;
+    let tracker = instance::resolve_instance(values, "trackers", planned.tracker, flag, release)?;
+    let shared = code_host
+        .recorded()
+        .or(tracker.recorded())
+        .map(instance::credential_ref);
+    let entry = |resolved: &Resolved| {
+        let mut entry = resolved.entry().clone();
+        if let (None, Some((secret, key))) = (resolved.recorded(), &shared) {
+            instance::set_credential_ref(&mut entry, secret, key);
+        }
+        entry
+    };
+    let (code_host_entry, tracker_entry) = (entry(&code_host), entry(&tracker));
+    let mut binding = planned.binding;
+    binding["tracker"] = tracker_entry["name"].clone();
+    binding["repos"][0]["codeHost"] = code_host_entry["name"].clone();
+    let binding = instance::resolve_binding(values, binding, release)?;
+    let mut credentials: Vec<CredentialRef> = Vec::new();
+    for entry in [&code_host_entry, &tracker_entry] {
+        // With a recorded entry every credential is a recorded one: its own,
+        // or the one the new sibling took from it.
+        let (secret, key) = instance::credential_ref(entry);
+        let credential = CredentialRef {
+            entry: entry["name"].as_str().unwrap_or_default().to_string(),
+            secret,
+            key,
+            recorded: shared.is_some(),
+        };
+        if !credentials
+            .iter()
+            .any(|seen| seen.secret == credential.secret && seen.key == credential.key)
+        {
+            credentials.push(credential);
+        }
+    }
+    let label = tracker_entry
+        .get("label")
+        .and_then(Value::as_str)
+        .filter(|_| tracker.recorded().is_some())
+        .unwrap_or(crate::factory_app::DEFAULT_LABEL)
+        .to_string();
+    let recorded = [
+        code_host.recorded().is_some(),
+        tracker.recorded().is_some(),
+        binding.recorded().is_some(),
+    ];
+    Ok(Resolution {
+        entries: NativeForgeEntries {
+            code_host: code_host_entry,
+            tracker: tracker_entry,
+            binding: binding.into_entry(),
+            ca_config_map: planned.ca_config_map,
+        },
+        label,
+        credentials,
+        recorded,
+    })
 }
 
 /// The egress entries for the server at `web_base`: the addresses its host
@@ -349,6 +450,91 @@ mod tests {
         assert_eq!(authority("https://gitlab.com"), "gitlab.com");
         assert_eq!(alias("acme/platform/Widgets.v2"), "widgets.v2");
         assert_eq!(alias("acme/_internal_"), "internal");
+    }
+
+    fn gitlab_fixture_facts(web_base: &str, project_id: u64) -> GitlabFacts {
+        GitlabFacts {
+            release: "acme".into(),
+            web_base: web_base.into(),
+            username: "bot".into(),
+            expires_at: None,
+            project_id,
+            path: "acme/widgets".into(),
+            label: crate::factory_app::DEFAULT_LABEL.into(),
+            egress: Vec::new(),
+            ca_config_map: None,
+        }
+    }
+
+    #[test]
+    fn a_second_server_resolves_to_new_entries_beside_the_first() {
+        let first = gitlab_entries(&gitlab_fixture_facts("https://a.example.test", 41));
+        let values = json!({"factory": {
+            "codeHosts": [first.code_host],
+            "trackers": [first.tracker],
+            "bindings": [first.binding],
+        }});
+        let second = resolve_gitlab_instance(
+            &values,
+            gitlab_entries(&gitlab_fixture_facts("https://b.example.test", 41)),
+            "acme",
+        )
+        .unwrap();
+        assert_eq!(second.recorded, [false, false, false]);
+        assert_ne!(second.entries.code_host["name"], first.code_host["name"]);
+        assert_ne!(second.entries.binding["name"], first.binding["name"]);
+        assert_eq!(second.credentials.len(), 1);
+        assert!(!second.credentials[0].recorded);
+        let again = resolve_gitlab_instance(
+            &values,
+            gitlab_entries(&gitlab_fixture_facts("https://a.example.test", 41)),
+            "acme",
+        )
+        .unwrap();
+        assert_eq!(again.recorded, [true, true, true]);
+        assert_eq!(again.entries.tracker, first.tracker);
+        assert!(again.credentials[0].recorded);
+    }
+
+    #[test]
+    fn a_new_tracker_beside_a_recorded_code_host_shares_its_secret() {
+        let recorded = json!({"name": "operator-code-host", "kind": "gitlab", "host": "a.example.test",
+            "apiUrl": "https://a.example.test/api/v4",
+            "credential": {"existingSecret": "operator-forge-credential", "existingSecretKey": "operator-key"}});
+        let values = json!({"factory": {"codeHosts": [recorded]}});
+        let resolved = resolve_gitlab_instance(
+            &values,
+            gitlab_entries(&gitlab_fixture_facts("https://a.example.test", 41)),
+            "acme",
+        )
+        .unwrap();
+        assert_eq!(resolved.recorded, [true, false, false]);
+        assert_eq!(
+            instance::credential_ref(&resolved.entries.tracker),
+            ("operator-forge-credential".into(), "operator-key".into())
+        );
+        assert_eq!(resolved.credentials.len(), 1);
+        assert!(resolved.credentials[0].recorded);
+        assert_eq!(
+            resolved.entries.binding["repos"][0]["codeHost"],
+            json!("operator-code-host")
+        );
+        assert_eq!(resolved.label, crate::factory_app::DEFAULT_LABEL);
+    }
+
+    #[test]
+    fn a_recorded_tracker_keeps_its_label() {
+        let first = gitlab_entries(&gitlab_fixture_facts("https://a.example.test", 41));
+        let mut tracker = first.tracker.clone();
+        tracker["label"] = json!("operator-default");
+        let values = json!({"factory": {"trackers": [tracker]}});
+        let resolved = resolve_gitlab_instance(
+            &values,
+            gitlab_entries(&gitlab_fixture_facts("https://a.example.test", 42)),
+            "acme",
+        )
+        .unwrap();
+        assert_eq!(resolved.label, "operator-default");
     }
 
     #[test]

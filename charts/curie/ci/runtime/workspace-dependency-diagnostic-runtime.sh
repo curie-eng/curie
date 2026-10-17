@@ -347,6 +347,7 @@ print("OK: the real worker observed repository-selection API HTTP 500")
 PY
 
 echo "Restoring the recorded PostgreSQL replica count and cold-start templates"
+RECOVERY_SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 restore_postgres || fail "PostgreSQL did not recover at its recorded replica count"
 # The test's long readiness tolerance keeps Deployment.Available true during
 # the outage. /ready uses the separate liveness pool; authenticated /agents
@@ -459,7 +460,7 @@ if [[ "$TURN_STATUS" != 0 ]]; then
     # Emit only fixed metadata. Arbitrary replies, API errors, identifiers, and
     # stderr remain private and are removed by this invocation's cleanup.
     python3 - "$WORKDIR/recovery.json" "$TURN_STATUS" <<'PY'
-import json, pathlib, sys
+import json, pathlib, re, sys
 try:
     payload = json.loads(pathlib.Path(sys.argv[1]).read_text())
 except (OSError, ValueError):
@@ -480,8 +481,37 @@ if isinstance(payload, dict):
     error = payload.get("error")
     summary["cli_error"] = isinstance(error, str)
     summary["error_agent_listing"] = isinstance(error, str) and "listing agents" in error
-    summary["error_http_500"] = isinstance(error, str) and "500" in error
+    # The CLI names an HTTP failure "failed with <status>" and a transport
+    # failure by the local port-forward URL, which can itself contain "500".
+    status = re.search(r"failed with (\d{3})\b", error) if isinstance(error, str) else None
+    summary["error_http_status"] = int(status.group(1)) if status else None
+    summary["error_transport"] = isinstance(error, str) and (
+        "is unreachable" in error or "could not send the requested operation" in error)
 print("Recovery diagnostic: " + json.dumps(summary, sort_keys=True))
+PY
+    # Name the API's server-side failure by exception type only. Messages and
+    # tracebacks stay private; type names are code identifiers, not data.
+    kc logs "deployment/$FULLNAME-api" --since-time="$RECOVERY_SINCE" >"$WORKDIR/recovery-api.log" 2>&1 || true
+    python3 - "$WORKDIR/recovery-api.log" <<'PY'
+import json, pathlib, re, sys
+name = r"(?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*(?:Error|Exception|Timeout|Exit)"
+patterns = (re.compile(rf"^({name})(?::|$)"), re.compile(rf"<class '({name})'>"))
+types, server_errors = set(), 0
+for raw in pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines():
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        record = None
+    texts = [record.get(key) for key in ("message", "exception")] if isinstance(record, dict) else [raw]
+    for text in texts:
+        if not isinstance(text, str):
+            continue
+        server_errors += '" 500' in text
+        for line in text.splitlines():
+            for pattern in patterns:
+                types.update(pattern.findall(line.strip()))
+summary = {"phase": "recovery", "api_exception_types": sorted(types)[:12], "api_http_500_lines": server_errors}
+print("Recovery API diagnostic: " + json.dumps(summary, sort_keys=True))
 PY
 fi
 [[ "$TURN_STATUS" == 0 ]] || fail "recovery CLI turn failed"

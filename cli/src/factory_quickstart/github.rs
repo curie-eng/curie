@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use super::instance::ReleaseWriteMark;
 use super::*;
 
 pub struct RerunTarget<'a> {
@@ -179,26 +180,31 @@ async fn read_bindings(common: &CommonOpts) -> Result<Vec<AgentBinding>> {
         .collect())
 }
 
-/// The serving release's recorded intake and, when this run may bind, its
-/// GitHub bindings. `None` recorded when no revision is serving.
-async fn read_install_state(
-    common: &CommonOpts,
-    opts: &QuickstartOpts,
-) -> Result<(Option<RecordedIntake>, Vec<AgentBinding>)> {
-    let Some((values, _)) = deployed_release_snapshot(common).await? else {
-        return Ok((None, Vec::new()));
+/// What a run read from the serving release: its snapshot, recorded
+/// intake and, when this run may bind, its GitHub bindings.
+type InstallState = (
+    Option<ReleaseSnapshot>,
+    Option<RecordedIntake>,
+    Vec<AgentBinding>,
+);
+
+/// The serving release's snapshot, its recorded intake and, when this run
+/// may bind, its GitHub bindings. All `None` when no revision is serving.
+async fn read_install_state(common: &CommonOpts, opts: &QuickstartOpts) -> Result<InstallState> {
+    let Some(snapshot) = deployed_release_snapshot(common).await? else {
+        return Ok((None, None, Vec::new()));
     };
-    let recorded = recorded_intake(&values);
+    let recorded = recorded_intake(&snapshot.values);
     let app_flags = opts.app_id.is_some() || opts.private_key_file.is_some();
     if !app_flags && recorded.is_none() {
         // The register path binds nothing, so it reads no bindings.
-        return Ok((None, Vec::new()));
+        return Ok((Some(snapshot), None, Vec::new()));
     }
     if !app_flags {
         // Decision 3: refuse the install's own flags before any further read.
         refuse_install_flags(opts.model.is_some(), opts.org.as_deref())?;
     }
-    Ok((recorded, read_bindings(common).await?))
+    Ok((Some(snapshot), recorded, read_bindings(common).await?))
 }
 
 /// The App the add agent path authenticates as: the PEM is read from the
@@ -323,11 +329,11 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
     let mut jira = None;
     let mut jira_reads = Vec::new();
     if jira_tracker && opts.dry_run {
-        let (described, reads) = jira_cloud::described(&opts.forge, &opts.repos)?;
+        let (described, reads) = jira_cloud::described(&opts.forge, &opts.repos, &opts.release)?;
         jira = Some(described);
         jira_reads = reads;
     } else if let (true, Some(app)) = (jira_tracker, &app) {
-        jira = Some(jira_cloud::preflight(&opts.forge, &opts.repos, app).await?);
+        jira = Some(jira_cloud::preflight(&opts.forge, &opts.repos, app, &opts.release).await?);
     }
     // Confirm before pin or helm. A non-terminal refusal here never reads the
     // release, and a declined prompt never installs.
@@ -369,11 +375,11 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
     // --context; without one, or when a read fails, it plans as if no intake
     // were recorded and says so.
     let mut assumed = None;
-    let (recorded, bindings) = if opts.dry_run {
+    let (snapshot, recorded, bindings) = if opts.dry_run {
         match &opts.context {
             None => {
                 assumed = Some("no --context was passed, so the release was not read; planned as if it records no factory intake".to_string());
-                (None, Vec::new())
+                (None, None, Vec::new())
             }
             Some(context) => {
                 let read = match crate::kube_context::pin_for_cluster_command(Some(context)) {
@@ -394,7 +400,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
                         assumed = Some(format!(
                             "the release could not be read ({error:#}); planned as if it records no factory intake"
                         ));
-                        (None, Vec::new())
+                        (None, None, Vec::new())
                     }
                 }
             }
@@ -402,7 +408,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
     } else if targeted.is_some() {
         read_install_state(&common, &opts).await?
     } else {
-        (None, Vec::new())
+        (None, None, Vec::new())
     };
     let add_agent = opts.app_id.is_none() && recorded.is_some();
     let release_has_real_model = if opts.dry_run || targeted.is_none() {
@@ -432,8 +438,41 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
     // needs it now, for the repository ids its binding records.
     if let (true, true, None, Some(recorded)) = (jira_tracker, add_agent, &jira, &recorded) {
         let recorded_app = recorded_app(&common, recorded, &opts.repos).await?;
-        jira = Some(jira_cloud::preflight(&opts.forge, &opts.repos, &recorded_app).await?);
+        jira = Some(
+            jira_cloud::preflight(&opts.forge, &opts.repos, &recorded_app, &opts.release).await?,
+        );
         app = Some(recorded_app);
+    }
+    // #4620: the site is found on the release by its identity, its Secret
+    // checked against the token, and the document the Jira write would
+    // apply checked against the release, on both paths before any write: on
+    // the install path before `cluster up` and the GitHub intake. What was
+    // read, with the serving Helm revision, is fenced on at every release
+    // write that follows (see `execute`).
+    let mut jira_observation = None;
+    if let Some(plan) = jira.take() {
+        let values = snapshot
+            .as_ref()
+            .map_or(&serde_json::Value::Null, |snapshot| &snapshot.values);
+        let plan = jira_cloud::bind_github_code_host(plan, values);
+        let mut plan = jira_cloud::resolve_jira_site(plan, values, "--forge-url", &opts.release)?;
+        if !opts.dry_run {
+            let document = crate::factory_intake::forge_entries_values(values, &plan)?;
+            crate::factory_intake::refuse_planned_factory(values, &document)?;
+            let observation =
+                Observation::new(&common, snapshot.as_ref().map(|snapshot| snapshot.revision));
+            // Without a targeted context the cluster does not exist yet, so
+            // there is no Secret to read; the release `cluster up` creates
+            // is adopted after it.
+            jira_observation = Some(if targeted.is_some() {
+                plan =
+                    jira_cloud::verify_secret(plan, &common, "--token-file", observation).await?;
+                plan.observation.clone()
+            } else {
+                observation
+            });
+        }
+        jira = Some(plan);
     }
     let install_label = if jira_tracker {
         jira.as_ref()
@@ -565,6 +604,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         install_label,
         rendered_image,
         published_candidate,
+        jira_observation,
     )
     .await
 }
@@ -631,6 +671,7 @@ pub(super) fn initial_binding(
     crate::api::add_channel_body(kind, address, None, None, label)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute(
     planned: &Planned,
     opts: &QuickstartOpts,
@@ -639,7 +680,15 @@ async fn execute(
     install_label: Option<String>,
     mut rendered_image: Option<String>,
     published_candidate: Option<&crate::examples::PublishedStockRunner>,
+    jira_observation: Option<Observation>,
 ) -> Result<QuickstartOutput> {
+    // A Jira run's observation guards every release write until its Jira
+    // entries are written: read again right before `cluster up` and the
+    // intake (and, inside the intake child, before its first write and its
+    // helm upgrade), whose revisions are then adopted, fenced by the Jira write
+    // itself, and read again before the first later write when an
+    // equivalent recorded site needs no Jira write at all.
+    let mut jira_fence = jira_observation;
     crate::ui::ui().note(&format!("Kubernetes context: {}", planned.context));
     if planned.cluster_up == ClusterUpStep::Skipped {
         crate::ui::ui().note("release already at the target chart and values; skipping cluster up");
@@ -673,8 +722,31 @@ async fn execute(
             }
         }
         match action {
-            Action::External { .. } | Action::Cluster { .. } => {
-                run_install_action(action, prompted_model.as_ref()).await?;
+            Action::External { .. } | Action::JiraTracker(_) | Action::Register { .. } => {}
+            Action::Cluster { .. } | Action::Intake(_) => {
+                if let Some(observation) = &jira_fence {
+                    observation.recheck().await?;
+                }
+            }
+            Action::ForgeEgress { .. }
+            | Action::RunnerEnv { .. }
+            | Action::TriggerLabel { .. }
+            | Action::Deploy { .. } => {
+                if let Some(observation) = jira_fence.take() {
+                    observation.recheck().await?;
+                }
+            }
+        }
+        match action {
+            Action::External { .. } => {
+                run_install_action(action, prompted_model.as_ref(), None).await?;
+            }
+            Action::Cluster { .. } => {
+                let mark = jira_fence.as_ref().map(|_| ReleaseWriteMark::fresh());
+                run_install_action(action, prompted_model.as_ref(), mark.as_ref()).await?;
+                if let (Some(observation), Some(mark)) = (&mut jira_fence, &mark) {
+                    observation.adopt_own_release_write(mark).await?;
+                }
             }
             Action::Register {
                 org,
@@ -717,7 +789,17 @@ async fn execute(
                     None => String::new(),
                 };
                 let args = intake_args(&planned.context, intake, &image);
-                intake_json = run_self(&args, "Configuring factory intake").await?;
+                // The intake child reads the network and the release before
+                // it writes, so it rechecks this observation immediately
+                // before its first write and again before its helm upgrade.
+                let mark = jira_fence.as_ref().map(|_| ReleaseWriteMark::fresh());
+                intake_json = run_self(
+                    &args,
+                    "Configuring factory intake",
+                    jira_fence.as_ref(),
+                    mark.as_ref(),
+                )
+                .await?;
                 if intake_json.get("github_app").is_none() {
                     return Err(step_error(
                         Path::new("curie"),
@@ -730,9 +812,15 @@ async fn execute(
                         None,
                     ));
                 }
+                if let (Some(observation), Some(mark)) = (&mut jira_fence, &mark) {
+                    observation.adopt_own_release_write(mark).await?;
+                }
             }
             Action::JiraTracker(jira) => {
-                apply_jira_tracker(opts, jira).await?;
+                let observation = jira_fence
+                    .take()
+                    .unwrap_or_else(|| jira.observation.clone());
+                apply_jira_tracker(opts, jira, &observation).await?;
             }
             Action::ForgeEgress { agent } => {
                 let chart = opts.chart.clone();
@@ -810,7 +898,7 @@ async fn execute(
                         (bundle_dir(namespace, release, agent), Some(image))
                     }
                 };
-                ensure_factory_agent(
+                let held = ensure_factory_agent(
                     &CommonOpts {
                         namespace: namespace.clone(),
                         release: release.clone(),
@@ -821,6 +909,10 @@ async fn execute(
                     repos.first().map(String::as_str),
                 )
                 .await?;
+                // A label-less Jira rerun keeps the surface the agent holds.
+                let kept_jira: Option<Option<String>> = jira_binding
+                    .as_deref()
+                    .and_then(|binding| surface_to_keep(&held, "jira", binding, label.as_deref()));
                 // `deploy_args` puts the deploy first, then the Jira binding or
                 // one GitHub binding per repository.
                 for (index, args) in deploy_args(
@@ -838,6 +930,14 @@ async fn execute(
                 .into_iter()
                 .enumerate()
                 {
+                    if index > 0 && kept_jira.is_some() {
+                        crate::ui::ui().note(&kept_surface_line(
+                            agent,
+                            "jira",
+                            jira_binding.as_deref().unwrap_or_default(),
+                        ));
+                        continue;
+                    }
                     let step = if index == 0 && agent == DEFAULT_AGENT {
                         "Deploying dark factory".to_string()
                     } else if index == 0 {
@@ -847,7 +947,7 @@ async fn execute(
                     } else {
                         "Binding GitHub repository".to_string()
                     };
-                    run_self(&args, &step).await?;
+                    run_self(&args, &step, None, None).await?;
                 }
                 for repo in bound {
                     crate::ui::ui().note(&skip_bound_line(agent, repo));
@@ -860,15 +960,19 @@ async fn execute(
                     *deadline_seconds,
                     *budget_usd,
                 ) {
-                    run_self(&args, step).await?;
+                    run_self(&args, step, None, None).await?;
                 }
                 if planned.path == QuickstartPath::AddAgent {
                     return Ok(QuickstartOutput::AgentAdded {
                         context: context.clone(),
                         agent: agent.clone(),
                         repos: repos.clone(),
-                        trigger_label: label.clone(),
-                        effective_label: label.clone().or(install_label).unwrap_or_default(),
+                        trigger_label: label.clone().or_else(|| kept_jira.clone().flatten()),
+                        effective_label: label
+                            .clone()
+                            .or_else(|| kept_jira.clone().flatten())
+                            .or(install_label)
+                            .unwrap_or_default(),
                         bundle: match bundle {
                             Some(dir) => dir.display().to_string(),
                             None => "published".to_string(),
@@ -903,6 +1007,7 @@ async fn execute(
                         .unwrap_or_default(),
                     effective_label: label
                         .clone()
+                        .or_else(|| kept_jira.clone().flatten())
                         .or_else(|| jira_binding.as_ref().and(install_label))
                         .unwrap_or_else(|| github_label.clone()),
                     label: github_label,
@@ -1029,25 +1134,29 @@ pub fn deploy_args(
     argvs
 }
 
-/// Write the Jira token Secret and the Jira tracker and binding entries on
-/// the release, once the planned entries pass the factory check. The token
-/// is read from its file here and goes only to `kubectl apply` on stdin.
-async fn apply_jira_tracker(opts: &QuickstartOpts, jira: &JiraPlan) -> Result<()> {
+/// Write the Jira tracker and binding entries on the release and, for a new
+/// site, its token Secret, once the planned entries pass the factory check
+/// and the observed objects are unchanged. The token is read from its file
+/// here and goes only to `kubectl create` on stdin.
+async fn apply_jira_tracker(
+    opts: &QuickstartOpts,
+    jira: &JiraPlan,
+    observation: &Observation,
+) -> Result<()> {
     let common = CommonOpts {
         namespace: opts.namespace.clone(),
         release: opts.release.clone(),
         dry_run: false,
     };
-    let token = jira_cloud::read_token(&jira.token_file)?;
-    let manifests = [(
-        jira_cloud::secret_manifest(&common.namespace, &token),
-        format!("Secret {}", jira.secret_name),
-    )];
+    let writes: Vec<ObjectWrite> = jira_cloud::secret_write(jira, &common)?
+        .into_iter()
+        .collect();
     crate::factory_intake::apply_forge_entries(
         &common,
         &opts.chart,
         &format!("the Jira tracker and binding `{}`", jira.binding_name),
-        &manifests,
+        observation,
+        &writes,
         |recorded| crate::factory_intake::forge_entries_values(recorded, jira),
     )
     .await

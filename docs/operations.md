@@ -2733,12 +2733,27 @@ section is the administrator's.
   approve. A user group set accepts chat and console principals but not an
   operator principal, so a route you drive from the CLI needs `approvers.users`.
 - Policy writes, arming, disarming, removal, breaker close, qualification
-  records and verifier runs need an ADR 0106 operator principal in addition to
-  the administrative credential, and record it as the actor. Mint one as
-  [Driving it from the CLI](approvals.md#driving-it-from-the-cli) shows and
-  export it as `CURIE_APPROVAL_PRINCIPAL_TOKEN`. Over HTTP it is the
-  `X-Curie-Approval-Principal` header. A write without one is refused
+  records and verifier runs need a remediation operator principal (the
+  `remediation.administer` scope) in addition to the administrative credential,
+  and record it as the actor. Mint one with
+  `curie cluster approvals <agent> --mint-remediation-principal <subject>`
+  (`curie local` at the local tier; over HTTP,
+  `POST /approvals/principals/remediation-operator`) and export it as
+  `CURIE_APPROVAL_PRINCIPAL_TOKEN`. Over HTTP it is the
+  `X-Curie-Approval-Principal` header. A write without one, or with a token from
+  `--mint-operator-principal` (which only resolves approvals), is refused
   `operator_principal_required`. Reads need none.
+- Binding (`PUT`) and arming (`POST .../arm`) a policy additionally need the
+  remediation authority key (ADR 0231): header `X-Curie-Remediation-Authority`
+  equal to `CURIE_REMEDIATION_AUTHORITY_KEY` (chart value
+  `api.remediationAuthorityKey`, generated and retained when unset, never equal
+  to `api.apiKey`, mounted into the API Deployment only). A missing or wrong
+  header, or a key unset in the API, is `403 remediation_authority_required` and
+  creates no generation. The platform key plus the operator principal is no
+  longer enough; the principal is attribution only. Delete, disarm and breaker
+  close keep the platform key plus the principal. The CLI `apply` and `arm`
+  verbs do not yet send the header (follow-up to #4225), so until then bind and
+  arm over the API with the header.
 - The protected worker is deployed. The capture of a nomination block from a
   protected turn is its runner client wrapper (AUTOMATED-REMEDIATION-6); without
   it no turn can submit a block, though the policy and qualification routes

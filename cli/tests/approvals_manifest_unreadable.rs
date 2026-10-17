@@ -69,6 +69,9 @@ fn gates(out: &ApprovalsOutput) -> (Vec<String>, Option<String>) {
         ApprovalsOutput::OperatorPrincipal { .. } => {
             panic!("expected the gate view, not an operator-principal mint")
         }
+        ApprovalsOutput::RemediationPrincipal { .. } => {
+            panic!("unexpected remediation-principal mint output")
+        }
         ApprovalsOutput::ConsoleLoginCode { .. } => {
             panic!("expected the gate view, not a console login-code mint")
         }

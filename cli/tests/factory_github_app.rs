@@ -542,6 +542,8 @@ impl Fixture {
                 "trackers":[{
                     "name":"github",
                     "kind":"github",
+                    "host":self.github.base_url.trim_start_matches("http://"),
+                    "apiUrl":format!("{}{}", self.github.base_url, self.api_prefix),
                     "mention":SLUG,
                     "label":"curie-factory",
                 }],

@@ -268,7 +268,7 @@ jobs:
           PYTEST_DESELECT: ${{ steps.python-runtime.outputs.pytest_deselect }}
           PYTEST_SCOPE: ${{ steps.python-runtime.outputs.pytest_scope }}
         run: |
-          pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/3" --reruns 1 -rsR --durations=25 --ignore=tools/factory-e2e/tests/test_c4_initial_binding.py --ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py --ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py)
+          pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/3" --reruns 1 -rsR --durations=25 --ignore=tools/factory-e2e/tests/test_c4_initial_binding.py --ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py --ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py --ignore=tools/factory-e2e/tests/test_c4_forge_instances.py)
           pytest_args+=(--deselect=tools/factory-e2e/tests/test_c4_admitted_agent.py)
           pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_upgrade_migration.py)
           pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_cluster_up.py)
@@ -281,7 +281,7 @@ jobs:
           if [[ "$PYTEST_SCOPE" == "cli" ]]; then
             mapfile -t cli_pytest_files < tools/e2e-ci-selection/cli_pytest_files.txt
             for path in "${cli_pytest_files[@]}"; do
-              if [[ "$path" != "tools/factory-e2e/tests/test_c4_initial_binding.py" && "$path" != "tools/factory-e2e/tests/test_c4_static_token_rotation.py" && "$path" != "tools/factory-e2e/tests/test_c4_upgrade_migration.py" && "$path" != "tools/factory-e2e/tests/test_c4_held_cancellation.py" && "$path" != "tools/factory-e2e/tests/test_c4_cluster_up.py" ]]; then
+              if [[ "$path" != "tools/factory-e2e/tests/test_c4_initial_binding.py" && "$path" != "tools/factory-e2e/tests/test_c4_static_token_rotation.py" && "$path" != "tools/factory-e2e/tests/test_c4_upgrade_migration.py" && "$path" != "tools/factory-e2e/tests/test_c4_held_cancellation.py" && "$path" != "tools/factory-e2e/tests/test_c4_cluster_up.py" && "$path" != "tools/factory-e2e/tests/test_c4_forge_instances.py" ]]; then
                 pytest_args+=("$path")
               fi
             done
@@ -378,6 +378,11 @@ jobs:
           uv run python scripts/check-alembic-revisions.py --other-train-ref "origin/$other_train"
       - name: Schema window gate
         run: uv run python scripts/check-schema-window.py
+      # ADR 0232 (#4610): a contract migration may not drop or rename what the
+      # previous release tag's code still names. Relies on this job's
+      # fetch-depth: 0 checkout so the release tags are present.
+      - name: Contract migration timing gate
+        run: uv run python scripts/check-contract-migration-timing.py
       - name: Ruff
         run: uv run ruff check .
       - name: Mypy
@@ -3008,6 +3013,91 @@ jobs:
           path: target/factory-e2e/scripted-*.json
           if-no-files-found: warn
 
+  # The module builds its own candidate binary and api, worker and runner
+  # images from the checkout, then creates and deletes up to four sequential
+  # kind clusters, so it needs none of the upstream build artifacts. It is
+  # selected exactly like the scripted factory scenario (#4620).
+  forge-instance-regression:
+    name: Forge instance regression (kind)
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.factory == 'true' }}
+    timeout-minutes: 165
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      # The driver creates and deletes its own cluster. The action only installs
+      # kind and kubectl; its post step still removes kind-registry, so that
+      # container must exist.
+      - name: Ensure kind-registry exists
+        run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Install kind and kubectl without creating a cluster
+        id: install_kind
+        continue-on-error: true
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          install_only: true
+      - name: Back off before retrying Install kind and kubectl without creating a cluster
+        if: steps.install_kind.outcome == 'failure'
+        run: |
+          echo "Install kind and kubectl without creating a cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          bash cli/scripts/ensure-kind-registry.sh
+          sleep 15
+      - name: Install kind and kubectl without creating a cluster (retry)
+        if: steps.install_kind.outcome == 'failure'
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          install_only: true
+      # This ubuntu-latest job owns a disposable hosted runner. The Android,
+      # .NET and Haskell SDKs are unused here; remove only those preinstalled
+      # SDK trees before downloading images to preserve the driver's 30 GB floor.
+      - name: Free disk for the disposable factory cluster
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+      - name: Run the forge instance regressions
+        run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_forge_instances.py
+
   # CHART RUNTIME REGRESSIONS, in parallel with the cluster rung. Most
   # regression proofs use this job's enforcing Calico cluster. The workspace
   # regression also uses the release CLI and candidate product images built
@@ -4722,7 +4812,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    needs: [changes, runtime-assertion-registration, e2e-ladder, e2e-oidc, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-cluster-approval-resume-restarts, e2e-scripted-factory, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
+    needs: [changes, runtime-assertion-registration, e2e-ladder, e2e-oidc, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-cluster-approval-resume-restarts, e2e-scripted-factory, forge-instance-regression, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
     # A cancelled run leaves no evidence and must rerun. In a completed run,
     # every dependency outcome reaches the strict matcher below, which rejects
     # selected results other than success.
@@ -4750,6 +4840,7 @@ jobs:
           ROLLOUT_RECOVERY_RESULT: ${{ needs.e2e-cluster-rollout-recovery.result }}
           APPROVAL_RESUME_RESULT: ${{ needs.e2e-cluster-approval-resume-restarts.result }}
           FACTORY_RESULT: ${{ needs.e2e-scripted-factory.result }}
+          FORGE_INSTANCE_RESULT: ${{ needs.forge-instance-regression.result }}
           RELEASED_UPGRADE_RESULT: ${{ needs.e2e-released-upgrade.result }}
           RELEASED_UPGRADE_NEGATIVE_RESULT: ${{ needs.e2e-released-upgrade-negative.result }}
           UPGRADE_MATRIX_SHARDS_RESULT: ${{ needs.e2e-cluster-upgrade-matrix-shards.result }}
@@ -4766,6 +4857,7 @@ jobs:
                   "$ROLLOUT_RECOVERY_RESULT" != "$rollout_recovery_expected" ||
                   "$APPROVAL_RESUME_RESULT" != "$approval_resume_expected" ||
                   "$FACTORY_RESULT" != "$factory_expected" ||
+                  "$FORGE_INSTANCE_RESULT" != "$factory_expected" ||
                   "$RELEASED_UPGRADE_RESULT" != "$released_upgrade_expected" ||
                   "$RELEASED_UPGRADE_NEGATIVE_RESULT" != "$released_upgrade_expected" ||
                   "$UPGRADE_MATRIX_RESULT" != "$upgrade_matrix_expected" ]]; then
@@ -4823,7 +4915,8 @@ jobs:
           if [[ "$APPROVAL_RESUME_SELECTED" == "true" ]]; then
             approval_resume_expected="success"
           fi
-          # Mirrors the scripted factory job's if, pull requests included.
+          # Mirrors the scripted factory and forge instance jobs' if, pull requests
+          # included.
           factory_expected="skipped"
           if [[ "$FACTORY_SELECTED" == "true" ]]; then
             factory_expected="success"
@@ -4849,7 +4942,7 @@ jobs:
           # rejected, so no dependency can drop out of the validator unnoticed.
           for name in SKILL_LOCAL_RESULT OIDC_RESULT LOCAL_RELEASE_RESULT CLUSTER_RESULT \
             CLUSTER_CHART_RESULT ROLLOUT_RECOVERY_RESULT APPROVAL_RESUME_RESULT \
-            FACTORY_RESULT \
+            FACTORY_RESULT FORGE_INSTANCE_RESULT \
             RELEASED_UPGRADE_RESULT \
             RELEASED_UPGRADE_NEGATIVE_RESULT UPGRADE_MATRIX_RESULT; do
             flipped="success"

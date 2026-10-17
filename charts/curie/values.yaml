@@ -1412,6 +1412,14 @@ api:
   # approval evidence. A sealed install generates and persists this value
   # independently; values-dev.yaml keeps the published deterministic default.
   approvalChatAttesterSecret: curie-dev-approval-chat-attester
+  # Remediation authority key (ADR 0231). Binding (PUT) and arming a remediation
+  # policy need it in X-Curie-Remediation-Authority; the platform key plus an
+  # operator principal is not enough, because every worker holds the platform
+  # key. It MUST differ from apiKey (the render refuses equality) and is mounted
+  # into the API Deployment only. A sealed install generates and persists it;
+  # values-dev.yaml keeps the published deterministic default. Read it back with
+  # kubectl get secret <release>-secrets -o jsonpath='{.data.remediationAuthorityKey}'.
+  remediationAuthorityKey: curie-dev-remediation-authority
   # Probe cadences. Database aware /ready keeps the API out of the Service until
   # Postgres responds, while process local /health keeps the process alive.
   # Liveness must outlast readiness. Cutoffs: readiness 120s, liveness 195s.
@@ -3137,13 +3145,13 @@ security:
   # chart credentials once its design pass lands.)
   checkDefaultCredentials: false
   # Auto-generate per-release chart credentials (issue #195). Default false: a
-  # no-override `helm install` generates strong random values for the thirteen
+  # no-override `helm install` generates strong random values for the fourteen
   # chart owned credentials: the backing store passwords, Langfuse
   # salt/encryptionKey/nextauthSecret, the two init credentials, the
-  # api/webhook keys, worker.internalWorkerToken, and
-  # api.approvalChatAttesterSecret. Set true (values-dev.yaml does) for a
-  # deterministic dev/CI render that keeps the published defaults
-  # byte-for-byte. The eleven non init credentials persist via `lookup`, so
+  # api/webhook keys, worker.internalWorkerToken,
+  # api.approvalChatAttesterSecret, and api.remediationAuthorityKey. Set true
+  # (values-dev.yaml does) for a deterministic dev/CI render that keeps the published defaults
+  # byte-for-byte. The twelve non init credentials persist via `lookup`, so
   # `helm upgrade` re-uses them. Their explicit `--set` overrides and per
   # store `existingSecret` values support
   # rotation and recovery. The two Langfuse init credentials are first boot

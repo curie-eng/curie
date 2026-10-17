@@ -544,6 +544,13 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                     expires_at: "2026-08-31T12:00:00Z".to_string(),
                 },
             },
+            "RemediationPrincipal" => ApprovalsOutput::RemediationPrincipal {
+                delivery: curie::api::OperatorPrincipalDelivery {
+                    token: "remediation-token".to_string(),
+                    subject: "operator@example.com".to_string(),
+                    expires_at: "2026-08-31T12:00:00Z".to_string(),
+                },
+            },
             "ConsoleLoginCode" => ApprovalsOutput::ConsoleLoginCode {
                 delivery: curie::api::ConsoleLoginCodeDelivery {
                     code: "console-login-code".to_string(),
