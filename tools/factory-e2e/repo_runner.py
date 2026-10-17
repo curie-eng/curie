@@ -111,18 +111,19 @@ REFUSAL_REASONS = FAULT_REASONS | {SELECTION_CONFLICT}
 # to this exact public reply.
 SELECTION_CONFLICT_REPLY = "This thread is already bound to a different repository."
 # The kernel answers a RepoRunnerPoolRefused once, as a plain reply with no
-# turn-failure marker: "This agent cannot start: {exc}. ..."
-# (apps/worker/src/curie_worker/kernel/attempt.py). The message names the
-# repository and ends its reason in "(missing_pool)" or "(stale_base)"
-# (RepoRunnerPoolRefused in apps/worker/src/curie_worker/sandbox/types.py).
+# turn-failure marker: "This agent cannot start: {exc}. An operator has to
+# make that change." (apps/worker/src/curie_worker/kernel/attempt.py), where
+# {exc} is RepoRunnerPoolRefused's message
+# (apps/worker/src/curie_worker/sandbox/types.py). Only that whole reply counts.
 _POOL_REFUSAL_REPLY = re.compile(
-    r"This agent cannot start: repository (?P<repository>\S+) .*?"
-    r"\((?P<reason>missing_pool|stale_base)\); ",
-    re.S,
+    r"This agent cannot start: repository (?P<repository>\S+) (?:"
+    r"is bound to runner pool (?P<pool>\S+), but SandboxWarmPool (?P=pool) was not rendered "
+    r"\((?P<missing>missing_pool)\); redeploy its runner"
+    r"|runner image was built on platform runner \S+, not this installation's "
+    r"(?:sha256:[0-9a-f]{64}|unpinned runner image) \((?P<stale>stale_base)\); rebuild it"
+    r") with `curie cluster factory --repo (?P=repository)`\. "
+    r"An operator has to make that change\."
 )
-_POOL_REFUSAL_REASONS = {
-    "missing_pool": "repo_runner_pool_missing", "stale_base": "repo_runner_base_mismatch",
-}
 SCRIPTED_KEY = "scripted-no-upstream"
 # The chart's default agentSandbox.runner.image.
 PLATFORM_RUNNER = f"{fe.GHCR.removeprefix('https://')}/{fe.IMAGE_OWNER}/{fe.RUNNER_IMAGE}"
@@ -131,11 +132,11 @@ ROOT = Path(__file__).resolve().parents[2]
 _REPOSITORY = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._~-]*/[A-Za-z0-9_][A-Za-z0-9._~-]*\Z")
 _MANIFEST_COUNT = re.compile(r"\btool[ _-]manifest\b[^\n]*?\b([0-9]+)\s+tools\b", re.I)
 # Claude Code appends budget notices to a Bash tool result as whole
-# <system-reminder> blocks (run 4919 recorded a token and a USD block after
-# the probe's own output). Only a tail made of nothing but such blocks is
-# removed from what the probe printed.
+# <system-reminder> blocks after a line break (run 4919 recorded a token and
+# a USD block after the probe's own output). The probe may be followed by
+# nothing else.
 _REMINDER_TAIL = re.compile(
-    r"(?:\s*<system-reminder>(?:(?!</?system-reminder>).)*</system-reminder>)+\s*\Z", re.S
+    r"\s*(?:\n\s*<system-reminder>(?:(?!</?system-reminder>).)*</system-reminder>\s*)*", re.S
 )
 
 
@@ -316,33 +317,31 @@ def _exact_digest(value: object) -> bool:
     return isinstance(value, str) and re.fullmatch(pattern, value) is not None
 
 
-def _probe_output(output: object) -> str | None:
-    """What the manifest probe printed, without the appended reminder blocks.
+def _reminders_only(text: str, start: int) -> bool:
+    """Whether ``text`` from ``start`` is only whitespace and whole reminder blocks."""
 
-    None when the result is not text, or when anything other than whole
-    ``<system-reminder>`` blocks follows the first one.
-    """
+    return _REMINDER_TAIL.fullmatch(text, start) is not None
 
-    if not isinstance(output, str):
-        return None
-    start = output.find("<system-reminder>")
-    if start < 0:
-        return output
-    if _REMINDER_TAIL.fullmatch(output, start) is None:
-        return None
-    return output[:start]
+
+def _reports_no_manifest(output: object) -> bool:
+    """The exact ``curie-no-tool-manifest`` line, then only reminder blocks."""
+
+    if not isinstance(output, str) or not output.startswith(NO_MANIFEST_OUTPUT):
+        return False
+    return _reminders_only(output, len(NO_MANIFEST_OUTPUT))
 
 
 def _manifest_failures(turn: Mapping[str, Any], runner: Mapping[str, Any]) -> list[str]:
-    output = _probe_output(turn.get("manifest_output"))
-    if output is None:
-        return ["the tool result has text other than system-reminder blocks after the probe"]
-    if not output.strip():
+    output = turn.get("manifest_output")
+    if not isinstance(output, str) or not output.strip():
         return ["no manifest output was captured from the tool result"]
+    start = len(output) - len(output.lstrip())
     try:
-        manifest = json.loads(output)
+        manifest, end = json.JSONDecoder().raw_decode(output, start)
     except ValueError:
         return ["the tool result is not valid manifest JSON"]
+    if not _reminders_only(output, end):
+        return ["the tool result has text other than system-reminder blocks after the manifest"]
     if not isinstance(manifest, dict):
         return ["the tool result is not a manifest object"]
     schema = _schema_resource("docs/schemas/tool-manifest.schema.json")
@@ -451,8 +450,7 @@ def _agent_image_failures(
     forbidden = set().union(*map(_allowed_digests, bindings.values()))
     if actual in forbidden or forbidden.intersection(digests):
         failures.append("agent image turn ran on a repository runner image")
-    output = _probe_output(turn.get("manifest_output"))
-    if output is None or output.rstrip() != NO_MANIFEST_OUTPUT:
+    if not _reports_no_manifest(turn.get("manifest_output")):
         failures.append(f"the manifest probe did not report {NO_MANIFEST_OUTPUT}")
     log = turn.get("boot_log")
     if not isinstance(log, str) or MANIFEST_ABSENT_LINE not in log or _MANIFEST_COUNT.search(log):
@@ -677,22 +675,23 @@ def refusal_reason(outcome: Mapping[str, Any], repository: str) -> str | None:
     """The documented refusal a CLI message outcome reports, or None.
 
     The worker delivers each of these refusals as an ordinary reply, so the
-    outcome's ``failed`` flag is not part of the evidence. A runner pool
-    refusal counts only when it names this turn's repository.
+    outcome's ``failed`` flag is not part of the evidence. Only the worker's
+    exact public replies count, or a failure class that is one of the reasons;
+    model text that mentions a reason does not. A runner pool refusal counts
+    only when it names this turn's repository.
     """
 
     failure_class = outcome.get("failure_class")
+    if isinstance(failure_class, str) and failure_class in REFUSAL_REASONS:
+        return failure_class
     reply = outcome.get("reply")
-    reply = reply if isinstance(reply, str) else ""
-    for reason in sorted(REFUSAL_REASONS):
-        if failure_class == reason or re.search(r"\b" + re.escape(reason) + r"\b", reply):
-            return reason
-    if SELECTION_CONFLICT_REPLY in reply:
+    reply = reply.strip() if isinstance(reply, str) else ""
+    if reply == SELECTION_CONFLICT_REPLY:
         return SELECTION_CONFLICT
-    match = _POOL_REFUSAL_REPLY.match(reply)
-    if match and match.group("repository").casefold() == repository.casefold():
-        return _POOL_REFUSAL_REASONS[match.group("reason")]
-    return None
+    match = _POOL_REFUSAL_REPLY.fullmatch(reply)
+    if match is None or match.group("repository").casefold() != repository.casefold():
+        return None
+    return "repo_runner_pool_missing" if match.group("missing") else "repo_runner_base_mismatch"
 
 
 def _plan_repositories(plan: Mapping[str, Any]) -> dict[str, dict[str, Any]]:

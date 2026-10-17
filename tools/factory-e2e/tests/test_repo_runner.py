@@ -1036,6 +1036,33 @@ def test_a_runner_pool_refusal_for_another_repository_is_not_this_turns_refusal(
     assert driver._turn(0, _plan()["turns"][0])["status"] != "refused"
 
 
+def test_the_live_unpinned_stale_base_reply_is_a_base_mismatch() -> None:
+    # Recorded verbatim from the worker in a live reproduction, before the
+    # install pinned the platform runner.
+    reply = (
+        f"This agent cannot start: repository {REPO_X} runner image was built on platform "
+        f"runner {_digest('6')}, not this installation's unpinned runner image (stale_base); "
+        f"rebuild it with `curie cluster factory --repo {REPO_X}`. An operator has to make "
+        "that change."
+    )
+    outcome = _reply_outcome(THREAD_X, reply)
+    assert repo_runner.refusal_reason(outcome, REPO_X) == "repo_runner_base_mismatch"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "No repo_runner_pool_missing occurred.",
+        "The repository_runner check passed; workspace.selection_conflict did not happen.",
+        f"Earlier I saw: {CONFLICT_REPLY} It is resolved now.",
+        _pool_refusal_reply(REPO_X, "fixture-pool", "missing_pool") + " Then it recovered.",
+    ],
+    ids=["reason-token", "conflict-token", "quoted-conflict", "pool-reply-with-more-text"],
+)
+def test_a_reply_that_only_mentions_a_refusal_is_not_one(reply: str) -> None:
+    assert repo_runner.refusal_reason(_reply_outcome(THREAD_X, reply), REPO_X) is None
+
+
 def test_model_text_naming_a_pool_reason_is_not_a_refusal(
     offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli],
 ) -> None:
@@ -1340,6 +1367,10 @@ def test_agent_turn_accepts_the_probe_output_with_appended_system_reminders() ->
         pytest.param("curie-no-tool-manifest: absent" + REMINDERS, id="different-first-line"),
         pytest.param(" curie-no-tool-manifest" + REMINDERS, id="indented-first-line"),
         pytest.param(REMINDERS, id="only-reminders"),
+        pytest.param(
+            "curie-no-tool-manifest<system-reminder>notice</system-reminder>",
+            id="reminder-on-the-first-line",
+        ),
     ],
 )
 def test_agent_turn_rejects_anything_but_the_line_and_reminder_blocks(output: str) -> None:
@@ -1352,6 +1383,14 @@ def test_runner_turn_reads_its_manifest_before_appended_system_reminders() -> No
     observation = _passing()
     observation["turns"][0]["manifest_output"] += REMINDERS
     assert repo_runner.judge_repo_runner(observation) == []
+
+
+def test_runner_turn_accepts_a_reminder_tag_inside_its_manifest_json() -> None:
+    observation = _passing()
+    manifest = json.loads(observation["turns"][0]["manifest_output"])
+    manifest["tools"][0]["path"] = "/opt/<system-reminder>/bin/tool"
+    observation["turns"][0]["manifest_output"] = json.dumps(manifest) + REMINDERS
+    assert not _mentions(repo_runner.judge_repo_runner(observation), "turn 1")
 
 
 def test_runner_turn_rejects_other_text_after_its_manifest() -> None:
