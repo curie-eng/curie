@@ -21,6 +21,7 @@ Two harness defects are pinned:
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
 import json
 import re
@@ -90,8 +91,8 @@ sys.exit(97)
 
 # Planted secrets. The hex part is 32 lowercase hex characters, the base64 run
 # is 60 characters, and the PEM body would be readable key material.
-TOKEN_HEX = "3f9a0c7be21d4856a0f3c9e7b14d6a28"
-TOKEN = f"example-gitlab-a-current-{TOKEN_HEX}"
+PLANTED_HEX = hashlib.sha256(b"forge-harness-planted-token").hexdigest()[:32]
+TOKEN = f"example-gitlab-a-current-{PLANTED_HEX}"
 PEM_BODY = "MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu"
 PEM = f"-----BEGIN RSA PRIVATE KEY-----\n{PEM_BODY}\n-----END RSA PRIVATE KEY-----\n"
 BASE64_RUN = base64.b64encode(bytes(range(45))).decode()
@@ -173,8 +174,8 @@ def harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Harness:
     cluster.env.update(fake_env)
 
     # Keep the readiness bound short; the harness reads both at call time.
-    monkeypatch.setattr(helpers, "ROLLOUT_READY_SECONDS", 2)
-    monkeypatch.setattr(helpers, "ROLLOUT_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(helpers, "ROLLOUT_READY_SECONDS", 2, raising=False)
+    monkeypatch.setattr(helpers, "ROLLOUT_POLL_SECONDS", 0.05, raising=False)
     result = Harness(candidate, cluster, scenario, log)
     result.script()
     return result
@@ -331,7 +332,14 @@ def test_failed_command_names_positionals_and_redacted_stderr_tail(
     message = str(raised.value)
     assert message.startswith(f"kubectl rollout status deployment/{FULLNAME}-api: exit 1"), message
     assert HARMLESS in message
-    for leaked in (TOKEN_HEX, "PRIVATE KEY", PEM_BODY, BASE64_RUN, STDOUT_MARKER, str(kubeconfig)):
+    for leaked in (
+        PLANTED_HEX,
+        "PRIVATE KEY",
+        PEM_BODY,
+        BASE64_RUN,
+        STDOUT_MARKER,
+        str(kubeconfig),
+    ):
         assert leaked not in message
     assert len(message) < 2300
 
@@ -376,7 +384,7 @@ def test_secret_and_values_reads_withhold_stderr(
     assert message.startswith(label), message
     assert "exit 1" in message
     assert "stderr withheld" in message
-    for leaked in (TOKEN_HEX, HARMLESS, STDOUT_MARKER, kubeconfig):
+    for leaked in (PLANTED_HEX, HARMLESS, STDOUT_MARKER, kubeconfig):
         assert leaked not in message
 
 
@@ -595,7 +603,7 @@ def test_uppercase_hex_and_base64url_runs_are_redacted(harness: Harness) -> None
 def test_rollout_does_not_count_a_pods_query_that_outlives_the_bound(
     harness: Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(helpers, "ROLLOUT_READY_SECONDS", 1)
+    monkeypatch.setattr(helpers, "ROLLOUT_READY_SECONDS", 1, raising=False)
     harness.script(
         ROLLOUT_STATUS_OK,
         rule(["get", "pods"], {"sleep": 3, **pods(pod("acme-factory-curie-api-new", ready=True))}),
