@@ -275,13 +275,18 @@ the API models. The current modules and table ownership are:
 
 | Worker module | Reads | Writes |
 |---|---|---|
+| `apps/worker/src/curie_worker/action_digest.py` | `agents` | None |
 | `apps/worker/src/curie_worker/binding.py` | `agents`, `agent_channels`, `deployments`, `agent_versions`, `approvals` | None |
 | `apps/worker/src/curie_worker/connector_loop.py` | `agents`, `deployments`, `agent_versions` | None |
+| `apps/worker/src/curie_worker/connector_probe.py` | `connector_capabilities` | None |
 | `apps/worker/src/curie_worker/cron_loop.py` | `agents`, `deployments`, `agent_versions`, `agent_channels`, `hook_runs`, `schedule_controls` | `hook_runs`, `schedule_controls` |
 | `apps/worker/src/curie_worker/hook_runs.py` | `hook_runs`, `schedule_controls` | `hook_runs` |
+| `apps/worker/src/curie_worker/hook_source_guard.py` | `agents`, `hook_source_policies`, `hook_source_operations` (hardcoded `curie` schema) | None |
+| `apps/worker/src/curie_worker/protected_binding.py` | `agents`, `agent_channels`, `agent_versions` | None |
 | `apps/worker/src/curie_worker/publication_store.py` | `publications`, `approvals`, `thread_publication_lineages`, `execution_requests`, `work_items` | `publications`, `approvals`, `thread_publication_lineages` |
 | `apps/worker/src/curie_worker/remediation_cards.py` | `remediation_approval_requests`, `approvals`, `remediation_nominations`, `remediation_policies`, `remediation_policy_generations`, `action_executions` | `remediation_approval_requests` |
 | `apps/worker/src/curie_worker/remediation_receipts.py` | `remediation_nominations`, `remediation_nomination_submissions`, `remediation_delivery_surfaces`, `remediation_escalations`, `action_executions`, `remediation_policy_generations`, `remediation_approval_requests`, `remediation_receipt_posts` | `remediation_receipt_posts` |
+| `apps/worker/src/curie_worker/sweep.py` | `agent_versions` | None |
 
 `tests/test_worker_sql_contract.py` creates an isolated database, applies the
 actual API Alembic chain to head, and checks every discovered worker text

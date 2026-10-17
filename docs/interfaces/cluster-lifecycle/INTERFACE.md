@@ -136,11 +136,15 @@ adding one.
     and credential references. It reuses an existing agent-sandbox controller
     only when it is Helm-owned by another release, or unowned, healthy and on an
     image compatible with the vendored one; anything else refuses. It reads the
-    configured gVisor RuntimeClass before the first install. Inferred mode can
-    become `off` when the class is absent (ADR-0193), or when a present class's
-    nonempty `scheduling.nodeSelector` matches no node in a successfully read
-    node list (ADR-0218). Explicit `auto` contradicting either fact refuses;
-    explicit `require` retains the scheduling preflight for a present class.
+    configured gVisor RuntimeClass before the first install. When the rendered
+    preflight does not create the RuntimeClass, inferred mode can become `off`
+    when the class is absent (ADR-0193), or when a present class's nonempty
+    `scheduling.nodeSelector` matches no node in a successfully read node list
+    (ADR-0218). Explicit `auto` contradicting either fact refuses; explicit
+    `require` also refuses an absent class, but retains the scheduling preflight
+    for a present class. When the rendered preflight creates the RuntimeClass
+    (`creates_runtime_class`), absence and unschedulability skip that inference
+    and those refusals (`cli/src/ops/up.rs`).
     Eligible fake-model auto installs also read the class and infer `off` from
     that scheduling result (ADR-0221): a second render with fake model disabled
     must produce a preflight that does not create the RuntimeClass. An absent

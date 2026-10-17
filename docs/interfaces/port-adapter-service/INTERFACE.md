@@ -240,7 +240,10 @@ service is material:
   (`apps/worker/src/curie_worker/deploy_notice.py::DeployNoticeConsumer`).
   Progress is also a 1.1 contract, but its coordinator accepts only eligible
   Slack turns (`apps/worker/src/curie_worker/turn_progress.py::progress_eligible`)
-  and the maintenance sweep currently has no deliverer. No non-Slack producer
+  and the worker has no progress deliverer on any path. Enabling progress
+  rendering is refused
+  (`apps/worker/src/curie_worker/config.py::WorkerConfig._progress_render_needs_a_deliverer`),
+  and the maintenance sweep runs without a deliverer. No non-Slack producer
   sends 1.1. Before one does, it must supply that version declaration or exclude
   routes whose adapters cannot decode it.
 - **Packaging, installation, discovery, lifecycle, and conformance remain

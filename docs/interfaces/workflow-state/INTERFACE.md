@@ -227,8 +227,8 @@ bypass from the memory side.
 The guidance endpoints are another direct ORM path through the same router:
 `get_memory_guidance`, `put_memory_guidance` and `delete_memory_guidance`
 (`apps/api/src/curie_api/routers/memory.py`) read or mutate the shared
-`memory/guidance` row without calling the state API. PUT borrows `enforce_caps`;
-DELETE does not use the state router's mutation recorder. A replacement state
+`memory/guidance` row without calling the state API. PUT borrows `enforce_caps`,
+but neither PUT nor DELETE calls `state_mutation.record`. A replacement state
 backend must cover these paths as well as the legacy log operations.
 
 ## Cross-links
