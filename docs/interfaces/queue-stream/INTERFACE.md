@@ -128,12 +128,14 @@ capable-peer prompt reclaim `XINFO CONSUMERS`/`XCLAIM` (#1532), and the
 delivery-cap dead-letter path's `XPENDING`/`XRANGE`/`XADD`. The runs and eval
 lanes share the ordered liveness publication, sustained-absence proof, and cap
 enforcement in `apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer`;
-an unmarked peer remains on the 900-second `XAUTOCLAIM` fallback. All stream
-verbs are issued from that shared base
+an unmarked peer remains on the 900-second `XAUTOCLAIM` fallback. The shared
+base issues consumer transport verbs
 (`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer`);
 the sacred `apps/worker/src/curie_worker/consumer.py::Consumer` subclass supplies the
-specs and handlers and issues only its own pre-claim `xpending_range`
-(`apps/worker/src/curie_worker/consumer.py::Consumer._pending_delivery_count`). A second, sibling stream
+specs and handlers and issues its own pre-claim `xpending_range`
+(`apps/worker/src/curie_worker/consumer.py::Consumer._pending_delivery_count`).
+Its queue metrics also read raw `xpending`, `xlen` and `xinfo_groups` through
+`_valkey` (`apps/worker/src/curie_worker/consumer.py::Consumer._observe_queue_state`). A second, sibling stream
 `"curie:evals"` uses the same one-field `payload` convention
 (`apps/worker/src/curie_worker/eval/stream.py`), reinforcing the wire shape as the
 real contract.
@@ -167,6 +169,10 @@ The complete runs capable producer set is:
 | `apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._xadd` | Direct Python append, retry append, and Lua `_MARK_AND_XADD` | WorkItem execute, terminate, and reconciliation wakes |
 | `apps/worker/src/curie_worker/cron_loop.py::CronSchedulerLoop._enqueue` | Python `xadd` | Scheduled turns |
 | `apps/worker/src/curie_worker/capacity_wait.py` | Lua `_WAKE_LUA` and `_RECONCILE_LUA` | Capacity wake and terminal reconciliation |
+| `apps/worker/src/curie_worker/markers.py::Markers.publish_successor` | Python `xadd` | Leaseless sweep continuation |
+| `apps/worker/src/curie_worker/markers.py` | Lua `_SETTLE_FENCED_AND_PUBLISH_LUA` | Fenced successor publication with predecessor settlement |
+| `packages/protected-hooks/src/curie_protected_hooks/admission_scripts.py` | First `XADD` in `TRANSACTION` (`module:1` in `wire_sites.json`) | Initial protected admission at the newly reserved stream id, carrying the protected envelope |
+| `packages/protected-hooks/src/curie_protected_hooks/admission_scripts.py` | Second `XADD` in `TRANSACTION` (`module:2` in `wire_sites.json`) | Protected admission recovery when the reserved entry is absent, carrying the protected envelope |
 | `cli/src/queue.rs` | Rust `queue::xadd` | Generic stream append used by runs and eval callers; the runtime stream argument makes this site runs capable |
 
 Sibling append sites are declared separately: API `EvalQueue.enqueue` in
@@ -177,6 +183,13 @@ Sibling append sites are declared separately: API `EvalQueue.enqueue` in
 `_DEAD_LETTER_COMPLETION_LUA` in `apps/worker/src/curie_worker/markers.py`, and progress
 `_DEAD_LETTER_LUA` in `apps/worker/src/curie_worker/progress.py`. Their eval, notice,
 progress, and graveyard destinations retain their own payload and retention rules.
+Three protected diagnostic writers are also declared in `wire_sites.json`:
+`apps/worker/src/curie_worker/protected_dispatch.py` publishes the original
+delivery diagnostic before fenced acknowledgement;
+`apps/worker/src/curie_worker/protected_lane.py` publishes a transport refusal
+after exact-row and ownership checks; and
+`apps/worker/src/curie_worker/protected_markers.py` publishes a completion
+graveyard row before resolving the exact outbox generation.
 
 Consumer group creation has one implementation,
 `packages/curie-internal/src/curie_internal/streams.py::ensure_group`.
@@ -226,6 +239,27 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
 `redis.asyncio.Redis` / `redis.Redis` satisfy the ports structurally with no adapter.
 
 ## Known leakage
+
+The producer ports also leave sweep successor and protected admission writes
+outside the boundary. `Markers.publish_successor` uses the raw client, and
+`_SETTLE_FENCED_AND_PUBLISH_LUA` atomically publishes the successor with fenced
+predecessor settlement (`apps/worker/src/curie_worker/markers.py`). Both protected
+admission `XADD` sites in
+`packages/protected-hooks/src/curie_protected_hooks/admission_scripts.py`
+use the private broker. Protected worker paths also issue direct `XRANGE`,
+`XACK` and diagnostic `XADD` through that broker or its Lua scripts
+(`apps/worker/src/curie_worker/protected_lane.py`,
+`apps/worker/src/curie_worker/protected_dispatch.py`,
+`apps/worker/src/curie_worker/protected_execution.py`,
+`apps/worker/src/curie_worker/protected_recovery.py`,
+`apps/worker/src/curie_worker/protected_markers.py`). They do not use
+`StreamBroker`; a broker swap must preserve their exact-row, generation and
+ownership fences as well as the ordinary stream semantics.
+
+Queue-state observation is another off-port reader:
+`Consumer._observe_queue_state` reads `xpending`, `xlen` and `xinfo_groups`
+through its concrete `_valkey` client. Implementing the consumer transport
+port alone does not supply those gauges.
 
 - **The composition root still touches redis directly.** The client construction in
   `apps/worker/src/curie_worker/run.py` (by design) builds concrete
@@ -324,7 +358,9 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
 - **The delivery lease store reads and claims the stream off-port.**
   `apps/worker/src/curie_worker/delivery_lease.py::DeliveryLeaseStore` is another
   narrow adjacent adapter on the concrete client. `entry_vanished` calls `xrange`
-  for one exact entry id, and `heartbeat` runs a Lua script that renews the lease
+  for one exact entry id and `xpending_range` for that same id; it reports the
+  delivery vanished only when both are empty and the lease is absent or still
+  owned by the caller. `heartbeat` runs a Lua script that renews the lease
   and re-claims the PEL row with `XCLAIM ... JUSTID` to the current consumer, so
   the claim does not burn a delivery of the ADR-0039 budget. A second broker must
   provide a claim that moves ownership without bumping the delivery count, or

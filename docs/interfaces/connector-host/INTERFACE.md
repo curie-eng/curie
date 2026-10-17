@@ -237,8 +237,9 @@ One production host plus a fake:
 
 - **Kubernetes:** `KubernetesConnectorClient`
   (`apps/worker/src/curie_worker/connector_k8s.py::KubernetesConnectorClient`),
-  in-cluster or kubeconfig auth. Everything Kubernetes-shaped in the reconciler
-  stops in that module. Writes are **server-side applies** with `force=True`
+  in-cluster or kubeconfig auth. Every Kubernetes API call made through the
+  reconciler's `ConnectorClient` stops in that module; Deployment-shaped
+  observations still reach the probe logic described below. Writes are **server-side applies** with `force=True`
   under a stable field manager, `FIELD_MANAGER`
   (`apps/worker/src/curie_worker/connector_k8s.py::FIELD_MANAGER`): not
   create-then-replace, because a rendered Service declares no `clusterIP` and
@@ -264,6 +265,18 @@ the `ManifestSource` implementation that fetches rendered objects from the API.
 ## Known leakage
 
 The port is a real `Protocol`, and the values crossing it are Kubernetes:
+
+The capability probe consumes Deployment details beyond the identity and owner
+fields used by reconciliation. `_ObservingClient`
+(`apps/worker/src/curie_worker/connector_loop.py::_ObservingClient`) retains the
+Deployments returned by `list_owned`; `ProbeTrigger`
+(`apps/worker/src/curie_worker/connector_probe.py::ProbeTrigger`) reads the caller
+proxy container's connector-name env entry and calls `action_digest.observe`
+(`apps/worker/src/curie_worker/action_digest.py::observe`). That helper requires
+Deployment generation, observed generation, desired, updated, available and
+total replica counts, plus the server container's pinned image. These reads
+make no additional Kubernetes API call, but a second host must supply that
+Deployment shape for capability probes to become eligible.
 
 - **The exchanged type is raw cluster wire JSON.** Every verb trades
   `dict[str, Any]` holding `kind`, `apiVersion` and `metadata`, and reads come
