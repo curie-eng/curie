@@ -11,6 +11,7 @@ import selectors
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 import uuid
 from collections.abc import Callable
@@ -47,6 +48,80 @@ class Ticket:
     number: int
     url: str = field(repr=False)
     agent: Agent
+
+
+_SUMMARY_REQUEST_FIELDS = (
+    "status", "sequence", "started_at", "execution_attempts", "start_deferrals",
+    "last_deferral_reason", "terminal_cause", "runtime_epoch", "execution_deadline",
+    "runtime_heartbeat_expires_at", "runtime_claim_name", "runtime_sandbox_name",
+)
+_SUMMARY_PUBLICATION_FIELDS = (
+    "status", "revision_number", "approval_id", "error", "approval_card_delivery_error",
+    "result_delivery_error", "created_at", "terminal_at",
+)
+
+
+def publication_failure_summary(
+    request_id: uuid.UUID,
+    snapshot: Any,
+    publications: Any,
+    worker_logs: dict[str, str],
+    sandboxes: list[dict[str, Any]],
+    model_calls: list[dict[str, Any]],
+    provider_calls: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """A bounded digest of why a request did not publish. Pure."""
+
+    request = snapshot.get("request", {}) if isinstance(snapshot, dict) else {}
+    conversation = str(request.get("conversation_id") or "")
+    keys = {str(request_id), conversation} - {""}
+    logs: dict[str, list[str]] = {}
+    for pod, text in worker_logs.items():
+        lines = []
+        for line in text.splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            message = str(record.get("message", ""))
+            severity = str(record.get("severity", ""))
+            if severity in {"WARNING", "ERROR", "CRITICAL"} or any(k in message for k in keys):
+                lines.append(
+                    f"{record.get('timestamp', '')} {severity} {record.get('logger', '')}: "
+                    + message[:400]
+                )
+        logs[pod] = lines[-60:]
+    return {
+        "request": {key: request.get(key) for key in _SUMMARY_REQUEST_FIELDS},
+        "publications": [
+            {key: row.get(key) for key in _SUMMARY_PUBLICATION_FIELDS}
+            | {"has_head_sha": bool(row.get("head_sha"))}
+            for row in (publications if isinstance(publications, list) else [])
+        ],
+        "sandboxes": [
+            {
+                "name": pod["metadata"]["name"],
+                "phase": pod.get("status", {}).get("phase"),
+                "deleting": "deletionTimestamp" in pod["metadata"],
+                "created": pod["metadata"].get("creationTimestamp"),
+                "containers": [
+                    (c["name"], c.get("ready"), c.get("restartCount"))
+                    for c in pod.get("status", {}).get("containerStatuses", [])
+                ],
+            }
+            for pod in sandboxes
+        ],
+        "model_calls": [
+            {key: call.get(key) for key in ("id", "round", "matched_marker")}
+            for call in model_calls[-20:]
+        ],
+        "provider_calls": [
+            {key: call.get(key) for key in ("id", "method", "path", "http_status")}
+            for call in provider_calls
+            if call.get("method") != "GET" or (call.get("http_status") or 0) >= 400
+        ][-40:],
+        "worker_logs": logs,
+    }
 
 
 class AdmittedKind(sk.ScriptedRun):
@@ -247,6 +322,20 @@ class AdmittedKind(sk.ScriptedRun):
                     "(request_id, expected_count, evidence, recorded_at) VALUES (?, ?, ?, ?)",
                     (str(request_id), count, json.dumps(scrub(evidence)), time.time()),
                 )
+            sandboxes = json.loads(self.kubectl(
+                "-n", self.namespace, "get", "pods", "-o", "json",
+                "-l", "!app.kubernetes.io/component",
+            ))["items"]
+            summary = publication_failure_summary(
+                request_id, snapshot, publications, worker_logs, sandboxes,
+                self.model.call_evidence(), provider_calls,
+            )
+            # A disposable CI runner discards the private database, so the
+            # failure also reports this bounded, scrubbed digest of fixture state.
+            print(
+                "publication failure summary: " + json.dumps(scrub(summary), sort_keys=True),
+                file=sys.stderr,
+            )
         except (KeyError, OSError, ValueError, TypeError, sqlite3.Error) as exc:
             self.record_failure("publication diagnostic persistence", exc)
             raise RuntimeError(
