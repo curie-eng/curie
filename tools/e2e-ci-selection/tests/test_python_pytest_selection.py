@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
 REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+ADMITTED_AGENT_RUNTIME = "tools/factory-e2e/tests/test_c4_admitted_agent.py"
+SCRIPTED_FACTORY_JOB = "e2e-scripted-factory"
+ADMITTED_AGENT_JOB = "factory-admitted-agent"
+ADMITTED_AGENT_SHARDS = [1, 2, 3, 4, 5]
+RELABEL_REGRESSION = (
+    "test_two_worker_ci_preserves_successor_identity_and_rejects_stale_predecessor"
+)
 
 
 def _invoke_selector(
@@ -446,6 +454,57 @@ def _run_bash(
     )
 
 
+def _record_uv_step(
+    tmp_path: Path,
+    step: dict[str, Any],
+    *,
+    environment: dict[str, str],
+    exit_code: int = 0,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "uv-argv"
+    stub = bin_dir / "uv"
+    stub.write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\0" "$@" >> "$UV_ARGV_LOG"\n'
+        f"exit {exit_code}\n"
+    )
+    stub.chmod(0o755)
+    result = _run_bash(
+        _string(step, "run"),
+        {
+            **environment,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "UV_ARGV_LOG": str(log),
+        },
+        tmp_path,
+    )
+    assert log.exists(), result.stdout + result.stderr
+    recorded = log.read_bytes().split(b"\0")
+    assert recorded.pop() == b""
+    return result, [argument.decode() for argument in recorded]
+
+
+def _without_admitted_agent_exclusion(arguments: list[str]) -> list[str]:
+    remaining = []
+    excluded = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        option, separator, value = argument.partition("=")
+        if option in {"--ignore", "--deselect"}:
+            if not separator and index + 1 < len(arguments):
+                value = arguments[index + 1]
+            if value == ADMITTED_AGENT_RUNTIME:
+                excluded.append(value)
+                index += 1 if separator else 2
+                continue
+        remaining.append(argument)
+        index += 1
+    assert excluded == [ADMITTED_AGENT_RUNTIME], arguments
+    return remaining
+
+
 def _run_pytest_step(
     tmp_path: Path,
     *,
@@ -459,12 +518,6 @@ def _run_pytest_step(
     script = _string(step, "run")
     assert "${{" not in script
     bindings = _bindings(step, PYTEST_STEP_EXPRESSIONS)
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    log = tmp_path / "uv-argv"
-    stub = bin_dir / "uv"
-    stub.write_text('#!/usr/bin/env bash\nprintf "%s\\0" "$@" >> "$UV_ARGV_LOG"\n')
-    stub.chmod(0o755)
     if scope == "cli":
         relative = "tools/e2e-ci-selection/cli_pytest_files.txt"
         destination = tmp_path / relative
@@ -474,20 +527,172 @@ def _run_pytest_step(
         else:
             destination.write_text("\n".join(cli_files) + "\n")
     state = {"shard": str(shard), "pytest_deselect": deselect, "pytest_scope": scope}
-    result = _run_bash(
-        script,
-        {
-            "PATH": f"{bin_dir}:{os.environ['PATH']}",
-            "UV_ARGV_LOG": str(log),
-            **{bindings[key]: value for key, value in state.items()},
-        },
-        tmp_path,
+    result, recorded = _record_uv_step(
+        tmp_path, step, environment={bindings[key]: value for key, value in state.items()}
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert log.exists(), "the workflow did not invoke uv"
-    recorded = log.read_bytes().split(b"\0")
-    assert recorded.pop() == b""
-    return [argument.decode() for argument in recorded]
+    return recorded
+
+
+def _admitted_agent_runtime_owner() -> tuple[dict[str, Any], dict[str, Any]]:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    owners = []
+    for job_id, job in jobs.items():
+        for step in job.get("steps", []):
+            script = _string(step, "run")
+            if ADMITTED_AGENT_RUNTIME not in script:
+                continue
+            arguments = shlex.split(script)
+            if "pytest" not in arguments:
+                continue
+            for index, argument in enumerate(arguments):
+                if argument.split("::", 1)[0] != ADMITTED_AGENT_RUNTIME:
+                    continue
+                if index and arguments[index - 1] in {"--ignore", "--deselect"}:
+                    continue
+                owners.append((job_id, step))
+    assert [job_id for job_id, _ in owners] == [ADMITTED_AGENT_JOB], owners
+    return jobs[ADMITTED_AGENT_JOB], owners[0][1]
+
+
+def test_admitted_agent_runtime_has_one_required_provisioned_factory_owner() -> None:
+    job, step = _admitted_agent_runtime_owner()
+    assert job["if"] == "${{ needs.changes.outputs.factory == 'true' }}"
+    assert "changes" in set(_needs(job))
+    assert not job.get("continue-on-error", False)
+    # Every leg must run to completion: one red leg cannot cancel the others,
+    # and the matrix result is failure unless every leg passed.
+    assert job["strategy"]["fail-fast"] is False
+    assert job["strategy"]["matrix"] == {"shard": ADMITTED_AGENT_SHARDS}
+    assert "if" not in step
+    assert not step.get("continue-on-error", False)
+    assert step["env"]["CASE_SHARD"] == (
+        "${{ matrix.shard }}/" + str(len(ADMITTED_AGENT_SHARDS))
+    )
+    assert ADMITTED_AGENT_JOB in _needs(_python_job("e2e-required"))
+    prior_steps = job["steps"][:job["steps"].index(step)]
+    uses = [prior.get("uses", "") for prior in prior_steps]
+    for action in ("astral-sh/setup-uv@", "azure/setup-helm@", "helm/kind-action@"):
+        assert any(value.startswith(action) for value in uses), action
+    assert any("/usr/share/dotnet" in prior.get("run", "") for prior in prior_steps)
+
+
+@pytest.mark.parametrize("exit_code", [0, 1, 5])
+def test_admitted_agent_factory_step_runs_whole_module_and_propagates_failure(
+    tmp_path: Path, exit_code: int
+) -> None:
+    _, step = _admitted_agent_runtime_owner()
+    completed, arguments = _record_uv_step(
+        tmp_path, step, environment={"CASE_SHARD": "3/5"}, exit_code=exit_code
+    )
+    assert arguments[:2] == ["run", "pytest"]
+    assert arguments.count(ADMITTED_AGENT_RUNTIME) == 1
+    assert arguments[arguments.index("--case-shard") + 1] == "3/5"
+    assert arguments[arguments.index("-n") + 1] == "0"
+    assert all(
+        argument in {
+            "run", "pytest", "-q", "-v", "-vv", "-n", "0", "--case-shard", "3/5",
+            ADMITTED_AGENT_RUNTIME,
+        }
+        for argument in arguments
+    ), arguments
+    assert completed.returncode == exit_code, completed.stdout + completed.stderr
+
+
+def test_admitted_agent_shards_partition_the_module_in_collection_order() -> None:
+    def collect(*extra: str) -> list[str]:
+        completed = subprocess.run(
+            [sys.executable, "-m", "pytest", "--collect-only", "-q", ADMITTED_AGENT_RUNTIME,
+             *extra],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        return [line for line in completed.stdout.splitlines() if "::" in line]
+
+    whole = collect()
+    count = len(ADMITTED_AGENT_SHARDS)
+    shards = [collect("--case-shard", f"{index}/{count}") for index in ADMITTED_AGENT_SHARDS]
+    assert all(shards)
+    assert [case for shard in shards for case in shard] == whole
+    # The successor regression keeps the continuation cases that precede it
+    # today in the same process, so its shard reproduces their order.
+    relabel = f"{ADMITTED_AGENT_RUNTIME}::{RELABEL_REGRESSION}"
+    [owner] = [shard for shard in shards if relabel in shard]
+    position = owner.index(relabel)
+    assert position >= 6
+    assert all(
+        "test_continuation_revalidates_current_authority" in case
+        for case in owner[position - 6:position]
+    )
+
+
+@pytest.mark.parametrize("shard", [1, 2, 3])
+@pytest.mark.parametrize("scope", ["full", "cli"])
+def test_admitted_agent_runtime_is_excluded_from_every_generic_shard(
+    tmp_path: Path, shard: int, scope: str
+) -> None:
+    neighbor = "tools/factory-e2e/tests/test_scripted_scenario.py"
+    arguments = _run_pytest_step(
+        tmp_path,
+        shard=shard,
+        deselect="",
+        scope=scope,
+        cli_files=(ADMITTED_AGENT_RUNTIME, neighbor),
+    )
+    without_exclusion = _without_admitted_agent_exclusion(arguments)
+    if scope == "cli":
+        assert ADMITTED_AGENT_RUNTIME in without_exclusion
+        assert neighbor in without_exclusion
+
+    for path in (ADMITTED_AGENT_RUNTIME, neighbor):
+        destination = tmp_path / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("def test_collection_probe():\n    pass\n")
+    config = tmp_path / "pytest.ini"
+    config.write_text("[pytest]\ntestpaths = tools/factory-e2e/tests\n")
+    expected_neighbor = f"{neighbor}::test_collection_probe"
+    expected_runtime = f"{ADMITTED_AGENT_RUNTIME}::test_collection_probe"
+
+    def collected(argv: list[str]) -> set[str]:
+        # Retain every selection argument; omit only CI scheduling and retry
+        # options so the real pytest collector runs once without extra plugins.
+        selection = []
+        index = 2
+        while index < len(argv):
+            argument = argv[index]
+            if argument in {"-n", "--dist", "--ci-shard", "--reruns"}:
+                index += 2
+                continue
+            selection.append(argument)
+            index += 1
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "pytest", "-c", str(config),
+                "--collect-only", *selection,
+            ],
+            cwd=tmp_path,
+            env={
+                **os.environ,
+                "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+                "PYTEST_ADDOPTS": "",
+                "PYTEST_PLUGINS": "",
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return {
+            line.strip()
+            for line in result.stdout.splitlines()
+            if line.strip().endswith("::test_collection_probe")
+        }
+
+    assert collected(arguments) == {expected_neighbor}
+    assert collected(without_exclusion) == {expected_neighbor, expected_runtime}
+    if scope == "cli":
+        ignored = [*without_exclusion, "--ignore", ADMITTED_AGENT_RUNTIME]
+        assert collected(ignored) == {expected_neighbor, expected_runtime}
 
 
 @pytest.mark.parametrize("scope", ("full", "cli"))

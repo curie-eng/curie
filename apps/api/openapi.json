@@ -3,6 +3,16 @@
     "schemas": {
       "AcquireBody": {
         "properties": {
+          "context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactoryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "generation": {
             "minimum": 1.0,
             "title": "Generation",
@@ -12,11 +22,16 @@
             "minLength": 1,
             "title": "Owner",
             "type": "string"
+          },
+          "wake": {
+            "$ref": "#/components/schemas/FactoryWake"
           }
         },
         "required": [
           "owner",
-          "generation"
+          "generation",
+          "wake",
+          "context"
         ],
         "title": "AcquireBody",
         "type": "object"
@@ -5651,6 +5666,91 @@
         "title": "ExecutionSample",
         "type": "object"
       },
+      "FactoryContext": {
+        "additionalProperties": false,
+        "properties": {
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "binding_id": {
+            "format": "uuid",
+            "title": "Binding Id",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "tenant_id",
+          "binding_id",
+          "kind",
+          "address",
+          "adapter"
+        ],
+        "title": "FactoryContext",
+        "type": "object"
+      },
+      "FactoryWake": {
+        "additionalProperties": false,
+        "properties": {
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address",
+          "adapter",
+          "conversation_id"
+        ],
+        "title": "FactoryWake",
+        "type": "object"
+      },
       "FinishBody": {
         "properties": {
           "cause": {
@@ -10377,9 +10477,75 @@
       },
       "RunningWorkItemRequest": {
         "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FactoryContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
           "execution_deadline": {
             "format": "date-time",
             "title": "Execution Deadline",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "lease_held_to_deadline": {
+            "title": "Lease Held To Deadline",
+            "type": "boolean"
+          },
+          "refusal": {
+            "anyOf": [
+              {
+                "enum": [
+                  "not_found",
+                  "identity_mismatch",
+                  "active_request",
+                  "work_item_cancelled",
+                  "not_dispatchable",
+                  "not_published",
+                  "duplicate",
+                  "stale_owner",
+                  "not_running",
+                  "waiting_deadline_elapsed",
+                  "binding_missing",
+                  "repository_not_allowed",
+                  "publication_pending",
+                  "factory_wake_mismatch",
+                  "factory_agent_missing",
+                  "factory_agent_mismatch",
+                  "factory_tenant_mismatch",
+                  "factory_binding_missing",
+                  "factory_binding_ambiguous",
+                  "factory_binding_changed",
+                  "factory_surface_mismatch",
+                  "factory_start_failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Refusal"
+          },
+          "repository_path": {
+            "title": "Repository Path",
             "type": "string"
           },
           "request_id": {
@@ -10396,6 +10562,11 @@
             "title": "Status",
             "type": "string"
           },
+          "wait_deadline": {
+            "format": "date-time",
+            "title": "Wait Deadline",
+            "type": "string"
+          },
           "work_item_id": {
             "format": "uuid",
             "title": "Work Item Id",
@@ -10403,11 +10574,19 @@
           }
         },
         "required": [
+          "lease_held_to_deadline",
           "work_item_id",
           "request_id",
           "runtime_epoch",
           "execution_deadline",
-          "status"
+          "status",
+          "agent_id",
+          "generation",
+          "conversation_id",
+          "wait_deadline",
+          "repository_path",
+          "context",
+          "refusal"
         ],
         "title": "RunningWorkItemRequest",
         "type": "object"
@@ -10979,6 +11158,9 @@
             "title": "Claim Name",
             "type": "string"
           },
+          "context": {
+            "$ref": "#/components/schemas/FactoryContext"
+          },
           "generation": {
             "minimum": 1.0,
             "title": "Generation",
@@ -10999,7 +11181,8 @@
           "owner",
           "generation",
           "claim_name",
-          "sandbox_name"
+          "sandbox_name",
+          "context"
         ],
         "title": "StartBody",
         "type": "object"
@@ -26259,6 +26442,49 @@
             "schema": {
               "title": "Conversation Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "wake_kind",
+            "required": true,
+            "schema": {
+              "title": "Wake Kind",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "wake_address",
+            "required": true,
+            "schema": {
+              "title": "Wake Address",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "wake_conversation_id",
+            "required": true,
+            "schema": {
+              "title": "Wake Conversation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "wake_adapter",
+            "required": true,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Wake Adapter"
             }
           },
           {

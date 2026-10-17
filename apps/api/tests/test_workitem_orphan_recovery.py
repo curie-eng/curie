@@ -33,6 +33,7 @@ from channel_protocol.work_item_events import execute_event_id
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.workitem_reconciler import WorkItemReconciler
+from curie_worker.binding import FactoryWake
 from curie_worker.config import WorkerConfig
 from curie_worker.kernel.core import Kernel
 from curie_worker.markers import Markers
@@ -45,8 +46,14 @@ from curie_worker.workitem_dispatch import (
 )
 from curie_worker.workitem_orphans import WorkItemOrphanSweeper
 from fastapi.testclient import TestClient
+from forge_fakes import factory_wake
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 WORKER_TOKEN = "work-item-orphan-worker-token"
 REPO = "acme-corp/acme-bot"
@@ -169,6 +176,12 @@ def _async_valkey() -> aredis.Redis:
     )
 
 
+async def _request_wake(engine: AsyncEngine, request_id: uuid.UUID) -> FactoryWake:
+    async with AsyncSession(engine) as session:
+        wake = await factory_wake(session, request_id)
+        return FactoryWake.model_validate(wake.model_dump())
+
+
 def _kernel(name: str, cluster: _Cluster, client: WorkItemDispatchClient, valkey: Any) -> Kernel:
     s = get_settings()
     prefix = f"test:orphan:{uuid.uuid4().hex}"
@@ -217,13 +230,17 @@ async def _recover(app: Any, request_id: uuid.UUID, old: str) -> dict[str, Any]:
                 api_base_url="http://api", worker_token=WORKER_TOKEN, client=http
             )
             # The old incarnation acquires and starts, then dies.
-            await client.acquire(request_id, owner=old, generation=1)
+            request_wake = await _request_wake(engine, request_id)
+            acquired = await client.acquire(
+                request_id, owner=old, generation=1, wake=request_wake, context=None,
+            )
             await client.start(
                 request_id,
                 owner=old,
                 generation=1,
                 claim_name=CLAIM_NAME,
                 sandbox_name=SANDBOX_NAME,
+                context=acquired.context,
             )
 
             # The restarted process: same name, a fresh kernel holding nothing.
@@ -291,18 +308,25 @@ async def _recover(app: Any, request_id: uuid.UUID, old: str) -> dict[str, Any]:
             # A redelivered wake for the lost request reaches acquire and is refused.
             lost_refusal: str | None = None
             try:
-                await client.acquire(request_id, owner=old, generation=1)
+                await client.acquire(
+                    request_id, owner=old, generation=1, wake=request_wake, context=None,
+                )
             except WorkItemConflict as exc:
                 lost_refusal = exc.code
             successor_grant = None
             duplicate_refusal: str | None = None
             if len(successors) == 1:
                 successor_id, _status, generation = successors[0]
+                successor_wake = await _request_wake(engine, successor_id)
                 successor_grant = await client.acquire(
-                    successor_id, owner=old, generation=generation
+                    successor_id, owner=old, generation=generation,
+                    wake=successor_wake, context=None,
                 )
                 try:
-                    await client.acquire(successor_id, owner=f"{old}-peer", generation=generation)
+                    await client.acquire(
+                        successor_id, owner=f"{old}-peer", generation=generation,
+                        wake=successor_wake, context=None,
+                    )
                 except WorkItemConflict as exc:
                     duplicate_refusal = exc.code
     finally:

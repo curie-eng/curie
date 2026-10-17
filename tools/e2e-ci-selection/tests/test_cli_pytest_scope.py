@@ -812,6 +812,7 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
         "--ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py",
         "--ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py",
         "--ignore=tools/factory-e2e/tests/test_c4_forge_instances.py",
+        "--deselect=tools/factory-e2e/tests/test_c4_admitted_agent.py",
         "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
         "--ignore", SELECTION_TESTS.CLUSTER_UP_MODULE,
     ]
@@ -822,10 +823,8 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
         files = (REPO_ROOT / LIST_PATH).read_text().splitlines()
         assert files
         expected.extend(path for path in files if path not in KIND_MODULES)
-    assert (
-        PYTEST_TESTS._run_pytest_step(tmp_path, shard=shard, deselect=deselect, scope=scope)
-        == expected
-    )
+    arguments = PYTEST_TESTS._run_pytest_step(tmp_path, shard=shard, deselect=deselect, scope=scope)
+    assert arguments == expected
 
 
 @pytest.mark.parametrize("scope", ["cli", "full"])
@@ -881,6 +880,7 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
         "--ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py",
         "--ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py",
         "--ignore=tools/factory-e2e/tests/test_c4_forge_instances.py",
+        "--deselect=tools/factory-e2e/tests/test_c4_admitted_agent.py",
         "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
         "--ignore", SELECTION_TESTS.CLUSTER_UP_MODULE,
         "--deselect", deselect,

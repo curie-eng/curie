@@ -42,7 +42,7 @@ from curie_worker.approvals import (
     SettledApproval,
 )
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.binding import GRANT_TOOL_ENV
+from curie_worker.binding import GRANT_TOOL_ENV, FactoryContext, FactoryWake
 from curie_worker.kernel.workspace import _WorkspaceInferenceCarry
 from curie_worker.reply_sink import TargetRoute, _ClusterMessageReplyAdapter
 from curie_worker.runner_client import RunnerError
@@ -51,6 +51,8 @@ from curie_worker.workspace import WorkspaceSelectionRefused
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, TraceState
+
+from apps.worker.tests.queue_fixtures import factory_context, factory_conversation
 
 # importlib import mode does not add the tests directory to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -2378,7 +2380,7 @@ def test_publication_create_stops_retrying_when_its_budget_is_spent() -> None:
 class _FactoryBinding:
     """A workspace-enabled deployment for a factory execute turn."""
 
-    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
+    def _deployment(self) -> object:
         return SimpleNamespace(
             agent_id=uuid.UUID("11111111-1111-4111-8111-111111114180"),
             agent_name="acme-bot",
@@ -2387,6 +2389,13 @@ class _FactoryBinding:
             adapter=None,
             approval_routes=None,
         )
+
+    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
+        return self._deployment()
+
+    async def resolve_factory(self, context: FactoryContext) -> object:
+        assert context.agent_id == uuid.UUID("11111111-1111-4111-8111-111111114180")
+        return self._deployment()
 
     def boot_env(self, _resolved: object, thread_key: str, **_: object) -> dict[str, str]:
         return {
@@ -2429,7 +2438,15 @@ class _FactoryWorkItems:
         self.calls: list[str] = []
         self.finishes: list[dict[str, object]] = []
 
-    async def acquire(self, request_id: uuid.UUID, *, owner: str, generation: int) -> object:
+    async def acquire(
+        self,
+        request_id: uuid.UUID,
+        *,
+        owner: str,
+        generation: int,
+        wake: FactoryWake,
+        context: FactoryContext | None,
+    ) -> object:
         from datetime import timedelta
 
         from curie_worker.workitem_dispatch import WorkItemAcquireGrant
@@ -2438,12 +2455,15 @@ class _FactoryWorkItems:
         return WorkItemAcquireGrant(
             generation=generation,
             work_item_id=request_id,
-            conversation_id=f"work-item-{request_id}",
-            wait_deadline=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            conversation_id=factory_conversation(wake),
+            wait_deadline=datetime.now(UTC) + timedelta(hours=1),
             repository_path="acme-corp/widgets",
+            context=factory_context(uuid.UUID("11111111-1111-4111-8111-111111114180"), wake),
         )
 
-    async def start(self, request_id: uuid.UUID, **_: object) -> object:
+    async def start(
+        self, request_id: uuid.UUID, *, context: FactoryContext, **_: object
+    ) -> object:
         from datetime import timedelta
 
         from curie_worker.workitem_dispatch import WorkItemStartGrant

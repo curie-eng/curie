@@ -121,6 +121,15 @@ RETRY_ALLOWLIST = frozenset(
             "forge-instance-regression",
             "Install kind and kubectl without creating a cluster",
         ),
+        # Issue #4619: the admitted agent shards acquire the same tools; each
+        # case creates its own cluster.
+        ("ci.yaml", "factory-admitted-agent", "Install uv"),
+        ("ci.yaml", "factory-admitted-agent", "Install Helm"),
+        (
+            "ci.yaml",
+            "factory-admitted-agent",
+            "Install kind and kubectl without creating a cluster",
+        ),
         # The CLI convergence regressions acquire Helm, kind and kubectl; each
         # test creates its own cluster.
         ("ci.yaml", "rust-convergence", "Install Helm"),

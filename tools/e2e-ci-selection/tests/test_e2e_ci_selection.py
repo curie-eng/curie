@@ -46,6 +46,11 @@ INITIAL_BINDING_INPUTS = (
 )
 STATIC_TOKEN_ROTATION_MODULE = "tools/factory-e2e/tests/test_c4_static_token_rotation.py"
 FORGE_INSTANCE_JOB = "forge-instance-regression"
+ADMITTED_AGENT_JOB = "factory-admitted-agent"
+FACTORY_SIBLING_RESULTS = {
+    "forge_instance_result": "FORGE_INSTANCE_RESULT",
+    "admitted_agent_result": "ADMITTED_AGENT_RESULT",
+}
 FORGE_INSTANCE_MODULE = "tools/factory-e2e/tests/test_c4_forge_instances.py"
 SRE_RUNTIME = "examples/tests/test_sre_bot_observability_runtime.py"
 FACTORY_UPGRADE_RUNTIME = "tools/factory-e2e/tests/test_c4_upgrade_migration.py"
@@ -607,9 +612,7 @@ def _tracked_repo_paths(root: Path) -> frozenset[str]:
 def _python_input_source(source: str) -> str:
     module = ast.parse(source)
     parents = {
-        child: parent
-        for parent in ast.walk(module)
-        for child in ast.iter_child_nodes(parent)
+        child: parent for parent in ast.walk(module) for child in ast.iter_child_nodes(parent)
     }
 
     def scope(node: ast.AST) -> ast.AST:
@@ -629,11 +632,13 @@ def _python_input_source(source: str) -> str:
             consumed.setdefault(scope(node), set()).update(names(node))
         elif isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            assignments.append((
-                scope(node),
-                {name for target in targets for name in names(target)},
-                names(node.value),
-            ))
+            assignments.append(
+                (
+                    scope(node),
+                    {name for target in targets for name in names(target)},
+                    names(node.value),
+                )
+            )
     changed = True
     while changed:
         changed = False
@@ -1114,7 +1119,7 @@ def test_inline_upgrade_guard_scans_a_called_helpers_own_reads(
     ("source", "problems"),
     [
         (
-            'def fixture(relative):\n'
+            "def fixture(relative):\n"
             '    if relative == ".github/workflows":\n'
             '        return 404, {"message": "Not Found"}\n'
             '    if relative == "README.md":\n'
@@ -1122,7 +1127,7 @@ def test_inline_upgrade_guard_scans_a_called_helpers_own_reads(
             [],
         ),
         (
-            'def fixture(relative):\n'
+            "def fixture(relative):\n"
             '    if relative in {".github/workflows", "README.md"}:\n'
             '        return 200, {"path": relative}\n',
             [],
@@ -1136,8 +1141,7 @@ def test_inline_upgrade_guard_scans_a_called_helpers_own_reads(
             ["cli/src/main.rs: does not select released-upgrade"],
         ),
         (
-            'def fixture():\n'
-            '    return 200, {"content": Path("cli/src/main.rs").read_text()}\n',
+            'def fixture():\n    return 200, {"content": Path("cli/src/main.rs").read_text()}\n',
             ["cli/src/main.rs: does not select released-upgrade"],
         ),
         (
@@ -1145,16 +1149,16 @@ def test_inline_upgrade_guard_scans_a_called_helpers_own_reads(
             ["cli/src/main.rs: does not select released-upgrade"],
         ),
         (
-            'def read(candidate):\n'
+            "def read(candidate):\n"
             '    if candidate == "cli/src/main.rs":\n'
-            '        Path(candidate).read_text()\n',
+            "        Path(candidate).read_text()\n",
             ["cli/src/main.rs: does not select released-upgrade"],
         ),
         (
-            'def read(candidate):\n'
+            "def read(candidate):\n"
             '    if candidate == ".github/workflows":\n'
-            '        selected = candidate\n'
-            '        Path(selected).is_dir()\n',
+            "        selected = candidate\n"
+            "        Path(selected).is_dir()\n",
             [".github/workflows: unlisted directory"],
         ),
         ('(seed / "README.md").write_text("Example fixture repository")\n', []),
@@ -1164,9 +1168,15 @@ def test_inline_upgrade_guard_scans_a_called_helpers_own_reads(
         ),
     ],
     ids=[
-        "remote-route-and-response", "remote-route-membership", "local-directory",
-        "local-read-in-comparison", "local-read-in-response", "local-path-variable",
-        "compared-local-path", "compared-local-path-alias", "generated-fixture-output",
+        "remote-route-and-response",
+        "remote-route-membership",
+        "local-directory",
+        "local-read-in-comparison",
+        "local-read-in-response",
+        "local-path-variable",
+        "compared-local-path",
+        "compared-local-path-alias",
+        "generated-fixture-output",
         "checkout-read-into-output",
     ],
 )
@@ -1180,7 +1190,8 @@ def test_python_helper_guard_distinguishes_remote_data_from_checkout_inputs(
 def test_upgrade_guard_keeps_the_explicit_pytest_input(python_helper: bool) -> None:
     source = (
         f'subprocess.run(["uv", "run", "pytest", "{FACTORY_UPGRADE_RUNTIME}", "-q"])\n'
-        if python_helper else f"uv run pytest {FACTORY_UPGRADE_RUNTIME} -q\n"
+        if python_helper
+        else f"uv run pytest {FACTORY_UPGRADE_RUNTIME} -q\n"
     )
     if python_helper:
         source = _python_input_source(source)
@@ -1193,7 +1204,7 @@ def test_remote_fixture_data_does_not_hide_a_transitive_checkout_read(
     subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
     sources = {
         "charts/curie/ci/live_manifest_parity.py": (
-            'def fixture(relative):\n'
+            "def fixture(relative):\n"
             '    if relative == ".github/workflows":\n'
             '        return 200, {"path": "README.md"}\n'
             'helper = Path("charts/curie/ci/make-upgrade-mutants.py")\n'
@@ -1906,6 +1917,7 @@ AGGREGATE_EXPRESSIONS = {
     "approval_resume_result": ("${{ needs.e2e-cluster-approval-resume-restarts.result }}"),
     "factory_result": "${{ needs.e2e-scripted-factory.result }}",
     "forge_instance_result": "${{ needs.forge-instance-regression.result }}",
+    "admitted_agent_result": "${{ needs.factory-admitted-agent.result }}",
     "released_upgrade_result": "${{ needs.e2e-released-upgrade.result }}",
     "released_upgrade_negative_result": ("${{ needs.e2e-released-upgrade-negative.result }}"),
     "upgrade_matrix_shards_result": ("${{ needs.e2e-cluster-upgrade-matrix-shards.result }}"),
@@ -2533,6 +2545,7 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
         "e2e-cluster-approval-resume-restarts",
         "e2e-scripted-factory",
         "forge-instance-regression",
+        "factory-admitted-agent",
         "e2e-released-upgrade",
         "e2e-released-upgrade-negative",
         "e2e-cluster-upgrade-matrix-shards",
@@ -2593,10 +2606,12 @@ def _run_aggregate(
         "upgrade_matrix_result": "skipped",
     }
     state.update(overrides)
-    # The forge instance job is gated exactly like the scripted factory job, so
-    # it follows the scripted result unless a test overrides it.
-    if "forge_instance_result" not in overrides:
-        state["forge_instance_result"] = state["factory_result"]
+    # The forge instance and admitted agent jobs are gated
+    # exactly like the scripted factory job, so they follow the scripted
+    # result unless a test overrides them.
+    for name in FACTORY_SIBLING_RESULTS:
+        if name not in overrides:
+            state[name] = state["factory_result"]
     if "chart_scenarios" not in overrides and state["cluster_selected"] == "true":
         state["chart_scenarios"] = '["workspace-diagnostic"]'
     environment = os.environ.copy()
@@ -3273,6 +3288,66 @@ def test_approval_resume_job_runs_on_pull_requests_and_gates_e2e_required() -> N
 # #4111: factory replay has its own required result, independent of the other
 # kind scenarios. The selector's existing factory output owns this selection.
 SCRIPTED_FACTORY_JOB = "e2e-scripted-factory"
+ADMITTED_AGENT_RUNTIME = "tools/factory-e2e/tests/test_c4_admitted_agent.py"
+ADMITTED_AGENT_INPUTS = (
+    "apps/api/src/curie_api/workitem_dispatch.py",
+    "apps/api/src/curie_api/routers/work_items.py",
+    "apps/api/src/curie_api/forges/surfaces.py",
+    "apps/api/src/curie_api/forges/trackers.py",
+    "apps/api/src/curie_api/forges/registry.py",
+    "apps/api/src/curie_api/crud/channels.py",
+    "apps/api/src/curie_api/threadkeys.py",
+    "packages/aci-protocol/src/aci_protocol/turn.py",
+    "apps/worker/src/curie_worker/workitem_dispatch.py",
+    "apps/worker/src/curie_worker/binding.py",
+    "apps/worker/src/curie_worker/kernel/constants.py",
+    "apps/worker/src/curie_worker/kernel/lifecycle.py",
+    "apps/worker/src/curie_worker/kernel/work_items.py",
+    "apps/worker/src/curie_worker/kernel/claim.py",
+    ADMITTED_AGENT_RUNTIME,
+)
+
+
+@pytest.mark.parametrize("path", ADMITTED_AGENT_INPUTS)
+def test_admitted_agent_authority_paths_select_scripted_factory(tmp_path: Path, path: str) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    outputs = _outputs_of(output)
+    assert outputs["factory"] == "true", path
+    assert outputs["cluster"] == "true", path
+
+
+@pytest.mark.parametrize("path", ADMITTED_AGENT_INPUTS)
+def test_admitted_agent_factory_selection_respects_kind_omission(tmp_path: Path, path: str) -> None:
+    completed, output = _invoke_selector(tmp_path, path, omit_kind=True)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert _outputs_of(output)["factory"] == "false"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "apps/api/src/curie_api/routers/state.py",
+        "apps/worker/src/curie_worker/state/config.py",
+        "apps/api/src/curie_api/workitem_dispatch.py.other",
+        "apps/api/src/curie_api/routers/work_items.py.other",
+        "apps/api/src/curie_api/forges.py",
+        "apps/api/src/curie_api/forges_other/surfaces.py",
+        "apps/api/src/curie_api/crud/channels.py.other",
+        "apps/api/src/curie_api/threadkeys.py.other",
+        "packages/aci-protocol/src/aci_protocol/turn.py.other",
+        "apps/worker/src/curie_worker/workitem_dispatch.py.other",
+        "apps/worker/src/curie_worker/binding.py.other",
+        "apps/worker/src/curie_worker/kernel/lifecycle.py.other",
+        "apps/worker/src/curie_worker/kernel/work_items.py.other",
+        "apps/worker/src/curie_worker/kernel/claim.py.other",
+        "docs/guides/getting-started.md",
+    ],
+)
+def test_unrelated_paths_do_not_select_admitted_agent_factory(tmp_path: Path, path: str) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert _outputs_of(output)["factory"] == "false", path
 
 
 @pytest.mark.parametrize("event_name", ["pull_request", "push", "workflow_dispatch"])
@@ -3300,29 +3375,34 @@ def test_aggregate_requires_scripted_factory_skip_when_not_selected(
     assert rejected.returncode != 0, rejected.stdout + rejected.stderr
 
 
+@pytest.mark.parametrize("sibling", sorted(FACTORY_SIBLING_RESULTS))
 @pytest.mark.parametrize("event_name", ["pull_request", "push", "workflow_dispatch"])
 @pytest.mark.parametrize("selected", ["true", "false"])
-def test_aggregate_requires_forge_instance_result_to_follow_factory_selection(
-    event_name: str, selected: str
+def test_aggregate_requires_factory_sibling_results_to_follow_factory_selection(
+    event_name: str, selected: str, sibling: str
 ) -> None:
     expected, wrong = ("success", "skipped") if selected == "true" else ("skipped", "success")
     state = {"event_name": event_name, "factory_selected": selected, "factory_result": expected}
-    ok = _run_aggregate(**state, forge_instance_result=expected)
+    ok = _run_aggregate(**state, **{sibling: expected})
     assert ok.returncode == 0, ok.stdout + ok.stderr
     for result in (wrong, "failure", "cancelled", ""):
-        rejected = _run_aggregate(**state, forge_instance_result=result)
+        rejected = _run_aggregate(**state, **{sibling: result})
         assert rejected.returncode != 0, rejected.stdout + rejected.stderr
 
 
+@pytest.mark.parametrize("sibling", sorted(FACTORY_SIBLING_RESULTS))
 @pytest.mark.parametrize(("selected", "result"), [("true", "success"), ("false", "skipped")])
-def test_negative_control_covers_forge_instance_result(selected: str, result: str) -> None:
+def test_negative_control_covers_factory_sibling_results(
+    selected: str, result: str, sibling: str
+) -> None:
+    variable = FACTORY_SIBLING_RESULTS[sibling]
     state = {
         "event_name": "pull_request",
         "factory_selected": selected,
         "factory_result": result,
-        "forge_instance_result": result,
+        sibling: result,
     }
-    check = '"$FORGE_INSTANCE_RESULT" != "$factory_expected" ||'
+    check = f'"${variable}" != "$factory_expected" ||'
 
     def accept_drift(script: str) -> str:
         assert script.count(check) == 1
@@ -3331,7 +3411,7 @@ def test_negative_control_covers_forge_instance_result(selected: str, result: st
     completed = _run_aggregate(script_transform=accept_drift, **state)
     output = completed.stdout + completed.stderr
     assert completed.returncode != 0, output
-    assert "Selected and skipped negative control failed for FORGE_INSTANCE_RESULT" in output
+    assert f"Selected and skipped negative control failed for {variable}" in output
 
 
 @pytest.mark.parametrize("selected", ["", "yes"])
@@ -3398,6 +3478,9 @@ def test_convergence_changes_select_the_fresh_install_runtime(
     (
         "apps/api/src/curie_api/forges/gitlab/connection.py",
         "apps/api/src/curie_api/forges/credential_providers.py",
+        "apps/api/src/curie_api/forges/surfaces.py.other",
+        "apps/api/src/curie_api/forges/trackers.py.other",
+        "apps/api/src/curie_api/forges/registry.py.other",
         "apps/api/src/curie_api/forge_credential_health.py",
         "apps/api/src/curie_api/routers/forge_credential_health.py",
         "cli/src/forge_expiry.rs",
@@ -3658,7 +3741,30 @@ def test_forge_instance_job_is_gated_like_the_scripted_factory_and_required() ->
     )
     script = required["run"]
     assert '"$FORGE_INSTANCE_RESULT" != "$factory_expected"' in script
-    assert "FACTORY_RESULT FORGE_INSTANCE_RESULT" in script
+    assert (
+        "FACTORY_RESULT FORGE_INSTANCE_RESULT ADMITTED_AGENT_RESULT"
+        in script
+    )
+
+
+@pytest.mark.parametrize(
+    ("job_id", "variable"),
+    [(ADMITTED_AGENT_JOB, "ADMITTED_AGENT_RESULT")],
+)
+def test_split_factory_jobs_are_gated_like_the_scripted_factory_and_required(
+    job_id: str, variable: str
+) -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    job = jobs[job_id]
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["timeout-minutes"] == 120
+    assert job["if"] == jobs[SCRIPTED_FACTORY_JOB]["if"]
+    assert job["needs"] == ["changes"]
+    assert not job.get("continue-on-error")
+    assert job_id in jobs["e2e-required"]["needs"]
+    required = jobs["e2e-required"]["steps"][0]
+    assert required["env"][variable] == "${{ needs." + job_id + ".result }}"
+    assert f'"${variable}" != "$factory_expected"' in required["run"]
 
 
 def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> None:

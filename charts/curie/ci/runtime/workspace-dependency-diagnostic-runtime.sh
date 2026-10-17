@@ -350,15 +350,104 @@ echo "Restoring the recorded PostgreSQL replica count and cold-start templates"
 RECOVERY_SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 restore_postgres || fail "PostgreSQL did not recover at its recorded replica count"
 # The test's long readiness tolerance keeps Deployment.Available true during
-# the outage. Probe the real API route instead of trusting that retained flag.
+# the outage. /ready uses the separate liveness pool; authenticated /agents
+# exercises the main pool. Probe both before the single recovery turn.
 deadline=$((SECONDS + 90))
-until kc exec "deployment/$FULLNAME-api" -- python3 -c \
-    'import json, urllib.request; response=urllib.request.urlopen("http://127.0.0.1:8000/ready", timeout=5); assert response.status == 200 and json.load(response) == {"status": "ok"}' \
-    >"$WORKDIR/recovery-readiness.log" 2>&1; do
-    (( SECONDS < deadline )) || fail "the real API readiness endpoint did not confirm PostgreSQL recovery"
-    sleep 1
+for recovery_probe in ready agents; do
+    probe_attempts=0
+    probe_status=75
+    while :; do
+        remaining=$((deadline - SECONDS))
+        if (( remaining <= 0 )); then
+            printf 'Recovery probe diagnostic: phase=%s attempts=%d probe_exit=%d deadline_exhausted=true\n' \
+                "$recovery_probe" "$probe_attempts" "$probe_status"
+            fail "the real API $recovery_probe endpoint did not confirm PostgreSQL recovery"
+        fi
+        probe_attempts=$((probe_attempts + 1))
+        if kc --request-timeout="${remaining}s" exec --pod-running-timeout="${remaining}s" \
+            -i "deployment/$FULLNAME-api" -- python3 - "$recovery_probe" "$AGENT" "$remaining" \
+            >"$WORKDIR/recovery-$recovery_probe.log" 2>&1 <<'PY'
+import http.client
+import json
+import os
+import signal
+import sys
+import urllib.error
+import urllib.request
+
+
+def expired(signum, frame):
+    raise SystemExit(75)
+
+
+signal.signal(signal.SIGALRM, expired)
+signal.alarm(int(sys.argv[3]))
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+phase, expected_agent = sys.argv[1:3]
+headers = {}
+if phase == "agents":
+    key = os.environ.get("API_KEY")
+    if not key or not key.strip():
+        raise SystemExit(64)
+    headers["X-API-Key"] = key
+request = urllib.request.Request(f"http://127.0.0.1:8000/{phase}", headers=headers)
+try:
+    with urllib.request.build_opener(NoRedirect).open(request, timeout=min(5, int(sys.argv[3]))) as response:
+        if response.status != 200:
+            raise SystemExit(69)
+        body = response.read()
+except urllib.error.HTTPError as exc:
+    raise SystemExit(75 if exc.code in {500, 502, 503, 504} else 69) from None
+except urllib.error.URLError as exc:
+    transient = isinstance(exc.reason, (TimeoutError, ConnectionRefusedError, ConnectionResetError, ConnectionAbortedError))
+    raise SystemExit(75 if transient else 69) from None
+except (TimeoutError, ConnectionRefusedError, ConnectionResetError, ConnectionAbortedError, http.client.IncompleteRead):
+    raise SystemExit(75) from None
+except (OSError, http.client.HTTPException):
+    raise SystemExit(69) from None
+
+if phase == "ready":
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeError):
+        raise SystemExit(65) from None
+    raise SystemExit(0 if payload == {"status": "ok"} else 65)
+
+from pydantic import TypeAdapter, ValidationError
+from curie_api.schemas.agents import AgentOut
+
+try:
+    agents = TypeAdapter(list[AgentOut]).validate_json(body, strict=True)
+except ValidationError:
+    raise SystemExit(65) from None
+matches = [agent for agent in agents if agent.name == expected_agent]
+if len(matches) != 1 or not any(binding.kind == "slack" and binding.address == "C0EXAMPLE1"
+                                and binding.adapter == "default" for binding in matches[0].channels):
+    raise SystemExit(66)
+PY
+        then
+            probe_status=0
+            (( SECONDS < deadline )) || continue
+            break
+        else
+            probe_status=$?
+        fi
+        if (( probe_status != 1 && probe_status != 75 )); then
+            printf 'Recovery probe diagnostic: phase=%s attempts=%d probe_exit=%d deadline_exhausted=false\n' \
+                "$recovery_probe" "$probe_attempts" "$probe_status"
+            fail "the real API $recovery_probe recovery probe failed permanently"
+        fi
+        (( SECONDS < deadline )) || continue
+        sleep 1
+    done
 done
-echo "OK: the real API readiness endpoint confirmed restored database access"
+echo "OK: the real API readiness and authenticated agent-list endpoints confirmed restored database access and the fixture binding"
 index=0
 while IFS= read -r template; do
     kc patch sandboxtemplate "$template" --type=merge --patch-file "$WORKDIR/template-$index.original.json" >/dev/null
