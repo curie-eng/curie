@@ -2,7 +2,7 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "curie.fullname" . }}-rustfs
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Service" "name" (printf "%s-rustfs" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
 spec:
@@ -31,7 +31,7 @@ data:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "curie.fullname" . }}-rustfs
+  name: {{ include "curie.checkedObjectName" (dict "kind" "StatefulSet" "name" (printf "%s-rustfs" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
 spec:
@@ -174,7 +174,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "curie.fullname" . }}-rustfs-init
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Job" "name" (printf "%s-rustfs-init" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
   annotations:

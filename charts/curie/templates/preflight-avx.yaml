@@ -19,7 +19,7 @@ can be read; it is replaced on the next install.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "curie.fullname" . }}-preflight-avx
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Job" "name" (printf "%s-preflight-avx" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
   annotations:

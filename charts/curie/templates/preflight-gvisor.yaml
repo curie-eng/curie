@@ -26,7 +26,7 @@ no-gvisor with a NOTES warning); `off` disables the rail entirely.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "curie.fullname" . }}-preflight-gvisor
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Job" "name" (printf "%s-preflight-gvisor" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: agent-sandbox

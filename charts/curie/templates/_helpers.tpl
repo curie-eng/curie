@@ -25,6 +25,16 @@ lifted from Langfuse's chart: flip `deploy` and fill `host` on the same block.
 {{- end -}}
 {{- end -}}
 
+{{/* Fail a render when a fullname-derived object name exceeds the 63 character
+     DNS and label limit. The helper returns the name unchanged. */}}
+{{- define "curie.checkedObjectName" -}}
+{{- $name := .name -}}
+{{- if gt (len $name) 63 -}}
+{{- fail (printf "%s name \"%s\" is %d characters; Kubernetes allows at most 63. Use a shorter release name or fullnameOverride." .kind $name (len $name)) -}}
+{{- end -}}
+{{- $name -}}
+{{- end -}}
+
 {{- define "curie.labels" -}}
 app.kubernetes.io/name: {{ include "curie.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}

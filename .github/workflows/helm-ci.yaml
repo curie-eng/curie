@@ -179,6 +179,9 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/render-assertions.sh
 
+      - name: Release name length assertions
+        run: bash charts/curie/ci/release-name-length-assertions.sh
+
       - name: Per-workload Secret checksum assertions
         run: bash charts/curie/ci/secret-checksum-assertions.sh
 
