@@ -57,6 +57,9 @@ def graph_payload() -> dict[str, Any]:
         ("0102", False),
         ("0103", False),
         ("0108", True),
+        # #3002's 0104 is numbered below 0108 but applied after it; the decision
+        # follows the revision graph, not the number.
+        ("0104", True),
         ("0000", True),
         ("future-expand", True),
     ],
