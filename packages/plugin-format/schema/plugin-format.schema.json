@@ -271,6 +271,18 @@
           "default": null,
           "title": "Image"
         },
+        "no_client_auth": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "No Client Auth"
+        },
         "port": {
           "default": 8000,
           "title": "Port",

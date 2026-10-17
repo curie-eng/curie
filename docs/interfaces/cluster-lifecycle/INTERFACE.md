@@ -136,8 +136,22 @@ adding one.
     and credential references. It reuses an existing agent-sandbox controller
     only when it is Helm-owned by another release, or unowned, healthy and on an
     image compatible with the vendored one; anything else refuses. It reads the
-    `gvisor` RuntimeClass before the first install and infers `off` only from a
-    NotFound (ADR-0193). `curie cluster down` bounds owned namespace deletion to
+    configured gVisor RuntimeClass before the first install. When the rendered
+    preflight does not create the RuntimeClass, inferred mode can become `off`
+    when the class is absent (ADR-0193), or when a present class's nonempty
+    `scheduling.nodeSelector` matches no node in a successfully read node list
+    (ADR-0218). Explicit `auto` contradicting either fact refuses; explicit
+    `require` also refuses an absent class, but retains the scheduling preflight
+    for a present class. When the rendered preflight creates the RuntimeClass
+    (`creates_runtime_class`), absence and unschedulability skip that inference
+    and those refusals (`cli/src/ops/up.rs`).
+    Eligible fake-model auto installs also read the class and infer `off` from
+    that scheduling result (ADR-0221): a second render with fake model disabled
+    must produce a preflight that does not create the RuntimeClass. An absent
+    class or unavailable evidence leaves that fake-model value plan unchanged.
+    Unreadable node lists never authorize inference. Prepared `curie apply`
+    and dry runs skip these lookups and scheduling inference
+    (`cli/src/ops/up.rs`). `curie cluster down` bounds owned namespace deletion to
     300 s, never clears finalizers, and on a remaining namespace returns a
     transient failure carrying the exact resume command.
 11. **Controller preflight.** `charts/curie/templates/preflight-controller.yaml` is
@@ -219,4 +233,4 @@ One, in three processes:
 4. **Related seam:** [substrate](../substrate/INTERFACE.md): the agent-sandbox controller that `cluster up` reuses or installs and the controller preflight gates.
 5. **Epic(s):** #2301 (one-command cluster upgrade with resume and proof); #2010 (a routine Helm upgrade must complete in-flight side-effecting turns rather than escalate them)
 6. **Vision doc:** [architecture-vision.md](../../architecture-vision.md): cluster lifecycle is not one of the six swap-readiness Jobs; not separately graded
-7. **ADR(s):** [ADR-0142](../../adr/0142-database-compatibility-windows-and-a-single-upgrade-phase.md): database compatibility is a release contract and migrations run in one upgrade phase; [ADR-0144](../../adr/0144-the-upgrade-lifecycle-admits-before-it-mutates.md) (Draft): admit before mutating, installation-scoped pause authority; [ADR-0193](../../adr/0193-cluster-up-reads-a-missing-runtimeclass-before-install.md): cluster up reads a missing RuntimeClass before install; [ADR-0209](../../adr/0209-pause-authority-after-a-drain-is-a-lease-held-by-a-live-upgrade-step.md): pause authority after a drain is a lease held by a live upgrade step
+7. **ADR(s):** [ADR-0142](../../adr/0142-database-compatibility-windows-and-a-single-upgrade-phase.md): database compatibility is a release contract and migrations run in one upgrade phase; [ADR-0144](../../adr/0144-the-upgrade-lifecycle-admits-before-it-mutates.md) (Draft): admit before mutating, installation-scoped pause authority; [ADR-0193](../../adr/0193-cluster-up-reads-a-missing-runtimeclass-before-install.md): cluster up reads a missing RuntimeClass before install; [ADR-0209](../../adr/0209-pause-authority-after-a-drain-is-a-lease-held-by-a-live-upgrade-step.md): pause authority after a drain is a lease held by a live upgrade step; [ADR-0218](../../adr/0218-cluster-up-infers-gvisor-off-when-the-runtimeclass-matches-no-node.md): infer gVisor off from a readable empty node-selector result; [ADR-0221](../../adr/0221-cluster-up-reads-the-gvisor-runtimeclass-for-a-fake-model-install.md): extend that inference to eligible fake-model auto installs

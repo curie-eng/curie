@@ -117,6 +117,11 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   `cli/src/release_accept.rs` (`ReleaseAcceptOutput`), `cli/src/seal.rs`
   (`SealOutput`), and `cli/src/secrets.rs` (`SecretsListOutput`).
 
+`ModelCreditOutput` in `cli/src/openrouter_credit.rs` also implements the trait
+and is inventoried in `cli/schema/index.json` against
+`cli/schema/model-credit.schema.json`. It is the `curie dev model-credit`
+result: JSON carries the `class` token and the human render prints that token.
+
 That set is not hand-maintained prose: `cli/schema/index.json` carries one
 `CliOutput` entry per implementation, and the `syn` walk in
 `cli/tests/support/schema_inventory.rs` fails the gate
@@ -125,18 +130,17 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
 
 ## Known leakage
 
-- **The trait is not the whole `--json` surface, but a new raw emitter now fails
-  the build (since #841).** `CliOutput` governs the success path of the verbs that
-  were converted. `schema_inventory.rs` pins the per-file `.emit_json(` call-site
-  count and raises `UnexpectedRawEmitter` when a new direct emitter appears, so a
-  handler that bypasses the seam and prints to stdout directly breaks CI rather
-  than sliding through on convention alone. Three accepted raw sites are pinned:
-  `Ui::emit` itself in `cli/src/ui.rs`, the error path in `main` in `cli/src/main.rs`,
-  and `report_sweep` in `cli/src/commands/eval.rs`, which emits the sweep payload through
-  `Ui::emit_json` directly. The residual is that this is a
-  syntactic call-site inventory, not a type-level proof that *every* verb returns
-  a `CliOutput`.
-- **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
+1. **The inventory counts direct `emit_json` calls only.** `CliOutput` governs
+  converted success paths. `cli/tests/support/schema_inventory.rs` pins the
+  per-file `.emit_json(` call count and raises `UnexpectedRawEmitter` when it
+  differs. The three accepted sites are `Ui::emit` in `cli/src/ui.rs`, the
+  error path in `cli/src/main.rs`, and `report_sweep` in
+  `cli/src/commands/eval.rs`. The gate does not count `print!` or `println!`,
+  so arbitrary stdout can bypass it. For example,
+  `dev_e2e_ci_selection` in `cli/src/commands/dev.rs` uses `print!` for the selector
+  result. This syntactic inventory does not prove that every verb returns a
+  `CliOutput` or honors the one-object JSON contract.
+2. **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
   longer schema-free: there are 73 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
@@ -155,7 +159,7 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   proven by execution rather than asserted. An agent
   parsing this output is now coupled to shapes enforced by committed schemas and a
   drift gate, like the ACI (`packages/aci-protocol`, ADR-0017), not by tests alone.
-- **Not separately graded.** This is not one of the six swap-readiness Jobs in the
+3. **Not separately graded.** This is not one of the six swap-readiness Jobs in the
   vision doc: the "second implementation" here would be a second *output format*
   (YAML, a table protocol), which nobody has asked for. Per the governing restraint,
   the port is documented where the code already draws the line and no speculative
@@ -167,4 +171,4 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
 - **Issue:** [#460](https://github.com/curie-eng/curie/issues/460) — the observability twin, whose local/cluster tiers share one `CliOutput`
 - **Issue:** [#841](https://github.com/curie-eng/curie/issues/841) — added the committed `cli/schema/` JSON Schemas, the `schema_inventory` build gate, and the `json_contract` output validation this seam now relies on
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — CLI output is not one of the six swap-readiness Jobs; not separately graded
-- **ADR(s):** [ADR-0021](../../adr/0021-curie-is-a-harness-for-coding-agents.md) — Curie is a harness for coding agents: the CLI's primary user is Claude Code (this seam is decision 1's enforcement); [ADR-0038](../../adr/0038-observability-cli-helper-for-the-agent-dev-loop.md) — the observability CLI is a thin client over the API proxy, not a second backend
+- **ADR(s):** [ADR-0021](../../adr/0021-agentos-is-a-harness-for-coding-agents.md) — Curie is a harness for coding agents: the CLI's primary user is Claude Code (this seam is decision 1's enforcement); [ADR-0038](../../adr/0038-observability-cli-helper-for-the-agent-dev-loop.md) — the observability CLI is a thin client over the API proxy, not a second backend

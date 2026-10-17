@@ -23,9 +23,12 @@ order: 7
 ## The black line
 
 On the write side, observability is swapped at the OTLP wire, not in code. The API,
-dispatcher, worker, eval worker, mail adapter, and runner emit OTLP traces, logs, and metrics to an
-OpenTelemetry Collector; services never authenticate to or speak a storage backend
-directly. Standard `OTEL_EXPORTER_OTLP_*` endpoint, protocol, and header variables select
+dispatcher, worker, eval worker, mail adapter, Discord adapter, and runner use the
+shared OTLP telemetry path to an OpenTelemetry Collector. Eval result recording
+is a separate exception: `LangfuseEvalRecorder`
+(`apps/worker/src/curie_worker/eval/recorder.py::LangfuseEvalRecorder`) authenticates
+and posts directly to Langfuse's `/api/public/ingestion`; see the
+[evals seam](../evals/INTERFACE.md). Standard `OTEL_EXPORTER_OTLP_*` endpoint, protocol, and header variables select
 the wire transport independently per signal. With no endpoint a process keeps its JSON
 stderr diagnostics and uses no-op trace/log exporters rather than inventing a localhost
 destination.
@@ -100,7 +103,8 @@ than an open bag of `gen_ai.*` names.
   (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`) rejects undeclared
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
   operation classes and outcomes, not event, run, session, sandbox, user, or
-  deployment identifiers. The one exception is `curie.agent.turn.completed`, whose
+  deployment identifiers. Two bounded identifier dimensions are declared:
+  `curie.agent.turn.completed`, whose
   `agent` label admits at most 32 distinct slugs per process and folds the rest,
   plus any name that is not a 1 to 63 character slug, into `other`
   (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`).
@@ -109,7 +113,10 @@ than an open bag of `gen_ai.*` names.
   `agent="other"` series means the ceiling or the slug rule is hiding a name.
   `unbound` is only a turn that never resolved an agent. A real agent named
   `other` or `unbound` shares `other`. Every other instrument refuses an
-  agent identifier. The application-defined series space remains bounded.
+  agent identifier. `curie.action_executor.execution` admits at most 16 distinct connector
+  slugs per process through its `connector` dimension, folding invalid names and
+  overflow into `other` (`packages/telemetry/src/curie_telemetry/metrics.py`).
+  The application-defined series space remains bounded.
   Standard resource identity still contributes one anonymous `service.instance.id` per
   running process. It is independent of turn input and adds at most one resource series
   per live or restarted process, never one per event, session, user, or sandbox. The
@@ -300,12 +307,17 @@ create a recursive failure loop.
 ## Implementations today
 
 One trace backend: Langfuse, reached through the OTel Collector (which authenticates and
-forwards over HTTP because Langfuse OTLP ingest is HTTP-only). Every producer knows only
-OTLP. The chart injects one destination into the API, dispatcher, worker, eval worker,
+forwards over HTTP because Langfuse OTLP ingest is HTTP-only). Shared service
+telemetry uses OTLP; eval result recording uses Langfuse ingestion directly.
+The chart injects one destination into the API, dispatcher, worker, eval worker,
 mail adapter, and sandbox runner: the in-cluster collector, a chart-owned external endpoint, or nothing
 when telemetry is explicitly disabled. The local Compose profiles do the same for the
 services they start. The read side (trace list and tree reconstruction) remains a
 separate API concern.
+
+The Discord adapter also calls `bootstrap_service_telemetry` and flushes it on
+exit (`adapters/discord/src/curie_discord_adapter/main.py`); its OTLP destination
+comes from its environment.
 
 The default chart intentionally has no log or metric storage implementation: those
 pipelines terminate in named no-op exporters unless the operator adds durable backends.
@@ -314,20 +326,26 @@ installable observability stack tracked by #1765.
 
 ## Known leakage
 
-Three vendor-named attributes are set at the source on the root span rather than mapped in
+Eval results bypass the collector through the authenticated Langfuse ingestion
+API (`apps/worker/src/curie_worker/eval/recorder.py`). Swapping only the collector
+exporter does not replace this path; its write and read contracts are documented
+in the [evals seam](../evals/INTERFACE.md).
+
+Five vendor-named attributes are set at the source rather than mapped in
 the collector. `RunTracer.run_span` stamps `langfuse.trace.name`, `langfuse.session.id`,
 and `langfuse.user.id` (`runner/src/curie_runner/otel.py::RunTracer.run_span`) so Langfuse
-maps them to its name/Sessions/Users features. The default collector trace pipeline is
+maps them to its name/Sessions/Users features. Generation spans additionally
+stamp `langfuse.observation.input` and `langfuse.observation.output`. The default collector trace pipeline is
 receivers/`memory_limiter`/`batch`/`otlphttp` with no attributes processor.
 Operators may define `otelCollector.extraProcessors` and select ordered
 `otelCollector.extraTracePipelineProcessors` between `memory_limiter` and `batch`
 (`charts/curie/templates/_helpers.tpl`), including their own attribute mapping. No
 default mapping renames these source attributes. A clean seam
-would emit neutral attributes the collector maps to the vendor names; today all three
+would emit neutral attributes the collector maps to the vendor names; today all five
 vendor names are set at the source, and they are members of the closed schema, so a second
 backend inherits them.
 
-A fourth, subtler one: `record_model` stamps the bare `model` key alongside the
+Another source coupling: `record_model` stamps the bare `model` key alongside the
 semantic-convention `gen_ai.request.model`
 (`runner/src/curie_runner/otel.py::_GenerationSpan.record_model`). `model` is not a
 `gen_ai` semantic-convention key; it exists because the generation span has to carry a
