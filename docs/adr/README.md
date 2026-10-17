@@ -250,4 +250,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0227 | [Opt-in final-answer publication validation](0227-opt-in-final-answer-publication-validation.md) | Accepted |
 | 0229 | [A hosted connector may declare the Host the caller proxy presents upstream](0229-a-hosted-connector-may-declare-the-host-the-caller-proxy-presents-upstream.md) | Accepted |
 | 0230 | [Cluster upgrade and rollback report outcomes from one lifecycle record checked against the cluster](0230-upgrade-and-rollback-report-from-one-lifecycle-record-checked-against-the-cluster.md) | Draft |
+| 0236 | [The commissioning operator splits provisioner and control processes](0236-the-commissioning-operator-splits-provisioner-and-control-processes.md) | Accepted |
 <!-- END GENERATED: adr-index -->
