@@ -18,9 +18,7 @@ from curie_api.remediation_verifier import header_secret_names
 from plugin_format.connectors import ConnectorSpec
 
 _VECTORS = Path(__file__).resolve().parents[3] / "tests" / "vectors"
-_DERIVED_BEARER = json.loads(
-    (_VECTORS / "connector-derived-bearer.json").read_text("utf-8")
-)
+_DERIVED_BEARER = json.loads((_VECTORS / "connector-derived-bearer.json").read_text("utf-8"))
 
 
 @pytest.mark.parametrize(

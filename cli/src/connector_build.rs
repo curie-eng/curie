@@ -2645,6 +2645,19 @@ connectors:
     }
 
     #[test]
+    fn no_client_auth_with_empty_bearer_secret_is_refused() {
+        let err = parse_connectors(
+            "connectors:\n  docs:\n    image: ghcr.io/example/docs-mcp:1\n    bearer_secret: ''\n    no_client_auth: In-cluster server; the boundary is its ingress NetworkPolicy.\n",
+        )
+        .expect_err("no_client_auth with an empty bearer_secret must be refused");
+        assert!(
+            err.to_string()
+                .contains("connectors.no_client_auth_with_bearer_secret"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn no_client_auth_on_a_remote_connector_is_refused() {
         let err = parse_connectors(
             "connectors:\n  r:\n    url: https://mcp.example.com/mcp\n    no_client_auth: In-cluster server; the boundary is its ingress NetworkPolicy.\n",

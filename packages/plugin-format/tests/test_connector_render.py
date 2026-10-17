@@ -1304,9 +1304,9 @@ def test_ingress_policy_selects_the_connector_not_the_sandbox() -> None:
         "release-r", "app-name", "agent-a"
     )
     dep = next(o for o in objs if o["kind"] == "Deployment")
-    assert ing["spec"]["podSelector"]["matchLabels"] == dep["spec"]["template"]["metadata"][
-        "labels"
-    ]
+    assert (
+        ing["spec"]["podSelector"]["matchLabels"] == dep["spec"]["template"]["metadata"]["labels"]
+    )
 
 
 def test_ingress_is_port_scoped_to_the_connector_port() -> None:
@@ -1629,9 +1629,7 @@ def test_service_dns_vectors(vector: dict) -> None:
         == vector["object_name"]
     )
     assert (
-        r.service_dns(
-            vector["release"], vector["agent"], vector["connector"], vector["namespace"]
-        )
+        r.service_dns(vector["release"], vector["agent"], vector["connector"], vector["namespace"])
         == vector["service_dns"]
     )
 
@@ -1640,9 +1638,7 @@ def test_the_dns_corpus_covers_the_truncation_branch() -> None:
     # Without an over-long name in the corpus the vectors freeze only the
     # concatenation, and the truncation-with-digest branch -- the half a hand
     # port gets wrong -- stays unpinned in both languages.
-    bases = [
-        f"{v['release']}-{v['agent']}-mcp-{v['connector']}" for v in _DNS_VECTORS["vectors"]
-    ]
+    bases = [f"{v['release']}-{v['agent']}-mcp-{v['connector']}" for v in _DNS_VECTORS["vectors"]]
     assert any(len(base) > 63 for base in bases)
     truncated = [
         v
@@ -1965,9 +1961,7 @@ def test_a_server_on_the_proxy_port_moves_the_proxy_not_the_server() -> None:
     spec = HOSTED.model_copy(update={"port": r.CALLER_PROXY_PORT})
     objs = _proxied(spec)
     containers = _containers(objs)
-    assert containers["server"]["ports"] == [
-        {"name": "http", "containerPort": r.CALLER_PROXY_PORT}
-    ]
+    assert containers["server"]["ports"] == [{"name": "http", "containerPort": r.CALLER_PROXY_PORT}]
     assert containers[r.CALLER_PROXY_CONTAINER]["ports"] == [
         {"name": "caller", "containerPort": r.CALLER_PROXY_ALTERNATE_PORT}
     ]
@@ -2247,7 +2241,5 @@ def test_no_client_auth_secrets_keep_pod_side_delivery() -> None:
     for name in ("UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"):
         assert by_name[name] == {
             "name": name,
-            "valueFrom": {
-                "secretKeyRef": {"name": "conn-secrets", "key": name, "optional": False}
-            },
+            "valueFrom": {"secretKeyRef": {"name": "conn-secrets", "key": name, "optional": False}},
         }

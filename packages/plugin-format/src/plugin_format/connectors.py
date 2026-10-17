@@ -444,9 +444,7 @@ def _escapes(path: str) -> bool:
     return False
 
 
-def _validate_build(
-    where: str, build: ConnectorBuild, errors: list[tuple[str, str]]
-) -> None:
+def _validate_build(where: str, build: ConnectorBuild, errors: list[tuple[str, str]]) -> None:
     """The `build:` form's own rules (ADR 0113).
 
     Each condition carries its own code so a caller can assert the exact outcome
@@ -704,7 +702,7 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     "Authorization header for it, so the declaration would change nothing",
                 )
             )
-        if spec.no_client_auth is not None and spec.bearer_secret:
+        if spec.no_client_auth is not None and spec.bearer_secret is not None:
             errors.append(
                 (
                     "connectors.no_client_auth_with_bearer_secret",

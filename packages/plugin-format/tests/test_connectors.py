@@ -1304,6 +1304,20 @@ def test_no_client_auth_with_bearer_secret_is_refused() -> None:
     )
 
 
+def test_no_client_auth_with_empty_bearer_secret_is_refused() -> None:
+    assert "connectors.no_client_auth_with_bearer_secret" in _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "bearer_secret": "",
+                    "no_client_auth": _NO_CLIENT_AUTH_REASON,
+                }
+            }
+        }
+    )
+
+
 def test_no_client_auth_on_a_remote_connector_is_refused() -> None:
     assert "connectors.remote_has_no_client_auth" in _codes(
         {
