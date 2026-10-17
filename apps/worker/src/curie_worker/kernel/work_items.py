@@ -377,6 +377,10 @@ async def _adopt_resumed_work_item(
             )
         except WorkItemConflict as exc:
             logger.info("refused factory continuation finish for %s: %s", event_id, exc.code)
+            if exc.code == "not_running":
+                # A retried finish whose first response was lost is refused
+                # once it committed, as in _finish_or_settle; the request ended.
+                run.finished = True
         if run.finished:
             await self._release_work_item_sandbox(run)
         raise failures._FactoryExecutionEnded
