@@ -58,12 +58,16 @@ Two, both under `apps/worker/src/curie_worker/sandbox/`:
 ## Protected substrate observations
 
 `apps/worker/src/curie_worker/protected_substrate_readers.py` defines a separate
-read boundary for factual observations of a protected launch. Its implementations
-pair one to one with the substrate: `DockerSubstrateReader` takes a
-`DockerControlPlane`, and `KubernetesSubstrateReader` takes a
-`KubernetesControlPlane`. These are not independent workload-host choices or
-methods added to `SandboxClient`. There is no reader selector in the ordinary
-worker composition root today.
+read boundary for factual observations of a protected launch.
+`DockerSubstrateReader` accepts a `DockerControlPlane`, and
+`KubernetesSubstrateReader` accepts a `KubernetesControlPlane`. No production
+module constructs these readers or their control-plane implementations; only
+tests instantiate them. They add no methods to `SandboxClient`.
+Protected production composition in `apps/worker/src/curie_worker/protected_run.py`
+uses `ProtectedSandboxSubstrate` with a launch client. The issuer's
+`apps/worker/src/curie_worker/protected_launch_kubernetes.py` calls
+`apps/worker/src/curie_worker/protected_substrate_facts.py::parse_kubernetes_runner_facts`
+directly.
 
 1. `DockerControlPlane` carries `authority_domain_id` and `endpoint_host`, with
    async `inspect_container(container_id)` and `inspect_image(image_id)` reads.
@@ -93,11 +97,12 @@ worker composition root today.
    projection; image qualification, preventive isolation and live admission
    remain separate guards. Invalid or unavailable evidence raises redacted
    `SubstrateFactsUnavailable` with the source exception chain detached.
-6. `DockerEngineControlPlane` and `KubernetesAPIControlPlane` use explicitly
-   selected authenticated HTTPS endpoints, verified TLS, five-second bounded
-   reads and at most 1 MiB responses, without ambient proxies, redirects or
-   retries. The Docker transport requires client certificate authentication;
-   Kubernetes takes an explicit read token and does not discover kubeconfig.
+6. `DockerEngineControlPlane` and `KubernetesAPIControlPlane` accept
+   caller-supplied authenticated HTTPS endpoints and use verified TLS,
+   five-second bounded reads and at most 1 MiB responses, without ambient
+   proxies, redirects or retries. The Docker transport requires client
+   certificate authentication; Kubernetes takes an explicit read token and does
+   not discover kubeconfig.
    `apps/worker/tests/test_protected_substrate_readers.py` covers successful
    observations, replacement and missing-provenance refusals, token-reference
    refusal, remote-loopback refusal, bounded transport and exception redaction.

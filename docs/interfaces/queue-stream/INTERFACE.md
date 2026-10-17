@@ -252,7 +252,7 @@ use the private broker. Protected worker paths also issue direct `XRANGE`,
 `apps/worker/src/curie_worker/protected_dispatch.py`,
 `apps/worker/src/curie_worker/protected_execution.py`,
 `apps/worker/src/curie_worker/protected_recovery.py`,
-`apps/worker/src/curie_worker/protected_markers.py`). They do not use
+`apps/worker/src/curie_worker/protected_markers.py`). These direct calls bypass
 `StreamBroker`; a broker swap must preserve their exact-row, generation and
 ownership fences as well as the ordinary stream semantics.
 

@@ -114,12 +114,15 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   hook route (`apps/api/src/curie_api/routers/hooks.py::ingest_hook`), when the
   caller passes the `tool_access` query parameter for an ordinary source; the
   signature covers that requested policy with the body. Protected sources force
-  `read-only` regardless of the query; a closed source with pending attempt
-  history also resolves to `read-only` and is refused. `_protected_turn` and
-  `_resolve_support` in `apps/api/src/curie_api/routers/hooks.py` separate the
-  requested policy from the effective one. The operator must first confirm the
-  worker and runner implement it. A receipt proves the queued policy, not runner
-  enforcement. An operator's own synthetic producer, such as a canary on the
+  `read-only` regardless of the query in `_protected_turn`. The support probe's
+  `_resolve_support` reports `read-only` and `source_closed` for a source with
+  no policy row and pending attempt history. Delivery ingress instead refuses
+  that pending history in
+  `apps/api/src/curie_api/hook_source_auth.py::authenticated_source`, before
+  `ingest_hook` resolves the policy. `_protected_turn` and `_resolve_support`
+  live in `apps/api/src/curie_api/routers/hooks.py`. The operator must first
+  confirm the worker and runner implement it. A receipt proves the queued
+  policy, not runner enforcement. An operator's own synthetic producer, such as a canary on the
   disconnected cluster-message relay, may set it too. An absent requested value
   keeps ordinary behavior only for an ordinary source.
 - **Egress** — the `ReplySink` Protocol (`apps/worker/src/curie_worker/reply_sink.py::ReplySink`),
