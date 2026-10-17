@@ -176,7 +176,8 @@ run_ladder() {
     fi
     render_to "$TMP/probe.yaml" probe "$CHART" -n curie-qa20261017 -f "$WIDE" --set fullnameOverride=q --is-upgrade "${SETS[@]}" \
       || fail "probe render failed at step $step: $(cat "$TMP/probe.yaml.err")"
-    mapfile -t rows < <(inventory "$TMP/probe.yaml" q)
+    inventory "$TMP/probe.yaml" q >"$TMP/inventory" || fail "inventory failed at step $step"
+    mapfile -t rows <"$TMP/inventory"
     if (( ${#rows[@]} == 0 )); then
       if (( step != 19 )); then
         : # empty inventory ends the ladder; step already incremented past the last object
