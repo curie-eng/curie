@@ -49,7 +49,8 @@ plugin shape verbatim plus a strict Curie-only overlay, not a Claude Code plugin
 
 ## Current contract
 
-The optional-secret contract follows the [accepted decision on the source release train](https://github.com/curie-eng/curie/blob/757ac40ff53af39622e0dc0fe09db4ea66dcf868/docs/adr/0209-a-bundle-may-declare-a-secret-optional.md) and #4129. This backport preserves that decision without assigning its number to a different decision on this release train.
+The optional-secret contract is recorded in
+[ADR 0210](../../adr/0210-a-bundle-may-declare-a-secret-optional.md) and #4129.
 
 `validate_bundle(path) -> ValidationResult` is the single entry point every deploy path calls
 (`packages/plugin-format/src/plugin_format/validate.py::validate_bundle`). It returns path-qualified
@@ -271,7 +272,7 @@ script from `.github/workflows/plugin-compat.yaml` on two triggers, because drif
 directions: a path-filtered `pull_request` trigger catches our own drift when we touch the bundles
 or the format models, and a nightly `schedule` catches Claude Code changing the format under us,
 which no PR of ours would ever surface. The check is deliberately not `--strict`: strict mode
-promotes unknown-field warnings to errors, and the seven Curie authoring extensions are
+promotes unknown-field warnings to errors, and the eleven Curie authoring extensions are
 unknown-to-Claude-Code by design, so warnings are the expected steady state and only a non-zero
 exit is a failure.
 
@@ -331,16 +332,19 @@ Code keys still validate.
 
 By intent, the manifest, skill, and MCP surfaces are Claude-Code-shaped — that is the wedge, not a
 leak. What the wedge
-costs is asymmetric fidelity: a bundle loaded by Claude Code **validates but degrades**. All seven
-Curie authoring extensions — `systemPrompt`, `starterPrompts`, `secrets`, `optionalSecrets`, `triggers`,
-`approvalPolicy`, `toolPolicy` — are unknown fields to Claude Code, which warns about each and then
-silently ignores it at load time. The manifest is accepted and the commands, agents, hooks, and MCP
-servers work; the agent's persona, its suggested openers, its secret declarations, its wake-up
-triggers, its approval gates, and its tool policy do not travel. That degradation is by design
+costs is asymmetric fidelity: a bundle loaded by Claude Code **validates but degrades**.
+All eleven Curie authoring extensions are unknown fields that Claude Code ignores:
+`systemPrompt`, `starterPrompts`, `secrets`, `optionalSecrets`, `triggers`,
+`approvalPolicy`, `toolPolicy`, `channelRead`, `canvasList`, `canvasRead` and
+`canvasEdit`. The manifest is accepted and the commands, agents, hooks and MCP
+servers work; the agent's persona, suggested openers, secret declarations,
+wake-up triggers, approval gates and tool policy do not travel. The four Slack
+grants also disappear, so they mount no platform history or canvas tools in
+Claude Code. That degradation is by design
 (there is nowhere in the Claude Code shape to put them), but it is silent from the operator's side,
 so it is documented here rather than discovered.
 
-`toolPolicy` degrades **worse than the other five**, and the difference is the reason it is
+`toolPolicy` degrades **worse than the other ten**, and the difference is the reason it is
 gated the way it is. The rest lose a capability: the agent is less useful. This one loses a
 **restriction**: a bundle whose tool surface is fenced by `toolPolicy`
 (`packages/plugin-format/src/plugin_format/models.py::ToolPolicy`) runs *unfenced* in Claude

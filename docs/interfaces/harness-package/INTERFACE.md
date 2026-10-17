@@ -98,8 +98,9 @@ Runner boot calls its environment builder and bundle compiler and supplies its
 tool set to `SideEffectClassifier`
 (`runner/src/curie_runner/side_effects.py::SideEffectClassifier`).
 Runner boot also supplies the tool set to per-turn tool access
-(`runner/src/curie_runner/__main__.py::_readonly_tools`) and reads
-`harness.auth.credential_env_keys` for held-secret redaction.
+(`runner/src/curie_runner/__main__.py::_readonly_tools`). Held-secret redaction
+receives `DEFAULT_CREDENTIAL_ENV_KEYS` from
+`runner/src/curie_runner/sdk_auth.py`; there is no auth field on the contribution.
 
 The Claude package also owns the SDK approval adapter at
 `runner/src/curie_runner/harness/claude/approval.py`. Approval policy stays in
@@ -156,4 +157,4 @@ second engine requires a new ADR under ADR 0140.
    above the session port; it is not a separately graded job.
 5. [ADR 0140](../../adr/0140-curie-supports-one-model-harness-until-a-second-one-exists.md)
    replaces the broader programs in ADRs 0060, 0061, and 0062. [#3828](https://github.com/curie-eng/curie/issues/3828)
-   tracks its approval and implementation.
+   is the closed tracker for that approval and implementation.

@@ -418,7 +418,8 @@ names as unrecognized on purpose, so arming one still trips the existing
 **One authorizer** (`apps/api/src/curie_api/authorizer.py`, pure policy with no Slack in
 it) over **five approver sets** behind the `ApproverSet` port (ADR-0034), after an
 independent authentication boundary resolves one of ADR-0106's `chat`, `console`, or
-`operator` principals, or ADR-0154's `adapter` principal. A set answers only "is this actor in the set"; every rule that is
+`operator` principals, ADR-0154's `adapter` principal, or ADR-0202's `test_driver`
+principal. A set answers only "is this actor in the set"; every rule that is
 not membership lives in the authorizer, applied identically whatever the set. Requester
 equality is deliberately not a rule: the selected set is always consulted, so a requester
 who belongs may confirm and one who does not remains denied. A deployment that needs
@@ -432,6 +433,16 @@ The resolve body carries policy input only: `decision` and optional `note`. The 
 `resolved_by` and `actor_channel` fields are rejected. The shared platform API key may mint
 operator principals and Console login codes but, alone, is not a human identity and cannot
 resolve an approval.
+
+A `test_driver` uses an approval-bound dispatcher attestation and is accepted only
+on the ordinary resolve endpoint
+(`apps/api/src/curie_api/approval_auth.py::authenticate_principal`). The API
+additionally requires `test_installation_enabled`, a declared driver whose bot
+user and channel match the principal, and a channel matching the recorded
+`card_channel` (falling back to `reply_channel`)
+(`apps/api/src/curie_api/routers/approvals.py::resolve_approval`). Only
+`ExplicitUsers` admits this principal, and its subject must be listed. Channel
+membership and user-group membership never authorize a test driver (ADR-0202).
 
 Two of the five sets are Slack's, and that is the honest framing: a channel and a user
 group are two ways Slack says "who is in the authorized set", not a neutral baseline plus a
@@ -457,7 +468,7 @@ Slack feature.
   IDs**: the binding schema rejects anything that is not a Slack `U`/`W`-prefixed ID
   (`apps/api/src/curie_api/schemas/channels.py::SLACK_USER_ID`), never a handle or a name, so even this
   "Slack-free" set is expressed in Slack-shaped identifiers. It is the only set eligible
-  for `operator` principals; Console principals may use it or a verified user group. It
+  for `operator` and `test_driver` principals; Console principals may use it or a verified user group. It
   refuses `adapter` principals: its entries are Slack IDs, and only the Slack dispatcher
   vouches for a Slack ID (ADR-0106), so an adapter naming a listed ID proves nothing
   ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md)'s separate finding). The authenticated subject must appear in the selected set.
@@ -588,8 +599,10 @@ through break-glass recovery (Current contract), which is audited and only ever 
 
 **`ApproverSet`** (`approvers.py`) is the black line #420 draws: `async contains(actor,
 actor_channel) -> MembershipVerdict`, plus `audit_name`, `operator_eligible`,
-`console_eligible`, and `adapter_eligible` policies for the audit and principal eligibility
-checks. It is async
+`console_eligible`, `adapter_eligible`, `chat_eligible`, `test_driver_eligible`,
+and `ineligible_reason` for audit and principal eligibility checks. The optional
+reason overrides the authorizer's default refusal for an ineligible principal.
+It is async
 because a set may own a lookup; `ExplicitUsers` simply never awaits. `MembershipVerdict`
 carries a third state beyond member/not-member: `undetermined`, meaning the set could not
 find out. The authorizer fails closed on it, and it is deliberately never collapsed into
@@ -601,7 +614,8 @@ policy over an outage.
 operator cannot inherit a channel or user-group membership proof. `adapter_eligible`
 governs the `adapter` principal, and no Slack set sets it: every Slack set names Slack IDs,
 which an adapter cannot vouch for. The config sentinels (`InvalidApprovers`,
-`UnboundRoute`) set every flag so their own fail-closed reason reaches the audit row.
+`UnboundRoute`) admit ordinary principal kinds to their own fail-closed verdict,
+but keep `test_driver_eligible=False`. Only `ExplicitUsers` sets that flag.
 
 The two Slack sets are asymmetrical and the port does not hide it. `contains` takes
 `actor_channel` precisely because channel membership proves membership from the authenticated
@@ -633,8 +647,12 @@ selector hands a user-group set the client for the identity that posted the card
 process for `slack_usergroup_cache_ttl_s` (env `SLACK_USERGROUP_CACHE_TTL_S`, default 60s;
 `0` forces a per-resolve fetch).
 
-**`main.py` is the composition root**: the only module that names Slack to build the
-selector, so the authorizer and the resolve endpoint depend on ports rather than a provider.
+**`main.py` is the application composition root**: it builds the selector so the
+authorizer and resolve endpoint depend on ports rather than a provider. A second
+builder lives in
+`apps/api/src/curie_api/remediation_undo_recovery.py::reconcile_undo_approvals`:
+when no selector is injected, it constructs one for the recovery pass with its
+own HTTP client and the current settings.
 
 This narrows the coupling; it does not make the path provider-neutral. **The binding schema
 is still Slack-shaped**: `apps/api/src/curie_api/schemas/approvals.py` and
@@ -664,8 +682,9 @@ tool call under any asserted identity. ADR-0033 (#410) closed the sandbox-key ga
 minting a scoped, agent-bound `state` token that only the state router accepts. ADR-0106
 closes the remaining caller-assertion gap: the resolve endpoint now accepts only a
 dispatcher-attested `chat` token, a live subject-bound Console session, a signed
-subject-bound `operator` token, or an authenticated `adapter` principal for a served
-binding. On the ordinary resolve path the platform key alone
+subject-bound `operator` token, an authenticated `adapter` principal for a served
+binding, or a dispatcher-attested `test_driver` admitted by the test-installation
+checks above. On the ordinary resolve path the platform key alone
 resolves nothing. Break-glass recovery is the exception: when an operator enables
 `approval_recovery_enabled`, the platform key plus any operator principal for attribution
 can reject any pending approval installation-wide, bypassing the authorizer. That blast
@@ -698,7 +717,7 @@ approve) are per-agent deployment config (#247, #1460).
 
 The audit trail now records both halves rather than overstating either one. Authentication
 establishes the actor and writes `principal_kind` (`chat`, `console`, `operator`, or
-`adapter`) with `authenticated=true`; authorization writes the selected set's evidence
+`adapter`, or `test_driver`) with `authenticated=true`; authorization writes the selected set's evidence
 and verdict. For an `adapter` principal, `principal_subject` names the adapter itself, not
 the sender it vouches for: the sender is carried as `actor` from the
 `X-Curie-Approval-Actor` header, and no Slack approver set admits an adapter, not even an
@@ -720,6 +739,9 @@ An audit row may truthfully show the same principal as requester and approver: t
 one authenticated member confirmed their own request, not that a second person reviewed it.
 
 ## Cross-links
+
+[ADR-0202](../../adr/0202-a-test-installation-admits-a-listed-bots-actions-and-approval-replies.md)
+adds the test-installation driver principal and its explicit-user-only admission.
 
 - **Epic(s):** [#22](https://github.com/curie-eng/curie/issues/22) — approval gates and human-in-the-loop; adds the durable record, `awaiting-approval` status, `canUseTool` gate, and the authorizer interface.
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — not one of the six graded jobs; a cross-cutting core lifecycle change, not separately graded.
