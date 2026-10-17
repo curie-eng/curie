@@ -45,6 +45,13 @@ INITIAL_BINDING_INPUTS = (
 )
 STATIC_TOKEN_ROTATION_MODULE = "tools/factory-e2e/tests/test_c4_static_token_rotation.py"
 FORGE_INSTANCE_JOB = "forge-instance-regression"
+ADMITTED_AGENT_JOB = "factory-admitted-agent"
+INITIAL_BINDING_JOB = "factory-initial-binding"
+FACTORY_SIBLING_RESULTS = {
+    "forge_instance_result": "FORGE_INSTANCE_RESULT",
+    "admitted_agent_result": "ADMITTED_AGENT_RESULT",
+    "initial_binding_result": "INITIAL_BINDING_RESULT",
+}
 FORGE_INSTANCE_MODULE = "tools/factory-e2e/tests/test_c4_forge_instances.py"
 SRE_RUNTIME = "examples/tests/test_sre_bot_observability_runtime.py"
 FACTORY_UPGRADE_RUNTIME = "tools/factory-e2e/tests/test_c4_upgrade_migration.py"
@@ -1911,6 +1918,8 @@ AGGREGATE_EXPRESSIONS = {
     "approval_resume_result": ("${{ needs.e2e-cluster-approval-resume-restarts.result }}"),
     "factory_result": "${{ needs.e2e-scripted-factory.result }}",
     "forge_instance_result": "${{ needs.forge-instance-regression.result }}",
+    "admitted_agent_result": "${{ needs.factory-admitted-agent.result }}",
+    "initial_binding_result": "${{ needs.factory-initial-binding.result }}",
     "released_upgrade_result": "${{ needs.e2e-released-upgrade.result }}",
     "released_upgrade_negative_result": ("${{ needs.e2e-released-upgrade-negative.result }}"),
     "upgrade_matrix_shards_result": ("${{ needs.e2e-cluster-upgrade-matrix-shards.result }}"),
@@ -2525,6 +2534,8 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
         "e2e-cluster-approval-resume-restarts",
         "e2e-scripted-factory",
         "forge-instance-regression",
+        "factory-admitted-agent",
+        "factory-initial-binding",
         "e2e-released-upgrade",
         "e2e-released-upgrade-negative",
         "e2e-cluster-upgrade-matrix-shards",
@@ -2585,10 +2596,12 @@ def _run_aggregate(
         "upgrade_matrix_result": "skipped",
     }
     state.update(overrides)
-    # The forge instance job is gated exactly like the scripted factory job, so
-    # it follows the scripted result unless a test overrides it.
-    if "forge_instance_result" not in overrides:
-        state["forge_instance_result"] = state["factory_result"]
+    # The forge instance, admitted agent and initial binding jobs are gated
+    # exactly like the scripted factory job, so they follow the scripted
+    # result unless a test overrides them.
+    for name in FACTORY_SIBLING_RESULTS:
+        if name not in overrides:
+            state[name] = state["factory_result"]
     if "chart_scenarios" not in overrides and state["cluster_selected"] == "true":
         state["chart_scenarios"] = '["workspace-diagnostic"]'
     environment = os.environ.copy()
@@ -3352,29 +3365,34 @@ def test_aggregate_requires_scripted_factory_skip_when_not_selected(
     assert rejected.returncode != 0, rejected.stdout + rejected.stderr
 
 
+@pytest.mark.parametrize("sibling", sorted(FACTORY_SIBLING_RESULTS))
 @pytest.mark.parametrize("event_name", ["pull_request", "push", "workflow_dispatch"])
 @pytest.mark.parametrize("selected", ["true", "false"])
-def test_aggregate_requires_forge_instance_result_to_follow_factory_selection(
-    event_name: str, selected: str
+def test_aggregate_requires_factory_sibling_results_to_follow_factory_selection(
+    event_name: str, selected: str, sibling: str
 ) -> None:
     expected, wrong = ("success", "skipped") if selected == "true" else ("skipped", "success")
     state = {"event_name": event_name, "factory_selected": selected, "factory_result": expected}
-    ok = _run_aggregate(**state, forge_instance_result=expected)
+    ok = _run_aggregate(**state, **{sibling: expected})
     assert ok.returncode == 0, ok.stdout + ok.stderr
     for result in (wrong, "failure", "cancelled", ""):
-        rejected = _run_aggregate(**state, forge_instance_result=result)
+        rejected = _run_aggregate(**state, **{sibling: result})
         assert rejected.returncode != 0, rejected.stdout + rejected.stderr
 
 
+@pytest.mark.parametrize("sibling", sorted(FACTORY_SIBLING_RESULTS))
 @pytest.mark.parametrize(("selected", "result"), [("true", "success"), ("false", "skipped")])
-def test_negative_control_covers_forge_instance_result(selected: str, result: str) -> None:
+def test_negative_control_covers_factory_sibling_results(
+    selected: str, result: str, sibling: str
+) -> None:
+    variable = FACTORY_SIBLING_RESULTS[sibling]
     state = {
         "event_name": "pull_request",
         "factory_selected": selected,
         "factory_result": result,
-        "forge_instance_result": result,
+        sibling: result,
     }
-    check = '"$FORGE_INSTANCE_RESULT" != "$factory_expected" ||'
+    check = f'"${variable}" != "$factory_expected" ||'
 
     def accept_drift(script: str) -> str:
         assert script.count(check) == 1
@@ -3383,7 +3401,7 @@ def test_negative_control_covers_forge_instance_result(selected: str, result: st
     completed = _run_aggregate(script_transform=accept_drift, **state)
     output = completed.stdout + completed.stderr
     assert completed.returncode != 0, output
-    assert "Selected and skipped negative control failed for FORGE_INSTANCE_RESULT" in output
+    assert f"Selected and skipped negative control failed for {variable}" in output
 
 
 @pytest.mark.parametrize("selected", ["", "yes"])
@@ -3504,23 +3522,33 @@ def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_p
     assert "continue-on-error" not in scenario[0]
 
     steps = job["steps"]
-    registrations = [step for step in steps if INITIAL_BINDING_MODULE in step.get("run", "")]
-    assert len(registrations) == 1
-    registration = registrations[0]
-    assert steps.index(scenario[0]) < steps.index(registration)
+    assert not any(INITIAL_BINDING_MODULE in step.get("run", "") for step in steps)
     rotations = [step for step in steps if STATIC_TOKEN_ROTATION_MODULE in step.get("run", "")]
     assert len(rotations) == 1
     rotation = rotations[0]
-    assert steps.index(registration) < steps.index(rotation)
+    assert steps.index(scenario[0]) < steps.index(rotation)
+    # The initial tracker binding module builds its own candidate and kind
+    # clusters, so it runs in its own required job beside the scenario.
+    binding_job = jobs[INITIAL_BINDING_JOB]
+    assert binding_job["if"] == job["if"]
+    assert binding_job["needs"] == ["changes"]
+    assert INITIAL_BINDING_JOB in jobs["e2e-required"]["needs"]
+    registrations = [
+        step for step in binding_job["steps"] if INITIAL_BINDING_MODULE in step.get("run", "")
+    ]
+    assert len(registrations) == 1
+    registration = registrations[0]
+    binding_steps = binding_job["steps"]
     assert rotation["run"] == f"uv run pytest -q -n 0 {STATIC_TOKEN_ROTATION_MODULE}"
     assert not rotation.get("if")
     assert not rotation.get("continue-on-error")
     assert not registration.get("if")
     assert not registration.get("continue-on-error")
-    assert any(
-        step.get("uses", "").startswith("astral-sh/setup-uv@")
-        for step in steps[: steps.index(registration)]
-    )
+    for action in ("astral-sh/setup-uv@", "azure/setup-helm@", "helm/kind-action@"):
+        assert any(
+            step.get("uses", "").startswith(action)
+            for step in binding_steps[: binding_steps.index(registration)]
+        ), action
     binaries = tmp_path / "bin"
     binaries.mkdir()
     log = tmp_path / "registration-argv.json"
@@ -3562,8 +3590,8 @@ def test_fresh_cluster_up_runtime_is_serial_and_propagates_failure(
     runtime_steps = [step for step in steps if CLUSTER_UP_MODULE in step.get("run", "")]
     assert len(runtime_steps) == 1
     runtime = runtime_steps[0]
-    registration = next(step for step in steps if INITIAL_BINDING_MODULE in step.get("run", ""))
-    assert steps.index(registration) < steps.index(runtime)
+    rotation = next(step for step in steps if STATIC_TOKEN_ROTATION_MODULE in step.get("run", ""))
+    assert steps.index(rotation) < steps.index(runtime)
     assert not runtime.get("if")
     assert not runtime.get("continue-on-error")
 
@@ -3622,7 +3650,33 @@ def test_forge_instance_job_is_gated_like_the_scripted_factory_and_required() ->
     )
     script = required["run"]
     assert '"$FORGE_INSTANCE_RESULT" != "$factory_expected"' in script
-    assert "FACTORY_RESULT FORGE_INSTANCE_RESULT" in script
+    assert (
+        "FACTORY_RESULT FORGE_INSTANCE_RESULT ADMITTED_AGENT_RESULT INITIAL_BINDING_RESULT"
+        in script
+    )
+
+
+@pytest.mark.parametrize(
+    ("job_id", "variable"),
+    [
+        (ADMITTED_AGENT_JOB, "ADMITTED_AGENT_RESULT"),
+        (INITIAL_BINDING_JOB, "INITIAL_BINDING_RESULT"),
+    ],
+)
+def test_split_factory_jobs_are_gated_like_the_scripted_factory_and_required(
+    job_id: str, variable: str
+) -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    job = jobs[job_id]
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["timeout-minutes"] == 120
+    assert job["if"] == jobs[SCRIPTED_FACTORY_JOB]["if"]
+    assert job["needs"] == ["changes"]
+    assert not job.get("continue-on-error")
+    assert job_id in jobs["e2e-required"]["needs"]
+    required = jobs["e2e-required"]["steps"][0]
+    assert required["env"][variable] == "${{ needs." + job_id + ".result }}"
+    assert f'"${variable}" != "$factory_expected"' in required["run"]
 
 
 def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> None:

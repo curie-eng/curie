@@ -332,9 +332,13 @@ class AdmittedKind(sk.ScriptedRun):
             )
             # A disposable CI runner discards the private database, so the
             # failure also reports this bounded, scrubbed digest of fixture state.
-            print(
-                "publication failure summary: " + json.dumps(scrub(summary), sort_keys=True),
-                file=sys.stderr,
+            digest = json.dumps(scrub(summary), sort_keys=True)
+            print("publication failure summary: " + digest, file=sys.stderr)
+            # CI uploads this directory as an artifact when the job fails.
+            artifacts = ROOT / "target/factory-e2e"
+            artifacts.mkdir(parents=True, exist_ok=True)
+            (artifacts / f"admitted-publication-failure-{request_id}-{count}.json").write_text(
+                digest + "\n"
             )
         except (KeyError, OSError, ValueError, TypeError, sqlite3.Error) as exc:
             self.record_failure("publication diagnostic persistence", exc)

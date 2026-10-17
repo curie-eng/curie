@@ -20,6 +20,11 @@ REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 ADMITTED_AGENT_RUNTIME = "tools/factory-e2e/tests/test_c4_admitted_agent.py"
 SCRIPTED_FACTORY_JOB = "e2e-scripted-factory"
+ADMITTED_AGENT_JOB = "factory-admitted-agent"
+ADMITTED_AGENT_SHARDS = [1, 2, 3, 4, 5]
+RELABEL_REGRESSION = (
+    "test_two_worker_ci_preserves_successor_identity_and_rejects_stale_predecessor"
+)
 
 
 def _invoke_selector(
@@ -546,32 +551,30 @@ def _admitted_agent_runtime_owner() -> tuple[dict[str, Any], dict[str, Any]]:
                 if index and arguments[index - 1] in {"--ignore", "--deselect"}:
                     continue
                 owners.append((job_id, step))
-    assert [job_id for job_id, _ in owners] == [SCRIPTED_FACTORY_JOB], owners
-    return jobs[SCRIPTED_FACTORY_JOB], owners[0][1]
+    assert [job_id for job_id, _ in owners] == [ADMITTED_AGENT_JOB], owners
+    return jobs[ADMITTED_AGENT_JOB], owners[0][1]
 
 
 def test_admitted_agent_runtime_has_one_required_provisioned_factory_owner() -> None:
     job, step = _admitted_agent_runtime_owner()
     assert job["if"] == "${{ needs.changes.outputs.factory == 'true' }}"
-    assert {"changes", "ci-images", "rust-build"} <= set(_needs(job))
+    assert "changes" in set(_needs(job))
     assert not job.get("continue-on-error", False)
-    assert "strategy" not in job
+    # Every leg must run to completion: one red leg cannot cancel the others,
+    # and the matrix result is failure unless every leg passed.
+    assert job["strategy"]["fail-fast"] is False
+    assert job["strategy"]["matrix"] == {"shard": ADMITTED_AGENT_SHARDS}
     assert "if" not in step
     assert not step.get("continue-on-error", False)
-    assert SCRIPTED_FACTORY_JOB in _needs(_python_job("e2e-required"))
+    assert step["env"]["CASE_SHARD"] == (
+        "${{ matrix.shard }}/" + str(len(ADMITTED_AGENT_SHARDS))
+    )
+    assert ADMITTED_AGENT_JOB in _needs(_python_job("e2e-required"))
     prior_steps = job["steps"][:job["steps"].index(step)]
     uses = [prior.get("uses", "") for prior in prior_steps]
     for action in ("astral-sh/setup-uv@", "azure/setup-helm@", "helm/kind-action@"):
         assert any(value.startswith(action) for value in uses), action
-    assert any(
-        prior.get("uses") == "./.github/actions/load-ci-images"
-        and {"api", "worker", "runner"} <= set(
-            prior["with"]["images"].strip("{}").split(",")
-        )
-        for prior in prior_steps
-    )
-    environment = {**job.get("env", {}), **step.get("env", {})}
-    assert environment["CURIE_BIN"] == "${{ github.workspace }}/cli/target/release/curie"
+    assert any("/usr/share/dotnet" in prior.get("run", "") for prior in prior_steps)
 
 
 @pytest.mark.parametrize("exit_code", [0, 1, 5])
@@ -580,15 +583,47 @@ def test_admitted_agent_factory_step_runs_whole_module_and_propagates_failure(
 ) -> None:
     _, step = _admitted_agent_runtime_owner()
     completed, arguments = _record_uv_step(
-        tmp_path, step, environment={}, exit_code=exit_code
+        tmp_path, step, environment={"CASE_SHARD": "3/5"}, exit_code=exit_code
     )
     assert arguments[:2] == ["run", "pytest"]
     assert arguments.count(ADMITTED_AGENT_RUNTIME) == 1
+    assert arguments[arguments.index("--case-shard") + 1] == "3/5"
+    assert arguments[arguments.index("-n") + 1] == "0"
     assert all(
-        argument in {"run", "pytest", "-q", "-v", "-vv", ADMITTED_AGENT_RUNTIME}
+        argument in {
+            "run", "pytest", "-q", "-v", "-vv", "-n", "0", "--case-shard", "3/5",
+            ADMITTED_AGENT_RUNTIME,
+        }
         for argument in arguments
     ), arguments
     assert completed.returncode == exit_code, completed.stdout + completed.stderr
+
+
+def test_admitted_agent_shards_partition_the_module_in_collection_order() -> None:
+    def collect(*extra: str) -> list[str]:
+        completed = subprocess.run(
+            [sys.executable, "-m", "pytest", "--collect-only", "-q", ADMITTED_AGENT_RUNTIME,
+             *extra],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        return [line for line in completed.stdout.splitlines() if "::" in line]
+
+    whole = collect()
+    count = len(ADMITTED_AGENT_SHARDS)
+    shards = [collect("--case-shard", f"{index}/{count}") for index in ADMITTED_AGENT_SHARDS]
+    assert all(shards)
+    assert [case for shard in shards for case in shard] == whole
+    # The successor regression keeps the continuation cases that precede it
+    # today in the same process, so its shard reproduces their order.
+    relabel = f"{ADMITTED_AGENT_RUNTIME}::{RELABEL_REGRESSION}"
+    [owner] = [shard for shard in shards if relabel in shard]
+    position = owner.index(relabel)
+    assert position >= 6
+    assert all(
+        "test_continuation_revalidates_current_authority" in case
+        for case in owner[position - 6:position]
+    )
 
 
 @pytest.mark.parametrize("shard", [1, 2, 3])

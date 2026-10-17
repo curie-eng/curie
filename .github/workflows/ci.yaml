@@ -2995,12 +2995,6 @@ jobs:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
           BUILDX_BUILDER: default
         run: python3 tools/factory-e2e/factory_e2e.py scripted
-      - name: Run the initial tracker binding regressions
-        run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_initial_binding.py
-      - name: Run admitted agent runtime regressions
-        env:
-          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
-        run: uv run pytest -q tools/factory-e2e/tests/test_c4_admitted_agent.py
       - name: Run the static token rotation regression
         run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_static_token_rotation.py
       - name: Run the fresh cluster install regression
@@ -3017,6 +3011,188 @@ jobs:
   # images from the checkout, then creates and deletes up to four sequential
   # kind clusters, so it needs none of the upstream build artifacts. It is
   # selected exactly like the scripted factory scenario (#4620).
+  # The admitted agent runtime module (#4619) gives every case its own kind
+  # cluster through a function-scoped fixture, so its cases share no state
+  # across runners. Each leg runs one contiguous collection-order block, so a
+  # case still runs after the cases that precede it today. The legs partition
+  # the module exactly, and `E2E required` needs every leg.
+  factory-admitted-agent:
+    name: Admitted agent runtime regressions (kind, shard ${{ matrix.shard }}/5)
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.factory == 'true' }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: "3.13"
+      - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      # The driver creates and deletes its own cluster. The action only installs
+      # kind and kubectl; its post step still removes kind-registry, so that
+      # container must exist.
+      - name: Ensure kind-registry exists
+        run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Install kind and kubectl without creating a cluster
+        id: install_kind
+        continue-on-error: true
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          install_only: true
+      - name: Back off before retrying Install kind and kubectl without creating a cluster
+        if: steps.install_kind.outcome == 'failure'
+        run: |
+          echo "Install kind and kubectl without creating a cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          bash cli/scripts/ensure-kind-registry.sh
+          sleep 15
+      - name: Install kind and kubectl without creating a cluster (retry)
+        if: steps.install_kind.outcome == 'failure'
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          install_only: true
+      # This ubuntu-latest job owns a disposable hosted runner. The Android,
+      # .NET and Haskell SDKs are unused here; remove only those preinstalled
+      # SDK trees before downloading images to preserve the driver's 30 GB floor.
+      - name: Free disk for the disposable factory cluster
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+      - name: Run admitted agent runtime regressions
+        env:
+          CASE_SHARD: ${{ matrix.shard }}/5
+        run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_admitted_agent.py --case-shard "$CASE_SHARD"
+      - name: Upload the publication failure digest
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: admitted-publication-digest-${{ github.sha }}-${{ matrix.shard }}
+          path: target/factory-e2e/admitted-publication-failure-*.json
+          if-no-files-found: ignore
+
+  # The initial tracker binding module builds its own candidate and clusters,
+  # so it runs beside the scripted scenario instead of after it.
+  factory-initial-binding:
+    name: Initial tracker binding regressions (kind)
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: ${{ needs.changes.outputs.factory == 'true' }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: "3.13"
+      - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      # The driver creates and deletes its own cluster. The action only installs
+      # kind and kubectl; its post step still removes kind-registry, so that
+      # container must exist.
+      - name: Ensure kind-registry exists
+        run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Install kind and kubectl without creating a cluster
+        id: install_kind
+        continue-on-error: true
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          install_only: true
+      - name: Back off before retrying Install kind and kubectl without creating a cluster
+        if: steps.install_kind.outcome == 'failure'
+        run: |
+          echo "Install kind and kubectl without creating a cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          bash cli/scripts/ensure-kind-registry.sh
+          sleep 15
+      - name: Install kind and kubectl without creating a cluster (retry)
+        if: steps.install_kind.outcome == 'failure'
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          install_only: true
+      # This ubuntu-latest job owns a disposable hosted runner. The Android,
+      # .NET and Haskell SDKs are unused here; remove only those preinstalled
+      # SDK trees before downloading images to preserve the driver's 30 GB floor.
+      - name: Free disk for the disposable factory cluster
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+      - name: Run the initial tracker binding regressions
+        run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_initial_binding.py
+
   forge-instance-regression:
     name: Forge instance regression (kind)
     runs-on: ubuntu-latest
@@ -4812,7 +4988,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    needs: [changes, runtime-assertion-registration, e2e-ladder, e2e-oidc, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-cluster-approval-resume-restarts, e2e-scripted-factory, forge-instance-regression, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
+    needs: [changes, runtime-assertion-registration, e2e-ladder, e2e-oidc, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-cluster-approval-resume-restarts, e2e-scripted-factory, forge-instance-regression, factory-admitted-agent, factory-initial-binding, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
     # A cancelled run leaves no evidence and must rerun. In a completed run,
     # every dependency outcome reaches the strict matcher below, which rejects
     # selected results other than success.
@@ -4841,6 +5017,8 @@ jobs:
           APPROVAL_RESUME_RESULT: ${{ needs.e2e-cluster-approval-resume-restarts.result }}
           FACTORY_RESULT: ${{ needs.e2e-scripted-factory.result }}
           FORGE_INSTANCE_RESULT: ${{ needs.forge-instance-regression.result }}
+          ADMITTED_AGENT_RESULT: ${{ needs.factory-admitted-agent.result }}
+          INITIAL_BINDING_RESULT: ${{ needs.factory-initial-binding.result }}
           RELEASED_UPGRADE_RESULT: ${{ needs.e2e-released-upgrade.result }}
           RELEASED_UPGRADE_NEGATIVE_RESULT: ${{ needs.e2e-released-upgrade-negative.result }}
           UPGRADE_MATRIX_SHARDS_RESULT: ${{ needs.e2e-cluster-upgrade-matrix-shards.result }}
@@ -4858,6 +5036,8 @@ jobs:
                   "$APPROVAL_RESUME_RESULT" != "$approval_resume_expected" ||
                   "$FACTORY_RESULT" != "$factory_expected" ||
                   "$FORGE_INSTANCE_RESULT" != "$factory_expected" ||
+                  "$ADMITTED_AGENT_RESULT" != "$factory_expected" ||
+                  "$INITIAL_BINDING_RESULT" != "$factory_expected" ||
                   "$RELEASED_UPGRADE_RESULT" != "$released_upgrade_expected" ||
                   "$RELEASED_UPGRADE_NEGATIVE_RESULT" != "$released_upgrade_expected" ||
                   "$UPGRADE_MATRIX_RESULT" != "$upgrade_matrix_expected" ]]; then
@@ -4942,7 +5122,7 @@ jobs:
           # rejected, so no dependency can drop out of the validator unnoticed.
           for name in SKILL_LOCAL_RESULT OIDC_RESULT LOCAL_RELEASE_RESULT CLUSTER_RESULT \
             CLUSTER_CHART_RESULT ROLLOUT_RECOVERY_RESULT APPROVAL_RESUME_RESULT \
-            FACTORY_RESULT FORGE_INSTANCE_RESULT \
+            FACTORY_RESULT FORGE_INSTANCE_RESULT ADMITTED_AGENT_RESULT INITIAL_BINDING_RESULT \
             RELEASED_UPGRADE_RESULT \
             RELEASED_UPGRADE_NEGATIVE_RESULT UPGRADE_MATRIX_RESULT; do
             flipped="success"
