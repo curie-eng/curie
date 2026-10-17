@@ -78,7 +78,7 @@ subjects:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "curie.fullname" . }}-mail-persistence-preflight
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Job" "name" (printf "%s-mail-persistence-preflight" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: mail-persistence-preflight
