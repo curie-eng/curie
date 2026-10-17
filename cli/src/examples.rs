@@ -819,6 +819,32 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     Ok(SreBotInstallResult::Installed(Box::new(deployed)))
 }
 
+/// Install only the factory-owned authoring skill; execution assets and image
+/// resolution are deliberately outside this local preparation path.
+pub fn install_factory_preparation(
+    options: crate::agent_skills::InstallOptions,
+) -> Result<Box<dyn CliOutput>> {
+    const PREFIX: &str = "preparation/skills/prepare-factory-ticket/";
+    let files: Vec<(&str, &[u8])> = DARK_FACTORY_BUNDLE_FILES
+        .iter()
+        .filter_map(|(name, bytes)| name.strip_prefix(PREFIX).map(|relative| (relative, *bytes)))
+        .collect();
+    let release = crate::managed_skills::embedded(&files)?;
+    crate::managed_skills::preflight_install(&options)?;
+    let result = crate::agent_skills::install("prepare-factory-ticket", &files, options.clone())?;
+    crate::managed_skills::record_install(release, &options)?;
+    Ok(result)
+}
+
+pub fn package_factory_preparation(out: &std::path::Path) -> Result<Box<dyn CliOutput>> {
+    const PREFIX: &str = "preparation/skills/prepare-factory-ticket/";
+    let files: Vec<(&str, &[u8])> = DARK_FACTORY_BUNDLE_FILES
+        .iter()
+        .filter_map(|(name, bytes)| name.strip_prefix(PREFIX).map(|relative| (relative, *bytes)))
+        .collect();
+    crate::managed_skills::package(crate::managed_skills::embedded(&files)?, out)
+}
+
 /// Every tracked file of `examples/dark-factory`, embedded so a released
 /// binary can render the factory bundle without a source checkout (#3619).
 pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
@@ -877,6 +903,46 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
     (
         "skills/implement-issue/SKILL.md",
         include_bytes!("../../examples/dark-factory/skills/implement-issue/SKILL.md"),
+    ),
+    (
+        "preparation/evals/README.md",
+        include_bytes!("../../examples/dark-factory/preparation/evals/README.md"),
+    ),
+    (
+        "preparation/evals/publication-cases.json",
+        include_bytes!("../../examples/dark-factory/preparation/evals/publication-cases.json"),
+    ),
+    (
+        "preparation/release-metadata.json",
+        include_bytes!("../../examples/dark-factory/preparation/release-metadata.json"),
+    ),
+    (
+        "preparation/README.md",
+        include_bytes!("../../examples/dark-factory/preparation/README.md"),
+    ),
+    (
+        "preparation/pyproject.toml",
+        include_bytes!("../../examples/dark-factory/preparation/pyproject.toml"),
+    ),
+    (
+        "preparation/src/curie_factory_preparation/__init__.py",
+        include_bytes!("../../examples/dark-factory/preparation/src/curie_factory_preparation/__init__.py"),
+    ),
+    (
+        "preparation/src/curie_factory_preparation/specification.py",
+        include_bytes!("../../examples/dark-factory/preparation/src/curie_factory_preparation/specification.py"),
+    ),
+    (
+        "preparation/src/curie_factory_preparation/ticket_set.py",
+        include_bytes!("../../examples/dark-factory/preparation/src/curie_factory_preparation/ticket_set.py"),
+    ),
+    (
+        "preparation/skills/prepare-factory-ticket/SKILL.md",
+        include_bytes!("../../examples/dark-factory/preparation/skills/prepare-factory-ticket/SKILL.md"),
+    ),
+    (
+        "preparation/skills/prepare-factory-ticket/references/specification.md",
+        include_bytes!("../../examples/dark-factory/preparation/skills/prepare-factory-ticket/references/specification.md"),
     ),
     (
         "verification/contract.md",

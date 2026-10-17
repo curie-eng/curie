@@ -98,6 +98,9 @@ class DeferBody(BaseModel):
 
 
 class StartBody(BaseModel):
+    runtime_deployment_id: uuid.UUID | None = None
+    runtime_version_id: uuid.UUID | None = None
+    runtime_bundle_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     owner: str = Field(min_length=1)
     generation: int = Field(ge=1)
     claim_name: str = Field(min_length=1)
@@ -143,6 +146,7 @@ class TerminationBody(BaseModel):
 
 
 class RunningWorkItemRequest(BaseModel):
+    input_contract_receipt: dict[str, Any] | None = None
     work_item_id: uuid.UUID
     request_id: uuid.UUID
     runtime_epoch: int
@@ -197,6 +201,7 @@ async def running_work_item_request(
         runtime_epoch=row.runtime_epoch,
         execution_deadline=row.execution_deadline,
         status="running",
+        input_contract_receipt=row.input_contract_receipt,
     )
 
 
@@ -265,6 +270,7 @@ async def acquire_work_item_request(
         "conversation_id": result.conversation_id,
         "wait_deadline": result.wait_deadline,
         "repository_path": result.repository_path,
+        "input_contract_receipt": result.input_contract_receipt,
     }
 
 
@@ -301,6 +307,9 @@ async def start_work_item_request(
         generation=body.generation,
         claim_name=body.claim_name,
         sandbox_name=body.sandbox_name,
+        runtime_deployment_id=body.runtime_deployment_id,
+        runtime_version_id=body.runtime_version_id,
+        runtime_bundle_sha256=body.runtime_bundle_sha256,
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)

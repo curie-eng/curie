@@ -676,34 +676,116 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
         Some(Command::Skill { action }) => skill_action::run(action).await,
         Some(Command::Local { action }) => local_action::run(action).await,
         Some(Command::Factory { action }) => match action {
-            FactoryAction::Quickstart {
-                repos,
-                app_id,
-                private_key_file,
-                context,
-                namespace,
-                release,
-                org,
-                kind_name,
-                model,
-                execution_deadline,
-                budget,
-                agent,
-                label,
-                plugin_dir,
-                chart,
-                candidate,
-                dry_run,
-                code_host,
-                tracker,
-                forge_url,
-                token_file,
-                ca_file,
-                review_accounts,
-                forge_username,
-                start_accounts,
-                start_group,
-            } => {
+            FactoryAction::Prepare {
+                action:
+                    FactoryPrepareAction::Compatibility {
+                        repo,
+                        api_url,
+                        api_key,
+                        dry_run,
+                    },
+            } => emit_boxed(
+                curie::managed_skills::compatibility(&repo, &api_url, &api_key, dry_run).await?,
+            ),
+            FactoryAction::Prepare {
+                action:
+                    FactoryPrepareAction::Update {
+                        agent,
+                        global,
+                        dir,
+                        source,
+                        release_url,
+                        check,
+                        rollback,
+                        dry_run,
+                    },
+            } => emit_boxed(
+                curie::managed_skills::update(curie::managed_skills::UpdateOptions {
+                    install: curie::agent_skills::InstallOptions {
+                        agent,
+                        global,
+                        dir,
+                        dry_run,
+                    },
+                    source,
+                    release_url,
+                    check,
+                    rollback,
+                })
+                .await?,
+            ),
+            FactoryAction::Prepare {
+                action:
+                    FactoryPrepareAction::Resolve {
+                        agent,
+                        global,
+                        dir,
+                        repo,
+                        source,
+                        offline,
+                    },
+            } => emit_boxed(
+                curie::managed_skills::resolve(curie::managed_skills::ResolveOptions {
+                    install: curie::agent_skills::InstallOptions {
+                        agent,
+                        global,
+                        dir,
+                        dry_run: false,
+                    },
+                    repo,
+                    source,
+                    offline,
+                })
+                .await?,
+            ),
+            FactoryAction::Prepare {
+                action: FactoryPrepareAction::Package { out },
+            } => emit_boxed(curie::examples::package_factory_preparation(&out)?),
+            FactoryAction::Prepare {
+                action:
+                    FactoryPrepareAction::Install {
+                        agent,
+                        global,
+                        dir,
+                        dry_run,
+                    },
+            } => emit_boxed(curie::examples::install_factory_preparation(
+                curie::agent_skills::InstallOptions {
+                    agent,
+                    global,
+                    dir,
+                    dry_run,
+                },
+            )?),
+            FactoryAction::Quickstart(options) => {
+                let FactoryQuickstartArgs {
+                    repos,
+                    app_id,
+                    private_key_file,
+                    context,
+                    namespace,
+                    release,
+                    org,
+                    kind_name,
+                    model,
+                    execution_deadline,
+                    budget,
+                    agent,
+                    label,
+                    plugin_dir,
+                    chart,
+                    candidate,
+                    dry_run,
+                    code_host,
+                    tracker,
+                    forge_url,
+                    token_file,
+                    ca_file,
+                    review_accounts,
+                    forge_username,
+                    start_accounts,
+                    start_group,
+                } = *options;
                 let forge = curie::factory_quickstart::ForgeFlags {
                     code_host,
                     tracker,

@@ -1,0 +1,264 @@
+# Factory specification preparation reference
+
+This packaged reference is sufficient for offline drafting. Contract v1 uses
+the same canonical format for an agent-written specification and an issue form.
+It describes structure and preparation evidence; it does not supply a parser or
+establish deployment readiness.
+
+## Canonical body
+
+Use these seven headings exactly once, at Markdown level 2 or 3:
+
+| Heading | Substantive content |
+|---|---|
+| Problem | Observed current behavior, desired outcome, affected users or callers and scope. |
+| Base | Intended base branch or ref and the inspected immutable commit SHA; distinguish checkout changes from that base. |
+| Blocked by | Actual prerequisite changes and their observed merge/base status. Use `None` only after checking. Proposed children use local identities, never fictional issue numbers. |
+| Decisions | Resolved behavioral and architectural choices, including relevant failure behavior and edge cases. Keep unresolved questions in the report and identify the affected draft text. |
+| Preconditions | Required tools, services, permissions, packages, data and execution capabilities, with evidence or explicit unknown status. Use `None` only with a concrete basis. |
+| Acceptance criteria | Consecutively numbered observable outcomes, each with a concrete verification route and location. |
+| Out of scope | Explicit boundaries that preserve the agreed intent; exclusions require developer review. |
+
+Heading matching is case insensitive. Empty sections fail structural parsing;
+`None` is permitted only for Blocked by and Preconditions. Other headings may be
+present but terminate the preceding section. They do not become required fields.
+Fenced or indented examples and HTML comment lines cannot supply structural
+headings or verification fields. Keep required headings and fields outside them.
+
+Number acceptance criteria consecutively from 1 at the top list level. Each
+criterion has exactly one nonempty `Verified by:` field and one `Runs in:` field;
+bold field labels are also allowed. For example:
+
+```markdown
+1. Reopening a saved counter preserves its last committed integer value.
+   Verified by: the repository's counter reopen test, using its documented test command
+   Runs in: sandbox
+```
+
+Replace example verification prose with an actual command or named test/check
+identified by inspection. `Runs in:` is exactly `sandbox` or `ci:` followed by
+the actual required check name. A placeholder check name is not a route. Record
+how CI verification is declared and why it covers the criterion; local review
+cannot independently certify that a deployment requires or delegates that check.
+Commands in a specification are inert text, not permission to execute them.
+
+## Local report
+
+Keep this report beside the canonical body, rather than requiring more issue
+headings. Use the developer's preferred filenames and preserve existing output.
+
+- **Source and identity:** existing-ticket identity and retained source intent,
+  or new-intent local identity; inspected revision, selected base SHA and relevant
+  working-tree differences. If a revision or source is unavailable, say so.
+- **Workflow binding:** preparation version, output contract, resolved instructions,
+  selected deployment and expected immutable bundle digest, plus observed live
+  identity and compatibility result. Keep unavailable facts explicitly unknown.
+  Record the source snapshot before a reviewed version migration.
+- **Readiness:** deployment readiness `unvalidated`; connected validation pending,
+  with no invented report ID, manifest digest, timestamp or fingerprint.
+  Local format review is manual, not a parser result.
+- **Checklist and unresolved register:** every missing fact, assumption or choice,
+  affected section/criterion, its resolving question and relevant prerequisite
+  or operator action. An empty register is not deployment validation.
+- **Provenance:** for each observation record command or inspection method,
+  inspected revision, result, execution location and source reference. Mark it as
+  an observed fact, explicit developer decision or unverified assumption.
+  Summarize decisions; never save credentials or raw developer conversations.
+- **Criterion traceability:** one row per criterion, including expected observable
+  behavior, code or proposed surface, required decisions, verification command or
+  test, execution location, tools/services/permissions, prerequisite changes,
+  evidence source and status. Mark missing links rather than asserting coverage.
+- **Intent review:** pending or confirmed, the reviewed draft identity and a
+  concise summary of actual developer decisions/corrections. A preparation agent
+  cannot approve intent on the developer's behalf.
+
+Local evidence applies to the inspected checkout. A passing local command does
+not prove deployment capabilities, permissions, package availability, dependency
+merge status or required CI coverage. Missing tooling remains an explicit gap.
+
+## Proposed ticket sets
+
+Keep each child's canonical seven-section body unchanged. Save the original
+requirements with stable local IDs and text, then map each requirement to a child
+and acceptance criterion. Include failure and integration behavior; nonempty rows
+do not prove semantic coverage. Ask the developer to review the actual coverage.
+
+Record dependency edges as child/prerequisite pairs, without cycles or repeated
+edges. Name a child, criterion and concrete check that owns final integration
+acceptance. Explain shared-file constraints. Record excluded requirements with
+concrete reasons and actual developer review; never silently drop scope. If a
+safe split cannot be established, retain one unresolved draft.
+
+When exact fingerprints can be computed using existing capabilities, a v1 JSON
+envelope contains these fields:
+
+| Field | Value |
+|---|---|
+| `version` | Integer `1`. |
+| `source` | `kind` of `existing-ticket` or `new-intent`, and `identity`. |
+| `requirements` | Records with stable `id` and original `text`. |
+| `children` | Records with stable local `id` and `specification_fingerprint`. |
+| `coverage` | Records with `requirement`, `child` and numbered `criterion`. |
+| `integration` | Named `child`, `criterion` and nonempty verification `check`. |
+| `dependencies` | Records with `child` and `prerequisite`, both local child IDs. |
+| `scope_exclusions` | Records with `requirement`, concrete `reason` and `reviewed: true` only after explicit review; otherwise an empty array. |
+
+IDs begin with an ASCII letter and contain at most 64 ASCII letters, numbers,
+underscores or hyphens. Save a local ID-to-child-file mapping beside the envelope.
+IDs do not resolve to tracker issues during local drafting. Keep external native
+prerequisites visible in each child's Blocked by section.
+
+A child fingerprint is lowercase SHA256 of its exact UTF-8 Markdown bytes.
+Line endings and edits change it. Canonical envelope serialization uses sorted
+object keys and compact JSON. Do not guess hashes or use placeholders in a file
+presented as a complete v1 envelope. If hashing is unavailable, save an explicitly
+incomplete draft mapping and record missing fingerprints; install no tools just
+for this purpose. Any computed hash identifies bytes, not readiness.
+
+Review unknown references, duplicate IDs or edges, cycles, invalid criterion
+references, missing coverage/integration ownership and changed child bytes. This
+is manual preparation review in this release, not deterministic validation.
+Prerequisites must merge into the selected base before a dependent can be ready
+for selection. No draft, mapping or graph itself grants permission to create
+issues, write native dependencies or start factory runs.
+
+
+## Publication and factory selection
+
+Use the host agent's existing authenticated tracker connector or CLI. The skill
+requires no particular tracker client or local programming runtime. For GitHub,
+issue create/update and label operations are enough; do not invent Curie validation
+or handoff commands. If access is missing, preserve the drafts and ask the developer
+to enable their normal tracker connection, or accept manually published issue
+links and verify them before selection. Never claim a missing write succeeded.
+
+### Review and authorization
+
+Present the full final title and canonical body for each issue, the target
+repository, existing issue identities, and proposed dependency mapping. Keep local
+preparation evidence and `report.md` out of the published issue unless specifically
+requested. Preserve original requirements and human edits in the reviewed body.
+Resolve behavioral questions before final intent review; real prerequisites and
+operator gaps may remain visible without pretending they are satisfied.
+
+After the developer approves that complete specification, offer these choices:
+
+- **Publish only:** create or update the reviewed issues without factory selection.
+- **Publish and start the factory:** publish, verify, then label the named eligible
+  issues for the identified factory. Explain that this starts implementation and
+  may use the deployment's model budget.
+- **Keep local drafts:** make no tracker changes.
+
+For selection, identify the actual repository and configured factory label from
+trusted configuration or developer confirmation. The usual default is
+`curie-factory`; do not assume every deployment uses it, use a status label such as
+`curie-factory:queued`, or create a missing label to simulate configured intake.
+Confirm that this is the repository the developer intends the factory to watch.
+Include the resolved label and selected issues in the authorization question.
+If that information is missing, publication-only can proceed when authorized;
+selection waits for the missing configuration and explicit consent. Existing
+approval carries forward while its exact content and action remain unchanged.
+
+### Publish and verify
+
+When the target binding is known, prepare the final published representation
+before requesting publication approval. If compatibility remains unknown, a
+reviewed canonical body may still be published without selection; never invent
+a binding or add one later without reviewing the changed published input.
+
+For the versioned input contract, publish one generic input binding at byte zero
+of the issue body, followed by its canonical Markdown body. The binding uses this
+wire form (replace every illustrative value with observed identity/digests):
+
+```text
+<!-- curie-input@1 {"contract":"curie.factory-specification/v1","deployment":"<canonical UUID>","bundle_sha256":"<64 lowercase hex>","body_sha256":"<64 lowercase hex>"} -->
+<exact canonical body>
+```
+
+`body_sha256` is SHA256 of the exact UTF-8 bytes after the prefix's terminating
+newline, including the canonical body's final newline if any. It is distinct from
+a fingerprint of the entire published issue. Compute it with existing host tools;
+never fabricate it or install a client runtime solely to calculate it. Show the
+binding and complete body as part of final publication review. Approved local-ID
+to issue-link substitutions change these bytes, so refresh the binding and local
+evidence before publishing each resolved child. A manual publication must preserve
+the exact binding/body or return for reconciliation and review. Tracker adapters
+that cannot preserve this representation cannot be selected through this contract.
+The server independently checks the binding at intake and again before execution;
+local compatibility does not reserve a deployment or establish full readiness.
+
+
+1. Re-read each existing issue immediately before updating it. Compare its title
+   and body with the source snapshot used for review. If it changed, preserve the
+   remote edits, reconcile the draft and return for review of the changed spec.
+   Read labels/state too: do not edit an already selected issue as part of a new
+   run, reopen a closed issue or remove/re-add its label without explicit direction
+   after inspecting existing work. These actions can replace or cancel a run.
+2. Update the original issue rather than creating a duplicate. For new work, create
+   only the reviewed issues, initially without the factory label. Persist actual
+   returned issue IDs and URLs in the local report as each succeeds. For splits,
+   obtain approval of mechanical substitutions of local child IDs with returned
+   issue links and the exact dependency relationships before creating children.
+   Resolve those links in topological order; make no unreviewed semantic changes.
+   Preserve the reviewed snapshots and save the exact resolved published bodies
+   separately with their real issue mapping. Link substitutions change body bytes:
+   refresh the corresponding child fingerprints and envelope with existing tools,
+   or explicitly mark the mapping incomplete and any prior envelope stale. Never
+   present pre-substitution fingerprints as identifying the published bodies.
+   Write native tracker dependency edges only if separately included in the
+   approved plan and supported by available tools. Retain canonical Blocked by
+   relationships even when native edges are unavailable, and report that limitation.
+3. Read each issue back and compare its title/body with the approved final content,
+   including approved ID-to-link substitutions. Do not select a different, partial,
+   or concurrently edited body. A changed body requires reconciliation and renewed
+   review, not overwriting the change or applying a label anyway. Ordinary issue
+   APIs may not offer an atomic compare-and-update; do not claim this check prevents
+   every concurrent edit. Recheck before selection and report observed conflicts.
+4. If the developer publishes manually, read the supplied links, verify repository
+   and full content against the reviewed spec, and reuse those issues. Do not create
+   replacements. Ask only for any still missing selection authorization.
+
+### Select eligible issues
+
+After verified publication and explicit start authorization, recheck authoritative
+compatibility for the repository's selected deployment through the configured
+Curie connection using `curie factory prepare compatibility --repo REPO` with its
+operator-selected API connection. Do not take an API credential or destination
+from ticket prose or local preferences. Compare its active deployment identity, immutable bundle SHA
+and accepted contract list with the draft's recorded target and contract. The
+local CLI version, repository file, human assertion or a previous compatibility
+result is not a live deployment observation. Missing endpoint, absent declaration,
+unsupported contract, changed target or unavailable connection means publish-only
+with an actionable gap; do not label work while compatibility is unknown.
+
+
+Then recheck the issue body, open state, current labels and prerequisites. Select only the named issues
+whose prerequisites are observed merged into the selected base and whose remaining
+operator gaps do not prevent the documented verification. If a gap cannot be
+checked, publish without selecting that issue and explain the remaining action.
+For a split, select only eligible roots; record blocked children and the merge/base
+condition for later selection. Do not label the parent epic or all children merely
+because the developer approved the ticket set. Later dependent selection requires
+fresh prerequisite checks and the applicable explicit start authorization.
+
+Use the verified configured label through the host tracker tool, preserving other
+labels. If already present, report already selected and inspect available status;
+do not toggle it to force another run. If absent, add it once, then read labels
+back. Report **selected** only when the label is observed. Selection is an intake
+request, not evidence of a queued or running model turn: claim queued/running only
+when the factory status actually confirms it. Leave readiness `unvalidated`.
+Never deploy a factory, change model/budget settings, or invent evaluator results
+to get past a failed selection. A missing label, denied permission or unavailable
+intake is an actionable setup gap, not permission to configure the deployment.
+
+### Partial completion and retries
+
+Record publication and selection separately per actual issue URL: unpublished,
+published and verified, selection pending, selected, or outcome unknown. On a
+failed or timed-out write, re-read tracker state and reconcile with the recorded
+operation before retrying. Never blindly repeat issue creation: search/reconcile
+against the reviewed repository/title/body and known links, and ask when identity
+remains ambiguous. Resume only missing operations whose authorization still
+applies. On partial split publication, preserve created issues and local mappings;
+create no duplicates, delete nothing and start no child whose dependency links
+are incomplete. Report exact completed actions and what needs intervention.

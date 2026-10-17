@@ -4,6 +4,7 @@
 //! local runner container (via the generated `curie-aci-protocol` crate) and
 //! the platform API's committed OpenAPI surface. Task I1.
 
+pub mod agent_skills;
 pub mod api;
 pub mod api_requests;
 pub mod approval_wording;
@@ -43,6 +44,7 @@ pub mod kube_context;
 pub mod local;
 pub mod local_stack_keys;
 pub mod mail_channel;
+pub mod managed_skills;
 pub mod message;
 pub mod migrate_store;
 pub mod modelpin;

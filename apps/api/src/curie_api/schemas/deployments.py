@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -163,3 +163,14 @@ class WebhookResult(BaseModel):
     deployment_id: uuid.UUID | None = None
     commit_sha: str | None = None
     errors: list[dict[str, str]] | None = None
+
+
+class InputContractsOut(BaseModel):
+    interface: Literal["curie/input-contracts@1"]
+    deployment_id: uuid.UUID
+    agent_id: uuid.UUID
+    version_id: uuid.UUID
+    bundle_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    accepted_contracts: list[str]
+    status: Literal["active"]
+    enforced: Literal[True]

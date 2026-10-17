@@ -7,9 +7,9 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from curie_api.crud import agents as crud_agents
 from curie_api.crud import deployments as crud_deployments
 from curie_api.crud import versions as crud_versions
-from curie_api.schemas.deployments import DeploymentCreate, DeploymentOut
+from curie_api.schemas.deployments import DeploymentCreate, DeploymentOut, InputContractsOut
 
-from .. import deploy
+from .. import deploy, input_contracts
 from ..auth import require_api_key
 from ..deps import SessionDep, StoreDep
 
@@ -89,3 +89,15 @@ async def end_deployment(deployment_id: uuid.UUID, session: SessionDep) -> None:
     if deployment is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "deployment not found")
     await crud_deployments.end_deployment(session, deployment)
+
+
+@router.get("/{deployment_id}/input-contracts", response_model=InputContractsOut)
+async def read_input_contracts(
+    deployment_id: uuid.UUID, session: SessionDep
+) -> InputContractsOut:
+    try:
+        return InputContractsOut.model_validate(
+            await input_contracts.deployment_contracts(session, deployment_id)
+        )
+    except input_contracts.InputCompatibilityError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=exc.code) from None

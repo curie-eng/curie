@@ -503,6 +503,13 @@ class GitHubTracker:
             return False
         return permission.get("permission") in ("write", "admin")
 
+    async def read_input_body(self, issue: TrackerIssueRef) -> str:
+        found = await self._issue(self._number(issue))
+        if found is None:
+            raise NotFound("issue")
+        body = found.get("body")
+        return body if isinstance(body, str) else ""
+
     async def read_ticket(self, issue: TrackerIssueRef) -> str:
         content = await self.read_issue_content(self._number(issue))
         parts = [f"# {content.title}", content.body]

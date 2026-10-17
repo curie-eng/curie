@@ -10,6 +10,12 @@
       "version": "1.0"
     },
     {
+      "result": "AgentSkillInstallOutput",
+      "kind": "CliOutput",
+      "schema": "agent-skill-install.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "AllTargetsDeployOutput",
       "kind": "CliOutput",
       "schema": "deploy.schema.json",
@@ -235,6 +241,12 @@
       "result": "LocalUpOutput",
       "kind": "CliOutput",
       "schema": "local-up.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "ManagedSkillOutput",
+      "kind": "CliOutput",
+      "schema": "managed-skill.schema.json",
       "version": "1.0"
     },
     {

@@ -155,6 +155,8 @@ fn check_run_args_are_the_exact_offline_argv() {
         "-e",
         "CURIE_PLUGIN_DIR=/plugin",
         "-e",
+        "CURIE_INPUT_CONTRACT_CONTEXT=standalone",
+        "-e",
         "CURIE_CHECK_TIMEOUT_S=30",
         "curie-runner",
         "python",

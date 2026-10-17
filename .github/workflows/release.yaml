@@ -962,6 +962,18 @@ jobs:
           output-file: dist/curie-${{ matrix.target }}.spdx.json
           upload-artifact: false
           upload-release-assets: false
+      - name: Package portable preparation release and its source inventory
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: dist/curie-x86_64-unknown-linux-gnu factory prepare package --out dist/factory-preparation.json
+      - name: Upload preparation release artifact
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-asset-preparation
+          path: |
+            dist/factory-preparation.json
+            dist/factory-preparation.json.spdx.json
+          if-no-files-found: error
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
         with:

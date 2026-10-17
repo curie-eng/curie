@@ -496,6 +496,9 @@ class AgentVersion(Base):
     version_label: Mapped[str]
     bundle_ref: Mapped[str | None] = mapped_column(default=None)
     bundle_sha256: Mapped[str | None] = mapped_column(default=None)
+    input_contracts: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
+    )
     # The git commit this version was built from (J1); lets promote reuse the
     # already-built bundle instead of rebuilding.
     commit_sha: Mapped[str | None] = mapped_column(default=None, index=True)
@@ -1141,6 +1144,9 @@ class ExecutionRequest(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     work_item_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
+    )
+    input_contract_receipt: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), default=None
     )
     sequence: Mapped[int]
     status: Mapped[str] = mapped_column(default="waiting", server_default="waiting")

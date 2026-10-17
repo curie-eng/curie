@@ -582,6 +582,10 @@ class JiraTracker:
             raise Unavailable("user_groups")
         return any(isinstance(group, dict) and group.get("groupId") == group_id for group in groups)
 
+    async def read_input_body(self, issue: TrackerIssueRef) -> str:
+        fields = _fields(await self._read_issue(self._issue_id(issue), "description"))
+        return adf.to_markdown(fields.get("description"))
+
     async def read_ticket(self, issue: TrackerIssueRef) -> str:
         """Decision 14: title, description, then up to 100 comments oldest first."""
 

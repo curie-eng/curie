@@ -1,0 +1,365 @@
+{
+  "version": 1,
+  "purpose": "Portable behavioral replay scenarios; run with mocked tracker tools and assert effects, not instruction wording. These fixtures are not themselves an executed integration test.",
+  "canonical_body_fixture": "Supply a complete seven-section body with real inspected verification route for each replay.",
+  "cases": [
+    {
+      "id": "whole-spec-review",
+      "given": {
+        "source": "existing issue or new intent",
+        "questions": "all behavioral questions resolved",
+        "drafts": "complete canonical issue bodies and separate local evidence report"
+      },
+      "user_turn": "Show me the final spec.",
+      "expected": {
+        "presentation": [
+          "every complete title and canonical body",
+          "repository and existing issue identity or proposed new issue",
+          "split coverage, ordering and dependencies if any",
+          "remaining prerequisite and operator gaps"
+        ],
+        "tracker_effects": [],
+        "next": "request intent review; after approval offer publish only, publish and start, or keep local"
+      },
+      "forbidden": [
+        "substituting report.md or acceptance-criteria summary for complete specification review",
+        "writing tracker or selecting before explicit action choice"
+      ]
+    },
+    {
+      "id": "review-is-not-publish",
+      "given": {
+        "full_spec_reviewed": true,
+        "publication_consent": false
+      },
+      "user_turn": "The specification looks good.",
+      "expected": {
+        "tracker_effects": [],
+        "next": "offer explicit publication choices with destination/actions/label and implementation-budget implication"
+      },
+      "forbidden": [
+        "create",
+        "update",
+        "label"
+      ]
+    },
+    {
+      "id": "publish-only",
+      "given": {
+        "full_spec_reviewed": true,
+        "issue": "https://github.com/example/repo/issues/21",
+        "remote_unchanged": true,
+        "factory_label": "curie-factory"
+      },
+      "user_turn": "Publish only. Do not start the factory.",
+      "expected": {
+        "tracker_effects": [
+          "read existing issue before update",
+          "update approved canonical title/body",
+          "read back and verify exact content"
+        ],
+        "selected_issues": [],
+        "readiness": "unvalidated"
+      },
+      "forbidden": [
+        "factory label addition",
+        "publish local evidence report as issue body"
+      ]
+    },
+    {
+      "id": "publish-and-start-custom-label",
+      "given": {
+        "full_spec_reviewed": true,
+        "issue": "https://github.com/example/repo/issues/21",
+        "remote_unchanged": true,
+        "open": true,
+        "prerequisites_merged": true,
+        "operator_gaps": [],
+        "configured_factory_label": "team-factory-intake",
+        "watched_repository": "example/repo",
+        "label_exists": true
+      },
+      "user_turn": "Publish and start this reviewed issue with team-factory-intake.",
+      "expected": {
+        "tracker_effects": [
+          "read existing source",
+          "update approved canonical title/body",
+          "read back exact title/body",
+          "recheck open state labels and prerequisites",
+          "add team-factory-intake once preserving other labels",
+          "read labels back"
+        ],
+        "selection": "selected only after observed label",
+        "readiness": "unvalidated"
+      },
+      "forbidden": [
+        "add default curie-factory instead of configured custom label",
+        "label before approved content persisted and verified",
+        "claim queued or running without observed factory status"
+      ]
+    },
+    {
+      "id": "missing-label-configuration",
+      "given": {
+        "full_spec_reviewed": true,
+        "publication_consent": true,
+        "factory_label": "unknown",
+        "watched_repository": "unknown"
+      },
+      "user_turn": "Publish and start it.",
+      "expected": {
+        "publication": "may proceed only if reviewed repository/create-update destination explicitly authorized",
+        "selection": "wait for identified watched repository and configured existing label plus explicit start authorization",
+        "tracker_effects": [
+          "authorized publication only"
+        ]
+      },
+      "forbidden": [
+        "guess default intake label",
+        "create a new label",
+        "use queued/running status label as intake",
+        "configure deployment"
+      ]
+    },
+    {
+      "id": "remote-human-conflict",
+      "given": {
+        "full_spec_reviewed": true,
+        "publication_and_start_consent": true,
+        "source_snapshot": "original source body",
+        "remote_body": "original source body plus new human criterion"
+      },
+      "user_turn": "Publish and start.",
+      "expected": {
+        "tracker_effects": [
+          "read current remote body"
+        ],
+        "next": "preserve human edit, reconcile full draft, request review/authorization of changed content"
+      },
+      "forbidden": [
+        "overwrite remote human edit",
+        "label conflicted content"
+      ]
+    },
+    {
+      "id": "new-split-topological",
+      "given": {
+        "full_spec_reviewed": true,
+        "children": [
+          "Core",
+          "UI"
+        ],
+        "dependencies": [
+          [
+            "UI",
+            "Core"
+          ]
+        ],
+        "mechanical_local_id_to_link_substitution_approved": true,
+        "native_dependency_writes_separately_approved": true,
+        "native_dependency_tool_available": true,
+        "factory_label": "curie-factory",
+        "operator_gaps": [],
+        "Core_has_no_prerequisites": true,
+        "Core_not_merged_into_UI_base": true
+      },
+      "user_turn": "Publish both and start eligible roots.",
+      "expected": {
+        "tracker_effects": [
+          "create Core without intake label",
+          "persist returned Core identity",
+          "resolve approved Core link in UI Blocked by",
+          "create UI without intake label",
+          "persist returned UI identity",
+          "write approved UI dependency on actual Core issue",
+          "verify all final bodies and dependency relationships",
+          "recheck eligibility and add intake label only to Core",
+          "read Core labels back"
+        ],
+        "selected_issues": [
+          "Core"
+        ],
+        "blocked_issues": [
+          "UI"
+        ],
+        "readiness": "unvalidated"
+      },
+      "forbidden": [
+        "fabricate actual issue numbers",
+        "label UI before Core merged into selected base",
+        "label epic",
+        "start while dependency links incomplete"
+      ]
+    },
+    {
+      "id": "create-timeout-reconcile",
+      "given": {
+        "new_issue_create": "timed out with unknown persisted outcome",
+        "known_url": null,
+        "reviewed_title_body_available": true,
+        "remaining_split_child": "not yet created"
+      },
+      "user_turn": "Continue the approved publication.",
+      "expected": {
+        "tracker_effects": [
+          "read/search reviewed repository for exact reviewed title/body and known links",
+          "reuse exact unique matching issue if confirmed; otherwise ask for resolution"
+        ],
+        "selection": "wait until identity/body/dependency checks complete"
+      },
+      "forbidden": [
+        "blindly repeat create",
+        "invent issue identity",
+        "delete successfully created issue",
+        "select incomplete split child"
+      ]
+    },
+    {
+      "id": "manual-publication",
+      "given": {
+        "full_spec_reviewed": true,
+        "manual_issue_links": [
+          "https://github.com/example/repo/issues/31"
+        ],
+        "exact_body_match": true,
+        "start_consent": false
+      },
+      "user_turn": "I published it here: https://github.com/example/repo/issues/31.",
+      "expected": {
+        "tracker_effects": [
+          "read supplied issue and verify repository/title/full body"
+        ],
+        "next": "reuse actual issue and request only missing selection authorization"
+      },
+      "forbidden": [
+        "create replacement issue",
+        "infer start authorization from manual publication"
+      ]
+    },
+    {
+      "id": "selection-write-timeout",
+      "given": {
+        "published_and_verified": true,
+        "start_consent": true,
+        "label_add_timed_out": true,
+        "configured_label": "curie-factory"
+      },
+      "user_turn": "Continue.",
+      "expected": {
+        "tracker_effects": [
+          "read actual labels",
+          "if label observed report selected without second add; if absent and still eligible retry only missing authorized add then verify"
+        ],
+        "publication": "preserve actual published issue identity"
+      },
+      "forbidden": [
+        "remove and re-add label to trigger rerun",
+        "claim selected with unknown label outcome"
+      ]
+    },
+    {
+      "id": "resolved-link-fingerprints",
+      "given": {
+        "reviewed_split_bodies_and_fingerprints": "local-ID versions retained",
+        "publication": "actual issue links substituted into canonical Blocked by as approved",
+        "existing_hashing_tools_available": true
+      },
+      "user_turn": "Save the published mapping and final envelope.",
+      "expected": {
+        "local_effects": [
+          "preserve reviewed snapshots",
+          "save resolved canonical bodies and actual local-ID-to-issue mapping",
+          "recompute exact child fingerprints and envelope for resolved bytes, or explicitly mark resolved mapping incomplete and old envelope stale"
+        ],
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "reuse local-ID body digest for changed published body",
+        "present old envelope as final resolved contract",
+        "invent hash if tooling missing"
+      ]
+    },
+    {
+      "id": "repository-pin-isolation",
+      "given": {
+        "global_entry_skill": "one discovered installation",
+        "repository_a": "cached preparation version 0.2.0 targeting contract A",
+        "repository_b": "cached preparation version 0.3.0 targeting contract B"
+      },
+      "user_turn": "Prepare this issue in repository B, then continue the separate draft in repository A.",
+      "expected": {
+        "local_effects": [
+          "resolve each current repository binding independently",
+          "load the matching cached instructions and reference for each draft",
+          "retain each draft target/version/contract evidence"
+        ],
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "change either repository pin through global entry upgrade",
+        "reuse repository B instructions or target in repository A"
+      ]
+    },
+    {
+      "id": "unknown-deployment-compatibility",
+      "given": {
+        "full_spec_reviewed": true,
+        "publication_and_start_consent": true,
+        "local_output_contract": "curie.factory-specification/v1",
+        "live_deployment_contracts": "endpoint unavailable or absent declaration"
+      },
+      "user_turn": "Publish and start it.",
+      "expected": {
+        "publication": "may publish reviewed content if its destination and exact bytes remain authorized",
+        "selection": "not selected; explain missing authoritative compatibility",
+        "tracker_effects": [
+          "authorized publication and readback only"
+        ]
+      },
+      "forbidden": [
+        "infer compatibility from installed CLI version",
+        "label while live contract is unknown",
+        "fabricate a binding or evaluator report"
+      ]
+    },
+    {
+      "id": "deployment-changed-after-review",
+      "given": {
+        "reviewed_binding": "deployment A and bundle digest X",
+        "live_deployment": "deployment A now reports bundle digest Y or is not effective"
+      },
+      "user_turn": "Start the reviewed issue.",
+      "expected": {
+        "tracker_effects": [],
+        "next": "resolve the changed target and return the entire migrated specification for review"
+      },
+      "forbidden": [
+        "silently rewrite the input prefix",
+        "apply factory label to stale binding"
+      ]
+    },
+    {
+      "id": "edited-skill-upgrade",
+      "given": {
+        "update_available": true,
+        "managed_file_edited": true,
+        "local_preferences_present": true
+      },
+      "user_turn": "Update the skill.",
+      "expected": {
+        "local_effects": [
+          "updater refuses edited managed file",
+          "preserve both edits and local preferences",
+          "explain manual reconciliation; retain current usable installation"
+        ],
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "overwrite edits",
+        "attempt three-way merge",
+        "modify repository pins"
+      ]
+    }
+  ],
+  "versioned_input_fixture": "For positive factory selection cases supply a repository pin and actual fake deployment contract response bound to its UUID/bundle digest, plus a valid curie-input@1 prefix whose digest is computed from the exact final canonical body. The local CLI product version is not compatibility evidence. All tracker/API effects remain fake."
+}

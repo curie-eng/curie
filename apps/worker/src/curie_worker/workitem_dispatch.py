@@ -79,6 +79,7 @@ class WorkItemAcquireGrant:
     # the synthetic grant an approval resume rebuilds, which keeps the
     # thread's existing workspace selection.
     repository_path: str | None
+    input_contract_receipt: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,7 @@ class WorkItemRunning:
     work_item_id: uuid.UUID
     runtime_epoch: int
     execution_deadline: datetime
+    input_contract_receipt: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -135,8 +137,7 @@ class TerminationObservation:
         sandboxes = ",".join(self.sandboxes)
         absent_at = self.observed_at.astimezone(UTC).isoformat()
         return (
-            f"claims={claims} sandboxes={sandboxes} "
-            f"absent_at={absent_at} observer={self.observer}"
+            f"claims={claims} sandboxes={sandboxes} absent_at={absent_at} observer={self.observer}"
         )
 
 
@@ -152,9 +153,7 @@ def parse_work_item_event_id(event_id: str) -> WorkItemEvent | None:
     parsed = _parse_shared_event_id(event_id)
     if parsed is None:
         return None
-    return WorkItemEvent(
-        request_id=parsed.request_id, kind=parsed.kind, generation=parsed.number
-    )
+    return WorkItemEvent(request_id=parsed.request_id, kind=parsed.kind, generation=parsed.number)
 
 
 def _conflict_code(response: httpx.Response) -> str:
@@ -222,11 +221,10 @@ class WorkItemDispatchClient:
                     if body.get("repository_path") is not None
                     else None
                 ),
+                input_contract_receipt=body.get("input_contract_receipt"),
             )
         except (KeyError, TypeError, ValueError) as exc:
-            raise WorkItemTransportError(
-                "work-item acquire returned an unusable body"
-            ) from exc
+            raise WorkItemTransportError("work-item acquire returned an unusable body") from exc
 
     async def defer(
         self,
@@ -269,6 +267,9 @@ class WorkItemDispatchClient:
         generation: int,
         claim_name: str,
         sandbox_name: str,
+        runtime_deployment_id: uuid.UUID | None = None,
+        runtime_version_id: uuid.UUID | None = None,
+        runtime_bundle_sha256: str | None = None,
     ) -> WorkItemStartGrant:
         try:
             body = await self._post(
@@ -278,6 +279,21 @@ class WorkItemDispatchClient:
                     "generation": generation,
                     "claim_name": claim_name,
                     "sandbox_name": sandbox_name,
+                    **(
+                        {"runtime_deployment_id": str(runtime_deployment_id)}
+                        if runtime_deployment_id is not None
+                        else {}
+                    ),
+                    **(
+                        {"runtime_version_id": str(runtime_version_id)}
+                        if runtime_version_id is not None
+                        else {}
+                    ),
+                    **(
+                        {"runtime_bundle_sha256": runtime_bundle_sha256}
+                        if runtime_bundle_sha256 is not None
+                        else {}
+                    ),
                 },
             )
         except WorkItemConflict as exc:
@@ -290,9 +306,7 @@ class WorkItemDispatchClient:
                 heartbeat_interval_s=float(body["heartbeat_interval_s"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
-            raise WorkItemTransportError(
-                "work-item start returned an unusable body"
-            ) from exc
+            raise WorkItemTransportError("work-item start returned an unusable body") from exc
 
     async def heartbeat(
         self,
@@ -312,9 +326,7 @@ class WorkItemDispatchClient:
                 work_item_cancelled=bool(body["work_item_cancelled"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
-            raise WorkItemTransportError(
-                "work-item heartbeat returned an unusable body"
-            ) from exc
+            raise WorkItemTransportError("work-item heartbeat returned an unusable body") from exc
 
     async def running_for_conversation(self, conversation_id: str) -> WorkItemRunning | None:
         response = await self._client.get(
@@ -338,6 +350,7 @@ class WorkItemDispatchClient:
                 request_id=uuid.UUID(str(body["request_id"])),
                 work_item_id=uuid.UUID(str(body["work_item_id"])),
                 runtime_epoch=int(body["runtime_epoch"]),
+                input_contract_receipt=body.get("input_contract_receipt"),
                 execution_deadline=_parse_datetime(body["execution_deadline"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -406,9 +419,7 @@ class WorkItemDispatchClient:
             {"runtime_epoch": runtime_epoch, "observation": observation},
         )
 
-    async def runtime_owners(
-        self, after: uuid.UUID | None = None
-    ) -> list[WorkItemRuntimeOwner]:
+    async def runtime_owners(self, after: uuid.UUID | None = None) -> list[WorkItemRuntimeOwner]:
         """One page of running requests and their owners, ordered by id."""
 
         try:
@@ -419,9 +430,7 @@ class WorkItemDispatchClient:
                 follow_redirects=False,
             )
         except httpx.HTTPError as exc:
-            raise WorkItemTransportError(
-                "work-item dispatch endpoint is unreachable"
-            ) from exc
+            raise WorkItemTransportError("work-item dispatch endpoint is unreachable") from exc
         if response.status_code != 200:
             raise WorkItemTransportError(
                 f"work-item runtime owners returned HTTP {response.status_code}"
@@ -457,17 +466,13 @@ class WorkItemDispatchClient:
                 follow_redirects=False,
             )
         except httpx.HTTPError as exc:
-            raise WorkItemTransportError(
-                "work-item dispatch endpoint is unreachable"
-            ) from exc
+            raise WorkItemTransportError("work-item dispatch endpoint is unreachable") from exc
         if response.status_code == 409:
             raise WorkItemConflict(_conflict_code(response))
         if response.status_code == 404:
             raise WorkItemConflict("not_found")
         if response.status_code != 200:
-            raise WorkItemTransportError(
-                f"work-item dispatch returned HTTP {response.status_code}"
-            )
+            raise WorkItemTransportError(f"work-item dispatch returned HTTP {response.status_code}")
         try:
             body = response.json()
             if not isinstance(body, dict):
@@ -521,9 +526,7 @@ class WorkItemDispatchClient:
                 follow_redirects=False,
             )
         except httpx.HTTPError as exc:
-            raise WorkItemTransportError(
-                "work-item dispatch endpoint is unreachable"
-            ) from exc
+            raise WorkItemTransportError("work-item dispatch endpoint is unreachable") from exc
         return self._post_result(response)
 
     async def _post_settlement(
@@ -549,15 +552,11 @@ class WorkItemDispatchClient:
         if response.status_code == 409:
             raise WorkItemConflict(_conflict_code(response))
         if response.status_code != 200:
-            raise WorkItemTransportError(
-                f"work-item dispatch returned HTTP {response.status_code}"
-            )
+            raise WorkItemTransportError(f"work-item dispatch returned HTTP {response.status_code}")
         try:
             body = response.json()
         except ValueError as exc:
-            raise WorkItemTransportError(
-                "work-item dispatch returned unusable JSON"
-            ) from exc
+            raise WorkItemTransportError("work-item dispatch returned unusable JSON") from exc
         if not isinstance(body, dict):
             raise WorkItemTransportError("work-item dispatch returned unusable JSON")
         return body
@@ -593,8 +592,22 @@ class WorkItemRun:
         self.owner = owner
         self.generation = grant.generation
         self.repository_path = grant.repository_path
+        self.input_contract_receipt = grant.input_contract_receipt
         self.event_id = event_id
         self.thread_key = thread_key
+        self.runtime_deployment_id: uuid.UUID | None = None
+        self.runtime_version_id: uuid.UUID | None = None
+        self.runtime_bundle_sha256: str | None = None
+        if self.input_contract_receipt is not None:
+            receipt = self.input_contract_receipt
+            if not isinstance(receipt, dict):
+                raise WorkItemTransportError("work-item input receipt is unusable")
+            try:
+                self.runtime_deployment_id = uuid.UUID(receipt["deployment_id"])
+                self.runtime_version_id = uuid.UUID(receipt["version_id"])
+                self.runtime_bundle_sha256 = str(receipt["bundle_sha256"])
+            except (KeyError, ValueError, TypeError) as exc:
+                raise WorkItemTransportError("work-item input receipt is unusable") from exc
         self.started = False
         self.finished = False
         # Set when the heartbeat gives the request up as a stale owner. A
@@ -646,12 +659,20 @@ class WorkItemRun:
         # to that claim (#4331). runtime_epoch stays the started-ness signal.
         self.claim_name = claim_name
         self.sandbox_name = sandbox_name
+        identity: dict[str, Any] = {}
+        if self.runtime_deployment_id is not None:
+            identity = {
+                "runtime_deployment_id": self.runtime_deployment_id,
+                "runtime_version_id": self.runtime_version_id,
+                "runtime_bundle_sha256": self.runtime_bundle_sha256,
+            }
         grant = await self._client.start(
             self.request_id,
             owner=self.owner,
             generation=self.generation,
             claim_name=claim_name,
             sandbox_name=sandbox_name,
+            **identity,
         )
         self.started = True
         self.runtime_epoch = grant.runtime_epoch
