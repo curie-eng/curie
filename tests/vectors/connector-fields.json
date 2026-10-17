@@ -10,6 +10,7 @@
       "env",
       "headers",
       "image",
+      "no_client_auth",
       "port",
       "sealed_secrets",
       "secret_files",

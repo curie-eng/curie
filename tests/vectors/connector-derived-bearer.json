@@ -1,5 +1,5 @@
 {
-  "comment": "The derived Bearer name for a hosted connector. Python owns the rule in packages/plugin-format/src/plugin_format/connector_render.py::_derived_headers; the Rust CLI hand-mirrors it as bearer_secret_name in cli/src/connector_build.rs. The two cannot share code across languages, so the cases are frozen here. Each vector is a connectors.yaml document with one hosted connector named gh. expected_name is the secret the derived Authorization: Bearer ${NAME} header expands, or null when no header is derived. Python asserts mcp_entry headers match; Rust asserts bearer_secret_name matches. Changing one language without this file fails that language; editing this file without the other language fails the other suite. Both lanes reject unknown vector keys so a key added for one side cannot pass vacuously on the other.",
+  "comment": "The derived Bearer name for a hosted connector. Python owns the rule in packages/plugin-format/src/plugin_format/connector_render.py::_derived_headers; the Rust CLI hand-mirrors it as bearer_secret_name in cli/src/connector_build.rs. The two cannot share code across languages, so the cases are frozen here. Each vector is a connectors.yaml document with one hosted connector named gh. expected_name is the secret the derived Authorization: Bearer ${NAME} header expands, or null when no header is derived. Python asserts mcp_entry headers match; Rust asserts bearer_secret_name matches; the API independence check asserts header_secret_names matches. Changing one language without this file fails that language; editing this file without the other language fails the other suite. Both lanes reject unknown vector keys so a key added for one side cannot pass vacuously on the other.",
   "vectors": [
     {
       "name": "explicit-bearer-secret",
@@ -92,6 +92,34 @@
           "gh": {
             "image": "ghcr.io/example/gh:1",
             "config": ["FOLDER_PATH"]
+          }
+        }
+      },
+      "expected_name": null
+    },
+    {
+      "name": "no-client-auth-two-plain-secrets",
+      "why": "no_client_auth declares the server authenticates no client, so two plain secrets derive no header and none is bound into the sandbox",
+      "document": {
+        "connectors": {
+          "gh": {
+            "image": "ghcr.io/example/gh:1",
+            "secrets": ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+            "no_client_auth": "In-cluster server; the boundary is its ingress NetworkPolicy."
+          }
+        }
+      },
+      "expected_name": null
+    },
+    {
+      "name": "no-client-auth-single-plain-secret",
+      "why": "no_client_auth also suppresses the single plain-secret derivation that would otherwise send the server's upstream credential as the Bearer token",
+      "document": {
+        "connectors": {
+          "gh": {
+            "image": "ghcr.io/example/gh:1",
+            "secrets": ["UPSTREAM_TOKEN"],
+            "no_client_auth": "In-cluster server; the boundary is its ingress NetworkPolicy."
           }
         }
       },
