@@ -40,6 +40,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Forge tracker and code host | CLEAN | in-memory pairs behind the Tracker and CodeHost ports, and the Jira Cloud tracker (JiraTracker) | not separately graded | #3831 | [Forge tracker and code host](interfaces/forge-tracker/INTERFACE.md) |
 | MCP service-key authentication | SOFT | 1 deployment-owned service identity mode | not separately graded | #3273, #3308 | [MCP service-key authentication](interfaces/mcp-service-auth/INTERFACE.md) |
 | Protected hook source authority | CLEAN | 0 production resolvers (tests inject the only implementation) | not separately graded | #3603 | [Protected hook source authority](interfaces/protected-hook-source-authority/INTERFACE.md) |
+| Channel read | CLEAN | 1 Slack reader pair (history and canvas) plus HTTP test fakes | not separately graded | ADR-0100, ADR-0200, #2877, #3819 | [Channel read](interfaces/channel-read/INTERFACE.md) |
 <!-- END GENERATED: seam-table -->
 
 ## Kind legend
