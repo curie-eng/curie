@@ -72,33 +72,36 @@ Cloudflare R2) needs no code, only env/settings:
 
 ## Implementations today
 
-One backend (S3/RustFS) behind the port, reached by one boto3 builder and three
-AWS CLI shell sites:
+One backend (S3/RustFS) behind the port, reached by one boto3 builder, three
+AWS CLI shell sites, and Langfuse's own S3 client:
 
-- **`ObjectStore` port** — `apps/api/src/curie_api/storage.py` (`Protocol`: the
+1. **`ObjectStore` port:** `apps/api/src/curie_api/storage.py` (`Protocol`: the
   four ops `ensure_bucket` / `exists` / `put` / `get` + the write-once contract). Consumers (`deps`/`gitflow`/`deploy`) type
   against it, so a second backend is a drop-in.
-- **API writer** — `apps/api/src/curie_api/storage.py::BundleStore`, the S3/RustFS backing
+2. **API writer:** `apps/api/src/curie_api/storage.py::BundleStore`, the S3/RustFS backing
   (async-offloaded boto3); client built by the shared `build_s3_client` factory.
-- **Worker reader** — `apps/worker/src/curie_worker/bundle_store.py::BundleReader`: a local `BundleReader`
+3. **Worker reader:** `apps/worker/src/curie_worker/bundle_store.py::BundleReader`: a local `BundleReader`
   Protocol (the read-only slice of the port; the worker does not import the API
 package) with `BundleStore` as its S3/RustFS backing.
-- **Chart bundle-fetch init** — `charts/curie/templates/agent-sandbox.yaml`
+4. **Chart bundle-fetch init:** `charts/curie/templates/agent-sandbox.yaml`
   uses the AWS CLI (`aws s3 cp` after `aws configure set default.s3.addressing_style path`),
   a second dialect of the same S3 protocol. It has its own key-free branch, gated on
   the same `curie.rustfs.staticCredentials` helper (`charts/curie/templates/_helpers.tpl`)
   the api and worker Deployments use.
-- **Chart bucket bootstrap** — `charts/curie/templates/rustfs.yaml`, a post-install
-  hook Job running `aws s3api head-bucket`/`create-bucket` against the in-chart store.
-  Renders only under `rustfs.deploy: true`, which is the static-credential case by
-  construction, so the key-free path never reaches it.
-- **Operator store migration** — `curie cluster migrate-store`
+5. **Chart bucket bootstrap and lifecycle reconciliation:**
+  `charts/curie/templates/rustfs.yaml` runs a post-install, post-upgrade hook Job
+  using `head-bucket`/`create-bucket` for the Langfuse, bundle and workspace
+  buckets. It reconciles the `langfuse-event-upload-retention` lifecycle rule on
+  `events/`, preserving other rules. Positive `langfuse.eventUpload.retentionDays`
+  sets expiry; zero removes that managed rule. It renders only for the in-chart
+  store (`rustfs.deploy: true`), which requires static credentials.
+6. **Operator store migration:** `curie cluster migrate-store`
   (`cli/src/migrate_store.rs`, its export/import/listing command builders):
   `aws s3 sync`/`mb`/`ls` run by `kubectl exec` inside a staging pod, deliberately
   with no S3 client in the CLI itself. Also in-cluster-store only (it addresses the
   chart's own `minio`/`rustfs` StatefulSet and reads that store's password from the
   release Secret), so it likewise never sees the key-free path.
-- **Worker workspace/attachment store** — `WorkspaceObjectPort`
+7. **Worker workspace/attachment store:** `WorkspaceObjectPort`
   (`apps/worker/src/curie_worker/workspace.py::WorkspaceObjectPort`;
   `put_stream` / `get_stream` / `presign_get` / `delete` / `list_keys`), backed
   by `WorkspaceObjectStore`
@@ -106,10 +109,18 @@ package) with `BundleStore` as its S3/RustFS backing.
   in `apps/worker/src/curie_worker/run.py::build`. The inbound-attachment lane
   reuses this same port
   (`apps/worker/src/curie_worker/attachments.py::AttachmentCoordinator`).
-- **Chart attachments-init** — `charts/curie/templates/agent-sandbox.yaml`
-  fetches each parked object through a presigned URL from
-  `apps/worker/src/curie_worker/workspace.py::WorkspaceObjectStore.presign_get`,
-  not through the AWS CLI bundle-fetch path.
+8. **Chart workspace-init and attachments-init:**
+  `charts/curie/templates/agent-sandbox.yaml` fetches workspace archives and
+  parked attachments through presigned HTTP GET URLs from
+  `apps/worker/src/curie_worker/workspace.py::WorkspaceObjectStore.presign_get`.
+  These consumers sit alongside the AWS CLI bundle-fetch path.
+
+Langfuse web and worker are separate S3 consumers. The chart helper
+`curie.langfuse.env` (`charts/curie/templates/_helpers.tpl`) supplies
+`LANGFUSE_S3_EVENT_UPLOAD_*` and `LANGFUSE_S3_MEDIA_UPLOAD_*` settings, using the
+same endpoint, region and credential-selection helper as the platform, with
+`events/` and `media/` prefixes. `compose.dev.yaml` supplies the corresponding
+dev settings. These clients do not use `ObjectStore` or the Python boto3 builder.
 
 ## Known leakage
 
@@ -157,10 +168,25 @@ retention arbitrates ownership by scanning those records before deleting bytes
 `apps/worker/src/curie_worker/attachments.py::AttachmentCoordinator._scan_owners`), so an
 eventually consistent list can miss a live owner's record and delete bytes that turn
 is about to install.
-The Kubernetes `attachments-init` container (`charts/curie/templates/agent-sandbox.yaml`)
-redeems those URLs, so a backend that cannot mint a presigned GET also breaks that path.
+The Kubernetes `attachments-init` and `workspace-init` containers
+(`charts/curie/templates/agent-sandbox.yaml`) redeem those URLs, so a backend that cannot
+mint a presigned GET breaks both paths.
 
-A second non-S3 backend is **three adapter surfaces, not one**: the API owns the full **async**
+Langfuse's own S3 SDK is another coupling outside the Python ports. Replacing
+the bundle and workspace adapters does not replace its event or media uploads;
+a non-S3 deployment needs a compatible object endpoint or a separate Langfuse
+storage change.
+
+The chart also depends on the in-chart store's disk layout. With persistence
+on, the `storage-guard` init container runs
+`charts/curie/files/rustfs-storage-guard.sh` before RustFS starts. When free
+inodes or bytes fall below 10 percent, it removes expired event object
+directories beneath `/data/<bucket>/events`, recognizing `xl.meta` and file
+modification times. Retention zero disables removal. This boot recovery path
+runs before S3 lifecycle expiry is available and is specific to RustFS storage,
+not an `ObjectStore` operation.
+
+The platform alone needs three adapter surfaces for a non-S3 backend: the API owns the full **async**
 `ObjectStore` port (`apps/api/src/curie_api/storage.py::ObjectStore`, `async` methods),
 the worker reads bundles through a separate **sync** `BundleReader` slice
 (`apps/worker/src/curie_worker/bundle_store.py::BundleReader`, a plain `get`) because it
@@ -174,4 +200,4 @@ streaming/presign/delete/list implementation.
 
 - **Epic(s):** #83 — vision epic for the blob-storage seam (extract a port only when a non-S3 backend lands).
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 4 (Blob storage), grade B+
-- **ADR(s):** [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — Adopt-not-build boundaries (RustFS adopted under Apache 2.0, "offer BYO-S3")
+- **ADR(s):** [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md): Adopt-not-build boundaries (RustFS adopted under Apache 2.0, "offer BYO-S3"); [ADR-0026](../../adr/0026-extract-storage-port-defer-second-adapter.md): extract the storage port and defer the second adapter
