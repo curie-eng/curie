@@ -51,6 +51,8 @@ def test_read_only_bash_calls_do_not_add_a_receipt() -> None:
         _action(tool="Bash", arguments={"command": command}, undoable=False, result=None)
         for command in (
             "pwd",
+            "ls -alh apps/worker",
+            "cat README.md",
             "rg -n receipt apps/worker",
             "sed -n '1,40p' apps/worker/src/curie_worker/receipt.py",
             "git status --short",
@@ -59,6 +61,207 @@ def test_read_only_bash_calls_do_not_add_a_receipt() -> None:
     ]
 
     assert render_receipt(actions) is None
+
+
+def test_read_only_find_calls_render_no_receipt() -> None:
+    actions = [
+        _action(
+            tool="Bash",
+            arguments={"command": command},
+            undoable=False,
+            result=None,
+            detail="non-idempotent tool completed",
+        )
+        for command in (
+            'find / -iname "*demo-agent*" -not -path "*/node_modules/*" 2>/dev/null',
+            "find /bundles/current/skills/demo-agent -type f",
+        )
+    ]
+    original = deepcopy(actions)
+
+    assert render_receipt(actions) is None
+    assert actions == original
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find .",
+        "find /",
+        "find /bundles/current/skills/demo-agent",
+        "find . ../demo_agent-2 /bundles/current",
+        "find ./-delete",
+        "find . ./-exec ./-fprint",
+        "find . -type f",
+        "find . -type d",
+        "find . -type l",
+        "find . -name '*.py'",
+        'find . -name "*.py"',
+        "find . -iname '*README?.md'",
+        'find . -iname "*README?.md"',
+        "find . -path '*/node_modules/*'",
+        'find . -path "*/node_modules/*"',
+        "find . -name '*demo_agent-?.txt'",
+        'find . -name "-delete"',
+        "find . -maxdepth 0",
+        "find . -mindepth 12",
+        "find . -maxdepth 002 -mindepth 0",
+        "find . -not -not -type d",
+        "find . -name '*.py' -name '*.rs'",
+        "find / /bundles -type f -mindepth 1 -maxdepth 3 -not -path '*/vendor/*'",
+        "find . 2>/dev/null",
+        "find . -name '*.py' 2>/dev/null",
+        " \tfind . -type f\n",
+    ],
+)
+def test_read_only_find_variants_render_no_receipt(command: str) -> None:
+    action = _action(tool="Bash", arguments={"command": command}, undoable=False, result=None)
+
+    assert render_receipt([action]) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find",
+        "find -type f",
+        "find -name '*.py'",
+        "find -maxdepth 1",
+        "find -L .",
+        "find -H .",
+        "find -P .",
+        "find . -delete",
+        "find . -exec rm {} \\;",
+        "find . -execdir rm {} +",
+        "find . -ok rm {} \\;",
+        "find . -okdir rm {} \\;",
+        "find . -fprint out",
+        "find . -fprint0 out",
+        "find . -fprintf out '%p'",
+        "find . -fls out",
+        "find . -type f -delete",
+        "find . -name '*.py' -exec rm {} +",
+        "find . -name '*.py' -fprint out",
+        "find . -print",
+        "find . -print0",
+        "find . -prune",
+        "find . -quit",
+        "find . -o -type f",
+        "find . -a -type f",
+        "find . ! -type f",
+        "find . \\( -type f \\)",
+        "find . -type b",
+        "find . -type c",
+        "find . -type p",
+        "find . -type s",
+        "find . -type F",
+        "find . -type ff",
+        "find . -type",
+        "find . -xtype f",
+        "find . -maxdepth",
+        "find . -maxdepth -1",
+        "find . -maxdepth +1",
+        "find . -maxdepth 1.5",
+        "find . -maxdepth 1x",
+        "find . -mindepth",
+        "find . -mindepth -1",
+        "find . -mindepth 1x",
+        "find . -type f /other",
+        "find . -name",
+        "find . -name *.py",
+        "find . -name x",
+        "find . -name ''",
+        'find . -iname ""',
+        "find . -path */vendor/*",
+        "find . -name '*.py",
+        "find . -name '*.py\"",
+        "find . -name 'a b'",
+        "find . -name '[ab]*'",
+        "find . -path '{src,tests}/*'",
+        "find . -name 'a;touch marker'",
+        "find ~",
+        'find "$HOME"',
+        "find ${ROOT}",
+        "find ./*",
+        "find 'with space'",
+        'find "/bundles"',
+        "find ./a:b",
+        "find $(pwd)",
+        "find `pwd`",
+        "find $((1+1))",
+        "find <(pwd)",
+        'find . -name "$(touch marker)"',
+        'find . -name "`touch marker`"',
+        'find . -name "${ROOT}*"',
+        "find . -name '$(touch marker)'",
+        "find . -name '*.py'$(touch marker)",
+        "find . -name x; rm y",
+        "find .; rm marker",
+        "find . -name '*.py'; touch marker",
+        "find . && rm marker",
+        "find . || touch marker",
+        "find . | xargs rm",
+        "find . & touch marker",
+        "find .\ntouch marker",
+        "find . -name '*.py'\ntouch marker",
+        "find . 2>/dev/null; touch marker",
+        "find . > out",
+        "find . >> out",
+        "find . 1> out",
+        "find . 2> out",
+        "find . 2>>/dev/null",
+        "find . 2> /dev/null",
+        "find . >/dev/null",
+        "find . &>/dev/null",
+        "find . 2>&1",
+        "find . < input",
+        "find . << EOF\nEOF",
+        "find . 2>/dev/null > out",
+        "find . >out 2>/dev/null",
+        "find . 2>/dev/null -type f",
+        "find . 2>/dev/null 2>/dev/null",
+        "find\t. -type f",
+        "find .\n-type f",
+        "/usr/bin/find .",
+        "command find .",
+        "head README.md",
+        "grep receipt README.md",
+    ],
+)
+def test_other_find_forms_keep_shell_receipt(command: str) -> None:
+    action = _action(tool="Bash", arguments={"command": command}, undoable=False, result=None)
+
+    receipt = render_receipt([action])
+
+    assert receipt is not None
+    assert "Shell request completed;" in receipt
+    assert "changes were not summarized and undo information is incomplete" in receipt
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({"result": {"summary": "located acme skill files"}}, "located acme skill files"),
+        ({"status": "failed"}, "failed"),
+        ({"undoable": True}, "restore information recorded"),
+        ({"detail": "manual restoration required"}, "manual restoration required"),
+    ],
+)
+def test_read_only_find_keeps_explicit_action_information(
+    overrides: dict[str, Any], expected: str
+) -> None:
+    action = _action(
+        tool="Bash", arguments={"command": "find . -type f"}, undoable=False, result=None
+    )
+    action.update(overrides)
+    original = deepcopy(action)
+
+    receipt = render_receipt([action])
+
+    assert receipt is not None
+    assert expected in receipt
+    assert "Shell request completed;" not in receipt
+    assert action == original
 
 
 def test_uncertain_bash_calls_are_counted_without_guessing_their_effects() -> None:
@@ -463,6 +666,7 @@ def test_off_mode_never_renders_a_receipt() -> None:
 
     for actions in ([], [_action()], _mixed_turn(), _long_turn(), _failed_only(_mixed_turn())):
         assert render_receipt(actions, mode="off") is None
+
 
 # --- #1461: memory saves are recorded, not announced --------------------------
 
