@@ -38,6 +38,18 @@ FULLNAME = f"{RELEASE}-curie"
 GROUPS = ("gitlab", "jira", "stale", "interrupted")
 CLEANUP_RESERVE = 8 * 60
 MODULE_SECONDS = 150 * 60
+ROLLOUT_READY_SECONDS = 180
+ROLLOUT_POLL_SECONDS = 1
+# Option flags whose value is a separate argv token and never part of a label.
+VALUE_OPTIONS = frozenset(
+    ("--kubeconfig", "--context", "--namespace", "--kube-context", "-n", "-f", "-o", "--values")
+)
+STDERR_TAIL = 2000
+SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
+    re.compile(r"[0-9a-fA-F]{32,}"),
+    re.compile(r"[A-Za-z0-9+/_-]{40,}={0,2}"),
+)
 
 
 class InfrastructureError(RuntimeError):
@@ -106,6 +118,64 @@ def object_state(obj: dict[str, Any], *, metadata: bool = True) -> dict[str, Any
     return result
 
 
+def argument_tokens(argv: Sequence[str | Path]) -> Iterator[str]:
+    """Tokens after the program, minus the separate values of VALUE_OPTIONS."""
+    skip = False
+    for token in (str(a) for a in argv[1:]):
+        if skip:
+            skip = False
+            continue
+        skip = token in VALUE_OPTIONS
+        yield token
+
+
+def command_label(argv: Sequence[str | Path]) -> str:
+    """Program plus up to three positionals, ending at the first option after one."""
+    positionals: list[str] = []
+    for token in argument_tokens(argv):
+        if token.startswith("-"):
+            if positionals:
+                break
+            continue
+        positionals.append(Path(token).name if token.startswith("/") else token)
+        if len(positionals) == 3:
+            break
+    program = Path(str(argv[0])).name if argv else ""
+    return " ".join([program, *positionals])
+
+
+def secret_forms(secrets: set[str]) -> list[str]:
+    """Each registered value with its padded and unpadded base64 encodings, longest first."""
+    forms: set[str] = set()
+    for value in filter(None, secrets):
+        forms.add(value)
+        for encode in (base64.b64encode, base64.urlsafe_b64encode):
+            encoded = encode(value.encode()).decode()
+            forms.update((encoded, encoded.rstrip("=")))
+    return sorted(forms, key=len, reverse=True)
+
+
+def redact(text: str, secrets: set[str]) -> str:
+    for form in secret_forms(secrets):
+        text = text.replace(form, "<redacted>")
+    for pattern in SECRET_PATTERNS:
+        text = pattern.sub("<redacted>", text)
+    return text
+
+
+def failure_detail(
+    argv: Sequence[str | Path], stderr: str | bytes | None, secrets: set[str]
+) -> str:
+    """Redacted stderr tail for a failure message; stdout never appears."""
+    positionals = [t.lower() for t in argument_tokens(argv) if not t.startswith("-")]
+    if "get" in positionals and any("secret" in t or t == "values" for t in positionals):
+        return "stderr withheld for a Secret or values read"
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors="replace")
+    # Redact the whole stream first so the tail cut cannot split a secret.
+    return redact(stderr or "", secrets)[-STDERR_TAIL:]
+
+
 def same_secret(left: dict[str, Any], right: dict[str, Any], *, version: bool = True) -> bool:
     keys = ["name", "uid"] + (["resourceVersion"] if version else [])
     return all(left["metadata"].get(k) == right["metadata"].get(k) for k in keys) and left.get(
@@ -132,6 +202,10 @@ class Candidate:
         self.before_clusters: set[str] = set()
         self.before_images: set[str] = set()
         self.ephemeral_names: list[str] = []
+        self.secrets: set[str] = set()
+
+    def register_secret(self, value: str) -> None:
+        self.secrets.add(value)
 
     def fail(self, message: str) -> Any:
         self.faults.append(message)
@@ -170,6 +244,7 @@ class Candidate:
         if not cleanup and remaining <= 0:
             return self.fail("150-minute module budget reached its cleanup reserve")
         operation = " ".join(str(a) for a in argv[:2])
+        result: subprocess.CompletedProcess[str] | None = None
         try:
             result = subprocess.run(
                 [str(a) for a in argv],
@@ -185,12 +260,18 @@ class Candidate:
             self.record_diagnostic(
                 operation, -1, getattr(error, "stdout", ""), getattr(error, "stderr", str(error))
             )
-            return self.fail(f"{operation}: {type(error).__name__}; output withheld")
+            error_name = type(error).__name__
+            error_stderr = getattr(error, "stderr", None)
+        # Fail outside the handler so the raised error chains no context holding argv.
+        if result is None:
+            detail = failure_detail(argv, error_stderr, self.secrets)
+            return self.fail(f"{command_label(argv)}: {error_name}; {detail}")
         answer = Result(result.returncode, result.stdout, result.stderr)
         if answer.returncode:
             self.record_diagnostic(operation, answer.returncode, answer.stdout, answer.stderr)
         if check and answer.returncode:
-            return self.fail(f"{operation}: exit {answer.returncode}; output withheld")
+            detail = failure_detail(argv, answer.stderr, self.secrets)
+            return self.fail(f"{command_label(argv)}: exit {answer.returncode}; {detail}")
         return answer
 
     def names(self, kind: str, *, cleanup: bool = False) -> set[str]:
@@ -441,6 +522,8 @@ class Cluster:
         self.api_relay_port = 18999
         self.api_key = f"example-c4-api-{uuid.uuid4().hex}"
         self.control_key = f"example-c4-control-{uuid.uuid4().hex}"
+        candidate.register_secret(self.api_key)
+        candidate.register_secret(self.control_key)
         self.bundle = self.root / "bundle"
         self.app_key = self.root / "app.pem"
 
@@ -597,6 +680,8 @@ class Cluster:
                 f"example-{name}-{role}-{uuid.uuid4().hex}"
                 for role in ("current", "conflict", "rotated")
             ]
+            for token in tokens:
+                self.candidate.register_secret(token)
             files = [self.root / "tokens" / f"{name}-{i}" for i in range(3)]
             for path, token in zip(files, tokens, strict=True):
                 private_write(path, token + "\n")
@@ -846,13 +931,15 @@ class Cluster:
             return {"repository": repository, "tag": tag, "pullPolicy": "Never"}
 
         runner, runner_tag = self.candidate.images["runner"].rsplit(":", 1)
+        webhook_secret = f"example-c4-webhook-{uuid.uuid4().hex}"
+        self.candidate.register_secret(webhook_secret)
         values = {
             "api": {
                 "image": image("api"),
                 "apiKey": self.api_key,
                 "githubApiUrl": self.peers["github"].origin,
                 # A real install gets one from cluster up; an enabled factory requires it.
-                "githubWebhookSecret": f"example-c4-webhook-{uuid.uuid4().hex}",
+                "githubWebhookSecret": webhook_secret,
             },
             "worker": {"image": image("worker")},
             "ui": {"deploy": False},
@@ -899,6 +986,8 @@ class Cluster:
                 ]
             ).stdout
         )
+        for role in ("signing", "verify", "sealing"):
+            self.candidate.register_secret(keys[role])
         values["connectorCaller"] = {"signingKey": keys["signing"], "verifyKey": keys["verify"]}
         values["sealing"] = {"privateKey": keys["sealing"]}
         path = self.root / "install.yaml"
@@ -953,7 +1042,7 @@ class Cluster:
         )
         self.rollout()
 
-    def api_pod(self) -> str:
+    def serving_api_pods(self, **kwargs: Any) -> list[dict[str, Any]]:
         items = json.loads(
             self.kubectl(
                 "get",
@@ -962,9 +1051,10 @@ class Cluster:
                 f"app.kubernetes.io/instance={RELEASE},app.kubernetes.io/component=api",
                 "-o",
                 "json",
+                **kwargs,
             ).stdout
         )["items"]
-        ready = [
+        return [
             p
             for p in items
             if not p["metadata"].get("deletionTimestamp")
@@ -973,6 +1063,9 @@ class Cluster:
                 for c in p.get("status", {}).get("conditions", [])
             )
         ]
+
+    def api_pod(self) -> str:
+        ready = self.serving_api_pods()
         if len(ready) != 1:
             return self.candidate.fail("expected one serving candidate API pod")
         return str(ready[0]["metadata"]["name"])
@@ -986,15 +1079,20 @@ class Cluster:
                 "--timeout=240s",
                 timeout=260,
             )
-        self.kubectl(
-            "wait",
-            "--for=condition=Ready",
-            "pod",
-            "-l",
-            f"app.kubernetes.io/instance={RELEASE},app.kubernetes.io/component=api",
-            "--timeout=180s",
-            timeout=200,
-        )
+        # The replaced pod stays listed while it terminates (the chart's preStop
+        # hook), and a label-selector `kubectl wait` latches onto it, so poll instead.
+        deadline = time.monotonic() + ROLLOUT_READY_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            serving = len(self.serving_api_pods(timeout=max(1, remaining)))
+            # A slow query that returns after the bound does not count.
+            if time.monotonic() >= deadline:
+                self.candidate.fail(
+                    f"API pods did not settle to one serving pod after rollout (serving={serving})"
+                )
+            if serving == 1:
+                return
+            time.sleep(ROLLOUT_POLL_SECONDS)
 
     def probe(self, operation: str, **fields: Any) -> dict[str, Any]:
         result = self.kubectl(

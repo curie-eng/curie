@@ -110,6 +110,7 @@ tools/factory-e2e/tests/test_c4_tracker_scope.py
 tools/factory-e2e/tests/test_c4_upgrade_migration.py
 tools/factory-e2e/tests/test_factory_e2e.py
 tools/factory-e2e/tests/test_factory_e2e_loop.py
+tools/factory-e2e/tests/test_forge_instance_harness.py
 tools/factory-e2e/tests/test_gitlab_acceptance.py
 tools/factory-e2e/tests/test_gitlab_driver.py
 tools/factory-e2e/tests/test_jira_driver.py
