@@ -383,21 +383,43 @@ def _canonical_arguments(arguments: object) -> str | None:
         return None
 
 
-def _grant_spent(config: ProxyConfig, grant: caller.Grant, now: int) -> bool:
-    """Spend a grant that already matches. A missing store never spends."""
+# Why a gated call was refused, for the proxy's own log line only. The client
+# still receives the one ``grant_required`` body: a sub-reason names a check,
+# never a claim value, so it carries no grant, token or argument text.
+GRANT_MULTIPLE_CALLS = "multiple_gated_calls"
+GRANT_HEADER_MISSING = "header_missing"
+GRANT_HEADER_REPEATED = "header_repeated"
+GRANT_INVALID = "grant_invalid"
+GRANT_EXPIRED = "grant_expired"
+GRANT_AGENT_MISMATCH = "agent_mismatch"
+GRANT_CONNECTOR_MISMATCH = "connector_mismatch"
+GRANT_TOOL_MISMATCH = "tool_mismatch"
+GRANT_ARGUMENTS_MISMATCH = "arguments_mismatch"
+GRANT_NO_STORE = "no_grant_store"
+GRANT_NOT_SPENT = "not_spent"
+GRANT_BODY_TOO_LARGE = "body_too_large"
+
+
+def _grant_spent(config: ProxyConfig, grant: caller.Grant, now: int) -> str | None:
+    """Spend a grant that already matches; the refusal sub-reason, or None.
+
+    A missing store never spends. A replay and a failed spend are one reason:
+    the store's own warning tells them apart.
+    """
 
     store = config.grant_store
     if store is None:
-        return False
+        return GRANT_NO_STORE
     try:
-        return bool(store.spend(grant.jti, max(grant.exp - now, 1)))
+        spent = bool(store.spend(grant.jti, max(grant.exp - now, 1)))
     except Exception:  # noqa: BLE001 - existing broad catch retained
         logger.warning("connector grant spend failed")
-        return False
+        spent = False
+    return None if spent else GRANT_NOT_SPENT
 
 
-def _grant_refused(request: web.Request, agent: str, body: bytes, now: int) -> bool:
-    """True when a gated tools/call in this admitted POST lacks one live grant.
+def _grant_refused(request: web.Request, agent: str, body: bytes, now: int) -> str | None:
+    """Why a gated tools/call in this admitted POST lacks one live grant, or None.
 
     Two or more gated calls are refused before a grant is spent.
     """
@@ -405,22 +427,30 @@ def _grant_refused(request: web.Request, agent: str, body: bytes, now: int) -> b
     config = request.app[_CONFIG]
     gated = [call for call in _tool_calls(body) if _is_gated(config, call.name)]
     if not gated:
-        return False
+        return None
     if len(gated) > 1:
-        return True
+        return GRANT_MULTIPLE_CALLS
     call = gated[0]
     presented = request.headers.getall(GRANT_HEADER, [])
+    if not presented:
+        return GRANT_HEADER_MISSING
     if len(presented) != 1:
-        return True
+        return GRANT_HEADER_REPEATED
     grant = caller.verify(config.public_keys, presented[0])
-    if grant is None or grant.exp <= now:
-        return True
-    if grant.agent != agent or grant.connector != config.connector or grant.tool != call.name:
-        return True
+    if grant is None:
+        return GRANT_INVALID
+    if grant.exp <= now:
+        return GRANT_EXPIRED
+    if grant.agent != agent:
+        return GRANT_AGENT_MISMATCH
+    if grant.connector != config.connector:
+        return GRANT_CONNECTOR_MISMATCH
+    if grant.tool != call.name:
+        return GRANT_TOOL_MISMATCH
     canonical = _canonical_arguments(call.arguments)
     if canonical is None or grant.args != canonical:
-        return True
-    return not _grant_spent(config, grant, now)
+        return GRANT_ARGUMENTS_MISMATCH
+    return _grant_spent(config, grant, now)
 
 
 def _decide(request: web.Request) -> caller.Decision:
@@ -448,6 +478,7 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
     # decided and never silently let through to the router's default.
     decision = _decide(request)
     refusal = decision.refusal
+    grant_reason: str | None = None
     body: bytes | None = None
     buffered = False
     if refusal is None and request.method == "POST" and request.body_exists:
@@ -463,18 +494,24 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
             )
             return web.Response(status=REFUSAL_STATUS, text="the request body is too large\n")
         buffered = True
-        if len(body) > _MAX_BODY_BYTES or _grant_refused(
-            request, decision.agent or "", body, int(request.app[_CLOCK]())
-        ):
+        grant_reason = (
+            GRANT_BODY_TOO_LARGE
+            if len(body) > _MAX_BODY_BYTES
+            else _grant_refused(request, decision.agent or "", body, int(request.app[_CLOCK]()))
+        )
+        if grant_reason is not None:
             refusal = caller.GRANT_REQUIRED
     # The path is decoded, so it is quoted: an encoded newline in it stays
     # `\n` inside this line rather than starting a line of its own.
+    # ``grant=`` names which grant check refused, from a fixed set, and is
+    # absent otherwise; it is never a claim value.
     logger.info(
-        "caller=%s outcome=%s method=%s path=%r",
+        "caller=%s outcome=%s method=%s path=%r%s",
         decision.agent or "-",
         refusal or "admitted",
         request.method,
         request.path,
+        f" grant={grant_reason}" if grant_reason is not None else "",
     )
     if refusal is not None:
         return web.json_response(refusal_body(refusal), status=REFUSAL_STATUS)
