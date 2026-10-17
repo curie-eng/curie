@@ -166,13 +166,21 @@ delivers the ref as `http(s)://api/agents/<id>/state/transcript/<thread_key>`
 (ADR-0033, #410) as the history token rather than the raw platform key. The ref
 is deterministic per ordinary agent and thread, so fresh, restarted and resumed
 sandboxes use the same ref. Protected deliveries use a separate derivation:
-`apps/worker/src/curie_worker/protected_binding.py` obtains the key through
-`apps/worker/src/curie_worker/protected_history.py::protected_history_key` from
-the verified runtime id and generation, actual reply kind, channel and route
-identity, and execution session key. It renders that key into the transcript
-URL and mints the binding-scoped history token through the manifest's
-`history_signing_credential_ref`. The protected address is deterministic for
-those delivery coordinates, rather than only the ordinary agent/thread pair.
+`apps/worker/src/curie_worker/protected_history.py::protected_history_key` derives
+the key from the verified runtime id and generation, actual reply kind, channel
+and route identity, and execution session key. The protected address is
+deterministic for those delivery coordinates, rather than only the ordinary
+agent/thread pair. The execution profile's `bindings`, validated by
+`apps/worker/src/curie_worker/protected_configuration.py`, supply
+`history_signing_credential_ref` and `runner_facing_api_base_url`.
+Production composition in `apps/worker/src/curie_worker/protected_run.py` uses
+`ProtectedMediatedBindingResolver` from
+`apps/worker/src/curie_worker/protected_binding.py`; its `boot_env` validates the
+delivery and returns `{}`. The issuer in
+`apps/worker/src/curie_worker/protected_launch_server.py` mints the binding-scoped
+history token using the execution profile's signing credential reference.
+`apps/worker/src/curie_worker/protected_kubernetes_projection.py::render_delivery_environment`
+renders the transcript URL from that profile's API base and the derived key.
 
 ## Known leakage
 

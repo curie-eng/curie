@@ -107,7 +107,8 @@ gateway. A minimal config: `CURIE_MODEL_BASE_URL=https://api.deepseek.com/anthro
 ## Known leakage
 
 The CLI's OpenRouter credit check sends the model credential as bearer auth to
-the provider's `/api/v1/key` and `/api/v1/credits` APIs
+OpenRouter's hardcoded default URLs `https://openrouter.ai/api/v1/key` and
+`https://openrouter.ai/api/v1/credits`
 (`cli/src/openrouter_credit.rs`). This provider-specific account query sits
 outside runner wire selection. Separately,
 `Settings.factory_price_source_url` (`apps/api/src/curie_api/config.py::Settings`)
