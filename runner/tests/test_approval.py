@@ -31,6 +31,7 @@ from curie_runner.approval import (
     build_approval_gate,
     guard_reserved_summary,
     load_approval_policy,
+    process_approval_request,
     resolve_approval_policy,
     summarize_tool_call,
 )
@@ -2070,6 +2071,84 @@ def test_policy_gate_non_grantable_route_stays_none() -> None:
         assert final["approval_granted_tool"] is None
 
     anyio.run(go)
+
+
+def _hosted_scale_gate(proxied: frozenset[str] = frozenset({"reference"})) -> ApprovalGate:
+    gate = ApprovalGate(
+        required=frozenset({"mcp__reference__scale"}),
+        route_by_tool={"mcp__reference__scale": "proof-operators"},
+        grantable_by_route={"proof-operators": "mcp__reference__scale"},
+        connector_servers={"reference"},
+    )
+    # Set after construction, the way the boot sets it once connectors derive.
+    gate.proxied_connector_servers = proxied
+    return gate
+
+
+def test_a_grantable_route_to_a_proxied_connector_tool_is_refused_in_turn() -> None:
+    """A policy approval cannot carry a hosted connector call through (#3552).
+
+    The caller proxy only forwards a gated call with a grant bound to its exact
+    arguments, and a policy approval has none, so the approved call would be
+    refused after a human approved it. The request is refused before any card,
+    naming the tool to call directly and never the route.
+    """
+
+    gate = _hosted_scale_gate()
+    result = process_approval_request(gate, {"summary": "Scale the owned record to 7"})
+
+    assert result.get("is_error") is True
+    text = result["content"][0]["text"]
+    assert "mcp__reference__scale" in text
+    assert "directly" in text
+    assert "proof-operators" not in text
+    assert gate.policy_requested is True
+    assert gate.policy_rejected is True
+    assert gate.policy_route is None
+
+
+def test_a_refused_proxied_route_ends_the_turn_with_no_approval() -> None:
+    async def go() -> None:
+        frames = await _run_policy_turn(_hosted_scale_gate(), "Scale the owned record to 7")
+
+        final = frames[-1]
+        assert final["status"] == "done"
+        assert final.get("approval_granted_tool") is None
+
+    anyio.run(go)
+
+
+def test_a_grantable_route_to_an_unproxied_tool_still_requests_approval() -> None:
+    """Scope: only a connector behind the caller proxy is refused.
+
+    A remote connector, a docker-tier connector with no caller token, and a
+    non-connector tool keep the ADR-0056 policy grant unchanged.
+    """
+
+    async def go() -> None:
+        gate = _hosted_scale_gate(proxied=frozenset())
+        frames = await _run_policy_turn(gate, "Scale the owned record to 7")
+
+        final = frames[-1]
+        assert final["status"] == "awaiting-approval"
+        assert final["approval_gate_kind"] == "policy"
+        assert final["approval_route"] == "proof-operators"
+        assert final["approval_granted_tool"] == "mcp__reference__scale"
+
+    anyio.run(go)
+
+
+def test_a_proxied_server_does_not_refuse_a_route_granting_another_tool() -> None:
+    gate = ApprovalGate(
+        required=frozenset({"Bash"}),
+        route_by_tool={"Bash": "managers"},
+        grantable_by_route={"managers": "close_issue"},
+        connector_servers={"reference"},
+    )
+    gate.proxied_connector_servers = frozenset({"reference"})
+    result = process_approval_request(gate, {"summary": "Close the ACME issue"})
+    assert result.get("is_error") is not True
+    assert gate.policy_route == "managers"
 
 
 def test_policy_gate_rejected_route_stays_none() -> None:
