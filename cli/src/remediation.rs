@@ -14,6 +14,7 @@ pub const POLICY_REFUSALS: &[&str] = &[
     "remediation_policy_absent",
     "hook_not_protected",
     "operator_principal_required",
+    "remediation_authority_required",
     "stale_policy_generation",
     "policy_operation_conflict",
     "route_unknown",

@@ -1743,6 +1743,166 @@ impl ConnectorSecretVolumes {
     }
 }
 
+// ─── Docker minimums for volume subpath mounts ───────────────────────────────
+
+const MIN_ENGINE_API: (u64, u64) = (1, 45);
+const MIN_COMPOSE_VERSION: (u64, u64, u64) = (2, 26, 0);
+const DOCKER_MINIMUM_DOCS: &str = "docs/onboarding.md Prerequisites";
+
+fn numeric_version_components(raw: &str, strip_leading_v: bool) -> Option<Vec<u64>> {
+    let trimmed = raw.trim();
+    let trimmed = if strip_leading_v {
+        trimmed
+            .strip_prefix('v')
+            .or_else(|| trimmed.strip_prefix('V'))
+            .unwrap_or(trimmed)
+    } else {
+        trimmed
+    };
+    let head = trimmed
+        .split(['-', '+'])
+        .next()
+        .filter(|head| !head.is_empty())?;
+    head.split('.')
+        .map(|part| {
+            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            part.parse::<u64>().ok()
+        })
+        .collect()
+}
+
+fn parse_engine_api_version(raw: &str) -> Option<(u64, u64)> {
+    let parts = numeric_version_components(raw, false)?;
+    if parts.len() < 2 {
+        return None;
+    }
+    Some((parts[0], parts[1]))
+}
+
+fn parse_compose_version(raw: &str) -> Option<(u64, u64, u64)> {
+    let parts = numeric_version_components(raw, true)?;
+    if parts.is_empty() {
+        return None;
+    }
+    Some((
+        parts[0],
+        parts.get(1).copied().unwrap_or(0),
+        parts.get(2).copied().unwrap_or(0),
+    ))
+}
+
+fn subpath_connector_names(volumes: &ConnectorSecretVolumes) -> String {
+    volumes
+        .volumes
+        .keys()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn check_engine_api_version(raw: &str, connectors: &str) -> Result<()> {
+    let observed = raw.trim();
+    match parse_engine_api_version(observed) {
+        Some(version) if version >= MIN_ENGINE_API => Ok(()),
+        Some(_) => anyhow::bail!(
+            "connector {connectors} declares secret_files, which needs a Docker volume \
+             subpath mount: Docker Engine 26.0 (Engine API 1.45) or later is required, \
+             but the Docker server reports Engine API {observed}. \
+             See {DOCKER_MINIMUM_DOCS}."
+        ),
+        None => anyhow::bail!(
+            "connector {connectors} declares secret_files, which needs a Docker volume \
+             subpath mount: Docker Engine 26.0 (Engine API 1.45) or later is required, \
+             but the Docker server reports Engine API '{observed}', which cannot be parsed. \
+             See {DOCKER_MINIMUM_DOCS}."
+        ),
+    }
+}
+
+fn check_compose_version(raw: &str, connectors: &str) -> Result<()> {
+    let observed = raw.trim();
+    match parse_compose_version(observed) {
+        Some(version) if version >= MIN_COMPOSE_VERSION => Ok(()),
+        Some(_) => anyhow::bail!(
+            "connector {connectors} declares secret_files, which needs a Docker volume \
+             subpath mount: Docker Compose 2.26.0 or later is required, \
+             but `docker compose version` reports {observed}. \
+             See {DOCKER_MINIMUM_DOCS}."
+        ),
+        None => anyhow::bail!(
+            "connector {connectors} declares secret_files, which needs a Docker volume \
+             subpath mount: Docker Compose 2.26.0 or later is required, \
+             but `docker compose version` reports '{observed}', which cannot be parsed. \
+             See {DOCKER_MINIMUM_DOCS}."
+        ),
+    }
+}
+
+/// Refuse a connector bring-up that is about to issue a volume subpath mount
+/// on a Docker too old to honor it.
+///
+/// A no-op when no hosted connector declares `secret_files`, so every other
+/// bundle keeps working on older Docker. The Engine check reads the server
+/// API version because it names the capability across distributions. The
+/// Compose check runs only on the local tier, which is the only tier that
+/// reaches the engine through Compose.
+pub async fn docker_subpath_preflight(
+    volumes: &ConnectorSecretVolumes,
+    require_compose: bool,
+) -> Result<()> {
+    if volumes.volumes.is_empty() {
+        return Ok(());
+    }
+    let connectors = subpath_connector_names(volumes);
+    let engine_command = plain_command(
+        "docker",
+        vec![
+            "version".into(),
+            "--format".into(),
+            "{{.Server.APIVersion}}".into(),
+        ],
+    );
+    let (ok, stdout, stderr) = crate::ops::run_capture(&engine_command).await?;
+    if !ok {
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        anyhow::bail!(
+            "connector {connectors} declares secret_files, which needs a Docker volume \
+             subpath mount: Docker Engine 26.0 (Engine API 1.45) or later is required, \
+             but reading the Docker server version failed: '{detail}'. \
+             See {DOCKER_MINIMUM_DOCS}."
+        );
+    }
+    check_engine_api_version(&stdout, &connectors)?;
+    if !require_compose {
+        return Ok(());
+    }
+    let compose_command = plain_command(
+        "docker",
+        vec!["compose".into(), "version".into(), "--short".into()],
+    );
+    let (ok, stdout, stderr) = crate::ops::run_capture(&compose_command).await?;
+    if !ok {
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        anyhow::bail!(
+            "connector {connectors} declares secret_files, which needs a Docker volume \
+             subpath mount: Docker Compose 2.26.0 or later is required, \
+             but reading the Compose version failed: '{detail}'. \
+             See {DOCKER_MINIMUM_DOCS}."
+        );
+    }
+    check_compose_version(&stdout, &connectors)
+}
+
 // ─── The compose overlay (the local tier's emitter) ──────────────────────────
 
 /// The compose network the worker puts a sandboxed runner on. Joined, never

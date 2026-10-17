@@ -31,9 +31,10 @@ use std::process::{Command, Stdio};
 
 use curie::factory_intake::forge_entries_values;
 use curie::factory_quickstart::{
-    deploy_args, describe, jira_preflight, quickstart_plan, Action, CodeHostKind, EgressEntry,
-    EgressPort, ForgeFlags, JiraPlan, PlanInput, RecordedIntake, ReleaseRead, TrackerKind,
-    DEFAULT_AGENT, DEFAULT_BUDGET_USD, DEFAULT_DEADLINE_SECONDS, DEFAULT_KIND_NAME, DEFAULT_MODEL,
+    deploy_args, describe, forge_binding_name, forge_entry_name, forge_secret_name, jira_preflight,
+    quickstart_plan, Action, CodeHostKind, EgressEntry, EgressPort, ForgeFlags, JiraPlan,
+    Observation, PlanInput, RecordedIntake, ReleaseRead, SecretUse, TrackerKind, DEFAULT_AGENT,
+    DEFAULT_BUDGET_USD, DEFAULT_DEADLINE_SECONDS, DEFAULT_KIND_NAME, DEFAULT_MODEL,
 };
 use curie::factory_toolchain::{preflight, preflight_with_pem, AppPreflight};
 use serde_json::{json, Value};
@@ -60,10 +61,20 @@ const INSTALL_TOKEN: &str = "ghs_fixture";
 const REPO: &str = "acme/widgets";
 const REPO_ID: u64 = 987654;
 
+/// The release every plan here targets.
+const RELEASE: &str = "curie";
+/// The fixture plan's recorded names, as an operator might give them; a
+/// preflight derives its own (#4620).
 const SECRET_NAME: &str = "curie-jira-token";
 const BINDING: &str = "jira";
-const JIRA_LINE: &str =
-    "Write the Jira Cloud tracker and binding `jira` and Secret curie-jira-token";
+
+/// The tracker entry name and Secret a run derives for a new site at
+/// `api_url`.
+fn derived(api_url: &str) -> (String, String) {
+    let name = forge_entry_name("jira_cloud", api_url);
+    let secret = forge_secret_name(RELEASE, &name);
+    (name, secret)
+}
 
 fn repos() -> Vec<String> {
     vec![REPO.to_string()]
@@ -341,17 +352,18 @@ async fn jira_preflight_classic_site_url_writes_tracker_binding_and_egress() {
     // A trailing newline, as an editor writes, is not part of the token.
     let tokens = token_file(dir.path(), &format!("{JIRA_TOKEN}\n"));
 
-    let plan = jira_preflight(&flags(&jira.base_url, &tokens), &repos(), &app)
+    let plan = jira_preflight(&flags(&jira.base_url, &tokens), &repos(), &app, RELEASE)
         .await
         .expect("a valid token, site and allowlist pass the preflight");
 
     let (host, port) = host_port(&jira);
+    let (name, secret) = derived(&jira.base_url);
     let egress = json!([{"cidr": "127.0.0.1/32", "ports": [{"protocol": "TCP", "port": port}]}]);
     assert_eq!(serde_json::to_value(&plan.egress).unwrap(), egress);
     assert_eq!(
         plan.tracker,
         json!({
-            "name": BINDING,
+            "name": name,
             "kind": "jira_cloud",
             "host": host,
             "apiUrl": jira.base_url,
@@ -360,15 +372,16 @@ async fn jira_preflight_classic_site_url_writes_tracker_binding_and_egress() {
             "credential": {
                 "type": "static_token",
                 "username": USERNAME,
-                "existingSecret": SECRET_NAME,
+                "existingSecret": secret,
                 "existingSecretKey": "token",
             },
             "egress": egress,
         })
     );
     let binding = &plan.binding;
-    assert_eq!(binding["name"], json!(BINDING));
-    assert_eq!(binding["tracker"], json!(BINDING));
+    let binding_name = forge_binding_name(&name, CLOUD_ID);
+    assert_eq!(binding["name"], json!(binding_name));
+    assert_eq!(binding["tracker"], json!(name));
     assert_eq!(binding["trackerScopeId"], json!(CLOUD_ID));
     assert_eq!(
         binding["startAuthority"],
@@ -389,9 +402,11 @@ async fn jira_preflight_classic_site_url_writes_tracker_binding_and_egress() {
     assert_eq!(listed[0]["projectId"], json!(REPO_ID.to_string()));
     assert_eq!(listed[0]["path"], json!(REPO));
     assert_eq!(binding["defaultRepo"], json!(alias));
-    assert_eq!(plan.secret_name, SECRET_NAME);
-    assert_eq!(plan.binding_name, BINDING);
+    assert_eq!(plan.secret_name, secret);
+    assert_eq!(plan.binding_name, binding_name);
     assert_eq!(plan.token_file, tokens);
+    assert_eq!(plan.recorded_tracker, None);
+    assert_eq!(plan.secret, SecretUse::Create);
 
     let paths = jira_paths(&jira);
     for expected in [
@@ -431,7 +446,7 @@ async fn jira_preflight_scoped_gateway_url_reads_through_the_gateway() {
     let tokens = token_file(dir.path(), JIRA_TOKEN);
     let scoped = format!("{}/ex/jira/{CLOUD_ID}", jira.base_url);
 
-    let plan = jira_preflight(&flags(&scoped, &tokens), &repos(), &app)
+    let plan = jira_preflight(&flags(&scoped, &tokens), &repos(), &app, RELEASE)
         .await
         .expect("a scoped URL whose cloud id matches tenant_info passes");
 
@@ -474,7 +489,7 @@ async fn jira_preflight_refuses_a_scoped_url_whose_cloud_id_differs_from_tenant_
     let tokens = token_file(dir.path(), JIRA_TOKEN);
     let scoped = format!("{}/ex/jira/{CLOUD_ID}", jira.base_url);
 
-    let error = jira_preflight(&flags(&scoped, &tokens), &repos(), &app)
+    let error = jira_preflight(&flags(&scoped, &tokens), &repos(), &app, RELEASE)
         .await
         .expect_err("a cloud id mismatch is refused");
     let text = err_text(&error);
@@ -492,7 +507,7 @@ async fn jira_preflight_refuses_an_unauthorized_token_naming_the_flag_and_status
     let app = app(&github, dir.path(), AppPath::Install).await;
     let tokens = token_file(dir.path(), WRONG_TOKEN);
 
-    let error = jira_preflight(&flags(&jira.base_url, &tokens), &repos(), &app)
+    let error = jira_preflight(&flags(&jira.base_url, &tokens), &repos(), &app, RELEASE)
         .await
         .expect_err("a token Jira answers 401 for is refused");
     let text = err_text(&error);
@@ -518,7 +533,7 @@ async fn jira_preflight_refuses_an_empty_or_missing_token_file() {
         ("empty", token_file(dir.path(), " \n")),
         ("missing", dir.path().join("absent-token")),
     ] {
-        let error = jira_preflight(&flags(&jira.base_url, &path), &repos(), &app)
+        let error = jira_preflight(&flags(&jira.base_url, &path), &repos(), &app, RELEASE)
             .await
             .expect_err(case);
         let text = err_text(&error);
@@ -540,7 +555,7 @@ async fn jira_preflight_refuses_an_unknown_start_account() {
     let mut forge = flags(&jira.base_url, &tokens);
     forge.start_accounts = vec![STARTER.to_string(), UNKNOWN_ACCOUNT.to_string()];
 
-    let error = jira_preflight(&forge, &repos(), &app)
+    let error = jira_preflight(&forge, &repos(), &app, RELEASE)
         .await
         .expect_err("an account Jira does not know is refused");
     let text = err_text(&error);
@@ -560,7 +575,7 @@ async fn jira_preflight_refuses_a_start_account_that_is_not_a_person() {
     let mut forge = flags(&jira.base_url, &tokens);
     forge.start_accounts = vec![APP_ACCOUNT.to_string()];
 
-    let error = jira_preflight(&forge, &repos(), &app)
+    let error = jira_preflight(&forge, &repos(), &app, RELEASE)
         .await
         .expect_err("an app account never starts work, so it is refused");
     let text = err_text(&error);
@@ -580,7 +595,7 @@ async fn jira_preflight_group_start_authority_is_checked_and_written() {
     forge.start_accounts = Vec::new();
     forge.start_group = Some(GROUP.to_string());
 
-    let plan = jira_preflight(&forge, &repos(), &app)
+    let plan = jira_preflight(&forge, &repos(), &app, RELEASE)
         .await
         .expect("a group Jira lists passes");
     assert_eq!(
@@ -596,7 +611,7 @@ async fn jira_preflight_group_start_authority_is_checked_and_written() {
     );
 
     forge.start_group = Some(UNKNOWN_GROUP.to_string());
-    let error = jira_preflight(&forge, &repos(), &app)
+    let error = jira_preflight(&forge, &repos(), &app, RELEASE)
         .await
         .expect_err("a group Jira does not list is refused");
     let text = err_text(&error);
@@ -618,7 +633,7 @@ async fn jira_preflight_reads_a_private_repository_id_with_the_installation_toke
         let before = github.recorded().len();
         let tokens = token_file(dir.path(), JIRA_TOKEN);
 
-        let plan = jira_preflight(&flags(&jira.base_url, &tokens), &repos(), &app)
+        let plan = jira_preflight(&flags(&jira.base_url, &tokens), &repos(), &app, RELEASE)
             .await
             .expect("a private repository id is readable with the installation token");
         assert_eq!(
@@ -682,8 +697,13 @@ fn fixture_plan() -> JiraPlan {
         }),
         egress,
         secret_name: SECRET_NAME.into(),
+        secret_key: "token".into(),
         token_file: PathBuf::from("/keys/jira-token"),
         binding_name: BINDING.into(),
+        recorded_tracker: None,
+        recorded_binding: None,
+        secret: SecretUse::Create,
+        observation: Observation::default(),
     }
 }
 
@@ -734,20 +754,24 @@ fn add_agent_input() -> PlanInput {
         repo_allowlist: repos(),
         pem_secret: "curie-github-app".into(),
         pem_secret_key: "private-key".into(),
-        jira_tracker: None,
-        jira_binding: None,
     });
+    input
+}
+
+/// `input` with the release recording `tracker` and `binding` for the
+/// plan's site, found by identity, and its Secret holding the token.
+fn on_jira_release(mut input: PlanInput, tracker: Value, binding: Value) -> PlanInput {
+    let jira = input.jira.as_mut().unwrap();
+    jira.recorded_tracker = Some(tracker);
+    jira.recorded_binding = Some(binding);
+    jira.secret = SecretUse::Reuse;
     input
 }
 
 /// The add agent path on a release whose `jira` tracker and binding another
 /// Jira agent already serves.
 fn add_agent_on_jira_release(tracker: Value, binding: Value) -> PlanInput {
-    let mut input = add_agent_input();
-    let recorded = input.recorded.as_mut().unwrap();
-    recorded.jira_tracker = Some(tracker);
-    recorded.jira_binding = Some(binding);
-    input
+    on_jira_release(add_agent_input(), tracker, binding)
 }
 
 /// The refusal's message and fix, after checking it exits 2 and carries no
@@ -786,7 +810,9 @@ fn jira_add_agent_writes_the_entry_the_release_lacks() {
     pinned_tmpdir();
     let plan = fixture_plan();
     let mut input = add_agent_input();
-    input.recorded.as_mut().unwrap().jira_tracker = Some(plan.tracker.clone());
+    let jira = input.jira.as_mut().unwrap();
+    jira.recorded_tracker = Some(plan.tracker.clone());
+    jira.secret = SecretUse::Reuse;
     let planned = quickstart_plan(&input).unwrap();
     assert_eq!(
         action_names(&planned.actions),
@@ -854,9 +880,7 @@ fn jira_add_agent_preserves_an_equivalent_recorded_entry() {
     binding["startAuthority"] = json!({"type": "allowlist", "accounts": [SECOND_STARTER, STARTER]});
     binding["repos"][0]["projectId"] = json!(REPO_ID);
     binding["components"] = json!({});
-    let recorded = input.recorded.as_mut().unwrap();
-    recorded.jira_tracker = Some(tracker.clone());
-    recorded.jira_binding = Some(binding.clone());
+    let mut input = on_jira_release(input, tracker.clone(), binding.clone());
     let planned = quickstart_plan(&input).expect("an equivalent jira entry is served as is");
     assert_eq!(
         action_names(&planned.actions),
@@ -865,8 +889,7 @@ fn jira_add_agent_preserves_an_equivalent_recorded_entry() {
 
     // A real difference beside them is still refused.
     tracker["pollIntervalS"] = json!(60);
-    let recorded = input.recorded.as_mut().unwrap();
-    recorded.jira_tracker = Some(tracker);
+    input.jira.as_mut().unwrap().recorded_tracker = Some(tracker);
     let text = usage_refusal(&input);
     assert!(text.contains("its pollIntervalS is 60"), "{text}");
     assert!(
@@ -876,19 +899,23 @@ fn jira_add_agent_preserves_an_equivalent_recorded_entry() {
 }
 
 #[test]
-fn jira_install_path_still_writes_over_a_recorded_jira_entry() {
-    // Liveness: the install path rewrites the intake whole, Jira included,
-    // and a first install with nothing recorded writes the entries.
+fn jira_install_path_refuses_a_differing_recorded_jira_entry() {
+    // #4620: the install path applies the add agent path's guard before the
+    // intake, and a first install with nothing recorded writes the entries.
     pinned_tmpdir();
     let plan = fixture_plan();
     let mut tracker = plan.tracker.clone();
-    tracker["apiUrl"] = json!("https://other.atlassian.net");
-    let mut install = add_agent_on_jira_release(tracker, plan.binding.clone());
-    install.app_id = Some("12345".into());
-    install.private_key_file = Some("/keys/app.pem".into());
+    tracker["mention"] = json!("another-bot");
+    let mut install = on_jira_release(install_input(), tracker, plan.binding.clone());
     install.agent = DEFAULT_AGENT.into();
-    let planned = quickstart_plan(&install).unwrap();
-    assert!(action_names(&planned.actions).contains(&"jira"));
+    let text = usage_refusal(&install);
+    assert!(text.contains("its mention is"), "{text}");
+    let same = on_jira_release(install_input(), plan.tracker.clone(), plan.binding.clone());
+    let planned = quickstart_plan(&same).unwrap();
+    assert!(
+        !action_names(&planned.actions).contains(&"jira"),
+        "an identical recorded site is not rewritten"
+    );
     let first = quickstart_plan(&install_input()).unwrap();
     assert_eq!(
         action_names(&first.actions),
@@ -901,30 +928,6 @@ fn jira_install_path_still_writes_over_a_recorded_jira_entry() {
             "deploy"
         ]
     );
-}
-
-#[test]
-fn recorded_intake_reads_the_jira_tracker_and_binding_by_name() {
-    let plan = fixture_plan();
-    let values = json!({
-        "api": {"githubRepoAllowlist": [REPO]},
-        "factory": {
-            "enabled": true,
-            "intake": "poll",
-            "codeHosts": [{"name": "github", "kind": "github", "credential": {"appId": "12345", "existingSecret": "curie-github-app"}}],
-            "trackers": [{"name": "github", "kind": "github", "label": "curie-factory"}, plan.tracker],
-            "bindings": [{"name": "ops", "tracker": "github"}, plan.binding],
-        }
-    });
-    let recorded = curie::factory_quickstart::recorded_intake(&values).unwrap();
-    assert_eq!(recorded.jira_tracker, Some(plan.tracker));
-    assert_eq!(recorded.jira_binding, Some(plan.binding));
-    let mut github_only = values.clone();
-    github_only["factory"]["trackers"] =
-        json!([{"name": "github", "kind": "github", "label": "curie-factory"}]);
-    github_only["factory"]["bindings"] = json!([]);
-    let recorded = curie::factory_quickstart::recorded_intake(&github_only).unwrap();
-    assert_eq!((recorded.jira_tracker, recorded.jira_binding), (None, None));
 }
 
 /// `bundle_dir` embeds the temp dir; pin it like the #4346 goldens do.
@@ -1166,25 +1169,26 @@ fn jira_forge_values_replace_only_the_jira_entries() {
     let github_tracker = json!({"name": "github", "kind": "github", "host": "github.com", "apiUrl": "https://api.github.com", "label": "curie-factory", "mention": "acme-factory[bot]", "credential": {"type": "github_app", "appId": "12345", "existingSecret": "curie-github-app", "existingSecretKey": "private-key"}});
     let code_host = json!({"name": "github", "kind": "github", "host": "github.com", "apiUrl": "https://api.github.com", "credential": {"type": "github_app", "appId": "12345", "existingSecret": "curie-github-app", "existingSecretKey": "private-key"}});
     let other_binding = json!({"name": "ops", "tracker": "github", "trackerScopeId": "1", "repos": [{"alias": "ops", "codeHost": "github", "projectId": "1", "path": "acme/ops"}]});
-    let stale_tracker = json!({"name": BINDING, "kind": "jira_cloud", "host": "old.example.com", "apiUrl": "https://old.example.com", "mention": "old"});
-    let stale_binding =
-        json!({"name": BINDING, "tracker": BINDING, "trackerScopeId": OTHER_CLOUD_ID, "repos": []});
+    // A second site under its own names coexists (#4620).
+    let other_tracker = json!({"name": "jira-other", "kind": "jira_cloud", "host": "old.example.com", "apiUrl": "https://old.example.com", "mention": "old"});
+    let other_site_binding = json!({"name": "jira-other-binding", "tracker": "jira-other", "trackerScopeId": OTHER_CLOUD_ID, "repos": []});
     let recorded = json!({
         "factory": {
             "enabled": true,
             "intake": "poll",
             "codeHosts": [code_host],
-            "trackers": [github_tracker, stale_tracker],
-            "bindings": [other_binding, stale_binding],
+            "trackers": [github_tracker, other_tracker],
+            "bindings": [other_binding, other_site_binding],
         }
     });
 
-    let values = forge_entries_values(&recorded, &plan);
+    let values = forge_entries_values(&recorded, &plan).unwrap();
     let trackers = values
         .pointer("/factory/trackers")
         .and_then(Value::as_array)
         .expect("factory.trackers is written whole");
-    assert_eq!(trackers.len(), 2, "{values}");
+    assert_eq!(trackers.len(), 3, "{values}");
+    assert!(trackers.contains(&other_tracker), "the other site is kept");
     assert!(
         trackers.contains(&github_tracker),
         "the GitHub tracker is kept"
@@ -1197,8 +1201,12 @@ fn jira_forge_values_replace_only_the_jira_entries() {
         .pointer("/factory/bindings")
         .and_then(Value::as_array)
         .expect("factory.bindings is written whole");
-    assert_eq!(bindings.len(), 2, "{values}");
+    assert_eq!(bindings.len(), 3, "{values}");
     assert!(bindings.contains(&other_binding), "other bindings are kept");
+    assert!(
+        bindings.contains(&other_site_binding),
+        "other bindings are kept"
+    );
     assert!(
         bindings.contains(&plan.binding),
         "the Jira binding is written"
@@ -1208,9 +1216,14 @@ fn jira_forge_values_replace_only_the_jira_entries() {
     }
     assert_no_token(&values.to_string(), "the values");
 
+    // A same-named entry of another site is refused, never replaced.
+    let stale_tracker = json!({"name": BINDING, "kind": "jira_cloud", "host": "old.example.com", "apiUrl": "https://old.example.com"});
+    let stale = json!({"factory": {"trackers": [github_tracker, stale_tracker]}});
+    assert!(forge_entries_values(&stale, &plan).is_err());
+
     // A release whose intake wrote only the GitHub entries gains the Jira ones.
     let fresh = json!({"factory": {"enabled": true, "codeHosts": [code_host], "trackers": [github_tracker]}});
-    let values = forge_entries_values(&fresh, &plan);
+    let values = forge_entries_values(&fresh, &plan).unwrap();
     assert_eq!(
         values.pointer("/factory/trackers"),
         Some(&json!([github_tracker, plan.tracker]))
@@ -1511,15 +1524,18 @@ fn factory_quickstart_jira_dry_run_describes_the_reads_and_makes_none() {
         .iter()
         .map(|line| line.as_str().unwrap().to_string())
         .collect();
-    assert!(lines.iter().any(|line| line == JIRA_LINE), "{lines:#?}");
+    let (name, secret) = derived(&jira.base_url);
+    let binding = format!("{name}-<cloud id>");
+    let jira_line =
+        format!("Write the Jira Cloud tracker and binding `{binding}` and Secret {secret}");
+    assert!(lines.contains(&jira_line), "{lines:#?}");
     assert!(
         lines.iter().any(|line| line.contains(&jira.base_url)),
         "the Jira reads are described against --forge-url: {lines:#?}"
     );
     assert!(
-        lines
-            .iter()
-            .any(|line| line.contains("cluster surfaces") && line.ends_with("--add jira=jira")),
+        lines.iter().any(|line| line.contains("cluster surfaces")
+            && line.ends_with(&format!("--add jira={binding}"))),
         "{lines:#?}"
     );
     assert!(

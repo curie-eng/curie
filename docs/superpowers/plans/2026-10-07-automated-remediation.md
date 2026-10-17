@@ -283,7 +283,8 @@ No task modifies `packages/aci-protocol` or `packages/plugin-format` (AR-27).
   incident is a per-target window of one hour after verification that a policy
   may only lengthen, never derived from the alert body (task 9); policy writes
   and breaker closes require an ADR 0106 operator principal recorded as the actor
-  (tasks 3, 4 and 9); tuning stops at the nomination and the approval card, and an
+  (tasks 3, 4 and 9), and binding or arming also needs the separate remediation
+  authority key (ADR 0231); tuning stops at the nomination and the approval card, and an
   approved tuning request ends refused with no write (task 16); one JSON pointer
   and a closed comparator set is the predicate grammar (tasks 2, 7 and 11).
 * **Tuning execution.** Automated rule-owner change requests need a separate

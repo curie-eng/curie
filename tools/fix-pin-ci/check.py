@@ -61,6 +61,7 @@ SELECTOR = re.compile(
 )
 FACTORY_UPGRADE_MODULE = "tools/factory-e2e/tests/test_c4_upgrade_migration.py"
 HELD_CANCELLATION_MODULE = "tools/factory-e2e/tests/test_c4_held_cancellation.py"
+FORGE_INSTANCES_MODULE = "tools/factory-e2e/tests/test_c4_forge_instances.py"
 # Pins in these modules run against an owned kind cluster, not the dev stack.
 KIND_MODULES = frozenset(
     {
@@ -68,6 +69,7 @@ KIND_MODULES = frozenset(
         "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
         FACTORY_UPGRADE_MODULE,
         HELD_CANCELLATION_MODULE,
+        FORGE_INSTANCES_MODULE,
     }
 )
 BUG_LABEL = "bug"

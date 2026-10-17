@@ -1010,6 +1010,16 @@ class Installation:
             raise InfrastructureError("the release tracker label is not a string")
         return label
 
+    def jira_binding(self) -> str:
+        """The Jira surface address: the binding name quickstart derived for the
+        release's one Jira Cloud tracker."""
+        factory = self.release_values()["factory"]
+        trackers = [entry["name"] for entry in factory["trackers"] if entry["kind"] == "jira_cloud"]
+        names = [entry["name"] for entry in factory["bindings"] if entry["tracker"] in trackers]
+        if len(trackers) != 1 or len(names) != 1:
+            raise InfrastructureError("the release does not record exactly one Jira binding")
+        return str(names[0])
+
 
 @pytest.fixture
 def installation(
@@ -1060,11 +1070,11 @@ def _deployment(installation: Installation, agent: dict[str, Any]) -> dict[str, 
     }
 
 
-def _surface(case: str) -> tuple[str, str]:
+def _surface(installation: Installation, case: str) -> tuple[str, str]:
     if case == "gitlab":
         return "gitlab", GITLAB_REPO
     if case in {"jira", "jira-bitbucket-dc"}:
-        return "jira", "jira"
+        return "jira", installation.jira_binding()
     return "github", GITHUB_REPO
 
 
@@ -1076,7 +1086,7 @@ def _assert_binding(
     *,
     tracker_default: str | None = DEFAULT_LABEL,
 ) -> None:
-    kind, address = _surface(case)
+    kind, address = _surface(installation, case)
     assert len(agent["channels"]) == 1, "factory registration retained an implicit Slack route"
     channel = agent["channels"][0]
     assert (channel["kind"], channel["address"]) == (kind, address)
@@ -1158,7 +1168,7 @@ def test_quickstarts_are_idempotent_and_binding_guards_hold(installation: Instal
         _assert_binding(installation, _agent(installation, SECOND_AGENT), case, SECOND_LABEL)
         assert len(installation.read("/agents")) == 2
 
-    kind, address = _surface(case)
+    kind, address = _surface(installation, case)
     tracker_label = installation.tracker_label(kind)
     for index, label in enumerate((DEFAULT_LABEL, SECOND_LABEL, None)):
         # Null vs explicit tracker default must have the same conflict outcome.
@@ -1215,7 +1225,7 @@ def test_mixed_trackers_preserve_the_first_deployment(installation: Installation
         )
         for kind, expected in tracker_defaults.items():
             assert installation.tracker_label(kind) == expected
-        kind, _address = _surface(case)
+        kind, _address = _surface(installation, case)
         tracker_defaults[kind] = installation.tracker_label(kind)
         _deployment(installation, _agent(installation, name))
         assert _agent(installation, FIRST_AGENT) == first

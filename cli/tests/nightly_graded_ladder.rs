@@ -1959,6 +1959,34 @@ fn plain_reply_observability_seeds_send_an_exact_marker_task() {
 }
 
 #[test]
+fn restored_healthy_control_forbids_tool_calls() {
+    let function = ladder_function("case_local_otel_runner_failure");
+    let assignment = "restored_marker=\"curie-restored-healthy-$$-$RANDOM\"";
+    let prompt =
+        "\"Reply with exactly: $restored_marker. Do not call tools or investigate anything.\"";
+    let assignment_at = function.find(assignment).unwrap_or_else(|| {
+        panic!("the restored healthy control must mint a run-unique marker: {function}")
+    });
+    let prompt_at = function.find(prompt).unwrap_or_else(|| {
+        panic!("the restored healthy control must forbid tool calls: {function}")
+    });
+    assert!(
+        assignment_at < prompt_at,
+        "the marker must be minted before the restored control sends it: {function}"
+    );
+    assert!(
+        function.contains(&format!(
+            "restored_out=\"$(\"$BIN\" --json local message --channel C0LOCALDEV {prompt}"
+        )),
+        "the no-tool prompt must be the restored control message: {function}"
+    );
+    assert!(
+        !function.contains("\"restored healthy control\""),
+        "the bare restored healthy control prompt must not return: {function}"
+    );
+}
+
+#[test]
 fn plain_reply_observability_seeds_reject_nonfinal_replies_and_restore_auth() {
     for function_name in ["seed_ordinary_turn", "case_local_langfuse_invalid_auth"] {
         let (output, invocations, phases) = run_plain_reply_seed(function_name, false);

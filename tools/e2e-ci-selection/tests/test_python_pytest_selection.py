@@ -392,7 +392,10 @@ def test_static_job_holds_exactly_the_moved_gates_in_order() -> None:
         "Install uv (retry)",
         "Lockfile is up to date",
         "Sync workspace",
-        *MOVED_STATIC_STEPS[1:],
+        *MOVED_STATIC_STEPS[1:4],
+        # ADR 0232 (#4610) added this gate after the move.
+        "Contract migration timing gate",
+        *MOVED_STATIC_STEPS[4:],
     ]
     assert static_names == expected
 
@@ -502,6 +505,7 @@ def test_ordinary_python_shards_exclude_the_owned_kind_modules(
         "tools/factory-e2e/tests/test_c4_upgrade_migration.py",
         "tools/factory-e2e/tests/test_c4_held_cancellation.py",
         "tools/factory-e2e/tests/test_c4_cluster_up.py",
+        "tools/factory-e2e/tests/test_c4_forge_instances.py",
     ):
         ignored = [
             argument.split("=", 1)[1] for argument in argv if argument.startswith("--ignore=")

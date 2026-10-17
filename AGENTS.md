@@ -153,6 +153,7 @@ Set `base=next` when your worktree targets `next`.
     echo "cross-train lineage skipped: base $base is not a train branch"
   fi
   uv run python scripts/check-schema-window.py
+  uv run python scripts/check-contract-migration-timing.py
   uv run ruff check .
   uv run mypy
   uv run lint-imports

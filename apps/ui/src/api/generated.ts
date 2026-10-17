@@ -565,7 +565,9 @@ export interface paths {
          * @description Bind, tighten or widen a protected hook's remediation policy.
          *
          *     A new binding starts disarmed; a later write keeps the armed flag. Each
-         *     write creates a generation recorded with the operator principal.
+         *     write creates a generation recorded with the operator principal. Needs the
+         *     remediation authority in ``X-Curie-Remediation-Authority`` (ADR 0231), else
+         *     ``remediation_authority_required``; the operator principal is attribution.
          */
         put: operations["put_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_put"];
         post?: never;
@@ -591,6 +593,10 @@ export interface paths {
         /**
          * Arm Remediation Policy
          * @description Arm the current policy as a new generation.
+         *
+         *     Needs the remediation authority in ``X-Curie-Remediation-Authority``
+         *     (ADR 0231), else ``remediation_authority_required``; the operator principal
+         *     is attribution.
          */
         post: operations["arm_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_arm_post"];
         delete?: never;
@@ -1423,6 +1429,31 @@ export interface paths {
          *     caller-supplied actor string.
          */
         post: operations["mint_operator_principal_approvals_principals_operator_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/approvals/principals/remediation-operator": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mint Remediation Operator Principal
+         * @description Mint a remediation operator credential (#4228).
+         *
+         *     The token carries the ``remediation.administer`` scope, which remediation
+         *     policy and qualification writes require; it never resolves an approval,
+         *     and an approval operator token never writes remediation policy.  Returned
+         *     once and marked non-cacheable, as the approval operator mint is.
+         */
+        post: operations["mint_remediation_operator_principal_approvals_principals_remediation_operator_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -10092,6 +10123,7 @@ export interface operations {
             query?: never;
             header?: {
                 "x-api-key"?: string | null;
+                "X-Curie-Remediation-Authority"?: string | null;
                 "X-Curie-Approval-Principal"?: string | null;
             };
             path: {
@@ -10223,6 +10255,7 @@ export interface operations {
             query?: never;
             header?: {
                 "x-api-key"?: string | null;
+                "X-Curie-Remediation-Authority"?: string | null;
                 "X-Curie-Approval-Principal"?: string | null;
             };
             path: {
@@ -12259,6 +12292,41 @@ export interface operations {
         };
     };
     mint_operator_principal_approvals_principals_operator_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApprovalPrincipalMint"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApprovalPrincipalOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    mint_remediation_operator_principal_approvals_principals_remediation_operator_post: {
         parameters: {
             query?: never;
             header?: {

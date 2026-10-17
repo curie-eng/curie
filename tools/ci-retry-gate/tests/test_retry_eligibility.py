@@ -112,6 +112,15 @@ RETRY_ALLOWLIST = frozenset(
             "e2e-scripted-factory",
             "Install kind and kubectl without creating a cluster",
         ),
+        # Issue #4620: the forge instance regression acquires uv, Helm, kind and
+        # kubectl before the module runs; the module creates its own clusters.
+        ("ci.yaml", "forge-instance-regression", "Install uv"),
+        ("ci.yaml", "forge-instance-regression", "Install Helm"),
+        (
+            "ci.yaml",
+            "forge-instance-regression",
+            "Install kind and kubectl without creating a cluster",
+        ),
         # The CLI convergence regressions acquire Helm, kind and kubectl; each
         # test creates its own cluster.
         ("ci.yaml", "rust-convergence", "Install Helm"),

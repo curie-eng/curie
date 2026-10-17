@@ -3018,6 +3018,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Administratively mint a reusable, subject-bound remediation operator principal (scope remediation.administer) for remediation policy, breaker, and qualification writes. The token is delivered once; export it as CURIE_APPROVAL_PRINCIPAL_TOKEN for those writes. It cannot resolve approvals",
+              "id": "mint_remediation_principal",
+              "long": "mint-remediation-principal",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Administratively mint a single-use, subject-bound Console login code",
               "id": "mint_console_login_code",
               "long": "mint-console-login-code",
@@ -9160,6 +9168,14 @@ export const commandManifest = {
               "help": "Administratively mint a reusable, subject-bound operator principal. The token is delivered once; export it as CURIE_APPROVAL_PRINCIPAL_TOKEN before resolving",
               "id": "mint_operator_principal",
               "long": "mint-operator-principal",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Administratively mint a reusable, subject-bound remediation operator principal (scope remediation.administer) for remediation policy, breaker, and qualification writes. The token is delivered once; export it as CURIE_APPROVAL_PRINCIPAL_TOKEN for those writes. It cannot resolve approvals",
+              "id": "mint_remediation_principal",
+              "long": "mint-remediation-principal",
               "positional": false,
               "required": false
             },

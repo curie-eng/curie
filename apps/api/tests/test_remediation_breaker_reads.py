@@ -26,6 +26,7 @@ Every identifier is a placeholder.
 
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,7 @@ from typing import Any
 import pytest
 from _migration_support import sql_dicts, sql_rows
 from _sealed_actions import executor_enabled  # noqa: F401 - fixture, requested by name
+from curie_api.config import get_settings
 from test_remediation_verifier import (
     ACT_CONNECTOR,
     ACT_TOOL,
@@ -186,3 +188,36 @@ def test_a_listed_id_is_the_one_the_close_route_accepts_and_the_read_wrote_nothi
     assert client.get(_path(agent_id), headers=auth_headers).json() == []
     after = client.get(_path(agent_id) + "?state=closed", headers=auth_headers).json()
     assert [row["id"] for row in after] == [listed[0]["id"]]
+
+
+def test_closing_a_breaker_needs_no_remediation_authority(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-11 @spec AUTOMATED-REMEDIATION-3 (ADR 0231)
+
+    Closing a breaker only lets a declared action run again under the policy
+    already bound and armed; ADR 0231 gates bind and arm, not this. With the
+    platform key and an operator principal, no ``X-Curie-Remediation-Authority``
+    header and the API's authority key unset, the close succeeds.
+    """
+
+    agent_id = _setup(client, auth_headers, tmp_path)
+    breaker_id = _breaker(agent_id, f'{ACT_CONNECTOR}:"example-api"')
+    headers = {**auth_headers, **_operator()}
+    assert "X-Curie-Remediation-Authority" not in headers
+    before = os.environ.pop("CURIE_REMEDIATION_AUTHORITY_KEY", None)
+    get_settings.cache_clear()
+    try:
+        closed = client.post(
+            f"{_path(agent_id)}/{breaker_id}/close",
+            json={"reason": "connector fixed"},
+            headers=headers,
+        )
+    finally:
+        if before is not None:
+            os.environ["CURIE_REMEDIATION_AUTHORITY_KEY"] = before
+        get_settings.cache_clear()
+
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["closed_by"] == OPERATOR
+    assert client.get(_path(agent_id), headers=auth_headers).json() == []
