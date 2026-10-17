@@ -32,7 +32,9 @@ class ApiIdentityAssertions(unittest.TestCase):
         mutations = [
             (
                 "api.yaml",
-                'name: {{ include "curie.checkedObjectName" (dict "kind" "Service" "name" (printf "%s-api" (include "curie.fullname" .))) }}',
+                "name: {{ include \"curie.checkedObjectName\" "
+                '(dict "kind" "Service" "name" (printf "%s-api" '
+                '(include "curie.fullname" .))) }}',
                 "name: wrong-api",
             ),
             (
