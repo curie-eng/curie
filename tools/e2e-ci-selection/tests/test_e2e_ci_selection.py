@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import functools
 import importlib.util
 import json
@@ -3412,10 +3413,105 @@ def test_unrelated_changes_do_not_select_the_factory_runtime(tmp_path: Path, pat
     assert _outputs_of(output)["factory"] == "false"
 
 
+FRESH_INSTALL_TEST = "test_fresh_cluster_up_converges_without_rerun"
+SCRIPTED_FACTORY_LEGS = (
+    ("scenario", lambda run: run == "python3 tools/factory-e2e/factory_e2e.py scripted"),
+    ("initial-binding", lambda run: INITIAL_BINDING_MODULE in run),
+    (
+        "static-token-rotation",
+        lambda run: run == f"uv run pytest -q -n 0 {STATIC_TOKEN_ROTATION_MODULE}",
+    ),
+    (
+        "fresh-install",
+        lambda run: run
+        == f"uv run pytest -q -n 0 {CLUSTER_UP_MODULE}::{FRESH_INSTALL_TEST}",
+    ),
+)
+SCRIPTED_FACTORY_EVIDENCE_STEP = "Upload scripted factory evidence"
+
+
+def _assert_scripted_factory_legs_map_one_to_one(job: dict[str, Any]) -> None:
+    """Every suite runs in exactly one matrix leg, so none can be silently skipped."""
+    legs = [leg for leg, _ in SCRIPTED_FACTORY_LEGS]
+    strategy = job.get("strategy", {})
+    if strategy.get("fail-fast") is not False:
+        raise AssertionError("strategy.fail-fast must be False")
+    if set(strategy.get("matrix", {})) != {"suite"} or strategy["matrix"]["suite"] != legs:
+        raise AssertionError(f"matrix must be exactly suite: {legs}")
+    if job.get("timeout-minutes") != 120:
+        raise AssertionError("timeout-minutes must be 120")
+    steps = job["steps"]
+    claimed: list[dict[str, Any]] = []
+    for leg, runs_command in SCRIPTED_FACTORY_LEGS:
+        owners = [step for step in steps if step.get("if") == f"matrix.suite == '{leg}'"]
+        if len(owners) != 1:
+            raise AssertionError(f"leg {leg} needs exactly one step, found {len(owners)}")
+        if not runs_command(owners[0].get("run", "")):
+            raise AssertionError(f"leg {leg} step runs the wrong command")
+        claimed.append(owners[0])
+    for step in steps:
+        if "matrix.suite" not in json.dumps(step) or any(step is owner for owner in claimed):
+            continue
+        if not (
+            step.get("name") == SCRIPTED_FACTORY_EVIDENCE_STEP
+            and step.get("if") == "always() && matrix.suite == 'scenario'"
+        ):
+            raise AssertionError(f"unexpected matrix.suite use in step {step.get('name')!r}")
+    evidence = [s for s in steps if s.get("name") == SCRIPTED_FACTORY_EVIDENCE_STEP]
+    if len(evidence) != 1 or evidence[0].get("if") != "always() && matrix.suite == 'scenario'":
+        raise AssertionError("evidence upload must run only in the scenario leg")
+
+
+def _scripted_factory_step(job: dict[str, Any], leg: str) -> dict[str, Any]:
+    return next(s for s in job["steps"] if s.get("if") == f"matrix.suite == '{leg}'")
+
+
+def _drop_leg(job: dict[str, Any]) -> None:
+    job["strategy"]["matrix"]["suite"].remove("fresh-install")
+
+
+def _drop_step_if(job: dict[str, Any]) -> None:
+    del _scripted_factory_step(job, "static-token-rotation")["if"]
+
+
+def _misdirect_step_if(job: dict[str, Any]) -> None:
+    _scripted_factory_step(job, "scenario")["if"] = "matrix.suite == 'initial-binding'"
+
+
+def _enable_fail_fast(job: dict[str, Any]) -> None:
+    job["strategy"]["fail-fast"] = True
+
+
+def _unguard_evidence(job: dict[str, Any]) -> None:
+    evidence = next(s for s in job["steps"] if s.get("name") == SCRIPTED_FACTORY_EVIDENCE_STEP)
+    evidence["if"] = "always()"
+
+
+def test_scripted_factory_matrix_maps_each_suite_to_exactly_one_leg() -> None:
+    job = yaml.safe_load(WORKFLOW.read_text())["jobs"][SCRIPTED_FACTORY_JOB]
+    _assert_scripted_factory_legs_map_one_to_one(job)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (_drop_leg, _drop_step_if, _misdirect_step_if, _enable_fail_fast, _unguard_evidence),
+)
+def test_scripted_factory_leg_mapping_rejects_skippable_shapes(
+    mutate: Callable[[dict[str, Any]], None],
+) -> None:
+    job = yaml.safe_load(WORKFLOW.read_text())["jobs"][SCRIPTED_FACTORY_JOB]
+    _assert_scripted_factory_legs_map_one_to_one(job)
+    mutated = copy.deepcopy(job)
+    mutate(mutated)
+    with pytest.raises(AssertionError):
+        _assert_scripted_factory_legs_map_one_to_one(mutated)
+
+
 def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_path: Path) -> None:
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     job = jobs[SCRIPTED_FACTORY_JOB]
-    assert job["name"] == "E2E scripted factory scenario (kind, scripted model)"
+    assert job["name"] == "E2E scripted factory (kind, scripted model, ${{ matrix.suite }})"
+    _assert_scripted_factory_legs_map_one_to_one(job)
     assert job["if"] == "${{ needs.changes.outputs.factory == 'true' }}"
     assert "pull_request" not in job["if"]
     assert job["needs"] == ["rust-build", "changes", "ci-images"]
@@ -3431,26 +3527,23 @@ def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_p
         "CURIE_BIN": "${{ github.workspace }}/cli/target/release/curie",
         "BUILDX_BUILDER": "default",
     }
-    assert "if" not in scenario[0]
     assert "continue-on-error" not in scenario[0]
 
     steps = job["steps"]
     registrations = [step for step in steps if INITIAL_BINDING_MODULE in step.get("run", "")]
     assert len(registrations) == 1
     registration = registrations[0]
-    assert steps.index(scenario[0]) < steps.index(registration)
     rotations = [step for step in steps if STATIC_TOKEN_ROTATION_MODULE in step.get("run", "")]
     assert len(rotations) == 1
     rotation = rotations[0]
-    assert steps.index(registration) < steps.index(rotation)
     assert rotation["run"] == f"uv run pytest -q -n 0 {STATIC_TOKEN_ROTATION_MODULE}"
-    assert not rotation.get("if")
     assert not rotation.get("continue-on-error")
-    assert not registration.get("if")
     assert not registration.get("continue-on-error")
+    pytest_steps = [step for step in steps if step.get("run", "").startswith("uv run pytest")]
+    assert len(pytest_steps) == 3
+    first_pytest = min(steps.index(step) for step in pytest_steps)
     assert any(
-        step.get("uses", "").startswith("astral-sh/setup-uv@")
-        for step in steps[: steps.index(registration)]
+        step.get("uses", "").startswith("astral-sh/setup-uv@") for step in steps[:first_pytest]
     )
     binaries = tmp_path / "bin"
     binaries.mkdir()
@@ -3493,9 +3586,8 @@ def test_fresh_cluster_up_runtime_is_serial_and_propagates_failure(
     runtime_steps = [step for step in steps if CLUSTER_UP_MODULE in step.get("run", "")]
     assert len(runtime_steps) == 1
     runtime = runtime_steps[0]
-    registration = next(step for step in steps if INITIAL_BINDING_MODULE in step.get("run", ""))
-    assert steps.index(registration) < steps.index(runtime)
-    assert not runtime.get("if")
+    _assert_scripted_factory_legs_map_one_to_one(job)
+    assert runtime["if"] == "matrix.suite == 'fresh-install'"
     assert not runtime.get("continue-on-error")
 
     binaries = tmp_path / "bin"
