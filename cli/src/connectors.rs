@@ -1516,6 +1516,99 @@ mod tests {
             assert!(!err.contains("token-a"));
         });
     }
+
+    fn sandbox_templates(per_agent: Option<Value>) -> Value {
+        let mut items = vec![json!({
+            "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+            "kind": "SandboxTemplate",
+            "metadata": {
+                "name": "curie-runner",
+                "labels": {
+                    "app.kubernetes.io/instance": "curie",
+                    "app.kubernetes.io/managed-by": "Helm"
+                },
+                "annotations": { "meta.helm.sh/release-name": "curie" }
+            },
+            "spec": { "podTemplate": { "spec": { "containers": [{ "name": "runner" }] } } }
+        })];
+        items.extend(per_agent);
+        json!({ "items": items })
+    }
+
+    #[test]
+    fn helm_owned_agent_template_is_not_recloned() {
+        let listed = sandbox_templates(Some(json!({
+            "kind": "SandboxTemplate",
+            "metadata": {
+                "name": "curie-agent-acme-bot-runner",
+                "labels": { "app.kubernetes.io/managed-by": "Helm" },
+                "annotations": { "meta.helm.sh/release-name": "curie" }
+            },
+            "spec": { "podTemplate": { "spec": { "containers": [{
+                "name": "runner",
+                "env": [{ "name": "MANAGER_MCP_TOKEN" }]
+            }] } } }
+        })));
+        match plan_owning_agent_pool(&listed, "curie", "acme-bot").unwrap() {
+            OwningAgentPoolPlan::HelmOwned {
+                template_name,
+                release,
+            } => {
+                assert_eq!(template_name, "curie-agent-acme-bot-runner");
+                assert_eq!(release, "curie");
+            }
+            other => panic!("a Helm-owned template must be left alone, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_agent_template_is_cloned_from_the_generic_one() {
+        let listed = sandbox_templates(None);
+        match plan_owning_agent_pool(&listed, "curie", "acme-bot").unwrap() {
+            OwningAgentPoolPlan::Clone {
+                prefix,
+                template_name,
+                pool_name,
+                template,
+            } => {
+                assert_eq!(prefix, "curie");
+                assert_eq!(template_name, "curie-agent-acme-bot-runner");
+                assert_eq!(pool_name, "curie-agent-acme-bot-runner-pool");
+                assert_eq!(
+                    object_name_of(&template),
+                    Some("curie-agent-acme-bot-runner")
+                );
+                assert_eq!(
+                    template.pointer("/metadata/labels/app.kubernetes.io~1managed-by"),
+                    Some(&json!("curie-cli"))
+                );
+                assert!(template.pointer("/metadata/annotations").is_none());
+                assert_eq!(
+                    template.pointer("/spec/podTemplate/metadata/labels/curietech.ai~1agent"),
+                    Some(&json!("acme-bot"))
+                );
+            }
+            other => panic!("a missing template must be cloned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_cloned_agent_template_is_refreshed() {
+        // Older clones copied `managed-by: Helm` from the generic template but
+        // never carry Helm's release annotation.
+        let listed = sandbox_templates(Some(json!({
+            "kind": "SandboxTemplate",
+            "metadata": {
+                "name": "curie-agent-acme-bot-runner",
+                "labels": { "app.kubernetes.io/managed-by": "Helm" }
+            },
+            "spec": {}
+        })));
+        assert!(matches!(
+            plan_owning_agent_pool(&listed, "curie", "acme-bot").unwrap(),
+            OwningAgentPoolPlan::Clone { .. }
+        ));
+    }
 }
 
 // --------------------------------------------------------------------------- #
@@ -1932,13 +2025,105 @@ async fn read_kubectl_json(target: &ClusterTarget, argv: &[String]) -> Result<Va
     serde_json::from_str(&out).context("parsing kubectl json")
 }
 
+/// The Helm release that owns `object`, from Helm's own release annotation.
+///
+/// The `app.kubernetes.io/managed-by: Helm` label is not enough on its own:
+/// older CLI clones copied it from the generic template they were cloned from.
+/// Helm writes the release annotation on everything it installs, and a clone
+/// never carries annotations, so the annotation is what tells the two apart.
+fn helm_release_owner(object: &Value) -> Option<&str> {
+    object
+        .pointer("/metadata/annotations/meta.helm.sh~1release-name")
+        .and_then(Value::as_str)
+        .filter(|release| !release.is_empty())
+}
+
+/// What `ensure_owning_agent_pool` should do for one agent.
+#[derive(Debug)]
+enum OwningAgentPoolPlan {
+    /// The chart already renders this agent's template (for example from
+    /// `agentSandbox.connectorSecrets.<agent>`). Re-applying a generic clone
+    /// over it would drop the env the chart added, so it is left alone.
+    HelmOwned {
+        template_name: String,
+        release: String,
+    },
+    /// No per-agent template exists, or the one that exists is a CLI clone.
+    Clone {
+        prefix: String,
+        template_name: String,
+        pool_name: String,
+        template: Value,
+    },
+}
+
+fn plan_owning_agent_pool(
+    listed: &Value,
+    release: &str,
+    agent: &str,
+) -> Result<OwningAgentPoolPlan> {
+    let Some(generic) = generic_runner_template(listed, release) else {
+        anyhow::bail!("no generic SandboxTemplate ending in -runner was found");
+    };
+    let Some(generic_name) = object_name_of(&generic).map(str::to_string) else {
+        anyhow::bail!("the generic SandboxTemplate has no name");
+    };
+    let Some(prefix) = generic_name.strip_suffix("-runner") else {
+        anyhow::bail!("SandboxTemplate {generic_name} has no -runner suffix");
+    };
+    let template_name = format!("{prefix}-agent-{agent}-runner");
+    let existing = listed
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|item| object_name_of(item) == Some(template_name.as_str()));
+    if let Some(owner) = existing.and_then(helm_release_owner) {
+        return Ok(OwningAgentPoolPlan::HelmOwned {
+            template_name,
+            release: owner.to_string(),
+        });
+    }
+    let pool_name = format!("{prefix}-agent-{agent}-runner-pool");
+    let mut template = scrubbed_object(&generic, &template_name);
+    if let Some(kind) = template.get_mut("kind") {
+        *kind = Value::String("SandboxTemplate".into());
+    }
+    mark_cli_managed(&mut template);
+    set_pod_agent_label(&mut template, agent);
+    Ok(OwningAgentPoolPlan::Clone {
+        prefix: prefix.to_string(),
+        template_name,
+        pool_name,
+        template,
+    })
+}
+
+/// Replace the `managed-by: Helm` label a clone inherits from the generic
+/// object, so the clone does not claim an owner it does not have.
+fn mark_cli_managed(object: &mut Value) {
+    let Some(metadata) = object.get_mut("metadata").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let labels = metadata
+        .entry("labels")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(labels) = labels.as_object_mut() {
+        labels.insert(
+            "app.kubernetes.io/managed-by".into(),
+            Value::String("curie-cli".into()),
+        );
+    }
+}
+
 /// Clone the generic SandboxTemplate and SandboxWarmPool for one agent.
 ///
 /// Names follow `agent_warm_pool_name`: `{prefix}-agent-{agent}-runner` and
 /// `{prefix}-agent-{agent}-runner-pool`. The template pod label
-/// `curietech.ai/agent` is what connector ingress selects. A missing generic
-/// template is an error the caller logs; connector objects already applied
-/// stay applied.
+/// `curietech.ai/agent` is what connector ingress selects. A per-agent
+/// template the Helm release already renders is left alone, along with its
+/// pool. A missing generic template is an error the caller logs; connector
+/// objects already applied stay applied.
 async fn ensure_owning_agent_pool(
     target: &ClusterTarget,
     namespace: &str,
@@ -1951,22 +2136,32 @@ async fn ensure_owning_agent_pool(
     )
     .await
     .context("reading SandboxTemplates")?;
-    let Some(generic) = generic_runner_template(&listed, release) else {
-        anyhow::bail!("no generic SandboxTemplate ending in -runner was found");
+    let (prefix, template_name, pool_name, template) = match plan_owning_agent_pool(
+        &listed, release, agent,
+    )? {
+        OwningAgentPoolPlan::HelmOwned {
+            template_name,
+            release: owner,
+        } => {
+            let ui = crate::ui::ui();
+            if owner == release {
+                ui.note(&format!(
+                    "connectors: sandbox pool for {agent} is owned by the Helm release; leaving it"
+                ));
+            } else {
+                ui.warn(&format!(
+                        "connectors: sandbox template {template_name} for {agent} is owned by Helm release {owner}, not {release}; leaving it"
+                    ));
+            }
+            return Ok(());
+        }
+        OwningAgentPoolPlan::Clone {
+            prefix,
+            template_name,
+            pool_name,
+            template,
+        } => (prefix, template_name, pool_name, template),
     };
-    let Some(generic_name) = object_name_of(&generic).map(str::to_string) else {
-        anyhow::bail!("the generic SandboxTemplate has no name");
-    };
-    let Some(prefix) = generic_name.strip_suffix("-runner") else {
-        anyhow::bail!("SandboxTemplate {generic_name} has no -runner suffix");
-    };
-    let template_name = format!("{prefix}-agent-{agent}-runner");
-    let pool_name = format!("{prefix}-agent-{agent}-runner-pool");
-    let mut template = scrubbed_object(&generic, &template_name);
-    if let Some(kind) = template.get_mut("kind") {
-        *kind = Value::String("SandboxTemplate".into());
-    }
-    set_pod_agent_label(&mut template, agent);
 
     let generic_pool = format!("{prefix}-runner-pool");
     let pool = match read_kubectl_json(
@@ -1980,6 +2175,7 @@ async fn ensure_owning_agent_pool(
             if let Some(kind) = pool.get_mut("kind") {
                 *kind = Value::String("SandboxWarmPool".into());
             }
+            mark_cli_managed(&mut pool);
             if let Some(name) = pool.pointer_mut("/spec/sandboxTemplateRef/name") {
                 *name = Value::String(template_name.clone());
             } else if let Some(spec) = pool.get_mut("spec").and_then(Value::as_object_mut) {
@@ -1997,7 +2193,10 @@ async fn ensure_owning_agent_pool(
             serde_json::json!({
                 "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
                 "kind": "SandboxWarmPool",
-                "metadata": { "name": pool_name },
+                "metadata": {
+                    "name": pool_name,
+                    "labels": { "app.kubernetes.io/managed-by": "curie-cli" }
+                },
                 "spec": {
                     "replicas": 0,
                     "sandboxTemplateRef": { "name": template_name }
@@ -2068,9 +2267,9 @@ pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
     }
 
     // Hosted connectors are only reachable from pods labeled for this agent.
-    // Clone the chart's generic sandbox onto that label when the pool is not
-    // already part of the Helm release. A failure here is logged: the connector
-    // objects above are already applied.
+    // Clone the chart's generic sandbox onto that label unless the Helm release
+    // already renders this agent's template; `ensure_owning_agent_pool` checks.
+    // A failure here is logged: the connector objects above are already applied.
     if !workloads.is_empty() {
         if let Err(error) =
             ensure_owning_agent_pool(&bound_target, &namespace, &target.release, &agent_name).await
