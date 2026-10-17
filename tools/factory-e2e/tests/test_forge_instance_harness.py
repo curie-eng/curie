@@ -205,16 +205,23 @@ def assert_polled_api_pods(harness: Harness) -> None:
     assert polls, "rollout must query the API pods by the release and component selector"
 
 
+REPLACING = pods(
+    pod("acme-factory-curie-api-old", ready=False, terminating=True),
+    pod("acme-factory-curie-api-new", ready=True),
+)
+
+
 def test_rollout_ignores_terminating_replaced_api_pod(harness: Harness) -> None:
+    # The old pod's Ready=False does not fail rollout (kubectl wait latched onto
+    # it); rollout keeps polling until it is gone and only the new pod is listed.
     harness.script(
         ROLLOUT_STATUS_OK,
         WAIT_AS_OBSERVED,
         rule(
             ["get", "pods"],
-            pods(
-                pod("acme-factory-curie-api-old", ready=False, terminating=True),
-                pod("acme-factory-curie-api-new", ready=True),
-            ),
+            REPLACING,
+            REPLACING,
+            pods(pod("acme-factory-curie-api-new", ready=True)),
         ),
     )
 
@@ -222,9 +229,26 @@ def test_rollout_ignores_terminating_replaced_api_pod(harness: Harness) -> None:
 
     assert_no_wait(harness)
     assert_polled_api_pods(harness)
+    polls = [call for call in harness.calls() if "get" in call and "pods" in call]
+    assert len(polls) >= 2
     statuses = [call for call in harness.calls() if "rollout" in call and "status" in call]
     for component in ("api", "worker"):
         assert any(f"deployment/{FULLNAME}-{component}" in call for call in statuses)
+
+
+def test_rollout_keeps_waiting_while_replaced_pod_terminates(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A terminating API pod blocks the next helm upgrade's drain hook, so the
+    # API is not settled until the selector lists the new pod alone.
+    monkeypatch.setattr(helpers, "ROLLOUT_READY_SECONDS", 1, raising=False)
+    harness.script(ROLLOUT_STATUS_OK, WAIT_AS_OBSERVED, rule(["get", "pods"], REPLACING))
+
+    with pytest.raises(InfrastructureError):
+        harness.cluster.rollout()
+
+    assert_no_wait(harness)
+    assert_polled_api_pods(harness)
 
 
 def test_rollout_waits_until_new_api_pod_becomes_ready(harness: Harness) -> None:
