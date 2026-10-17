@@ -121,20 +121,13 @@ RETRY_ALLOWLIST = frozenset(
             "forge-instance-regression",
             "Install kind and kubectl without creating a cluster",
         ),
-        # Issue #4619: the admitted agent shards and the initial binding job
-        # acquire the same tools; each module creates its own clusters.
+        # Issue #4619: the admitted agent shards acquire the same tools; each
+        # case creates its own cluster.
         ("ci.yaml", "factory-admitted-agent", "Install uv"),
         ("ci.yaml", "factory-admitted-agent", "Install Helm"),
         (
             "ci.yaml",
             "factory-admitted-agent",
-            "Install kind and kubectl without creating a cluster",
-        ),
-        ("ci.yaml", "factory-initial-binding", "Install uv"),
-        ("ci.yaml", "factory-initial-binding", "Install Helm"),
-        (
-            "ci.yaml",
-            "factory-initial-binding",
             "Install kind and kubectl without creating a cluster",
         ),
         # The CLI convergence regressions acquire Helm, kind and kubectl; each
@@ -147,6 +140,11 @@ RETRY_ALLOWLIST = frozenset(
         ),
         ("ci.yaml", "e2e-required", "Install uv for the runtime assertion gate"),
         ("helm-ci.yaml", "chart-lint-and-assertions-1", "Install Helm"),
+        (
+            "helm-ci.yaml",
+            "chart-lint-and-assertions-1",
+            "Install kind and kubectl without creating a cluster",
+        ),
         ("helm-ci.yaml", "chart-assertions-2", "Install Helm"),
         ("helm-ci.yaml", "chart-assertions-2", "Install uv"),
         ("helm-ci.yaml", "chart-assertions-retained-values", "Install Helm"),
