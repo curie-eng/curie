@@ -3082,6 +3082,77 @@ def test_valid_successor_continues_beside_stale_held_predecessor(
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("response", ["delivered", "lost", "stale_owner"])
+def test_refused_held_resume_releases_its_claim_only_when_the_finish_committed(
+    make_harness, response: str,
+) -> None:
+    """A refused held continuation finishes its epoch and frees its sandbox.
+
+    The client retries a settlement whose response was lost; the retry of a
+    committed finish is refused ``not_running``. That refusal still means the
+    request ended, so the recorded claim is released exactly as when the
+    response arrives. A different conflict leaves the claim to its owner.
+    """
+
+    class RefusedHold(_WorkItems):
+        def __init__(self) -> None:
+            super().__init__()
+            self.refused: uuid.UUID | None = None
+
+        async def running_for_conversation(
+            self, conversation_id: str, *, wake: FactoryWake,
+        ) -> WorkItemRunning | None:
+            running = await super().running_for_conversation(conversation_id, wake=wake)
+            if running is not None and running.request_id == self.refused:
+                return replace(running, context=None, refusal="factory_binding_missing")
+            return running
+
+        async def finish(self, request_id: uuid.UUID, **kwargs: object) -> None:
+            if response == "stale_owner":
+                self.calls.append("finish")
+                raise WorkItemConflict("stale_owner")
+            await super().finish(request_id, **kwargs)
+            if response == "lost":
+                raise WorkItemConflict("not_running")
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace, approvals=_Approvals(),
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            items = RefusedHold()
+            h.kernel._work_items = items
+            request_id = uuid.uuid4()
+            held = await _park_factory_request(h, request_id)
+            items.refused = request_id
+            try:
+                with pytest.raises(failures._FactoryExecutionEnded):
+                    await h.kernel._adopt_resumed_work_item(
+                        f"approval-{uuid.uuid4()}-resolved", held.thread_key,
+                        wake=FactoryWake(
+                            kind="slack", address=CHANNEL, adapter=None,
+                            conversation_id="1700000000.000001",
+                        ),
+                    )
+                assert items.calls.count("finish") == 1
+                assert held.thread_key not in h.kernel._held_work_items
+                assert not h.kernel.owns_work_item(request_id)
+                assert h.runner.opened == [ISSUE_URL]
+                if response == "stale_owner":
+                    assert request_id not in items.terminal_outcomes
+                    assert held.claim_name not in h.fake_k8s.deleted_claims
+                    assert held.claim_name in h.fake_k8s.claims
+                else:
+                    assert items.terminal_outcomes == {request_id: "failed"}
+                    assert items.finishes[0]["cause"] == "runner_escalated"
+                    assert held.claim_name in h.fake_k8s.deleted_claims
+                    assert h.substrate._affinity.get(held.thread_key) is None
+            finally:
+                await asyncio.to_thread(h.substrate.release, held.thread_key)
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("successor_route", [False, True])
 def test_matching_held_resume_early_exit_releases_only_its_recorded_claim(
     make_harness, monkeypatch: pytest.MonkeyPatch, successor_route: bool,
