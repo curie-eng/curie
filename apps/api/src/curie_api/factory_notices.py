@@ -32,6 +32,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -45,7 +46,7 @@ from .config import Settings
 from .factory_comment_text import marker_for, redact_factory_comment, status_marker
 from .factory_progress import PhaseView, phase_view, pill_for
 from .factory_reply_target import stored_reply_target
-from .factory_usage import usage_line, work_item_usage
+from .factory_usage import format_usd, usage_line, work_item_usage
 from .forges.capabilities import Operation, Support
 from .forges.errors import ForgeError, Unauthorized
 from .forges.github.comments import static_token
@@ -359,12 +360,14 @@ def result_section(
     superseded: bool = False,
     lost_streak: int = 0,
     lost_retried: bool = False,
+    run_cost_usd: Decimal | None = None,
 ) -> str:
     """The terminal result lines of a status comment, without any marker.
 
     For ``owner_lost``, ``lost_streak`` is the consecutive losses through
     this request and ``lost_retried`` whether its settlement admitted a
     successor (ADR 0206); together they choose the retry or exhausted sentence.
+    ``run_cost_usd`` is this request's recorded estimate, not the WorkItem total.
     """
 
     if cause == "completed":
@@ -451,12 +454,22 @@ def result_section(
                 and math.isfinite(usd := float(usd_budget[1]))
                 and usd > 0
             ):
-                sentence = (
-                    "the run reached its USD cap "
-                    f"(max_usd_per_day={usd_budget[1]}) before it finished. "
-                    "To raise the USD cap, run "
-                    "`curie cluster budget <agent> --limit <usd>`, then retry."
-                )
+                if run_cost_usd is not None and run_cost_usd < Decimal(usd_budget[1]):
+                    sentence = (
+                        "the run stopped on the agent SDK's own USD estimate, which reached "
+                        f"the cap (max_usd_per_day={usd_budget[1]}), while Curie's recorded "
+                        f"estimate for this run is {format_usd(run_cost_usd)}. "
+                        "The SDK prices this model above its provider price, so raising the "
+                        "cap only delays the stop. To raise it anyway, run "
+                        "`curie cluster budget <agent> --limit <usd>`, then retry."
+                    )
+                else:
+                    sentence = (
+                        "the run reached its USD cap "
+                        f"(max_usd_per_day={usd_budget[1]}) before it finished. "
+                        "To raise the USD cap, run "
+                        "`curie cluster budget <agent> --limit <usd>`, then retry."
+                    )
             else:
                 sentence = (
                     "the run reached a budget limit before it finished, but Curie "
@@ -548,10 +561,10 @@ def status_body(
 ) -> str:
     """The whole status comment. A ``result`` makes it the final body.
 
-    Model-written notes are never rendered here, only on the card, so model
-    text cannot become a Markdown link or a mention on GitHub. The card already
-    draws the phases, so with a card the checklist and the waiting placeholder
-    are left out; without one the checklist is the fallback (#3125).
+    Live progress notes stay on the card; a final budget result includes its
+    last nonempty note as one inert line. The card already draws the phases,
+    so with a card the checklist and the waiting placeholder are left out;
+    without one the checklist is the fallback (#3125).
     """
 
     parts: list[str] = []
@@ -1087,6 +1100,15 @@ async def _render(
                 )
                 is None
             )
+            usage = await work_item_usage(session, work_item.id)
+            run_cost_usd = next(
+                (
+                    entry.estimated_cost_usd
+                    for entry in usage.requests
+                    if entry.request_id == request.id
+                ),
+                None,
+            )
             result = result_section(
                 cause,
                 pr_url=pr_url,
@@ -1097,12 +1119,13 @@ async def _render(
                 and await _superseded(session, work_item, request),
                 lost_streak=streak,
                 lost_retried=retrying,
+                run_cost_usd=run_cost_usd,
             )
             # Tokens and estimated cost over every round of the work item
             # (#3223), after the Cause line so its parse is unchanged.
-            usage = usage_line(await work_item_usage(session, work_item.id))
-            if usage is not None:
-                result = result.rstrip("\n") + "\n" + usage + "\n"
+            line = usage_line(usage)
+            if line is not None:
+                result = result.rstrip("\n") + "\n" + line + "\n"
     publishing = (
         await session.scalar(
             select(Publication.id)
@@ -1114,7 +1137,7 @@ async def _render(
         )
     ) is not None
     view: PhaseView | None = None
-    if row.declaration is not None:
+    if row.declaration is not None or (result is not None and cause == "budget_exceeded"):
         reports = list(
             await session.scalars(
                 select(ExecutionRequestPhaseReport)
@@ -1122,7 +1145,20 @@ async def _render(
                 .order_by(ExecutionRequestPhaseReport.id)
             )
         )
-        view = phase_view(row.declaration, reports, request.status, cause)
+        if row.declaration is not None:
+            view = phase_view(row.declaration, reports, request.status, cause)
+        if result is not None and cause == "budget_exceeded":
+            latest_note = next(
+                (report for report in reversed(reports) if report.note and report.note.strip()),
+                None,
+            )
+            if latest_note is not None:
+                labels = (
+                    {phase.id: phase.label for phase in view.phases} if view is not None else {}
+                )
+                label = labels.get(latest_note.phase, latest_note.phase)
+                progress = _inert_line(f"Last progress note: {label}: {latest_note.note}")[:300]
+                result += progress + "\n"
     pill_label, _color, _live = pill_for(request.status, publishing, retrying=retrying)
     pending_count = await session.scalar(
         select(func.count(ExecutionRequest.id)).where(
