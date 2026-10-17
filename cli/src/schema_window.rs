@@ -565,7 +565,7 @@ print(json.dumps(graph))
         // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
         assert_eq!(candidate.schema_min, "0108");
-        assert_eq!(candidate.schema_head, "0108");
+        assert_eq!(candidate.schema_head, "0104");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -582,6 +582,7 @@ print(json.dumps(graph))
             assert!(!live_in_window(below, &current), "{below}");
         }
         assert!(live_in_window("0108", &current));
+        assert!(live_in_window("0104", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");
@@ -606,10 +607,16 @@ print(json.dumps(graph))
         for revision in ["0082", "0091a", "0098", "0099"] {
             assert!(!live_in_window(revision, &published_stable));
         }
-        let candidate_release = window_for("0.13.0").expect("feature candidate is catalogued");
+        let published_feature = window_for("0.13.0").expect("published feature is catalogued");
+        assert_eq!(published_feature.schema_min, "0108");
+        assert_eq!(published_feature.schema_head, "0108");
+        assert!(live_in_window("0108", &published_feature));
+        assert!(!live_in_window("0104", &published_feature));
+        let candidate_release = window_for("0.14.0").expect("feature candidate is catalogued");
         assert_eq!(candidate_release.schema_min, candidate.schema_min);
         assert_eq!(candidate_release.schema_head, candidate.schema_head);
         assert!(live_in_window("0108", &candidate_release));
+        assert!(live_in_window("0104", &candidate_release));
         assert!(!live_in_window("0100", &candidate_release));
         assert!(!live_in_window("0075", &candidate_release));
         let published =
