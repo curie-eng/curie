@@ -2893,12 +2893,19 @@ jobs:
   # The factory driver owns its kind cluster, registry, and local endpoints.
   # Replay drives the production factory from one labelled fixture issue to
   # its pull request and final comment without a provider key.
+  # Each factory suite runs in its own matrix leg, so no leg carries the sum
+  # of the others. needs.e2e-scripted-factory.result is success only when
+  # every leg succeeds.
   e2e-scripted-factory:
-    name: E2E scripted factory scenario (kind, scripted model)
+    name: E2E scripted factory (kind, scripted model, ${{ matrix.suite }})
     runs-on: ubuntu-latest
     needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.factory == 'true' }}
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [scenario, initial-binding, static-token-rotation, fresh-install]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -2990,18 +2997,22 @@ jobs:
           docker tag curie-ci/ui:candidate curie-ui:local
           docker tag curie-ci/runner:candidate curie-runner:latest
       - name: Run the scripted factory scenario
+        if: matrix.suite == 'scenario'
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
           BUILDX_BUILDER: default
         run: python3 tools/factory-e2e/factory_e2e.py scripted
       - name: Run the initial tracker binding regressions
+        if: matrix.suite == 'initial-binding'
         run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_initial_binding.py
       - name: Run the static token rotation regression
+        if: matrix.suite == 'static-token-rotation'
         run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_static_token_rotation.py
       - name: Run the fresh cluster install regression
+        if: matrix.suite == 'fresh-install'
         run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_cluster_up.py::test_fresh_cluster_up_converges_without_rerun
       - name: Upload scripted factory evidence
-        if: always()
+        if: always() && matrix.suite == 'scenario'
         uses: actions/upload-artifact@v7
         with:
           name: scripted-factory-evidence-${{ github.sha }}
