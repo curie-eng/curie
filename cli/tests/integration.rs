@@ -3,6 +3,7 @@
 //! an undeclared file never compiles, which the guard test below catches.
 
 mod support;
+mod dev_test_env;
 
 mod actions_cli;
 mod agent_update_body;
