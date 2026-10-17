@@ -152,9 +152,10 @@ Sandbox capacity (resourceQuota vs. node allocatable):
 Enable a real model and a Slack workspace:
   The dispatcher is not deployed (no Slack tokens set). If you also installed
   without CURIE_CREDENTIALS, the runner is in offline fake-model mode and
-  replies are canned. The `curie cluster up`/`cluster comms`/`cluster message`/`cluster status` verbs default to
-  release/namespace {{ .Release.Name }}/{{ .Release.Namespace }} (add --dry-run to
-  print the exact helm/kubectl command first); the Slack workspace is wired with
+  replies are canned. Every `curie cluster` verb defaults to release and namespace
+  `curie`, so this release needs `--namespace {{ .Release.Namespace }} --release {{ .Release.Name }}`
+  on each call (add --dry-run to print the exact helm/kubectl command first);
+  the Slack workspace is wired with
   `curie cluster comms --slack`.
 
   # 1. Enable the real model: set CURIE_CREDENTIALS (an Anthropic API key)
@@ -177,18 +178,6 @@ Enable a real model and a Slack workspace:
   # Release health + access URLs at any point (read-only):
   curie cluster status --namespace {{ .Release.Namespace }} --release {{ .Release.Name }}
 
-  Or do both (model + Slack) in one helm upgrade -- the runner NetworkPolicy is
-  fail-closed, so real model calls need the egress allowlist too; add more
-  allowedEgress entries for any MCP endpoints the runner needs:
-
-  helm upgrade {{ .Release.Name }} charts/curie -n {{ .Release.Namespace }} --reuse-values \
-    --set dispatcher.slack.appToken=xapp-... --set dispatcher.slack.botToken=xoxb-... \
-    --set worker.slackApiBaseUrl= \
-    --set agentSandbox.runner.fakeModel=false \
-    --set agentSandbox.runner.credentials=sk-ant-... \
-    --set 'security.networkPolicy.allowedEgress[0].cidr=160.79.104.0/23' \
-    --set 'security.networkPolicy.allowedEgress[0].ports[0].protocol=TCP' \
-    --set 'security.networkPolicy.allowedEgress[0].ports[0].port=443'
 {{- end }}
 
 {{- if .Values.langfuse.deploy }}

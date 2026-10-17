@@ -397,7 +397,7 @@ async def work_item_usage(session: AsyncSession, work_item_id: uuid.UUID) -> Wor
     )
 
 
-def _money(value: Decimal) -> str:
+def format_usd(value: Decimal) -> str:
     return f"${value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,}"
 
 
@@ -405,7 +405,7 @@ def _role_text(label: str, role: WorkItemUsageRole) -> str:
     if role.estimated_cost_usd is None or not role.cost_complete:
         cost = "cost unknown"
     else:
-        cost = _money(role.estimated_cost_usd)
+        cost = format_usd(role.estimated_cost_usd)
     return f"{label} {role.tokens:,} tokens ({cost})"
 
 
@@ -425,9 +425,9 @@ def usage_line(usage: WorkItemUsageOut) -> str | None:
     if usage.estimated_cost_usd is None:
         parts.append("total cost unknown")
     elif usage.cost_complete:
-        parts.append(f"total {_money(usage.estimated_cost_usd)}")
+        parts.append(f"total {format_usd(usage.estimated_cost_usd)}")
     else:
-        parts.append(f"total at least {_money(usage.estimated_cost_usd)}")
+        parts.append(f"total at least {format_usd(usage.estimated_cost_usd)}")
     line = "Usage: " + ", ".join(parts)
     if usage.price_sources:
         names = ", ".join(entry.source for entry in usage.price_sources)

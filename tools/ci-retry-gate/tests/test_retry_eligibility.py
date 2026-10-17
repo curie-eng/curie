@@ -131,6 +131,11 @@ RETRY_ALLOWLIST = frozenset(
         ),
         ("ci.yaml", "e2e-required", "Install uv for the runtime assertion gate"),
         ("helm-ci.yaml", "chart-lint-and-assertions-1", "Install Helm"),
+        (
+            "helm-ci.yaml",
+            "chart-lint-and-assertions-1",
+            "Install kind and kubectl without creating a cluster",
+        ),
         ("helm-ci.yaml", "chart-assertions-2", "Install Helm"),
         ("helm-ci.yaml", "chart-assertions-2", "Install uv"),
         ("helm-ci.yaml", "chart-assertions-retained-values", "Install Helm"),
