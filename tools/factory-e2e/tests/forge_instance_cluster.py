@@ -1042,8 +1042,8 @@ class Cluster:
         )
         self.rollout()
 
-    def serving_api_pods(self, **kwargs: Any) -> list[dict[str, Any]]:
-        items = json.loads(
+    def api_pods(self, **kwargs: Any) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = json.loads(
             self.kubectl(
                 "get",
                 "pods",
@@ -1054,6 +1054,10 @@ class Cluster:
                 **kwargs,
             ).stdout
         )["items"]
+        return items
+
+    @staticmethod
+    def serving(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [
             p
             for p in items
@@ -1065,7 +1069,7 @@ class Cluster:
         ]
 
     def api_pod(self) -> str:
-        ready = self.serving_api_pods()
+        ready = self.serving(self.api_pods())
         if len(ready) != 1:
             return self.candidate.fail("expected one serving candidate API pod")
         return str(ready[0]["metadata"]["name"])
@@ -1079,18 +1083,20 @@ class Cluster:
                 "--timeout=240s",
                 timeout=260,
             )
-        # The replaced pod stays listed while it terminates (the chart's preStop
-        # hook), and a label-selector `kubectl wait` latches onto it, so poll instead.
+        # The replaced pod stays listed while its preStop hook runs; it must be gone,
+        # not just unready, before the release counts as settled (`kubectl wait` latches onto it).
         deadline = time.monotonic() + ROLLOUT_READY_SECONDS
         while True:
             remaining = deadline - time.monotonic()
-            serving = len(self.serving_api_pods(timeout=max(1, remaining)))
+            items = self.api_pods(timeout=max(1, remaining))
+            listed, serving = len(items), len(self.serving(items))
             # A slow query that returns after the bound does not count.
             if time.monotonic() >= deadline:
                 self.candidate.fail(
-                    f"API pods did not settle to one serving pod after rollout (serving={serving})"
+                    "API pods did not settle to one serving pod after rollout "
+                    f"(pods={listed} serving={serving})"
                 )
-            if serving == 1:
+            if listed == 1 and serving == 1:
                 return
             time.sleep(ROLLOUT_POLL_SECONDS)
 
