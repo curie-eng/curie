@@ -376,9 +376,11 @@ image the bundle version was built and deployed with. `deploy.yaml` degrades
 harmlessly by comparison, since routing is Curie's concern and Claude Code has nothing to route.
 
 The outbound gate covers this unevenly, and the gap is worth naming.
-`examples/tests/test_plugin_compat_coverage.py` pins that each of the six manifest extensions
+`examples/tests/test_plugin_compat_coverage.py` pins that each of the original six manifest extensions
 appears in at least one discovered example bundle, so the gate cannot cover them vacuously, but it
-checks manifest FIELDS only. `connectors.yaml` is exercised incidentally because the weather bundle
+checks manifest FIELDS only. `optionalSecrets` and the four Slack grants
+(`channelRead`, `canvasList`, `canvasRead`, `canvasEdit`) are outside that coverage pin.
+`connectors.yaml` is exercised incidentally because the weather bundle
 happens to carry one. `examples/sre-bot` carries a `deploy.yaml`, so the outbound gate validates a
 bundle directory containing that file and proves Claude Code tolerates it. The separate
 `examples/tests/test_sre_bot_hygiene.py` suite also requires that file and validates its Curie

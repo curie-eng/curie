@@ -118,9 +118,12 @@ package) with `BundleStore` as its S3/RustFS backing.
 Langfuse web and worker are separate S3 consumers. The chart helper
 `curie.langfuse.env` (`charts/curie/templates/_helpers.tpl`) supplies
 `LANGFUSE_S3_EVENT_UPLOAD_*` and `LANGFUSE_S3_MEDIA_UPLOAD_*` settings, using the
-same endpoint, region and credential-selection helper as the platform, with
-`events/` and `media/` prefixes. `compose.dev.yaml` supplies the corresponding
-dev settings. These clients do not use `ObjectStore` or the Python boto3 builder.
+same endpoint, region and credential-selection helper as the platform. Both
+upload buckets are `rustfs.bucket`, with `events/` and `media/` prefixes. That
+same bucket is the event lifecycle rule's target and supplies the storage
+guard's `/data/<bucket>/events` path; neither cleanup targets `media/`.
+`compose.dev.yaml` supplies the corresponding dev settings. These clients do
+not use `ObjectStore` or the Python boto3 builder.
 
 ## Known leakage
 

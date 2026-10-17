@@ -418,7 +418,7 @@ names as unrecognized on purpose, so arming one still trips the existing
 **One authorizer** (`apps/api/src/curie_api/authorizer.py`, pure policy with no Slack in
 it) over **five approver sets** behind the `ApproverSet` port (ADR-0034), after an
 independent authentication boundary resolves one of ADR-0106's `chat`, `console`, or
-`operator` principals, ADR-0154's `adapter` principal, or ADR-0202's `test_driver`
+`operator` principals, ADR-0156's `adapter` principal, or ADR-0202's `test_driver`
 principal. A set answers only "is this actor in the set"; every rule that is
 not membership lives in the authorizer, applied identically whatever the set. Requester
 equality is deliberately not a rule: the selected set is always consulted, so a requester
@@ -716,7 +716,7 @@ bindings (where the verified card resolves, where a text-only notification goes,
 approve) are per-agent deployment config (#247, #1460).
 
 The audit trail now records both halves rather than overstating either one. Authentication
-establishes the actor and writes `principal_kind` (`chat`, `console`, `operator`, or
+establishes the actor and writes `principal_kind` (`chat`, `console`, `operator`,
 `adapter`, or `test_driver`) with `authenticated=true`; authorization writes the selected set's evidence
 and verdict. For an `adapter` principal, `principal_subject` names the adapter itself, not
 the sender it vouches for: the sender is carried as `actor` from the
@@ -740,12 +740,10 @@ one authenticated member confirmed their own request, not that a second person r
 
 ## Cross-links
 
-[ADR-0202](../../adr/0202-a-test-installation-admits-a-listed-bots-actions-and-approval-replies.md)
-adds the test-installation driver principal and its explicit-user-only admission.
-
-- **Epic(s):** [#22](https://github.com/curie-eng/curie/issues/22) — approval gates and human-in-the-loop; adds the durable record, `awaiting-approval` status, `canUseTool` gate, and the authorizer interface.
-- **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — not one of the six graded jobs; a cross-cutting core lifecycle change, not separately graded.
-- **ADR(s):** [ADR-0010](../../adr/0010-approval-gates-and-human-in-the-loop.md) — Approval gates and human-in-the-loop (Accepted); grounds this intended line, including the authorizer sequence (channel membership first, then user-group, explicit user-list, platform-RBAC). [ADR-0034](../../adr/0034-approval-authorizers-resolve-membership-in-the-api.md) — Approval authorizers resolve membership in the API (Accepted); adds the user-group and user-list sets, the API-resident membership lookup, the scoped fail-closed rule, and fresh-read binding resolution. Supersedes ADR-0010's framing of those four as `Authorizer` implementations: they are approver SETS behind one authorizer, and platform-RBAC becomes the fourth set. [ADR-0106](../../adr/0106-an-approver-is-an-authenticated-principal.md) — An approver is an authenticated principal (Accepted); removes caller-asserted resolver identity/channel, makes membership the boundary even for the requester, limits operators to explicit users, and lets Console subjects pass through the same membership sets their authenticated identity can satisfy. Composes with [ADR-0003](../../adr/0003-stateless-first-rehydrate-on-resume.md) (stateless-first suspend/resume, the pause mechanism).
-- **Additional ADR:** [ADR-0154](../../adr/0154-adapter-principal-with-a-scoped-credential.md): Adapter principal with a scoped credential (Accepted); adds the adapter authentication boundary and restricts adapter principals to explicit-user routes.
-- **Additional ADR:** [ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md): An approval is answered where it was asked, including by email (Accepted); adds the `requesting_surface` route mode and the requester-only set for non-Slack cards, and refuses adapter principals on every Slack approver set.
-- **Additional ADR:** [ADR-0177 amendment](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md#amendment-email-approver-lists): email approver lists (2026-10-01); replaces ADR-0177's requester-only set with the route's approver `emails`, checked after the binding's `allowed_callers`.
+1. **Epic(s):** [#22](https://github.com/curie-eng/curie/issues/22): approval gates and human-in-the-loop; adds the durable record, `awaiting-approval` status, `canUseTool` gate, and the authorizer interface.
+2. **Vision doc:** [architecture-vision.md](../../architecture-vision.md): not one of the six graded jobs; a cross-cutting core lifecycle change, not separately graded.
+3. **ADR(s):** [ADR-0010](../../adr/0010-approval-gates-and-human-in-the-loop.md): Approval gates and human-in-the-loop (Accepted); grounds this intended line, including the authorizer sequence (channel membership first, then user-group, explicit user-list, platform-RBAC). [ADR-0034](../../adr/0034-approval-authorizers-resolve-membership-in-the-api.md): Approval authorizers resolve membership in the API (Accepted); adds the user-group and user-list sets, the API-resident membership lookup, the scoped fail-closed rule, and fresh-read binding resolution. Supersedes ADR-0010's framing of those four as `Authorizer` implementations: they are approver SETS behind one authorizer, and platform-RBAC becomes the fourth set. [ADR-0106](../../adr/0106-an-approver-is-an-authenticated-principal.md): An approver is an authenticated principal (Accepted); removes caller-asserted resolver identity/channel, makes membership the boundary even for the requester, limits operators to explicit users, and lets Console subjects pass through the same membership sets their authenticated identity can satisfy. Composes with [ADR-0003](../../adr/0003-stateless-first-rehydrate-on-resume.md) (stateless-first suspend/resume, the pause mechanism).
+4. **Additional ADR:** [ADR-0156](../../adr/0156-adapter-principal-with-a-scoped-credential.md): Adapter principal with a scoped credential (Accepted); adds the adapter authentication boundary and restricts adapter principals to explicit-user routes.
+5. **Additional ADR:** [ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md): An approval is answered where it was asked, including by email (Accepted); adds the `requesting_surface` route mode and the requester-only set for non-Slack cards, and refuses adapter principals on every Slack approver set.
+6. **Additional ADR:** [ADR-0177 amendment](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md#amendment-email-approver-lists): email approver lists (2026-10-01); replaces ADR-0177's requester-only set with the route's approver `emails`, checked after the binding's `allowed_callers`.
+7. **Additional ADR:** [ADR-0202](../../adr/0202-a-test-installation-admits-a-listed-bots-actions-and-approval-replies.md): adds the test-installation driver principal and its explicit-user-only admission.
