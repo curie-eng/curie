@@ -13,12 +13,13 @@ on:
   # the default branch, so the schedule itself cannot live here.
   workflow_dispatch:
 
-# Supersede an in-flight run of the same event on the same ref. The event
-# name is part of the group so a dispatch is not cancelled by a push to
-# that ref, and a push still cancels only the older push.
+# The event name is part of the group so a dispatch is not cancelled by a
+# push to that ref. A pull request or dispatch supersedes its own in-flight
+# run. A push to main or next runs to completion, so a burst of merges still
+# leaves completed results; GitHub replaces only an older pending push run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 permissions:
   contents: read

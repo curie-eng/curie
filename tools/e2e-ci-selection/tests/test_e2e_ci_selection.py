@@ -1936,6 +1936,19 @@ def test_next_omits_kind_and_dispatch_keeps_it() -> None:
     assert "--omit-kind" not in main_or_dispatch
 
 
+def test_push_runs_complete_while_pull_requests_and_dispatches_supersede() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    concurrency = workflow["concurrency"]
+    assert set(concurrency) == {"group", "cancel-in-progress"}
+    assert concurrency["group"] == (
+        "${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}"
+    )
+    # Only push runs complete; pull requests and dispatches supersede.
+    assert concurrency["cancel-in-progress"] == "${{ github.event_name != 'push' }}"
+    # A new trigger must force a decision about whether its runs cancel.
+    assert set(workflow[True]) == {"push", "pull_request", "workflow_dispatch"}
+
+
 def test_workflow_consumes_each_selection_output_exactly() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     jobs = workflow["jobs"]
