@@ -2,13 +2,14 @@
 
 Date: 2026-10-17
 
-Status: Draft
+Status: Accepted
+
+Accepted on 2026-10-17 with explicit maintainer approval.
 
 Tracked in [#4557](https://github.com/curie-eng/curie/issues/4557).
 This realizes the operator qualification command required by
 [ADR 0224](0224-protected-runtime-commissioning-precedes-installation-acceptance.md).
-It does not change the commissioning record grammar or authorize
-implementation while Draft.
+It does not change the commissioning record grammar.
 
 ## Context
 
