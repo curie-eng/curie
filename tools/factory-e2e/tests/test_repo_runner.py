@@ -32,6 +32,8 @@ import factory_e2e as fe
 import pytest
 import repo_runner
 from channel_protocol.identity import scoped_conversation_id
+from curie_worker.repo_runner_pools import platform_runner_digest
+from curie_worker.sandbox.types import RepoRunnerPoolRefused
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "fixtures" / "repo-runner"
@@ -48,6 +50,35 @@ AGENT_TEMPLATE = "factory-tools-agent-factory-e2e"
 AGENT_TAG = "registry.example.com/curie-runner:v0.13.0"
 CONFLICT_REPLY = "This thread is already bound to a different repository."
 TOKEN_NAME = "CLAUDE_CODE_MAX_OUTPUT_TOKENS"
+# Claude Code appended these blocks to the manifest probe's Bash tool result
+# in live run 4919 (the values are that run's budget readings).
+REMINDERS = (
+    "\n\n<system-reminder>\n<total_tokens>14999998 tokens left</total_tokens>\n"
+    "</system-reminder>\n\n<system-reminder>\n"
+    "USD budget: $0.000017999999999999997/$10; $9.999982 remaining\n</system-reminder>"
+)
+
+
+def _reply_outcome(thread: str, reply: str) -> dict[str, Any]:
+    """`curie cluster message --json` for a delivered reply (cli/src/message.rs
+    message_reply_json). The worker answers every refusal this way, with no
+    turn-failure marker, so the CLI reports it finalized and not failed."""
+
+    return {"reply": reply, "thread": thread, "finalized": True}
+
+
+def _pool_refusal_reply(repository: str, pool: str, reason: str, base: str = "") -> str:
+    """The kernel's one reply to a RepoRunnerPoolRefused, built from the worker's
+    own exception (apps/worker/src/curie_worker/kernel/attempt.py)."""
+
+    error = RepoRunnerPoolRefused(
+        repo=repository,
+        pool=pool,
+        reason=reason,
+        base=base or None,  # type: ignore[arg-type]
+        platform_digest=INSTALLED_BASE,
+    )
+    return f"This agent cannot start: {error}. An operator has to make that change."
 
 
 def _digest(character: str) -> str:
@@ -535,7 +566,7 @@ class _KubernetesCli:
         )
         self.exited = False
         self.current = None
-        success = {"finalized": True, "failed": False, "reply": "Manifest captured."}
+        success = _reply_outcome(thread, "Manifest captured.")
         profile: dict[str, Any] | None
         outcome: dict[str, Any]
         bound = self.thread_repository.get(thread)
@@ -544,37 +575,17 @@ class _KubernetesCli:
         if bound is not None and bound != repository:
             # apps/worker/src/curie_worker/workspace.py maps
             # workspace.selection_conflict to this exact public reply.
-            profile, outcome = (
-                None,
-                {
-                    "finalized": True,
-                    "failed": True,
-                    "failure_class": "runner_failed",
-                    "reply": CONFLICT_REPLY,
-                },
-            )
+            profile, outcome = None, _reply_outcome(thread, CONFLICT_REPLY)
         elif repository == REPO_U:
             profile, outcome = _profiles()["u"], success
         elif pools[repository]["pool"].startswith("absent-"):
-            profile, outcome = (
-                None,
-                {
-                    "finalized": True,
-                    "failed": True,
-                    "failure_class": "repo_runner_pool_missing",
-                    "reply": "The repository runner pool is missing (repo_runner_pool_missing).",
-                },
-            )
+            reply = _pool_refusal_reply(repository, pools[repository]["pool"], "missing_pool")
+            profile, outcome = None, _reply_outcome(thread, reply)
         elif pools[repository]["base"] != INSTALLED_BASE:
-            profile, outcome = (
-                None,
-                {
-                    "finalized": True,
-                    "failed": True,
-                    "failure_class": "repo_runner_base_mismatch",
-                    "reply": "The runner base differs (repo_runner_base_mismatch).",
-                },
+            reply = _pool_refusal_reply(
+                repository, pools[repository]["pool"], "stale_base", pools[repository]["base"]
             )
+            profile, outcome = None, _reply_outcome(thread, reply)
         elif pools[repository]["pool"] == baseline[REPO_X]["pool"]:
             profile, outcome = _profiles()["x"], success
         elif repository == REPO_Y:
@@ -792,7 +803,7 @@ def offline_driver(
                 output = profile["manifest_output"]
                 if output == repo_runner.NO_MANIFEST_OUTPUT:
                     output += "\n"  # echo's own newline
-                result["messages"][-1]["content"][0]["content"] = output
+                result["messages"][-1]["content"][0]["content"] = output + REMINDERS
                 assert _model_request(model, result)[0] == 200
 
         def poll(self) -> int:
@@ -850,7 +861,7 @@ def test_seven_planned_turns_drive_offline_to_a_passing_judgment(
     assert "runner starting" not in x_first["boot_log"]
     assert agent["warm_pool"] == AGENT_POOL
     assert agent["agent_image"] == {"spec_image": AGENT_PINNED, "digests": AGENT_DIGESTS}
-    assert agent["manifest_output"].strip() == repo_runner.NO_MANIFEST_OUTPUT
+    assert agent["manifest_output"] == repo_runner.NO_MANIFEST_OUTPUT + "\n" + REMINDERS
     assert repo_runner.MANIFEST_ABSENT_LINE in agent["boot_log"]
     assert conflict["reason"] == repo_runner.SELECTION_CONFLICT
     assert conflict["model_requests"] == 0 and conflict["new_claims"] == []
@@ -861,6 +872,14 @@ def test_seven_planned_turns_drive_offline_to_a_passing_judgment(
     assert set(cli.retirement_queries) == {"fixture-claim-x"}
     assert missing["reason"] == "repo_runner_pool_missing"
     assert stale["reason"] == "repo_runner_base_mismatch"
+    # The worker delivers every refusal as an ordinary reply; the CLI exits 0.
+    for turn in (conflict, missing, stale):
+        assert turn["cli_exit_code"] == 0 and turn["cli_failure_class"] is None
+    assert conflict["cli_reply"] == CONFLICT_REPLY
+    assert "(missing_pool)" in missing["cli_reply"]
+    assert "(stale_base)" in stale["cli_reply"]
+    for turn in (x_first, y_first, agent, changed):
+        assert turn["cli_reply"] == "Manifest captured." and turn["cli_failure_class"] is None
     assert len(cli.messages) == 7
     driver.obs["worker_pools"] = copy.deepcopy(driver.baseline_pools)
     assert repo_runner.judge_repo_runner(driver.obs) == []
@@ -932,7 +951,7 @@ def test_turn_completion_uses_real_claim_pod_probe_and_scripted_http_evidence(
     assert turn["observed_repository"] == REPO_X
     assert turn["capture_error"] is None
     assert turn["model_requests"] == 2
-    assert turn["manifest_output"] == _passing()["turns"][0]["manifest_output"]
+    assert turn["manifest_output"] == _passing()["turns"][0]["manifest_output"] + REMINDERS
     assert turn["errors"] == []
     assert cli.patches == []
 
@@ -972,11 +991,86 @@ def test_generic_runner_failure_is_a_failed_turn_not_a_refusal(
     cli.forced_outcome = {
         "failed": True,
         "failure_class": "runner_failed",
-        "reply": "A runner failed.",
+        "reply": "curie-turn-failure: runner_failed\nA runner failed.",
     }
     turn = driver._turn(0, _plan()["turns"][0])
     assert turn["status"] == "failed"
     assert turn["reason"] == "runner_failed"
+    # The CLI outcome is kept, so a failed turn is diagnosable from evidence.
+    assert turn["cli_failure_class"] == "runner_failed"
+    assert turn["cli_reply"] == "curie-turn-failure: runner_failed\nA runner failed."
+
+
+def test_a_turn_that_never_reaches_the_cli_records_no_cli_outcome(
+    offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli],
+) -> None:
+    driver, cli = offline_driver
+    turn = driver._turn(4, _plan()["turns"][4])
+    assert turn["reason"] == "runner_changed_prior_claim_absent"
+    assert turn["cli_failure_class"] is None and turn["cli_reply"] is None
+    assert cli.messages == []
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [("missing_pool", "repo_runner_pool_missing"), ("stale_base", "repo_runner_base_mismatch")],
+)
+def test_a_runner_pool_refusal_reply_is_its_documented_refusal(
+    reason: str, expected: str, offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli]
+) -> None:
+    driver, cli = offline_driver
+    cli.forced_outcome = _reply_outcome(
+        THREAD_X, _pool_refusal_reply(REPO_X, "fixture-pool", reason, _digest("f"))
+    )
+    turn = driver._turn(0, _plan()["turns"][0])
+    assert (turn["status"], turn["reason"]) == ("refused", expected)
+
+
+def test_a_runner_pool_refusal_for_another_repository_is_not_this_turns_refusal(
+    offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli],
+) -> None:
+    driver, cli = offline_driver
+    cli.forced_outcome = _reply_outcome(
+        THREAD_X, _pool_refusal_reply(REPO_Y, "fixture-pool", "missing_pool")
+    )
+    assert driver._turn(0, _plan()["turns"][0])["status"] != "refused"
+
+
+def test_the_live_unpinned_stale_base_reply_is_a_base_mismatch() -> None:
+    # Recorded verbatim from the worker in a live reproduction, before the
+    # install pinned the platform runner.
+    reply = (
+        f"This agent cannot start: repository {REPO_X} runner image was built on platform "
+        f"runner {_digest('6')}, not this installation's unpinned runner image (stale_base); "
+        f"rebuild it with `curie cluster factory --repo {REPO_X}`. An operator has to make "
+        "that change."
+    )
+    outcome = _reply_outcome(THREAD_X, reply)
+    assert repo_runner.refusal_reason(outcome, REPO_X) == "repo_runner_base_mismatch"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "No repo_runner_pool_missing occurred.",
+        "The repository_runner check passed; workspace.selection_conflict did not happen.",
+        f"Earlier I saw: {CONFLICT_REPLY} It is resolved now.",
+        _pool_refusal_reply(REPO_X, "fixture-pool", "missing_pool") + " Then it recovered.",
+    ],
+    ids=["reason-token", "conflict-token", "quoted-conflict", "pool-reply-with-more-text"],
+)
+def test_a_reply_that_only_mentions_a_refusal_is_not_one(reply: str) -> None:
+    assert repo_runner.refusal_reason(_reply_outcome(THREAD_X, reply), REPO_X) is None
+
+
+def test_model_text_naming_a_pool_reason_is_not_a_refusal(
+    offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli],
+) -> None:
+    driver, cli = offline_driver
+    cli.forced_outcome = _reply_outcome(
+        THREAD_X, f"The manifest lists uv. Repository {REPO_X} is fine (missing_pool); ok"
+    )
+    assert driver._turn(0, _plan()["turns"][0])["status"] == "completed"
 
 
 # --------------------------------------------------------------------------
@@ -1017,17 +1111,38 @@ def test_rendered_pools_for_exactly_the_runner_repositories_are_the_baseline(
 # --------------------------------------------------------------------------
 
 
-def _install_base(runner_env: dict[str, Any] | None) -> dict[str, Any]:
-    sandbox: dict[str, Any] = {"deploy": False, "runner": {"image": "registry.example.com/r"}}
+def _install_base(
+    runner_env: dict[str, Any] | None, runner: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    sandbox: dict[str, Any] = {
+        "deploy": False,
+        "runner": runner or {"image": "registry.example.com/curie-runner", "tag": "v0.13.0"},
+    }
     if runner_env is not None:
         sandbox["runnerEnv"] = runner_env
     return {"factory": {"enabled": True}, "agentSandbox": sandbox, "api": {}}
 
 
+def _inspect(monkeypatch: pytest.MonkeyPatch, *, owner: str = "registry.example.com") -> list[str]:
+    """Replay `docker buildx imagetools inspect` (both documented forms) for one runner."""
+
+    seen: list[str] = []
+
+    def run(argv: list[str], *, check: bool = True, input_text: str | None = None) -> str:
+        assert argv[:4] == ["docker", "buildx", "imagetools", "inspect"], argv
+        assert argv[-1].startswith(f"{owner}/curie-runner"), argv
+        seen.append(argv[-1])
+        return json.dumps(AGENT_INDEX) if "--raw" in argv else _inspect_text(argv[-1])
+
+    monkeypatch.setattr(fe, "run", run)
+    return seen
+
+
 @pytest.mark.parametrize("existing", [None, {}, {"other-agent": {"OTHER_SETTING": "kept"}}])
 def test_install_values_set_the_factory_agent_runner_env_and_keep_other_agents(
-    existing: dict[str, Any] | None, preflight: fe.Preflight
+    existing: dict[str, Any] | None, preflight: fe.Preflight, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _inspect(monkeypatch)
     preflight.release = "factory-tools"
     driver = repo_runner.RepoRunnerRun(preflight, _plan())
     base = _install_base(copy.deepcopy(existing))
@@ -1047,6 +1162,70 @@ def test_install_values_set_the_factory_agent_runner_env_and_keep_other_agents(
     assert base == original
     runner_env[fe.FACTORY_AGENT][TOKEN_NAME] = "changed"
     assert repo_runner.RUNNER_ENV == {TOKEN_NAME: "16000"}
+
+
+@pytest.mark.parametrize(
+    ("runner", "owner", "reference"),
+    [
+        pytest.param(
+            {"tag": "sha-abc"},
+            "ghcr.io/curie-eng",
+            "ghcr.io/curie-eng/curie-runner:sha-abc",
+            id="published-chart-default-image",
+        ),
+        pytest.param(
+            {"image": "registry.example.com/curie-runner", "tag": "candidate"},
+            "registry.example.com",
+            "registry.example.com/curie-runner:candidate",
+            id="built-candidate-image",
+        ),
+    ],
+)
+def test_install_pins_the_platform_runner_the_repository_images_were_built_on(
+    runner: dict[str, Any],
+    owner: str,
+    reference: str,
+    preflight: fe.Preflight,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Live run 4919: installed by tag only, the worker had no platform runner
+    # digest and refused every runner repository as stale_base before a claim.
+    seen = _inspect(monkeypatch, owner=owner)
+    driver = repo_runner.RepoRunnerRun(preflight, _plan())
+    values = driver.install_values(_install_base(None, runner))
+    assert values["agentSandbox"]["runner"]["digest"] == _digest("2")
+    assert seen[0] == reference
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm is not installed")
+def test_the_rendered_worker_reads_the_pinned_platform_runner_digest(
+    preflight: fe.Preflight, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _inspect(monkeypatch, owner="ghcr.io/curie-eng")
+    driver = repo_runner.RepoRunnerRun(preflight, _plan())
+    values = driver.install_values(_install_base(None, {"tag": "sha-abc"}))
+    values_file = tmp_path / "values.json"
+    values_file.write_text(json.dumps({"agentSandbox": values["agentSandbox"]}))
+    rendered = subprocess.run(
+        [
+            "helm",
+            "template",
+            "t",
+            str(ROOT.parents[1] / "charts" / "curie"),
+            "-f",
+            str(values_file),
+            "--show-only",
+            "templates/worker.yaml",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    image = json.loads(
+        rendered.split("- name: CURIE_RUNNER_IMAGE\n", 1)[1].split("value: ", 1)[1].split("\n")[0]
+    )
+    # The worker's own reader (apps/worker/src/curie_worker/run.py) of this env.
+    assert platform_runner_digest(image) == _digest("2")
 
 
 def test_driver_records_runner_env_from_the_pod_runner_container(
@@ -1138,7 +1317,7 @@ def test_agent_turn_records_the_no_manifest_probe_and_the_absent_boot_line(
     driver, _cli = offline_driver
     turn = driver._turn(2, _plan()["turns"][2])
     assert turn["status"] == "completed"
-    assert turn["manifest_output"].strip() == repo_runner.NO_MANIFEST_OUTPUT
+    assert turn["manifest_output"] == repo_runner.NO_MANIFEST_OUTPUT + "\n" + REMINDERS
     assert repo_runner.MANIFEST_ABSENT_LINE in turn["boot_log"]
     assert "runner starting" not in turn["boot_log"]
     assert "runner ready" not in turn["boot_log"]
@@ -1163,6 +1342,61 @@ def test_agent_turn_requires_no_manifest_evidence(field: str, value: str) -> Non
         value = observation["turns"][0]["manifest_output"]
     observation["turns"][2][field] = value
     assert _mentions(repo_runner.judge_repo_runner(observation), "turn 3")
+
+
+def test_agent_turn_accepts_the_probe_output_with_appended_system_reminders() -> None:
+    # Live run 4919 turn 3: the probe's line, then two appended reminder blocks.
+    observation = _passing()
+    observation["turns"][2]["manifest_output"] = repo_runner.NO_MANIFEST_OUTPUT + "\n" + REMINDERS
+    assert repo_runner.judge_repo_runner(observation) == []
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        pytest.param(REMINDERS + "\ncurie-no-tool-manifest", id="reminders-before-the-line"),
+        pytest.param("curie-no-tool-manifest\nextra" + REMINDERS, id="text-before-reminders"),
+        pytest.param("curie-no-tool-manifest" + REMINDERS + "\nextra", id="text-after-reminders"),
+        pytest.param(
+            "curie-no-tool-manifest\n<system-reminder>\nnever closed\n", id="unclosed-reminder"
+        ),
+        pytest.param(
+            "curie-no-tool-manifest\n<system-reminder>a<system-reminder>b</system-reminder>",
+            id="nested-reminder",
+        ),
+        pytest.param("curie-no-tool-manifest: absent" + REMINDERS, id="different-first-line"),
+        pytest.param(" curie-no-tool-manifest" + REMINDERS, id="indented-first-line"),
+        pytest.param(REMINDERS, id="only-reminders"),
+        pytest.param(
+            "curie-no-tool-manifest<system-reminder>notice</system-reminder>",
+            id="reminder-on-the-first-line",
+        ),
+    ],
+)
+def test_agent_turn_rejects_anything_but_the_line_and_reminder_blocks(output: str) -> None:
+    observation = _passing()
+    observation["turns"][2]["manifest_output"] = output
+    assert _mentions(repo_runner.judge_repo_runner(observation), "turn 3")
+
+
+def test_runner_turn_reads_its_manifest_before_appended_system_reminders() -> None:
+    observation = _passing()
+    observation["turns"][0]["manifest_output"] += REMINDERS
+    assert repo_runner.judge_repo_runner(observation) == []
+
+
+def test_runner_turn_accepts_a_reminder_tag_inside_its_manifest_json() -> None:
+    observation = _passing()
+    manifest = json.loads(observation["turns"][0]["manifest_output"])
+    manifest["tools"][0]["path"] = "/opt/<system-reminder>/bin/tool"
+    observation["turns"][0]["manifest_output"] = json.dumps(manifest) + REMINDERS
+    assert not _mentions(repo_runner.judge_repo_runner(observation), "turn 1")
+
+
+def test_runner_turn_rejects_other_text_after_its_manifest() -> None:
+    observation = _passing()
+    observation["turns"][0]["manifest_output"] += REMINDERS + "\ntrailing text"
+    assert _mentions(repo_runner.judge_repo_runner(observation), "turn 1")
 
 
 def test_agent_turn_accepts_the_echoed_no_manifest_output_with_a_newline() -> None:
@@ -1375,13 +1609,32 @@ def test_driver_maps_the_selection_conflict_reply_to_an_accepted_refusal(
     assert cli.patches == []
 
 
-def test_selection_conflict_reply_on_a_turn_that_did_not_fail_is_not_a_refusal(
+def test_selection_conflict_is_refused_from_its_reply_without_a_failed_flag(
     offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli],
 ) -> None:
+    # Live run 4919 turn 4: the worker answers the conflict as an ordinary
+    # reply, so the CLI reports it finalized, not failed, and exits 0.
+    driver, _cli = offline_driver
+    first, conflict = _run_plan(driver, [0, 3])
+    assert first["status"] == "completed"
+    assert conflict["cli_reply"] == CONFLICT_REPLY and conflict["cli_exit_code"] == 0
+    assert (conflict["status"], conflict["reason"]) == ("refused", repo_runner.SELECTION_CONFLICT)
+
+
+def test_a_conflict_reply_on_a_turn_that_ran_is_refused_and_then_rejected(
+    offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli],
+) -> None:
+    # A conflict reply on a turn that also acquired a claim and asked the
+    # model is recorded as the refusal it claims to be; the judge's refusal
+    # checks, not the classifier, then reject it.
     driver, cli = offline_driver
-    cli.forced_outcome = {"finalized": True, "failed": False, "reply": CONFLICT_REPLY}
-    turn = driver._turn(0, _plan()["turns"][0])
-    assert turn["status"] != "refused"
+    cli.forced_outcome = _reply_outcome(THREAD_X, CONFLICT_REPLY)
+    turns = _run_plan(driver)
+    assert turns[0]["status"] == "refused" and turns[0]["claim"]
+    driver.obs["worker_pools"] = copy.deepcopy(driver.baseline_pools)
+    failures = repo_runner.judge_repo_runner(driver.obs)
+    assert "turn 1: refused turn acquired claim" in failures
+    assert "turn 1: refusal must precede every model request" in failures
 
 
 @pytest.mark.parametrize(
