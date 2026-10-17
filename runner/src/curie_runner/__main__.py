@@ -63,6 +63,7 @@ from .connectors import (
     drop_connector_secret_names,
     materialize_connector_caller_headers,
     materialize_hosted_bearer_headers,
+    proxied_connector_servers,
 )
 from .executor import EXECUTOR_MODE, RUNNER_MODE_ENV
 from .fake import FakeModelSession
@@ -1055,6 +1056,10 @@ def build_runner(
         caller_header=config.connector_caller_token is not None,
         env=os.environ,
     )
+    # A policy approval cannot carry a call to these through the caller proxy
+    # (#3552); the gate sends the model to the permission path instead.
+    if approval_gate is not None:
+        approval_gate.proxied_connector_servers = proxied_connector_servers(derived_mcp_servers)
     # Expand hosted Bearer ${NAME} headers in memory and drop NAME so Bash
     # cannot read the PAT from the process env (#2559). The on-disk catalog
     # keeps the placeholder; derive_mcp_servers never sees a value.

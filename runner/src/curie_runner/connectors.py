@@ -238,6 +238,22 @@ def derive_mcp_servers(
     return entries
 
 
+def proxied_connector_servers(servers: Mapping[str, Any]) -> frozenset[str]:
+    """Derived entries that reach their connector through the caller proxy.
+
+    Exactly the hosted entries ``derive_mcp_servers`` gave the caller header,
+    which it does only when the worker minted a caller token.
+    """
+
+    return frozenset(
+        name
+        for name, entry in servers.items()
+        if isinstance(entry, Mapping)
+        and isinstance(entry.get("headers"), Mapping)
+        and CALLER_HEADER in entry["headers"]
+    )
+
+
 def _without_unreachable_bearer(entry: dict[str, Any], spec: ConnectorSpec) -> dict[str, Any]:
     """Drop a client Bearer implied only by a lone ``from_secret`` credential (#2825).
 
