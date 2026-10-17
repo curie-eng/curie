@@ -283,7 +283,7 @@ def test_progress_notes_stay_off_running_and_other_terminal_comments(
     else:
         body = _finish_body(client, sink, request_id, epoch, cause=cause, detail="Last reply")
         if cause in {"early_stop", "no_pull_request"}:
-            assert "Agent's last message:\n```text\nLast reply\n```" in body
+            assert "Agent's last message:\n> Last reply\n\n" in body
         else:
             assert "Provider message: Last reply\n" in body
     assert note not in body

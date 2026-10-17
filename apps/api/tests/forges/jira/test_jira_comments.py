@@ -10,7 +10,7 @@ judged from the fake's state and the requests it received.
 ADF conventions the golden pins: a text node without marks has no ``marks``
 key; a checklist line ``- [x] X`` is a bullet item whose text starts with
 ``[x] ``; an image becomes a paragraph holding a link; a paragraph that is only
-an HTML comment disappears; a fenced block keeps its language.
+an HTML comment disappears; the quoted handoff retains inline marks and lists.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 from curie_api.factory_comment_text import marker_for
+from curie_api.factory_notices import result_section, status_body
 from curie_api.forges import types
 from curie_api.forges.errors import NotFound
 from curie_api.forges.types import PullRequestRef, ReplyTarget, RepositoryRef
@@ -75,6 +76,75 @@ async def test_jira_comments_the_posted_adf_matches_the_golden() -> None:
     assert result.comment.id == str(own.id)
     assert result.comment.target == target
     assert own.body == golden
+    (quote,) = [node for node in own.body["content"] if node["type"] == "blockquote"]
+    strong, code, ordered = quote["content"]
+    assert strong["content"] == [
+        {
+            "type": "text",
+            "text": "Maintainer decision required",
+            "marks": [{"type": "strong"}],
+        }
+    ]
+    assert code["content"][1] == {
+        "type": "text",
+        "text": "parser.py",
+        "marks": [{"type": "code"}],
+    }
+    assert ordered["type"] == "orderedList"
+    assert [flatten(item).strip() for item in ordered["content"]] == [
+        "Confirm the input format.",
+        "Pick the parser.",
+    ]
+    assert all(item["type"] == "listItem" for item in ordered["content"])
+
+
+@pytest.mark.anyio
+async def test_jira_comments_a_rendered_final_handoff_keeps_its_marks_and_list() -> None:
+    fake, tracker, target = _setup()
+    message = (
+        "**Maintainer decision required**\n\n"
+        "Choose `parser.py` before retrying.\n\n"
+        "1. Confirm the input format.\n"
+        "2. Pick the parser."
+    )
+    body = status_body(
+        request_id=REQUEST_ID,
+        card_url=None,
+        pill_label="FAILED",
+        phase_view=None,
+        result=result_section("no_pull_request", pr_url=None, detail=message),
+    )
+
+    result = await tracker.marked_comments.upsert_marked(target, MARKER, body)
+
+    golden = json.loads((GOLDENS / "status_comment.json").read_text())
+    (expected_quote,) = [node for node in golden["content"] if node["type"] == "blockquote"]
+    (own,) = fake.own_comments(_issue_id(target))
+    (quote,) = [node for node in own.body["content"] if node["type"] == "blockquote"]
+    assert result.written is True
+    assert quote == expected_quote
+    (create,) = fake.requests_of("comment_create")
+    assert create.json["body"] == own.body
+    assert "Cause: no_pull_request" in flatten(own.body)
+    assert "Agent's last message:" in flatten(own.body)
+    assert not any(node["type"] == "codeBlock" for node in own.body["content"])
+    assert own.properties[PROPERTY]["body_sha256"] == _sha(body)
+
+
+@pytest.mark.anyio
+async def test_jira_comments_a_non_handoff_fence_keeps_its_language() -> None:
+    fake, tracker, target = _setup()
+
+    await tracker.marked_comments.upsert_marked(target, MARKER, "```text\ntests failed: 2\n```\n")
+
+    (own,) = fake.own_comments(_issue_id(target))
+    assert own.body["content"] == [
+        {
+            "type": "codeBlock",
+            "attrs": {"language": "text"},
+            "content": [{"type": "text", "text": "tests failed: 2"}],
+        }
+    ]
 
 
 @pytest.mark.anyio

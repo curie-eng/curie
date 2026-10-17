@@ -1869,8 +1869,10 @@ in place; there is no separate final comment. While the run is live the
 comment shows a checklist of the phases the agent reports through
 `report_progress` and a `Status:` line (`QUEUED`, `RUNNING`, `PUBLISHING`,
 `STOPPING`). Its last edit adds the result, marks the comment final, and it is
-not edited again. A comment a person deletes is re-created once on the next
-pass; unlabel the issue to stop the run instead.
+not edited again. In a final checklist, the current phase reads `(stopped here)`
+without a round label; a live checklist keeps `(in progress)` and its round
+label. A comment a person deletes is re-created once on the next pass; unlabel
+the issue to stop the run instead.
 
 When publication succeeds, the result names the exact pull request
 URL. A follow-up that needs no change, including a relabel that continues the
@@ -1885,7 +1887,15 @@ of keys and tokens. An execute turn that ends without publishing is prompted
 once more in the same session. If it still does not publish, it ends as
 `early_stop` (it called no work tool and never reported progress) or
 `no_pull_request`, and an `Agent's last message:` block carries the agent's
-final reply, redacted and shown inside a code fence so none of it renders.
+final reply as a Markdown blockquote. Curie redacts the detail before capping
+the stored text at 4,000 characters, including `...` when clipped. Curie
+normalizes CRLF and lone CR to LF before quoting. Every message line starts
+with `> `; an empty line is `>`, so the message cannot add a top-level `Cause:`
+line. A blank line follows the quote so Curie's cause, feedback and usage stay
+outside it. Curie first inserts U+200B after the `<` in each HTML
+comment opener, then replaces every `<` with `&lt;`, every `![` with `!\[`, and
+inserts U+200B after every `@`. This preserves emphasis, inline code and lists
+while neutralizing raw HTML, image syntax and mentions.
 A last `Cause:` line names the platform cause code
 (`capacity_wait_expired`, `start_failed`, `execution_deadline`, `issue_cancelled`,
 `owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
@@ -2124,8 +2134,11 @@ default `no_pull_request` or `early_stop` for `--expect comment`, plus
 `execution_deadline` for `--expect any`. When `--expect comment` or `--expect
 any` accepts a `no_pull_request` or `early_stop` ending, the agent's final reply
 must separately contain `Could not complete:` followed by its reason. The reply
-is read from the final comment's `Agent's last message:` block, and from the
-thread transcript only when the comment has none. Each `--expect-reason` must
+is read from the contiguous quoted block immediately after the final comment's
+exact `Agent's last message:` label. The reader stops at the first unquoted
+line, strips one quote prefix per line and reverses only Curie's substitutions
+once. It reads no fenced form. The thread transcript supplies the reply only
+when the comment has no quoted message. Each `--expect-reason` must
 match that reply, ignoring case. The platform
 cause does not establish the agent's reason. Only a comment the App posted with
 this run's execution request marker counts, and more than one fails. A rename out of

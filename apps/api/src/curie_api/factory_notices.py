@@ -189,7 +189,7 @@ _DETAIL_CAUSES = frozenset(
     }
 )
 # A run that ended without publishing carries the agent's own last message
-# (#3128). That text is model-authored, so it renders inert inside a code fence.
+# (#3128). Quote each line and neutralize HTML, image syntax and mentions.
 _AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request"})
 # Wire classification a text-only consumer reads off the status comment (#3401).
 # Same tokens as the channel reply's ``curie-turn-failure:`` line. Causes with
@@ -514,31 +514,35 @@ def _inert_line(text: str) -> str:
 
 
 def _agent_message_block(message: str) -> str:
-    """The agent's last message, fenced so GitHub renders none of it.
+    """The agent's last message as a neutralized Markdown blockquote.
 
-    The fence is longer than any backtick run in the message, so the message
-    cannot close it and spoof the ``Cause:`` line. HTML comment openers are
-    broken because the marker scan reads the raw body.
+    Normalize CRLF and lone CR to LF before quoting every line, so the message
+    cannot spoof a top-level ``Cause:`` line. Break HTML comment openers for
+    the raw marker scan, then escape ``<`` and ``![`` and insert U+200B after
+    every ``@`` to neutralize HTML, images and mentions. A blank line separates
+    the quote from Curie's following lines.
     """
 
+    message = message.replace("\r\n", "\n").replace("\r", "\n")
     message = _break_html_comments(message)
-    fence = _fence_for(message, minimum=3)
-    return f"Agent's last message:\n{fence}text\n{message}\n{fence}\n"
+    message = message.replace("<", "&lt;").replace("![", "!\\[").replace("@", "@\u200b")
+    quoted = "\n".join(f"> {line}" if line else ">" for line in message.split("\n"))
+    return f"Agent's last message:\n{quoted}\n\n"
 
 
 def _escape_markdown(value: str) -> str:
     return "".join(f"\\{char}" if char in _MARKDOWN_SPECIAL else char for char in value)
 
 
-def _checklist(view: PhaseView) -> list[str]:
+def _checklist(view: PhaseView, *, final: bool) -> list[str]:
     lines: list[str] = []
     for slot in view.phases:
         label = _escape_markdown(slot.label)
         if slot.state == "done":
             lines.append(f"- [x] {label}")
         elif slot.state == "current":
-            detail = "in progress"
-            if slot.round_label is not None and slot.round_label.startswith("round "):
+            detail = "stopped here" if final else "in progress"
+            if not final and slot.round_label is not None and slot.round_label.startswith("round "):
                 detail += f", {slot.round_label}"
             lines.append(f"- [ ] **{label}** ({detail})")
         elif slot.state == "redo":
@@ -562,9 +566,10 @@ def status_body(
     """The whole status comment. A ``result`` makes it the final body.
 
     Live progress notes stay on the card; a final budget result includes its
-    last nonempty note as one inert line. The card already draws the phases,
-    so with a card the checklist and the waiting placeholder are left out;
-    without one the checklist is the fallback (#3125).
+    last nonempty note as one inert line. A final result can also include the
+    agent's last message as a neutralized Markdown quote. With a card, the checklist
+    and waiting placeholder are left out; without one the checklist is the
+    fallback (#3125).
     """
 
     parts: list[str] = []
@@ -573,7 +578,7 @@ def status_body(
     if card_url:
         parts.append(f"![Curie status]({card_url})")
     elif phase_view is not None and phase_view.phases:
-        parts.append("\n".join(_checklist(phase_view)))
+        parts.append("\n".join(_checklist(phase_view, final=result is not None)))
     elif result is None:
         parts.append(_WAITING_FOR_PROGRESS)
     parts.append(f"Status: {pill_label}")
@@ -1125,7 +1130,8 @@ async def _render(
             # (#3223), after the Cause line so its parse is unchanged.
             line = usage_line(usage)
             if line is not None:
-                result = result.rstrip("\n") + "\n" + line + "\n"
+                separator = "\n\n" if result.endswith("\n\n") else "\n"
+                result = result.rstrip("\n") + separator + line + "\n"
     publishing = (
         await session.scalar(
             select(Publication.id)

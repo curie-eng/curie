@@ -4143,15 +4143,14 @@ def select_case_transcript(
 
 
 _AGENT_MESSAGE_LABEL = "Agent's last message:"
-_FENCE_OPENER = re.compile(r"(`{3,})text")
 
 
 def agent_message_from_comment(body: str) -> str | None:
     """The agent's last message from a final issue comment, or None (#3128).
 
-    The API renders it in a ``text`` fence after an ``Agent's last message:``
-    line, with a fence longer than any backtick run inside, so the first line
-    equal to the opening fence closes it.
+    Read only the contiguous quoted block immediately after the exact label.
+    Strip one quote prefix per line and reverse the API's HTML, image, mention
+    and comment-opener substitutions once.
     """
 
     lines = body.split("\n")
@@ -4159,16 +4158,23 @@ def agent_message_from_comment(body: str) -> str | None:
         label = lines.index(_AGENT_MESSAGE_LABEL)
     except ValueError:
         return None
-    if label + 1 >= len(lines):
+    quoted: list[str] = []
+    for line in lines[label + 1 :]:
+        if line == ">":
+            quoted.append("")
+        elif line.startswith("> "):
+            quoted.append(line[2:])
+        else:
+            break
+    if not quoted:
         return None
-    opener = _FENCE_OPENER.fullmatch(lines[label + 1])
-    if opener is None:
-        return None
-    fence = opener.group(1)
-    for index in range(label + 2, len(lines)):
-        if lines[index] == fence:
-            return "\n".join(lines[label + 2 : index])
-    return None
+    return (
+        "\n".join(quoted)
+        .replace("@\u200b", "@")
+        .replace("!\\[", "![")
+        .replace("&lt;", "<")
+        .replace("<\u200b!--", "<!--")
+    )
 
 
 def _agent_final_reply(p: Preflight, *, final_comment: str | None) -> tuple[str | None, str]:
