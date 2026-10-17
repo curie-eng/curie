@@ -156,3 +156,8 @@ a6ad6a14d49962754a56754da7c216469acd3bb6:runner/tests/test_redact.py:generic-api
 # A settings attribute passed as the HMAC key to verify an operator principal
 # (`get_settings().api_key`), not a credential value: the remediation policy routes.
 174651d715a0afa6355aadf91707df28adbdc027:apps/api/src/curie_api/routers/remediation_policy.py:generic-api-key:94
+
+# Synthetic planted hex in the Forge harness redaction test (#4706). A later
+# commit on the same branch derives it at runtime; this fingerprint stays
+# because the first commit is still reachable from the pull request branch.
+79fb0fbeea09d12ea223ca4382c9e443dc235bd7:tools/factory-e2e/tests/test_forge_instance_harness.py:generic-api-key:93
