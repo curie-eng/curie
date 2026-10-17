@@ -661,6 +661,10 @@ async def _process_event(
                         logger.info(
                             "factory refusal settlement for %s refused: %s", event_id, exc.code
                         )
+                        if factory_run.started and exc.code == "not_running":
+                            # A retried finish whose first response was lost
+                            # is refused once it committed; the request ended.
+                            factory_run.finished = True
                     await self._markers.mark_done(event_id, marker_value="1")
                     return
             else:
