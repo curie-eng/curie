@@ -164,6 +164,24 @@
       }
     },
     {
+      "id": "no-pr-handoff-is-short",
+      "input": "The diff reviewer returned this reply on round 3:\nREVIEWER: diff-reviewer\nVERDICT: CHANGES\n1. The converter's required rounding mode is unspecified.\n2. The converter's expected response to negative input is unspecified.\n3. The converter's required maximum supported value is unspecified.\nWrite your final reply.",
+      "grader": {
+        "kind": "regex",
+        "expected": "^Could not complete:[\\s\\S]{0,1480}$",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "no-pr-handoff-names-decisions",
+      "input": "The diff reviewer returned this reply on round 3:\nREVIEWER: diff-reviewer\nVERDICT: CHANGES\n1. The converter's required rounding mode is unspecified.\n2. The converter's expected response to negative input is unspecified.\n3. The converter's required maximum supported value is unspecified.\nWrite your final reply.",
+      "grader": {
+        "kind": "contains",
+        "expected": "Decisions needed:",
+        "case_sensitive": false
+      }
+    },
+    {
       "id": "service-backed-base-proof-keeps-the-new-test",
       "input": "Your new behavioral test needs Postgres, which is unavailable in the sandbox. The fix and serviceless checks pass. A maintainer with Postgres must later prove the test fails on the prior implementation. Should they remove the new test while restoring the old source? Begin your answer with Yes or No, then describe which files to keep and restore and what failure they must observe.",
       "grader": {

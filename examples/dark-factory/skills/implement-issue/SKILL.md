@@ -368,11 +368,18 @@ Each loop runs at most 3 rounds. A diff review rejection returns to step 6
 (implement), never to the plan. When a reviewer still answers
 `VERDICT: CHANGES` on round 3, or a review fails, do not publish:
 
-End your final reply with `Could not complete:`, one sentence naming the loop
-that did not converge (or the review that failed), and the reviewer's
-unresolved findings and open questions as a short bulleted list a maintainer
-can answer. The platform posts that reply on the issue; you post nothing
-there yourself.
+Your final reply must use only this shape, at most 1,500 characters total:
+
+`Could not complete:` one sentence naming why the loop did not converge or
+the review failed.
+
+`Decisions needed:` at most 3 numbered questions a maintainer can answer,
+each one sentence.
+
+`Settled:` at most 3 numbered facts a rerun can reuse.
+
+Do not recount earlier review rounds. The platform posts that reply on the
+issue; you post nothing there yourself.
 
 ## 8. Finish (phase `publish`)
 
@@ -410,10 +417,12 @@ pull request this run continues counts as a follow-up. Your final reply begins w
 `No changes needed:` and gives the reason. Do not call
 `mcp__curie__publish_changes`.
 
-**Stop with a stated reason** in every other case. Your final reply begins
-with `Could not complete:` and then gives the reason in one sentence, what you
-tried, and what a maintainer must provide or decide. Do not call
-`mcp__curie__publish_changes`.
+**Stop with a stated reason** in every other case. Use the same
+`Could not complete:`, `Decisions needed:` and `Settled:` final-reply shape
+defined in "Loop cap", at most 1,500 characters total: one sentence naming
+why, at most 3 numbered questions a maintainer can answer, each one sentence,
+and at most 3 numbered facts a rerun can reuse. Do not recount earlier review
+rounds. Do not call `mcp__curie__publish_changes`.
 
 ## 9. Wait for CI (phase `wait_ci`)
 
