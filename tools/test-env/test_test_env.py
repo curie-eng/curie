@@ -64,6 +64,7 @@ def test_environment_replaces_every_consumer_endpoint_without_mutating_the_calle
         "TEST_VALKEY_HOST": "unowned.example.com",
         "TEST_VALKEY_PORT": "2",
         "TEST_VALKEY_PW": "example password/@",
+        "TEST_VALKEY_URL": "redis://unowned.example.com:9/4",
         "S3_ENDPOINT_URL": "http://unowned.example.com:3",
         "TEST_S3_ENDPOINT_URL": "http://unowned.example.com:4",
         "TEST_OTEL_COLLECTOR_ENDPOINT": "http://unowned.example.com:5/v1/traces",
@@ -92,7 +93,9 @@ def test_environment_replaces_every_consumer_endpoint_without_mutating_the_calle
     assert result["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://127.0.0.1:34318"
     assert result["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
     assert result["CURIE_PRIMARY_SOURCE_RESOURCES"] == "1"
-    redis = urlsplit(result["CURIE_SETTLEMENT_TEST_REDIS_URL"])
+    assert result["TEST_VALKEY_URL"] == result["CURIE_SETTLEMENT_TEST_REDIS_URL"]
+    redis = urlsplit(result["TEST_VALKEY_URL"])
+    assert redis.scheme == "redis" and redis.path == "/0"
     assert redis.hostname == "127.0.0.1" and redis.port == 36379
     assert unquote(redis.password or "") == original["TEST_VALKEY_PW"]
     assert result["CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT"] == original["COMPOSE_PROJECT_NAME"]

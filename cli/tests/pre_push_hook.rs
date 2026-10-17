@@ -133,6 +133,7 @@ impl Fixture {
         .unwrap();
         fs::write(self.root.join("tools/preflight/always.txt"), "").unwrap();
         for relative in [
+            "tools/test-env/test_env.py",
             "tools/e2e-ci-selection/select_tiers.py",
             ".github/e2e-selection.yaml",
             "release/atlas.py",

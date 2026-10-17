@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 import yaml
@@ -38,6 +39,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 
@@ -61,9 +63,13 @@ async def main():
     assert os.environ["VALKEY_PORT"] == os.environ["TEST_VALKEY_PORT"]
     dsn = os.environ["TEST_DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://", 1)
     endpoint = urlsplit(dsn)
-    cache = redis.Redis(
-        host=os.environ["TEST_VALKEY_HOST"], port=int(os.environ["TEST_VALKEY_PORT"]),
-        password=os.environ["TEST_VALKEY_PW"], decode_responses=True,
+    valkey_url = os.environ["TEST_VALKEY_URL"]
+    assert valkey_url == os.environ["CURIE_SETTLEMENT_TEST_REDIS_URL"]
+    valkey_endpoint = urlsplit(valkey_url)
+    assert valkey_endpoint.hostname == os.environ["TEST_VALKEY_HOST"]
+    assert valkey_endpoint.port == int(os.environ["TEST_VALKEY_PORT"])
+    cache = redis.Redis.from_url(
+        valkey_url, decode_responses=True,
         socket_connect_timeout=10, socket_timeout=10,
     )
     connection = await asyncpg.connect(dsn, timeout=15)
@@ -72,11 +78,60 @@ async def main():
         await connection.execute("CREATE TABLE isolated_test_env_probe (value text NOT NULL)")
         await connection.execute("INSERT INTO isolated_test_env_probe VALUES ($1)", token)
         assert cache.set("isolated-test-env-probe", token)
+        otel_endpoint = os.environ["TEST_OTEL_COLLECTOR_ENDPOINT"]
+        otel_base = ""
+        if mode == "full":
+            collector = urlsplit(otel_endpoint)
+            assert collector.scheme == "http" and collector.hostname == endpoint.hostname
+            assert collector.port is not None and collector.path == "/v1/traces"
+            assert not collector.query and not collector.fragment
+            otel_base = otel_endpoint.removesuffix("/v1/traces")
+        else:
+            assert otel_endpoint == ""
+            for name in ("LANGFUSE_HOST", "TEST_LANGFUSE_HOST", "CURIE_LOCAL_OTEL_METRICS_URL"):
+                assert os.environ[name] == "", name
+        for name in (
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT",
+            "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT",
+        ):
+            assert os.environ[name] == otel_base, name
+        assert os.environ["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
+        for lane in ("TRACES", "LOGS", "METRICS"):
+            expected = f"{otel_base}/v1/{lane.lower()}" if otel_base else ""
+            assert os.environ[f"OTEL_EXPORTER_OTLP_{lane}_ENDPOINT"] == expected, lane
+            assert os.environ[f"OTEL_EXPORTER_OTLP_{lane}_PROTOCOL"] == "http/protobuf", lane
+        for name, value in os.environ.items():
+            if name.startswith("OTEL_EXPORTER_OTLP_") and name.endswith("_HEADERS"):
+                assert value == "", name
         if mode == "full":
             url = os.environ["TEST_LANGFUSE_HOST"].rstrip("/") + "/api/public/health"
             with urllib.request.urlopen(url, timeout=20) as response:
                 assert response.status == 200
             assert os.environ["LANGFUSE_HOST"] == os.environ["TEST_LANGFUSE_HOST"]
+            # https://opentelemetry.io/docs/specs/otlp/#otlphttp
+            request = urllib.request.Request(
+                otel_endpoint, data=b'{"resourceSpans":[]}',
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 60
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "The isolated collector OTLP HTTP receiver did not become ready"
+                    )
+                try:
+                    with urllib.request.urlopen(request, timeout=min(5, remaining)) as response:
+                        assert response.status == 200
+                        break
+                except urllib.error.HTTPError as error:
+                    if error.code not in (502, 503, 504):
+                        raise
+                except (urllib.error.URLError, TimeoutError, ConnectionError):
+                    pass
+                await asyncio.sleep(min(0.5, max(0, deadline - loop.time())))
         if mode == "signal":
             descendant = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(600)"]
@@ -89,6 +144,9 @@ async def main():
             "valkey_host": os.environ["TEST_VALKEY_HOST"],
             "valkey_port": int(os.environ["TEST_VALKEY_PORT"]),
             "runner_network": os.environ["CURIE_DOCKER_NETWORK"],
+            "otel_endpoint": otel_endpoint,
+            "langfuse_host": os.environ["TEST_LANGFUSE_HOST"],
+            "metrics_url": os.environ["CURIE_LOCAL_OTEL_METRICS_URL"],
         }
         print('{"child_stdout":"isolated-test-env"}', flush=True)
         print("child-stderr:" + token, file=sys.stderr, flush=True)
@@ -439,9 +497,27 @@ def trial(tmp_path: Path, request: pytest.FixtureRequest) -> Trial:
         "PATH": str(wrapper_directory) + os.pathsep + os.environ.get("PATH", ""),
         "TEST_ENV_REAL_DOCKER": docker,
         "TEST_ENV_CONTROL_DATABASE": str(database),
+        "TEST_VALKEY_URL": "redis://ambient.example.com:9/7",
+        "CURIE_SETTLEMENT_TEST_REDIS_URL": "redis://ambient.example.com:9/8",
     }
     for name in ("COMPOSE_FILE", "COMPOSE_PROJECT_NAME", "TEST_ENV_FAIL_STARTUP"):
         result.environment.pop(name, None)
+    for name in (
+        "TEST_OTEL_COLLECTOR_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT",
+        "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT",
+        "LANGFUSE_HOST",
+        "TEST_LANGFUSE_HOST",
+        "CURIE_LOCAL_OTEL_METRICS_URL",
+    ):
+        result.environment[name] = "http://ambient.example.com:9/ignored"
+    for lane in ("", "TRACES_", "LOGS_", "METRICS_"):
+        result.environment[f"OTEL_EXPORTER_OTLP_{lane}PROTOCOL"] = "grpc"
+        result.environment[f"OTEL_EXPORTER_OTLP_{lane}HEADERS"] = "x-test-env=ambient"
     image = yaml.safe_load((ROOT / "compose.dev.yaml").read_text())["services"]["valkey"]["image"]
     result.docker_run("pull", image, timeout=300)
     network_ids = result.docker_run("network", "ls", "-q").split()
@@ -509,15 +585,25 @@ def _ports(trial: Trial, environment: dict[str, Any]) -> set[int]:
     return ports
 
 
-def _networks(trial: Trial, environment: dict[str, Any]) -> set[str]:
+def _networks(
+    trial: Trial, environment: dict[str, Any]
+) -> tuple[set[str], list[ipaddress.IPv4Network | ipaddress.IPv6Network]]:
     identities = trial.inventory(environment["project"])["networks"]
     assert identities
     actual = json.loads(trial.docker_run("network", "inspect", *sorted(identities)))
+    subnets = []
     for network in actual:
         assert network["Labels"]["com.docker.compose.project"] == environment["project"]
+        allocated = [
+            ipaddress.ip_network(config["Subnet"], strict=False)
+            for config in (network.get("IPAM", {}).get("Config") or [])
+            if config.get("Subnet")
+        ]
+        assert allocated, "An owned Docker network has no actual subnet"
+        subnets.extend(allocated)
     names = {network["Name"] for network in actual}
     assert environment["runner_network"] in names
-    return names
+    return names, subnets
 
 
 def test_concurrent_default_core_environments_have_disjoint_ports_networks_and_data(trial: Trial):
@@ -528,9 +614,14 @@ def test_concurrent_default_core_environments_have_disjoint_ports_networks_and_d
     assert left["project"] != right["project"]
     assert left["runner_network"] != right["runner_network"]
     actual_ports = [_ports(trial, environment) for environment in environments]
-    actual_networks = [_networks(trial, environment) for environment in environments]
+    network_details = [_networks(trial, environment) for environment in environments]
+    actual_networks = [names for names, _ in network_details]
+    actual_subnets = [subnet for _, subnets in network_details for subnet in subnets]
     assert actual_ports[0].isdisjoint(actual_ports[1])
     assert actual_networks[0].isdisjoint(actual_networks[1])
+    for index, subnet in enumerate(actual_subnets):
+        for other in actual_subnets[index + 1 :]:
+            assert not subnet.overlaps(other), f"Docker subnets overlap: {subnet} and {other}"
     owned = [trial.inventory(environment["project"]) for environment in environments]
     assert owned[0]["networks"] and owned[1]["networks"]
     assert owned[0]["networks"].isdisjoint(owned[1]["networks"])
@@ -575,9 +666,15 @@ def test_concurrent_default_core_environments_have_disjoint_ports_networks_and_d
 def test_explicit_full_profile_supplies_a_live_observability_endpoint(trial: Trial):
     invocation = trial.launch(profile="full", mode="full")
     trial.wait_ready(invocation)
+    environment = _environment(trial, invocation)
+    actual_ports = _ports(trial, environment)
     trial.release(invocation)
     report = trial.finish(invocation, code=0, child_code=0)
     assert report["profile"] == "full"
+    assert urlsplit(environment["otel_endpoint"]).port == report["ports"]["otel-http"]
+    assert urlsplit(environment["langfuse_host"]).port == report["ports"]["langfuse-web"]
+    assert urlsplit(environment["metrics_url"]).port == report["ports"]["otel-metrics"]
+    assert set(report["ports"].values()) == actual_ports
 
 
 def test_child_exit_42_is_preserved_in_metadata_and_maps_to_cli_failure(trial: Trial):
