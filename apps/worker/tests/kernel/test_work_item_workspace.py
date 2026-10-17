@@ -41,7 +41,12 @@ from curie_worker.approvals import (
     PublicationLineage,
 )
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.binding import AmbiguousRoute, FactoryContext, FactoryWake
+from curie_worker.binding import (
+    AmbiguousRoute,
+    FactoryBindingRefused,
+    FactoryContext,
+    FactoryWake,
+)
 from curie_worker.config import WorkerConfig
 from curie_worker.kernel import failures
 from curie_worker.kernel.failures import ThreadBusyError
@@ -3138,6 +3143,71 @@ def test_refused_held_resume_releases_its_claim_only_when_the_finish_committed(
                 assert held.thread_key not in h.kernel._held_work_items
                 assert not h.kernel.owns_work_item(request_id)
                 assert h.runner.opened == [ISSUE_URL]
+                if response == "stale_owner":
+                    assert request_id not in items.terminal_outcomes
+                    assert held.claim_name not in h.fake_k8s.deleted_claims
+                    assert held.claim_name in h.fake_k8s.claims
+                else:
+                    assert items.terminal_outcomes == {request_id: "failed"}
+                    assert items.finishes[0]["cause"] == "runner_escalated"
+                    assert held.claim_name in h.fake_k8s.deleted_claims
+                    assert h.substrate._affinity.get(held.thread_key) is None
+            finally:
+                await asyncio.to_thread(h.substrate.release, held.thread_key)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("response", ["delivered", "lost", "stale_owner"])
+def test_binding_refused_after_held_adoption_releases_claim_only_when_finish_committed(
+    make_harness, response: str,
+) -> None:
+    """The binding is removed after a held continuation is adopted.
+
+    The delivery's factory resolution refuses, so the adopted run finishes its
+    epoch as escalated. A retried finish whose first response was lost is
+    refused ``not_running`` and still ends the request, so the recorded claim
+    is released. A different conflict leaves the claim to its owner.
+    """
+
+    class RemovedBinding(_Binding):
+        removed = False
+
+        async def resolve_factory(self, context: FactoryContext) -> object:
+            if self.removed:
+                raise FactoryBindingRefused("factory_binding_missing")
+            return await super().resolve_factory(context)
+
+    class FinishOutcome(_WorkItems):
+        async def finish(self, request_id: uuid.UUID, **kwargs: object) -> None:
+            if response == "stale_owner":
+                self.calls.append("finish")
+                raise WorkItemConflict("stale_owner")
+            await super().finish(request_id, **kwargs)
+            if response == "lost":
+                raise WorkItemConflict("not_running")
+
+    async def exercise() -> None:
+        binding = RemovedBinding()
+        async with make_harness(
+            binding=binding, workspace_factory=_Workspace, approvals=_Approvals(),
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            items = FinishOutcome()
+            h.kernel._work_items = items
+            request_id = uuid.uuid4()
+            held = await _park_factory_request(h, request_id)
+            binding.removed = True
+            incoming = _turn(
+                f"approval-{uuid.uuid4()}-resolved", "[approval resolved] approved",
+            )
+            try:
+                await h.kernel.process_event(incoming)
+                assert items.calls.count("finish") == 1
+                assert h.runner.opened == [ISSUE_URL]
+                assert held.thread_key not in h.kernel._held_work_items
+                assert not h.kernel.owns_work_item(request_id)
+                assert await h.kernel._markers.is_terminal(incoming.event_id)
                 if response == "stale_owner":
                     assert request_id not in items.terminal_outcomes
                     assert held.claim_name not in h.fake_k8s.deleted_claims
