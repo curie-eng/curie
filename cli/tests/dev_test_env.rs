@@ -58,7 +58,9 @@ fn missing_or_invalid_run_arguments_are_usage_errors_with_one_json_object() {
             .unwrap();
         assert_eq!(output.status.code(), Some(2), "arguments: {tail:?}");
         let value = object(&output);
-        assert!(value["error"].as_str().is_some_and(|error| !error.is_empty()));
+        assert!(value["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()));
     }
 }
 
@@ -79,7 +81,9 @@ fn valid_profiles_reach_the_real_missing_tool_boundary_as_transient_errors() {
             .unwrap();
         assert_eq!(output.status.code(), Some(3), "profile: {profile:?}");
         let value = object(&output);
-        assert!(value["error"].as_str().is_some_and(|error| !error.is_empty()));
+        assert!(value["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()));
     }
 }
 
@@ -95,5 +99,7 @@ fn run_outside_a_source_checkout_is_a_usage_error() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let value = object(&output);
-    assert!(value["error"].as_str().is_some_and(|error| !error.is_empty()));
+    assert!(value["error"]
+        .as_str()
+        .is_some_and(|error| !error.is_empty()));
 }

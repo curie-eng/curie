@@ -20,6 +20,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 TOOL = ROOT / "tools/preflight/preflight.py"
+TEST_ENV = ROOT / "tools/test-env/test_env.py"
 FIXTURES = Path(__file__).with_name("fixtures")
 # Sanitized GitHub check-runs response fields, with conclusions seeded for
 # success, failure and pending coverage. The provider owns this response shape:
@@ -29,6 +30,15 @@ PYTHON_CHECK = "Python (ruff + mypy + pytest)"
 
 def load_tool():
     spec = importlib.util.spec_from_file_location("curie_full_preflight_test_subject", TOOL)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_helper():
+    spec = importlib.util.spec_from_file_location("curie_full_preflight_test_env_subject", TEST_ENV)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -406,7 +416,7 @@ def test_private_service_environment_replaces_a_conflicting_ambient_contract(
         "CURIE_RELEASED_UPGRADE_POSTGRES_HOST": "localhost",
         "CURIE_RELEASED_UPGRADE_POSTGRES_PORT": "25432",
     }
-    environment = load_tool().private_service_environment(
+    environment = load_helper().private_service_environment(
         base, postgres=43210, valkey=43211, s3=43212, otel=43213
     )
     assert base["CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT"] == "someone-elses-stack"
@@ -464,7 +474,7 @@ def test_private_service_environment_unavailable_postgres_fails_the_real_gate_te
     # The private project has no containers, so `docker compose ps -q postgres`
     # succeeds with empty output and the gate fixture reaches its "not running" branch.
     project = "curie-preflight-absent-" + uuid.uuid4().hex[:8]
-    environment = load_tool().private_service_environment(
+    environment = load_helper().private_service_environment(
         private_base_environment(project, tmp_path / "override.yaml"),
         postgres=unused_port(),
         valkey=unused_port(),
@@ -765,8 +775,9 @@ def test_private_services_shared_worktree_lock_refuses_detached_checkout(
     # No Compose source is present, so even a broken lock cannot start services.
     with (scratch / f"{project}.lock").open("w") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        with pytest.raises(ValueError, match="Another full preflight owns"):
-            with load_tool().private_services(checkout, worktree):
+        helper = load_helper()
+        with pytest.raises(helper.TransientError):
+            with helper.private_services(checkout, worktree):
                 pytest.fail("A second invocation acquired the existing owner's project")
 
 
@@ -789,7 +800,7 @@ def test_private_services_unavailable_daemon_is_transient_error(
     # inventory or startup can reach a daemon. Do not replace the Docker tool.
     monkeypatch.setenv("DOCKER_HOST", f"unix://{socket_path}")
     monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
-    module = load_tool()
+    module = load_helper()
     with pytest.raises(module.TransientError, match="Docker"):
         with module.private_services(ROOT, worktree):
             pytest.fail("An unavailable daemon cannot yield usable private services")
@@ -815,7 +826,7 @@ def test_private_config_accepts_loopback_binding_and_owned_network() -> None:
         },
     }
     assert (
-        load_tool().validate_private_config(
+        load_helper().validate_private_config(
             configuration, project, {"postgres": [5432]}, subnets
         )
         is None
@@ -842,7 +853,7 @@ def test_private_config_shared_binding_is_gate_failure(host_ip: str | None) -> N
             },
         },
     }
-    module = load_tool()
+    module = load_helper()
     with pytest.raises(module.GateFailure, match="shared binding"):
         module.validate_private_config(configuration, project, {"postgres": [5432]}, subnets)
 
@@ -850,7 +861,9 @@ def test_private_config_shared_binding_is_gate_failure(host_ip: str | None) -> N
 def test_private_config_shared_network_is_gate_failure() -> None:
     subnets = ("10.240.0.0/24", "10.240.1.0/24")
     configuration = {
-        "services": {"postgres": {"ports": [{"host_ip": "127.0.0.1", "target": 5432}]}},
+        "services": {
+            "postgres": {"ports": [{"host_ip": "127.0.0.1", "target": 5432, "published": "35432"}]}
+        },
         "networks": {
             "default": {
                 "name": "curie-preflight-example_default",
@@ -862,7 +875,7 @@ def test_private_config_shared_network_is_gate_failure() -> None:
             },
         },
     }
-    module = load_tool()
+    module = load_helper()
     with pytest.raises(module.GateFailure, match="incorrect owner"):
         module.validate_private_config(
             configuration, "curie-preflight-example", {"postgres": [5432]}, subnets
@@ -870,7 +883,7 @@ def test_private_config_shared_network_is_gate_failure() -> None:
 
 
 def test_private_preflight_networks_skip_occupied_subnets() -> None:
-    module = load_tool()
+    module = load_helper()
     occupied = [
         f"10.240.{octet}.0/24" for octet in range(16) if octet not in {0, 1}
     ]
@@ -885,7 +898,7 @@ def test_private_preflight_networks_skip_occupied_subnets() -> None:
 
 
 def test_private_preflight_networks_fail_when_reserved_pool_is_full() -> None:
-    module = load_tool()
+    module = load_helper()
     occupied = [f"10.240.{octet}.0/24" for octet in range(16)]
     occupied.extend(f"172.31.{octet}.0/24" for octet in range(240, 256))
     occupied.extend(f"192.168.{octet}.0/24" for octet in range(240, 256))
