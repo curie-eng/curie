@@ -3125,11 +3125,23 @@ jobs:
           if-no-files-found: ignore
 
   forge-instance-regression:
-    name: Forge instance regression (kind)
+    name: Forge instance regression (kind, ${{ matrix.suite }})
     runs-on: ubuntu-latest
     needs: [changes]
     if: ${{ needs.changes.outputs.factory == 'true' }}
     timeout-minutes: 165
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: second-gitlab
+            test: test_second_gitlab_registration_preserves_first
+          - suite: jira-sites
+            test: test_jira_sites_coexist_and_conflicts_preserve_all_routes
+          - suite: stale-observation
+            test: test_registration_stale_observation_refuses
+          - suite: interrupted-resources
+            test: test_interrupted_owned_resources_are_reused_and_foreign_resources_refuse
     steps:
       - uses: actions/checkout@v7
         with:
@@ -3203,7 +3215,9 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           df -h /
       - name: Run the forge instance regressions
-        run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_forge_instances.py
+        env:
+          CASE_SELECTOR: tools/factory-e2e/tests/test_c4_forge_instances.py::${{ matrix.test }}
+        run: uv run pytest -q -n 0 "$CASE_SELECTOR"
 
   # CHART RUNTIME REGRESSIONS, in parallel with the cluster rung. Most
   # regression proofs use this job's enforcing Calico cluster. The workspace

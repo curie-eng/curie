@@ -532,16 +532,34 @@ def test_second_gitlab_registration_preserves_first(gitlab_cluster: Cluster) -> 
 def test_jira_sites_coexist_and_conflicts_preserve_all_routes(jira_cluster: Cluster) -> None:
     cluster = jira_cluster
     first, second = cluster.peers["jira-a"], cluster.peers["jira-b"]
-    gitlab = copy.deepcopy(cluster.values()["factory"])
+    before_jira = cluster.values()
+    gitlab = copy.deepcopy(before_jira["factory"])
+    expected_env = copy.deepcopy(before_jira.get("agentSandbox", {}).get("runnerEnv", {}))
+    history_before = json.loads(
+        cluster.helm("history", RELEASE, "-o", "json", "--max", "256").stdout
+    )
+    assert isinstance(history_before, list)
     installed = cluster.quickstart(first, app_flags=True)
     assert installed.returncode == 0
+    history_after = json.loads(
+        cluster.helm("history", RELEASE, "-o", "json", "--max", "256").stdout
+    )
+    assert isinstance(history_after, list)
+    assert len(history_after) - len(history_before) == 2, (
+        "first Jira registration must write GitHub intake and the Jira tracker with its runner "
+        "environment, without a standalone environment upgrade"
+    )
     initial = cluster.values()
+    expected_env.setdefault("acme-first", {})["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = "16000"
+    assert initial["agentSandbox"]["runnerEnv"] == expected_env
     first_binding = copy.deepcopy(binding_for(initial, first))
     first_tracker = named(initial, "trackers", first_binding["tracker"])
     first_secret = cluster.secret(first_tracker)
     second_install = cluster.quickstart(second, app_flags=True, agent="acme-second")
     assert second_install.returncode == 0
     current = cluster.values()
+    expected_env.setdefault("acme-second", {})["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = "16000"
+    assert current["agentSandbox"]["runnerEnv"] == expected_env
     jira_trackers = entries(current, "trackers", "jira_cloud")
     assert len(jira_trackers) == 2
     assert {t["apiUrl"] for t in jira_trackers} == {first.origin, second.origin}
@@ -617,6 +635,8 @@ def test_jira_sites_coexist_and_conflicts_preserve_all_routes(jira_cluster: Clus
         first, agent="acme-labelled", accounts=accounts, label="only-this-agent"
     )
     assert same_site.returncode == 0
+    expected_env.setdefault("acme-labelled", {})["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = "16000"
+    assert cluster.values()["agentSandbox"]["runnerEnv"] == expected_env
     assert binding_for(cluster.values(), first)["name"] == "operator-jira-binding"
     assert same_secret(canonical_jira_before, cluster.secret(tracker))
     assert named(cluster.values(), "trackers", "operator-jira-site")["egress"] == tracker["egress"]

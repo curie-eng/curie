@@ -52,6 +52,14 @@ FACTORY_SIBLING_RESULTS = {
     "admitted_agent_result": "ADMITTED_AGENT_RESULT",
 }
 FORGE_INSTANCE_MODULE = "tools/factory-e2e/tests/test_c4_forge_instances.py"
+FORGE_INSTANCE_LEGS = {
+    "second-gitlab": "test_second_gitlab_registration_preserves_first",
+    "jira-sites": "test_jira_sites_coexist_and_conflicts_preserve_all_routes",
+    "stale-observation": "test_registration_stale_observation_refuses",
+    "interrupted-resources": (
+        "test_interrupted_owned_resources_are_reused_and_foreign_resources_refuse"
+    ),
+}
 SRE_RUNTIME = "examples/tests/test_sre_bot_observability_runtime.py"
 FACTORY_UPGRADE_RUNTIME = "tools/factory-e2e/tests/test_c4_upgrade_migration.py"
 SRE_RUNTIME_INPUTS = (
@@ -3714,21 +3722,61 @@ def test_fresh_cluster_up_runtime_is_serial_and_propagates_failure(
     assert not any(arg.startswith(("-k", "-m", "--deselect", "--ignore")) for arg in argv)
 
 
+@functools.cache
+def _collect_forge_instance_cases(*pytest_args: str) -> tuple[str, ...]:
+    collected = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only",
+         *(pytest_args or ("-q", "-n", "0", FORGE_INSTANCE_MODULE))],
+        cwd=REPO_ROOT,
+        env={**os.environ, "PYTEST_ADDOPTS": ""},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    cases = tuple(
+        line.strip() for line in collected.stdout.splitlines()
+        if line.startswith(FORGE_INSTANCE_MODULE + "::")
+    )
+    assert cases, collected.stdout + collected.stderr
+    return cases
+
+
+def _assert_forge_instance_legs_map_one_to_one(
+    job: dict[str, Any], collected: tuple[str, ...],
+) -> None:
+    matrix = job["strategy"]["matrix"]
+    assert set(matrix) == {"include"}
+    legs = matrix["include"]
+    selectors = [f"{FORGE_INSTANCE_MODULE}::{leg['test']}" for leg in legs]
+    assert sorted(selectors) == sorted(collected), "each collected case needs exactly one leg"
+    assert len({leg["suite"] for leg in legs}) == len(legs), "suite labels must be unique"
+
+
 def test_forge_instance_job_is_gated_like_the_scripted_factory_and_required() -> None:
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     job = jobs[FORGE_INSTANCE_JOB]
-    assert job["name"] == "Forge instance regression (kind)"
+    assert job["name"] == "Forge instance regression (kind, ${{ matrix.suite }})"
     assert job["runs-on"] == "ubuntu-latest"
     assert job["timeout-minutes"] == 165
+    assert job["strategy"] == {
+        "fail-fast": False,
+        "matrix": {"include": [
+            {"suite": suite, "test": test} for suite, test in FORGE_INSTANCE_LEGS.items()
+        ]},
+    }
+    assert not job.get("continue-on-error")
     assert job["if"] == jobs[SCRIPTED_FACTORY_JOB]["if"]
     assert "needs.changes.outputs.factory == 'true'" in job["if"]
-    assert "changes" in job["needs"]
+    assert job["needs"] == ["changes"]
     assert FORGE_INSTANCE_JOB in jobs["e2e-required"]["needs"]
     steps = job["steps"]
-    runs = [step for step in steps if FORGE_INSTANCE_MODULE in step.get("run", "")]
+    runs = [step for step in steps if FORGE_INSTANCE_MODULE in json.dumps(step)]
     assert len(runs) == 1
     run = runs[0]
-    assert run["run"] == f"uv run pytest -q -n 0 {FORGE_INSTANCE_MODULE}"
+    assert run["run"] == 'uv run pytest -q -n 0 "$CASE_SELECTOR"'
+    assert run["env"] == {"CASE_SELECTOR": FORGE_INSTANCE_MODULE + "::${{ matrix.test }}"}
     assert not run.get("if")
     assert not run.get("continue-on-error")
     before = steps[: steps.index(run)]
@@ -3744,6 +3792,76 @@ def test_forge_instance_job_is_gated_like_the_scripted_factory_and_required() ->
     assert (
         "FACTORY_RESULT FORGE_INSTANCE_RESULT ADMITTED_AGENT_RESULT"
         in script
+    )
+
+
+@pytest.mark.parametrize("mutation", ("extra-case", "missing-leg", "duplicate-leg"))
+def test_forge_instance_leg_mapping_rejects_missing_or_duplicate_coverage(mutation: str) -> None:
+    job = yaml.safe_load(WORKFLOW.read_text())["jobs"][FORGE_INSTANCE_JOB]
+    collected = _collect_forge_instance_cases()
+    _assert_forge_instance_legs_map_one_to_one(job, collected)
+    if mutation == "extra-case":
+        collected += (FORGE_INSTANCE_MODULE + "::test_new_unmapped_regression",)
+    elif mutation == "missing-leg":
+        job["strategy"]["matrix"]["include"].pop()
+    else:
+        job["strategy"]["matrix"]["include"].append(
+            copy.deepcopy(job["strategy"]["matrix"]["include"][0])
+        )
+    with pytest.raises(AssertionError, match="each collected case needs exactly one leg"):
+        _assert_forge_instance_legs_map_one_to_one(job, collected)
+
+
+@pytest.mark.parametrize("failing_suite", (None, *FORGE_INSTANCE_LEGS))
+def test_forge_instance_matrix_executes_each_case_and_propagates_failure(
+    tmp_path: Path, failing_suite: str | None,
+) -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    job = jobs[FORGE_INSTANCE_JOB]
+    _assert_forge_instance_legs_map_one_to_one(job, _collect_forge_instance_cases())
+    runtime = next(step for step in job["steps"] if FORGE_INSTANCE_MODULE in json.dumps(step))
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    uv = binaries / "uv"
+    uv.write_text(
+        f"#!{sys.executable}\nimport json, os, sys\nfrom pathlib import Path\n"
+        "Path(os.environ['FORGE_ARGV']).write_text(json.dumps(sys.argv[1:]))\n"
+        "sys.exit(int(os.environ['FORGE_EXIT_CODE']))\n"
+    )
+    uv.chmod(0o755)
+    selected = []
+    results = []
+    for leg in job["strategy"]["matrix"]["include"]:
+        log = tmp_path / f"{leg['suite']}.json"
+        exit_code = 17 if leg["suite"] == failing_suite else 0
+        environment = {
+            key: value.replace("${{ matrix.test }}", leg["test"])
+            for key, value in runtime["env"].items()
+        }
+        executed = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", runtime["run"]],
+            cwd=tmp_path,
+            env={**os.environ, **environment, "PATH": f"{binaries}:{os.environ['PATH']}",
+                 "FORGE_ARGV": str(log), "FORGE_EXIT_CODE": str(exit_code)},
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        assert executed.returncode == exit_code, executed.stdout + executed.stderr
+        argv = json.loads(log.read_text())
+        selector = f"{FORGE_INSTANCE_MODULE}::{leg['test']}"
+        assert argv == ["run", "pytest", "-q", "-n", "0", selector]
+        cases = _collect_forge_instance_cases(*argv[2:])
+        assert cases == (selector,)
+        selected.extend(cases)
+        results.append(executed.returncode)
+    assert sorted(selected) == sorted(_collect_forge_instance_cases())
+    aggregate = _run_aggregate(
+        event_name="pull_request",
+        factory_selected="true",
+        factory_result="success",
+        forge_instance_result="failure" if any(results) else "success",
+    )
+    assert (aggregate.returncode == 0) == (failing_suite is None), (
+        aggregate.stdout + aggregate.stderr
     )
 
 
