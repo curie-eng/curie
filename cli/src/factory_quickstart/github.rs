@@ -1157,7 +1157,15 @@ async fn apply_jira_tracker(
         &format!("the Jira tracker and binding `{}`", jira.binding_name),
         observation,
         &writes,
-        |recorded| crate::factory_intake::forge_entries_values(recorded, jira),
+        |recorded| {
+            let mut values = crate::factory_intake::forge_entries_values(recorded, jira)?;
+            values["agentSandbox"] = serde_json::json!({
+                "runnerEnv": {
+                    &opts.agent: {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "16000"}
+                }
+            });
+            Ok(values)
+        },
     )
     .await
 }

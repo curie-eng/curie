@@ -2116,7 +2116,7 @@ fn jira_stale_observation_refuses_before_tracker_env_and_deploy() {
             .env("QUICKSTART_STALE_SECRET", secret)
             .env("QUICKSTART_STALE_KIND", kind);
         let (code, shown) = capture_quickstart(command);
-        assert_eq!(code, 1, "{kind}: {shown}");
+        assert_eq!(code, 2, "{kind}: {shown}");
         assert!(
             shown.contains(cause) && shown.contains("stale"),
             "{kind}: {shown}"
