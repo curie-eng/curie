@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -1095,7 +1096,7 @@ def two_worker_ci(
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
     paused_factory: AdmittedKind,
-) -> tuple[AdmittedKind, str, str]:
+) -> tuple[AdmittedKind, str, str, float]:
     run = paused_factory
     owner_stream = RUNS_STREAM_DEFAULT + ":c4-owner"
     continuation_stream = RUNS_STREAM_DEFAULT + ":c4-holder"
@@ -1189,6 +1190,17 @@ def two_worker_ci(
         if len(worker_lane_identity(run, label)) != 1:
             raise RuntimeError("the independent worker lane has no unique running process")
 
+    proof_window_s = float(run.kubectl(
+        "-n", run.namespace, "exec", "deployment/" + deployment_name, "-c", "worker", "--",
+        "python3", "-c",
+        "from curie_worker.config import WorkerConfig\n"
+        "config = WorkerConfig()\n"
+        "print(config.consumer_heartbeat_ttl_ms / 1000 "
+        "+ 2 * config.work_item_orphan_sweep_interval_s + 5)",
+    ))
+    if not 0 < proof_window_s <= 90:
+        raise RuntimeError("the peer absence proof exceeds the bounded model-response hold")
+
     scripted_reply = run.model._match
 
     def model_reply(method: str, path: str, body: bytes) -> Any:
@@ -1204,7 +1216,7 @@ def two_worker_ci(
         return reply
 
     monkeypatch.setattr(run.model, "_match", model_reply)
-    return run, owner_stream, continuation_stream
+    return run, owner_stream, continuation_stream, proof_window_s
 
 
 def forward_worker_wake(run: AdmittedKind, stream: str, wake: dict[str, Any]) -> None:
@@ -1267,9 +1279,11 @@ def change_github_fixture_label(run: AdmittedKind, ticket: Ticket, *, present: b
 
 
 def test_two_worker_ci_preserves_successor_identity_and_rejects_stale_predecessor(
-    two_worker_ci: tuple[AdmittedKind, str, str],
+    two_worker_ci: tuple[AdmittedKind, str, str, float],
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run, owner_stream, continuation_stream = two_worker_ci
+    run, owner_stream, continuation_stream, proof_window_s = two_worker_ci
     owner_before = worker_lane_identity(run, "worker")
     continuation_worker_before = worker_lane_identity(run, "c4-held-worker")
     ticket, _, execute = waiting_ticket(run)
@@ -1305,6 +1319,30 @@ def test_two_worker_ci_preserves_successor_identity_and_rejects_stale_predecesso
     )
 
     before_calls = max(call["id"] for call in run.model.call_evidence())
+    publication_response_held = threading.Event()
+    release_publication_response = threading.Event()
+    response_hold_expired = threading.Event()
+    request.addfinalizer(release_publication_response.set)
+    scripted_reply = run.model._match
+
+    def hold_successor_publication(method: str, path: str, body: bytes) -> Any:
+        reply = scripted_reply(method, path, body)
+        if (
+            reply is not None
+            and ticket.url in body.decode()
+            and any(
+                block.get("type") == "tool_use"
+                and block.get("name") == "mcp__curie__publish_changes"
+                and block.get("id") == "toolu_publish_1"
+                for block in reply["message"]["content"]
+            )
+        ):
+            publication_response_held.set()
+            if not release_publication_response.wait(timeout=180):
+                response_hold_expired.set()
+        return reply
+
+    monkeypatch.setattr(run.model, "_match", hold_successor_publication)
     change_github_fixture_label(run, ticket, present=True)
     successor = observe_until(
         lambda: r if (r := run.request(ticket)) and r["id"] != predecessor["id"] else None
@@ -1318,6 +1356,25 @@ def test_two_worker_ci_preserves_successor_identity_and_rejects_stale_predecesso
     successor_execute = run.take_execute_wake(successor)
     forward_worker_wake(run, owner_stream, successor_execute)
     successor = assert_started(run, ticket)
+    try:
+        assert publication_response_held.wait(timeout=90), (
+            "the successor did not reach its scripted publication response barrier"
+        )
+        held_until = time.monotonic() + proof_window_s
+        while True:
+            held = run.request(ticket)
+            assert held is not None
+            assert held["status"] == "running", "a live successor was cancelled during the hold"
+            assert_execution_identity(successor, held)
+            assert held["runtime_owner"] == successor["runtime_owner"]
+            assert run.publication_rows(successor) == []
+            assert not response_hold_expired.is_set(), "the scripted response hold expired"
+            remaining = held_until - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(1, remaining))
+    finally:
+        release_publication_response.set()
     successor_publications = assert_published(run, successor, 1)
     assert_marker(run, ticket, 1)
     assert successor["runtime_sandbox_name"] != predecessor["runtime_sandbox_name"]

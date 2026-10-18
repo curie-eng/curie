@@ -48,6 +48,7 @@ from curie_worker.binding import (
     FactoryWake,
 )
 from curie_worker.config import WorkerConfig
+from curie_worker.consumer_liveness import ConsumerLivenessStore, ThreadLockOwnerLiveness
 from curie_worker.kernel import failures
 from curie_worker.kernel.failures import ThreadBusyError
 from curie_worker.reply_sink import ReplySink, TargetRoute, build_reply_sink
@@ -1991,12 +1992,13 @@ def test_orphan_sweeper_reclaims_a_held_run_only_past_its_deadline(
             self_name = h.kernel._config.consumer_name
             client = _OwnerRows(request_id, self_name)
 
-            async def alive(_owner: str) -> bool:
-                return True
-
             sweeper = WorkItemOrphanSweeper(
                 client,
-                alive,
+                ThreadLockOwnerLiveness(
+                    ConsumerLivenessStore(h.async_redis),
+                    stream=h.config.stream,
+                    group=h.config.consumer_group,
+                ),
                 self_name=self_name,
                 locally_owned=h.kernel.owns_work_item,
                 absence_proof_s=60.0,

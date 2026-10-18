@@ -35,6 +35,7 @@ from curie_api.main import create_app
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_worker.binding import FactoryWake
 from curie_worker.config import WorkerConfig
+from curie_worker.consumer_liveness import ConsumerLivenessStore, ThreadLockOwnerLiveness
 from curie_worker.kernel.core import Kernel
 from curie_worker.markers import Markers
 from curie_worker.runner_client import RunnerClient
@@ -251,15 +252,13 @@ async def _recover(app: Any, request_id: uuid.UUID, old: str) -> dict[str, Any]:
             await reconciler._publish_terminate_wakes()
             wakes_before = await _published_turns(valkey)
 
-            liveness_calls: list[str] = []
-
-            async def liveness(owner: str) -> bool:
-                liveness_calls.append(owner)
-                return False
-
             sweeper = WorkItemOrphanSweeper(
                 client,
-                liveness,
+                ThreadLockOwnerLiveness(
+                    ConsumerLivenessStore(valkey),
+                    stream=kernel._config.stream,
+                    group=kernel._config.consumer_group,
+                ),
                 self_name=old,
                 locally_owned=kernel.owns_work_item,
                 absence_proof_s=3600.0,
