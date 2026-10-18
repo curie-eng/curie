@@ -27,6 +27,7 @@ from curie_worker.approvals import (
     CreatedPublication,
 )
 from curie_worker.binding import FactoryWake
+from curie_worker.consumer_liveness import ConsumerLivenessStore, ThreadLockOwnerLiveness
 from curie_worker.kernel import failures
 from curie_worker.sandbox import RouteState, SandboxHandle
 from curie_worker.workitem_dispatch import (
@@ -243,9 +244,6 @@ def _sweeper(
     *,
     observed_ownership: list[tuple[float, bool]] | None = None,
 ) -> WorkItemOrphanSweeper:
-    async def alive(_owner: str) -> bool:
-        return True
-
     def locally_owned(request_id: uuid.UUID) -> bool:
         owned = h.kernel.owns_work_item(request_id)
         if observed_ownership is not None:
@@ -254,7 +252,11 @@ def _sweeper(
 
     return WorkItemOrphanSweeper(
         client,
-        alive,
+        ThreadLockOwnerLiveness(
+            ConsumerLivenessStore(h.async_redis),
+            stream=h.config.stream,
+            group=h.config.consumer_group,
+        ),
         self_name=h.config.consumer_name,
         locally_owned=locally_owned,
         absence_proof_s=30,
