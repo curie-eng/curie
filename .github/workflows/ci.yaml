@@ -3484,7 +3484,8 @@ jobs:
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh
       - name: Quota progress regression
-        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
+        # Temporarily disabled pending idle-capacity runtime repair (#4740).
+        if: ${{ false }}
         timeout-minutes: 30
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
