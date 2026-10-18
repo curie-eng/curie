@@ -24,6 +24,7 @@ State labels move through the tracker port's ``set_state_label``.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import math
@@ -623,36 +624,55 @@ async def sync_status_comments(
         timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
     ) as client:
         for _ in range(limit):
-            async with sessionmaker() as session:
-                claim = await _claim_next(
-                    session,
-                    settings,
-                    owner=owner,
-                    attempted_ids=attempted_ids,
-                    paused_for_upgrade=paused_for_upgrade,
-                )
-                await session.commit()
-            if claim is None:
-                break
-            attempted_ids.add(claim.row.execution_request_id)
-            calls = GitHubCalls()
-            token = github_calls.set(calls)
-            started = time.monotonic()
+            claim = None
             try:
-                writes += await _sync_one(client, settings, claim)
-                claim.row.attempts += 1
                 async with sessionmaker() as session:
-                    await _write_back(session, claim, owner=owner)
+                    claim = await _claim_next(
+                        session,
+                        settings,
+                        owner=owner,
+                        attempted_ids=attempted_ids,
+                        paused_for_upgrade=paused_for_upgrade,
+                    )
                     await session.commit()
-            finally:
-                github_calls.reset(token)
-                elapsed_ms = (time.monotonic() - started) * 1000
-                logger.info(
-                    "factory status sync calls=%d elapsed_ms=%.1f",
-                    calls.count,
-                    elapsed_ms,
-                    extra={"call_count": calls.count, "elapsed_ms": elapsed_ms},
-                )
+                if claim is None:
+                    break
+                attempted_ids.add(claim.row.execution_request_id)
+                calls = GitHubCalls()
+                token = github_calls.set(calls)
+                started = time.monotonic()
+                try:
+                    writes += await _sync_one(client, settings, claim)
+                    claim.row.attempts += 1
+                    async with sessionmaker() as session:
+                        await _write_back(session, claim, owner=owner)
+                        await session.commit()
+                finally:
+                    github_calls.reset(token)
+                    elapsed_ms = (time.monotonic() - started) * 1000
+                    logger.info(
+                        "factory status sync calls=%d elapsed_ms=%.1f",
+                        calls.count,
+                        elapsed_ms,
+                        extra={"call_count": calls.count, "elapsed_ms": elapsed_ms},
+                    )
+            except asyncio.CancelledError:
+                if claim is not None:
+                    cleanup = asyncio.create_task(
+                        _release_sync_claim(
+                            sessionmaker, claim.row.execution_request_id, owner=owner
+                        )
+                    )
+                    try:
+                        while not cleanup.done():
+                            try:
+                                await asyncio.shield(cleanup)
+                            except asyncio.CancelledError:
+                                continue
+                        cleanup.result()
+                    except BaseException:
+                        logger.exception("factory status sync claim release failed")
+                raise
     return writes
 
 
@@ -828,6 +848,21 @@ async def _write_back(session: AsyncSession, claim: _StatusClaim, *, owner: str)
         logger.info("factory status sync dropped stale owner writeback")
         return False
     return True
+
+
+async def _release_sync_claim(
+    sessionmaker: async_sessionmaker[AsyncSession], request_id: uuid.UUID, *, owner: str
+) -> None:
+    async with sessionmaker() as session:
+        await session.execute(
+            update(FactoryStatusComment)
+            .where(
+                FactoryStatusComment.execution_request_id == request_id,
+                FactoryStatusComment.sync_owner == owner,
+            )
+            .values(sync_owner=None, sync_lease_expires_at=None)
+        )
+        await session.commit()
 
 
 async def _sync_one(
