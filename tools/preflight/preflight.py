@@ -4,15 +4,11 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
-import hashlib
-import ipaddress
 import json
 import os
 import re
 import shlex
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -26,6 +22,17 @@ from urllib.parse import quote
 
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "test-env"))
+
+from test_env import (
+    GateFailure,
+    Interrupted,
+    TransientError,
+    interrupt,
+    private_services,
+    run_process,
+)
+
 
 @dataclass(frozen=True)
 class Check:
@@ -38,61 +45,9 @@ class Check:
     ci_command: str
 
 
-class TransientError(ValueError):
-    """An unavailable operational dependency may recover with the same input."""
-
-
-class GateFailure(ValueError):
-    """A well-formed invocation reached a failing product verification gate."""
-
-
 def pytest_command(tests: Sequence[str]) -> list[str]:
     # Matches CI's xdist scheduling; the root conftest.py groups tests for loadgroup.
     return ["uv", "run", "pytest", "-q", "-n", "4", "--dist", "loadgroup", *tests]
-
-
-def released_upgrade_environment(
-    project: str, compose_files: str, postgres_port: int
-) -> dict[str, str]:
-    # scripts/check-released-upgrade.py reads this isolation contract; INTEGRATION=1
-    # makes a missing private Postgres fail instead of skip, as in the isolated baseline.
-    return {
-        "CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT": project,
-        "CURIE_RELEASED_UPGRADE_COMPOSE_FILES": compose_files,
-        "CURIE_RELEASED_UPGRADE_POSTGRES_HOST": "127.0.0.1",
-        "CURIE_RELEASED_UPGRADE_POSTGRES_PORT": str(postgres_port),
-        "CURIE_RELEASED_UPGRADE_INTEGRATION": "1",
-    }
-
-
-def private_service_environment(
-    environment: dict[str, str], *, postgres: int, valkey: int, s3: int, otel: int
-) -> dict[str, str]:
-    # Every endpoint the Python gates read, pointed at the private project's
-    # published ports. Ambient values for the same variables are replaced.
-    database = f"postgresql+asyncpg://postgres:postgres@127.0.0.1:{postgres}/postgres"
-    return {
-        **environment,
-        **released_upgrade_environment(
-            environment["COMPOSE_PROJECT_NAME"], environment["COMPOSE_FILE"], postgres
-        ),
-        "DATABASE_URL": database,
-        "TEST_DATABASE_URL": database,
-        "TEST_VALKEY_HOST": "127.0.0.1",
-        "TEST_VALKEY_PORT": str(valkey),
-        "CURIE_PRIMARY_SOURCE_RESOURCES": "1",
-        "CURIE_SETTLEMENT_TEST_REDIS_URL": (
-            f"redis://:{quote(environment.get('TEST_VALKEY_PW', 'valkeypass'), safe='')}"
-            f"@127.0.0.1:{valkey}/0"
-        ),
-        "VALKEY_HOST": "127.0.0.1",
-        "VALKEY_PORT": str(valkey),
-        "S3_ENDPOINT_URL": f"http://127.0.0.1:{s3}",
-        "TEST_S3_ENDPOINT_URL": f"http://127.0.0.1:{s3}",
-        "TEST_OTEL_COLLECTOR_ENDPOINT": f"http://127.0.0.1:{otel}/v1/traces",
-        "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{otel}",
-        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
-    }
 
 
 def exact(job: str, step: str, command: str, cwd: str, group: str) -> Check:
@@ -600,39 +555,6 @@ def select_ci_only(root: Path, paths: list[str], base: str, head: str) -> list[s
     return selected
 
 
-def run_process(
-    command: list[str], root: Path, environment: dict[str, str] | None = None
-) -> subprocess.CompletedProcess[str]:
-    # A signal must reap the owned foreground process tree before its Compose
-    # services or committed checkout can be removed.
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=root,
-            env=environment,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    except OSError as error:
-        raise TransientError("Cannot start the required preflight toolchain command") from error
-    try:
-        output, _ = process.communicate()
-    except BaseException:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            process.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.communicate()
-        raise
-    return subprocess.CompletedProcess(command, process.returncode, output)
-
-
 def run_check(
     root: Path,
     name: str,
@@ -847,327 +769,6 @@ def check_pr_body(
                 )
             )
         return checks
-
-
-class Interrupted(BaseException):
-    def __init__(self, signum: int) -> None:
-        self.signum = signum
-
-
-def interrupt(signum: int, _frame: Any) -> Never:
-    raise Interrupted(signum)
-
-
-def docker_output(root: Path, environment: dict[str, str], *arguments: str) -> str:
-    try:
-        result = subprocess.run(
-            ["docker", *arguments],
-            cwd=root,
-            env=environment,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-    except OSError as error:
-        raise TransientError("Cannot run Docker for the private preflight services") from error
-    if result.returncode:
-        # Docker's diagnostics can contain substituted credentials. The exit
-        # and operation suffice here; the caller can inspect its private stack.
-        error_class = GateFailure if "config" in arguments else TransientError
-        raise error_class(f"Docker {arguments[0]} operation failed (exit {result.returncode})")
-    return result.stdout.strip()
-
-
-def owned_resources(root: Path, environment: dict[str, str], project: str) -> list[str]:
-    label = f"label=com.docker.compose.project={project}"
-    return [
-        identity
-        for arguments in (("ps", "-aq"), ("network", "ls", "-q"), ("volume", "ls", "-q"))
-        for identity in docker_output(root, environment, *arguments, "--filter", label).splitlines()
-    ]
-
-
-def validate_private_config(
-    configuration: dict[str, Any],
-    project: str,
-    published: dict[str, list[int]],
-    network_subnets: tuple[str, str],
-) -> None:
-    for service in published:
-        if any(
-            port.get("host_ip") != "127.0.0.1"
-            for port in configuration["services"][service]["ports"]
-        ):
-            raise GateFailure("The private Compose configuration retained a shared binding")
-    expected = {
-        "default": (f"{project}_default", network_subnets[0]),
-        "curie_runner": (f"{project}_runner", network_subnets[1]),
-    }
-    for name, (expected_name, expected_subnet) in expected.items():
-        network = configuration["networks"][name]
-        if network["name"] != expected_name:
-            raise GateFailure(f"The private {name} network has an incorrect owner")
-        actual_subnets = [
-            item.get("subnet") for item in network.get("ipam", {}).get("config", [])
-        ]
-        if expected_subnet not in actual_subnets:
-            raise GateFailure(f"The private {name} network has no owned subnet")
-
-
-def private_network_subnets(project: str, occupied: Sequence[str]) -> tuple[str, str]:
-    """Choose two unused /24s outside Docker's exhausted automatic pools."""
-    existing = [ipaddress.ip_network(value, strict=False) for value in occupied]
-    pools = (
-        ipaddress.ip_network("10.240.0.0/20"),
-        ipaddress.ip_network("172.31.240.0/20"),
-        ipaddress.ip_network("192.168.240.0/20"),
-    )
-    seed = int(hashlib.sha256(project.encode()).hexdigest(), 16)
-    selected: list[str] = []
-    for pool_index, pool in enumerate(pools):
-        candidates = list(pool.subnets(new_prefix=24))
-        start = (seed + pool_index) % len(candidates)
-        for offset in range(len(candidates)):
-            candidate = candidates[(start + offset) % len(candidates)]
-            if any(candidate.overlaps(network) for network in existing):
-                continue
-            selected.append(str(candidate))
-            existing.append(candidate)
-            if len(selected) == 2:
-                return selected[0], selected[1]
-    raise TransientError("No free private preflight subnets remain in the reserved range")
-
-
-def docker_network_subnets(root: Path, environment: dict[str, str]) -> list[str]:
-    network_ids = docker_output(root, environment, "network", "ls", "-q").splitlines()
-    if not network_ids:
-        return []
-    rendered = docker_output(
-        root,
-        environment,
-        "network",
-        "inspect",
-        *network_ids,
-        "--format",
-        "{{json .IPAM.Config}}",
-    )
-    result: list[str] = []
-    for line in rendered.splitlines():
-        configurations = json.loads(line)
-        if not isinstance(configurations, list):
-            continue
-        for configuration in configurations:
-            subnet = configuration.get("Subnet")
-            if isinstance(subnet, str):
-                result.append(subnet)
-    return result
-
-
-def free_port() -> int:
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
-
-
-def port_is_occupied(port: int) -> bool:
-    with socket.socket() as listener:
-        try:
-            listener.bind(("127.0.0.1", port))
-        except OSError:
-            return True
-    return False
-
-
-@contextmanager
-def private_services(root: Path, worktree: Path) -> Iterator[dict[str, str]]:
-    """Own the Python shard's backing services and verify their teardown."""
-    project = "curie-preflight-" + hashlib.sha256(str(worktree.resolve()).encode()).hexdigest()[:10]
-    scratch = root / ".projects" / "preflight"
-    scratch.mkdir(parents=True, exist_ok=True)
-    lock_directory = worktree / ".projects" / "preflight"
-    lock_directory.mkdir(parents=True, exist_ok=True)
-    # The project identity is intentionally stable for this worktree. A lock
-    # and label inventory prevent simultaneous invocations adopting each other.
-    with (lock_directory / f"{project}.lock").open("w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise TransientError(
-                "Another full preflight owns this worktree's Compose project"
-            ) from error
-        with tempfile.TemporaryDirectory(prefix="compose-", dir=scratch) as directory:
-            override = Path(directory) / "compose.yaml"
-            environment = {
-                **os.environ,
-                "COMPOSE_PROJECT_NAME": project,
-                "COMPOSE_FILE": f"{root / 'compose.dev.yaml'}:{override}",
-                "CURIE_LOCAL_POSTGRES_PASSWORD": "postgres",
-                "VALKEY_PASSWORD": "valkeypass",
-                "TEST_VALKEY_PW": "valkeypass",
-                "S3_ACCESS_KEY": "rustfs",
-                "TEST_S3_ACCESS_KEY": "rustfs",
-                "S3_SECRET_KEY": "rustfssecret",
-                "TEST_S3_SECRET_KEY": "rustfssecret",
-                "LANGFUSE_PUBLIC_KEY": "pk-lf-curie-dev",
-                "TEST_LANGFUSE_PUBLIC_KEY": "pk-lf-curie-dev",
-                "LANGFUSE_SECRET_KEY": "sk-lf-curie-dev",
-                "TEST_LANGFUSE_SECRET_KEY": "sk-lf-curie-dev",
-                "CI_REQUIRE_POSTGRES_TESTS": "1",
-                "CI_REQUIRE_VALKEY_TESTS": "1",
-                "CURIE_DOCKER_NETWORK": f"{project}_runner",
-            }
-            compose = [
-                "compose",
-                "-p",
-                project,
-                "-f",
-                str(root / "compose.dev.yaml"),
-                "-f",
-                str(override),
-            ]
-            if owned_resources(root, environment, project):
-                raise TransientError(
-                    "The private preflight project already has resources; preserve its owner"
-                )
-            previous = {
-                number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)
-            }
-            for number in previous:
-                signal.signal(number, interrupt)
-
-            def cleanup() -> None:
-                for number in previous:
-                    signal.signal(number, signal.SIG_IGN)
-                try:
-                    docker_output(root, environment, *compose, "--profile", "full", "down", "-v")
-                    if owned_resources(root, environment, project):
-                        raise TransientError(
-                            "The owned preflight Compose resources were not removed"
-                        )
-                    print(f"preflight: removed private Compose project {project}", file=sys.stderr)
-                finally:
-                    for number in previous:
-                        signal.signal(number, interrupt)
-
-            try:
-                # Docker allocates every backing port. Only the web readiness
-                # URL must be known before the existing startup helper runs.
-                for attempt in range(3):
-                    web_port = free_port()
-                    published = {
-                        "postgres": [5432],
-                        "valkey": [6379],
-                        "clickhouse": [8123, 9000],
-                        "rustfs": [9000, 9001],
-                        "langfuse-web": [3000],
-                        "otel-collector": [4317, 4318, 8888],
-                    }
-                    lines = ["services:"]
-                    for service, ports in published.items():
-                        bindings = [
-                            f"127.0.0.1:{web_port if service == 'langfuse-web' else ''}:{port}"
-                            for port in ports
-                        ]
-                        lines.extend(
-                            (f"  {service}:", "    ports: !override " + json.dumps(bindings))
-                        )
-                    network_subnets = private_network_subnets(
-                        project, docker_network_subnets(root, environment)
-                    )
-                    lines.extend(
-                        (
-                            "networks:",
-                            "  default:",
-                            f"    name: {project}_default",
-                            "    ipam:",
-                            "      config:",
-                            f"        - subnet: {network_subnets[0]}",
-                            "  curie_runner:",
-                            f"    name: {project}_runner",
-                            "    ipam:",
-                            "      config:",
-                            f"        - subnet: {network_subnets[1]}",
-                        )
-                    )
-                    override.write_text("\n".join(lines) + "\n")
-                    configuration = json.loads(
-                        docker_output(
-                            root,
-                            environment,
-                            *compose,
-                            "--profile",
-                            "full",
-                            "config",
-                            "--format",
-                            "json",
-                        )
-                    )
-                    validate_private_config(
-                        configuration, project, published, network_subnets
-                    )
-                    environment["TEST_LANGFUSE_HOST"] = f"http://127.0.0.1:{web_port}"
-                    environment["LANGFUSE_HOST"] = environment["TEST_LANGFUSE_HOST"]
-                    startup = run_check(
-                        root,
-                        "Python backing services",
-                        [
-                            sys.executable,
-                            "scripts/wait-for-langfuse.py",
-                            "--start",
-                            "--timeout-seconds",
-                            "480",
-                        ],
-                        environment,
-                    )
-                    if startup["status"] == "passed":
-                        break
-                    web = docker_output(
-                        root,
-                        environment,
-                        *compose,
-                        "ps",
-                        "--status",
-                        "running",
-                        "-q",
-                        "langfuse-web",
-                    )
-                    collision = not web and port_is_occupied(web_port)
-                    if not collision or attempt == 2:
-                        raise TransientError(startup["detail"])
-                    cleanup()
-                print(f"preflight: started private Compose project {project}", file=sys.stderr)
-
-                def port(service: str, container_port: int) -> int:
-                    address = docker_output(
-                        root, environment, *compose, "port", service, str(container_port)
-                    )
-                    host, value = address.rsplit(":", 1)
-                    if host != "127.0.0.1":
-                        raise GateFailure("The private Compose port is not bound to loopback")
-                    return int(value)
-
-                postgres = port("postgres", 5432)
-                valkey = port("valkey", 6379)
-                s3 = port("rustfs", 9000)
-                otel = port("otel-collector", 4318)
-                environment = private_service_environment(
-                    environment, postgres=postgres, valkey=valkey, s3=s3, otel=otel
-                )
-                migration = run_check(
-                    root / "apps/api",
-                    "Python test database migrations",
-                    ["uv", "run", "alembic", "upgrade", "head"],
-                    environment,
-                )
-                if migration["status"] == "failed":
-                    raise GateFailure(migration["detail"])
-                yield environment
-            finally:
-                try:
-                    cleanup()
-                finally:
-                    for number, handler in previous.items():
-                        signal.signal(number, handler)
 
 
 def render_command(root: Path, check: Check, base: str, head: str) -> str:

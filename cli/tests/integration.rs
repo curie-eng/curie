@@ -3,7 +3,6 @@
 //! an undeclared file never compiles, which the guard test below catches.
 
 mod support;
-mod dev_test_env;
 
 mod actions_cli;
 mod agent_update_body;
@@ -81,6 +80,7 @@ mod delivery_pin;
 mod deploy_environment;
 mod deploy_transport;
 mod dev_model_credit;
+mod dev_test_env;
 mod doctor_api;
 mod doctor_recovery;
 mod doctor_release_health;
