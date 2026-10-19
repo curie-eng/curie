@@ -2,9 +2,10 @@
 
 Date: 2026-10-19
 
-Status: Draft
+Status: Accepted
 
-This proposal is not authorization to implement. It supersedes no Accepted ADR.
+Maintainer Junwon Jung explicitly accepted this design and authorized its
+implementation on 2026-10-19. It supersedes no Accepted ADR.
 It complements the unaccepted receipt migration in
 [ADR 0184](0184-settled-stream-entries-are-trimmed-receipts-live-in-postgres-backlog-is-counted.md)
 and preserves the separate authority in
@@ -25,7 +26,7 @@ authorizes that migration nor specifies the retained tool policy. A second
 independent database write after XADD also needs a defined crash recovery
 protocol before it can establish an immutable receipt.
 
-## Proposed decision requiring maintainer acceptance
+## Decision
 
 Preserve a bounded ordinary hook receipt beside the existing permanent claim in
 the same Valkey authority, atomically with the successful owned enqueue. The
@@ -57,7 +58,7 @@ atomic claim, enqueue and receipt persistence, and
 A hook-specific optional metadata write must not alter channel ingress callers.
 The adoption specification must be amended before tests and implementation.
 
-## Acceptance tests for a later implementation
+## Acceptance tests
 
 1. An authenticated ordinary delivery followed by acknowledgement and production
    settled retention returns its original accepted receipt on a faithful retry,
@@ -97,8 +98,8 @@ never treat absence of metadata as proof of unrestricted policy.
 - Move receipts to Postgres now: deferred to ADR 0184's separate acceptance and
   crash consistency design; this proposal retains the existing atomic authority.
 
-## Implementation stop point
+## Acceptance
 
-A maintainer must explicitly accept the durable ordinary receipt contract and
-publish this ADR as Accepted before receipt storage or duplicate handling changes.
-The Draft and reproduction provide no permission to change existing refusals.
+Maintainer Junwon Jung approved this exact receipt design on 2026-10-19 and
+authorized continued implementation. The realizing paths are named above.
+This acceptance does not authorize release preparation or deployment.
