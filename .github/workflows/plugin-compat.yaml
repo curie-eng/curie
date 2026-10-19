@@ -13,7 +13,7 @@ name: Plugin compat
 # The job is a checkout plus one npm install, so running both is cheap.
 on:
   pull_request:
-    branches: [main, next]
+    branches: [main, next, "epic/**"]
     paths:
       - "examples/**"
       - "packages/plugin-format/**"

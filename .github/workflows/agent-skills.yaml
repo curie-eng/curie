@@ -14,7 +14,7 @@ name: Agent Skills
 # newer spec revision is a reviewed edit to that pin, not a surprise from cron.
 on:
   pull_request:
-    branches: [main, next]
+    branches: [main, next, "epic/**"]
     paths:
       - ".claude/skills/**"
       - "examples/**"

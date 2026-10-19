@@ -3,7 +3,7 @@
 name: CloudWatch example
 on:
   pull_request:
-    branches: [main, next]
+    branches: [main, next, "epic/**"]
     paths:
       - .github/workflows/cloudwatch-example.yaml
       - examples/sre-bot/observability/cloudwatch-alarms/**

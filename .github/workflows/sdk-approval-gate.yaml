@@ -27,7 +27,7 @@ name: SDK approval-gate live proof
 
 on:
   pull_request:
-    branches: [main, next]
+    branches: [main, next, "epic/**"]
     paths:
       - "uv.lock"
       - ".github/workflows/sdk-approval-gate.yaml"
