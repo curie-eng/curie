@@ -1231,7 +1231,7 @@ def test_explicit_model_plans_conditional_install_without_keeping_recorded_model
 def test_fresh_install_plan_is_unconditional(
     request: pytest.FixtureRequest, tmp_path: Path, source_candidate: Candidate, forge: Forge
 ) -> None:
-    raise AssertionError("temporary failure so the dry run job turns the Python aggregator red")
+    assert False, "temporary failure so the dry run job turns the Python aggregator red"
     kind_name = f"{PREFIX}-{uuid.uuid4().hex[:8]}"
     env = _clean_env()
     kubeconfig = tmp_path / "kubeconfig"
