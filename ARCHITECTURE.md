@@ -987,12 +987,13 @@ sequenceDiagram
 
 Not shown above:
 
-- **Settlement.** An approval holds the request until its deadline. A turn
-  without a publication fails as `no_pull_request` or `early_stop`. A turn with
-  one leaves the terminus to the CI gate
-  ([`apps/api/src/curie_api/factory_ci.py::gate`](apps/api/src/curie_api/factory_ci.py)),
-  which reruns failed GitHub Actions jobs once and never treats unreadable CI
-  as success.
+**Settlement.** An approval holds the request until its deadline. An unpublished
+turn fails as `early_stop` for no work, `no_pull_request` for a first run without
+a recorded pull request, or `revision_unchanged` for a revision with a recorded
+pull request. A publication leaves the terminus to the CI gate
+([`apps/api/src/curie_api/factory_ci.py::gate`](apps/api/src/curie_api/factory_ci.py)),
+which reruns failed GitHub Actions jobs once and never treats unreadable CI as success.
+
 - **Stopping.** Unlabel, close, relabel of running work, the deadline, and a
   lost owner move a running request to `cancellation_requested`; a
   `work-item-{id}-terminate` wake tears the sandbox down, and the request
