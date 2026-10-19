@@ -493,7 +493,7 @@ def test_ci_policy_registry_covers_modules_and_existing_path_literals() -> None:
 
 
 def _policy_guard_fixture(tmp_path: Path) -> dict[str, list[str]]:
-    entries = yaml.safe_load(REGISTRY.read_text())["ci_policy_tests"]
+    entries: dict[str, list[str]] = yaml.safe_load(REGISTRY.read_text())["ci_policy_tests"]
     for directory in CI_POLICY_DIRS:
         for source in (REPO_ROOT / directory / "tests").rglob("test_*.py"):
             destination = tmp_path / source.relative_to(REPO_ROOT)

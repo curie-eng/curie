@@ -911,7 +911,7 @@ def test_grouped_acquisition_names_and_trios() -> None:
             assert f"no `{missing}` step" in _trio_problems(base, _locate_trio(reduced, base))
 
 
-def test_a_grouped_proof_retry_is_rejected(monkeypatch) -> None:
+def test_a_grouped_proof_retry_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     base = "Toolchain: Repository toolchain proof"
     assert ("ci.yaml", "image-proofs", base) in PROTECTED_STEPS
     retry = ("ci.yaml", "image-proofs", 0, {"name": base + RETRY_SUFFIX})

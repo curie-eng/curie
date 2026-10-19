@@ -17,7 +17,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -1037,7 +1037,7 @@ def _load_ci() -> dict[str, Any]:
 
 
 def _workflow_trigger(document: dict[str, Any]) -> dict[str, Any]:
-    trigger = document.get("on", document.get(True))
+    trigger = document.get("on", cast(dict[object, Any], document).get(True))
     assert isinstance(trigger, dict), "ci.yaml must declare an on mapping"
     return trigger
 
@@ -1270,7 +1270,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
                     with pytest.raises(AssertionError):
                         assert_full_suite([*pytest_command, *mutation], shard, deselect)
                 for missing_option, missing_path in runtime_exclusions:
-                    reduced = []
+                    reduced: list[str] = []
                     arguments = iter(pytest_command)
                     for argument in arguments:
                         if argument in {"--ignore", "--deselect"}:
