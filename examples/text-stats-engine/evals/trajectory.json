@@ -1,0 +1,28 @@
+{
+  "specs": [
+    {
+      "case_id": "word-count-three",
+      "expected": [
+        "mcp__plugin_text-stats-engine_text-stats-engine__word_count"
+      ],
+      "mode": "in_order",
+      "threshold": 1.0
+    },
+    {
+      "case_id": "word-count-empty",
+      "expected": [
+        "mcp__plugin_text-stats-engine_text-stats-engine__word_count"
+      ],
+      "mode": "in_order",
+      "threshold": 1.0
+    },
+    {
+      "case_id": "characters-without-whitespace",
+      "expected": [
+        "mcp__plugin_text-stats-engine_text-stats-engine__char_count"
+      ],
+      "mode": "in_order",
+      "threshold": 1.0
+    }
+  ]
+}

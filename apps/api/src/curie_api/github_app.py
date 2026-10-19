@@ -184,6 +184,9 @@ class GitHubCredentials:
     _mint_locks: dict[str, threading.Lock] = field(default_factory=dict)
     # Guards only the dict above, and is never held across a network call.
     _mint_locks_guard: threading.Lock = field(default_factory=threading.Lock)
+    # The App's slug, read once with the App JWT; an App's slug never changes.
+    _app_slug: str | None = None
+    _app_slug_lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
     def app_configured(self) -> bool:
@@ -282,10 +285,7 @@ class GitHubCredentials:
         repo_full_name = normalize_repo_full_name(repo_full_name)
         if not self.app_configured:
             raise GitHubInstallationRefused("review feedback requires a configured GitHub App")
-        url = (
-            f"{self.auth.api_url.rstrip('/')}"
-            f"/repos/{repo_url_path(repo_full_name)}/installation"
-        )
+        url = f"{self.auth.api_url.rstrip('/')}/repos/{repo_url_path(repo_full_name)}/installation"
         with self._mint_lock_for(repo_full_name):
             try:
                 with httpx.Client(
@@ -342,6 +342,31 @@ class GitHubCredentials:
         _, token = self.fresh_installation_token(repo_full_name, expected_installation_id)
         return token
 
+    def app_slug(self) -> str:
+        """The App's slug, read once with the App JWT and cached (#4629).
+
+        The App's bot user, which authors what an installation token writes,
+        is ``<slug>[bot]``.
+        https://docs.github.com/en/rest/apps/apps#get-the-authenticated-app
+        Raises `GitHubAppError` when no App is configured or the slug cannot
+        be read; a failed read is not cached.
+        """
+
+        if not self.app_configured:
+            raise GitHubAppError("no GitHub App is configured")
+        with self._app_slug_lock:
+            if self._app_slug is None:
+                url = f"{self.auth.api_url.rstrip('/')}/app"
+                try:
+                    payload = self._get(url)
+                except ValueError as exc:
+                    raise GitHubAppError(f"GitHub returned an unreadable body for {url}") from exc
+                slug = payload.get("slug")
+                if not isinstance(slug, str) or not slug.strip():
+                    raise GitHubAppError(f"GitHub reported no App slug at {url}")
+                self._app_slug = slug
+            return self._app_slug
+
     def _mint_lock_for(self, repo_full_name: str) -> threading.Lock:
         with self._mint_locks_guard:
             lock = self._mint_locks.get(repo_full_name)
@@ -384,10 +409,7 @@ class GitHubCredentials:
     def _discover_installation_id(self, repo_full_name: str) -> int:
         """Ask GitHub which installation covers this repository, and cache it."""
 
-        url = (
-            f"{self.auth.api_url.rstrip('/')}"
-            f"/repos/{repo_url_path(repo_full_name)}/installation"
-        )
+        url = f"{self.auth.api_url.rstrip('/')}/repos/{repo_url_path(repo_full_name)}/installation"
         data = self._get(url)
         installation_id = data.get("id")
         if not isinstance(installation_id, int):
@@ -436,10 +458,7 @@ class GitHubCredentials:
     def _mint_for_installation(
         self, repo_full_name: str, installation_id: int
     ) -> tuple[str, float]:
-        url = (
-            f"{self.auth.api_url.rstrip('/')}"
-            f"/app/installations/{installation_id}/access_tokens"
-        )
+        url = f"{self.auth.api_url.rstrip('/')}/app/installations/{installation_id}/access_tokens"
         # Scoped to this one repository even though the installation may cover
         # more. A credential that leaks is then useless against the others --
         # the narrowing ADR-0092 buys over an org-wide PAT.

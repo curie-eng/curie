@@ -32,6 +32,8 @@ from curie_worker.run import (
 )
 from curie_worker.sandbox import DockerSandboxClient, SubstrateConfig
 
+from .sandbox.conftest import _FakeBundleStore, _flag_values, _RecordingDocker
+
 _SUB = SubstrateConfig(namespace="default", warm_pool="pool")
 
 # A non-secret placeholder credential. The docker fail-closed gate only checks
@@ -376,20 +378,8 @@ def test_docker_with_otlp_endpoint_does_not_warn(caplog) -> None:
 def test_docker_runner_uses_its_network_specific_otlp_endpoint(
     monkeypatch, runner_endpoint: str | None, expected_endpoint: str | None
 ) -> None:
-    calls: list[list[str]] = []
-
-    def capture_docker(
-        _self: DockerSandboxClient,
-        args: list[str],
-        *,
-        request_timeout_seconds: float,
-    ) -> str:
-        assert request_timeout_seconds > 0
-        calls.append(args)
-        return ""
-
+    docker = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
-    monkeypatch.setattr(DockerSandboxClient, "_docker", capture_docker)
     env = {
         "CURIE_SANDBOX_SUBSTRATE": "docker",
         "OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector.example.com:4318",
@@ -402,10 +392,19 @@ def test_docker_runner_uses_its_network_specific_otlp_endpoint(
         _SUB,
     )
     assert isinstance(client, DockerSandboxClient)
+    monkeypatch.setattr(client, "_docker", docker._docker)
     client.create_claim("acme-sandbox", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
-    assert len(calls) == 1
-    assert not any(arg.startswith("CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT=") for arg in calls[0])
-    endpoint_args = [arg for arg in calls[0] if arg.startswith("OTEL_EXPORTER_OTLP_ENDPOINT=")]
+    assert all(timeout > 0 for timeout in docker.timeouts)
+    (runner_args,) = [
+        args
+        for args in docker.calls
+        if args[0] == "create"
+        and "curietech.ai/component=claim-runner" in _flag_values(args, "--label")
+    ]
+    assert not any(
+        arg.startswith("CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT=") for arg in runner_args
+    )
+    endpoint_args = [arg for arg in runner_args if arg.startswith("OTEL_EXPORTER_OTLP_ENDPOINT=")]
     assert endpoint_args == (
         [f"OTEL_EXPORTER_OTLP_ENDPOINT={expected_endpoint}"] if expected_endpoint else []
     )
@@ -431,26 +430,15 @@ def test_docker_runner_snapshot_checks_the_claims_code_host_origin(
 
     from curie_runner.workspace_snapshot import capture_workspace_snapshot
 
-    calls: list[list[str]] = []
-
-    def capture_docker(
-        _self: DockerSandboxClient,
-        args: list[str],
-        *,
-        request_timeout_seconds: float,
-    ) -> str:
-        assert request_timeout_seconds > 0
-        calls.append(args)
-        return ""
-
+    docker = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     monkeypatch.setattr(DockerSandboxClient, "ensure_image", lambda self: None)
-    monkeypatch.setattr(DockerSandboxClient, "_docker", capture_docker)
     client = _sandbox_client(
         WorkerConfig(fake_model=True),
         {"CURIE_SANDBOX_SUBSTRATE": "docker"},
         _SUB,
     )
     assert isinstance(client, DockerSandboxClient)
+    monkeypatch.setattr(client, "_docker", docker._docker)
     client.create_claim(
         "acme-sandbox",
         pool="pool",
@@ -460,8 +448,17 @@ def test_docker_runner_snapshot_checks_the_claims_code_host_origin(
             "CURIE_REPO_PATH": repo_name,
         },
     )
-    assert not any(arg.startswith("CURIE_GITHUB_API_URL=") for arg in calls[0])
-    forwarded = dict(arg.partition("=")[::2] for arg in calls[0] if arg.startswith("CURIE_REPO_"))
+    assert all(timeout > 0 for timeout in docker.timeouts)
+    (runner_args,) = [
+        args
+        for args in docker.calls
+        if args[0] == "create"
+        and "curietech.ai/component=claim-runner" in _flag_values(args, "--label")
+    ]
+    assert not any(arg.startswith("CURIE_GITHUB_API_URL=") for arg in runner_args)
+    forwarded = dict(
+        arg.partition("=")[::2] for arg in runner_args if arg.startswith("CURIE_REPO_")
+    )
     assert forwarded == {"CURIE_REPO_ORIGIN": origin, "CURIE_REPO_PATH": repo_name}
     for args in (
         ("init", "--quiet"),

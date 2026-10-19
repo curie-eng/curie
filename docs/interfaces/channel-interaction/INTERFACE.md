@@ -257,20 +257,21 @@ owes, and no deliverer calls an adapter with it.
   from the schema. A Python field added without extending the corpus can therefore
   escape that gate; `deny_unknown_fields` makes the mirror reject it. The handwritten
   model still carries drift risk, and four renderers do not imply four generated adapters.
-- **Capability negotiation is modeled but unwired.**
-  `packages/channel-protocol/src/channel_protocol/models.py::ChannelCapability`
-  and
+2. **Rendering capability advertisement is modeled but unwired.**
   `packages/channel-protocol/src/channel_protocol/models.py::ChannelCapabilities`
-  exist and are exported to the committed JSON Schema, but a repo-wide sweep
-  (Python, Rust, TypeScript) finds no reference outside that package and its
-  schema export: nothing advertises capabilities and nothing reads them. Both
-  shipped adapters decide their affordances statically instead. So the "Advertise
-  capabilities" adapter requirement above states ADR-0020's intent, not a live
-  wire, and a third channel would find no negotiation to plug into. Documented
-  rather than built: what the capability set should contain is exactly what a real
-  third channel would teach, and inventing it ahead of one is the speculative
-  layer the architecture vision rules out.
-- **`allow_free_text` reaches the Slack renderer on one path only.** The terminal
+  has no runtime producer or consumer. All four renderers, Slack, terminal,
+  mail and Discord, choose their affordances statically. The "Advertise
+  capabilities" requirement states ADR-0020's intent; another renderer has no
+  live negotiation wire to join. The enum itself does have API consumers:
+  `apps/api/src/curie_api/channel_read/slack_reads.py::SlackChannelReader`
+  advertises `ChannelCapability.HISTORY_READ`, checked by
+  `apps/api/src/curie_api/channel_read/readers.py::reader_for`.
+  `apps/api/src/curie_api/channel_read/slack_canvas.py::SlackCanvasReader`
+  advertises `CANVAS_READ` and `CANVAS_EDIT`, checked through
+  `apps/api/src/curie_api/channel_read/readers.py::canvas_reader_for` from
+  `apps/api/src/curie_api/channel_read/canvas.py`. These local reader checks
+  do not produce or consume `ChannelCapabilities` advertisements.
+3. **`allow_free_text` reaches the Slack renderer on one path only.** The terminal
   renderer carries the field for both `choice` and `confirm`; the Slack renderer
   reads it only for the kernel's approval-card `confirm`, because
   `apps/worker/src/curie_worker/blocks.py::_reply_from_message` projects
@@ -280,7 +281,7 @@ owes, and no deliverer calls an adapter with it.
   does hide its compose option. But the field is dropped at the projection rather
   than deliberately declined, so the asymmetry is invisible in the code, and the
   next Slack-side interaction that wants it will find nothing to read.
-- **Progress is accepted but not rendered.** The `curie_progress` operation is
+4. **Progress is accepted but not rendered.** The `curie_progress` operation is
   the runner's platform `progress` tool (`mcp__curie__progress`), and a
   person's Slack turn carries a per-turn capability for it. The tool posts each
   `ProgressCommand` to the API's scoped ingress
@@ -296,7 +297,7 @@ owes, and no deliverer calls an adapter with it.
   What the models realize on the wire is the closed shape: a command that names
   a routing, credential, delivery or budget field is refused at validation. The
   terminal mirror in `cli/src/channel.rs` does not model progress either.
-- **The mail renderer keys an approval card on a display label.**
+5. **The mail renderer keys an approval card on a display label.**
   `apps/mail-adapter/src/curie_mail_adapter/egress.py::EgressHandler` collects the
   approver addresses by comparing each `MessageField.label` with
   `APPROVER_FIELD_LABEL`, the string `"Approver"`. The constant is defined twice, in
@@ -305,12 +306,12 @@ owes, and no deliverer calls an adapter with it.
   gates the two against each other. Rewording the label on the worker side silently
   leaves the email naming no approvers, because a field label is display text, not a
   typed key. Only the platform decides who may answer; the label only words the email.
-- **The envelope is a text-channel workaround.** ACI has no native
+6. **The envelope is a text-channel workaround.** ACI has no native
   semantic-message event, so the message rides inside the runner's final text as a
   fenced block. Every adapter therefore carries fence-parsing and partial-envelope
   suppression that a native event would delete. Named in "ACI envelope" above as
   explicitly interim.
-- **Not separately graded** — this seam is the interaction half of ADR-0020 and is
+7. **Not separately graded:** this seam is the interaction half of ADR-0020 and is
   not one of the six swap-readiness Jobs. The channel *ingress/egress* swap story is
   graded, and graded `C`, on the [channel-ingress](../channel-ingress/INTERFACE.md)
   seam. Read that grade as the honest one for "can we add a second channel"; this

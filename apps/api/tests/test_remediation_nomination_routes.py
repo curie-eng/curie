@@ -81,6 +81,7 @@ TIMEOUT = 90
 ROUTE = "/v1/internal/remediation/nominations"
 WORKER_HEADER = "X-Curie-Worker-Token"
 PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
+AUTHORITY_HEADER = "X-Curie-Remediation-Authority"
 REMEDIATION_SETTING = "CURIE_REMEDIATION_ENABLED"
 EXECUTOR_SETTING = "CURIE_ACTION_EXECUTOR_ENABLED"
 OPERATOR = "U0EXAMPLE1"
@@ -194,7 +195,30 @@ def worker_headers() -> dict[str, str]:
 
 
 def admin_headers() -> dict[str, str]:
-    """Platform key plus an ADR 0106 operator principal: a valid policy writer."""
+    """Platform key plus a remediation operator principal, minted as
+    ``POST /approvals/principals/remediation-operator`` does, plus the ADR 0231
+    remediation authority: a valid policy (bind and arm included), breaker and
+    qualification writer.
+    """
+
+    token = approval_principal.mint(
+        get_settings().api_key,
+        subject=OPERATOR,
+        kind="operator",
+        scope=approval_principal.REMEDIATION_ADMIN_SCOPE,
+        exp=int(time.time()) + 300,
+    )
+    return {
+        "X-API-Key": get_settings().api_key,
+        PRINCIPAL_HEADER: token,
+        AUTHORITY_HEADER: get_settings().remediation_authority_key,
+    }
+
+
+def approver_headers() -> dict[str, str]:
+    """Platform key plus an ADR 0106 approval resolution operator principal, minted
+    as ``POST /approvals/principals/operator`` does: resolves approvals only.
+    """
 
     token = approval_principal.mint(
         get_settings().api_key,

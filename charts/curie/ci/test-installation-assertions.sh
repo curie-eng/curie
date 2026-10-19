@@ -56,7 +56,8 @@ SIBLING = {
     "agent": "acme-tester",
 }
 REAL_SECRETS = {
-    "api": {"apiKey": "example-api-key", "approvalChatAttesterSecret": "example-attester"},
+    "api": {"apiKey": "example-api-key", "approvalChatAttesterSecret": "example-attester",
+            "remediationAuthorityKey": "example-remediation-authority"},
     "worker": {"internalWorkerToken": "example-worker-token"},
 }
 
@@ -189,11 +190,14 @@ for key, overlay in (
     ("worker.internalWorkerToken", {"worker": {"internalWorkerToken": "curie-dev-worker-token"}}),
     ("api.approvalChatAttesterSecret",
      {"api": {"approvalChatAttesterSecret": "curie-dev-approval-chat-attester"}}),
+    ("api.remediationAuthorityKey",
+     {"api": {"remediationAuthorityKey": "curie-dev-remediation-authority"}}),
 ):
     refuse(f"(e) {key}", REAL_SECRETS, overlay, on(), expected=[key])
-# values-dev.yaml alone keeps all three published defaults.
+# values-dev.yaml alone keeps all four published defaults.
 refuse("(e) values-dev.yaml defaults", on(),
-       expected=["api.apiKey", "worker.internalWorkerToken", "api.approvalChatAttesterSecret"])
+       expected=["api.apiKey", "worker.internalWorkerToken", "api.approvalChatAttesterSecret",
+                 "api.remediationAuthorityKey"])
 # A sealed install generates each one, so it renders.
 ok(on(), dev=False)
 
@@ -226,6 +230,7 @@ for key, overlay in (
     ("api.apiKey", {"api": {"apiKey": "curie-dev-key"}}),
     ("worker.internalWorkerToken", {"worker": {"internalWorkerToken": "curie-dev-worker-token"}}),
     ("api.approvalChatAttesterSecret", {"api": {"approvalChatAttesterSecret": "curie-dev-approval-chat-attester"}}),
+    ("api.remediationAuthorityKey", {"api": {"remediationAuthorityKey": "curie-dev-remediation-authority"}}),
 ):
     refuse(f"(f) schemaless {key}", REAL_SECRETS, overlay, on(), source=schemaless / "curie",
            expected=[key, "published default"])
@@ -262,7 +267,8 @@ validator = Draft7Validator(schema)
 safe = {
     "testInstallation": {"enabled": True, "drivers": []},
     "security": {"allowDevDefaults": True},
-    "api": {"environment": "dev", "apiKey": "example-api-key", "approvalChatAttesterSecret": "example-attester"},
+    "api": {"environment": "dev", "apiKey": "example-api-key", "approvalChatAttesterSecret": "example-attester",
+            "remediationAuthorityKey": "example-remediation-authority"},
     "worker": {"internalWorkerToken": "example-worker-token"},
 }
 validator.validate(safe)
@@ -270,6 +276,7 @@ sealed = json.loads(json.dumps(safe))
 sealed["security"]["allowDevDefaults"] = False
 sealed["api"]["apiKey"] = "curie-dev-key"
 sealed["api"]["approvalChatAttesterSecret"] = "curie-dev-approval-chat-attester"
+sealed["api"]["remediationAuthorityKey"] = "curie-dev-remediation-authority"
 sealed["worker"]["internalWorkerToken"] = "curie-dev-worker-token"
 validator.validate(sealed)
 for area, field, value in (
@@ -277,6 +284,7 @@ for area, field, value in (
     ("api", "environment", " PROD "),
     ("api", "apiKey", "curie-dev-key"),
     ("api", "approvalChatAttesterSecret", "curie-dev-approval-chat-attester"),
+    ("api", "remediationAuthorityKey", "curie-dev-remediation-authority"),
     ("worker", "internalWorkerToken", "curie-dev-worker-token"),
 ):
     candidate = json.loads(json.dumps(safe))
@@ -294,6 +302,7 @@ os.environ.update(rendered)
 os.environ["API_KEY"] = "example-api-key"
 os.environ["CURIE_API_KEY"] = "example-api-key"
 os.environ["CURIE_APPROVAL_CHAT_ATTESTER_SECRET"] = "example-attester-secret"
+os.environ["CURIE_REMEDIATION_AUTHORITY_KEY"] = "example-remediation-authority"
 os.environ["CURIE_INTERNAL_WORKER_TOKEN"] = "example-worker-token"
 
 from curie_api.config import Settings

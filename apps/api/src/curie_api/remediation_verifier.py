@@ -182,11 +182,14 @@ def header_secret_names(spec: ConnectorSpec) -> frozenset[str]:
 
     A hosted connector's header is derived (``connector_render``):
     ``Authorization: Bearer ${NAME}`` from ``bearer_secret``, otherwise from a
-    lone plain string secret; a ``SecretRef`` alone derives none. A remote
+    lone plain string secret; a ``SecretRef`` alone derives none, and a
+    ``no_client_auth`` declaration derives none either. A remote
     connector's headers name theirs as environment references.
     """
 
     if spec.is_hosted:
+        if spec.no_client_auth is not None:
+            return frozenset()
         if spec.bearer_secret:
             return frozenset({spec.bearer_secret})
         if len(spec.secrets) == 1 and isinstance(spec.secrets[0], str):

@@ -17,6 +17,7 @@ import pytest
 from curie_api.forges.errors import Unavailable
 from curie_api.forges.types import (
     Commit,
+    FactoryPublication,
     PullRequest,
     PullRequestRef,
     PullRequestState,
@@ -120,6 +121,12 @@ class _CodeHost:
         self._maybe_fail()
         return self.existing
 
+    async def list_factory_publications(
+        self, repository: RepositoryRef
+    ) -> tuple[FactoryPublication, ...]:
+        self._maybe_fail()
+        return ()
+
     async def open_pull_request(self, repository: RepositoryRef, **fields: Any) -> PullRequest:
         self.opened.append(fields)
         return self._pull(
@@ -154,7 +161,7 @@ def _seed(
             {"id": uuid.UUID(publication["lineage_id"])},
         )
     )
-    monkeypatch.setattr(publication_code_host, "code_host_for", lambda _s, _c: code_host)
+    monkeypatch.setattr(publication_code_host, "publishing_code_host", lambda _s, _c, _r: code_host)
     return client, publication, code_host
 
 

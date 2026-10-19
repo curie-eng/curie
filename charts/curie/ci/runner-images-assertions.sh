@@ -43,6 +43,7 @@ esac
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_SCHEMA="$CHART/../../apps/worker/schema/repo-runner-pools.schema.json"
+DAEMON_VECTOR="$CHART/../../tests/vectors/daemon-config.json"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -189,6 +190,7 @@ elif mode == "runner-env":
         sys.exit("runnerEnv-only agents must not add duplicate platform prewarm images")
 elif mode == "repositories":
     values = json.load(open(args[0]))
+    daemon = json.load(open(args[2]))["daemon"]
     assert_runner_env(values)
     repos = values["factory"]["bindings"][0]["repos"]
     agent = "factory"
@@ -245,6 +247,11 @@ elif mode == "repositories":
             "docker": enabled,
             "egress": docker.get("egressAllowlist", []) if enabled else [],
         }
+        if enabled:
+            expected_daemon = copy.deepcopy(daemon)
+            expected_daemon["namespace"] = f"default-{prefix}-docker"
+            expected_daemon["image"] = values["factory"]["docker"]["daemonImage"]
+            expected_repo_pools[repo["path"]]["daemon"] = expected_daemon
     if set(templates) != expected_names:
         sys.exit(f"repository digest templates were not deduplicated: {sorted(templates)}")
     if set(pools) != {name + "-pool" for name in expected_names}:
@@ -441,7 +448,9 @@ values = {
     "factory": {
         "docker": {"daemonImage": "registry.example.com/acme/curie-docker-daemon@" + digest("7")},
         "sandboxEgress": {"factory": True, "unused": False},
-        "bindings": [{"name": "acme", "repos": [
+        "trackers": [{"name": "github", "kind": "github", "host": "github.com", "apiUrl": "https://api.github.com",
+                      "credential": {"type": "github_app", "existingSecret": "acme-github-app", "existingSecretKey": "private-key"}}],
+        "bindings": [{"name": "acme", "tracker": "github", "trackerScopeId": "123456", "repos": [
             {"path": "acme-corp/api", "runner": copy.deepcopy(shared), "docker": {
                 "enabled": True,
                 "egressAllowlist": [{"cidr": "203.0.113.0/24", "ports": [{"protocol": "TCP", "port": 443}]}],
@@ -465,7 +474,7 @@ PY
 render -f "$TMP/no-runner-values.json" >"$TMP/no-runners.yaml" || fail "repositories without runner blocks"
 python3 "$CHECKER" no-repositories "$TMP/no-runners.yaml" || fail "no repository runner output"
 render -f "$TMP/repository-values.json" >"$TMP/repositories.yaml" || fail "repository runners render"
-python3 "$CHECKER" repositories "$TMP/repositories.yaml" "$TMP/repository-values.json" "$REPO_SCHEMA" || fail "(g) repository runner render"
+python3 "$CHECKER" repositories "$TMP/repositories.yaml" "$TMP/repository-values.json" "$REPO_SCHEMA" "$DAEMON_VECTOR" || fail "(g) repository runner render"
 
 # (h) A runner declaration cannot guess which agent to use or silently alias a
 # distinct digest or image metadata onto an existing pool.
@@ -484,7 +493,7 @@ expect_repository_fail "worker.warmPool" --set-string 'worker.warmPool=acme-cust
 # only the template would accept an invalid Kubernetes resource name.
 expect_repository_fail "63" --set-string 'fullnameOverride=acme-installation-long'
 render -f "$TMP/repository-values.json" --set-string 'fullnameOverride=acme-installation-ok' >"$TMP/repo-name-boundary.yaml" || fail "63-character repository pool name"
-python3 "$CHECKER" repositories "$TMP/repo-name-boundary.yaml" "$TMP/repository-values.json" "$REPO_SCHEMA" || fail "valid repository name boundary"
+python3 "$CHECKER" repositories "$TMP/repo-name-boundary.yaml" "$TMP/repository-values.json" "$REPO_SCHEMA" "$DAEMON_VECTOR" || fail "valid repository name boundary"
 COLLISION="sha256:$(printf 'a%.0s' {1..12})$(printf 'b%.0s' {1..52})"
 expect_repository_fail "collision" --set-string "factory.bindings[0].repos[2].runner.image=registry.example.com/acme/repository-runner@$COLLISION"
 expect_repository_fail "runner" --set-string "factory.bindings[0].repos[1].runner.base=sha256:$(printf 'e%.0s' {1..64})"
@@ -613,7 +622,7 @@ PY
   helm --kube-context k8 install "$RELEASE" "$CHART" --namespace "$NS" --skip-crds --no-hooks "${CLUSTER_VALUES[@]}" >"$TMP/install.out" 2>&1 || { cat "$TMP/install.out" >&2; fail "cluster fixture install"; }
   helm --kube-context k8 get values "$RELEASE" --namespace "$NS" -o json >"$TMP/installed-values.json" || fail "installed values readback"
   kubectl --context k8 --namespace "$NS" get sandboxtemplates.extensions.agents.x-k8s.io,sandboxwarmpools.extensions.agents.x-k8s.io,deployment -o json >"$TMP/installed.json" || fail "installed object readback"
-  python3 - "$TMP/installed.json" "$TMP/repository-values.json" "$REPO_SCHEMA" "$TMP" <<'PY'
+  python3 - "$TMP/installed.json" "$TMP/repository-values.json" "$REPO_SCHEMA" "$TMP" "$NS" "$RELEASE" "$DAEMON_VECTOR" <<'PY'
 import copy, json, pathlib, sys
 import jsonschema
 docs = json.load(open(sys.argv[1]))["items"]
@@ -623,6 +632,7 @@ templates = {d["metadata"]["name"]: d for d in docs if d["kind"] == "SandboxTemp
 pools = {d["metadata"]["name"]: d for d in docs if d["kind"] == "SandboxWarmPool"}
 names = {prefix + "-runner", prefix + "-agent-factory-runner"}
 expected = {}
+daemon = json.load(open(sys.argv[7]))["daemon"]
 for repo in values["factory"]["bindings"][0]["repos"]:
     runner = repo.get("runner")
     if not runner:
@@ -633,6 +643,12 @@ for repo in values["factory"]["bindings"][0]["repos"]:
     docker = repo.get("docker", {})
     enabled = docker.get("enabled", False)
     expected[repo["path"]] = {"pool": name + "-pool", "digests": [index, runner["platformDigests"]["linux/amd64"], runner["platformDigests"]["linux/arm64"]], "base": runner["base"], "docker": enabled, "egress": docker.get("egressAllowlist", []) if enabled else []}
+    if enabled:
+        expected_daemon = copy.deepcopy(daemon)
+        expected_daemon["namespace"] = f"{sys.argv[5]}-{prefix}-docker"
+        expected_daemon["selectorLabels"]["app.kubernetes.io/instance"] = sys.argv[6]
+        expected_daemon["image"] = values["factory"]["docker"]["daemonImage"]
+        expected[repo["path"]]["daemon"] = expected_daemon
 assert set(templates) == names, "installed repository templates differ from the render"
 assert set(pools) == {name + "-pool" for name in names}, "installed repository pools differ from the render"
 for name in names:

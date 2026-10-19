@@ -274,7 +274,11 @@ fn local_and_cluster_expose_the_same_principal_bootstrap_modes() {
             output.status.success(),
             "{tier} approvals help must render: {help}"
         );
-        for mode in ["--mint-operator-principal", "--mint-console-login-code"] {
+        for mode in [
+            "--mint-operator-principal",
+            "--mint-console-login-code",
+            "--mint-remediation-principal",
+        ] {
             assert!(
                 help.contains(mode),
                 "{tier} must expose the same administrative bootstrap mode {mode}; help:\n{help}"
@@ -364,6 +368,194 @@ fn operator_and_console_bootstrap_emit_typed_single_delivery_outputs() {
         assert!(
             !stderr.contains(secret),
             "{mode} must not leak its delivery secret through progress/error output: {stderr}"
+        );
+    }
+}
+
+const REMEDIATION_MINT_PATH: &str = "/approvals/principals/remediation-operator";
+const REMEDIATION_SUBJECT: &str = "U0REMEDIATE";
+const REMEDIATION_PRINCIPAL: &str = "apr.test-issued-remediation-token";
+
+/// Run `curie <tier> approvals weather ...` against `server` with no ambient
+/// values inherited from the developer's shell and no reachable kubeconfig, so
+/// the cluster tier can only use the explicit `--api-url`.
+fn run_approvals(tier: &str, args: &[&str], server: &MockServer) -> Output {
+    Command::new(bin())
+        .args([tier, "approvals", "weather"])
+        .args(args)
+        .args(["--api-url", &server.base_url, "--api-key", TEST_API_KEY])
+        .env_remove("CURIE_API_URL")
+        .env_remove("CURIE_API_KEY")
+        .env_remove("CURIE_APPROVAL_PRINCIPAL_TOKEN")
+        .env("KUBECONFIG", "/nonexistent/curie-test-kubeconfig")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap_or_else(|err| {
+            panic!(
+                "run curie {tier} approvals weather {}: {err}",
+                args.join(" ")
+            )
+        })
+}
+
+/// A stub that answers nothing usefully: any request it records is a failure.
+fn refusing_server() -> MockServer {
+    serve(|_| Response::json(500, r#"{"detail":"no request was expected"}"#))
+}
+
+// #4228: a remediation administrator principal is a separate mint from the
+// approval resolution operator principal, on both platform tiers.
+#[test]
+fn remediation_principal_mint_emits_one_typed_object_on_both_tiers() {
+    for tier in ["local", "cluster"] {
+        let server = serve(
+            |request| match (request.method.as_str(), request.path.as_str()) {
+                ("POST", REMEDIATION_MINT_PATH) => Response::json(
+                    201,
+                    &format!(
+                        r#"{{"token":"{REMEDIATION_PRINCIPAL}","subject":"{REMEDIATION_SUBJECT}","expires_at":"2026-08-31T12:00:00Z"}}"#
+                    ),
+                ),
+                _ => Response::json(500, r#"{"detail":"unexpected request"}"#),
+            },
+        );
+
+        let output = run_approvals(
+            tier,
+            &[
+                "--mint-remediation-principal",
+                REMEDIATION_SUBJECT,
+                "--json",
+            ],
+            &server,
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{tier} --mint-remediation-principal must succeed against its typed API response; stderr: {stderr}"
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+            panic!("{tier} --mint-remediation-principal --json must be one JSON object: {err}")
+        });
+        let object = value.as_object().expect("the output is one JSON object");
+        assert_eq!(
+            object.keys().collect::<Vec<_>>(),
+            vec!["remediation_principal"],
+            "{tier}: the output is exactly one typed remediation_principal object"
+        );
+        let delivery = value["remediation_principal"]
+            .as_object()
+            .expect("remediation_principal is an object");
+        let mut keys: Vec<&str> = delivery.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["expires_at", "subject", "token"], "{tier}");
+        assert_eq!(delivery["subject"], REMEDIATION_SUBJECT, "{tier}");
+        assert_eq!(delivery["token"], REMEDIATION_PRINCIPAL, "{tier}");
+        assert_eq!(delivery["expires_at"], "2026-08-31T12:00:00Z", "{tier}");
+        assert_eq!(
+            stdout.matches(REMEDIATION_PRINCIPAL).count(),
+            1,
+            "{tier}: the one-time token is delivered exactly once in stdout"
+        );
+        assert!(
+            !stderr.contains(REMEDIATION_PRINCIPAL),
+            "{tier}: the token must not leak through progress or error output"
+        );
+
+        let recorded = server.recorded();
+        let sent: Vec<(&str, &str)> = recorded
+            .iter()
+            .map(|r| (r.method.as_str(), r.path.as_str()))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![("POST", REMEDIATION_MINT_PATH)],
+            "{tier}: exactly one request, to the remediation mint and not the operator mint"
+        );
+        let body: Value =
+            serde_json::from_slice(&recorded[0].body).expect("remediation mint body is JSON");
+        assert_eq!(body, json!({"subject": REMEDIATION_SUBJECT}), "{tier}");
+    }
+}
+
+#[test]
+fn remediation_principal_mint_is_exclusive_with_the_other_bootstrap_modes() {
+    let pairs = [
+        (
+            ["--mint-remediation-principal", REMEDIATION_SUBJECT],
+            ["--mint-operator-principal", OPERATOR_SUBJECT],
+        ),
+        (
+            ["--mint-remediation-principal", REMEDIATION_SUBJECT],
+            ["--mint-console-login-code", "U0CONSOLE"],
+        ),
+    ];
+    for tier in ["local", "cluster"] {
+        for (first, second) in &pairs {
+            for json_mode in [false, true] {
+                let server = refusing_server();
+                let mut args: Vec<&str> = first.iter().chain(second.iter()).copied().collect();
+                if json_mode {
+                    args.push("--json");
+                }
+                let output = run_approvals(tier, &args, &server);
+                let combined = text(&output);
+                assert_eq!(
+                    output.status.code(),
+                    Some(2),
+                    "{tier} {} must be a usage error; output:\n{combined}",
+                    args.join(" ")
+                );
+                assert!(
+                    server.recorded().is_empty(),
+                    "{tier} {}: nothing is sent: {:?}",
+                    args.join(" "),
+                    server
+                        .recorded()
+                        .iter()
+                        .map(|r| &r.path)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn remediation_principal_mint_dry_run_prints_the_endpoint_and_sends_nothing() {
+    for tier in ["local", "cluster"] {
+        let server = refusing_server();
+        let output = run_approvals(
+            tier,
+            &[
+                "--mint-remediation-principal",
+                REMEDIATION_SUBJECT,
+                "--dry-run",
+            ],
+            &server,
+        );
+        let combined = text(&output);
+        assert!(
+            output.status.success(),
+            "{tier} --mint-remediation-principal --dry-run must succeed; output:\n{combined}"
+        );
+        assert!(
+            combined.contains(&format!("{}{REMEDIATION_MINT_PATH}", server.base_url)),
+            "{tier}: the dry run names the remediation mint endpoint; output:\n{combined}"
+        );
+        assert!(
+            !combined.contains("/approvals/principals/operator"),
+            "{tier}: the dry run does not name the operator mint; output:\n{combined}"
+        );
+        assert!(
+            server.recorded().is_empty(),
+            "{tier}: a dry run sends nothing: {:?}",
+            server
+                .recorded()
+                .iter()
+                .map(|r| &r.path)
+                .collect::<Vec<_>>()
         );
     }
 }

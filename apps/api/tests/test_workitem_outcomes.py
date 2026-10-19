@@ -53,6 +53,7 @@ from curie_api.models import ExecutionRequest, WorkItem
 from curie_api.publication_authority import VerifiedPublicationIdentity
 from curie_api.schemas.publications import PublicationLineageAdvance
 from curie_api.workitem_dispatch import (
+    AcquireGrant,
     acquire,
     admit,
     admit_revision,
@@ -67,6 +68,7 @@ from curie_api.workitem_outcomes import derive_outcome
 from curie_api.workitems import lifecycle as workitems
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
+from forge_fakes import factory_wake
 from forge_fakes.github import (
     ci_view,
     forges_document,
@@ -295,7 +297,15 @@ def _admit_revision(facts: SimpleNamespace) -> SimpleNamespace:
 
 def _start(request_id: uuid.UUID, *, generation: int = 1) -> int:
     async def body(session: AsyncSession) -> int:
-        await acquire(session, request_id, owner=OWNER, generation=generation)
+        acquired = await acquire(
+            session,
+            request_id,
+            owner=OWNER,
+            generation=generation,
+            wake=await factory_wake(session, request_id),
+            context=None,
+        )
+        assert isinstance(acquired, AcquireGrant), acquired
         started = await start(
             session,
             request_id,
@@ -303,6 +313,7 @@ def _start(request_id: uuid.UUID, *, generation: int = 1) -> int:
             generation=generation,
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
+            context=acquired.context,
         )
         return int(started.runtime_epoch)
 
@@ -571,7 +582,15 @@ def test_capacity_deferral_is_waiting_and_names_capacity(
     seeded = _admit(facts)
 
     async def body(session: AsyncSession) -> None:
-        await acquire(session, facts.request_id, owner=OWNER, generation=1)
+        acquired = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
+        )
+        assert isinstance(acquired, AcquireGrant), acquired
         await defer(
             session,
             facts.request_id,
@@ -733,7 +752,14 @@ def test_failed_start_failed_names_the_attempts_and_last_reason(
                 text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
                 {"id": facts.request_id},
             )
-            granted = await acquire(session, facts.request_id, owner=OWNER, generation=generation)
+            granted = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=generation,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
+            )
             assert getattr(granted, "code", None) is None, granted
             deferred = await defer(
                 session,

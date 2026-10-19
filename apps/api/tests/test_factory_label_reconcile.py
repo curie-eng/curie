@@ -118,6 +118,10 @@ class GitHubAPI:
                     "labels": [{"name": LABEL}] if labeled else [],
                 },
             )
+        if path == f"/repos/{REPO}/pulls" and request.method == "GET":
+            # Rediscovery's repository-wide listing (#4629): no factory
+            # publication exists in this stand-in.
+            return httpx.Response(200, json=[])
         if path == f"/repos/{REPO}/collaborators/{SENDER}/permission":
             return httpx.Response(
                 200,

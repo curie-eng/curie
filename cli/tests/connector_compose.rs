@@ -1,104 +1,5 @@
-//! RED contract for PR B / Stream B1: running a locked connector locally.
-//!
-//! Two emitters, one set of semantics. The skill tier starts each hosted
-//! connector with `docker run` (`docker::ConnectorStartSpec`, block B1-4); the
-//! local tier generates a compose overlay and brings it up (block B1-9). Both
-//! must reproduce `connector_render.render_deployment` field for field --
-//! substituted `args`, substituted `env`, declared secrets, `secret_files`,
-//! the hardening set, and the port -- because the runner derives the URL it
-//! dials from the PYTHON copy. An approximation here does not degrade: it
-//! either times out against a name no container owns, or (the review's finding
-//! 5) silently drops `args` and restores general write plus the
-//! credential-exposing `configuration_view` tool.
-//!
-//! This file also carries the three smaller B1 pins that have nowhere better
-//! to live: `RunnerState` recording what boot created, the packer's treatment
-//! of the lock and the overlay, and the teardown ordering.
-//!
-//! Everything is pure. Nothing here starts a container, and the credential
-//! staging is asserted at the filesystem level (write it, read the exact bytes
-//! back, wipe it, assert it is gone) rather than by inspecting flags -- an
-//! argv assertion passes against an empty mount, which is the failure this
-//! replaces. The daemon-backed half of that proof is the ladder's job (B3).
-//!
-//! One test calls a function that WOULD reach the daemon --
-//! `bring_up_local_refuses_a_declared_secret_with_no_value` -- precisely because
-//! the property under test is that it refuses before getting there. Its
-//! assertion that no overlay file was written is what pins the refusal's
-//! position; a regression there turns it into a slow test, which is the signal.
-//!
-//! Surface the implementer must add:
-//!
-//! ```ignore
-//! // curie::connector_build
-//! pub struct ConnectorScope { pub release: String, pub agent: String, pub namespace: String }
-//! pub fn connector_substitutions(
-//!     scope: &ConnectorScope, connector: &str, port: u32,
-//! ) -> BTreeMap<String, String>;
-//! pub fn substitute(value: &str, subs: &BTreeMap<String, String>) -> String;
-//! pub fn connector_scope_env(scope: &ConnectorScope) -> Vec<(String, String)>;
-//! pub fn connector_secrets_root(plugin_dir: &Path) -> PathBuf;
-//! pub fn stage_secret_file(
-//!     plugin_dir: &Path, connector: &str, declared_path: &str, value: &str,
-//! ) -> anyhow::Result<PathBuf>;
-//! pub fn wipe_connector_secrets(plugin_dir: &Path) -> anyhow::Result<()>;
-//! pub fn compose_overlay_path(plugin_dir: &Path) -> PathBuf;
-//! pub fn compose_overlay(
-//!     lock: &ConnectorLockFileDecl,
-//!     decl: &ConnectorsFileDecl,
-//!     identity: &ConnectorScope,
-//!     project: &str,
-//!     plugin_dir: &Path,
-//!     caller_public_key: Option<&str>,
-//! ) -> anyhow::Result<serde_json::Value>;
-//! /// Resolved secret values handed to the compose child's environment only,
-//! /// where the overlay's `${NAME}` references expand from; the file on disk
-//! /// never holds a value.
-//! pub fn compose_up_command(
-//!     overlay: &Path, project: &str, secret_values: &BTreeMap<String, String>,
-//!     connector_start_timeout: Duration,
-//! ) -> curie::ops::OpsCommand;
-//!
-//! // curie::docker
-//! pub const CONNECTOR_COMPONENT_LABEL: &str = "curietech.ai/component=connector";
-//! pub fn connector_project_label(project: &str) -> String;
-//! pub struct ConnectorStartSpec {
-//!     // .. image / container_name / network / alias / args / env ..
-//!     /// Resolved secret values handed to the Docker CLI child process only,
-//!     /// forwarded by bare `-e NAME` so they never enter argv. Same rule
-//!     /// `StartSpec::docker_env` already follows.
-//!     pub docker_env: Vec<(String, String)>,
-//! }
-//! impl ConnectorStartSpec {
-//!     pub fn from_declaration(
-//!         connector: &str,
-//!         spec: &ConnectorSpecDecl,
-//!         image: &str,
-//!         identity: &ConnectorScope,
-//!         network: &str,
-//!         project: &str,
-//!         plugin_dir: &Path,
-//!         secret_values: &BTreeMap<String, String>,
-//!         caller_public_key: Option<&str>,
-//!     ) -> anyhow::Result<Self>;
-//!     pub fn run_args(&self) -> Vec<String>;
-//! }
-//! pub enum ConnectorTeardownStep {
-//!     ReapLabeled(OpsCommand), RemoveNetwork(OpsCommand), WipeSecrets(PathBuf),
-//! }
-//! pub fn connector_teardown_plan(
-//!     project: &str, network: Option<&str>, plugin_dir: Option<&Path>,
-//! ) -> Vec<ConnectorTeardownStep>;
-//!
-//! // curie::local
-//! /// The plan `local down` runs: the label-scoped reap, plus the staged tree
-//! /// when the directory it ran from holds one.
-//! pub fn connector_teardown_plan_for_down(cwd: &Path, project: &str) -> Vec<ConnectorTeardownStep>;
-//!
-//! // curie::state::RunnerState
-//! pub connector_containers: Vec<String>,
-//! pub connector_network: Option<String>,
-//! ```
+//! Connector argv, Compose overlays, and project-scoped credential volume teardown.
+//! Daemon-backed transfer behavior is covered by the local lifecycle tests.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -106,18 +7,18 @@ use std::time::Duration;
 
 use curie::connector_build::{
     compose_overlay, compose_overlay_path, compose_up_command, connector_scope_env,
-    connector_secrets_root, connector_substitutions, object_name, service_dns, stage_secret_file,
-    staged_secret_path, substitute, ConnectorBuildDecl, ConnectorLockEntryDecl,
-    ConnectorLockFileDecl, ConnectorScope, ConnectorSpecDecl, ConnectorsFileDecl, Delivery,
-    SecretDecl, LOCK_VERSION,
+    connector_substitutions, object_name, service_dns, substitute, ConnectorBuildDecl,
+    ConnectorLockEntryDecl, ConnectorLockFileDecl, ConnectorScope, ConnectorSecretVolumes,
+    ConnectorSpecDecl, ConnectorsFileDecl, Delivery, SecretDecl, LOCK_VERSION,
 };
 use curie::docker::{
-    connector_project_label, connector_teardown_plan, run_connector_teardown, ConnectorStartSpec,
-    ConnectorTeardownStep, CLI_MANAGED_LABEL, CONNECTOR_COMPONENT_LABEL,
+    connector_project_label, connector_teardown_plan, ConnectorStartSpec, ConnectorTeardownStep,
+    CLI_MANAGED_LABEL, CONNECTOR_COMPONENT_LABEL,
 };
 use curie::local::connector_teardown_plan_for_down;
 use curie_aci_protocol::env_keys;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const TEMPO_IMAGE: &str = "ghcr.io/acme-corp/sre-bot-tempo@sha256:\
@@ -200,18 +101,29 @@ fn start_spec(
     plugin_dir: &Path,
     secret_values: &BTreeMap<String, String>,
 ) -> ConnectorStartSpec {
-    ConnectorStartSpec::from_declaration(
+    let decl = ConnectorsFileDecl {
+        connectors: BTreeMap::from([(connector.to_string(), spec.clone())]),
+        ..Default::default()
+    };
+    let volumes = ConnectorSecretVolumes::new(&decl);
+    let rendered = ConnectorStartSpec::from_declaration(
         connector,
         spec,
         image,
         identity,
         "curie-skill-net",
         "curie-skill-abc123",
-        plugin_dir,
+        &volumes,
         secret_values,
         Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
     )
-    .unwrap_or_else(|error| panic!("start spec for {connector}: {error:#}"))
+    .unwrap_or_else(|error| panic!("start spec for {connector}: {error:#}"));
+    let args = rendered.run_args();
+    crate::docker_no_host_binds::assert_no_client_host_binds(&args);
+    assert!(!args
+        .iter()
+        .any(|arg| arg.contains(&plugin_dir.display().to_string())));
+    rendered
 }
 
 fn pairs_after(argv: &[String], flag: &str) -> Vec<String> {
@@ -496,7 +408,7 @@ fn substituted_args_and_env_reach_the_container() {
     );
 }
 
-// ─── Secrets: never in argv, readable on disk, gone after teardown ───────────
+// Credential environment and daemon volume mounts.
 
 /// A declared secret is forwarded by NAME; its value never enters argv.
 ///
@@ -543,7 +455,6 @@ fn a_declared_secrets_value_never_appears_in_argv() {
 /// has to name all three ways forward (7.3, review round 2 finding r2-8).
 #[test]
 fn an_out_of_band_secret_reference_fails_closed_with_all_three_alternatives() {
-    let dir = TempDir::new().expect("a scratch bundle");
     let spec = ConnectorSpecDecl {
         secrets: vec![SecretDecl::Ref {
             name: "GRAFANA_TOKEN".to_string(),
@@ -560,7 +471,7 @@ fn an_out_of_band_secret_reference_fails_closed_with_all_three_alternatives() {
         &scope("sre-bot"),
         "curie-skill-net",
         "curie-skill-abc123",
-        dir.path(),
+        &ConnectorSecretVolumes::new(&ConnectorsFileDecl::default()),
         &BTreeMap::new(),
         Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
     )
@@ -575,318 +486,200 @@ fn an_out_of_band_secret_reference_fails_closed_with_all_three_alternatives() {
     }
 }
 
-/// The credential file is staged at a DETERMINISTIC path, holds exactly the
-/// resolved value, and is bind-mounted read-only where the declaration says.
-///
-/// Deterministic, not a per-run tempdir: teardown is label-driven and a reap
-/// that never inspected a container cannot discover a random path, so the
-/// credential would survive every `down` (review round 3, finding r3-9). The
-/// content assertion is what an argv check cannot make -- an empty mount
-/// satisfies every flag.
 #[test]
-fn a_secret_file_is_staged_readable_and_mounted_where_declared() {
-    let dir = TempDir::new().expect("a scratch bundle");
-    let staged = stage_secret_file(
-        dir.path(),
-        "kubernetes",
-        "/secrets/kubeconfig",
-        "apiVersion: v1\nkind: Config\n",
-    )
-    .expect("stage the credential");
-
-    let connector_dir = connector_secrets_root(dir.path()).join("kubernetes");
-    assert_eq!(
-        staged.parent(),
-        Some(connector_dir.as_path()),
-        "the path is recomputable by `skill down` from the plugin dir alone"
-    );
-    assert!(
-        staged
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("kubeconfig-")),
-        "the declared name still leads, so an operator can read the tree: {staged:?}"
-    );
-    assert!(
-        connector_secrets_root(dir.path()).starts_with(dir.path().join(".curie")),
-        "the tree lives under .curie/, which the packer excludes and the scaffold gitignores"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&staged).expect("read the staged credential"),
-        "apiVersion: v1\nkind: Config\n",
-        "an empty file mounts just as successfully as a correct one"
-    );
-
-    let argv = start_spec(
-        "kubernetes",
-        &kubernetes_spec(),
-        TEMPO_IMAGE,
-        &scope("sre-bot"),
-        dir.path(),
-        &BTreeMap::new(),
-    )
-    .run_args();
-    assert!(
-        pairs_after(&argv, "-v")
-            .iter()
-            .any(|m| m == &format!("{}:/secrets/kubeconfig:ro", staged.display())),
-        "the declared mount path is the container's, not the host's: {argv:?}"
-    );
-}
-
-/// Two `secret_files` entries sharing a basename must not stage over each other.
-///
-/// `/a/token` and `/b/token` are two different credentials in the container, and
-/// a name derived from the basename alone silently leaves the connector holding
-/// the second value at both mount points.
-#[test]
-fn two_secret_files_sharing_a_basename_stage_to_distinct_paths() {
-    let dir = TempDir::new().expect("a scratch bundle");
-    let first =
-        stage_secret_file(dir.path(), "kubernetes", "/a/token", "alpha").expect("stage /a/token");
-    let second =
-        stage_secret_file(dir.path(), "kubernetes", "/b/token", "bravo").expect("stage /b/token");
-
-    assert_ne!(first, second, "one basename, two declarations, two files");
-    assert_eq!(
-        std::fs::read_to_string(&first).expect("read the first credential"),
-        "alpha",
-        "staging the second must not overwrite the first"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&second).expect("read the second credential"),
-        "bravo"
-    );
-}
-
-/// Restaging replaces the hardened file. The first staging leaves 0400/0444,
-/// so a plain write onto it is EACCES and a redeploy or rotation would wedge;
-/// deleting the replace-before-write from `stage_secret_file` fails this.
-#[test]
-fn restaging_replaces_the_hardened_credential() {
-    let dir = TempDir::new().expect("a scratch bundle");
-    let first = stage_secret_file(dir.path(), "kubernetes", "/secrets/kubeconfig", "old-creds")
-        .expect("first staging");
-    let again = stage_secret_file(dir.path(), "kubernetes", "/secrets/kubeconfig", "new-creds")
-        .expect("restaging over the hardened file must succeed");
-    assert_eq!(first, again, "one declaration, one staged path");
-    assert_eq!(
-        std::fs::read_to_string(&again).expect("read the rotated credential"),
-        "new-creds",
-        "rotation must land the new value"
-    );
-}
-
-/// A declared path is the CONTAINER's, so nothing constrains its shape. Every
-/// one of these must still land inside the connector's own directory: the
-/// staged path is a host filesystem write, and the bundle author picks its input.
-#[test]
-fn a_hostile_declared_path_cannot_escape_the_connector_directory() {
-    let dir = TempDir::new().expect("a scratch bundle");
-    let expected_parent = connector_secrets_root(dir.path()).join("kubernetes");
-
-    for declared in ["..", "../../evil", "/secrets/../../evil", "c:\\evil", "/"] {
-        let staged = staged_secret_path(dir.path(), "kubernetes", declared);
+fn secret_files_mount_one_daemon_volume_at_the_exact_declared_targets() {
+    let mut spec = kubernetes_spec();
+    spec.secret_files = BTreeMap::from([
+        ("FIRST_TOKEN".to_string(), "/a/token".to_string()),
+        ("SECOND_TOKEN".to_string(), "/b/token".to_string()),
+    ]);
+    let decl = ConnectorsFileDecl {
+        connectors: BTreeMap::from([("kubernetes".to_string(), spec.clone())]),
+        ..Default::default()
+    };
+    let volumes = ConnectorSecretVolumes::new(&decl);
+    let mounts = volumes
+        .mounts("kubernetes", &spec)
+        .expect("credential mounts");
+    assert_eq!(mounts.len(), 2);
+    assert_eq!(mounts[0].volume, mounts[1].volume);
+    assert_ne!(mounts[0].subpath, mounts[1].subpath);
+    for (mount, target) in mounts.iter().zip(["/a/token", "/b/token"]) {
+        assert_eq!(mount.target, target);
         assert_eq!(
-            staged.parent(),
-            Some(expected_parent.as_path()),
-            "{declared:?} escaped to {staged:?}"
+            mount.subpath,
+            Sha256::digest(target.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
         );
+        assert_eq!(mount.volume, volumes.volumes["kubernetes"]);
+    }
+
+    let start = ConnectorStartSpec::from_declaration(
+        "kubernetes",
+        &spec,
+        TEMPO_IMAGE,
+        &scope("acme-bot"),
+        "curie-skill-net",
+        "curie-skill-abc123",
+        &volumes,
+        &BTreeMap::new(),
+        Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
+    )
+    .expect("render the connector");
+    let argv = start.run_args();
+    crate::docker_no_host_binds::assert_no_client_host_binds(&argv);
+    assert_eq!(
+        pairs_after(&argv, "--mount"),
+        mounts
+            .iter()
+            .map(|mount| mount.docker_mount())
+            .collect::<Vec<_>>()
+    );
+    for mount in &mounts {
+        assert!(mount.docker_mount().contains("readonly"));
+        assert!(mount.docker_mount().contains("volume-nocopy"));
+    }
+
+    let overlay = compose_overlay(
+        &ConnectorLockFileDecl::default(),
+        &decl,
+        &scope("acme-bot"),
+        "acme-project",
+        &volumes,
+        Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
+    )
+    .expect("render the same credential volumes for Compose");
+    let service = &overlay["services"][object_name("curie", "acme-bot", "kubernetes")];
+    let compose_mounts = service["volumes"].as_array().expect("credential mounts");
+    assert_eq!(compose_mounts.len(), mounts.len());
+    for (actual, expected) in compose_mounts.iter().zip(&mounts) {
+        assert_eq!(actual["type"], "volume");
+        assert_eq!(actual["source"], expected.volume);
+        assert_eq!(actual["target"], expected.target);
+        assert_eq!(actual["read_only"], true);
+        assert_eq!(actual["volume"]["subpath"], expected.subpath);
+        assert_eq!(actual["volume"]["nocopy"], true);
+        assert_eq!(overlay["volumes"][&expected.volume]["external"], true);
+        assert_eq!(
+            overlay["volumes"][&expected.volume]["name"],
+            expected.volume
+        );
+    }
+
+    let absent = ConnectorSecretVolumes::new(&ConnectorsFileDecl::default());
+    assert!(absent.mounts("kubernetes", &spec).is_err());
+}
+
+#[test]
+fn connector_volumes_are_private_to_each_connector_and_bring_up() {
+    let decl = ConnectorsFileDecl {
+        connectors: BTreeMap::from([
+            ("first".to_string(), kubernetes_spec()),
+            ("second".to_string(), kubernetes_spec()),
+        ]),
+        ..Default::default()
+    };
+    let first = ConnectorSecretVolumes::new(&decl);
+    let second = ConnectorSecretVolumes::new(&decl);
+    assert_eq!(first.volumes.len(), 2);
+    assert_eq!(second.volumes.len(), 2);
+    assert_ne!(first.run_id, second.run_id);
+    let unique: std::collections::BTreeSet<_> = first
+        .volumes
+        .values()
+        .chain(second.volumes.values())
+        .collect();
+    assert_eq!(unique.len(), 4);
+}
+
+#[test]
+fn secret_subpaths_hash_the_full_target_without_filesystem_traversal() {
+    for target in [
+        "/a/token",
+        "/b/token",
+        "/secrets/../../token",
+        "/secrets/a,b$c",
+    ] {
+        let mut spec = kubernetes_spec();
+        spec.secret_files = BTreeMap::from([("TOKEN".to_string(), target.to_string())]);
+        let decl = ConnectorsFileDecl {
+            connectors: BTreeMap::from([("kubernetes".to_string(), spec.clone())]),
+            ..Default::default()
+        };
+        let volumes = ConnectorSecretVolumes::new(&decl);
+        let mounts = volumes
+            .mounts("kubernetes", &spec)
+            .expect("credential mounts");
+        assert_eq!(mounts[0].target, target);
+        assert_eq!(
+            mounts[0].subpath,
+            Sha256::digest(target.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(mounts[0].subpath.len(), 64);
+        assert!(mounts[0]
+            .subpath
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
     }
 }
 
-/// The parent directory is 0700, so the fallback file mode is still private.
-///
-/// Rootless Docker and Docker Desktop map uids differently, so the `chown` to
-/// 65532 is not always permitted; where it is not, the file falls back to 0444
-/// and the private parent is the only thing keeping the credential unreadable.
-/// That is why the parent mode is load-bearing rather than tidiness.
-#[cfg(unix)]
 #[test]
-fn the_staging_tree_is_private_even_when_the_file_must_be_world_readable() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = TempDir::new().expect("a scratch bundle");
-    let staged = stage_secret_file(dir.path(), "kubernetes", "/secrets/kubeconfig", "creds")
-        .expect("stage the credential");
-
-    let root_mode = std::fs::metadata(connector_secrets_root(dir.path()))
-        .expect("stat the root")
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(root_mode, 0o700, "connector-secrets/ must be private");
-
-    let connector_mode = std::fs::metadata(staged.parent().expect("a parent"))
-        .expect("stat the connector dir")
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(connector_mode, 0o700, "each connector's subdirectory too");
-
-    let file_mode = std::fs::metadata(&staged)
-        .expect("stat the file")
-        .permissions()
-        .mode()
-        & 0o777;
-    assert!(
-        file_mode == 0o400 || file_mode == 0o444,
-        "0400 when chown succeeded, 0444 inside the 0700 parent when it could not; got {file_mode:o}"
-    );
-}
-
-/// Teardown removes the tree. Deleting the `WipeSecrets` arm must fail this.
-///
-/// Driven through `run_connector_teardown`, the executor production runs, not
-/// through the helper it calls -- a test of the helper alone stays green while
-/// the arm that reaches it is gone. The step is built on its own because its
-/// two siblings shell to docker.
-#[tokio::test]
-async fn teardown_wipes_the_staged_credentials() {
-    let dir = TempDir::new().expect("a scratch bundle");
-    stage_secret_file(dir.path(), "kubernetes", "/secrets/kubeconfig", "creds")
-        .expect("stage the credential");
-    let root = connector_secrets_root(dir.path());
-    assert!(root.exists());
-
-    let steps = vec![ConnectorTeardownStep::WipeSecrets(root.clone())];
-    assert!(
-        run_connector_teardown(&steps).await.is_empty(),
-        "the wipe must report no problem"
-    );
-    assert!(
-        !root.exists(),
-        "a resolved credential must not outlive the containers that used it"
-    );
-
-    assert!(
-        run_connector_teardown(&steps).await.is_empty(),
-        "a second wipe is a no-op; `down` after `down` must not error"
-    );
-}
-
-// ─── Teardown ordering (block B1-8) ──────────────────────────────────────────
-
-/// Containers first, then the network, then the credential tree.
-///
-/// The order is the property: a network still attached to a running container
-/// cannot be removed, and a tree still bind-mounted into one cannot be wiped
-/// cleanly. Reaping is label-scoped rather than file-scoped because
-/// `LocalDownOpts` carries no plugin directory and a `down` run from another
-/// directory must still reap (review round 2, finding r2-4).
-#[test]
-fn teardown_reaps_by_label_then_removes_the_network_then_wipes_the_tree() {
-    let dir = TempDir::new().expect("a scratch bundle");
-    let steps = connector_teardown_plan("curie", Some("curie-skill-net"), Some(dir.path()));
-
+fn teardown_reaps_containers_then_secret_volumes_then_the_network() {
+    let steps = connector_teardown_plan("acme-project", Some("acme-skill-net"));
     assert_eq!(steps.len(), 3, "{steps:?}");
-
     match &steps[0] {
         ConnectorTeardownStep::ReapLabeled(command) => {
             assert_eq!(command.program, "docker");
             let argv = command.argv();
             let filters = pairs_after(&argv, "--filter");
-            assert!(
-                filters
-                    .iter()
-                    .any(|f| f == &format!("label={CONNECTOR_COMPONENT_LABEL}")),
-                "{argv:?}"
-            );
-            assert!(
-                filters
-                    .iter()
-                    .any(|f| f == &format!("label={}", connector_project_label("curie"))),
-                "the project label is what keeps two concurrent stacks apart: {argv:?}"
-            );
-            assert!(
-                argv.iter().any(|t| t == "-a" || t == "--all"),
-                "a stopped connector still holds the mount: {argv:?}"
-            );
+            for label in [
+                CLI_MANAGED_LABEL.to_string(),
+                CONNECTOR_COMPONENT_LABEL.to_string(),
+                connector_project_label("acme-project"),
+            ] {
+                assert!(filters.contains(&format!("label={label}")), "{argv:?}");
+            }
+            assert!(argv.iter().any(|arg| arg == "-a" || arg == "--all"));
         }
-        other => panic!("the first step must reap containers, got {other:?}"),
+        other => panic!("containers must be removed first: {other:?}"),
     }
-
-    match &steps[1] {
-        ConnectorTeardownStep::RemoveNetwork(command) => {
-            let argv = command.argv();
-            assert!(argv.iter().any(|t| t == "curie-skill-net"), "{argv:?}");
-        }
-        other => panic!("the network comes after the containers, got {other:?}"),
-    }
-
+    assert!(matches!(
+        &steps[1],
+        ConnectorTeardownStep::RemoveSecretVolumes(project) if project == "acme-project"
+    ));
     match &steps[2] {
-        ConnectorTeardownStep::WipeSecrets(path) => {
-            assert_eq!(path, &connector_secrets_root(dir.path()));
+        ConnectorTeardownStep::RemoveNetwork(command) => {
+            assert_eq!(command.argv(), vec!["network", "rm", "acme-skill-net"]);
         }
-        other => panic!("the credential tree is wiped last, got {other:?}"),
+        other => panic!("the network must be removed last: {other:?}"),
     }
 }
 
-/// `curie local down` from any directory still reaps, with no plugin dir and no
-/// network of its own to remove.
 #[test]
-fn teardown_without_a_plugin_dir_still_reaps_the_containers() {
-    let steps = connector_teardown_plan("curie", None, None);
-    assert_eq!(steps.len(), 1, "{steps:?}");
-    assert!(
-        matches!(steps[0], ConnectorTeardownStep::ReapLabeled(_)),
-        "{steps:?}"
-    );
+fn teardown_without_a_network_still_collects_project_secret_volumes() {
+    let steps = connector_teardown_plan("acme-project", None);
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    assert!(matches!(&steps[0], ConnectorTeardownStep::ReapLabeled(_)));
+    assert!(matches!(
+        &steps[1],
+        ConnectorTeardownStep::RemoveSecretVolumes(project) if project == "acme-project"
+    ));
 }
 
-/// `curie local down` run from the bundle's own directory also removes the tree
-/// a `local deploy` staged there.
-///
-/// The local tier records the deployed bundle's directory nowhere, so the
-/// resolution is the directory `down` ran from -- the one `local deploy`
-/// defaults `--plugin-dir` to. Built through the same resolver `down` calls, so
-/// what stays unpinned here is only its `current_dir()` hand-off. The wipe is
-/// run on its own because its two siblings shell to docker.
-#[tokio::test]
-async fn local_down_wipes_the_staged_tree_of_the_bundle_it_was_run_from() {
-    let dir = TempDir::new().expect("a scratch bundle");
-    stage_secret_file(dir.path(), "kubernetes", "/secrets/kubeconfig", "creds")
-        .expect("stage the credential");
-    let root = connector_secrets_root(dir.path());
-
-    let steps = connector_teardown_plan_for_down(dir.path(), curie::local::COMPOSE_PROJECT);
-    assert_eq!(
-        steps.len(),
-        2,
-        "the reap is unchanged; the wipe is added: {steps:?}"
-    );
-    assert!(
-        matches!(steps[0], ConnectorTeardownStep::ReapLabeled(_)),
-        "containers first, or the tree is still bind-mounted: {steps:?}"
-    );
-    match &steps[1] {
-        ConnectorTeardownStep::WipeSecrets(path) => assert_eq!(path, &root),
-        other => panic!("the staged tree is wiped last, got {other:?}"),
-    }
-
-    assert!(
-        run_connector_teardown(&[ConnectorTeardownStep::WipeSecrets(root.clone())])
-            .await
-            .is_empty(),
-        "the wipe must report no problem"
-    );
-    assert!(
-        !root.exists(),
-        "a resolved credential must not outlive `curie local down`"
-    );
-}
-
-/// A `down` from a directory holding no staged tree plans no wipe: the
-/// resolution never guesses at another bundle's credentials.
 #[test]
-fn local_down_plans_no_wipe_without_a_staged_tree() {
-    let dir = TempDir::new().expect("a directory that is not a staged bundle");
-    let steps = connector_teardown_plan_for_down(dir.path(), curie::local::COMPOSE_PROJECT);
-    assert_eq!(steps.len(), 1, "{steps:?}");
-    assert!(
-        matches!(steps[0], ConnectorTeardownStep::ReapLabeled(_)),
-        "{steps:?}"
-    );
+fn local_down_collects_secret_volumes_without_a_bundle_directory() {
+    let steps = connector_teardown_plan_for_down("acme-project");
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    assert!(matches!(&steps[0], ConnectorTeardownStep::ReapLabeled(_)));
+    assert!(matches!(
+        &steps[1],
+        ConnectorTeardownStep::RemoveSecretVolumes(project) if project == "acme-project"
+    ));
 }
 
 // ─── The compose overlay (block B1-9) ────────────────────────────────────────
@@ -937,15 +730,20 @@ fn overlay_fixture(agent: &str, plugin_dir: &Path) -> Value {
         );
     }
 
-    compose_overlay(
+    let volumes = ConnectorSecretVolumes::new(&decl);
+    let overlay = compose_overlay(
         &lock,
         &decl,
         &scope(agent),
         "curie",
-        plugin_dir,
+        &volumes,
         Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
     )
-    .expect("generate the overlay")
+    .expect("generate the overlay");
+    assert!(!overlay
+        .to_string()
+        .contains(&plugin_dir.display().to_string()));
+    overlay
 }
 
 /// One service per hosted connector, pinned to the locked digest, joined to the
@@ -1059,16 +857,19 @@ fn the_overlay_reproduces_the_same_args_env_and_secret_files() {
          the resolved value: {write}"
     );
 
-    let mounts: Vec<&str> = write["volumes"]
-        .as_array()
-        .expect("volumes")
-        .iter()
-        .map(|v| v.as_str().expect("a string"))
-        .collect();
+    let mounts = write["volumes"].as_array().expect("volumes");
     assert!(
-        mounts
-            .iter()
-            .any(|m| m.ends_with(":/secrets/kubeconfig:ro")),
+        mounts.iter().any(|mount| {
+            mount["type"] == "volume"
+                && mount["target"] == "/secrets/kubeconfig"
+                && mount["read_only"] == true
+                && mount["volume"]["subpath"]
+                    == Sha256::digest(b"/secrets/kubeconfig")
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>()
+                && mount["volume"]["nocopy"] == true
+        }),
         "the credential file mounts read-only at its declared path: {mounts:?}"
     );
 }
@@ -1390,9 +1191,8 @@ fn a_state_file_predating_connectors_still_loads() {
 /// `connectors.lock.yaml` reaches the platform; `.curie/` does not.
 ///
 /// Both halves matter. Without the lock the API cannot resolve the `build:`
-/// declaration and intake refuses the bundle. With the overlay, a resolved
-/// credential (staged under the same `.curie/`) would ride the upload into
-/// stored bundle bytes.
+/// declaration and intake refuses the bundle. The overlay is runtime state
+/// tied to private daemon volumes and must stay outside the upload.
 ///
 /// Listed through `tar` rather than a decoder because `flate2`/`tar` are
 /// library dependencies, not dev-dependencies, and this target must not add
@@ -1408,8 +1208,6 @@ fn the_packed_bundle_carries_the_lock_and_no_runtime_state() {
     .expect("write the lock");
     std::fs::create_dir_all(dir.path().join(".curie")).expect("mkdir .curie");
     std::fs::write(compose_overlay_path(dir.path()), "services: {}\n").expect("write the overlay");
-    stage_secret_file(dir.path(), "kubernetes", "/secrets/kubeconfig", "creds")
-        .expect("stage a credential");
 
     let archive = dir.path().join("bundle.tar.gz");
     std::fs::write(
@@ -1434,6 +1232,6 @@ fn the_packed_bundle_carries_the_lock_and_no_runtime_state() {
     );
     assert!(
         !names.contains(".curie"),
-        "runtime state, including a staged credential, must never enter the upload: {names}"
+        "runtime state must never enter the upload: {names}"
     );
 }

@@ -32,6 +32,7 @@ from curie_api.threadkeys import (
 )
 from curie_api.workitem_dispatch import (
     Admission,
+    FactoryWake,
     admit,
     cancel,
     claim_terminate_publishes,
@@ -237,7 +238,11 @@ def test_a_continuation_finds_a_work_item_keyed_before_the_identity(
 ) -> None:
     async def body(session: AsyncSession) -> None:
         await _legacy_mail_work_item(session)
-        state, _ = await running_for_conversation(session, NEW_KEY)
+        state, _ = await running_for_conversation(
+            session, NEW_KEY, wake=FactoryWake(
+                kind="email", address=ADDRESS, adapter=ADAPTER, conversation_id=THREAD
+            )
+        )
         # Waiting, not running: found, so "ended", never "absent".
         assert state == "ended"
 
@@ -281,7 +286,12 @@ def test_a_named_slack_key_never_finds_the_default_apps_work_item(
             _facts(agent_id, kind="slack", address="C0EXAMPLE1", reply_conversation_id=SLACK_TS),
         )
         named = scoped_conversation_id("slack", "C0EXAMPLE1", SLACK_TS, identity="second-bot")
-        state, _ = await running_for_conversation(session, named)
+        state, _ = await running_for_conversation(
+            session, named, wake=FactoryWake(
+                kind="slack", address="C0EXAMPLE1", adapter="second-bot",
+                conversation_id=SLACK_TS,
+            )
+        )
         assert state == "absent"
 
     _with_session(body)
@@ -296,7 +306,11 @@ def test_a_continuation_does_not_find_a_legacy_work_item_under_a_different_curre
         # key can only be ITS route's, so a lookup implying another route's
         # identity must not adopt it.
         other = scoped_conversation_id("email", ADDRESS, THREAD, identity="other-inbox")
-        state, _ = await running_for_conversation(session, other)
+        state, _ = await running_for_conversation(
+            session, other, wake=FactoryWake(
+                kind="email", address=ADDRESS, adapter="other-inbox", conversation_id=THREAD
+            )
+        )
         assert state == "absent"
 
     _with_session(body)

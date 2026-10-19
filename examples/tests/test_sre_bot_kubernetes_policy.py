@@ -225,3 +225,14 @@ def test_workload_role_lets_approved_pod_server_side_apply_succeed() -> None:
     assert not any(
         "patch" in rule["verbs"] for rule in cluster_role["rules"]
     ), "patch must stay namespaced to sre-demo"
+
+
+def test_the_kubernetes_connector_declares_a_loopback_upstream_host() -> None:
+    # @spec ADR-0229 d1: the pinned server refuses a Service Host on the
+    # proxy's loopback connection, so it declares the Host the proxy presents
+    # on admitted requests. Grafana keys on its allowed-hosts list and keeps
+    # the caller's Host.
+    connectors = _connectors()
+    assert connectors["kubernetes"]["proxy_upstream_host"] == "localhost"
+    assert "proxy_upstream_host" not in connectors["grafana"]
+    assert "proxy_upstream_host" not in connectors["tempo"]

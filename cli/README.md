@@ -358,8 +358,9 @@ accept `--url`. Setting `skill up --model <id>` makes token usage attributable
 in Langfuse traces.
 
 `skill up` also packs the bundle into a content-addressed snapshot under
-`<bundle>/.curie/snapshots/<digest>/` and mounts that read-only, matching what
-the local and cluster tiers do with a deployed bundle. So editing a bundle file
+`<bundle>/.curie/snapshots/<digest>/`, copies it through the Docker API into a
+private named volume, and mounts the volume read only, matching the immutable
+bundle behavior of the local and cluster tiers. So editing a bundle file
 on the host does not reach the running runner: re-run `curie skill up` and
 confirm the new `bundle_digest` in `curie skill status --json`. A verified
 same-directory runner is replaced automatically; `--replace` still forces a
@@ -368,22 +369,31 @@ optional `evals/trajectory.json` sidecar are the exceptions. `skill eval` reads
 them live from source, so an eval edit needs no restart. `skill down` and a
 replacement `up` release the snapshot along with the container.
 
-For a Docker daemon whose filesystem is separate from the CLI host, set
-`DOCKER_PUBLISHED_HOST` to the hostname or IP where its published ports are
-reachable, without a URL scheme or port. Its presence selects remote snapshot
-transport even when it names `localhost`. The CLI copies the immutable snapshot
-through the Docker API into a private named volume and mounts it read only.
-`skill check`, `skill up`, `skill eval --model`, and `curie try` use this
-transport; runner requests use the configured address, including IPv6 addresses.
-`skill down`, replacement, and failed startup release the volume. Docker's
-connection settings such as `DOCKER_HOST` remain independent. With
-`DOCKER_PUBLISHED_HOST` unset, the existing bind mount and localhost endpoint
-are used.
+`skill check`, `skill up`, `skill eval --model`, and `curie try` always copy
+snapshot bytes through the Docker API into private named volumes, for local and
+remote daemons alike. The client workspace and `TMPDIR` need no matching paths
+on the daemon host. `skill down`, replacement, and failed startup release the
+owned volumes.
 
-Hosted connectors that declare `secret_files` need host-path mounts and are
-refused before startup when `DOCKER_PUBLISHED_HOST` is set. Hosted connectors
-with environment secrets remain supported, as do connectors using a remote
-`url` or `unhosted_url`.
+Set `DOCKER_PUBLISHED_HOST` to the hostname or IP where published ports are
+reachable, without a URL scheme or port. Runner requests use that address,
+including IPv6 addresses; the default is `localhost`. This setting only selects
+the published endpoint. Docker connection settings such as `DOCKER_HOST` select
+the daemon independently.
+
+Hosted connectors support `secret_files` with local and remote Docker. At
+startup, the CLI streams credentials from memory into a private named volume
+for each connector and run. Each file has mode `0400`, belongs to UID/GID
+`65532:65532`, and is mounted read only through a volume subpath at its exact
+declared destination. Credential values are not written to client staging files
+or passed in Docker argv. Connector teardown and failed startup release owned
+credential volumes. Environment secrets and connectors using a remote `url` or
+`unhosted_url` remain supported. That subpath mount needs Docker Engine 26.0
+or later (Engine API 1.45) and, on the local tier, Docker Compose v2.26.0 or
+later. `curie skill up` and `curie local up` connector bring-up refuse before
+creating any volume or container when a hosted connector declares
+`secret_files` on an older Docker, and bundles without `secret_files` are not
+checked.
 
 #### `local` target
 
@@ -392,7 +402,18 @@ queue -> worker -> sandboxed runner -> reply path on one machine, no Slack and
 no Kubernetes. `curie local up` uses the `full` compose profile by default.
 `curie local up --minimal` uses the smaller `core` profile. The compose API is
 published on host port `28000`. Add `curie local up --slack` to also start
-the optional Slack dispatcher.
+the optional Slack dispatcher. A bundle whose hosted connector declares
+`secret_files` needs Docker Engine 26.0 or later (Engine API 1.45) and Docker
+Compose v2.26.0 or later on this tier, as the `secret_files` note under the
+skill target explains; the local connector bring-up refuses on older versions.
+
+The Docker worker fetches and validates bundle, workspace, and attachment inputs,
+then copies them through the Docker API into claim-owned named volumes. Bundle
+and attachment mounts are read only; the workspace is writable by UID `1000`.
+No shared staging directory or daemon-visible client workspace is required.
+The dev collector config travels in a small Docker build context, while the
+generated release Compose uses inline content configs. The worker's Docker
+socket mount refers to the daemon host's socket.
 
 | Command | What it does |
 |---|---|
@@ -417,7 +438,7 @@ the optional Slack dispatcher.
 | `curie local hooks show <agent>` | Read the agent's `hook_partitions` and `source_bindings` through the local platform API. Accepts an agent name or id. With `--json`, returns `id`, `agent`, `hook_partitions`, and `source_bindings`. |
 | `curie local hooks configure <agent> --file <PATH>` | Read a JSON object with `hook_partitions`, `source_bindings`, or both, then send only the supplied maps to `PATCH /agents/{id}`. Each supplied map replaces that whole map; `{}` clears it. An omitted map stays unchanged. Invalid file structure is rejected before an API request. With `--json`, returns the same configuration shape as `show`. |
 | `curie local hooks secret <agent>` | Deliberately read and print the derived hook signing secret. Human output prints the secret on stdout; `--json` returns only `{"secret":"..."}`. `--dry-run` makes no API request and redacts the secret. Use `--api-url` to select a local API and `CURIE_API_KEY` to authenticate without putting the key in command arguments. |
-| `curie local approvals <agent>` | Inspect or configure approval gates and route bindings, list pending records with each card's real bound channel, mint subject-bound resolver credentials, or resolve one record.<br>• `--mint-operator-principal <SUBJECT>` administratively mints a reusable token whose one-time output is exported as `CURIE_APPROVAL_PRINCIPAL_TOKEN`; the token carries no Slack channel and may resolve only an explicit-user route containing that subject.<br>• `--mint-console-login-code <SUBJECT>` creates a single-use code that exchanges for an HttpOnly, subject-bound Console session.<br>• `--resolve <ID>` approves by default; add `--reject` to reject and `--note` for an optional reason. It sends only decision/note, derives the actor from `CURIE_APPROVAL_PRINCIPAL_TOKEN`, and has no `--as` or `--actor-channel` assertion flags.<br>• Requester equality neither grants nor vetoes: the authenticated requester may self-confirm only when the selected approver set admits that same subject. A distinct-person requirement is a separate policy, not an ordinary gate default.<br>• A route write (`--clear-routes`, `--route-resolution`, `--route-approvers`, `--routes-from`) first reads the agent's active deployments and refuses locally (exit 2, nothing sent) when one declares a route the write would remove. If that read fails it warns and sends the write, and the API decides. `--dry-run` stays offline. |
+| `curie local approvals <agent>` | Inspect or configure approval gates and route bindings, list pending records with each card's real bound channel, mint subject-bound resolver credentials, or resolve one record.<br>• `--mint-operator-principal <SUBJECT>` administratively mints a reusable token whose one-time output is exported as `CURIE_APPROVAL_PRINCIPAL_TOKEN`; the token carries no Slack channel and may resolve only an explicit-user route containing that subject.<br>• `--mint-remediation-principal <SUBJECT>` mints a reusable `remediation.administer` token for remediation policy, breaker, and qualification writes; export it as `CURIE_APPROVAL_PRINCIPAL_TOKEN`. It cannot resolve approvals.<br>• `--mint-console-login-code <SUBJECT>` creates a single-use code that exchanges for an HttpOnly, subject-bound Console session.<br>• `--resolve <ID>` approves by default; add `--reject` to reject and `--note` for an optional reason. It sends only decision/note, derives the actor from `CURIE_APPROVAL_PRINCIPAL_TOKEN`, and has no `--as` or `--actor-channel` assertion flags.<br>• Requester equality neither grants nor vetoes: the authenticated requester may self-confirm only when the selected approver set admits that same subject. A distinct-person requirement is a separate policy, not an ordinary gate default.<br>• A route write (`--clear-routes`, `--route-resolution`, `--route-approvers`, `--routes-from`) first reads the agent's active deployments and refuses locally (exit 2, nothing sent) when one declares a route the write would remove. If that read fails it warns and sends the write, and the API decides. `--dry-run` stays offline. |
 | `curie local overrides <agent> [--model V\|--clear-model] [--thinking V\|--clear-thinking] [--execution-deadline SECONDS\|--clear-execution-deadline] [--runner-resources JSON\|--clear-runner-resources] [--memory-writes on\|off]` | Read or change the agent's nullable operator overrides via the compose platform API (`PATCH /agents/{id}`).<br>• With no change flags it INSPECTS and writes nothing.<br>• `--clear-<field>` sends explicit JSON null, restoring the platform default; an omitted field is left alone, which is a different request the API tells apart with `model_fields_set`.<br>• A blank value is refused rather than forwarded: an empty override skips the platform default instead of restoring it.<br>• `--execution-deadline` pins the agent's run deadline (`execution_deadline_seconds`, a JSON number) and is refused client-side outside 60-10800 seconds or for a non-integer value; the platform default is 1800s.<br>• `--runner-resources` pins cpu, memory, and ephemeral-storage requests and limits as one JSON object. Null means the chart block. The API refuses a value that cannot fit the sandbox quota.<br>• `--memory-writes on\|off` turns the agent's remember/update/forget memory tools on or off (`memory_writes`, a JSON boolean) from the next sandbox boot. Any other value is refused. The result always reports it (`memory_writes` in `--json`, `memory writes on\|off` in text), inspect included. |
 | `curie local callers <agent> --surface KIND=ADDRESS [--set ID,ID...\|--clear] [--adapter NAME]` | Show, set or clear who may talk to the bot through one surface via the compose platform API (`PUT /agents/{id}/channels/callers`, ADR 0175).<br>• With neither `--set` nor `--clear` it SHOWS the list and writes nothing; `allowed_callers` is `null` when everyone may talk to the bot.<br>• `--set` replaces the whole list with exact ids: Slack user or bot ids (`U`, `W`, `B`) for a Slack surface, bare email addresses for an email one. The API checks them against the surface's kind and refuses an empty list.<br>• `--clear` sends an explicit JSON null, so everyone may talk to the bot again.<br>• Anyone not on a list gets no reply at all. Editing the list does not bump the binding generation, so the surface's adapter token keeps working. |
 | `curie local reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the compose platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737).<br>• The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted.<br>• Waits for the worker to drain the request. When the key matched no route (a named bot's key carries its identity as its own segment, `kind:identity:channel:conversation`), nothing was released: the command says so and exits 2 instead of reporting `released`; `--json` adds `route_existed` when the API reported the outcome.<br>• Interrupts a live turn on the thread first, so it refuses without `--yes`. |
@@ -508,7 +529,7 @@ flag, or `CURIE_NAMESPACE` for namespace, still overrides the saved field.
 | `curie cluster budget <agent> [--limit <n>] [--output-tokens <n>]` | Set the USD limit for each SDK session with `--limit`, the output token cap for each run with `--output-tokens`, or both. At least one flag is required. Reads the current budget before updating it through the platform API, preserving every unspecified limit and platform default. The USD field (`BudgetConfig.max_usd_per_day`) uses the SDK cost estimate and does not meter aggregate daily spend across runs. `local budget` has the same flag surface. |
 | `curie cluster schedules [--agent <agent>]` | List cron hooks, their paused state, and separate latest scheduled and manual histories. A manual fire does not replace the scheduled result. Use `--agent <agent> --pause <hook>` or `--agent <agent> --resume <hook>` to control one named hook without redeploying. Resume applies the scheduler's bounded catch up rule. |
 | `curie cluster hook record <agent> <name> <id>` | Print the persisted run. With `--json`, includes its `source` (`schedule` or `manual`). A found record exits 0 even for a non-`ran` or in-flight outcome; it does not wait. Use the run id from a hook fire timeout to inspect its current state. |
-| `curie cluster approvals <agent>` | The deployed equivalent of `local approvals`: inspect/configure gates and routes, list pending records, administratively mint an operator principal or Console login code, and resolve using an authenticated principal.<br>• A platform API key can mint credentials but cannot itself resolve. `--resolve <ID>` reads `CURIE_APPROVAL_PRINCIPAL_TOKEN`; its subject must be in the route's explicit users list because a terminal principal carries no Slack channel/group evidence.<br>• `--list` reports `card_channel`, and a parked-turn hint names that route-bound authenticated-card channel rather than the requesting-channel stub. Use the Slack card for channel-membership or group routes.<br>• A route write (`--clear-routes`, `--route-resolution`, `--route-approvers`, `--routes-from`) first reads the agent's active deployments and refuses locally (exit 2, nothing sent) when one declares a route the write would remove. If that read fails it warns and sends the write, and the API decides. `--dry-run` stays offline. |
+| `curie cluster approvals <agent>` | The deployed equivalent of `local approvals`: inspect/configure gates and routes, list pending records, administratively mint an operator principal, a remediation operator principal, or Console login code, and resolve using an authenticated principal.<br>• A platform API key can mint credentials but cannot itself resolve. `--resolve <ID>` reads `CURIE_APPROVAL_PRINCIPAL_TOKEN`; its subject must be in the route's explicit users list because a terminal principal carries no Slack channel/group evidence.<br>• `--list` reports `card_channel`, and a parked-turn hint names that route-bound authenticated-card channel rather than the requesting-channel stub. Use the Slack card for channel-membership or group routes.<br>• A route write (`--clear-routes`, `--route-resolution`, `--route-approvers`, `--routes-from`) first reads the agent's active deployments and refuses locally (exit 2, nothing sent) when one declares a route the write would remove. If that read fails it warns and sends the write, and the API decides. `--dry-run` stays offline. |
 | `curie cluster hooks show <agent>` | Read the agent's hook maps from the release API. With `--json`, returns `id`, `agent`, `hook_partitions`, and `source_bindings`. |
 | `curie cluster hooks configure <agent> --file <PATH>` | Replace only the hook maps present in the JSON file through `PATCH /agents/{id}`. An empty `{}` map clears that map; omitting a map preserves it. With `--json`, returns the updated configuration. |
 | `curie cluster hooks secret <agent>` | Deliberately print the derived signing secret on stdout. With `--json`, returns only `{"secret":"..."}`. `--dry-run` makes no API request and redacts the secret. All three cluster hook commands use the cluster API connection behavior described below. |

@@ -92,6 +92,13 @@ valid; assigning two distinct grantable tools to one route is rejected as
 single-valued rather than letting a model-selected request decide which tool receives the
 one-shot allowance.
 
+A grantable route whose tool is on a hosted connector behind the caller proxy is the
+exception. The proxy forwards a gated call only with a grant bound to its exact arguments,
+and a policy approval carries none, so the approved call could never run. The runner
+refuses that `request_approval` in-turn, before any card, and tells the model to call the
+tool directly. The permission gate then holds the call with its arguments on the card, and
+the resume grant is bound to them. It is still one approval.
+
 View what a bundle declares, offline and with no credential:
 
 ```bash
@@ -402,6 +409,9 @@ curie local approvals my-agent --resolve <id> --reject --note "discount too deep
 # create the Console's single-use, subject-bound login code instead
 curie local approvals my-agent --mint-console-login-code U0EXAMPLE1
 
+# mint a remediation operator principal for remediation policy writes instead
+curie local approvals my-agent --mint-remediation-principal U0EXAMPLE1
+
 # which tools are gated behind approval
 curie local approvals my-agent
 ```
@@ -417,6 +427,16 @@ route-bound resolution address when one was configured, not the requesting-chann
 so a human knows where that authenticated card lives. A null or empty `card_channel` is
 from an older row or a direct API write that omitted the field; for that compatibility
 case, the requesting channel is the card location.
+
+The two operator mints carry different scopes and neither stands in for the other.
+`--mint-operator-principal` (`POST /approvals/principals/operator`) carries
+`approval.resolve` and settles approvals. `--mint-remediation-principal`
+(`POST /approvals/principals/remediation-operator`) carries
+`remediation.administer` and is what remediation policy, breaker and qualification
+writes require as attribution (binding and arming also need the separate
+remediation authority key, ADR 0231); it resolves no approval, and an approval operator token on a
+remediation write is refused `operator_principal_required`. Both are sent as
+`CURIE_APPROVAL_PRINCIPAL_TOKEN` (header `X-Curie-Approval-Principal`).
 
 A single operator does not need a second person to settle a card. An authenticated
 member of the approver set may approve their own request, including the person who

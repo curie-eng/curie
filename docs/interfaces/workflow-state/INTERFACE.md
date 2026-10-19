@@ -104,8 +104,13 @@ identity segment, and the key's binding (and a binding path's) must be the
 claim's. The unbound credential of a targetless cron reaches only its own
 agent's `@cron` threads, a key no producer builds is refused, and a transcript
 listing is filtered to the reachable threads. A pre-ADR-0188 token keeps its
-transcript reach until it expires, with a "legacy sandbox token" warning and a
-`curie.state.legacy_token` count. General state keeps the broad reach. The narrow
+ordinary transcript reach until it expires, with a "legacy sandbox token"
+warning and a `curie.state.legacy_token` count. Protected history is excluded:
+legacy credentials are refused on protected keys and protected binding paths,
+and transcript listings filter out protected-shaped keys, including malformed
+ones (`apps/api/src/curie_api/routers/state.py::_protected_transcript_key`,
+`apps/api/src/curie_api/routers/state.py::_visible_transcripts`). General state
+keeps the broad reach. The narrow
 `state.app` scope backs the bundle-facing `CURIE_STATE_TOKEN` and is refused on
 the reserved namespaces server-side by
 `apps/api/src/curie_api/routers/state.py::forbid_reserved_namespace`, so a skill
@@ -130,7 +135,8 @@ which keeps the refusal record for 24 hours. Thus sandbox state access depends o
 Valkey authorization state as well as the Postgres data backend.
 
 Every completed state delete, shared or binding scoped and including a
-transcript, and every operator memory edit or delete, leaves one INFO line on
+transcript or fact, and every operator edit or delete of a legacy memory log
+entry, leaves one INFO line on
 the `curie_api.state_mutation` logger, plus one `curie.state.mutation` count
 when it changed stored state (#3673,
 `apps/api/src/curie_api/state_mutation.py::record`). The line names the
@@ -138,7 +144,9 @@ operation, agent, scope, namespace, key or memory index, whether anything was
 removed, and the `StateCaller` kind that authenticated the call. It never
 carries the stored value or a memory entry's content. A compare-and-delete that
 conflicts is refused before anything is recorded, and a write that bypasses the
-API, such as a direct database statement, leaves no record here.
+API, such as a direct database statement, leaves no record here. The memory
+router's guidance PUT and DELETE also leave no mutation record, although they
+mutate the same backing table.
 
 The worker-side route store is separate. `AffinityStore` at
 `apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore` records the
@@ -158,6 +166,11 @@ route-state contract:
 - `live_claim_names(...) -> set[str]` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.live_claim_names`)
 - `route_inventory(...) -> dict[RouteState, set[str]]` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.route_inventory`)
 - `mark_suspended(thread_key, history_ref, ttl_seconds) -> RouteRecord` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.mark_suspended`)
+
+`AffinityStore.executor_routes(scan_count=500) -> dict[str, RouteRecord]`
+(`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.executor_routes`)
+also inventories unexpired `action-exec:<id>` routes for executor recovery,
+excluding ordinary turn routes.
 
 The stored value is a `RouteRecord` (`apps/worker/src/curie_worker/sandbox/types.py::RouteRecord`) JSON-serialized. This is route affinity, not general workflow state.
 
@@ -210,6 +223,13 @@ keep reading the Postgres table the first backend owned. Anything the API-side s
 by being HTTP (auth scope, reserved-namespace guard, size caps at the boundary) is
 re-implemented or bypassed on this path. The memory seam's own file covers the same
 bypass from the memory side.
+
+The guidance endpoints are another direct ORM path through the same router:
+`get_memory_guidance`, `put_memory_guidance` and `delete_memory_guidance`
+(`apps/api/src/curie_api/routers/memory.py`) read or mutate the shared
+`memory/guidance` row without calling the state API. PUT borrows `enforce_caps`,
+but neither PUT nor DELETE calls `state_mutation.record`. A replacement state
+backend must cover these paths as well as the legacy log operations.
 
 ## Cross-links
 

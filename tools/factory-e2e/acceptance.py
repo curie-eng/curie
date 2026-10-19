@@ -18,20 +18,23 @@ and to `--evidence` when given.
 
 `--dry-run` lists every step and launches nothing. It fails on an entry with
 an unset step field, and reports "not installed" for an entry whose forge
-drivers are not installed or whose pairing is refused. github+github,
-jira_cloud+github, gitlab+gitlab@fixture and gitlab+gitlab@saas are installed
-today; jira_cloud+gitlab is a complete step definition waiting on its install
-path. Bitbucket
-pairs only with a Jira Cloud tracker, and both Bitbucket entries are refused
-until the combined Jira Cloud and Bitbucket quickstart lands (#4400): their
-drivers are installed but no install path sets up that pairing yet.
+drivers are not installed. github+github,
+jira_cloud+github, jira_cloud+bitbucket_cloud, jira_cloud+bitbucket_dc,
+gitlab+gitlab@fixture and gitlab+gitlab@saas are installed today;
+jira_cloud+gitlab is a complete step definition waiting on its install path.
+Bitbucket pairs only with a Jira Cloud tracker, installed by the combined
+`curie factory quickstart --tracker jira-cloud --code-host bitbucket-*`.
 
 The jira_cloud+github entry is driven by the jira_cloud driver (`--forge
 jira_cloud`), which delegates the change, CI, review and merge steps to the
 GitHub driver, so it asserts the same loop plus the tracker evidence. A
 Bitbucket entry is driven by its code host's driver, which delegates the
 ticket to the jira_cloud driver and asserts the loop only. Every Jira entry
-asserts the "close Jira test issues" teardown.
+asserts the "close Jira test issues" teardown. jira_cloud+bitbucket_dc brings
+a Bitbucket Data Center fixture up for the run unless
+CURIE_BITBUCKET_DC_FIXTURE names one, and removes the one it started.
+jira_cloud+bitbucket_cloud reads its test repository, the two token files and
+the reviewer's account id from CURIE_BITBUCKET_CLOUD_* variables.
 
 The GitLab entries are driven by the gitlab driver with `--forge-target`.
 `@fixture` brings a GitLab CE fixture up for the run on the kube context
@@ -114,8 +117,6 @@ class Pairing:
     code_host: str
     installed: bool
     steps: tuple[Step, ...]
-    # Why an entry whose drivers are installed is still not installed.
-    refused: str | None = None
     # The forge deployment the entry drives (`--forge-target`); None for a forge with one.
     target: str | None = None
 
@@ -165,6 +166,13 @@ def _gitlab() -> Any:
     return sys.modules["factory_e2e_forges.gitlab"]
 
 
+def _bitbucket_dc() -> Any:
+    """The bitbucket_dc forge entry module (forges/bitbucket_dc.py)."""
+
+    fe.load_forge_entries()
+    return sys.modules["factory_e2e_forges.bitbucket_dc"]
+
+
 def _driver(tracker: str, code_host: str) -> str:
     """The driver the loop runs, which --forge and the evidence forge name.
 
@@ -179,10 +187,27 @@ def _driver(tracker: str, code_host: str) -> str:
 
 
 def _inputs(tracker: str, code_host: str) -> dict[str, str]:
-    credentials = (
-        "CURIE_FACTORY_* variables and files for the test App, actor and fixture, "
-        "with CURIE_FACTORY_MODEL_API_KEY for a real model"
-    )
+    if code_host == "bitbucket_cloud":
+        credentials = (
+            "CURIE_FACTORY_* variables for the cluster, the layer registry and a real model "
+            "(CURIE_FACTORY_MODEL_API_KEY); CURIE_BITBUCKET_CLOUD_REPO names the test "
+            "repository, CURIE_BITBUCKET_CLOUD_TOKEN_FILE the factory's and "
+            "CURIE_BITBUCKET_CLOUD_REVIEWER_TOKEN_FILE the reviewer's repository access "
+            "token files, and CURIE_BITBUCKET_CLOUD_REVIEWER_ACCOUNT_ID the reviewer's account"
+        )
+    elif code_host == "bitbucket_dc":
+        credentials = (
+            "CURIE_FACTORY_* variables for the cluster, the layer registry and a real model "
+            "(CURIE_FACTORY_MODEL_API_KEY); the Bitbucket Data Center fixture is brought up "
+            "for the run with `forge-fixture bitbucket-dc up` on the InternalIP of the kube "
+            "context node running the Docker daemon, unless CURIE_BITBUCKET_DC_FIXTURE names "
+            "a running one, and removed after it"
+        )
+    else:
+        credentials = (
+            "CURIE_FACTORY_* variables and files for the test App, actor and fixture, "
+            "with CURIE_FACTORY_MODEL_API_KEY for a real model"
+        )
     if tracker == "jira_cloud":
         credentials += (
             ", and CURIE_FACTORY_JIRA_ENV_FILE naming the Jira test site, the labeler and "
@@ -267,6 +292,8 @@ def _loop_step(tracker: str, code_host: str) -> Step:
             "reset fixture repository",
             "restore fixture default branch",
             "delete namespaces",
+            # The fixture the run brought up is removed last.
+            *((_bitbucket_dc().FIXTURE_DOWN_STEP,) if code_host == "bitbucket_dc" else ()),
         )
     return Step(
         name=f"{scenario} {tracker}+{code_host}",
@@ -279,10 +306,8 @@ def _loop_step(tracker: str, code_host: str) -> Step:
     )
 
 
-def _pairing(
-    tracker: str, code_host: str, *, installed: bool, refused: str | None = None
-) -> Pairing:
-    return Pairing(tracker, code_host, installed, (_loop_step(tracker, code_host),), refused)
+def _pairing(tracker: str, code_host: str, *, installed: bool) -> Pairing:
+    return Pairing(tracker, code_host, installed, (_loop_step(tracker, code_host),))
 
 
 def _gitlab_step(target: str) -> Step:
@@ -374,11 +399,6 @@ def _gitlab_pairing(target: str) -> Pairing:
     return Pairing("gitlab", "gitlab", True, (_gitlab_step(target),), target=target)
 
 
-# The Bitbucket drivers are installed, but nothing installs a Jira Cloud tracker
-# beside a Bitbucket code host until the combined quickstart lands.
-BITBUCKET_REFUSED = "the combined Jira Cloud and Bitbucket quickstart is not in this build (#4400)"
-
-
 PAIRINGS: dict[str, Pairing] = {
     p.key: p
     for p in (
@@ -387,8 +407,8 @@ PAIRINGS: dict[str, Pairing] = {
         _gitlab_pairing("fixture"),
         _gitlab_pairing("saas"),
         _pairing("jira_cloud", "gitlab", installed=False),
-        _pairing("jira_cloud", "bitbucket_cloud", installed=False, refused=BITBUCKET_REFUSED),
-        _pairing("jira_cloud", "bitbucket_dc", installed=False, refused=BITBUCKET_REFUSED),
+        _pairing("jira_cloud", "bitbucket_cloud", installed=True),
+        _pairing("jira_cloud", "bitbucket_dc", installed=True),
     )
 }
 
@@ -433,8 +453,6 @@ def _missing_drivers(pairing: Pairing) -> list[str]:
 
 
 def _not_installed(pairing: Pairing) -> str:
-    if pairing.refused:
-        return f"{pairing.key} is not installed: {pairing.refused}"
     missing = _missing_drivers(pairing)
     if not missing:
         return f"{pairing.key} is not installed: no install path sets up this pairing yet"

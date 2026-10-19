@@ -53,6 +53,11 @@ RETRY_ALLOWLIST = frozenset(
         ("ci.yaml", "python-pytest", "Install uv"),
         ("ci.yaml", "turn-canary-contract", "Install uv"),
         ("fix-pin.yaml", "fix-pin", "Install uv"),
+        (
+            "fix-pin.yaml",
+            "fix-pin",
+            "Install kind and kubectl without creating a cluster",
+        ),
         ("ci.yaml", "e2e-ladder-cluster", "Create the kind cluster"),
         ("ci.yaml", "e2e-cluster-chart-regressions", "Create the kind cluster"),
         ("ci.yaml", "e2e-cluster-rollout-recovery", "Create the kind cluster"),
@@ -91,6 +96,8 @@ RETRY_ALLOWLIST = frozenset(
         ),
         ("ci.yaml", "e2e-cluster-rollout-recovery", "Install Helm"),
         ("ci.yaml", "e2e-cluster-approval-resume-restarts", "Install Helm"),
+        # Issue #4628: the pinned setup action acquires uv before workspace sync.
+        ("ci.yaml", "e2e-released-upgrade", "Install uv"),
         ("ci.yaml", "e2e-released-upgrade", "Install Helm"),
         ("ci.yaml", "e2e-released-upgrade", "Create the disposable kind cluster"),
         ("ci.yaml", "e2e-released-upgrade-negative", "Install Helm"),
@@ -98,14 +105,46 @@ RETRY_ALLOWLIST = frozenset(
         ("ci.yaml", "e2e-cluster-upgrade-matrix", "Install Helm"),
         # Issue #4111: the scripted factory job acquires Helm, kind and kubectl
         # before the driver runs; the driver creates its own cluster.
+        ("ci.yaml", "e2e-scripted-factory", "Install uv"),
         ("ci.yaml", "e2e-scripted-factory", "Install Helm"),
         (
             "ci.yaml",
             "e2e-scripted-factory",
             "Install kind and kubectl without creating a cluster",
         ),
+        # Issue #4620: the forge instance regression acquires uv, Helm, kind and
+        # kubectl before the module runs; the module creates its own clusters.
+        ("ci.yaml", "forge-instance-regression", "Install uv"),
+        ("ci.yaml", "forge-instance-regression", "Install Helm"),
+        (
+            "ci.yaml",
+            "forge-instance-regression",
+            "Install kind and kubectl without creating a cluster",
+        ),
+        # Issue #4619: the admitted agent shards acquire the same tools; each
+        # case creates its own cluster.
+        ("ci.yaml", "factory-admitted-agent", "Install uv"),
+        ("ci.yaml", "factory-admitted-agent", "Install Helm"),
+        (
+            "ci.yaml",
+            "factory-admitted-agent",
+            "Install kind and kubectl without creating a cluster",
+        ),
+        # The CLI convergence regressions acquire Helm, kind and kubectl; each
+        # test creates its own cluster.
+        ("ci.yaml", "rust-convergence", "Install Helm"),
+        (
+            "ci.yaml",
+            "rust-convergence",
+            "Install kind and kubectl without creating a cluster",
+        ),
         ("ci.yaml", "e2e-required", "Install uv for the runtime assertion gate"),
         ("helm-ci.yaml", "chart-lint-and-assertions-1", "Install Helm"),
+        (
+            "helm-ci.yaml",
+            "chart-lint-and-assertions-1",
+            "Install kind and kubectl without creating a cluster",
+        ),
         ("helm-ci.yaml", "chart-assertions-2", "Install Helm"),
         ("helm-ci.yaml", "chart-assertions-2", "Install uv"),
         ("helm-ci.yaml", "chart-assertions-retained-values", "Install Helm"),
@@ -155,6 +194,7 @@ PROTECTED_STEPS = frozenset(
         ("ci.yaml", "python-pytest", "Pytest"),
         ("ci.yaml", "python-static", "Docs gate (catalog drift + agent contract + citations)"),
         ("ci.yaml", "rust-test", "Test"),
+        ("ci.yaml", "rust-convergence", "Test"),
         ("ci.yaml", "ui", "Lint"),
         ("ci.yaml", "ui", "Command manifest is current"),
         ("ci.yaml", "commit-messages", "Check the PR's commit messages"),

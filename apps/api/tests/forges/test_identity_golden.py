@@ -82,6 +82,7 @@ def _legacy_notice(**changes: object) -> FactoryNotice:
         "issue_number": ISSUE_NUMBER,
         "sender_id": 6601,
         "sender_login": "octocat",
+        "label_event_at": None,
         "label": "factory",
     }
     fields.update(changes)
@@ -89,7 +90,9 @@ def _legacy_notice(**changes: object) -> FactoryNotice:
 
 
 def _notice(disposition: Disposition, event_id: str) -> MarkedNotice:
-    return MarkedNotice(ISSUE, "factory", SENDER, event_id, disposition, cursor="1")
+    return MarkedNotice(
+        ISSUE, "factory", SENDER, event_id, disposition, cursor="1", occurred_at=None
+    )
 
 
 def test_label_admission_with_a_timeline_event() -> None:
@@ -174,7 +177,9 @@ def test_other_kinds_derive_distinct_identities_from_the_full_key() -> None:
         issue_lock_keys(other_host),
         GOLDEN_LOCK_KEYS[(4401, 12)],
     }
-    admit = MarkedNotice(gitlab, "factory", SENDER, str(LABEL_EVENT_ID), Disposition.ADMIT, "1")
+    admit = MarkedNotice(
+        gitlab, "factory", SENDER, str(LABEL_EVENT_ID), Disposition.ADMIT, "1", occurred_at=None
+    )
     assert str(notice_request_id(admit)) != GOLDEN_LABEL_EVENT_REQUEST
     assert notice_request_id(admit) == notice_request_id(admit)
 

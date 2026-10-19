@@ -1074,6 +1074,236 @@ fn installation_for_the_stateful_guard() -> &'static str {
     "version: 1\ninstall:\n  namespace: parity\n  release: parity\n"
 }
 
+fn install_factory_revision_reads(fixture: &HelmFixture, legacy: bool) {
+    let HelmValuesResponse::Object(mut user) = recorded_runner_values() else {
+        panic!("recorded runner fixture must contain supplied values");
+    };
+    user["config"] = json!({"schemaVersion": "0.9.0"});
+    user["worker"]["runnerTotalTimeoutSeconds"] = json!(511);
+    if legacy {
+        user["api"]["githubFactoryIngressEnabled"] = json!(false);
+    }
+    let mut computed = user.clone();
+    computed["api"]["githubFactoryIngressEnabled"] = json!(false);
+    computed["api"]["githubFactoryIntake"] = json!("poll");
+    computed["api"]["githubFactoryPollIntervalSeconds"] = json!(45);
+    computed["api"]["githubFactoryLabel"] = json!("");
+    computed["api"]["githubFactoryMention"] = json!("");
+    computed["api"]["githubFactoryCardBaseUrl"] = json!("");
+    computed["api"]["githubFactoryCiWaitSeconds"] = json!(1200);
+    for key in [
+        "githubFactoryBases",
+        "githubFactoryPythonCi",
+        "githubFactoryMetadataCi",
+    ] {
+        computed["api"][key] = json!({});
+    }
+    let mut inputs = super::cluster_upgrade::factory_read_inputs(user, computed);
+    inputs["unpinned_revision"] = json!(if legacy { "4" } else { "5" });
+    let bin_dir = fixture.temp.path().join("bin");
+    let base = bin_dir.join("base");
+    fs::create_dir(&base).unwrap();
+    fs::rename(bin_dir.join("helm"), base.join("helm")).unwrap();
+    fs::write(bin_dir.join("factory-inputs.json"), inputs.to_string()).unwrap();
+    let resolved = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .expect("resolve real Helm before installing the factory wrapper");
+    assert!(
+        resolved.status.success(),
+        "real Helm is required for the values parser"
+    );
+    let helm = String::from_utf8(resolved.stdout).expect("UTF-8 Helm path");
+    let helm = fs::canonicalize(helm.trim()).expect("real Helm executable");
+    let helm = serde_json::to_string(helm.to_str().expect("UTF-8 Helm path")).unwrap();
+    let wrapper = format!(
+        r#"#!/usr/bin/python3
+import os
+import sys
+if sys.argv[1:3] == ['template', 'curie-values-lint']:
+    os.execv({helm}, [{helm}, *sys.argv[1:]])
+{}"#,
+        super::cluster_upgrade::FACTORY_READ_WRAPPER
+            .strip_prefix("#!/usr/bin/python3\n")
+            .expect("Python factory wrapper")
+    );
+    test_executable::install(&bin_dir.join("helm"), &wrapper);
+}
+
+fn factory_revision_calls(fixture: &HelmFixture) -> Vec<Vec<String>> {
+    fixture
+        .calls()
+        .lines()
+        .filter_map(|line| line.strip_prefix("FACTORY_CALL: "))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn factory_consumed_values(fixture: &HelmFixture) -> Vec<Value> {
+    fixture
+        .calls()
+        .lines()
+        .filter_map(|line| line.strip_prefix("FACTORY_VALUES: "))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn factory_non_upgrade_callers_pin_latest_user_and_computed_values_after_the_initial_read() {
+    let live_statefulset = live_rustfs_statefulset();
+    for surface in ["up", "apply", "diff"] {
+        let fixture = HelmFixture::new(
+            installation_for_the_stateful_guard(),
+            recorded_runner_values(),
+        );
+        install_factory_revision_reads(&fixture, true);
+        let output = match surface {
+            "up" => fixture.cluster_up_without_credentials(&[]),
+            "apply" => fixture.apply(&[], &[]),
+            _ => fixture.diff(&[("CURIE_TEST_KUBECTL_STS", live_statefulset.as_str())]),
+        };
+        json_output(output, surface);
+        let calls = factory_revision_calls(&fixture);
+        let pinned: Vec<_> = calls
+            .iter()
+            .filter(|call| {
+                call.get(1).is_some_and(|arg| arg == "get")
+                    && call.get(2).is_some_and(|arg| arg == "values")
+                    && call.iter().any(|arg| arg == "--revision")
+            })
+            .collect();
+        assert!(
+            pinned
+                .iter()
+                .any(|call| call.iter().any(|arg| arg == "--all")),
+            "{surface} must read computed source values at the captured latest revision: {calls:?}"
+        );
+        assert!(
+            pinned
+                .iter()
+                .any(|call| !call.iter().any(|arg| arg == "--all")),
+            "{surface} must replace any earlier unpinned user document: {calls:?}"
+        );
+        assert!(
+            pinned
+                .iter()
+                .all(|call| call.windows(2).any(|pair| pair == ["--revision", "5"])),
+            "{surface} retains latest semantics while revision 4 is serving: {calls:?}"
+        );
+        assert!(
+            pinned
+                .iter()
+                .all(|call| call.get(3).is_some_and(|arg| arg == "parity")
+                    && call.windows(2).any(|pair| pair == ["-n", "parity"])),
+            "{surface} source documents must belong to the same release and namespace: {pinned:?}"
+        );
+        let consumed = factory_consumed_values(&fixture);
+        assert!(
+            !consumed.is_empty(),
+            "{surface} must render the completed source snapshot"
+        );
+        let mut saw_latest = false;
+        let mut saw_disabled = false;
+        for consumer in consumed {
+            let arguments = consumer["argv"].as_array().unwrap();
+            saw_latest |= arguments
+                .iter()
+                .any(|arg| arg == "worker.runnerTotalTimeoutSeconds=511");
+            saw_disabled |= arguments.iter().any(|arg| arg == "factory.enabled=false");
+            assert!(
+                !arguments
+                    .iter()
+                    .any(|arg| arg == "worker.runnerTotalTimeoutSeconds=411"),
+                "{surface} must not consume the stale initial user values"
+            );
+            for document in consumer["documents"].as_array().unwrap() {
+                let values: Value = serde_norway::from_str(document.as_str().unwrap()).unwrap();
+                saw_latest |=
+                    values.pointer("/worker/runnerTotalTimeoutSeconds") == Some(&json!(511));
+                saw_disabled |= values.pointer("/factory/enabled") == Some(&json!(false));
+                assert_ne!(
+                    values.pointer("/worker/runnerTotalTimeoutSeconds"),
+                    Some(&json!(411))
+                );
+                assert!(values.pointer("/api/githubFactoryIngressEnabled").is_none());
+            }
+        }
+        assert!(
+            saw_latest,
+            "{surface} must pass the pinned latest user setting to Helm"
+        );
+        assert!(
+            saw_disabled,
+            "{surface} must pass migrated disabled intent to Helm"
+        );
+    }
+}
+
+#[test]
+fn factory_absent_supplied_input_keeps_non_upgrade_latest_reads_without_factory_changes() {
+    for surface in ["up", "apply", "diff"] {
+        let fixture = HelmFixture::new(
+            installation_for_the_stateful_guard(),
+            recorded_runner_values(),
+        );
+        install_factory_revision_reads(&fixture, false);
+        let output = match surface {
+            "up" => fixture.cluster_up_without_credentials(&[]),
+            "apply" => fixture.apply(&[], &[]),
+            _ => fixture.diff(&[]),
+        };
+        json_output(output, surface);
+        let calls = factory_revision_calls(&fixture);
+        let reads: Vec<_> = calls
+            .iter()
+            .filter(|call| {
+                call.get(1).is_some_and(|arg| arg == "get")
+                    && call.get(2).is_some_and(|arg| arg == "values")
+            })
+            .collect();
+        assert!(!reads.is_empty());
+        assert!(
+            reads
+                .iter()
+                .all(|call| !call.iter().any(|arg| arg == "--revision")),
+            "{surface} must preserve the established no-legacy read behavior: {reads:?}"
+        );
+        for consumer in factory_consumed_values(&fixture) {
+            assert!(!consumer["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg.as_str().is_some_and(|arg| arg.starts_with("factory."))));
+            for document in consumer["documents"].as_array().unwrap() {
+                let values: Value = serde_norway::from_str(document.as_str().unwrap()).unwrap();
+                assert!(
+                    values.get("factory").is_none(),
+                    "computed legacy defaults must not create factory intent"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn factory_apply_dry_run_with_legacy_identity_requirements_refuses_without_live_reads() {
+    let config = "version: 1\ninstall:\n  namespace: parity\n  release: parity\nset:\n  api.githubFactoryLabel: identity-sentinel-4628\n";
+    let fixture = HelmFixture::new(config, recorded_runner_values());
+    let output = fixture.apply_dry_run(&[]);
+    assert!(
+        !output.status.success(),
+        "local preview must refuse unresolved legacy identity"
+    );
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(message.contains("api.githubFactory") || message.contains("factory.bindings"));
+    assert!(!message.contains("identity-sentinel-4628"));
+    assert!(fixture.calls().is_empty(), "apply dry-run must stay local");
+}
+
 /// A live release running a `minio` object store, in the shape
 /// `kubectl get statefulset -o json` returns it. The component label is the
 /// identity the guard reads; the resource name is what an operator sees.
@@ -6023,5 +6253,45 @@ fn fresh_cluster_up_does_not_invent_inference() {
     assert!(
         calls.contains("RUNNER_FRESH_FAKE_MODE: yes"),
         "a fresh install without a model source stays fake:\n{calls}"
+    );
+}
+
+/// #4626: `curie apply` does not detect cluster facts, so its dry run has no
+/// controller decision to state. The shared namespace header must not mention
+/// the controller Deployment, and the stamp stays conditional.
+#[test]
+fn apply_dry_run_plans_the_shared_namespace_without_a_controller_decision() {
+    let fixture = HelmFixture::new(
+        "version: 1\ninstall:\n  namespace: parity\n  release: parity\n",
+        HelmValuesResponse::Absent,
+    );
+    let apply = plan(fixture.apply_dry_run(&[]));
+    let lines: Vec<&str> = apply.lines().collect();
+    let header = "# not read under --dry-run: whether namespace agent-sandbox-system already exists; a live run checks it before helm runs";
+    let stamp = "#   if namespace agent-sandbox-system does not exist before helm runs and exists after: kubectl label namespace agent-sandbox-system curietech.ai/created-by=parity curietech.ai/created-in=parity --overwrite";
+    for expected in [header, stamp] {
+        assert_eq!(
+            lines.iter().filter(|line| **line == expected).count(),
+            1,
+            "apply must plan {expected:?} exactly once: {apply}"
+        );
+    }
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("and Deployment agent-sandbox-controller already exist")),
+        "apply detects no controller facts, so it must not name the Deployment: {apply}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("reuse it with agentSandbox.controller.deploy=false")),
+        "apply must not plan a controller reuse it never decides: {apply}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("kubectl label namespace")),
+        "apply must not plan an unconditional namespace stamp: {apply}"
     );
 }

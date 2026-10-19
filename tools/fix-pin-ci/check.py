@@ -59,6 +59,21 @@ SELECTOR = re.compile(
     r"|charts/curie/ci/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.sh"
     r")"
 )
+FACTORY_UPGRADE_MODULE = "tools/factory-e2e/tests/test_c4_upgrade_migration.py"
+HELD_CANCELLATION_MODULE = "tools/factory-e2e/tests/test_c4_held_cancellation.py"
+FORGE_INSTANCES_MODULE = "tools/factory-e2e/tests/test_c4_forge_instances.py"
+# Pins in these modules run against an owned kind cluster, not the dev stack.
+KIND_MODULES = frozenset(
+    {
+        "charts/curie/ci/notes-release-target-assertions.sh",
+        "tools/factory-e2e/tests/test_c4_initial_binding.py",
+        "tools/factory-e2e/tests/test_c4_admitted_agent.py",
+        "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
+        FACTORY_UPGRADE_MODULE,
+        HELD_CANCELLATION_MODULE,
+        FORGE_INSTANCES_MODULE,
+    }
+)
 BUG_LABEL = "bug"
 # Discovery surfaces and pin tiers share this order. A pin whose location maps
 # below the closed issue's found:* label fails unless the body also carries
@@ -104,7 +119,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--needs-curie",
         action="store_true",
-        help="report whether this body would invoke the curie binary",
+        help="report whether this body needs the curie binary, dev stack, or kind",
     )
     return parser
 
@@ -160,9 +175,7 @@ def _effective_train(event: dict[str, object]) -> str:
     if base_ref in {"main", "next"}:
         return base_ref
     if not base_ref.startswith("task/"):
-        raise ValueError(
-            f"pull request base {base_ref!r} is not main, next, or a task branch"
-        )
+        raise ValueError(f"pull request base {base_ref!r} is not main, next, or a task branch")
 
     pull_request = event.get("pull_request")
     if not isinstance(pull_request, dict):
@@ -250,9 +263,7 @@ def _effective_train(event: dict[str, object]) -> str:
 
 def _declaration(body: str) -> Declaration:
     uncommented = COMMENT.sub("", body)
-    attempts = [
-        line for line in uncommented.splitlines() if DECLARATION_ATTEMPT.search(line)
-    ]
+    attempts = [line for line in uncommented.splitlines() if DECLARATION_ATTEMPT.search(line)]
     if not attempts:
         return Declaration()
 
@@ -263,9 +274,7 @@ def _declaration(body: str) -> Declaration:
         rest = NOT_APPLICABLE_REASON.fullmatch(excused.group("rest"))
         reason = rest.group("reason").strip() if rest is not None else ""
         if not reason:
-            raise ValueError(
-                "Fix pin: n/a must state why, as `Fix pin: n/a - <reason>`"
-            )
+            raise ValueError("Fix pin: n/a must state why, as `Fix pin: n/a - <reason>`")
         return Declaration(not_applicable=reason)
 
     if (match := DECLARATION.fullmatch(attempts[0])) is None:
@@ -319,12 +328,21 @@ def _discovery_tier(labels: Sequence[str], body: str = "") -> str | None:
     return max(found, key=lambda tier: TIER_RANK[tier])
 
 
-def _needs_curie(body: str) -> bool:
-    """True iff ``main`` would invoke the curie binary for this body."""
+def _pin_requirements(body: str) -> dict[str, bool]:
     try:
-        return _declaration(body).selector is not None
+        selector = _declaration(body).selector
     except ValueError:
-        return False
+        selector = None
+    needed = selector is not None
+    module = selector.split("::", 1)[0] if selector is not None else None
+    needs_factory_upgrade = module == FACTORY_UPGRADE_MODULE
+    needs_kind = module in KIND_MODULES
+    return {
+        "needed": needed,
+        "needs_stack": needed and not needs_kind,
+        "needs_kind": needs_kind,
+        "needs_factory_upgrade": needs_factory_upgrade,
+    }
 
 
 def _report_needs_curie(event_path: Path) -> int:
@@ -334,21 +352,22 @@ def _report_needs_curie(event_path: Path) -> int:
         return 1
 
     try:
-        needed = _needs_curie(_body(_event(event_path)))
+        requirements = _pin_requirements(_body(_event(event_path)))
     except ValueError as error:
         print(f"Fix pin declaration error: {error}", file=sys.stderr)
         return 1
 
-    line = f"needed={'true' if needed else 'false'}\n"
+    lines = "".join(
+        f"{key}={'true' if value else 'false'}\n" for key, value in requirements.items()
+    )
     try:
         with Path(output_path).open("a", encoding="utf-8") as stream:
-            stream.write(line)
+            stream.write(lines)
     except OSError as error:
         print(f"Fix pin cargo guard error: could not write GITHUB_OUTPUT: {error}", file=sys.stderr)
         return 1
-    sys.stdout.write(line)
+    sys.stdout.write(lines)
     return 0
-
 
 
 def _closed_issues(body: str) -> list[int]:
@@ -407,9 +426,7 @@ def _issue_record(repository: str | None, issue: int) -> IssueRecord:
     )
 
 
-def _closed_issue_records(
-    event: dict[str, object], body: str
-) -> list[tuple[int, IssueRecord]]:
+def _closed_issue_records(event: dict[str, object], body: str) -> list[tuple[int, IssueRecord]]:
     issues = _closed_issues(body)
     if not issues:
         return []
@@ -419,15 +436,11 @@ def _closed_issue_records(
 
 def _closed_bugs(event: dict[str, object], body: str) -> list[int]:
     return [
-        issue
-        for issue, record in _closed_issue_records(event, body)
-        if BUG_LABEL in record.labels
+        issue for issue, record in _closed_issue_records(event, body) if BUG_LABEL in record.labels
     ]
 
 
-def _required_discovery(
-    event: dict[str, object], body: str
-) -> str | None:
+def _required_discovery(event: dict[str, object], body: str) -> str | None:
     """Highest found:* label or body field among closed bug issues."""
     found: list[str] = []
     for _issue, record in _closed_issue_records(event, body):

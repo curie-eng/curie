@@ -46,7 +46,8 @@ from typing import Any, Protocol
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
-from curie_api.forges.credential_providers import StaticTokenProvider
+from curie_api.forges.config import StaticTokenCredentialConfig
+from curie_api.forges.credential_providers import StaticTokenProvider, TokenSnapshot
 from curie_api.forges.types import (
     CiRollup,
     Commit,
@@ -105,12 +106,14 @@ def adapter_for(client: httpx.AsyncClient, token: str, *, api_url: str = API_URL
 
     from curie_api.forges.bitbucket_cloud.code_host import BitbucketCloudCodeHost
 
+    credential = StaticTokenCredentialConfig.model_validate({"token": token})
     return BitbucketCloudCodeHost(
         client,
+        entry="bitbucket-cloud",
         api_url=api_url,
-        token=token,
+        token=TokenSnapshot(credential),
         credentials=StaticTokenProvider(
-            token,
+            credential,
             origin=f"https://{HOST}",
             header=CredentialHeader.AUTHORIZATION_BASIC,
             username="x-token-auth",

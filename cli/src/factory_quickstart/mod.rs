@@ -14,6 +14,7 @@ use std::process::{Output, Stdio};
 
 use anyhow::Result;
 
+use crate::api_requests::ChannelBindingWrite;
 use crate::exit::CliError;
 use crate::factory_intake::{intake_values, FactoryIntakeOpts};
 use crate::ops::{require_on_path, CommonOpts};
@@ -23,11 +24,41 @@ mod bitbucket_cloud;
 mod bitbucket_dc;
 mod github;
 mod gitlab;
+mod instance;
+mod jira_bitbucket;
 mod jira_cloud;
+mod native;
 
 pub use github::{deploy_args, intake_args, registration_steps, RerunTarget};
 pub use gitlab::{gitlab_entries, gitlab_web_base, GitlabFacts, GITLAB_DEFAULT_URL};
+pub use instance::{
+    code_host_trust_name, forge_binding_name, forge_entry_name, forge_secret_name,
+    normalized_api_url, ObjectWrite, Observation, SecretUse, MANAGED_BY, MANAGED_BY_LABEL,
+    RELEASE_LABEL,
+};
 pub use jira_cloud::{preflight as jira_preflight, JiraPlan};
+
+/// `list` of the recorded values with `entry` put in by identity (#4620):
+/// the same-named entry of the same identity is replaced, a new name is
+/// appended, and a name or identity the release changed since the run
+/// resolved its entries refuses.
+pub fn put_forge_entry(
+    recorded: &serde_json::Value,
+    list: &str,
+    entry: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    instance::put_entry(recorded, list, entry)
+}
+
+/// The recorded `list` entry with `planned`'s identity (kind and host for a
+/// forge entry), whatever its name (#4620).
+pub fn recorded_forge_entry<'a>(
+    recorded: &'a serde_json::Value,
+    list: &str,
+    planned: &serde_json::Value,
+) -> Option<&'a serde_json::Value> {
+    instance::recorded_identity(recorded, list, planned)
+}
 
 pub const DEFAULT_KIND_NAME: &str = "curie-factory";
 pub const DEFAULT_MODEL: &str = "z-ai/glm-5.3-flash";
@@ -131,10 +162,6 @@ pub struct RecordedIntake {
     /// The Secret and data key holding the App private key.
     pub pem_secret: String,
     pub pem_secret_key: String,
-    /// The `jira` entries of `factory.trackers` and `factory.bindings`, which
-    /// a Jira quickstart wrote and every Jira agent on the release serves.
-    pub jira_tracker: Option<serde_json::Value>,
-    pub jira_binding: Option<serde_json::Value>,
 }
 
 /// One agent's GitHub binding on the serving release, as the API lists it.
@@ -188,19 +215,12 @@ pub fn recorded_intake(values: &serde_json::Value) -> Option<RecordedIntake> {
                 .collect()
         })
         .unwrap_or_default();
-    let named = |list: &str| {
-        factory.get(list)?.as_array()?.iter().find(|entry| {
-            entry.get("name").and_then(|v| v.as_str()) == Some(jira_cloud::BINDING_NAME)
-        })
-    };
     Some(RecordedIntake {
         app_id,
         install_label,
         repo_allowlist,
         pem_secret,
         pem_secret_key,
-        jira_tracker: named("trackers").cloned(),
-        jira_binding: named("bindings").cloned(),
     })
 }
 
@@ -240,6 +260,12 @@ pub struct ForgeFlags {
     pub start_accounts: Vec<String>,
     /// The Jira group allowed to start work (`--start-group`).
     pub start_group: Option<String>,
+    /// The Jira URL beside a Bitbucket code host (`--tracker-url`), whose
+    /// URL is `--forge-url`.
+    pub tracker_url: Option<String>,
+    /// The Jira token file beside a Bitbucket code host
+    /// (`--tracker-token-file`), whose token is `--token-file`.
+    pub tracker_token_file: Option<PathBuf>,
 }
 
 /// One port of a forge egress entry, as the chart's `egress[].ports` reads it.
@@ -374,14 +400,17 @@ pub(super) fn http_client(ca_file: Option<&Path>) -> Result<reqwest::Client> {
     })
 }
 
-/// Refuses `--candidate` on a GitLab quickstart. Pure, so it runs before the
-/// candidate's published images are resolved: the GitHub path installs those
-/// images, while a GitLab quickstart binds the release's own.
+/// Refuses `--candidate` on a non-GitHub code host. Pure, so it runs before
+/// the candidate's published images are resolved: the GitHub path installs
+/// those images, while a GitLab or Bitbucket quickstart binds the release's own.
 pub fn check_candidate_forge(forge: &ForgeFlags, candidate: Option<&str>) -> Result<()> {
-    if candidate.is_some() && forge.code_host == CodeHostKind::Gitlab {
-        return Err(CliError::usage(
-            "--candidate installs published images through the GitHub quickstart; --code-host gitlab binds the release's own images",
-        )
+    if candidate.is_some() && forge.code_host != CodeHostKind::Github {
+        let kind = clap::ValueEnum::to_possible_value(&forge.code_host)
+            .map(|value| value.get_name().to_string())
+            .unwrap_or_default();
+        return Err(CliError::usage(format!(
+            "--candidate installs published images through the GitHub quickstart; --code-host {kind} binds the release's own images"
+        ))
         .with_fix("drop --candidate, or install the candidate with `curie cluster up` before the quickstart")
         .into());
     }
@@ -402,6 +431,8 @@ pub fn select_forge(forge: &ForgeFlags) -> Result<()> {
                 ("--forge-username", forge.forge_username.is_some()),
                 ("--start-account", !forge.start_accounts.is_empty()),
                 ("--start-group", forge.start_group.is_some()),
+                ("--tracker-url", forge.tracker_url.is_some()),
+                ("--tracker-token-file", forge.tracker_token_file.is_some()),
             ];
             match shared.iter().find(|(_, set)| *set) {
                 Some((flag, _)) => Err(CliError::usage(format!(
@@ -416,7 +447,7 @@ pub fn select_forge(forge: &ForgeFlags) -> Result<()> {
         (CodeHostKind::Gitlab, _) | (CodeHostKind::Github, TrackerKind::Gitlab) => {
             gitlab::check(forge)
         }
-        // A reserved kind's not-installed error wins over any pairing rule.
+        // Bitbucket pairs only with Jira Cloud; each module refuses the rest.
         (CodeHostKind::BitbucketCloud, _) => bitbucket_cloud::check(forge),
         (CodeHostKind::BitbucketDc, _) => bitbucket_dc::check(forge),
         (CodeHostKind::Github, TrackerKind::JiraCloud) => jira_cloud::check(forge),
@@ -444,9 +475,8 @@ pub struct PlanInput {
     /// `--chart` was passed; `cluster deploy` then gets it as well.
     pub chart_explicit: bool,
     pub interactive: bool,
-    /// The release is already the chart and the quickstart values, so this
-    /// plan must not invoke `cluster up`.
-    pub release_at_target: bool,
+    /// What the plan knows about the release `cluster up` would install.
+    pub release_read: ReleaseRead,
     /// The agent to deploy.
     pub agent: String,
     /// The trigger label for this agent's bindings; `None` is the install label.
@@ -464,6 +494,33 @@ pub struct PlanInput {
     /// The Jira tracker this agent is bound through (`--tracker jira-cloud`);
     /// `None` binds each repository's GitHub surface.
     pub jira: Option<JiraPlan>,
+}
+
+/// What the plan knows about the release `cluster up` would install (#4626).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseRead {
+    /// The release was read and already runs the target chart and values.
+    AtTarget,
+    /// The release was read and differs, or nothing is targeted yet.
+    NotAtTarget,
+    /// `--dry-run` did not read the release. `recorded_model_kept`: no
+    /// `--model` and no explicit credential, so a release recording a real
+    /// model keeps that model instead of the planned one.
+    Unread { recorded_model_kept: bool },
+}
+
+/// Whether the plan runs `cluster up` (#4626).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterUpStep {
+    /// The add agent path runs no `cluster up`.
+    NotPlanned,
+    /// The release is already at the target, so `cluster up` is left out.
+    Skipped,
+    /// `cluster up` runs.
+    Run,
+    /// `--dry-run` did not read the release: a live run skips `cluster up`
+    /// when the release is at the target and runs it otherwise.
+    UnlessAtTarget { recorded_model_kept: bool },
 }
 
 /// Which run this is (#4362 decision 2).
@@ -559,11 +616,13 @@ pub struct Planned {
     pub kind_cluster: Option<String>,
     pub credential: CredentialDecision,
     pub actions: Vec<Action>,
-    /// `cluster up` was left out because the release is already at the target.
-    pub skipped_cluster_up: bool,
+    /// Whether the plan runs `cluster up`.
+    pub cluster_up: ClusterUpStep,
     pub path: QuickstartPath,
     pub agent: String,
     pub release: String,
+    /// The release's namespace, named by the conditional `cluster up` lines.
+    pub namespace: String,
 }
 
 #[derive(Debug)]
@@ -1175,7 +1234,7 @@ pub(super) struct InstallTarget<'a> {
     pub release: &'a str,
     pub model: &'a str,
     pub chart: &'a str,
-    pub release_at_target: bool,
+    pub release_read: ReleaseRead,
     /// The add agent path never touches the cluster underneath the release.
     pub add_agent: bool,
 }
@@ -1188,8 +1247,8 @@ pub(super) struct InstallSteps {
     pub context_reason: String,
     pub kind_cluster: Option<String>,
     pub actions: Vec<Action>,
-    /// `cluster up` was left out because the release is already at the target.
-    pub skipped_cluster_up: bool,
+    /// Whether the plan runs `cluster up`.
+    pub cluster_up: ClusterUpStep,
 }
 
 pub(super) fn install_steps(target: &InstallTarget<'_>) -> InstallSteps {
@@ -1262,9 +1321,25 @@ pub(super) fn install_steps(target: &InstallTarget<'_>) -> InstallSteps {
     }
     // ADR 0114 and ADR 0193 keep install-fact inference inside `cluster up`.
     // The skip stays here: quickstart does not invoke `cluster up` when the
-    // release is already that chart and these values.
-    let skipped_cluster_up = target.release_at_target && !target.add_agent;
-    if !target.release_at_target && !target.add_agent {
+    // release is already that chart and these values. An unread release
+    // (`--dry-run`, #4626) keeps the action as the `otherwise` branch.
+    let cluster_up = if target.add_agent {
+        ClusterUpStep::NotPlanned
+    } else {
+        match target.release_read {
+            ReleaseRead::AtTarget => ClusterUpStep::Skipped,
+            ReleaseRead::NotAtTarget => ClusterUpStep::Run,
+            ReleaseRead::Unread {
+                recorded_model_kept,
+            } => ClusterUpStep::UnlessAtTarget {
+                recorded_model_kept,
+            },
+        }
+    };
+    if matches!(
+        cluster_up,
+        ClusterUpStep::Run | ClusterUpStep::UnlessAtTarget { .. }
+    ) {
         actions.push(Action::Cluster { args: up });
     }
     let context_reason = context_reason(
@@ -1279,7 +1354,7 @@ pub(super) fn install_steps(target: &InstallTarget<'_>) -> InstallSteps {
         context_reason,
         kind_cluster,
         actions,
-        skipped_cluster_up,
+        cluster_up,
     }
 }
 
@@ -1335,21 +1410,18 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         (false, Some(_)) => QuickstartPath::AddAgent,
         (false, None) => QuickstartPath::Register,
     };
+    // A recorded Jira tracker and binding serve every Jira agent on their
+    // site, so on either path one that differs from this run is refused
+    // before any mutation (#4620), and the entries are written only when the
+    // release lacks one.
+    let write_jira = match &input.jira {
+        Some(jira) => jira_cloud::check_recorded(jira, &input.release)?,
+        None => false,
+    };
     // #4362 decision 5, in order, before any mutation.
-    // The `jira` tracker and binding serve every Jira agent on the release,
-    // so the add agent path writes them only when the release has none.
-    let mut write_jira = input.jira.is_some();
     if let (QuickstartPath::AddAgent, Some(recorded)) = (path, &input.recorded) {
         refuse_install_flags(input.model_explicit, input.org.as_deref())?;
         check_recorded_allowlist(input, recorded)?;
-        if let Some(jira) = &input.jira {
-            write_jira = jira_cloud::check_recorded(
-                jira,
-                recorded.jira_tracker.as_ref(),
-                recorded.jira_binding.as_ref(),
-                &input.release,
-            )?;
-        }
     }
     // A Jira agent holds no GitHub surface, so the GitHub binding rules do
     // not apply to it.
@@ -1366,7 +1438,7 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         context_reason,
         kind_cluster,
         mut actions,
-        skipped_cluster_up,
+        cluster_up,
     } = install_steps(&InstallTarget {
         explicit_context: input.explicit_context.as_deref(),
         current_context: input.current_context.as_deref(),
@@ -1376,7 +1448,7 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         release: &input.release,
         model: &input.model,
         chart: &input.chart,
-        release_at_target: input.release_at_target,
+        release_read: input.release_read,
         add_agent,
     });
 
@@ -1469,10 +1541,11 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
             )
         },
         actions,
-        skipped_cluster_up,
+        cluster_up,
         path,
         agent: input.agent.clone(),
         release: input.release.clone(),
+        namespace: input.namespace.clone(),
     })
 }
 
@@ -1513,14 +1586,19 @@ pub fn describe(planned: &Planned) -> Vec<String> {
             planned.agent, planned.release
         ));
     }
-    lines.push(credential_line(&planned.credential).to_string());
-    if planned.skipped_cluster_up {
+    lines.push(credential_line(&planned.credential, planned.cluster_up));
+    if planned.cluster_up == ClusterUpStep::Skipped {
         lines.push(SKIPPED_CLUSTER_UP_LINE.to_string());
     }
     for action in &planned.actions {
         match action {
             Action::External { .. } | Action::Cluster { .. } => {
-                lines.extend(install_action_line(action));
+                lines.extend(install_action_lines(
+                    action,
+                    planned.cluster_up,
+                    &planned.release,
+                    &planned.namespace,
+                ));
             }
             Action::Register {
                 org,
@@ -1600,6 +1678,10 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                 chart,
             } => {
                 lines.push(bundle_line(bundle.as_deref(), runner_image.as_deref()));
+                lines.push(initial_agent_line(
+                    agent,
+                    &github::initial_binding(repos, jira_binding.as_deref(), label.as_deref()),
+                ));
                 let dir = match bundle {
                     None => bundle_dir(namespace, release, agent),
                     Some(dir) => dir.clone(),
@@ -1637,6 +1719,79 @@ pub fn describe(planned: &Planned) -> Vec<String> {
         }
     }
     lines
+}
+
+fn initial_agent_line(agent: &str, binding: &ChannelBindingWrite) -> String {
+    let label = match &binding.trigger_label {
+        Some(label) => format!("label {label}"),
+        None => "the tracker default label".to_string(),
+    };
+    format!(
+        "create agent {agent} only if absent, with initial surface {}={} and {label}; preserve an existing agent",
+        binding.kind, binding.address
+    )
+}
+
+async fn ensure_factory_agent(
+    common: &CommonOpts,
+    agent: &str,
+    binding: ChannelBindingWrite,
+    repo_full_name: Option<&str>,
+) -> Result<crate::api::Agent> {
+    let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let (url, key, port_forward) = crate::commands::resolve_cluster_conn(
+        env("CURIE_API_URL"),
+        env("CURIE_API_KEY"),
+        &common.namespace,
+        &common.release,
+        false,
+    )
+    .await?;
+    let result = crate::api::ApiClient::new(&url, &key)?
+        .find_or_create_agent(agent, binding, repo_full_name)
+        .await;
+    drop(port_forward);
+    result
+}
+
+/// The trigger label stored on the surface `agent` already holds on
+/// `kind=address`: `None` when it holds no such surface, `Some(None)` when it
+/// holds one that stores no label (the tracker label serves it). A rerun
+/// without `--label` keeps such a surface as it is (#4620).
+fn held_surface_label(
+    agent: &crate::api::Agent,
+    kind: &str,
+    address: &str,
+) -> Option<Option<String>> {
+    agent
+        .channels
+        .iter()
+        .find(|channel| channel.kind == kind && channel.address == address)
+        .map(|channel| channel.trigger_label.clone())
+}
+
+/// The stored label of the surface a rerun keeps: `Some` only when no `--label`
+/// was passed and `agent` already holds `kind=address`.
+fn surface_to_keep(
+    agent: &crate::api::Agent,
+    kind: &str,
+    address: &str,
+    label: Option<&str>,
+) -> Option<Option<String>> {
+    match label {
+        None => held_surface_label(agent, kind, address),
+        Some(_) => None,
+    }
+}
+
+/// The dry-run plan line for the surfaces step a label-less rerun skips.
+fn keep_surface_plan_line(kind: &str, address: &str) -> String {
+    format!("without --label, skip the {kind}={address} surfaces step when the agent already holds that surface, and keep its stored trigger label")
+}
+
+/// The progress note for a surface a rerun keeps instead of adding again.
+fn kept_surface_line(agent: &str, kind: &str, address: &str) -> String {
+    format!("keeping the {kind}={address} surface agent {agent} already holds, with its stored trigger label")
 }
 
 /// The plan line for enrolling `agent` for forge egress.
@@ -1707,38 +1862,117 @@ fn agent_settings(
 const SKIPPED_CLUSTER_UP_LINE: &str =
     "skip cluster up: the release is already at the target chart and values";
 
-/// The plan line for the model credential decision.
-fn credential_line(decision: &CredentialDecision) -> &'static str {
+/// The plan line for the model credential decision. An unread release
+/// (`--dry-run`, #4626) may record a real model, so a prompt or a refusal is
+/// stated as conditional on it.
+fn credential_line(decision: &CredentialDecision, cluster_up: ClusterUpStep) -> String {
+    let clause = credential_decision_clause(decision);
+    match (cluster_up, decision) {
+        (
+            ClusterUpStep::UnlessAtTarget { .. },
+            CredentialDecision::PromptOnce | CredentialDecision::RefuseNonInteractive,
+        ) => format!(
+            "model credential: if the release records a real model, keep it (no prompt); otherwise {clause}"
+        ),
+        _ => format!("model credential: {clause}"),
+    }
+}
+
+/// The clause after `model credential: ` for a credential decision.
+fn credential_decision_clause(decision: &CredentialDecision) -> &'static str {
     match decision {
-        CredentialDecision::UseEnv => "model credential: use CURIE_CREDENTIALS (no prompt)",
+        CredentialDecision::UseEnv => "use CURIE_CREDENTIALS (no prompt)",
         CredentialDecision::PreserveRecorded => {
-            "model credential: keep the real model already recorded on the release (no prompt)"
+            "keep the real model already recorded on the release (no prompt)"
         }
         CredentialDecision::PromptOnce => {
-            "model credential: prompt once for an Anthropic API key (sk-ant-) or OpenRouter key (sk-or-) before cluster up"
+            "prompt once for an Anthropic API key (sk-ant-) or OpenRouter key (sk-or-) before cluster up"
         }
         CredentialDecision::RefuseNonInteractive => {
-            "model credential: refuse because CURIE_CREDENTIALS is unset, the release has no real model, and stdin is not a terminal"
+            "refuse because CURIE_CREDENTIALS is unset, the release has no real model, and stdin is not a terminal"
         }
         CredentialDecision::NotNeeded => {
-            "model credential: not needed; the release keeps the model it records (no prompt)"
+            "not needed; the release keeps the model it records (no prompt)"
         }
     }
 }
 
-/// The plan line for a kind, kubectl or `cluster up` step; `None` for any
-/// other action.
-fn install_action_line(action: &Action) -> Option<String> {
+/// Index of the `--model` value in a quickstart `cluster up` argv.
+fn cluster_up_model_index(args: &[String]) -> usize {
+    args.iter()
+        .position(|arg| arg == "--model")
+        .expect("quickstart cluster up always specifies its model")
+        + 1
+}
+
+/// The plan lines for the install steps: the skipped `cluster up` line when
+/// the release is already at the target, then each install action.
+fn install_plan_lines(
+    cluster_up: ClusterUpStep,
+    actions: &[Action],
+    release: &str,
+    namespace: &str,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if cluster_up == ClusterUpStep::Skipped {
+        lines.push(SKIPPED_CLUSTER_UP_LINE.to_string());
+    }
+    lines.extend(
+        actions
+            .iter()
+            .flat_map(|action| install_action_lines(action, cluster_up, release, namespace)),
+    );
+    lines
+}
+
+/// The plan lines for a kind, kubectl or `cluster up` step; empty for any
+/// other action. Under an unread release (`--dry-run`, #4626) `cluster up` is
+/// the `otherwise` branch of the decision a live run makes after reading
+/// release `release` in namespace `namespace`.
+fn install_action_lines(
+    action: &Action,
+    cluster_up: ClusterUpStep,
+    release: &str,
+    namespace: &str,
+) -> Vec<String> {
     match action {
-        Action::External { program, args } => Some(format!("{program} {}", args.join(" "))),
-        Action::Cluster { args } => Some(format!("curie {}", args.join(" "))),
-        _ => None,
+        Action::External { program, args } => vec![format!("{program} {}", args.join(" "))],
+        Action::Cluster { args } => match cluster_up {
+            ClusterUpStep::UnlessAtTarget {
+                recorded_model_kept,
+            } => {
+                let keep = if recorded_model_kept {
+                    " and keep the model the release records"
+                } else {
+                    ""
+                };
+                let mut lines = vec![
+                    format!("release {release} in namespace {namespace} was not read under --dry-run; a live run reads it and decides whether cluster up runs"),
+                    format!("if the release already runs the target chart and values: skip cluster up{keep}"),
+                ];
+                if recorded_model_kept {
+                    let model = &args[cluster_up_model_index(args)];
+                    lines.push(format!("if the release records a real model, cluster up keeps that model and its credential in place of --model {model}"));
+                }
+                lines.push(format!("otherwise: curie {}", args.join(" ")));
+                lines
+            }
+            _ => vec![format!("curie {}", args.join(" "))],
+        },
+        _ => Vec::new(),
     }
 }
 
 /// Runs one kind, kubectl or `cluster up` step. `prompted_model` replaces the
 /// `cluster up` model when the credential was prompted for.
-async fn run_install_action(action: &Action, prompted_model: Option<&String>) -> Result<()> {
+/// Runs one install step. `mark` is the release write mark a `cluster up`
+/// child records on its Helm write, so the caller adopts exactly that
+/// write's revision.
+async fn run_install_action(
+    action: &Action,
+    prompted_model: Option<&String>,
+    mark: Option<&instance::ReleaseWriteMark>,
+) -> Result<()> {
     match action {
         Action::External { program, args } => {
             let step = if program == "kind" {
@@ -1753,55 +1987,15 @@ async fn run_install_action(action: &Action, prompted_model: Option<&String>) ->
             // this action. Resolve again so an omitted model follows that key.
             let mut args = args.clone();
             if let Some(model) = prompted_model {
-                let model_index = args
-                    .iter()
-                    .position(|arg| arg == "--model")
-                    .expect("quickstart cluster up always specifies its model");
-                args[model_index + 1] = model.clone();
+                let model_index = cluster_up_model_index(&args);
+                args[model_index] = model.clone();
             }
-            run_self(&args, "Installing Curie").await.map(|_| ())
+            run_self(&args, "Installing Curie", None, mark)
+                .await
+                .map(|_| ())
         }
         _ => Err(CliError::failure("not an install step").into()),
     }
-}
-
-/// The Opaque Secret holding a forge token under the data key `token`.
-pub(crate) fn token_secret_manifest(namespace: &str, name: &str, token: &str) -> serde_json::Value {
-    use base64::Engine;
-    serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "type": "Opaque",
-        "metadata": {"name": name, "namespace": namespace},
-        "data": {"token": base64::engine::general_purpose::STANDARD.encode(token.as_bytes())},
-    })
-}
-
-/// Applies `manifest` with `kubectl apply -f -` on stdin. kubectl's output is
-/// dropped: a failed apply can echo the manifest, which may hold a token.
-/// `what` names the object in the refusal.
-pub(super) async fn apply_manifest(
-    namespace: &str,
-    manifest: &serde_json::Value,
-    what: &str,
-) -> Result<()> {
-    crate::ui::ui().note(&format!("Writing {what}"));
-    let body = serde_json::to_vec(manifest)?;
-    let (ok, _, _) = crate::ops::run_capture_with_stdin(
-        &crate::factory_app::secret_apply_command(namespace),
-        &body,
-    )
-    .await?;
-    if !ok {
-        return Err(CliError::failure(format!(
-            "writing {what} in namespace {namespace} failed; the forge entries were not written"
-        ))
-        .with_fix(format!(
-            "check access with `kubectl -n {namespace} auth can-i create secrets` and rerun"
-        ))
-        .into());
-    }
-    Ok(())
 }
 
 /// The plan line for the Jira tracker action.
@@ -1911,12 +2105,17 @@ async fn capture_helm_json(cmd: &crate::ops::OpsCommand) -> Result<Option<serde_
     Ok(serde_json::from_str(&stdout).ok())
 }
 
+/// The revision a release is serving, with its user values and metadata.
+pub(super) struct ReleaseSnapshot {
+    pub values: serde_json::Value,
+    pub metadata: serde_json::Value,
+    pub revision: u32,
+}
+
 /// Values and metadata of the revision the release is serving. `None` when
 /// helm has no `deployed` revision: a failed install can still carry the
 /// target chart and values, and that must not count as installed (#3934).
-async fn deployed_release_snapshot(
-    common: &CommonOpts,
-) -> Result<Option<(serde_json::Value, serde_json::Value)>> {
+async fn deployed_release_snapshot(common: &CommonOpts) -> Result<Option<ReleaseSnapshot>> {
     let Some(history) = capture_helm_json(&crate::ops::helm_history_cmd(common)).await? else {
         return Ok(None);
     };
@@ -1933,9 +2132,54 @@ async fn deployed_release_snapshot(
     ))
     .await?;
     Ok(match (values, metadata) {
-        (Some(values), Some(metadata)) => Some((values, metadata)),
+        (Some(values), Some(metadata)) => Some(ReleaseSnapshot {
+            values,
+            metadata,
+            revision,
+        }),
         _ => None,
     })
+}
+
+/// Reads the release for the planners (#4626). `add_agent` plans no cluster
+/// up, so it reads nothing. A dry run does not read the release, so the plan
+/// states the live skip decision as a condition; a live run with a target
+/// reads it. `preserve_recorded_model` and `explicit_credential_absent` come
+/// from one read of the credential environment by the caller.
+async fn read_release(
+    opts: &QuickstartOpts,
+    targeted: Option<&str>,
+    add_agent: bool,
+    model: String,
+    preserve_recorded_model: bool,
+    explicit_credential_absent: bool,
+) -> Result<(ReleaseRead, String)> {
+    match targeted {
+        Some(_) if opts.dry_run && !add_agent => Ok((
+            ReleaseRead::Unread {
+                recorded_model_kept: opts.model.is_none() && explicit_credential_absent,
+            },
+            model,
+        )),
+        Some(context) if !opts.dry_run && !add_agent => {
+            let (at_target, model) = release_matches_quickstart_target(
+                opts,
+                &model,
+                preserve_recorded_model,
+                is_kind_context(context),
+            )
+            .await?;
+            Ok((
+                if at_target {
+                    ReleaseRead::AtTarget
+                } else {
+                    ReleaseRead::NotAtTarget
+                },
+                model,
+            ))
+        }
+        _ => Ok((ReleaseRead::NotAtTarget, model)),
+    }
 }
 
 async fn release_matches_quickstart_target(
@@ -1950,7 +2194,10 @@ async fn release_matches_quickstart_target(
         dry_run: false,
     };
     let chart_version = crate::ops::chart_version(&opts.chart).await?;
-    let Some((values, metadata)) = deployed_release_snapshot(&common).await? else {
+    let Some(ReleaseSnapshot {
+        values, metadata, ..
+    }) = deployed_release_snapshot(&common).await?
+    else {
         return Ok((false, model.to_string()));
     };
     // With no local credential the release keeps its recorded key. Keep its
@@ -1997,15 +2244,18 @@ async fn release_matches_quickstart_target(
 }
 
 /// Runs the quickstart for the selected forge: GitLab as both code host and
-/// tracker, or GitHub with a GitHub or Jira Cloud tracker composed into the
-/// GitHub flow. The selection is checked again here so a caller that skipped
+/// tracker, a Bitbucket code host with the Jira Cloud tracker, or GitHub with
+/// a GitHub or Jira Cloud tracker composed into the GitHub flow. The selection is checked again here so a caller that skipped
 /// [`select_forge`] still cannot run the flow for a kind this build does not
 /// install.
 pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     select_forge(&opts.forge)?;
     match opts.forge.code_host {
         CodeHostKind::Gitlab => gitlab::quickstart(opts).await,
-        _ => github::quickstart(opts).await,
+        CodeHostKind::BitbucketCloud | CodeHostKind::BitbucketDc => {
+            jira_bitbucket::quickstart(opts).await
+        }
+        CodeHostKind::Github => github::quickstart(opts).await,
     }
 }
 
@@ -2172,7 +2422,14 @@ async fn kind_clusters() -> Result<Vec<String>> {
         .collect())
 }
 
-async fn run_self(args: &[String], step: &str) -> Result<serde_json::Value> {
+/// Runs this binary as a child. `fence` is the observation a GitHub intake
+/// child fences its Secret writes and Helm upgrade on (#4620).
+async fn run_self(
+    args: &[String],
+    step: &str,
+    fence: Option<&Observation>,
+    mark: Option<&instance::ReleaseWriteMark>,
+) -> Result<serde_json::Value> {
     let program = std::env::current_exe().map_err(|err| {
         CliError::failure(format!("cannot locate the curie binary to continue: {err}"))
     })?;
@@ -2186,7 +2443,7 @@ async fn run_self(args: &[String], step: &str) -> Result<serde_json::Value> {
         "--color".into(),
         "never".into(),
     ]);
-    let output = run_command(&program, &args, step).await?;
+    let output = run_command(&program, &args, step, fence, mark).await?;
     serde_json::from_slice(&output.stdout).map_err(|error| {
         step_error(
             &program,
@@ -2200,7 +2457,7 @@ async fn run_self(args: &[String], step: &str) -> Result<serde_json::Value> {
 
 async fn run_program(program: &str, args: &[String], step: &str) -> Result<()> {
     require_on_path(program)?;
-    run_command(Path::new(program), args, step).await?;
+    run_command(Path::new(program), args, step, None, None).await?;
     Ok(())
 }
 
@@ -2248,17 +2505,33 @@ fn step_error(
     crate::exit::operator_context(source, message, Some(fix))
 }
 
-async fn run_command(program: &Path, args: &[String], step: &str) -> Result<Output> {
+async fn run_command(
+    program: &Path,
+    args: &[String],
+    step: &str,
+    fence: Option<&Observation>,
+    mark: Option<&instance::ReleaseWriteMark>,
+) -> Result<Output> {
     let ui = crate::ui::ui();
     ui.note(step);
     ui.plumbing(&format!("+ {} {}", program.display(), args.join(" ")));
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Only the mark this run hands over names a child's release write.
+    cmd.env_remove(crate::ops::QUICKSTART_RELEASE_WRITE_ENV);
+    if let Some(mark) = mark {
+        cmd.env(crate::ops::QUICKSTART_RELEASE_WRITE_ENV, mark.as_str());
+    }
     if args.first().map(String::as_str) == Some("cluster")
         && args.get(1).map(String::as_str) == Some("factory")
     {
         // Poll quickstart has no webhook secret, just as its in-process plan.
         cmd.env_remove(crate::factory_intake::WEBHOOK_SECRET_ENV);
+        // Only the observation this run hands over fences the intake child.
+        cmd.env_remove(instance::INTAKE_FENCE_ENV);
+        if let Some(fence) = fence {
+            cmd.env(instance::INTAKE_FENCE_ENV, fence.intake_fence_json());
+        }
     }
     if args.first().map(String::as_str) == Some("cluster")
         && args.get(1).map(String::as_str) == Some("up")
@@ -2340,6 +2613,48 @@ async fn run_command(program: &Path, args: &[String], step: &str) -> Result<Outp
 mod tests {
     use super::*;
 
+    fn agent_holding(kind: &str, address: &str, label: Option<&str>) -> crate::api::Agent {
+        serde_json::from_value(serde_json::json!({
+            "id": "agent-1",
+            "name": "acme-second",
+            "memory": false,
+            "channels": [{"kind": kind, "address": address, "trigger_label": label}],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_label_less_rerun_keeps_a_held_labelled_surface() {
+        let agent = agent_holding("gitlab", "grp/proj", Some("second-agent-only"));
+        assert_eq!(
+            surface_to_keep(&agent, "gitlab", "grp/proj", None),
+            Some(Some("second-agent-only".to_string()))
+        );
+        let unlabelled = agent_holding("gitlab", "grp/proj", None);
+        assert_eq!(
+            surface_to_keep(&unlabelled, "gitlab", "grp/proj", None),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn a_case_only_address_difference_is_not_a_held_surface() {
+        let agent = agent_holding("gitlab", "grp/proj", Some("second-agent-only"));
+        assert_eq!(surface_to_keep(&agent, "gitlab", "Grp/Proj", None), None);
+        assert_eq!(surface_to_keep(&agent, "GitLab", "grp/proj", None), None);
+    }
+
+    #[test]
+    fn an_explicit_label_or_a_missing_surface_still_adds() {
+        let agent = agent_holding("gitlab", "grp/proj", Some("second-agent-only"));
+        assert_eq!(
+            surface_to_keep(&agent, "gitlab", "grp/proj", Some("second-agent-only")),
+            None
+        );
+        assert_eq!(surface_to_keep(&agent, "gitlab", "grp/other", None), None);
+        assert_eq!(surface_to_keep(&agent, "jira", "grp/proj", None), None);
+    }
+
     fn base() -> PlanInput {
         PlanInput {
             repos: vec!["acme/widgets".to_string()],
@@ -2360,7 +2675,7 @@ mod tests {
             release_has_real_model: false,
             chart_explicit: false,
             interactive: true,
-            release_at_target: false,
+            release_read: ReleaseRead::NotAtTarget,
             agent: DEFAULT_AGENT.into(),
             label: None,
             plugin_dir: None,
@@ -2417,7 +2732,7 @@ mod tests {
             false
         ));
         let mut input = base();
-        input.release_at_target = true;
+        input.release_read = ReleaseRead::AtTarget;
         input.current_context = Some("kind-curie-factory".into());
         let lines = describe(&quickstart_plan(&input).unwrap());
         let text = lines.join("\n");
@@ -2785,6 +3100,7 @@ mod tests {
             "configure factory intake factory.intake=poll for acme/widgets with --app-id 12345 --private-key-file /keys/app.pem and no webhook secret; the same helm upgrade binds the dark factory runner image".to_string(),
             "configure agentSandbox.runnerEnv.dark-factory.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000 with helm upgrade --reuse-values unless the release already records that string; preserve sibling values".to_string(),
             "render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image".to_string(),
+            "create agent dark-factory only if absent, with initial surface github=acme/widgets and the tracker default label; preserve an existing agent".to_string(),
             format!("curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir {} --agent dark-factory --env prod --repo acme/widgets", dir.display()),
             "curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=acme/widgets".to_string(),
             "curie cluster overrides dark-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 10800".to_string(),
@@ -3121,8 +3437,6 @@ mod tests {
             repo_allowlist: vec!["acme/widgets".into()],
             pem_secret: "factory-app".into(),
             pem_secret_key: "private-key.pem".into(),
-            jira_tracker: None,
-            jira_binding: None,
         }
     }
 

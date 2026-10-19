@@ -34,6 +34,8 @@ from ..binding import (
     RESUMED_KIND_ENV,
     SANDBOX_TOKEN_TTL_SECONDS,
     AmbiguousRoute,
+    FactoryBindingRefused,
+    FactoryWake,
     binding_adapter_for_handle,
 )
 from ..capacity_wait import (
@@ -342,11 +344,19 @@ async def _process_event(
                 )
                 return
             assert parsed_work_item.generation is not None
+            assert handle is not None
             try:
                 grant = await self._work_items.acquire(
                     parsed_work_item.request_id,
                     owner=self._config.consumer_name,
                     generation=parsed_work_item.generation,
+                    wake=FactoryWake(
+                        kind=handle.kind,
+                        address=handle.channel,
+                        adapter=binding_adapter_for_handle(handle),
+                        conversation_id=qevent.conversation_id,
+                    ),
+                    context=None,
                 )
             except WorkItemConflict as exc:
                 logger.info(
@@ -360,6 +370,12 @@ async def _process_event(
                 request_id=parsed_work_item.request_id,
                 owner=self._config.consumer_name,
                 grant=grant,
+                wake=FactoryWake(
+                    kind=handle.kind,
+                    address=handle.channel,
+                    adapter=binding_adapter_for_handle(handle),
+                    conversation_id=qevent.conversation_id,
+                ),
                 event_id=event_id,
                 thread_key=thread_key,
                 on_stop=self._stop_owned_work_item,
@@ -367,19 +383,27 @@ async def _process_event(
             )
             owned_work_item_id = parsed_work_item.request_id
         elif parsed_work_item is not None and parsed_work_item.is_ci_fix:
+            assert handle is not None
             # A CI fix round continues the SAME running request (#3097): adopt
             # it by conversation the way an approval continuation does, and
             # refuse the turn when the running request is not the one the
             # event names (a relabel replaced it) or the execution ended.
             try:
-                adopted = await self._adopt_resumed_work_item(event_id, thread_key)
+                adopted = await self._adopt_resumed_work_item(
+                    event_id,
+                    thread_key,
+                    wake=FactoryWake(
+                        kind=handle.kind,
+                        address=handle.channel,
+                        adapter=binding_adapter_for_handle(handle),
+                        conversation_id=qevent.conversation_id,
+                    ),
+                )
             except failures._FactoryExecutionEnded:
                 self._factory_work_item_events.add(event_id)
                 await self._markers.mark_done(event_id, marker_value="1")
                 return
             if adopted != parsed_work_item.request_id:
-                if adopted is not None:
-                    self._work_item_runs.pop(adopted, None)
                 logger.info(
                     "work-item CI continuation %s is stale: running request is %s",
                     event_id,
@@ -389,13 +413,25 @@ async def _process_event(
                 return
             owned_work_item_id = adopted
         elif self._is_approval_resume(event_id):
+            assert handle is not None
             try:
-                owned_work_item_id = await self._adopt_resumed_work_item(event_id, thread_key)
+                owned_work_item_id = await self._adopt_resumed_work_item(
+                    event_id,
+                    thread_key,
+                    wake=FactoryWake(
+                        kind=handle.kind,
+                        address=handle.channel,
+                        adapter=binding_adapter_for_handle(handle),
+                        conversation_id=qevent.conversation_id,
+                    ),
+                )
             except failures._FactoryExecutionEnded:
                 self._factory_work_item_events.add(event_id)
                 await self._markers.mark_done(event_id, marker_value="1")
                 return
         constants._OWNED_WORK_ITEM.set(owned_work_item_id)
+        if owned_work_item_id is not None and self._binding is None:
+            raise WorkItemTransportError("factory execution has no binding resolver")
 
         # ADR-0168 decision 5: a turn addressed to an identity this worker
         # cannot speak as ends here, before a card, a claim or a model call.
@@ -589,13 +625,56 @@ async def _process_event(
             # else's route.
             # @spec WORKER-CANARY-1 WORKER-CANARY-2: the relay's identity
             # chooses the binding; its adapter stays on the reply route.
-            try:
-                resolved = await self._binding.resolve(
-                    handle.kind, binding_adapter_for_handle(handle), handle.channel
-                )
-            except AmbiguousRoute as exc:
-                await self._drop_ambiguous_route(qevent, route, exc, lease=lease)
-                return
+            factory_run = (
+                self._work_item_runs.get(owned_work_item_id)
+                if owned_work_item_id is not None
+                else None
+            )
+            if owned_work_item_id is not None:
+                if (
+                    factory_run is None
+                    or factory_run.event_id != event_id
+                    or factory_run.context is None
+                ):
+                    logger.info("factory binding refused for %s: factory_wake_mismatch", event_id)
+                    return
+                try:
+                    resolved = await self._binding.resolve_factory(factory_run.context)
+                except FactoryBindingRefused as exc:
+                    refusal = exc.code
+                    resolved = None
+                else:
+                    refusal = "deployment_missing" if resolved is None else None
+                if refusal is not None:
+                    logger.info("factory binding refused for %s: %s", event_id, refusal)
+                    try:
+                        if factory_run.started:
+                            await factory_run.finish(
+                                outcome="failed",
+                                cause="runner_escalated",
+                                detail="Factory execution authority is no longer valid.",
+                                ci_fix_round=None,
+                            )
+                        else:
+                            await factory_run.defer(f"not_started:{refusal}", capacity=False)
+                    except WorkItemConflict as exc:
+                        logger.info(
+                            "factory refusal settlement for %s refused: %s", event_id, exc.code
+                        )
+                        if factory_run.started and exc.code == "not_running":
+                            # A retried finish whose first response was lost
+                            # is refused once it committed; the request ended.
+                            factory_run.finished = True
+                    await self._markers.mark_done(event_id, marker_value="1")
+                    return
+            else:
+                try:
+                    resolved = await self._binding.resolve(
+                        handle.kind, binding_adapter_for_handle(handle), handle.channel
+                    )
+                except AmbiguousRoute as exc:
+                    await self._drop_ambiguous_route(qevent, route, exc, lease=lease)
+                    return
             if resolved is None:
                 # Binding doubles predate the diagnostic lookup; keep a miss
                 # on those doubles on the established polite-drop path.
@@ -1477,12 +1556,11 @@ async def _process_event(
             # A settlement handoff already removed the active entry. Its
             # task exclusively owns heartbeat close and sandbox release.
             owned_run = self._work_item_runs.get(owned_work_item_id)
-            if owned_run is not None and owned_run.held:
-                self._held_work_items[owned_run.thread_key] = owned_run
+            if owned_run is not None and owned_run.event_id == event_id:
                 self._work_item_runs.pop(owned_work_item_id, None)
-            else:
-                owned_run = self._work_item_runs.pop(owned_work_item_id, None)
-                if owned_run is not None:
+                if owned_run.held:
+                    self._held_work_items[owned_run.thread_key] = owned_run
+                else:
                     await owned_run.close()
                     if owned_run.finished:
                         # The turn has ended and the request is settled, so

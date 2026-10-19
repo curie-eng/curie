@@ -10,6 +10,9 @@ head hash, so every pull request read expands it (decision 8.4). Review
 feedback is pull request comments only (decision 10). ``ci_diagnostics``,
 ``rerun_failed`` and ``user_can_write`` are unsupported (decision 3); review
 authority falls back to the binding's allowlist (decision 11).
+
+``read_pull_request`` reads the mergeability checks around two pull request
+reads and never merges (#4624).
 """
 
 from __future__ import annotations
@@ -29,8 +32,8 @@ from curie_api.forges.bitbucket_cloud.comments import BitbucketCloudMarkedCommen
 from curie_api.forges.bitbucket_cloud.connection import HOST
 from curie_api.forges.bitbucket_cloud.transport import CloudTransport
 from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Support
-from curie_api.forges.credential_providers import StaticTokenProvider
-from curie_api.forges.errors import Ambiguous, NotFound, Unavailable, Unsupported
+from curie_api.forges.credential_providers import StaticTokenProvider, TokenSnapshot
+from curie_api.forges.errors import Ambiguous, ForgeError, NotFound, Unavailable, Unsupported
 from curie_api.forges.paths import valid_repository_path
 from curie_api.forges.types import (
     Actor,
@@ -41,6 +44,7 @@ from curie_api.forges.types import (
     Commit,
     Credential,
     CredentialScope,
+    FactoryPublication,
     FeedbackKind,
     FeedbackPage,
     NormalizedCheck,
@@ -52,8 +56,11 @@ from curie_api.forges.types import (
     RerunObserver,
     RerunRecord,
     ReviewFeedback,
+    publication_body,
+    publication_url,
     status_key,
 )
+from curie_api.publication_policy import is_publication_branch
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +76,8 @@ OVERLAP = timedelta(seconds=120)
 # Bitbucket Cloud's page length ceiling on pull request listings; most others allow 100.
 _PULL_PAGELEN = 50
 _FULL_HASH = 40
+# Where Bitbucket Cloud's pull request pages live; a listed URL must be on it.
+_WEB_BASE = f"https://{HOST}"
 
 _PULL_STATES = {
     "OPEN": PullRequestState.OPEN,
@@ -111,6 +120,42 @@ def _bbql_string(value: str) -> str:
 
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def _git_conflicted(payload: Mapping[str, Any]) -> bool | None:
+    """Whether the pull request has Git conflicts, from its mergeability checks.
+
+    Per the Bitbucket Cloud reference for ``pullrequests/{id}/mergeability/checks``,
+    only the ``git_mergeability_check`` entry speaks to conflicts, and its UNKNOWN
+    status does not imply the pull request is conflict-free. Anything but a clean
+    pass or a conflict failure is None.
+    """
+
+    values = payload.get("values")
+    if not isinstance(values, list):
+        return None
+    git = [
+        item
+        for item in values
+        if isinstance(item, dict) and item.get("type") == "git_mergeability_check"
+    ]
+    if len(git) != 1:
+        return None
+    verdict = (git[0].get("status"), git[0].get("reason"))
+    if verdict == ("PASSED", "clean"):
+        return False
+    if verdict == ("FAILED", "conflicts"):
+        return True
+    return None
+
+
+def _commits(payload: Mapping[str, Any]) -> tuple[str, str]:
+    """The raw source and destination commit hashes of a pull request payload."""
+
+    return (
+        _text(_dict(_dict(payload.get("source")).get("commit")).get("hash")),
+        _text(_dict(_dict(payload.get("destination")).get("commit")).get("hash")),
+    )
 
 
 def account(user: Any) -> Actor | None:
@@ -192,12 +237,14 @@ class BitbucketCloudCodeHost:
         self,
         client: httpx.AsyncClient,
         *,
+        entry: str,
         api_url: str,
-        token: str,
+        token: TokenSnapshot,
         credentials: StaticTokenProvider,
         page_size: int = 100,
     ) -> None:
-        self._http = CloudTransport(client, api_url=api_url, token=token)
+        self._http = CloudTransport(client, entry=entry, api_url=api_url, token=token)
+        self._token = token
         self._credentials = credentials
         self._page_size = page_size
         # Abbreviated hash -> full hash, per repository; a commit never changes.
@@ -259,7 +306,8 @@ class BitbucketCloudCodeHost:
         current = await self.resolve_repository(repository.project_id)
         if current.path != repository.path:
             raise NotFound("repository_renamed")
-        return await self._credentials.get(scope)
+        # The token this adapter's requests sent, not a fresh read (#4630).
+        return self._credentials.credential(self._token, scope)
 
     async def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:
         url = f"{self.repo_url(repository)}/refs/branches/{quote(branch, safe='')}"
@@ -318,7 +366,13 @@ class BitbucketCloudCodeHost:
             await self.read_pull(pull_request)
         return self._authors[pull_request]
 
-    async def _pull(self, repository: RepositoryRef, payload: Mapping[str, Any]) -> PullRequest:
+    async def _pull(
+        self,
+        repository: RepositoryRef,
+        payload: Mapping[str, Any],
+        *,
+        conflicted: bool | None,
+    ) -> PullRequest:
         number = payload.get("id")
         if type(number) is not int:
             raise Unavailable("pull_request")
@@ -336,7 +390,7 @@ class BitbucketCloudCodeHost:
             title=_text(payload.get("title")),
             body=_text(payload.get("description")),
             draft=payload.get("draft") is True,
-            conflicted=None,
+            conflicted=conflicted,
             updated_at=_time(payload.get("updated_on")),
         )
 
@@ -361,7 +415,82 @@ class BitbucketCloudCodeHost:
             return None
         if len(matches) > 1:
             raise Ambiguous("pull_request")
-        return await self._pull(repository, matches[0])
+        return await self._pull(repository, matches[0], conflicted=None)
+
+    async def list_factory_publications(
+        self, repository: RepositoryRef
+    ) -> tuple[FactoryPublication, ...]:
+        """Every pull request from a publication branch of ``repository``
+        itself, in any state, each with ``owner_verified=False`` (#4629).
+
+        Bounded limitation: an access token cannot read its own account
+        (``GET /2.0/user`` answers 403, see `bitbucket_cloud.comments`), so
+        ownership cannot be checked here. Every same-repository pull request
+        whose branch is publication shaped is listed, a writer's lookalike
+        included, and rediscovery drops every unverified publication, so it never treats one
+        as evidence and does not suppress a reinstall on Bitbucket Cloud.
+
+        ``GET /repositories/{workspace}/{slug}/pullrequests`` with every
+        ``state`` (https://developer.atlassian.com/cloud/bitbucket/rest/api-group-pullrequests/#api-repositories-workspace-repo-slug-pullrequests-get)
+        read to its last page. A pull request counts when its source and
+        destination repository are this one (by UUID). An item, branch, state,
+        description or URL that cannot be read fails the listing; a null
+        description is an empty body, and the ``links.html.href`` must be on
+        ``https://bitbucket.org`` (`types.publication_url`). Bitbucket Cloud reports
+        no close time, so ``closed_at`` of a merged or declined one is its
+        ``updated_on``: never earlier than the real close.
+        """
+
+        listed = await self._http.pages(
+            f"{self.repo_url(repository)}/pullrequests",
+            what="pull_request",
+            params=[
+                *(("state", state) for state in _PULL_STATES),
+                ("pagelen", self.pagelen(_PULL_PAGELEN)),
+            ],
+            strict=True,
+        )
+        found: list[FactoryPublication] = []
+        for item in listed:
+            number, state = item.get("id"), item.get("state")
+            source, target = item.get("source"), item.get("destination")
+            if (
+                type(number) is not int
+                or not isinstance(state, str)
+                or state not in _PULL_STATES
+                or not isinstance(source, dict)
+                or not isinstance(target, dict)
+            ):
+                raise Unavailable("pull_request")
+            branch = _dict(source.get("branch")).get("name")
+            if not isinstance(branch, str) or not branch:
+                raise Unavailable("pull_request")
+            if not is_publication_branch(branch):
+                continue
+            if not all(
+                _dict(side.get("repository")).get("uuid") == repository.project_id
+                for side in (source, target)
+            ):
+                # A fork's branch is never ours.
+                continue
+            url = _dict(_dict(item.get("links")).get("html")).get("href")
+            pull_state = _PULL_STATES[state]
+            found.append(
+                FactoryPublication(
+                    ref=PullRequestRef(repository, str(number)),
+                    url=publication_url(url, _WEB_BASE),
+                    head_ref=branch,
+                    state=pull_state,
+                    body=publication_body(item, "description"),
+                    closed_at=(
+                        None
+                        if pull_state is PullRequestState.OPEN
+                        else _time(item.get("updated_on"))
+                    ),
+                    owner_verified=False,
+                )
+            )
+        return tuple(found)
 
     async def open_pull_request(
         self,
@@ -386,7 +515,7 @@ class BitbucketCloudCodeHost:
                 "close_source_branch": False,
             },
         )
-        return await self._pull(repository, payload)
+        return await self._pull(repository, payload, conflicted=None)
 
     async def update_pull_request(
         self, pull_request: PullRequestRef, *, title: str | None, body: str | None
@@ -401,10 +530,27 @@ class BitbucketCloudCodeHost:
         payload = await self._http.json(
             "PUT", self.pull_url(pull_request), what="pull_request", json=change
         )
-        return await self._pull(pull_request.repository, payload)
+        return await self._pull(pull_request.repository, payload, conflicted=None)
 
     async def read_pull_request(self, pull_request: PullRequestRef) -> PullRequest:
-        return await self._pull(pull_request.repository, await self.read_pull(pull_request))
+        """The pull request with its Git mergeability, proven only when the
+        source and destination commits did not move around the checks read."""
+
+        before = await self.read_pull(pull_request)
+        if _text(before.get("state")) != "OPEN":
+            return await self._pull(pull_request.repository, before, conflicted=None)
+        try:
+            checks: dict[str, Any] | None = await self._http.json(
+                "GET", f"{self.pull_url(pull_request)}/mergeability/checks", what="mergeability"
+            )
+        except ForgeError:
+            checks = None
+        after = await self.read_pull(pull_request)
+        conflicted: bool | None = None
+        pinned = _commits(before)
+        if checks is not None and all(pinned) and pinned == _commits(after):
+            conflicted = _git_conflicted(checks)
+        return await self._pull(pull_request.repository, after, conflicted=conflicted)
 
     # CI ----------------------------------------------------------------------
 
@@ -518,7 +664,10 @@ class BitbucketCloudCodeHost:
         """
 
         previous = _Cursor.parse(cursor)
-        pull = await self.read_pull_request(pull_request)
+        # Only the head is needed here, so no mergeability read.
+        pull = await self._pull(
+            pull_request.repository, await self.read_pull(pull_request), conflicted=None
+        )
         own = self._authors.get(pull_request)
         listed = await self.list_comments(
             pull_request, since=previous.since - OVERLAP if previous is not None else None

@@ -54,11 +54,11 @@ EXPECTED_PAIRINGS = {
 INSTALLED = {
     "github+github",
     "jira_cloud+github",
+    "jira_cloud+bitbucket_cloud",
+    "jira_cloud+bitbucket_dc",
     "gitlab+gitlab@fixture",
     "gitlab+gitlab@saas",
 }
-# Installed drivers, refused pairing: the combined quickstart is #4400.
-REFUSED_4400 = {"jira_cloud+bitbucket_cloud", "jira_cloud+bitbucket_dc"}
 NOT_INSTALLED = sorted(EXPECTED_PAIRINGS - INSTALLED)
 NAMESPACE = "test-factory-acceptance"
 # The steps every forge-loop entry tears down, whatever its driver adds.
@@ -89,9 +89,6 @@ def test_each_entry_names_its_tracker_code_host_and_install_state(key: str) -> N
     tracker, code_host = _forges(key)
     assert (pairing.tracker, pairing.code_host) == (tracker, code_host)
     assert pairing.installed is (key in INSTALLED)
-    assert (pairing.refused is not None) is (key in REFUSED_4400)
-    if key in REFUSED_4400:
-        assert "#4400" in acceptance._not_installed(pairing)
 
 
 @pytest.mark.parametrize("key", sorted(EXPECTED_PAIRINGS))

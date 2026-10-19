@@ -351,6 +351,7 @@ _HTTP_OPERATIONS = [
     "/approvals/principals/adapter",
     "/approvals/principals/adapter/rotate",
     "/approvals/principals/operator",
+    "/approvals/principals/remediation-operator",
     "/approvals/{approval_id}",
     "/approvals/{approval_id}/audit",
     "/approvals/{approval_id}/resolve",
@@ -452,6 +453,8 @@ _HTTP_OPERATIONS = [
     # Deliberate progress from a running turn (ADR 0130).
     "/v1/turn-progress/{progress_id}",
     "/v1/factory/cards/{token}.svg",
+    # Forge credential health (#4630).
+    "/forges/credentials/health",
     "/remediation-nominations",
     "/remediation-nominations/{nomination_id}",
     "/schedules",

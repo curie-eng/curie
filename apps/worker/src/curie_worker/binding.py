@@ -86,7 +86,7 @@ from aci_protocol.turn import (
 from curie_internal import sandbox_token
 from curie_internal.sealing_key import is_sealing_key_name
 from plugin_format import is_reserved_boot_env_name
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -319,7 +319,7 @@ DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 # disagreement costs a DESTRUCTIVE prune (the reconciler removes the connector
 # objects of the version the sandbox is actually booting), not merely a stale
 # apply, so the key is duplicated verbatim in both statements.
-_RESOLVE_SQL = """
+_RESOLVE_SELECT_SQL = """
 SELECT a.id AS agent_id,
        a.name AS agent_name,
        a.max_usd_per_day AS max_usd_per_day,
@@ -346,9 +346,30 @@ FROM {schema}.agents a
 JOIN {schema}.agent_channels c ON c.agent_id = a.id
 JOIN {schema}.deployments d ON d.agent_id = a.id AND d.status = 'active'
 JOIN {schema}.agent_versions v ON v.id = d.version_id AND v.agent_id = a.id
+"""
+
+_RESOLVE_ORDER_SQL = """
+ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
+"""
+
+_RESOLVE_SQL = _RESOLVE_SELECT_SQL + """
 WHERE c.kind = :kind AND c.address = :address
   AND a.tenant_id = :tenant_id AND c.tenant_id = :tenant_id
-ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
+""" + _RESOLVE_ORDER_SQL
+
+_RESOLVE_FACTORY_SQL = _RESOLVE_SELECT_SQL + """
+WHERE a.id = :agent_id AND c.id = :binding_id
+  AND c.kind = :kind AND c.address = :address
+  AND c.adapter IS NOT DISTINCT FROM :adapter
+  AND a.tenant_id = :tenant_id AND c.tenant_id = :tenant_id
+""" + _RESOLVE_ORDER_SQL
+
+_FACTORY_BINDING_SQL = """
+SELECT c.id, c.agent_id, c.tenant_id, c.kind, c.address, c.adapter
+FROM {schema}.agent_channels c
+JOIN {schema}.agents a ON a.id = c.agent_id
+WHERE c.id = :binding_id AND a.id = :agent_id
+  AND a.tenant_id = :tenant_id AND c.tenant_id = :tenant_id
 """
 
 # A targetless cron turn (#2963) is routed by the hook run's agent, not by a
@@ -492,6 +513,32 @@ class ResolvedDeployment(BaseModel):
     # 0068 and resolution runs against older schemas, so the kernel reads it
     # with ``memory_writes_for`` and copies it on, as with runner_resources.
     memory_writes: bool = False
+
+
+class FactoryWake(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: str
+    address: str
+    adapter: str | None
+    conversation_id: str
+
+
+class FactoryContext(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    agent_id: uuid.UUID
+    tenant_id: uuid.UUID
+    binding_id: uuid.UUID
+    kind: str
+    address: str
+    adapter: str | None
+
+
+class FactoryBindingRefused(RuntimeError):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
 
 
 class AmbiguousRoute(RuntimeError):
@@ -657,6 +704,8 @@ class BindingResolver:
         self._tenant_id = tenant_id
         # Table identifiers are not user input; the schema comes from config.
         self._sql = text(_RESOLVE_SQL.format(schema=config.db_schema))
+        self._resolve_factory_sql = text(_RESOLVE_FACTORY_SQL.format(schema=config.db_schema))
+        self._factory_binding_sql = text(_FACTORY_BINDING_SQL.format(schema=config.db_schema))
         self._undeployed_binding_sql = text(_UNDEPLOYED_BINDING_SQL.format(schema=config.db_schema))
         self._resolve_agent_sql = text(_RESOLVE_AGENT_SQL.format(schema=config.db_schema))
         self._address_identity_sql = text(_ADDRESS_IDENTITY_SQL.format(schema=config.db_schema))
@@ -699,6 +748,27 @@ class BindingResolver:
         mapped = [dict(row._mapping) for row in matches]
         warn_if_multiple_agents_bound(kind, address, mapped)
         return _deployment_from_row(mapped[0])
+
+    async def resolve_factory(self, context: FactoryContext) -> ResolvedDeployment | None:
+        """Resolve only the authenticated delivery's current agent and binding."""
+
+        if context.tenant_id != self._tenant_id:
+            raise FactoryBindingRefused("factory_tenant_mismatch")
+        if not _valid_slack_selector(context.kind, context.adapter):
+            raise FactoryBindingRefused("factory_surface_mismatch")
+        params = context.model_dump()
+        async with self._engine.connect() as conn:
+            bound = (await conn.execute(self._factory_binding_sql, params)).mappings().first()
+            if bound is None:
+                raise FactoryBindingRefused("factory_binding_missing")
+            if (
+                bound["kind"] != context.kind
+                or bound["address"] != context.address
+                or bound["adapter"] != context.adapter
+            ):
+                raise FactoryBindingRefused("factory_binding_changed")
+            row = (await conn.execute(self._resolve_factory_sql, params)).mappings().first()
+        return None if row is None else _deployment_from_row(dict(row))
 
     async def resolve_agent(self, agent_id: uuid.UUID) -> ResolvedDeployment | None:
         """Resolve an explicit agent to its active deployment, with no binding.

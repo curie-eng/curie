@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from curie_telemetry.redact import redact_text
-from sqlalchemy import and_, exists, func, or_, select, update
+from sqlalchemy import and_, case, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1692,6 +1692,21 @@ async def hold_for_ci_fix(
     return changed_id is not None
 
 
+def _release_parked_hold() -> ColumnElement[datetime]:
+    # hold_for_approval / hold_for_ci_fix park the lease at the execution
+    # deadline so owner loss cannot reclaim waiting work. An explicit stop must
+    # let any worker claim termination (#4627), so expire a parked hold now. An
+    # ordinary short live lease is kept so claim_termination still fences a
+    # live owner.
+    return case(
+        (
+            ExecutionRequest.runtime_heartbeat_expires_at == ExecutionRequest.execution_deadline,
+            func.clock_timestamp(),
+        ),
+        else_=ExecutionRequest.runtime_heartbeat_expires_at,
+    )
+
+
 async def request_cancellation(
     session: AsyncSession,
     *,
@@ -1776,6 +1791,7 @@ async def request_cancellation(
                 status="cancellation_requested",
                 terminal_cause="issue_cancelled",
                 cancellation_requested_at=now,
+                runtime_heartbeat_expires_at=_release_parked_hold(),
                 version=ExecutionRequest.version + 1,
                 updated_at=func.clock_timestamp(),
             )
@@ -1855,6 +1871,7 @@ async def readmit(
                     status="cancellation_requested",
                     terminal_cause="issue_cancelled",
                     cancellation_requested_at=now,
+                    runtime_heartbeat_expires_at=_release_parked_hold(),
                     version=ExecutionRequest.version + 1,
                     updated_at=func.clock_timestamp(),
                 )

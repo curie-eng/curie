@@ -31,6 +31,7 @@ pub mod evals;
 pub mod examples;
 pub mod exit;
 pub mod factory_app;
+pub mod factory_config_migrate;
 pub mod factory_intake;
 pub mod factory_quickstart;
 pub mod factory_toolchain;

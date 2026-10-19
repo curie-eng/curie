@@ -1628,3 +1628,61 @@ def test_per_turn_reduction_reduces_the_later_turn_holding_its_result(tmp_path, 
     assert [e["parentUuid"] for e in entries[1:]] == [e["uuid"] for e in entries[:-1]]
     (warning,) = _warnings(caplog)
     assert "turns_reduced=2" in warning.getMessage()
+
+
+def _resumed_after_rejection():
+    """A thread resumed after a declined tool call, then a fresh user message.
+
+    The native transcript keeps the declined turn's message ID on the first
+    assistant row after the new user message; the portable rows leave it
+    ungrouped.
+    """
+
+    first = hashlib.sha256(b"msg_acme_first").hexdigest()
+    second = hashlib.sha256(b"msg_acme_second").hexdigest()
+    third = hashlib.sha256(b"msg_acme_third").hexdigest()
+    thinking = _thinking()
+    messages = (
+        _text("user", _sent("open the acme file")),
+        ConversationMessage(role="assistant", content=thinking.content, assistant_group=first),
+        _call(1, first),
+        _result(1, "declined by the approver", error=True),
+        _text("user", _sent("read it without asking")),
+        _call(2, None),
+        _result(2),
+        _call(3, second),
+        _result(3),
+        ConversationMessage(
+            role="assistant", content=[{"type": "text", "text": "acme done"}], assistant_group=third
+        ),
+    )
+    native_ids = {
+        1: "msg_acme_first",
+        2: "msg_acme_first",
+        5: "msg_acme_first",
+        7: "msg_acme_second",
+        9: "msg_acme_third",
+    }
+    native = []
+    for index, message in enumerate(messages):
+        payload = {"role": message.role, "content": message.content}
+        if index in native_ids:
+            payload["id"] = native_ids[index]
+        native.append({"type": message.role, "uuid": f"acme-entry-{index}", "message": payload})
+    return messages, HarnessReplayState(harness="claude", kind="checkpoint", entries=tuple(native))
+
+
+def test_checkpoint_group_reused_across_a_user_boundary_is_set_aside(tmp_path):
+    # @spec RUNNER-HISTORY-GROUP-4: a checkpoint supplies group identity only with
+    # valid causal boundaries. A native ID that would join an assistant row to a
+    # group from before a genuine user message proves nothing, so the checkpoint
+    # is set aside and the portable rows replay instead of failing the boot.
+    messages, checkpoint = _resumed_after_rejection()
+    resume = build_structured_resume(
+        messages, curie_session_id="acme-thread", cwd=str(tmp_path), harness_replay=checkpoint
+    )
+    entries = anyio.run(resume.session_store.load, resume.session_key)
+    assert _rows(entries) == [(m.role, m.content) for m in messages]
+    assert all(e["uuid"] != f"acme-entry-{i}" for i, e in enumerate(entries))
+    assert entries[5]["message"].get("id") != entries[2]["message"]["id"]
+    assert entries[1]["message"]["id"] == entries[2]["message"]["id"]

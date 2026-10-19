@@ -162,8 +162,8 @@ fn write_principal_token() -> Result<String> {
                  but identifies nobody)",
             )
             .with_fix(
-                "mint a reusable operator credential with `curie <local|cluster> approvals \
-                 <AGENT> --mint-operator-principal <SUBJECT>`, export the one-time result as \
+                "mint a reusable remediation operator credential with `curie <local|cluster> approvals \
+                 <AGENT> --mint-remediation-principal <SUBJECT>`, export the one-time result as \
                  CURIE_APPROVAL_PRINCIPAL_TOKEN, and retry",
             ),
         )

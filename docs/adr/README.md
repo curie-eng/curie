@@ -158,7 +158,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0126 | [Runtime repository selection is sticky authorized thread state](0126-runtime-repository-selection-is-sticky-authorized-thread-state.md) | Accepted |
 | 0127 | [An inbound ACP client admits any ACP harness behind the harness port](0127-an-inbound-acp-client-admits-any-acp-harness.md) | Draft |
 | 0128 | [An installation owns the model gateway and operator bindings select its aliases](0128-install-owned-model-gateway-and-agent-aliases.md) | Draft |
-| 0129 | [One release owns a cluster's shared singletons; every other release declares what it needs from them](0129-one-release-owns-a-clusters-shared-singletons.md) | Draft |
+| 0129 | [One release owns a cluster's shared singletons; every other release declares what it needs from them](0129-one-release-owns-a-clusters-shared-singletons.md) | Accepted |
 | 0130 | [Deliberate progress is bounded durable channel state, not answer streaming](0130-deliberate-progress-is-bounded-durable-channel-state.md) | Accepted |
 | 0131 | [A delivery has one deadline and one renewable fenced owner](0131-a-delivery-has-one-deadline-and-one-renewable-fenced-owner.md) | Accepted |
 | 0132 | [Gate evals on the worst cohort and require cross-family verifiers](0132-worst-cohort-eval-gates-and-cross-family-verifiers.md) | Draft |
@@ -251,4 +251,9 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0228 | [Mail services plug into one email adapter, which owns approvals by email](0228-mail-services-plug-into-one-email-adapter-which-owns-approvals-by-email.md) | Draft |
 | 0229 | [A hosted connector may declare the Host the caller proxy presents upstream](0229-a-hosted-connector-may-declare-the-host-the-caller-proxy-presents-upstream.md) | Accepted |
 | 0230 | [Cluster upgrade and rollback report outcomes from one lifecycle record checked against the cluster](0230-upgrade-and-rollback-report-from-one-lifecycle-record-checked-against-the-cluster.md) | Draft |
+| 0231 | [Remediation policy bind and arm need an authority the platform key cannot derive](0231-remediation-policy-bind-and-arm-need-an-authority-the-platform-key-cannot-derive.md) | Accepted |
+| 0232 | [A contract migration ships one release after the code stops using what it drops](0232-a-contract-migration-ships-one-release-after-the-code-stops-using-what-it-drops.md) | Accepted |
+| 0233 | [Factory publication recovery requires explicit operator adoption](0233-factory-publication-recovery-requires-explicit-operator-adoption.md) | Draft |
+| 0234 | [Factory-owned pull requests accept authorized feedback without a mention](0234-factory-owned-pull-requests-accept-authorized-feedback-without-a-mention.md) | Accepted |
+| 0236 | [The commissioning operator splits provisioner and control processes](0236-the-commissioning-operator-splits-provisioner-and-control-processes.md) | Accepted |
 <!-- END GENERATED: adr-index -->

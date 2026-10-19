@@ -64,6 +64,7 @@ from .history import (
     HistoryError,
     reduce_unprovable_overlap_turns,
     validate_assistant_groups,
+    validate_group_provenance,
 )
 from .mcp_argv import install as install_mcp_argv_offload
 from .startup_diagnostics import StderrTail, sdk_initialize_diagnostics
@@ -153,6 +154,14 @@ def _recover_assistant_groups(
         )
         for message, group in pairs
     )
+    try:
+        validate_group_provenance(recovered)
+    except HistoryError:
+        # A native ID shared across a genuine user boundary, such as the first
+        # call after a declined approval, would join the earlier group. That
+        # correspondence proves nothing, so neither its groups nor the
+        # checkpoint are used.
+        return messages, False
     return recovered, native_eligible
 
 

@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import base64
 import enum
-from collections.abc import Awaitable, Callable
+import unicodedata
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
+from urllib.parse import urlsplit
+
+from .errors import Unavailable
 
 # Forge kinds. Only GitHub has an adapter today; the other kinds are named so
 # the pairing rules in `capabilities` can be stated before their adapters land.
@@ -134,6 +138,78 @@ class PullRequest:
     # when the payload carried no usable time. A metadata-only revision records
     # it so CI freshness is judged after the edit.
     updated_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class FactoryPublication:
+    """A pull or merge request a factory publication opened (#4629).
+
+    Listed by `CodeHost.list_factory_publications`: opened in the repository
+    from a branch of that repository whose last path component is
+    ``publication-<32 hex>``. ``owner_verified`` is True when the code host
+    confirmed its own identity authored it; False only where the code host
+    cannot read its own identity (Bitbucket Cloud, and Bitbucket Data Center
+    when its answer carries no ``X-AUSERID`` header), so the caller never
+    treats it as proof on its own. ``url`` is a plain http(s) URL on the code
+    host's configured web host (`publication_url`).
+    """
+
+    ref: PullRequestRef
+    url: str
+    head_ref: str
+    state: PullRequestState
+    body: str
+    # When it was merged or closed, as the code host reports it; None while open
+    # or when the payload carried no usable time.
+    closed_at: datetime | None
+    owner_verified: bool
+
+
+def publication_body(item: Mapping[str, Any], key: str) -> str:
+    """A listed publication's body read from ``item[key]`` (#4629).
+
+    An explicit JSON null is the empty body, the way providers report an empty
+    description. A missing key or any other non-text value is `Unavailable`:
+    a body that cannot be read is incomplete evidence, never an empty one.
+    """
+
+    if key not in item:
+        raise Unavailable("publication_body")
+    body = item[key]
+    if body is None:
+        return ""
+    if not isinstance(body, str):
+        raise Unavailable("publication_body")
+    return body
+
+
+def publication_url(url: object, web_base: str) -> str:
+    """``url`` when it is a plain http(s) URL on ``web_base``'s host (#4629).
+
+    It is reported on the issue, so anything else is `Unavailable`: another
+    scheme or host, userinfo, whitespace, control or format characters, and
+    angle brackets (the report renders each URL inside them).
+    """
+
+    if not isinstance(url, str) or not url:
+        raise Unavailable("publication_url")
+    if any(char.isspace() or char in "<>" or unicodedata.category(char)[0] == "C" for char in url):
+        raise Unavailable("publication_url")
+    try:
+        parts, base = urlsplit(url), urlsplit(web_base)
+        expected = base.netloc.casefold()
+        if (
+            parts.scheme not in {"http", "https"}
+            or parts.username is not None
+            or parts.password is not None
+            or "@" in parts.netloc
+            or not expected
+            or parts.netloc.casefold() != expected
+        ):
+            raise Unavailable("publication_url")
+    except ValueError:
+        raise Unavailable("publication_url") from None
+    return url
 
 
 @dataclass(frozen=True)
@@ -486,7 +562,9 @@ class MarkedNotice:
 
     ``event_id`` is the tracker's immutable id for the event (a GitHub timeline
     event id, a webhook delivery id, or a comment id for a mention). ``cursor``
-    is the opaque poll position just after this notice.
+    is the opaque poll position just after this notice. ``occurred_at`` is when
+    the tracker says the event happened, or None when it reported no usable
+    time; admission treats None as unknown and decides fail-closed (#4629).
     """
 
     issue: TrackerIssueRef
@@ -495,6 +573,7 @@ class MarkedNotice:
     event_id: str
     disposition: Disposition
     cursor: str
+    occurred_at: datetime | None
 
 
 @dataclass(frozen=True)

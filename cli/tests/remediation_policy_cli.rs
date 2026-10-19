@@ -630,6 +630,13 @@ fn every_write_without_a_principal_is_refused_before_any_request() {
                     value.to_string().contains("CURIE_APPROVAL_PRINCIPAL_TOKEN"),
                     "{what}: the error names the env-backed credential: {value}"
                 );
+                // #4228: an approval resolution token cannot write remediation
+                // policy, so the fix names the remediation mint, not the operator one.
+                assert!(
+                    value.to_string().contains("--mint-remediation-principal")
+                        && !value.to_string().contains("--mint-operator-principal"),
+                    "{what}: the fix names the remediation principal mint: {value}"
+                );
                 assert!(
                     server.recorded().is_empty(),
                     "{what}: no request is sent: {:?}",
