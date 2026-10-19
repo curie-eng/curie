@@ -2,9 +2,11 @@
 
 Date: 2026-10-14
 
-Status: Draft
+Status: Accepted
 
-This Draft records a direction the maintainer, Brian Conn, gave on 2026-10-14: a surface talks to one email adapter, each mail service is an implementation under it, and approvals by email live in that upstream adapter. It is open for discussion and authorizes no implementation until it is published as Accepted.
+Accepted 2026-10-16 with explicit maintainer approval from Brian Conn, recorded as an approving review on the publishing pull request ([#4588](https://github.com/curie-eng/curie/pull/4588)).
+
+This ADR records a direction the maintainer, Brian Conn, gave on 2026-10-14: a surface talks to one email adapter, each mail service is an implementation under it, and approvals by email live in that upstream adapter.
 
 It builds on [ADR 0096](0096-port-adapters-are-deployed-services.md) (decision 4, in-process entry points), [ADR 0120](0120-durable-first-party-email-state.md) (the adapter's local durable state), [ADR 0177](0177-an-approval-is-answered-where-it-was-asked-including-by-email.md) and its amendment (approvals by email), [ADR 0175](0175-a-bot-may-limit-who-can-talk-to-it.md) (caller lists) and [ADR 0220](0220-one-identity-provider-decides-who-may-invoke-and-approve-on-every-channel.md) (who an email sender is). It supersedes nothing and changes no frozen contract.
 
@@ -140,7 +142,7 @@ Good:
 - The intake path and the approval reply code get live callers again, in tests and in any deployment whose provider verifies senders.
 - A deployment on another mail service needs a provider package and a derived image, not a fork.
 - AgentMail installs see no change: the same settings, chart values, behavior and refusal, still before any body fetch.
-- Once the code draws this line, the seam is registered in `docs/interfaces.md` with its own `INTERFACE.md`, counting one in-tree implementation (AgentMail) plus out-of-tree providers. This Draft adds no registry row, because the catalog documents only lines the code already draws.
+- Once the code draws this line, the seam is registered in `docs/interfaces.md` with its own `INTERFACE.md`, counting one in-tree implementation (AgentMail) plus out-of-tree providers. This ADR adds no registry row, because the catalog documents only lines the code already draws.
 
 Bad:
 
