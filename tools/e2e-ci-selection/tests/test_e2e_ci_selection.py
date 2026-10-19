@@ -191,6 +191,14 @@ class _ChartScenario(TypedDict):
 
 
 CHART_SCENARIOS: dict[str, _ChartScenario] = {
+    "failed-first-install-retry": {
+        "step": "Failed first install retry recreates data volumes",
+        "inputs": [
+            "charts/curie/ci/runtime/failed-first-install-retry-runtime.sh",
+            "cli/src/ops/up.rs",
+        ],
+        "leg": "workload",
+    },
     "installation-identity": {
         "step": "Installation identity Secret lifecycle",
         "inputs": ["charts/curie/ci/runtime/upgrade-drain-installation-runtime.sh"],
@@ -265,7 +273,9 @@ CHART_IDS = tuple(sorted(CHART_SCENARIOS))
 
 
 CHART_LEGS = ("chart", "workload")
-WORKLOAD_SCENARIOS = frozenset({"workspace-diagnostic", "quota-progress"})
+WORKLOAD_SCENARIOS = frozenset(
+    {"workspace-diagnostic", "quota-progress", "failed-first-install-retry"}
+)
 
 
 def _chart_leg_clause(leg: str) -> str:
@@ -3463,7 +3473,8 @@ def test_single_regression_proofs_run_outside_the_cluster_rung() -> None:
 WORKLOAD_STAGING_IF = (
     "${{ matrix.leg == 'workload' && "
     "(contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') "
-    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress')) }}"
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') "
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry')) }}"
 )
 
 
@@ -3530,6 +3541,37 @@ def test_workspace_diagnostic_reuses_the_chart_cluster_and_candidate_artifacts()
     image_load = stage_run[stage_run.index("kind load docker-image") :]
     for component in ("api", "worker", "runner"):
         assert f"curie-{component}:wsdiag-${{{{ github.sha }}}}" in image_load
+
+
+def test_failed_first_install_retry_reuses_the_chart_cluster_and_candidate_artifacts() -> None:
+    chart = yaml.safe_load(WORKFLOW.read_text())["jobs"][CHART_JOB]
+    steps = chart["steps"]
+    matches = [
+        step
+        for step in steps
+        if step.get("name") == CHART_SCENARIOS["failed-first-install-retry"]["step"]
+    ]
+    assert len(matches) == 1
+    retry = matches[0]
+    workspace = next(
+        step for step in steps if step.get("if") == _chart_step_if("workspace-diagnostic")
+    )
+    assert retry["if"] == _chart_step_if("failed-first-install-retry")
+    assert retry["timeout-minutes"] == 30
+    assert retry["env"] == workspace["env"]
+    assert "continue-on-error" not in retry
+    commands = retry["run"].replace("\\\n", " ")
+    assert [" ".join(line.split()) for line in commands.splitlines() if line.strip()] == [
+        "set -euo pipefail",
+        "bash tools/runtime-assertion-gate/run.sh "
+        "charts/curie/ci/runtime/failed-first-install-retry-runtime.sh",
+    ]
+    stage = next(
+        step
+        for step in steps
+        if step.get("name") == "Stage the workspace diagnostic images in kind"
+    )
+    assert steps.index(stage) < steps.index(retry)
 
 
 def test_quota_progress_is_intentionally_disabled_pending_idle_capacity_repair() -> None:
@@ -4471,6 +4513,23 @@ def test_chart_scenario_input_matching_keeps_the_existing_prefix_rules(
     completed, output = _invoke_selector(tmp_path, path)
     assert completed.returncode == 0, completed.stderr
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == list(expected)
+
+
+def test_failed_first_install_retry_script_alone_selects_its_scenario(tmp_path: Path) -> None:
+    completed, output = _invoke_selector(
+        tmp_path, "charts/curie/ci/runtime/failed-first-install-retry-runtime.sh"
+    )
+    assert completed.returncode == 0, completed.stderr
+    selected = _outputs_of(output)
+    assert selected["cluster"] == "true"
+    assert json.loads(selected["chart_scenarios"]) == ["failed-first-install-retry"]
+    assert json.loads(selected["chart_legs"]) == ["workload"]
+
+
+def test_failed_first_install_retry_tracks_the_production_discard_path(tmp_path: Path) -> None:
+    completed, output = _invoke_selector(tmp_path, "cli/src/ops/up.rs")
+    assert completed.returncode == 0, completed.stderr
+    assert "failed-first-install-retry" in json.loads(_outputs_of(output)["chart_scenarios"])
 
 
 def test_chart_scenario_union_is_sorted_and_deduplicated(tmp_path: Path) -> None:

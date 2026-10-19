@@ -421,6 +421,24 @@ if [ "$1" = "get" ] && [ "$2" = "statefulset" ]; then
     exit 64
 fi
 
+if [ "$1" = "get" ] && [ "$2" = "pvc" ]; then
+    if [ "$#" -eq 8 ] && [ "$3" = "-n" ] && [ "$4" = "target-namespace" ] && [ "$5" = "-o" ] && [ "$6" = "json" ] && [ "$7" = "-l" ] && [ "$8" = "app.kubernetes.io/instance=target-release,app.kubernetes.io/component in (postgres,clickhouse,rustfs,valkey)" ]; then
+        printf '%s\n' '{"apiVersion":"v1","kind":"PersistentVolumeClaimList","items":[]}'
+        exit 0
+    fi
+    printf 'unexpected failed-install PVC query: %s\n' "$*" >&2
+    exit 64
+fi
+
+if [ "$1" = "get" ] && [ "$2" = "secret" ] && [ "$3" = "sh.helm.release.v1.target-release.v1" ]; then
+    if [ "$#" -eq 7 ] && [ "$4" = "-n" ] && [ "$5" = "target-namespace" ] && [ "$6" = "-o" ] && [ "$7" = "json" ]; then
+        printf '%s\n' '{"apiVersion":"v1","kind":"Secret","type":"helm.sh/release.v1","metadata":{"name":"sh.helm.release.v1.target-release.v1","namespace":"target-namespace","creationTimestamp":"2026-10-17T10:00:00Z","labels":{"owner":"helm","name":"target-release","version":"1","status":"failed"}}}'
+        exit 0
+    fi
+    printf 'unexpected revision-1 Helm Secret query: %s\n' "$*" >&2
+    exit 64
+fi
+
 if [ "$1" = "label" ] && [ "$2" = "namespace" ] && [ "$3" = "target-namespace" ]; then
     case " $* " in
         *" --overwrite "*) exit 0 ;;
