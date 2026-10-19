@@ -22,18 +22,18 @@ before the model starts. A ``not_declared`` record takes no route.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import os
 import re
 import shlex
 import shutil
-import subprocess
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
-
-import anyio
 
 from .progress import ProgressClient
 from .subprocess_env import shell_and_hook_env
@@ -479,26 +479,16 @@ async def _run(
     if not _resolvable(argv[0], workspace):
         return _Result("unavailable", missing=(_binary_name(argv[0]),))
     try:
-        result = await anyio.to_thread.run_sync(
-            lambda: subprocess.run(
-                list(argv),
-                cwd=workspace,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT_SECONDS,
-                check=False,
-            )
-        )
-    except subprocess.TimeoutExpired as exc:
-        output = "\n".join((_subprocess_text(exc.stdout), _subprocess_text(exc.stderr)))
-        missing, blocked = _failures(output, names)
-        if missing or blocked:
-            return _Result("unavailable", missing=tuple(missing), blocked=tuple(blocked))
-        return _Result(
-            "failed",
-            exit_status=124,
-            failure_reason=f"{label} timed out after {_TIMEOUT_SECONDS:g} seconds",
+        # An asyncio child in its own process group, not subprocess.run on a
+        # worker thread: a thread cannot be cancelled, so shutting down during
+        # a held check waited out the whole timeout (#4777).
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=workspace,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
     except OSError as exc:
         # ``which`` and process creation can race if the image is changing.
@@ -511,12 +501,43 @@ async def _run(
             exit_status=126 if isinstance(exc, PermissionError) else 125,
             failure_reason=f"{label} could not start ({type(exc).__name__})",
         )
-    if result.returncode == 0:
+    stdout = bytearray()
+    stderr = bytearray()
+
+    async def drain(stream: asyncio.StreamReader | None, into: bytearray) -> None:
+        if stream is None:
+            return
+        while chunk := await stream.read(65536):
+            into.extend(chunk)
+
+    try:
+        async with asyncio.timeout(_TIMEOUT_SECONDS):
+            await asyncio.gather(drain(process.stdout, stdout), drain(process.stderr, stderr))
+            await process.wait()
+    except TimeoutError:
+        output = "\n".join((_subprocess_text(bytes(stdout)), _subprocess_text(bytes(stderr))))
+        missing, blocked = _failures(output, names)
+        if missing or blocked:
+            return _Result("unavailable", missing=tuple(missing), blocked=tuple(blocked))
+        return _Result(
+            "failed",
+            exit_status=124,
+            failure_reason=f"{label} timed out after {_TIMEOUT_SECONDS:g} seconds",
+        )
+    finally:
+        # Timeout and cancellation both kill the whole group and reap the
+        # child, so no check outlives the preflight that started it.
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            await asyncio.shield(process.wait())
+    if process.returncode == 0:
         return _Result("passed", exit_status=0)
-    missing, blocked = _failures(f"{result.stdout}\n{result.stderr}", names)
+    output = f"{_subprocess_text(bytes(stdout))}\n{_subprocess_text(bytes(stderr))}"
+    missing, blocked = _failures(output, names)
     if missing or blocked:
         return _Result("unavailable", missing=tuple(missing), blocked=tuple(blocked))
-    return _Result("failed", exit_status=result.returncode)
+    return _Result("failed", exit_status=process.returncode)
 
 
 def _fit_stored_size(record: dict[str, Any]) -> dict[str, Any]:
