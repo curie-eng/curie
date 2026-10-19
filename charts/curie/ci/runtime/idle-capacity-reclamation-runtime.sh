@@ -564,25 +564,37 @@ def burst_sixteen():
         time.sleep(0.2)
     logs = run([*kube, "logs", "deployment/" + fullname + "-worker", "--since-time=" + started, "--timestamps"], timeout=60)
     parks, wakes = {}, {}
+    saw_capacity_text = False
     for line in logs.splitlines():
-        parked_line = "capacity wait parked event_id=" in line
-        woke_line = "capacity wait woke event_id=" in line
-        if not parked_line and not woke_line:
+        if "capacity wait parked" not in line and "capacity wait woke" not in line:
             continue
-        parts = line.split()
-        if len(parts) < 2:
+        saw_capacity_text = True
+        start_json = line.find("{")
+        end_json = line.rfind("}")
+        if start_json < 0 or end_json <= start_json:
             raise AssertionError("malformed capacity wait log")
-        stamp = parts[0]
-        if "T" not in stamp:
+        try:
+            payload = json.loads(line[start_json:end_json + 1])
+        except json.JSONDecodeError as error:
+            raise AssertionError("malformed capacity wait log") from error
+        if not isinstance(payload, dict):
+            raise AssertionError("malformed capacity wait log")
+        stamp = payload.get("timestamp")
+        message = payload.get("message")
+        if not isinstance(stamp, str) or not isinstance(message, str) or "T" not in stamp:
             raise AssertionError("malformed capacity wait timestamp")
-        event_id = ""
-        for token in parts:
-            if token.startswith("event_id="):
-                event_id = token.split("=", 1)[1]
-        if not event_id:
+        parked_line = message.startswith("capacity wait parked event_id=")
+        woke_line = message.startswith("capacity wait woke event_id=")
+        if parked_line == woke_line:
+            raise AssertionError("malformed capacity wait event id")
+        event_id = message.split("event_id=", 1)[1].split()[0]
+        if not event_id or any(character.isspace() for character in event_id):
             raise AssertionError("malformed capacity wait event id")
         whole, _, fraction = stamp.partition(".")
-        seconds = calendar.timegm(time.strptime(whole, "%Y-%m-%dT%H:%M:%S"))
+        try:
+            seconds = calendar.timegm(time.strptime(whole, "%Y-%m-%dT%H:%M:%S"))
+        except ValueError as error:
+            raise AssertionError("malformed capacity wait timestamp") from error
         if fraction:
             digits = ""
             for character in fraction:
@@ -590,10 +602,13 @@ def burst_sixteen():
                     digits += character
                 else:
                     break
-            if digits:
-                seconds += int(digits[:6]) / 1_000_000
+            if not digits:
+                raise AssertionError("malformed capacity wait timestamp")
+            seconds += int(digits[:6]) / 1_000_000
         bucket = parks if parked_line else wakes
         bucket.setdefault(event_id, []).append(seconds)
+    if saw_capacity_text and not parks:
+        raise AssertionError("malformed capacity wait log")
     assert parks, "sixteen-thread burst recorded no park"
     unmatched = 0
     longest = 0.0

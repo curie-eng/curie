@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import time
 from pathlib import Path
@@ -182,7 +183,7 @@ async def _wait_deferrals(consumer: Consumer, event_id: str, deferral: int) -> A
     raise AssertionError(f"deferral {deferral} was not observed")
 
 
-def test_reparks_do_not_resend_a_delivered_queued_notice(make_harness) -> None:
+def test_reparks_do_not_resend_a_delivered_queued_notice(make_harness, caplog) -> None:
     async def delivered(h: Any) -> None:
         h.fake_k8s.quota_rejection = _refusal()
         consumer = _consumer(h)
@@ -227,10 +228,14 @@ def test_reparks_do_not_resend_a_delivered_queued_notice(make_harness) -> None:
             await _wait_deferrals(consumer, event.event_id, 1)
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
-                record = await consumer._waits.get(event.event_id)
-                if record is not None and record.notice_pending:
+                if "capacity wait notice failed" in caplog.text:
                     break
                 await asyncio.sleep(0.02)
+            else:
+                raise AssertionError("the first queued notice did not fail")
+            record = await consumer._waits.get(event.event_id)
+            assert record is not None and record.notice_pending
+            assert await _queued(h) == 0
             h.sink.fail_events.discard("reply.update")
             await h.async_redis.zadd(consumer._waits._due, {event.event_id: 0})
             await _wait_deferrals(consumer, event.event_id, 2)
@@ -266,6 +271,7 @@ def test_reparks_do_not_resend_a_delivered_queued_notice(make_harness) -> None:
             await task
 
     async def go() -> None:
+        caplog.set_level(logging.WARNING)
         async with make_harness(
             slack_no_edit_streaming=True,
             claim_timeout_seconds=0.05,
