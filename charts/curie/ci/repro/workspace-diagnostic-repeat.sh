@@ -18,24 +18,32 @@ cluster="${CURIE_REPRO_CLUSTER:-}"
 [[ ${#cluster} -le 49 && "$cluster" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
     || invalid "CURIE_REPRO_CLUSTER must be 1 to 49 lowercase letters, digits or interior hyphens"
 
-for tool in kind docker cargo kubectl helm setsid curl sha256sum python3 mktemp cat tee rm bash; do
+for tool in kind docker cargo kubectl helm setsid curl sha256sum python3 mktemp cat tee rm bash dirname; do
     command -v "$tool" >/dev/null || fail "required executable is unavailable: $tool"
 done
-repo_root="$(cd -- "${BASH_SOURCE[0]%/*}/../../../.." && pwd)"
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd -- "$repo_root"
 images=(
     "curie-api:wsdiag-repro-$cluster"
     "curie-worker:wsdiag-repro-$cluster"
     "curie-runner:wsdiag-repro-$cluster"
 )
-clusters="$(kind get clusters)" || fail "could not inventory kind clusters"
-while IFS= read -r existing; do
-    [[ "$existing" != "$cluster" ]] || fail "refusing to use a preexisting kind cluster"
-done <<< "$clusters"
-for image in "${images[@]}"; do
+require_cluster_absent() {
+    local clusters existing
+    clusters="$(kind get clusters)" || fail "could not inventory kind clusters"
+    while IFS= read -r existing; do
+        [[ "$existing" != "$cluster" ]] || fail "refusing to use a preexisting kind cluster"
+    done <<< "$clusters"
+}
+require_image_absent() {
+    local image="$1" existing
     existing="$(docker image ls --filter "reference=$image" --format '{{.Repository}}:{{.Tag}}')" \
         || fail "could not inventory the candidate image tag"
     [[ -z "$existing" ]] || fail "refusing to overwrite a preexisting candidate image tag"
+}
+require_cluster_absent
+for image in "${images[@]}"; do
+    require_image_absent "$image"
 done
 
 workdir=""
@@ -97,11 +105,14 @@ workdir="$(mktemp -d "${TMPDIR:-/tmp}/curie-wsdiag-repro.XXXXXXXX")"
 export KUBECONFIG="$workdir/kubeconfig"
 python3 -c 'import yaml' || fail "Python 3 with PyYAML is required by the scenario"
 
+export CARGO_TARGET_DIR="$repo_root/cli/target"
+unset CARGO_BUILD_TARGET
 cargo build --release --manifest-path cli/Cargo.toml
 export CURIE_BIN="$repo_root/cli/target/release/curie"
 [[ -f "$CURIE_BIN" && -x "$CURIE_BIN" ]] || fail "the candidate CLI was not built"
 dockerfiles=(apps/api/Dockerfile apps/worker/Dockerfile runner/Dockerfile)
 for index in "${!images[@]}"; do
+    require_image_absent "${images[$index]}"
     owned_images+=("${images[$index]}")
     docker build -f "${dockerfiles[$index]}" -t "${images[$index]}" .
 done
@@ -115,6 +126,7 @@ networking:
 nodes:
   - role: control-plane
 YAML
+require_cluster_absent
 cluster_owned=1
 kind create cluster --name "$cluster" --image kindest/node:v1.31.0 \
     --config "$workdir/kind.yaml" --kubeconfig "$KUBECONFIG"
@@ -136,6 +148,7 @@ run_prefix="$(python3 -c 'import secrets; print(secrets.token_hex(6))')"
 passed=0
 recovery_500=0
 other_fail=0
+export TMPDIR="$workdir"
 for (( iteration=1; iteration<=iterations; iteration++ )); do
     export CURIE_SCENARIO_RUN_ID="wsd-$run_prefix-$iteration"
     logfile="$workdir/iteration-$iteration.log"

@@ -166,6 +166,7 @@ import shlex
 import signal
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 tool, args = Path(sys.argv[0]).name, sys.argv[1:]
@@ -231,6 +232,12 @@ with sqlite3.connect(os.environ["REPRO_STATE"], isolation_level=None) as db:
             assert args == ["build", "-f", dockerfile, "-t", image, "."]
             assert os.getcwd() == os.environ["REPRO_ROOT"]
             db.execute("INSERT INTO resources VALUES ('image', ?)", (image,))
+            late_resource = os.environ.get("REPRO_LATE_RESOURCE", "")
+            if component == "runner" and late_resource == "cluster":
+                db.execute("INSERT INTO resources VALUES ('cluster', ?)", (cluster,))
+            elif component == "api" and late_resource == "worker":
+                db.execute("INSERT INTO resources VALUES ('image', ?)",
+                           (f"curie-worker:wsdiag-repro-{cluster}",))
             if failure == f"build-{component}":
                 raise SystemExit(91)
         elif args[:2] == ["image", "rm"]:
@@ -244,7 +251,10 @@ with sqlite3.connect(os.environ["REPRO_STATE"], isolation_level=None) as db:
         assert args == ["build", "--release", "--manifest-path", "cli/Cargo.toml"]
         if failure == "cargo":
             raise SystemExit(91)
-        binary = Path("cli/target/release/curie")
+        target = Path(os.environ.get("CARGO_TARGET_DIR", "cli/target"))
+        if os.environ.get("CARGO_BUILD_TARGET"):
+            target /= os.environ["CARGO_BUILD_TARGET"]
+        binary = target / "release/curie"
         binary.parent.mkdir(parents=True)
         binary.write_text("#!/bin/sh\nexit 0\n")
         binary.chmod(0o755)
@@ -277,6 +287,10 @@ with sqlite3.connect(os.environ["REPRO_STATE"], isolation_level=None) as db:
                 f"curie-{component.lower()}:wsdiag-repro-{cluster}"
             )
         assert os.environ["DOCKER_HOST"] == "tcp://docker.example.com:2376"
+        scenario_workdir = Path(tempfile.mkdtemp(prefix="wsdiag-scenario-"))
+        (scenario_workdir / "diagnostic.log").write_text("scenario diagnostics\n")
+        db.execute("INSERT INTO scenario_temps VALUES (?, ?)",
+                   (os.environ["CURIE_SCENARIO_RUN_ID"], str(scenario_workdir)))
         number = db.execute("SELECT COUNT(*) FROM calls WHERE tool = 'bash'").fetchone()[0]
         outcome = os.environ.get("REPRO_OUTCOMES", "pass").split(",")[number - 1]
         print("scenario-stderr", file=sys.stderr, flush=True)
@@ -361,6 +375,7 @@ def harness(tmp_path: Path) -> Harness:
             "CREATE TABLE calls(sequence INTEGER PRIMARY KEY, tool TEXT, arguments TEXT, "
             "cwd TEXT, kubeconfig TEXT, run_id TEXT)"
         )
+        db.execute("CREATE TABLE scenario_temps(run_id TEXT PRIMARY KEY, path TEXT)")
     caller_kubeconfig = tmp_path / "caller-kubeconfig"
     caller_kubeconfig.write_text("caller config must survive\n")
     environment = {
@@ -457,6 +472,107 @@ def test_existing_resources_are_refused_without_taking_ownership(
         or (tool == "docker" and args[:2] == ["image", "ls"])
         for tool, args, *_ in harness.calls()
     )
+
+
+@pytest.mark.parametrize(
+    ("late_resource", "built_components"),
+    [("cluster", ("api", "worker", "runner")), ("worker", ("api",))],
+)
+def test_resources_appearing_during_builds_are_refused_without_taking_ownership(
+    harness: Harness, late_resource: str, built_components: tuple[str, ...]
+) -> None:
+    harness.environment["REPRO_LATE_RESOURCE"] = late_resource
+    cluster = harness.environment["CURIE_REPRO_CLUSTER"]
+    foreign = (
+        ("cluster", cluster)
+        if late_resource == "cluster"
+        else ("image", f"curie-{late_resource}:wsdiag-repro-{cluster}")
+    )
+    before = harness.resources()
+    result = harness.run()
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "refusing" in result.stderr
+    assert "summary iterations=" not in result.stdout
+    calls = harness.calls()
+    assert not any(tool == "bash" for tool, *_ in calls)
+    assert all(args == ["get", "clusters"] for tool, args, *_ in calls if tool == "kind")
+    built = [
+        args[args.index("-t") + 1]
+        for tool, args, *_ in calls
+        if tool == "docker" and args[0] == "build"
+    ]
+    expected_images = [
+        f"curie-{component}:wsdiag-repro-{cluster}" for component in built_components
+    ]
+    assert built == expected_images
+    removed = [
+        args[2] for tool, args, *_ in calls if tool == "docker" and args[:2] == ["image", "rm"]
+    ]
+    assert len(removed) == len(expected_images)
+    assert set(removed) == set(expected_images)
+    assert harness.resources() == before | {foreign}
+    assert Path(harness.environment["KUBECONFIG"]).read_text() == "caller config must survive\n"
+    private_configs = {config for _, _, _, config, _ in calls if config}
+    private_configs.discard(harness.environment["KUBECONFIG"])
+    assert len(private_configs) == 1
+    assert all(not Path(config).parent.exists() for config in private_configs)
+
+
+def test_invocation_from_repro_directory_without_a_slash_reaches_the_scenario(
+    harness: Harness,
+) -> None:
+    before = harness.resources()
+    result = subprocess.run(
+        [harness.bash, SCRIPT.name],
+        cwd=harness.root / "charts/curie/ci/repro",
+        env=harness.environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "summary iterations=1 pass=1 recovery_500=0 other_fail=0\n" in result.stdout
+    calls = harness.calls()
+    assert sum(tool == "bash" for tool, *_ in calls) == 1
+    assert all(cwd == str(harness.root) for _, _, cwd, _, _ in calls)
+    assert harness.resources() == before
+
+
+def test_caller_build_targets_and_scenario_temps_remain_owned(harness: Harness) -> None:
+    caller_target = harness.root.parent / "caller-target"
+    harness.environment.update(
+        CARGO_TARGET_DIR=str(caller_target),
+        CARGO_BUILD_TARGET="aarch64-unknown-linux-gnu",
+        CURIE_REPRO_ITERATIONS="2",
+        REPRO_OUTCOMES="other,pass",
+    )
+    before = harness.resources()
+    result = harness.run()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "iteration=1 result=other-fail\n" in result.stdout
+    assert "iteration=2 result=pass\n" in result.stdout
+    assert "summary iterations=2 pass=1 recovery_500=0 other_fail=1\n" in result.stdout
+    assert (harness.root / "cli/target/release/curie").is_file()
+    assert not caller_target.exists()
+    calls = harness.calls()
+    run_ids = [run_id for tool, *_, run_id in calls if tool == "bash"]
+    assert len(run_ids) == 2
+    private_workdirs = {
+        Path(config).parent
+        for _, _, _, config, _ in calls
+        if config and config != harness.environment["KUBECONFIG"]
+    }
+    assert len(private_workdirs) == 1
+    workdir = private_workdirs.pop()
+    with sqlite3.connect(harness.state) as db:
+        allocations = db.execute("SELECT run_id, path FROM scenario_temps").fetchall()
+    assert {run_id for run_id, _ in allocations} == set(run_ids)
+    assert len(allocations) == 2
+    assert all(Path(path).is_relative_to(workdir) for _, path in allocations)
+    assert all(not Path(path).exists() for _, path in allocations)
+    assert not workdir.exists()
+    assert harness.resources() == before
 
 
 def test_all_classes_continue_with_combined_output_and_owned_cleanup(harness: Harness) -> None:
