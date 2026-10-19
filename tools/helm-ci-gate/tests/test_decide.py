@@ -238,8 +238,9 @@ def test_aggregate_cli_failure_exits_one():
 
 def test_workflow_triggers_are_unfiltered_on_both_releasable_branches():
     triggers = _workflow()[True]
+    assert triggers["push"]["branches"] == ["main", "next"]
+    assert triggers["pull_request"]["branches"] == ["main", "next", "epic/**"]
     for event in ("push", "pull_request"):
-        assert triggers[event]["branches"] == ["main", "next"]
         assert "paths" not in triggers[event]
         assert "paths-ignore" not in triggers[event]
 
