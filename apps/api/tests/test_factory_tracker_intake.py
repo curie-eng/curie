@@ -66,6 +66,7 @@ STARTERS_GROUP = "f1e2d3c4-0000-4000-8000-0000000000aa"
 SWEEP = 300.0
 LABEL_REFUSAL_MARKER = "curie-factory-label-refusal"
 HOLD_MARKER = "curie-factory-intake-hold"
+REPO_REFUSAL_MARKER = "<!-- curie-factory-repo-refusal -->"
 # What the DC outage answers: a body echoing the token, so a leak is visible.
 DC_SENTINEL = f"upstream echoed {bitbucket_dc.FACTORY_TOKEN}"
 DC_REPO = {
@@ -911,6 +912,158 @@ def _assert_on_dc(issue: jira_fake.JiraIssue) -> None:
         item["repository_path"],
     ) == (types.BITBUCKET_DC, bitbucket_dc.HOST, str(bitbucket_dc.REPO_ID), bitbucket_dc.REPO_PATH)
     assert item["cancelled_at"] is None
+
+
+def test_missing_repository_comments_once(
+    make_intake: Callable[[dict[str, Any]], Intake],
+) -> None:
+    intake = make_intake(_dc_document())
+    dc_issue, healthy, event = _held_tickets(intake)
+    intake.dc_down = True
+    intake.dc_status = 404
+
+    intake.poll()
+
+    assert _work_items(dc_issue) == []
+    _assert_admitted_once(intake, healthy, event)
+    assert _bot_comments(intake, healthy) == []
+    [comment] = _bot_comments(intake, dc_issue)
+    assert _marker(comment) == REPO_REFUSAL_MARKER
+    assert _code_spans(comment.body) == [DC_REPO["alias"]]
+    body = jira_fake.flatten(comment.body)
+    assert "repository" in body and "re-add" in body
+    for leaked in (DC_SENTINEL, bitbucket_dc.FACTORY_TOKEN, jira_fake.TOKEN, "NotFound"):
+        assert leaked not in body
+    assert _cursor() is not None
+    writes = intake.jira.writes
+
+    intake.sweep()
+    intake.sweep()
+
+    assert intake.jira.writes == writes
+    assert len(_bot_comments(intake, dc_issue)) == 1
+    assert _work_items(dc_issue) == []
+    _assert_admitted_once(intake, healthy, event)
+
+    intake.dc_down = False
+    intake.jira.remove_label(dc_issue.id, LABEL, intake.starter)
+    repaired_event = intake.jira.add_label(dc_issue.id, LABEL, intake.starter)
+    intake.poll()
+
+    _assert_on_dc(dc_issue)
+    _assert_admitted_once(intake, dc_issue, repaired_event)
+    _assert_admitted_once(intake, healthy, event)
+    assert len(_bot_comments(intake, dc_issue)) == 1
+
+
+def test_missing_repository_logs_warning(
+    make_intake: Callable[[dict[str, Any]], Intake], caplog: pytest.LogCaptureFixture
+) -> None:
+    intake = make_intake(_dc_document())
+    intake.agent()
+    intake.poll()
+    issue = _issue(intake)
+    intake.jira.add_label(issue.id, "repo:dc", intake.starter)
+    intake.jira.add_label(issue.id, LABEL, intake.starter)
+    intake.dc_down = True
+    intake.dc_status = 404
+
+    with caplog.at_level(logging.DEBUG):
+        intake.poll()
+
+    [warning] = [
+        record
+        for record in caplog.records
+        if record.name == "curie_api.factory_tracker_intake" and record.levelno == logging.WARNING
+    ]
+    message = warning.getMessage()
+    assert all(value in message for value in (BINDING, DC_REPO["alias"], DC_REPO["path"]))
+    assert warning.exc_info is None
+    for leaked in (DC_SENTINEL, bitbucket_dc.FACTORY_TOKEN, jira_fake.TOKEN, "NotFound"):
+        assert leaked not in caplog.text
+    assert _work_items(issue) == []
+    [comment] = _bot_comments(intake, issue)
+    assert _marker(comment) == REPO_REFUSAL_MARKER
+
+
+@pytest.mark.parametrize("read_after", [0, 1, 2], ids=["verify", "labels", "repository-probe"])
+def test_missing_issue_skips_silently(
+    make_intake: Callable[[dict[str, Any]], Intake],
+    caplog: pytest.LogCaptureFixture,
+    read_after: int,
+) -> None:
+    intake = make_intake(_dc_document())
+    intake.agent()
+    intake.poll()
+    saved = _cursor()
+    missing = _issue(intake, "Widget exporter drops the header row")
+    healthy = _issue(intake)
+    intake.jira.add_label(missing.id, "repo:dc", intake.starter)
+    intake.jira.add_label(missing.id, LABEL, intake.starter)
+    intake.jira.advance(5)
+    event = intake.jira.add_label(healthy.id, LABEL, intake.starter)
+    intake.dc_down = True
+    intake.dc_status = 404
+    intake.jira.fail_next(
+        "issue", status=404, after=read_after, body={"errorMessages": [DC_SENTINEL]}
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        intake.poll()
+
+    reads = [
+        request
+        for request in intake.jira.requests_of("issue")
+        if request.path.endswith(f"/issue/{missing.id}")
+    ]
+    assert [request.status for request in reads] == [200] * read_after + [404]
+    assert _work_items(missing) == []
+    assert _bot_comments(intake, missing) == []
+    _assert_admitted_once(intake, healthy, event)
+    assert intake.jira.requests_of("comment_create") == []
+    assert intake.jira.requests_of("comment_update") == []
+    assert len(
+        [
+            request
+            for request in intake.jira.requests_of("comments")
+            if request.path.endswith(f"/issue/{missing.id}/comment")
+        ]
+    ) == 1
+    assert intake.jira.writes == 0
+    assert _cursor() not in (None, saved)
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+    for leaked in (DC_SENTINEL, bitbucket_dc.FACTORY_TOKEN, jira_fake.TOKEN):
+        assert leaked not in caplog.text
+
+
+@pytest.mark.parametrize("failure", ["probe", "feedback"])
+def test_missing_repository_failure_holds_only_its_issue(
+    make_intake: Callable[[dict[str, Any]], Intake], failure: str
+) -> None:
+    intake = make_intake(_dc_document())
+    dc_issue, healthy, event = _held_tickets(intake)
+    intake.dc_down = True
+    intake.dc_status = 404
+    if failure == "probe":
+        intake.jira.fail_next("issue", status=503, after=2)
+    else:
+        intake.jira.fail_next("comment_create", status=503)
+
+    intake.poll()
+
+    _assert_held(intake, dc_issue)
+    _assert_admitted_once(intake, healthy, event)
+    assert _cursor() is None
+
+    intake.poll()
+
+    assert _work_items(dc_issue) == []
+    assert {_marker(comment) for comment in _bot_comments(intake, dc_issue)} == {
+        HOLD_MARKER,
+        REPO_REFUSAL_MARKER,
+    }
+    _assert_admitted_once(intake, healthy, event)
+    assert _cursor() is not None
 
 
 def test_unavailable_notice_does_not_starve_other_repositories(

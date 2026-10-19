@@ -471,10 +471,10 @@ class BitbucketDcCodeHost:
         repository. One counts when both ``fromRef`` and ``toRef`` name this
         repository's id and, when `own_user_id` is known, ``author.user.id`` is
         it (``owner_verified=True``). Without the ``X-AUSERID`` header every
-        such pull request is listed with ``owner_verified=False``, the
-        Bitbucket Cloud semantics: rediscovery ignores unverified publications,
-        so nothing is suppressed there and a reinstall can still open one
-        duplicate pull request. An item, author, branch, state, description or URL
+        such pull request is listed with ``owner_verified=False``, and
+        rediscovery ignores unverified publications on Data Center, so nothing
+        is suppressed there and a reinstall can still open one duplicate pull
+        request. An item, author, branch, state, description or URL
         that cannot be read fails the listing; a null or absent description
         is an empty body, and the ``links.self`` URL must be on the configured server
         (`types.publication_url`). ``closed_at`` is ``closedDate``, else

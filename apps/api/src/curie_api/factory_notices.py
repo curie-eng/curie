@@ -45,7 +45,7 @@ from starlette.concurrency import run_in_threadpool
 from .code_host_trust import code_host_verify
 from .config import Settings
 from .factory_comment_text import marker_for, redact_factory_comment, status_marker
-from .factory_progress import PhaseView, phase_view, pill_for
+from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, PhaseView, phase_view, pill_for
 from .factory_reply_target import stored_reply_target
 from .factory_usage import format_usd, usage_line, work_item_usage
 from .forges.capabilities import Operation, Support
@@ -172,6 +172,7 @@ _CAUSE_TEXT = {
         "no pull request checks. The pull request stays open; resolve the conflicts "
         "to continue."
     ),
+    "pr_closed": "a person closed the pull request without merging it during the CI wait.",
     "ci_fix_unpublished": (
         "a CI fix round ended without pushing a fix. The pull request stays open."
     ),
@@ -185,6 +186,7 @@ _DETAIL_CAUSES = frozenset(
         "ci_timeout",
         "ci_unverified",
         "merge_conflict",
+        "pr_closed",
         "approval_create_failed",
         "publication_unrecorded",
     }
@@ -773,13 +775,18 @@ async def _claim_next(
         .execution_options(synchronize_session=False)
     )
     target = stored_reply_target(request, work_item)
+    # The pull request belongs to the lineage's first succeeded publication: a
+    # failed attempt never pushed, so it cannot have opened it (#4744).
     opened_pr = (
         pr_number
         if pr_number is not None
         and work_item.publication_lineage_id is not None
         and await session.scalar(
             select(Publication.execution_request_id)
-            .where(Publication.lineage_id == work_item.publication_lineage_id)
+            .where(
+                Publication.lineage_id == work_item.publication_lineage_id,
+                Publication.status == "succeeded",
+            )
             .order_by(Publication.created_at, Publication.id)
             .limit(1)
         )
@@ -1184,7 +1191,13 @@ async def _render(
             view = phase_view(row.declaration, reports, request.status, cause)
         if result is not None and cause == "budget_exceeded":
             latest_note = next(
-                (report for report in reversed(reports) if report.note and report.note.strip()),
+                (
+                    report
+                    for report in reversed(reports)
+                    if report.phase != VERIFICATION_PREFLIGHT_PHASE
+                    and report.note
+                    and report.note.strip()
+                ),
                 None,
             )
             if latest_note is not None:

@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.factory_notices import FINAL_MARKER, result_section
 from forge_fakes.github_comments import admitted, comments  # noqa: F401 (fixtures)
-from test_factory_progress import DECLARATION, report
+from test_factory_progress import DECLARATION, NOT_DECLARED, report, verification
 from test_factory_status_comment import _admit, _execute, _finish_failed, _marked
 from test_factory_terminus import _label, _reconcile, _requests, _start_running
 from test_factory_usage import (  # noqa: F401 (fixtures)
@@ -197,6 +197,47 @@ def test_budget_stop_uses_the_latest_nonempty_progress_note(
     assert "Last progress note: Plan review: Found the root cause\n" in body
     assert body.count("Last progress note:") == 1
     assert "Superseded diagnosis" not in body
+
+
+PREFLIGHT_NOTE = (
+    '{"blocked_services":[],"check":null,"command":null,"exit_status":null,'
+    '"missing_binaries":[],"outcome":"not_declared"}'
+)
+
+
+def test_budget_stop_never_prints_the_verification_preflight_record(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 47561)
+    epoch = _start_running(request_id)
+    response = verification(client, request_id, NOT_DECLARED)
+    assert response.status_code == 201, response.text
+
+    body = _finish_body(client, sink, request_id, epoch)
+
+    assert PREFLIGHT_NOTE not in body
+    assert "verification_preflight" not in body
+    assert "Last progress note:" not in body
+
+
+def test_budget_stop_falls_back_to_the_latest_human_note_before_the_preflight_record(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 47562)
+    epoch = _start_running(request_id)
+    response = report(client, request_id, "plan_review", note="Found the root cause")
+    assert response.status_code == 201, response.text
+    response = verification(client, request_id, NOT_DECLARED)
+    assert response.status_code == 201, response.text
+
+    body = _finish_body(client, sink, request_id, epoch)
+
+    assert "Last progress note: Plan review: Found the root cause\n" in body
+    assert body.count("Last progress note:") == 1
+    assert PREFLIGHT_NOTE not in body
+    assert "verification_preflight" not in body
 
 
 @pytest.mark.parametrize("with_report", [False, True])
