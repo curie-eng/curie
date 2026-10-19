@@ -327,7 +327,7 @@ fn local_runners_explicitly_declare_standalone_input_context() {
             ..spec()
         },
     ] {
-        let args = candidate.run_args();
+        let args = candidate.run_args("curie-snapshot-acme-test");
         assert!(
             args.windows(2).any(|pair| pair[0] == "-e" && pair[1] == "CURIE_INPUT_CONTRACT_CONTEXT=standalone"),
             "local skill/eval runner must explicitly declare its standalone context: {args:?}"
@@ -342,7 +342,7 @@ fn local_bundle_checks_explicitly_declare_standalone_input_context() {
         plugin_dir: "/tmp/demo".into(),
         timeout_s: 30,
     }
-    .run_args();
+    .run_args("curie-snapshot-acme-test");
     assert!(args
         .windows(2)
         .any(|pair| pair[0] == "-e" && pair[1] == "CURIE_INPUT_CONTRACT_CONTEXT=standalone"));

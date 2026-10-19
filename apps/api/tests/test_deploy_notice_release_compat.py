@@ -44,17 +44,17 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # application windows remain fixed while the candidate advances. The
     # minimum is the join containing both the stable reply selector columns
     # and the feature train schema.
-    candidate = {"schema_min": "0108", "schema_head": "0108"}
+    candidate = {"schema_min": "0109", "schema_head": "0109"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
     assert catalog["windows"]["0.12.2"] == {"schema_min": "0076", "schema_head": "0081"}
     assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
     assert catalog["candidate"] == candidate
-    assert catalog["windows"]["0.13.0"] == candidate
-    assert catalog["revisions"][-12:] == [
+    assert catalog["windows"]["0.13.0"] == {"schema_min": "0108", "schema_head": "0108"}
+    assert catalog["revisions"][-13:] == [
         "0095", "0096", "0097", "0098", "0099", "0100", "0101", "0102", "0103",
-        "0105", "0107", "0108",
+        "0105", "0107", "0108", "0109",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(

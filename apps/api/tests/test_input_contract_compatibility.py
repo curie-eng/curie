@@ -244,6 +244,46 @@ def test_central_admission_refuses_incompatible_input_before_allocating_work(
     create_revision.assert_not_awaited()
 
 
+def test_admission_carries_verified_receipt_from_normalized_namespace_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_api import workitem_dispatch
+    from curie_api.forges.types import RepositoryRef, TrackerIssueRef
+
+    install_transports(monkeypatch)
+    monkeypatch.setattr(
+        workitem_dispatch,
+        "_admission_refusal",
+        AsyncMock(return_value=SimpleNamespace(adapter=None)),
+    )
+    allocate = AsyncMock(return_value=SimpleNamespace(accepted=True))
+    monkeypatch.setattr(workitem_dispatch, "_admit_new", allocate)
+    session = SimpleNamespace(scalar=AsyncMock(return_value=None))
+    facts = SimpleNamespace(
+        agent_id=AGENT,
+        request_id=uuid.uuid4(),
+        kind="github",
+        address="example/repository",
+        reply_conversation_id="issue-1",
+        issue=TrackerIssueRef("github", "github.com", "fixture", "1"),
+        repository=RepositoryRef("github", "github.com", "fixture", "example/repository"),
+        code_host_installation_id=None,
+        objective="Implement the reviewed behavior",
+        requester="fixture-user",
+        reply_url="https://github.com/example/repository/issues/1",
+    )
+
+    result = asyncio.run(workitem_dispatch.admit(session, facts))
+
+    assert result.accepted
+    allocated = allocate.await_args.args[1]
+    assert allocated.input_contract_receipt == admit()
+    assert allocated.issue == facts.issue
+    assert allocated.repository == facts.repository
+    assert allocated.reply_url == facts.reply_url
+    assert not hasattr(facts, "input_contract_receipt")
+
+
 def test_central_start_refuses_changed_runtime_before_mutating_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -254,11 +294,22 @@ def test_central_start_refuses_changed_runtime_before_mutating_execution(
     install_transports(monkeypatch)
     receipt = admit()
     now = datetime.now(UTC)
-    item = SimpleNamespace(id=uuid.uuid4(), agent_id=AGENT, version=1)
+    context = workitem_dispatch.FactoryContext(
+        agent_id=AGENT,
+        tenant_id=uuid.uuid4(),
+        binding_id=uuid.uuid4(),
+        kind="github",
+        address="example/repository",
+        adapter=None,
+    )
+    monkeypatch.setattr(workitem_dispatch, "_factory_context", AsyncMock(return_value=context))
+    item = SimpleNamespace(id=uuid.uuid4(), agent_id=AGENT, version=1, cancelled_at=None)
     request = SimpleNamespace(
         id=uuid.uuid4(),
         version=1,
         input_contract_receipt=receipt,
+        status="waiting",
+        wait_deadline=now + timedelta(minutes=1),
         acquire_owner="fixture-worker",
         acquired_generation=1,
         acquire_expires_at=now + timedelta(minutes=1),
@@ -276,6 +327,7 @@ def test_central_start_refuses_changed_runtime_before_mutating_execution(
             generation=1,
             claim_name="fixture-claim",
             sandbox_name="fixture-sandbox",
+            context=context,
             runtime_deployment_id=DEPLOYMENT,
             runtime_version_id=uuid.UUID("55555555-5555-4555-8555-555555555555"),
             runtime_bundle_sha256=BUNDLE,

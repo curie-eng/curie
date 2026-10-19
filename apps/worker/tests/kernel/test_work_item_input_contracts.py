@@ -45,9 +45,19 @@ class VersionedItems(_WorkItems):
         self.deferrals.append(kwargs)
         return None
 
-    async def acquire(self, request_id, *, owner, generation):
-        grant = await super().acquire(request_id, owner=owner, generation=generation)
-        return replace(grant, input_contract_receipt=dict(RECEIPT))
+    async def acquire(self, request_id, *, owner, generation, wake, context):
+        grant = await super().acquire(
+            request_id, owner=owner, generation=generation, wake=wake, context=context
+        )
+        grant = replace(grant, input_contract_receipt=dict(RECEIPT))
+        self.acquisitions[request_id] = grant
+        return grant
+
+    async def running_for_conversation(self, conversation_id, *, wake):
+        running = await super().running_for_conversation(conversation_id, wake=wake)
+        if running is None:
+            return None
+        return replace(running, input_contract_receipt=dict(RECEIPT))
 
 
 class VersionedBinding(_Binding):
@@ -67,6 +77,9 @@ class VersionedBinding(_Binding):
             resolved.endpoint = "https://current-adapter.example.test/replies"
             resolved.adapter = "fixture-current-adapter"
         return resolved
+
+    async def resolve_factory(self, context):
+        return await self.resolve(context.kind, context.adapter, context.address)
 
     async def resolve_deployment(self, agent_id, deployment_id):
         assert agent_id == AGENT_ID

@@ -78,11 +78,11 @@ class WorkItemAcquireGrant:
     wait_deadline: datetime
     repository_path: str
     context: FactoryContext
+    input_contract_receipt: dict[str, Any] | None = None
 
     @property
     def agent_id(self) -> uuid.UUID:
         return self.context.agent_id
-    input_contract_receipt: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

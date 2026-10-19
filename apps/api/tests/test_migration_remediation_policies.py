@@ -40,7 +40,7 @@ BELOW = "0086"
 # follows all of it, #2911's tenant scope (0101) follows that, #3831's reply
 # target (0102), tracker identity (0103) and the trigger label (0105) revisions
 # follow that, and the train join revision (0108) is last.
-HEAD = "0108"
+HEAD = "0109"
 
 POLICY_COLUMNS = {"agent_id", "hook", "generation", "operation_id", "armed", "active", "updated_at"}
 GENERATION_COLUMNS = {
