@@ -1047,7 +1047,8 @@ def test_diff_review_failure_keeps_completed_phases_after_renewed_plan_review(
     body = comment["body"]
     for label in ("Plan", "Plan review", "Failing test", "Implement"):
         assert f"[x] {label}" in body
-    assert "[ ] **Review diff** (in progress)" in body
+    assert "[ ] **Review diff** (stopped here)" in body
+    assert "in progress" not in body
     assert "[ ] Publish PR" in body
     assert "Status: NEEDS HUMAN" in body
     assert "Status: FAILED" not in body
