@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -124,11 +126,16 @@ SHARD_RECORD_EXPRESSIONS = {
 }
 
 
+@lru_cache(maxsize=1)
+def _parse_workflow(contents: str) -> Any:
+    return yaml.safe_load(contents)
+
+
 def _python_job(job_id: str = "python") -> dict[str, Any]:
-    workflow = yaml.safe_load(WORKFLOW.read_text())
+    workflow = _parse_workflow(WORKFLOW.read_text())
     job = workflow["jobs"][job_id]
     assert isinstance(job, dict)
-    return job
+    return deepcopy(job)
 
 
 def _named_steps(job_id: str = "python") -> dict[str, dict[str, Any]]:
@@ -157,6 +164,34 @@ def _needs(job: dict[str, Any]) -> list[str]:
 SHARDS_SELECTED = "${{ needs.changes.outputs.pytest == 'true' }}"
 PYTEST_NOT_SELECTED = "steps.python-runtime.outputs.pytest == 'false'"
 DECISION_STEP = "Decide whether compose and pytest are needed"
+
+
+def test_python_job_sees_workflow_updates_and_isolates_mutations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workflow = tmp_path / "ci.yaml"
+    contents = (
+        "jobs:\n"
+        "  python:\n"
+        "    steps:\n"
+        "      - name: initial\n"
+        "        env:\n"
+        "          VALUE: initial\n"
+    )
+    workflow.write_text(contents)
+    monkeypatch.setattr(sys.modules[__name__], "WORKFLOW", workflow)
+
+    job = _python_job()
+    assert job == {"steps": [{"name": "initial", "env": {"VALUE": "initial"}}]}
+    job["steps"][0]["env"]["VALUE"] = "mutated"
+    job["steps"].append({"name": "extra"})
+    assert _python_job() == {"steps": [{"name": "initial", "env": {"VALUE": "initial"}}]}
+
+    workflow.write_text(contents.replace("initial", "updated"))
+    updated = _python_job()
+    assert updated == {"steps": [{"name": "updated", "env": {"VALUE": "updated"}}]}
+    updated["steps"][0]["name"] = "mutated"
+    assert _python_job() == {"steps": [{"name": "updated", "env": {"VALUE": "updated"}}]}
 
 
 @pytest.mark.parametrize(
