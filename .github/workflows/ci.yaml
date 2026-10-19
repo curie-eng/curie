@@ -8,9 +8,8 @@ on:
     # Commit events only. A title or body edit must not cancel an in-flight
     # run and restart kind shards. Body-edit guards live in their own workflows.
     types: [opened, synchronize, reopened]
-  # Manual run of the full suite, including kind. The nightly workflow on
-  # main dispatches this against next. Scheduled workflows only run from
-  # the default branch, so the schedule itself cannot live here.
+  # Manual run of the full suite, including kind. The scheduled workflow on
+  # the default branch dispatches this against main or next.
   workflow_dispatch:
 
 # The event name is part of the group so a dispatch is not cancelled by a
@@ -2711,14 +2710,13 @@ jobs:
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
-      # Kind normally stays on main. Next pull requests and pushes to next
-      # omit it except when a PR changes cluster runtime assertions or the
-      # released-upgrade jobs; a dispatch (including nightly) keeps it.
+      # Pushes to both release train branches omit kind. Next pull requests
+      # omit it except for changed runtime assertions or upgrade jobs.
+      # Dispatches select the full kind tier and upgrade matrix.
       - id: filter
         run: |
           set -euo pipefail
           event="${{ github.event_name }}"
-          ref="${{ github.ref }}"
           base_ref="${{ github.base_ref }}"
           if [ "$event" = "pull_request" ]; then
             git fetch --quiet origin "$base_ref"
@@ -2732,14 +2730,14 @@ jobs:
               --base "origin/$base_ref" \
               --head HEAD \
               "${extra[@]}"
-          elif [ "$event" = "push" ] && [ "$ref" = "refs/heads/next" ]; then
+          elif [ "$event" = "push" ]; then
             uv run --no-project --with pyyaml==6.0.3 python \
               tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --push \
               --omit-kind
           else
-            # workflow_dispatch and push to main. Dispatch is the nightly run.
+            # workflow_dispatch keeps the full suite, including kind.
             uv run --no-project --with pyyaml==6.0.3 python \
               tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
@@ -3722,11 +3720,10 @@ jobs:
   # ROLLOUT-FREE FIRST INVOCATION AND DEAD-CONSUMER RECOVERY (QA4-02), off the
   # pull request path. It needs a full platform install of its own, which on a
   # pull request would sit on the cluster rung's critical path. It runs on every
-  # push to main and on every dispatch, including the nightly kind dispatch on
-  # next (nightly-kind.yaml), whenever the cluster tier is selected. The
-  # pull request cluster rung still drives the first no-Slack `cluster message`
-  # through the parity ladder; this job adds the rollout-free and PEL recovery
-  # assertions.
+  # dispatch of main or next (nightly-kind.yaml), whenever the cluster tier is
+  # selected. The pull request cluster rung still drives the first no-Slack
+  # `cluster message` through the parity ladder; this job adds the rollout-free
+  # and PEL recovery assertions.
   e2e-cluster-rollout-recovery:
     name: E2E rollout-free invocation and dead-consumer recovery (kind)
     runs-on: ubuntu-latest
@@ -4716,7 +4713,7 @@ jobs:
     name: E2E released chart upgrade negative control (nil unsafe helpers)
     runs-on: ubuntu-latest
     needs: [rust-build, changes, ci-images]
-    if: ${{ needs.changes.outputs.released_upgrade_full == 'true' }}
+    if: ${{ needs.changes.outputs.released_upgrade == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -4893,11 +4890,9 @@ jobs:
   # released-upgrade. Unrelated CLI, docs, and UI PRs must not occupy 12 kind
   # runners. The shard lister stays on every PR so coverage cannot drift.
   #
-  # An ordinary pull request that selects released-upgrade runs only the
-  # smoke shard, s01: no failure injection, covering fresh install, N-1 to N
-  # upgrade with state, same-version upgrade, and soak refusal. A PR editing
-  # these upgrade jobs, a push to main, or a dispatch (nightly on next) runs
-  # every shard plus the released chart upgrade jobs above.
+  # Every pull request that selects released-upgrade runs the smoke shard,
+  # s01, and the released chart negative control. Dispatches run every shard
+  # and the positive released chart upgrade job as well.
   e2e-cluster-upgrade-matrix-shards:
     name: E2E cluster upgrade matrix shards
     runs-on: ubuntu-latest
@@ -5188,7 +5183,7 @@ jobs:
                   "$FORGE_INSTANCE_RESULT" != "$factory_expected" ||
                   "$ADMITTED_AGENT_RESULT" != "$factory_expected" ||
                   "$RELEASED_UPGRADE_RESULT" != "$released_upgrade_expected" ||
-                  "$RELEASED_UPGRADE_NEGATIVE_RESULT" != "$released_upgrade_expected" ||
+                  "$RELEASED_UPGRADE_NEGATIVE_RESULT" != "$released_upgrade_negative_expected" ||
                   "$UPGRADE_MATRIX_RESULT" != "$upgrade_matrix_expected" ]]; then
               return 1
             fi
@@ -5250,15 +5245,16 @@ jobs:
           if [[ "$FACTORY_SELECTED" == "true" ]]; then
             factory_expected="success"
           fi
-          # Full runs include pushes, dispatches, and PRs editing an upgrade
-          # job. Ordinary PRs selecting released-upgrade run one smoke shard.
-          # The matrix reports success only when all selected shards succeed.
+          # Dispatches run the positive upgrade. Every selected upgrade tier
+          # runs its negative control and all selected matrix shards.
           released_upgrade_expected="skipped"
           if [[ "$RELEASED_UPGRADE_FULL" == "true" ]]; then
             released_upgrade_expected="success"
           fi
+          released_upgrade_negative_expected="skipped"
           upgrade_matrix_expected="skipped"
           if [[ "$RELEASED_UPGRADE_SELECTED" == "true" ]]; then
+            released_upgrade_negative_expected="success"
             upgrade_matrix_expected="success"
           fi
 
