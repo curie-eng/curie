@@ -47,7 +47,7 @@ def _snapshot(valkey: redis.Redis, agent_id: str, stream: str) -> tuple[Any, ...
     return (
         valkey.dump(_claim(agent_id)),
         valkey.dump(_receipt_key(agent_id)),
-        valkey.xrange(stream),
+        valkey.dump(stream),
         _backlog(valkey, agent_id),
     )
 
@@ -278,7 +278,8 @@ def test_oversized_reply_conversation_refuses_before_claim_quota_and_enqueue(
     hooks_client: TestClient, hook_agent: str, valkey: redis.Redis, runs_stream: str,
 ) -> None:
     """@spec HOOK-RECEIPT-2: account for UTF-8 and JSON encoding before any writes."""
-    refused = _explicit(hooks_client, hook_agent, "\u2603" * 16384)
+    # Escaped JSON exceeds 16KiB while the URL stays below HTTPx's URL cap.
+    refused = _explicit(hooks_client, hook_agent, "\u2603" * 3000)
     assert refused.status_code == 422, refused.text
     assert not valkey.exists(_claim(hook_agent), _receipt_key(hook_agent))
     assert _backlog(valkey, hook_agent) == {}
@@ -481,5 +482,36 @@ def test_changed_claim_between_observation_and_receipt_read_refuses(
     monkeypatch.setattr(client, "get", get_then_replace)
     refused = _post(hooks_client, hook_agent)
     assert replaced
+    assert refused.status_code == 409, refused.text
+    assert _snapshot(valkey, hook_agent, runs_stream) == saved
+
+
+@pytest.mark.parametrize("bad_payload", ["malformed-json", "invalid-turn", "invalid-utf8"])
+def test_legacy_unverifiable_queue_payload_refuses_without_mutation(
+    hooks_client: TestClient, hook_agent: str, valkey: redis.Redis, runs_stream: str,
+    bad_payload: str,
+) -> None:
+    """@spec HOOK-RECEIPT-4: corrupt legacy evidence refuses instead of raising 500."""
+    first = _post(hooks_client, hook_agent)
+    assert first.status_code == 200, first.text
+    stream_id = first.json()["stream_id"]
+    ((original_id, fields),) = valkey.xrange(runs_stream)
+    assert original_id == stream_id
+    original_claim = valkey.get(_claim(hook_agent))
+    payloads: dict[str, str | bytes] = {
+        "malformed-json": "{",
+        "invalid-turn": '{"synthetic":"not-a-QueuedTurn"}',
+        "invalid-utf8": b"\xff",
+    }
+    fields["payload"] = payloads[bad_payload]
+    valkey.delete(_receipt_key(hook_agent))  # Emulate a legacy producer.
+    # Recreate this isolated, single-entry fixture stream at the identical ID.
+    # All other fields and the permanent delivery claim remain unchanged.
+    valkey.delete(runs_stream)
+    assert valkey.xadd(runs_stream, fields, id=stream_id) == stream_id
+    assert valkey.get(_claim(hook_agent)) == original_claim
+    assert valkey.ttl(_claim(hook_agent)) == -1
+    saved = _snapshot(valkey, hook_agent, runs_stream)
+    refused = _post(hooks_client, hook_agent)
     assert refused.status_code == 409, refused.text
     assert _snapshot(valkey, hook_agent, runs_stream) == saved
