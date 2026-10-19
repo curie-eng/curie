@@ -938,6 +938,8 @@ jobs:
     needs: [rust-select, rust-test-build]
     if: ${{ needs.rust-select.outputs.tests == 'true' }}
     timeout-minutes: 45
+    env:
+      CI_REQUIRE_DOCKER_TESTS: "1"
     steps:
       - uses: actions/checkout@v7
         with:
