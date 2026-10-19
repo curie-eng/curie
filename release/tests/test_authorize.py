@@ -1681,7 +1681,7 @@ class TestHelmCiWorkflowTriggers:
         assert triggers["push"]["branches"] == ["main", "next"]
         assert "paths" not in triggers["push"]
         assert "paths-ignore" not in triggers["push"]
-        assert triggers["pull_request"]["branches"] == ["main", "next"]
+        assert triggers["pull_request"]["branches"] == ["main", "next", "epic/**"]
         assert "paths" not in triggers["pull_request"]
         assert "paths-ignore" not in triggers["pull_request"]
         # Those trees are executed by the chart scripts. The list now lives
