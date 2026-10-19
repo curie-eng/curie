@@ -3618,11 +3618,10 @@ jobs:
   # ROLLOUT-FREE FIRST INVOCATION AND DEAD-CONSUMER RECOVERY (QA4-02), off the
   # pull request path. It needs a full platform install of its own, which on a
   # pull request would sit on the cluster rung's critical path. It runs on every
-  # dispatch of main or next (nightly-kind.yaml), whenever the cluster tier
-  # is selected. The
-  # pull request cluster rung still drives the first no-Slack `cluster message`
-  # through the parity ladder; this job adds the rollout-free and PEL recovery
-  # assertions.
+  # dispatch of main or next (nightly-kind.yaml), whenever the cluster tier is
+  # selected. The pull request cluster rung still drives the first no-Slack
+  # `cluster message` through the parity ladder; this job adds the rollout-free
+  # and PEL recovery assertions.
   e2e-cluster-rollout-recovery:
     name: E2E rollout-free invocation and dead-consumer recovery (kind)
     runs-on: ubuntu-latest
