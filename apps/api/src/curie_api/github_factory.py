@@ -441,8 +441,8 @@ async def _refuse_rediscovered(
     """Refuse a label admission with no local WorkItem when the code host
     already has this issue's factory publication (#4629).
 
-    Raises `FactoryRefused` ``publication_exists`` (an open or
-    ambiguous one is named on the issue; a completed one whose trigger this
+    Raises `FactoryRefused` ``publication_exists`` (an open, ambiguous or
+    unconfirmed one is named on the issue; a completed one whose trigger this
     replays is logged), or `FeedbackUnavailable` when the evidence cannot be
     read completely, so the caller defers instead of admitting.
     """

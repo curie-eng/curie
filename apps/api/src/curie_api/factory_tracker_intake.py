@@ -619,7 +619,8 @@ async def _rediscovered(
     """True when the code host already has this issue's factory publication,
     so an admission with no local WorkItem is refused (#4629).
 
-    An open or ambiguous one is named on the issue; a completed one
+    An open, ambiguous or unconfirmed (Bitbucket Cloud, #4747) one is named
+    on the issue; a completed one
     whose trigger this notice replays is only logged. Evidence that cannot be
     read completely defers (one of ``_DEFERRED``), so the cursor stays. A
     `NotFound` from the listing defers too: the repository was just resolved, so
