@@ -205,6 +205,7 @@ stray generic `PORT` or `POLL_INTERVAL` in the pod environment cannot reach one.
 | `CURIE_MAIL_ALLOW_ALL_SENDERS` | `false` | explicit opt in permitting a `*` entry at boot. Never bypasses sender authentication, so every current AgentMail message is still refused |
 | `CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS` | "" | comma-separated CIDRs the egress policy admits for AgentMail. When set, the AgentMail client dials only addresses inside them (see below). Empty dials whatever DNS returns |
 | `CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS` | `120` | how long a continuous discovery failure run lasts before `/readyz` reports 503. Must be greater than zero |
+| `CURIE_MAIL_PROVIDER` | `agentmail` | the mail provider (ADR 0228). `agentmail` is built in; any other name is a provider package registered in the `curie.mail_provider` entry-point group (see "Mail providers"). The state file records its provider on first boot, and a different provider refuses to start on it |
 
 ### Egress pinning and discovery readiness
 

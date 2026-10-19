@@ -1,13 +1,20 @@
-"""The AgentMail REST client: the adapter's only outbound provider surface.
+"""AgentMail: the built-in mail provider (ADR 0228) and its REST client.
 
-Four calls, all stdlib ``urllib``. Every method returns ``(status, parsed)`` and
-never raises for a transport failure, which is reported as status ``0`` so the
-caller can tell "the provider said no" from "the provider was unreachable".
-Bearer auth is on every call (https://docs.agentmail.to/api-reference/overview).
+``AgentMailClient`` is four calls, all stdlib ``urllib``. Every method returns
+``(status, parsed)`` and never raises for a transport failure, which is
+reported as status ``0`` so the caller can tell "the provider said no" from
+"the provider was unreachable". Bearer auth is on every call
+(https://docs.agentmail.to/api-reference/overview).
+
+``AgentMailProvider`` puts that client behind the mail provider interface in
+``provider.py``: it owns AgentMail's labels, paging, text fields, header map,
+404 body rule and egress pinning, and maps every HTTP answer to a neutral
+failure kind.
 """
 
 from __future__ import annotations
 
+import email.utils
 import errno
 import http.client
 import ipaddress
@@ -21,6 +28,18 @@ from dataclasses import dataclass
 from typing import Any
 
 from .config import MailAdapterConfig
+from .provider import (
+    ACCEPTED,
+    FAILURE_CAUSE_MAX_CHARS,
+    INTERFACE_VERSION,
+    UNVERIFIABLE,
+    Accepted,
+    Failure,
+    Message,
+    MessagePage,
+    MessageSummary,
+    ThreadAnswer,
+)
 
 HTTP_TIMEOUT_SECONDS = 30.0
 EGRESS_REFUSAL_ERROR = "connection_refused"
@@ -203,7 +222,7 @@ def _quoted(value: str) -> str:
 
 
 class AgentMailClient:
-    """The provider seam. Holds the config; owns no state of its own."""
+    """AgentMail's REST API. Holds the config; owns no state of its own."""
 
     def __init__(self, config: MailAdapterConfig) -> None:
         self.config = config
@@ -261,3 +280,184 @@ class AgentMailClient:
             f"/inboxes/{self._inbox}/messages/{_quoted(message_id)}/reply",
             body,
         )
+
+
+# -- the built-in mail provider (ADR 0228) -------------------------------------
+
+OVERSIZE_ERROR = "response body exceeds configured byte limit"
+
+
+class AgentMailProvider:
+    """AgentMail behind the mail provider interface.
+
+    AgentMail exposes labels and an arbitrary header map, without a trusted
+    aligned authentication verdict or a guarantee of header provenance or
+    stripping, and its inbound policy permits DMARC failure under ``p=none``
+    (https://docs.agentmail.to/api-reference/inboxes/messages/get,
+    https://docs.agentmail.to/knowledge-base/inbound-emails-missing). So this
+    provider declares ``verifies_senders`` false and every read carries
+    ``unverifiable``: an AgentMail install refuses every message from the
+    listing alone, before any body fetch.
+
+    A reply is visible in its thread as soon as Reply To Message returns, so
+    ``sent_visible_within`` is zero.
+    """
+
+    name = "agentmail"
+    interface_version = INTERFACE_VERSION
+    verifies_senders = False
+    sent_visible_within = 0.0
+
+    def __init__(self, config: MailAdapterConfig, client: AgentMailClient | None = None) -> None:
+        self.config = config
+        self.client = client if client is not None else AgentMailClient(config)
+
+    @property
+    def inbox_address(self) -> str:
+        """``AGENTMAIL_INBOX``, so every existing conversation keeps its identity."""
+        return self.config.agentmail_inbox
+
+    def config_problems(self) -> list[str]:
+        """The AgentMail settings this provider cannot run without."""
+        problems = []
+        for env_name, value in (
+            ("AGENTMAIL_INBOX", self.config.agentmail_inbox),
+            ("AGENTMAIL_API_KEY", self.config.agentmail_api_key),
+        ):
+            if not value.strip():
+                problems.append(f"{env_name} is required and is unset or empty")
+        return problems
+
+    def list_messages(self, cursor: str | None, limit: int) -> MessagePage | Failure:
+        """One page of the inbox, with the three ``include_*=false`` constants."""
+        status, page = self.client.list_messages(limit, cursor)
+        if status != 200 or not isinstance(page, dict):
+            return self._failure(status, page)
+        summaries = []
+        for item in page.get("messages", []):
+            if not isinstance(item, dict):
+                continue
+            message_id = str(item.get("message_id") or "")
+            summaries.append(
+                MessageSummary(
+                    message_id=message_id,
+                    thread_id=str(item.get("thread_id") or message_id),
+                    sent_by_inbox="sent" in _labels(item),
+                    senders=_mailboxes(item.get("from")),
+                )
+            )
+        next_cursor = page.get("next_page_token") or None
+        return MessagePage(tuple(summaries), str(next_cursor) if next_cursor else None)
+
+    def get_message(self, message_id: str) -> Message | Failure:
+        """Get Message, normalized. ``extracted_text`` is the new text without quoted history."""
+        status, full = self.client.get_message(message_id)
+        if status != 200 or not isinstance(full, dict):
+            return self._failure(status, full)
+        headers = full.get("headers")
+        return Message(
+            message_id=str(full.get("message_id") or message_id),
+            thread_id=str(full.get("thread_id") or message_id),
+            subject=str(full.get("subject") or ""),
+            senders=_mailboxes(full.get("from")),
+            to=_mailboxes(full.get("to")),
+            cc=_mailboxes(full.get("cc")),
+            new_text=_text_or_none(full.get("extracted_text")),
+            text=_text_or_none(full.get("text")),
+            new_html=_text_or_none(full.get("extracted_html")),
+            html=_text_or_none(full.get("html")),
+            headers=(
+                {str(key): str(value) for key, value in headers.items()}
+                if isinstance(headers, dict)
+                else None
+            ),
+            verdict=UNVERIFIABLE,
+        )
+
+    def send_reply(self, message_id: str, text: str, reply_all: bool) -> Accepted | Failure:
+        """Reply To Message, sender-only unless ``reply_all``."""
+        status, body = self.client.reply(message_id, text, reply_all=reply_all)
+        if 200 <= status < 300:
+            return ACCEPTED
+        return self._failure(status, body)
+
+    def thread_contains(self, thread_id: str, marker: str) -> ThreadAnswer | Failure:
+        """Get Thread, scanning each message's text fields for the marker.
+
+        Only AgentMail's own answer is deletion: a 404 carrying a JSON object.
+        A 404 with any other body came from something between the adapter and
+        AgentMail, such as an edge or gateway page, and is unreadable, because
+        a deletion is a permanent tombstone after which no retry asks again.
+        https://docs.agentmail.to/api-reference/inboxes/threads/get
+        """
+        status, thread = self.client.get_thread(thread_id)
+        if status == 404:
+            if isinstance(thread, dict):
+                return "deleted"
+            return Failure("server_error", "http_404_without_provider_body")
+        if status != 200 or not isinstance(thread, dict):
+            return self._failure(status, thread)
+        for message in thread.get("messages", []):
+            if not isinstance(message, dict):
+                continue
+            for field in ("extracted_text", "text", "preview"):
+                if marker in str(message.get(field) or ""):
+                    return "yes"
+        return "no"
+
+    def _failure(self, status: int, body: Any) -> Failure:
+        """Map one AgentMail answer to a neutral failure with a bounded cause.
+
+        Only a status 0 body is one this package wrote (``request`` builds it
+        for a refused connection, another ``OSError`` or an oversize response),
+        so only that body is read. Every other body is provider authored and may
+        carry mail content, so it is reduced to its status token.
+        """
+        if status == 0:
+            error = body.get("error") if isinstance(body, dict) else None
+            if error == EGRESS_REFUSAL_ERROR:
+                return Failure("egress_refused", EGRESS_REFUSAL_ERROR)
+            if error == OVERSIZE_ERROR:
+                return Failure("too_large", OVERSIZE_ERROR)
+            return Failure("unreachable", self._local_cause(error))
+        cause = f"http_{status}" if 100 <= status <= 599 else "http_invalid"
+        if status == 429:
+            return Failure("rate_limited", cause)
+        if 400 <= status < 500:
+            return Failure("refused", cause)
+        # A 5xx, and anything else that is not an answer, neither arms nor
+        # clears a poll backoff (the adapter's existing rule for a 5xx).
+        return Failure("server_error", cause)
+
+    def _local_cause(self, error: Any) -> str:
+        """A locally written error string, redacted of the API key and bounded."""
+        if not isinstance(error, str) or not error.strip():
+            return "unavailable"
+        cause = " ".join(error.split())
+        if self.config.agentmail_api_key:
+            cause = cause.replace(self.config.agentmail_api_key, "[redacted]")
+        if len(cause) > FAILURE_CAUSE_MAX_CHARS:
+            cause = cause[:FAILURE_CAUSE_MAX_CHARS] + "..."
+        return cause
+
+
+def _labels(message: dict[str, Any]) -> list[str]:
+    return [str(label).strip().lower() for label in (message.get("labels") or [])]
+
+
+def _mailboxes(value: Any) -> tuple[str, ...]:
+    """Every mailbox in an address field, as listed, one string each.
+
+    AgentMail serves addresses "In format `username@domain.com` or `Display Name
+    <username@domain.com>`", as a string or a list of them.
+    """
+    entries = value if isinstance(value, list) else [value]
+    found: list[str] = []
+    for name, address in email.utils.getaddresses([str(entry) for entry in entries if entry]):
+        if address:
+            found.append(email.utils.formataddr((name, address)) if name else address)
+    return tuple(found)
+
+
+def _text_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) else None

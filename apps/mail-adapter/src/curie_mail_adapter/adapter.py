@@ -1,4 +1,9 @@
-"""AgentMail ingress and email egress backed by one durable local state store."""
+"""The neutral email adapter: mail ingress and egress over one durable local store.
+
+Everything here is independent of the mail service. The service sits behind
+the mail provider interface (``provider.py``, ADR 0228); AgentMail is the
+built-in provider (``agentmail.AgentMailProvider``).
+"""
 
 from __future__ import annotations
 
@@ -14,14 +19,15 @@ import threading
 import time
 import urllib.parse
 from collections import OrderedDict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal
 
 from channel_protocol import SettledOutcome
 
-from .agentmail import EGRESS_REFUSAL_ERROR, AgentMailClient, request
+from .agentmail import AgentMailClient, AgentMailProvider, request
 from .config import MailAdapterConfig
+from .provider import Failure, MailProvider, Message, MessageSummary
 from .state import MailState
 
 logger = logging.getLogger(__name__)
@@ -42,7 +48,26 @@ BACKOFF_MAX_SECONDS = 60.0
 # both use the bounded discovery backoff. A 5xx deliberately retains its prior
 # semantics: it neither arms nor clears an already armed delay.
 CAUSE_MAX_CHARS = 120
+# Refusal reasons the inbound gate records (ADR 0228 decision 3). Each leaves
+# the same id-only ``rejected`` receipt.
 AUTHENTICATION_UNVERIFIABLE = "authentication_unverifiable"
+AUTHENTICATION_FAILED = "authentication_failed"
+AUTHENTICATION_MISALIGNED = "authentication_domain_mismatch"
+SENDER_NOT_ALLOWED = "sender_not_allowed"
+SENDER_NOT_SINGLE = "sender_not_single_mailbox"
+
+# What a discovery pass reports for each neutral failure kind. The poll loop's
+# backoff and readiness rules were written for HTTP statuses: a transport
+# failure (0) and a refusal (4xx) arm the bounded backoff, and a 5xx neither
+# arms nor clears it. Each kind keeps the behavior it had as a status.
+_DISCOVERY_STATUS: dict[str, int] = {
+    "unreachable": 0,
+    "egress_refused": 0,
+    "too_large": 0,
+    "rate_limited": 429,
+    "refused": 400,
+    "server_error": 500,
+}
 
 # What one channel port POST settled: admitted, refused for good by the
 # binding's caller list (403, ADR 0175), or left pending for another attempt.
@@ -108,20 +133,44 @@ class ProviderThreadDeletedError(RuntimeError):
 
 
 class ProviderEgressRefusedError(RuntimeError):
-    """The outbound AgentMail connection was refused before an HTTP response."""
+    """The outbound provider connection was refused before an answer."""
 
 
 class MailAdapter:
-    """One AgentMail inbox bridged to one Curie channel binding."""
+    """One mail provider's inbox bridged to one Curie channel binding."""
 
-    def __init__(self, config: MailAdapterConfig, client: AgentMailClient | None = None) -> None:
+    def __init__(
+        self,
+        config: MailAdapterConfig,
+        client: AgentMailClient | None = None,
+        *,
+        provider: MailProvider | None = None,
+    ) -> None:
+        """Build the adapter over one provider.
+
+        Args:
+            config: the neutral adapter settings.
+            client: an AgentMail client for the built-in provider; ignored when
+                ``provider`` is given.
+            provider: the mail provider; defaults to AgentMail over ``client``.
+
+        Raises:
+            RuntimeError: the state file belongs to another provider.
+        """
         self.config = config
-        self.client = client if client is not None else AgentMailClient(config)
+        self.provider: MailProvider = (
+            provider if provider is not None else AgentMailProvider(config, client)
+        )
         self.state = MailState(
             config.state_path,
             max_pending=config.max_pending_deliveries,
             max_bytes=config.max_state_bytes,
         )
+        try:
+            self.state.bind_provider(self.provider.name)
+        except BaseException:
+            self.state.close()
+            raise
         self.shutdown = threading.Event()
         self.ready = threading.Event()
         self.lock = self.state.lock
@@ -142,6 +191,11 @@ class MailAdapter:
         self.discovery_failures = 0
         self.discovery_last_failure_at = 0.0
         self.discovery_unreachable_logged = False
+
+    @property
+    def inbox_address(self) -> str:
+        """The provider's inbox: every turn's address and the reply wire's target."""
+        return self.provider.inbox_address
 
     def status(self) -> dict[str, Any]:
         """Report diagnostic claims only; the adapter cannot verify the signature."""
@@ -229,20 +283,21 @@ class MailAdapter:
         backoff = 0.0
         while not self.shutdown.is_set():
             page_token: str | None = None
-            staged: list[dict[str, Any]] = []
+            staged: list[MessageSummary] = []
             succeeded = True
             seen_tokens: set[str] = set()
             while not self.shutdown.is_set():
-                status, page = self.client.list_messages(PRIME_LIMIT, page_token)
-                if status != 200 or not isinstance(page, dict):
+                page = self.provider.list_messages(page_token, PRIME_LIMIT)
+                if isinstance(page, Failure):
                     succeeded = False
-                    logger.warning("prime: list failed with status=%s", status)
+                    logger.warning(
+                        "prime: list failed with status=%s", _discovery_status(page)
+                    )
                     break
-                staged.extend(item for item in page.get("messages", []) if isinstance(item, dict))
-                next_token = page.get("next_page_token") or None
+                staged.extend(page.messages)
+                next_token = page.next_cursor
                 if next_token is None:
                     break
-                next_token = str(next_token)
                 if next_token in seen_tokens:
                     succeeded = False
                     logger.warning("prime: provider repeated a pagination token")
@@ -250,21 +305,25 @@ class MailAdapter:
                 seen_tokens.add(next_token)
                 page_token = next_token
             if succeeded:
-                for message in staged:
-                    if "sent" in _labels(message):
+                for summary in staged:
+                    if summary.sent_by_inbox:
                         continue
-                    message_id = str(message.get("message_id") or "")
+                    message_id = summary.message_id
                     if not message_id:
                         logger.warning("prime: ignoring provider item without a message id")
                         continue
-                    rejection = self._listing_rejection(message)
-                    admission = self.state.record_terminal(message_id, "rejected")
+                    # Mail already in the inbox at first boot never becomes a
+                    # turn. What the gate would refuse is recorded as refused.
+                    rejection = self._listing_rejection(summary)
+                    admission = self.state.record_terminal(
+                        message_id, "rejected" if rejection is not None else "primed"
+                    )
                     if admission == "full":
                         succeeded = False
                         logger.error("prime: durable state capacity reached before completion")
                         break
                     self._mark_seen(message_id)
-                    if admission == "admitted":
+                    if admission == "admitted" and rejection is not None:
                         self._log_listing_rejection(message_id, rejection)
             if succeeded:
                 self.state.finish_prime()
@@ -316,39 +375,50 @@ class MailAdapter:
         """Retry durable work, then perform one bounded discovery pass."""
         self._retry_pending()
         status = 200
-        pending: list[dict[str, Any]] = []
+        pending: list[MessageSummary] = []
         page_token = self.page_cursor
         for _ in range(POLL_MAX_PAGES):
-            status, page = self.client.list_messages(POLL_LIMIT, page_token)
-            if status != 200 or not isinstance(page, dict):
+            page = self.provider.list_messages(page_token, POLL_LIMIT)
+            if isinstance(page, Failure):
+                status = _discovery_status(page)
                 logger.warning(
                     "poll: list failed with status=%s cause=%s",
                     status,
-                    self._transport_cause(status, page),
+                    self._bounded_cause(page.cause),
                 )
                 self.page_cursor = None
                 return status
-            messages = [item for item in page.get("messages", []) if isinstance(item, dict)]
-            pending.extend(messages)
-            page_token = page.get("next_page_token") or None
-            if page_token is None or any(
-                str(item.get("message_id")) in self.seen for item in messages
-            ):
+            pending.extend(page.messages)
+            page_token = page.next_cursor
+            if page_token is None or any(item.message_id in self.seen for item in page.messages):
                 page_token = None
                 break
-            page_token = str(page_token)
         else:
             logger.warning("poll: page budget reached; the next pass resumes discovery")
         self.page_cursor = page_token
 
-        for message in reversed(pending):
-            if "sent" in _labels(message):
+        for summary in reversed(pending):
+            if summary.sent_by_inbox:
                 continue
-            message_id = str(message.get("message_id") or "")
+            message_id = summary.message_id
             if not message_id or message_id in self.seen:
                 continue
-            rejection = self._listing_rejection(message)
-            admission = self.state.record_terminal(message_id, "rejected")
+            rejection = self._listing_rejection(summary)
+            if rejection is not None:
+                admission = self.state.record_terminal(message_id, "rejected")
+                if admission == "full":
+                    logger.warning(
+                        "back-pressure: refusing correlation=%s before acceptance or mark-seen",
+                        _correlation(message_id),
+                    )
+                    continue
+                self._mark_seen(message_id)
+                if admission == "admitted":
+                    self._log_listing_rejection(message_id, rejection)
+                continue
+            admission = self.state.admit(
+                {"message_id": message_id, "thread_id": summary.thread_id}
+            )
             if admission == "full":
                 logger.warning(
                     "back-pressure: refusing correlation=%s before acceptance or mark-seen",
@@ -356,52 +426,35 @@ class MailAdapter:
                 )
                 continue
             self._mark_seen(message_id)
-            if admission == "admitted":
-                self._log_listing_rejection(message_id, rejection)
+            if admission == "known":
+                # Already claimed: the pending retry owns it from here.
+                continue
+            try:
+                self._fetch_and_admit(message_id, summary.thread_id)
+            except Exception:  # noqa: BLE001 - one message must not stop the pass
+                logger.error(
+                    "poll: handling correlation=%s failed unexpectedly",
+                    _correlation(message_id),
+                )
         return status
 
-    def _transport_cause(self, status: int, body: Any) -> str:
-        """Render a failed list call's cause as a bounded, credential-free string.
+    def _bounded_cause(self, cause: str) -> str:
+        """Render a provider failure's cause as a bounded, credential-free string.
 
-        Status is the gate, not the body's shape. Only a status 0 body is one
-        this package synthesized locally: ``agentmail.request`` builds
-        ``{"error": "connection_refused"}`` for a refused TCP connection,
-        ``{"error": str(exc)}`` for another ``OSError``, and ``{"error": "response
-        body exceeds configured byte limit"}`` for an oversize response, all
-        local strings with a shape the adapter can reason about. Every other
-        status carries a body the PROVIDER authored - arbitrary, unbounded, and
-        able to carry mail content, an upstream stack trace or a page of HTML -
-        including one that happens to hold an ``error`` key. Such a body is
-        never rendered, only counted by its status code, because logging any
-        part of it would breach this package's no-mail-PII rule and push
-        whatever the provider felt like sending into the cluster's log
-        retention. That is a structural refusal at the top of this helper rather
-        than a condition at the call site, so a future caller cannot reintroduce
-        the exposure by passing a provider payload in.
-
-        The budget is a fixed constant rather than a config knob because the
-        size of a log line must not be something a hostile or broken provider
-        can grow, and an operator cannot tune a value they only discover after
-        the disk filled. The redaction pass is defence in depth: ``str(OSError)``
-        from urllib carries no request header today, but the adapter must not
-        depend on a stdlib rendering staying that way.
+        A provider owes a cause that is bounded and carries no credential and no
+        mail content (ADR 0228 decision 2), and the built-in one reduces every
+        body it did not write itself to a status token. This pass is defence in
+        depth against a provider that does not: it removes the adapter's own
+        credentials and enforces the budget. The budget is a fixed constant
+        rather than a config knob because the size of a log line must not be
+        something a hostile or broken provider can grow.
         """
-        if status != 0:
-            # The status line is the only provider-authored response metadata
-            # admitted into this diagnostic. Valid HTTP codes have a fixed
-            # three-digit budget; an impossible value gets one fixed fallback
-            # rather than an unbounded rendering of the integer.
-            return f"http_{status}" if 100 <= status <= 599 else "http_invalid"
-        if not isinstance(body, dict):
-            return "unavailable"
-        error = body.get("error")
-        if not isinstance(error, str) or not error.strip():
-            return "unavailable"
-        cause = " ".join(error.split())
+        cause = " ".join(str(cause or "").split()) or "unavailable"
         for credential in (
             self.config.agentmail_api_key,
             self.config.channel_token,
             self.config.egress_secret,
+            self.config.adapter_principal,
         ):
             if credential:
                 cause = cause.replace(credential, "[redacted]")
@@ -410,33 +463,78 @@ class MailAdapter:
         return cause
 
     def _retry_pending(self) -> None:
+        """Retry durable intake: re-read an unread body, or re-post a stored turn.
+
+        The same gate applies. A provider that does not verify senders refuses
+        every pending row from its id alone, so a row left pending from before
+        never posts a turn.
+        """
         for pending in self.state.pending():
+            message_id = pending["message_id"]
             try:
-                rejection = self._listing_rejection(pending["summary"])
-                self._refuse_inbound(pending["message_id"], rejection)
+                if not self.provider.verifies_senders:
+                    self._refuse_inbound(message_id, (AUTHENTICATION_UNVERIFIABLE, ""))
+                elif pending["state"] == "body_pending":
+                    self._fetch_and_admit(message_id, str(pending["conversation_id"]))
+                elif pending["turn"] is not None:
+                    self._deliver_turn(message_id, pending["turn"])
             except Exception:  # noqa: BLE001 - existing broad catch retained
                 logger.error(
                     "poll: retrying correlation=%s failed unexpectedly",
-                    _correlation(pending["message_id"]),
+                    _correlation(message_id),
                 )
 
-    def handle_inbound(self, message: dict[str, Any]) -> bool:
-        """Refuse current AgentMail intake before body fetch or approval handling."""
-        message_id = str(message["message_id"])
-        rejection = self._listing_rejection(message)
-        return self._refuse_inbound(message_id, rejection)
+    def handle_inbound(self, summary: MessageSummary) -> bool:
+        """Gate one listed message, then fetch, admit and deliver what passes.
 
-    def _listing_rejection(self, message: dict[str, Any]) -> tuple[str, str]:
-        """Refuse metadata that cannot prove positive sender authentication.
-
-        AgentMail exposes labels and arbitrary headers, without a trusted
-        aligned verdict or header provenance guarantee. Neither those fields
-        nor an allowed sender can supply a verdict Curie verifies itself.
-        Until such evidence exists, every AgentMail message is refused.
-        https://docs.agentmail.to/api-reference/inboxes/messages/get
-        https://docs.agentmail.to/knowledge-base/inbound-emails-missing
+        Returns:
+            True when the message is settled or delivered, False when it stays
+            pending for a later pass.
         """
-        return (AUTHENTICATION_UNVERIFIABLE, "")
+        rejection = self._listing_rejection(summary)
+        if rejection is not None:
+            return self._refuse_inbound(summary.message_id, rejection)
+        return self._fetch_and_admit(summary.message_id, summary.thread_id)
+
+    def _listing_rejection(self, summary: MessageSummary) -> tuple[str, str] | None:
+        """The gate's checks before any fetch (ADR 0228 decision 3, steps 1 and 2).
+
+        A provider that does not verify senders refuses every message from the
+        listing alone. Otherwise the listed From must be exactly one mailbox
+        that passes ``CURIE_MAIL_ALLOWED_SENDERS``: a cheap filter, never
+        authentication.
+        """
+        if not self.provider.verifies_senders:
+            return (AUTHENTICATION_UNVERIFIABLE, "")
+        if len(summary.senders) != 1:
+            return (SENDER_NOT_SINGLE, "")
+        if not self.sender_allowed(summary.senders[0]):
+            return (SENDER_NOT_ALLOWED, "")
+        return None
+
+    def _message_rejection(self, message: Message) -> tuple[str, str] | None:
+        """The gate's check after the fetch (ADR 0228 decision 3, step 3).
+
+        Exactly one From mailbox, that address passes the sender filter, the
+        verdict is ``verified``, and the verdict's domain equals the From
+        address's domain: the same name, compared case-insensitively, with no
+        organizational-domain rule, so a parent domain or a subdomain is not
+        equal.
+        """
+        if len(message.senders) != 1:
+            return (SENDER_NOT_SINGLE, "")
+        sender = message.senders[0]
+        if not self.sender_allowed(sender):
+            return (SENDER_NOT_ALLOWED, "")
+        verdict = message.verdict
+        if verdict.outcome == "failed":
+            return (AUTHENTICATION_FAILED, "")
+        if verdict.outcome != "verified":
+            return (AUTHENTICATION_UNVERIFIABLE, "")
+        domain = _bare_address(sender).rpartition("@")[2]
+        if not domain or verdict.domain.strip().lower() != domain:
+            return (AUTHENTICATION_MISALIGNED, "")
+        return None
 
     def _log_listing_rejection(
         self, message_id: str, rejection: tuple[str, str]
@@ -459,10 +557,86 @@ class MailAdapter:
             if turn is not None:
                 self.state.finish_reply(str(turn["conversation_id"]), str(turn["reply_ref"]))
             self.state.settle_without_turn(message_id, "rejected")
-        # A historical accepted delivery may still owe egress. Its stored reply
-        # ownership survives, but it must never post another unauthenticated turn.
+        # An accepted delivery may still owe egress. Its stored reply ownership
+        # survives, but it never posts another turn.
         self._log_listing_rejection(message_id, rejection)
         return True
+
+    def _fetch_and_admit(self, message_id: str, conversation_id: str) -> bool:
+        """The intake path: fetch, gate, answer an approval or build and post a turn.
+
+        The turn's text is the subject, a blank line, then the first of the new
+        text, the full text, the new HTML and the full HTML that is present.
+
+        Returns:
+            True when the message is settled or delivered, False when it stays
+            pending for a later pass.
+        """
+        message = self.provider.get_message(message_id)
+        if isinstance(message, Failure):
+            if message.kind == "too_large":
+                self.state.settle_without_turn(message_id, "oversize")
+                logger.warning(
+                    "body correlation=%s exceeds CURIE_MAIL_MAX_BODY_BYTES",
+                    _correlation(message_id),
+                )
+                return True
+            backing_off = self.state.body_failed(message_id, abandon_after=BODY_ATTEMPT_MAX)
+            logger.warning(
+                "body fetch correlation=%s failed with status=%s; %s",
+                _correlation(message_id),
+                _discovery_status(message),
+                "backing off while pending" if backing_off else "leaving pending",
+            )
+            return backing_off
+        rejection = self._message_rejection(message)
+        if rejection is not None:
+            return self._refuse_inbound(message_id, rejection)
+        sender = message.senders[0]
+        if self.config.adapter_principal:
+            handled = self._handle_approval_reply(message_id, conversation_id, sender, message)
+            if handled is not None:
+                return handled
+        body = message.new_text or message.text or message.new_html or message.html or ""
+        text = f"{message.subject}\n\n{body}"
+        if len(text.encode("utf-8")) > self.config.max_body_bytes:
+            self.state.settle_without_turn(message_id, "oversize")
+            logger.warning(
+                "body correlation=%s exceeds CURIE_MAIL_MAX_BODY_BYTES",
+                _correlation(message_id),
+            )
+            return True
+        turn = {
+            "kind": CHANNEL_KIND,
+            "address": self.inbox_address,
+            "delivery_id": message_id,
+            "conversation_id": conversation_id,
+            "author": _bare_address(sender) or "unknown@unknown",
+            "text": text,
+            "reply_ref": message_id,
+        }
+        self.state.store_turn(message_id, turn)
+        logger.info("inbound admitted correlation=%s", _correlation(message_id))
+        return self._deliver_turn(message_id, turn)
+
+    def _deliver_turn(self, message_id: str, turn: dict[str, Any]) -> bool:
+        """Post a stored turn; settle it on a caller-list refusal, defer it otherwise."""
+        outcome = self.post_turn(turn)
+        if outcome == "accepted":
+            self.state.accept_ingress(message_id)
+            return True
+        if outcome == "refused":
+            # ADR 0175: the binding's caller list does not admit this sender.
+            # Final, like the adapter's own sender gate: the message is settled
+            # without a turn and never retried, and the reply slot store_turn
+            # opened is closed first, so a crash between the two steps leaves a
+            # delivery that is retried (and refused again) rather than a live
+            # reply slot for a turn that will never exist.
+            self.state.finish_reply(str(turn["conversation_id"]), str(turn["reply_ref"]))
+            self.state.settle_without_turn(message_id, "rejected")
+            return True
+        self.state.defer_ingress(message_id, 0.0)
+        return False
 
     def sender_allowed(self, from_header: str) -> bool:
         address = _bare_address(from_header)
@@ -551,7 +725,7 @@ class MailAdapter:
         message_id: str,
         conversation_id: str,
         sender: str,
-        full: dict[str, Any],
+        full: Message,
     ) -> bool | None:
         """Handle a message in a thread this adapter rendered an approval in.
 
@@ -560,22 +734,22 @@ class MailAdapter:
         is never a turn (ADR-0106): it is an answer, or it gets the instructions
         back, and the return value is ``handle_inbound``'s.
 
-        Current AgentMail ingress has no path to this interpreter:
-        ``handle_inbound`` refuses every message before body fetch because
-        Curie cannot verify a positive sender authentication verdict. Sender
-        filtering and this reference interpreter cannot establish that verdict.
-        Its remaining checks require a reference issued in this thread, still
-        live, the message was not sent automatically, and the first line of its
-        new text is one decision word. Who may answer is not decided here: the
-        verified sender is carried to the platform, which checks the binding's
-        ``allowed_callers`` and the route's approver emails.
+        Only the intake path reaches this interpreter, after the inbound gate:
+        the sender is the one From mailbox, it passes the sender filter, and the
+        provider's verdict is ``verified`` for its domain (ADR 0228 decision 3).
+        An AgentMail install never gets here, because AgentMail cannot verify a
+        sender. The remaining checks require a reference issued in this thread,
+        still live, the message was not sent automatically, and the first line
+        of its new text is one decision word. Who may answer is not decided
+        here: the verified sender is carried to the platform, which checks the
+        binding's ``allowed_callers`` and the route's approver emails.
         """
         refs = self.state.approval_refs_in(conversation_id)
         if not refs:
             return None
         named = set(
             APPROVAL_REF_PATTERN.findall(
-                " ".join(str(full.get(field) or "") for field in ("extracted_text", "text"))
+                " ".join(part or "" for part in (full.new_text, full.text))
             )
         )
         matched = [ref for ref in refs if ref["reference"] in named]
@@ -584,14 +758,14 @@ class MailAdapter:
             # Every approval in this thread is over: the conversation goes on.
             return None
         correlation = _correlation(message_id)
-        if _sent_automatically(full, sender):
+        if _sent_automatically(full.headers, sender):
             # Never answer an auto-reply, an out-of-office or a bounce: a
             # response invites a mail loop, and its words are nobody's decision.
             logger.info("approval reply correlation=%s ignored: sent automatically", correlation)
             self.state.settle_without_turn(message_id, "answered")
             return True
         ref = matched[-1] if matched else live[-1]
-        decision, note = _parse_decision(full) if matched else (None, None)
+        decision, note = _parse_decision(full.new_text) if matched else (None, None)
         copies_in = decision is None and _brings_in_an_approver(ref, sender, full)
         if ref["state"] == "live" and copies_in:
             # ADR-0177 amendment A5: the requester did what the request email
@@ -627,7 +801,7 @@ class MailAdapter:
         decision: str,
         note: str | None,
         message_id: str,
-        full: dict[str, Any],
+        full: Message,
     ) -> AnswerOutcome:
         """Resolve the approval with the adapter's credential and the sender as actor.
 
@@ -699,10 +873,12 @@ class MailAdapter:
         These are notices about an answer, not an agent's reply: a lost one is
         a smaller wrong than a duplicate, so there is no durable retry.
         """
-        status, _body = self.client.reply(message_id, text)
-        if not 200 <= status < 300:
+        sent = self.provider.send_reply(message_id, text, False)
+        if isinstance(sent, Failure):
             logger.warning(
-                "approval notice correlation=%s not sent: status=%s", correlation, status
+                "approval notice correlation=%s not sent: status=%s",
+                correlation,
+                _discovery_status(sent),
             )
 
     def record_approval_card(
@@ -797,12 +973,12 @@ class MailAdapter:
         for index, (message_id, reply_all) in enumerate(sends):
             if index < ref["follow_ups_sent"]:
                 continue
-            status, _body = self.client.reply(message_id, text, reply_all=reply_all)
-            if not 200 <= status < 300:
+            sent = self.provider.send_reply(message_id, text, reply_all)
+            if isinstance(sent, Failure):
                 logger.warning(
                     "approval follow-up correlation=%s failed: status=%s",
                     _correlation(approval_id),
-                    status,
+                    _discovery_status(sent),
                 )
                 self.state.release_approval_settlement(ref["reference"])
                 return 502
@@ -810,16 +986,14 @@ class MailAdapter:
         self.state.set_approval_ref_state(ref["reference"], "spent")
         return 200
 
-    def _participants(self, full: dict[str, Any]) -> set[str]:
+    def _participants(self, full: Message) -> set[str]:
         """The bare addresses on one message, From, To and Cc, without this inbox."""
         found: set[str] = set()
-        for field in ("from", "to", "cc"):
-            value = full.get(field)
-            for entry in value if isinstance(value, list) else [value]:
-                address = _bare_address(str(entry or ""))
-                if address:
-                    found.add(address)
-        found.discard(self.config.agentmail_inbox.strip().lower())
+        for entry in (*full.senders, *full.to, *full.cc):
+            address = _bare_address(entry)
+            if address:
+                found.add(address)
+        found.discard(self.inbox_address.strip().lower())
         return found
 
     def _on_thread(self, reply_ref: str, requester: str, listed: list[str]) -> list[str] | None:
@@ -830,8 +1004,8 @@ class MailAdapter:
         read and the requester is not listed, the answer is unknown, and the
         request is worded so it holds either way.
         """
-        status, full = self.client.get_message(reply_ref)
-        if status == 200 and isinstance(full, dict):
+        full = self.provider.get_message(reply_ref)
+        if isinstance(full, Message):
             present = self._participants(full) | {requester}
             return [address for address in listed if address in present]
         if requester in listed:
@@ -899,40 +1073,32 @@ class MailAdapter:
         return 200, chosen_ref
 
     def thread_carries(self, conversation_id: str, event_id: str) -> bool | None:
-        status, thread = self.client.get_thread(conversation_id)
-        if (
-            status == 0
-            and isinstance(thread, dict)
-            and thread.get("error") == EGRESS_REFUSAL_ERROR
-        ):
-            raise ProviderEgressRefusedError
-        if status == 404:
-            # Only the PROVIDER's own answer is deletion. `request` parses a JSON
-            # body and hands back the raw text when it is not JSON, so a 404
-            # carrying anything but an object came from something between us and
-            # AgentMail -- an edge or gateway 404 page, a stale route mid-deploy,
-            # a path that never reached the API. Believing one of those writes a
-            # PERMANENT tombstone (`delete_event`) after which no retry ever
-            # calls the provider again, and the reply is lost with the release
-            # otherwise healthy. Ambiguity retries; only a confirmed answer is
-            # terminal, which is the invariant CLAUDE.md already states.
-            if not isinstance(thread, dict):
-                logger.warning(
-                    "thread listing -> 404 with no provider body; durable witness unreadable"
-                )
-                return None
-            raise ProviderThreadDeletedError
-        if status != 200 or not isinstance(thread, dict):
-            logger.warning("thread listing -> %s; durable witness unreadable", status)
+        """Whether the thread already carries this event's marker: the send dedupe witness.
+
+        Only the provider's definitive answer is deletion: it writes a
+        PERMANENT tombstone (``delete_event``) after which no retry asks again,
+        so anything ambiguous comes back as a failure and reads as unreadable.
+
+        Returns:
+            True or False, or None when the witness is unreadable.
+
+        Raises:
+            ProviderEgressRefusedError: the provider connection was refused.
+            ProviderThreadDeletedError: the provider says the thread is gone.
+        """
+        answer = self.provider.thread_contains(conversation_id, f"{EVENT_MARKER} {event_id}")
+        if isinstance(answer, Failure):
+            if answer.kind == "egress_refused":
+                raise ProviderEgressRefusedError
+            logger.warning(
+                "thread listing -> %s (%s); durable witness unreadable",
+                _discovery_status(answer),
+                self._bounded_cause(answer.cause),
+            )
             return None
-        marker = f"{EVENT_MARKER} {event_id}"
-        for message in thread.get("messages", []):
-            if not isinstance(message, dict):
-                continue
-            for field in ("extracted_text", "text", "preview"):
-                if marker in str(message.get(field) or ""):
-                    return True
-        return False
+        if answer == "deleted":
+            raise ProviderThreadDeletedError
+        return answer == "yes"
 
     def send_reply(
         self,
@@ -996,6 +1162,20 @@ class MailAdapter:
                 self.state.finish_event(event_id)
                 self.state.finish_reply(conversation_id, reply_ref)
                 return 200
+            bound = float(self.provider.sent_visible_within)
+            if bound > 0:
+                # ADR 0228 decision 2: a provider that files the sent copy later
+                # declares the bound within which it becomes visible. Inside the
+                # bound after an attempt, "not in the thread" proves nothing,
+                # so this retries later instead of sending a second copy.
+                attempted = self.state.send_attempted_at(event_id)
+                if attempted is not None and time.time() - attempted < bound:
+                    logger.info(
+                        "reply correlation=%s attempted within the visibility bound; "
+                        "retrying later",
+                        _correlation(event_id),
+                    )
+                    return 502
             exists, text = self.state.reply_text(conversation_id, reply_ref)
             if not exists:
                 logger.warning(
@@ -1015,27 +1195,25 @@ class MailAdapter:
             # Every other reply, the resumed answer included, goes to the
             # sender, which on that message is the requester.
             reply_all = self.state.live_approval_on(conversation_id, reply_ref)
-            status, response = self.client.reply(reply_ref, body, reply_all=reply_all)
-            if (
-                status == 0
-                and isinstance(response, dict)
-                and response.get("error") == EGRESS_REFUSAL_ERROR
-            ):
-                logger.warning(
-                    "provider egress connection refused during send; correlation=%s",
-                    _correlation(event_id),
-                )
-                return 424
-            if 200 <= status < 300:
+            if bound > 0:
+                self.state.record_send_attempt(event_id)
+            sent = self.provider.send_reply(reply_ref, body, reply_all)
+            if not isinstance(sent, Failure):
                 self.state.finish_event(event_id)
                 if exists:
                     self.state.finish_reply(conversation_id, reply_ref)
                 logger.info("reply sent correlation=%s", _correlation(event_id))
                 return 200
+            if sent.kind == "egress_refused":
+                logger.warning(
+                    "provider egress connection refused during send; correlation=%s",
+                    _correlation(event_id),
+                )
+                return 424
             logger.warning(
                 "reply correlation=%s failed at the provider with status=%s",
                 _correlation(event_id),
-                status,
+                _discovery_status(sent),
             )
             return 502
         finally:
@@ -1053,8 +1231,9 @@ class MailAdapter:
         self.state.close()
 
 
-def _labels(message: dict[str, Any]) -> list[str]:
-    return [str(label).strip().lower() for label in (message.get("labels") or [])]
+def _discovery_status(failure: Failure) -> int:
+    """The status a failure kind stands for in the poll loop's backoff rules."""
+    return _DISCOVERY_STATUS.get(failure.kind, 500)
 
 
 def _listed_addresses(approvers: Iterable[str]) -> list[str]:
@@ -1108,16 +1287,12 @@ def _request_instructions(listed: list[str], on_thread: list[str] | None) -> str
     )
 
 
-def _brings_in_an_approver(ref: dict[str, Any], sender: str, full: dict[str, Any]) -> bool:
+def _brings_in_an_approver(ref: dict[str, Any], sender: str, full: Message) -> bool:
     """Whether a non-answer from someone not listed copies a listed approver in."""
     listed = set(ref.get("approvers") or [])
     if not listed or _bare_address(sender) in listed:
         return False
-    copied = set()
-    for field in ("to", "cc"):
-        value = full.get(field)
-        for entry in value if isinstance(value, list) else [value]:
-            copied.add(_bare_address(str(entry or "")))
+    copied = {_bare_address(entry) for entry in (*full.to, *full.cc)}
     return bool(listed & copied)
 
 
@@ -1142,16 +1317,13 @@ def _follow_up_sends(ref: dict[str, Any]) -> list[tuple[str, bool]]:
     return sends
 
 
-def _sent_automatically(full: dict[str, Any], sender: str) -> bool:
+def _sent_automatically(headers: Mapping[str, str] | None, sender: str) -> bool:
     """Whether a message was sent by software rather than a person.
 
     Fails closed: a message whose headers the provider did not return cannot
-    be shown to be a person's, so it is treated as automatic. AgentMail
-    documents ``headers`` as an optional map from string to string
-    (https://docs.agentmail.to/api-reference/inboxes/messages/get).
+    be shown to be a person's, so it is treated as automatic.
     """
-    headers = full.get("headers")
-    if not isinstance(headers, dict):
+    if headers is None:
         return True
     lowered = {str(key).lower(): str(value).strip().lower() for key, value in headers.items()}
     auto_submitted = lowered.get("auto-submitted")
@@ -1168,15 +1340,14 @@ def _sent_automatically(full: dict[str, Any], sender: str) -> bool:
     return _bare_address(sender).partition("@")[0] in _BOUNCE_LOCAL_PARTS
 
 
-def _parse_decision(full: dict[str, Any]) -> tuple[str | None, str | None]:
+def _parse_decision(new_text: str | None) -> tuple[str | None, str | None]:
     """The decision on the first line of the NEW text, and the rest as the note.
 
-    Only ``extracted_text``: AgentMail strips "quoted history and trailing
-    boilerplate" from it (https://www.agentmail.to/docs/messages), so a decision
+    Only the provider's new text, with quoted history removed, so a decision
     word that appears only inside the quoted request is never read as an
-    answer. A message without it has no new text this can trust.
+    answer. A message without new text has nothing this can trust, and a
+    decision is never read from HTML.
     """
-    new_text = full.get("extracted_text")
     if not isinstance(new_text, str):
         return None, None
     lines = new_text.strip().splitlines()

@@ -205,7 +205,7 @@ class EgressHandler(BaseHTTPRequestHandler):
             return self._respond(400, {"detail": "invalid reply event"})
         if (
             event.target.kind != CHANNEL_KIND
-            or event.target.address != self.adapter.config.agentmail_inbox
+            or event.target.address != self.adapter.inbox_address
         ):
             return self._respond(
                 422,
