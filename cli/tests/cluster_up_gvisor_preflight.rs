@@ -9,6 +9,10 @@
 //! https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/event-v1/
 //! The empty `kubectl get nodes -l <selector> -o name` response and the
 //! RuntimeClass JSON shape were also observed on disposable kind in #4411.
+//! StatefulSet selectors, replicas and claim templates use the apps/v1 API:
+//! https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/stateful-set-v1/
+//! Claim timestamps and UIDs use server-assigned ObjectMeta fields:
+//! https://kubernetes.io/docs/reference/kubernetes-api/common-definitions/object-meta/
 
 use crate::support::executable as test_executable;
 
@@ -25,6 +29,7 @@ const RUNTIME_CLASS_REJECTION: &str = "Error creating: pods \"acme-runtime-prefl
 const OPENROUTER_CREDENTIAL: &str = "sk-or-v1-PLACEHOLDER";
 const GVISOR_NODE_SELECTOR: &str = "sandbox.gke.io/runtime=gvisor";
 const SCHEDULING_EVENT_MESSAGE: &str = "SENSITIVE_EVENT_MESSAGE_MUST_NOT_APPEAR";
+const RETAINED_DATA_PVC: &str = "data-acme-runtime-postgres-0";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -38,7 +43,8 @@ fn install_converged_stub(dir: &Path, name: &str, body: &str) {
     let body = if matches!(name, "helm" | "kubectl") {
         format!(
             "#!/bin/sh\n{}\n{}\n{}",
-            r#"case "$CURIE_TEST_EVENT_MODE" in
+            r#"printf '%s %s\n' "${0##*/}" "$*" >> "$CURIE_TEST_TOOL_LOG"
+case "$CURIE_TEST_EVENT_MODE" in
     failed-scheduling*|deadline-no-events|scheduling-events-*)
         if [ ! -e "$CURIE_TEST_HELM_SUCCESS" ] && [ "${0##*/}" = "helm" ] && [ "$1" = "status" ]; then
             printf '%s\n' '{"version":1,"info":{"status":"failed"},"hooks":[{"name":"acme-runtime-preflight-gvisor","kind":"Job","events":["pre-install","pre-upgrade"],"manifest":"apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: acme-runtime-preflight-gvisor\n  namespace: target-namespace\nspec:\n  template:\n    spec:\n      containers:\n        - name: probe\n          image: busybox:1\n"}]}'
@@ -77,11 +83,13 @@ struct Fixture {
     event_emitted: PathBuf,
     runtimeclass_log: PathBuf,
     nodes_log: PathBuf,
+    tool_log: PathBuf,
     event_mode: String,
     singleton_mode: String,
     credential: String,
     history_status: String,
     runtimeclass_lookup: String,
+    same_second_data_pvc: bool,
 }
 
 impl Fixture {
@@ -109,6 +117,7 @@ impl Fixture {
         let event_emitted = temp.path().join("event-emitted");
         let runtimeclass_log = temp.path().join("runtimeclass.log");
         let nodes_log = temp.path().join("nodes.log");
+        let tool_log = temp.path().join("tools.log");
 
         install_converged_stub(
             &bin_dir,
@@ -246,6 +255,50 @@ if [ "$1" = "template" ]; then
 
     if [ -z "$show_only" ]; then
         printf '%s\n' 'apiVersion: apps/v1' 'kind: Deployment' 'metadata:' '  name: acme-platform' 'spec:' '  template:' '    spec:' '      containers:' '        - name: platform' '          resources:' '            requests:' '              cpu: 100m' '              memory: 128Mi'
+        if [ "$CURIE_TEST_SAME_SECOND_DATA_PVC" = "true" ]; then
+            cat <<'YAML'
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: acme-runtime-postgres
+  namespace: target-namespace
+  labels:
+    app.kubernetes.io/name: curie
+    app.kubernetes.io/instance: target-release
+    app.kubernetes.io/component: postgres
+    app.kubernetes.io/managed-by: Helm
+spec:
+  serviceName: acme-runtime-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: curie
+      app.kubernetes.io/instance: target-release
+      app.kubernetes.io/component: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: curie
+        app.kubernetes.io/instance: target-release
+        app.kubernetes.io/component: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16.15-alpine
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi
+YAML
+        fi
         exit 0
     fi
     printf 'unexpected helm template invocation: %s\n' "$*" >&2
@@ -414,6 +467,28 @@ fi
 
 if [ "$1" = "get" ] && [ "$2" = "statefulset" ]; then
     if [ "$3" = "-n" ] && [ "$4" = "target-namespace" ] && [ "$5" = "-o" ] && [ "$6" = "json" ]; then
+        if [ "$CURIE_TEST_SAME_SECOND_DATA_PVC" = "true" ]; then
+            cat <<'JSON'
+{"apiVersion":"apps/v1","kind":"StatefulSetList","items":[{
+  "apiVersion":"apps/v1","kind":"StatefulSet",
+  "metadata":{
+    "name":"acme-runtime-postgres","namespace":"target-namespace",
+    "labels":{"app.kubernetes.io/name":"curie","app.kubernetes.io/instance":"target-release","app.kubernetes.io/managed-by":"Helm"},
+    "annotations":{"meta.helm.sh/release-name":"target-release","meta.helm.sh/release-namespace":"target-namespace"}
+  },
+  "spec":{
+    "serviceName":"acme-runtime-postgres","replicas":1,
+    "selector":{"matchLabels":{"app.kubernetes.io/name":"curie","app.kubernetes.io/instance":"target-release","app.kubernetes.io/component":"postgres"}},
+    "template":{
+      "metadata":{"labels":{"app.kubernetes.io/name":"curie","app.kubernetes.io/instance":"target-release","app.kubernetes.io/component":"postgres"}},
+      "spec":{"containers":[{"name":"postgres","image":"postgres:16.15-alpine","volumeMounts":[{"name":"data","mountPath":"/var/lib/postgresql/data"}]}]}
+    },
+    "volumeClaimTemplates":[{"metadata":{"name":"data"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"1Gi"}}}}]
+  }
+}]}
+JSON
+            exit 0
+        fi
         printf '%s\n' '{"apiVersion":"v1","kind":"List","items":[]}'
         exit 0
     fi
@@ -423,6 +498,20 @@ fi
 
 if [ "$1" = "get" ] && [ "$2" = "pvc" ]; then
     if [ "$#" -eq 8 ] && [ "$3" = "-n" ] && [ "$4" = "target-namespace" ] && [ "$5" = "-o" ] && [ "$6" = "json" ] && [ "$7" = "-l" ] && [ "$8" = "app.kubernetes.io/instance=target-release,app.kubernetes.io/component in (postgres,clickhouse,rustfs,valkey)" ]; then
+        if [ "$CURIE_TEST_SAME_SECOND_DATA_PVC" = "true" ]; then
+            cat <<'JSON'
+{"apiVersion":"v1","kind":"PersistentVolumeClaimList","items":[{
+  "apiVersion":"v1","kind":"PersistentVolumeClaim",
+  "metadata":{
+    "name":"data-acme-runtime-postgres-0","namespace":"target-namespace",
+    "uid":"uid-failed-first-postgres-data","creationTimestamp":"2026-10-17T10:00:00Z",
+    "labels":{"app.kubernetes.io/name":"curie","app.kubernetes.io/instance":"target-release","app.kubernetes.io/component":"postgres"}
+  },
+  "spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"1Gi"}}}
+}]}
+JSON
+            exit 0
+        fi
         printf '%s\n' '{"apiVersion":"v1","kind":"PersistentVolumeClaimList","items":[]}'
         exit 0
     fi
@@ -777,11 +866,13 @@ exit 64
             event_emitted,
             runtimeclass_log,
             nodes_log,
+            tool_log,
             event_mode: event_mode.to_string(),
             singleton_mode: singleton_mode.to_string(),
             credential: credential.to_string(),
             history_status: "auto".to_string(),
             runtimeclass_lookup: "forbidden".to_string(),
+            same_second_data_pvc: false,
         }
     }
 
@@ -792,6 +883,13 @@ exit 64
 
     fn with_runtimeclass_lookup(mut self, lookup: &str) -> Self {
         self.runtimeclass_lookup = lookup.to_string();
+        self
+    }
+
+    fn with_same_second_data_pvc(mut self) -> Self {
+        self.same_second_data_pvc = true;
+        fs::write(self.bin_dir.join("convergence-release-failed"), "")
+            .expect("report the failed revision during convergence observation");
         self
     }
 
@@ -864,6 +962,15 @@ exit 64
             .env("CURIE_TEST_RUNTIMECLASS_LOG", &self.runtimeclass_log)
             .env("CURIE_TEST_RUNTIMECLASS_LOOKUP", &self.runtimeclass_lookup)
             .env("CURIE_TEST_NODES_LOG", &self.nodes_log)
+            .env("CURIE_TEST_TOOL_LOG", &self.tool_log)
+            .env(
+                "CURIE_TEST_SAME_SECOND_DATA_PVC",
+                if self.same_second_data_pvc {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
             .env(
                 "CURIE_TEST_PROVIDER_EGRESS_JSON",
                 r#"{"openrouter.ai":["1.1.1.1"],"api.anthropic.com":["8.8.8.8"]}"#,
@@ -965,6 +1072,38 @@ exit 64
             uninstalls.is_empty(),
             "this path must not helm uninstall the release:\n{uninstalls}"
         );
+    }
+
+    fn assert_same_second_data_pvc_recovery(&self, output: &Output) {
+        let shown = stderr(output);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "ambiguous PVC provenance must stop the install:\n{shown}"
+        );
+        assert!(
+            shown.contains(&format!("retained PVCs [{RETAINED_DATA_PVC}]")),
+            "the error must name the retained installed data claim:\n{shown}"
+        );
+        assert!(
+            shown.contains("provenance check failed")
+                && shown.contains(&format!("PVC {RETAINED_DATA_PVC} creation timestamp"))
+                && shown.contains("not strictly later than the revision 1 Helm Secret timestamp"),
+            "the error must explain the strict timestamp provenance refusal:\n{shown}"
+        );
+        assert!(
+            shown.contains("inspect the retained PVCs and revision 1 Helm Secret for release target-release in namespace target-namespace before retrying"),
+            "the original actionable recovery must survive failed-revision observation:\n{shown}"
+        );
+        let invocations = fs::read_to_string(&self.tool_log).expect("read external tool calls");
+        assert!(
+            !invocations.lines().any(|line| {
+                line.starts_with("kubectl ")
+                    && line.split_whitespace().any(|argument| argument == "delete")
+            }),
+            "provenance refusal must happen before any kubectl delete:\n{invocations}"
+        );
+        self.assert_no_failed_revision_discard();
     }
 
     fn write_apply_plan(&self, gvisor_mode: &str) {
@@ -1598,6 +1737,25 @@ fn gvisor_retry_uninstalls_a_failed_first_revision_before_reinstall() {
     fixture.assert_children_stopped();
 }
 
+#[test]
+fn gvisor_retry_preserves_same_second_data_pvc_provenance_recovery() {
+    let fixture =
+        Fixture::new("matching", "foreign", OPENROUTER_CREDENTIAL).with_same_second_data_pvc();
+    let (output, elapsed) = fixture.run(&[]);
+    let shown = stderr(&output);
+
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}\n{shown}");
+    fixture.assert_same_second_data_pvc_recovery(&output);
+    assert_eq!(
+        fixture.upgrade_count(),
+        1,
+        "ambiguous PVC provenance must stop before the gVisor-off reinstall:\n{shown}"
+    );
+    fixture.assert_event_was_observed_for_rendered_job();
+    fixture.assert_graceful_helm_interruption();
+    fixture.assert_children_stopped();
+}
+
 /// Negative for #2347: a history that already has a known-good revision is an
 /// in-place upgrade. Discarding it would delete a working release.
 #[test]
@@ -1683,6 +1841,26 @@ fn apply_discards_a_failed_only_revision_before_install() {
     assert_process_stopped(&fixture.helm_pid, "helm upgrade");
 }
 
+#[test]
+fn apply_preserves_same_second_data_pvc_provenance_recovery() {
+    let fixture = Fixture::new("matching", "absent", OPENROUTER_CREDENTIAL)
+        .with_history_status("failed")
+        .with_same_second_data_pvc();
+    fixture.write_apply_plan("off");
+    let (output, elapsed) = fixture.run_apply();
+    let shown = stderr(&output);
+
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}\n{shown}");
+    fixture.assert_same_second_data_pvc_recovery(&output);
+    assert_eq!(
+        fixture.upgrade_count(),
+        0,
+        "ambiguous PVC provenance must stop apply before installing:\n{shown}"
+    );
+    fixture.assert_no_event_watch();
+    assert!(!fixture.helm_pid.exists(), "Helm must not start:\n{shown}");
+}
+
 /// Negative for #2856: a known-good history is an in-place upgrade.
 #[test]
 fn apply_preserves_a_known_good_release() {
@@ -1737,6 +1915,25 @@ fn cluster_up_discards_a_failed_only_revision_before_install() {
     fixture.assert_failed_only_release_discarded_before_install();
     fixture.assert_no_event_watch();
     assert_process_stopped(&fixture.helm_pid, "helm upgrade");
+}
+
+#[test]
+fn cluster_up_preserves_same_second_data_pvc_provenance_recovery() {
+    let fixture = Fixture::new("matching", "absent", "")
+        .with_history_status("failed")
+        .with_same_second_data_pvc();
+    let (output, elapsed) = fixture.run(&["--fake-model", "--set", "security.gvisor.mode=off"]);
+    let shown = stderr(&output);
+
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}\n{shown}");
+    fixture.assert_same_second_data_pvc_recovery(&output);
+    assert_eq!(
+        fixture.upgrade_count(),
+        0,
+        "ambiguous PVC provenance must stop cluster up before installing:\n{shown}"
+    );
+    fixture.assert_no_event_watch();
+    assert!(!fixture.helm_pid.exists(), "Helm must not start:\n{shown}");
 }
 
 /// In-flight Helm status is not an upgrade target and is not silently discarded.
