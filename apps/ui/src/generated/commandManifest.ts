@@ -9288,48 +9288,6 @@ export const commandManifest = {
           "name": "prepare",
           "subcommands": [
             {
-              "about": "Verify that the selected live deployment enforces the repository's input contract",
-              "args": [
-                {
-                  "global": false,
-                  "id": "repo",
-                  "long": "repo",
-                  "positional": false,
-                  "required": true
-                },
-                {
-                  "env": "CURIE_API_URL",
-                  "global": false,
-                  "id": "api_url",
-                  "long": "api-url",
-                  "positional": false,
-                  "required": true
-                },
-                {
-                  "env": "CURIE_API_KEY",
-                  "global": false,
-                  "id": "api_key",
-                  "long": "api-key",
-                  "positional": false,
-                  "required": true
-                },
-                {
-                  "global": false,
-                  "help": "Show the check without contacting the service",
-                  "id": "dry_run",
-                  "long": "dry-run",
-                  "positional": false,
-                  "possible_values": [
-                    "true",
-                    "false"
-                  ],
-                  "required": false
-                }
-              ],
-              "hidden": false,
-              "name": "compatibility"
-            },
-            {
               "about": "Check, update or roll back an unedited managed preparation skill",
               "args": [
                 {
@@ -9421,7 +9379,7 @@ export const commandManifest = {
               "name": "update"
             },
             {
-              "about": "Resolve the preparation release pinned by a repository's factory binding",
+              "about": "Resolve an optional repository preparation pin or the installed release",
               "args": [
                 {
                   "global": false,
@@ -9457,7 +9415,7 @@ export const commandManifest = {
                 },
                 {
                   "global": false,
-                  "help": "Repository containing .curie-factory.json",
+                  "help": "Repository optionally containing .curie-factory.json",
                   "id": "repo",
                   "long": "repo",
                   "positional": false,

@@ -57,11 +57,20 @@ folder. `curie factory prepare update --agent codex --global --check` reports an
 upstream release without changing files. Omit `--check` after reviewing the update;
 use `--rollback` to restore the previous managed release. Edited managed files are
 refused and preserved; there is no automatic merge. Per-repository
-`.curie-factory.json` pins resolve with
-`curie factory prepare resolve --agent codex --global --repo DIR`. The same global
-skill can use different cached preparation versions for different repositories.
-`curie factory prepare compatibility --repo DIR` checks the actual selected
-deployment through the configured API connection; CLI version alone is not proof.
+`.curie-factory.json` optionally pins local preparation and specification versions:
+
+```json
+{"schema_version": 2, "preparation_version": "0.3.0", "contract_version": "curie.factory-specification/v1"}
+```
+
+`curie factory prepare resolve --agent codex --global --repo DIR` selects that
+exact release and format from local cache or an explicit source. Without a pin,
+it uses the installed managed release. Different repositories can use different
+cached versions through the same global entry skill. Pins do not bind deployments
+or enforce factory admission. Legacy schema 1 deployment bindings require manual
+migration: copy `target.contract_version` to `contract_version`, remove `target`,
+and change `schema_version` to 2. The command refuses legacy bindings and leaves
+files unchanged. Separate local preferences retain their own schema version 1.
 See the guide for preferences, release locators, offline behavior and recovery.
 
 ## Interactive mode

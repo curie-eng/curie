@@ -678,17 +678,6 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
         Some(Command::Factory { action }) => match action {
             FactoryAction::Prepare {
                 action:
-                    FactoryPrepareAction::Compatibility {
-                        repo,
-                        api_url,
-                        api_key,
-                        dry_run,
-                    },
-            } => emit_boxed(
-                curie::managed_skills::compatibility(&repo, &api_url, &api_key, dry_run).await?,
-            ),
-            FactoryAction::Prepare {
-                action:
                     FactoryPrepareAction::Update {
                         agent,
                         global,

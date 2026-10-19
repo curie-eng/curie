@@ -29,19 +29,12 @@ pub struct Release {
     pub contract_versions: Vec<String>,
     pub files: BTreeMap<String, ReleaseFile>,
 }
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Target {
-    pub deployment_id: String,
-    pub bundle_sha256: String,
-    pub contract_version: String,
-}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Binding {
     schema_version: u32,
-    target: Target,
     preparation_version: String,
+    contract_version: String,
     preparation_release: Option<String>,
 }
 #[derive(Clone, Deserialize, Serialize)]
@@ -73,7 +66,6 @@ pub struct ManagedSkillOutput {
     instructions_path: Option<PathBuf>,
     preferences_path: Option<PathBuf>,
     backup_path: Option<PathBuf>,
-    target: Option<Target>,
 }
 impl CliOutput for ManagedSkillOutput {
     fn to_json(&self) -> serde_json::Value {
@@ -100,9 +92,6 @@ impl CliOutput for ManagedSkillOutput {
         if let Some(path) = &self.backup_path {
             ui.payload_plain(&format!("Backup: {}", path.display()));
         }
-        if let Some(target) = &self.target {
-            ui.payload_plain(&format!("Factory deployment: {}", target.deployment_id));
-        }
     }
 }
 fn output(status: &'static str, directory: PathBuf) -> ManagedSkillOutput {
@@ -117,7 +106,6 @@ fn output(status: &'static str, directory: PathBuf) -> ManagedSkillOutput {
         instructions_path: None,
         preferences_path: None,
         backup_path: None,
-        target: None,
     }
 }
 fn hash(bytes: &[u8]) -> String {
@@ -706,7 +694,23 @@ pub struct ResolveOptions {
 }
 pub async fn resolve(options: ResolveOptions) -> Result<Box<dyn CliOutput>> {
     let (root, _, state) = locations(&options.install)?;
-    let (repo, binding) = read_binding(&options.repo)?;
+    let (repo, pin) = read_binding(&options.repo)?;
+    let binding = match pin {
+        Some(binding) => binding,
+        None => {
+            let release = receipt(&state)?.release;
+            validate(&release)?;
+            if release.contract_versions.len() != 1 {
+                bail!("Installed release supports multiple specification formats; select contract_version with an optional schema_version 2 repository pin");
+            }
+            Binding {
+                schema_version: 2,
+                preparation_version: release.preparation_version,
+                contract_version: release.contract_versions[0].clone(),
+                preparation_release: None,
+            }
+        }
+    };
     let mut candidates = Vec::new();
     if let Some(source) = options.source {
         let release = local_release(&source)?;
@@ -745,92 +749,37 @@ pub async fn resolve(options: ResolveOptions) -> Result<Box<dyn CliOutput>> {
             }
         }
     }
-    let release=candidates.into_iter().find(|r| r.preparation_version==binding.preparation_version && r.contract_versions.contains(&binding.target.contract_version)).context("No cached compatible preparation release for repository pin; supply --source DIR or set preparation_release to an exact published release tag. Current installed skill remains unchanged")?;
+    let release=candidates.into_iter().find(|r| r.preparation_version==binding.preparation_version && r.contract_versions.contains(&binding.contract_version)).context("No cached compatible preparation release for repository pin; supply --source DIR or set preparation_release to an exact published release tag. Current installed skill remains unchanged")?;
     let dir = cache(&state, &release)?;
     let mut result = output("resolved", dir.clone());
     result.preparation_version = Some(release.preparation_version);
-    result.contract_version = Some(binding.target.contract_version.clone());
+    result.contract_version = Some(binding.contract_version.clone());
     result.instructions_path = Some(dir.join("SKILL.md"));
     result.preferences_path = Some(repo.join(".curie/factory-preparation.local.json"));
-    result.target = Some(binding.target);
     Ok(Box::new(result))
 }
 
-fn read_binding(repo: &Path) -> Result<(PathBuf, Binding)> {
+fn read_binding(repo: &Path) -> Result<(PathBuf, Option<Binding>)> {
     let repo = repo
         .canonicalize()
         .context("resolve repository directory")?;
     let config = repo.join(".curie-factory.json");
-    let binding:Binding=serde_json::from_slice(&fs::read(&config).context("Repository has no .curie-factory.json binding; select a factory target and preparation version before continuing")?)?;
-    if binding.schema_version != 1
+    let bytes = match fs::read(&config) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((repo, None)),
+        Err(error) => return Err(error).context("read repository preparation pin"),
+    };
+    const MIGRATION: &str = "Repository preparation pin must use schema_version 2 with preparation_version and contract_version (optional preparation_release). For a legacy deployment binding, copy target.contract_version to contract_version and remove target after review. No file was changed. Remove the optional pin to use the installed release.";
+    let binding: Binding = serde_json::from_slice(&bytes).context(MIGRATION)?;
+    if binding.schema_version != 2
         || !safe_version(&binding.preparation_version)
-        || binding.target.deployment_id.is_empty()
-        || binding.target.contract_version.trim().is_empty()
-        || binding.target.bundle_sha256.len() != 64
-        || !binding
-            .target
-            .bundle_sha256
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit())
+        || binding.contract_version.trim().is_empty()
+        || binding
+            .preparation_release
+            .as_ref()
+            .is_some_and(|tag| !safe_version(tag))
     {
-        bail!("invalid repository factory binding");
+        bail!(MIGRATION);
     }
-    Ok((repo, binding))
-}
-
-/// This read is advisory before publication; the platform rechecks at intake and start.
-pub async fn compatibility(
-    repo: &Path,
-    api_url: &str,
-    api_key: &str,
-    dry_run: bool,
-) -> Result<Box<dyn CliOutput>> {
-    let (repo, binding) = read_binding(repo)?;
-    let deployment = uuid::Uuid::parse_str(&binding.target.deployment_id)
-        .context("factory target deployment_id must be a UUID")?;
-    if dry_run {
-        return Ok(Box::new(crate::ui::DryRunPlan {
-            lines: vec![format!(
-                "Check deployment {deployment} input contracts using the selected API connection"
-            )],
-        }));
-    }
-    let client = crate::api::ApiClient::with_resolved_key(api_url, api_key)?;
-    let body = client
-        .deployment_input_contracts(&deployment.to_string())
-        .await?;
-    let valid_identity = body
-        .get("deployment_id")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|id| uuid::Uuid::parse_str(id).ok())
-        == Some(deployment)
-        && ["agent_id", "version_id"].iter().all(|key| {
-            body.get(*key)
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
-        })
-        && body
-            .get("bundle_sha256")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|digest| digest.eq_ignore_ascii_case(&binding.target.bundle_sha256));
-    let valid_contract = body.get("interface").and_then(serde_json::Value::as_str)
-        == Some("curie/input-contracts@1")
-        && body.get("status").and_then(serde_json::Value::as_str) == Some("active")
-        && body.get("enforced").and_then(serde_json::Value::as_bool) == Some(true)
-        && body
-            .get("accepted_contracts")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|contracts| {
-                contracts.iter().any(|contract| {
-                    contract.as_str() == Some(binding.target.contract_version.as_str())
-                })
-            });
-    if !valid_identity || !valid_contract {
-        bail!("Factory input compatibility could not be verified for the repository binding. Keep the published ticket unselected; review the target and specification before starting work.");
-    }
-    let mut result = output("compatible", repo);
-    result.preparation_version = Some(binding.preparation_version);
-    result.contract_version = Some(binding.target.contract_version.clone());
-    result.target = Some(binding.target);
-    Ok(Box::new(result))
+    Ok((repo, Some(binding)))
 }

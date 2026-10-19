@@ -56,8 +56,7 @@
         "resolved",
         "packaged",
         "offline",
-        "planned",
-        "compatible"
+        "planned"
       ]
     },
     "dry_run": {
@@ -66,34 +65,6 @@
     "directory": {
       "type": "string",
       "minLength": 1
-    },
-    "target": {
-      "anyOf": [
-        {
-          "type": "null"
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "deployment_id": {
-              "type": "string"
-            },
-            "bundle_sha256": {
-              "type": "string",
-              "pattern": "^[a-fA-F0-9]{64}$"
-            },
-            "contract_version": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "deployment_id",
-            "bundle_sha256",
-            "contract_version"
-          ]
-        }
-      ]
     }
   },
   "required": [
@@ -106,7 +77,6 @@
     "backup_path",
     "status",
     "dry_run",
-    "directory",
-    "target"
+    "directory"
   ]
 }

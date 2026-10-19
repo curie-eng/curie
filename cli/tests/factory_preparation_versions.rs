@@ -99,10 +99,15 @@ impl Fixture {
     }
 
     fn pin(&self, repo: &Path, version: &str, contract: &str) {
-        fs::write(repo.join(".curie-factory.json"), serde_json::to_vec_pretty(&json!({
-            "schema_version":1,"target":{"deployment_id":"22222222-2222-4222-8222-222222222222","bundle_sha256":"a".repeat(64),"contract_version":contract},
-            "preparation_version":version
-        })).unwrap()).unwrap();
+        fs::write(
+            repo.join(".curie-factory.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version":2,"contract_version":contract,
+                "preparation_version":version
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     }
 }
 
@@ -278,10 +283,9 @@ fn two_repositories_resolve_different_cached_versions_under_one_installation() {
 }
 
 #[test]
-fn missing_unknown_and_incompatible_repository_bindings_fail_closed() {
+fn unavailable_and_incompatible_repository_pins_fail_closed() {
     let f = Fixture::new();
     f.install();
-    refused(&f.resolve(&f.repo, &["--offline"]));
     f.pin(&f.repo, "9.9.9", CONTRACT);
     refused(&f.resolve(&f.repo, &["--offline"]));
     f.pin(&f.repo, "1.1.0", "curie.factory-specification/v99");
@@ -516,122 +520,45 @@ fn interrupted_activation_preserves_read_only_checks_then_recovers_before_upgrad
     );
 }
 
-fn compatibility_response() -> Value {
-    json!({
-        "interface":"curie/input-contracts@1",
-        "deployment_id":"22222222-2222-4222-8222-222222222222",
-        "agent_id":"11111111-1111-4111-8111-111111111111",
-        "version_id":"33333333-3333-4333-8333-333333333333",
-        "bundle_sha256":"a".repeat(64),
-        "accepted_contracts":[CONTRACT],"status":"active","enforced":true
-    })
-}
-
 #[test]
-fn compatibility_checks_exact_target_over_authenticated_http() {
-    use crate::support::{serve, Response};
+fn optional_pin_uses_installed_release_without_a_deployment() {
     let f = Fixture::new();
-    f.pin(&f.repo, "1.1.0", CONTRACT);
-    let body = compatibility_response();
-    let server = serve(move |request| {
-        assert_eq!(request.method, "GET");
-        assert_eq!(
-            request.path,
-            "/deployments/22222222-2222-4222-8222-222222222222/input-contracts"
-        );
-        assert_eq!(request.header("x-api-key"), Some("fixture-api-key"));
-        Response::json(200, &body.to_string())
-    });
+    f.install();
     let before = snapshot(&f.repo);
-    let result = ok(&f.run(&[
-        "compatibility",
-        "--repo",
-        f.repo.to_str().unwrap(),
-        "--api-url",
-        &server.base_url,
-        "--api-key",
-        "fixture-api-key",
-    ]));
-    assert_eq!(result["status"], "compatible");
-    assert_eq!(server.recorded().len(), 1);
+    let result = ok(&f.resolve(&f.repo, &["--offline"]));
+    assert_eq!(result["status"], "resolved");
+    assert!(result["preparation_version"].is_string());
+    assert_eq!(result["contract_version"], CONTRACT);
+    assert!(result.get("target").is_none());
     assert_eq!(snapshot(&f.repo), before);
 }
 
 #[test]
-fn compatibility_refuses_unknown_or_changed_deployment_contracts() {
-    use crate::support::{serve, Response};
-    for mutation in [
-        "bundle",
-        "deployment",
-        "contract",
-        "status",
-        "enforced",
-        "interface",
-        "missing",
-    ] {
-        let f = Fixture::new();
-        f.pin(&f.repo, "1.1.0", CONTRACT);
-        let mut body = compatibility_response();
-        match mutation {
-            "bundle" => body["bundle_sha256"] = json!("b".repeat(64)),
-            "deployment" => body["deployment_id"] = json!("44444444-4444-4444-8444-444444444444"),
-            "contract" => body["accepted_contracts"] = json!(["example.other/v1"]),
-            "status" => body["status"] = json!("inactive"),
-            "enforced" => body["enforced"] = json!(false),
-            "interface" => body["interface"] = json!("curie/input-contracts@99"),
-            _ => {}
-        }
-        let server = serve(move |_| {
-            Response::json(
-                if mutation == "missing" { 404 } else { 200 },
-                &body.to_string(),
-            )
-        });
-        refused(&f.run(&[
-            "compatibility",
-            "--repo",
-            f.repo.to_str().unwrap(),
-            "--api-url",
-            &server.base_url,
-            "--api-key",
-            "fixture-api-key",
-        ]));
-        assert_eq!(server.recorded().len(), 1, "{mutation}");
-    }
-}
-
-#[test]
-fn compatibility_dry_run_does_not_read_the_service() {
-    use crate::support::{serve, Response};
+fn legacy_and_unknown_pins_require_explicit_migration_without_writes() {
     let f = Fixture::new();
-    f.pin(&f.repo, "1.1.0", CONTRACT);
-    let server = serve(|_| Response::json(500, r#"{"error":"must not contact service"}"#));
-    let result = ok(&f.run(&[
-        "compatibility",
-        "--repo",
-        f.repo.to_str().unwrap(),
-        "--api-url",
-        &server.base_url,
-        "--api-key",
-        "fixture-api-key",
-        "--dry-run",
-    ]));
-    assert_eq!(result["dry_run"], true);
-    assert!(server.recorded().is_empty());
-    assert!(!String::from_utf8_lossy(
-        &f.run(&[
-            "compatibility",
-            "--repo",
-            f.repo.to_str().unwrap(),
-            "--api-url",
-            &server.base_url,
-            "--api-key",
-            "fixture-api-key",
-            "--dry-run"
-        ])
-        .stdout
-    )
-    .contains("fixture-api-key"));
+    f.install();
+    for value in [
+        json!({"schema_version":1,"target":{"deployment_id":"example","bundle_sha256":"a".repeat(64),"contract_version":CONTRACT},"preparation_version":"1.0.0"}),
+        json!({"schema_version":99,"preparation_version":"1.0.0","contract_version":CONTRACT}),
+        json!({"schema_version":2,"target":{},"preparation_version":"1.0.0","contract_version":CONTRACT}),
+    ] {
+        fs::write(
+            f.repo.join(".curie-factory.json"),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        let before = snapshot(f.temp.path());
+        let result = f.resolve(&f.repo, &["--offline"]);
+        refused(&result);
+        let message = format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(message.contains("schema_version 2"), "{message}");
+        assert!(message.contains("contract_version"), "{message}");
+        assert_eq!(snapshot(f.temp.path()), before);
+    }
 }
 
 #[test]

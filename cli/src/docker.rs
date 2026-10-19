@@ -139,8 +139,6 @@ impl CheckSpec {
             "-e".into(),
             format!("{}=/plugin", env_keys::CURIE_PLUGIN_DIR),
             "-e".into(),
-            format!("{}=standalone", env_keys::CURIE_INPUT_CONTRACT_CONTEXT),
-            "-e".into(),
             format!("CURIE_CHECK_TIMEOUT_S={}", self.timeout_s),
         ]);
         args.extend([
@@ -178,8 +176,6 @@ impl StartSpec {
             format!("{volume}:/plugin:ro"),
             "-e".into(),
             format!("{}=/plugin", env_keys::CURIE_PLUGIN_DIR),
-            "-e".into(),
-            format!("{}=standalone", env_keys::CURIE_INPUT_CONTRACT_CONTEXT),
             "-e".into(),
             format!("{}={}", env_keys::CURIE_SESSION_ID, self.session_id),
             "-e".into(),

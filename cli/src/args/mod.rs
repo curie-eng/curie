@@ -1520,18 +1520,6 @@ pub(crate) struct FactoryQuickstartArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum FactoryPrepareAction {
-    /// Verify that the selected live deployment enforces the repository's input contract.
-    Compatibility {
-        #[arg(long, value_name = "DIR")]
-        repo: PathBuf,
-        #[arg(long, env = "CURIE_API_URL")]
-        api_url: String,
-        #[arg(long, env = "CURIE_API_KEY", hide_env_values = true)]
-        api_key: String,
-        /// Show the check without contacting the service.
-        #[arg(long)]
-        dry_run: bool,
-    },
     /// Check, update or roll back an unedited managed preparation skill.
     Update {
         #[arg(long, value_enum, value_name = "CLIENT")]
@@ -1556,7 +1544,7 @@ pub(crate) enum FactoryPrepareAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Resolve the preparation release pinned by a repository's factory binding.
+    /// Resolve an optional repository preparation pin or the installed release.
     Resolve {
         #[arg(long, value_enum, value_name = "CLIENT")]
         agent: curie::agent_skills::AgentClient,
@@ -1564,7 +1552,7 @@ pub(crate) enum FactoryPrepareAction {
         global: bool,
         #[arg(long, value_name = "DIR")]
         dir: Option<PathBuf>,
-        /// Repository containing .curie-factory.json.
+        /// Repository optionally containing .curie-factory.json.
         #[arg(long, value_name = "DIR")]
         repo: PathBuf,
         #[arg(long, value_name = "DIR")]
