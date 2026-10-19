@@ -1902,7 +1902,7 @@ jobs:
 
           gzip_headers="$(curl -sS -D - -o /dev/null -H 'Accept-Encoding: gzip' "${BASE_URL}${ASSET_PATH}" | tr 'A-Z' 'a-z')"
 
-          if ! echo "$gzip_headers" | grep -q '^content-encoding: gzip-4725-invalid'; then
+          if ! echo "$gzip_headers" | grep -q '^content-encoding: gzip'; then
             echo "Missing header: Content-Encoding: gzip on ${ASSET_PATH}" >&2
             echo "$gzip_headers" >&2
             exit 1
