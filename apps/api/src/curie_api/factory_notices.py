@@ -45,7 +45,7 @@ from starlette.concurrency import run_in_threadpool
 from .code_host_trust import code_host_verify
 from .config import Settings
 from .factory_comment_text import marker_for, redact_factory_comment, status_marker
-from .factory_progress import PhaseView, phase_view, pill_for
+from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, PhaseView, phase_view, pill_for
 from .factory_reply_target import stored_reply_target
 from .factory_usage import format_usd, usage_line, work_item_usage
 from .forges.capabilities import Operation, Support
@@ -1184,7 +1184,13 @@ async def _render(
             view = phase_view(row.declaration, reports, request.status, cause)
         if result is not None and cause == "budget_exceeded":
             latest_note = next(
-                (report for report in reversed(reports) if report.note and report.note.strip()),
+                (
+                    report
+                    for report in reversed(reports)
+                    if report.phase != VERIFICATION_PREFLIGHT_PHASE
+                    and report.note
+                    and report.note.strip()
+                ),
                 None,
             )
             if latest_note is not None:
