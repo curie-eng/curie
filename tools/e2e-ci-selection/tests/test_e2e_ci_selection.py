@@ -2068,6 +2068,100 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
     assert jobs["eval-falsifiability"]["if"] == ("${{ needs.changes.outputs.skill == 'true' }}")
 
 
+def _assert_connector_image_import_coverage(job: dict[str, Any]) -> None:
+    assert job["name"] == "Build ${{ matrix.name }} image (no push)"
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["strategy"]["fail-fast"] is False
+    rows = job["strategy"]["matrix"]["include"]
+    connectors = [row for row in rows if (REPO_ROOT / row["context"] / "server.py").is_file()]
+    assert connectors, "the images matrix must cover Python connector servers"
+    steps = job["steps"]
+    builds = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if str(step.get("uses", "")).startswith("docker/build-push-action@")
+    ]
+    assert len(builds) == 2, "connectors need both multiarch and native image builds"
+    (multiarch_index, multiarch), (native_index, native) = builds
+    imports = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if step.get("name") == "Import the connector server"
+    ]
+    assert len(imports) == 1, "connectors need an import check in their built image"
+    import_index, import_step = imports[0]
+    assert multiarch_index < native_index < import_index
+    assert "if" not in multiarch
+    assert native["uses"] == multiarch["uses"]
+    condition = "${{ hashFiles(format('{0}/server.py', matrix.context)) != '' }}"
+    assert native.get("if") == condition, "native builds must cover every server.py row"
+    assert import_step.get("if") == condition, "imports must cover every server.py row"
+    for step in (multiarch, native, import_step):
+        assert not step.get("continue-on-error")
+
+    def expand(value: str, row: dict[str, Any]) -> str:
+        return re.sub(r"\$\{\{\s*matrix\.(\w+)\s*\}\}", lambda m: row[m[1]], value)
+
+    for row in connectors:
+        expected_cache = {
+            "cache-from": f"type=gha,scope={row['name']}",
+            "cache-to": f"type=gha,mode=max,scope={row['name']}",
+        }
+        expected_inputs = {
+            "context": row["context"],
+            "file": row["dockerfile"],
+            "push": False,
+            **expected_cache,
+        }
+        assert set(row["platforms"].split(",")) == {"linux/amd64", "linux/arm64"}
+        for step, expected in (
+            (multiarch, {**expected_inputs, "platforms": row["platforms"], "load": False}),
+            (
+                native,
+                {
+                    **expected_inputs,
+                    "platforms": "linux/amd64",
+                    "load": True,
+                    "tags": f"curie-ci-connector/{row['name']}:candidate",
+                },
+            ),
+        ):
+            actual = {
+                key: expand(value, row) if isinstance(value, str) else value
+                for key, value in step["with"].items()
+            }
+            assert actual == expected, row["name"]
+        command = expand(import_step["run"], row).strip()
+        assert command == (
+            "docker run --rm --entrypoint python "
+            f'curie-ci-connector/{row["name"]}:candidate -c "import server"'
+        ), row["name"]
+
+
+def test_connector_image_workflow_imports_every_python_server() -> None:
+    job = yaml.safe_load(WORKFLOW.read_text())["jobs"]["images"]
+    _assert_connector_image_import_coverage(job)
+
+
+@pytest.mark.parametrize(
+    "step_name", ["Build the native connector image", "Import the connector server"]
+)
+def test_connector_image_import_coverage_rejects_one_skipped_row(step_name: str) -> None:
+    job = yaml.safe_load(WORKFLOW.read_text())["jobs"]["images"]
+    _assert_connector_image_import_coverage(job)
+    for row in job["strategy"]["matrix"]["include"]:
+        if not (REPO_ROOT / row["context"] / "server.py").is_file():
+            continue
+        mutated = copy.deepcopy(job)
+        step = next(step for step in mutated["steps"] if step.get("name") == step_name)
+        step["if"] = (
+            "${{ hashFiles(format('{0}/server.py', matrix.context)) != '' && "
+            f"matrix.name != '{row['name']}' }}}}"
+        )
+        with pytest.raises(AssertionError):
+            _assert_connector_image_import_coverage(mutated)
+
+
 def test_upgrade_matrix_shards_job_gates_coverage_and_lists_shards() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     job = workflow["jobs"]["e2e-cluster-upgrade-matrix-shards"]
