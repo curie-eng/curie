@@ -7,7 +7,7 @@ name: P0 Closes spec-vs-impl reminder
 # required Python check.
 on:
   pull_request:
-    branches: [main, next, "epic/**"]
+    branches: [main, next]
     # A closing keyword can appear or disappear in a body-only edit. Re-run so
     # the reminder tracks the body GitHub will actually close from.
     types: [opened, synchronize, reopened, edited]

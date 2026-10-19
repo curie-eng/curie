@@ -6,7 +6,7 @@ name: Two-release approval e2e
 on:
   workflow_dispatch:
   pull_request:
-    branches: [next, "epic/**"]
+    branches: [next]
     paths:
       - "apps/dispatcher/src/curie_dispatcher/approval_actions.py"
       - "apps/dispatcher/src/curie_dispatcher/handlers.py"

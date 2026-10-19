@@ -2,14 +2,14 @@ name: SRE scheduled job alerts
 
 on:
   pull_request:
-    branches: [main, next, "epic/**"]
+    branches: [main, next]
     paths:
       - 'examples/sre-bot/observability/*scheduled_job_alerts.py'
       - 'examples/tests/test_scheduled_job_alerts.py'
       - 'examples/sre-bot/docs/SCHEDULED-JOB-ALERTS.md'
       - '.github/workflows/sre-scheduled-alerts.yaml'
   push:
-    branches: [main, next, "epic/**"]
+    branches: [main, next]
     paths:
       - 'examples/sre-bot/observability/*scheduled_job_alerts.py'
       - 'examples/tests/test_scheduled_job_alerts.py'

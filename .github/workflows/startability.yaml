@@ -3,7 +3,7 @@ name: SRE startability observer
 
 on:
   pull_request:
-    branches: [main, next, "epic/**"]
+    branches: [main, next]
     paths:
       - "examples/sre-bot/observability/startability/**"
       - "examples/sre-bot/docs/STARTABILITY.md"
