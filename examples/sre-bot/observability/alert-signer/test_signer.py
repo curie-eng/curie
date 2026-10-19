@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import importlib.util
 import json
 import logging
@@ -324,3 +325,55 @@ def test_transport_failure_returns_502_without_exception_details(
     assert messages == ["hook ingress forwarding failed (reason=transport_error)"]
     assert "synthetic-private" not in caplog.text
     assert ingress_url not in caplog.text
+
+
+def test_malformed_upstream_status_returns_502_with_only_safe_transport_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """@spec SIGNER-DIAGNOSTICS-1: protocol parse errors never disclose raw bytes."""
+    class MalformedStatus(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def do_POST(self) -> None:  # noqa: N802
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.wfile.write(
+                b"synthetic-private-upstream-status secret=synthetic-private-hook-secret\r\n\r\n"
+            )
+            self.close_connection = True
+
+    monkeypatch.setenv("CURIE_HOOK_SECRET", "synthetic-private-hook-secret")
+    monkeypatch.setenv("CURIE_SIGNER_TOKEN", "synthetic-private-signer-token")
+    actual: int | None = None
+    with _http_server(MalformedStatus) as ingress_url:
+        monkeypatch.setenv("CURIE_HOOK_URL", f"{ingress_url}/hooks/acme-agent/alertmanager")
+        with _http_server(signer.Handler) as signer_url, caplog.at_level(logging.WARNING):
+            request = urllib.request.Request(
+                signer_url,
+                data=b'{"groupKey":"synthetic-private-payload","alerts":[]}',
+                method="POST",
+                headers={"Authorization": "Bearer synthetic-private-signer-token"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    actual = response.status
+            except urllib.error.HTTPError as error:
+                actual = error.code
+                assert error.read() == b""
+            except http.client.HTTPException:
+                # An uncaught upstream parse error closes the downstream socket;
+                # retain the observation so the diagnostic assertions still run.
+                actual = None
+    captured = capsys.readouterr()
+    diagnostics = caplog.text + captured.out + captured.err
+    assert "synthetic-private" not in diagnostics
+    assert ingress_url not in diagnostics
+    assert "Traceback" not in diagnostics
+    assert actual == 502
+    records = [record for record in caplog.records if record.name == "alert_signer"]
+    assert [record.getMessage() for record in records] == [
+        "hook ingress forwarding failed (reason=transport_error)"
+    ]
+    assert all(record.exc_info is None for record in records)
