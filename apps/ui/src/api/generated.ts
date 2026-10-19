@@ -2049,6 +2049,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/deployments/{deployment_id}/input-contracts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read Input Contracts */
+        get: operations["read_input_contracts_deployments__deployment_id__input_contracts_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/evals/matrix": {
         parameters: {
             query?: never;
@@ -6263,6 +6280,43 @@ export interface components {
             /** Supported */
             supported: boolean;
         };
+        /** InputContractsOut */
+        InputContractsOut: {
+            /** Accepted Contracts */
+            accepted_contracts: string[];
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Bundle Sha256 */
+            bundle_sha256: string;
+            /**
+             * Deployment Id
+             * Format: uuid
+             */
+            deployment_id: string;
+            /**
+             * Enforced
+             * @constant
+             */
+            enforced: true;
+            /**
+             * Interface
+             * @constant
+             */
+            interface: "curie/input-contracts@1";
+            /**
+             * Status
+             * @constant
+             */
+            status: "active";
+            /**
+             * Version Id
+             * Format: uuid
+             */
+            version_id: string;
+        };
         /**
          * IssueReadContext
          * @description The execution scoped capability and the one issue it names: ``issue`` is
@@ -8044,10 +8098,14 @@ export interface components {
             execution_deadline: string;
             /** Generation */
             generation: number;
+            /** Input Contract Receipt */
+            input_contract_receipt?: {
+                [key: string]: unknown;
+            } | null;
             /** Lease Held To Deadline */
             lease_held_to_deadline: boolean;
             /** Refusal */
-            refusal: ("not_found" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed") | null;
+            refusal: ("not_found" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed" | "input_contract_unknown" | "input_contract_mismatch") | null;
             /** Repository Path */
             repository_path: string;
             /**
@@ -8303,6 +8361,12 @@ export interface components {
             generation: number;
             /** Owner */
             owner: string;
+            /** Runtime Bundle Sha256 */
+            runtime_bundle_sha256?: string | null;
+            /** Runtime Deployment Id */
+            runtime_deployment_id?: string | null;
+            /** Runtime Version Id */
+            runtime_version_id?: string | null;
             /** Sandbox Name */
             sandbox_name: string;
         };
@@ -13516,6 +13580,39 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_input_contracts_deployments__deployment_id__input_contracts_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                deployment_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InputContractsOut"];
+                };
             };
             /** @description Validation Error */
             422: {
