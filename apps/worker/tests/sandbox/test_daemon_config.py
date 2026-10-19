@@ -330,9 +330,24 @@ def _chart_values() -> dict[str, Any]:
         "factory": {
             "docker": {"daemonImage": DAEMON["image"]},
             "sandboxEgress": {"factory": True},
+            "trackers": [
+                {
+                    "name": "github",
+                    "kind": "github",
+                    "host": "github.com",
+                    "apiUrl": "https://api.github.com",
+                    "credential": {
+                        "type": "github_app",
+                        "existingSecret": "acme-github-app",
+                        "existingSecretKey": "private-key",
+                    },
+                }
+            ],
             "bindings": [
                 {
                     "name": "acme",
+                    "tracker": "github",
+                    "trackerScopeId": "123456",
                     "repos": [
                         {
                             "path": REPO,
