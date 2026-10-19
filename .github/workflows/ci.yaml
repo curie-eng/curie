@@ -1672,24 +1672,28 @@ jobs:
         if: ${{ hashFiles(format('{0}/server.py', matrix.context)) != '' }}
         run: docker run --rm --entrypoint python curie-ci-connector/${{ matrix.name }}:candidate -c "import server"
 
-  # The per-run Docker daemon image (ADR 0217 decision 4): the curie-authz
-  # plugin crate's fmt, clippy and tests, a build for both release arches (the
-  # Dockerfile cross compiles on the build platform, so no QEMU), and the
-  # black-box escape test against the amd64 image. Self-gated rather than wired
-  # into `changes`: on a pull request it runs only when apps/docker-daemon or
-  # this workflow changed; pushes and dispatches always run it.
-  docker-daemon:
-    name: Docker daemon image (authz plugin + escape test)
+  image-proofs:
+    name: Image proofs (smoke, Docker daemon, toolchain)
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: apps/docker-daemon
+    needs: [changes, ci-images]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.ci-images.result == 'success' || needs.ci-images.result == 'skipped') }}
+    env:
+      CURIE_REPO_TOOLCHAIN_PROOF: required
     steps:
-      - uses: actions/checkout@v7
+      # The per-run Docker daemon image (ADR 0217 decision 4): the curie-authz
+      # plugin crate's fmt, clippy and tests, a build for both release arches (the
+      # Dockerfile cross compiles on the build platform, so no QEMU), and the
+      # black-box escape test against the amd64 image. Self-gated rather than wired
+      # into `changes`: on a pull request it runs only when apps/docker-daemon or
+      # this workflow changed; pushes and dispatches always run it.
+      - name: "Docker daemon: Checkout"
+        if: ${{ !cancelled() }}
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Scope
+      - name: "Docker daemon: Scope"
+        if: ${{ !cancelled() }}
         id: scope
         working-directory: ${{ github.workspace }}
         env:
@@ -1707,54 +1711,59 @@ jobs:
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
-      - name: Toolchain
-        if: steps.scope.outputs.run == 'true'
+      - name: "Docker daemon: Toolchain"
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' }}
+        working-directory: apps/docker-daemon
         run: rustup component add rustfmt clippy
-      - name: Cargo cache
-        if: steps.scope.outputs.run == 'true'
+      - name: "Docker daemon: Cargo cache"
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' }}
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: apps/docker-daemon
-      - name: Fmt
-        if: steps.scope.outputs.run == 'true'
+      - name: "Docker daemon: Fmt"
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' }}
+        working-directory: apps/docker-daemon
         run: cargo fmt --check
-      - name: Clippy
-        if: steps.scope.outputs.run == 'true'
+      - name: "Docker daemon: Clippy"
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' }}
+        working-directory: apps/docker-daemon
         run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Test
-        if: steps.scope.outputs.run == 'true'
+      - name: "Docker daemon: Test"
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' }}
+        working-directory: apps/docker-daemon
         run: cargo test --locked
-      - name: Entrypoint test
-        if: steps.scope.outputs.run == 'true'
+      - name: "Docker daemon: Entrypoint test"
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' }}
         working-directory: ${{ github.workspace }}
         run: bash apps/docker-daemon/tests/entrypoint_test.sh
-      - name: Pull Docker Hub images through the mirror
-        if: steps.scope.outputs.run == 'true'
+      - name: "Docker daemon: Pull Docker Hub images through the mirror"
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' }}
         working-directory: ${{ github.workspace }}
         run: bash cli/scripts/configure-docker-hub-mirror.sh
-      - name: Set up Buildx
+      - name: "Docker daemon: Set up Buildx"
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' }}
         id: set_up_buildx
-        if: steps.scope.outputs.run == 'true'
         continue-on-error: true
         uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           buildkitd-config-inline: |
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
-      - name: Back off before retrying Set up Buildx
-        if: steps.set_up_buildx.outcome == 'failure'
+      - name: "Docker daemon: Back off before retrying Set up Buildx"
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' && steps.set_up_buildx.outcome == 'failure' }}
+        working-directory: apps/docker-daemon
         run: |
           echo "Set up Buildx failed on attempt 1 of 2, retrying in 15 seconds"
           sleep 15
-      - name: Set up Buildx (retry)
-        if: steps.set_up_buildx.outcome == 'failure'
+      - name: "Docker daemon: Set up Buildx (retry)"
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' && steps.set_up_buildx.outcome == 'failure' }}
         uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
         with:
           buildkitd-config-inline: |
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
-      - name: Build both release arches (no push)
-        if: steps.scope.outputs.run == 'true'
+      - name: "Docker daemon: Build both release arches (no push)"
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' }}
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: apps/docker-daemon
@@ -1764,8 +1773,8 @@ jobs:
           load: false
           cache-from: type=gha,scope=docker-daemon
           cache-to: type=gha,mode=max,scope=docker-daemon
-      - name: Build the amd64 candidate
-        if: steps.scope.outputs.run == 'true'
+      - name: "Docker daemon: Build the amd64 candidate"
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' }}
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: apps/docker-daemon
@@ -1775,84 +1784,82 @@ jobs:
           load: true
           tags: curie-ci/docker-daemon:candidate
           cache-from: type=gha,scope=docker-daemon
-      - name: Escape test against the candidate
-        if: steps.scope.outputs.run == 'true'
+      - name: "Docker daemon: Escape test against the candidate"
+        if: ${{ !cancelled() && steps.scope.outputs.run == 'true' }}
         working-directory: ${{ github.workspace }}
         run: bash apps/docker-daemon/tests/e2e.sh curie-ci/docker-daemon:candidate --registry-mirror=https://mirror.gcr.io
-  # only the package's DECLARED dependencies. aci-protocol is a uv workspace
-  # member imported by handlers.py/queue.py; if it is not declared in
-  # apps/dispatcher/pyproject.toml it stays importable from a source checkout
-  # but is absent from the isolated image venv, and the process crash-loops on
-  # startup (issue #428). The ci-images job only builds the image. Load that
-  # real image and assert the entrypoint's imports resolve inside it -- the one
-  # place that gap is observable.
-  dispatcher-image-smoke:
-    name: Dispatcher image imports resolve
-    runs-on: ubuntu-latest
-    needs: [changes, ci-images]
-    if: ${{ needs.changes.outputs.images == 'true' }}
-    steps:
-      - uses: actions/checkout@v7
+
+      # only the package's DECLARED dependencies. aci-protocol is a uv workspace
+      # member imported by handlers.py/queue.py; if it is not declared in
+      # apps/dispatcher/pyproject.toml it stays importable from a source checkout
+      # but is absent from the isolated image venv, and the process crash-loops on
+      # startup (issue #428). The ci-images job only builds the image. Load that
+      # real image and assert the entrypoint's imports resolve inside it -- the one
+      # place that gap is observable.
+      - name: "Dispatcher: Checkout"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Load the dispatcher image built by the ci-images job
+      - name: "Dispatcher: Load the dispatcher image built by the ci-images job"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         uses: ./.github/actions/load-ci-images
         with:
           images: dispatcher
-      - name: Tag the dispatcher image for this smoke test
+      - name: "Dispatcher: Tag the dispatcher image for this smoke test"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         run: docker tag curie-ci/dispatcher:candidate curie-dispatcher:ci-smoke
-      - name: Entrypoint imports resolve in the built image
+      - name: "Dispatcher: Entrypoint imports resolve in the built image"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         run: docker run --rm --entrypoint python curie-dispatcher:ci-smoke -c "import curie_dispatcher; import aci_protocol"
 
-  # Same gap, same shape (issue #428). The mail adapter image also builds with
-  # `uv sync --no-editable`, so it installs only the package's DECLARED
-  # dependencies: aci-protocol (a uv workspace member) and pydantic-settings
-  # stay importable from a source checkout while being absent from the isolated
-  # image venv, and the process crash-loops on startup. The ci-images job only
-  # builds the image, so this is the one place that is observable.
-  mail-adapter-image-smoke:
-    name: Mail adapter image imports resolve
-    runs-on: ubuntu-latest
-    needs: [changes, ci-images]
-    if: ${{ needs.changes.outputs.images == 'true' }}
-    steps:
-      - uses: actions/checkout@v7
+      # Same gap, same shape (issue #428). The mail adapter image also builds with
+      # `uv sync --no-editable`, so it installs only the package's DECLARED
+      # dependencies: aci-protocol (a uv workspace member) and pydantic-settings
+      # stay importable from a source checkout while being absent from the isolated
+      # image venv, and the process crash-loops on startup. The ci-images job only
+      # builds the image, so this is the one place that is observable.
+      - name: "Mail adapter: Checkout"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Load the mail-adapter image built by the ci-images job
+      - name: "Mail adapter: Load the mail-adapter image built by the ci-images job"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         uses: ./.github/actions/load-ci-images
         with:
           images: mail-adapter
-      - name: Tag the mail-adapter image for this smoke test
+      - name: "Mail adapter: Tag the mail-adapter image for this smoke test"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         run: docker tag curie-ci/mail-adapter:candidate curie-mail-adapter:ci-smoke
-      - name: Entrypoint imports resolve in the built image
+      - name: "Mail adapter: Entrypoint imports resolve in the built image"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         run: docker run --rm --entrypoint python curie-mail-adapter:ci-smoke -c "import curie_mail_adapter; import aci_protocol; import pydantic_settings"
 
-  # The console UI image serves its build through an nginx template that lives
-  # as a heredoc in apps/ui/Dockerfile, not as a checked-in config file, so
-  # nothing reviews it directly. The ci-images job only builds it and never runs
-  # the image, and the Playwright suite previews the raw Vite build on port
-  # 4273, bypassing nginx entirely. That leaves the built container as the
-  # only place the served response headers, compression and cache behavior
-  # are observable at all. This job loads the real image, boots it, and pins
-  # those headers so a template regression fails CI instead of surfacing as a
-  # production caching or compression bug.
-  ui-image-smoke:
-    name: UI image response headers are correct
-    runs-on: ubuntu-latest
-    needs: [changes, ci-images]
-    if: ${{ needs.changes.outputs.images == 'true' }}
-    steps:
-      - uses: actions/checkout@v7
+      # The console UI image serves its build through an nginx template that lives
+      # as a heredoc in apps/ui/Dockerfile, not as a checked-in config file, so
+      # nothing reviews it directly. The ci-images job only builds it and never runs
+      # the image, and the Playwright suite previews the raw Vite build on port
+      # 4273, bypassing nginx entirely. That leaves the built container as the
+      # only place the served response headers, compression and cache behavior
+      # are observable at all. This group loads the real image, boots it, and pins
+      # those headers so a template regression fails CI instead of surfacing as a
+      # production caching or compression bug.
+      - name: "UI: Checkout"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Load the ui image built by the ci-images job
+      - name: "UI: Load the ui image built by the ci-images job"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         uses: ./.github/actions/load-ci-images
         with:
           images: ui
-      - name: Tag the ui image for this smoke test
+      - name: "UI: Tag the ui image for this smoke test"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         run: docker tag curie-ci/ui:candidate curie-ui:ci-smoke
-      - name: Start the stub API upstream
+      - name: "UI: Start the stub API upstream"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         run: |
           set -euo pipefail
           docker network create curie-ui-smoke-net
@@ -1874,7 +1881,8 @@ jobs:
           echo "Stub API upstream never became ready" >&2
           docker logs curie-api-smoke || true
           exit 1
-      - name: Start the UI container
+      - name: "UI: Start the UI container"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         run: |
           set -euo pipefail
           docker run -d --name curie-ui-smoke \
@@ -1891,7 +1899,8 @@ jobs:
           echo "UI container never became ready" >&2
           docker logs curie-ui-smoke || true
           exit 1
-      - name: Assert response headers
+      - name: "UI: Assert response headers"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         run: |
           set -euo pipefail
 
@@ -2116,58 +2125,53 @@ jobs:
           fi
 
           echo "All UI image header assertions passed"
-      - name: Tear down the UI container and its API upstream
-        if: always()
+      - name: "UI: Tear down the UI container and its API upstream"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' && always() }}
         run: |
           docker rm -f curie-ui-smoke || true
           docker rm -f curie-api-smoke || true
           docker network rm curie-ui-smoke-net || true
 
-  # #2611: the Python job never builds curie-runner, so every container leg of
-  # runner/tests/test_repo_toolchain_proof.py skips on that job. This is the
-  # missing half: it loads the runner image the ci-images job built and runs
-  # the harness with CURIE_REPO_TOOLCHAIN_PROOF=required so an absent image is
-  # a failure rather than a skip. No `needs:` on the Python job -- the proof
-  # must not serialise behind the ~22 min suite (#2230). The harness runs in
-  # ~39s locally in required mode (14 passed), so wall clock grows only if
-  # this job exceeds Python.
-  repo-toolchain-proof:
-    name: Repository toolchain proof (runner image)
-    runs-on: ubuntu-latest
-    needs: [changes, ci-images]
-    if: ${{ needs.changes.outputs.images == 'true' }}
-    env:
-      CURIE_REPO_TOOLCHAIN_PROOF: required
-    steps:
-      - uses: actions/checkout@v7
+      # #2611: the Python job never builds curie-runner, so every container leg of
+      # runner/tests/test_repo_toolchain_proof.py skips on that job. This group
+      # loads the runner image built by ci-images and runs the harness with
+      # CURIE_REPO_TOOLCHAIN_PROOF=required so an absent image fails. The proof
+      # depends only on changes and ci-images, never the Python suite (#2230).
+      - name: "Toolchain: Checkout"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Install uv
+      - name: "Toolchain: Install uv"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         id: install_uv
         continue-on-error: true
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           python-version: "3.13"
-      - name: Back off before retrying Install uv
-        if: steps.install_uv.outcome == 'failure'
+      - name: "Toolchain: Back off before retrying Install uv"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' && steps.install_uv.outcome == 'failure' }}
         run: |
           echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
           sleep 15
-      - name: Install uv (retry)
-        if: steps.install_uv.outcome == 'failure'
+      - name: "Toolchain: Install uv (retry)"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' && steps.install_uv.outcome == 'failure' }}
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           python-version: "3.13"
-      - name: Sync workspace
+      - name: "Toolchain: Sync workspace"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         run: uv sync
-      - name: Required setting is present (negative control)
+      - name: "Toolchain: Required setting is present (negative control)"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         run: |
           set -euo pipefail
           if [ "${CURIE_REPO_TOOLCHAIN_PROOF}" != "required" ]; then
             echo "CURIE_REPO_TOOLCHAIN_PROOF must be required so a missing image cannot skip; got ${CURIE_REPO_TOOLCHAIN_PROOF:-<empty>}" >&2
             exit 1
           fi
-      - name: Absent image fails in required mode (negative control)
+      - name: "Toolchain: Absent image fails in required mode (negative control)"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         env:
           CURIE_RUNNER_IMAGE: curie-runner-absent-2611
         run: |
@@ -2184,13 +2188,16 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$output" | grep -F "may not skip"
-      - name: Load the runner image built by the ci-images job
+      - name: "Toolchain: Load the runner image built by the ci-images job"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         uses: ./.github/actions/load-ci-images
         with:
           images: runner
-      - name: Tag the runner image as the harness default (curie-runner)
+      - name: "Toolchain: Tag the runner image as the harness default (curie-runner)"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         run: docker tag curie-ci/runner:candidate curie-runner
-      - name: Repository toolchain proof
+      - name: "Toolchain: Repository toolchain proof"
+        if: ${{ !cancelled() && needs.changes.outputs.images == 'true' }}
         env:
           CURIE_PROOF_EVIDENCE_DIR: ${{ runner.temp }}/repo-toolchain-proof
         run: uv run pytest runner/tests/test_repo_toolchain_proof.py -q --durations=25

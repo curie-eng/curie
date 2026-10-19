@@ -243,8 +243,8 @@ rules:
     docs: []
     apps/ui: []
     apps/dispatcher: []
-    # Nothing deploys the per-run Docker daemon image yet; its own CI job
-    # (docker-daemon) builds it and runs the escape tests against it.
+    # Nothing deploys the per-run Docker daemon image yet; its group in
+    # image-proofs builds it and runs the escape tests against it.
     apps/docker-daemon: []
     scripts: []
     # The revision-based selector inspects ci.yaml hunks and runs the full

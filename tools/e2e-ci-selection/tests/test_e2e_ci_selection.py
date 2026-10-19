@@ -2010,6 +2010,230 @@ def test_push_runs_complete_while_pull_requests_and_dispatches_supersede() -> No
     assert set(workflow[True]) == {"push", "pull_request", "workflow_dispatch"}
 
 
+IMAGE_PROOFS_IF = (
+    "${{ !cancelled() && needs.changes.result == 'success' && "
+    "(needs.ci-images.result == 'success' || needs.ci-images.result == 'skipped') }}"
+)
+IMAGE_GROUP_IF = "${{ !cancelled() && needs.changes.outputs.images == 'true' }}"
+DOCKER_GROUP_IF = "${{ !cancelled() && steps.scope.outputs.run == 'true' }}"
+IMAGE_PROOF_GROUPS = {
+    "Docker daemon: ": (
+        "Checkout",
+        "Scope",
+        "Toolchain",
+        "Cargo cache",
+        "Fmt",
+        "Clippy",
+        "Test",
+        "Entrypoint test",
+        "Pull Docker Hub images through the mirror",
+        "Set up Buildx",
+        "Back off before retrying Set up Buildx",
+        "Set up Buildx (retry)",
+        "Build both release arches (no push)",
+        "Build the amd64 candidate",
+        "Escape test against the candidate",
+    ),
+    "Dispatcher: ": (
+        "Checkout",
+        "Load the dispatcher image built by the ci-images job",
+        "Tag the dispatcher image for this smoke test",
+        "Entrypoint imports resolve in the built image",
+    ),
+    "Mail adapter: ": (
+        "Checkout",
+        "Load the mail-adapter image built by the ci-images job",
+        "Tag the mail-adapter image for this smoke test",
+        "Entrypoint imports resolve in the built image",
+    ),
+    "UI: ": (
+        "Checkout",
+        "Load the ui image built by the ci-images job",
+        "Tag the ui image for this smoke test",
+        "Start the stub API upstream",
+        "Start the UI container",
+        "Assert response headers",
+        "Tear down the UI container and its API upstream",
+    ),
+    "Toolchain: ": (
+        "Checkout",
+        "Install uv",
+        "Back off before retrying Install uv",
+        "Install uv (retry)",
+        "Sync workspace",
+        "Required setting is present (negative control)",
+        "Absent image fails in required mode (negative control)",
+        "Load the runner image built by the ci-images job",
+        "Tag the runner image as the harness default (curie-runner)",
+        "Repository toolchain proof",
+    ),
+}
+
+
+def _assert_image_proofs(workflow: dict[str, Any]) -> None:
+    jobs = workflow["jobs"]
+    assert not {
+        "docker-daemon",
+        "dispatcher-image-smoke",
+        "mail-adapter-image-smoke",
+        "ui-image-smoke",
+        "repo-toolchain-proof",
+    } & jobs.keys()
+    assert "image-proofs" in jobs
+    job = jobs["image-proofs"]
+    assert job["name"] == "Image proofs (smoke, Docker daemon, toolchain)"
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["needs"] == ["changes", "ci-images"]
+    assert job["if"] == IMAGE_PROOFS_IF
+    assert job["env"] == {"CURIE_REPO_TOOLCHAIN_PROOF": "required"}
+    assert not {"defaults", "continue-on-error", "timeout-minutes"} & job.keys()
+    steps = job["steps"]
+    assert len(steps) == 40
+    assert [step["name"] for step in steps] == [
+        prefix + name for prefix, names in IMAGE_PROOF_GROUPS.items() for name in names
+    ], "all former steps must retain group order, with UI before Toolchain"
+    by_name = {step["name"]: step for step in steps}
+    assert [
+        (step["name"], step["with"]["images"])
+        for step in steps
+        if step.get("uses") == "./.github/actions/load-ci-images"
+    ] == [
+        (prefix + f"Load the {image} image built by the ci-images job", image)
+        for prefix, image in (
+            ("Dispatcher: ", "dispatcher"),
+            ("Mail adapter: ", "mail-adapter"),
+            ("UI: ", "ui"),
+            ("Toolchain: ", "runner"),
+        )
+    ]
+    for prefix in IMAGE_PROOF_GROUPS:
+        checkout = by_name[prefix + "Checkout"]
+        assert checkout["uses"].startswith("actions/checkout@")
+        assert checkout["with"] == (
+            {"fetch-depth": 0, "persist-credentials": False}
+            if prefix == "Docker daemon: "
+            else {"persist-credentials": False}
+        )
+    assert sum(step.get("uses", "").startswith("actions/checkout@") for step in steps) == 5
+    scope = by_name["Docker daemon: Scope"]
+    assert scope["id"] == "scope"
+    assert scope["env"] == {
+        "EVENT_NAME": "${{ github.event_name }}",
+        "BASE_REF": "${{ github.base_ref }}",
+    }
+    assert by_name["Docker daemon: Set up Buildx"]["id"] == "set_up_buildx"
+    assert by_name["Toolchain: Install uv"]["id"] == "install_uv"
+    assert {step["name"] for step in steps if "continue-on-error" in step} == {
+        "Docker daemon: Set up Buildx",
+        "Toolchain: Install uv",
+    }
+    for name in ("Docker daemon: Set up Buildx", "Toolchain: Install uv"):
+        assert by_name[name]["continue-on-error"] is True
+    inherited = {"Toolchain", "Fmt", "Clippy", "Test", "Back off before retrying Set up Buildx"}
+    workspace = {
+        "Scope",
+        "Entrypoint test",
+        "Pull Docker Hub images through the mirror",
+        "Escape test against the candidate",
+    }
+    for step in steps:
+        name = step["name"]
+        docker = name.startswith("Docker daemon: ")
+        gate = DOCKER_GROUP_IF if docker else IMAGE_GROUP_IF
+        if name in ("Docker daemon: Checkout", "Docker daemon: Scope"):
+            gate = "${{ !cancelled() }}"
+        elif name in (
+            "Docker daemon: Back off before retrying Set up Buildx",
+            "Docker daemon: Set up Buildx (retry)",
+            "Toolchain: Back off before retrying Install uv",
+            "Toolchain: Install uv (retry)",
+        ):
+            attempt = "set_up_buildx" if docker else "install_uv"
+            gate = gate.removesuffix(" }}") + f" && steps.{attempt}.outcome == 'failure'" + " }}"
+        elif name == "UI: Tear down the UI container and its API upstream":
+            gate = "${{ !cancelled() && needs.changes.outputs.images == 'true' && always() }}"
+        assert step.get("if") == gate, f"step gate: {name}"
+        label = name.removeprefix("Docker daemon: ")
+        if docker and label in inherited:
+            directory = "apps/docker-daemon"
+        elif docker and label in workspace:
+            directory = "${{ github.workspace }}"
+        else:
+            directory = None
+        assert step.get("working-directory") == directory, name
+
+
+def test_image_proofs_workflow_contract() -> None:
+    _assert_image_proofs(yaml.safe_load(WORKFLOW.read_text()))
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Dispatcher: Entrypoint imports resolve in the built image",
+        "Mail adapter: Entrypoint imports resolve in the built image",
+        "UI: Assert response headers",
+        "Toolchain: Repository toolchain proof",
+    ],
+)
+def test_image_proofs_rejects_a_group_losing_its_image_gate(name: str) -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    _assert_image_proofs(workflow)
+    step = next(step for step in workflow["jobs"]["image-proofs"]["steps"] if step["name"] == name)
+    step["if"] = step["if"].replace(" && needs.changes.outputs.images == 'true'", "")
+    with pytest.raises(AssertionError, match="step gate"):
+        _assert_image_proofs(workflow)
+
+
+@pytest.mark.parametrize(
+    ("name", "clause"),
+    [
+        ("Docker daemon: Scope", "!cancelled()"),
+        ("Docker daemon: Fmt", "steps.scope.outputs.run == 'true'"),
+        (
+            "Docker daemon: Back off before retrying Set up Buildx",
+            "steps.scope.outputs.run == 'true'",
+        ),
+        ("Docker daemon: Set up Buildx (retry)", "steps.set_up_buildx.outcome == 'failure'"),
+        (
+            "Toolchain: Back off before retrying Install uv",
+            "needs.changes.outputs.images == 'true'",
+        ),
+        ("Toolchain: Install uv (retry)", "steps.install_uv.outcome == 'failure'"),
+        ("UI: Tear down the UI container and its API upstream", "always()"),
+    ],
+)
+def test_image_proofs_rejects_a_changed_step_gate(name: str, clause: str) -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    _assert_image_proofs(workflow)
+    step = next(step for step in workflow["jobs"]["image-proofs"]["steps"] if step["name"] == name)
+    step["if"] = step["if"].replace(clause, "true")
+    with pytest.raises(AssertionError, match="step gate"):
+        _assert_image_proofs(workflow)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing-step", "toolchain-first", "union-load", "scoped-bootstrap"]
+)
+def test_image_proofs_rejects_a_changed_group_contract(mutation: str) -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    _assert_image_proofs(workflow)
+    steps = workflow["jobs"]["image-proofs"]["steps"]
+    if mutation == "missing-step":
+        steps.pop()
+    elif mutation == "toolchain-first":
+        steps[23:] = steps[30:] + steps[23:30]
+    elif mutation == "union-load":
+        load = next(
+            step for step in steps if step.get("uses") == "./.github/actions/load-ci-images"
+        )
+        load["with"]["images"] = "dispatcher,mail-adapter,ui,runner"
+    else:
+        steps[1]["if"] = DOCKER_GROUP_IF
+    with pytest.raises(AssertionError):
+        _assert_image_proofs(workflow)
+
+
 def test_workflow_consumes_each_selection_output_exactly() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     jobs = workflow["jobs"]
@@ -2064,10 +2288,7 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
     assert "if" not in jobs["e2e-cluster-upgrade-matrix-shards"]
     assert jobs["images"]["if"] == "${{ needs.changes.outputs.images == 'true' }}"
     assert "worker-local-image" not in jobs
-    assert jobs["dispatcher-image-smoke"]["if"] == jobs["images"]["if"]
-    assert jobs["mail-adapter-image-smoke"]["if"] == jobs["images"]["if"]
-    assert jobs["ui-image-smoke"]["if"] == jobs["images"]["if"]
-    assert jobs["repo-toolchain-proof"]["if"] == jobs["images"]["if"]
+    _assert_image_proofs(workflow)
     assert jobs["cli-portability"]["if"] == (
         "${{ github.event_name != 'pull_request' && needs.changes.outputs.cli_release == 'true' }}"
     )
