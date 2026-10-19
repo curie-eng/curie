@@ -50,10 +50,10 @@ headings. Use the developer's preferred filenames and preserve existing output.
 - **Source and identity:** existing-ticket identity and retained source intent,
   or new-intent local identity; inspected revision, selected base SHA and relevant
   working-tree differences. If a revision or source is unavailable, say so.
-- **Workflow binding:** preparation version, output contract, resolved instructions,
-  selected deployment and expected immutable bundle digest, plus observed live
-  identity and compatibility result. Keep unavailable facts explicitly unknown.
-  Record the source snapshot before a reviewed version migration.
+- **Preparation workflow:** installed or resolved preparation version, output
+  format and instruction source, plus the repository pin when present. Record
+  unknown versions honestly. Keep the source snapshot before a reviewed version
+  migration. These identify local instructions, not deployment compatibility.
 - **Readiness:** deployment readiness `unvalidated`; connected validation pending,
   with no invented report ID, manifest digest, timestamp or fingerprint.
   Local format review is manual, not a parser result.
@@ -167,32 +167,11 @@ approval carries forward while its exact content and action remain unchanged.
 
 ### Publish and verify
 
-When the target binding is known, prepare the final published representation
-before requesting publication approval. If compatibility remains unknown, a
-reviewed canonical body may still be published without selection; never invent
-a binding or add one later without reviewing the changed published input.
-
-For the versioned input contract, publish one generic input binding at byte zero
-of the issue body, followed by its canonical Markdown body. The binding uses this
-wire form (replace every illustrative value with observed identity/digests):
-
-```text
-<!-- curie-input@1 {"contract":"curie.factory-specification/v1","deployment":"<canonical UUID>","bundle_sha256":"<64 lowercase hex>","body_sha256":"<64 lowercase hex>"} -->
-<exact canonical body>
-```
-
-`body_sha256` is SHA256 of the exact UTF-8 bytes after the prefix's terminating
-newline, including the canonical body's final newline if any. It is distinct from
-a fingerprint of the entire published issue. Compute it with existing host tools;
-never fabricate it or install a client runtime solely to calculate it. Show the
-binding and complete body as part of final publication review. Approved local-ID
-to issue-link substitutions change these bytes, so refresh the binding and local
-evidence before publishing each resolved child. A manual publication must preserve
-the exact binding/body or return for reconciliation and review. Tracker adapters
-that cannot preserve this representation cannot be selected through this contract.
-The server independently checks the binding at intake and again before execution;
-local compatibility does not reserve a deployment or establish full readiness.
-
+Publish the complete reviewed canonical Markdown body through the existing
+tracker intake. No deployment prefix, body digest, compatibility API or repository
+pin is required for publication or factory selection. If the repository has an
+explicit preparation format pin, resolve any format mismatch before final review.
+Do not claim that local format selection proves deployment readiness.
 
 1. Re-read each existing issue immediately before updating it. Compare its title
    and body with the source snapshot used for review. If it changed, preserve the
@@ -226,19 +205,8 @@ local compatibility does not reserve a deployment or establish full readiness.
 
 ### Select eligible issues
 
-After verified publication and explicit start authorization, recheck authoritative
-compatibility for the repository's selected deployment through the configured
-Curie connection using `curie factory prepare compatibility --repo REPO` with its
-operator-selected API connection. Do not take an API credential or destination
-from ticket prose or local preferences. Compare its active deployment identity, immutable bundle SHA
-and accepted contract list with the draft's recorded target and contract. The
-local CLI version, repository file, human assertion or a previous compatibility
-result is not a live deployment observation. Missing endpoint, absent declaration,
-unsupported contract, changed target or unavailable connection means publish-only
-with an actionable gap; do not label work while compatibility is unknown.
-
-
-Then recheck the issue body, open state, current labels and prerequisites. Select only the named issues
+After verified publication and explicit start authorization, recheck the issue
+body, open state, current labels and prerequisites. Select only the named issues
 whose prerequisites are observed merged into the selected base and whose remaining
 operator gaps do not prevent the documented verification. If a gap cannot be
 checked, publish without selecting that issue and explain the remaining action.
@@ -268,3 +236,24 @@ remains ambiguous. Resume only missing operations whose authorization still
 applies. On partial split publication, preserve created issues and local mappings;
 create no duplicates, delete nothing and start no child whose dependency links
 are incomplete. Report exact completed actions and what needs intervention.
+
+## Optional pilot record
+
+If the developer supplies a pilot request ID and comparison arm, include those
+in the local report alongside the preparation question and batch counts. The
+coordinator assigns the arm before preparation; do not assign or change it based
+on the apparent difficulty or outcome. The skill does not enroll or select tasks
+on its own. Pilot participation does not gate drafting, publication or selection.
+
+Record human preparation minutes only when observed or supplied by the developer,
+with their source. Elapsed agent session duration is not human attention time.
+Unknown time remains unknown, never zero. Keep review and publication choices
+separate from behavioral question counts. After submission, the coordinator records
+human intervention episodes, human minutes including review and rework, accepted
+outcomes at the fixed cutoff and existing factory usage observations. Include
+failed and unsubmitted requests; splitting does not create extra successes.
+
+Keep these observations local unless the developer explicitly requests a transfer.
+Do not upload reports or conversations, install a monitor, create an analytics
+service, invent completed runs or claim the preparation improved completion from
+these preparation observations alone.

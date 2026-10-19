@@ -41,10 +41,15 @@ recovery without writing real issues. These are opt-in host-agent evaluations,
 not automated CI tests or proof of deployed factory intake.
 
 Managed installation supports update checks, unchanged-file upgrades and rollback.
-Repository bindings in `.curie-factory.json` select a preparation release and actual
-factory deployment; the global entry skill resolves each checkout independently.
-Local preferences remain outside managed assets. Compatibility compares opaque
-contract and immutable deployment identities, not the client's platform version.
-The factory retains ownership of specification semantics. See the
-[preparation guide](../../../docs/guides/factory-preparation.md#versions-and-upgrades)
-for the full version and customization workflow.
+Optional repository pins in `.curie-factory.json` select preparation instructions
+and output format independently for each checkout. They do not bind a deployment
+or gate existing label intake. Without a pin or CLI, the installed text workflow
+can still prepare, review, publish and select work. Local preferences remain
+outside managed assets. The factory retains ownership of specification semantics.
+See the [preparation guide](../../../docs/guides/factory-preparation.md#versions-and-upgrades)
+for version and customization details.
+
+The optional [pilot protocol](pilot/README.md) and blank [ledger](pilot/outcomes.csv)
+compare usual intake with prepared intake. They measure accepted outcomes,
+postsubmission interventions and total human effort using existing factory
+observations, without a new runtime service.

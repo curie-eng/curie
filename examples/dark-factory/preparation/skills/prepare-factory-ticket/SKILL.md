@@ -19,38 +19,45 @@ Before choosing a specification format, identify the actual checkout, coding
 client and installed skill scope. A global installation serves multiple
 repositories; never use the last repository's version or target for this one.
 
-For a managed installation with the current Curie CLI available, run
+Repository pins are optional. Without `.curie-factory.json`, use this installed
+skill and its [reference](references/specification.md). Drafting, reviewed
+publication and selection through the existing configured factory label do not
+require a CLI, pin, compatibility endpoint or new factory version.
+
+When a pin is present and the managed Curie CLI is available, run
 `curie factory prepare resolve --agent CLIENT --repo REPO` with `--global` for a
-personal installation, or `--dir INSTALL_ROOT` for a project installation. Read
-that repository's `.curie-factory.json`, then load the returned `instructions_path`
-and its packaged reference. The resolver checks the exact preparation version,
-accepted output contract and cached file hashes. If those are this same workflow,
-continue without recursively invoking the skill. Otherwise use the resolved
-workflow for this draft. Freeze its version, contract, target deployment, bundle
-digest and instruction identity in the local report; refresh only through an
-explicit draft migration and full specification review.
+personal installation, or `--dir INSTALL_ROOT` for a project installation. Schema 2
+pins specify `preparation_version`, `contract_version` and an optional exact
+`preparation_release`. Load the returned `instructions_path` and packaged
+reference. The resolver checks cached file hashes and whether that release
+supports the pinned output format. If those are this same workflow, continue
+without recursively invoking the skill. Otherwise use the resolved workflow.
+Record the selected instructions, preparation version and format in the local
+report. This is local workflow selection, not proof of deployed factory support.
 
-At most once per preparation session, perform a read-only upstream update check with
-`curie factory prepare update --check --agent CLIENT` and the same installation
-scope. Tell the developer what changed and whether it affects action permissions
-before applying an update. Preserve their chosen pin or update policy. Updating
-an entry skill does not change repository pins or an ongoing draft's workflow.
-A failed network check is not a reason to discard a compatible cached workflow.
-Never install or upgrade the CLI without authorization. Edited managed files
-require manual reconciliation; there is no automatic merge. Use the updater's
-backup and rollback, not ad hoc overwrites.
+An explicit pin that cannot be resolved is a workflow choice to settle with the
+developer. Preserve it and explain the gap; do not silently substitute a different
+format. An older schema 1 deployment binding requires explicit manual migration
+to schema 2. Without the CLI, read the pin and available instructions, explain what
+cannot be verified and ask about any format mismatch. Preserve an ongoing draft's
+chosen workflow; changing versions requires review of the complete changed spec.
+Never carry another repository's pin or preferences into this checkout.
 
-Read the returned local preferences file when present. Preferences schema 1 uses
+At most once per preparation session, when the managed CLI is available, perform
+a read-only upstream update check with `curie factory prepare update --check
+--agent CLIENT` and the same installation scope. Tell the developer what changed
+and whether it affects action permissions before applying an update. Preserve
+their pin and update policy. Updating the entry skill does not change repository
+pins or an ongoing draft. A failed network check does not discard usable cached
+instructions. Never install or upgrade the CLI without authorization. Edited
+managed files require manual reconciliation; use the updater's backup and
+rollback rather than overwriting edits. There is no automatic merge.
+
+Read the local preferences file when present. Preferences schema 1 uses
 `schema_version: 1` and a `preferences` object with optional `output_directory`,
 `review_style` and `repository_notes` strings. Preserve it across upgrades. Explain
 unknown, malformed or incompatible preferences and ask about the affected choice;
-do not rewrite it silently or let it override contract checks and action approval.
-
-If the CLI, binding or pinned release is unavailable, explain the exact gap. You
-may draft with the installed [reference](references/specification.md), clearly
-recording unresolved compatibility, but do not claim the target is compatible or
-select it for factory execution. When migrating an existing draft, reuse its
-recorded decisions and evidence and review the full changed specification.
+do not rewrite it silently or let it grant publication or selection authority.
 
 ## Establish the source
 

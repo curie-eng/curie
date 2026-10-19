@@ -69,7 +69,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 74 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 `ManagedSkillOutput` in `cli/src/managed_skills.rs` covers version checks, updates,
-rollback, repository resolution, release packaging and deployment compatibility.
+rollback, repository resolution, and release packaging.
 Its result is registered in `cli/schema/managed-skill.schema.json`.
 
 - **`DryRunPlan`** (`cli/src/ui.rs`) — the generic `--dry-run` plan; JSON is

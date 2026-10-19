@@ -77,17 +77,17 @@ def test_execution_validation_does_not_discover_preparation_skill(tmp_path: Path
     execution = list((copy / "skills").rglob("SKILL.md"))
     assert [path.parent.name for path in execution] == ["implement-issue"]
     before = validate_bundle(
-        copy, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT, input_contract_context="standalone"
+        copy, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT
     )
     nested = copy / SKILL.relative_to(BUNDLE) / "SKILL.md"
     nested.write_text("---\nname: []\n---\n", encoding="utf-8")
     after = validate_bundle(
-        copy, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT, input_contract_context="standalone"
+        copy, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT
     )
     assert after == before
     execution[0].write_text("---\nname: []\n---\n", encoding="utf-8")
     rejected = validate_bundle(
-        copy, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT, input_contract_context="standalone"
+        copy, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT
     )
     assert any(
         issue.code == "skill.frontmatter_invalid"
