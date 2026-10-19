@@ -17,7 +17,7 @@ ci_policy_tests:
     [.github, tools/ci-retry-gate, conftest.py, pyproject.toml, uv.lock]
   tools/ci-workflow-paths/tests/test_workflow_paths.py:
     [.github, tools/ci-workflow-paths, conftest.py, pyproject.toml, uv.lock,
-     apps/ui, scripts/check-glibc-floor.sh, scripts/check-version-consistency.sh]
+     apps/ui, cli, scripts/check-glibc-floor.sh, scripts/check-version-consistency.sh]
   tools/close-on-next/tests/test_close_on_next.py:
     [.github, tools/close-on-next, conftest.py, pyproject.toml, uv.lock]
   tools/dependency-audit-paths/tests/test_dependency_audit_paths.py:
@@ -66,7 +66,8 @@ ci_policy_tests:
      apps, charts/curie, cli, compose/generate_release_compose.py,
      docs/adr/README.md, packages/aci-protocol, scripts/check-docs.sh]
   tools/p0-closes-ci/tests/test_p0_closes_ci.py:
-    [.github, tools/p0-closes-ci, conftest.py, pyproject.toml, uv.lock]
+    [.github, tools/p0-closes-ci, conftest.py, pyproject.toml, uv.lock,
+     tools/e2e-ci-selection/cli_pytest_files.txt]
   tools/runtime-assertion-gate/tests/test_runtime_assertion_gate.py:
     [.github, tools/runtime-assertion-gate, conftest.py, pyproject.toml, uv.lock,
      charts/curie/ci/runtime, charts/curie/templates]

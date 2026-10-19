@@ -502,6 +502,22 @@ def _policy_guard_fixture(tmp_path: Path) -> dict[str, list[str]]:
     return entries
 
 
+def test_ci_policy_guard_covers_existing_ignored_build_directories(tmp_path: Path) -> None:
+    entries = _policy_guard_fixture(tmp_path)
+    for directory in ("target", "dist"):
+        (tmp_path / "cli" / directory).mkdir(parents=True, exist_ok=True)
+    _assert_ci_policy_registry(tmp_path, entries)
+
+    module = "tools/ci-workflow-paths/tests/test_workflow_paths.py"
+    entries[module].remove("cli")
+    with pytest.raises(
+        AssertionError, match=re.escape(module) + r": undeclared repository path cli/(target|dist)$"
+    ):
+        _assert_ci_policy_registry(tmp_path, entries)
+    entries[module].append("cli")
+    _assert_ci_policy_registry(tmp_path, entries)
+
+
 def test_ci_policy_guard_rejects_missing_entry(tmp_path: Path) -> None:
     entries = _policy_guard_fixture(tmp_path)
     _assert_ci_policy_registry(tmp_path, entries)

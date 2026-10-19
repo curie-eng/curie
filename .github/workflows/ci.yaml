@@ -629,8 +629,8 @@ jobs:
     # running (and so reporting the required check) whatever the shards did.
     # A failed or cancelled shard fails the aggregate step below, and so does a
     # skipped shard job unless `changes` selected no pytest (#3858). It checks
-    # the container fixtures against that selection and requires `python-static`
-    # to succeed.
+    # the container fixtures against that selection, requires `python-static`
+    # to succeed, and checks `ci-policy` against its own selection.
     needs: [changes, python-pytest, python-container-fixtures, python-static, ci-policy]
     if: always()
     runs-on: ubuntu-latest
