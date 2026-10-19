@@ -248,4 +248,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0232 | [A contract migration ships one release after the code stops using what it drops](0232-a-contract-migration-ships-one-release-after-the-code-stops-using-what-it-drops.md) | Accepted |
 | 0233 | [Factory publication recovery requires explicit operator adoption](0233-factory-publication-recovery-requires-explicit-operator-adoption.md) | Draft |
 | 0234 | [Factory-owned pull requests accept authorized feedback without a mention](0234-factory-owned-pull-requests-accept-authorized-feedback-without-a-mention.md) | Accepted |
+| 0235 | [Bitbucket Cloud publication discovery trusts tracker-authenticated receipts](0235-bitbucket-cloud-publication-discovery-trusts-tracker-authenticated-receipts.md) | Draft |
 <!-- END GENERATED: adr-index -->
