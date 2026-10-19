@@ -657,6 +657,42 @@ fn factory_migrates_all_ten_nondefault_keys_with_native_identity() {
 }
 
 #[test]
+fn legacy_factory_without_required_ci_validates_chart_schema() {
+    let schema: Value = serde_json::from_str(include_str!("../../charts/curie/values.schema.json"))
+        .expect("committed chart values schema");
+    let validator = jsonschema::validator_for(&schema).expect("chart values schema compiles");
+    for metadata_only in [false, true] {
+        let mut values = legacy_factory_values();
+        let api = values["api"].as_object_mut().unwrap();
+        api.remove("githubFactoryPythonCi");
+        if !metadata_only {
+            api.remove("githubFactoryMetadataCi");
+        }
+        let outcome = migrated_factory(values);
+        validator
+            .validate(&outcome.values)
+            .expect("full migrated values without required CI must satisfy the chart schema");
+        assert_legacy_factory_removed(&outcome.values);
+        let (_, repo) = only_github_repo(&outcome.values);
+        if metadata_only {
+            let ci = repo.get("ci").expect("metadata-only CI policy is retained");
+            assert!(ci.get("required").is_none());
+            assert_eq!(
+                ci["metadataRerunKeys"],
+                json!([
+                    "body-check",
+                    "fix-pin",
+                    "status:approval",
+                    "status:status:retained-context"
+                ])
+            );
+        } else {
+            assert!(repo.get("ci").is_none());
+        }
+    }
+}
+
+#[test]
 fn factory_migration_reuses_equal_typed_entries_with_arbitrary_names() {
     let mut values = legacy_factory_values();
     let typed = equal_typed_factory();
@@ -1617,12 +1653,7 @@ fn factory_each_resolved_repository_gets_its_own_policy_and_native_scope() {
     assert_eq!(other["repos"][0]["path"], "acme-corp/other");
     assert_eq!(other["repos"][0]["bases"], json!(["stable", "main"]));
     assert_eq!(other["repos"][0]["defaultBase"], "stable");
-    assert!(other["repos"][0]["ci"]
-        .get("required")
-        .is_none_or(Value::is_null));
-    assert!(other["repos"][0]["ci"]
-        .get("metadataRerunKeys")
-        .is_none_or(|keys| keys == &json!([])));
+    assert!(other["repos"][0].get("ci").is_none());
     let (_, repo) = only_github_repo(&outcome.values);
     assert_eq!(repo["ci"]["required"]["key"], "required-python");
 }
