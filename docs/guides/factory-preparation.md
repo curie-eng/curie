@@ -185,9 +185,9 @@ sets that ownership boundary; #4589 tracks the minimum isolated evaluation suppo
 ## Versions and upgrades
 
 A preparation version identifies the installed instructions. An output contract
-identifies the format and semantics the factory accepts. The selected deployment
-and its immutable bundle digest identify the actual consumer. The local Curie CLI
-release does not prove that those three match.
+identifies the specification format used by those instructions. Optional repository
+pins select a preparation version and format for that repository. These are local
+authoring choices, not a declaration of deployment compatibility or readiness.
 
 The installer records a managed receipt and original file hashes outside the
 client's discovered skill folder. Check for a release without changing files:
@@ -217,19 +217,15 @@ used in early branch testing still embeds its original files until rebuilt.
 
 ## One agent, multiple repository pins
 
-Keep the repository binding in `.curie-factory.json`, which can be committed.
+Optionally keep a repository pin in `.curie-factory.json`, which can be committed.
 Unlike `.curie/`, this file is not ignored by the default repository configuration.
-Use actual observed identities in place of these illustrative values:
+For example:
 
 ```json
 {
-  "schema_version": 1,
-  "preparation_version": "0.2.1",
-  "target": {
-    "deployment_id": "00000000-0000-4000-8000-000000000001",
-    "bundle_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-    "contract_version": "curie.factory-specification/v1"
-  }
+  "schema_version": 2,
+  "preparation_version": "0.3.0",
+  "contract_version": "curie.factory-specification/v1"
 }
 ```
 
@@ -246,7 +242,7 @@ curie factory prepare resolve --agent codex --global --repo /path/to/repository
 ```
 
 The result identifies the matching versioned instructions, preferences file and
-factory target. Each repository can select a different cached release through the
+specification format. Each repository can select a different cached release through the
 same global entry skill. Cached versions remain outside the client's discovery
 directories, avoiding duplicate skill names. Resolution checks file hashes and
 contract support; it does not change the repository's pin or another repository's
@@ -257,7 +253,7 @@ directory containing the self-contained `release.json` package.
 An invocation checks for entry skill updates once per preparation session when the
 CLI and network are available, then notifies before an update is applied. It
 records and keeps the selected workflow for the draft. Moving a draft to another
-version or target requires review of the entire changed specification. A network
+version or format requires review of the entire changed specification. A network
 failure does not discard a compatible cached release. This is an on-use check,
 not an idle background service installed into the coding agent.
 
@@ -277,24 +273,34 @@ Local preferences live in the checkout's `.curie` directory, in
 
 The skill checks these preferences when loading them, explains unknown or
 incompatible choices, and keeps the original file intact. Preferences cannot
-change the output contract, grant publication authority or bypass target checks.
+change the output contract or grant publication authority.
 
-## Target compatibility
+A repository pin is optional. Without one, use the installed skill and record its
+version and format in the local report. The CLI and a pin are not prerequisites
+for reviewing, publishing or selecting work through the existing factory label.
+Do not borrow another repository's pin. A legacy schema 1 pin containing a
+`target` is refused with migration guidance: review its preparation version and
+format, then explicitly replace it with schema 2. Deployment IDs and bundle hashes
+are not fields in the new pin.
 
-Before selecting published work, the skill uses the configured Curie connection
-to read the actual deployment's contract declaration. A missing endpoint, absent
-declaration, changed deployment digest or unsupported contract leaves compatibility
-unknown or incompatible. The issue may still be published after review, but the
-skill does not add the factory label.
+This release publishes the reviewed canonical body through the existing tracker
+workflow. It adds no versioned input prefix, deployment compatibility endpoint or
+runtime admission gate. An optional pin can select instructions that produce a
+known format; it cannot prove that an installed factory can execute the resulting
+work. Confirm the actual repository, configured label and prerequisites as part
+of the normal selection review.
 
-Versioned input carries one generic identity prefix bound to the exact canonical
-body bytes, output contract, deployment UUID and bundle digest. The full published
-representation is reviewed before submission. Intake and execution start compare
-that binding independently; the local check is not a reservation. Existing legacy
-bundles without the declaration retain their legacy workflow. Their absence of
-contract support does not authorize the preparation skill to select versioned work.
+## Measure whether preparation helps
 
-The generic declaration and prefix are specified in the separate contract PR
-#4615. Dependent runtime integration must not merge or deploy before that reviewed
-contract lands. Static compatibility does not replace the future bounded semantic
-evaluator or establish deployment readiness.
+Use the [preparation pilot protocol](../../examples/dark-factory/preparation/pilot/README.md)
+and its blank ledger to compare ordinary intake with prepared intake. Enroll
+original requests before preparing them, keep the factory setup comparable, and
+measure accepted outcomes and postsubmission interventions at the same cutoff.
+Include preparation time as well as supervision, review and rework so that moving
+questions earlier is not mistaken for eliminating human effort.
+
+The pilot uses a private local ledger and existing
+[outcome and usage evidence](measuring-factory-outcomes.md). It installs no
+analytics service and uploads nothing. Participation is optional and does not
+block publication or factory selection. A small exploratory trial can guide the
+next change; it does not establish a universal productivity improvement.
