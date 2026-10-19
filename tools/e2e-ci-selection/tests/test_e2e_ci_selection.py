@@ -186,14 +186,17 @@ CHART_SCENARIOS = {
     "installation-identity": {
         "step": "Installation identity Secret lifecycle",
         "inputs": ["charts/curie/ci/runtime/upgrade-drain-installation-runtime.sh"],
+        "leg": "chart",
     },
     "connector-identity": {
         "step": "End to end connector identity is denied outside its scope",
         "inputs": ["charts/curie/ci/runtime/e2e-connector-identity-runtime.sh"],
+        "leg": "chart",
     },
     "runner-resources-render": {
         "step": "Per-agent runner resource override renders",
         "inputs": ["charts/curie/ci/runtime/runner-resources-assertions.sh"],
+        "leg": "chart",
     },
     "langfuse-postgres-readiness": {
         "step": "Langfuse web waits for delayed Postgres without restarting",
@@ -201,6 +204,7 @@ CHART_SCENARIOS = {
             "charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh",
             "charts/curie/ci/postgres-readiness-delay.Dockerfile",
         ],
+        "leg": "chart",
     },
     "connector-readiness": {
         "step": "Connector that never listens stays not-Ready until it binds",
@@ -211,14 +215,17 @@ CHART_SCENARIOS = {
             "pyproject.toml",
             "uv.lock",
         ],
+        "leg": "chart",
     },
     "runner-template-admission": {
         "step": "Runner template admission refuses host escapes, token mounts, and unlisted images",
         "inputs": ["charts/curie/ci/runtime/runner-template-admission-runtime.sh"],
+        "leg": "chart",
     },
     "runner-byo-egress": {
         "step": "Runner BYO egress enforces (not just rendered)",
         "inputs": ["scripts/check-runner-byo-egress.sh"],
+        "leg": "chart",
     },
     "controller-preflight": {
         "step": "Controller preflight accepts a serving upgrade and refuses broken RBAC",
@@ -227,6 +234,7 @@ CHART_SCENARIOS = {
             "pyproject.toml",
             "uv.lock",
         ],
+        "leg": "chart",
     },
     "workspace-diagnostic": {
         "step": "Workspace dependency failure reaches the terminal diagnostic",
@@ -234,6 +242,7 @@ CHART_SCENARIOS = {
             "charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh",
             *CHART_IMAGE_INPUTS,
         ],
+        "leg": "workload",
     },
     "quota-progress": {
         "step": "Quota progress regression",
@@ -241,15 +250,37 @@ CHART_SCENARIOS = {
             "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",
             *CHART_IMAGE_INPUTS,
         ],
+        "leg": "workload",
     },
 }
 CHART_IDS = tuple(sorted(CHART_SCENARIOS))
 
 
-def _chart_step_if(scenario: str) -> str:
+CHART_LEGS = ("chart", "workload")
+WORKLOAD_SCENARIOS = frozenset({"workspace-diagnostic", "quota-progress"})
+
+
+def _chart_leg_clause(leg: str) -> str:
+    return "matrix.leg == '" + leg + "'"
+
+
+def _chart_step_if(scenario: str, leg: str | None = None) -> str:
     if scenario == "quota-progress":
         return "${{ false }}"
-    return "${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), '" + scenario + "') }}"
+    return (
+        "${{ "
+        + _chart_leg_clause(CHART_SCENARIOS[scenario]["leg"] if leg is None else leg)
+        + " && contains(fromJSON(needs.changes.outputs.chart_scenarios), '"
+        + scenario
+        + "') }}"
+    )
+
+
+def _expected_chart_legs(scenarios: tuple[str, ...] | list[str]) -> list[str]:
+    # An unregistered step carries no leg condition, so it selects every leg.
+    if "unregistered" in scenarios:
+        return list(CHART_LEGS)
+    return sorted({CHART_SCENARIOS[scenario]["leg"] for scenario in scenarios})
 
 
 def _matches_chart_input(path: str, value: str) -> bool:
@@ -409,10 +440,9 @@ def _expected_output(
     lines.append(f"factory={'true' if factory else 'false'}")
     lines.append(f"approval_resume={'true' if approval_resume else 'false'}")
     scenarios = CHART_IDS if chart_scenarios is None else chart_scenarios
-    lines.append(
-        "chart_scenarios="
-        + json.dumps(list(scenarios) if "cluster" in selected_tiers else [], separators=(",", ":"))
-    )
+    rendered = list(scenarios) if "cluster" in selected_tiers else []
+    lines.append("chart_scenarios=" + json.dumps(rendered, separators=(",", ":")))
+    lines.append("chart_legs=" + json.dumps(_expected_chart_legs(rendered), separators=(",", ":")))
     return "\n".join(lines) + "\n"
 
 
@@ -1981,6 +2011,7 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         "local_release": "${{ steps.filter.outputs.local_release }}",
         "cluster": "${{ steps.filter.outputs.cluster }}",
         "chart_scenarios": "${{ steps.filter.outputs.chart_scenarios }}",
+        "chart_legs": "${{ steps.filter.outputs.chart_legs }}",
         "released_upgrade": "${{ steps.filter.outputs.released_upgrade }}",
         "released_upgrade_full": ("${{ steps.filter.outputs.released_upgrade_full }}"),
         "skill_local_tiers": "${{ steps.filter.outputs.skill_local_tiers }}",
@@ -3041,6 +3072,13 @@ def test_single_regression_proofs_run_outside_the_cluster_rung() -> None:
     assert "e2e-cluster-rollout-recovery" in jobs["e2e-required"]["needs"]
 
 
+WORKLOAD_STAGING_IF = (
+    "${{ matrix.leg == 'workload' && "
+    "(contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') "
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress')) }}"
+)
+
+
 def test_workspace_diagnostic_reuses_the_chart_cluster_and_candidate_artifacts() -> None:
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     chart = jobs["e2e-cluster-chart-regressions"]
@@ -3081,10 +3119,7 @@ def test_workspace_diagnostic_reuses_the_chart_cluster_and_candidate_artifacts()
     assert steps.index(staging[1]) < steps.index(staging[2]) < steps.index(workspace)
     assert workspace["if"] == _chart_step_if("workspace-diagnostic")
     for step in staging:
-        assert step["if"] == (
-            "${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') "
-            "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}"
-        ), step
+        assert step["if"] == WORKLOAD_STAGING_IF, step
         assert "continue-on-error" not in step
     download, load, stage = staging
     assert download["uses"].startswith("actions/download-artifact@")
@@ -3979,6 +4014,9 @@ def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
     assert _outputs_of(output)["chart_scenarios"] == rendered
     assert output.count("chart_scenarios=") == 1
     assert f"chart_scenarios={rendered}" in completed.stdout
+    legs = json.dumps(_expected_chart_legs(expected), separators=(",", ":"))
+    assert _outputs_of(output)["chart_legs"] == legs
+    assert f"chart_legs={legs}" in completed.stdout
     if expected:
         assert _outputs_of(output)["cluster"] == "true"
 
@@ -4044,7 +4082,9 @@ def _chart_consistency_problems(workflow: dict[str, Any], registry: dict[str, An
             continue
         if name not in by_step:
             problems.append(f"unregistered scenario step: {name}")
-        elif step.get("if") != _chart_step_if(by_step[name]):
+        elif scenarios[by_step[name]].get("leg") not in CHART_LEGS:
+            problems.append(f"scenario without a leg: {by_step[name]}")
+        elif step.get("if") != _chart_step_if(by_step[name], scenarios[by_step[name]]["leg"]):
             problems.append(f"noncanonical scenario condition: {name}")
     for entry in scenarios.values():
         if entry["step"] not in steps:
@@ -4065,7 +4105,9 @@ def test_chart_scenario_registry_and_real_workflow_are_consistent() -> None:
     assert not _chart_consistency_problems(workflow, registry)
 
 
-@pytest.mark.parametrize("mutation", ["unregistered", "orphan", "missing-if", "wrong-if"])
+@pytest.mark.parametrize(
+    "mutation", ["unregistered", "orphan", "missing-if", "wrong-if", "missing-leg", "wrong-leg"]
+)
 def test_chart_consistency_check_rejects_workflow_drift(mutation: str) -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     registry = yaml.safe_load(REGISTRY.read_text())
@@ -4078,9 +4120,153 @@ def test_chart_consistency_check_rejects_workflow_drift(mutation: str) -> None:
         entry["step"] = "Absent scenario step"
     elif mutation == "missing-if":
         step.pop("if")
+    elif mutation == "missing-leg":
+        # The pre-#4722 condition: the step would run in both legs.
+        step["if"] = (
+            "${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), "
+            "'connector-readiness') }}"
+        )
+    elif mutation == "wrong-leg":
+        step["if"] = _chart_step_if("connector-readiness", "workload")
     else:
         step["if"] = _chart_step_if("controller-preflight")
     assert _chart_consistency_problems(workflow, registry)
+
+
+def test_every_chart_scenario_belongs_to_exactly_one_leg() -> None:
+    scenarios = yaml.safe_load(REGISTRY.read_text())["chart_scenarios"]["scenarios"]
+    assert set(scenarios) == set(CHART_SCENARIOS)
+    for scenario, entry in scenarios.items():
+        assert isinstance(entry.get("leg"), str), scenario
+        assert entry["leg"] in CHART_LEGS, scenario
+    workload = {scenario for scenario, entry in scenarios.items() if entry["leg"] == "workload"}
+    assert workload == WORKLOAD_SCENARIOS
+    loaded = _SELECTOR_MODULE._load_registry(REGISTRY).chart_scenarios.scenarios
+    assert {scenario: loaded[scenario].leg for scenario in loaded} == {
+        scenario: entry["leg"] for scenario, entry in scenarios.items()
+    }
+
+
+@pytest.mark.parametrize(
+    ("paths", "push", "scenarios", "legs"),
+    [
+        (
+            ("charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",),
+            False,
+            ["quota-progress"],
+            ["workload"],
+        ),
+        (
+            ("charts/curie/ci/runtime/connector-readiness-runtime.sh",),
+            False,
+            ["connector-readiness"],
+            ["chart"],
+        ),
+        ((), True, list(CHART_IDS), ["chart", "workload"]),
+        (("docs/adr/AGENTS.md",), False, [], []),
+    ],
+    ids=("quota-only", "chart-only", "push", "docs"),
+)
+def test_chart_legs_follow_the_selected_scenarios(
+    tmp_path: Path,
+    paths: tuple[str, ...],
+    push: bool,
+    scenarios: list[str],
+    legs: list[str],
+) -> None:
+    completed, output = _invoke_selector(tmp_path, *paths, push=push)
+    assert completed.returncode == 0, completed.stderr
+    outputs = _outputs_of(output)
+    assert json.loads(outputs["chart_scenarios"]) == scenarios
+    rendered = json.dumps(legs, separators=(",", ":"))
+    assert outputs["chart_legs"] == rendered
+    assert output.count("chart_legs=") == 1
+    # The legs line follows the scenarios line it is derived from.
+    keys = [line.split("=", 1)[0] for line in output.splitlines()]
+    assert keys.index("chart_legs") == keys.index("chart_scenarios") + 1
+    assert f"chart_legs={rendered}" in completed.stdout
+
+
+@pytest.mark.parametrize("mutation", ["missing-leg", "unknown-leg", "nonstring-leg"])
+def test_chart_scenario_registry_rejects_a_scenario_without_a_valid_leg(
+    tmp_path: Path, mutation: str
+) -> None:
+    valid = tmp_path / "valid.yaml"
+    valid.write_text(VALID_REGISTRY)
+    # Liveness: the unmutated registry, with a leg on every scenario, loads.
+    _SELECTOR_MODULE._load_registry(valid)
+    registry = yaml.safe_load(VALID_REGISTRY)
+    entry = registry["chart_scenarios"]["scenarios"]["connector-readiness"]
+    if mutation == "missing-leg":
+        del entry["leg"]
+    elif mutation == "unknown-leg":
+        entry["leg"] = "upgrade"
+    else:
+        entry["leg"] = ["chart"]
+    path = tmp_path / "registry.yaml"
+    path.write_text(yaml.safe_dump(registry))
+    with pytest.raises(_SELECTOR_MODULE.RegistryError, match="leg"):
+        _SELECTOR_MODULE._load_registry(path)
+
+
+CHART_FIXTURE_STEPS = (
+    "Load the Postgres readiness fixture built by the ci-images job",
+    "Tag the Postgres readiness fixture",
+    "Load the Postgres readiness fixture into the kind cluster",
+)
+WORKLOAD_STAGING_STEPS = (
+    "Download the workspace diagnostic CLI",
+    "Load the workspace diagnostic candidate images",
+    "Stage the workspace diagnostic images in kind",
+)
+
+
+def test_chart_job_runs_one_leg_per_runner_from_the_selected_legs() -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    chart = jobs[CHART_JOB]
+    assert chart["name"] == "E2E chart runtime regressions (kind, Calico, ${{ matrix.leg }})"
+    assert chart["strategy"] == {
+        "fail-fast": False,
+        "matrix": {"leg": "${{ fromJSON(needs.changes.outputs.chart_legs) }}"},
+    }
+    assert chart["if"] == CHART_JOB_IF
+    steps = {step.get("name"): step for step in chart["steps"]}
+    for name in CHART_FIXTURE_STEPS:
+        assert steps[name].get("if") == "${{ matrix.leg == 'chart' }}", name
+    for name in WORKLOAD_STAGING_STEPS:
+        assert steps[name].get("if") == WORKLOAD_STAGING_IF, name
+    upload = steps["Upload runtime assertion receipts"]
+    assert upload["with"]["name"] == (
+        "runtime-assertion-receipts-${{ github.job }}-${{ matrix.leg }}"
+    )
+    # Every step that names a scenario is bound to that scenario's leg.
+    for name, step in steps.items():
+        condition = str(step.get("if", ""))
+        named = [scenario for scenario in CHART_IDS if f"'{scenario}'" in condition]
+        if not named or name == CHART_SCENARIOS["quota-progress"]["step"]:
+            continue
+        legs = {CHART_SCENARIOS[scenario]["leg"] for scenario in named}
+        assert len(legs) == 1, name
+        assert condition.startswith("${{ " + _chart_leg_clause(legs.pop()) + " && "), name
+
+
+def test_a_failing_chart_leg_fails_e2e_required() -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    # A matrix job's result is the aggregate of its legs, so either failing
+    # leg reaches E2E required through this one needs entry.
+    assert CHART_JOB in jobs["e2e-required"]["needs"]
+    _script, bindings = _aggregate_contract()
+    assert bindings["cluster_chart_result"] == "CLUSTER_CHART_RESULT"
+    state = {
+        "event_name": "pull_request",
+        "cluster_selected": "true",
+        "cluster_result": "success",
+        "chart_scenarios": '["connector-readiness","quota-progress"]',
+    }
+    passing = _run_aggregate(cluster_chart_result="success", **state)
+    assert passing.returncode == 0, passing.stdout + passing.stderr
+    failing = _run_aggregate(cluster_chart_result="failure", **state)
+    assert failing.returncode != 0, failing.stdout + failing.stderr
 
 
 @pytest.mark.parametrize(
@@ -4177,9 +4363,12 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
         CHART_IDS if mode in {"push", "revisions"} else ("quota-progress", "workspace-diagnostic")
     )
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == sorted((*expected, "unregistered"))
+    # An unregistered step has no leg condition, so it must run in every leg.
+    assert json.loads(_outputs_of(output)["chart_legs"]) == ["chart", "workload"]
     docs, docs_output = _invoke_selector(tmp_path, "docs/example.md", cwd=repository)
     assert docs.returncode == 0, docs.stderr
     assert _outputs_of(docs_output)["chart_scenarios"] == "[]"
+    assert _outputs_of(docs_output)["chart_legs"] == "[]"
 
 
 @pytest.mark.parametrize(

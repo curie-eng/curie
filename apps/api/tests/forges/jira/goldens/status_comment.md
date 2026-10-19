@@ -4,18 +4,24 @@ Working on [PROJ-7](https://acme.atlassian.example/browse/PROJ-7) in `acme-corp/
 
 - [x] Plan
 - [x] Implement
-- [ ] **Review** (in progress, round 2)
+- [ ] **Review** (stopped here)
 - [ ] Publish PR
 
 ![Curie status](https://curie.example.com/cards/abc.svg)
 
-Status: WORKING
+Status: FAILED
 
 ---
 
-```text
-tests failed: 2
-```
+Agent's last message:
+> **Maintainer decision required**
+>
+> Choose `parser.py` before retrying.
+>
+> 1. Confirm the input format.
+> 2. Pick the parser.
+
+Cause: no_pull_request
 
 - Pull request: [#12](https://github.com/acme-corp/acme-bot/pull/12)
 - *Base*: next
