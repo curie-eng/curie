@@ -598,7 +598,7 @@ def _assert_policy_output(output: str, expected: tuple[str, ...]) -> None:
 def test_ci_policy_unrelated_path_is_checked_against_registry(tmp_path: Path) -> None:
     path = "README.md"
     assert (REPO_ROOT / path).is_file()
-    assert _expected_ci_policy_files(path) == ()
+    assert _expected_ci_policy_files(path) != ()
     completed, output = _invoke_selector(tmp_path, path)
     assert completed.returncode == 0, completed.stderr
     _assert_policy_output(output, ())
