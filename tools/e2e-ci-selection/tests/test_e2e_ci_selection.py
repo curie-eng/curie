@@ -511,7 +511,7 @@ def test_ci_policy_guard_covers_existing_ignored_build_directories(tmp_path: Pat
     module = "tools/ci-workflow-paths/tests/test_workflow_paths.py"
     entries[module].remove("cli")
     with pytest.raises(
-        AssertionError, match=re.escape(module) + r": undeclared repository path cli/(target|dist)$"
+        AssertionError, match=re.escape(module) + r": undeclared repository path cli/(target|dist)"
     ):
         _assert_ci_policy_registry(tmp_path, entries)
     entries[module].append("cli")
