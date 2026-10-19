@@ -2076,11 +2076,24 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
     assert jobs["eval-falsifiability"]["if"] == ("${{ needs.changes.outputs.skill == 'true' }}")
 
 
+def _connector_image_contexts() -> set[str]:
+    return {
+        str(server.parent.relative_to(REPO_ROOT))
+        for server in REPO_ROOT.glob("examples/*/connectors/*/server.py")
+        if (server.parent / "Dockerfile").is_file()
+    }
+
+
 def _assert_connector_image_import_coverage(job: dict[str, Any]) -> None:
     assert job["name"] == "Build ${{ matrix.name }} image (no push)"
     assert job["runs-on"] == "ubuntu-latest"
     assert job["strategy"]["fail-fast"] is False
     rows = job["strategy"]["matrix"]["include"]
+    contexts = _connector_image_contexts()
+    assert contexts, "the repository must contain Python connector image contexts"
+    matrix_contexts = [row["context"] for row in rows]
+    assert len(matrix_contexts) == len(set(matrix_contexts)), "matrix contexts must be unique"
+    assert contexts <= set(matrix_contexts), "every connector image context needs a matrix row"
     connectors = [row for row in rows if (REPO_ROOT / row["context"] / "server.py").is_file()]
     assert connectors, "the images matrix must cover Python connector servers"
     steps = job["steps"]
@@ -2149,6 +2162,29 @@ def _assert_connector_image_import_coverage(job: dict[str, Any]) -> None:
 def test_connector_image_workflow_imports_every_python_server() -> None:
     job = yaml.safe_load(WORKFLOW.read_text())["jobs"]["images"]
     _assert_connector_image_import_coverage(job)
+
+
+@pytest.mark.parametrize("context", sorted(_connector_image_contexts()))
+def test_connector_image_import_coverage_rejects_deleted_row(context: str) -> None:
+    job = yaml.safe_load(WORKFLOW.read_text())["jobs"]["images"]
+    _assert_connector_image_import_coverage(job)
+    mutated = copy.deepcopy(job)
+    rows = mutated["strategy"]["matrix"]["include"]
+    rows[:] = [row for row in rows if row["context"] != context]
+    with pytest.raises(AssertionError):
+        _assert_connector_image_import_coverage(mutated)
+
+
+@pytest.mark.parametrize(
+    "step_name", ["Build the native connector image", "Import the connector server"]
+)
+def test_connector_image_import_coverage_rejects_deleted_step(step_name: str) -> None:
+    job = yaml.safe_load(WORKFLOW.read_text())["jobs"]["images"]
+    _assert_connector_image_import_coverage(job)
+    mutated = copy.deepcopy(job)
+    mutated["steps"] = [step for step in mutated["steps"] if step.get("name") != step_name]
+    with pytest.raises(AssertionError):
+        _assert_connector_image_import_coverage(mutated)
 
 
 @pytest.mark.parametrize(
