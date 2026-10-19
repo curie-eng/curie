@@ -978,11 +978,30 @@ REPLY_TARGET_CHECK = (
 )
 
 
+# Migration 0109 carries a frozen copy of this nullable, exact receipt shape.
+INPUT_CONTRACT_RECEIPT_CHECK = (
+    "input_contract_receipt IS NULL OR CASE "
+    "WHEN jsonb_typeof(input_contract_receipt) = 'object' THEN ("
+    "input_contract_receipt - ARRAY['interface','contract','deployment_id',"
+    "'version_id','bundle_sha256','body_sha256']::text[] = '{}'::jsonb "
+    "AND jsonb_typeof(input_contract_receipt->'interface') = 'string' "
+    "AND jsonb_typeof(input_contract_receipt->'contract') = 'string' "
+    "AND jsonb_typeof(input_contract_receipt->'deployment_id') = 'string' "
+    "AND jsonb_typeof(input_contract_receipt->'version_id') = 'string' "
+    "AND jsonb_typeof(input_contract_receipt->'bundle_sha256') = 'string' "
+    "AND jsonb_typeof(input_contract_receipt->'body_sha256') = 'string'"
+    ") IS TRUE ELSE FALSE END"
+)
+
+
 class ExecutionRequest(Base):
     """One bounded execution attempt owned by a WorkItem."""
 
     __tablename__ = "execution_requests"
     __table_args__ = (
+        CheckConstraint(
+            INPUT_CONTRACT_RECEIPT_CHECK, name="execution_requests_input_contract_receipt_ck"
+        ),
         CheckConstraint("sequence > 0", name="execution_requests_sequence_ck"),
         CheckConstraint("version >= 1", name="execution_requests_version_ck"),
         CheckConstraint(
