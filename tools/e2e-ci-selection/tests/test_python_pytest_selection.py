@@ -303,6 +303,7 @@ def test_deleting_a_docs_guides_sentence_does_not_select_pytest(tmp_path: Path) 
 
 
 def test_required_python_job_keeps_ruleset_name_and_is_not_skippable() -> None:
+    assert os.getenv("SHARD") is None, "intentional shard failure control for #4721"
     job = _python_job()
     assert job["name"] == "Python (ruff + mypy + pytest)"
     # It waits for the shards only to aggregate them; always() keeps it
