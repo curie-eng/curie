@@ -284,7 +284,8 @@ children = []
 
 def run(args, *, timeout=30):
     result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-    assert result.returncode == 0, "an owned runtime observation or setup command failed"
+    verb = " ".join(args[5:8]) if len(args) > 5 else "command"
+    assert result.returncode == 0, "an owned runtime observation or setup command failed: " + verb + " exit " + str(result.returncode)
     return result.stdout
 
 
@@ -554,15 +555,37 @@ def burst_sixteen():
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     turns = [start(f"burst16-{index}", "[fake:progress-demo] held-open capacity probe burst16 " + str(index))
              for index in range(16)]
+    def observe_burst():
+        last = None
+        for _attempt in range(5):
+            try:
+                return observe()
+            except AssertionError as error:
+                last = error
+                if "command failed" not in str(error):
+                    raise
+                time.sleep(1)
+        raise last
+
     deadline = time.monotonic() + 320
     while True:
         completed = [finished(turn) for turn in turns]
-        observe()
+        observe_burst()
         if all(completed):
             break
         assert time.monotonic() < deadline, "sixteen-thread burst exceeded its bounded runtime"
         time.sleep(0.2)
-    logs = run([*kube, "logs", "deployment/" + fullname + "-worker", "--since-time=" + started, "--timestamps"], timeout=60)
+    logs = ""
+    last = None
+    for _attempt in range(5):
+        try:
+            logs = run([*kube, "logs", "deployment/" + fullname + "-worker", "--since-time=" + started], timeout=60)
+            break
+        except AssertionError as error:
+            last = error
+            time.sleep(2)
+    else:
+        raise last
     parks, wakes = {}, {}
     saw_capacity_text = False
     for line in logs.splitlines():
