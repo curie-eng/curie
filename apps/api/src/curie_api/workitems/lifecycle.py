@@ -74,7 +74,7 @@ _ACTIVE_STATUSES = ("waiting", "running", "cancellation_requested")
 IN_FLIGHT_PUBLICATION = ("pending", "approved", "launching", "running")
 AWAITING_PUBLICATION = (*IN_FLIGHT_PUBLICATION, "succeeded")
 # A failed finish that never published defers to an in-flight publication (#2577, #3128).
-_UNPUBLISHED_CAUSES = frozenset({"no_pull_request", "early_stop"})
+_UNPUBLISHED_CAUSES = frozenset({"no_pull_request", "early_stop", "revision_unchanged"})
 # Longest provider message a factory notice keeps (#3073).
 _NOTICE_DETAIL_MAX = 4000
 # Consecutive owner_lost requests a WorkItem runs before a person is needed (ADR 0206).

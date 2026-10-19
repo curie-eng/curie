@@ -321,6 +321,7 @@ TERMINUS_CAUSES = (
     "max_turns",
     "runner_failed",
     "no_pull_request",
+    "revision_unchanged",
     "early_stop",
     "publication_denied",
     "publication_expired",
@@ -329,7 +330,7 @@ TERMINUS_CAUSES = (
 DEFAULT_COMMENT_CAUSES = frozenset({"no_pull_request", "early_stop"})
 DEFAULT_ANY_COMMENT_CAUSES = frozenset({"no_pull_request", "early_stop", "execution_deadline"})
 # Endings where the agent declined to publish; its stated reason is required (#3128).
-AGENT_REASON_CAUSES = frozenset({"no_pull_request", "early_stop"})
+AGENT_REASON_CAUSES = frozenset({"no_pull_request", "early_stop", "revision_unchanged"})
 FINAL_REPLY_LIMIT = 4000
 # The dark-factory bundle's contract for a run that opens no pull request.
 _REASON_CONTRACT = re.compile(r"could not complete:\s*\S", re.IGNORECASE)
