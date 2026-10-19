@@ -10909,6 +10909,399 @@ fn should_discard_failed_gvisor_install(history: &[HelmRevision], recorded_only:
     history_has_no_known_good_revision(history)
 }
 
+#[derive(Debug, Clone)]
+struct FailedFirstRevisionDataPvc {
+    name: String,
+    uid: String,
+}
+
+#[derive(Debug)]
+struct FailedFirstRevisionDataPvcPlan {
+    claims: Vec<FailedFirstRevisionDataPvc>,
+    kept: Vec<(String, String)>,
+    delete: Option<OpsCommand>,
+    uninstall: Option<OpsCommand>,
+}
+
+#[derive(Debug)]
+enum FailedFirstRevisionCleanupAction {
+    Delete(OpsCommand),
+    Uninstall(OpsCommand),
+    WaitForPvcs { deadline: Duration },
+    Reinstall,
+}
+
+impl FailedFirstRevisionDataPvcPlan {
+    fn first_action(&self) -> FailedFirstRevisionCleanupAction {
+        if let Some(command) = &self.delete {
+            FailedFirstRevisionCleanupAction::Delete(command.clone())
+        } else if let Some(command) = &self.uninstall {
+            FailedFirstRevisionCleanupAction::Uninstall(command.clone())
+        } else {
+            FailedFirstRevisionCleanupAction::Reinstall
+        }
+    }
+
+    fn claim_names(&self) -> String {
+        self.claims
+            .iter()
+            .map(|claim| claim.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn failed_first_revision_inventory(
+    input: std::result::Result<&str, &str>,
+    resource: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let json = input.map_err(|error| anyhow::anyhow!("could not read {resource}: {error}"))?;
+    let list: serde_json::Value =
+        serde_json::from_str(json).with_context(|| format!("malformed {resource} inventory"))?;
+    list.get("items")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .with_context(|| format!("{resource} inventory has no items array"))
+}
+
+struct FailedFirstRevisionClaimTemplate {
+    prefix: String,
+    component: String,
+    start: u64,
+    end: u64,
+}
+
+impl FailedFirstRevisionClaimTemplate {
+    fn matches(&self, name: &str, component: &str) -> bool {
+        if component != self.component {
+            return false;
+        }
+        let Some(suffix) = name.strip_prefix(&self.prefix) else {
+            return false;
+        };
+        let Ok(ordinal) = suffix.parse::<u64>() else {
+            return false;
+        };
+        (self.start..self.end).contains(&ordinal) && suffix == ordinal.to_string()
+    }
+}
+
+fn failed_first_revision_claim_templates(
+    common: &CommonOpts,
+    statefulsets: &[serde_json::Value],
+) -> Result<Vec<FailedFirstRevisionClaimTemplate>> {
+    let mut templates = Vec::new();
+    for statefulset in statefulsets {
+        let metadata = &statefulset["metadata"];
+        if metadata["namespace"].as_str() != Some(common.namespace.as_str())
+            || metadata["labels"]["app.kubernetes.io/managed-by"].as_str() != Some("Helm")
+            || metadata["annotations"]["meta.helm.sh/release-name"].as_str()
+                != Some(common.release.as_str())
+            || metadata["annotations"]["meta.helm.sh/release-namespace"].as_str()
+                != Some(common.namespace.as_str())
+        {
+            continue;
+        }
+        let name = metadata["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .context("installed StatefulSet has no name")?;
+        let selector = &statefulset["spec"]["selector"]["matchLabels"];
+        let instance = selector["app.kubernetes.io/instance"]
+            .as_str()
+            .with_context(|| format!("StatefulSet {name} has no release selector"))?;
+        let component = selector["app.kubernetes.io/component"]
+            .as_str()
+            .with_context(|| format!("StatefulSet {name} has no component selector"))?;
+        if instance != common.release
+            || !matches!(component, "postgres" | "clickhouse" | "rustfs" | "valkey")
+        {
+            continue;
+        }
+        let spec = &statefulset["spec"];
+        let replicas = spec["replicas"]
+            .as_u64()
+            .filter(|replicas| *replicas <= i32::MAX as u64)
+            .with_context(|| format!("StatefulSet {name} has malformed replicas"))?;
+        let start = match spec.get("ordinals") {
+            None => 0,
+            Some(ordinals) => {
+                let ordinals = ordinals
+                    .as_object()
+                    .with_context(|| format!("StatefulSet {name} has malformed ordinals"))?;
+                match ordinals.get("start") {
+                    None => 0,
+                    Some(start) => start
+                        .as_u64()
+                        .filter(|start| *start <= i32::MAX as u64)
+                        .with_context(|| {
+                            format!("StatefulSet {name} has malformed ordinal start")
+                        })?,
+                }
+            }
+        };
+        let end = start
+            .checked_add(replicas)
+            .with_context(|| format!("StatefulSet {name} ordinal range overflows"))?;
+        let Some(claim_templates) = spec.get("volumeClaimTemplates") else {
+            continue;
+        };
+        for template in claim_templates
+            .as_array()
+            .with_context(|| format!("StatefulSet {name} has malformed volumeClaimTemplates"))?
+        {
+            let template_name = template["metadata"]["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .with_context(|| {
+                    format!("StatefulSet {name} has a claim template without a name")
+                })?;
+            templates.push(FailedFirstRevisionClaimTemplate {
+                prefix: format!("{template_name}-{name}-"),
+                component: component.to_string(),
+                start,
+                end,
+            });
+        }
+    }
+    Ok(templates)
+}
+
+fn plan_failed_first_revision_data_pvcs(
+    common: &CommonOpts,
+    history: &[HelmRevision],
+    recorded_only: bool,
+    anchor: std::result::Result<&str, &str>,
+    statefulsets: std::result::Result<&str, &str>,
+    pvcs: std::result::Result<&str, &str>,
+) -> Result<FailedFirstRevisionDataPvcPlan> {
+    let mut plan = FailedFirstRevisionDataPvcPlan {
+        claims: Vec::new(),
+        kept: Vec::new(),
+        delete: None,
+        uninstall: should_discard_failed_gvisor_install(history, recorded_only).then(|| {
+            OpsCommand::new(
+                "helm",
+                vec![
+                    plain("uninstall"),
+                    plain(&common.release),
+                    plain("-n"),
+                    plain(&common.namespace),
+                    plain("--wait"),
+                    plain("--timeout"),
+                    plain("60s"),
+                ],
+            )
+        }),
+    };
+    if !history_is_failed_only(history) {
+        return Ok(plan);
+    }
+
+    let candidates = failed_first_revision_inventory(pvcs, "PVCs")?;
+    let names = candidates
+        .iter()
+        .map(|claim| {
+            claim["metadata"]["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .context("PVC inventory contains a claim without a name")
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    (|| -> Result<()> {
+        let statefulsets = failed_first_revision_inventory(statefulsets, "StatefulSets")?;
+        let templates = failed_first_revision_claim_templates(common, &statefulsets)?;
+        anyhow::ensure!(
+            history.iter().any(|revision| revision.revision == 1),
+            "Helm history is missing revision 1"
+        );
+        let anchor = anchor
+            .map_err(|error| anyhow::anyhow!("could not read revision 1 Helm Secret: {error}"))?;
+        let anchor: serde_json::Value =
+            serde_json::from_str(anchor).context("malformed revision 1 Helm Secret")?;
+        let anchor_name = format!("sh.helm.release.v1.{}.v1", common.release);
+        let metadata = &anchor["metadata"];
+        anyhow::ensure!(
+            anchor["kind"].as_str() == Some("Secret")
+                && anchor["type"].as_str() == Some("helm.sh/release.v1")
+                && metadata["name"].as_str() == Some(anchor_name.as_str())
+                && metadata["namespace"].as_str() == Some(common.namespace.as_str())
+                && metadata["labels"]["owner"].as_str() == Some("helm")
+                && metadata["labels"]["name"].as_str() == Some(common.release.as_str())
+                && metadata["labels"]["version"].as_str() == Some("1"),
+            "revision 1 Helm Secret identity or storage driver does not match this release"
+        );
+        let timestamp = metadata["creationTimestamp"]
+            .as_str()
+            .context("revision 1 Helm Secret creation timestamp is missing or malformed")?;
+        let anchor_time = time::OffsetDateTime::parse(
+            timestamp,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .context("revision 1 Helm Secret creation timestamp is malformed")?;
+
+        for claim in &candidates {
+            let metadata = &claim["metadata"];
+            let name = metadata["name"].as_str().context("PVC name is missing")?;
+            let component = metadata["labels"]["app.kubernetes.io/component"].as_str();
+            let reason = if metadata["namespace"].as_str() != Some(common.namespace.as_str()) {
+                Some("claim is outside the release namespace")
+            } else if metadata["labels"]["app.kubernetes.io/instance"].as_str()
+                != Some(common.release.as_str())
+            {
+                Some("claim does not carry this release's instance label")
+            } else if !matches!(component, Some("postgres" | "clickhouse" | "rustfs" | "valkey")) {
+                Some("claim does not carry a data-store component label")
+            } else if !component.is_some_and(|component| {
+                templates
+                    .iter()
+                    .any(|template| template.matches(name, component))
+            }) {
+                Some("claim does not match an installed Helm-owned StatefulSet claim template and ordinal")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                plan.kept.push((name.to_string(), reason.to_string()));
+                continue;
+            }
+            let timestamp = metadata["creationTimestamp"]
+                .as_str()
+                .with_context(|| format!("PVC {name} creation timestamp is missing or malformed"))?;
+            let created = time::OffsetDateTime::parse(
+                timestamp,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .with_context(|| format!("PVC {name} creation timestamp is malformed"))?;
+            anyhow::ensure!(
+                created > anchor_time,
+                "PVC {name} creation timestamp is not strictly later than the revision 1 Helm Secret timestamp"
+            );
+            let uid = metadata["uid"]
+                .as_str()
+                .filter(|uid| !uid.is_empty())
+                .with_context(|| format!("PVC {name} UID is missing or malformed"))?;
+            plan.claims.push(FailedFirstRevisionDataPvc {
+                name: name.to_string(),
+                uid: uid.to_string(),
+            });
+        }
+        Ok(())
+    })()
+    .with_context(|| {
+        format!("refusing to discard failed first revision; retained PVCs [{names}]; provenance check failed")
+    })?;
+
+    plan.claims
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    if !plan.claims.is_empty() {
+        let mut args = vec![plain("delete"), plain("pvc")];
+        args.extend(plan.claims.iter().map(|claim| plain(&claim.name)));
+        args.extend([plain("-n"), plain(&common.namespace), plain("--wait=false")]);
+        plan.delete = Some(OpsCommand::new("kubectl", args));
+    }
+    Ok(plan)
+}
+
+fn failed_first_revision_cleanup_transition(
+    plan: &FailedFirstRevisionDataPvcPlan,
+    action: &FailedFirstRevisionCleanupAction,
+    observation: std::result::Result<&str, &str>,
+    now: Duration,
+) -> Result<FailedFirstRevisionCleanupAction> {
+    use FailedFirstRevisionCleanupAction::*;
+    let output = observation.map_err(|error| {
+        anyhow::anyhow!(
+            "failed first revision cleanup stopped for PVCs [{}]: {error}",
+            plan.claim_names()
+        )
+    })?;
+    match action {
+        Delete(_) => {
+            Ok(Uninstall(plan.uninstall.clone().context(
+                "PVC deletion plan has no Helm uninstall command",
+            )?))
+        }
+        Uninstall(_) if plan.claims.is_empty() => Ok(Reinstall),
+        Uninstall(_) => Ok(WaitForPvcs {
+            deadline: now + Duration::from_secs(60),
+        }),
+        WaitForPvcs { deadline } => {
+            let pvcs = failed_first_revision_inventory(Ok(output), "PVCs").with_context(|| {
+                format!(
+                    "could not confirm deletion of PVCs [{}]",
+                    plan.claim_names()
+                )
+            })?;
+            let uids = pvcs
+                .iter()
+                .map(|claim| {
+                    claim["metadata"]["uid"]
+                        .as_str()
+                        .filter(|uid| !uid.is_empty())
+                        .context("PVC deletion observation contains a missing or malformed UID")
+                })
+                .collect::<Result<BTreeSet<_>>>()
+                .with_context(|| {
+                    format!(
+                        "could not confirm deletion of PVCs [{}]",
+                        plan.claim_names()
+                    )
+                })?;
+            let remaining = plan
+                .claims
+                .iter()
+                .filter(|claim| uids.contains(claim.uid.as_str()))
+                .map(|claim| claim.name.as_str())
+                .collect::<Vec<_>>();
+            if remaining.is_empty() {
+                return Ok(Reinstall);
+            }
+            anyhow::ensure!(
+                now < *deadline,
+                "timed out after 60 seconds waiting for failed first revision PVCs: {}",
+                remaining.join(", ")
+            );
+            Ok(WaitForPvcs {
+                deadline: *deadline,
+            })
+        }
+        Reinstall => Ok(Reinstall),
+    }
+}
+
+fn failed_first_revision_get_command(
+    common: &CommonOpts,
+    resource: &str,
+    name: Option<&str>,
+    selector: Option<&str>,
+) -> OpsCommand {
+    let mut args = vec![plain("get"), plain(resource)];
+    if let Some(name) = name {
+        args.push(plain(name));
+    }
+    args.extend([
+        plain("-n"),
+        plain(&common.namespace),
+        plain("-o"),
+        plain("json"),
+    ]);
+    if let Some(selector) = selector {
+        args.extend([plain("-l"), plain(selector)]);
+    }
+    OpsCommand::new("kubectl", args)
+}
+
+async fn failed_first_revision_read(command: &OpsCommand) -> std::result::Result<String, String> {
+    crate::ui::ui().plumbing(&format!("+ {}", command.display()));
+    match run_capture(command).await {
+        Ok((true, output, _)) => Ok(output),
+        Ok((false, _, error)) => Err(format!("{} failed: {}", command.display(), error.trim())),
+        Err(error) => Err(format!("{error:#}")),
+    }
+}
+
 /// Remove a never-deployed failed revision so the next Helm command is a
 /// clean install (#2347, #2856).
 ///
@@ -10975,42 +11368,165 @@ async fn discard_failed_gvisor_install_if_never_deployed(
         return Ok(());
     }
 
-    let uninstall = OpsCommand::new(
-        "helm",
-        vec![
-            plain("uninstall"),
-            plain(&common.release),
-            plain("-n"),
-            plain(&common.namespace),
-            plain("--wait"),
-            plain("--timeout"),
-            plain("60s"),
-        ],
-    );
-    ui.plumbing(&format!("+ {}", uninstall.display()));
-    let step = cl.step("discarding failed Helm revision");
-    let (ok, out, err) = run_capture(&uninstall).await?;
-    for line in out.lines().chain(err.lines()) {
-        ui.plumbing(line);
-    }
-    if ok {
-        step.done("removed");
-        Ok(())
-    } else if err.contains("not found") || out.contains("not found") {
-        step.done("already absent");
-        Ok(())
-    } else {
-        step.fail("failed");
-        Err(crate::exit::CliError::failure(format!(
-            "helm uninstall of the failed first revision failed: {}",
-            err.trim()
+    let mut anchor = Err("Helm history does not authorize PVC inspection".to_string());
+    let mut statefulsets = anchor.clone();
+    let mut pvcs = anchor.clone();
+    if history_is_failed_only(&history) {
+        let selector = format!(
+            "app.kubernetes.io/instance={},app.kubernetes.io/component in (postgres,clickhouse,rustfs,valkey)",
+            common.release
+        );
+        pvcs = failed_first_revision_read(&failed_first_revision_get_command(
+            common,
+            "pvc",
+            None,
+            Some(&selector),
         ))
-        .with_fix(format!(
-            "curie cluster down --yes --namespace {} --release {}",
-            common.namespace, common.release
+        .await;
+        statefulsets = failed_first_revision_read(&failed_first_revision_get_command(
+            common,
+            "statefulset",
+            None,
+            None,
         ))
-        .into())
+        .await;
+        anchor = failed_first_revision_read(&failed_first_revision_get_command(
+            common,
+            "secret",
+            Some(&format!("sh.helm.release.v1.{}.v1", common.release)),
+            None,
+        ))
+        .await;
     }
+    let plan = plan_failed_first_revision_data_pvcs(
+        common,
+        &history,
+        recorded_only,
+        anchor.as_deref().map_err(String::as_str),
+        statefulsets.as_deref().map_err(String::as_str),
+        pvcs.as_deref().map_err(String::as_str),
+    )
+    .map_err(|error| {
+        crate::exit::CliError::failure(format!("{error:#}")).with_fix(format!(
+            "inspect the retained PVCs and revision 1 Helm Secret for release {} in namespace {} before retrying",
+            common.release, common.namespace
+        ))
+    })?;
+    for (name, reason) in &plan.kept {
+        ui.note(&format!("keeping PVC {name}: {reason}"));
+    }
+    let data_step = plan.delete.as_ref().map(|_| {
+        cl.step(&format!(
+            "removing data volumes of the failed first revision: {}",
+            plan.claim_names()
+        ))
+    });
+    let started = tokio::time::Instant::now();
+    let mut action = plan.first_action();
+    let mut last_snapshot = pvcs;
+    let result: Result<()> = async {
+        loop {
+            let next = match &action {
+                FailedFirstRevisionCleanupAction::Delete(command)
+                | FailedFirstRevisionCleanupAction::Uninstall(command) => {
+                    let uninstall =
+                        matches!(action, FailedFirstRevisionCleanupAction::Uninstall(_));
+                    let step = uninstall.then(|| cl.step("discarding failed Helm revision"));
+                    ui.plumbing(&format!("+ {}", command.display()));
+                    let observation = match run_capture(command).await {
+                        Ok((ok, out, err)) => {
+                            for line in out.lines().chain(err.lines()) {
+                                ui.plumbing(line);
+                            }
+                            let absent = uninstall
+                                && (err.contains("not found") || out.contains("not found"));
+                            if let Some(step) = step {
+                                if ok || absent {
+                                    step.done(if absent { "already absent" } else { "removed" });
+                                } else {
+                                    step.fail("failed");
+                                }
+                            }
+                            if ok || absent {
+                                Ok(out)
+                            } else {
+                                Err(format!("{} failed: {}", command.display(), err.trim()))
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(step) = step {
+                                step.fail("failed");
+                            }
+                            Err(format!("{error:#}"))
+                        }
+                    };
+                    failed_first_revision_cleanup_transition(
+                        &plan,
+                        &action,
+                        observation.as_deref().map_err(String::as_str),
+                        started.elapsed(),
+                    )?
+                }
+                FailedFirstRevisionCleanupAction::WaitForPvcs { deadline } => {
+                    let command = failed_first_revision_get_command(common, "pvc", None, None);
+                    let observation = if started.elapsed() >= *deadline {
+                        None
+                    } else {
+                        tokio::time::timeout_at(
+                            started + *deadline,
+                            failed_first_revision_read(&command),
+                        )
+                        .await
+                        .ok()
+                    };
+                    let next = if let Some(observation) = observation {
+                        let next = failed_first_revision_cleanup_transition(
+                            &plan,
+                            &action,
+                            observation.as_deref().map_err(String::as_str),
+                            started.elapsed(),
+                        )?;
+                        last_snapshot = observation;
+                        next
+                    } else {
+                        failed_first_revision_cleanup_transition(
+                            &plan,
+                            &action,
+                            last_snapshot.as_deref().map_err(String::as_str),
+                            started.elapsed(),
+                        )?
+                    };
+                    if let FailedFirstRevisionCleanupAction::WaitForPvcs { deadline } = &next {
+                        tokio::time::sleep(
+                            deadline
+                                .saturating_sub(started.elapsed())
+                                .min(Duration::from_secs(1)),
+                        )
+                        .await;
+                    }
+                    next
+                }
+                FailedFirstRevisionCleanupAction::Reinstall => return Ok(()),
+            };
+            action = next;
+        }
+    }
+    .await;
+    if let Some(step) = data_step {
+        if result.is_ok() {
+            step.done("removed");
+        } else {
+            step.fail("failed");
+        }
+    }
+    result.map_err(|error| {
+        crate::exit::CliError::failure(format!("{error:#}"))
+            .with_fix(format!(
+                "curie cluster down --yes --namespace {} --release {}",
+                common.namespace, common.release
+            ))
+            .into()
+    })
 }
 
 pub(crate) async fn namespace_probe(namespace: &str) -> Result<NamespaceProbe> {
