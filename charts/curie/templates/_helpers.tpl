@@ -25,6 +25,16 @@ lifted from Langfuse's chart: flip `deploy` and fill `host` on the same block.
 {{- end -}}
 {{- end -}}
 
+{{/* Fail a render when a fullname-derived object name exceeds the 63 character
+     DNS and label limit. The helper returns the name unchanged. */}}
+{{- define "curie.checkedObjectName" -}}
+{{- $name := .name -}}
+{{- if gt (len $name) 63 -}}
+{{- fail (printf "%s name \"%s\" is %d characters; Kubernetes allows at most 63. Use a shorter release name or fullnameOverride." .kind $name (len $name)) -}}
+{{- end -}}
+{{- $name -}}
+{{- end -}}
+
 {{- define "curie.labels" -}}
 app.kubernetes.io/name: {{ include "curie.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
@@ -1190,6 +1200,9 @@ credentials and the derived collector header cannot disagree. */}}
 {{- if eq (toString .Values.api.approvalChatAttesterSecret) (toString .Values.api.apiKey) }}
 {{- fail "api.approvalChatAttesterSecret and api.apiKey must differ. Set the Slack approval attestation credential independently; neither value is printed because both are live credentials." }}
 {{- end }}
+{{- if eq (toString .Values.api.remediationAuthorityKey) (toString .Values.api.apiKey) }}
+{{- fail "api.remediationAuthorityKey and api.apiKey must differ. Binding and arming a remediation policy need an authority the platform key cannot derive (ADR 0231); neither value is printed because both are live credentials." }}
+{{- end }}
 {{- include "curie.installationIdentity.init" . -}}
 {{- $existingSecret := get . "_curieManagedSecret" | default dict -}}
 {{- $existingSecretData := $existingSecret.data | default dict -}}
@@ -1227,6 +1240,12 @@ credentials and the derived collector header cannot disagree. */}}
 {{- $_ := set $content "adapterCredentials" ((include "curie.adapterCredentials" .) | toString) -}}
 {{- $_ := set $content "apiKey" ((include "curie.managedSecret" (dict "root" . "key" "apiKey" "value" .Values.api.apiKey "default" "curie-dev-key" "hex" false "existingData" $existingSecretData)) | toString) -}}
 {{- $_ := set $content "approvalChatAttesterSecret" ((include "curie.managedSecret" (dict "root" . "key" "approvalChatAttesterSecret" "value" .Values.api.approvalChatAttesterSecret "default" "curie-dev-approval-chat-attester" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "remediationAuthorityKey" ((include "curie.managedSecret" (dict "root" . "key" "remediationAuthorityKey" "value" .Values.api.remediationAuthorityKey "default" "curie-dev-remediation-authority" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{/* The values check above cannot see a credential the managed Secret retained
+     from an earlier install; compare what the Secret will actually hold. */}}
+{{- if eq (index $content "remediationAuthorityKey") (index $content "apiKey") -}}
+{{- fail "api.remediationAuthorityKey and api.apiKey resolve to the same retained credential. Set api.remediationAuthorityKey to an independent value (ADR 0231); neither value is printed because both are live credentials." -}}
+{{- end -}}
 {{- $_ := set $content "internalWorkerToken" ((include "curie.managedSecret" (dict "root" . "key" "internalWorkerToken" "value" .Values.worker.internalWorkerToken "default" "curie-dev-worker-token" "hex" false "existingData" $existingSecretData)) | toString) -}}
 {{- $_ := set $content "githubWebhookSecret" ((include "curie.managedSecret" (dict "root" . "key" "githubWebhookSecret" "value" .Values.api.githubWebhookSecret "default" "dev-webhook-secret" "hex" false "existingData" $existingSecretData)) | toString) -}}
 {{- $_ := set $content "githubToken" ((.Values.api.githubToken | default "") | toString) -}}
@@ -2700,7 +2719,7 @@ true
 {{- range $workload := list "api" "worker" -}}
 {{- range (get (get $.Values $workload | default dict) "extraEnv" | default list) -}}
 {{- if eq (get . "name") $name -}}
-{{- fail (printf "%s.extraEnv %s is no longer read; configure the factory under factory.* (repository CI and bases under factory.bindings[].repos[]) and remove the entry" $workload $name) -}}
+{{- fail (printf "%s.extraEnv %s is no longer read; use `curie cluster upgrade` to migrate retained factory settings to factory.* (repository CI and bases under factory.bindings[].repos[]), or remove unsupported raw entries" $workload $name) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -2709,7 +2728,7 @@ true
 {{- $node := $.Values -}}
 {{- range splitList "." $key }}{{ $node = and (kindIs "map" $node) (get $node .) }}{{ end -}}
 {{- if and $node (not (has (include "curie.factory.str" $node) (list "poll" "45" "1200"))) -}}
-{{- fail (printf "%s is no longer read; configure the factory under factory.* (run `curie cluster factory` to rewrite it, which also sets %s to null)" $key $key) -}}
+{{- fail (printf "%s is no longer read; use `curie cluster upgrade` to migrate retained factory settings to factory.* (repository CI and bases under factory.bindings[].repos[]), or remove unsupported raw values" $key) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -2729,6 +2748,59 @@ true
 {{- if and $appId $own (eq (get .credential "type" | default "github_app") "github_app") (ne (include "curie.factory.str" $own) $appId) -}}
 {{- fail (printf "%s credential appId %s differs from api.githubAppId %s; the factory and git-flow must use one GitHub App" $where (include "curie.factory.str" $own) $appId) -}}
 {{- end -}}
+{{- end -}}
+{{- /* One binding per tracker scope (#4622, ADR 0197), whether or not
+factory.enabled: CURIE_FORGES renders from these lists either way and the API's
+ForgesConfig.check_references refuses the same document at boot. The scope is
+(tracker kind, host stripped and lowercased, trackerScopeId), as the runtime
+resolves it, so two tracker entries for one site cannot hide a duplicate. */ -}}
+{{- $trackers := dict -}}
+{{- range $index, $tracker := (get $factory "trackers" | default list) -}}
+{{- $name := get $tracker "name" | default "" | toString -}}
+{{- if hasKey $trackers $name -}}
+{{- fail (printf "factory.trackers[%v] (%s) repeats a tracker name; tracker names must be unique" $index $name) -}}
+{{- end -}}
+{{- $_ := set $trackers $name $tracker -}}
+{{- end -}}
+{{- $bindings := dict -}}
+{{- $scopes := dict -}}
+{{- range $index, $binding := (get $factory "bindings" | default list) -}}
+{{- $name := get $binding "name" | default "" | toString -}}
+{{- if hasKey $bindings $name -}}
+{{- fail (printf "factory.bindings[%v] (%s) repeats a binding name; binding names must be unique" $index $name) -}}
+{{- end -}}
+{{- $_ := set $bindings $name true -}}
+{{- end -}}
+{{- range $index, $binding := (get $factory "bindings" | default list) -}}
+{{- $name := get $binding "name" | default "" | toString -}}
+{{- $trackerName := get $binding "tracker" | default "" | toString -}}
+{{- if not (hasKey $trackers $trackerName) -}}
+{{- fail (printf "factory.bindings[%v] (%s) names unknown tracker %s; add it to factory.trackers or name an existing tracker" $index $name $trackerName) -}}
+{{- end -}}
+{{- $tracker := get $trackers $trackerName -}}
+{{- $kind := get $tracker "kind" | default "" | toString -}}
+{{- $host := get $tracker "host" | default "" | toString | trim | lower -}}
+{{- /* A trackerScopeId is a nonempty string, taken as is like the runtime, or
+a whole number below 2^53 in magnitude, which Helm's float64 holds exactly and
+renders as plain decimal digits. Anything else (missing, null, empty, a list
+or map, a fraction, a larger number) is refused, as the CLI preflight does. */ -}}
+{{- $rawScope := get $binding "trackerScopeId" -}}
+{{- $validScope := false -}}
+{{- if kindIs "string" $rawScope }}{{ $validScope = ne $rawScope "" }}
+{{- else if or (kindIs "float64" $rawScope) (kindIs "int64" $rawScope) (kindIs "int" $rawScope) -}}
+{{- $f := float64 $rawScope -}}
+{{- $validScope = and (eq $f (floor $f)) (lt $f 9007199254740992.0) (gt $f -9007199254740992.0) -}}
+{{- end -}}
+{{- if not $validScope -}}
+{{- fail (printf "factory.bindings[%v] (%s) trackerScopeId must be a nonempty string or a whole number; quote the tracker's scope id" $index $name) -}}
+{{- end -}}
+{{- $scopeId := include "curie.factory.str" $rawScope -}}
+{{- $key := toJson (list $kind $host $scopeId) -}}
+{{- if hasKey $scopes $key -}}
+{{- $first := get $scopes $key -}}
+{{- fail (printf "factory.bindings %s and %s claim the same tracker scope (%s on %s, trackerScopeId %s); keep one binding per tracker scope: add the other repositories to binding %s repos and select one with a repo:<alias> label" $first $name $kind $host $scopeId $first) -}}
+{{- end -}}
+{{- $_ := set $scopes $key $name -}}
 {{- end -}}
 {{- /* factory.enabled needs a tracker and a code host of any installed kind (#4399).
 A GitHub entry in either list keeps GitHub's own pairing: a github tracker and a

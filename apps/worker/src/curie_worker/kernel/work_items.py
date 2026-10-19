@@ -10,11 +10,11 @@ from aci_protocol import (
     QueuedTurn,
 )
 
+from ..binding import FactoryWake
 from ..delivery_lease import DeliveryLease
 from ..killswitch import KillSwitch
 from ..workitem_dispatch import (
     TerminationObservation,
-    WorkItemAcquireGrant,
     WorkItemConflict,
     WorkItemRun,
     WorkItemTransportError,
@@ -267,67 +267,126 @@ def _is_factory_work_item_turn(self: Kernel, event_id: str) -> bool:
 
 
 def _work_item_repository(self: Kernel, event_id: str) -> str | None:
-    """The WorkItem repository for an acquired execute wake, else None."""
+    """The persisted repository of this delivery's authenticated factory run."""
 
-    parsed = parse_work_item_event_id(event_id)
-    if parsed is None or parsed.kind != "execute":
-        return None
-    run = self._work_item_runs.get(parsed.request_id)
-    return run.repository_path if run is not None else None
+    owned_id = constants._OWNED_WORK_ITEM.get()
+    run = self._work_item_runs.get(owned_id) if owned_id is not None else None
+    return run.repository_path if run is not None and run.event_id == event_id else None
 
 
 async def _adopt_resumed_work_item(
-    self: Kernel, event_id: str, thread_key: str
+    self: Kernel, event_id: str, thread_key: str, *, wake: FactoryWake
 ) -> uuid.UUID | None:
-    """Reattach the execution an approval continuation still owns.
+    """Revalidate held and cold continuations through the authenticated API."""
 
-    The execute wake already returned. The same process keeps the run.
-    A restarted worker reads the still-running request by conversation.
-    Either way the continuation finishes that request and bounds the
-    runner by the original execution deadline.
-    """
-
-    # An expired held run cannot be finished by this continuation; evict it
-    # so the lookup below asks the API instead (#3564).
     self._evict_expired_held_work_items()
-    held = self._held_work_items.pop(thread_key, None)
-    if held is None and self._work_items is not None:
-        try:
-            found = await self._work_items.running_for_conversation(thread_key)
-        except WorkItemTransportError:
-            raise
-        except WorkItemConflict as exc:
-            if exc.code == "execution_ended":
-                raise failures._FactoryExecutionEnded from exc
-            found = None
-        if found is not None:
-            held = WorkItemRun(
-                client=self._work_items,
-                request_id=found.request_id,
-                owner=self._config.consumer_name,
-                grant=WorkItemAcquireGrant(
-                    generation=0,
-                    work_item_id=found.work_item_id,
-                    conversation_id=thread_key,
-                    wait_deadline="",
-                    repository_path=None,
-                ),
-                event_id=event_id,
-                thread_key=thread_key,
-                on_stop=self._stop_owned_work_item,
-                on_stale=self._abandon_stale_work_item,
-            )
-            held.started = True
-            held.runtime_epoch = found.runtime_epoch
-            held.execution_deadline = found.execution_deadline
-    if held is None:
+    held = self._held_work_items.get(thread_key)
+    if self._work_items is None:
+        if held is not None:
+            raise WorkItemTransportError("factory continuation has no dispatch client")
         return None
-    held.held = False
-    held.finished = False
-    held.event_id = event_id
-    self._work_item_runs[held.request_id] = held
+    try:
+        found = await self._work_items.running_for_conversation(thread_key, wake=wake)
+    except WorkItemConflict as exc:
+        if (
+            exc.code == "execution_ended"
+            and held is not None
+            and self._held_work_items.get(thread_key) is held
+        ):
+            self._held_work_items.pop(thread_key, None)
+            await held.close()
+        raise failures._FactoryExecutionEnded from exc
+    if held is not None and self._held_work_items.get(thread_key) is not held:
+        held = None
+    if found is None:
+        if held is not None:
+            self._held_work_items.pop(thread_key, None)
+            await held.close()
+            raise failures._FactoryExecutionEnded
+        return None
+    parsed = parse_work_item_event_id(event_id)
+    if parsed is not None and parsed.is_ci_fix:
+        if found.request_id != parsed.request_id:
+            return found.request_id
+    elif not found.lease_held_to_deadline:
+        logger.info(
+            "factory approval continuation %s pending: lease not held to deadline", event_id
+        )
+        raise failures._FactoryContinuationPending("execution lease is not held to its deadline")
+    active = self._work_item_runs.get(found.request_id)
+    if found.request_id in self._settling_work_items or (
+        active is not None
+        and active.started
+        and not active.finished
+        and active.event_id != event_id
+    ):
+        logger.info("factory continuation %s pending: active or settling delivery", event_id)
+        raise failures._FactoryContinuationPending("execution has an active or settling delivery")
+    refusal = found.refusal
+    if held is not None:
+        await held.close()
+        if self._held_work_items.get(thread_key) is not held:
+            held = None
+    active = self._work_item_runs.get(found.request_id)
+    if found.request_id in self._settling_work_items or (
+        active is not None
+        and active.started
+        and not active.finished
+        and active.event_id != event_id
+    ):
+        logger.info("factory continuation %s pending: active or settling delivery", event_id)
+        raise failures._FactoryContinuationPending("execution has an active or settling delivery")
+    if held is not None:
+        self._held_work_items.pop(thread_key, None)
+        if held.request_id != found.request_id or held.runtime_epoch != found.runtime_epoch:
+            logger.info("factory continuation %s discarded stale held bookkeeping", event_id)
+            held = None
+        elif held.agent_id != found.agent_id:
+            refusal = "factory_agent_mismatch"
+        elif held.context is not None and found.context is not None:
+            if held.context.tenant_id != found.context.tenant_id:
+                refusal = "factory_tenant_mismatch"
+            elif held.context != found.context:
+                refusal = "factory_binding_changed"
+    run = WorkItemRun(
+        client=self._work_items,
+        request_id=found.request_id,
+        owner=self._config.consumer_name,
+        grant=found,
+        wake=wake,
+        event_id=event_id,
+        thread_key=thread_key,
+        on_stop=self._stop_owned_work_item,
+        on_stale=self._abandon_stale_work_item,
+    )
+    run.started = True
+    run.runtime_epoch = found.runtime_epoch
+    run.execution_deadline = found.execution_deadline
+    if held is not None:
+        run.claim_name = held.claim_name
+        run.sandbox_name = held.sandbox_name
+    if refusal is not None:
+        await run.close()
+        logger.info("factory continuation %s refused: %s", event_id, refusal)
+        try:
+            await run.finish(
+                outcome="failed",
+                cause="runner_escalated",
+                detail="Factory execution authority is no longer valid.",
+                ci_fix_round=None,
+            )
+        except WorkItemConflict as exc:
+            logger.info("refused factory continuation finish for %s: %s", event_id, exc.code)
+            if exc.code == "not_running":
+                # A retried finish whose first response was lost is refused
+                # once it committed, as in _finish_or_settle; the request ended.
+                run.finished = True
+        if run.finished:
+            await self._release_work_item_sandbox(run)
+        raise failures._FactoryExecutionEnded
+    self._work_item_runs[run.request_id] = run
     self._factory_work_item_events.add(event_id)
-    return held.request_id
+    return run.request_id
 
 
 async def reap_orphans(self: Kernel) -> list[str]:

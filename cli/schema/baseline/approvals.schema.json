@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/approvals/v2.3.json",
+  "$id": "https://schemas.curietech.ai/cli/approvals/v2.4.json",
   "title": "curie <tier> approvals --json",
   "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); a single resolved record; one-time operator-principal or console-login-code delivery; or the agent's approval route bindings. Each binding separates its verified interactive Slack `resolution`, optional text-only `notification`, and optional `approvers` authority. Administrative recovery (#2753) adds two further shapes: `identity_report`, the installation-wide report of approval identity FACTS (`facts`, a string array per row) plus the `declarations` skeleton, forwarded verbatim from the API so an unknown field still reaches the operator; and `recovered`, one approval administratively rejected under the recovery grant.",
   "$defs": {
@@ -329,6 +329,35 @@
       },
       "required": [
         "operator_principal"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "remediation_principal": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "token": {
+              "type": "string"
+            },
+            "subject": {
+              "type": "string"
+            },
+            "expires_at": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "token",
+            "subject",
+            "expires_at"
+          ]
+        }
+      },
+      "required": [
+        "remediation_principal"
       ]
     },
     {

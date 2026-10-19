@@ -2,7 +2,7 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "curie.fullname" . }}-postgres
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Service" "name" (printf "%s-postgres" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
 spec:
@@ -17,7 +17,7 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "curie.fullname" . }}-postgres
+  name: {{ include "curie.checkedObjectName" (dict "kind" "StatefulSet" "name" (printf "%s-postgres" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
 spec:

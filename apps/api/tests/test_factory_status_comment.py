@@ -37,6 +37,7 @@ from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER, result_section, sync_status_comments
 from curie_api.github_app import GitHubAppError
 from curie_api.workitem_dispatch import DispatchConflict, acquire, defer
+from forge_fakes import factory_wake
 from forge_fakes.github import (
     LABEL,
     _issue_event,
@@ -290,6 +291,149 @@ def test_concurrent_status_passes_claim_one_row_and_post_one_comment(admitted: A
         {"id": request_id},
     )[0]
     assert row == {"sync_owner": None, "sync_lease_expires_at": None, "attempts": 1}
+
+
+def test_cancelled_status_sync_releases_claim_and_replacement_finalizes(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 9964
+    request_id = _admit(client, github, sink, number)
+    _start_running(request_id)
+    _attach_publication(_request(number)["work_item_id"], status="succeeded", pr=77)
+    client.portal.call(client.app.state.work_item_reconciler.run_once)
+    assert _request(number)["status"] == "completed"
+
+    async def go() -> None:
+        maker = client.app.state.sessionmaker
+        with pytest.raises(asyncio.CancelledError):
+            async with _blocked_status_sync(client, sink, number) as (sync, _released):
+                async with maker() as session:
+                    claimed = (
+                        await session.execute(
+                            text(
+                                "SELECT sync_owner, sync_lease_expires_at > clock_timestamp(), "
+                                "attempts, finalized_at FROM curie.factory_terminal_notices "
+                                "WHERE execution_request_id = :id"
+                            ),
+                            {"id": request_id},
+                        )
+                    ).one()
+                assert claimed[0].startswith("work-item-reconciler:")
+                assert tuple(claimed[1:]) == (True, 0, None)
+                assert _posts(sink) == []
+                assert sync.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(sync, 5)
+                assert sync.cancelled()
+        assert sync.cancelled()
+        assert (
+            await asyncio.wait_for(
+                sync_status_comments(maker, get_settings(), owner="status-owner-b", limit=1), 5
+            )
+            > 0
+        )
+        assert (
+            await sync_status_comments(maker, get_settings(), owner="status-owner-c", limit=1)
+            == 0
+        )
+
+    client.portal.call(go)
+    (comment,) = _marked(sink, request_id)
+    assert "Status: SUCCEEDED" in comment["body"]
+    assert FINAL_MARKER in comment["body"]
+    assert len(_posts(sink)) == 1
+    row = _rows(
+        "SELECT sync_owner, sync_lease_expires_at, attempts, finalized_at, comment_id "
+        "FROM curie.factory_terminal_notices WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]
+    assert row["sync_owner"] is None
+    assert row["sync_lease_expires_at"] is None
+    assert row["attempts"] == 1
+    assert row["finalized_at"] is not None
+    assert row["comment_id"] == comment["id"]
+
+
+def test_cancelled_stale_status_sync_preserves_replacement_claim(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 9965
+    request_id = _admit(client, github, sink, number)
+    epoch = _start_running(request_id)
+    _finish_failed(client, request_id, epoch, "runner_escalated")
+
+    async def go() -> None:
+        maker = client.app.state.sessionmaker
+        entered, released = asyncio.Event(), asyncio.Event()
+        replacement = None
+        statement = text(
+            "SELECT sync_owner, sync_lease_expires_at, attempts, finalized_at "
+            "FROM curie.factory_terminal_notices WHERE execution_request_id = :id"
+        )
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                async with _blocked_status_sync(client, sink, number) as (first, _released):
+                    async with maker() as session:
+                        await session.execute(
+                            text(
+                                "UPDATE curie.factory_terminal_notices "
+                                "SET sync_lease_expires_at = "
+                                "clock_timestamp() - interval '1 second' "
+                                "WHERE execution_request_id = :id"
+                            ),
+                            {"id": request_id},
+                        )
+                        await session.commit()
+                    sink.get_barrier = (
+                        f"/repos/{REPO}/issues/{number}",
+                        asyncio.get_running_loop(),
+                        entered,
+                        released,
+                    )
+                    replacement = asyncio.create_task(
+                        sync_status_comments(maker, get_settings(), owner="status-owner-b", limit=1)
+                    )
+                    await asyncio.wait_for(entered.wait(), 5)
+                    async with maker() as session:
+                        before = (await session.execute(statement, {"id": request_id})).one()
+                        assert await session.scalar(
+                            text(
+                                "SELECT sync_lease_expires_at > clock_timestamp() "
+                                "FROM curie.factory_terminal_notices "
+                                "WHERE execution_request_id = :id"
+                            ),
+                            {"id": request_id},
+                        )
+                    assert before[0] == "status-owner-b"
+                    assert tuple(before[2:]) == (0, None)
+                    assert first.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await asyncio.wait_for(first, 5)
+                    assert first.cancelled()
+                    async with maker() as session:
+                        after = (await session.execute(statement, {"id": request_id})).one()
+                    assert after == before
+                    assert not replacement.done()
+                    assert (
+                        await sync_status_comments(
+                            maker, get_settings(), owner="status-owner-c", limit=1
+                        )
+                        == 0
+                    )
+                    assert _posts(sink) == []
+            assert first.cancelled()
+        finally:
+            released.set()
+            sink.get_barrier = None
+            if replacement is not None:
+                await asyncio.wait_for(replacement, 10)
+
+    client.portal.call(go)
+    (comment,) = _marked(sink, request_id)
+    assert FINAL_MARKER in comment["body"]
+    assert len(_posts(sink)) == 1
+    row = _notices(request_id)[0]
+    assert row["attempts"] == 1
+    assert row["finalized_at"] is not None
+    assert row["comment_id"] == comment["id"]
 
 
 def test_expired_status_claim_is_taken_over_and_old_writeback_is_dropped(
@@ -1357,7 +1501,9 @@ def _defer_start(request_id: uuid.UUID, times: int) -> None:
                         {"id": request_id},
                     )
                     acquired = await acquire(
-                        session, request_id, owner="factory-owner", generation=generation
+                        session, request_id, owner="factory-owner", generation=generation,
+                        wake=await factory_wake(session, request_id),
+                        context=None,
                     )
                     assert not isinstance(acquired, DispatchConflict), acquired
                     deferred = await defer(

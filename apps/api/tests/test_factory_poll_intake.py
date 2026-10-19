@@ -390,6 +390,10 @@ class PollGitHub:
         if path == f"{root}/issues/comments":
             comments = self._recent(request, list(self.comments.values()))
             return self._page(request, "issue-comments", comments)
+        if path == f"{root}/pulls" and request.method == "GET":
+            # Rediscovery's repository-wide listing (#4629): no factory
+            # publication exists in this stand-in.
+            return httpx.Response(200, json=[])
         if path == f"{root}/pulls/comments":
             return self._page(
                 request,

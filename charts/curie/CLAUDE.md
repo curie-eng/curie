@@ -284,7 +284,9 @@ component and rail detail in `charts/curie/README.md`.
   false`, and it types only four bounded values: the three worker knobs
   (`worker.claimTimeoutSeconds`, `worker.routeTtlSeconds`,
   `worker.suspendedRouteTtlSeconds`) and the approval-chat attester's explicit
-  nonblank contract (`api.approvalChatAttesterSecret`), plus
+  nonblank contract (`api.approvalChatAttesterSecret`), the remediation
+  authority key's identical nonblank contract (`api.remediationAuthorityKey`,
+  ADR 0231), plus
   `worker.streamRetention.minAgeSeconds` (a new key, so no existing values
   file can disagree with it; the template reads it through `dig` for a
   retained release without the block) and the new

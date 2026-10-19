@@ -106,7 +106,7 @@ subjects:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "curie.fullname" . }}-preflight-controller
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Job" "name" (printf "%s-preflight-controller" (include "curie.fullname" .))) }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}

@@ -14,6 +14,16 @@
       "omissions": []
     },
     {
+      "struct": "ForgeCredentialHealthReport",
+      "schema": "ForgeCredentialHealthReport",
+      "omissions": []
+    },
+    {
+      "struct": "ForgeCredentialHealth",
+      "schema": "ForgeCredentialHealth",
+      "omissions": []
+    },
+    {
       "struct": "ScheduleList",
       "schema": "ScheduleListOut",
       "omissions": []
@@ -834,6 +844,12 @@
       "struct": "ApprovalPrincipalMint",
       "method": "post",
       "path": "/approvals/principals/operator"
+    },
+    {
+      "function": "mint_remediation_principal",
+      "struct": "ApprovalPrincipalMint",
+      "method": "post",
+      "path": "/approvals/principals/remediation-operator"
     },
     {
       "function": "mint_console_login_code",

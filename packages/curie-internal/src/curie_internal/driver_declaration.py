@@ -36,6 +36,7 @@ TEST_INSTALLATION_DRIVERS_ENV = "CURIE_TEST_INSTALLATION_DRIVERS"
 PUBLISHED_DEFAULT_API_KEY = "curie-dev-key"
 PUBLISHED_DEFAULT_INTERNAL_WORKER_TOKEN = "curie-dev-worker-token"
 PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = "curie-dev-approval-chat-attester"
+PUBLISHED_DEFAULT_REMEDIATION_AUTHORITY_KEY = "curie-dev-remediation-authority"
 
 _CHANNEL_ID = re.compile(r"^[CG][A-Z0-9]+$")
 _BOT_ID = re.compile(r"^B[A-Z0-9]+$")
@@ -121,6 +122,7 @@ def refuse_published_defaults(enabled: bool, secrets: Mapping[str, str]) -> None
         "CURIE_API_KEY": PUBLISHED_DEFAULT_API_KEY,
         "CURIE_INTERNAL_WORKER_TOKEN": PUBLISHED_DEFAULT_INTERNAL_WORKER_TOKEN,
         "CURIE_APPROVAL_CHAT_ATTESTER_SECRET": PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET,
+        "CURIE_REMEDIATION_AUTHORITY_KEY": PUBLISHED_DEFAULT_REMEDIATION_AUTHORITY_KEY,
     }
     offenders = [name for name, value in secrets.items() if value == published[name]]
     if offenders:

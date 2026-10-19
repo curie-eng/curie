@@ -4,6 +4,8 @@ Date: 2026-10-05
 
 Status: Accepted
 
+Superseded in part by [ADR 0231](0231-remediation-policy-bind-and-arm-need-an-authority-the-platform-key-cannot-derive.md): REMEDIATION-13 only. Binding and arming a remediation policy need the separate remediation authority key, not the platform administrative authority.
+
 Maintainer jw3329 explicitly approved acceptance on 2026-10-05, with the
 rulings recorded below, together with
 [ADR 0121](0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md)

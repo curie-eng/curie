@@ -115,6 +115,7 @@ from test_remediation_nomination_routes import (
     ROUTE_NAME,
     Stage,
     admin_headers,
+    approver_headers,
     block,
     remediation,
     staged,
@@ -711,7 +712,7 @@ async def age(seconds: int) -> None:
 def _approver() -> dict[str, str]:
     """The route's approver (``approvers.users``) as an operator principal, no platform key."""
 
-    return {k: v for k, v in admin_headers().items() if k != "X-API-Key"}
+    return {k: v for k, v in approver_headers().items() if k != "X-API-Key"}
 
 
 async def assert_requested(row: dict[str, Any]) -> dict[str, Any]:
@@ -2120,6 +2121,11 @@ def test_only_the_administrative_route_with_an_operator_principal_closes_a_break
             )
             assert platform_only.status_code == 403, platform_only.text
             assert platform_only.json()["detail"]["code"] == "operator_principal_required"
+            approval_scope = await w.stage.client.post(
+                url, json={"reason": reason}, headers=approver_headers()
+            )
+            assert approval_scope.status_code == 403, approval_scope.text
+            assert approval_scope.json()["detail"]["code"] == "operator_principal_required"
             unknown = await w.stage.client.post(
                 _close_url(w.stage, uuid.uuid4()), json={"reason": reason}, headers=admin_headers()
             )

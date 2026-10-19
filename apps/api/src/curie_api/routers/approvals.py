@@ -108,6 +108,24 @@ def _remediation_refused(refused: ForwardRefused) -> HTTPException:
     )
 
 
+def _issue_operator_principal(subject: str, scope: str, response: Response) -> ApprovalPrincipalOut:
+    now = datetime.now(UTC)
+    expires_at = now + timedelta(seconds=approval_principal.OPERATOR_TOKEN_TTL_SECONDS)
+    token = approval_principal.mint(
+        get_settings().api_key,
+        subject=subject,
+        kind="operator",
+        scope=scope,
+        exp=int(expires_at.timestamp()),
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return ApprovalPrincipalOut(
+        token=token,
+        subject=subject,
+        expires_at=expires_at,
+    )
+
+
 @router.post(
     "/principals/operator",
     response_model=ApprovalPrincipalOut,
@@ -124,20 +142,28 @@ async def mint_operator_principal(
     caller-supplied actor string.
     """
 
-    now = datetime.now(UTC)
-    expires_at = now + timedelta(seconds=approval_principal.OPERATOR_TOKEN_TTL_SECONDS)
-    token = approval_principal.mint(
-        get_settings().api_key,
-        subject=data.subject,
-        kind="operator",
-        scope=approval_principal.APPROVE_SCOPE,
-        exp=int(expires_at.timestamp()),
-    )
-    response.headers["Cache-Control"] = "no-store"
-    return ApprovalPrincipalOut(
-        token=token,
-        subject=data.subject,
-        expires_at=expires_at,
+    return _issue_operator_principal(data.subject, approval_principal.APPROVE_SCOPE, response)
+
+
+@router.post(
+    "/principals/remediation-operator",
+    response_model=ApprovalPrincipalOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_platform_key)],
+)
+async def mint_remediation_operator_principal(
+    data: ApprovalPrincipalMint, response: Response
+) -> ApprovalPrincipalOut:
+    """Mint a remediation operator credential (#4228).
+
+    The token carries the ``remediation.administer`` scope, which remediation
+    policy and qualification writes require; it never resolves an approval,
+    and an approval operator token never writes remediation policy.  Returned
+    once and marked non-cacheable, as the approval operator mint is.
+    """
+
+    return _issue_operator_principal(
+        data.subject, approval_principal.REMEDIATION_ADMIN_SCOPE, response
     )
 
 

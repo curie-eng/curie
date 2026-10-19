@@ -189,11 +189,12 @@ async def test_bitbucket_config_credentials(
                 "https://bitbucket.org",
             )
         else:
-            # Decision 4.2 and 5.2: Bearer for git too, on the server's own base URL.
+            # Decision 4.2 and 5.2: Bearer for git too, under the server's
+            # /scm, so <origin>/<KEY>/<slug>.git is its clone URL.
             assert (minted.header, minted.username, minted.origin) == (
                 CredentialHeader.AUTHORIZATION_BEARER,
                 None,
-                DC_API_URL,
+                f"{DC_API_URL}/scm",
             )
         assert TOKEN not in repr(minted)
     assert connection.credentials.expiry().expiry is expiry

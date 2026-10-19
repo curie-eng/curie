@@ -4,7 +4,7 @@
 (``apps/worker/src/curie_worker/sandbox/k8s.py``) that ``SandboxSubstrate`` is
 written against, so selecting it (``CURIE_SANDBOX_SUBSTRATE=docker``) makes the
 whole worker -- both the runs kernel and the eval consumer, which share one
-substrate object -- boot runner containers with ``docker run`` instead of
+substrate object -- boot runner containers with ``docker create`` and ``docker start`` instead of
 claiming agent-sandbox CRs. The boot recipe mirrors the CLI's
 ``cli/src/docker.rs`` (image ``curie-runner``, port publish, plugin mount,
 network join, the ACI boot env).
@@ -22,7 +22,8 @@ missing.
 Model mapping. Docker has no warm pool, no separate Sandbox object, and no init
 containers, so one container is simultaneously the "claim" and the "sandbox"
 (claim name == container name == sandbox name), and there is no bundle-fetch init
-pair -- the worker fetches the plugin bundle from RustFS and bind-mounts it. The
+pair -- the worker fetches the plugin bundle from RustFS and copies it into a
+claim-owned Docker volume. The
 host-process worker reaches each runner over a loopback-bound, Docker-assigned
 host port (``docker port <name> 8080``) -- but only when it can actually reach
 that host loopback. A worker running as a host-net *container* on Docker Desktop
@@ -51,6 +52,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -214,6 +216,32 @@ _DOCKER_CONTROL_TIMEOUT_S = 30.0
 _DOCKER_CREATE_TIMEOUT_S = 90.0
 _DOCKER_IMAGE_PULL_TIMEOUT_S = 300.0
 _LIST_INSPECTION_TIMEOUT_S = 30.0
+_CLAIM_LABEL = "curietech.ai/claim"
+_COMPONENT_LABEL = "curietech.ai/component"
+_ATTEMPT_LABEL = "curietech.ai/claim-attempt"
+_STACK_LABEL = "curietech.ai/stack"
+_INPUT_COMPONENTS = ("claim-bundle", "claim-workspace", "claim-attachments")
+_INPUT_SEED_LIFETIME_S = 1800
+_SEED_WORKSPACE = """import os
+import stat
+def fail(error):
+    raise error
+def prepare(path):
+    os.chown(path, 0, 0, follow_symlinks=False)
+    entry = os.lstat(path)
+    if not stat.S_ISLNK(entry.st_mode):
+        mode = 0o700 if stat.S_ISDIR(entry.st_mode) else 0o600
+        os.chmod(path, entry.st_mode | mode, follow_symlinks=False)
+paths = ['/curie-input']
+prepare('/curie-input')
+for root, directories, files in os.walk('/curie-input', topdown=True, onerror=fail):
+    for name in directories + files:
+        path = os.path.join(root, name)
+        prepare(path)
+        paths.append(path)
+for path in reversed(paths):
+    os.chown(path, 1000, 1000, follow_symlinks=False)
+"""
 
 # Declared boot keys this substrate produces. Docker is the OTel producer here
 # (the chart's env block is its Kubernetes counterpart), and the runner parses
@@ -461,6 +489,7 @@ class DockerSandboxClient:
         self._image = image
         self._bundles = bundle_store
         self._network = network
+        self._stack = network or "default"
         self._otel_endpoint = otel_endpoint
         self._host = host
         self._default_plugin_dir = default_plugin_dir
@@ -479,12 +508,11 @@ class DockerSandboxClient:
         # Presence-only view of the worker environment, used to decide which SDK
         # credential vars to forward by name. Never read for their values.
         self._environ = environ if environ is not None else os.environ
-        # Per-container host dir holding the extracted bundle, cleaned on delete.
+        # Attempt keys keep a losing creator from deleting a winner's staging.
         self._bundle_dirs: dict[str, str] = {}
         self._workspace_dirs: dict[str, str] = {}
         self._workspace_limits = workspace_limits or WorkspaceLimits()
-        # Per-container host dir holding the redeemed attachments, cleaned on
-        # delete exactly as the bundle and workspace dirs are.
+        # Staging is released once the Docker volumes have been seeded.
         self._attachment_dirs: dict[str, str] = {}
         self._attachment_limits = attachment_limits or AttachmentLimits()
 
@@ -505,14 +533,12 @@ class DockerSandboxClient:
         executor = executor_secret_names is not None
         if executor_secret_names is not None:
             env = _executor_claim_env(env, executor_secret_names)
+        attempt = uuid.uuid4().hex
         plugin_dir = env.get(PLUGIN_DIR_ENV, self._default_plugin_dir)
         args = [
-            "run",
-            "-d",
+            "create",
             "--name",
             name,
-            "--label",
-            f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}",
             "-p",
             f"{self._host}::{RUNNER_CONTAINER_PORT}",
         ]
@@ -534,47 +560,46 @@ class DockerSandboxClient:
             )
         for key, value in (labels or {}).items():
             args += ["--label", f"{key}={value}"]
+        args += [
+            "--label",
+            f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}",
+            "--label",
+            f"{_CLAIM_LABEL}={name}",
+            "--label",
+            f"{_COMPONENT_LABEL}=claim-runner",
+            "--label",
+            f"{_ATTEMPT_LABEL}={attempt}",
+            "--label",
+            f"{_STACK_LABEL}={self._stack}",
+        ]
         bundle_ref = env.get(BUNDLE_REF_ENV)
         if bundle_ref:
             args += ["--label", f"{BUNDLE_REF_LABEL}={bundle_ref}"]
         if self._network:
             args += ["--network", self._network]
 
-        # Bundle: no init containers here, so fetch + extract + bind-mount the
-        # plugin dir ourselves (fail-open only when there is no ref, e.g. a fake
-        # model run that never reads the plugin dir).
-        if env.get(BUNDLE_REF_ENV):
-            root = self._prepare_bundle(name, env[BUNDLE_REF_ENV])
-            args += ["-v", f"{root}:{plugin_dir}:ro"]
-        if env.get(WORKSPACE_REF_ENV):
-            try:
+        inputs: list[tuple[str, str, str, bool]] = []
+        try:
+            if env.get(BUNDLE_REF_ENV):
+                root = self._prepare_bundle(attempt, env[BUNDLE_REF_ENV])
+                inputs.append(("claim-bundle", root, plugin_dir, False))
+            if env.get(WORKSPACE_REF_ENV):
                 root = self._prepare_workspace(
-                    name,
+                    attempt,
                     env[WORKSPACE_REF_ENV],
                     env.get(WORKSPACE_SHA256_ENV, ""),
                 )
-            except Exception:
-                self._cleanup_bundle(name)
-                raise
-            args += ["-v", f"{root}:{WORKSPACE_MOUNT_PATH}:rw"]
-        # Attachments: same reason as the bundle above -- no init containers
-        # here, so this driver redeems the signed reference itself. Kubernetes
-        # does this in `attachments-init`; without the equivalent, `curie local
-        # up` and `curie skill` would park the bytes and hand the agent nothing,
-        # which is a fabricated empty result at those tiers (ADR-0041) and the
-        # very silent loss #2567 exists to close. Read-only: an attachment is an
-        # input a person sent, not a scratch space.
-        if env.get(ATTACHMENTS_REF_ENV):
-            try:
-                root = self._prepare_attachments(name, env[ATTACHMENTS_REF_ENV])
-            except _NoAttachments:
-                pass
-            except Exception:
-                self._cleanup_workspace(name)
-                self._cleanup_bundle(name)
-                raise
-            else:
-                args += ["-v", f"{root}:{ATTACHMENTS_MOUNT_PATH}:ro"]
+                inputs.append(("claim-workspace", root, WORKSPACE_MOUNT_PATH, True))
+            if env.get(ATTACHMENTS_REF_ENV):
+                try:
+                    root = self._prepare_attachments(attempt, env[ATTACHMENTS_REF_ENV])
+                except _NoAttachments:
+                    pass
+                else:
+                    inputs.append(("claim-attachments", root, ATTACHMENTS_MOUNT_PATH, False))
+        except BaseException:
+            self._cleanup_staged_inputs(attempt)
+            raise
 
         args += [
             "-e",
@@ -632,18 +657,46 @@ class DockerSandboxClient:
                 for var in _SDK_PASSTHROUGH_ENV:
                     if var in self._environ:
                         args += ["-e", var]
-        args.append(self._image)
-
+        volumes: list[tuple[str, str, str]] = []
         try:
-            self._docker(
+            for component, _root, destination, writable in inputs:
+                volume, helper = self._allocate_input_volume(name, component, attempt=attempt)
+                volumes.append((component, volume, helper))
+                mode = "rw" if writable else "ro"
+                args += ["-v", f"{volume}:{destination}:{mode}"]
+            args.append(self._image)
+            runner = self._docker(
                 args,
                 request_timeout_seconds=_DOCKER_CREATE_TIMEOUT_S,
+            ).strip()
+            if not runner:
+                raise DockerError("docker create returned no runner identity")
+            for (component, root, _destination, writable), (_, volume, helper) in zip(
+                inputs, volumes, strict=True
+            ):
+                self._validate_input_volume(name, component, volume, attempt=attempt)
+                self._seed_input_volume(helper, root, writable=writable)
+            self._cleanup_staged_inputs(attempt)
+            for component, volume, helper in volumes:
+                self._validate_input_volume(name, component, volume, attempt=attempt)
+                self._validate_seed_helper(name, component, helper, attempt=attempt)
+            inspected = self._inspect(runner, deadline=time.monotonic() + _DOCKER_CONTROL_TIMEOUT_S)
+            if inspected is None or not self._owns_resource(
+                inspected[1], name=name, component="claim-runner", attempt=attempt
+            ):
+                raise DockerError("runner ownership changed before start")
+            self._docker(["start", runner], request_timeout_seconds=_DOCKER_CREATE_TIMEOUT_S)
+            for _component, _volume, helper in volumes:
+                self._docker(
+                    ["rm", "-f", helper], request_timeout_seconds=_DOCKER_CONTROL_TIMEOUT_S
+                )
+        except BaseException:
+            self._cleanup_claim_inputs(
+                name,
+                request_timeout_seconds=_DOCKER_CREATE_TIMEOUT_S,
+                attempt=attempt,
+                include_runner=True,
             )
-        except DockerError:
-            # A failed boot must not leak staged claim data.
-            self._cleanup_bundle(name)
-            self._cleanup_workspace(name)
-            self._cleanup_attachments(name)
             raise
 
     def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
@@ -651,17 +704,24 @@ class DockerSandboxClient:
         inspected = self._inspect(name, deadline=deadline)
         if inspected is None:
             return None
-        status, labels, created = inspected
-        ready = status == "running" and self._healthz_ok(name, deadline=deadline)
+        status, labels, created, identifier = inspected
+        if not self._owns_resource(labels, name=name, component="claim-runner"):
+            return None
+        attempt = labels.get(_ATTEMPT_LABEL)
+        if (
+            status == "created"
+            and attempt
+            and self._attempt_is_seeding(name, attempt, deadline=deadline)
+        ):
+            return None
+        ready = status == "running" and self._healthz_ok(identifier, deadline=deadline)
         return ClaimView(
             name=name,
             ready=ready,
             # The container is its own sandbox; expose the name once it exists so
             # the substrate can advance to awaiting the dial target.
             sandbox_name=name,
-            # The container's own creation instant is this tier's claim age: the
-            # substrate runs one reaper over both tiers, so returning None here
-            # would silently stop reaping local orphans.
+            # The bind window starts after seeding, when the runner starts.
             created_at=created,
             quota_rejection=None,
             ready_reason=None,
@@ -670,21 +730,21 @@ class DockerSandboxClient:
         )
 
     def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
-        # -f removes a running/paused container too; ignore "no such container".
-        self._docker(
-            ["rm", "-f", name],
-            request_timeout_seconds=request_timeout_seconds,
-            check=False,
+        self._cleanup_claim_inputs(
+            name, request_timeout_seconds=request_timeout_seconds, include_runner=True
         )
-        self._cleanup_bundle(name)
-        self._cleanup_workspace(name)
-        self._cleanup_attachments(name)
 
     def list_claims(self, *, label_selector: str) -> list[ClaimView]:
         out = self._docker(
             [
                 "ps",
                 "-a",
+                "--filter",
+                f"label={MANAGED_BY_LABEL}={MANAGED_BY_VALUE}",
+                "--filter",
+                f"label={_STACK_LABEL}={self._stack}",
+                "--filter",
+                f"label={_COMPONENT_LABEL}=claim-runner",
                 "--filter",
                 f"label={label_selector}",
                 "--format",
@@ -701,9 +761,88 @@ class DockerSandboxClient:
         return views
 
     def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
-        # Docker creates no claim-scoped templates; tokens ride the container env.
-        del keep, created_before
-        return []
+        removed: list[str] = []
+        removed_attempts: set[str] = set()
+        for component in _INPUT_COMPONENTS:
+            volumes = self._docker(
+                [
+                    "volume",
+                    "ls",
+                    "--filter",
+                    f"label={MANAGED_BY_LABEL}={MANAGED_BY_VALUE}",
+                    "--filter",
+                    f"label={_STACK_LABEL}={self._stack}",
+                    "--filter",
+                    f"label={_COMPONENT_LABEL}={component}",
+                    "--format",
+                    "{{.Name}}",
+                ],
+                request_timeout_seconds=_DOCKER_CONTROL_TIMEOUT_S,
+            )
+            for volume in volumes.splitlines():
+                if not volume.strip():
+                    continue
+                inspected = self._docker(
+                    [
+                        "volume",
+                        "inspect",
+                        "--format",
+                        "{{json .Labels}}\t{{.CreatedAt}}",
+                        volume.strip(),
+                    ],
+                    request_timeout_seconds=_DOCKER_CONTROL_TIMEOUT_S,
+                    check=False,
+                )
+                labels_json, _, created_raw = inspected.strip().partition("\t")
+                if not labels_json:
+                    continue
+                labels = json.loads(labels_json)
+                if not isinstance(labels, dict):
+                    continue
+                claim = labels.get(_CLAIM_LABEL)
+                attempt = labels.get(_ATTEMPT_LABEL)
+                created = _parse_created(created_raw)
+                if (
+                    labels.get(MANAGED_BY_LABEL) != MANAGED_BY_VALUE
+                    or labels.get(_STACK_LABEL) != self._stack
+                    or labels.get(_COMPONENT_LABEL) != component
+                    or not isinstance(claim, str)
+                    or not claim
+                    or not isinstance(attempt, str)
+                    or not attempt
+                    or claim in keep
+                    or attempt in removed_attempts
+                    or created is None
+                    or created >= created_before
+                ):
+                    continue
+                if self._attempt_is_seeding(
+                    claim, attempt, deadline=time.monotonic() + _DOCKER_CONTROL_TIMEOUT_S
+                ):
+                    continue
+                runner = self._inspect(claim, deadline=time.monotonic() + _DOCKER_CONTROL_TIMEOUT_S)
+                if (
+                    runner is not None
+                    and self._owns_resource(
+                        runner[1], name=claim, component="claim-runner", attempt=attempt
+                    )
+                    and (runner[2] is None or runner[2] >= created_before)
+                ):
+                    continue
+                removed_attempts.add(attempt)
+                try:
+                    self._cleanup_claim_inputs(
+                        claim,
+                        request_timeout_seconds=_DOCKER_CREATE_TIMEOUT_S,
+                        attempt=attempt,
+                        include_runner=True,
+                    )
+                except DockerError:
+                    logger.warning("orphaned claim input cleanup failed; retrying next sweep")
+                    continue
+                if claim not in removed:
+                    removed.append(claim)
+        return removed
 
     # -- sandbox lifecycle ----------------------------------------------------
 
@@ -712,9 +851,11 @@ class DockerSandboxClient:
         inspected = self._inspect(name, deadline=deadline)
         if inspected is None:
             return None
-        # A Sandbox has no age question; this unpacks three only because
+        # A Sandbox has no age question; this unpacks four only because
         # get_claim shares the same single inspect call.
-        status, _labels, _created = inspected
+        status, labels, _created, identifier = inspected
+        if not self._owns_resource(labels, name=name, component="claim-runner"):
+            return None
         # Only a running or paused container is a live/suspended sandbox. An
         # exited/dead/created/restarting container is NOT live: report it gone
         # (None) so the substrate evicts the stale route and re-claims rather than
@@ -725,7 +866,7 @@ class DockerSandboxClient:
             operating_mode = "Running"
         else:
             return None
-        endpoint = self._dial_endpoint(name, deadline=deadline)
+        endpoint = self._dial_endpoint(identifier, deadline=deadline)
         return SandboxView(
             name=name,
             ready=status == "running",
@@ -745,9 +886,7 @@ class DockerSandboxClient:
         del rejection, request_timeout_seconds
         return False
 
-    def pod_unschedulable(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> str | None:
+    def pod_unschedulable(self, name: str, *, request_timeout_seconds: float) -> str | None:
         # A Docker runner has no scheduler; it starts or fails.
         del name, request_timeout_seconds
         return None
@@ -763,13 +902,260 @@ class DockerSandboxClient:
         # Docker has no cold suspend; pause freezes the process while keeping the
         # published port, which is all the substrate's liveness check reads back.
         verb = "pause" if mode == "Suspended" else "unpause"
+        inspected = self._inspect(name, deadline=time.monotonic() + _DOCKER_CONTROL_TIMEOUT_S)
+        if inspected is None or not self._owns_resource(
+            inspected[1], name=name, component="claim-runner"
+        ):
+            return
         self._docker(
-            [verb, name],
+            [verb, inspected[3]],
             request_timeout_seconds=_DOCKER_CONTROL_TIMEOUT_S,
             check=False,
         )
 
     # -- helpers --------------------------------------------------------------
+
+    def _resource_labels(self, name: str, component: str, attempt: str) -> dict[str, str]:
+        return {
+            MANAGED_BY_LABEL: MANAGED_BY_VALUE,
+            _STACK_LABEL: self._stack,
+            _CLAIM_LABEL: name,
+            _COMPONENT_LABEL: component,
+            _ATTEMPT_LABEL: attempt,
+        }
+
+    def _owns_resource(
+        self,
+        labels: Mapping[str, str],
+        *,
+        name: str,
+        component: str,
+        attempt: str | None = None,
+    ) -> bool:
+        expected = self._resource_labels(name, component, attempt or "")
+        if attempt is None:
+            del expected[_ATTEMPT_LABEL]
+        return all(labels.get(key) == value for key, value in expected.items())
+
+    def _allocate_input_volume(self, name: str, component: str, *, attempt: str) -> tuple[str, str]:
+        volume = f"curie-input-{uuid.uuid4().hex}"
+        helper = f"{volume}-seed"
+        labels = [
+            argument
+            for key, value in self._resource_labels(name, component, attempt).items()
+            for argument in ("--label", f"{key}={value}")
+        ]
+        self._docker(
+            ["volume", "create", *labels, volume],
+            request_timeout_seconds=_DOCKER_CONTROL_TIMEOUT_S,
+        )
+        helper_id = self._docker(
+            [
+                "create",
+                "--name",
+                helper,
+                *labels,
+                "--network",
+                "none",
+                "--user",
+                "0:0",
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--cap-add",
+                "CHOWN",
+                "--security-opt",
+                "no-new-privileges",
+                "--mount",
+                f"type=volume,source={volume},target=/curie-input,volume-nocopy",
+                "--entrypoint",
+                "python",
+                self._image,
+                "-c",
+                f"import time; time.sleep({_INPUT_SEED_LIFETIME_S})",
+            ],
+            request_timeout_seconds=_DOCKER_CREATE_TIMEOUT_S,
+        ).strip()
+        if not helper_id:
+            raise DockerError("docker create returned no input helper identity")
+        self._docker(["start", helper_id], request_timeout_seconds=_DOCKER_CONTROL_TIMEOUT_S)
+        self._validate_input_volume(name, component, volume, attempt=attempt)
+        self._validate_seed_helper(name, component, helper_id, attempt=attempt)
+        return volume, helper_id
+
+    def _validate_input_volume(
+        self, name: str, component: str, volume: str, *, attempt: str
+    ) -> None:
+        inspected = self._docker(
+            ["volume", "inspect", "--format", "{{json .Labels}}", volume],
+            request_timeout_seconds=_DOCKER_CONTROL_TIMEOUT_S,
+        )
+        try:
+            labels = json.loads(inspected)
+        except (TypeError, ValueError) as exc:
+            raise DockerError("claim input volume has invalid ownership labels") from exc
+        if labels != self._resource_labels(name, component, attempt):
+            raise DockerError("claim input volume ownership changed before runner start")
+
+    def _validate_seed_helper(
+        self, name: str, component: str, helper: str, *, attempt: str
+    ) -> None:
+        inspected = self._inspect(helper, deadline=time.monotonic() + _DOCKER_CONTROL_TIMEOUT_S)
+        if (
+            inspected is None
+            or inspected[0] != "running"
+            or not self._owns_resource(
+                inspected[1], name=name, component=component, attempt=attempt
+            )
+        ):
+            raise DockerError("claim input helper is no longer active")
+
+    def _seed_input_volume(self, helper: str, root: str, *, writable: bool = False) -> None:
+        self._docker(
+            ["cp", f"{root}/.", f"{helper}:/curie-input"],
+            request_timeout_seconds=_DOCKER_CREATE_TIMEOUT_S,
+        )
+        if writable:
+            self._docker(
+                ["exec", helper, "python", "-c", _SEED_WORKSPACE],
+                request_timeout_seconds=_DOCKER_CREATE_TIMEOUT_S,
+            )
+
+    def _attempt_is_seeding(self, name: str, attempt: str, *, deadline: float) -> bool:
+        runner = self._inspect(name, deadline=deadline)
+        if (
+            runner is not None
+            and self._owns_resource(runner[1], name=name, component="claim-runner", attempt=attempt)
+            and runner[0] != "created"
+        ):
+            return False
+        helpers = self._docker(
+            [
+                "ps",
+                "--filter",
+                f"label={MANAGED_BY_LABEL}={MANAGED_BY_VALUE}",
+                "--filter",
+                f"label={_STACK_LABEL}={self._stack}",
+                "--filter",
+                f"label={_CLAIM_LABEL}={name}",
+                "--filter",
+                f"label={_ATTEMPT_LABEL}={attempt}",
+                "--filter",
+                "status=running",
+                "--format",
+                "{{.ID}}",
+            ],
+            request_timeout_seconds=self._remaining_seconds(deadline),
+        )
+        for helper in helpers.splitlines():
+            inspected = self._inspect(helper.strip(), deadline=deadline)
+            if inspected is None or inspected[0] != "running":
+                continue
+            component = inspected[1].get(_COMPONENT_LABEL)
+            if (
+                component is not None
+                and component in _INPUT_COMPONENTS
+                and self._owns_resource(
+                    inspected[1], name=name, component=component, attempt=attempt
+                )
+            ):
+                return True
+        return False
+
+    def _cleanup_claim_inputs(
+        self,
+        name: str,
+        *,
+        request_timeout_seconds: float,
+        attempt: str | None = None,
+        include_runner: bool = False,
+    ) -> None:
+        deadline = time.monotonic() + request_timeout_seconds
+        failures: list[str] = []
+        try:
+            components = (("claim-runner",) if include_runner else ()) + _INPUT_COMPONENTS
+            for component in components:
+                filters = [
+                    "--filter",
+                    f"label={MANAGED_BY_LABEL}={MANAGED_BY_VALUE}",
+                    "--filter",
+                    f"label={_STACK_LABEL}={self._stack}",
+                    "--filter",
+                    f"label={_CLAIM_LABEL}={name}",
+                    "--filter",
+                    f"label={_COMPONENT_LABEL}={component}",
+                ]
+                if attempt is not None:
+                    filters += ["--filter", f"label={_ATTEMPT_LABEL}={attempt}"]
+                operations = [(["ps", "-a", *filters, "--format", "{{.ID}}"], ["rm", "-f"])]
+                if component != "claim-runner":
+                    operations.append(
+                        (
+                            ["volume", "ls", *filters, "--format", "{{.Name}}"],
+                            ["volume", "rm"],
+                        )
+                    )
+                for listing, removal in operations:
+                    try:
+                        resources = self._docker(
+                            listing, request_timeout_seconds=self._remaining_seconds(deadline)
+                        )
+                    except DockerError as exc:
+                        failures.append(str(exc))
+                        continue
+                    for resource in resources.splitlines():
+                        if not resource.strip():
+                            continue
+                        try:
+                            resource = resource.strip()
+                            if removal[0] == "rm":
+                                inspected = self._inspect(resource, deadline=deadline)
+                                if inspected is None or not self._owns_resource(
+                                    inspected[1],
+                                    name=name,
+                                    component=component,
+                                    attempt=attempt,
+                                ):
+                                    continue
+                                resource = inspected[3]
+                            else:
+                                inspected_labels = self._docker(
+                                    [
+                                        "volume",
+                                        "inspect",
+                                        "--format",
+                                        "{{json .Labels}}",
+                                        resource,
+                                    ],
+                                    request_timeout_seconds=self._remaining_seconds(deadline),
+                                    check=False,
+                                )
+                                if not inspected_labels.strip():
+                                    continue
+                                volume_labels = json.loads(inspected_labels)
+                                if not isinstance(volume_labels, dict) or not self._owns_resource(
+                                    volume_labels,
+                                    name=name,
+                                    component=component,
+                                    attempt=attempt,
+                                ):
+                                    continue
+                            self._docker(
+                                [*removal, resource],
+                                request_timeout_seconds=self._remaining_seconds(deadline),
+                            )
+                        except DockerError as exc:
+                            failures.append(str(exc))
+        finally:
+            if attempt is not None:
+                self._cleanup_staged_inputs(attempt)
+        if failures:
+            raise DockerError("claim input cleanup failed: " + "; ".join(failures))
+
+    def _cleanup_staged_inputs(self, name: str) -> None:
+        self._cleanup_bundle(name)
+        self._cleanup_workspace(name)
+        self._cleanup_attachments(name)
 
     def _prepare_bundle(self, name: str, ref: str) -> str:
         data = self._bundles.get(ref)
@@ -847,17 +1233,6 @@ class DockerSandboxClient:
             with tarfile.open(archive_path, mode="r:*") as archive:
                 archive.extractall(root, filter="data")
             archive_path.unlink(missing_ok=True)
-
-            # Local Docker may run under a host uid different from the runner's
-            # fixed uid 1000. The workspace is deliberately writable, so make
-            # the bind mount writable independent of that host uid.
-            os.chmod(root, 0o777)
-            for dirpath, dirnames, filenames in os.walk(root):
-                for dirname in dirnames:
-                    os.chmod(os.path.join(dirpath, dirname), 0o777)
-                for filename in filenames:
-                    path = os.path.join(dirpath, filename)
-                    os.chmod(path, os.stat(path).st_mode | 0o666)
         except Exception:
             shutil.rmtree(tmp, ignore_errors=True)
             raise
@@ -1058,18 +1433,19 @@ class DockerSandboxClient:
 
     def _inspect(
         self, name: str, *, deadline: float
-    ) -> tuple[str, dict[str, str], datetime | None] | None:
-        """(status, labels, created) for the container, or None when it does not
+    ) -> tuple[str, dict[str, str], datetime | None, str] | None:
+        """(status, labels, age origin, id), or None when the container does not
         exist.
 
-        One docker call carries all three: the creation instant rides along with
-        the status read rather than costing a second inspect per poll.
+        Starting the runner begins its bind window after input seeding. The id
+        keeps subsequent actions on the inspected container across name reuse.
         """
         out = self._docker(
             [
                 "inspect",
                 "--format",
-                "{{.State.Status}}\t{{json .Config.Labels}}\t{{.Created}}",
+                "{{.State.Status}}\t{{json .Config.Labels}}\t{{.Created}}"
+                "\t{{.Id}}\t{{.State.StartedAt}}",
                 name,
             ],
             request_timeout_seconds=self._remaining_seconds(deadline),
@@ -1078,10 +1454,18 @@ class DockerSandboxClient:
         if not out.strip():
             return None
         status, _, rest = out.strip().partition("\t")
-        labels_json, _, created_raw = rest.partition("\t")
+        labels_json, _, rest = rest.partition("\t")
+        created_raw, _, rest = rest.partition("\t")
+        identifier, _, started_raw = rest.partition("\t")
         labels_raw = json.loads(labels_json) if labels_json and labels_json != "null" else {}
         labels = {str(k): str(v) for k, v in labels_raw.items()}
-        return status, labels, _parse_created(created_raw)
+        if not identifier:
+            raise DockerError("docker inspect returned no container identity")
+        created = _parse_created(created_raw)
+        started = _parse_created(started_raw)
+        if started is not None and (created is None or started > created):
+            created = started
+        return status, labels, created, identifier
 
     def _published_port(self, name: str, *, deadline: float) -> int | None:
         out = self._docker(

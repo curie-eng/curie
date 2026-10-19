@@ -23,17 +23,20 @@ The substrate is where a conversation thread claims, dials, suspends, and reaps 
 
 ## Current contract
 
-A second implementation must satisfy the `SandboxClient` `Protocol` at `apps/worker/src/curie_worker/sandbox/types.py::SandboxClient`, nine methods:
+A second implementation must satisfy the `SandboxClient` `Protocol` at `apps/worker/src/curie_worker/sandbox/types.py::SandboxClient`, ten methods:
 
-- `create_claim(name, *, pool, env=None, labels=None, runner_resources=None, agent_name=None) -> None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.create_claim`); every implementation must apply `filter_agent_child_env` (`apps/worker/src/curie_worker/sandbox/types.py::filter_agent_child_env`) to `env` before building the agent child environment
-- `get_claim(name, *, request_timeout_seconds) -> ClaimView | None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.get_claim`)
-- `delete_claim(name, *, request_timeout_seconds) -> None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.delete_claim`)
-- `list_claims(*, label_selector) -> list[ClaimView]` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.list_claims`)
-- `get_sandbox(name, *, request_timeout_seconds) -> SandboxView | None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.get_sandbox`)
-- `quota_has_headroom(rejection, *, request_timeout_seconds) -> bool` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.quota_has_headroom`)
-- `pod_unschedulable(name, *, request_timeout_seconds) -> str | None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.pod_unschedulable`)
-- `pod_termination(name, *, since: datetime, request_timeout_seconds) -> SandboxTermination | None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.pod_termination`)
-- `set_sandbox_mode(name, mode: OperatingMode) -> None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.set_sandbox_mode`)
+1. `create_claim(name, *, pool, env=None, labels=None, runner_resources=None, agent_name=None, executor_secret_names=None) -> None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.create_claim`); every implementation must apply `filter_agent_child_env` (`apps/worker/src/curie_worker/sandbox/types.py::filter_agent_child_env`) to `env` before building the agent child environment
+2. `get_claim(name, *, request_timeout_seconds) -> ClaimView | None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.get_claim`)
+3. `delete_claim(name, *, request_timeout_seconds) -> None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.delete_claim`)
+4. `list_claims(*, label_selector) -> list[ClaimView]` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.list_claims`)
+5. `reap_claim_templates(*, keep: set[str], created_before: datetime) -> list[str]` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.reap_claim_templates`); keep objects whose claim is in `keep`, whose creation is at or after the cutoff, or whose age is unknown; a substrate with no claim-scoped objects returns `[]`
+6. `get_sandbox(name, *, request_timeout_seconds) -> SandboxView | None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.get_sandbox`)
+7. `quota_has_headroom(rejection, *, request_timeout_seconds) -> bool` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.quota_has_headroom`)
+8. `pod_unschedulable(name, *, request_timeout_seconds) -> str | None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.pod_unschedulable`)
+9. `pod_termination(name, *, since: datetime, request_timeout_seconds) -> SandboxTermination | None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.pod_termination`)
+10. `set_sandbox_mode(name, mode: OperatingMode) -> None` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient.set_sandbox_mode`)
+
+`executor_secret_names=None` means an ordinary claim. A set, including an empty set, marks an executor claim: exclude model credentials, the model env-key declaration, and connector secrets outside the set regardless of the pool template.
 
 The exchanged value types are `ClaimView` (`apps/worker/src/curie_worker/sandbox/types.py::ClaimView`: `name`, `ready`, `sandbox_name`, `created_at`, `quota_rejection`, `ready_reason`, `ready_message`, `bundle_ref`) and `SandboxView` (`apps/worker/src/curie_worker/sandbox/types.py::SandboxView`: `name`, `ready`, `service_fqdn`, `operating_mode`, `port`). `QuotaRejection` preserves the complete `requested`, `used`, and `hard` resource maps reported by Kubernetes. Kubernetes must populate `quota_rejection`, `ready_reason`, and `ready_message` from quota rejection and raw Ready condition evidence. Docker must supply `None` for those diagnostic fields. `operating_mode` must report `"Running"` for a claim to be handed back (`apps/worker/src/curie_worker/sandbox/substrate.py::SandboxSubstrate.claim`), and `OperatingMode` is `Literal["Running", "Suspended"]` (`apps/worker/src/curie_worker/sandbox/types.py::OperatingMode`). A second implementation **must** populate `ClaimView.created_at` from the backing object's own creation instant, as tz-aware UTC: `reap_orphans()` (`apps/worker/src/curie_worker/sandbox/substrate.py::SandboxSubstrate.reap_orphans`) reads it as the bind-window grace, sparing any claim younger than `claim_timeout_seconds` plus a fixed margin, because a claim still binding has no route yet and "no live route" alone would read as litter. An adapter that returns `None` for every claim disables orphan reaping on that tier entirely (the substrate spares unknown-age claims and logs a warning), so `None` is reserved for a genuinely unreadable timestamp. The selector reads `CURIE_SANDBOX_SUBSTRATE` (default `"kubernetes"`, else `"docker"`) in `_sandbox_client()` at `apps/worker/src/curie_worker/run.py::_sandbox_client`, which branches on the value inside that same function.
 
@@ -52,6 +55,58 @@ Two, both under `apps/worker/src/curie_worker/sandbox/`:
 - `KubernetesSandboxClient` (`apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient`) — drives agent-sandbox CRDs (`Sandbox` in `agents.x-k8s.io`, `SandboxClaim` in `extensions.agents.x-k8s.io`) via `CustomObjectsApi`.
 - `DockerSandboxClient` (`apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient`) — boots runner containers on the local Docker daemon for middle mode (a laptop, no cluster).
 
+## Protected substrate observations
+
+`apps/worker/src/curie_worker/protected_substrate_readers.py` defines a separate
+read boundary for factual observations of a protected launch.
+`DockerSubstrateReader` accepts a `DockerControlPlane`, and
+`KubernetesSubstrateReader` accepts a `KubernetesControlPlane`. No production
+module constructs these readers or their control-plane implementations; only
+tests instantiate them. They add no methods to `SandboxClient`.
+Protected production composition in `apps/worker/src/curie_worker/protected_run.py`
+uses `ProtectedSandboxSubstrate` with a launch client. The issuer's
+`apps/worker/src/curie_worker/protected_launch_kubernetes.py` calls
+`apps/worker/src/curie_worker/protected_substrate_facts.py::parse_kubernetes_runner_facts`
+directly.
+
+1. `DockerControlPlane` carries `authority_domain_id` and `endpoint_host`, with
+   async `inspect_container(container_id)` and `inspect_image(image_id)` reads.
+   `KubernetesControlPlane` carries `authority_domain_id`, with async
+   `read_pod(namespace, name)`, `read_node(name)`, `read_service(namespace, name)`
+   and `list_endpoint_slices(namespace, service_name)` reads. Each returns an
+   object that the reader validates as control-plane wire data.
+2. Both readers expose async `observe(receipt: ProtectedLaunchReceipt, *,
+   handle: SandboxHandle) -> ProtectedRunnerObservation`. They bind the exact
+   handle, authority domain, execution session and token hash to the receipt.
+   Receipts must come from an independently owned cold launcher; constructing
+   one does not confer launch authority.
+3. Docker verifies the exact container and image objects, name, running state,
+   start instant, zero restarts, token hash and one loopback `8080/tcp` binding
+   matching the handle. It reports declared image, image config id, repository
+   digests and image-reported platform separately. A remote Engine endpoint
+   cannot attest the worker's loopback dial target in this implementation.
+4. Kubernetes verifies pod and container identity, start and Sandbox owner,
+   runner facts and token value, then the exact headless Service and one
+   complete EndpointSlice targeting that pod UID and IP at port 8080. Platform
+   and runtime facts come from the selected Node's status, with its UID. A
+   `secretKeyRef` alone is refused because it does not prove the token assignment;
+   current protected templates need independent assignment proof to use this path.
+5. Returned observations contain bounded identity and platform facts, a token
+   hash and a raw launch-document hash. They contain no raw environment or
+   credentials. The document hash is not the qualified launch-configuration
+   projection; image qualification, preventive isolation and live admission
+   remain separate guards. Invalid or unavailable evidence raises redacted
+   `SubstrateFactsUnavailable` with the source exception chain detached.
+6. `DockerEngineControlPlane` and `KubernetesAPIControlPlane` accept
+   caller-supplied authenticated HTTPS endpoints and use verified TLS,
+   five-second bounded reads and at most 1 MiB responses, without ambient
+   proxies, redirects or retries. The Docker transport requires client
+   certificate authentication; Kubernetes takes an explicit read token and does
+   not discover kubeconfig.
+   `apps/worker/tests/test_protected_substrate_readers.py` covers successful
+   observations, replacement and missing-provenance refusals, token-reference
+   refusal, remote-loopback refusal, bounded transport and exception redaction.
+
 ## Known leakage
 
 Claim-timeout diagnosis bypasses the port. `SandboxSubstrate._await_bound`
@@ -66,13 +121,17 @@ The `SandboxView.port` field (`apps/worker/src/curie_worker/sandbox/types.py::Sa
 
 Per-agent connector secrets diverge harder, and this one is a behavior difference, not just a shape difference. The binding injects them into the substrate-agnostic boot env by value and marks their names in `CURIE_CONNECTOR_SECRET_KEYS` (`apps/worker/src/curie_worker/binding.py::inject_connector_secrets`). The k8s client strips both that marker and every key it names off the value-only claim (`apps/worker/src/curie_worker/sandbox/k8s.py::CONNECTOR_SECRET_KEYS_ENV`, applied in `apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient.create_claim`), because a claim env entry is plaintext in etcd; delivery is the per-agent SandboxTemplate `secretKeyRef` plus `warmPoolRef` routing (`apps/worker/src/curie_worker/sandbox/types.py::claim_warm_pool`, #1488). The Docker client has nowhere to leak them to and forwards them by value through its generic `-e key=value` loop, since `apps/worker/src/curie_worker/sandbox/docker.py::_WORKER_OWNED_ENV` covers only the bundle ref, the plugin dir, the sandbox id, the model credential, the attachment ref (`apps/worker/src/curie_worker/attachments.py::ATTACHMENTS_REF_ENV`), the workspace ref (`apps/worker/src/curie_worker/workspace.py::WORKSPACE_REF_ENV`), and the workspace digest (`apps/worker/src/curie_worker/workspace.py::WORKSPACE_SHA256_ENV`). Same `SandboxClient` calls and the same env dict go in; Kubernetes resolves values from the template Secret and Docker from argv. A third substrate has to pick a side of that, and the `Protocol` says nothing about which. These are runtime-shaped asymmetries the `Protocol` does not fully hide. Which agent may call a hosted connector is checked by the connector's caller proxy (ADR-0168 decision 7, `packages/plugin-format/src/plugin_format/connector_render.py::ConnectorProxy`), not by a per-agent sandbox selector, so hosted-connector isolation no longer waits on a plugin-format selector change (issue #1488 item 6).
 
-Scoped tokens diverge the same way (#3842). The binding puts the runner, history, memory, state, progress, issue-read and connector-caller tokens in the boot env by value. The k8s client splits them off the claim (`apps/worker/src/curie_worker/sandbox/claim_tokens.py::split_claim_tokens`) and writes them to a per-claim `<claim>-tokens` Secret read by a per-claim copy of the pool's SandboxTemplate through `secretKeyRef`, routed by a `replicas: 0` per-claim warm pool. The Secret and pool are owned by the template and the template by the claim, so garbage collection removes them with the claim, and `SandboxClient.reap_claim_templates` lets the reaper delete templates whose claim is gone. The Docker client forwards the tokens in the container env as before and its `reap_claim_templates` is a no-op.
+Scoped tokens diverge the same way (#3842). The binding puts the runner, history, memory, state, progress, issue-read and connector-caller tokens in the boot env by value. The k8s client splits them off the claim (`apps/worker/src/curie_worker/sandbox/claim_tokens.py::split_claim_tokens`) and writes them to a per-claim `<claim>-tokens` Secret read by a per-claim copy of the pool's SandboxTemplate through `secretKeyRef`, routed by a `replicas: 0` per-claim warm pool. The Secret and pool are owned by the template and the template by the claim, so garbage collection removes them with the claim, and `SandboxClient.reap_claim_templates` lets the reaper delete templates whose claim is gone. The Docker client forwards the tokens in the container env as before; its `reap_claim_templates` removes stale orphan input volumes and helpers by claim and creation attempt, preserving claims in `keep` and inputs newer than the cutoff.
 
-Attachment redemption diverges the same way (#2567). Docker redeems the capability in `apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient._prepare_attachments` and bind-mounts the files read-only. Kubernetes hands the key only to the `attachments-init` container (`apps/worker/src/curie_worker/sandbox/k8s.py::ATTACHMENT_INIT_CONTAINERS`, applied in `apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient.create_claim`) and keeps it off the runner.
+Attachment redemption diverges the same way (#2567). Docker redeems and validates the capability in `apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient._prepare_attachments`, copies the files through the Docker API into a named volume, and mounts the volume read only. Kubernetes hands the key only to the `attachments-init` container (`apps/worker/src/curie_worker/sandbox/k8s.py::ATTACHMENT_INIT_CONTAINERS`, applied in `apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient.create_claim`) and keeps it off the runner.
 
-Workspace redemption has the same substrate split. Docker fetches, validates, and bind-mounts the archive in `apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient._prepare_workspace`. Kubernetes forwards only the workspace ref and digest to the `workspace-init` container (`apps/worker/src/curie_worker/sandbox/k8s.py::WORKSPACE_INIT_CONTAINERS`, applied in `apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient.create_claim`).
+Workspace redemption has the same substrate split. Docker fetches and validates the archive in `apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient._prepare_workspace`, then copies the extracted workspace into a named volume mounted read write with UID/GID `1000:1000` ownership. Kubernetes forwards only the workspace ref and digest to the `workspace-init` container (`apps/worker/src/curie_worker/sandbox/k8s.py::WORKSPACE_INIT_CONTAINERS`, applied in `apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient.create_claim`).
 
-Pool selection leaks the port in two places. `SandboxSubstrate` imports the concrete `DockerSandboxClient` (`apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient`) and branches on `isinstance` in `_claim_fresh`: Docker uses `SubstrateConfig.warm_pool` as is, and every other client goes through `claim_warm_pool` and the per-agent pool lookup. That lookup, `SandboxSubstrate._existing_agent_pool`, also probes the client with `getattr(self._k8s, "warm_pool_exists", None)`, a method that is not on the `SandboxClient` `Protocol` and that only `KubernetesSandboxClient` defines (`apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient.warm_pool_exists`). A third substrate would be sent down the Kubernetes branch and silently skip the per-agent pool probe unless it defines that method. This is documented, not scheduled: moving pool selection behind the port is worth doing only when a third substrate is real.
+Docker bundles follow the same transfer path: `apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient._prepare_bundle` fetches and validates the bundle, and `apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient._seed_input_volume` copies each prepared input through the Docker API. The runner mounts bundle and attachment volumes read only. Volume and helper labels identify both the claim and its creation attempt, allowing failed creation, deletion, and orphan cleanup to remove owned resources without touching another attempt. Worker extraction paths need no shared filesystem with the daemon.
+
+Pool selection leaks the port. `SandboxSubstrate` imports the concrete `DockerSandboxClient` (`apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient`) and branches on `isinstance` in `_claim_fresh`: Docker uses `SubstrateConfig.warm_pool` as is, and every other client goes through `claim_warm_pool` and the per-agent pool lookup. That lookup, `SandboxSubstrate._existing_agent_pool`, also probes the client with `getattr(self._k8s, "warm_pool_exists", None)`, a method that is not on the `SandboxClient` `Protocol` and that only `KubernetesSandboxClient` defines (`apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient.warm_pool_exists`). A third substrate would be sent down the Kubernetes branch and silently skip the per-agent pool probe unless it defines that method.
+
+Repository runner routing adds the same leakage under [ADR 0216](../../adr/0216-a-factory-repository-binding-selects-its-own-runner-image-built-from-a-tool-catalog.md): `SandboxSubstrate._repo_runner` and `SandboxSubstrate._route_matches_runner` branch on `isinstance(..., DockerSandboxClient)` to bypass repository pool selection and image matching on Docker. `_repo_runner` also makes a second `getattr(..., "warm_pool_exists", None)` probe for the repository pool. A third substrate inherits the non-Docker routing and can silently omit that probe unless it implements the undeclared method. Moving pool selection behind the port remains deferred until a third substrate is real.
 
 ## Cross-links
 

@@ -22,7 +22,7 @@ same way without a second mutation.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "curie.fullname" . }}-schema-migrate
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Job" "name" (printf "%s-schema-migrate" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: schema-migrate

@@ -53,7 +53,7 @@ clears it on the next attempt.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "curie.fullname" . }}-upgrade-drain
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Job" "name" (printf "%s-upgrade-drain" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: upgrade-drain
@@ -137,7 +137,7 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "curie.fullname" . }}-upgrade-drain-release
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Job" "name" (printf "%s-upgrade-drain-release" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: upgrade-drain-release
@@ -215,7 +215,7 @@ finalizer wedges the next before-hook-creation delete.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "curie.fullname" . }}-upgrade-drain-attest
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Job" "name" (printf "%s-upgrade-drain-attest" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: upgrade-drain-attest
@@ -292,7 +292,7 @@ Missing or foreign authority refuses the roll without recreating the marker.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "curie.fullname" . }}-upgrade-drain-hold
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Job" "name" (printf "%s-upgrade-drain-hold" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: upgrade-drain-hold

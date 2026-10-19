@@ -1,0 +1,2724 @@
+{
+  "description": "Tracker scope uniqueness for factory bindings (#4622, ADR 0197: one binding per resolved tracker scope). A scope is (tracker kind, tracker host trimmed and lowercased, trackerScopeId). Each case gives `values`, the chart's `factory:` block with credentials as existingSecret references, and `forges`, the CURIE_FORGES document charts/curie renders for those values; for a refused case it is the document a chart without the scope check renders. `outcome` is {accepted: true}, {refused: duplicate_scope, bindings: [first, second], scope: {kind, host, trackerScopeId}}, {refused: unknown_tracker, binding, tracker} or {refused: duplicate_name, section: trackers|bindings, name} or {refused: invalid_scope_id, binding, loader: accepted}. A trackerScopeId must be a nonempty string or a whole number below 2^53 in magnitude; the chart and the CLI refuse anything else, while the runtime loader accepts the string an unchecked chart renders for it, so `loader: accepted` records the loader outcome for those cases. A trackerScopeId is compared exactly as rendered: the chart renders a numeric id as its string, and case is significant. Readers, each through its production parser: tools/factory-e2e/tests/test_c4_tracker_scope.py (helm template of charts/curie, curie cluster upgrade, the candidate API image), cli/tests/factory_tracker_scope.rs (curie::factory_intake::check_factory_document) and apps/api/tests/forges/test_tracker_scope_vectors.py (curie_api.forges.loader.load_forges_json). Identifiers are examples only.",
+  "credential_mount": "/etc/curie/forges",
+  "cases": [
+    {
+      "name": "quickstart_jira_binding",
+      "description": "The one Bitbucket code host, Jira tracker and Jira binding named jira that quickstart writes. The pin installs it as the baseline release.",
+      "values": {
+        "codeHosts": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.20/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "api.bitbucket.org"
+              }
+            ],
+            "name": "bitbucket",
+            "kind": "bitbucket_cloud",
+            "host": "bitbucket.org",
+            "apiUrl": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-bitbucket-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "trackers": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "example.atlassian.net"
+              }
+            ],
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": "example.atlassian.net",
+            "apiUrl": "https://example.atlassian.net",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "bindings": [
+          {
+            "name": "jira",
+            "tracker": "jira",
+            "trackerScopeId": "00000000-0000-0000-0000-000000000000",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000001}",
+                "path": "acme/example-repo"
+              }
+            ],
+            "defaultRepo": "example-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          }
+        ]
+      },
+      "forges": {
+        "bindings": [
+          {
+            "default_repo": "example-repo",
+            "name": "jira",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "code_host": "bitbucket",
+                "path": "acme/example-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000001}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "00000000-0000-0000-0000-000000000000"
+          }
+        ],
+        "card_base_url": "",
+        "code_hosts": [
+          {
+            "api_url": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "token_file": "/etc/curie/forges/code_hosts-bitbucket/token",
+              "type": "static_token"
+            },
+            "host": "bitbucket.org",
+            "kind": "bitbucket_cloud",
+            "name": "bitbucket"
+          }
+        ],
+        "trackers": [
+          {
+            "api_url": "https://example.atlassian.net",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "example.atlassian.net",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira"
+          }
+        ]
+      },
+      "outcome": {
+        "accepted": true
+      }
+    },
+    {
+      "name": "valid_mixed_repositories",
+      "description": "One Jira binding listing a GitHub, a GitLab and a Bitbucket Cloud repository under distinct aliases, with a defaultRepo and an allowlist startAuthority.",
+      "values": {
+        "codeHosts": [
+          {
+            "name": "github",
+            "kind": "github",
+            "host": "github.com",
+            "apiUrl": "https://api.github.com",
+            "credential": {
+              "type": "github_app",
+              "appId": "123456",
+              "existingSecret": "curie-github-app",
+              "existingSecretKey": "private-key"
+            }
+          },
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.30/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "gitlab.example.com"
+              }
+            ],
+            "name": "gitlab",
+            "kind": "gitlab",
+            "host": "gitlab.example.com",
+            "apiUrl": "https://gitlab.example.com/api/v4",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-gitlab-token",
+              "existingSecretKey": "token"
+            }
+          },
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.20/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "api.bitbucket.org"
+              }
+            ],
+            "name": "bitbucket",
+            "kind": "bitbucket_cloud",
+            "host": "bitbucket.org",
+            "apiUrl": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-bitbucket-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "trackers": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "example.atlassian.net"
+              }
+            ],
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": "example.atlassian.net",
+            "apiUrl": "https://example.atlassian.net",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "bindings": [
+          {
+            "name": "jira",
+            "tracker": "jira",
+            "trackerScopeId": "00000000-0000-0000-0000-000000000000",
+            "repos": [
+              {
+                "alias": "widgets",
+                "codeHost": "github",
+                "projectId": "123456789",
+                "path": "acme/widgets"
+              },
+              {
+                "alias": "gadgets",
+                "codeHost": "gitlab",
+                "projectId": "4242",
+                "path": "acme/gadgets"
+              },
+              {
+                "alias": "gizmos",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000001}",
+                "path": "acme/gizmos"
+              }
+            ],
+            "defaultRepo": "widgets",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          }
+        ]
+      },
+      "forges": {
+        "bindings": [
+          {
+            "default_repo": "widgets",
+            "name": "jira",
+            "repos": [
+              {
+                "alias": "widgets",
+                "code_host": "github",
+                "path": "acme/widgets",
+                "project_id": "123456789"
+              },
+              {
+                "alias": "gadgets",
+                "code_host": "gitlab",
+                "path": "acme/gadgets",
+                "project_id": "4242"
+              },
+              {
+                "alias": "gizmos",
+                "code_host": "bitbucket",
+                "path": "acme/gizmos",
+                "project_id": "{00000000-0000-4000-8000-000000000001}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "00000000-0000-0000-0000-000000000000"
+          }
+        ],
+        "card_base_url": "",
+        "code_hosts": [
+          {
+            "api_url": "https://api.github.com",
+            "credential": {
+              "app_id": "123456",
+              "private_key_file": "/etc/curie/forges/code_hosts-github/private_key",
+              "type": "github_app"
+            },
+            "host": "github.com",
+            "kind": "github",
+            "name": "github"
+          },
+          {
+            "api_url": "https://gitlab.example.com/api/v4",
+            "credential": {
+              "token_file": "/etc/curie/forges/code_hosts-gitlab/token",
+              "type": "static_token"
+            },
+            "host": "gitlab.example.com",
+            "kind": "gitlab",
+            "name": "gitlab"
+          },
+          {
+            "api_url": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "token_file": "/etc/curie/forges/code_hosts-bitbucket/token",
+              "type": "static_token"
+            },
+            "host": "bitbucket.org",
+            "kind": "bitbucket_cloud",
+            "name": "bitbucket"
+          }
+        ],
+        "trackers": [
+          {
+            "api_url": "https://example.atlassian.net",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "example.atlassian.net",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira"
+          }
+        ]
+      },
+      "outcome": {
+        "accepted": true
+      }
+    },
+    {
+      "name": "duplicate_scope_through_distinct_tracker_names",
+      "description": "The released Bitbucket manual-values example applied over the quickstart binding: a second tracker entry for the same Jira site, its host written with different case and surrounding whitespace, and a second binding with the same trackerScopeId.",
+      "values": {
+        "codeHosts": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.20/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "api.bitbucket.org"
+              }
+            ],
+            "name": "bitbucket",
+            "kind": "bitbucket_cloud",
+            "host": "bitbucket.org",
+            "apiUrl": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-bitbucket-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "trackers": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "example.atlassian.net"
+              }
+            ],
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": "example.atlassian.net",
+            "apiUrl": "https://example.atlassian.net",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-token",
+              "existingSecretKey": "token"
+            }
+          },
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "example.atlassian.net"
+              }
+            ],
+            "name": "jira-site",
+            "kind": "jira_cloud",
+            "host": " Example.Atlassian.NET ",
+            "apiUrl": "https://example.atlassian.net",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-site-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "bindings": [
+          {
+            "name": "jira",
+            "tracker": "jira",
+            "trackerScopeId": "00000000-0000-0000-0000-000000000000",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000001}",
+                "path": "acme/example-repo"
+              }
+            ],
+            "defaultRepo": "example-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          },
+          {
+            "name": "example",
+            "tracker": "jira-site",
+            "trackerScopeId": "00000000-0000-0000-0000-000000000000",
+            "repos": [
+              {
+                "alias": "other-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000002}",
+                "path": "acme/other-repo"
+              }
+            ],
+            "defaultRepo": "other-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          }
+        ]
+      },
+      "forges": {
+        "bindings": [
+          {
+            "default_repo": "example-repo",
+            "name": "jira",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "code_host": "bitbucket",
+                "path": "acme/example-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000001}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "00000000-0000-0000-0000-000000000000"
+          },
+          {
+            "default_repo": "other-repo",
+            "name": "example",
+            "repos": [
+              {
+                "alias": "other-repo",
+                "code_host": "bitbucket",
+                "path": "acme/other-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000002}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira-site",
+            "tracker_scope_id": "00000000-0000-0000-0000-000000000000"
+          }
+        ],
+        "card_base_url": "",
+        "code_hosts": [
+          {
+            "api_url": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "token_file": "/etc/curie/forges/code_hosts-bitbucket/token",
+              "type": "static_token"
+            },
+            "host": "bitbucket.org",
+            "kind": "bitbucket_cloud",
+            "name": "bitbucket"
+          }
+        ],
+        "trackers": [
+          {
+            "api_url": "https://example.atlassian.net",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "example.atlassian.net",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira"
+          },
+          {
+            "api_url": "https://example.atlassian.net",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira-site/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": " Example.Atlassian.NET ",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira-site"
+          }
+        ]
+      },
+      "outcome": {
+        "refused": "duplicate_scope",
+        "bindings": [
+          "jira",
+          "example"
+        ],
+        "scope": {
+          "kind": "jira_cloud",
+          "host": "example.atlassian.net",
+          "trackerScopeId": "00000000-0000-0000-0000-000000000000"
+        }
+      }
+    },
+    {
+      "name": "duplicate_scope_same_tracker",
+      "description": "Two bindings naming the same tracker with the same trackerScopeId.",
+      "values": {
+        "codeHosts": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.20/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "api.bitbucket.org"
+              }
+            ],
+            "name": "bitbucket",
+            "kind": "bitbucket_cloud",
+            "host": "bitbucket.org",
+            "apiUrl": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-bitbucket-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "trackers": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "example.atlassian.net"
+              }
+            ],
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": "example.atlassian.net",
+            "apiUrl": "https://example.atlassian.net",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "bindings": [
+          {
+            "name": "jira",
+            "tracker": "jira",
+            "trackerScopeId": "00000000-0000-0000-0000-000000000000",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000001}",
+                "path": "acme/example-repo"
+              }
+            ],
+            "defaultRepo": "example-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          },
+          {
+            "name": "example",
+            "tracker": "jira",
+            "trackerScopeId": "00000000-0000-0000-0000-000000000000",
+            "repos": [
+              {
+                "alias": "other-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000002}",
+                "path": "acme/other-repo"
+              }
+            ],
+            "defaultRepo": "other-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          }
+        ]
+      },
+      "forges": {
+        "bindings": [
+          {
+            "default_repo": "example-repo",
+            "name": "jira",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "code_host": "bitbucket",
+                "path": "acme/example-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000001}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "00000000-0000-0000-0000-000000000000"
+          },
+          {
+            "default_repo": "other-repo",
+            "name": "example",
+            "repos": [
+              {
+                "alias": "other-repo",
+                "code_host": "bitbucket",
+                "path": "acme/other-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000002}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "00000000-0000-0000-0000-000000000000"
+          }
+        ],
+        "card_base_url": "",
+        "code_hosts": [
+          {
+            "api_url": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "token_file": "/etc/curie/forges/code_hosts-bitbucket/token",
+              "type": "static_token"
+            },
+            "host": "bitbucket.org",
+            "kind": "bitbucket_cloud",
+            "name": "bitbucket"
+          }
+        ],
+        "trackers": [
+          {
+            "api_url": "https://example.atlassian.net",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "example.atlassian.net",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira"
+          }
+        ]
+      },
+      "outcome": {
+        "refused": "duplicate_scope",
+        "bindings": [
+          "jira",
+          "example"
+        ],
+        "scope": {
+          "kind": "jira_cloud",
+          "host": "example.atlassian.net",
+          "trackerScopeId": "00000000-0000-0000-0000-000000000000"
+        }
+      }
+    },
+    {
+      "name": "unknown_tracker_reference",
+      "description": "A binding naming a tracker absent from factory.trackers.",
+      "values": {
+        "codeHosts": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.20/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "api.bitbucket.org"
+              }
+            ],
+            "name": "bitbucket",
+            "kind": "bitbucket_cloud",
+            "host": "bitbucket.org",
+            "apiUrl": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-bitbucket-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "trackers": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "example.atlassian.net"
+              }
+            ],
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": "example.atlassian.net",
+            "apiUrl": "https://example.atlassian.net",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "bindings": [
+          {
+            "name": "jira",
+            "tracker": "jira",
+            "trackerScopeId": "00000000-0000-0000-0000-000000000000",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000001}",
+                "path": "acme/example-repo"
+              }
+            ],
+            "defaultRepo": "example-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          },
+          {
+            "name": "example",
+            "tracker": "jira-cloud",
+            "trackerScopeId": "00000000-0000-0000-0000-000000000001",
+            "repos": [
+              {
+                "alias": "other-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000002}",
+                "path": "acme/other-repo"
+              }
+            ],
+            "defaultRepo": "other-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          }
+        ]
+      },
+      "forges": {
+        "bindings": [
+          {
+            "default_repo": "example-repo",
+            "name": "jira",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "code_host": "bitbucket",
+                "path": "acme/example-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000001}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "00000000-0000-0000-0000-000000000000"
+          },
+          {
+            "default_repo": "other-repo",
+            "name": "example",
+            "repos": [
+              {
+                "alias": "other-repo",
+                "code_host": "bitbucket",
+                "path": "acme/other-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000002}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira-cloud",
+            "tracker_scope_id": "00000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "card_base_url": "",
+        "code_hosts": [
+          {
+            "api_url": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "token_file": "/etc/curie/forges/code_hosts-bitbucket/token",
+              "type": "static_token"
+            },
+            "host": "bitbucket.org",
+            "kind": "bitbucket_cloud",
+            "name": "bitbucket"
+          }
+        ],
+        "trackers": [
+          {
+            "api_url": "https://example.atlassian.net",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "example.atlassian.net",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira"
+          }
+        ]
+      },
+      "outcome": {
+        "refused": "unknown_tracker",
+        "binding": "example",
+        "tracker": "jira-cloud"
+      }
+    },
+    {
+      "name": "distinct_scopes",
+      "description": "Two bindings on one tracker with different trackerScopeIds, and a third binding with the first trackerScopeId on a Jira tracker of the same kind on another host. Every scope differs, so all are accepted.",
+      "values": {
+        "codeHosts": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.20/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "api.bitbucket.org"
+              }
+            ],
+            "name": "bitbucket",
+            "kind": "bitbucket_cloud",
+            "host": "bitbucket.org",
+            "apiUrl": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-bitbucket-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "trackers": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "example.atlassian.net"
+              }
+            ],
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": "example.atlassian.net",
+            "apiUrl": "https://example.atlassian.net",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-token",
+              "existingSecretKey": "token"
+            }
+          },
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "jira.example.org"
+              }
+            ],
+            "name": "jira-other",
+            "kind": "jira_cloud",
+            "host": "jira.example.org",
+            "apiUrl": "https://jira.example.org",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-other-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "bindings": [
+          {
+            "name": "jira",
+            "tracker": "jira",
+            "trackerScopeId": "00000000-0000-0000-0000-000000000000",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000001}",
+                "path": "acme/example-repo"
+              }
+            ],
+            "defaultRepo": "example-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          },
+          {
+            "name": "example",
+            "tracker": "jira",
+            "trackerScopeId": "00000000-0000-0000-0000-000000000001",
+            "repos": [
+              {
+                "alias": "other-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000002}",
+                "path": "acme/other-repo"
+              }
+            ],
+            "defaultRepo": "other-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          },
+          {
+            "name": "other",
+            "tracker": "jira-other",
+            "trackerScopeId": "00000000-0000-0000-0000-000000000000",
+            "repos": [
+              {
+                "alias": "third-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000003}",
+                "path": "acme/third-repo"
+              }
+            ],
+            "defaultRepo": "third-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          }
+        ]
+      },
+      "forges": {
+        "bindings": [
+          {
+            "default_repo": "example-repo",
+            "name": "jira",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "code_host": "bitbucket",
+                "path": "acme/example-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000001}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "00000000-0000-0000-0000-000000000000"
+          },
+          {
+            "default_repo": "other-repo",
+            "name": "example",
+            "repos": [
+              {
+                "alias": "other-repo",
+                "code_host": "bitbucket",
+                "path": "acme/other-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000002}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "00000000-0000-0000-0000-000000000001"
+          },
+          {
+            "default_repo": "third-repo",
+            "name": "other",
+            "repos": [
+              {
+                "alias": "third-repo",
+                "code_host": "bitbucket",
+                "path": "acme/third-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000003}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira-other",
+            "tracker_scope_id": "00000000-0000-0000-0000-000000000000"
+          }
+        ],
+        "card_base_url": "",
+        "code_hosts": [
+          {
+            "api_url": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "token_file": "/etc/curie/forges/code_hosts-bitbucket/token",
+              "type": "static_token"
+            },
+            "host": "bitbucket.org",
+            "kind": "bitbucket_cloud",
+            "name": "bitbucket"
+          }
+        ],
+        "trackers": [
+          {
+            "api_url": "https://example.atlassian.net",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "example.atlassian.net",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira"
+          },
+          {
+            "api_url": "https://jira.example.org",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira-other/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "jira.example.org",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira-other"
+          }
+        ]
+      },
+      "outcome": {
+        "accepted": true
+      }
+    },
+    {
+      "name": "duplicate_tracker_names",
+      "description": "Two factory.trackers entries share the name jira, on different hosts.",
+      "values": {
+        "codeHosts": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.20/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "api.bitbucket.org"
+              }
+            ],
+            "name": "bitbucket",
+            "kind": "bitbucket_cloud",
+            "host": "bitbucket.org",
+            "apiUrl": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-bitbucket-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "trackers": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "example.atlassian.net"
+              }
+            ],
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": "example.atlassian.net",
+            "apiUrl": "https://example.atlassian.net",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-token",
+              "existingSecretKey": "token"
+            }
+          },
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "jira.example.org"
+              }
+            ],
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": "jira.example.org",
+            "apiUrl": "https://jira.example.org",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-other-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "bindings": [
+          {
+            "name": "jira",
+            "tracker": "jira",
+            "trackerScopeId": "00000000-0000-0000-0000-000000000000",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000001}",
+                "path": "acme/example-repo"
+              }
+            ],
+            "defaultRepo": "example-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          }
+        ]
+      },
+      "forges": {
+        "bindings": [
+          {
+            "default_repo": "example-repo",
+            "name": "jira",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "code_host": "bitbucket",
+                "path": "acme/example-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000001}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "00000000-0000-0000-0000-000000000000"
+          }
+        ],
+        "card_base_url": "",
+        "code_hosts": [
+          {
+            "api_url": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "token_file": "/etc/curie/forges/code_hosts-bitbucket/token",
+              "type": "static_token"
+            },
+            "host": "bitbucket.org",
+            "kind": "bitbucket_cloud",
+            "name": "bitbucket"
+          }
+        ],
+        "trackers": [
+          {
+            "api_url": "https://example.atlassian.net",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "example.atlassian.net",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira"
+          },
+          {
+            "api_url": "https://jira.example.org",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "jira.example.org",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira"
+          }
+        ]
+      },
+      "outcome": {
+        "refused": "duplicate_name",
+        "section": "trackers",
+        "name": "jira"
+      }
+    },
+    {
+      "name": "duplicate_binding_names",
+      "description": "Two factory.bindings entries share the name jira, each with its own trackerScopeId.",
+      "values": {
+        "codeHosts": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.20/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "api.bitbucket.org"
+              }
+            ],
+            "name": "bitbucket",
+            "kind": "bitbucket_cloud",
+            "host": "bitbucket.org",
+            "apiUrl": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-bitbucket-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "trackers": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "example.atlassian.net"
+              }
+            ],
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": "example.atlassian.net",
+            "apiUrl": "https://example.atlassian.net",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "bindings": [
+          {
+            "name": "jira",
+            "tracker": "jira",
+            "trackerScopeId": "00000000-0000-0000-0000-000000000000",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000001}",
+                "path": "acme/example-repo"
+              }
+            ],
+            "defaultRepo": "example-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          },
+          {
+            "name": "jira",
+            "tracker": "jira",
+            "trackerScopeId": "00000000-0000-0000-0000-000000000001",
+            "repos": [
+              {
+                "alias": "other-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000002}",
+                "path": "acme/other-repo"
+              }
+            ],
+            "defaultRepo": "other-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          }
+        ]
+      },
+      "forges": {
+        "bindings": [
+          {
+            "default_repo": "example-repo",
+            "name": "jira",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "code_host": "bitbucket",
+                "path": "acme/example-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000001}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "00000000-0000-0000-0000-000000000000"
+          },
+          {
+            "default_repo": "other-repo",
+            "name": "jira",
+            "repos": [
+              {
+                "alias": "other-repo",
+                "code_host": "bitbucket",
+                "path": "acme/other-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000002}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "00000000-0000-0000-0000-000000000001"
+          }
+        ],
+        "card_base_url": "",
+        "code_hosts": [
+          {
+            "api_url": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "token_file": "/etc/curie/forges/code_hosts-bitbucket/token",
+              "type": "static_token"
+            },
+            "host": "bitbucket.org",
+            "kind": "bitbucket_cloud",
+            "name": "bitbucket"
+          }
+        ],
+        "trackers": [
+          {
+            "api_url": "https://example.atlassian.net",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "example.atlassian.net",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira"
+          }
+        ]
+      },
+      "outcome": {
+        "refused": "duplicate_name",
+        "section": "bindings",
+        "name": "jira"
+      }
+    },
+    {
+      "name": "duplicate_numeric_scope",
+      "description": "One binding writes trackerScopeId as the number 12345678901 and a second writes the same id as a string; the chart renders both as the string, so they are one scope.",
+      "values": {
+        "codeHosts": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.20/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "api.bitbucket.org"
+              }
+            ],
+            "name": "bitbucket",
+            "kind": "bitbucket_cloud",
+            "host": "bitbucket.org",
+            "apiUrl": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-bitbucket-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "trackers": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "example.atlassian.net"
+              }
+            ],
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": "example.atlassian.net",
+            "apiUrl": "https://example.atlassian.net",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "bindings": [
+          {
+            "name": "jira",
+            "tracker": "jira",
+            "trackerScopeId": 12345678901,
+            "repos": [
+              {
+                "alias": "example-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000001}",
+                "path": "acme/example-repo"
+              }
+            ],
+            "defaultRepo": "example-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          },
+          {
+            "name": "example",
+            "tracker": "jira",
+            "trackerScopeId": "12345678901",
+            "repos": [
+              {
+                "alias": "other-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000002}",
+                "path": "acme/other-repo"
+              }
+            ],
+            "defaultRepo": "other-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          }
+        ]
+      },
+      "forges": {
+        "bindings": [
+          {
+            "default_repo": "example-repo",
+            "name": "jira",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "code_host": "bitbucket",
+                "path": "acme/example-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000001}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "12345678901"
+          },
+          {
+            "default_repo": "other-repo",
+            "name": "example",
+            "repos": [
+              {
+                "alias": "other-repo",
+                "code_host": "bitbucket",
+                "path": "acme/other-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000002}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "12345678901"
+          }
+        ],
+        "card_base_url": "",
+        "code_hosts": [
+          {
+            "api_url": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "token_file": "/etc/curie/forges/code_hosts-bitbucket/token",
+              "type": "static_token"
+            },
+            "host": "bitbucket.org",
+            "kind": "bitbucket_cloud",
+            "name": "bitbucket"
+          }
+        ],
+        "trackers": [
+          {
+            "api_url": "https://example.atlassian.net",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "example.atlassian.net",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira"
+          }
+        ]
+      },
+      "outcome": {
+        "refused": "duplicate_scope",
+        "bindings": [
+          "jira",
+          "example"
+        ],
+        "scope": {
+          "kind": "jira_cloud",
+          "host": "example.atlassian.net",
+          "trackerScopeId": "12345678901"
+        }
+      }
+    },
+    {
+      "name": "duplicate_scope_factory_disabled",
+      "description": "factory.enabled false does not exempt a duplicate scope: CURIE_FORGES renders from the lists either way and the API loads it at boot.",
+      "values": {
+        "enabled": false,
+        "codeHosts": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.20/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "api.bitbucket.org"
+              }
+            ],
+            "name": "bitbucket",
+            "kind": "bitbucket_cloud",
+            "host": "bitbucket.org",
+            "apiUrl": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-bitbucket-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "trackers": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "example.atlassian.net"
+              }
+            ],
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": "example.atlassian.net",
+            "apiUrl": "https://example.atlassian.net",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "bindings": [
+          {
+            "name": "jira",
+            "tracker": "jira",
+            "trackerScopeId": "00000000-0000-0000-0000-000000000000",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000001}",
+                "path": "acme/example-repo"
+              }
+            ],
+            "defaultRepo": "example-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          },
+          {
+            "name": "example",
+            "tracker": "jira",
+            "trackerScopeId": "00000000-0000-0000-0000-000000000000",
+            "repos": [
+              {
+                "alias": "other-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000002}",
+                "path": "acme/other-repo"
+              }
+            ],
+            "defaultRepo": "other-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          }
+        ]
+      },
+      "forges": {
+        "bindings": [
+          {
+            "default_repo": "example-repo",
+            "name": "jira",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "code_host": "bitbucket",
+                "path": "acme/example-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000001}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "00000000-0000-0000-0000-000000000000"
+          },
+          {
+            "default_repo": "other-repo",
+            "name": "example",
+            "repos": [
+              {
+                "alias": "other-repo",
+                "code_host": "bitbucket",
+                "path": "acme/other-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000002}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "00000000-0000-0000-0000-000000000000"
+          }
+        ],
+        "card_base_url": "",
+        "code_hosts": [
+          {
+            "api_url": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "token_file": "/etc/curie/forges/code_hosts-bitbucket/token",
+              "type": "static_token"
+            },
+            "host": "bitbucket.org",
+            "kind": "bitbucket_cloud",
+            "name": "bitbucket"
+          }
+        ],
+        "trackers": [
+          {
+            "api_url": "https://example.atlassian.net",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "example.atlassian.net",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira"
+          }
+        ]
+      },
+      "outcome": {
+        "refused": "duplicate_scope",
+        "bindings": [
+          "jira",
+          "example"
+        ],
+        "scope": {
+          "kind": "jira_cloud",
+          "host": "example.atlassian.net",
+          "trackerScopeId": "00000000-0000-0000-0000-000000000000"
+        }
+      }
+    },
+    {
+      "name": "case_distinct_scope_ids",
+      "description": "trackerScopeIds ABC and abc on one tracker are distinct scopes: the runtime compares them exactly, without case folding.",
+      "values": {
+        "codeHosts": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.20/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "api.bitbucket.org"
+              }
+            ],
+            "name": "bitbucket",
+            "kind": "bitbucket_cloud",
+            "host": "bitbucket.org",
+            "apiUrl": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-bitbucket-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "trackers": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "example.atlassian.net"
+              }
+            ],
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": "example.atlassian.net",
+            "apiUrl": "https://example.atlassian.net",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "bindings": [
+          {
+            "name": "jira",
+            "tracker": "jira",
+            "trackerScopeId": "ABC",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000001}",
+                "path": "acme/example-repo"
+              }
+            ],
+            "defaultRepo": "example-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          },
+          {
+            "name": "example",
+            "tracker": "jira",
+            "trackerScopeId": "abc",
+            "repos": [
+              {
+                "alias": "other-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000002}",
+                "path": "acme/other-repo"
+              }
+            ],
+            "defaultRepo": "other-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          }
+        ]
+      },
+      "forges": {
+        "bindings": [
+          {
+            "default_repo": "example-repo",
+            "name": "jira",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "code_host": "bitbucket",
+                "path": "acme/example-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000001}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "ABC"
+          },
+          {
+            "default_repo": "other-repo",
+            "name": "example",
+            "repos": [
+              {
+                "alias": "other-repo",
+                "code_host": "bitbucket",
+                "path": "acme/other-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000002}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "abc"
+          }
+        ],
+        "card_base_url": "",
+        "code_hosts": [
+          {
+            "api_url": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "token_file": "/etc/curie/forges/code_hosts-bitbucket/token",
+              "type": "static_token"
+            },
+            "host": "bitbucket.org",
+            "kind": "bitbucket_cloud",
+            "name": "bitbucket"
+          }
+        ],
+        "trackers": [
+          {
+            "api_url": "https://example.atlassian.net",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "example.atlassian.net",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira"
+          }
+        ]
+      },
+      "outcome": {
+        "accepted": true
+      }
+    },
+    {
+      "name": "same_scope_id_different_tracker_kinds",
+      "description": "A jira_cloud tracker and a gitlab tracker on the same host, each bound with trackerScopeId 4242: the tracker kind is part of the scope, so they are distinct.",
+      "values": {
+        "codeHosts": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.30/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "gitlab.example.com"
+              }
+            ],
+            "name": "gitlab",
+            "kind": "gitlab",
+            "host": "gitlab.example.com",
+            "apiUrl": "https://gitlab.example.com/api/v4",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-gitlab-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "trackers": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "gitlab.example.com"
+              }
+            ],
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": "gitlab.example.com",
+            "apiUrl": "https://gitlab.example.com",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-token",
+              "existingSecretKey": "token"
+            }
+          },
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "gitlab.example.com"
+              }
+            ],
+            "name": "gitlab",
+            "kind": "gitlab",
+            "host": "gitlab.example.com",
+            "apiUrl": "https://gitlab.example.com/api/v4",
+            "label": "curie-factory",
+            "mention": "factory-bot",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-gitlab-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "bindings": [
+          {
+            "name": "jira",
+            "tracker": "jira",
+            "trackerScopeId": "4242",
+            "repos": [
+              {
+                "alias": "widgets",
+                "codeHost": "gitlab",
+                "projectId": "4242",
+                "path": "acme/widgets"
+              }
+            ],
+            "defaultRepo": "widgets",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          },
+          {
+            "name": "gitlab",
+            "tracker": "gitlab",
+            "trackerScopeId": "4242",
+            "repos": [
+              {
+                "alias": "gadgets",
+                "codeHost": "gitlab",
+                "projectId": "4242",
+                "path": "acme/gadgets"
+              }
+            ],
+            "startAuthority": {
+              "type": "write_check"
+            }
+          }
+        ]
+      },
+      "forges": {
+        "bindings": [
+          {
+            "default_repo": "widgets",
+            "name": "jira",
+            "repos": [
+              {
+                "alias": "widgets",
+                "code_host": "gitlab",
+                "path": "acme/widgets",
+                "project_id": "4242"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "4242"
+          },
+          {
+            "name": "gitlab",
+            "repos": [
+              {
+                "alias": "gadgets",
+                "code_host": "gitlab",
+                "path": "acme/gadgets",
+                "project_id": "4242"
+              }
+            ],
+            "start_authority": {
+              "type": "write_check"
+            },
+            "tracker": "gitlab",
+            "tracker_scope_id": "4242"
+          }
+        ],
+        "card_base_url": "",
+        "code_hosts": [
+          {
+            "api_url": "https://gitlab.example.com/api/v4",
+            "credential": {
+              "token_file": "/etc/curie/forges/code_hosts-gitlab/token",
+              "type": "static_token"
+            },
+            "host": "gitlab.example.com",
+            "kind": "gitlab",
+            "name": "gitlab"
+          }
+        ],
+        "trackers": [
+          {
+            "api_url": "https://gitlab.example.com",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "gitlab.example.com",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira"
+          },
+          {
+            "api_url": "https://gitlab.example.com/api/v4",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-gitlab/token",
+              "type": "static_token"
+            },
+            "host": "gitlab.example.com",
+            "kind": "gitlab",
+            "label": "curie-factory",
+            "mention": "factory-bot",
+            "name": "gitlab"
+          }
+        ]
+      },
+      "outcome": {
+        "accepted": true
+      }
+    },
+    {
+      "name": "scope_id_null",
+      "description": "The quickstart binding with trackerScopeId null. The chart and the CLI refuse it before rollout; a chart without the check renders it as \"<nil>\", which the runtime loader accepts as a string.",
+      "values": {
+        "codeHosts": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.20/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "api.bitbucket.org"
+              }
+            ],
+            "name": "bitbucket",
+            "kind": "bitbucket_cloud",
+            "host": "bitbucket.org",
+            "apiUrl": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-bitbucket-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "trackers": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "example.atlassian.net"
+              }
+            ],
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": "example.atlassian.net",
+            "apiUrl": "https://example.atlassian.net",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "bindings": [
+          {
+            "name": "jira",
+            "tracker": "jira",
+            "trackerScopeId": null,
+            "repos": [
+              {
+                "alias": "example-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000001}",
+                "path": "acme/example-repo"
+              }
+            ],
+            "defaultRepo": "example-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          }
+        ]
+      },
+      "forges": {
+        "bindings": [
+          {
+            "default_repo": "example-repo",
+            "name": "jira",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "code_host": "bitbucket",
+                "path": "acme/example-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000001}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "<nil>"
+          }
+        ],
+        "card_base_url": "",
+        "code_hosts": [
+          {
+            "api_url": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "token_file": "/etc/curie/forges/code_hosts-bitbucket/token",
+              "type": "static_token"
+            },
+            "host": "bitbucket.org",
+            "kind": "bitbucket_cloud",
+            "name": "bitbucket"
+          }
+        ],
+        "trackers": [
+          {
+            "api_url": "https://example.atlassian.net",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "example.atlassian.net",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira"
+          }
+        ]
+      },
+      "outcome": {
+        "refused": "invalid_scope_id",
+        "binding": "jira",
+        "loader": "accepted"
+      }
+    },
+    {
+      "name": "scope_id_list",
+      "description": "The quickstart binding with trackerScopeId the list [1, 2]. The chart and the CLI refuse it before rollout; a chart without the check renders it as \"[1 2]\", which the runtime loader accepts as a string.",
+      "values": {
+        "codeHosts": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.20/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "api.bitbucket.org"
+              }
+            ],
+            "name": "bitbucket",
+            "kind": "bitbucket_cloud",
+            "host": "bitbucket.org",
+            "apiUrl": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-bitbucket-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "trackers": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "example.atlassian.net"
+              }
+            ],
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": "example.atlassian.net",
+            "apiUrl": "https://example.atlassian.net",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "bindings": [
+          {
+            "name": "jira",
+            "tracker": "jira",
+            "trackerScopeId": [
+              1,
+              2
+            ],
+            "repos": [
+              {
+                "alias": "example-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000001}",
+                "path": "acme/example-repo"
+              }
+            ],
+            "defaultRepo": "example-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          }
+        ]
+      },
+      "forges": {
+        "bindings": [
+          {
+            "default_repo": "example-repo",
+            "name": "jira",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "code_host": "bitbucket",
+                "path": "acme/example-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000001}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "[1 2]"
+          }
+        ],
+        "card_base_url": "",
+        "code_hosts": [
+          {
+            "api_url": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "token_file": "/etc/curie/forges/code_hosts-bitbucket/token",
+              "type": "static_token"
+            },
+            "host": "bitbucket.org",
+            "kind": "bitbucket_cloud",
+            "name": "bitbucket"
+          }
+        ],
+        "trackers": [
+          {
+            "api_url": "https://example.atlassian.net",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "example.atlassian.net",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira"
+          }
+        ]
+      },
+      "outcome": {
+        "refused": "invalid_scope_id",
+        "binding": "jira",
+        "loader": "accepted"
+      }
+    },
+    {
+      "name": "scope_id_out_of_range",
+      "description": "The quickstart binding with trackerScopeId 1e20, a number past 2^53. The chart and the CLI refuse it before rollout; a chart without the check renders it as \"-9223372036854775808\" on amd64, which the runtime loader accepts as a string.",
+      "values": {
+        "codeHosts": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.20/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "api.bitbucket.org"
+              }
+            ],
+            "name": "bitbucket",
+            "kind": "bitbucket_cloud",
+            "host": "bitbucket.org",
+            "apiUrl": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "type": "static_token",
+              "existingSecret": "curie-bitbucket-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "trackers": [
+          {
+            "egress": [
+              {
+                "cidr": "192.0.2.10/32",
+                "ports": [
+                  {
+                    "protocol": "TCP",
+                    "port": 443
+                  }
+                ],
+                "host": "example.atlassian.net"
+              }
+            ],
+            "name": "jira",
+            "kind": "jira_cloud",
+            "host": "example.atlassian.net",
+            "apiUrl": "https://example.atlassian.net",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "credential": {
+              "type": "static_token",
+              "username": "factory-bot@example.com",
+              "existingSecret": "curie-jira-token",
+              "existingSecretKey": "token"
+            }
+          }
+        ],
+        "bindings": [
+          {
+            "name": "jira",
+            "tracker": "jira",
+            "trackerScopeId": 1e+20,
+            "repos": [
+              {
+                "alias": "example-repo",
+                "codeHost": "bitbucket",
+                "projectId": "{00000000-0000-4000-8000-000000000001}",
+                "path": "acme/example-repo"
+              }
+            ],
+            "defaultRepo": "example-repo",
+            "startAuthority": {
+              "type": "allowlist",
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          }
+        ]
+      },
+      "forges": {
+        "bindings": [
+          {
+            "default_repo": "example-repo",
+            "name": "jira",
+            "repos": [
+              {
+                "alias": "example-repo",
+                "code_host": "bitbucket",
+                "path": "acme/example-repo",
+                "project_id": "{00000000-0000-4000-8000-000000000001}"
+              }
+            ],
+            "start_authority": {
+              "accounts": [
+                "557058:00000000-0000-0000-0000-000000000000"
+              ],
+              "type": "allowlist"
+            },
+            "tracker": "jira",
+            "tracker_scope_id": "-9223372036854775808"
+          }
+        ],
+        "card_base_url": "",
+        "code_hosts": [
+          {
+            "api_url": "https://api.bitbucket.org/2.0",
+            "credential": {
+              "token_file": "/etc/curie/forges/code_hosts-bitbucket/token",
+              "type": "static_token"
+            },
+            "host": "bitbucket.org",
+            "kind": "bitbucket_cloud",
+            "name": "bitbucket"
+          }
+        ],
+        "trackers": [
+          {
+            "api_url": "https://example.atlassian.net",
+            "credential": {
+              "token_file": "/etc/curie/forges/trackers-jira/token",
+              "type": "static_token",
+              "username": "factory-bot@example.com"
+            },
+            "host": "example.atlassian.net",
+            "kind": "jira_cloud",
+            "label": "curie-factory",
+            "mention": "712020:00000000-0000-0000-0000-000000000000",
+            "name": "jira"
+          }
+        ]
+      },
+      "outcome": {
+        "refused": "invalid_scope_id",
+        "binding": "jira",
+        "loader": "accepted"
+      }
+    }
+  ]
+}

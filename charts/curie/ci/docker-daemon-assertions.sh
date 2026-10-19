@@ -497,7 +497,9 @@ values = {
     "factory": {
         "sandboxEgress": {"factory": True},
         "docker": {"daemonImage": image},
-        "bindings": [{"name": "acme", "repos": [
+        "trackers": [{"name": "github", "kind": "github", "host": "github.com", "apiUrl": "https://api.github.com",
+                      "credential": {"type": "github_app", "existingSecret": "acme-github-app", "existingSecretKey": "private-key"}}],
+        "bindings": [{"name": "acme", "tracker": "github", "trackerScopeId": "123456", "repos": [
             {"path": "acme-corp/api", "runner": copy.deepcopy(runner), "docker": {
                 "enabled": True,
                 "egressAllowlist": [{"cidr": "203.0.113.0/24", "ports": [{"protocol": "TCP", "port": 443}]}],

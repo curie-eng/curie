@@ -30,7 +30,13 @@ class ApiIdentityAssertions(unittest.TestCase):
 
     def test_ingress_identity_and_routing_mutations_are_refused(self) -> None:
         mutations = [
-            ("api.yaml", 'name: {{ include "curie.fullname" . }}-api', "name: wrong-api"),
+            (
+                "api.yaml",
+                "name: {{ include \"curie.checkedObjectName\" "
+                '(dict "kind" "Service" "name" (printf "%s-api" '
+                '(include "curie.fullname" .))) }}',
+                "name: wrong-api",
+            ),
             (
                 "api-ingress.yaml",
                 '                name: {{ include "curie.fullname" . }}-api',

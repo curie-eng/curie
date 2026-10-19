@@ -27,8 +27,10 @@ in the container env.
 
 > Handoff: `CURIE_BUNDLE_REF` is a RustFS object key; the runner reads
 > `CURIE_PLUGIN_DIR` as a local mounted path and does not fetch. Fetching the
-> bundle key into the plugin dir is sandbox provisioning (an init container in the
-> sandbox substrate's SandboxTemplate / the chart), owned there, not by the worker.
+> bundle key into the plugin dir belongs to sandbox provisioning. Kubernetes
+> uses the SandboxTemplate's init containers; the Docker substrate fetches and
+> validates the bundle, then copies it through the Docker API into a read-only
+> named volume.
 
 **Kill switch** (`killswitch.py`): subscribes to the kill-switch Valkey channel
 `curie:kill-events`; on `kill` for an agent it interrupts that agent's live
@@ -606,6 +608,15 @@ local message`, pinned at whichever API port you brought up) -- the hand-run
 worker claims runner containers on the same Docker daemon exactly as the
 compose-managed one would. For an offline round-trip, add `CURIE_FAKE_MODEL=1`
 to the env above and drop the credential.
+
+The Docker substrate fetches and validates the bundle, workspace, and attachment
+inputs before copying them through the Docker API into named volumes. Each
+volume and transfer helper carries claim and creation-attempt ownership labels.
+The runner mounts the bundle and attachments read only and the workspace read
+write with ownership set to UID/GID `1000:1000`. Temporary extraction directories
+belong to the worker process and need no matching path on the daemon host.
+Failed creation, claim deletion, and orphan cleanup remove only the owned
+resources. Kubernetes keeps its existing init-container provisioning path.
 
 ## Delivery ownership: one deadline, one fenced owner (ADR-0131)
 

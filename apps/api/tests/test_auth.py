@@ -5,6 +5,7 @@ import time
 import uuid
 from typing import Any
 
+import pytest
 from curie_api.config import get_settings
 from curie_internal.sandbox_token import mint
 from sqlalchemy import text
@@ -230,19 +231,23 @@ def test_agents_accept_valid_key(
     assert client.get("/agents", headers=auth_headers).status_code == 200
 
 
+@pytest.mark.parametrize(
+    "endpoint",
+    ["/approvals/principals/operator", "/approvals/principals/remediation-operator"],
+)
 def test_operator_principal_requires_nonblank_platform_key(
-    client: Any, auth_headers: dict[str, str]
+    client: Any, auth_headers: dict[str, str], endpoint: str
 ) -> None:
     for headers in ({}, {"X-API-Key": ""}, {"X-API-Key": "   "}, {"X-API-Key": "wrong"}):
         response = client.post(
-            "/approvals/principals/operator",
+            endpoint,
             headers=headers,
             json={"subject": "operator-example"},
         )
         assert response.status_code == 401
 
     accepted = client.post(
-        "/approvals/principals/operator",
+        endpoint,
         headers=auth_headers,
         json={"subject": "operator-example"},
     )

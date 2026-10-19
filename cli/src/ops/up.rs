@@ -1234,6 +1234,36 @@ const ADOPT_HINT: &str =
 /// Set only on the `cluster up` child that `factory quickstart` spawns.
 /// Quickstart has no `--adopt`, so that child names a working remedy instead.
 pub(crate) const QUICKSTART_NAMESPACE_HINT_ENV: &str = "CURIE_QUICKSTART_NAMESPACE_HINT";
+/// Set only on a child `factory quickstart` spawns to write the release
+/// (`cluster up`, the GitHub intake): the mark that child's Helm write
+/// records as its `--description`, so the parent adopts exactly the
+/// revisions that write produced and no other (#4620).
+pub(crate) const QUICKSTART_RELEASE_WRITE_ENV: &str = "CURIE_QUICKSTART_RELEASE_WRITE";
+/// Every release write mark starts with this.
+pub(crate) const QUICKSTART_RELEASE_WRITE_PREFIX: &str = "curie-quickstart-write-";
+
+/// `cmd`, a Helm install or upgrade of the release, with `--description`
+/// naming the release write mark a quickstart parent handed this process in
+/// [`QUICKSTART_RELEASE_WRITE_ENV`]; unchanged when it handed none.
+pub(crate) fn quickstart_marked_release_write(cmd: &OpsCommand) -> OpsCommand {
+    release_write_with_mark(
+        cmd,
+        std::env::var(QUICKSTART_RELEASE_WRITE_ENV).ok().as_deref(),
+    )
+}
+
+/// `cmd` with `--description <mark>` when `mark` is a release write mark.
+fn release_write_with_mark(cmd: &OpsCommand, mark: Option<&str>) -> OpsCommand {
+    let mut marked = cmd.clone();
+    let valid = mark.filter(|mark| {
+        mark.strip_prefix(QUICKSTART_RELEASE_WRITE_PREFIX)
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+    });
+    if let Some(mark) = valid {
+        marked.args.extend([plain("--description"), plain(mark)]);
+    }
+    marked
+}
 const METADATA_NAME_LABEL: &str = "kubernetes.io/metadata.name";
 
 /// Emitted alongside [`MODEL_CREDENTIAL_KEY`], and only when a credential is
@@ -2378,6 +2408,7 @@ fn complete_up_opts_without_runner_egress(
     github_token: Option<&str>,
     clear_github_token: bool,
     overlay_live: bool,
+    factory: &crate::config_migrate::FactoryMigrationContext,
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
     refuse_half_a_caller_key_pair(&operator_sets)?;
@@ -2398,9 +2429,22 @@ fn complete_up_opts_without_runner_egress(
     opts.retained_mail_values = resolve_retained_mail_values(existing, &operator_sets)?;
     let migrated_owned;
     let existing = if let Some(values) = existing {
-        let outcome = crate::config_migrate::migrate_installed_config(values.clone(), None)?;
+        let outcome =
+            crate::config_migrate::migrate_installed_config(values.clone(), None, factory)?;
         stamp_config_schema(&mut opts, &outcome);
         overlay_migration_results(&mut opts, &outcome.values, &operator_sets);
+        if matches!(
+            factory,
+            crate::config_migrate::FactoryMigrationContext::LegacyGitHub { .. }
+        ) && opts.file_values.is_none()
+        {
+            overlay_leaf(
+                &mut opts,
+                &outcome.values,
+                "factory",
+                &std::collections::HashSet::new(),
+            );
+        }
         if overlay_live {
             overlay_live_operator_values(&mut opts, &outcome.values, &operator_sets)?;
         }
@@ -2733,12 +2777,204 @@ fn overlay_json(
 /// Finish an already validated up plan with the one live values read and, when
 /// requested, resolved provider addresses. This is kept separate from command
 /// execution so apply and diff can compare the same completed values.
+pub(crate) struct PreparedFactoryMigration {
+    pub opts: UpOpts,
+    pub existing: Option<serde_json::Value>,
+    pub effective: Option<serde_json::Value>,
+    pub context: crate::config_migrate::FactoryMigrationContext,
+}
+
+pub(crate) async fn prepare_factory_migration(
+    mut opts: UpOpts,
+    mut existing: Option<serde_json::Value>,
+    live: bool,
+    retain_all: bool,
+) -> Result<PreparedFactoryMigration> {
+    use crate::config_migrate::{
+        has_legacy_factory_input, legacy_factory_keys, FactoryMigrationContext,
+    };
+    let legacy_keys = legacy_factory_keys();
+    let operator_may_require = opts.set.iter().chain(&opts.set_string).any(|expression| {
+        operator_set_entries(std::slice::from_ref(expression))
+            .iter()
+            .any(|(key, value)| {
+                legacy_keys
+                    .iter()
+                    .any(|legacy| key_is_or_descends_from(key.trim(), legacy))
+                    || ((key.starts_with("api.extraEnv") || key.starts_with("worker.extraEnv"))
+                        && value.contains("GITHUB_FACTORY_"))
+            })
+    });
+    if !existing.as_ref().is_some_and(has_legacy_factory_input)
+        && !opts
+            .file_values
+            .as_ref()
+            .is_some_and(|values| has_legacy_factory_input(&values.0))
+        && !operator_may_require
+    {
+        return Ok(PreparedFactoryMigration {
+            opts,
+            effective: existing.clone(),
+            existing,
+            context: FactoryMigrationContext::NotRequired,
+        });
+    }
+    let mut explicit = opts
+        .file_values
+        .as_ref()
+        .map(|values| values.0.clone())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !live {
+        for (expressions, typed) in [(&opts.set, true), (&opts.set_string, false)] {
+            for (key, value) in operator_set_entries(expressions) {
+                let key = key.trim();
+                if key.starts_with("api.extraEnv") || key.starts_with("worker.extraEnv") {
+                    bail!("api.extraEnv factory settings require live factory.bindings resolution");
+                }
+                if !legacy_keys.iter().any(|old| key == old) {
+                    continue;
+                }
+                let parsed = if typed {
+                    serde_norway::from_str(value)
+                        .map_err(|_| anyhow::anyhow!("api.githubFactory settings are malformed"))?
+                } else {
+                    serde_json::json!(value)
+                };
+                crate::config_migrate::set_path(&mut explicit, key, parsed);
+            }
+        }
+    } else {
+        let arguments = file_set_args(&opts);
+        if !arguments.is_empty() {
+            explicit = super::lint_values::pending_set_values(&explicit, &arguments)
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "api.githubFactory settings could not parse the supplied overlay"
+                    )
+                })?;
+        }
+    }
+    let mut overlay = existing.clone().unwrap_or_else(|| serde_json::json!({}));
+    crate::config_migrate::clear_replaced_secret_refs(&mut overlay, &explicit);
+    super::lint_values::merge_values(&mut overlay, explicit.clone());
+    if !has_legacy_factory_input(&overlay) {
+        return Ok(PreparedFactoryMigration {
+            opts,
+            effective: existing.clone(),
+            existing,
+            context: FactoryMigrationContext::NotRequired,
+        });
+    }
+    let source = if live && existing.is_some() {
+        let (ok, output, _) = run_capture(&super::verbs::helm_history_cmd(&opts.common))
+            .await
+            .map_err(|_| anyhow::anyhow!("installed factory release history could not be read"))?;
+        if !ok {
+            bail!("installed factory release history could not be read");
+        }
+        let history = super::verbs::parse_helm_history(&output)
+            .map_err(|_| anyhow::anyhow!("installed factory release history is malformed"))?;
+        let latest = history
+            .into_iter()
+            .max_by_key(|row| row.revision)
+            .ok_or_else(|| {
+                anyhow::anyhow!("installed factory release history has no latest revision")
+            })?;
+        let source = crate::factory_config_migrate::read_installed_factory_source(
+            &opts.common,
+            latest.revision,
+            latest.chart,
+        )
+        .await?;
+        existing = Some(source.user_values.clone());
+        overlay = source.user_values.clone();
+        crate::config_migrate::clear_replaced_secret_refs(&mut overlay, &explicit);
+        super::lint_values::merge_values(&mut overlay, explicit.clone());
+        Some(source)
+    } else {
+        None
+    };
+    if !has_legacy_factory_input(&overlay) {
+        return Ok(PreparedFactoryMigration {
+            opts,
+            effective: existing.clone(),
+            existing,
+            context: FactoryMigrationContext::NotRequired,
+        });
+    }
+    let context = if live {
+        crate::factory_config_migrate::resolve_factory_migration_context(
+            &opts.common,
+            source.as_ref(),
+            &overlay,
+        )
+        .await?
+    } else {
+        let effective_legacy = crate::config_migrate::normalized_factory_input(&overlay)?;
+        if crate::config_migrate::LegacyFactory::parse(&effective_legacy)?.needs_identity() {
+            bail!("api.githubFactory settings require live factory.bindings resolution");
+        }
+        FactoryMigrationContext::LegacyGitHub {
+            effective_legacy,
+            repositories: Vec::new(),
+        }
+    };
+    let migrated = crate::config_migrate::migrate_installed_config(
+        overlay,
+        source.as_ref().map(|s| s.installed_chart.as_str()),
+        &context,
+    )?
+    .values;
+    let mut supplied_keys = BTreeMap::new();
+    flatten_file_values(&explicit, "", &mut supplied_keys);
+    let document = if retain_all {
+        migrated.clone()
+    } else {
+        let mut document = crate::config_migrate::normalized_factory_input(&explicit)?;
+        for key in legacy_factory_keys() {
+            crate::config_migrate::remove_path(&mut document, &key);
+        }
+        crate::config_migrate::remove_path(&mut document, "worker.publication.githubHttpsCidrs");
+        if let Some(factory) = migrated.get("factory") {
+            document["factory"] = factory.clone();
+        }
+        document
+    };
+    let mut flattened = BTreeMap::new();
+    flatten_file_values(&document, "", &mut flattened);
+    flattened.retain(|key, _| {
+        supplied_keys.contains_key(key) || key_is_or_descends_from(key, "factory")
+    });
+    opts.file_values = Some(PrivateHelmValues(document, flattened));
+    if live {
+        opts.set.clear();
+        opts.set_string.clear();
+    } else {
+        for expressions in [&mut opts.set, &mut opts.set_string] {
+            expressions.retain(|expression| {
+                !operator_set_entries(std::slice::from_ref(expression))
+                    .iter()
+                    .any(|(key, _)| legacy_keys.iter().any(|old| key.trim() == old))
+            });
+        }
+    }
+    let effective = existing.as_ref().map(|_| migrated);
+    Ok(PreparedFactoryMigration {
+        opts,
+        existing,
+        effective,
+        context,
+    })
+}
+
 pub(crate) fn complete_up_opts(
     opts: UpOpts,
     existing: Option<&serde_json::Value>,
     github_token: Option<&str>,
     clear_github_token: bool,
     resolve_provider_egress: bool,
+    factory: &crate::config_migrate::FactoryMigrationContext,
 ) -> Result<UpOpts> {
     let mut opts = complete_up_opts_without_runner_egress(
         opts,
@@ -2746,6 +2982,7 @@ pub(crate) fn complete_up_opts(
         github_token,
         clear_github_token,
         false,
+        factory,
     )?;
     let operator_sets = opts.operator_sets();
     resolve_preserved_runner_egress_values(&mut opts, existing, &operator_sets, false);
@@ -5040,6 +5277,8 @@ async fn run_install_with_observers(
 ) -> Result<InstallOutcome> {
     let ui = crate::ui::ui();
     let namespace = &common.namespace;
+    let marked = quickstart_marked_release_write(cmd);
+    let cmd = &marked;
     ui.plumbing(&format!("+ {}", cmd.display()));
     let step = cl.step(label);
     let namespace_existed_before_install = namespace_states
@@ -5398,8 +5637,12 @@ pub async fn up(
     } else {
         None
     };
+    let prepared = prepare_factory_migration(opts, existing, resolve_provider_egress, true).await?;
+    opts = prepared.opts;
+    let existing = prepared.existing;
+    let factory = prepared.context;
     // @spec CLUSTER-VALUES-FILES c3: preserve completion, with explicit files winning.
-    let mut effective_existing = existing.clone();
+    let mut effective_existing = prepared.effective;
     if let Some(values) = &opts.file_values {
         let supplied_keys: BTreeSet<String> = values.1.keys().cloned().collect();
         let merged = effective_existing.get_or_insert_with(|| serde_json::json!({}));
@@ -5410,11 +5653,25 @@ pub async fn up(
         opts.file_values = Some(PrivateHelmValues(merged.clone(), BTreeMap::new()));
         apply_flags_to_file_values(&mut opts, github_token.as_deref(), clear_github_token);
         let mut values = opts.file_values.take().expect("captured file snapshot");
-        values.0 = crate::config_migrate::migrate_installed_config(values.0, None)?.values;
+        values.0 =
+            crate::config_migrate::migrate_installed_config(values.0, None, &factory)?.values;
         flatten_file_values(&values.0, "", &mut values.1);
         values.1.retain(|key, _| supplied_keys.contains(key));
         *merged = values.0.clone();
         opts.file_values = Some(values);
+    }
+    // #4622, ADR 0197: once the release's values were read, the merged
+    // snapshot is the whole document Helm renders, so dangling tracker
+    // references and duplicate tracker scopes refuse before any mutation. A
+    // dry run reads no release values, so its files alone are not that
+    // document; the chart render refuses those at apply.
+    if should_read_existing(opts.dev, opts.common.dry_run) {
+        if let Some(values) = &opts.file_values {
+            crate::factory_intake::check_factory_document(&values.0).map_err(|message| {
+                crate::exit::CliError::usage(message)
+                    .with_fix("fix factory.codeHosts, factory.trackers or factory.bindings; nothing was applied")
+            })?;
+        }
     }
     opts = complete_up_opts_without_runner_egress(
         opts,
@@ -5422,6 +5679,7 @@ pub async fn up(
         github_token.as_deref(),
         clear_github_token,
         true,
+        &factory,
     )?;
     // @spec CLUSTER-VALUES-FILES c3: an overlay is not an installed release.
     if existing.is_none() && opts.file_values.is_some() && !opts.dev {
@@ -5483,6 +5741,73 @@ pub(crate) async fn up_prepared(
         UpInvocation::Apply,
     )
     .await
+}
+
+/// What an offline plan states about an existing shared controller (#4626).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedControllerPlan {
+    /// No explicit controller value: a live run infers reuse of a foreign or
+    /// unowned controller.
+    Reuse,
+    /// `agentSandbox.controller.deploy=true` was set: a live run refuses a
+    /// controller this release does not own.
+    RefuseExplicitDeploy,
+    /// Another explicit value, or fact detection is off: nothing to state.
+    Unstated,
+}
+
+/// The conditional ownership plan `--dry-run` prints in place of stamp
+/// commands (#4626). A dry run reads neither namespace nor the controller, so
+/// each live decision is a comment line naming its condition. `shared` is
+/// `Some` only when the chart deploys the controller and the primary namespace
+/// is not the shared one.
+fn dry_run_ownership_lines(
+    common: &CommonOpts,
+    shared: Option<SharedControllerPlan>,
+) -> Vec<String> {
+    let namespace = &common.namespace;
+    let release = &common.release;
+    let created = format!("{CREATED_BY_LABEL}={release} {CREATED_IN_LABEL}={namespace}");
+    let mut lines = vec![
+        format!("# not read under --dry-run: whether namespace {namespace} exists and which release owns it; a live run checks it before helm runs"),
+        format!("#   if namespace {namespace} does not exist: create it with labels {created}"),
+        format!("#   if namespace {namespace} is not terminating and already has this release's created-by and created-in labels, or its adopted-by and adopted-in labels: use it and leave its labels unchanged"),
+    ];
+    if namespace != CONTROLLER_DEPLOYMENT_NAMESPACE {
+        lines.push(format!("#   if namespace {namespace} is not terminating and exists with no ownership or foreign labels and only its default objects: add labels {created}"));
+    }
+    lines.push(format!(
+        "#   otherwise: refuse to install into namespace {namespace}"
+    ));
+    let Some(shared) = shared else {
+        return lines;
+    };
+    let stamp = ownership_label_commands(
+        &ns_common(common, CONTROLLER_DEPLOYMENT_NAMESPACE, true),
+        namespace,
+        false,
+    )
+    .into_iter()
+    .next()
+    .expect("the create-only controller stamp has one command")
+    .display();
+    if shared == SharedControllerPlan::Unstated {
+        lines.push(format!("# not read under --dry-run: whether namespace {CONTROLLER_DEPLOYMENT_NAMESPACE} already exists; a live run checks it before helm runs"));
+    } else {
+        lines.push(format!("# not read under --dry-run: whether namespace {CONTROLLER_DEPLOYMENT_NAMESPACE} and Deployment {CONTROLLER_DEPLOYMENT_NAME} already exist; a live run checks them before helm runs"));
+    }
+    lines.push(format!("#   if namespace {CONTROLLER_DEPLOYMENT_NAMESPACE} does not exist before helm runs and exists after: {stamp}"));
+    lines.push(format!("#   if namespace {CONTROLLER_DEPLOYMENT_NAMESPACE} already exists: use it and leave its labels unchanged"));
+    match shared {
+        SharedControllerPlan::Reuse => {
+            lines.push(format!("#   if Deployment {CONTROLLER_DEPLOYMENT_NAME} already runs there and another release or no Helm release owns it: reuse it with {CONTROLLER_DEPLOY_KEY}=false and leave its ownership metadata unchanged; an unowned controller that is unhealthy or runs an incompatible image is refused"));
+        }
+        SharedControllerPlan::RefuseExplicitDeploy => {
+            lines.push(format!("#   if Deployment {CONTROLLER_DEPLOYMENT_NAME} already runs there and this release does not own it: refuse, because {CONTROLLER_DEPLOY_KEY}=true was set"));
+        }
+        SharedControllerPlan::Unstated => {}
+    }
+    lines
 }
 
 async fn run_prepared_up(
@@ -5716,37 +6041,23 @@ async fn run_prepared_up(
     // label namespace <missing>`. Mirror the resolve_generated_secrets
     // existing/fresh split: both runtime probes live here in the executor, the
     // argv stays in the pure `ownership_label_commands` builder. `--dry-run`
-    // stays offline and previews the fresh-install stamp for the primary
-    // namespace and, when controller deployment is enabled, the shared namespace
-    // (existed == false), never touching the cluster or running the post-install
-    // probe.
-    let mut owned_namespaces = vec![opts.common.namespace.clone()];
-    if opts.common.namespace != "agent-sandbox-system" {
-        owned_namespaces.push("agent-sandbox-system".to_string());
-    }
+    // stays offline: it reads neither namespace nor the shared controller, so it
+    // prints the conditional ownership plan a live run decides (see
+    // `dry_run_ownership_lines`, #4626) instead of any stamp command, never
+    // touching the cluster or running the post-install probe, so
+    // `ownership_candidates` stays empty on a dry run.
+    let mut ownership_candidates: Vec<(String, bool)> = Vec::new();
     if !opts.common.dry_run {
+        let mut owned_namespaces = vec![opts.common.namespace.clone()];
+        if opts.common.namespace != "agent-sandbox-system" {
+            owned_namespaces.push("agent-sandbox-system".to_string());
+        }
         require_on_path("kubectl")?;
         establish_primary_namespace_ownership(&opts.common, opts.adopt).await?;
-    }
-    let mut ownership_candidates: Vec<(String, bool)> = Vec::new();
-    for ns in owned_namespaces {
-        let existed_before = if opts.common.dry_run {
-            false
-        } else {
-            namespace_exists(&ns).await?
-        };
-        if opts.common.dry_run
-            && (ns == opts.common.namespace || controller_deploy_enabled(&value_plan))
-        {
-            // existed_before is provably false on this branch (set above).
-            let common = ns_common(&opts.common, &ns, true);
-            cmds.extend(ownership_label_commands(
-                &common,
-                &opts.common.namespace,
-                false,
-            ));
+        for ns in owned_namespaces {
+            let existed_before = namespace_exists(&ns).await?;
+            ownership_candidates.push((ns, existed_before));
         }
-        ownership_candidates.push((ns, existed_before));
     }
 
     // Count named provider intent on both live and dry runs, plus egress
@@ -5786,6 +6097,20 @@ async fn run_prepared_up(
     }
     if opts.common.dry_run {
         let mut lines: Vec<String> = cmds.iter().map(OpsCommand::display).collect();
+        let controller = match (
+            detect_facts,
+            final_operator_value(&opts, CONTROLLER_DEPLOY_KEY),
+        ) {
+            (true, None) => SharedControllerPlan::Reuse,
+            (true, Some("true")) => SharedControllerPlan::RefuseExplicitDeploy,
+            _ => SharedControllerPlan::Unstated,
+        };
+        let shared_namespace = controller_deploy_enabled(&value_plan)
+            && opts.common.namespace != CONTROLLER_DEPLOYMENT_NAMESPACE;
+        lines.extend(dry_run_ownership_lines(
+            &opts.common,
+            shared_namespace.then_some(controller),
+        ));
         if opts.adopt {
             lines.push(format!(
                 "# --adopt: a live run may adopt a pre-existing primary namespace with foreign labels or non-default contents, stamp {ADOPTED_BY_LABEL}={}/{ADOPTED_IN_LABEL}={} with an audit record, and retain it on cluster down. The shared controller and terminating namespaces remain ineligible.",
@@ -6114,6 +6439,25 @@ mod tests {
     use crate::ops::testsupport::*;
 
     #[test]
+    fn a_quickstart_release_write_records_only_a_well_formed_mark() {
+        let cmd = OpsCommand::new("helm", vec![plain("upgrade"), plain("r")]);
+        let mark = format!("{QUICKSTART_RELEASE_WRITE_PREFIX}0a1b");
+        assert_eq!(
+            release_write_with_mark(&cmd, Some(&mark)).argv(),
+            ["upgrade", "r", "--description", mark.as_str()]
+        );
+        assert_eq!(release_write_with_mark(&cmd, None), cmd);
+        for forged in [
+            "",
+            QUICKSTART_RELEASE_WRITE_PREFIX,
+            "operator note",
+            "curie-quickstart-write-a b",
+        ] {
+            assert_eq!(release_write_with_mark(&cmd, Some(forged)), cmd, "{forged}");
+        }
+    }
+
+    #[test]
     fn file_set_capture_masks_credential_values_in_command_diagnostics() {
         // @spec CLUSTER-VALUES-FILES c4
         let o = UpOpts {
@@ -6172,6 +6516,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap()
     }
@@ -6384,6 +6729,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap();
 
@@ -6428,6 +6774,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap();
 
@@ -6498,6 +6845,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap()
     }
@@ -6720,6 +7068,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap()
     }
@@ -6894,9 +7243,15 @@ mod tests {
                 }]
             }
         });
-        let opts =
-            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
-                .unwrap();
+        let opts = complete_up_opts_without_runner_egress(
+            opts(),
+            Some(&existing),
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap();
 
         assert_eq!(
             up_value_plan(&opts)
@@ -6935,9 +7290,15 @@ mod tests {
                 }
             }
         });
-        let opts =
-            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
-                .unwrap();
+        let opts = complete_up_opts_without_runner_egress(
+            opts(),
+            Some(&existing),
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap();
 
         let effective = up_value_plan(&opts).effective_values();
         assert_eq!(
@@ -7044,6 +7405,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap();
 
@@ -7079,9 +7441,15 @@ mod tests {
         let existing = serde_json::json!({
             "worker": { "slackTrustedOrigins": "http://host.docker.internal" }
         });
-        let opts =
-            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
-                .unwrap();
+        let opts = complete_up_opts_without_runner_egress(
+            opts(),
+            Some(&existing),
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap();
 
         let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
         let argv = materialized.argv().join(" ");
@@ -7112,6 +7480,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap();
 
@@ -7144,6 +7513,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap();
 
@@ -7168,9 +7538,15 @@ mod tests {
         let existing = serde_json::json!({
             "worker": { "slackTrustedOrigins": recorded }
         });
-        let opts =
-            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
-                .unwrap();
+        let opts = complete_up_opts_without_runner_egress(
+            opts(),
+            Some(&existing),
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap();
 
         assert_eq!(
             up_value_plan(&opts)
@@ -7209,6 +7585,7 @@ mod tests {
                 None,
                 false,
                 true,
+                &crate::config_migrate::FactoryMigrationContext::NotRequired,
             )
             .unwrap();
 
@@ -7328,6 +7705,7 @@ mod tests {
             None,
             false,
             overlay_live,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap()
     }
@@ -8174,6 +8552,7 @@ mod tests {
             None,
             false,
             true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
         )
         .unwrap()
     }
@@ -8278,7 +8657,15 @@ mod tests {
         opts.dev = false;
         opts.secrets = vec![];
         opts.set = set;
-        complete_up_opts_without_runner_egress(opts, existing, None, false, true).unwrap()
+        complete_up_opts_without_runner_egress(
+            opts,
+            existing,
+            None,
+            false,
+            true,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .unwrap()
     }
 
     /// ADR-0168 decision 7, through the wiring rather than the helper: a sealed
@@ -8356,6 +8743,7 @@ mod tests {
                     None,
                     false,
                     true,
+                    &crate::config_migrate::FactoryMigrationContext::NotRequired,
                 ) else {
                     panic!("half a caller key pair must be refused: {half} dev={dev}");
                 };

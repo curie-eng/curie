@@ -59,7 +59,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -69,21 +69,27 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           python-version: "3.13"
       - name: Sync workspace
         run: uv sync
-      # Everything below the probe is gated on it, so a pull request that
-      # declares nothing, or declares `n/a`, still costs only the probe. That
-      # is #2228's win, preserved: the parser does not reach the binary for
-      # those, so no build, no Helm, and no compose stack is paid for them.
+      # Setup follows the parsed requirements. Verification always runs so
+      # malformed or missing declarations still reach the policy gate.
       - name: Decide whether the current curie binary is needed
         id: fix-pin-curie
         run: >-
           python3 tools/fix-pin-ci/check.py
           --event "$GITHUB_EVENT_PATH"
           --needs-curie
+      - name: Prepare source-local factory upgrade artifacts
+        if: steps.fix-pin-curie.outputs.needs_factory_upgrade == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/.projects/4628/tmp" \
+            "$GITHUB_WORKSPACE/.projects/4628/assets"
+          echo "TMPDIR=$GITHUB_WORKSPACE/.projects/4628/tmp" >> "$GITHUB_ENV"
+          echo "CURIE_C4_RELEASE_ASSETS=$GITHUB_WORKSPACE/.projects/4628/assets" >> "$GITHUB_ENV"
       - name: Cargo cache
         if: steps.fix-pin-curie.outputs.needed == 'true'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -100,19 +106,69 @@ jobs:
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.16.4
+      # The kind runtime pins build four candidate images (api, worker, ui,
+      # runner) and the scripted driver requires 30 GB free. Remove only the
+      # preinstalled .NET, Haskell and Android trees, which are unused here.
+      - name: Free disk for the disposable factory cluster
+        if: steps.fix-pin-curie.outputs.needs_kind == 'true'
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+      - name: Ensure kind-registry exists
+        if: steps.fix-pin-curie.outputs.needs_kind == 'true'
+        run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Install kind and kubectl without creating a cluster
+        if: steps.fix-pin-curie.outputs.needs_kind == 'true'
+        id: install_kind
+        continue-on-error: true
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          install_only: true
+      - name: Back off before retrying Install kind and kubectl without creating a cluster
+        if: steps.fix-pin-curie.outputs.needs_kind == 'true' && steps.install_kind.outcome == 'failure'
+        run: |
+          echo "Install kind and kubectl without creating a cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          bash cli/scripts/ensure-kind-registry.sh
+          sleep 15
+      - name: Install kind and kubectl without creating a cluster (retry)
+        if: steps.fix-pin-curie.outputs.needs_kind == 'true' && steps.install_kind.outcome == 'failure'
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          install_only: true
+      - name: Download and verify the exact public v0.12.5 factory upgrade assets
+        if: steps.fix-pin-curie.outputs.needs_factory_upgrade == 'true'
+        run: |
+          set -euo pipefail
+          release_url=https://github.com/curie-eng/curie/releases/download/v0.12.5
+          curl -fsSL --retry 3 --retry-all-errors --retry-delay 5 \
+            -o "$CURIE_C4_RELEASE_ASSETS/checksums.txt" "$release_url/checksums.txt"
+          for asset in curie-0.12.5.tgz curie-x86_64-unknown-linux-gnu; do
+            curl -fsSL --retry 3 --retry-all-errors --retry-delay 5 \
+              -o "$CURIE_C4_RELEASE_ASSETS/$asset" "$release_url/$asset"
+            awk -v asset="$asset" '$2 == asset {print; count++} END {if (count != 1) exit 1}' \
+              "$CURIE_C4_RELEASE_ASSETS/checksums.txt" | (
+                cd "$CURIE_C4_RELEASE_ASSETS"
+                sha256sum --check --strict
+              )
+          done
       # Use the same migration, authenticated read and worker readiness gate
       # as the Python job before executing any pinned integration selector.
       - name: Start dev stack
-        if: steps.fix-pin-curie.outputs.needed == 'true'
+        if: steps.fix-pin-curie.outputs.needs_stack == 'true'
         run: python3 scripts/wait-for-langfuse.py --start --timeout-seconds 480
       - name: Wait for Langfuse to serve
-        if: steps.fix-pin-curie.outputs.needed == 'true'
+        if: steps.fix-pin-curie.outputs.needs_stack == 'true'
         run: python3 scripts/wait-for-langfuse.py
       # A pinned worker binding test dials the shared default database and
       # assumes the curie schema exists, exactly as it does under the Python
       # job, so the same migration runs here.
       - name: Migrate the shared database
-        if: steps.fix-pin-curie.outputs.needed == 'true'
+        if: steps.fix-pin-curie.outputs.needs_stack == 'true'
         working-directory: apps/api
         run: uv run alembic upgrade head
       - name: Require declared fixes to be pinned by a changed test
@@ -128,5 +184,5 @@ jobs:
       # --profile full, `docker compose logs` matches no service and prints
       # nothing, so a real outage gets diagnosed with no container logs at all.
       - name: Dump dev stack logs on failure
-        if: ${{ failure() && steps.fix-pin-curie.outputs.needed == 'true' }}
+        if: ${{ failure() && steps.fix-pin-curie.outputs.needs_stack == 'true' }}
         run: docker compose --profile full -f compose.dev.yaml logs --no-color --tail=200

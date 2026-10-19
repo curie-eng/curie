@@ -1,6 +1,6 @@
 # Curie
 
-> Open-source, self-hostable platform that turns supported agents into co-workers in team workspaces. Start with Software Factory: delegate a GitHub issue and inspect a reviewed pull request or a clear failure reason. Bring supported existing skills and tools onto the same platform.
+> Open-source, self-hostable platform that turns supported agents into co-workers in team workspaces. Start with Software Factory: delegate a GitHub, GitLab or Jira Cloud issue and inspect a reviewed pull request or merge request or a clear failure reason. Bring supported existing skills and tools onto the same platform.
 
 The CLI can be driven by a coding agent or a developer. Use released installation
 paths for adoption; contributor builds are a separate journey. Read capability
@@ -10,7 +10,9 @@ status before promising a channel, model runtime, memory behavior, or control.
 
 - [README.md](README.md): product identity and three developer adoption paths.
 - [docs/software-factory.md](docs/software-factory.md): Software Factory overview.
-- [docs/guides/dark-factory-quickstart.md](docs/guides/dark-factory-quickstart.md): canonical issue-to-PR installation walkthrough.
+- [docs/guides/dark-factory-quickstart.md](docs/guides/dark-factory-quickstart.md): choose a supported issue tracker and code host; GitHub installation and configuration reference.
+- [docs/guides/factory-gitlab-quickstart.md](docs/guides/factory-gitlab-quickstart.md): GitLab issues to merge requests, on gitlab.com or self-managed GitLab.
+- [docs/guides/factory-jira-github-quickstart.md](docs/guides/factory-jira-github-quickstart.md): Jira Cloud issues to GitHub pull requests.
 - [docs/bring-your-agent.md](docs/bring-your-agent.md): supported compatibility and agent adoption.
 - [examples/sre-bot/README.md](examples/sre-bot/README.md): SRE workflow, authority, and installation.
 - [QUICKSTART.md](QUICKSTART.md): use-case chooser and scripted runner evaluation without Slack.

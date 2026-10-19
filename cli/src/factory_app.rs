@@ -123,22 +123,24 @@ pub fn read_private_key(path: &std::path::Path) -> Result<String> {
     Ok(pem)
 }
 
-/// A thin GitHub REST client over `CURIE_GITHUB_API_URL` / `GITHUB_API_URL`
-/// / api.github.com.
+/// GitHub REST at an explicit origin with optional additional trust.
 pub struct GithubApi {
     client: reqwest::Client,
     base: reqwest::Url,
 }
 
 impl GithubApi {
-    pub fn new() -> Result<Self> {
-        let raw = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
-        let base = reqwest::Url::parse(&raw).map_err(|error| {
+    pub fn new(raw: &str, certificate: Option<reqwest::Certificate>) -> Result<Self> {
+        let base = reqwest::Url::parse(raw).map_err(|error| {
             CliError::usage(format!("GitHub API URL {raw:?} is not a URL: {error}"))
         })?;
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(20));
+        if let Some(certificate) = certificate {
+            builder = builder.add_root_certificate(certificate);
+        }
+        let client = builder
             .build()
             .map_err(|err| CliError::failure(format!("could not build an HTTP client: {err}")))?;
         Ok(Self { client, base })
