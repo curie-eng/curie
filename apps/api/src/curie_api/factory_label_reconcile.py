@@ -241,6 +241,7 @@ async def _reconcile_label(
             number,
             sender_id,
             sender_login,
+            label_event_at=labeled_at,
             label=label,
         )
         if await _admit(sessionmaker, settings, client, notice, tracker, repository):
@@ -271,7 +272,9 @@ async def _admit(
                 tracker=tracker,
                 repository=repository,
             )
-            outcome = await github_factory.admit_notice(session, notice, settings, verified)
+            outcome = await github_factory.admit_notice(
+                session, notice, settings, verified, client=client
+            )
         except (FeedbackUnavailable, FeedbackIgnored) as exc:
             await session.rollback()
             logger.info(

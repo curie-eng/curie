@@ -423,7 +423,7 @@ pub(super) async fn boot_eval_runner(
         passthrough_env,
         docker_env,
     );
-    docker::start_runner(&spec, published_host.as_deref())
+    docker::start_runner(&spec)
         .await
         .with_context(|| format!("booting eval runner for model {model}"))
         // A container created between the preflight and here still loses the

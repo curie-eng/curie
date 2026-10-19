@@ -7,13 +7,14 @@ the outcome you want before installing or building a bundle:
 
 | You want to | Start here |
 | --- | --- |
-| Delegate a software issue and inspect the resulting PR | [Software Factory](docs/software-factory.md), then the [factory quickstart](docs/guides/dark-factory-quickstart.md) |
+| Delegate a software issue and inspect the resulting PR or merge request | [Software Factory](docs/software-factory.md), then the [factory quickstart](docs/guides/dark-factory-quickstart.md) |
 | Investigate Kubernetes workloads with approved actions | [SRE co-worker](examples/sre-bot/README.md) |
 | Reuse an existing agent's skills and tools | [Bring your agent](docs/bring-your-agent.md) |
 | Evaluate the runner before connecting a workspace | Continue with the local first-reply path below |
 
 The factory is the primary path for engineering teams. Its prerequisites include
-a model credential, GitHub App setup, and Kubernetes tooling. The path below
+a model credential, Kubernetes tooling, and the credentials for your chosen
+[issue tracker and code host](docs/guides/dark-factory-quickstart.md#choose-your-tracker-and-code-host). The path below
 tests a generic bundle with a scripted model; it does not implement an issue or
 prove agent answer quality. Check [capabilities and release status](docs/capabilities.md)
 before choosing an integration.

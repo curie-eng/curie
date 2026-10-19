@@ -1244,3 +1244,371 @@ def test_a_remote_connector_cannot_declare_config() -> None:
     assert "connectors.remote_has_config" in _codes(
         {"connectors": {"r": {"url": "https://mcp.example.com/mcp", "config": ["A_SETTING"]}}}
     )
+
+
+# --------------------------------------------------------------------------- #
+# `proxy_upstream_host`: the Host the caller proxy presents on admitted
+# requests (ADR 0229)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "127.8.9.10", "::1"])
+def test_a_hosted_connector_may_declare_a_loopback_upstream_host(host: str) -> None:
+    # @spec ADR-0229 d1
+    parsed, errors = validate_connectors(
+        {"connectors": {"kubernetes": {"image": "x:1", "proxy_upstream_host": host}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["kubernetes"].proxy_upstream_host == host
+
+
+def test_the_upstream_host_is_absent_by_default() -> None:
+    # @spec ADR-0229 d1: omitted keeps today's behavior, the caller's Host.
+    parsed, errors = validate_connectors({"connectors": {"grafana": {"image": "x:1"}}})
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["grafana"].proxy_upstream_host is None
+
+
+def test_a_build_form_connector_may_declare_the_upstream_host() -> None:
+    # @spec ADR-0229 d1
+    assert (
+        _codes(
+            {
+                "connectors": {
+                    "kubernetes": {
+                        "build": {"context": "connectors/kubernetes", "platforms": ["linux/amd64"]},
+                        "proxy_upstream_host": "localhost",
+                    }
+                }
+            }
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "10.0.0.1",
+        "example.com",
+        "curie-sre-bot-kubernetes",
+        "localhost:8000",
+        "127.0.0.1:8000",
+        "[::1]",
+        "[::1]:8000",
+        "0.0.0.0",
+        "::",
+        "LOCALHOST",
+        "localhost\r\nX-Injected: 1",
+        "",
+    ],
+)
+def test_a_non_loopback_or_malformed_upstream_host_is_refused(host: str) -> None:
+    # @spec ADR-0229 d1: loopback host only, with no port; the proxy adds the
+    # server's port itself.
+    assert _codes(
+        {"connectors": {"kubernetes": {"image": "x:1", "proxy_upstream_host": host}}}
+    ) == ["connectors.bad_proxy_upstream_host"]
+
+
+def test_the_upstream_host_on_a_remote_connector_is_refused() -> None:
+    # @spec ADR-0229 d1: a `url` connector has no proxy Curie renders.
+    assert _codes(
+        {
+            "connectors": {
+                "internal": {
+                    "url": "https://mcp.example.com/mcp",
+                    "proxy_upstream_host": "localhost",
+                }
+            }
+        }
+    ) == ["connectors.remote_has_proxy_upstream_host"]
+
+
+def test_bundle_surfaces_a_refused_upstream_host(tmp_path: Path) -> None:
+    root = _bundle(
+        tmp_path,
+        "connectors:\n  kubernetes:\n    image: x:1\n    proxy_upstream_host: example.com\n",
+    )
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert [e.code for e in result.errors] == ["connectors.bad_proxy_upstream_host"]
+
+
+# --------------------------------------------------------------------------- #
+# `readiness_path`: an HTTP readiness check for the hosted server container.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("path", ["/healthz", "/", "/api/v1/health", "/ready-z_1.ok~"])
+def test_a_hosted_connector_may_declare_a_readiness_path(path: str) -> None:
+    parsed, errors = validate_connectors(
+        {"connectors": {"docs": {"image": "x:1", "readiness_path": path}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["docs"].readiness_path == path
+
+
+def test_a_build_form_connector_may_declare_a_readiness_path() -> None:
+    assert (
+        _codes(
+            {
+                "connectors": {
+                    "docs": {
+                        "build": {"context": "connectors/docs", "platforms": ["linux/amd64"]},
+                        "readiness_path": "/healthz",
+                    }
+                }
+            }
+        )
+        == []
+    )
+
+
+def test_the_readiness_path_and_resources_are_absent_by_default() -> None:
+    parsed, errors = validate_connectors({"connectors": {"docs": {"image": "x:1"}}})
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["docs"].readiness_path is None
+    assert parsed.connectors["docs"].resources is None
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "",
+        "healthz",
+        "./healthz",
+        "/health z",
+        "/health\tz",
+        "/healthz\r\nX-Injected: 1",
+        "/healthz?verbose=1",
+        "/healthz#top",
+        "/héalth",
+        "/health\x00",
+    ],
+)
+def test_a_malformed_readiness_path_is_refused(path: str) -> None:
+    assert _codes({"connectors": {"docs": {"image": "x:1", "readiness_path": path}}}) == [
+        "connectors.bad_readiness_path"
+    ]
+
+
+def test_a_readiness_path_on_a_remote_connector_is_refused() -> None:
+    assert _codes(
+        {"connectors": {"r": {"url": "https://mcp.example.com/mcp", "readiness_path": "/healthz"}}}
+    ) == ["connectors.remote_has_readiness_path"]
+
+
+def test_bundle_surfaces_a_refused_readiness_path(tmp_path: Path) -> None:
+    root = _bundle(tmp_path, "connectors:\n  docs:\n    image: x:1\n    readiness_path: healthz\n")
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert [e.code for e in result.errors] == ["connectors.bad_readiness_path"]
+
+
+# --------------------------------------------------------------------------- #
+# `resources`: requests and limits for the hosted server container.
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "resources",
+    [
+        {"limits": {"memory": "1Gi"}},
+        {"requests": {"cpu": "100m"}},
+        {"requests": {"cpu": "250m", "memory": "128Mi"}, "limits": {"cpu": "1", "memory": "512Mi"}},
+        {"requests": {"memory": "256Mi"}, "limits": {"memory": "256Mi"}},
+        {"limits": {"cpu": "2.5", "memory": "1G"}},
+        {"limits": {"memory": "1e9"}},
+        {"requests": {}, "limits": {}},
+        {},
+    ],
+)
+def test_a_hosted_connector_may_declare_resources(resources: dict) -> None:
+    parsed, errors = validate_connectors(
+        {"connectors": {"docs": {"image": "x:1", "resources": resources}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["docs"].resources is not None
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        {"limits": {"memory": "lots"}},
+        {"limits": {"memory": "1 Gi"}},
+        {"limits": {"memory": "1GB"}},
+        {"limits": {"memory": "-1Gi"}},
+        {"limits": {"memory": "+1Gi"}},
+        {"limits": {"memory": "0"}},
+        {"limits": {"cpu": "0m"}},
+        {"limits": {"cpu": ""}},
+        {"limits": {"cpu": "1.2.3"}},
+        {"limits": {"cpu": ".5m"}},
+    ],
+)
+def test_a_malformed_quantity_is_refused(resources: dict) -> None:
+    assert _codes({"connectors": {"docs": {"image": "x:1", "resources": resources}}}) == [
+        "connectors.bad_resources"
+    ]
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        # Above the 256Mi default limit, with no limit declared.
+        {"requests": {"memory": "512Mi"}},
+        # Below the 64Mi default request, with no request declared.
+        {"limits": {"memory": "32Mi"}},
+        {"requests": {"cpu": "2"}, "limits": {"cpu": "1500m"}},
+        {"requests": {"memory": "1Gi"}, "limits": {"memory": "1000Mi"}},
+    ],
+)
+def test_a_request_above_its_merged_limit_is_refused(resources: dict) -> None:
+    assert _codes({"connectors": {"docs": {"image": "x:1", "resources": resources}}}) == [
+        "connectors.bad_resources"
+    ]
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        {"limits": {"gpu": "1"}},
+        {"limit": {"memory": "1Gi"}},
+        {"limits": {"memory": 1024}},
+    ],
+)
+def test_an_unknown_resource_key_or_a_non_string_quantity_is_refused(resources: dict) -> None:
+    assert _codes({"connectors": {"docs": {"image": "x:1", "resources": resources}}}) == [
+        "connectors.invalid"
+    ]
+
+
+def test_resources_on_a_remote_connector_are_refused() -> None:
+    assert _codes(
+        {
+            "connectors": {
+                "r": {
+                    "url": "https://mcp.example.com/mcp",
+                    "resources": {"limits": {"memory": "1Gi"}},
+                }
+            }
+        }
+    ) == ["connectors.remote_has_resources"]
+
+
+def test_bundle_surfaces_refused_resources(tmp_path: Path) -> None:
+    root = _bundle(
+        tmp_path,
+        "connectors:\n  docs:\n    image: x:1\n    resources:\n      limits:\n"
+        "        memory: 32Mi\n",
+    )
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert [e.code for e in result.errors] == ["connectors.bad_resources"]
+
+
+def test_the_resource_models_match_the_frozen_vector() -> None:
+    from plugin_format.connectors import ConnectorResourceQuantities, ConnectorResources
+
+    fields = _vector_file("connector-fields.json")["models"]
+    assert set(ConnectorResources.model_fields) == set(fields["ConnectorResources"])
+    assert set(ConnectorResourceQuantities.model_fields) == set(
+        fields["ConnectorResourceQuantities"]
+    )
+
+
+_NO_CLIENT_AUTH_REASON = (
+    "In-cluster MCP server reached over the pod network; it authenticates no "
+    "client and the boundary is its ingress NetworkPolicy."
+)
+
+
+def test_no_client_auth_synthetic_example_validates() -> None:
+    parsed, errors = validate_connectors(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "port": 8000,
+                    "secrets": ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+                    "no_client_auth": _NO_CLIENT_AUTH_REASON,
+                }
+            }
+        }
+    )
+    assert errors == []
+    assert parsed is not None
+    spec = parsed.connectors["docs"]
+    assert spec.no_client_auth == _NO_CLIENT_AUTH_REASON
+    assert spec.secret_names() == ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"]
+    assert spec.resolved_secrets() == ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"]
+
+
+def test_no_client_auth_absent_still_requires_bearer_secret() -> None:
+    assert "connectors.bearer_secret_required" in _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "secrets": ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+                }
+            }
+        }
+    )
+
+
+def test_no_client_auth_with_bearer_secret_is_refused() -> None:
+    assert "connectors.no_client_auth_with_bearer_secret" in _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "secrets": ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+                    "bearer_secret": "UPSTREAM_CLIENT_SECRET",
+                    "no_client_auth": _NO_CLIENT_AUTH_REASON,
+                }
+            }
+        }
+    )
+
+
+def test_no_client_auth_with_empty_bearer_secret_is_refused() -> None:
+    assert "connectors.no_client_auth_with_bearer_secret" in _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "bearer_secret": "",
+                    "no_client_auth": _NO_CLIENT_AUTH_REASON,
+                }
+            }
+        }
+    )
+
+
+def test_no_client_auth_on_a_remote_connector_is_refused() -> None:
+    assert "connectors.remote_has_no_client_auth" in _codes(
+        {
+            "connectors": {
+                "r": {
+                    "url": "https://mcp.example.com/mcp",
+                    "no_client_auth": _NO_CLIENT_AUTH_REASON,
+                }
+            }
+        }
+    )
+
+
+@pytest.mark.parametrize("reason", ["", "   ", "\n\t "])
+def test_no_client_auth_blank_reason_is_refused(reason: str) -> None:
+    assert "connectors.bad_no_client_auth" in _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "secrets": ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+                    "no_client_auth": reason,
+                }
+            }
+        }
+    )

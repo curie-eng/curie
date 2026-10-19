@@ -30,6 +30,10 @@ REGISTRY = SELECTION_TESTS.REGISTRY
 REPO_ROOT = SELECTION_TESTS.REPO_ROOT
 SRE_RUNTIME = SELECTION_TESTS.SRE_RUNTIME
 SRE_RUNTIME_INPUTS = SELECTION_TESTS.SRE_RUNTIME_INPUTS
+C4_TRACKER_SCOPE = SELECTION_TESTS.C4_TRACKER_SCOPE
+C4_DRY_RUN = SELECTION_TESTS.C4_DRY_RUN
+CONDITIONAL_PYTEST_FILES = SELECTION_TESTS.CONDITIONAL_PYTEST_FILES
+ALL_CONDITIONAL = SELECTION_TESTS.ALL_CONDITIONAL
 _invoke_selector = SELECTION_TESTS._invoke_selector
 _load_selector_module = SELECTION_TESTS._load_selector_module
 _run_pytest_step = PYTEST_TESTS._run_pytest_step
@@ -56,7 +60,9 @@ def _selection(tmp_path: Path, *paths: str, **options: object) -> dict[str, str]
 def test_sre_runtime_deselected_for_unrelated_paths(tmp_path: Path, path: str) -> None:
     output = _selection(tmp_path, path)
     assert output["pytest"] == "true"
-    assert output["pytest_deselect"] == "examples/tests/test_sre_bot_observability_runtime.py"
+    assert "examples/tests/test_sre_bot_observability_runtime.py" in output[
+        "pytest_deselect"
+    ].split(",")
 
 
 @pytest.mark.parametrize(
@@ -81,7 +87,61 @@ def test_sre_runtime_deselected_for_unrelated_paths(tmp_path: Path, path: str) -
     ],
 )
 def test_sre_runtime_selected_when_an_input_changes(tmp_path: Path, paths: tuple[str, ...]) -> None:
-    assert _selection(tmp_path, *paths)["pytest_deselect"] == ""
+    assert SRE_RUNTIME not in _selection(tmp_path, *paths)["pytest_deselect"].split(",")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "apps/api/src/curie_api/main.py",
+        "apps/api/src/curie_api/forges-other/config.py",
+        "examples/sre-bot/observability/tempo.yaml",
+        "runner/Dockerfile",
+    ],
+)
+def test_c4_tracker_scope_deselected_for_unrelated_paths(tmp_path: Path, path: str) -> None:
+    assert C4_TRACKER_SCOPE in _selection(tmp_path, path)["pytest_deselect"].split(",")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "charts/curie/templates/_helpers.tpl",
+        "cli/src/factory_intake.rs",
+        "apps/api/src/curie_api/forges/config.py",
+        "tests/vectors/forge-tracker-scopes.json",
+        C4_TRACKER_SCOPE,
+    ],
+)
+def test_c4_tracker_scope_selected_when_an_input_changes(tmp_path: Path, path: str) -> None:
+    assert C4_TRACKER_SCOPE not in _selection(tmp_path, path)["pytest_deselect"].split(",")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "apps/api/src/curie_api/main.py",
+        "apps/worker/src/curie_worker/main.py",
+        "examples/sre-bot/observability/tempo.yaml",
+        "runner/Dockerfile",
+    ],
+)
+def test_c4_dry_run_deselected_for_unrelated_paths(tmp_path: Path, path: str) -> None:
+    assert C4_DRY_RUN in _selection(tmp_path, path)["pytest_deselect"].split(",")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "cli/src/ops/up.rs",
+        "cli/src/factory_quickstart/native.rs",
+        "charts/curie/files/agent-sandbox/controller.yaml",
+        "apps/api/Dockerfile",
+        C4_DRY_RUN,
+    ],
+)
+def test_c4_dry_run_selected_when_an_input_changes(tmp_path: Path, path: str) -> None:
+    assert C4_DRY_RUN not in _selection(tmp_path, path)["pytest_deselect"].split(",")
 
 
 @pytest.mark.parametrize(
@@ -137,7 +197,7 @@ def test_classified_ignored_path_does_not_keep_an_unrelated_file(
 ) -> None:
     output = _selection(tmp_path, "apps/api/src/curie_api/main.py", ignored)
     assert output["pytest"] == "true"
-    assert output["pytest_deselect"] == SRE_RUNTIME
+    assert output["pytest_deselect"] == ALL_CONDITIONAL
 
 
 @pytest.mark.parametrize("path", ["examples/sre-bot-other/file.yaml", "runner-other/file.py"])
@@ -147,7 +207,7 @@ def test_conditional_inputs_respect_directory_boundaries(tmp_path: Path, path: s
     registry["rules"]["exact"][path] = ["local"]
     registry_path = tmp_path / "registry.yaml"
     registry_path.write_text(yaml.safe_dump(registry, sort_keys=False))
-    assert _selection(tmp_path, path, registry=registry_path)["pytest_deselect"] == SRE_RUNTIME
+    assert _selection(tmp_path, path, registry=registry_path)["pytest_deselect"] == ALL_CONDITIONAL
 
 
 def test_conditional_deselection_is_sorted_and_matches_exact_inputs(tmp_path: Path) -> None:
@@ -164,9 +224,10 @@ def test_conditional_deselection_is_sorted_and_matches_exact_inputs(tmp_path: Pa
     assert _selection(tmp_path, "runner/Dockerfile", registry=registry_path)["pytest_deselect"] == (
         "examples/tests/test_a.py"
     )
-    assert _selection(
-        tmp_path, "runner/Dockerfile.other", registry=registry_path
-    )["pytest_deselect"] == "examples/tests/test_a.py,examples/tests/test_z.py"
+    assert (
+        _selection(tmp_path, "runner/Dockerfile.other", registry=registry_path)["pytest_deselect"]
+        == "examples/tests/test_a.py,examples/tests/test_z.py"
+    )
 
 
 @pytest.mark.parametrize("shard", [1, 2, 3])
@@ -175,17 +236,36 @@ def test_pytest_step_appends_deselect_only_when_selected(
     tmp_path: Path, shard: int, deselect: str
 ) -> None:
     expected = [
-        "run", "pytest", "-q", "-n", "4", "--dist", "loadgroup",
-        "--ci-shard", f"{shard}/3", "--reruns", "1", "-rsR", "--durations=25",
+        "run",
+        "pytest",
+        "-q",
+        "-n",
+        "4",
+        "--dist",
+        "loadgroup",
+        "--ci-shard",
+        f"{shard}/3",
+        "--reruns",
+        "1",
+        "-rsR",
+        "--durations=25",
+        "--ignore=tools/factory-e2e/tests/test_c4_initial_binding.py",
+        "--ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py",
+        "--ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py",
+        "--ignore=tools/factory-e2e/tests/test_c4_forge_instances.py",
+        "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
+        "--ignore", SELECTION_TESTS.CLUSTER_UP_MODULE,
     ]
     if deselect:
         expected += ["--deselect", "examples/tests/test_sre_bot_observability_runtime.py"]
-    assert _run_pytest_step(tmp_path, shard=shard, deselect=deselect) == expected
+    arguments = _run_pytest_step(tmp_path, shard=shard, deselect=deselect)
+    assert PYTEST_TESTS._without_admitted_agent_exclusion(arguments) == expected
 
 
 def test_pytest_step_preserves_each_deselect_argument(tmp_path: Path) -> None:
     paths = ["examples/tests/test_additional file.py", SRE_RUNTIME]
     argv = _run_pytest_step(tmp_path, shard=2, deselect=",".join(paths))
+    argv = PYTEST_TESTS._without_admitted_agent_exclusion(argv)
     assert argv[-4:] == ["--deselect", paths[0], "--deselect", paths[1]]
 
 
@@ -206,7 +286,7 @@ def _tracking_problems(entries: dict[str, list[str]], tracked: set[str]) -> list
 
 def test_conditional_inputs_are_tracked() -> None:
     entries = yaml.safe_load(REGISTRY.read_text())["conditional_pytest_files"]
-    assert entries == {SRE_RUNTIME: list(SRE_RUNTIME_INPUTS)}
+    assert entries == {name: list(inputs) for name, inputs in CONDITIONAL_PYTEST_FILES.items()}
     completed = subprocess.run(
         ["git", "ls-files", "-z"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
     )
@@ -286,11 +366,13 @@ def test_repo_read_coverage_resolves_constants_and_rejects_missing_input() -> No
     source = (
         'CONFIG_DIR = REPO_ROOT / "examples" / "acme-bot"\n'
         'CONFIG_FILE = CONFIG_DIR / "config.yaml"\n'
-        'content = CONFIG_FILE.read_text()\n'
+        "content = CONFIG_FILE.read_text()\n"
         'other = (REPO_ROOT / "otel" / "collector-config.yaml").read_text()\n'
     )
     assert _repo_paths(source) == {
-        "examples/acme-bot", "examples/acme-bot/config.yaml", "otel/collector-config.yaml"
+        "examples/acme-bot",
+        "examples/acme-bot/config.yaml",
+        "otel/collector-config.yaml",
     }
     assert _uncovered_repo_paths(source, ["examples/acme-bot"]) == ["otel/collector-config.yaml"]
     assert not _uncovered_repo_paths(source, ["examples/acme-bot", "otel/collector-config.yaml"])
@@ -313,9 +395,17 @@ def test_repo_read_coverage_resolves_constants_and_rejects_missing_input() -> No
         {1: ["runner"]},
     ],
     ids=[
-        "not-mapping", "empty-inputs", "duplicate-input", "not-input-list",
-        "empty-input", "absolute-input", "slash-terminated-input", "not-string-input",
-        "empty-test-path", "absolute-test-path", "slash-terminated-test-path",
+        "not-mapping",
+        "empty-inputs",
+        "duplicate-input",
+        "not-input-list",
+        "empty-input",
+        "absolute-input",
+        "slash-terminated-input",
+        "not-string-input",
+        "empty-test-path",
+        "absolute-test-path",
+        "slash-terminated-test-path",
         "not-string-test-path",
     ],
 )

@@ -14,24 +14,31 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from curie_api.forges.errors import NotFound, Unavailable
+from curie_api.forges.identity import notice_request_id
 from curie_api.forges.types import Disposition, MarkedNotice, NoticePage, TicketLabels
 from forge_fakes.jira import (
     BOT_ACCOUNT_ID,
     BOT_NAME,
+    BOT_TIME_ZONE,
     LABEL,
     START_MS,
     JiraFake,
+    JiraIssue,
     JiraUser,
     adf_mention,
+    jira_time,
     jira_tracker,
     ms_of,
+    payload,
 )
 
-FIELDS = {"labels", "status", "components", "updated", "summary"}
+FIELDS = {"labels", "status", "components", "updated", "summary", "creator", "created"}
 FIRST_POLL_JQL = 'labels = "factory" AND statusCategory != Done ORDER BY updated ASC'
 
 
@@ -64,6 +71,46 @@ def _admits(page: NoticePage) -> list[MarkedNotice]:
 def _fields(sent: str | list[str]) -> set[str]:
     names = sent.split(",") if isinstance(sent, str) else sent
     return {name.strip() for name in names}
+
+
+def _issue_response(issue: JiraIssue) -> dict[str, Any]:
+    # IssueBean fields and UserDetails are provider data, including distinct creator/reporter.
+    # https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-issueidorkey-get
+    return {
+        "id": str(issue.id),
+        "key": issue.key,
+        "fields": {
+            "labels": list(issue.labels),
+            "status": payload("statuses")[issue.status],
+            "summary": issue.summary,
+            "updated": jira_time(issue.updated_ms, BOT_TIME_ZONE),
+            "created": jira_time(issue.created_ms, BOT_TIME_ZONE),
+            "creator": issue.creator.bean(),
+            "reporter": issue.reporter.bean(),
+        },
+    }
+
+
+def _changelog_page(*histories: Any, **pagination: Any) -> dict[str, Any]:
+    # PageBeanChangelog permits paged ChangeDetails; malformed cases use the raw HTTP hook.
+    # https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-issueidorkey-changelog-get
+    return {
+        "startAt": 0,
+        "maxResults": 100,
+        "total": len(histories),
+        "isLast": True,
+        "values": list(histories),
+        **pagination,
+    }
+
+
+def _label_add_response(issue: JiraIssue, author: JiraUser) -> dict[str, Any]:
+    return {
+        "id": "10300",
+        "created": jira_time(issue.updated_ms, BOT_TIME_ZONE),
+        "author": author.bean(),
+        "items": [{"fieldId": "labels", "fromString": None, "toString": LABEL}],
+    }
 
 
 # The search request ---------------------------------------------------------------
@@ -461,3 +508,387 @@ async def test_a_cursor_that_does_not_parse_raises_value_error(cursor: str) -> N
     with pytest.raises(ValueError):
         await tracker.poll_marked(cursor, running=())
     assert fake.requests_of("search") == []
+
+
+@pytest.mark.anyio
+async def test_initial_label_admits_creator_at_creation() -> None:
+    fake = JiraFake()
+    creator = _human(fake)
+    issue = fake.seed_issue("Initially labelled", creator=creator, labels=[LABEL])
+    fake.seed_issue("Unlabelled", creator=creator)
+    fake.seed_issue("Already done", creator=creator, labels=[LABEL], status="Done")
+    tracker = jira_tracker(fake)
+
+    page = await tracker.poll_marked(None, running=())
+
+    assert len(page.notices) == 1
+    [notice] = page.notices
+    assert notice.disposition is Disposition.ADMIT
+    assert (notice.issue, notice.marker, notice.actor) == (fake.ref(issue), LABEL, creator.actor)
+    assert notice.actor != issue.reporter.actor
+    assert notice.occurred_at == datetime.fromtimestamp(issue.created_ms / 1000, UTC)
+    assert notice.event_id == f"creation:{issue.id}:{issue.created_ms}"
+    assert issue.history == []
+    assert fake.requests_of("issue") == []
+    assert await tracker.marking_actor(fake.ref(issue), LABEL) == creator.actor
+    assert await tracker.verify_current(notice) is True
+    assert fake.writes == 0
+
+
+@pytest.mark.anyio
+async def test_initial_label_identity_survives_cursor_sweep_unrelated_edits_and_key_move() -> None:
+    fake = JiraFake(page_cap=1)
+    creator, reporter = _human(fake), _human(fake, 2)
+    issue = fake.seed_issue("Initially labelled", creator=creator, labels=[LABEL])
+    tracker = jira_tracker(fake)
+    first = await tracker.poll_marked(None, running=())
+    [notice] = first.notices
+    request_id = notice_request_id(notice)
+
+    repeated = await tracker.poll_marked(None, running=())
+    assert repeated == first
+    assert (await tracker.poll_marked(first.cursor, running=())).notices == ()
+    overlap = await tracker.poll_marked(_cursor(issue.created_ms), running=())
+    assert overlap.notices == first.notices
+
+    fake.advance(30)
+    fake.edit_summary(issue.id, "Renamed without relabelling", reporter)
+    fake.edit_reporter(issue.id, reporter, reporter)
+    fake.move_issue_logged(issue.id, "MOVED-21", reporter)
+    assert issue.creator == creator and issue.reporter == reporter
+    assert (await tracker.poll_marked(first.cursor, running=())).notices == ()
+    [swept] = (await tracker.poll_marked(None, running=())).notices
+    assert swept.issue.display_key == "MOVED-21"
+    assert (swept.event_id, swept.actor, swept.occurred_at) == (
+        notice.event_id,
+        creator.actor,
+        notice.occurred_at,
+    )
+    assert notice_request_id(swept) == request_id
+    assert await tracker.marking_actor(fake.ref(issue), LABEL) == creator.actor
+    assert await tracker.verify_current(notice) is True
+    assert await tracker.verify_current(replace(notice, actor=reporter.actor)) is False
+    assert await tracker.verify_current(replace(notice, event_id="creation:99999:0")) is False
+
+
+@pytest.mark.anyio
+async def test_initial_label_late_indexing_same_millisecond_and_cursor_namespaces() -> None:
+    fake = JiraFake()
+    creator = _human(fake)
+    for n in range(99):
+        fake.seed_issue(f"Unlabelled issue {n}")
+    seen = fake.seed_issue("Visible immediately", creator=creator, labels=[LABEL])
+    fake.advance(-1)
+    late = fake.seed_issue("Index catches up", creator=creator, labels=[LABEL], indexed=False)
+    assert seen.created_ms == late.created_ms
+    tracker = jira_tracker(fake)
+    first = await tracker.poll_marked(None, running=())
+    [original] = first.notices
+    fake.set_indexed(late.id, True)
+
+    second = await tracker.poll_marked(first.cursor, running=())
+    [indexed] = second.notices
+    assert indexed.issue == fake.ref(late)
+    assert indexed.event_id != original.event_id
+    assert indexed.occurred_at == original.occurred_at
+    assert notice_request_id(indexed) != notice_request_id(original)
+
+    fake.advance(10)
+    conventional = fake.seed_issue("Later label", creator=creator)
+    added = fake.add_label(conventional.id, LABEL, creator)
+    mention = fake.add_comment(seen.id, creator, adf_mention(BOT_ACCOUNT_ID, BOT_NAME))
+    fake.add_label(seen.id, "unrelated", creator)
+    page = await tracker.poll_marked(second.cursor, running=())
+    assert str(seen.id) == added == mention
+    assert {(n.disposition, n.event_id) for n in page.notices} == {
+        (Disposition.MENTION, mention),
+        (Disposition.ADMIT, added),
+    }
+    assert (await tracker.poll_marked(page.cursor, running=())).notices == ()
+
+
+@pytest.mark.anyio
+async def test_initial_label_window_uses_creation_time_and_expires_overlap_ids() -> None:
+    fake = JiraFake()
+    creator = _human(fake)
+    old = fake.seed_issue("Old creation", creator=creator, labels=[LABEL])
+    tracker = jira_tracker(fake)
+    first = await tracker.poll_marked(None, running=())
+    fake.advance(600)
+    boundary = fake.seed_issue("At overlap boundary", creator=creator, labels=[LABEL])
+    fake.advance(119)
+    latest = fake.seed_issue("New creation", creator=creator, labels=[LABEL])
+    assert latest.created_ms - boundary.created_ms == 120_000
+    fake.edit_summary(old.id, "Updated into search window", creator)
+
+    windowed = await tracker.poll_marked(_cursor(latest.created_ms), running=())
+    assert {n.issue for n in windowed.notices} == {fake.ref(boundary), fake.ref(latest)}
+    assert f"i{old.id}:{old.created_ms}" not in windowed.cursor.split(";", 1)[1].split(",")
+    assert (await tracker.poll_marked(windowed.cursor, running=())).notices == ()
+    assert {n.issue for n in (await tracker.poll_marked("0;", running=())).notices} == {
+        fake.ref(old),
+        fake.ref(boundary),
+        fake.ref(latest),
+    }
+    assert {n.issue for n in (await tracker.poll_marked(first.cursor, running=())).notices} == {
+        fake.ref(boundary),
+        fake.ref(latest),
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "token", ["i", "i10001", "i10001:", "i:1", "i10001:no", "i10001:-1", "i١:1", "i1:1:1"]
+)
+async def test_initial_label_malformed_cursor_is_rejected_before_http(token: str) -> None:
+    fake = JiraFake()
+    tracker = jira_tracker(fake)
+    with pytest.raises(ValueError):
+        await tracker.poll_marked(_cursor(START_MS, token), running=())
+    assert fake.requests == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("change", ["remove", "done", "delete"])
+async def test_initial_label_removal_done_and_deletion_invalidate_saved_notice(change: str) -> None:
+    fake = JiraFake()
+    creator = _human(fake)
+    issue = fake.seed_issue("Will leave intake", creator=creator, labels=[LABEL])
+    neighbor = fake.seed_issue("Still eligible", creator=creator, labels=[LABEL])
+    tracker = jira_tracker(fake)
+    page = await tracker.poll_marked(None, running=())
+    notices = {n.issue.issue_id: n for n in page.notices}
+    original = notices[str(issue.id)]
+    if change == "remove":
+        fake.remove_label(issue.id, LABEL, creator)
+    elif change == "done":
+        fake.set_status(issue.id, "Done", creator)
+    else:
+        fake.delete_issue(issue.id)
+
+    assert await tracker.verify_current(original) is False
+    assert await tracker.verify_current(notices[str(neighbor.id)]) is True
+    assert [n.issue for n in (await tracker.poll_marked(None, running=())).notices] == [
+        fake.ref(neighbor)
+    ]
+    if change != "delete":
+        assert await tracker.marking_actor(original.issue, LABEL) is None
+        cancellations = await tracker.poll_marked(page.cursor, running=[original.issue])
+        assert [(n.issue, n.disposition) for n in cancellations.notices] == [
+            (original.issue, Disposition.CANCEL)
+        ]
+
+
+@pytest.mark.anyio
+async def test_initial_label_real_readd_supersedes_creation_with_its_author() -> None:
+    fake = JiraFake(page_cap=1)
+    creator, relabeller = _human(fake), _human(fake, 2)
+    issue = fake.seed_issue("Initially labelled", creator=creator, labels=[LABEL])
+    tracker = jira_tracker(fake)
+    [original] = (await tracker.poll_marked(None, running=())).notices
+    fake.edit_summary(issue.id, "Unrelated history on first page", creator)
+    fake.remove_label(issue.id, LABEL, creator)
+    real = fake.add_label(issue.id, LABEL, relabeller)
+
+    for cursor in (None, "0;", original.cursor):
+        [notice] = _admits(await tracker.poll_marked(cursor, running=()))
+        assert (notice.event_id, notice.actor) == (real, relabeller.actor)
+        assert notice_request_id(notice) != notice_request_id(original)
+        assert await tracker.verify_current(notice) is True
+    assert await tracker.verify_current(original) is False
+    assert await tracker.marking_actor(fake.ref(issue), LABEL) == relabeller.actor
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("author_type", ["bot", "app", "customer"])
+async def test_initial_label_nonhuman_real_add_never_restores_creator(author_type: str) -> None:
+    fake = JiraFake(bot_type="atlassian")
+    creator = _human(fake)
+    by = (
+        fake.bot
+        if author_type == "bot"
+        else fake.add_user("5b10a0000000000000000003", "Nonhuman", account_type=author_type)
+    )
+    issue = fake.seed_issue("Initially labelled", creator=creator, labels=[LABEL])
+    tracker = jira_tracker(fake)
+    [original] = (await tracker.poll_marked(None, running=())).notices
+    fake.remove_label(issue.id, LABEL, creator)
+    fake.add_label(issue.id, LABEL, by)
+    neighbor = fake.seed_issue("Human real add", creator=creator)
+    added = fake.add_label(neighbor.id, LABEL, creator)
+
+    for cursor in (None, "0;", original.cursor):
+        assert [
+            (n.issue, n.event_id) for n in _admits(await tracker.poll_marked(cursor, running=()))
+        ] == [(fake.ref(neighbor), added)]
+    assert await tracker.verify_current(original) is False
+    assert await tracker.marking_actor(fake.ref(issue), LABEL) != creator.actor
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("id", ...),
+        ("id", None),
+        ("id", "bad"),
+        ("created", ...),
+        ("created", None),
+        ("created", "bad"),
+        ("author", ...),
+        ("author", None),
+        ("author", {}),
+    ],
+)
+async def test_initial_label_malformed_real_add_metadata_never_restores_creator(
+    field: str,
+    value: Any,
+) -> None:
+    fake = JiraFake()
+    creator, relabeller = _human(fake), _human(fake, 2)
+    issue = fake.seed_issue("Initially labelled", creator=creator, labels=[LABEL])
+    tracker = jira_tracker(fake)
+    [original] = (await tracker.poll_marked(None, running=())).notices
+    history = _label_add_response(issue, relabeller)
+    if value is ...:
+        history.pop(field)
+    else:
+        history[field] = value
+    neighbor = fake.seed_issue("Valid neighbor", creator=creator, labels=[LABEL])
+
+    for cursor in (None, "0;"):
+        fake.fail_next("changelog", status=200, body=_changelog_page(history))
+        page = await tracker.poll_marked(cursor, running=())
+        assert [n.issue for n in page.notices] == [fake.ref(neighbor)]
+    fake.fail_next("changelog", status=200, body=_changelog_page(history))
+    assert await tracker.verify_current(original) is False
+    fake.fail_next("changelog", status=200, body=_changelog_page(history))
+    assert await tracker.marking_actor(fake.ref(issue), LABEL) != creator.actor
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "history",
+    [
+        None,
+        "unreadable",
+        {},
+        {"items": None},
+        {"items": [None]},
+        {"items": [{}]},
+        {"items": [{"field": "labels", "toString": LABEL}]},
+        {"items": [{"fieldId": "labels", "fromString": [], "toString": LABEL}]},
+        {"items": [{"field": "labels", "fromString": None, "toString": {}}]},
+    ],
+)
+async def test_initial_label_unreadable_history_defers_and_same_cursor_recovers(
+    history: Any,
+) -> None:
+    fake = JiraFake()
+    creator = _human(fake)
+    issue = fake.seed_issue("Initially labelled", creator=creator, labels=[LABEL])
+    tracker = jira_tracker(fake)
+    [original] = (await tracker.poll_marked(None, running=())).notices
+
+    fake.fail_next("changelog", status=200, body=_changelog_page(history))
+    with pytest.raises(Unavailable):
+        await tracker.poll_marked("0;", running=())
+    fake.fail_next("changelog", status=200, body=_changelog_page(history))
+    with pytest.raises(Unavailable):
+        await tracker.verify_current(original)
+    fake.fail_next("changelog", status=200, body=_changelog_page(history))
+    with pytest.raises(Unavailable):
+        await tracker.marking_actor(fake.ref(issue), LABEL)
+
+    [recovered] = (await tracker.poll_marked("0;", running=())).notices
+    assert recovered.event_id == original.event_id
+    assert await tracker.verify_current(recovered) is True
+    assert await tracker.marking_actor(fake.ref(issue), LABEL) == creator.actor
+    assert fake.writes == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("page", [_changelog_page(isLast=False), _changelog_page(values=None)])
+async def test_initial_label_incomplete_history_page_defers_and_recovers(
+    page: dict[str, Any],
+) -> None:
+    fake = JiraFake()
+    creator = _human(fake)
+    issue = fake.seed_issue("Initially labelled", creator=creator, labels=[LABEL])
+    tracker = jira_tracker(fake)
+    fake.fail_next("changelog", status=200, body=page)
+
+    with pytest.raises(Unavailable):
+        await tracker.poll_marked("0;", running=())
+    [recovered] = (await tracker.poll_marked("0;", running=())).notices
+    assert recovered.event_id == f"creation:{issue.id}:{issue.created_ms}"
+    assert await tracker.verify_current(recovered) is True
+
+
+@pytest.mark.anyio
+async def test_initial_label_failed_later_history_page_defers_and_same_cursor_recovers() -> None:
+    fake = JiraFake(page_cap=1)
+    creator = _human(fake)
+    issue = fake.seed_issue("Initially labelled", creator=creator, labels=[LABEL])
+    fake.edit_summary(issue.id, "First unrelated edit", creator)
+    fake.edit_summary(issue.id, "Second unrelated edit", creator)
+    tracker = jira_tracker(fake)
+    fake.fail_next("changelog", after=1, status=503)
+
+    with pytest.raises(Unavailable):
+        await tracker.poll_marked("0;", running=())
+    [recovered] = (await tracker.poll_marked("0;", running=())).notices
+    assert recovered.event_id == f"creation:{issue.id}:{issue.created_ms}"
+    assert await tracker.verify_current(recovered) is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("creator", ...),
+        ("creator", None),
+        ("creator", []),
+        ("creator", {}),
+        ("creator", {"accountType": "atlassian"}),
+        ("creator", {"accountId": "creator-without-type"}),
+        ("creator", {"accountId": "", "accountType": "atlassian"}),
+        ("created", ...),
+        ("created", None),
+        ("created", "not-a-time"),
+        ("created", 123),
+    ],
+)
+async def test_initial_label_missing_or_malformed_metadata_never_uses_reporter(
+    field: str,
+    value: Any,
+) -> None:
+    fake = JiraFake()
+    creator = _human(fake)
+    issue = fake.seed_issue("Malformed creation", creator=creator, reporter=creator, labels=[LABEL])
+    neighbor = fake.seed_issue("Valid creation", creator=creator, labels=[LABEL])
+    tracker = jira_tracker(fake)
+    first = await tracker.poll_marked(None, running=())
+    original = next(n for n in first.notices if n.issue == fake.ref(issue))
+    malformed = _issue_response(issue)
+    if value is ...:
+        malformed["fields"].pop(field)
+    else:
+        malformed["fields"][field] = value
+    fake.fail_next(
+        "search",
+        status=200,
+        body={"issues": [malformed, _issue_response(neighbor)], "isLast": True},
+    )
+    assert [n.issue for n in (await tracker.poll_marked(None, running=())).notices] == [
+        fake.ref(neighbor)
+    ]
+    fake.fail_next("issue", status=200, body=malformed)
+    assert await tracker.marking_actor(fake.ref(issue), LABEL) is None
+    fake.fail_next("issue", status=200, body=malformed)
+    assert await tracker.verify_current(original) is False
+    assert {n.issue for n in (await tracker.poll_marked(None, running=())).notices} == {
+        fake.ref(issue),
+        fake.ref(neighbor),
+    }
+    assert fake.writes == 0

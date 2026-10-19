@@ -145,6 +145,6 @@ def test_sre_bot_python_connectors_pin_the_mcp_2_runtime_their_servers_import() 
 
     for connector in connectors:
         requirements = (connector / "requirements.txt").read_text().splitlines()
-        assert "mcp==2.1.1" in requirements, (
-            f"{connector.name} imports mcp.server.mcpserver but its image does not pin MCP 2.1.1"
+        assert "mcp==2.2.0" in requirements, (
+            f"{connector.name} imports mcp.server.mcpserver but its image does not pin MCP 2.2.0"
         )

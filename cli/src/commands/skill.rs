@@ -121,7 +121,7 @@ pub(super) fn short_digest(digest: &str) -> String {
 
 /// Release everything a boot that has already packed its snapshot leaves behind
 /// when it aborts: the ollama sidecar, the hosted connectors, the network
-/// `start` owns, the credentials it staged, and the snapshot itself.
+/// `start` owns and the snapshot itself.
 ///
 /// One definition for all three abort arms between the pack and a recorded
 /// state, because nothing else will ever collect these: no state was saved, so
@@ -137,7 +137,7 @@ pub(super) fn short_digest(digest: &str) -> String {
 /// the error it reports or the code it exits with.
 pub(super) async fn release_boot_scaffolding(
     ollama_container: Option<&String>,
-    connector_containers: &[String],
+    connector_project: &str,
     owned_network: Option<&String>,
     snapshot_dir: &Path,
     plugin_dir: &Path,
@@ -145,35 +145,13 @@ pub(super) async fn release_boot_scaffolding(
     if let Some(ollama) = ollama_container {
         let _ = docker::remove_container(ollama).await;
     }
-    for connector in connector_containers {
-        let _ = docker::remove_container(connector).await;
-    }
+    let _ =
+        docker::run_connector_teardown(&docker::connector_teardown_plan(connector_project, None))
+            .await;
     if let Some(net) = owned_network {
         let _ = docker::remove_network(net).await;
     }
-    // After the connectors, never before: a tree still bind-mounted into a
-    // running container cannot be wiped cleanly, the same ordering
-    // `connector_teardown_plan` holds. Resolved credentials must not outlive a
-    // boot that no `skill down` can find.
-    let _ = crate::connector_build::wipe_connector_secrets(plugin_dir);
     let _ = crate::bundle::remove_snapshot(snapshot_dir, plugin_dir);
-}
-
-pub(super) fn refuse_remote_connector_secret_files(
-    decl: &crate::connector_build::ConnectorsFileDecl,
-    published: Option<&str>,
-) -> Result<()> {
-    if docker::remote_mode(published) {
-        if let Some((connector, _)) = decl.connectors.iter().find(|(_, spec)| {
-            spec.url.is_none() && spec.unhosted_url.is_none() && !spec.secret_files.is_empty()
-        }) {
-            return Err(crate::exit::usage(format!(
-                "connector '{connector}' declares secret_files, which skill up cannot mount with \
-                 DOCKER_PUBLISHED_HOST set; use environment secrets or an unhosted connector URL"
-            )));
-        }
-    }
-    Ok(())
 }
 
 pub async fn start(opts: StartOpts) -> Result<()> {
@@ -187,12 +165,6 @@ pub async fn start(opts: StartOpts) -> Result<()> {
     // Fail fast on a directory that is not a bundle; the runner would reject
     // it at boot anyway (real-model mode), with a worse error surface.
     let (plugin_name, manifest_version) = read_manifest(&plugin_dir)?;
-    if docker::remote_mode(published_host.as_deref()) {
-        refuse_remote_connector_secret_files(
-            &crate::connector_build::load(&plugin_dir)?,
-            published_host.as_deref(),
-        )?;
-    }
 
     if opts.local_model.is_some() && opts.fake_model {
         return Err(crate::exit::usage(
@@ -332,7 +304,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
     )
     .await?;
 
-    let session_id = format!("local-{}", unix_now());
+    let session_id = format!("local-{}", uuid::Uuid::new_v4());
     let mut network = opts.network.clone();
     let mut owned_network: Option<String> = None;
     let mut ollama_container: Option<String> = None;
@@ -598,11 +570,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
             Err(err) => {
                 // Nothing is recorded yet, so this is the only chance to release
                 // whatever the partial bring-up created (#747).
-                let steps = docker::connector_teardown_plan(
-                    &session_id,
-                    owned_network.as_deref(),
-                    Some(&plugin_dir),
-                );
+                let steps = docker::connector_teardown_plan(&session_id, owned_network.as_deref());
                 let _ = docker::run_connector_teardown(&steps).await;
                 if let Some(ollama) = &ollama_container {
                     let _ = docker::remove_container(ollama).await;
@@ -644,7 +612,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         "starting runner container '{}' from '{}'",
         opts.name, opts.image
     ));
-    let container_id = match docker::start_runner(&spec, published_host.as_deref()).await {
+    let container_id = match docker::start_runner(&spec).await {
         Ok(id) => id,
         Err(err) => {
             // Nothing recorded the snapshot, so no teardown will ever find it
@@ -652,7 +620,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
             // and the network.
             release_boot_scaffolding(
                 ollama_container.as_ref(),
-                &connector_containers,
+                &session_id,
                 owned_network.as_ref(),
                 &snapshot.dir,
                 &plugin_dir,
@@ -681,7 +649,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         // chance to release it (#1087).
         release_boot_scaffolding(
             ollama_container.as_ref(),
-            &connector_containers,
+            &session_id,
             owned_network.as_ref(),
             &snapshot.dir,
             &plugin_dir,
@@ -704,7 +672,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
             image: opts.image,
             port: opts.port,
             base_url: base_url.clone(),
-            session_id,
+            session_id: session_id.clone(),
             plugin_dir: plugin_dir.display().to_string(),
             fake_model: opts.fake_model,
             ollama_container: ollama_container.clone(),
@@ -722,7 +690,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         // nothing behind (#1087).
         release_boot_scaffolding(
             ollama_container.as_ref(),
-            &connector_containers,
+            &session_id,
             owned_network.as_ref(),
             &snapshot.dir,
             &plugin_dir,
@@ -1075,16 +1043,10 @@ pub(super) async fn stop_recorded(
             "kept model-cache volume '{volume}' for fast re-up; remove it with 'docker volume rm {volume}'"
         ));
     }
-    // Connector containers, then the staged credential tree (ADR 0113,
-    // block B1-8). Label-scoped, so a connector this bundle started is reaped
-    // even if the record is incomplete; the network is left to the owned-network
-    // branch below, which alone knows whether this boot created it.
-    let connector_problems = docker::run_connector_teardown(&docker::connector_teardown_plan(
-        &saved.session_id,
-        None,
-        Some(dir),
-    ))
-    .await;
+    // Reap this session's connectors and credential volumes before its network.
+    let connector_problems =
+        docker::run_connector_teardown(&docker::connector_teardown_plan(&saved.session_id, None))
+            .await;
     for problem in connector_problems {
         ui.warn(&problem);
     }

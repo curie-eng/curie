@@ -2,13 +2,26 @@
 
 <a id="dark-factory-quickstart"></a>
 
-Turn a labelled GitHub issue into a pull request you can review, using the
-Software Factory co-worker. `dark-factory` remains its implementation name.
+Turn a labelled issue into a pull request or merge request you can review,
+using the Software Factory co-worker. `dark-factory` remains its implementation name.
 See the [solution overview](../software-factory.md) for the delegation workflow,
 supported toolchains, review limits, and production differences.
 
 This guide uses the latest released CLI and factory runner by default. See the
 [capability reference](../capabilities.md) for supported integrations and limits.
+
+## Choose your tracker and code host
+
+| Your pairing | Start here |
+|---|---|
+| GitHub issues and GitHub pull requests | [GitHub walkthrough below](#what-you-need), starting with prerequisites and CLI installation |
+| GitLab issues and GitLab merge requests | [Complete GitLab walkthrough](factory-gitlab-quickstart.md), including local cluster, credentials and first issue |
+| Jira Cloud issues and GitHub pull requests | [Complete Jira Cloud and GitHub walkthrough](factory-jira-github-quickstart.md), including the GitHub App and start authority |
+| Jira Cloud issues and Bitbucket Cloud or Data Center pull requests | [Bitbucket quickstart](#run-quickstart-for-bitbucket), with the Jira factory account from [Jira Cloud](#jira-cloud) and the [Bitbucket configuration](#bitbucket-cloud-and-data-center) limits |
+
+The walkthrough on this page uses **GitHub issues and GitHub pull requests**.
+The [GitLab](#gitlab) and [Jira Cloud](#jira-cloud) sections farther down are
+advanced configuration references for those pairings.
 
 `curie factory quickstart` installs Curie on a local
 [kind](https://kind.sigs.k8s.io/) cluster or an explicitly selected existing
@@ -26,8 +39,8 @@ and [45 seconds for an intake polling interval](../../charts/curie/values.yaml).
 These are configured phase limits and an interval, not a measured total or a
 guarantee that the whole walkthrough finishes within the allowance.
 
-Polling is the intake. There is no webhook, no tunnel, and no personal access
-token. The platform reads the issue for the sandbox.
+For the GitHub walkthrough, polling is the intake. There is no webhook, no
+tunnel, and no personal access token. The platform reads the issue for the sandbox.
 
 Quickstart selects automatic initial PR publication and a 5 USD configured
 session ceiling. Despite the `max_usd_per_day` field name, the SDK applies this
@@ -185,6 +198,26 @@ Issues, Pull requests, Checks, Commit statuses, and Actions. Then:
 3. Under **Install App**, install it on the trial repository. This is a click
    in the website. The command does not install the App for you.
 
+### Apple Silicon recovery for older charts
+
+The current source chart detects native ARM64 and leaves the preflight enabled.
+Older released charts can reject ARM64 because they check an x86-only AVX flag.
+If the first quickstart command stops with that specific preflight failure on
+an ARM64 node, keep the same Bash session and trial kubeconfig, then run:
+
+```bash
+curie cluster up --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" \
+  --set preflights.avxCheck.enabled=false
+```
+
+Rerun the first quickstart command after the installation succeeds to obtain
+the App registration link. This recovery is only for the older architecture
+check on ARM64. On x86, keep the AVX check enabled; the pinned x86 ClickHouse
+build requires it. Do not downgrade ClickHouse separately from Langfuse.
+For the README recipe, use its `CURIE_FACTORY_KUBECONFIG` and explicit
+`kind-$CURIE_FACTORY_CLUSTER` context as shown there.
+
 ## Rerun with the App
 
 Run each prompt separately and answer it before copying the next block.
@@ -281,9 +314,15 @@ default reviewer model. To pin another reviewer model for this agent, use the sa
 namespace and release as the quickstart:
 
 ```bash
+read -r -p "Reviewer model id for your provider: " CURIE_REVIEWER_MODEL
+```
+
+After answering, apply the override:
+
+```bash
 curie cluster overrides dark-factory --context "$CURIE_CONTEXT" \
   --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" \
-  --reviewer-model <provider-model-id>
+  --reviewer-model "$CURIE_REVIEWER_MODEL"
 ```
 
 Use `--clear-reviewer-model` in place of `--reviewer-model <provider-model-id>`
@@ -334,9 +373,9 @@ Quickstart writes the factory's forge settings for you. These flags select them:
    and where it takes issues. Both default to `github`. `--tracker jira-cloud`
    with `--code-host github` is installed; see [Jira Cloud](#jira-cloud).
    `--code-host gitlab --tracker gitlab` is installed; see [GitLab](#gitlab).
-   `bitbucket-cloud` and `bitbucket-dc` need `--tracker
-   jira-cloud`, and the command refuses that pairing until its quickstart
-   lands; see [Bitbucket Cloud and Data Center](#bitbucket-cloud-and-data-center).
+   `--code-host bitbucket-cloud` or `bitbucket-dc` with `--tracker
+   jira-cloud` is installed; see
+   [Bitbucket Cloud and Data Center](#bitbucket-cloud-and-data-center).
 2. `--forge-url`, `--token-file`, `--ca-file` and `--review-account` (repeatable)
    describe a non-GitHub forge: its base URL, a file holding its access token,
    a CA bundle for a private certificate, and the accounts whose reviews count.
@@ -345,6 +384,10 @@ Quickstart writes the factory's forge settings for you. These flags select them:
 3. `--forge-username`, `--start-account` (repeatable) and `--start-group` are
    the Jira Cloud flags: the email the token belongs to, and who may start
    work. Each is refused for `github`.
+4. `--tracker-url` and `--tracker-token-file` are the Jira site URL and token
+   file beside a Bitbucket code host, whose own URL and token are
+   `--forge-url` and `--token-file`. Beside GitHub, Jira takes `--forge-url`
+   and `--token-file` instead, and these two are refused.
 
 The chart holds the result in one top-level `factory:` block, which the API
 reads as a single forge configuration document:
@@ -367,10 +410,48 @@ reads as a single forge configuration document:
    `factory.cardBaseUrl` and `factory.ciWaitSeconds` replace the matching
    `api.*` settings.
 
-The old `api.githubFactory*` keys are removed. A release that still sets one
-fails at render with a message naming `factory.*` and `curie cluster factory`.
-Move the values into `factory:` and rerun. See
-[factory settings](../operations.md#admitting-a-labelled-github-issue).
+The old `api.githubFactory*` keys are removed. To upgrade a v0.12.5
+installation configured with `curie cluster factory`, use a CLI containing
+the fix for [#4628](https://github.com/curie-eng/curie/issues/4628) and run the
+normal `curie cluster upgrade --to <target-version>` flow. It automatically
+migrates retained factory settings before candidate validation, preserving
+labels, mention, intake, repository routing, bases, CI policies, credential
+references and unrelated settings. The same upgrade performs drain,
+checkpoint, convergence, canary and known-good recording.
+
+Preview with `--dry-run --json`; migration plan lines and refusals name
+settings without printing their values. Conflicting or malformed legacy
+configuration and ambiguous bindings refuse before any Helm mutation, leaving
+the old release serving.
+
+Identity migration requires explicit repositories in `api.githubRepoAllowlist`
+and a retained `api.githubAppExistingSecret` reference; `owner/*` and
+inline-only App keys refuse. The CLI machine must reach the retained
+`api.githubApiUrl` during live `curie cluster up`, `curie apply`, `curie diff`
+and `curie cluster upgrade`, including upgrade `--dry-run`. Each migration
+consumer may mint external App installation tokens and create audit entries.
+Local `curie cluster up --dry-run` and `curie apply --dry-run` refuse legacy
+settings needing live identity resolution. For a private CA, supply
+`codeHostTrust.caBundle` with a namespace ConfigMap reference in the upgrade
+values overlay.
+
+For GHES, supply explicit typed code-host and tracker egress. Retained
+publication CIDRs alone supply only the code-host route. Tracker inference
+requires an unambiguous retained connector list with matching API ports and
+either the same publication grants or every CIDR covering the literal origin
+IP without excluding it. GHES migration may enroll an otherwise unlisted
+agent when no factory agent is enrolled and its retained grant covers the
+full forge egress union; this also adds per-agent sandbox and warm-pool
+membership. The github.com path does not infer enrollment. See
+[automatic migration](../operations.md#automatic-migration-of-a-legacy-github-factory)
+for the precise trust/egress prerequisites and schema compatibility rules.
+
+The released v0.13.0 CLI lacks this automatic migration, and its suggested
+`cluster factory` remedy also fails on legacy installations. The
+[historical manual procedure](../operations.md#manual-factory-migration-from-v0125-to-v0130)
+applies when using that CLI. See
+[factory settings](../operations.md#admitting-a-labelled-github-issue) for the
+current configuration model.
 
 `curie cluster status` and `curie doctor` print one line per forge credential,
 for example `credential tracker github (github_app): none`. The expiry reads
@@ -379,7 +460,68 @@ reads `none`. A static token with a recorded expiry reads `known`, and the line
 adds a rotation warning once the date is past or within 14 days. A token with no
 recorded expiry reads `unknown`.
 
+Each credential line also carries its authentication state from a live read
+through the API: `accepted`, `rejected` or `unknown`, with a reason. This is
+separate from expiry. See [Replace a static token](#replace-a-static-token).
+
+## Replace a static token
+
+This applies to a GitLab, Bitbucket Cloud, Bitbucket Data Center or Jira Cloud
+static token. Curie never mints or rotates a static token. The operator
+replaces it, and the running API picks the new value up without a restart.
+GitHub App keys and OAuth client secrets are not covered by this procedure.
+
+1. Save the new token in a local file outside the repository using your
+   editor. Keep it out of command arguments, commits and chat. Look up the
+   Secret name and key the install recorded for that credential in the
+   release's `existingSecret` and `existingSecretKey` values.
+2. Replace only that key of the existing Secret, reading the value from the
+   file. A merge patch touches the selected key and leaves every other key in
+   the Secret alone, and the token never appears in command arguments:
+
+   ```bash
+   printf '{"data":{"<key>":"%s"}}' "$(base64 -w0 < <token-file>)" > <patch-file>
+   kubectl --context <ctx> -n <ns> patch secret <secret> \
+     --type merge --patch-file <patch-file>
+   rm <patch-file>
+   ```
+
+   Use the same Secret name and key. A different key or Secret needs a Helm
+   upgrade, because the release references the one it recorded.
+3. Wait. The credentials are a projected Secret volume at `/etc/curie/forges`,
+   and the kubelet refreshes the projected file, typically within about a
+   minute. The API rereads the file at its next forge call or git credential
+   use. No pod restart, Helm upgrade or reload is needed.
+4. Run `curie cluster status`. The replaced credential should read
+   `authentication accepted`.
+
+Curie never falls back to an older token. A rejected, missing, empty or
+malformed file stops intake for that entry only, and other entries keep
+working. Intake resumes by itself once a valid value is in place.
+
+`curie cluster status`, in human form and with `--json`, shows each code host
+and tracker credential's authentication state from a live read through the
+API, separately from expiry (`known`, `unknown` or `none`).
+
+1. `accepted` means the forge accepted the current token on a read.
+2. `rejected` means the forge refused it. A rejected credential marks the
+   cluster unhealthy and the command exits nonzero.
+3. `unknown` means Curie could not tell: the API is unreachable, there is no
+   binding to probe, the file is unreadable or the forge is unavailable.
+   Unknown never reads as accepted.
+
+Each `credentials[]` item in the JSON adds `authentication`,
+`authentication_reason` and `observed_at` beside the existing expiry fields.
+
+When intake is deferred because a credential was rejected or its file is
+unreadable, the API logs a WARNING that names the tracker, binding and label.
+It never logs the token.
+
 ## Jira Cloud
+
+For a complete local install through the first pull request, follow the
+[Jira Cloud and GitHub walkthrough](factory-jira-github-quickstart.md). The
+sections here explain credentials and the chart values quickstart writes.
 
 The factory can take its issues from Jira Cloud while it publishes to GitHub.
 Pull requests, CI, review feedback and merges stay on GitHub, and the GitHub
@@ -392,9 +534,9 @@ carries `Jira: <KEY> <issue URL>`.
 
 Create a dedicated Atlassian account for the factory and an API token for it
 at <https://id.atlassian.com/manage-profile/security/api-tokens>. Write the
-token to a file; quickstart reads it from there and stores it in the Secret
-`curie-jira-token`, which only the API mounts. Give the account these
-permissions:
+token to a file; quickstart reads it from there and stores it in a Secret
+that only the API mounts (see [Names and reruns](#names-and-reruns)). Give the
+account these permissions:
 
 1. Browse Projects, on the projects the factory should serve and no others.
 2. Add Comments.
@@ -445,7 +587,36 @@ the site's cloud id and the factory account's `accountId`, confirms each start
 account is a person (or reads the group), and reads each repository's id with
 the App. It then writes the token Secret, the `trackers` and `bindings`
 entries below and the Jira egress, and binds the agent to the binding as
-`jira=jira` instead of one GitHub surface per repository.
+`jira=<binding>` instead of one GitHub surface per repository.
+
+### Names and reruns
+
+Quickstart names what it creates after the instance, so several GitLab, Jira
+and Bitbucket instances coexist on one release:
+
+1. A new tracker or code host entry is named for its kind and the first 8 hex
+   digits of the SHA-256 of its `apiUrl`, for example `jira-cloud-b6a8e8d4`.
+2. A new binding is named `<tracker>-<trackerScopeId>`.
+3. A new entry's token goes in the Secret `<release>-<entry>-token`, key
+   `token`, labelled `app.kubernetes.io/managed-by=curie-quickstart` and
+   `curie.dev/release=<release>`.
+4. A CA bundle goes in the ConfigMap `<release>-code-host-trust`, key
+   `ca.crt`, unless `codeHostTrust.caBundle` already names one. Quickstart adds
+   only certificates that bundle lacks, and writes nothing when none are new.
+
+A rerun finds recorded entries by identity, the kind and host for an instance
+and the tracker and scope for a binding, whatever they are named, and keeps
+their names, Secrets and trigger label. A new tracker always gets the label
+`curie-factory`; `--label` names the agent's label, and quickstart prints the
+label each tracker actually uses. An equivalent rerun writes no Secret or
+ConfigMap.
+
+Quickstart never rotates a token. When a recorded entry's Secret holds a
+different token, or a Secret it would create already exists with other
+content or belongs to someone else, it refuses before any write and names the
+Secret: update or remove that Secret yourself, then rerun. It also refuses a
+conflicting URL, an occupied name, a missing referenced CA ConfigMap, and a
+Secret, ConfigMap or Helm revision that changed while it ran.
 
 ### The chart values it writes
 
@@ -456,7 +627,7 @@ and each repository's `projectId` is its GitHub repository id.
 ```yaml
 factory:
   trackers:
-    - name: jira
+    - name: jira-cloud-b6a8e8d4
       kind: jira_cloud
       host: example.atlassian.net
       apiUrl: https://example.atlassian.net
@@ -465,15 +636,15 @@ factory:
       credential:
         type: static_token
         username: factory-bot@example.com
-        existingSecret: curie-jira-token
+        existingSecret: curie-jira-cloud-b6a8e8d4-token
         existingSecretKey: token
       egress:
         - cidr: 192.0.2.10/32
           ports: [{protocol: TCP, port: 443}]
           host: example.atlassian.net
   bindings:
-    - name: jira
-      tracker: jira
+    - name: jira-cloud-b6a8e8d4-00000000-0000-0000-0000-000000000000
+      tracker: jira-cloud-b6a8e8d4
       trackerScopeId: 00000000-0000-0000-0000-000000000000
       repos:
         - alias: widgets
@@ -498,11 +669,16 @@ issue's workflow status.
 
 ## GitLab
 
+For a complete local install through the first merge request, follow the
+[GitLab walkthrough](factory-gitlab-quickstart.md). The sections here retain
+the advanced server, credential and chart configuration reference.
+
 The factory can take issues from GitLab and publish merge requests to it, on
 gitlab.com or a self-managed server. It labels the issue, opens a merge request
 whose description says `Closes #<iid>`, follows the pipeline, answers review
 discussions in the thread, and never merges or resolves a thread. The GitLab
-server must be version 17.0 or later; only 19.4.1 has been tested.
+server must be version 17.0 or later. See the
+[capability reference](../capabilities.md) for verification limits.
 
 ### The factory account and token
 
@@ -523,8 +699,8 @@ Secret that only the API mounts; it never prints the token or puts it in argv.
 
 ```bash
 curie factory quickstart --code-host gitlab --tracker gitlab \
-  --repo <group/.../project> --token-file <path> \
-  [--forge-url <web base>] [--ca-file <pem>] [--dry-run]
+  --repo "$CURIE_REPO" --token-file "$CURIE_GITLAB_TOKEN_FILE" \
+  --forge-url "$CURIE_GITLAB_URL"
 ```
 
 Without `--forge-url` the target is `https://gitlab.com`. `--repo` is the full
@@ -547,8 +723,9 @@ Before changing the cluster, quickstart:
 1. **Sub-path installs.** `--forge-url` is the web base, for example
    `https://host/gitlab`. Quickstart derives the API URL by appending
    `/api/v4`, so the tracker's `apiUrl` is `https://host/gitlab/api/v4`.
-2. **Custom CA.** `--ca-file <pem>` is written to a ConfigMap and referenced
-   from `codeHostTrust.caBundle`, so the API trusts a private certificate.
+2. **Custom CA.** `--ca-file <pem>` must hold only PEM certificates. They are
+   merged into the release's one `codeHostTrust.caBundle` ConfigMap, so the
+   API trusts a private certificate. See [Names and reruns](#names-and-reruns).
 3. **Plain http.** Only `localhost` and `127.0.0.1` are accepted without TLS.
 
 ### Labels
@@ -568,8 +745,9 @@ and `tracker_scope_id`.
 ### Token expiry
 
 Quickstart prints `Token expires <YYYY-MM-DD> (<n> days)`, or `Token has no
-expiry`, and records the date in the credential. The factory does not rotate
-tokens; replace the token before that date.
+expiry`, and records the date in the credential. Curie never mints or rotates
+a static token; replace it before that date as described in
+[Replace a static token](#replace-a-static-token).
 
 ### Polling cost
 
@@ -582,9 +760,7 @@ the last poll and one read for each issue that is running.
 
 Bitbucket has no issue tracker the factory reads, so a Bitbucket code host
 pairs only with a Jira Cloud tracker. The ticket is a Jira issue, and the pull
-request, its build statuses and its review comments are on Bitbucket. The
-combined quickstart for this pairing is tracked in #4400; until it lands, write
-the `factory:` values below yourself.
+request, its build statuses and its review comments are on Bitbucket.
 
 Each kind takes a static access token, never a username and password:
 
@@ -593,7 +769,9 @@ Each kind takes a static access token, never a username and password:
    it as a Bearer token, and git uses it as the password for the user
    `x-token-auth`. The entry's `host` is `bitbucket.org` and its `apiUrl` is
    `https://api.bitbucket.org/2.0`. A repository's `projectId` is its UUID,
-   braces included, and its `path` is `<workspace>/<repo slug>`.
+   braces included, and its `path` is `<workspace>/<repo slug>`. The
+   mergeability read uses the token's pull request read scope (covered by
+   `pullrequest:write`) and never merges.
 2. **Bitbucket Data Center** 9.4.0 or newer takes a project or repository HTTP
    access token with `REPO_WRITE`, sent as a Bearer token to the API and to
    git. An older server is refused. The entry's `host` is the server's
@@ -610,18 +788,94 @@ approval or a "needs work" status with no text is not feedback. A Data Center
 server with a private certificate needs its CA through `--ca-file`, which
 lands in `codeHostTrust`.
 
+### Run quickstart for Bitbucket
+
+Quickstart installs Curie, then writes one Bitbucket code host named
+`bitbucket`, the Jira tracker and one Jira binding named `jira`, and binds the
+agent as `jira=jira`. It serves one repository. Prepare the Jira factory
+account and token as [Jira Cloud](#jira-cloud) describes, and pass them with
+`--tracker-url` and `--tracker-token-file`. The Bitbucket flags are
+`--token-file`, `--review-account` (repeatable), and on Data Center
+`--forge-url` and, for a private certificate, `--ca-file`. A Bitbucket install
+registers no GitHub App, so `--app-id`, `--private-key-file` and `--org` are
+refused. The identifiers below are examples:
+
+```bash
+# Bitbucket Cloud: --repo <workspace>/<repo slug>
+curie factory quickstart --repo example-workspace/example-repo \
+  --tracker jira-cloud --code-host bitbucket-cloud \
+  --token-file /path/to/bitbucket-token \
+  --review-account '712020:00000000-0000-0000-0000-000000000000' \
+  --tracker-url https://example.atlassian.net \
+  --tracker-token-file /path/to/jira-token \
+  --forge-username factory-bot@example.com \
+  --start-account 557058:00000000-0000-0000-0000-000000000000
+
+# Bitbucket Data Center: --repo <PROJECT KEY>/<repo slug>
+curie factory quickstart --repo FAC/demo \
+  --tracker jira-cloud --code-host bitbucket-dc \
+  --forge-url https://bitbucket.example.invalid \
+  --ca-file /path/to/ca.pem \
+  --token-file /path/to/bitbucket-dc-token \
+  --review-account 101 \
+  --tracker-url https://example.atlassian.net \
+  --tracker-token-file /path/to/jira-token \
+  --forge-username factory-bot@example.com \
+  --start-account 557058:00000000-0000-0000-0000-000000000000
+```
+
+Before writing anything, quickstart checks the Jira token and start authority
+as on GitHub, and reads the repository with the Bitbucket token: on Cloud its
+UUID, with Atlassian's published Bitbucket address ranges as the egress, and
+on Data Center the server version (9.4.0 or newer) and the numeric repository
+id, with the addresses the server's host resolves to as the egress. It then
+writes the Jira and Bitbucket token Secrets, merges `--ca-file` into the
+release's CA bundle ConfigMap, and writes the entries, named as in
+[Names and reruns](#names-and-reruns). A Bitbucket access token cannot read a person's account, so look up
+each review account once: on Cloud the `account_id` on a comment or pull
+request that person wrote, on Data Center the user's numeric `id` from
+`/rest/api/latest/users/<slug>`.
+
+To ask for a revision, a review account comments on the pull request and
+mentions the Jira tracker's `mention`, the factory account's `accountId`, as
+`@<accountId>`. The factory reads pull request comments on its poll interval
+and acts only on one that carries that mention.
+
+### Writing the values by hand
+
+Several Bitbucket repositories in one binding, or two Bitbucket code hosts,
+are not a quickstart run; write the `factory:` values yourself.
+
+One Jira site takes exactly one binding. Quickstart already wrote a binding
+for your site, so extend that binding rather than adding a second one:
+
+1. Add each further repository under the existing binding's `repos`, with an
+   alias no other repository in the binding uses.
+2. Keep the binding's `defaultRepo`, its `startAuthority` and its
+   `reviewFeedbackAllowlist` entries, adding an allowlist entry for each new
+   code host.
+3. On each Jira issue, pick the repository with one `repo:<alias>` label. An
+   issue without one runs against `defaultRepo`.
+
+A second binding with the same `trackerScopeId` on the same Jira site is
+refused when the chart renders, even when it names a second tracker entry for
+that site, so `helm upgrade` and `curie cluster upgrade` stop before anything
+rolls out. The refusal names both bindings and the site.
+
+The example below extends a quickstart binding on the tracker
+`jira-cloud-b6a8e8d4`, carrying a Bitbucket Cloud and a Bitbucket Data Center repository.
 These values use example identifiers only. Replace them with your own:
 
 ```yaml
 factory:
   codeHosts:
-    - name: bitbucket
+    - name: bitbucket-cloud-7b02dee3
       kind: bitbucket_cloud
       host: bitbucket.org
       apiUrl: https://api.bitbucket.org/2.0
       credential:
         type: static_token
-        existingSecret: factory-bitbucket
+        existingSecret: curie-bitbucket-cloud-7b02dee3-token
         existingSecretKey: token
     - name: bitbucket-dc
       kind: bitbucket_dc
@@ -632,12 +886,12 @@ factory:
         existingSecret: factory-bitbucket-dc
         existingSecretKey: token
   bindings:
-    - name: example
-      tracker: jira
+    - name: jira-cloud-b6a8e8d4-<Jira site id>
+      tracker: jira-cloud-b6a8e8d4
       trackerScopeId: "<Jira site id>"
       repos:
         - alias: example-repo
-          codeHost: bitbucket
+          codeHost: bitbucket-cloud-7b02dee3
           projectId: "{00000000-0000-4000-8000-000000000001}"
           path: example-workspace/example-repo
         - alias: demo
@@ -649,14 +903,14 @@ factory:
         type: allowlist
         accounts: ["<Jira account id>"]
       reviewFeedbackAllowlist:
-        bitbucket: ["<Atlassian account_id>"]
+        bitbucket-cloud-7b02dee3: ["<Atlassian account_id>"]
         bitbucket-dc: ["<numeric user id>"]
 ```
 
 A Jira binding must name a `defaultRepo`, the alias a ticket runs against when
 nothing picks another, and a `startAuthority` of type `allowlist` (Jira
 account ids) or `group` (a Jira `groupId`): Jira cannot report repository
-write access, so the default write check is refused. The `jira` tracker entry
+write access, so the default write check is refused. The tracker entry
 under `factory.trackers` is the Jira Cloud half of the pairing, as
 [Jira Cloud](#jira-cloud) shows it. Each code host also needs its `egress` entries: the Bitbucket
 Cloud ranges from `https://ip-ranges.atlassian.com/` on port 443, or the
@@ -687,8 +941,11 @@ A cancelled run removes all four. Curie never changes your `curie-factory` label
 ## What a repository with no CI sees
 
 1. After publishing, Curie waits on the pull request's checks. With no checks
-   within 120 seconds of the push, no required check configured, and GitHub
-   reporting the PR mergeable or already merged, the run completes and the status comment says `Note: No CI checks appeared within 120 s.`
+   within 120 seconds of the push, no required check configured, and the code
+   host proving the PR mergeable or already merged, the run completes and the status comment says `Note: No CI checks appeared within 120 s.`
+   On GitHub that proof is its mergeable state, on Bitbucket Cloud it is the
+   `git_mergeability_check` of the pull request mergeability checks reporting
+   PASSED clean, and on Bitbucket Data Center it is the merge endpoint.
 2. Before the model starts, the runner runs checks declared in
    `.curie/verification.json`. With no declaration it records `not_declared`. <!-- doclint:ignore-line -->
    See [Repository toolchain in the managed sandbox](repository-toolchain-in-the-managed-sandbox.md).
@@ -702,7 +959,7 @@ own trigger label. On a release that already records factory intake, run
 quickstart with a new agent name and no App flags:
 
 ```bash
-curie factory quickstart --agent <name> --label <label> [--plugin-dir <dir>]
+curie factory quickstart --agent fast --label curie-factory-fast
 ```
 
 For example, `--agent fast --label dark-factory-fast` deploys an agent named

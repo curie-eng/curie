@@ -26,7 +26,7 @@ _LOCKFILE_COPY = "COPY uv.lock ./uv.lock"
 # Mirror apps/api/Dockerfile.dockerignore plus the trees a repo-root build
 # otherwise walks on a developer checkout.
 _REQUIRED_IGNORE_PATTERNS = (
-    ".git",
+    "**/.git",
     "**/.venv",
     "**/__pycache__",
     "**/*.pyc",
@@ -45,8 +45,8 @@ _REQUIRED_IGNORE_PATTERNS = (
     "*.md",
     "**/*.md",
     "**/.env",
-    ".worktrees",
-    ".projects",
+    "**/.worktrees",
+    "**/.projects",
 )
 
 _COPY_SOURCES = (

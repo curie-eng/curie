@@ -18,6 +18,8 @@ PLATFORM_AUTHORIZER = "publication-policy"
 DEFAULT_BRANCH_PREFIX = "curie/"
 
 _BRANCH_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}/$")
+# The last path component `publication_branch_name` writes, under any prefix.
+_PUBLICATION_BRANCH = re.compile(r"publication-[0-9a-f]{32}")
 
 
 class PublicationPolicyConflict(Exception):
@@ -66,6 +68,14 @@ def publication_branch_name(lineage_id_hex: str, *, prefix: str | None, auto: bo
 
     name_prefix = prefix if auto and prefix else DEFAULT_BRANCH_PREFIX
     return f"{name_prefix}publication-{lineage_id_hex}"
+
+
+def is_publication_branch(ref: str) -> bool:
+    """Whether ``ref`` is a lineage branch `publication_branch_name` could have
+    named: its last path component is ``publication-<32 lowercase hex>``, under
+    any prefix, so branches of every earlier release are included (#4629)."""
+
+    return _PUBLICATION_BRANCH.fullmatch(ref.rsplit("/", 1)[-1]) is not None
 
 
 def policy_still_authorizes(agent: Any, approval: Any) -> bool:

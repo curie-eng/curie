@@ -249,6 +249,40 @@ def test_resolve_rejects_every_non_principal_credential_shape(
     assert pending.json()["status"] == "pending"
 
 
+def test_resolve_refuses_a_remediation_operator_token_as_unauthenticated(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """#4228: a valid ``remediation.administer`` operator token for a listed
+    approver is not an approval principal; resolve refuses it as unauthenticated
+    and the approval stays pending, while the same subject's ``approval.resolve``
+    token still resolves it."""
+
+    approval = _explicit_approval(approvals_client, auth_headers, users=[SUBJECT])
+    url = f"/approvals/{approval['id']}/resolve"
+
+    refused = approvals_client.post(
+        url,
+        json={"decision": "approved"},
+        headers=_principal_headers(
+            _operator_token(SUBJECT, scope=approval_principal.REMEDIATION_ADMIN_SCOPE)
+        ),
+    )
+    assert refused.status_code == 401, refused.text
+    assert refused.json()["detail"] == "missing or invalid approval principal"
+    assert refused.headers.get("cache-control") == "no-store"
+    _assert_still_pending(approvals_client, auth_headers, approval["id"])
+
+    resolved = approvals_client.post(
+        url,
+        json={"decision": "approved"},
+        headers=_principal_headers(_operator_token(SUBJECT)),
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["resolved_by"] == SUBJECT
+
+
 @pytest.mark.parametrize("retired_field", ["resolved_by", "actor_channel"])
 def test_resolve_loudly_rejects_retired_identity_fields(
     approvals_client: TestClient,
@@ -703,7 +737,11 @@ def test_administrative_mints_never_accept_a_cookie_or_principal_token(
     cookie = _cookie_headers(_mint_console_session(approvals_client, auth_headers))
     principal = _principal_headers(_operator_token())
 
-    for endpoint in ("/console/login-codes", "/approvals/principals/operator"):
+    for endpoint in (
+        "/console/login-codes",
+        "/approvals/principals/operator",
+        "/approvals/principals/remediation-operator",
+    ):
         for headers in (cookie, principal):
             denied = approvals_client.post(endpoint, json={"subject": OTHER}, headers=headers)
             assert denied.status_code == 401, (endpoint, headers.keys(), denied.text)

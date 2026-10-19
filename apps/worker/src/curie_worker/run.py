@@ -785,7 +785,7 @@ def build(
                     ConsumerLivenessStore(async_redis),
                     stream=config.stream,
                     group=config.consumer_group,
-                ).is_alive,
+                ),
                 self_name=config.consumer_name,
                 locally_owned=kernel.owns_work_item,
                 absence_proof_s=config.consumer_heartbeat_ttl_ms / 1000,

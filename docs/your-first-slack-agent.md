@@ -37,6 +37,10 @@ export CURIE_CREDENTIALS=sk-ant-...
 
 ## 1. Build it on your laptop (2 min)
 
+Already have a bundle? Validate it locally with [Bring your agent](bring-your-agent.md),
+stay in its directory, and continue at [Get the Slack tokens](#2-get-the-slack-tokens).
+The scaffold below is for a new agent.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/curie-eng/curie/main/get-curie.sh | bash
 curie init my-agent && cd my-agent
@@ -64,18 +68,38 @@ Then collect two tokens:
 - **App-Level Token** with scope `connections:write` → `xapp-…`
 - **Install to Workspace**, then **Bot User OAuth Token** → `xoxb-…`
 
+In Bash, load the two tokens into the environment without putting their values
+in command arguments or shell history:
+
+```bash
+read -r -s -p "Slack app token: " SLACK_APP_TOKEN
+printf '\n'
+read -r -s -p "Slack bot token: " SLACK_BOT_TOKEN
+printf '\n'
+export SLACK_APP_TOKEN SLACK_BOT_TOKEN
+```
+
+Keep token values outside your bundle and repository. The comms command below
+reads these environment variables directly.
+
 Invite the bot to your channel, and copy the **channel ID** — right-click the
 channel → *View channel details*, it's at the bottom and looks like `C0…`.
 
 ## 3. Put it on the cluster (10 min)
 
 ```bash
-curie cluster up --namespace my-agent --release my-agent
+CURIE_CONTEXT="$(kubectl config current-context)"
+CURIE_NAMESPACE=my-agent
+CURIE_RELEASE=my-agent
 
-curie cluster comms --slack --namespace my-agent --release my-agent \
-  --app-token "$SLACK_APP_TOKEN" --bot-token "$SLACK_BOT_TOKEN"
+curie cluster up --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE"
 
-curie cluster deploy --plugin-dir . --namespace my-agent --release my-agent \
+curie cluster comms --slack --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE"
+
+curie cluster deploy --plugin-dir . --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" \
   --repo <owner>/<repo> --slack-channel C0YOURCHANNEL
 ```
 
@@ -92,7 +116,36 @@ PriorityClasses and the sandbox controller when their complete Helm ownership
 metadata names an existing release. Every applied inference is printed with
 its equivalent override.
 
-`@mention` the bot in that channel. That's the whole thing.
+`@mention` the bot in that channel. Keep the deploy receipt: its
+`bundle.sha256` in the JSON receipt identifies the artifact running in the workspace.
+
+### Verify your workspace reply
+
+Send a fresh mention with the request you already tested locally. Check the
+visible Slack reply, then inspect the run through the same release:
+
+```bash
+curie cluster observability --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" --json runs --agent-id <agent-id>
+
+curie cluster observability --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" --json run <trace-id>
+```
+
+Choose the run matching your message, agent and channel. The run command shows
+the tool names and timing; it does not expose their input and returned payloads.
+An administrator can read the matching conversation through the
+[workflow state API](interfaces/workflow-state/INTERFACE.md):
+`GET /agents/<agent-id>/state/transcript/<url-encoded-thread-key>`.
+For Slack, the thread key is `slack:<channel-id>:<parent-message-ts>`.
+Use the configured platform API authentication and inspect only your agent's
+thread. In `value[].messages`, match the `tool_use` block's `id` to the
+`tool_result` block's `tool_use_id`.
+
+For the text-stats example, confirm that the `word_count` input is
+`{"text":"one two three"}`, the matching result contains `3`, and
+`is_error` is absent or false. A tool request alone does not prove execution;
+an unrelated older trace does not prove your fresh Slack message reached the agent.
 
 ## 4. Make it ship itself
 
@@ -157,9 +210,9 @@ connectors:
 `secrets` are **names only** — the value never enters your repository:
 
 ```bash
-CURIE_CLUSTER_ID="ca:$(kubectl config view --minify --raw -o json | jq -r '.clusters[0].cluster | ((.server // "") + "\\n" + (."certificate-authority-data" // ."certificate-authority" // ""))' | sha256sum | awk '{print $1}')"
+CURIE_CLUSTER_ID="ca:$(kubectl --context "$CURIE_CONTEXT" config view --minify --raw -o json | jq -r '.clusters[0].cluster | ((.server // "") + "\\n" + (."certificate-authority-data" // ."certificate-authority" // ""))' | sha256sum | awk '{print $1}')"
 curie secrets set GRAFANA_SERVICE_ACCOUNT_TOKEN --from-env GRAFANA_SERVICE_ACCOUNT_TOKEN \
-  --cluster-identity "$CURIE_CLUSTER_ID" --release curie --namespace curie
+  --cluster-identity "$CURIE_CLUSTER_ID" --release "$CURIE_RELEASE" --namespace "$CURIE_NAMESPACE"
 ```
 
 At cluster deploy time, Curie delivers both connector `secrets` and

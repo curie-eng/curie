@@ -32,14 +32,33 @@ The state file must be on persistent storage shared by repeated invocations.
 A separate `.lock` file holds the process lock while atomic state replacement
 keeps the previous complete state readable through an interrupted write. An
 existing empty or corrupt state file refuses all probes. Before enqueue, the
-checker fsyncs a `pending` record with the exact agent ID and scoped thread key.
-It removes that record only after the matching reset is confirmed. A crash or
-unconfirmed reset leaves it in place, and later invocations refuse to enqueue.
-An operator must verify that exact route has been released before clearing
-`pending` and changing `cleanup_blocked` to `false`. Never treat an absent route
-as confirmation.
+checker fsyncs a record with the exact agent ID and scoped thread key under the
+route's label in `pending_routes`. It removes that record only after the
+matching reset confirms release. A crash or unconfirmed reset leaves it in
+place, and later cycles skip that route only; other routes keep turning. Each
+later cycle re-requests the reset for at most `TURN_CANARY_MAX_TARGETS` pending
+records, least recently checked first, and clears a record once the worker
+drains that reset: either it released the route, or at least one cycle after
+the probe it found no route under the exact owned key. The route is then
+turned again without operator action. Right after the probe, an absent route
+is never treated as confirmation, because the queued turn may not have claimed
+it yet.
+
+`cleanup_blocked: true` still holds every route. The checker no longer sets it.
+A state file written by an earlier version may carry a single `pending` record
+with `cleanup_blocked: true`; that record names no route, so it holds every
+route until the same re-check clears it, and clearing it also sets
+`cleanup_blocked` to `false`. A `cleanup_blocked: true` without any pending
+record is an operator hold, cleared only by an operator.
 The file also retains the capacity skip counter and last success timestamps.
 The script does not resolve approval cards.
+
+Each probe's conversation ID is `eval:turn-canary-` followed by a UUIDv4, so a
+log filter on that prefix selects canary threads and nothing else.
+`TURN_CANARY_CONVERSATION_PREFIX` replaces the prefix; it must match
+`eval:[A-Za-z0-9._-]{0,48}` because the worker isolates conversations by the
+`eval:` prefix. Event IDs start with `EvCANARY-` and the author is
+`turn-canary`.
 
 `TURN_CANARY_CYCLE_INTERVAL`, `TURN_CANARY_TURN_DEADLINE`,
 `TURN_CANARY_CLEANUP_DEADLINE`, and `TURN_CANARY_POLL_PERIOD` are seconds,
@@ -49,6 +68,33 @@ configured interval, or use the exporter mode below.
 `TURN_CANARY_DB_SCHEMA` defaults to `curie`. `TURN_CANARY_METRICS_PATH` writes
 Prometheus exposition after each cycle. Logs contain only phase, outcome, HTTP
 status, and exception type.
+
+The exposition carries these series, shown with the default prefix:
+
+| Series | Meaning |
+|---|---|
+| `turn_canary_cycle_success` | 1 when inventory and admission succeeded, no all-route hold remains, at least one selected route was turned or skipped for capacity, no turned route failed, and no cleanup in the cycle was left unconfirmed. Capacity skips and routes held by an earlier pending cleanup are not failures. |
+| `turn_canary_last_cycle_timestamp_seconds` | End of the last cycle. |
+| `turn_canary_last_success_timestamp_seconds` | Last successful cycle. |
+| `turn_canary_cleanup_degraded` | 1 while any route has a pending cleanup or an all-route hold remains. |
+| `turn_canary_capacity_skips_total` | Persisted count of capacity skips. |
+| `turn_canary_target_success{route}` | Last turn result of the route. Published only for a route whose turn was attempted; a capacity-skipped route publishes no sample in that cycle, and the exporter keeps its previous value. |
+| `turn_canary_target_last_run_timestamp_seconds{route}` | Last cycle that selected the route for a turn or a capacity check. |
+| `turn_canary_target_last_success_timestamp_seconds{route}` | Last delivered turn of the route. |
+| `turn_canary_target_capacity_skipped{route}` | Added. 1 when the route was skipped for capacity in the cycle, 0 when it was turned. |
+| `turn_canary_target_cleanup_degraded{route}` | Added. 1 while the route has a pending cleanup and is not turned, 0 once its cleanup is confirmed or cleared. |
+
+Before this change, a capacity skip published `target_success` 0 and
+`cycle_success` 0, and one unconfirmed cleanup held every route until an
+operator edited the state file.
+
+For the optional ResourceQuota check below, quota `hard` and `used` values and
+`TURN_CANARY_QUOTA_MIN_FREE` are Kubernetes quantities: plain integers and
+decimals, `m` and the other decimal suffixes (`k` or `K`, `M`, `G`, `T`, `P`,
+`E`, `n`, `u`), and the binary suffixes `Ki`, `Mi`, `Gi`, `Ti`, `Pi`, `Ei`. A
+used `1500m` against a hard `16` CPU leaves 14.5 free, and `512Mi` used against
+`2Gi` hard parses as bytes. Set `TURN_CANARY_QUOTA_MIN_FREE` in the resource's
+own unit, for example `500m` for `limits.cpu` or `1Gi` for `limits.memory`.
 
 ## Standing monitor options
 
@@ -88,9 +134,39 @@ default prefix: `turn_canary_binding_check_success{route,outcome}`,
 (exporter only),
 and `turn_canary_rotation`.
 
+- `TURN_CANARY_DECLARED_BINDINGS` takes a JSON list of the route triples the
+  installation is meant to have, for example
+  `[["slack","C-EXAMPLE-1","default"]]`. Each cycle reports declared triples
+  missing from the live bindings and live triples of a declared kind that are
+  not declared (TURN-CANARY-11).
+- `TURN_CANARY_BINDING_ADAPTER_HEALTH=/healthz` probes each binding's stored
+  endpoint origin at that path, once per distinct URL per cycle
+  (TURN-CANARY-12).
+- `TURN_CANARY_COVERAGE=1` reports agents with an active deployment that the
+  monitor cannot observe through a turn candidate or a binding health URL
+  (TURN-CANARY-13).
+- `TURN_CANARY_EXCLUDE_BINDING_KINDS` takes a comma-separated list of binding
+  kinds, for example `qualification`, that every observation ignores: such a
+  binding is never turned, checked, probed or compared, and an agent that has
+  only such bindings is not reported as uncovered (TURN-CANARY-15).
+- `TURN_CANARY_ROUTE_LABELS=split` replaces the JSON `route` label with
+  `agent`, `kind`, `address` and `adapter` labels (TURN-CANARY-14).
+
+These add `turn_canary_binding_drift{route,side}`,
+`turn_canary_binding_drift_total`, `turn_canary_binding_adapter_up{route,outcome}`,
+`turn_canary_agent_uncovered{agent}` and `turn_canary_uncovered_agents`.
+
 For an optional ResourceQuota observation, set `TURN_CANARY_QUOTA_URL` to the
-explicit Kubernetes quota list endpoint, `TURN_CANARY_QUOTA_TOKEN` to its bearer
-token, and optionally `TURN_CANARY_QUOTA_RESOURCE` and
-`TURN_CANARY_QUOTA_MIN_FREE`. The default resource is `count/pods` and the
-minimum free count is 1. An unreadable quota skips enqueue. This check is a
+explicit Kubernetes quota list endpoint, its bearer token through exactly one of
+`TURN_CANARY_QUOTA_TOKEN` (a static token) or `TURN_CANARY_QUOTA_TOKEN_FILE` (a
+path to a file holding the token), and optionally `TURN_CANARY_QUOTA_RESOURCE`
+and `TURN_CANARY_QUOTA_MIN_FREE`. Setting both token options refuses to start.
+The checker reads the token file again for every quota request and keeps
+nothing past that request, so a token that the kubelet rotates is picked up on
+the next request. Inside a pod, the usual value is the projected service
+account token, `/var/run/secrets/kubernetes.io/serviceaccount/token`; it is
+not a default and must be set explicitly. A missing, unreadable, or blank token
+file makes the quota unreadable, and the token is never logged. The default resource is `count/pods` and the
+minimum free amount is 1. An unreadable quota skips enqueue, reported as a
+capacity skip rather than a turn failure. This check is a
 snapshot, not a reservation or a cluster wide sandbox limit.

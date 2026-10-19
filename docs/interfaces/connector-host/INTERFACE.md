@@ -188,7 +188,13 @@ verifies, that has not expired and that names a listed agent
 that passes the grant check below. It strips the header and forwards the
 request to the server over loopback with its `Host` unchanged and its body as
 sent
-(`apps/worker/src/curie_connector_proxy/server.py::make_app`). On that forward
+(`apps/worker/src/curie_connector_proxy/server.py::make_app`). A connector that
+declares `proxy_upstream_host` (ADR 0229) gets that loopback host and the
+server's port as `Host` instead, on admitted requests only
+(`apps/worker/src/curie_connector_proxy/server.py::ProxyConfig`). It is for a
+server that refuses a non-loopback `Host` on a loopback connection. A refused
+request never reaches the server, and a `-direct` caller keeps its own `Host`.
+On that forward
 it sets `X-Curie-Agent` from the verified token. When the token also carries
 `run` and `work_item` (ADR 0178), it sets `X-Curie-Run` and
 `X-Curie-Work-Item` from those claims. Inbound copies of the three headers
@@ -237,8 +243,9 @@ One production host plus a fake:
 
 - **Kubernetes:** `KubernetesConnectorClient`
   (`apps/worker/src/curie_worker/connector_k8s.py::KubernetesConnectorClient`),
-  in-cluster or kubeconfig auth. Everything Kubernetes-shaped in the reconciler
-  stops in that module. Writes are **server-side applies** with `force=True`
+  in-cluster or kubeconfig auth. Every Kubernetes API call made through the
+  reconciler's `ConnectorClient` stops in that module; Deployment-shaped
+  observations still reach the probe logic described below. Writes are **server-side applies** with `force=True`
   under a stable field manager, `FIELD_MANAGER`
   (`apps/worker/src/curie_worker/connector_k8s.py::FIELD_MANAGER`): not
   create-then-replace, because a rendered Service declares no `clusterIP` and
@@ -264,6 +271,18 @@ the `ManifestSource` implementation that fetches rendered objects from the API.
 ## Known leakage
 
 The port is a real `Protocol`, and the values crossing it are Kubernetes:
+
+The capability probe consumes Deployment details beyond the identity and owner
+fields used by reconciliation. `_ObservingClient`
+(`apps/worker/src/curie_worker/connector_loop.py::_ObservingClient`) retains the
+Deployments returned by `list_owned`; `ProbeTrigger`
+(`apps/worker/src/curie_worker/connector_probe.py::ProbeTrigger`) reads the caller
+proxy container's connector-name env entry and calls `action_digest.observe`
+(`apps/worker/src/curie_worker/action_digest.py::observe`). That helper requires
+Deployment generation, observed generation, desired, updated, available and
+total replica counts, plus the server container's pinned image. These reads
+make no additional Kubernetes API call, but a second host must supply that
+Deployment shape for capability probes to become eligible.
 
 - **The exchanged type is raw cluster wire JSON.** Every verb trades
   `dict[str, Any]` holding `kind`, `apiVersion` and `metadata`, and reads come
@@ -316,8 +335,27 @@ The port is a real `Protocol`, and the values crossing it are Kubernetes:
   renderer (`packages/plugin-format/src/plugin_format/connector_render.py::_derived_headers`)
   and the CLI (`cli/src/connector_build.rs`) both accept an explicit
   `bearer_secret` or one plain-string secret and exclude an implicit `SecretRef`.
-  Unlike `OWNER_LABEL`, the four cases are frozen in
-  `tests/vectors/connector-derived-bearer.json`.
+  Unlike `OWNER_LABEL`, the cases are frozen in
+  `tests/vectors/connector-derived-bearer.json`, which the API's independence check
+  (`apps/api/src/curie_api/remediation_verifier.py::header_secret_names`) reads as a third copy of
+  the same rule. A hosted connector may also declare `no_client_auth: <reason>` beside
+  `bearer_secret`, stating why its server authenticates no client. Every copy then derives no
+  `Authorization` header, including for the single plain-secret shape, and the CLI binds no secret
+  name into the sandbox, while every declared secret keeps its pod-side `secretKeyRef` delivery
+  and the rendered Deployment, Service and NetworkPolicy stay byte-identical because the reason is
+  never rendered. The reason must be non-empty, it cannot sit beside `bearer_secret`, and a `url`
+  connector cannot declare it. For example:
+
+  ```yaml
+  connectors:
+    docs:
+      image: ghcr.io/example/docs-mcp:1
+      port: 8000
+      secrets: [UPSTREAM_CLIENT_ID, UPSTREAM_CLIENT_SECRET]
+      no_client_auth: >-
+        In-cluster MCP server reached over the pod network; it authenticates no
+        client and the boundary is its ingress NetworkPolicy.
+  ```
 - **The Docker dev-tier host enforces no caller.** Its connector containers share
   one network with no policy and no caller proxy, so any container on it can
   reach a connector's port, the trade ADR-0009 makes for the local substrate.

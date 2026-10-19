@@ -164,7 +164,7 @@ def is_tool_result_message(message: ConversationMessage) -> bool:
     )
 
 
-def _validate_group_provenance(messages: Sequence[ConversationMessage]) -> None:
+def validate_group_provenance(messages: Sequence[ConversationMessage]) -> None:
     """Validate causal boundaries before either replay or group compaction."""
     seen_groups: set[str] = set()
     current_group: str | None = None
@@ -192,7 +192,7 @@ def validate_assistant_groups(messages: Sequence[ConversationMessage]) -> None:
     seeing it (RUNNER-HISTORY-GROUP-4).
     """
 
-    _validate_group_provenance(messages)
+    validate_group_provenance(messages)
     seen_calls: set[str] = set()
     pending: dict[str, str | None] = {}
     for message in messages:
@@ -809,7 +809,7 @@ def bound_turn_record(record: TurnRecord, *, max_value_bytes: int) -> TurnRecord
     if max_value_bytes <= 0:
         raise HistoryError("history value byte cap must be positive")
 
-    _validate_group_provenance(record.messages)
+    validate_group_provenance(record.messages)
     raw = record.to_dict()
     if _state_value_size(raw) <= max_value_bytes:
         return record

@@ -1556,7 +1556,10 @@ def test_relabel_during_a_fix_turn_waits_for_the_old_request_to_settle(
     assert again.json()["status"] == "factory_readmit_pending"
 
     _reconcile()
-    _reconcile_later(130)
+    # Past the CI poll, inside the cancel-settle window. The relabel stop now
+    # releases the parked fix hold (#4627), so a later reconcile past that
+    # window would take the forced-settle fallback instead of waiting here.
+    _reconcile_later(60)
 
     rows = _all(number)
     assert len(rows) == 1, rows

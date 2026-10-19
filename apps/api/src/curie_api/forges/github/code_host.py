@@ -48,6 +48,7 @@ from curie_api.forges.types import (
     CredentialExpiry,
     CredentialHeader,
     CredentialScope,
+    FactoryPublication,
     FeedbackKind,
     FeedbackPage,
     NormalizedCheck,
@@ -62,9 +63,11 @@ from curie_api.forges.types import (
     RerunRecord,
     ReviewFeedback,
     check_run_key,
+    publication_body,
     status_key,
 )
 from curie_api.github_app import GitHubAppError
+from curie_api.publication_policy import is_publication_branch
 from curie_api.repo_full_name import repo_url_path
 from curie_api.repository_auth import resolve_repository_credential
 
@@ -79,6 +82,9 @@ _TRANSIENT_MINT_REASONS = frozenset(
 _SHA = re.compile(r"[0-9a-f]{40,64}")
 _PER_PAGE = 100
 _MAX_PAGES = 50
+# The publication listing reads every pull request the repository has ever had;
+# a repository with more than this many pages is refused rather than half read.
+_MAX_PUBLICATION_PAGES = 1000
 _EXCERPT_MAX = 6000
 _FEEDBACK_EVENTS = {
     FeedbackKind.COMMENT: "issues/comments",
@@ -627,6 +633,134 @@ class GitHubCodeHost:
             conflicted=conflicted(payload),
             updated_at=_timestamp(payload.get("updated_at")),
         )
+
+    async def _own_login(self, repository: RepositoryRef) -> tuple[str, str]:
+        """The login and account type this adapter's credential writes as.
+
+        An App writes as its bot user, ``<slug>[bot]`` of type ``Bot``, with
+        the slug read by `GitHubCredentials.app_slug` under the App JWT. A
+        token writes as its own user (``GET /user``,
+        https://docs.github.com/en/rest/users/users#get-the-authenticated-user).
+        Neither readable is `Unavailable`.
+        """
+
+        credentials = self._credentials
+        if credentials is not None and getattr(credentials, "app_configured", False):
+            try:
+                slug = await run_in_threadpool(credentials.app_slug)
+            except GitHubAppError:
+                raise Unavailable("own_identity_unreadable") from None
+            return f"{slug}[bot]", "Bot"
+        auth = getattr(credentials, "auth", None)
+        if not getattr(auth, "token", ""):
+            raise Unavailable("own_identity_unreadable")
+        try:
+            user = await self._json("GET", "/user", token=await self._token(repository.path))
+        except ForgeError:
+            raise Unavailable("own_identity_unreadable") from None
+        login = user.get("login") if isinstance(user, dict) else None
+        kind = user.get("type", "User") if isinstance(user, dict) else None
+        if not isinstance(login, str) or not login or not isinstance(kind, str) or not kind:
+            raise Unavailable("own_identity_unreadable")
+        return login, kind
+
+    async def _every_pull(self, repository: RepositoryRef, token: str) -> list[Any]:
+        """Every pull request of ``repository`` in any state, following the
+        ``Link`` header's ``next`` to the end. A failed page, a ``next`` off
+        this API, or a listing longer than `_MAX_PUBLICATION_PAGES` raises
+        `Unavailable`.
+        https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api
+        """
+
+        items: list[Any] = []
+        path: str = f"{self._repo(repository.path)}/pulls"
+        params: Mapping[str, Any] | None = {"state": "all", "per_page": self._page_size}
+        for _ in range(_MAX_PUBLICATION_PAGES):
+            response = await self._send("GET", path, token=token, params=params)
+            try:
+                payload = response.json()
+            except ValueError:
+                raise Unavailable("malformed_response") from None
+            if not isinstance(payload, list):
+                raise Unavailable("malformed_response")
+            items.extend(payload)
+            following = response.links.get("next", {}).get("url")
+            if not following:
+                return items
+            if not following.startswith(f"{self._api}/"):
+                # Never send the token to another origin.
+                raise Unavailable("pagination")
+            # The ``next`` link carries the whole query.
+            path, params = following[len(self._api) :], None
+        raise Unavailable("listing_incomplete")
+
+    async def list_factory_publications(
+        self, repository: RepositoryRef
+    ) -> tuple[FactoryPublication, ...]:
+        """Every pull request this credential's identity opened from a
+        publication branch of ``repository`` itself, in any state (#4629).
+
+        ``GET /repos/{owner}/{repo}/pulls?state=all``
+        (https://docs.github.com/en/rest/pulls/pulls#list-pull-requests) read
+        to its last page. A pull request counts when its ``user`` is the own
+        identity (`_own_login`, login compared case-insensitively, type
+        equal) and both its head and base repository are ``repository``. Any
+        item whose author, branch, state or body cannot be read fails the
+        listing; a null body is an empty one (`types.publication_body`), and
+        the URL must be the repository's canonical pull URL.
+        """
+
+        own_login, own_type = await self._own_login(repository)
+        token = await self._token(repository.path)
+        found: list[FactoryPublication] = []
+        for item in await self._every_pull(repository, token):
+            if not isinstance(item, dict):
+                raise Unavailable("malformed_response")
+            user, head, base = item.get("user"), item.get("head"), item.get("base")
+            if (
+                not isinstance(user, dict)
+                or not isinstance(head, dict)
+                or not isinstance(base, dict)
+            ):
+                raise Unavailable("malformed_response")
+            login, kind, head_ref = user.get("login"), user.get("type"), head.get("ref")
+            if (
+                not isinstance(login, str)
+                or not isinstance(kind, str)
+                or not isinstance(head_ref, str)
+                or not head_ref
+                or item.get("state") not in {"open", "closed"}
+            ):
+                raise Unavailable("malformed_response")
+            if (
+                login.casefold() != own_login.casefold()
+                or kind != own_type
+                or not is_publication_branch(head_ref)
+            ):
+                continue
+            sides = [side.get("repo") for side in (head, base)]
+            if not all(
+                isinstance(repo, dict)
+                and isinstance(repo.get("full_name"), str)
+                and repo["full_name"].casefold() == repository.path.casefold()
+                for repo in sides
+            ):
+                # A fork's branch (or a deleted fork, ``repo: null``) is never ours.
+                continue
+            pull = self._pull_request(repository, item, require_sides=True)
+            found.append(
+                FactoryPublication(
+                    ref=pull.ref,
+                    url=pull.url,
+                    head_ref=pull.head_ref,
+                    state=pull.state,
+                    body=publication_body(item, "body"),
+                    closed_at=_timestamp(item.get("merged_at"))
+                    or _timestamp(item.get("closed_at")),
+                    owner_verified=True,
+                )
+            )
+        return tuple(found)
 
     async def find_pull_request(
         self, repository: RepositoryRef, *, head_ref: str

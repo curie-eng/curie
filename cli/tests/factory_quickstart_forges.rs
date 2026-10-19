@@ -6,7 +6,7 @@
 //! comparing. Fixture updates require review of the full current plan.
 
 use curie::factory_quickstart::{
-    describe, quickstart_plan, PlanInput, DEFAULT_AGENT, DEFAULT_BUDGET_USD,
+    describe, quickstart_plan, PlanInput, ReleaseRead, DEFAULT_AGENT, DEFAULT_BUDGET_USD,
     DEFAULT_DEADLINE_SECONDS, DEFAULT_KIND_NAME, DEFAULT_MODEL,
 };
 use std::path::{Path, PathBuf};
@@ -40,7 +40,7 @@ fn base() -> PlanInput {
         release_has_real_model: false,
         chart_explicit: false,
         interactive: true,
-        release_at_target: false,
+        release_read: ReleaseRead::NotAtTarget,
         agent: DEFAULT_AGENT.into(),
         label: None,
         plugin_dir: None,
@@ -210,6 +210,12 @@ fn quickstart(extra: &[&str]) -> Run {
     }
 }
 
+/// The Jira URL and token flags of the Bitbucket pairing.
+const TRACKER_FLAGS: [(&str, &str); 2] = [
+    ("--tracker-url", "https://example.atlassian.net"),
+    ("--tracker-token-file", "/tmp/jira-token"),
+];
+
 const SHARED_FLAGS: [(&str, &str); 4] = [
     ("--forge-url", "https://forge.example.com"),
     ("--token-file", "/tmp/forge-token"),
@@ -218,14 +224,18 @@ const SHARED_FLAGS: [(&str, &str); 4] = [
 ];
 
 #[test]
-fn factory_quickstart_reserved_code_host_kind_is_not_installed() {
-    // #4399 installs gitlab; its refusals live in factory_quickstart_gitlab.rs.
+fn factory_quickstart_bitbucket_without_jira_is_a_pairing_refusal() {
+    // Bitbucket has no tracker of its own; it pairs only with Jira Cloud.
     for kind in ["bitbucket-cloud", "bitbucket-dc"] {
         let run = quickstart(&["--code-host", kind]);
         let text = run.all();
         assert_ne!(run.code, 0, "{kind}: {text}");
-        assert!(text.contains("not installed"), "{kind}: {text}");
+        assert!(
+            text.contains("pairs only with --tracker jira-cloud"),
+            "{kind}: {text}"
+        );
         assert!(text.contains(kind), "{kind}: {text}");
+        assert!(!text.contains("not installed"), "{kind}: {text}");
     }
 }
 
@@ -244,8 +254,8 @@ fn factory_quickstart_gitlab_with_a_github_partner_is_a_pairing_refusal() {
 }
 
 #[test]
-fn factory_quickstart_shared_flags_reach_the_reserved_module_not_the_parser() {
-    for (flag, value) in SHARED_FLAGS {
+fn factory_quickstart_shared_flags_reach_the_bitbucket_module_not_the_parser() {
+    for (flag, value) in SHARED_FLAGS.iter().chain(&TRACKER_FLAGS) {
         let run = quickstart(&["--code-host", "bitbucket-dc", flag, value]);
         let text = run.all();
         assert!(
@@ -253,7 +263,38 @@ fn factory_quickstart_shared_flags_reach_the_reserved_module_not_the_parser() {
             "{flag} must parse for a non-github kind: {text}"
         );
         assert_ne!(run.code, 0, "{flag}: {text}");
-        assert!(text.contains("not installed"), "{flag}: {text}");
+        assert!(
+            text.contains("pairs only with --tracker jira-cloud"),
+            "{flag}: {text}"
+        );
+    }
+}
+
+#[test]
+fn factory_quickstart_tracker_flags_apply_only_beside_bitbucket() {
+    for (flag, value) in TRACKER_FLAGS {
+        for extra in [
+            &[][..],
+            &["--tracker", "jira-cloud"][..],
+            &[
+                "--code-host",
+                "gitlab",
+                "--tracker",
+                "gitlab",
+                "--token-file",
+                "/tmp/gitlab-token",
+            ][..],
+        ] {
+            let mut args = extra.to_vec();
+            args.extend([flag, value]);
+            let run = quickstart(&args);
+            let text = run.all();
+            assert_ne!(run.code, 0, "{args:?}: {text}");
+            assert!(
+                text.contains(flag),
+                "{args:?}: refusal names {flag}: {text}"
+            );
+        }
     }
 }
 

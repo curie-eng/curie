@@ -32,14 +32,14 @@ pod; if `cluster message` can't auto-detect a pod-reachable host, pass
 
 **On Apple Silicon (arm64)**, two caveats:
 
-- The AVX preflight is x86-only. `preflights.avxCheck` greps the node's
-  `/proc/cpuinfo` for the `avx` flag, which no arm64 CPU reports, so the
-  check fails on every arm64 node regardless of tool. Disable it with
-  `curie cluster up --set preflights.avxCheck.enabled=false`. The chart
-  README's other remedy for a failing AVX check -- pinning an SSE4.2-safe
-  ClickHouse tag -- is no better here: those tags predate the current
-  Langfuse migration set and cannot apply it (see
-  `charts/curie/README.md`).
+- The current chart keeps the AVX preflight enabled and detects native ARM64,
+  which does not require x86 AVX. It still checks AVX on x86 and rejects
+  unsupported architectures. Older released charts check only the x86 flag
+  and can reject a valid ARM64 node. For that specific failure, use the
+  [factory ARM recovery](guides/dark-factory-quickstart.md#apple-silicon-recovery-for-older-charts)
+  with the same trial kubeconfig and explicit context. Do not disable the check
+  on an x86 node or downgrade ClickHouse independently of Langfuse: older
+  SSE4.2-safe tags cannot apply the current migration set.
 - Prefer **kind** over **minikube** when the full stack matters. On
   minikube's docker driver, ClickHouse has been observed crash-looping
   (`std::terminate` in `MergeTreeData::loadOutdatedDataParts`, signal 5)
@@ -1227,13 +1227,269 @@ Once wired, a push to the agent's dev branch builds and deploys under its
 dev bot identity; a push or merge to its prod branch promotes that same
 built artifact without rebuilding.
 
+### Automatic migration of a legacy GitHub factory
+
+Use a CLI containing the fix for
+[#4628](https://github.com/curie-eng/curie/issues/4628) to upgrade a v0.12.5
+GitHub factory through the normal `curie cluster upgrade --to <target-version>`
+flow. It translates retained `api.githubFactory*` settings into `factory.*`
+before validating the candidate and removes the legacy keys from the migrated
+values. The operation stays within the upgrade lifecycle, including drain,
+checkpoint, convergence, canary and known-good recording. Do not run
+`curie cluster factory` as an intermediate chart upgrade.
+
+The migration preserves effective enablement, intake, polling interval, label,
+mention, card URL, CI wait, repository routing, bases and CI policies. Existing
+credential references, repository allowlist, agent surfaces and unrelated
+retained settings are preserved. Identity migration requires explicit
+`owner/repository` entries in `api.githubRepoAllowlist` and a retained App
+Secret reference through `api.githubAppExistingSecret` and
+`api.githubAppExistingSecretKey`. An `owner/*` allowlist or an inline-only
+`api.githubAppPrivateKey` refuses.
+
+The CLI machine must reach the retained `api.githubApiUrl` for identity
+resolution. Live `curie cluster up`, `curie apply`, `curie diff` and
+`curie cluster upgrade`, including upgrade `--dry-run`, may mint external
+GitHub App installation tokens; issuance can appear in GitHub's audit log.
+`curie diff` and upgrade `--dry-run` leave installed product configuration
+unchanged. The local previews `curie cluster up --dry-run` and
+`curie apply --dry-run` refuse legacy settings that require live repository
+identity resolution.
+
+For a private CA, pass an upgrade `--values-file` overlay setting
+`codeHostTrust.caBundle.configMapRef.name` and `.key` to an existing ConfigMap
+in the installation namespace containing the PEM CA certificate. The CLI and
+candidate workloads use this trust reference. The same origin and trust must
+be available to the other live migration commands.
+
+For GitHub Enterprise Server, provide explicit CIDRs and TCP ports in the
+matching `factory.codeHosts[].egress` and `factory.trackers[].egress` entries.
+Retained `worker.publication.githubHttpsCidrs` supplies only the code-host
+route. A missing route can be inferred from an unambiguous retained
+`agentSandbox.connectorEgress` list only when its TCP ports match the API port
+and either its grants equal the publication route or every CIDR contains the
+origin's literal IP without excluding it. Otherwise supply explicit code-host
+and tracker egress. A port match alone is insufficient; do not substitute the
+public github.com CIDR set.
+
+On GHES, if no factory agent is already enrolled, migration may enroll an
+otherwise unlisted agent whose retained connector grant covers the complete
+egress union of the configured forges. This also adds the agent to the chart's
+per-agent SandboxTemplate and warm-pool set. The github.com migration path
+does not infer agent enrollment.
+
+Preview the upgrade with `--dry-run --json`. The dry run changes no installed
+configuration. Migration plan lines and migration refusals name settings
+without printing their values. Conflicting typed and legacy settings,
+ambiguous bindings and malformed legacy input refuse before any Helm mutation,
+leaving the old release serving. Normal
+[schema compatibility and forward-only requirements](#curie-cluster-upgrade)
+still apply.
+
+The released v0.13.0 CLI does not contain this migration fix. Its limitation
+and historical manual procedure are documented below; automatic migration
+requires a CLI containing the fix.
+
+### Manual factory migration from v0.12.5 to v0.13.0
+
+This historical workaround applies to the released v0.13.0 CLI. That CLI
+cannot migrate the retained factory automatically, and its suggested
+`cluster factory` rewrite also fails on these legacy releases. Prefer the
+[automatic migration](#automatic-migration-of-a-legacy-github-factory) with a
+CLI containing the fix.
+
+The following procedure was executed with the released v0.12.5 and v0.13.0
+CLIs and charts, a GitHub App, one repository, polling intake, an explicit
+label and mention, and non-default polling interval, card URL, CI wait, branch
+and CI policies. The upgrade completed convergence and its canary, recorded
+v0.13.0 as known-good, and served healthy API endpoints with the typed factory
+configuration loaded. No separate Helm upgrade is needed.
+
+1. Keep the existing App Secret in the installation namespace. Use the
+   v0.13.0 CLI for the upgrade below. Set `CONTEXT`, `NAMESPACE` and `RELEASE`
+   to the existing installation. Save its values privately for reference:
+
+   ```bash
+   umask 077
+   helm get values "$RELEASE" --kube-context "$CONTEXT" \
+     --namespace "$NAMESPACE" --output yaml > installed-values.yaml
+   ```
+
+   Do not publish this file or paste its contents into a terminal transcript.
+   Retain the existing `api.githubAppId`, `api.githubAppExistingSecret`,
+   `api.githubAppExistingSecretKey`, `api.githubRepoAllowlist`, webhook secret,
+   agent surfaces and unrelated configuration. `cluster upgrade` retains these
+   automatically; the migration overlay below only changes factory settings.
+   Read the existing App ID and Secret reference from the saved file. Obtain
+   each repository's numeric ID with `gh api repos/acme-corp/acme-bot --jq .id`
+   using an identity that can read that repository.
+
+2. Create one `factory-migration.yaml` overlay. The example uses placeholder
+   identity and repository values. JSON is valid YAML. Replace the placeholders
+   with the installed values,
+   preserving the label and mention exactly, including a mention without `@`.
+   Both credential entries reference the same existing Secret; do not put its
+   private key in the overlay. Use the same repository ID for `trackerScopeId`
+   and `projectId`. This example covers one repository.
+
+   ```json
+   {
+     "api": {
+       "githubFactoryIngressEnabled": null,
+       "githubFactoryIntake": null,
+       "githubFactoryPollIntervalSeconds": null,
+       "githubFactoryLabel": null,
+       "githubFactoryMention": null,
+       "githubFactoryCardBaseUrl": null,
+       "githubFactoryCiWaitSeconds": null,
+       "githubFactoryPythonCi": null,
+       "githubFactoryBases": null,
+       "githubFactoryMetadataCi": null
+     },
+     "factory": {
+       "enabled": true,
+       "intake": "poll",
+       "cardBaseUrl": "",
+       "ciWaitSeconds": 1200,
+       "codeHosts": [
+         {
+           "name": "github",
+           "kind": "github",
+           "host": "github.com",
+           "apiUrl": "https://api.github.com",
+           "credential": {
+             "type": "github_app",
+             "appId": "<APP_ID>",
+             "existingSecret": "curie-github-app",
+             "existingSecretKey": "privateKey"
+           }
+         }
+       ],
+       "trackers": [
+         {
+           "name": "github",
+           "kind": "github",
+           "host": "github.com",
+           "apiUrl": "https://api.github.com",
+           "credential": {
+             "type": "github_app",
+             "appId": "<APP_ID>",
+             "existingSecret": "curie-github-app",
+             "existingSecretKey": "privateKey"
+           },
+           "label": "<EXISTING_LABEL>",
+           "mention": "<EXISTING_APP_SLUG>",
+           "pollIntervalSeconds": 45
+         }
+       ],
+       "bindings": [
+         {
+           "name": "repo",
+           "tracker": "github",
+           "trackerScopeId": "<REPOSITORY_ID>",
+           "defaultRepo": "repo",
+           "repos": [
+             {
+               "alias": "repo",
+               "codeHost": "github",
+               "projectId": "<REPOSITORY_ID>",
+               "path": "acme-corp/acme-bot"
+             }
+           ]
+         }
+       ]
+     }
+   }
+   ```
+
+   Set every old factory key to `null`, including
+   `api.githubFactoryIngressEnabled`. Merely omitting the keys from this
+   overlay leaves the installed values in place and the upgrade still refuses.
+   Copy the installed enablement, intake, card URL and CI wait into
+   `factory.enabled`, `factory.intake`, `factory.cardBaseUrl` and
+   `factory.ciWaitSeconds`. Copy the old polling interval, label and mention
+   into the GitHub tracker. The defaults above are examples, not replacement
+   policy. For non-default repository policies, add the following fields to
+   that binding's `repos` entry in the same overlay:
+
+   | Old per-repository setting | New repository field |
+   |---|---|
+   | `api.githubFactoryBases[repo].bases` | `bases` |
+   | `api.githubFactoryBases[repo].default_base` | `defaultBase` |
+   | `api.githubFactoryPythonCi[repo].check` | `ci.required.key` |
+   | `api.githubFactoryPythonCi[repo].paths` | `ci.required.paths` |
+   | `api.githubFactoryPythonCi[repo].pendingCheckPrefix` | `ci.required.pendingKeyPrefix` |
+   | `api.githubFactoryMetadataCi[repo].checks` | `ci.metadataRerunKeys`, keeping each check name |
+   | `api.githubFactoryMetadataCi[repo].statuses` | The same `ci.metadataRerunKeys` list, with `status:` prepended to each context |
+
+3. Back up the database before accepting a forward-only schema migration.
+   The executed upgrade first refused a pending contract migration without
+   `--forward-only`; adding the flag allowed it to proceed. This accepts the
+   loss of the patch rollback window described in
+   [cluster upgrade](#curie-cluster-upgrade). Run the v0.13.0 CLI with the one
+   overlay through the normal upgrade lifecycle:
+
+   ```bash
+   curie cluster upgrade --context "$CONTEXT" \
+     --namespace "$NAMESPACE" --release "$RELEASE" \
+     --to 0.13.0 --values-file factory-migration.yaml --forward-only --yes
+   ```
+
+   Require a successful exit, convergence and a passed canary, with v0.13.0
+   recorded as known-good. Do not use the v0.13.0 `cluster factory` command as
+   an intermediate chart upgrade.
+
+4. Check the installed factory settings without displaying values or Secrets:
+
+   ```bash
+   helm get values "$RELEASE" --kube-context "$CONTEXT" \
+     --namespace "$NAMESPACE" --output json | python3 -c '
+   import json, sys
+   values = json.load(sys.stdin)
+   assert not any(v is not None for k, v in values.get("api", {}).items()
+                  if k.startswith("githubFactory"))
+   factory = values["factory"]
+   assert factory["enabled"] and factory["codeHosts"] and factory["bindings"]
+   assert all(t["label"] and t["mention"] for t in factory["trackers"])
+   assert all(r["path"] and r["projectId"]
+              for b in factory["bindings"] for r in b["repos"])
+   print("Typed factory settings present; legacy keys cleared")'
+   ```
+
+   Set `API_DEPLOYMENT` to the installation's API Deployment name and check
+   the running API without displaying credentials:
+
+   ```bash
+   kubectl --context "$CONTEXT" --namespace "$NAMESPACE" \
+     exec -i "deployment/$API_DEPLOYMENT" -c api -- python3 - <<'PY'
+   import urllib.request
+   from curie_api.config import Settings
+   settings = Settings()
+   assert settings.factory_enabled and settings.forges.trackers
+   assert settings.forges.bindings
+   for path in ("/health", "/ready"):
+       assert urllib.request.urlopen("http://127.0.0.1:8000" + path).status == 200
+   print("Typed factory configuration loaded; API health and readiness passed")
+   PY
+   ```
+
+   Compare the loaded tracker and repository configuration privately with the
+   settings saved before the upgrade. The executed migration verified the
+   expected label, mention, repository, polling interval, card URL, CI wait,
+   branch policy and CI policy. This verifies configuration migration and API
+   health; it does not establish a factory work item's outcome.
+
 ### Admitting a labelled GitHub issue
 
 Factory intake polls GitHub by default. It is off until `factory.enabled` is
 true (environment `FACTORY_ENABLED=true`). `factory.intake` (`FACTORY_INTAKE`)
 is `poll` or `webhook`, and `poll` is the default. The `factory:` block replaces
-the removed `api.githubFactory*` keys; a release that still sets one is refused
-at render with a message naming `factory.*` and `curie cluster factory`.
+the removed `api.githubFactory*` keys. For a v0.12.5 installation configured
+with `curie cluster factory`, use the
+[automatic retained migration](#automatic-migration-of-a-legacy-github-factory)
+through `curie cluster upgrade` with a CLI containing the #4628 fix. If using
+the released v0.13.0 CLI, follow the historical
+[manual migration](#manual-factory-migration-from-v0125-to-v0130) above.
 Poll mode accepts a blank webhook secret, which disables signed deliveries.
 A configured secret permits signed deliveries in either intake mode. The
 published development secret is refused whenever factory intake is enabled.
@@ -1279,6 +1535,40 @@ a delivery, including the labeling user's current write permission, and it
 never admits an issue that already has a work item, so it does not duplicate a
 delivery that arrived. A manual redelivery of the lost label after that
 backstop admitted the issue counts as a relabel and starts a second run.
+
+A reinstall, or any other loss of factory storage, leaves labelled issues with
+no work item. Before admitting such an issue, every intake path (polling, a
+webhook delivery, the missed-label backstop, and the GitLab and Jira trackers)
+asks the code host for the pull or merge requests the publishing identity
+opened from a factory publication branch of that same repository, and keeps
+the ones whose body names the issue. A tracker state label is never used as
+evidence. The outcome is decided in this order:
+
+1. One open match: the issue is not run again, and its one status comment
+   links that pull request.
+2. More than one open match: the issue is refused, and the status comment
+   lists each of them. Close all but one to continue.
+3. A pull request whose author the code host cannot confirm is never
+   evidence and is ignored, with one info log line per check. Bitbucket Cloud
+   cannot read its own identity, and Bitbucket Data Center cannot when its
+   answers omit the `X-AUSERID` header, so on those hosts ownership cannot be
+   verified, rediscovery does not suppress, and a reinstall can still open one
+   duplicate pull request. When nothing matches, the issue is admitted
+   normally.
+4. Only closed or merged matches: the old label is a replay of a run that
+   already finished, so it is logged and nothing runs. A label added after the
+   most recent close or merge is an intentional rerun and is admitted. When
+   the label time or the close time is unknown, the label counts as a replay.
+5. Evidence that cannot be read completely defers the issue: a failed or
+   missing page, an unreadable item, body or author, an own identity that
+   cannot be read, or a pull request URL that is not on the configured code
+   host. Polling does not advance its cursor, a webhook delivery is retryable,
+   and the issue is decided again on the next pass.
+
+The publication step repeats the check right before it opens a new pull
+request, leaving out its own branch. If another open factory pull request for
+the issue appeared in the meantime, it refuses with `publication_exists`
+instead of opening a second one.
 
 When intake is webhook, subscribe the App webhook to **Issues** and **Issue
 comments** in addition to the review subscriptions when both gates are on. Give
@@ -2444,12 +2734,27 @@ section is the administrator's.
   approve. A user group set accepts chat and console principals but not an
   operator principal, so a route you drive from the CLI needs `approvers.users`.
 - Policy writes, arming, disarming, removal, breaker close, qualification
-  records and verifier runs need an ADR 0106 operator principal in addition to
-  the administrative credential, and record it as the actor. Mint one as
-  [Driving it from the CLI](approvals.md#driving-it-from-the-cli) shows and
-  export it as `CURIE_APPROVAL_PRINCIPAL_TOKEN`. Over HTTP it is the
-  `X-Curie-Approval-Principal` header. A write without one is refused
+  records and verifier runs need a remediation operator principal (the
+  `remediation.administer` scope) in addition to the administrative credential,
+  and record it as the actor. Mint one with
+  `curie cluster approvals <agent> --mint-remediation-principal <subject>`
+  (`curie local` at the local tier; over HTTP,
+  `POST /approvals/principals/remediation-operator`) and export it as
+  `CURIE_APPROVAL_PRINCIPAL_TOKEN`. Over HTTP it is the
+  `X-Curie-Approval-Principal` header. A write without one, or with a token from
+  `--mint-operator-principal` (which only resolves approvals), is refused
   `operator_principal_required`. Reads need none.
+- Binding (`PUT`) and arming (`POST .../arm`) a policy additionally need the
+  remediation authority key (ADR 0231): header `X-Curie-Remediation-Authority`
+  equal to `CURIE_REMEDIATION_AUTHORITY_KEY` (chart value
+  `api.remediationAuthorityKey`, generated and retained when unset, never equal
+  to `api.apiKey`, mounted into the API Deployment only). A missing or wrong
+  header, or a key unset in the API, is `403 remediation_authority_required` and
+  creates no generation. The platform key plus the operator principal is no
+  longer enough; the principal is attribution only. Delete, disarm and breaker
+  close keep the platform key plus the principal. The CLI `apply` and `arm`
+  verbs do not yet send the header (follow-up to #4225), so until then bind and
+  arm over the API with the header.
 - The protected worker is deployed. The capture of a nomination block from a
   protected turn is its runner client wrapper (AUTOMATED-REMEDIATION-6); without
   it no turn can submit a block, though the policy and qualification routes

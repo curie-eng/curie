@@ -20,6 +20,8 @@ import httpx
 import pytest
 from curie_api.factory_comment_text import marker_for
 from curie_api.forges import types
+from curie_api.forges.authority import may_start_with
+from curie_api.forges.config import AccountAllowlist, GroupAuthority
 from curie_api.forges.errors import ForgeError, Unauthorized, Unavailable
 from curie_api.forges.types import (
     PullRequest,
@@ -37,6 +39,7 @@ from forge_fakes.jira import (
     SCOPED_API,
     SITE,
     SITE_HOST,
+    STARTERS,
     TOKEN,
     JiraFake,
     JiraUser,
@@ -365,3 +368,73 @@ async def test_jira_identity_the_configured_bot_writes_after_one_verification() 
     assert len(fake.requests_of("remote_link_create")) == 1
     assert len(fake.requests_of("tenant_info")) == 1
     assert len(fake.requests_of("myself")) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("creator_type", ["bot", "app", "customer"])
+async def test_initial_label_nonhuman_creator_cannot_borrow_human_reporter(
+    creator_type: str,
+) -> None:
+    # UserDetails.accountType distinguishes people, apps and portal customers.
+    # https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-users/#api-rest-api-3-user-get
+    fake = JiraFake(bot_type="atlassian")
+    human = fake.add_user(HUMAN_ID, "Allowed human")
+    creator = (
+        fake.bot
+        if creator_type == "bot"
+        else fake.add_user(
+            "5b10a0000000000000000003", "Nonhuman creator", account_type=creator_type
+        )
+    )
+    ignored = fake.seed_issue("Nonhuman creation", creator=creator, labels=[LABEL])
+    fake.edit_reporter(ignored.id, human, human)
+    neighbor = fake.seed_issue("Human creation", creator=human, labels=[LABEL])
+    tracker = jira_tracker(fake, start_authority={"type": "allowlist", "accounts": [HUMAN_ID]})
+
+    for cursor in (None, "0;"):
+        page = await tracker.poll_marked(cursor, running=())
+        assert [(n.issue, n.actor) for n in page.notices] == [(fake.ref(neighbor), human.actor)]
+    assert await tracker.marking_actor(fake.ref(ignored), LABEL) is None
+    assert await tracker.marking_actor(fake.ref(neighbor), LABEL) == human.actor
+    assert fake.writes == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("authority_kind", ["allowlist", "group"])
+async def test_initial_label_authority_uses_creator_after_reporter_change(
+    authority_kind: str,
+) -> None:
+    fake = JiraFake()
+    allowed = fake.add_user(HUMAN_ID, "Allowed creator")
+    outsider = fake.add_user(OTHER_BOT, "Unauthorized human")
+    authority = (
+        AccountAllowlist(type="allowlist", accounts=frozenset({allowed.account_id}))
+        if authority_kind == "allowlist"
+        else GroupAuthority(type="group", group_id=STARTERS)
+    )
+    fake.set_group_member(STARTERS, allowed.account_id, True)
+    fake.set_group_member("other-group", outsider.account_id, True)
+    denied = fake.seed_issue("Unauthorized creator", creator=outsider, labels=[LABEL])
+    accepted = fake.seed_issue("Authorized creator", creator=allowed, labels=[LABEL])
+    tracker = jira_tracker(fake, start_authority=authority.model_dump())
+    fake.edit_reporter(denied.id, allowed, allowed)
+    fake.edit_reporter(accepted.id, outsider, outsider)
+
+    page = await tracker.poll_marked(None, running=())
+    assert {n.issue for n in page.notices} == {fake.ref(denied), fake.ref(accepted)}
+    for notice in page.notices:
+        expected = notice.issue == fake.ref(accepted)
+        assert notice.actor == (allowed.actor if expected else outsider.actor)
+        assert await tracker.verify_current(notice) is True
+        assert await tracker.marking_actor(notice.issue, LABEL) == notice.actor
+        assert (
+            await may_start_with(authority, notice.issue, notice.actor, tracker=tracker) is expected
+        )
+    if authority_kind == "group":
+        assert {r.params["accountId"] for r in fake.requests_of("user_groups")} == {
+            allowed.account_id,
+            outsider.account_id,
+        }
+    else:
+        assert fake.requests_of("user_groups") == []
+    assert fake.writes == 0

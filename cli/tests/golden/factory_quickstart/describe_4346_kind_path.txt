@@ -11,6 +11,7 @@ curie cluster up --context kind-curie-factory --namespace curie --release curie 
 configure factory intake factory.intake=poll for acme/widgets with --app-id 12345 --private-key-file /keys/app.pem and no webhook secret; the same helm upgrade binds the dark factory runner image
 configure agentSandbox.runnerEnv.dark-factory.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000 with helm upgrade --reuse-values unless the release already records that string; preserve sibling values
 render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image
+create agent dark-factory only if absent, with initial surface github=acme/widgets and the tracker default label; preserve an existing agent
 curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir /tmp/factory-quickstart-golden/curie-factory-quickstart-curie-curie/dark-factory --agent dark-factory --env prod --repo acme/widgets
 curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=acme/widgets
 curie cluster overrides dark-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 10800

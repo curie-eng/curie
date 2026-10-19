@@ -16,7 +16,11 @@ Install the local path tools:
 
 - `uv`, the Python workspace manager, and Python `3.13`. The workspace requires
   `>=3.13`.
-- Docker with Compose v2, for the dev stack and the local runner container.
+- Docker Engine 26.0 or later and Docker Compose v2.26.0 or later, for the
+  dev stack and the local runner container. Older versions run the stack but
+  cannot start a hosted connector that declares `secret_files`, because its
+  credential files are mounted through a Docker volume subpath. The CLI
+  refuses that bring-up and names the version it found.
 - A `curie` CLI binary. Download, verify, and install the prebuilt binary for
   your platform by following
   [docs/release-verification.md](release-verification.md#verify-the-cli-before-installing-it).

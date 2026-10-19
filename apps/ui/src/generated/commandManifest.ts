@@ -3018,6 +3018,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Administratively mint a reusable, subject-bound remediation operator principal (scope remediation.administer) for remediation policy, breaker, and qualification writes. The token is delivered once; export it as CURIE_APPROVAL_PRINCIPAL_TOKEN for those writes. It cannot resolve approvals",
+              "id": "mint_remediation_principal",
+              "long": "mint-remediation-principal",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Administratively mint a single-use, subject-bound Console login code",
               "id": "mint_console_login_code",
               "long": "mint-console-login-code",
@@ -9165,6 +9173,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Administratively mint a reusable, subject-bound remediation operator principal (scope remediation.administer) for remediation policy, breaker, and qualification writes. The token is delivered once; export it as CURIE_APPROVAL_PRINCIPAL_TOKEN for those writes. It cannot resolve approvals",
+              "id": "mint_remediation_principal",
+              "long": "mint-remediation-principal",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Administratively mint a single-use, subject-bound Console login code",
               "id": "mint_console_login_code",
               "long": "mint-console-login-code",
@@ -9433,7 +9449,7 @@ export const commandManifest = {
                 "github"
               ],
               "global": false,
-              "help": "Code host the factory publishes to. Only github is installed in this build",
+              "help": "Code host the factory publishes to: github, gitlab with --tracker gitlab, or bitbucket-cloud or bitbucket-dc with --tracker jira-cloud",
               "id": "code_host",
               "long": "code-host",
               "positional": false,
@@ -9450,7 +9466,7 @@ export const commandManifest = {
                 "github"
               ],
               "global": false,
-              "help": "Tracker the factory takes issues from: github, or jira-cloud with --code-host github",
+              "help": "Tracker the factory takes issues from: github, gitlab, or jira-cloud with --code-host github, bitbucket-cloud or bitbucket-dc",
               "id": "tracker",
               "long": "tracker",
               "positional": false,
@@ -9514,6 +9530,22 @@ export const commandManifest = {
               "help": "Jira groupId whose members may start work. Refused for github",
               "id": "start_group",
               "long": "start-group",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Jira Cloud site or API gateway URL beside a Bitbucket code host, whose own URL is --forge-url. Refused for any other pairing",
+              "id": "tracker_url",
+              "long": "tracker-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "File holding the Jira API token beside a Bitbucket code host, whose own token is --token-file. Refused for any other pairing",
+              "id": "tracker_token_file",
+              "long": "tracker-token-file",
               "positional": false,
               "required": false
             }

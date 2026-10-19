@@ -4,7 +4,11 @@ import logging
 import threading
 
 import pytest
+from curie_dispatcher.app import SocketModeConnection
 from curie_dispatcher.supervisor import BackoffPolicy, Supervisor
+from slack_bolt import App
+
+from .conftest import _authorize
 
 
 def test_backoff_is_exponential_and_capped() -> None:
@@ -208,3 +212,65 @@ def test_a_close_error_on_shutdown_names_the_identity(caplog: pytest.LogCaptureF
     assert not thread.is_alive()
     messages = [r.getMessage() for r in caplog.records if r.name == logger.name]
     assert messages == ["Slack identity ops-bot: error closing connection during shutdown"]
+
+
+def test_session_failure_backs_off_and_builds_a_fresh_connection(
+    offline_socket_mode: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    logger, connected = _signalling_logger("test-supervisor-sessions", "socket mode connected")
+    built: list[SocketModeConnection] = []
+    slept: list[float] = []
+    errors: list[BaseException] = []
+    now = 0.0
+    app = App(
+        signing_secret="unused-in-socket-mode",
+        authorize=_authorize,
+        token_verification_enabled=False,
+    )
+
+    def factory() -> SocketModeConnection:
+        connection = SocketModeConnection(app, "xapp-test", logger=logger, clock=lambda: now)
+        built.append(connection)
+        return connection
+
+    supervisor = Supervisor(
+        factory, logger=logger, sleep=slept.append,
+        backoff=BackoffPolicy(initial_seconds=2.0, max_seconds=10.0),
+    )
+
+    def run() -> None:
+        try:
+            supervisor.run()
+        except BaseException as exc:  # noqa: BLE001 - report thread failures to the test
+            errors.append(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    try:
+        thread.start()
+        assert connected.seen.wait(2)
+        connected.seen.clear()
+        first = built[0]
+        for at in (10, 20, 30):
+            now = at
+            first._handler.client.connect()
+
+        assert connected.seen.wait(5), "supervisor did not start a fresh Socket Mode connection"
+        assert errors == []
+        assert slept == [2.0]
+        assert len(built) == 2
+        assert built[1] is not first
+        assert not first.is_connected()
+        assert first._handler.client.closed
+        assert built[1].is_connected()
+        assert [
+            record.getMessage() for record in caplog.records
+            if record.name == logger.name and record.getMessage().startswith("connection failed:")
+        ] == ["connection failed: Socket Mode sessions failed 3 times within 300 seconds"]
+    finally:
+        supervisor.request_stop()
+        thread.join(5)
+        logger.removeHandler(connected)
+        assert not thread.is_alive(), "supervisor thread survived cleanup"
+        assert all(not connection.is_connected() for connection in built)
+    assert slept == [2.0]
+    assert errors == []

@@ -121,7 +121,10 @@ with no fallback between the two modes.
    random `jti`. It uses the same signing key as `cct` and is told apart by
    prefix and claim set. The runner adds `X-Curie-Connector-Grant`
    (`runner/src/curie_runner/connectors.py::GRANT_HEADER`) to hosted entries only
-   when a grant is present.
+   when a grant is present. Only a permission-gate approval carries the arguments a grant
+   binds. A `grantableViaPolicy` route that would grant a proxied connector tool is
+   refused when it is requested, so the model calls the tool and the permission gate
+   holds it (see [approval](../approval/INTERFACE.md)).
 9. **One spend per grant.** For a gated `tools/call`, `_grant_refused`
    (`apps/worker/src/curie_connector_proxy/server.py::_grant_refused`) requires one
    grant that `verify` (`apps/worker/src/curie_connector_proxy/caller.py::verify`)
@@ -129,7 +132,11 @@ with no fallback between the two modes.
    arguments, then spends its `jti` through `_ValkeyGrantStore`
    (`apps/worker/src/curie_connector_proxy/server.py::_ValkeyGrantStore`) as
    `SET connector-grant:<jti> 1 NX EX`. A replay, a missing store or a failed
-   spend refuses with `grant_required`. Approval resolution itself stays in the
+   spend refuses with `grant_required`. The proxy's log line names the refused check as
+   `grant=<reason>` (`header_missing`, `grant_invalid`, `agent_mismatch`,
+   `tool_mismatch`, `arguments_mismatch`, `no_grant_store`, `not_spent`, and the
+   rest in `server.py`); the client body stays the one refusal, and no claim value
+   is logged. Approval resolution itself stays in the
    [approval](../approval/INTERFACE.md) seam; the grant only carries its result to
    the connector boundary.
 

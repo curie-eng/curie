@@ -1849,7 +1849,7 @@ const GVISOR_LOOKUP_INFERENCE: &str =
     "inferred that the cluster has no `gvisor` RuntimeClass from the RuntimeClass lookup (NotFound)";
 const GVISOR_SCHEDULING_INFERENCE: &str = "inferred that RuntimeClass `gvisor` cannot schedule: no node matches its nodeSelector `sandbox.gke.io/runtime=gvisor` (on GKE, add a GKE Sandbox node pool to keep gVisor); applying `--set security.gvisor.mode=off`";
 const GVISOR_SCHEDULING_DIAGNOSIS: &str = "gVisor preflight Job `acme-runtime-preflight-gvisor` was never scheduled (FailedScheduling): RuntimeClass `gvisor` requires nodes labelled `sandbox.gke.io/runtime=gvisor` and no node has that label; on GKE this means the cluster has no GKE Sandbox node pool";
-const GVISOR_DEADLINE_ERROR: &str = "Helm installation failed; observed rollout reasons: Helm release: latest revision is not deployed; acme-probe: target workload is absent; acme-runtime-preflight-gvisor: DeadlineExceeded";
+const GVISOR_DEADLINE_ERROR: &str = "Helm installation failed; observed rollout reasons: Helm release: latest revision=1 status=failed is not deployed; acme-probe: target workload is absent; acme-runtime-preflight-gvisor: DeadlineExceeded";
 
 fn assert_neither_gvisor_inference(shown: &str) {
     assert!(

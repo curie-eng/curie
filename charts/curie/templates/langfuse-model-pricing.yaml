@@ -15,7 +15,7 @@ present, and treats a 409 from the create as success, so a re-upgrade is safe.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "curie.fullname" . }}-langfuse-model-pricing
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Job" "name" (printf "%s-langfuse-model-pricing" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
   annotations:

@@ -1,0 +1,29 @@
+{
+  "name": "text-stats-engine",
+  "cases": [
+    {
+      "id": "word-count-three",
+      "input": "Use the text-stats skill and call mcp__plugin_text-stats-engine_text-stats-engine__word_count with text \"hello brave world\". Return only the numeric tool result.",
+      "grader": {
+        "kind": "exact",
+        "expected": "3"
+      }
+    },
+    {
+      "id": "word-count-empty",
+      "input": "Use the text-stats skill and call mcp__plugin_text-stats-engine_text-stats-engine__word_count with the empty text string \"\". Return only the numeric tool result.",
+      "grader": {
+        "kind": "exact",
+        "expected": "0"
+      }
+    },
+    {
+      "id": "characters-without-whitespace",
+      "input": "Use the text-stats skill and call mcp__plugin_text-stats-engine_text-stats-engine__char_count with text \"alpha beta\" and include_whitespace false. Return only the numeric tool result.",
+      "grader": {
+        "kind": "exact",
+        "expected": "9"
+      }
+    }
+  ]
+}

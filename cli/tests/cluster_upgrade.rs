@@ -16,6 +16,961 @@ use curie::ops::{
     RunnerLayerPlan, UpgradeChart, UpgradeOpts, UpgradePhase,
 };
 use curie::ui::CliOutput;
+use serde_json::{json, Value};
+
+pub(super) const FACTORY_READ_WRAPPER: &str = r#"#!/usr/bin/python3
+import json
+import os
+import sys
+from pathlib import Path
+
+root = Path(__file__).resolve().parent
+tool = Path(sys.argv[0]).name
+args = sys.argv[1:]
+settings = json.loads((root / 'factory-inputs.json').read_text())
+
+def finish(value=None, error=None):
+    log = os.environ.get('CURIE_TEST_CALL_LOG')
+    if log:
+        with open(log, 'a') as stream:
+            stream.write('FACTORY_CALL: ' + json.dumps([tool, *args]) + '\n')
+    else:
+        with open(root / 'argv.log', 'a') as stream:
+            stream.write(json.dumps([tool, *args]) + '\n')
+    if error:
+        print(error, file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(value))
+    sys.exit(0)
+
+def flag(name):
+    for index, arg in enumerate(args):
+        if arg == name and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith(name + '='):
+            return arg.split('=', 1)[1]
+    return None
+
+if tool == 'helm':
+    if args[:1] == ['history']:
+        finish(settings['history'])
+    if args[:2] == ['get', 'values']:
+        revision = flag('--revision') or settings.get('unpinned_revision', '5')
+        if '--all' in args and settings.get('computed_error'):
+            finish(error=settings['computed_error'])
+        section = 'computed' if '--all' in args else 'user'
+        finish(settings[section][revision])
+    if args[:2] == ['get', 'metadata']:
+        revision = flag('--revision') or '5'
+        version = '0.12.5' if revision == '4' else '0.13.0'
+        finish({'name': 'rel', 'chart': 'curie', 'version': version,
+                'appVersion': version, 'revision': int(revision), 'namespace': 'ns',
+                'status': 'deployed' if revision == '4' else 'failed'})
+    if args[:2] == ['show', 'chart']:
+        finish({'apiVersion': 'v2', 'name': 'curie', 'version': '0.13.0', 'appVersion': '0.13.0'})
+if tool == 'kubectl' and 'get' in args:
+    at = args.index('get')
+    resource = args[at + 1] if at + 1 < len(args) else ''
+    if resource in ('secret', 'secrets'):
+        finish(settings.get('secret'), settings.get('secret_error'))
+    if resource in ('configmap', 'configmaps') and at + 2 < len(args) and args[at + 2] == 'acme-factory-ca':
+        finish(settings.get('ca'), settings.get('ca_error'))
+
+delegate = root / 'base' / tool
+if tool == 'helm' and args and args[0] in ('template', 'upgrade'):
+    documents = []
+    for index, arg in enumerate(args[:-1]):
+        if arg in ('-f', '--values'):
+            documents.append(Path(args[index + 1]).read_text())
+    log = os.environ.get('CURIE_TEST_CALL_LOG')
+    if log:
+        with open(log, 'a') as stream:
+            stream.write('FACTORY_VALUES: ' + json.dumps({'argv': args, 'documents': documents}) + '\n')
+if not delegate.exists():
+    finish(error='unexpected resolver command')
+os.execv(str(delegate), [str(delegate), *args])
+"#;
+
+pub(super) fn factory_read_inputs(user: Value, computed: Value) -> Value {
+    let mut older = user.clone();
+    older["worker"]["runnerTotalTimeoutSeconds"] = json!(411);
+    json!({
+        "history": [
+            {"revision": 4, "status": "deployed", "chart": "curie-0.12.5", "app_version": "0.12.5", "description": "Upgrade complete"},
+            {"revision": 5, "status": "failed", "chart": "curie-0.13.0", "app_version": "0.13.0", "description": "Upgrade failed"}
+        ],
+        "user": {"4": older, "5": user},
+        "computed": {"4": computed.clone(), "5": computed}
+    })
+}
+
+const FACTORY_RESOLVER_CHILD: &str = "CURIE_TEST_FACTORY_RESOLVER_CHILD";
+
+async fn factory_resolver_in_child(selector: &str) -> bool {
+    if std::env::var(FACTORY_RESOLVER_CHILD).as_deref() == Ok(selector) {
+        return true;
+    }
+    let child = {
+        let _lock = crate::support::ENV_LOCK.lock().await;
+        std::process::Command::new(std::env::current_exe().expect("integration test executable"))
+            .args([
+                "--exact",
+                selector,
+                "--nocapture",
+                "--test-threads=1",
+                "--format=pretty",
+            ])
+            .env(FACTORY_RESOLVER_CHILD, selector)
+            .env("RUST_TEST_THREADS", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn isolated factory resolver case")
+    };
+    let output = child
+        .wait_with_output()
+        .expect("wait for isolated resolver case");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "isolated resolver case {selector} failed:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("running 1 test")
+            && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+        "the isolated process must execute exactly the selected resolver case:\n{stdout}\n{stderr}"
+    );
+    false
+}
+
+struct FactoryResolverEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl FactoryResolverEnvironment {
+    fn set(values: &[(&'static str, std::ffi::OsString)]) -> Self {
+        assert!(
+            std::env::var_os(FACTORY_RESOLVER_CHILD).is_some(),
+            "resolver environment changes require an isolated test process"
+        );
+        let mut previous = Vec::new();
+        for (key, value) in values {
+            previous.push((*key, std::env::var_os(key)));
+            std::env::set_var(key, value);
+        }
+        Self(previous)
+    }
+}
+
+impl Drop for FactoryResolverEnvironment {
+    fn drop(&mut self) {
+        for (key, value) in self.0.iter().rev() {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+struct FactoryResolverFixture {
+    dir: tempfile::TempDir,
+    inputs: Value,
+    pem: String,
+}
+
+impl FactoryResolverFixture {
+    fn new(user: Value, computed: Value) -> Self {
+        use base64::Engine;
+        let dir = tempfile::tempdir().expect("resolver fixture directory");
+        for tool in ["helm", "kubectl"] {
+            crate::support::executable::install(&dir.path().join(tool), FACTORY_READ_WRAPPER);
+        }
+        let output = std::process::Command::new("openssl")
+            .args(["genrsa", "2048"])
+            .output()
+            .expect("OpenSSL is required for the external GitHub fixture");
+        assert!(output.status.success(), "generate fixture App key");
+        let pem = String::from_utf8(output.stdout).unwrap();
+        let mut inputs = factory_read_inputs(user, computed);
+        inputs["secret"] = json!({
+            "apiVersion": "v1", "kind": "Secret",
+            "metadata": {"name": "acme-factory-app", "namespace": "ns",
+                "annotations": {"curie.ai/github-app-id": "90817"}},
+            "data": {"signing.pem": base64::engine::general_purpose::STANDARD.encode(pem.as_bytes())}
+        });
+        let fixture = Self { dir, inputs, pem };
+        fixture.save();
+        fixture
+    }
+
+    fn save(&self) {
+        std::fs::write(
+            self.dir.path().join("factory-inputs.json"),
+            self.inputs.to_string(),
+        )
+        .unwrap();
+    }
+
+    fn environment(&self, first_url: &str, second_url: &str) -> FactoryResolverEnvironment {
+        let mut paths = vec![self.dir.path().to_path_buf()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        FactoryResolverEnvironment::set(&[
+            ("PATH", std::env::join_paths(paths).unwrap()),
+            ("CURIE_GITHUB_API_URL", first_url.into()),
+            ("GITHUB_API_URL", second_url.into()),
+        ])
+    }
+
+    fn calls(&self) -> Vec<Vec<String>> {
+        std::fs::read_to_string(self.dir.path().join("argv.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn upgrade_dry_run(&self) -> std::process::Output {
+        self.upgrade_run(true)
+    }
+
+    fn upgrade_run(&self, dry_run: bool) -> std::process::Output {
+        let base = self.dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        for tool in ["helm", "kubectl"] {
+            crate::support::executable::install(
+                &base.join(tool),
+                include_str!("data/upgrade-driver.py"),
+            );
+        }
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_curie"));
+        command.args([
+            "--json",
+            "cluster",
+            "upgrade",
+            "--namespace",
+            "ns",
+            "--release",
+            "rel",
+            "--to",
+            "0.13.0",
+            "--chart",
+            "charts/curie",
+            "--yes",
+        ]);
+        if dry_run {
+            command.arg("--dry-run");
+        }
+        command
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.dir.path().display()),
+            )
+            .env("UPGRADE_DRIVER_ROOT", self.dir.path())
+            .env("UPGRADE_DRIVER_SCENARIO", "healthy")
+            .env("CURIE_GITHUB_API_URL", "http://127.0.0.1:1")
+            .env("GITHUB_API_URL", "http://127.0.0.1:2")
+            .output()
+            .expect("real upgrade CLI")
+    }
+}
+
+fn resolver_factory_values(origin: &str) -> Value {
+    let mut values = super::config_migrate::legacy_factory_values();
+    values["api"]["githubAppId"] = json!("90817");
+    values["api"]["githubApiUrl"] = json!(origin);
+    values["api"]["githubFactoryIntake"] = json!("poll");
+    let endpoint = reqwest::Url::parse(origin).unwrap();
+    let host = format!(
+        "{}:{}",
+        endpoint.host_str().unwrap(),
+        endpoint.port().unwrap()
+    );
+    let credential = json!({"type": "github_app", "appId": "90817",
+        "existingSecret": "acme-factory-app", "existingSecretKey": "signing.pem"});
+    let egress = json!([{"cidr": "127.0.0.1/32", "ports": [{"protocol": "TCP", "port": endpoint.port().unwrap()}]}]);
+    values["factory"] = json!({
+        "codeHosts": [{"name": "retained-code", "kind": "github", "host": host,
+            "apiUrl": origin, "credential": credential.clone(), "egress": egress.clone()}],
+        "trackers": [{"name": "retained-issues", "kind": "github", "host": host,
+            "apiUrl": origin, "credential": credential, "egress": egress,
+            "label": "triage-ready", "mention": "acme-maintainer", "pollIntervalSeconds": 83}],
+        "sandboxEgress": {"acme-bot": true}
+    });
+    values
+}
+
+// https://docs.github.com/en/rest/apps/apps#get-the-authenticated-app
+// https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
+// https://docs.github.com/en/rest/apps/installations#list-repositories-accessible-to-the-app-installation
+// https://docs.github.com/en/rest/repos/repos#get-a-repository
+fn factory_resolver_http(failure: &str) -> crate::support::MockServer {
+    let failure = failure.to_string();
+    crate::support::serve(move |request| {
+        let path = request.path.split('?').next().unwrap();
+        let body = match (request.method.as_str(), path) {
+            ("GET", "/app") if failure == "app-auth" => {
+                return crate::support::Response::json(
+                    401,
+                    r#"{"message":"raw-http-sentinel-4628"}"#,
+                );
+            }
+            ("GET", "/app") => json!({"id": 90817, "slug": "acme-maintainer"}),
+            ("GET", "/app/installations") => json!([{"id": 29}]),
+            ("POST", "/app/installations/29/access_tokens") => {
+                json!({"token": "installation-token-sentinel-4628", "expires_at": "2099-01-01T00:00:00Z"})
+            }
+            ("GET", "/installation/repositories") => {
+                json!({"repositories": [{"id": 73, "full_name": "acme-corp/acme-bot"}]})
+            }
+            ("GET", "/repos/acme-corp/acme-bot") if failure == "repository" => {
+                return crate::support::Response::json(
+                    403,
+                    r#"{"message":"raw-http-sentinel-4628"}"#,
+                );
+            }
+            ("GET", "/repos/acme-corp/acme-bot") if failure == "repository-json" => {
+                json!({"id": "raw-http-sentinel-4628"})
+            }
+            ("GET", "/repos/acme-corp/acme-bot") => {
+                json!({"id": 73, "full_name": "acme-corp/acme-bot"})
+            }
+            _ => {
+                return crate::support::Response::json(
+                    404,
+                    r#"{"message":"unexpected fixture route"}"#,
+                )
+            }
+        };
+        assert!(
+            request.header("authorization").is_some(),
+            "GitHub reads must authenticate"
+        );
+        crate::support::Response::json(200, &body.to_string())
+    })
+}
+
+fn installed_factory_source(
+    user: Value,
+    computed: Value,
+) -> curie::factory_config_migrate::InstalledFactorySource {
+    curie::factory_config_migrate::InstalledFactorySource {
+        revision: 4,
+        installed_chart: "curie-0.12.5".into(),
+        user_values: user,
+        computed_values: computed,
+    }
+}
+
+#[tokio::test]
+async fn factory_resolver_uses_the_supplied_snapshot_and_ignores_both_url_environment_variables() {
+    if !factory_resolver_in_child(
+        "cluster_upgrade::factory_resolver_uses_the_supplied_snapshot_and_ignores_both_url_environment_variables",
+    ).await {
+        return;
+    }
+    let _lock = crate::support::ENV_LOCK.lock().await;
+    let retained = factory_resolver_http("");
+    let first = crate::support::serve(|_| crate::support::Response::json(503, "{}"));
+    let second = crate::support::serve(|_| crate::support::Response::json(503, "{}"));
+    let mut values = resolver_factory_values(&retained.base_url);
+    values["api"]["githubStubCaConfigMap"] = json!("legacy-ca-must-not-be-read");
+    let fixture = FactoryResolverFixture::new(values.clone(), values.clone());
+    let _environment = fixture.environment(&first.base_url, &second.base_url);
+    let source = installed_factory_source(values.clone(), values.clone());
+    let context = curie::factory_config_migrate::resolve_factory_migration_context(
+        &CommonOpts {
+            namespace: "ns".into(),
+            release: "rel".into(),
+            dry_run: true,
+        },
+        Some(&source),
+        &values,
+    )
+    .await
+    .expect("resolve through the retained origin");
+    let curie::config_migrate::FactoryMigrationContext::LegacyGitHub {
+        effective_legacy,
+        repositories,
+    } = &context
+    else {
+        panic!("configured factory requires resolved migration context");
+    };
+    assert_eq!(repositories.len(), 1);
+    assert_eq!(repositories[0].project_id, "73");
+    assert_eq!(repositories[0].path, "acme-corp/acme-bot");
+    assert!(!effective_legacy.to_string().contains(&fixture.pem));
+    assert!(!effective_legacy
+        .to_string()
+        .contains("installation-token-sentinel-4628"));
+    assert!(first.recorded().is_empty());
+    assert!(second.recorded().is_empty());
+    assert!(retained
+        .recorded()
+        .iter()
+        .any(|request| request.path == "/repos/acme-corp/acme-bot"));
+    let calls = fixture.calls();
+    assert!(!calls.is_empty(), "read the referenced App Secret");
+    assert!(
+        calls
+            .iter()
+            .all(|call| call[0] == "kubectl" && call.iter().any(|arg| arg == "get")),
+        "the caller snapshot must not cause Helm rereads or persistent writes: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.iter().any(|arg| arg == "acme-factory-app")),
+        "read the retained Secret reference"
+    );
+    assert!(calls
+        .iter()
+        .all(|call| !call.iter().any(|arg| arg == "legacy-ca-must-not-be-read")));
+    let outcome =
+        curie::config_migrate::migrate_installed_config(values, Some("curie-0.12.5"), &context)
+            .unwrap();
+    assert_eq!(
+        outcome.values["factory"]["bindings"][0]["repos"][0]["projectId"],
+        "73"
+    );
+}
+
+#[tokio::test]
+async fn factory_resolver_refuses_secret_decode_pem_auth_and_repository_errors_without_retaining_their_chains(
+) {
+    use base64::Engine;
+    if !factory_resolver_in_child(
+        "cluster_upgrade::factory_resolver_refuses_secret_decode_pem_auth_and_repository_errors_without_retaining_their_chains",
+    ).await {
+        return;
+    }
+    let _lock = crate::support::ENV_LOCK.lock().await;
+    for failure in [
+        "secret",
+        "decode",
+        "pem",
+        "app-auth",
+        "repository",
+        "repository-json",
+        "ca-read",
+        "ca-pem",
+        "ca-key",
+    ] {
+        let retained = factory_resolver_http(failure);
+        let mut values = resolver_factory_values(&retained.base_url);
+        if failure.starts_with("ca-") {
+            values["codeHostTrust"] = json!({"caBundle": {"configMapRef": {
+                "name": "acme-factory-ca", "key": "ca.crt"
+            }}});
+        }
+        let mut fixture = FactoryResolverFixture::new(values.clone(), values.clone());
+        match failure {
+            "secret" => {
+                fixture.inputs["secret_error"] =
+                    json!("secret-error-sentinel-4628 app 90817 acme-corp/acme-bot")
+            }
+            "decode" => {
+                fixture.inputs["secret"]["data"]["signing.pem"] =
+                    json!("not-base64-secret-sentinel-4628")
+            }
+            "pem" => {
+                fixture.inputs["secret"]["data"]["signing.pem"] =
+                    json!(base64::engine::general_purpose::STANDARD
+                        .encode("pem-secret-sentinel-4628"))
+            }
+            "ca-read" => {
+                fixture.inputs["ca_error"] =
+                    json!("ca-read-sentinel-4628 app 90817 acme-corp/acme-bot")
+            }
+            "ca-pem" => {
+                fixture.inputs["ca"] =
+                    json!({"kind": "ConfigMap", "data": {"ca.crt": "ca-pem-sentinel-4628"}})
+            }
+            "ca-key" => {
+                fixture.inputs["ca"] =
+                    json!({"kind": "ConfigMap", "data": {"wrong.key": "ca-key-sentinel-4628"}})
+            }
+            _ => {}
+        }
+        fixture.save();
+        let _environment = fixture.environment("http://127.0.0.1:1", "http://127.0.0.1:2");
+        let source = installed_factory_source(values.clone(), values.clone());
+        let result = curie::factory_config_migrate::resolve_factory_migration_context(
+            &CommonOpts {
+                namespace: "ns".into(),
+                release: "rel".into(),
+                dry_run: true,
+            },
+            Some(&source),
+            &values,
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("{failure} must refuse"),
+        };
+        let message = format!("{error}\n{error:#}\n{error:?}");
+        let setting = if failure.starts_with("ca-") {
+            "codeHostTrust.caBundle"
+        } else if failure.starts_with("repository") {
+            "api.githubRepoAllowlist"
+        } else {
+            "api.githubApp"
+        };
+        assert!(
+            message.contains(setting),
+            "{failure} must identify {setting}: {message}"
+        );
+        for forbidden in [
+            "sentinel-4628",
+            "90817",
+            "acme-corp/acme-bot",
+            fixture.pem.lines().nth(1).unwrap(),
+        ] {
+            assert!(
+                !message.contains(forbidden),
+                "{failure} error must contain setting names only"
+            );
+        }
+        assert!(fixture
+            .calls()
+            .iter()
+            .all(|call| call[0] == "kubectl" && call.iter().any(|arg| arg == "get")));
+        if failure.starts_with("ca-") {
+            assert!(
+                fixture.calls().iter().any(|call| call
+                    .windows(3)
+                    .any(|args| args == ["get", "configmap", "acme-factory-ca"])),
+                "{failure} must reach the referenced ConfigMap read"
+            );
+            let reason = match failure {
+                "ca-read" => "could not be read",
+                "ca-pem" => "PEM certificate",
+                "ca-key" => "referenced CA key",
+                _ => unreachable!(),
+            };
+            assert!(
+                message.contains(reason),
+                "{failure} must refuse at the intended CA boundary: {message}"
+            );
+            assert!(retained.recorded().is_empty());
+        }
+        if matches!(failure, "app-auth" | "repository" | "repository-json") {
+            assert!(
+                !retained.recorded().is_empty(),
+                "the refusal must reach the external helper"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn factory_resolver_computed_defaults_and_supplied_disabled_defaults_do_not_discover_credentials(
+) {
+    if !factory_resolver_in_child(
+        "cluster_upgrade::factory_resolver_computed_defaults_and_supplied_disabled_defaults_do_not_discover_credentials",
+    ).await {
+        return;
+    }
+    let _lock = crate::support::ENV_LOCK.lock().await;
+    for supplied_disabled in [false, true] {
+        let values = if supplied_disabled {
+            json!({"config": {"schemaVersion": "0.9.0"}, "api": {"githubFactoryIngressEnabled": false}})
+        } else {
+            json!({"config": {"schemaVersion": "0.9.0"}})
+        };
+        let computed = json!({"config": {"schemaVersion": "0.9.0"}, "api": {
+            "githubFactoryIngressEnabled": false, "githubFactoryIntake": "poll",
+            "githubFactoryPollIntervalSeconds": 45, "githubFactoryLabel": "", "githubFactoryMention": "",
+            "githubFactoryCardBaseUrl": "", "githubFactoryCiWaitSeconds": 1200,
+            "githubFactoryBases": {}, "githubFactoryPythonCi": {}, "githubFactoryMetadataCi": {}
+        }});
+        let fixture = FactoryResolverFixture::new(values.clone(), computed.clone());
+        let _environment = fixture.environment("http://127.0.0.1:1", "http://127.0.0.1:2");
+        let source = installed_factory_source(values.clone(), computed);
+        let context = curie::factory_config_migrate::resolve_factory_migration_context(
+            &CommonOpts {
+                namespace: "ns".into(),
+                release: "rel".into(),
+                dry_run: true,
+            },
+            Some(&source),
+            &values,
+        )
+        .await
+        .expect("unconfigured factory needs no discovery");
+        match context {
+            curie::config_migrate::FactoryMigrationContext::NotRequired => {
+                assert!(!supplied_disabled)
+            }
+            curie::config_migrate::FactoryMigrationContext::LegacyGitHub {
+                repositories, ..
+            } => {
+                assert!(supplied_disabled);
+                assert!(repositories.is_empty());
+            }
+        }
+        assert!(
+            fixture.calls().is_empty(),
+            "disabled/default inputs must not read credentials or trust"
+        );
+    }
+}
+
+#[test]
+fn factory_upgrade_reads_serving_user_and_computed_values_at_the_same_revision() {
+    let user = json!({
+        "config": {"schemaVersion": "0.9.0"},
+        "connectorCaller": {"existingSecret": "acme-caller-pair"},
+        "api": {"githubFactoryIngressEnabled": false},
+        "worker": {"runnerTotalTimeoutSeconds": 511}
+    });
+    let computed = json!({"config": {"schemaVersion": "0.9.0"}, "api": {
+        "githubFactoryIngressEnabled": false, "githubFactoryIntake": "poll",
+        "githubFactoryPollIntervalSeconds": 45, "githubFactoryLabel": "", "githubFactoryMention": "",
+        "githubFactoryCardBaseUrl": "", "githubFactoryCiWaitSeconds": 1200,
+        "githubFactoryBases": {}, "githubFactoryPythonCi": {}, "githubFactoryMetadataCi": {}
+    }});
+    let fixture = FactoryResolverFixture::new(user, computed);
+    let output = fixture.upgrade_dry_run();
+    assert!(
+        output.status.success(),
+        "dry upgrade must admit disabled migration: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fixture.calls();
+    let reads: Vec<_> = calls
+        .iter()
+        .filter(|call| call.starts_with(&["helm".into(), "get".into(), "values".into()]))
+        .collect();
+    assert!(
+        reads
+            .iter()
+            .any(|call| !call.iter().any(|arg| arg == "--all")),
+        "read serving user values"
+    );
+    assert!(
+        reads
+            .iter()
+            .any(|call| call.iter().any(|arg| arg == "--all")),
+        "read matching serving computed values"
+    );
+    assert!(
+        reads
+            .iter()
+            .all(|call| call.windows(2).any(|pair| pair == ["--revision", "4"])),
+        "upgrade must pin every source document to serving revision 4: {reads:?}"
+    );
+    assert!(
+        !calls.iter().any(|call| matches!(
+            call.get(1).map(String::as_str),
+            Some("upgrade" | "install" | "rollback" | "patch" | "create" | "apply" | "delete")
+        )),
+        "dry migration must not mutate: {calls:?}"
+    );
+    let rendered: Vec<_> = std::fs::read_dir(fixture.dir.path())
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("render-values-")
+                .then_some(path)
+        })
+        .collect();
+    assert!(!rendered.is_empty(), "validate the actual migrated overlay");
+    for path in rendered {
+        let values: Value =
+            serde_norway::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(values["worker"]["runnerTotalTimeoutSeconds"], 411);
+        assert_eq!(values["factory"]["enabled"], false);
+        assert!(values["api"].get("githubFactoryIngressEnabled").is_none());
+        assert!(
+            values["factory"].get("ciWaitSeconds").is_none(),
+            "computed defaults must not freeze intent"
+        );
+    }
+}
+
+#[test]
+fn upgrade_release_not_found_preserves_supplied_values_in_admission_and_apply() {
+    let helm = std::process::Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .expect("locate real Helm for supplied values parsing");
+    assert!(helm.status.success(), "real Helm is required");
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    std::fs::create_dir(&base).unwrap();
+    for tool in [base.join("helm"), dir.path().join("kubectl")] {
+        crate::support::executable::install(&tool, include_str!("data/upgrade-driver.py"));
+    }
+    crate::support::executable::install(
+        &dir.path().join("helm"),
+        r#"#!/usr/bin/python3
+import json
+import os
+import sys
+from pathlib import Path
+
+root = Path(os.environ['UPGRADE_DRIVER_ROOT'])
+args = sys.argv[1:]
+log = root / 'argv.log'
+calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+if args[:2] == ['get', 'values'] and not any(call[:2] == ['helm', 'upgrade'] for call in calls):
+    with log.open('a') as stream:
+        stream.write(json.dumps(['helm', *args]) + '\n')
+    print('Error: release: not found', file=sys.stderr)
+    sys.exit(1)
+delegate = root / 'base' / 'helm'
+os.execv(str(delegate), [str(delegate), *args])
+"#,
+    );
+    let supplied = json!({
+        "config": {"schemaVersion": "0.9.0"},
+        "connectorCaller": {"existingSecret": "acme-caller-pair"},
+        "worker": {"deliveryBudgetSeconds": 733,
+            "extraEnv": [{"name": "ACME_NUMERIC_STRING", "value": "8080"}]},
+        "api": {"podLabels": {"example.com/preserved": "off"}}
+    });
+    let file = dir.path().join("operator-values.yaml");
+    std::fs::write(&file, serde_json::to_vec_pretty(&supplied).unwrap()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_curie"))
+        .args([
+            "--json",
+            "cluster",
+            "upgrade",
+            "--to",
+            "0.9.0",
+            "--namespace",
+            "ns",
+            "--release",
+            "rel",
+            "--chart",
+            "charts/curie",
+            "--yes",
+            "--values-file",
+        ])
+        .arg(&file)
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
+        .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+        .env("UPGRADE_DRIVER_ROOT", dir.path())
+        .env("UPGRADE_DRIVER_SCENARIO", "healthy")
+        .env("VALUES_FILES_REAL_HELM", helm.trim())
+        .output()
+        .expect("real upgrade CLI with supplied values and a positively missing release");
+    assert!(
+        output.status.success(),
+        "supplied files must survive a positively missing retained release: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls: Vec<Vec<String>> = std::fs::read_to_string(dir.path().join("argv.log"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let values_read = calls
+        .iter()
+        .position(|call| call.starts_with(&["helm".into(), "get".into(), "values".into()]))
+        .expect("reach the positively missing retained-values read");
+    assert!(
+        calls[..values_read]
+            .iter()
+            .any(|call| call.starts_with(&["helm".into(), "history".into()])),
+        "exercise release-not-found after history, rather than the no-history branch"
+    );
+    let upgrades: Vec<_> = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, call)| call.starts_with(&["helm".into(), "upgrade".into()]))
+        .collect();
+    assert_eq!(upgrades.len(), 1, "one lifecycle Apply");
+    assert!(values_read < upgrades[0].0);
+    assert!(
+        upgrades[0].1.iter().any(|arg| arg == "-f"),
+        "Apply must carry the supplied overlay"
+    );
+    let applied: Value =
+        serde_norway::from_str(&std::fs::read_to_string(dir.path().join("values-1.yaml")).unwrap())
+            .unwrap();
+    for key in ["config", "connectorCaller", "worker", "api"] {
+        assert_eq!(applied[key], supplied[key], "preserve supplied {key}");
+    }
+    let admitted: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("render-values-")
+        })
+        .collect();
+    assert!(
+        !admitted.is_empty(),
+        "admit the supplied overlay before Apply"
+    );
+    for path in admitted {
+        let values: Value =
+            serde_norway::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            values, applied,
+            "admission and Apply must use the same overlay"
+        );
+    }
+}
+
+#[test]
+fn factory_upgrade_resolver_refusal_redacts_cli_output_before_target_render_or_helm_mutation() {
+    let peer = factory_resolver_http("");
+    let mut values = resolver_factory_values(&peer.base_url);
+    values["connectorCaller"] = json!({"existingSecret": "acme-caller-pair"});
+    let mut fixture = FactoryResolverFixture::new(values.clone(), values);
+    fixture.inputs["secret_error"] =
+        json!("secret-read-sentinel-4628 app 90817 acme-corp/acme-bot");
+    fixture.save();
+    let output = fixture.upgrade_dry_run();
+    assert!(
+        !output.status.success(),
+        "failed credential read must refuse the upgrade"
+    );
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        visible.contains("api.githubApp"),
+        "refusal must name the credential setting: {visible}"
+    );
+    for forbidden in ["sentinel-4628", "90817", "acme-corp/acme-bot"] {
+        assert!(
+            !visible.contains(forbidden),
+            "CLI output must replace unsafe helper chains"
+        );
+    }
+    let calls = fixture.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call[0] == "kubectl" && call.iter().any(|arg| arg == "acme-factory-app")),
+        "refusal must reach the retained credential read"
+    );
+    assert!(calls.iter().all(|call| !matches!(
+        call.get(1).map(String::as_str),
+        Some("upgrade" | "install" | "rollback" | "patch" | "create" | "apply" | "delete")
+    )));
+    assert!(
+        !calls.iter().any(|call| call[0] == "helm"
+            && call.get(1).is_some_and(|arg| arg == "template")
+            && !call
+                .iter()
+                .any(|arg| arg == "--show-only" || arg.starts_with("--show-only="))),
+        "refuse before rendering the target overlay"
+    );
+    assert!(
+        peer.recorded().is_empty(),
+        "failed credential read precedes external authentication"
+    );
+}
+
+#[test]
+fn factory_upgrade_egress_port_only_connector_refuses_without_changing_helm_history() {
+    for dry_run in [true, false] {
+        let peer = factory_resolver_http("");
+        let mut values = resolver_factory_values(&peer.base_url);
+        values.as_object_mut().unwrap().remove("factory");
+        values["connectorCaller"] = json!({"existingSecret": "acme-caller-pair"});
+        let port = reqwest::Url::parse(&peer.base_url).unwrap().port().unwrap();
+        values["agentSandbox"]["connectorEgress"] = json!({"acme-unrelated-4628": [{
+            "cidr": "198.51.100.19/32", "ports": [{"protocol": "TCP", "port": port}]
+        }]});
+        let fixture = FactoryResolverFixture::new(values.clone(), values);
+        let retained = std::fs::read(fixture.dir.path().join("factory-inputs.json")).unwrap();
+        let read_history = || {
+            let output = std::process::Command::new(fixture.dir.path().join("helm"))
+                .args(["history", "rel", "-n", "ns", "-o", "json"])
+                .output()
+                .expect("read recorded Helm history");
+            assert!(output.status.success());
+            serde_json::from_slice::<Value>(&output.stdout).expect("Helm history JSON")
+        };
+        let before = read_history();
+        let output = fixture.upgrade_run(dry_run);
+        assert!(
+            !output.status.success(),
+            "matching the API port cannot authorize connector egress"
+        );
+        let visible = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for setting in [
+            "api.githubApiUrl",
+            "factory.codeHosts.egress",
+            "factory.trackers.egress",
+        ] {
+            assert!(
+                visible.contains(setting),
+                "refusal must name {setting}: {visible}"
+            );
+        }
+        for forbidden in [
+            peer.base_url.as_str(),
+            "198.51.100.19",
+            "acme-unrelated-4628",
+            "90817",
+            "acme-corp/acme-bot",
+            "acme-factory-app",
+            "installation-token-sentinel-4628",
+            fixture.pem.lines().nth(1).unwrap(),
+        ] {
+            assert!(
+                !visible.contains(forbidden),
+                "CLI refusal must contain setting names only"
+            );
+        }
+        assert_eq!(
+            read_history(),
+            before,
+            "refusal must preserve serving revision and history"
+        );
+        assert!(
+            std::fs::read(fixture.dir.path().join("factory-inputs.json")).unwrap() == retained,
+            "refusal must preserve retained configuration and credentials"
+        );
+        let calls = fixture.calls();
+        assert!(
+            !calls.iter().any(|call| call[0] == "helm"
+                && matches!(
+                    call.get(1).map(String::as_str),
+                    Some("upgrade" | "install" | "rollback" | "uninstall")
+                )),
+            "refusal must occur before any Helm mutation: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|call| call[0] == "helm"
+                && call.get(1).is_some_and(|arg| arg == "template")
+                && !call
+                    .iter()
+                    .any(|arg| arg == "--show-only" || arg.starts_with("--show-only="))),
+            "unproven connector egress must not reach target rendering"
+        );
+        assert!(
+            peer.recorded().iter().all(|request| request.method == "GET"
+                || (request.method == "POST"
+                    && request.path == "/app/installations/29/access_tokens")),
+            "preparation must not write persistent GitHub configuration"
+        );
+    }
+}
 
 fn opts(to: &str) -> UpgradeOpts {
     UpgradeOpts {
@@ -935,4 +1890,191 @@ async fn resume_before_apply_refreshes_the_canary_expectations_from_the_executed
         serde_json::json!([["acme-bot", {"Image": STOCK_LAYER}]]),
         "the resumed run persists the expectations of the plan Apply executed: {persisted}"
     );
+}
+
+fn render_factory_upgrade_overlay(values: &Value) -> std::process::Output {
+    let dir = tempfile::tempdir().expect("private render values directory");
+    let file = dir.path().join("values.json");
+    std::fs::write(&file, serde_json::to_vec(values).unwrap()).expect("write render overlay");
+    std::process::Command::new("helm")
+        .args(["template", "curie"])
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../charts/curie"))
+        .arg("-f")
+        .arg(file)
+        .output()
+        .expect("Helm is required for the factory migration render boundary")
+}
+
+fn rendered_factory_api(values: &Value) -> Value {
+    let output = render_factory_upgrade_overlay(values);
+    assert!(
+        output.status.success(),
+        "migrated overlay must render: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let yaml = String::from_utf8(output.stdout).expect("UTF-8 chart render");
+    let api = serde_norway::Deserializer::from_str(&yaml)
+        .map(|document| {
+            <Value as serde::Deserialize>::deserialize(document).expect("rendered YAML")
+        })
+        .find(|object| object["kind"] == "Deployment" && object["metadata"]["name"] == "curie-api")
+        .expect("rendered API deployment");
+    api
+}
+
+fn factory_api_env<'a>(api: &'a Value, name: &str) -> &'a Value {
+    api["spec"]["template"]["spec"]["containers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|container| container["name"] == "api")
+        .expect("API container")["env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == name)
+        .expect("API environment entry")
+}
+
+#[test]
+fn factory_upgrade_migrated_overlay_renders_the_preserved_runtime_policy_and_secret_mounts() {
+    let values = super::config_migrate::legacy_factory_values();
+    let context = super::config_migrate::factory_context(&values);
+    let outcome =
+        curie::config_migrate::migrate_installed_config(values, Some("curie-0.12.5"), &context)
+            .expect("legacy factory migration");
+    let api = rendered_factory_api(&outcome.values);
+    assert_eq!(factory_api_env(&api, "FACTORY_ENABLED")["value"], "true");
+    assert_eq!(factory_api_env(&api, "FACTORY_INTAKE")["value"], "webhook");
+    assert_eq!(factory_api_env(&api, "FACTORY_CI_WAIT_S")["value"], "2345");
+    assert_eq!(
+        factory_api_env(&api, "GITHUB_API_URL")["value"],
+        "https://api.github.com"
+    );
+    assert_eq!(
+        factory_api_env(&api, "GITHUB_APP_PRIVATE_KEY")["valueFrom"]["secretKeyRef"],
+        json!({"name": "acme-factory-app", "key": "signing.pem"})
+    );
+    let forges: Value = serde_json::from_str(
+        factory_api_env(&api, "CURIE_FORGES")["value"]
+            .as_str()
+            .unwrap(),
+    )
+    .expect("actual API factory JSON");
+    assert_eq!(forges["card_base_url"], "https://cards.example.com/factory");
+    let hosts = forges["code_hosts"].as_array().unwrap();
+    let trackers = forges["trackers"].as_array().unwrap();
+    let bindings = forges["bindings"].as_array().unwrap();
+    assert_eq!(hosts.len(), 1);
+    assert_eq!(trackers.len(), 1);
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(hosts[0]["host"], "github.com");
+    assert_eq!(hosts[0]["api_url"], "https://api.github.com");
+    assert_eq!(trackers[0]["label"], "triage-ready");
+    assert_eq!(trackers[0]["mention"], "acme-maintainer");
+    assert_eq!(trackers[0]["poll_interval_s"], 83);
+    assert_eq!(bindings[0]["tracker"], trackers[0]["name"]);
+    assert_eq!(bindings[0]["tracker_scope_id"], "73");
+    let repos = bindings[0]["repos"].as_array().unwrap();
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0]["code_host"], hosts[0]["name"]);
+    assert_eq!(repos[0]["project_id"], "73");
+    assert_eq!(repos[0]["path"], "acme-corp/acme-bot");
+    assert_eq!(repos[0]["bases"], json!(["release/2026", "main"]));
+    assert_eq!(repos[0]["default_base"], "release/2026");
+    assert_eq!(
+        repos[0]["ci"]["required"],
+        json!({
+            "key": "required-python", "paths": ["apps", "packages/python"],
+            "pending_key_prefix": "python-shard-"
+        })
+    );
+    let keys = repos[0]["ci"]["metadata_rerun_keys"].as_array().unwrap();
+    let actual: std::collections::BTreeSet<_> =
+        keys.iter().map(|key| key.as_str().unwrap()).collect();
+    assert_eq!(
+        actual,
+        std::collections::BTreeSet::from([
+            "body-check",
+            "fix-pin",
+            "status:approval",
+            "status:status:retained-context"
+        ])
+    );
+    assert_eq!(keys.len(), 4);
+    let volumes = api["spec"]["template"]["spec"]["volumes"]
+        .as_array()
+        .unwrap();
+    let projected = &volumes
+        .iter()
+        .find(|volume| volume["name"] == "forge-credentials")
+        .expect("projected forge credentials")["projected"]["sources"];
+    let sources = projected.as_array().unwrap();
+    assert_eq!(sources.len(), 2);
+    for (entry, section) in [(&hosts[0], "code_hosts"), (&trackers[0], "trackers")] {
+        assert_eq!(entry["credential"]["type"], "github_app");
+        assert_eq!(entry["credential"]["app_id"], "17");
+        assert!(entry["credential"].get("private_key").is_none());
+        let relative_path = format!("{section}-{}/private_key", entry["name"].as_str().unwrap());
+        assert_eq!(
+            entry["credential"]["private_key_file"],
+            format!("/etc/curie/forges/{relative_path}")
+        );
+        let matching: Vec<_> = sources
+            .iter()
+            .filter(|source| source["secret"]["items"][0]["path"] == relative_path)
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0]["secret"]["name"], "acme-factory-app");
+        assert_eq!(matching[0]["secret"]["items"][0]["key"], "signing.pem");
+    }
+}
+
+#[test]
+fn factory_upgrade_disabled_configuration_stays_disabled_in_the_actual_chart() {
+    let mut values = super::config_migrate::legacy_factory_values();
+    values["api"]["githubFactoryIngressEnabled"] = json!(false);
+    let context = super::config_migrate::factory_context(&values);
+    let outcome =
+        curie::config_migrate::migrate_installed_config(values, Some("curie-0.12.5"), &context)
+            .expect("disabled configured legacy migration");
+    let api = rendered_factory_api(&outcome.values);
+    assert_eq!(factory_api_env(&api, "FACTORY_ENABLED")["value"], "false");
+    let forges: Value = serde_json::from_str(
+        factory_api_env(&api, "CURIE_FORGES")["value"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(forges["trackers"][0]["label"], "triage-ready");
+    assert_eq!(
+        forges["bindings"][0]["repos"][0]["ci"]["required"]["key"],
+        "required-python"
+    );
+}
+
+#[test]
+fn factory_upgrade_raw_legacy_values_still_refuse_with_the_stable_guard_prefix() {
+    let values = super::config_migrate::legacy_factory_values();
+    let output = render_factory_upgrade_overlay(&values);
+    assert!(
+        !output.status.success(),
+        "raw legacy values must remain unsupported"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("api.githubFactoryIngressEnabled is no longer read"),
+        "{stderr}"
+    );
+    for value in [
+        "triage-ready",
+        "acme-maintainer",
+        "acme-corp/acme-bot",
+        "acme-factory-app",
+    ] {
+        assert!(
+            !stderr.contains(value),
+            "the raw guard must not echo operator values"
+        );
+    }
 }
