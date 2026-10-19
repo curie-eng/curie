@@ -2824,7 +2824,8 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
         "E2E released chart upgrade negative control (nil unsafe helpers)"
     )
     assert negative_job["runs-on"] == "ubuntu-latest"
-    assert negative_job["if"] == job["if"]
+    assert negative_job["if"] == "${{ needs.changes.outputs.released_upgrade == 'true' }}"
+    assert job["if"] == "${{ needs.changes.outputs.released_upgrade_full == 'true' }}"
     assert set(negative_job["needs"]) == set(job["needs"])
     negative_steps = {
         step["name"]: step for step in negative_job["steps"] if isinstance(step.get("name"), str)
