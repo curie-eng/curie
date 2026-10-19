@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import json
 import logging
 import os
@@ -145,7 +146,7 @@ class Handler(BaseHTTPRequestHandler):
         # @spec SIGNER-DIAGNOSTICS-1: exception text may contain credentials.
         try:
             status = forward(body, signature, delivery, timestamp)
-        except (urllib.error.URLError, OSError):
+        except (urllib.error.URLError, OSError, http.client.HTTPException):
             logger.warning("hook ingress forwarding failed (reason=transport_error)")
             self.send_response(502)
             self.end_headers()
