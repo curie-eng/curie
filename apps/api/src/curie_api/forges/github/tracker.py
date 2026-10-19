@@ -50,6 +50,7 @@ from curie_api.forges.github.transport import (
     get_github_json,
     github_headers,
     list_pages,
+    parse_time,
     repository_identity_matches,
 )
 from curie_api.forges.github.transport import Unavailable as TransportUnavailable
@@ -349,6 +350,7 @@ class GitHubTracker:
             event_id=str(event_id),
             disposition=Disposition.ADMIT if kind == "labeled" else Disposition.CANCEL,
             cursor=cursor,
+            occurred_at=parse_time(event.get("created_at")),
         )
 
     def _mention_notice(self, comment: Any, cursor: str) -> MarkedNotice | None:
@@ -380,6 +382,7 @@ class GitHubTracker:
             event_id=str(comment_id),
             disposition=Disposition.MENTION,
             cursor=cursor,
+            occurred_at=parse_time(comment.get("created_at")),
         )
 
     async def _removal(self, issue: TrackerIssueRef, cursor: str) -> MarkedNotice | None:
@@ -655,6 +658,14 @@ class GitHubTracker:
         if repository.kind == GITHUB and repository.project_id == issue.scope_id:
             return f"Closes #{number}"
         return f"Closes {self.repo_full_name}#{number}"
+
+    async def publication_references(
+        self, issue: TrackerIssueRef, repository: RepositoryRef
+    ) -> tuple[str, ...]:
+        """The closing reference, which is already scope-qualified: a bare
+        ``Closes #n`` only in the issue's own repository, else ``owner/repo#n``."""
+
+        return (await self.closing_reference(issue, repository),)
 
     async def link_pull_request(self, issue: TrackerIssueRef, pull_request: PullRequest) -> None:
         self._number(issue)

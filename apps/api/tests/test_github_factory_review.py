@@ -707,9 +707,7 @@ def _reconcile_queued_revisions(monkeypatch: pytest.MonkeyPatch) -> None:
     async def go() -> None:
         engine = create_async_engine(get_settings().database_url)
         maker = async_sessionmaker(engine, expire_on_commit=False)
-        valkey = redis.Redis(
-            host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None
-        )
+        valkey = redis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
         reconciler = WorkItemReconciler(maker, valkey, get_settings())
 
         async def skip_github_io() -> None:
@@ -758,13 +756,16 @@ def test_review_mention_during_live_run_waits_then_becomes_next_request(
         f"{_pr_url(pr)}#{FRAGMENTS[event].format(id=fid)}"
     )
     assert _stored_reply_target(revision) == _reply_target(event, pr, fid)
-    assert len(
-        _rows(
-            "SELECT execution_request_id FROM curie.factory_terminal_notices "
-            "WHERE execution_request_id = :id",
-            {"id": revision["id"]},
+    assert (
+        len(
+            _rows(
+                "SELECT execution_request_id FROM curie.factory_terminal_notices "
+                "WHERE execution_request_id = :id",
+                {"id": revision["id"]},
+            )
         )
-    ) == 1
+        == 1
+    )
 
     _reconcile_queued_revisions(monkeypatch)
     assert _requests(number)[1]["status"] == "queued"
@@ -824,9 +825,7 @@ def test_distinct_review_mentions_wait_in_order_until_each_live_run_ends(
 
     _mark_running(first_revision_id)
     _reconcile_queued_revisions(monkeypatch)
-    assert [row["status"] for row in _requests(number)] == [
-        "completed", "running", "queued"
-    ]
+    assert [row["status"] for row in _requests(number)] == ["completed", "running", "queued"]
     _execute(
         "UPDATE curie.execution_requests SET status = 'completed', "
         "terminal_at = clock_timestamp(), terminal_cause = 'completed', "
@@ -879,19 +878,14 @@ def test_review_admission_survives_work_item_version_change_during_verification(
         try:
             async with engine.begin() as connection:
                 await connection.execute(
-                    text(
-                        "UPDATE curie.work_items SET version = version + 1 "
-                        "WHERE id = :id"
-                    ),
+                    text("UPDATE curie.work_items SET version = version + 1 WHERE id = :id"),
                     {"id": first["work_item_id"]},
                 )
         finally:
             await engine.dispose()
         return head
 
-    monkeypatch.setattr(
-        github_factory_review, "verify_feedback_truth", verify_with_version_change
-    )
+    monkeypatch.setattr(github_factory_review, "verify_feedback_truth", verify_with_version_change)
 
     response = _post(client, "issue_comment", payload)
     replay = _post(client, "issue_comment", payload, delivery=str(uuid.uuid4()))
@@ -1056,6 +1050,10 @@ def test_factory_review_truth_mints_with_the_code_host_credential(
             issuers.append(jwt.decode(app_jwt, options={"verify_signature": False})["iss"])
         if request.method == "GET" and request.url.path == installation_path:
             return httpx.Response(200, json={"id": INSTALLATION_ID})
+        if request.method == "GET" and request.url.path == "/app":
+            # Rediscovery reads the publishing App's slug at admission (#4629).
+            # https://docs.github.com/en/rest/apps/apps#get-the-authenticated-app
+            return httpx.Response(200, json={"id": 1, "slug": "curie-fixture"})
         if request.method == "POST" and request.url.path == token_path:
             return httpx.Response(
                 201,
@@ -1075,6 +1073,9 @@ def test_factory_review_truth_mints_with_the_code_host_credential(
     try:
         monkeypatch.setattr("curie_api.github_app.httpx.Client", stub_client)
         number, pr, first = _owned(client, review_api)
+        # The admission's rediscovery lists with the install's own publishing
+        # App (#4629); the pin here is the review truth read that follows.
+        issuers.clear()
         payload, _ = _feedback_event(review_api, "issue_comment", pr, _mention())
 
         response = _post(client, "issue_comment", payload)

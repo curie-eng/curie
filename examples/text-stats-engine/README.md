@@ -1,11 +1,13 @@
-# text-stats-engine — engine as an in-bundle stdio MCP server
+# text-stats-engine: reuse your analysis tools
 
-A blessed template bundle for the **"engine as an in-bundle stdio MCP server"**
-shape (#274). The bundle's tools live *inside the bundle* and are spawned as a
-stdio subprocess by the harness — no network service, no hosted sidecar, nothing
-to provision. A hosted harness that can only reach remote MCP URLs cannot do
-this; running the engine in-process next to the agent is the differentiator this
-template paves.
+Bring existing text-analysis instructions and deterministic code into a Curie
+co-worker. This bundle keeps the analysis engine as an in-bundle MCP server,
+uses a skill to direct its tools, and lets Curie supply the model loop and
+workspace connection. Start with [Bring your agent](../../docs/bring-your-agent.md)
+to copy it, prove a real local tool call, and deploy the same bundle to Slack.
+
+No separate tool service is required. The engine is a stdio subprocess shipped
+inside the bundle with no external dependencies.
 
 ## What's here
 
@@ -15,6 +17,8 @@ text-stats-engine/
   .mcp.json                    declares the stdio server (command + args)
   scripts/engine_server.py     the engine: a stdlib-only stdio MCP server
   skills/text-stats/SKILL.md   a skill that drives the engine's tools
+  evals/cases.json             numerical requests for the engine
+  evals/trajectory.json        requires each requested MCP tool
 ```
 
 The engine (`scripts/engine_server.py`) speaks the MCP **stdio transport**:
@@ -48,6 +52,31 @@ You will see three JSON-RPC responses: the handshake, the tool catalog, and
 `3` (the word count). Under a real agent, `curie skill up` spawns the same
 server from the `.mcp.json` declaration and the `text-stats` skill calls its
 tools.
+
+## Verify a real model uses the engine
+
+With a supported model credential configured:
+
+```bash
+curie skill check --json
+curie skill up
+curie skill message --json "Use the text-stats skill and the text-stats-engine word_count tool to count the words in: one two three. Report the tool result."
+curie skill eval --json
+curie skill down
+```
+
+Check the answer is three and the tool activity includes `word count`. The
+trajectory sidecar requires the MCP request for each eval case; it does not
+assert successful execution or the answer. Check the numerical reply separately.
+The bare skill CLI shows request activity, not returned MCP payloads. After
+deployment, use the [workspace run inspection](../../docs/your-first-slack-agent.md#verify-your-workspace-reply)
+to verify the successful tool result. A short word-count question can be
+answered without using a tool, so it
+is insufficient as a tool-execution check.
+
+To test that the trajectory oracle detects a missing capability, use a
+disposable copy without the MCP server declaration and rerun the same suite.
+The missing-tool case must fail. Keep the working bundle intact.
 
 ## When to use this shape vs. a CLI subprocess
 

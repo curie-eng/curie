@@ -940,6 +940,8 @@ def _derived_headers(spec: ConnectorSpec) -> dict[str, Any]:
     the runner can diagnose its missing sandbox value honestly.
     """
 
+    if spec.no_client_auth is not None:
+        return {}
     if spec.bearer_secret:
         name = spec.bearer_secret
     elif len(spec.secrets) == 1 and isinstance(spec.secrets[0], str):

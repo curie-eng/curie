@@ -83,6 +83,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
+from forge_fakes import factory_wake
 from forge_fakes.github import REPO, forges_document, forges_env_json
 from forge_fakes.github_comments import _clear_ci_keys, _rows
 
@@ -198,7 +199,11 @@ def jira_tracker_entry() -> dict[str, Any]:
         "kind": "jira_cloud",
         "host": JIRA_HOST,
         "api_url": f"https://{JIRA_HOST}",
-        "credential": {"type": "static_token", "token": "fixture-jira-token"},
+        "credential": {
+            "type": "static_token",
+            "username": "acme-bot@example.com",
+            "token": "fixture-jira-token",
+        },
         "label": LABEL,
         "mention": MENTION,
     }
@@ -353,7 +358,9 @@ def _start(request_id: uuid.UUID) -> None:
         try:
             async with AsyncSession(engine) as session:
                 acquired = await acquire(
-                    session, request_id, owner="factory-owner", generation=generation
+                    session, request_id, owner="factory-owner", generation=generation,
+                    wake=await factory_wake(session, request_id),
+                    context=None,
                 )
                 assert not isinstance(acquired, DispatchConflict), acquired
                 started = await start(
@@ -363,6 +370,7 @@ def _start(request_id: uuid.UUID) -> None:
                     generation=generation,
                     claim_name="claim-factory",
                     sandbox_name="sbx-factory",
+                    context=acquired.context,
                 )
                 assert not isinstance(started, DispatchConflict), started
         finally:
@@ -378,14 +386,14 @@ def _agent_id() -> uuid.UUID:
     return agent_id
 
 
-def _create_agent(client: TestClient) -> None:
+def _create_agent(client: TestClient, *, binding_name: str) -> None:
     created = client.post(
         "/agents",
         headers={"X-API-Key": get_settings().api_key},
         json={
             "name": f"acme-factory-{uuid.uuid4().hex[:8]}",
             "repo_full_name": REPO,
-            "channel": {"kind": "github", "address": REPO},
+            "channel": {"kind": "jira", "address": binding_name},
         },
     )
     assert created.status_code == 201, created.text
@@ -435,7 +443,8 @@ class BitbucketPair:
             ("curie_api.repository_access", ("code_host_for",)),
             ("curie_api.github_factory", ("factory_code_host",)),
             ("curie_api.routers.publications", ("code_host_for",)),
-            ("curie_api.routers.publication_code_host", ("code_host_for",)),
+            ("curie_api.routers.publication_code_host", ("publishing_code_host",)),
+            ("curie_api.factory_rediscovery", ("publishing_code_host",)),
         ):
             for seam in seams:
                 monkeypatch.setattr(f"{module}.{seam}", host)
@@ -544,9 +553,9 @@ class BitbucketPair:
             return await self._dispatch(
                 Admission(
                     agent_id=agent_id,
-                    kind="github",
-                    address=REPO,
-                    reply_conversation_id=f"{types.JIRA_CLOUD}-issue-{self.issue.issue_id}",
+                    kind="jira",
+                    address=self.binding.name,
+                    reply_conversation_id=f"issue-{self.issue.issue_id}",
                     issue=self.issue,
                     repository=self.repository,
                     code_host_installation_id=None,
@@ -640,9 +649,9 @@ class BitbucketPair:
             return await self._dispatch(
                 Admission(
                     agent_id=agent_id,
-                    kind="github",
-                    address=REPO,
-                    reply_conversation_id=f"{types.JIRA_CLOUD}-issue-{self.issue.issue_id}",
+                    kind="jira",
+                    address=self.binding.name,
+                    reply_conversation_id=f"issue-{self.issue.issue_id}",
                     issue=self.issue,
                     repository=self.repository,
                     code_host_installation_id=None,
@@ -727,7 +736,7 @@ def bitbucket_pair(
     get_settings.cache_clear()
     try:
         with TestClient(create_app()) as client:
-            _create_agent(client)
+            _create_agent(client, binding_name=binding_entry["name"])
             http = backend.adapter_client()
             try:
                 registry = forges_registry(get_settings())

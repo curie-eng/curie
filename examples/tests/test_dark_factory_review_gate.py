@@ -33,6 +33,7 @@ from curie_api import factory_ci
 from curie_api.forges.github.ci import CiDetail
 from curie_api.forges.github.code_host import diagnostics_of, normalize_checks
 from curie_runner.__main__ import _format_check_data, format_workspace_preamble
+from curie_runner.sender_frame import frame_user_turn
 from curie_runner.verification import (
     load_verification_declaration,
     preflight_route,
@@ -665,6 +666,31 @@ def test_ci_round_goes_straight_to_implement_and_diff_review(tmp_path: Path) -> 
     s.review(DIFF, reply(DIFF, "APPROVE"))
     assert s.pre(PUBLISH)["permissionDecision"] == "allow"
     assert s.phases() == [("wait_ci", 2), ("review_diff", 1)]
+
+
+@pytest.mark.parametrize("event", ["message", "job"])
+def test_ci_round_is_found_inside_the_runner_sender_frame(tmp_path: Path, event: str) -> None:
+    """The runner queries the model with the platform sender frame around the
+    turn, so the marker is the framed message's second line, not the prompt's."""
+
+    framed = frame_user_turn(event, "jira_cloud:account:Reviewer", _ci_prompt(2), "jira")
+    s, out = _ci_session(tmp_path, framed)
+
+    assert "CI fix round" in context_of(out)
+    assert s.phases() == [("wait_ci", 2)]
+    s.review(DIFF, reply(DIFF, "APPROVE"))
+    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
+
+
+@pytest.mark.parametrize("marker_line", [2, 3])
+def test_a_framed_marker_off_the_message_line_two_has_no_effect(
+    tmp_path: Path, marker_line: int
+) -> None:
+    framed = frame_user_turn("message", "u", _ci_prompt(2, marker_line=marker_line), "jira")
+    s, out = _ci_session(tmp_path, framed)
+
+    assert "CI fix round" not in context_of(out)
+    assert s.phases() == []
 
 
 def test_ci_round_three_reports_its_round(tmp_path: Path) -> None:

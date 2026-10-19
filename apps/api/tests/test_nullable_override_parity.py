@@ -110,6 +110,7 @@ KNOWN_BODY_MODULES = frozenset(
         "curie_api.schemas.workitems",
         "curie_api.schemas.workspaces",
         "curie_api.turn_progress",
+        "curie_api.workitem_dispatch",
         "aci_protocol.turn",
         "aci_protocol.wire",
         "curie_api.routers.channels",

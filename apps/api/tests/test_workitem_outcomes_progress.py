@@ -27,9 +27,10 @@ from curie_api.models import (
     ExecutionRequestPhaseReport,
     FactoryStatusComment,
 )
-from curie_api.workitem_dispatch import acquire, admit, finish, start
+from curie_api.workitem_dispatch import AcquireGrant, acquire, admit, finish, start
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
+from forge_fakes import factory_wake
 from sqlalchemy import delete, event, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
@@ -182,7 +183,15 @@ def _admit(facts: SimpleNamespace) -> uuid.UUID:
 
 def _start(request_id: uuid.UUID) -> int:
     async def body(session: AsyncSession) -> int:
-        await acquire(session, request_id, owner=OWNER, generation=1)
+        acquired = await acquire(
+            session,
+            request_id,
+            owner=OWNER,
+            generation=1,
+            wake=await factory_wake(session, request_id),
+            context=None,
+        )
+        assert isinstance(acquired, AcquireGrant), acquired
         started = await start(
             session,
             request_id,
@@ -190,6 +199,7 @@ def _start(request_id: uuid.UUID) -> int:
             generation=1,
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
+            context=acquired.context,
         )
         return int(started.runtime_epoch)  # type: ignore[union-attr]
 

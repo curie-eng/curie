@@ -18,11 +18,15 @@ cancelled through a tracker, so each poll of that tracker cancels it.
 
 The opaque ``poll_marked`` cursor is kept per label in the tracker scope's
 ``factory_poll_cursors`` row, under ``etags["marked:<label>"]``, and saved only
-after every notice of a page was applied or deliberately refused. A refused
-admission is not held: every ``factory_reconcile_interval_s`` a sweep re-reads
-the latest label add of every labelled issue and applies it again under the
-original event's request id, so a repaired ticket admits and an admitted one
-replays.
+after every notice of a page was applied or deliberately refused. A notice
+whose tracker or code host could not answer holds only its own issue (#4621):
+the issue's later notices in the page wait behind it, it gets one marked hold
+comment, the cursor stays, and every other issue in the page is still applied.
+The next poll replays the page, and an already applied notice replays under
+its request id. A refused admission is not held: every
+``factory_reconcile_interval_s`` a sweep re-reads the latest label add of every
+labelled issue and applies it again under the original event's request id, so
+a repaired ticket admits and an admitted one replays.
 
 The pass holds ``pg_try_advisory_lock(3745, 197)`` on one connection, so only
 one replica polls. A tracker's credential and responses stay in the API: logs
@@ -41,15 +45,16 @@ import httpx
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from . import factory_base, workitem_dispatch
+from . import factory_base, factory_rediscovery, workitem_dispatch
 from .config import Settings
 from .factory_admission import LABEL_REFUSAL_MARKER, cancel_work_item, label_refusal
 from .forges.authority import may_start_with
 from .forges.config import BindingConfig, RepositoryBindingConfig, TrackerConfig
-from .forges.errors import ForgeError, NotFound, Unauthorized, Unavailable
+from .forges.connections import CodeHostConnection
+from .forges.errors import CredentialUnreadable, ForgeError, NotFound, Unauthorized, Unavailable
 from .forges.hosts import resolve_stored
 from .forges.identity import notice_request_id
-from .forges.ports import Tracker
+from .forges.ports import CodeHost, Tracker
 from .forges.registry import ForgeRegistry, forges_registry
 from .forges.resolution import REFUSAL_MARKER as REPO_REFUSAL_MARKER
 from .forges.resolution import Refusal, refusal_body, resolve_repository
@@ -82,9 +87,16 @@ _LOCK = text("SELECT pg_try_advisory_lock(CAST(:classid AS integer), CAST(:objid
 _UNLOCK = text("SELECT pg_advisory_unlock(CAST(:classid AS integer), CAST(:objid AS integer))")
 _LOCK_ARGS = {"classid": 3745, "objid": 197}
 
-# A pass over one label stops at these and keeps its cursor: the tracker or a
-# code host could not answer now, or refused the credential.
+# The tracker or a code host could not answer now, or refused the credential.
+# On a page read the label's pass stops; on one notice only its issue is held.
+# Either way the label's cursor stays.
 _DEFERRED = (Unavailable, Unauthorized, FeedbackUnavailable)
+
+HOLD_MARKER = "curie-factory-intake-hold"
+_HOLD_BODY = (
+    "Curie could not start this issue yet: a tracker or code host it needs did not "
+    "answer. Curie retries on its next poll; nothing is needed unless this persists."
+)
 
 
 @dataclass(frozen=True)
@@ -279,16 +291,40 @@ async def _poll_binding(
                 scope.tracker.name,
             )
             return
-        # A label whose poll was deferred is not swept in the same pass: the
-        # tracker could not answer it now.
+        # A label whose page could not be read is not swept in the same pass:
+        # the tracker could not answer it now. A held issue does not stop the
+        # sweep, which skips that issue until the next pass.
+        held: set[TrackerIssueRef] = set()
         polled = not polling or await _poll_label(
-            sessionmaker, scope, tracker, label, running.get(label, [])
+            sessionmaker, scope, tracker, label, running.get(label, []), held
         )
         if polled and label in sweeps:
-            await _sweep_label(sessionmaker, scope, tracker, label)
+            await _sweep_label(sessionmaker, scope, tracker, label, held)
 
 
 def _deferred(scope: _Scope, label: str, what: str, exc: Exception) -> None:
+    """Log a deferred pass. A refused or unreadable credential is a WARNING with
+    a fixed classification and never the exception's text (#4630), so an
+    operator sees a rotation gone wrong; any other deferral stays INFO."""
+
+    classification = (
+        "credential unreadable"
+        if isinstance(exc, CredentialUnreadable)
+        else "authentication rejected"
+        if isinstance(exc, Unauthorized)
+        else None
+    )
+    if classification is not None:
+        logger.warning(
+            "tracker intake %s for tracker %s binding %s label %r deferred: %s",
+            what,
+            scope.tracker.name,
+            scope.binding.name,
+            label,
+            classification,
+        )
+        return
+    # A port error carries only its code, never forge text (ADR 0197).
     logger.info(
         "tracker intake %s for tracker %s binding %s label %r deferred: %s %s",
         what,
@@ -300,21 +336,44 @@ def _deferred(scope: _Scope, label: str, what: str, exc: Exception) -> None:
     )
 
 
+async def _hold(
+    scope: _Scope, tracker: Tracker, label: str, issue: TrackerIssueRef, exc: Exception
+) -> None:
+    """Log one issue's deferral and say so on the issue once (upserted)."""
+
+    _deferred(scope, label, "notice", exc)
+    try:
+        await tracker.marked_comments.upsert_marked(
+            ReplyTarget.on_issue(issue), HOLD_MARKER, _HOLD_BODY
+        )
+    except ForgeError as failed:
+        # The retained cursor is the retry authority; the hold is a courtesy.
+        logger.info(
+            "tracker intake for binding %s could not post a hold: %s",
+            scope.binding.name,
+            type(failed).__name__,
+        )
+
+
 async def _poll_label(
     sessionmaker: async_sessionmaker[AsyncSession],
     scope: _Scope,
     tracker: Tracker,
     label: str,
     running: list[TrackerIssueRef],
+    held: set[TrackerIssueRef],
 ) -> bool:
-    """Poll one label from its stored cursor; False when the poll was deferred."""
+    """Poll one label from its stored cursor; False when the page was not read.
+
+    A deferred notice adds its issue to ``held``: that issue's later notices
+    wait, the others are applied, and the cursor stays for the next poll to
+    replay.
+    """
 
     key = f"marked:{label}"
     stored = await _load_cursor(sessionmaker, scope, key)
     try:
         page = await tracker.poll_marked(stored, running=tuple(running))
-        for notice in page.notices:
-            await _apply(sessionmaker, scope, tracker, label, notice)
     except _DEFERRED as exc:
         _deferred(scope, label, "poll", exc)
         return False
@@ -328,7 +387,16 @@ async def _poll_label(
             label,
         )
         return False
-    await _save_cursor(sessionmaker, scope, key, page.cursor)
+    for notice in page.notices:
+        if notice.issue in held:
+            continue
+        try:
+            await _apply(sessionmaker, scope, tracker, label, notice)
+        except _DEFERRED as exc:
+            held.add(notice.issue)
+            await _hold(scope, tracker, label, notice.issue, exc)
+    if not held:
+        await _save_cursor(sessionmaker, scope, key, page.cursor)
     return True
 
 
@@ -337,20 +405,28 @@ async def _sweep_label(
     scope: _Scope,
     tracker: Tracker,
     label: str,
+    held: set[TrackerIssueRef],
 ) -> None:
     """Apply the latest label add of every labelled issue again (plan D2).
 
     No cursor is read or written. An admitted issue replays under its request
-    id; a refused one is judged again on its current ticket.
+    id; a refused one is judged again on its current ticket. An issue in
+    ``held`` is skipped, and one that defers here is held.
     """
 
     try:
         page = await tracker.poll_marked(None, running=())
-        for notice in page.notices:
-            if notice.disposition is Disposition.ADMIT:
-                await _apply(sessionmaker, scope, tracker, label, notice)
     except _DEFERRED as exc:
         _deferred(scope, label, "sweep", exc)
+        return
+    for notice in page.notices:
+        if notice.disposition is not Disposition.ADMIT or notice.issue in held:
+            continue
+        try:
+            await _apply(sessionmaker, scope, tracker, label, notice)
+        except _DEFERRED as exc:
+            held.add(notice.issue)
+            await _hold(scope, tracker, label, notice.issue, exc)
 
 
 async def _load_cursor(
@@ -400,7 +476,7 @@ async def _apply(
     """Apply one notice under its issue lock, committing what it decided.
 
     A deliberate refusal returns; a deferral raises one of ``_DEFERRED`` so the
-    label's cursor stays.
+    notice's issue is held and the label's cursor stays.
     """
 
     async with sessionmaker() as session:
@@ -494,8 +570,21 @@ async def _admit(
     if isinstance(chosen, Refusal):
         await _comment(tracker, issue, REPO_REFUSAL_MARKER, refusal_body(chosen))
         return
+    connection, code_host, repository = await _chosen_repository(scope, chosen)
+    if existing is None and await _rediscovered(scope, tracker, notice, repository):
+        return
     admission = await _admission(
-        session, scope, tracker, label, notice, surface.agent_id, chosen, existing, ticket
+        tracker,
+        scope,
+        label,
+        notice,
+        surface.agent_id,
+        chosen,
+        connection,
+        code_host,
+        repository,
+        existing is not None and await _has_open_pr(session, existing),
+        ticket,
     )
     if admission is None:
         return
@@ -508,30 +597,76 @@ async def _admit(
     _log_dispatch(scope, result)
 
 
-async def _admission(
-    session: AsyncSession,
-    scope: _Scope,
-    tracker: Tracker,
-    label: str,
-    notice: MarkedNotice,
-    agent_id: uuid.UUID,
-    repo: RepositoryBindingConfig,
-    existing: WorkItem | None,
-    ticket: TicketLabels,
-) -> Admission | None:
-    """The admission facts on the chosen repository, or None after a base refusal."""
+async def _chosen_repository(
+    scope: _Scope, repo: RepositoryBindingConfig
+) -> tuple[CodeHostConnection, CodeHost, RepositoryRef]:
+    """The chosen repository's code host entry, its adapter, and the repository
+    read now by its configured path; the answer's immutable id must be the
+    configured one, or the repository is refused as moved."""
 
     connection = scope.registry.code_host(repo.code_host)
     code_host = connection.adapter(scope.client)
-    # Read by its configured path; the answer's immutable id must be the
-    # configured one, or the repository is refused as moved.
     repository = await resolve_stored(
         code_host,
         RepositoryRef(connection.config.kind, connection.config.host, repo.project_id, repo.path),
     )
+    return connection, code_host, repository
+
+
+async def _rediscovered(
+    scope: _Scope, tracker: Tracker, notice: MarkedNotice, repository: RepositoryRef
+) -> bool:
+    """True when the code host already has this issue's factory publication,
+    so an admission with no local WorkItem is refused (#4629).
+
+    An open or ambiguous one is named on the issue; a completed one
+    whose trigger this notice replays is only logged. Evidence that cannot be
+    read completely defers (one of ``_DEFERRED``), so the cursor stays. A
+    `NotFound` from the listing defers too: the repository was just resolved, so
+    a missing answer is incomplete evidence, not a missing issue.
+    """
+
+    code_host = factory_rediscovery.publishing_code_host(scope.settings, scope.client, repository)
+    try:
+        found = await factory_rediscovery.rediscover(
+            tracker, code_host, notice.issue, repository, event_at=notice.occurred_at
+        )
+    except (Unavailable, Unauthorized):
+        raise
+    except ForgeError as exc:
+        raise Unavailable("publication_listing") from exc
+    if found.verdict == "clear":
+        return False
+    try:
+        await factory_rediscovery.report(tracker, notice.issue, found)
+    except ForgeError:
+        raise FeedbackUnavailable("publication_report_unavailable") from None
+    logger.info(
+        "tracker intake for binding %s refused an admission: publication_exists (%s)",
+        scope.binding.name,
+        found.verdict,
+    )
+    return True
+
+
+async def _admission(
+    tracker: Tracker,
+    scope: _Scope,
+    label: str,
+    notice: MarkedNotice,
+    agent_id: uuid.UUID,
+    repo: RepositoryBindingConfig,
+    connection: CodeHostConnection,
+    code_host: CodeHost,
+    repository: RepositoryRef,
+    has_open_pr: bool,
+    ticket: TicketLabels,
+) -> Admission | None:
+    """The admission facts on the chosen repository, or None after a base refusal."""
+
     installation = await connection.installation_for(repository)
     base: factory_base.ResolvedBase | None = None
-    if existing is None or not await _has_open_pr(session, existing):
+    if not has_open_pr:
         resolved = await factory_base.resolve_base(
             policy=repo,
             labels=set(ticket.labels),

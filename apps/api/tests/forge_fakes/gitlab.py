@@ -1878,6 +1878,9 @@ class GitLabAPI:
         for key in ("source_branch", "target_branch"):
             if key in params:
                 found = [m for m in found if getattr(m, key) == params[key]]
+        # ``author_id``: merge requests created by the user with this id (same reference).
+        if params.get("author_id", "").isdigit():
+            found = [m for m in found if m.author == int(params["author_id"])]
         iids = {int(v) for k, v in query if k == "iids[]"}
         if iids:
             found = [m for m in found if m.iid in iids]

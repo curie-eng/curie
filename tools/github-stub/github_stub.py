@@ -511,6 +511,11 @@ class GithubStub:
     def _rest(
         self, method: str, path: str, query: dict[str, list[str]], body: Any
     ) -> tuple[int, Any] | None:
+        if method == "GET" and path == "/app":
+            # The authenticated App; its bot user, ``<slug>[bot]``, authors what
+            # its installation token writes (BOT).
+            # https://docs.github.com/en/rest/apps/apps#get-the-authenticated-app
+            return 200, {"id": 51, "slug": BOT["login"].removesuffix("[bot]")}
         if method == "POST" and path == "/app/installations/5501/access_tokens":
             if body.get("repositories") != ["acme-bot"]:
                 return 422, {"message": "token must be scoped to acme-bot"}

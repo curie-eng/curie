@@ -586,27 +586,57 @@ exit 64
             .iter()
             .map(|line| line.as_str().expect("plan line is a string"))
             .collect();
-        let primary_stamp = format!(
-            "kubectl label namespace {primary} curietech.ai/created-by={TARGET_RELEASE} curietech.ai/created-in={primary} --overwrite"
+        // #4626: --dry-run does not read whether a namespace exists, so the plan
+        // states the live decision as conditional comment lines and never as
+        // an unconditional `kubectl label namespace` command.
+        assert!(
+            plan.iter().all(|line| {
+                !line.starts_with("kubectl label namespace")
+                    && !line.starts_with("kubectl annotate namespace")
+            }),
+            "{name}: a dry run must not plan an unconditional namespace stamp: {plan:?}"
         );
-        assert_eq!(
-            plan.iter().filter(|line| **line == primary_stamp).count(),
-            1,
-            "{name}: primary ownership must be planned exactly once: {plan:?}"
+        let mut primary_block = vec![
+            format!("# not read under --dry-run: whether namespace {primary} exists and which release owns it; a live run checks it before helm runs"),
+            format!("#   if namespace {primary} does not exist: create it with labels curietech.ai/created-by={TARGET_RELEASE} curietech.ai/created-in={primary}"),
+            format!("#   if namespace {primary} is not terminating and already has this release's created-by and created-in labels, or its adopted-by and adopted-in labels: use it and leave its labels unchanged"),
+        ];
+        if *primary != "agent-sandbox-system" {
+            primary_block.push(format!("#   if namespace {primary} is not terminating and exists with no ownership or foreign labels and only its default objects: add labels curietech.ai/created-by={TARGET_RELEASE} curietech.ai/created-in={primary}"));
+        }
+        primary_block.push(format!(
+            "#   otherwise: refuse to install into namespace {primary}"
+        ));
+        for expected in &primary_block {
+            assert_eq!(
+                plan.iter()
+                    .filter(|line| **line == expected.as_str())
+                    .count(),
+                1,
+                "{name}: primary ownership must be planned exactly once ({expected}): {plan:?}"
+            );
+        }
+        let shared_stamp = format!(
+            "#   if namespace agent-sandbox-system does not exist before helm runs and exists after: kubectl label namespace agent-sandbox-system curietech.ai/created-by={TARGET_RELEASE} curietech.ai/created-in={primary} --overwrite"
         );
-        let shared_writes: Vec<_> = plan
-            .iter()
-            .filter(|line| {
-                line.contains("label namespace agent-sandbox-system ")
-                    || line.contains("annotate namespace agent-sandbox-system ")
-            })
-            .collect();
-        let shared_expected = *controller_enabled || *primary == "agent-sandbox-system";
-        assert_eq!(
-            shared_writes.len(),
-            usize::from(shared_expected),
-            "{name}: shared ownership must follow the effective controller decision and primary namespace: {plan:?}"
-        );
+        let shared_header = "# not read under --dry-run: whether namespace agent-sandbox-system and Deployment agent-sandbox-controller already exist; a live run checks them before helm runs";
+        let shared_kept =
+            "#   if namespace agent-sandbox-system already exists: use it and leave its labels unchanged";
+        let shared_expected = *controller_enabled && *primary != "agent-sandbox-system";
+        for expected in [shared_header, shared_stamp.as_str(), shared_kept] {
+            assert_eq!(
+                plan.iter().filter(|line| **line == expected).count(),
+                usize::from(shared_expected),
+                "{name}: shared ownership must follow the effective controller decision and primary namespace ({expected}): {plan:?}"
+            );
+        }
+        if !*controller_enabled {
+            assert!(
+                plan.iter()
+                    .all(|line| !line.contains("agent-sandbox-system")),
+                "{name}: a disabled controller plans nothing for the shared namespace: {plan:?}"
+            );
+        }
     }
 }
 

@@ -7,15 +7,19 @@ project factory-fixture/nested/widgets has id 1234, default branch main, and iss
 factory-bot has access level 30 (Developer) on factory-fixture/nested/widgets
 ensure labels curie-factory, curie-factory:queued, curie-factory:running, curie-factory:pr-open, curie-factory:needs-human on project 1234, creating only the missing ones, before any cluster step
 kubectl --context kind-curie-factory -n kube-system scale deployment/coredns --replicas=1
-curie cluster up --context kind-curie-factory --namespace curie --release curie --model z-ai/glm-5.3-flash --chart <chart> --set security.gvisor.mode=off
-write Secret curie-gitlab-token key token in namespace curie from --token-file <dir>/token-7c1e (the token is never printed)
-write ConfigMap curie-gitlab-ca key ca.crt in namespace curie from --ca-file <ca-file> and set codeHostTrust.caBundle.configMapRef.name=curie-gitlab-ca
-write factory.enabled=true, factory.intake=poll, factory.codeHosts and factory.trackers entry gitlab (apiUrl http://<forge-host>/api/v4, label curie-factory, mention factory-bot, credential expiresAt <expires>T00:00:00Z) and factory.bindings entry gitlab-1234 (project_id and tracker_scope_id 1234, path factory-fixture/nested/widgets): helm upgrade --reuse-values of release curie, then roll the API
-forge egress for gitlab: 127.0.0.1/32 TCP <port>
+release curie in namespace curie was not read under --dry-run; a live run reads it and decides whether cluster up runs
+if the release already runs the target chart and values: skip cluster up
+otherwise: curie cluster up --context kind-curie-factory --namespace curie --release curie --model z-ai/glm-5.3-flash --chart <chart> --set security.gvisor.mode=off
+write Secret curie-<entry>-token key token in namespace curie from --token-file <dir>/token-7c1e (the token is never printed), unless this release's quickstart already left it holding that token
+write ConfigMap curie-code-host-trust key ca.crt in namespace curie from --ca-file <ca-file> and set codeHostTrust.caBundle.configMapRef.name=curie-code-host-trust
+write factory.enabled=true, factory.intake=poll, factory.codeHosts entry <entry> and factory.trackers entry <entry> (apiUrl http://<forge-host>/api/v4, label curie-factory, mention factory-bot, credential expiresAt <expires>T00:00:00Z) and factory.bindings entry <entry>-1234 (project_id and tracker_scope_id 1234, path factory-fixture/nested/widgets): helm upgrade --reuse-values of release curie, then roll the API
+forge egress for <entry>: 127.0.0.1/32 TCP <port>
 enroll dark-factory for forge egress: helm upgrade --reset-then-reuse-values --set factory.sandboxEgress.dark-factory=true unless the release already records it; the API does not roll
 render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image
+create agent dark-factory only if absent, with initial surface gitlab=factory-fixture/nested/widgets and the tracker default label; preserve an existing agent
 curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir <dir>/curie-factory-quickstart-curie-curie/dark-factory --agent dark-factory --env prod --chart <chart>
 curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add gitlab=factory-fixture/nested/widgets
+without --label, skip the gitlab=factory-fixture/nested/widgets surfaces step when the agent already holds that surface, and keep its stored trigger label
 curie cluster overrides dark-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 10800
 curie cluster publication-policy dark-factory --context kind-curie-factory --namespace curie --release curie --policy auto
 curie cluster budget dark-factory --context kind-curie-factory --namespace curie --release curie --limit 5

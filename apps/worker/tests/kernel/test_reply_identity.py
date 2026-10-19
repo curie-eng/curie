@@ -19,10 +19,19 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from curie_worker.approvals import CreatedApproval
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.binding import BUDGET_ENV, BUNDLE_REF_ENV, PLUGIN_DIR_ENV, ResolvedDeployment
+from curie_worker.binding import (
+    BUDGET_ENV,
+    BUNDLE_REF_ENV,
+    PLUGIN_DIR_ENV,
+    FactoryContext,
+    FactoryWake,
+    ResolvedDeployment,
+)
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import ReplySinkRouter, build_reply_sink
 from curie_worker.workitem_dispatch import WorkItemRunning
+
+from apps.worker.tests.queue_fixtures import factory_context
 
 DONE = SessionStatus.DONE
 AWAITING = SessionStatus.AWAITING_APPROVAL
@@ -76,6 +85,12 @@ class _TripleBinding:
         self, kind: str, adapter: str | None, address: str
     ) -> ResolvedDeployment | None:
         return self._routes.get((kind, route_identity(kind, adapter), address))
+
+    async def resolve_factory(self, context: FactoryContext) -> ResolvedDeployment | None:
+        resolved = self._routes.get((context.kind, context.adapter, context.address))
+        assert resolved is not None
+        assert resolved.agent_id == context.agent_id
+        return resolved
 
     def boot_env(
         self,
@@ -247,16 +262,32 @@ def test_a_turn_on_an_identity_this_worker_cannot_speak_as_is_dropped_before_it_
 class _CiWorkItems:
     """Names one already-running request, like a CI continuation's dispatch."""
 
-    def __init__(self, running: uuid.UUID) -> None:
+    def __init__(self, running: uuid.UUID, *, agent_id: uuid.UUID) -> None:
         self.running = running
+        self.agent_id = agent_id
+        self.execution_deadline = datetime.now(UTC) + timedelta(minutes=20)
+        self.runtime_heartbeat_expires_at = self.execution_deadline
         self.finishes: list[tuple[uuid.UUID, dict[str, object]]] = []
 
-    async def running_for_conversation(self, _conversation_id: str) -> WorkItemRunning:
+    async def running_for_conversation(
+        self, conversation_id: str, *, wake: FactoryWake
+    ) -> WorkItemRunning:
         return WorkItemRunning(
             request_id=self.running,
             work_item_id=self.running,
+            agent_id=self.agent_id,
+            generation=1,
+            conversation_id=conversation_id,
+            wait_deadline=datetime.now(UTC) + timedelta(hours=1),
+            repository_path="acme-corp/widgets",
+            context=factory_context(self.agent_id, wake),
+            refusal=None,
             runtime_epoch=1,
-            execution_deadline=datetime.now(UTC) + timedelta(minutes=20),
+            execution_deadline=self.execution_deadline,
+            lease_held_to_deadline=(
+                self.runtime_heartbeat_expires_at == self.execution_deadline
+                and self.execution_deadline > datetime.now(UTC)
+            ),
         )
 
     async def finish(self, request_id: uuid.UUID, **kwargs: object) -> None:
@@ -297,9 +328,10 @@ def test_a_factory_work_item_turn_runs_on_an_untokened_identity(
             port = server.port
             assert port is not None
             request_id = uuid.uuid4()
-            binding = _TripleBinding({("slack", "ghost", _CHANNEL): _resolved("ghost")})
+            deployment = _resolved("ghost")
+            binding = _TripleBinding({("slack", "ghost", _CHANNEL): deployment})
             async with make_harness(binding=binding, sink=_sink(port)) as h:
-                h.kernel._work_items = _CiWorkItems(request_id)
+                h.kernel._work_items = _CiWorkItems(request_id, agent_id=deployment.agent_id)
                 h.runner.default_script = [Final(text="fixed it", status=DONE)]
                 ev = QueuedTurn(
                     event_id=f"work-item-{request_id}-ci-2",

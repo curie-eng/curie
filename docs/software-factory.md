@@ -1,16 +1,27 @@
 # Software Factory
 
-Delegate a GitHub issue to a Curie co-worker and get a pull request to review,
+Delegate an issue to a Curie co-worker and get a pull request or merge request to review,
 or a stated reason it could not complete. You can leave the work running
 asynchronously, inspect progress on the issue, and request revisions on the
-same pull request. Curie runs in your infrastructure; configured model and
-GitHub services still receive the data needed for their work.
+same change. Curie runs in your infrastructure; configured model providers,
+issue trackers and code hosts still receive the data needed for their work.
 
 Software Factory is the first developer adoption path for the broader
 [co-worker platform](co-workers.md). `dark-factory` remains the bundle name,
 agent identifier, and CLI example name. Existing commands and paths keep working.
 
-**Start here:** [the factory quickstart](guides/dark-factory-quickstart.md).
+**Start here:** choose your issues and code:
+
+| Issues | Code host | Quickstart |
+| --- | --- | --- |
+| GitHub | GitHub | [GitHub](guides/dark-factory-quickstart.md#what-you-need) |
+| GitLab | GitLab | [GitLab, including self-managed](guides/factory-gitlab-quickstart.md) |
+| Jira Cloud | GitHub | [Jira Cloud with GitHub](guides/factory-jira-github-quickstart.md) |
+
+Bitbucket Cloud and Data Center adapters ship, but their combined Jira Cloud
+quickstart is unavailable. Jira Cloud with GitLab also has no supported
+installation path. See [integration limits](capabilities.md).
+
 For a larger repository or production deployment, use the
 [bundle reference](../examples/dark-factory/README.md#deploy-it-as-the-factory-agent).
 
@@ -26,10 +37,11 @@ their limits.
 | Host | Released CLI assets support Linux x86_64, Linux arm64, and Apple silicon macOS. The quickstart has no Intel macOS asset. |
 | Cluster | Kubernetes with `kubectl` and Helm; Docker and kind v0.24+ are needed only if quickstart must create a local cluster. Review the selected context before installing. |
 | Model | An Anthropic or OpenRouter credential, with available provider credit. Implementation and review use separately configured models. |
-| GitHub | A repository with an initial commit, and a GitHub App installed on it. Public and private repositories are supported through that installation. The delegating user needs write or admin access. |
-| Repository | Clear acceptance criteria and documented checks. A small repository is the first trial; Curie-sized builds need additional disk, memory, registry access, and CI configuration. |
+| Repository | A small repository with an initial commit and a bounded issue. GitHub and Jira Cloud with GitHub need a GitHub App installed on the repository. GitLab needs an active token with `api` and `write_repository` scopes and Developer access or higher. |
+| Tracker authority | GitHub requires a permitted user with repository write or admin access; GitLab requires Developer access or higher. Jira Cloud requires an explicit account or group allowed to start work, plus the factory account's project permissions. |
+| Task | Clear acceptance criteria and documented checks. A small repository is the first trial; Curie-sized builds need additional disk, memory, registry access, and CI configuration. |
 | Toolchains | The stock layer supplies Python 3.13, Node 22, uv, Rust, and pnpm 9. Locked dependency fetching is restricted to the bundle's supported uv, Cargo, and pnpm commands and operator-approved registry routes. Other toolchains require a custom layer. |
-| Result | A pull request with verification information, or a classified failure/clarification request. Model review and passing checks do not certify correctness or merge the PR. |
+| Result | A pull request or merge request with verification information, or a classified failure/clarification request. Model review and passing checks do not certify correctness or merge the PR. |
 | Time and cost | Quickstart reserves about 190 minutes of configured waiting windows plus variable setup time. This is neither measured latency nor a completion promise. About 5 USD of available OpenRouter credit is planning guidance; actual usage varies. |
 
 The quickstart documents precise prerequisites, models, installation, inspection,
@@ -41,8 +53,13 @@ and bundle reference explain locked installs, absent services, and resource limi
 
 ## Delegate, inspect, and refine
 
-1. **Write a bounded issue.** Describe the behavior, acceptance criteria, and
-   how to verify it. Start with a small change. The sandbox receives the
+The GitHub workflow is below. The GitLab and Jira Cloud quickstarts above
+provide the equivalent provider-specific steps.
+
+1. **Write a bounded GitHub issue.** Describe the behavior, acceptance criteria, and
+   how to verify it. Use Codex, Claude Code, or another coding agent to help
+   investigate and draft the issue if useful; Curie's factory runner takes over
+   after admission. Start with a small change. The sandbox receives the
    repository checkout and reads the issue and comments through a scoped
    platform tool; it holds no GitHub publication credential.
 2. **Add the configured label.** The default is `curie-factory`. A permitted
@@ -66,6 +83,17 @@ and bundle reference explain locked installs, absent services, and resource limi
    is observed; an existing PR remains open and linked. After resolving a
    failure or answering clarification, re-add the label or send an authorized
    mention. Relabelling replaces the current run; inspect existing work first.
+   After a reinstall or lost factory storage, a still-labelled issue whose
+   factory pull request is open is not run again; its status comment links
+   that pull request, and several open ones are refused until one remains. A
+   closed or merged one stops the old label from running again, while a label
+   added after it finished starts a new run. On Bitbucket Cloud, and on
+   Bitbucket Data Center when the authenticated-user header is absent,
+   ownership cannot be verified, so this does not suppress there and a
+   reinstall can still open one duplicate pull request. When the code host cannot be read
+   completely, admission waits for the next pass. The
+   [operations reference](operations.md#admitting-a-labelled-github-issue)
+   has the full order.
 
 For operator inspection, `curie cluster work-items --agent dark-factory`
 shows work item outcomes; supply an item ID for detail. This is distinct from
@@ -106,15 +134,20 @@ resources also constrain which tickets can finish.
 ## CI is part of the result
 
 After publication, the platform waits for checks within the execution deadline.
-Failures can trigger up to three repair rounds on the same PR. Failed GitHub
-Actions jobs are rerun once before repair when the App has Actions write access;
+Failures can trigger up to three repair rounds on the same PR or merge request.
+Failed GitHub Actions jobs are rerun once before repair when the App has Actions write access;
 without it, check summaries remain available but logs/reruns can be unavailable.
+
+GitLab uses pipeline status on the merge-request head; GitHub Actions log and
+rerun behavior does not apply to it. Jira Cloud with GitHub uses GitHub CI.
 
 The default CI wait is 1200 seconds from the push, bounded by the remaining
 execution deadline. Unreadable checks, missing required evidence, and a wait
 that expires produce unverified or timed-out results. A merge conflict is
 reported for human resolution. Zero checks complete only after the 120-second
-no-check grace, with no required check missing, and a mergeable or merged PR.
+no-check grace, with no required check missing, and a PR that the code host
+proves mergeable or merged; each code host supplies that proof its own way,
+Bitbucket Cloud through its pull request mergeability checks. An unknown mergeability answer never completes.
 That result carries a no-CI note; it is not evidence that tests passed.
 Required repository policies can impose stricter evidence. The detailed
 [factory operations reference](operations.md#admitting-a-labelled-github-issue)

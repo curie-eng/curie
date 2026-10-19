@@ -10,6 +10,7 @@ client is exercised by the env-gated k8scratch e2e in ``test_e2e_k8scratch.py``.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from collections.abc import Callable, Iterator
@@ -32,7 +33,7 @@ from curie_worker.sandbox import (
     SandboxView,
     SubstrateConfig,
 )
-from curie_worker.sandbox.docker import DockerSandboxClient
+from curie_worker.sandbox.docker import DockerError, DockerSandboxClient
 from curie_worker.sandbox.types import SandboxTermination
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
@@ -60,13 +61,42 @@ class _FakeBundleStore:
 
 
 class _RecordingDocker(DockerSandboxClient):
-    """Captures every docker argv and returns canned stdout per subcommand."""
+    """Model Docker resources and label filters at the CLI boundary."""
 
     def __init__(self, **kwargs: object) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
         self.calls: list[list[str]] = []
         self.timeouts: list[float] = []
         self.outputs: dict[str, str] = {}
+        self.copied_files: dict[str, dict[str, bytes]] = {}
+        self.volumes: dict[str, dict[str, str]] = {}
+        self.volume_created_at: dict[str, str] = {}
+        self.volume_files: dict[str, dict[str, bytes]] = {}
+        self.volume_modes: dict[str, dict[str, int]] = {}
+        self.auto_created_volumes: list[str] = []
+        self.copy_checks: list[Callable[[Path], None]] = []
+        self.containers: dict[str, dict[str, str]] = {}
+        self.container_ids: dict[str, str] = {}
+        self.container_status: dict[str, str] = {}
+        self.container_created_at: dict[str, str] = {}
+        self.container_started_at: dict[str, str] = {}
+        self.container_mounts: dict[str, dict[str, tuple[str, str]]] = {}
+        self.started_containers: list[str] = []
+
+    @property
+    def runner_argv(self) -> list[str]:
+        return next(
+            argv
+            for argv in reversed(self.calls)
+            if argv[0] == "create"
+            and "curietech.ai/component=claim-runner" in _flag_values(argv, "--label")
+        )
+
+    def _container_name(self, identifier: str) -> str:
+        return next(
+            (name for name, value in self.container_ids.items() if value == identifier),
+            identifier,
+        )
 
     def _docker(
         self,
@@ -77,11 +107,216 @@ class _RecordingDocker(DockerSandboxClient):
     ) -> str:
         self.timeouts.append(request_timeout_seconds)
         self.calls.append(args)
+        if args[:2] == ["volume", "create"]:
+            if args[-1] not in self.volumes:
+                self.volumes[args[-1]] = dict(
+                    value.split("=", 1) for value in _flag_values(args, "--label")
+                )
+                self.volume_created_at[args[-1]] = datetime.now(UTC).isoformat()
+                self.volume_files[args[-1]] = {}
+                self.volume_modes[args[-1]] = {}
+            return args[-1]
+        if args[:2] == ["volume", "ls"]:
+            filters = _flag_values(args, "--filter")
+            referenced = {
+                source
+                for container, mounts in self.container_mounts.items()
+                if container in self.containers
+                for source, mode in mounts.values()
+            }
+            return "\n".join(
+                name
+                for name, labels in self.volumes.items()
+                if _matches_label_filters(args, labels)
+                and ("dangling=true" not in filters or name not in referenced)
+                and ("dangling=false" not in filters or name in referenced)
+            )
+        if args[:2] == ["volume", "inspect"]:
+            name = args[-1]
+            if name not in self.volumes:
+                if check:
+                    raise DockerError(f"no such volume: {name}")
+                return ""
+            template = _flag_values(args, "--format")[0]
+            return (
+                template.replace("{{json .Labels}}", json.dumps(self.volumes[name]))
+                .replace("{{.CreatedAt}}", self.volume_created_at.get(name, ""))
+                .replace("{{.Name}}", name)
+            )
+        if args[:2] == ["volume", "rm"]:
+            for name in args[2:]:
+                # https://docs.docker.com/engine/storage/volumes/: a volume
+                # referenced by a container cannot be removed, even if stopped.
+                if any(
+                    name in {source for source, mode in mounts.values()}
+                    for container, mounts in self.container_mounts.items()
+                    if container in self.containers
+                ):
+                    if check:
+                        raise DockerError(f"volume {name!r} is in use")
+                    continue
+                self.volumes.pop(name, None)
+                self.volume_created_at.pop(name, None)
+                self.volume_files.pop(name, None)
+                self.volume_modes.pop(name, None)
+        if args[0] in ("run", "create"):
+            name = _flag_values(args, "--name")[0]
+            if name in self.containers:
+                raise DockerError(f"container name {name!r} is already in use")
+            mounts = _volume_mounts(args)
+            # https://docs.docker.com/engine/storage/volumes/: named volumes
+            # are created automatically when a container mounts a missing one.
+            for source, _mode in mounts.values():
+                if source not in self.volumes:
+                    self.volumes[source] = {}
+                    self.volume_created_at[source] = datetime.now(UTC).isoformat()
+                    self.volume_files[source] = {}
+                    self.volume_modes[source] = {}
+                    self.auto_created_volumes.append(source)
+            self.containers[name] = dict(
+                value.split("=", 1) for value in _flag_values(args, "--label")
+            )
+            self.container_ids[name] = uuid.uuid4().hex + uuid.uuid4().hex
+            self.container_status[name] = "running" if args[0] == "run" else "created"
+            self.container_created_at[name] = datetime.now(UTC).isoformat()
+            self.container_started_at[name] = (
+                self.container_created_at[name] if args[0] == "run" else "0001-01-01T00:00:00Z"
+            )
+            self.container_mounts[name] = mounts
+            if args[0] == "run":
+                self.started_containers.append(name)
+            return self.container_ids[name]
+        if args[0] == "start":
+            name = self._container_name(args[-1])
+            if name not in self.containers:
+                raise DockerError(f"no such container: {name}")
+            self.container_status[name] = "exited" if "-a" in args else "running"
+            self.container_started_at[name] = datetime.now(UTC).isoformat()
+            self.started_containers.append(name)
+        if args[0] == "exec":
+            name = self._container_name(args[1])
+            if name not in self.containers or self.container_status[name] != "running":
+                raise DockerError(f"container is not running: {name}")
+        if args[0] == "ps" and "ps" not in self.outputs:
+            filters = _flag_values(args, "--filter")
+            template = _flag_values(args, "--format")[0]
+            return "\n".join(
+                self.container_ids[name] if template == "{{.ID}}" else name
+                for name, labels in self.containers.items()
+                if _matches_label_filters(args, labels)
+                and ("-a" in args or "--all" in args or self.container_status[name] == "running")
+                and all(
+                    value.removeprefix("volume=")
+                    in {source for source, mode in self.container_mounts.get(name, {}).values()}
+                    for value in filters
+                    if value.startswith("volume=")
+                )
+                and all(
+                    self.container_status[name] == value.removeprefix("status=")
+                    for value in filters
+                    if value.startswith("status=")
+                )
+            )
+        if args[0] == "inspect" and "inspect" not in self.outputs:
+            name = self._container_name(args[-1])
+            if name not in self.containers:
+                return ""
+            template = _flag_values(args, "--format")[0]
+            return (
+                template.replace("{{.State.Status}}", self.container_status[name])
+                .replace("{{json .Config.Labels}}", json.dumps(self.containers[name]))
+                .replace("{{.Created}}", self.container_created_at[name])
+                .replace("{{.Id}}", self.container_ids[name])
+                .replace("{{.State.StartedAt}}", self.container_started_at[name])
+                .replace("{{json .NetworkSettings.Networks}}", "{}")
+            )
+        if args[0] == "rm":
+            for identifier in args[1:]:
+                name = self._container_name(identifier)
+                self.containers.pop(name, None)
+                self.container_status.pop(name, None)
+                self.container_created_at.pop(name, None)
+                self.container_started_at.pop(name, None)
+                self.container_mounts.pop(name, None)
+        if args[0] == "cp":
+            source = Path(args[-2])
+            container, _, destination = args[-1].partition(":")
+            container = self._container_name(container)
+            if container not in self.containers:
+                raise DockerError(f"no such container: {container}")
+            if not source.is_dir():
+                raise DockerError(f"copy source is missing: {source}")
+            for copy_check in self.copy_checks:
+                copy_check(source)
+            if source.is_dir():
+                self.copied_files[args[-1]] = {
+                    str(path.relative_to(source)): path.read_bytes()
+                    for path in source.rglob("*")
+                    if path.is_file()
+                }
+                volume, mode = self.container_mounts[container][destination]
+                if volume not in self.volumes:
+                    raise DockerError(f"no such volume: {volume}")
+                self.volume_files[volume] = dict(self.copied_files[args[-1]])
+                self.volume_modes[volume] = {
+                    ".": source.stat().st_mode,
+                    **{
+                        str(path.relative_to(source)): path.stat().st_mode
+                        for path in source.rglob("*")
+                    },
+                }
         return self.outputs.get(args[0], "")
 
 
 def _flag_values(argv: list[str], flag: str) -> list[str]:
     return [argv[i + 1] for i, a in enumerate(argv) if a == flag and i + 1 < len(argv)]
+
+
+def _matches_label_filters(argv: list[str], labels: dict[str, str]) -> bool:
+    selectors = [
+        value.removeprefix("label=")
+        for value in _flag_values(argv, "--filter")
+        if value.startswith("label=")
+    ]
+    return all(
+        labels.get(key) == value if sep else key in labels
+        for selector in selectors
+        for key, sep, value in [selector.partition("=")]
+    )
+
+
+def _volume_mounts(argv: list[str]) -> dict[str, tuple[str, str]]:
+    mounts: dict[str, tuple[str, str]] = {}
+    for value in _flag_values(argv, "-v") + _flag_values(argv, "--volume"):
+        source, target, *options = value.split(":")
+        assert source and not any(part in source for part in ("/", "\\")), value
+        mounts[target] = (source, "ro" if "ro" in options else "rw")
+    for value in _flag_values(argv, "--mount"):
+        fields = dict(part.partition("=")[::2] for part in value.split(","))
+        assert fields.get("type") == "volume", value
+        source = fields.get("source", fields.get("src", ""))
+        target = fields.get("target", fields.get("dst", fields.get("destination", "")))
+        assert source and target, value
+        assert not any(part in source for part in ("/", "\\")), value
+        readonly = any(key in fields for key in ("readonly", "ro"))
+        mounts[target] = (source, "ro" if readonly else "rw")
+    return mounts
+
+
+def _seed_source(client: _RecordingDocker, target: str) -> Path:
+    volume, mode = _volume_mounts(client.runner_argv)[target]
+    helper = next(
+        argv
+        for argv in client.calls
+        if argv[0] == "create"
+        and "curietech.ai/component=claim-runner" not in _flag_values(argv, "--label")
+        and volume in {source for source, mode in _volume_mounts(argv).values()}
+    )
+    name = client.container_ids[_flag_values(helper, "--name")[0]]
+    copied = next(
+        argv for argv in client.calls if argv[0] == "cp" and argv[-1].startswith(f"{name}:")
+    )
+    return Path(copied[-2])
 
 
 @pytest.fixture

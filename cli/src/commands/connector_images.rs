@@ -1014,6 +1014,9 @@ pub async fn bring_up_local(
     // are serving.
     refuse_missing_connector_secrets(decl)?;
 
+    let secret_volumes = cb::ConnectorSecretVolumes::new(decl);
+    cb::docker_subpath_preflight(&secret_volumes, true).await?;
+
     // Reconcile before starting: compose only ADDS the services the overlay
     // names, so a connector this bundle version dropped or renamed would keep
     // running -- serving the runner an MCP endpoint the bundle no longer
@@ -1047,94 +1050,133 @@ pub async fn bring_up_local(
         })
         .collect();
 
-    let mut secret_values = std::collections::BTreeMap::new();
-    for (connector, spec) in &hosted {
-        for name in cb::declared_secret_names(spec) {
-            // The refusal above already proved every one of these resolves, so a
-            // gap here is reported as the missing credential it is rather than
-            // silently skipped.
-            let value = resolve_connector_secret(&name)?
-                .ok_or_else(|| cb::missing_secrets_error(std::slice::from_ref(&name)))?;
-            secret_values.insert(name, value);
+    let previous_volumes =
+        docker::connector_secret_volumes_for_agent(project, &identity.agent).await?;
+    let result = async {
+        let mut secret_values = std::collections::BTreeMap::new();
+        for (connector, spec) in &hosted {
+            for name in cb::declared_secret_names(spec).into_iter().chain(spec.secret_files.keys().cloned()) {
+                // The refusal above already proved every one of these resolves, so a
+                // gap here is reported as the missing credential it is rather than
+                // silently skipped.
+                let value = resolve_connector_secret(&name)?
+                    .ok_or_else(|| cb::missing_secrets_error(std::slice::from_ref(&name)))?;
+                secret_values.insert(name, value);
+            }
+            docker::prepare_connector_secret_volume(
+                &secret_volumes,
+                connector,
+                spec,
+                &cb::resolved_image(connector, spec, lock)?,
+                identity,
+                project,
+                &secret_values,
+            ).await?;
         }
-        // Credential files are staged where both emitters expect them, so the
-        // container finds bytes rather than an empty mount.
-        for (key, declared_path) in &spec.secret_files {
-            let value = resolve_connector_secret(key)?
-                .ok_or_else(|| cb::missing_secrets_error(std::slice::from_ref(key)))?;
-            cb::stage_secret_file(plugin_dir, connector, declared_path, &value)?;
+
+        let caller_key = crate::connector_caller::generate_keypair()?;
+        let overlay = cb::compose_overlay(
+            lock,
+            decl,
+            identity,
+            project,
+            &secret_volumes,
+            Some(&caller_key.verify_key),
+        )?;
+        let path = cb::compose_overlay_path(plugin_dir);
+        std::fs::create_dir_all(path.parent().expect("the overlay path has a parent"))?;
+        std::fs::write(
+            &path,
+            serde_norway::to_string(&overlay).context("serialize the connector compose overlay")?,
+        )
+        .with_context(|| format!("write {}", path.display()))?;
+
+        // The values reach the containers through the compose child's environment,
+        // where `${NAME}` in the file above expands from -- never through the file,
+        // never through argv, and masked in anything printed.
+        let command = cb::compose_up_command(&path, project, &secret_values, connector_start_timeout);
+        // Compose receives the configured readiness limit exactly. The client gets
+        // a separate five second allowance for process creation and polling
+        // overhead. ID resolution and final diagnostics retain their own clocks.
+        let compose_client_timeout = connector_start_timeout
+            .checked_add(CONNECTOR_COMPOSE_CLIENT_ALLOWANCE)
+            .expect("the connector timeout parser validated the client allowance");
+        let activation_context = "the API deployment was activated and was not rolled back, but starting the bundle's connectors failed";
+        let compose_succeeded =
+            match tokio::time::timeout(compose_client_timeout, crate::ops::run_capture(&command)).await
+            {
+                // `compose up --wait` can identify an exited or unhealthy service, but
+                // its text is not a stable connector diagnostic. The shared Docker
+                // waiter below reads the owned service IDs and reports the named reason
+                // without exposing Compose, container, or health check logs.
+                Ok(Ok((ok, _out, _err))) => ok,
+                Err(_) => false,
+                Ok(Err(err)) => return Err(err).context(activation_context),
+            };
+        // Compose can return ready at the end of its configured readiness limit.
+        // Resolve the declared keys to actual Docker IDs in a separately
+        // bounded window so that work cannot consume the five-second readiness
+        // observation a no-health connector needs to prove uninterrupted running.
+        let resolution_deadline = Instant::now() + docker::CONNECTOR_ID_RESOLUTION_TIMEOUT;
+        let readiness_targets = compose_connector_readiness_targets(
+            &path,
+            project,
+            &connector_services,
+            resolution_deadline,
+        )
+        .await;
+        // The waiter starts this fresh clock only after every ID lookup has
+        // completed. This never turns a failed Compose invocation into success.
+        let mut readiness =
+            docker::wait_for_connectors_ready(&readiness_targets, docker::CONNECTOR_DIAGNOSTIC_TIMEOUT)
+                .await;
+        if !compose_succeeded && readiness.is_ok() {
+            let connector_keys = connector_services
+                .iter()
+                .map(|(connector, _)| connector.clone())
+                .collect::<Vec<_>>();
+            readiness = Err(docker::connector_compose_start_failure(&connector_keys));
         }
+        if let Err(err) = readiness {
+            let (_, remedy) = crate::exit::classify(&err);
+            let message = format!("{activation_context}: {err}");
+            return Err(crate::exit::operator_context(err, message, remedy));
+        }
+        Ok(())
     }
-
-    let caller_key = crate::connector_caller::generate_keypair()?;
-    let overlay = cb::compose_overlay(
-        lock,
-        decl,
-        identity,
-        project,
-        plugin_dir,
-        Some(&caller_key.verify_key),
-    )?;
-    let path = cb::compose_overlay_path(plugin_dir);
-    std::fs::create_dir_all(path.parent().expect("the overlay path has a parent"))?;
-    std::fs::write(
-        &path,
-        serde_norway::to_string(&overlay).context("serialize the connector compose overlay")?,
-    )
-    .with_context(|| format!("write {}", path.display()))?;
-
-    // The values reach the containers through the compose child's environment,
-    // where `${NAME}` in the file above expands from -- never through the file,
-    // never through argv, and masked in anything printed.
-    let command = cb::compose_up_command(&path, project, &secret_values, connector_start_timeout);
-    // Compose receives the configured readiness limit exactly. The client gets
-    // a separate five second allowance for process creation and polling
-    // overhead. ID resolution and final diagnostics retain their own clocks.
-    let compose_client_timeout = connector_start_timeout
-        .checked_add(CONNECTOR_COMPOSE_CLIENT_ALLOWANCE)
-        .expect("the connector timeout parser validated the client allowance");
-    let activation_context = "the API deployment was activated and was not rolled back, but starting the bundle's connectors failed";
-    let compose_succeeded =
-        match tokio::time::timeout(compose_client_timeout, crate::ops::run_capture(&command)).await
-        {
-            // `compose up --wait` can identify an exited or unhealthy service, but
-            // its text is not a stable connector diagnostic. The shared Docker
-            // waiter below reads the owned service IDs and reports the named reason
-            // without exposing Compose, container, or health check logs.
-            Ok(Ok((ok, _out, _err))) => ok,
-            Err(_) => false,
-            Ok(Err(err)) => return Err(err).context(activation_context),
-        };
-    // Compose can return ready at the end of its configured readiness limit.
-    // Resolve the declared keys to actual Docker IDs in a separately
-    // bounded window so that work cannot consume the five-second readiness
-    // observation a no-health connector needs to prove uninterrupted running.
-    let resolution_deadline = Instant::now() + docker::CONNECTOR_ID_RESOLUTION_TIMEOUT;
-    let readiness_targets = compose_connector_readiness_targets(
-        &path,
-        project,
-        &connector_services,
-        resolution_deadline,
-    )
     .await;
-    // The waiter starts this fresh clock only after every ID lookup has
-    // completed. This never turns a failed Compose invocation into success.
-    let mut readiness =
-        docker::wait_for_connectors_ready(&readiness_targets, docker::CONNECTOR_DIAGNOSTIC_TIMEOUT)
-            .await;
-    if !compose_succeeded && readiness.is_ok() {
-        let connector_keys = connector_services
-            .iter()
-            .map(|(connector, _)| connector.clone())
-            .collect::<Vec<_>>();
-        readiness = Err(docker::connector_compose_start_failure(&connector_keys));
+    finish_connector_bring_up(
+        result,
+        project,
+        &identity.agent,
+        &secret_volumes,
+        &previous_volumes,
+    )
+    .await
+}
+
+async fn finish_connector_bring_up<T>(
+    result: Result<T>,
+    project: &str,
+    agent: &str,
+    secret_volumes: &crate::connector_build::ConnectorSecretVolumes,
+    previous_volumes: &[String],
+) -> Result<T> {
+    let result = match result {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            match docker::cleanup_connector_run(project, agent, &secret_volumes.run_id).await {
+                Ok(()) => Err(err),
+                Err(cleanup) => {
+                    Err(err.context(format!("connector startup cleanup failed: {cleanup}")))
+                }
+            }
+        }
+    };
+    if let Err(err) = docker::release_unused_connector_secret_volumes(previous_volumes).await {
+        crate::ui::ui().warn(&err.to_string());
     }
-    if let Err(err) = readiness {
-        let (_, remedy) = crate::exit::classify(&err);
-        let message = format!("{activation_context}: {err}");
-        return Err(crate::exit::operator_context(err, message, remedy));
-    }
-    Ok(())
+    result
 }
 
 /// Refuse the WHOLE bundle when a hosted connector declares a secret this box
@@ -1219,9 +1261,7 @@ pub fn skill_connector_plan(
 
 /// Start one container per hosted connector on the runner's private network.
 ///
-/// Returns the container names so `skill down` reaps exactly what this boot
-/// created. Credentials are staged first, so each container finds bytes at its
-/// declared mount path rather than an empty file.
+/// Return the containers owned by this boot, with credentials copied at runtime.
 pub(super) async fn start_skill_connectors(
     plugin_dir: &Path,
     decl: &crate::connector_build::ConnectorsFileDecl,
@@ -1237,46 +1277,61 @@ pub(super) async fn start_skill_connectors(
         connectors: std::collections::BTreeMap::new(),
         runner: None,
     });
-    let mut started = Vec::new();
-    let mut readiness_targets = Vec::new();
-    for (connector, image) in skill_connector_plan(decl, &lock)? {
-        let connector = connector.as_str();
-        let spec = decl
-            .connectors
-            .get(connector)
-            .expect("the plan names only this declaration's own connectors");
-        cb::refuse_out_of_band_secrets(connector, spec)?;
-        let mut secret_values = std::collections::BTreeMap::new();
-        for name in cb::declared_secret_names(spec) {
-            if let Some(value) = resolve_connector_secret(&name)? {
+    let plan = skill_connector_plan(decl, &lock)?;
+    let secret_volumes = cb::ConnectorSecretVolumes::new(decl);
+    cb::docker_subpath_preflight(&secret_volumes, false).await?;
+    let result = async {
+        let mut started = Vec::new();
+        let mut readiness_targets = Vec::new();
+        for (connector, image) in plan {
+            let connector = connector.as_str();
+            let spec = decl
+                .connectors
+                .get(connector)
+                .expect("the plan names only this declaration's own connectors");
+            cb::refuse_out_of_band_secrets(connector, spec)?;
+            let mut secret_values = std::collections::BTreeMap::new();
+            for name in cb::declared_secret_names(spec)
+                .into_iter()
+                .chain(spec.secret_files.keys().cloned())
+            {
+                let value = resolve_connector_secret(&name)?
+                    .ok_or_else(|| cb::missing_secrets_error(std::slice::from_ref(&name)))?;
                 secret_values.insert(name, value);
             }
+            docker::prepare_connector_secret_volume(
+                &secret_volumes,
+                connector,
+                spec,
+                &image,
+                identity,
+                project,
+                &secret_values,
+            )
+            .await?;
+            let caller_key = crate::connector_caller::generate_keypair()?;
+            let start = docker::ConnectorStartSpec::from_declaration(
+                connector,
+                spec,
+                &image,
+                identity,
+                network,
+                project,
+                &secret_volumes,
+                &secret_values,
+                Some(&caller_key.verify_key),
+            )?;
+            docker::docker_with_env(&start.run_args(), &start.docker_env)
+                .await
+                .with_context(|| format!("starting connector '{connector}'"))?;
+            readiness_targets.push((connector.to_string(), start.container_name.clone()));
+            started.push(start.container_name);
         }
-        for (key, declared_path) in &spec.secret_files {
-            if let Some(value) = resolve_connector_secret(key)? {
-                cb::stage_secret_file(plugin_dir, connector, declared_path, &value)?;
-            }
-        }
-        let caller_key = crate::connector_caller::generate_keypair()?;
-        let start = docker::ConnectorStartSpec::from_declaration(
-            connector,
-            spec,
-            &image,
-            identity,
-            network,
-            project,
-            plugin_dir,
-            &secret_values,
-            Some(&caller_key.verify_key),
-        )?;
-        docker::docker_with_env(&start.run_args(), &start.docker_env)
-            .await
-            .with_context(|| format!("starting connector '{connector}'"))?;
-        readiness_targets.push((connector.to_string(), start.container_name.clone()));
-        started.push(start.container_name);
+        docker::wait_for_connectors_ready(&readiness_targets, readiness_timeout).await?;
+        Ok(started)
     }
-    docker::wait_for_connectors_ready(&readiness_targets, readiness_timeout).await?;
-    Ok(started)
+    .await;
+    finish_connector_bring_up(result, project, &identity.agent, &secret_volumes, &[]).await
 }
 
 #[cfg(test)]

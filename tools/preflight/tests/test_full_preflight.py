@@ -75,6 +75,7 @@ def repository(tmp_path: Path) -> Path:
         "scripts/check-commit-messages.sh",
         "tools/fix-pin-ci/check.py",
         "tools/e2e-ci-selection/select_tiers.py",
+        "tools/e2e-ci-selection/cli_pytest_files.txt",
         "release/atlas.py",
         "cli/Cargo.toml",
         "pyproject.toml",

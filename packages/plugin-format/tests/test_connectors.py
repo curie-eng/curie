@@ -1515,3 +1515,100 @@ def test_the_resource_models_match_the_frozen_vector() -> None:
     assert set(ConnectorResourceQuantities.model_fields) == set(
         fields["ConnectorResourceQuantities"]
     )
+
+
+_NO_CLIENT_AUTH_REASON = (
+    "In-cluster MCP server reached over the pod network; it authenticates no "
+    "client and the boundary is its ingress NetworkPolicy."
+)
+
+
+def test_no_client_auth_synthetic_example_validates() -> None:
+    parsed, errors = validate_connectors(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "port": 8000,
+                    "secrets": ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+                    "no_client_auth": _NO_CLIENT_AUTH_REASON,
+                }
+            }
+        }
+    )
+    assert errors == []
+    assert parsed is not None
+    spec = parsed.connectors["docs"]
+    assert spec.no_client_auth == _NO_CLIENT_AUTH_REASON
+    assert spec.secret_names() == ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"]
+    assert spec.resolved_secrets() == ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"]
+
+
+def test_no_client_auth_absent_still_requires_bearer_secret() -> None:
+    assert "connectors.bearer_secret_required" in _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "secrets": ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+                }
+            }
+        }
+    )
+
+
+def test_no_client_auth_with_bearer_secret_is_refused() -> None:
+    assert "connectors.no_client_auth_with_bearer_secret" in _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "secrets": ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+                    "bearer_secret": "UPSTREAM_CLIENT_SECRET",
+                    "no_client_auth": _NO_CLIENT_AUTH_REASON,
+                }
+            }
+        }
+    )
+
+
+def test_no_client_auth_with_empty_bearer_secret_is_refused() -> None:
+    assert "connectors.no_client_auth_with_bearer_secret" in _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "bearer_secret": "",
+                    "no_client_auth": _NO_CLIENT_AUTH_REASON,
+                }
+            }
+        }
+    )
+
+
+def test_no_client_auth_on_a_remote_connector_is_refused() -> None:
+    assert "connectors.remote_has_no_client_auth" in _codes(
+        {
+            "connectors": {
+                "r": {
+                    "url": "https://mcp.example.com/mcp",
+                    "no_client_auth": _NO_CLIENT_AUTH_REASON,
+                }
+            }
+        }
+    )
+
+
+@pytest.mark.parametrize("reason", ["", "   ", "\n\t "])
+def test_no_client_auth_blank_reason_is_refused(reason: str) -> None:
+    assert "connectors.bad_no_client_auth" in _codes(
+        {
+            "connectors": {
+                "docs": {
+                    "image": "ghcr.io/example/docs-mcp:1",
+                    "secrets": ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+                    "no_client_auth": reason,
+                }
+            }
+        }
+    )

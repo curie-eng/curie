@@ -4,12 +4,11 @@
 //! as its last argument. An empty key is the same named failure the chart
 //! render uses.
 
-use std::collections::BTreeMap;
-use std::path::Path;
-
-use curie::connector_build::{ConnectorScope, ConnectorSpecDecl};
+use curie::connector_build::{
+    ConnectorScope, ConnectorSecretVolumes, ConnectorSpecDecl, ConnectorsFileDecl,
+};
 use curie::docker::ConnectorStartSpec;
-use tempfile::TempDir;
+use std::collections::BTreeMap;
 
 fn scope() -> ConnectorScope {
     ConnectorScope {
@@ -28,7 +27,6 @@ fn hosted() -> ConnectorSpecDecl {
 
 fn start(
     spec: &ConnectorSpecDecl,
-    plugin_dir: &Path,
     caller_public_key: Option<&str>,
 ) -> anyhow::Result<ConnectorStartSpec> {
     ConnectorStartSpec::from_declaration(
@@ -38,7 +36,7 @@ fn start(
         &scope(),
         "curie-skill-net",
         "curie-skill-abc123",
-        plugin_dir,
+        &ConnectorSecretVolumes::new(&ConnectorsFileDecl::default()),
         &BTreeMap::new(),
         caller_public_key,
     )
@@ -46,10 +44,9 @@ fn start(
 
 #[test]
 fn a_hosted_connector_with_an_empty_caller_public_key_is_refused() {
-    let dir = TempDir::new().expect("a scratch bundle");
     for key in [None, Some("")] {
-        let error = start(&hosted(), dir.path(), key)
-            .expect_err("a hosted connector with an empty caller public key");
+        let error =
+            start(&hosted(), key).expect_err("a hosted connector with an empty caller public key");
         let text = format!("{error:#}");
         assert!(
             text.contains("hosted_connector_requires_caller_key"),
@@ -60,10 +57,8 @@ fn a_hosted_connector_with_an_empty_caller_public_key_is_refused() {
 
 #[test]
 fn a_hosted_connector_with_a_caller_public_key_still_starts() {
-    let dir = TempDir::new().expect("a scratch bundle");
     start(
         &hosted(),
-        dir.path(),
         Some("A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="),
     )
     .expect("a caller public key lets the hosted connector start");
@@ -71,10 +66,9 @@ fn a_hosted_connector_with_a_caller_public_key_still_starts() {
 
 #[test]
 fn a_remote_connector_does_not_need_a_caller_public_key() {
-    let dir = TempDir::new().expect("a scratch bundle");
     let spec = ConnectorSpecDecl {
         url: Some("https://mcp.example.com/mcp".to_string()),
         ..Default::default()
     };
-    start(&spec, dir.path(), None).expect("a remote connector is not hosted");
+    start(&spec, None).expect("a remote connector is not hosted");
 }

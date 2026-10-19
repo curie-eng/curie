@@ -20,11 +20,8 @@
 #   CURIE_E2E_PORT      host port (default 7245)
 #   CURIE_E2E_NETWORK   docker network to join (e.g. curie_default)
 #   CURIE_E2E_OTEL      OTLP endpoint (e.g. http://otel-collector:4318)
-#   DOCKER_PUBLISHED_HOST  daemon's published hostname or IP; selects API
-#                         snapshot transfer instead of a client-path bind mount.
-#                         Leave unset for the existing local Docker path.
-#   TMPDIR              put temporary bundles in a daemon-visible directory
-#                         when using bind mounts with a remote Docker transport.
+#   DOCKER_PUBLISHED_HOST  daemon's published hostname or IP (default localhost).
+#                         Snapshots always transfer through Docker named volumes.
 #   CURIE_E2E_LIVE      1 = real model, requiring a credential in the
 #                         environment (ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,
 #                         or CURIE_CREDENTIALS); default 0 runs the runner's
@@ -543,21 +540,15 @@ mounts = [mount for mount in json.loads(sys.argv[2]) if mount["Destination"] == 
 if len(mounts) != 1 or mounts[0].get("RW") is not False:
     sys.exit("error: the runner must mount exactly one immutable /plugin snapshot")
 mount = mounts[0]
-remote = "DOCKER_PUBLISHED_HOST" in os.environ
-expected_type = "volume" if remote else "bind"
-if mount["Type"] != expected_type:
-    sys.exit(f"error: expected /plugin mount type {expected_type}, got {mount['Type']}")
-if remote and not mount.get("Name"):
-    sys.exit("error: remote snapshot mount has no named volume")
-if not remote and mount["Source"] != state["bundle_snapshot_dir"]:
-    sys.exit("error: local snapshot bind differs from the recorded immutable snapshot")
+if mount["Type"] != "volume" or not mount.get("Name"):
+    sys.exit("error: the immutable /plugin snapshot must use a named volume")
 host = os.environ.get("DOCKER_PUBLISHED_HOST", "localhost")
 if ":" in host and not host.startswith("["):
     host = f"[{host}]"
 expected_url = f"http://{host}:{state['port']}"
 if state["base_url"] != expected_url:
     sys.exit(f"error: recorded endpoint differs from published address {expected_url}")
-print(f"confirmed: readonly {expected_type} snapshot and recorded published endpoint")
+print("confirmed: readonly named volume snapshot and recorded published endpoint")
 PY
 SNAPSHOT_VOLUME_1="$(docker inspect --type container --format '{{range .Mounts}}{{if eq .Destination "/plugin"}}{{if eq .Type "volume"}}{{.Name}}{{end}}{{end}}{{end}}' "$CONTAINER")"
 

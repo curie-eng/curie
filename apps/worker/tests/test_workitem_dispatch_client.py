@@ -6,31 +6,61 @@ import asyncio
 import json
 import logging
 import uuid
+from datetime import UTC, datetime
 
 import httpx
 import pytest
 from curie_worker import workitem_dispatch
+from curie_worker.binding import FactoryContext, FactoryWake
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemDispatchClient,
     WorkItemRun,
+    WorkItemRunning,
+    WorkItemStartRefused,
     WorkItemTransportError,
 )
 
 REQUEST_ID = uuid.UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 WORK_ITEM_ID = uuid.UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 
+AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
+CONTEXT = FactoryContext(
+    agent_id=AGENT_ID,
+    tenant_id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+    binding_id=uuid.UUID("33333333-3333-4333-8333-333333333333"),
+    kind="slack",
+    address="C0EXAMPLE1",
+    adapter="default",
+)
+WAKE = FactoryWake(
+    kind="slack", address="C0EXAMPLE1", adapter="default", conversation_id="thread"
+)
 
-def _acquire(body: dict[str, object]) -> object:
+
+def _grant() -> WorkItemAcquireGrant:
+    return WorkItemAcquireGrant(
+        generation=1,
+        work_item_id=WORK_ITEM_ID,
+        conversation_id="slack:C0EXAMPLE1:thread",
+        wait_deadline=datetime(2099, 1, 1, tzinfo=UTC),
+        repository_path="acme-corp/widgets",
+        context=CONTEXT,
+    )
+
+
+def _acquire(body: dict[str, object]) -> WorkItemAcquireGrant:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=body)
 
-    async def go() -> object:
+    async def go() -> WorkItemAcquireGrant:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
             client = WorkItemDispatchClient(
                 api_base_url="http://api.example", worker_token="example-token", client=http
             )
-            return await client.acquire(REQUEST_ID, owner="worker-1", generation=1)
+            return await client.acquire(
+                REQUEST_ID, owner="worker-1", generation=1, wake=WAKE, context=None
+            )
 
     return asyncio.run(go())
 
@@ -40,6 +70,8 @@ BASE = {
     "work_item_id": str(WORK_ITEM_ID),
     "conversation_id": "work-item-thread",
     "wait_deadline": "2026-09-23T02:00:00+00:00",
+    "repository_path": "acme-corp/widgets",
+    "context": CONTEXT.model_dump(mode="json"),
 }
 
 
@@ -48,12 +80,34 @@ def test_acquire_grant_carries_the_work_item_repository() -> None:
     assert grant.repository_path == "acme-corp/widgets"  # type: ignore[attr-defined]
 
 
-@pytest.mark.parametrize("body", [BASE, {**BASE, "repository_path": None}])
-def test_acquire_from_an_api_without_the_field_still_grants(body: dict[str, object]) -> None:
-    # A worker rolled out ahead of its API replica must not fail an acquisition
-    # the API has already committed.
-    grant = _acquire(body)
-    assert grant.repository_path is None  # type: ignore[attr-defined]
+@pytest.mark.parametrize(
+    "field",
+    [
+        "generation", "work_item_id", "conversation_id",
+        "wait_deadline", "repository_path", "context",
+    ],
+)
+def test_acquire_refuses_a_missing_required_field(field: str) -> None:
+    body = dict(BASE)
+    del body[field]
+    with pytest.raises(WorkItemTransportError):
+        _acquire(body)
+
+
+@pytest.mark.parametrize("repository", [None, "", " ", 42])
+def test_acquire_refuses_an_unusable_repository(repository: object) -> None:
+    with pytest.raises(WorkItemTransportError):
+        _acquire({**BASE, "repository_path": repository})
+
+
+@pytest.mark.parametrize(
+    "field", ["agent_id", "tenant_id", "binding_id", "kind", "address", "adapter"]
+)
+def test_acquire_refuses_incomplete_authority(field: str) -> None:
+    context = CONTEXT.model_dump(mode="json")
+    del context[field]
+    with pytest.raises(WorkItemTransportError):
+        _acquire({**BASE, "context": context})
 
 
 # --- #3076 orphan recovery verbs -------------------------------------------
@@ -70,6 +124,128 @@ def _run(handler, call):  # type: ignore[no-untyped-def]
             return await call(client)
 
     return asyncio.run(go())
+
+
+def test_acquire_sends_wake_and_initial_authority_explicitly() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=BASE)
+
+    granted = _run(
+        handler,
+        lambda client: client.acquire(
+            REQUEST_ID, owner="worker-1", generation=1, wake=WAKE, context=None
+        ),
+    )
+    assert json.loads(seen[0].content) == {
+        "owner": "worker-1",
+        "generation": 1,
+        "wake": WAKE.model_dump(mode="json"),
+        "context": None,
+    }
+    assert granted.context == CONTEXT  # type: ignore[attr-defined]
+    assert granted.agent_id == AGENT_ID  # type: ignore[attr-defined]
+    assert granted.wait_deadline == datetime(2026, 9, 23, 2, tzinfo=UTC)  # type: ignore[attr-defined]
+
+
+def _running_body() -> dict[str, object]:
+    return {
+        **BASE,
+        "request_id": str(REQUEST_ID),
+        "agent_id": str(AGENT_ID),
+        "runtime_epoch": 7,
+        "execution_deadline": "2099-01-01T00:00:00+00:00",
+        "lease_held_to_deadline": False,
+        "refusal": None,
+    }
+
+
+@pytest.mark.parametrize("lease_held_to_deadline", [False, True])
+def test_running_sends_the_wake_and_preserves_persisted_execution_facts(
+    lease_held_to_deadline: bool,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200, json={**_running_body(), "lease_held_to_deadline": lease_held_to_deadline},
+        )
+
+    found = _run(
+        handler, lambda client: client.running_for_conversation("thread", wake=WAKE)
+    )
+    assert isinstance(found, WorkItemRunning)
+    assert dict(seen[0].url.params) == {
+        "conversation_id": "thread",
+        "wake_kind": WAKE.kind,
+        "wake_address": WAKE.address,
+        "wake_adapter": "default",
+        "wake_conversation_id": WAKE.conversation_id,
+    }
+    assert found.agent_id == AGENT_ID
+    assert found.generation == 1
+    assert found.runtime_epoch == 7
+    assert found.conversation_id == BASE["conversation_id"]
+    assert found.wait_deadline == datetime(2026, 9, 23, 2, tzinfo=UTC)
+    assert found.repository_path == "acme-corp/widgets"
+    assert found.context == CONTEXT
+    assert found.refusal is None
+    assert found.lease_held_to_deadline is lease_held_to_deadline
+
+
+@pytest.mark.parametrize("field", list(_running_body()))
+def test_running_refuses_missing_required_facts(field: str) -> None:
+    body = _running_body()
+    del body[field]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    with pytest.raises(WorkItemTransportError):
+        _run(handler, lambda client: client.running_for_conversation("thread", wake=WAKE))
+
+
+def test_running_preserves_the_refusal_without_runnable_authority() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={**_running_body(), "context": None, "refusal": "factory_binding_missing"},
+        )
+
+    found = _run(handler, lambda client: client.running_for_conversation("thread", wake=WAKE))
+    assert isinstance(found, WorkItemRunning)
+    assert found.request_id == REQUEST_ID
+    assert found.agent_id == AGENT_ID
+    assert found.runtime_epoch == 7
+    assert found.repository_path == "acme-corp/widgets"
+    assert found.context is None
+    assert found.refusal == "factory_binding_missing"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"context": None, "refusal": None},
+        {"refusal": "factory_binding_missing"},
+        {"context": None, "refusal": "unrecognized_refusal"},
+        {"agent_id": str(REQUEST_ID)},
+        {"lease_held_to_deadline": None},
+        {"lease_held_to_deadline": "false"},
+        {"lease_held_to_deadline": 0},
+        {"lease_held_to_deadline": 1},
+        {"lease_held_to_deadline": []},
+        {"lease_held_to_deadline": {}},
+    ],
+)
+def test_running_refuses_inconsistent_authority(change: dict[str, object]) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={**_running_body(), **change})
+
+    with pytest.raises(WorkItemTransportError):
+        _run(handler, lambda client: client.running_for_conversation("thread", wake=WAKE))
 
 
 def test_runtime_owners_parses_the_running_list() -> None:
@@ -173,7 +349,8 @@ def test_run_settlement_retries_transports_but_not_conflicts(
                 ),
                 request_id=REQUEST_ID,
                 owner="worker-1",
-                grant=WorkItemAcquireGrant(1, WORK_ITEM_ID, "thread", "2099-01-01T00:00:00Z", None),
+                grant=_grant(),
+                wake=WAKE,
                 event_id="event",
                 thread_key="slack:C1:thread",
                 on_stop=stop,
@@ -239,7 +416,8 @@ def test_run_finish_clamps_retry_budget_to_execution_deadline(monkeypatch) -> No
                 ),
                 request_id=REQUEST_ID,
                 owner="worker-1",
-                grant=WorkItemAcquireGrant(1, WORK_ITEM_ID, "thread", "2099-01-01T00:00:00Z", None),
+                grant=_grant(),
+                wake=WAKE,
                 event_id="event",
                 thread_key="slack:C1:thread",
                 on_stop=stop,
@@ -338,7 +516,8 @@ def _deferring_run(body: object) -> tuple[str | None, WorkItemRun]:
                 client=client,
                 request_id=REQUEST_ID,
                 owner="worker-1",
-                grant=WorkItemAcquireGrant(1, WORK_ITEM_ID, "thread", "2099-01-01T00:00:00Z", None),
+                grant=_grant(),
+                wake=WAKE,
                 event_id="event",
                 thread_key="slack:C1:thread",
                 on_stop=stop,
@@ -421,7 +600,8 @@ def _renewing_run(client: WorkItemDispatchClient) -> WorkItemRun:
         client=client,
         request_id=REQUEST_ID,
         owner="worker-1",
-        grant=WorkItemAcquireGrant(1, WORK_ITEM_ID, "thread", "2099-01-01T00:00:00Z", None),
+        grant=_grant(),
+        wake=WAKE,
         event_id="event",
         thread_key="slack:C0EXAMPLE1:thread",
         on_stop=unexpected_stop,
@@ -453,7 +633,7 @@ def test_acquire_renewal_keeps_the_same_owner_and_generation_every_twenty_second
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append((clock.now, request))
         # Grant shape is defined by the API's internal acquire route.
-        return httpx.Response(200, json={**BASE, "repo_full_name": "acme-corp/acme-bot"})
+        return httpx.Response(200, json=BASE)
 
     async def go() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
@@ -468,7 +648,11 @@ def test_acquire_renewal_keeps_the_same_owner_and_generation_every_twenty_second
                     for _, request in seen
                 )
                 assert all(
-                    json.loads(request.content) == {"owner": "worker-1", "generation": 1}
+                    json.loads(request.content) == {
+                        "owner": "worker-1", "generation": 1,
+                        "wake": WAKE.model_dump(mode="json"),
+                        "context": CONTEXT.model_dump(mode="json"),
+                    }
                     for _, request in seen
                 )
             finally:
@@ -727,6 +911,46 @@ def test_defer_stops_renewal_before_its_post_returns_or_raises(
                     pending.cancel()
                     with pytest.raises(asyncio.CancelledError):
                         await pending
+                await run.close()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("code", ["factory_binding_missing", "factory_start_failed"])
+def test_factory_renewal_refusal_fences_subsequent_start_without_another_http_write(
+    acquire_renew_clock: _AcquireRenewClock, code: str,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(409, json={"detail": {"code": code}})
+
+    async def go() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            run = _renewing_run(_renewal_client(http))
+            try:
+                run.ensure_acquired()
+                await acquire_renew_clock.advance(20)
+                with pytest.raises(WorkItemStartRefused) as refused:
+                    run.ensure_acquired()
+                assert refused.value.code == code
+                with pytest.raises(WorkItemStartRefused) as start_refused:
+                    await run.start(claim_name="owned-claim", sandbox_name="owned-sandbox")
+                assert start_refused.value.code == code
+                assert run.claim_name == "owned-claim"
+                assert run.sandbox_name == "owned-sandbox"
+                assert not run.started
+                assert run.finished is (code == "factory_start_failed")
+                await acquire_renew_clock.advance(40)
+                assert len(seen) == 1
+                assert seen[0].url.path.endswith("/acquire")
+                assert json.loads(seen[0].content) == {
+                    "owner": "worker-1", "generation": 1,
+                    "wake": WAKE.model_dump(mode="json"),
+                    "context": CONTEXT.model_dump(mode="json"),
+                }
+            finally:
                 await run.close()
 
     asyncio.run(go())

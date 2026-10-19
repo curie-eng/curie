@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use crate::config_migrate::legacy_factory_keys;
 use crate::exit::CliError;
 use crate::ops::{
     fetch_release_computed_values, fetch_release_values, plain, require_on_path, run_capture,
@@ -202,18 +203,9 @@ pub fn resolve_webhook_secret(file: Option<&Path>) -> Result<Option<String>> {
     Ok(Some(value))
 }
 
-/// The chart's removed `api.*` factory keys (#4397), from the one file that
-/// names them. Each is written as null so a `--reuse-values` upgrade sheds it.
-fn legacy_factory_keys() -> Vec<String> {
-    serde_norway::from_str(include_str!(
-        "../../charts/curie/files/legacy-factory-keys.yaml"
-    ))
-    .expect("charts/curie/files/legacy-factory-keys.yaml is a list of dotted chart keys")
-}
-
-/// The name of the one GitHub entry this command writes in
-/// `factory.codeHosts` and `factory.trackers`.
-const GITHUB_ENTRY: &str = "github";
+/// The name of the GitHub entry this command writes in `factory.codeHosts`
+/// and `factory.trackers` when the release records none of its identity.
+pub(crate) const GITHUB_ENTRY: &str = "github";
 
 /// The App credential a factory GitHub entry carries: its id and the Secret
 /// holding its private key. The key itself never enters the values.
@@ -244,15 +236,131 @@ impl FactoryCredential {
 }
 
 /// The host GitHub's API answers for: `github.com` for the public API, else
-/// the API URL's own host (a GitHub Enterprise Server).
+/// the API URL's own authority (a GitHub Enterprise Server): lowercased host
+/// plus an explicit non-default port, as the API's `urlsplit(..).netloc.lower()`
+/// (config.py `_validate_forge_github_host`) compares it.
 fn github_host(api_url: &str) -> String {
     if api_url == crate::github_app::DEFAULT_GITHUB_API_URL {
         return "github.com".to_string();
     }
     reqwest::Url::parse(api_url)
         .ok()
-        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .and_then(|url| {
+            let host = url.host_str()?.to_ascii_lowercase();
+            Some(match url.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host,
+            })
+        })
         .unwrap_or_default()
+}
+
+/// The identity of the GitHub instance this command writes: kind `github`
+/// on the host its API answers for.
+fn planned_github_identity(api_url: &str) -> serde_json::Value {
+    serde_json::json!({"kind": "github", "host": github_host(api_url)})
+}
+
+/// The recorded `list` entry of the GitHub instance this command writes,
+/// found by its identity (kind `github` and its host), whatever its name. A
+/// `github` entry whose normalized apiUrl is this command's GitHub API URL is
+/// also this instance, whatever host it records (none, or the portless host
+/// an earlier release wrote for an apiUrl that carries a port); the entry
+/// this command writes then carries the corrected host. An entry naming
+/// another API URL, or none, with no matching host is not adopted.
+fn recorded_github_entry<'a>(
+    recorded: &'a serde_json::Value,
+    list: &str,
+) -> Option<&'a serde_json::Value> {
+    let api_url = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
+    recorded_github_entry_at(recorded, list, &api_url)
+}
+
+/// [`recorded_github_entry`] for the GitHub API URL `api_url`.
+fn recorded_github_entry_at<'a>(
+    recorded: &'a serde_json::Value,
+    list: &str,
+    api_url: &str,
+) -> Option<&'a serde_json::Value> {
+    let planned_api = crate::factory_quickstart::normalized_api_url(api_url);
+    crate::factory_quickstart::recorded_forge_entry(
+        recorded,
+        list,
+        &planned_github_identity(api_url),
+    )
+    .or_else(|| {
+        factory_list(recorded, list).iter().find(|entry| {
+            let text = |key: &str| entry.get(key).and_then(serde_json::Value::as_str);
+            text("kind") == Some("github")
+                && text("apiUrl")
+                    .map(crate::factory_quickstart::normalized_api_url)
+                    .is_some_and(|api| api == planned_api)
+        })
+    })
+}
+
+/// Refuses, before any write, a release whose `factory.codeHosts` or
+/// `factory.trackers` has no entry of this command's GitHub identity but an
+/// entry of another identity under [`GITHUB_ENTRY`], the name the planned
+/// GitHub entry takes: writing it would give two entries one name.
+fn refuse_occupied_github_entry_name(recorded: &serde_json::Value) -> Result<()> {
+    for list in ["codeHosts", "trackers"] {
+        let blank = |entry: &serde_json::Value, key: &str| {
+            entry
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+        };
+        if let Some(unidentified) = factory_list(recorded, list).iter().find(|entry| {
+            factory_scalar(entry, "kind") == "github"
+                && blank(entry, "host")
+                && blank(entry, "apiUrl")
+        }) {
+            let name = factory_scalar(unidentified, "name");
+            return Err(CliError::usage(format!(
+                "factory.{list} entry `{name}` is a GitHub entry that records neither host nor apiUrl, so it names no instance; refused before any write"
+            ))
+            .with_fix(format!(
+                "record host and apiUrl on factory.{list}[{name}] or remove it from the release, then rerun"
+            ))
+            .into());
+        }
+        if recorded_github_entry(recorded, list).is_some() {
+            continue;
+        }
+        let Some(occupant) = factory_list(recorded, list)
+            .iter()
+            .find(|entry| factory_scalar(entry, "name") == GITHUB_ENTRY)
+        else {
+            continue;
+        };
+        let api_url = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
+        let identity = planned_github_identity(&api_url);
+        return Err(CliError::usage(format!(
+            "factory.{list} name `{GITHUB_ENTRY}`, which the GitHub {} entry this run writes takes, is occupied by an entry of a different identity ({} host {}, apiUrl {}); refused before any write",
+            factory_scalar(&identity, "host"),
+            factory_scalar(occupant, "kind"),
+            factory_scalar(occupant, "host"),
+            factory_scalar(occupant, "apiUrl"),
+        ))
+        .with_fix(format!(
+            "rename or remove factory.{list}[{GITHUB_ENTRY}] on the release, then rerun"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// The name a Jira binding's repositories give the release's GitHub code
+/// host (#4620): the recorded entry of this command's GitHub identity keeps
+/// its name, whatever it is; a release recording none gets [`GITHUB_ENTRY`],
+/// the entry the GitHub intake writes.
+pub fn github_code_host_name(recorded: &serde_json::Value) -> String {
+    recorded_github_entry(recorded, "codeHosts")
+        .and_then(|entry| entry.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(GITHUB_ENTRY)
+        .to_string()
 }
 
 /// Write the GitHub code host and tracker entries. Helm replaces a list
@@ -404,53 +512,38 @@ pub fn intake_commands(
     cmds
 }
 
-/// `list` of the recorded `factory` values with the entry named like `entry`
-/// replaced by it, or appended when none is. Every other entry is kept.
-fn replace_named(
-    recorded: &serde_json::Value,
-    list: &str,
-    entry: &serde_json::Value,
-) -> serde_json::Value {
-    let name = entry.get("name");
-    let mut entries: Vec<serde_json::Value> = recorded
-        .pointer(&format!("/factory/{list}"))
-        .and_then(|v| v.as_array())
-        .map(|list| {
-            list.iter()
-                .filter(|kept| kept.get("name") != name)
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
-    entries.push(entry.clone());
-    serde_json::Value::Array(entries)
-}
-
 /// The values document a Jira quickstart applies with `--reuse-values -f`:
 /// the release's `factory.trackers` and `factory.bindings` with the Jira
-/// entries put in. Helm replaces a list whole, so each is written complete.
-/// The token is not here; it lives only in the Secret the tracker names.
+/// entries put in, each found by identity (see
+/// [`crate::factory_quickstart::put_forge_entry`]). An entry the release
+/// records is written back as recorded. Helm replaces a list whole, so each
+/// is written complete. The token is not here; it lives only in the Secret
+/// the tracker names.
 pub fn forge_entries_values(
     recorded: &serde_json::Value,
     plan: &crate::factory_quickstart::JiraPlan,
-) -> serde_json::Value {
-    serde_json::json!({
+) -> Result<serde_json::Value> {
+    let tracker = plan.recorded_tracker.as_ref().unwrap_or(&plan.tracker);
+    let binding = plan.recorded_binding.as_ref().unwrap_or(&plan.binding);
+    Ok(serde_json::json!({
         "factory": {
-            "trackers": replace_named(recorded, "trackers", &plan.tracker),
-            "bindings": replace_named(recorded, "bindings", &plan.binding),
+            "trackers": crate::factory_quickstart::put_forge_entry(recorded, "trackers", tracker)?,
+            "bindings": crate::factory_quickstart::put_forge_entry(recorded, "bindings", binding)?,
         }
-    })
+    }))
 }
 
 /// One forge's `factory.codeHosts`, `factory.trackers` and `factory.bindings`
-/// entries, each replacing the recorded entry of the same name, and the
-/// ConfigMap holding the code host's CA bundle, when it needs one.
+/// entries, each already resolved against the release (a recorded entry as
+/// recorded, a new one under its derived name), and the CA bundle ConfigMap
+/// this run creates, when the release references none yet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativeForgeEntries {
     pub code_host: serde_json::Value,
     pub tracker: serde_json::Value,
     pub binding: serde_json::Value,
-    /// Set as `codeHostTrust.caBundle.configMapRef.name`, key `ca.crt`.
+    /// Set as `codeHostTrust.caBundle.configMapRef.name`, key `ca.crt`, only
+    /// when this run creates the bundle: a recorded reference is kept.
     pub ca_config_map: Option<String>,
 }
 
@@ -458,51 +551,72 @@ pub struct NativeForgeEntries {
 /// host and the tracker) applies with `--reuse-values -f`: the factory
 /// enabled with poll intake (the native forge is the install's only trigger
 /// source, and the API polls no tracker while the factory is off), the
-/// release's three `factory` lists with `entries` put in, each written
-/// complete since Helm replaces a list whole, and the CA ConfigMap reference
-/// when given. The token is not here; it lives only in the Secret the
-/// credentials name.
+/// release's three `factory` lists with `entries` put in by identity (see
+/// [`crate::factory_quickstart::put_forge_entry`]), each written complete
+/// since Helm replaces a list whole, and the CA ConfigMap reference when
+/// this run creates the bundle. The token is not here; it lives only in the
+/// Secret the credentials name.
 pub fn native_forge_values(
     recorded: &serde_json::Value,
     entries: &NativeForgeEntries,
-) -> serde_json::Value {
+) -> Result<serde_json::Value> {
+    use crate::factory_quickstart::put_forge_entry;
     let mut values = serde_json::json!({
         "factory": {
             "enabled": true,
             "intake": crate::factory_quickstart::POLL_INTAKE,
-            "codeHosts": replace_named(recorded, "codeHosts", &entries.code_host),
-            "trackers": replace_named(recorded, "trackers", &entries.tracker),
-            "bindings": replace_named(recorded, "bindings", &entries.binding),
+            "codeHosts": put_forge_entry(recorded, "codeHosts", &entries.code_host)?,
+            "trackers": put_forge_entry(recorded, "trackers", &entries.tracker)?,
+            "bindings": put_forge_entry(recorded, "bindings", &entries.binding)?,
         }
     });
     if let Some(name) = &entries.ca_config_map {
         values["codeHostTrust"] =
             serde_json::json!({"caBundle": {"configMapRef": {"name": name, "key": "ca.crt"}}});
     }
-    values
+    Ok(values)
 }
 
 /// Write forge entries on the release: the same helm upgrade and api rollout
 /// as the intake, over the document `values` builds from the recorded user
-/// values. `what` names the entries in the progress lines.
+/// values. The recorded values are read once and the planned factory
+/// document is checked before anything is written, so a refused document
+/// leaves the release and its namespace untouched. `observation` is then
+/// read again, refusing when an object it holds or the Helm revision it
+/// fences on changed concurrently. Only then are `writes` (a token Secret
+/// created, a CA bundle created or replaced at its observed resourceVersion)
+/// applied, followed by the upgrade, with the Helm revision read again
+/// immediately before it, and the rollout. `what` names the entries in the
+/// progress lines.
 pub async fn apply_forge_entries(
     common: &CommonOpts,
     chart: &str,
     what: &str,
-    values: impl FnOnce(&serde_json::Value) -> serde_json::Value,
+    observation: &crate::factory_quickstart::Observation,
+    writes: &[crate::factory_quickstart::ObjectWrite],
+    values: impl FnOnce(&serde_json::Value) -> Result<serde_json::Value>,
 ) -> Result<()> {
     require_on_path("helm")?;
     require_on_path("kubectl")?;
     let recorded = fetch_release_values(common)
         .await?
         .unwrap_or(serde_json::Value::Null);
-    let values = values(&recorded);
+    let values = values(&recorded)?;
+    refuse_planned_factory(&recorded, &values)?;
+    observation.recheck().await?;
+    for write in writes {
+        write.apply(&common.namespace).await?;
+    }
     let timeout = effective_helm_timeout(None, release_minimum_helm_timeout(common).await);
     let ui = crate::ui::ui();
     let cl = ui.checklist();
     {
         let file = crate::ops::SecretValuesFileGuard::private_document(&values)?;
         let cmd = helm_upgrade(common, chart, file.path(), timeout);
+        // The revision fence, immediately before the upgrade: `--reuse-values`
+        // of a document planned from a revision an operator has since
+        // replaced would overwrite that change.
+        observation.fence_release_revision().await?;
         ui.plumbing(&format!("+ {}", cmd.display()));
         let step = cl.step(&format!("writing {what} on release {}", common.release));
         let (ok, _, stderr) = run_capture(&cmd).await?;
@@ -570,6 +684,132 @@ fn overlay(
         }
     }
     serde_json::Value::Object(merged)
+}
+
+/// A values list under `factory`; absent or null means empty.
+fn factory_list<'a>(values: &'a serde_json::Value, key: &str) -> &'a [serde_json::Value] {
+    values
+        .pointer(&format!("/factory/{key}"))
+        .and_then(serde_json::Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+/// A scalar field as the chart renders it into CURIE_FORGES: a string as
+/// is, a whole number (see [`whole_number`]) as plain decimal digits,
+/// anything else as its JSON text.
+fn factory_scalar(entry: &serde_json::Value, key: &str) -> String {
+    match entry.get(key) {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Number(number)) => {
+            whole_number(number).map_or_else(|| number.to_string(), |whole| whole.to_string())
+        }
+        Some(other) => other.to_string(),
+    }
+}
+
+/// A number Helm holds exactly and the chart renders as plain digits: Helm
+/// reads every values number as a float64, so only a whole number below 2^53
+/// in magnitude survives unrounded.
+fn whole_number(number: &serde_json::Number) -> Option<i64> {
+    // 2^53; every whole float64 strictly inside (-2^53, 2^53) is exact.
+    const LIMIT: f64 = 9_007_199_254_740_992.0;
+    let value = number.as_f64()?;
+    (value.is_finite() && value.fract() == 0.0 && value.abs() < LIMIT).then_some(value as i64)
+}
+
+/// An identifier value as the chart renders it, or `None` when the chart
+/// refuses it: a nonempty string as is (the runtime takes it as is), or a
+/// [`whole_number`].
+pub(crate) fn normalize_identifier_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) if !text.is_empty() => Some(text.clone()),
+        serde_json::Value::Number(number) => whole_number(number).map(|n| n.to_string()),
+        _ => None,
+    }
+}
+
+/// The API's forge reference rules (`ForgesConfig.check_references`) over an
+/// effective chart values document, so a CLI apply refuses before Helm or any
+/// rollout: code host, tracker and binding names unique, each binding names a
+/// configured tracker, and one binding per resolved tracker scope (tracker
+/// kind, host trimmed and lowercased, trackerScopeId; ADR 0197).
+pub fn check_factory_document(values: &serde_json::Value) -> std::result::Result<(), String> {
+    let code_hosts = factory_list(values, "codeHosts");
+    let trackers = factory_list(values, "trackers");
+    let bindings = factory_list(values, "bindings");
+    for (section, entries) in [
+        ("codeHosts", code_hosts),
+        ("trackers", trackers),
+        ("bindings", bindings),
+    ] {
+        let mut seen = BTreeSet::new();
+        let duplicated: BTreeSet<String> = entries
+            .iter()
+            .map(|entry| factory_scalar(entry, "name"))
+            .filter(|name| !seen.insert(name.clone()))
+            .collect();
+        if !duplicated.is_empty() {
+            let names: Vec<String> = duplicated.into_iter().collect();
+            return Err(format!(
+                "factory.{section} names are not unique: {}; give each entry its own name",
+                names.join(", ")
+            ));
+        }
+    }
+    let by_name: BTreeMap<String, &serde_json::Value> = trackers
+        .iter()
+        .map(|tracker| (factory_scalar(tracker, "name"), tracker))
+        .collect();
+    let mut scopes: BTreeMap<(String, String, String), String> = BTreeMap::new();
+    for (index, binding) in bindings.iter().enumerate() {
+        let name = factory_scalar(binding, "name");
+        let tracker_name = factory_scalar(binding, "tracker");
+        let Some(tracker) = by_name.get(&tracker_name) else {
+            return Err(format!(
+                "factory.bindings[{index}] ({name}) names unknown tracker {tracker_name}; \
+                 add it to factory.trackers or name an existing tracker"
+            ));
+        };
+        let kind = factory_scalar(tracker, "kind");
+        let host = factory_scalar(tracker, "host").trim().to_lowercase();
+        let Some(scope_id) = normalize_identifier_value(&binding["trackerScopeId"]) else {
+            return Err(format!(
+                "factory.bindings[{index}] ({name}) trackerScopeId must be a nonempty string \
+                 or a whole number; quote the tracker's scope id"
+            ));
+        };
+        let scope = (kind.clone(), host.clone(), scope_id.clone());
+        if let Some(first) = scopes.get(&scope) {
+            return Err(format!(
+                "factory.bindings {first} and {name} claim the same tracker scope \
+                 ({kind} on {host}, trackerScopeId {scope_id}); keep one binding per tracker \
+                 scope: add the other repositories to binding {first} repos and select one \
+                 with a repo:<alias> label"
+            ));
+        }
+        scopes.insert(scope, name);
+    }
+    Ok(())
+}
+
+/// The document Helm renders when `planned` is applied with `--reuse-values
+/// -f` over the `recorded` user values, reduced to the `factory` map: a
+/// planned key replaces the recorded one, and a planned list replaces the
+/// recorded list whole. Refuses before any mutation when that document breaks
+/// [`check_factory_document`].
+pub(crate) fn refuse_planned_factory(
+    recorded: &serde_json::Value,
+    planned: &serde_json::Value,
+) -> Result<()> {
+    let effective = serde_json::json!({ "factory": overlay(recorded, planned, "factory") });
+    check_factory_document(&effective).map_err(|message| {
+        CliError::usage(message)
+            .with_fix(
+                "fix factory.codeHosts, factory.trackers or factory.bindings; nothing was applied",
+            )
+            .into()
+    })
 }
 
 /// The GitHub tracker entry of a `factory` map, if one is configured.
@@ -781,7 +1021,39 @@ fn planned_values(
         label.as_deref(),
         mention.as_deref(),
     );
+    keep_other_forges(&mut values, recorded);
     values
+}
+
+/// Puts the planned GitHub code host and tracker in place of the recorded
+/// entry of the same identity (kind `github` and its host), under the
+/// recorded name, and keeps every other entry: another quickstart's GitLab
+/// or Jira instance is not this command's to drop (#4620). The code host
+/// name is the one [`github_code_host_name`] gives a Jira binding.
+fn keep_other_forges(values: &mut serde_json::Value, recorded: &serde_json::Value) {
+    for list in ["codeHosts", "trackers"] {
+        let Some(mut github) = values.pointer(&format!("/factory/{list}/0")).cloned() else {
+            continue;
+        };
+        let same = recorded_github_entry(recorded, list);
+        if let Some(name) = same.and_then(|entry| entry.get("name")) {
+            github["name"] = name.clone();
+        }
+        let mut merged = Vec::new();
+        let mut placed = false;
+        for entry in factory_list(recorded, list) {
+            if same.is_some_and(|same| std::ptr::eq(same, entry)) {
+                merged.push(github.clone());
+                placed = true;
+            } else {
+                merged.push(entry.clone());
+            }
+        }
+        if !placed {
+            merged.insert(0, github);
+        }
+        values["factory"][list] = serde_json::Value::Array(merged);
+    }
 }
 
 fn app_values(plan: &AppPlan) -> serde_json::Value {
@@ -1301,6 +1573,12 @@ async fn update_repositories(opts: FactoryIntakeOpts) -> Result<Box<dyn crate::u
         .await?
         .unwrap_or(serde_json::Value::Null);
     let (mut bindings, indices) = repository_update_bindings(&recorded, &updates)?;
+    // The update rewrites only runner and Docker fields of these bindings, so
+    // the scope the upgrade applies is decided here, before any build.
+    refuse_planned_factory(
+        &recorded,
+        &serde_json::json!({"factory": {"bindings": bindings}}),
+    )?;
     let computed = fetch_release_computed_values(&opts.common)
         .await?
         .ok_or_else(|| CliError::usage("repository updates require an existing Helm release"))?;
@@ -1348,7 +1626,12 @@ async fn update_repositories(opts: FactoryIntakeOpts) -> Result<Box<dyn crate::u
         None => effective_helm_timeout(None, release_minimum_helm_timeout(&opts.common).await),
     };
     let file = crate::ops::SecretValuesFileGuard::private_document(&values)?;
-    let command = helm_upgrade(&opts.common, &opts.chart, file.path(), timeout);
+    let command = crate::ops::quickstart_marked_release_write(&helm_upgrade(
+        &opts.common,
+        &opts.chart,
+        file.path(),
+        timeout,
+    ));
     crate::ui::ui().plumbing(&format!("+ {}", command.display()));
     let (ok, _, stderr) = run_capture(&command).await?;
     if !ok {
@@ -1471,6 +1754,10 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
             crate::ui::DryRunPlan { lines },
         )));
     }
+    // #4620: a quickstart parent hands over what it observed, so a change
+    // made while this run reads the network and the release refuses it
+    // instead of being overwritten.
+    let fence = crate::factory_quickstart::Observation::intake_fence(&opts.common)?;
     let mut app_plan = None;
     let mut publication = None;
     let mut reports = BTreeMap::new();
@@ -1498,9 +1785,12 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
         }
         if let (None, Some(slug)) = (&preflight, &opts.mention) {
             publication = Some(
-                crate::factory_app::GithubApi::new()?
-                    .bot_publication_identity(slug)
-                    .await?,
+                crate::factory_app::GithubApi::new(
+                    &crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE),
+                    None,
+                )?
+                .bot_publication_identity(slug)
+                .await?,
             );
         }
         recorded = fetch_release_values(&opts.common)
@@ -1539,7 +1829,9 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
         }) {
             publication = None;
         }
+        refuse_occupied_github_entry_name(&recorded)?;
         let planned = planned_values(&opts, &recorded, app_plan.as_ref());
+        refuse_planned_factory(&recorded, &planned)?;
         let offenders = intake_gate_offenders(&recorded, &planned);
         if !offenders.is_empty() {
             let fixes: Vec<String> = offenders
@@ -1611,6 +1903,9 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
     let cl = ui.checklist();
     let mut labels_created = Vec::new();
     let mut secret_written = false;
+    if let Some(fence) = &fence {
+        fence.recheck().await?;
+    }
     if let Some(plan) = &app_plan {
         if let crate::factory_app::SecretPlan::Write(manifest) = &plan.secret {
             let step = cl.step(&format!(
@@ -1627,8 +1922,17 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
         }
     }
     {
+        if let Some(fence) = &fence {
+            fence.recheck().await?;
+        }
         let file = crate::ops::SecretValuesFileGuard::private_document(&values)?;
-        let cmd = helm_upgrade(&opts.common, &opts.chart, file.path(), timeout);
+        // A quickstart parent adopts only the revision this upgrade records.
+        let cmd = crate::ops::quickstart_marked_release_write(&helm_upgrade(
+            &opts.common,
+            &opts.chart,
+            file.path(),
+            timeout,
+        ));
         ui.plumbing(&format!("+ {}", cmd.display()));
         let step = cl.step(&format!(
             "configuring the factory intake on release {}",
@@ -1686,6 +1990,16 @@ mod tests {
     use super::*;
     use crate::ops::{CommonOpts, OpsCommand};
     use std::path::Path;
+
+    #[test]
+    fn github_host_keeps_an_explicit_port_and_maps_the_public_api() {
+        assert_eq!(github_host("http://127.0.0.1:57445"), "127.0.0.1:57445");
+        assert_eq!(github_host("https://api.github.com"), "github.com");
+        assert_eq!(
+            github_host("https://GHE.Example.com/api/v3"),
+            "ghe.example.com"
+        );
+    }
 
     const SECRET: &str = "whsec-test-value-9f2c";
 
@@ -1811,6 +2125,165 @@ mod tests {
             "factory_intake.rs still builds a GitHub {meta} request"
         );
         assert!(!production.contains("connectorEgress"));
+    }
+
+    #[test]
+    fn the_recorded_github_code_host_keeps_its_name_by_identity() {
+        let mut o = opts();
+        o.app_id = Some("123".into());
+        let api_url = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
+        let host = github_host(&api_url);
+        let recorded = serde_json::json!({"factory": {"codeHosts": [
+            {"name": "operator-gitlab", "kind": "gitlab", "host": "gitlab.example.com"},
+            {"name": "operator-github", "kind": "github", "host": host.to_uppercase()},
+            {"name": "enterprise", "kind": "github", "host": "ghe.example.com"},
+        ]}});
+        assert_eq!(github_code_host_name(&recorded), "operator-github");
+        assert_eq!(
+            github_code_host_name(&serde_json::Value::Null),
+            GITHUB_ENTRY
+        );
+        let values = planned_values(&o, &recorded, None);
+        let names: Vec<&str> = values["factory"]["codeHosts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["operator-gitlab", "operator-github", "enterprise"]);
+        assert_eq!(
+            values["factory"]["codeHosts"][1]["apiUrl"],
+            serde_json::json!(api_url)
+        );
+    }
+
+    #[test]
+    fn a_github_entry_name_held_by_another_identity_refuses_before_any_write() {
+        let mut o = opts();
+        o.app_id = Some("123".into());
+        let api_url = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
+        let host = github_host(&api_url);
+        let gitlab = serde_json::json!({"factory": {"codeHosts": [
+            {"name": GITHUB_ENTRY, "kind": "gitlab", "host": "gitlab.example.com"},
+        ]}});
+        let text = format!(
+            "{:#}",
+            refuse_occupied_github_entry_name(&gitlab).unwrap_err()
+        );
+        assert!(
+            text.contains("factory.codeHosts name `github`")
+                && text.contains("gitlab host gitlab.example.com"),
+            "{text}"
+        );
+        // Unchecked, the planned document carries two code hosts named
+        // `github`, which the document check refuses on its own.
+        let planned = planned_values(&o, &gitlab, None);
+        let message = refuse_planned_factory(&gitlab, &planned)
+            .map(|()| String::new())
+            .unwrap_or_else(|error| format!("{error:#}"));
+        assert!(
+            message.starts_with("factory.codeHosts names are not unique: github"),
+            "{message}"
+        );
+        let tracker = serde_json::json!({"factory": {"trackers": [
+            {"name": GITHUB_ENTRY, "kind": "jira_cloud", "host": "acme.atlassian.net"},
+        ]}});
+        assert!(refuse_occupied_github_entry_name(&tracker).is_err());
+        // Liveness: the equivalent recorded GitHub entry named `github` is
+        // this instance, and the rerun passes both checks.
+        let entry = serde_json::json!({"name": GITHUB_ENTRY, "kind": "github",
+                                       "host": host, "apiUrl": format!("{api_url}/")});
+        let equivalent = serde_json::json!({"factory": {
+            "codeHosts": [entry.clone()], "trackers": [entry],
+        }});
+        refuse_occupied_github_entry_name(&equivalent).expect("the same identity");
+        let planned = planned_values(&o, &equivalent, None);
+        refuse_planned_factory(&equivalent, &planned).expect("one entry per name");
+        assert_eq!(planned["factory"]["codeHosts"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_portless_recorded_host_is_this_instance_at_its_ported_api_url() {
+        let ported = "https://ghe.example.com:8443/api/v3";
+        let recorded = |host: &str, api: &str| {
+            serde_json::json!({"factory": {"codeHosts": [
+                {"name": GITHUB_ENTRY, "kind": "github", "host": host, "apiUrl": api},
+            ]}})
+        };
+        let legacy = recorded("ghe.example.com", ported);
+        assert!(recorded_github_entry_at(&legacy, "codeHosts", ported).is_some());
+        let slashed = recorded("ghe.example.com", &format!("{ported}/"));
+        assert!(recorded_github_entry_at(&slashed, "codeHosts", ported).is_some());
+        let other = recorded("ghe.example.com", "https://ghe.example.com:9443/api/v3");
+        assert!(recorded_github_entry_at(&other, "codeHosts", ported).is_none());
+        let current = recorded("ghe.example.com:8443", ported);
+        assert!(recorded_github_entry_at(&current, "codeHosts", ported).is_some());
+    }
+
+    #[test]
+    fn a_hostless_github_entry_is_this_instance_only_at_its_api_url() {
+        let api_url = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
+        let hostless = |api: Option<&str>| {
+            let mut entry = serde_json::json!({"name": GITHUB_ENTRY, "kind": "github"});
+            if let Some(api) = api {
+                entry["apiUrl"] = serde_json::json!(api);
+            }
+            serde_json::json!({"factory": {"codeHosts": [entry]}})
+        };
+        let same = hostless(Some(&format!(" {api_url}/ ")));
+        assert!(recorded_github_entry(&same, "codeHosts").is_some());
+        refuse_occupied_github_entry_name(&same).expect("the incomplete entry is ours");
+        // An entry naming neither host nor apiUrl names no instance, so it
+        // is not adopted.
+        assert!(recorded_github_entry(&hostless(None), "codeHosts").is_none());
+        let other = hostless(Some("https://ghe.example.com/api/v3"));
+        assert!(
+            recorded_github_entry(&other, "codeHosts").is_none(),
+            "{other}"
+        );
+        let text = format!(
+            "{:#}",
+            refuse_occupied_github_entry_name(&other).unwrap_err()
+        );
+        assert!(text.contains("https://ghe.example.com/api/v3"), "{text}");
+    }
+
+    #[test]
+    fn an_unidentified_github_entry_under_any_name_refuses_before_any_write() {
+        for list in ["codeHosts", "trackers"] {
+            let recorded = serde_json::json!({"factory": {list: [
+                {"name": "operator-github", "kind": "github"},
+            ]}});
+            let text = format!(
+                "{:#}",
+                refuse_occupied_github_entry_name(&recorded).unwrap_err()
+            );
+            assert!(
+                text.contains(&format!("factory.{list} entry `operator-github`"))
+                    && text.contains("neither host nor apiUrl"),
+                "{text}"
+            );
+        }
+        // Liveness: a fully identified entry under another name is reused.
+        let api_url = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
+        let identified = serde_json::json!({"factory": {"codeHosts": [
+            {"name": "operator-github", "kind": "github",
+             "host": github_host(&api_url), "apiUrl": api_url},
+        ]}});
+        refuse_occupied_github_entry_name(&identified).expect("identified entry is reused");
+    }
+
+    #[test]
+    fn duplicate_code_host_names_are_refused() {
+        let document = serde_json::json!({"factory": {"codeHosts": [
+            {"name": "forge", "kind": "github", "host": "github.com"},
+            {"name": "forge", "kind": "gitlab", "host": "gitlab.example.com"},
+        ]}});
+        let message = check_factory_document(&document).expect_err("duplicate code host names");
+        assert!(
+            message.starts_with("factory.codeHosts names are not unique: forge"),
+            "{message}"
+        );
     }
 
     /// The one `factory.<section>` entry named `github`.
@@ -2298,5 +2771,167 @@ metadata:
             HELM_TIMEOUT_FLOOR_SECS
         );
         assert_eq!(effective_helm_timeout(Some(30000), Some(21900)), 30000);
+    }
+
+    fn jira_tracker(name: &str, host: &str) -> serde_json::Value {
+        serde_json::json!({"name": name, "kind": "jira_cloud", "host": host})
+    }
+
+    fn jira_binding(name: &str, tracker: &str, scope: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"name": name, "tracker": tracker, "trackerScopeId": scope})
+    }
+
+    #[test]
+    fn a_planned_binding_list_replaces_the_recorded_one_before_the_scope_check() {
+        let recorded = serde_json::json!({"factory": {
+            "trackers": [jira_tracker("jira", "example.atlassian.net")],
+            "bindings": [jira_binding("jira", "jira", serde_json::json!("scope-a"))],
+        }});
+        // Liveness: the recorded binding is replaced, not doubled.
+        let replaced = serde_json::json!({"factory": {"bindings": [
+            jira_binding("example", "jira", serde_json::json!("scope-a")),
+        ]}});
+        refuse_planned_factory(&recorded, &replaced).expect("one binding per scope");
+        // A planned list that keeps the recorded binding and adds a second on
+        // the same scope through another tracker name on the same site.
+        let duplicate = serde_json::json!({"factory": {
+            "trackers": [
+                jira_tracker("jira", "example.atlassian.net"),
+                jira_tracker("jira-site", " Example.Atlassian.NET "),
+            ],
+            "bindings": [
+                jira_binding("jira", "jira", serde_json::json!("scope-a")),
+                jira_binding("example", "jira-site", serde_json::json!("scope-a")),
+            ],
+        }});
+        let message = refuse_planned_factory(&recorded, &duplicate)
+            .expect_err("a duplicate scope is refused")
+            .to_string();
+        assert_eq!(
+            message,
+            "factory.bindings jira and example claim the same tracker scope (jira_cloud on \
+             example.atlassian.net, trackerScopeId scope-a); keep one binding per tracker \
+             scope: add the other repositories to binding jira repos and select one with a \
+             repo:<alias> label"
+        );
+        // A planned binding list with no trackers keeps the recorded trackers.
+        let unknown = serde_json::json!({"factory": {"bindings": [
+            jira_binding("example", "jira-cloud", serde_json::json!("scope-a")),
+        ]}});
+        let message = refuse_planned_factory(&recorded, &unknown)
+            .expect_err("a dangling tracker reference is refused")
+            .to_string();
+        assert_eq!(
+            message,
+            "factory.bindings[0] (example) names unknown tracker jira-cloud; add it to \
+             factory.trackers or name an existing tracker"
+        );
+    }
+
+    #[test]
+    fn scope_ids_compare_as_the_chart_renders_them_and_hosts_and_ids_separate_scopes() {
+        let trackers = serde_json::json!([
+            jira_tracker("jira", "example.atlassian.net"),
+            jira_tracker("other", "other.atlassian.net"),
+        ]);
+        let numeric = serde_json::json!({"factory": {"trackers": trackers, "bindings": [
+            jira_binding("a", "jira", serde_json::json!(10000)),
+            jira_binding("b", "jira", serde_json::json!("10000")),
+        ]}});
+        let message = check_factory_document(&numeric).expect_err("same rendered scope id");
+        assert!(message.contains("trackerScopeId 10000)"), "{message}");
+        let float = serde_json::json!({"factory": {"trackers": trackers, "bindings": [
+            jira_binding("a", "jira", serde_json::json!(12345.0)),
+            jira_binding("b", "jira", serde_json::json!("12345")),
+        ]}});
+        let message = check_factory_document(&float).expect_err("no exponent");
+        assert!(message.contains("trackerScopeId 12345)"), "{message}");
+        let distinct = serde_json::json!({"factory": {"trackers": trackers, "bindings": [
+            jira_binding("a", "jira", serde_json::json!("1")),
+            jira_binding("b", "jira", serde_json::json!("2")),
+            jira_binding("c", "other", serde_json::json!("1")),
+        ]}});
+        assert_eq!(check_factory_document(&distinct), Ok(()));
+        let null_lists = serde_json::json!({"factory": {"trackers": null, "bindings": null}});
+        assert_eq!(check_factory_document(&null_lists), Ok(()));
+    }
+
+    #[test]
+    fn scope_ids_must_be_nonempty_strings_or_whole_numbers_below_2_pow_53() {
+        let trackers = serde_json::json!([jira_tracker("jira", "example.atlassian.net")]);
+        let pair = |number: serde_json::Value, text: &str| {
+            serde_json::json!({"factory": {"trackers": trackers, "bindings": [
+                jira_binding("a", "jira", number),
+                jira_binding("b", "jira", serde_json::json!(text)),
+            ]}})
+        };
+        let large = pair(serde_json::json!(12345678901_i64), "12345678901");
+        let message = check_factory_document(&large).expect_err("no exponent");
+        assert!(message.contains("trackerScopeId 12345678901)"), "{message}");
+        let large_float = pair(serde_json::json!(12345678901.0), "12345678901");
+        assert!(check_factory_document(&large_float)
+            .expect_err("same id")
+            .contains("claim the same tracker scope"));
+        let largest = pair(serde_json::json!(9007199254740991_i64), "9007199254740991");
+        assert!(check_factory_document(&largest)
+            .expect_err("same id")
+            .contains("trackerScopeId 9007199254740991)"));
+        // Liveness: a string id and a zero UUID string pass.
+        let strings = serde_json::json!({"factory": {"trackers": trackers, "bindings": [
+            jira_binding("a", "jira", serde_json::json!("10000")),
+            jira_binding("b", "jira", serde_json::json!("00000000-0000-0000-0000-000000000000")),
+            jira_binding("c", "jira", serde_json::json!(" ")),
+        ]}});
+        assert_eq!(check_factory_document(&strings), Ok(()));
+        let refusal = "factory.bindings[0] (a) trackerScopeId must be a nonempty string or a \
+                       whole number; quote the tracker's scope id";
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!([1, 2]),
+            serde_json::json!({"id": 1}),
+            serde_json::json!(true),
+            serde_json::json!(-3.9),
+            serde_json::json!(1e20),
+            serde_json::json!(9007199254740992_u64),
+            serde_json::json!(9007199254740993_u64),
+            serde_json::json!(-9007199254740992_i64),
+        ] {
+            let document = pair(bad.clone(), "other");
+            assert_eq!(
+                check_factory_document(&document),
+                Err(refusal.to_string()),
+                "{bad}"
+            );
+        }
+        let missing = serde_json::json!({"factory": {"trackers": trackers, "bindings": [
+            {"name": "a", "tracker": "jira"},
+        ]}});
+        assert_eq!(check_factory_document(&missing), Err(refusal.to_string()));
+    }
+
+    #[test]
+    fn duplicate_tracker_and_binding_names_are_refused_first() {
+        let trackers = serde_json::json!({"factory": {"trackers": [
+            jira_tracker("jira", "a.atlassian.net"),
+            jira_tracker("jira", "b.atlassian.net"),
+        ], "bindings": [jira_binding("x", "missing", serde_json::json!("1"))]}});
+        let message = check_factory_document(&trackers).expect_err("duplicate tracker names");
+        assert!(
+            message.starts_with("factory.trackers names are not unique: jira"),
+            "{message}"
+        );
+        let bindings = serde_json::json!({"factory": {
+            "trackers": [jira_tracker("jira", "a.atlassian.net")],
+            "bindings": [
+                jira_binding("x", "jira", serde_json::json!("1")),
+                jira_binding("x", "jira", serde_json::json!("2")),
+            ],
+        }});
+        let message = check_factory_document(&bindings).expect_err("duplicate binding names");
+        assert!(
+            message.starts_with("factory.bindings names are not unique: x"),
+            "{message}"
+        );
     }
 }

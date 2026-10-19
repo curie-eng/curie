@@ -11,12 +11,13 @@ from uuid import UUID
 
 import pytest
 from channel_protocol import scoped_conversation_id
-from curie_api import workitem_dispatch
+from curie_api import models, workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.forges.types import GITHUB, RepositoryRef, TrackerIssueRef
 from curie_api.main import create_app
 from curie_api.routers import work_items
 from curie_api.workitem_dispatch import (
+    AcquireGrant,
     Admission,
     acquire,
     admit,
@@ -31,8 +32,10 @@ from curie_api.workitem_dispatch import (
 )
 from curie_api.workitems import lifecycle as workitems
 from fastapi.testclient import TestClient
+from forge_fakes import factory_wake
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from test_workitems import _grant_opened_pull_request
 
 REPO = "acme-corp/acme-bot"
 OTHER_REPO = "attacker/other-bot"
@@ -161,6 +164,20 @@ def _facts_json(facts: Admission) -> dict[str, Any]:
     }
 
 
+def _acquire_body(generation: int) -> dict[str, Any]:
+    return {
+        "owner": OWNER,
+        "generation": generation,
+        "wake": workitem_dispatch.FactoryWake(
+            kind="slack",
+            address=ADDRESS,
+            adapter="default",
+            conversation_id=WIRE_CONVERSATION,
+        ).model_dump(mode="json"),
+        "context": None,
+    }
+
+
 async def _request_row(session: AsyncSession, request_id: uuid.UUID) -> Any:
     row = (
         (
@@ -168,7 +185,7 @@ async def _request_row(session: AsyncSession, request_id: uuid.UUID) -> Any:
                 text(
                     "SELECT r.id, r.work_item_id, r.status, r.wait_deadline, "
                     "r.started_at, r.execution_deadline, r.version, "
-                    "r.execution_attempts, r.capacity_deferrals, "
+                    "r.execution_attempts, r.capacity_deferrals, r.start_deferrals, "
                     "r.dispatch_generation, r.published_generation, "
                     "r.dispatch_not_before, r.last_deferral_reason, "
                     "r.runtime_owner, r.runtime_epoch, "
@@ -328,7 +345,14 @@ def test_acquire_wrong_generation_duplicate_owner_and_cancelled_item(
         facts = _facts(agent_id)
         admitted = await admit(session, facts)
         assert admitted.request is not None
-        unpublished = await acquire(session, facts.request_id, owner=OWNER, generation=1)
+        unpublished = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
+        )
         assert unpublished.generation == 1
         assert unpublished.work_item_id == admitted.work_item.id
         assert unpublished.conversation_id == scoped_conversation_id(
@@ -337,11 +361,32 @@ def test_acquire_wrong_generation_duplicate_owner_and_cancelled_item(
         assert unpublished.wait_deadline == admitted.request.wait_deadline
         assert unpublished.repository_path == facts.repository.path
 
-        stale = await acquire(session, facts.request_id, owner=OWNER, generation=0)
+        stale = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=0,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
+        )
         assert _code(stale) == "not_published"
-        future = await acquire(session, facts.request_id, owner=OWNER, generation=2)
+        future = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=2,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
+        )
         assert _code(future) in {"not_published", "not_dispatchable"}
-        duplicate = await acquire(session, facts.request_id, owner=OTHER_OWNER, generation=1)
+        duplicate = await acquire(
+            session,
+            facts.request_id,
+            owner=OTHER_OWNER,
+            generation=1,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
+        )
         assert _code(duplicate) == "duplicate"
 
         cancelled = await cancel(
@@ -350,7 +395,14 @@ def test_acquire_wrong_generation_duplicate_owner_and_cancelled_item(
             expected_version=admitted.work_item.version,
         )
         assert cancelled.work_item.cancelled_at is not None
-        refused = await acquire(session, facts.request_id, owner=OWNER, generation=1)
+        refused = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
+        )
         assert _code(refused) == "work_item_cancelled"
 
     with_session(body)
@@ -366,7 +418,14 @@ def test_default_acquire_lease_and_same_owner_renewal_use_database_time(
     async def body(session: AsyncSession) -> None:
         facts = _facts(await _agent_with_channel(session))
         await admit(session, facts)
-        first = await acquire(session, facts.request_id, owner=OWNER, generation=1)
+        first = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
+        )
         assert isinstance(first, workitem_dispatch.AcquireGrant)
         acquired = await _request_row(session, facts.request_id)
         now = await _now(session)
@@ -381,14 +440,28 @@ def test_default_acquire_lease_and_same_owner_renewal_use_database_time(
         )
         await session.commit()
         shortened = await _request_row(session, facts.request_id)
-        renewed = await acquire(session, facts.request_id, owner=OWNER, generation=1)
+        renewed = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=await factory_wake(session, facts.request_id),
+            context=first.context,
+        )
         assert renewed == first
         after = await _request_row(session, facts.request_id)
         now = await _now(session)
         assert 59 <= (after.acquire_expires_at - now).total_seconds() <= 61
         assert after.acquire_expires_at > shortened.acquire_expires_at
         assert (after.acquire_owner, after.acquired_generation) == (OWNER, 1)
-        refused = await acquire(session, facts.request_id, owner=OTHER_OWNER, generation=1)
+        refused = await acquire(
+            session,
+            facts.request_id,
+            owner=OTHER_OWNER,
+            generation=1,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
+        )
         assert _code(refused) == "duplicate"
 
     with_session(body)
@@ -410,7 +483,14 @@ def test_default_acquire_lease_redispatches_only_after_expiry(
     async def body(session: AsyncSession) -> None:
         facts = _facts(await _agent_with_channel(session))
         await admit(session, facts)
-        acquired = await acquire(session, facts.request_id, owner=OWNER, generation=1)
+        acquired = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
+        )
         assert isinstance(acquired, workitem_dispatch.AcquireGrant)
         await session.execute(
             text(
@@ -438,6 +518,8 @@ def test_default_acquire_lease_redispatches_only_after_expiry(
                 facts.request_id,
                 owner=OTHER_OWNER,
                 generation=after.dispatch_generation,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
             )
             assert isinstance(replacement, workitem_dispatch.AcquireGrant)
             assert replacement.generation == before.dispatch_generation + 1
@@ -446,7 +528,12 @@ def test_default_acquire_lease_redispatches_only_after_expiry(
             assert after.acquire_owner == OWNER
             assert after.acquire_expires_at == before.acquire_expires_at
             refused = await acquire(
-                session, facts.request_id, owner=OTHER_OWNER, generation=after.dispatch_generation
+                session,
+                facts.request_id,
+                owner=OTHER_OWNER,
+                generation=after.dispatch_generation,
+                wake=await factory_wake(session, facts.request_id),
+                context=None,
             )
             assert _code(refused) == "duplicate"
 
@@ -461,7 +548,14 @@ def test_defer_preserves_deadline_version_start_and_attempts(
         facts = _facts(agent_id)
         admitted = await admit(session, facts)
         assert admitted.request is not None
-        granted = await acquire(session, facts.request_id, owner=OWNER, generation=1)
+        granted = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
+        )
         assert granted.generation == 1
         before = await _request_row(session, facts.request_id)
         now = await _now(session)
@@ -485,12 +579,15 @@ def test_defer_preserves_deadline_version_start_and_attempts(
         assert after_busy.last_deferral_reason == "thread_busy"
         assert busy.dispatch_generation == after_busy.dispatch_generation
 
-        await acquire(
+        acquired = await acquire(
             session,
             facts.request_id,
             owner=OWNER,
             generation=after_busy.dispatch_generation,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
         )
+        assert isinstance(acquired, AcquireGrant), acquired
         capacity = await defer(
             session,
             facts.request_id,
@@ -518,7 +615,15 @@ def test_start_records_attempt_epoch_deadline_and_runtime_names(
         agent_id = await _agent_with_channel(session)
         facts = _facts(agent_id)
         await admit(session, facts)
-        await acquire(session, facts.request_id, owner=OWNER, generation=1)
+        acquired = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
+        )
+        assert isinstance(acquired, AcquireGrant), acquired
         started = await start(
             session,
             facts.request_id,
@@ -526,6 +631,7 @@ def test_start_records_attempt_epoch_deadline_and_runtime_names(
             generation=1,
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
+            context=acquired.context,
         )
         row = await _request_row(session, facts.request_id)
         assert row.status == "running"
@@ -549,7 +655,15 @@ def test_heartbeat_and_finish_refuse_a_stale_runtime_epoch(
         agent_id = await _agent_with_channel(session)
         facts = _facts(agent_id)
         await admit(session, facts)
-        await acquire(session, facts.request_id, owner=OWNER, generation=1)
+        acquired = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
+        )
+        assert isinstance(acquired, AcquireGrant), acquired
         await start(
             session,
             facts.request_id,
@@ -557,6 +671,7 @@ def test_heartbeat_and_finish_refuse_a_stale_runtime_epoch(
             generation=1,
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
+            context=acquired.context,
         )
         before = await _request_row(session, facts.request_id)
         stale_heartbeat = await heartbeat(session, facts.request_id, runtime_epoch=2)
@@ -725,7 +840,15 @@ def test_termination_claim_waits_for_heartbeat_expiry_and_maps_owner_lost(
         agent_id = await _agent_with_channel(session)
         facts = _facts(agent_id)
         admitted = await admit(session, facts)
-        await acquire(session, facts.request_id, owner=OWNER, generation=1)
+        acquired = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
+        )
+        assert isinstance(acquired, AcquireGrant), acquired
         await start(
             session,
             facts.request_id,
@@ -733,6 +856,7 @@ def test_termination_claim_waits_for_heartbeat_expiry_and_maps_owner_lost(
             generation=1,
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
+            context=acquired.context,
         )
         cancelled = await cancel(
             session,
@@ -757,7 +881,15 @@ def test_termination_claim_waits_for_heartbeat_expiry_and_maps_owner_lost(
 
         owner_lost_facts = _facts(agent_id, issue_number=2574)
         owner_lost = await admit(session, owner_lost_facts)
-        await acquire(session, owner_lost_facts.request_id, owner=OWNER, generation=1)
+        acquired = await acquire(
+            session,
+            owner_lost_facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=await factory_wake(session, owner_lost_facts.request_id),
+            context=None,
+        )
+        assert isinstance(acquired, AcquireGrant), acquired
         await start(
             session,
             owner_lost_facts.request_id,
@@ -765,6 +897,7 @@ def test_termination_claim_waits_for_heartbeat_expiry_and_maps_owner_lost(
             generation=1,
             claim_name=CLAIM_NAME,
             sandbox_name=SANDBOX_NAME,
+            context=acquired.context,
         )
         await session.execute(
             text(
@@ -828,7 +961,7 @@ def _auth_routes() -> list[tuple[str, str, dict[str, Any] | None]]:
         (
             "POST",
             f"{INTERNAL_PREFIX}/requests/{request_id}/acquire",
-            {"owner": OWNER, "generation": 1},
+            _acquire_body(1),
         ),
         (
             "POST",
@@ -848,6 +981,14 @@ def _auth_routes() -> list[tuple[str, str, dict[str, Any] | None]]:
                 "generation": 1,
                 "claim_name": CLAIM_NAME,
                 "sandbox_name": SANDBOX_NAME,
+                "context": {
+                    "agent_id": admissions["agent_id"],
+                    "tenant_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                    "binding_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                    "kind": "slack",
+                    "address": ADDRESS,
+                    "adapter": "default",
+                },
             },
         ),
         (
@@ -941,7 +1082,7 @@ def test_http_admit_replay_acquire_start_heartbeat_and_stale_finish(
 
     acquired = dispatch_client.post(
         f"{INTERNAL_PREFIX}/requests/{request_id}/acquire",
-        json={"owner": OWNER, "generation": 1},
+        json=_acquire_body(1),
         headers=WORKER_HEADERS,
     )
     assert acquired.status_code == 200, acquired.text
@@ -953,12 +1094,36 @@ def test_http_admit_replay_acquire_start_heartbeat_and_stale_finish(
             "generation": 1,
             "claim_name": CLAIM_NAME,
             "sandbox_name": SANDBOX_NAME,
+            "context": acquired.json()["context"],
         },
         headers=WORKER_HEADERS,
     )
     assert started.status_code == 200, started.text
     start_body = started.json()
     assert start_body["runtime_epoch"] == 1
+    running = dispatch_client.get(
+        f"{INTERNAL_PREFIX}/running",
+        params={
+            "conversation_id": acquired.json()["conversation_id"],
+            "wake_kind": "slack",
+            "wake_address": ADDRESS,
+            "wake_adapter": "default",
+            "wake_conversation_id": WIRE_CONVERSATION,
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert running.status_code == 200, running.text
+    running_body = running.json()
+    assert running_body["request_id"] == request_id
+    assert running_body["agent_id"] == str(agent_id)
+    assert running_body["generation"] == acquired.json()["generation"]
+    assert running_body["conversation_id"] == acquired.json()["conversation_id"]
+    assert running_body["wait_deadline"] == acquired.json()["wait_deadline"]
+    assert running_body["repository_path"] == facts.repository.path
+    assert running_body["execution_deadline"] == start_body["execution_deadline"]
+    assert running_body["lease_held_to_deadline"] is False
+    assert running_body["context"] == acquired.json()["context"]
+    assert running_body["refusal"] is None
     viewed = dispatch_client.get(
         f"{INTERNAL_PREFIX}/requests/{request_id}",
         headers=WORKER_HEADERS,
@@ -1007,12 +1172,18 @@ def short_runtime_ttl(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     get_settings.cache_clear()
 
 
-async def _running(
-    session: AsyncSession, agent_id: uuid.UUID, *, issue: int = 2573
-) -> Admission:
+async def _running(session: AsyncSession, agent_id: uuid.UUID, *, issue: int = 2573) -> Admission:
     facts = _facts(agent_id, issue_number=issue)
     await admit(session, facts)
-    await acquire(session, facts.request_id, owner=OWNER, generation=1)
+    acquired = await acquire(
+        session,
+        facts.request_id,
+        owner=OWNER,
+        generation=1,
+        wake=await factory_wake(session, facts.request_id),
+        context=None,
+    )
+    assert isinstance(acquired, AcquireGrant), acquired
     await start(
         session,
         facts.request_id,
@@ -1020,6 +1191,7 @@ async def _running(
         generation=1,
         claim_name=CLAIM_NAME,
         sandbox_name=SANDBOX_NAME,
+        context=acquired.context,
     )
     return facts
 
@@ -1130,6 +1302,57 @@ def test_approval_hold_is_not_an_orphan(clean_db: None, allowlisted: None) -> No
     with_session(body)
 
 
+def test_running_reports_approval_hold_and_heartbeat_transitions_read_only(
+    clean_db: None,
+    allowlisted: None,
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        facts = await _running(session, await _agent_with_channel(session))
+        wake = await factory_wake(session, facts.request_id)
+        conversation = scoped_conversation_id("slack", ADDRESS, WIRE_CONVERSATION)
+
+        async def observe(expected: bool) -> None:
+            before = await _request_row(session, facts.request_id)
+            state, result = await workitem_dispatch.running_for_conversation(
+                session,
+                conversation,
+                wake=wake,
+            )
+            assert state == "running"
+            assert isinstance(result, workitem_dispatch.RunningResult)
+            assert result.request_id == facts.request_id
+            assert result.runtime_epoch == before.runtime_epoch
+            assert result.lease_held_to_deadline is expected
+            assert result.context is not None and result.context.agent_id == facts.agent_id
+            assert result.refusal is None
+            assert dict(await _request_row(session, facts.request_id)) == dict(before)
+
+        await observe(False)
+        held = await workitem_dispatch.hold_for_approval(
+            session,
+            facts.request_id,
+            runtime_epoch=1,
+        )
+        assert isinstance(held, workitem_dispatch.HeartbeatResult)
+        row = await _request_row(session, facts.request_id)
+        assert row.runtime_heartbeat_expires_at == row.execution_deadline
+        await observe(True)
+        renewed = await heartbeat(session, facts.request_id, runtime_epoch=1)
+        assert isinstance(renewed, workitem_dispatch.HeartbeatResult)
+        row = await _request_row(session, facts.request_id)
+        assert row.runtime_heartbeat_expires_at != row.execution_deadline
+        await observe(False)
+        held_again = await workitem_dispatch.hold_for_approval(
+            session,
+            facts.request_id,
+            runtime_epoch=1,
+        )
+        assert isinstance(held_again, workitem_dispatch.HeartbeatResult)
+        await observe(True)
+
+    with_session(body)
+
+
 def test_expired_approval_hold_is_an_orphan(clean_db: None, allowlisted: None) -> None:
     async def body(session: AsyncSession) -> None:
         agent_id = await _agent_with_channel(session)
@@ -1156,6 +1379,15 @@ def test_expired_approval_hold_is_an_orphan(clean_db: None, allowlisted: None) -
         await session.commit()
         before = await _request_row(session, held.request_id)
         assert before.runtime_heartbeat_expires_at == before.execution_deadline
+
+        state, result = await workitem_dispatch.running_for_conversation(
+            session,
+            scoped_conversation_id("slack", ADDRESS, WIRE_CONVERSATION),
+            wake=await factory_wake(session, held.request_id),
+        )
+        assert state == "ended"
+        assert result is None
+        assert dict(await _request_row(session, held.request_id)) == dict(before)
 
         owners = await workitem_dispatch.list_runtime_owners(session, limit=50)
         assert [o.request_id for o in owners] == [held.request_id]
@@ -1194,24 +1426,24 @@ def test_http_runtime_owners_and_owner_lost(
     )
     assert admitted.status_code == 200, admitted.text
     request_id = admitted.json()["request"]["id"]
-    for verb, payload in (
-        ("acquire", {"owner": OWNER, "generation": 1}),
-        (
-            "start",
-            {
-                "owner": OWNER,
-                "generation": 1,
-                "claim_name": CLAIM_NAME,
-                "sandbox_name": SANDBOX_NAME,
-            },
-        ),
-    ):
-        response = dispatch_client.post(
-            f"{INTERNAL_PREFIX}/requests/{request_id}/{verb}",
-            json=payload,
-            headers=WORKER_HEADERS,
-        )
-        assert response.status_code == 200, response.text
+    acquired = dispatch_client.post(
+        f"{INTERNAL_PREFIX}/requests/{request_id}/acquire",
+        json=_acquire_body(1),
+        headers=WORKER_HEADERS,
+    )
+    assert acquired.status_code == 200, acquired.text
+    started = dispatch_client.post(
+        f"{INTERNAL_PREFIX}/requests/{request_id}/start",
+        json={
+            "owner": OWNER,
+            "generation": 1,
+            "claim_name": CLAIM_NAME,
+            "sandbox_name": SANDBOX_NAME,
+            "context": acquired.json()["context"],
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert started.status_code == 200, started.text
 
     unauth = dispatch_client.get(f"{INTERNAL_PREFIX}/runtime-owners")
     assert unauth.status_code in {401, 403}, unauth.text
@@ -1325,7 +1557,14 @@ async def _acquire_and_defer(
     """Acquire the current generation, defer it, and bracket the defer's clock."""
 
     row = await _start_row(session, request_id)
-    granted = await acquire(session, request_id, owner=OWNER, generation=row.dispatch_generation)
+    granted = await acquire(
+        session,
+        request_id,
+        owner=OWNER,
+        generation=row.dispatch_generation,
+        wake=await factory_wake(session, request_id),
+        context=None,
+    )
     assert getattr(granted, "code", None) is None, granted
     before = await _now(session)
     result = await defer(
@@ -1411,7 +1650,12 @@ def test_fifth_start_deferral_fails_the_request_as_start_failed(
         )
         assert _code(again) == "not_dispatchable"
         reacquired = await acquire(
-            session, facts.request_id, owner=OWNER, generation=row.dispatch_generation
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=row.dispatch_generation,
+            wake=await factory_wake(session, facts.request_id),
+            context=None,
         )
         assert _code(reacquired) == "not_dispatchable"
         unchanged = await _start_row(session, facts.request_id)
@@ -1612,7 +1856,7 @@ def test_http_defer_reports_start_failed_on_the_fifth_start_deferral(
     for reason in START_REASONS:
         acquired = dispatch_client.post(
             f"{INTERNAL_PREFIX}/requests/{request_id}/acquire",
-            json={"owner": OWNER, "generation": generation},
+            json=_acquire_body(generation),
             headers=WORKER_HEADERS,
         )
         assert acquired.status_code == 200, acquired.text
@@ -1648,8 +1892,823 @@ def test_http_defer_reports_start_failed_on_the_fifth_start_deferral(
 
     refused = dispatch_client.post(
         f"{INTERNAL_PREFIX}/requests/{request_id}/acquire",
-        json={"owner": OWNER, "generation": generation},
+        json=_acquire_body(generation),
         headers=WORKER_HEADERS,
     )
     assert refused.status_code == 409, refused.text
     assert _http_code(refused) == "not_dispatchable"
+
+
+async def _assert_factory_neighbor_starts(session: AsyncSession) -> None:
+    address = "C0EXAMPLE2"
+    agent_id = await _agent_with_channel(session, address=address)
+    facts = _facts(agent_id, issue_number=4620, address=address)
+    admitted = await admit(session, facts)
+    assert isinstance(admitted, workitems.WorkItemOutcome)
+    acquired = await acquire(
+        session,
+        facts.request_id,
+        owner=OTHER_OWNER,
+        generation=1,
+        wake=await factory_wake(session, facts.request_id),
+        context=None,
+    )
+    assert isinstance(acquired, workitem_dispatch.AcquireGrant)
+    assert acquired.context.agent_id == agent_id
+    started = await start(
+        session,
+        facts.request_id,
+        owner=OTHER_OWNER,
+        generation=1,
+        claim_name="claim-neighbor",
+        sandbox_name="sandbox-neighbor",
+        context=acquired.context,
+    )
+    assert isinstance(started, workitem_dispatch.StartResult)
+    row = await _request_row(session, facts.request_id)
+    assert (row.status, row.runtime_owner, row.execution_attempts) == ("running", OTHER_OWNER, 1)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"kind": "github"},
+        {"address": "C0EXAMPLE3"},
+        {"adapter": "other-bot"},
+        {"conversation_id": "1700000000.000999"},
+    ],
+)
+def test_factory_wake_mismatch_leaves_authority_untouched_and_valid_delivery_starts(
+    clean_db: None, allowlisted: None, change: dict[str, str]
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        facts = _facts(await _agent_with_channel(session))
+        await admit(session, facts)
+        wake = await factory_wake(session, facts.request_id)
+        before = dict(await _request_row(session, facts.request_id))
+        refused = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=wake.model_copy(update=change),
+            context=None,
+        )
+        assert _code(refused) == "factory_wake_mismatch"
+        assert dict(await _request_row(session, facts.request_id)) == before
+        acquired = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=wake,
+            context=None,
+        )
+        assert isinstance(acquired, workitem_dispatch.AcquireGrant)
+        started = await start(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            claim_name=CLAIM_NAME,
+            sandbox_name=SANDBOX_NAME,
+            context=acquired.context,
+        )
+        assert isinstance(started, workitem_dispatch.StartResult)
+        row = await _request_row(session, facts.request_id)
+        assert (row.status, row.runtime_owner, row.execution_attempts) == ("running", OWNER, 1)
+
+    with_session(body)
+
+
+# Tenants this module inserts carry this deployment_id prefix so the
+# owned_tenants fixture can remove exactly them from the shared database.
+OWNED_TENANT_MARK = "test-workitem-dispatch-tenant-"
+
+
+async def _delete_owned_tenants(session: AsyncSession) -> int:
+    owned = "SELECT id FROM curie.tenants WHERE deployment_id LIKE :mark"
+    mark = {"mark": f"{OWNED_TENANT_MARK}%"}
+    await session.execute(
+        text(f"DELETE FROM curie.agent_channels WHERE tenant_id IN ({owned})"), mark
+    )
+    await session.execute(text("DELETE FROM curie.tenants WHERE deployment_id LIKE :mark"), mark)
+    await session.commit()
+    remaining = await session.execute(
+        text("SELECT count(*) FROM curie.tenants WHERE deployment_id LIKE :mark"), mark
+    )
+    return int(remaining.scalar_one())
+
+
+@pytest.fixture
+def owned_tenants() -> Iterator[None]:
+    assert with_session(_delete_owned_tenants) == 0
+    yield
+    assert with_session(_delete_owned_tenants) == 0, "an owned tenant survived cleanup"
+
+
+async def _invalidate_factory_binding(
+    session: AsyncSession, agent_id: uuid.UUID, mutation: str
+) -> None:
+    if mutation == "tenant":
+        tenant_id = uuid.uuid4()
+        await session.execute(
+            text(
+                "INSERT INTO curie.tenants (id, deployment_id, status) "
+                "VALUES (:id, :deployment, 'active')"
+            ),
+            {"id": tenant_id, "deployment": f"{OWNED_TENANT_MARK}{uuid.uuid4()}"},
+        )
+        await session.execute(
+            text("UPDATE curie.agent_channels SET tenant_id = :tenant WHERE agent_id = :agent"),
+            {"tenant": tenant_id, "agent": agent_id},
+        )
+    elif mutation == "removed":
+        await session.execute(
+            text("DELETE FROM curie.agent_channels WHERE agent_id = :agent"), {"agent": agent_id}
+        )
+    elif mutation == "moved":
+        await session.execute(
+            text("UPDATE curie.agent_channels SET address = 'C0EXAMPLE3' WHERE agent_id = :agent"),
+            {"agent": agent_id},
+        )
+    elif mutation == "replaced":
+        await session.execute(
+            text("UPDATE curie.agent_channels SET id = :binding WHERE agent_id = :agent"),
+            {"binding": uuid.uuid4(), "agent": agent_id},
+        )
+    else:
+        raise AssertionError(mutation)
+    await session.commit()
+
+
+@pytest.mark.parametrize("phase", ["acquire", "renew", "start"])
+@pytest.mark.parametrize(
+    "mutation, code",
+    [
+        ("tenant", "factory_tenant_mismatch"),
+        ("removed", "factory_binding_missing"),
+        ("moved", "factory_binding_missing"),
+    ],
+)
+def test_invalid_factory_authority_defers_without_starting_while_neighbor_progresses(
+    clean_db: None, allowlisted: None, owned_tenants: None, phase: str, mutation: str, code: str
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = _facts(agent_id)
+        await admit(session, facts)
+        wake = await factory_wake(session, facts.request_id)
+        context = None
+        if phase != "acquire":
+            granted = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=wake,
+                context=None,
+            )
+            assert isinstance(granted, workitem_dispatch.AcquireGrant)
+            context = granted.context
+        before = await _request_row(session, facts.request_id)
+        await _invalidate_factory_binding(session, agent_id, mutation)
+        if phase == "start":
+            assert context is not None
+            refused = await start(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                claim_name=CLAIM_NAME,
+                sandbox_name=SANDBOX_NAME,
+                context=context,
+            )
+        else:
+            refused = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=wake,
+                context=context,
+            )
+        assert _code(refused) == code
+        after = await _request_row(session, facts.request_id)
+        assert after.status == "waiting"
+        assert after.last_deferral_reason == f"not_started:{code}"
+        assert after.start_deferrals == before.start_deferrals + 1
+        assert after.dispatch_generation == before.dispatch_generation + 1
+        assert after.wait_deadline == before.wait_deadline
+        assert after.execution_attempts == 0
+        assert after.started_at is None
+        assert after.runtime_owner is None
+        assert after.runtime_epoch == before.runtime_epoch
+        assert after.acquire_owner is None
+        assert after.acquire_expires_at is None
+        assert after.acquired_generation is None
+        assert after.terminal_cause is None
+        await _assert_factory_neighbor_starts(session)
+        assert dict(await _request_row(session, facts.request_id)) == dict(after)
+
+    with_session(body)
+
+
+@pytest.mark.parametrize("phase", ["renew", "start"])
+@pytest.mark.parametrize(
+    "field, code",
+    [
+        ("agent_id", "factory_agent_mismatch"),
+        ("tenant_id", "factory_tenant_mismatch"),
+        ("binding_id", "factory_binding_changed"),
+    ],
+)
+def test_factory_revalidation_rejects_foreign_context_and_preserves_neighbor(
+    clean_db: None, allowlisted: None, phase: str, field: str, code: str
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        facts = _facts(await _agent_with_channel(session))
+        await admit(session, facts)
+        wake = await factory_wake(session, facts.request_id)
+        acquired = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=wake,
+            context=None,
+        )
+        assert isinstance(acquired, workitem_dispatch.AcquireGrant)
+        context = acquired.context.model_copy(update={field: uuid.uuid4()})
+        if phase == "renew":
+            refused = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=wake,
+                context=context,
+            )
+        else:
+            refused = await start(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                claim_name=CLAIM_NAME,
+                sandbox_name=SANDBOX_NAME,
+                context=context,
+            )
+        assert _code(refused) == code
+        row = await _request_row(session, facts.request_id)
+        assert row.status == "waiting"
+        assert row.last_deferral_reason == f"not_started:{code}"
+        assert row.start_deferrals == 1
+        assert row.dispatch_generation == 2
+        assert row.acquire_owner is None
+        assert row.execution_attempts == 0
+        assert row.started_at is None
+        await _assert_factory_neighbor_starts(session)
+
+    with_session(body)
+
+
+@pytest.mark.parametrize("phase", ["renew", "start"])
+def test_replacing_current_binding_invalidates_the_acquired_context(
+    clean_db: None, allowlisted: None, phase: str
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        facts = _facts(await _agent_with_channel(session))
+        await admit(session, facts)
+        wake = await factory_wake(session, facts.request_id)
+        acquired = await acquire(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=1,
+            wake=wake,
+            context=None,
+        )
+        assert isinstance(acquired, workitem_dispatch.AcquireGrant)
+        await _invalidate_factory_binding(session, facts.agent_id, "replaced")
+        if phase == "renew":
+            refused = await acquire(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                wake=wake,
+                context=acquired.context,
+            )
+        else:
+            refused = await start(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=1,
+                claim_name=CLAIM_NAME,
+                sandbox_name=SANDBOX_NAME,
+                context=acquired.context,
+            )
+        assert _code(refused) == "factory_binding_changed"
+        row = await _request_row(session, facts.request_id)
+        assert row.last_deferral_reason == "not_started:factory_binding_changed"
+        assert row.status == "waiting"
+        assert row.start_deferrals == 1
+        assert row.acquire_owner is None
+        assert row.started_at is None
+        await _assert_factory_neighbor_starts(session)
+
+    with_session(body)
+
+
+async def _hold_running_for_ci_fix(session: AsyncSession, facts: Admission) -> None:
+    row = await _request_row(session, facts.request_id)
+    version_id, deployment_id = uuid.uuid4(), uuid.uuid4()
+    lineage_id, approval_id, publication_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    base_sha, head_sha = "a1" * 20, "b2" * 20
+    session.add(
+        models.AgentVersion(
+            id=version_id,
+            agent_id=facts.agent_id,
+            version_label="ci-hold",
+            created_by="fixture",
+        )
+    )
+    await session.flush()
+    session.add(
+        models.Deployment(
+            id=deployment_id,
+            agent_id=facts.agent_id,
+            version_id=version_id,
+            environment=models.Environment.dev,
+        )
+    )
+    await session.flush()
+    session.add(
+        models.ThreadPublicationLineage(
+            id=lineage_id,
+            agent_id=facts.agent_id,
+            deployment_id=deployment_id,
+            conversation_id=scoped_conversation_id("slack", ADDRESS, WIRE_CONVERSATION),
+            repo_full_name=REPO,
+            base_sha=base_sha,
+            branch=f"curie/ci-hold-{lineage_id.hex}",
+            pr_number=77,
+            pr_url=f"https://github.com/{REPO}/pull/77",
+            head_sha=head_sha,
+            code_host_kind="github",
+            code_host_host="github.com",
+            repository_project_id="101",
+            code_host_installation_id=202,
+            code_host_pr_id=f"PR_{lineage_id.hex}",
+            base_ref="main",
+        )
+    )
+    session.add(
+        models.Approval(
+            id=approval_id,
+            agent_id=facts.agent_id,
+            conversation_id=WIRE_CONVERSATION,
+            author=REQUESTER,
+            summary="Publish the CI fixture",
+            reply_kind="slack",
+            reply_channel=ADDRESS,
+            dedupe_key=f"ci-hold-{publication_id.hex}",
+            status="approved",
+            purpose="publication",
+        )
+    )
+    await session.flush()
+    session.add(
+        models.Publication(
+            id=publication_id,
+            approval_id=approval_id,
+            deployment_id=deployment_id,
+            workspace_conversation_id=scoped_conversation_id("slack", ADDRESS, WIRE_CONVERSATION),
+            lineage_id=lineage_id,
+            execution_request_id=facts.request_id,
+            revision_number=1,
+            repo_full_name=REPO,
+            status="succeeded",
+            base_sha=base_sha,
+            changed_paths=["README.md"],
+            title="Update README",
+            body="Approved fixture publication.",
+            reply_kind="slack",
+            reply_channel=ADDRESS,
+            result_url=f"https://github.com/{REPO}/pull/77",
+        )
+    )
+    await session.commit()
+    linked = await workitems.link_publication_lineage(
+        session,
+        work_item_id=row.work_item_id,
+        request_id=facts.request_id,
+        publication_lineage_id=lineage_id,
+        expected_work_item_version=row.work_item_version,
+        expected_request_version=row.version,
+    )
+    assert isinstance(linked, workitems.WorkItemOutcome)
+    assert linked.request is not None
+    before = await _request_row(session, facts.request_id)
+    stale = await workitems.hold_for_ci_fix(
+        session,
+        work_item_id=row.work_item_id,
+        request_id=facts.request_id,
+        expected_request_version=linked.request.version,
+        expected_publication_id=publication_id,
+        expected_head_sha="c3" * 20,
+    )
+    assert stale is False
+    assert dict(await _request_row(session, facts.request_id)) == dict(before)
+    held = await workitems.hold_for_ci_fix(
+        session,
+        work_item_id=row.work_item_id,
+        request_id=facts.request_id,
+        expected_request_version=linked.request.version,
+        expected_publication_id=publication_id,
+        expected_head_sha=head_sha,
+    )
+    assert held is True
+    current = await _request_row(session, facts.request_id)
+    assert current.runtime_heartbeat_expires_at == current.execution_deadline
+
+
+@pytest.mark.parametrize("hold_kind", ["none", "approval", "ci"])
+def test_running_returns_real_execution_facts_and_named_current_authority_refusal(
+    clean_db: None,
+    allowlisted: None,
+    hold_kind: str,
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        facts = await _running(session, await _agent_with_channel(session))
+        if hold_kind == "ci":
+            await _hold_running_for_ci_fix(session, facts)
+        elif hold_kind == "approval":
+            held = await workitem_dispatch.hold_for_approval(
+                session,
+                facts.request_id,
+                runtime_epoch=1,
+            )
+            assert isinstance(held, workitem_dispatch.HeartbeatResult)
+        wake = await factory_wake(session, facts.request_id)
+        before = await _request_row(session, facts.request_id)
+        conversation = scoped_conversation_id("slack", ADDRESS, WIRE_CONVERSATION)
+        state, found = await workitem_dispatch.running_for_conversation(
+            session,
+            conversation,
+            wake=wake,
+        )
+        assert state == "running"
+        assert isinstance(found, workitem_dispatch.RunningResult)
+        assert found.context is not None
+        assert found.context.agent_id == facts.agent_id
+        assert found.agent_id == facts.agent_id
+        assert found.generation == before.dispatch_generation
+        assert found.conversation_id == conversation
+        assert found.repository_path == REPO
+        assert found.wait_deadline == before.wait_deadline
+        assert found.runtime_epoch == before.runtime_epoch
+        assert found.execution_deadline == before.execution_deadline
+        assert found.lease_held_to_deadline is (hold_kind != "none")
+        assert found.refusal is None
+        mismatched_state, mismatched = await workitem_dispatch.running_for_conversation(
+            session,
+            conversation,
+            wake=wake.model_copy(update={"address": "C0EXAMPLE3"}),
+        )
+        assert mismatched_state == "running"
+        assert _code(mismatched) == "factory_wake_mismatch"
+        assert dict(await _request_row(session, facts.request_id)) == dict(before)
+        await _invalidate_factory_binding(session, facts.agent_id, "removed")
+        state, refused = await workitem_dispatch.running_for_conversation(
+            session,
+            conversation,
+            wake=wake,
+        )
+        assert state == "running"
+        assert isinstance(refused, workitem_dispatch.RunningResult)
+        assert refused.context is None
+        assert refused.refusal == "factory_binding_missing"
+        assert refused.request_id == facts.request_id
+        assert refused.agent_id == facts.agent_id
+        assert refused.generation == found.generation
+        assert refused.conversation_id == found.conversation_id
+        assert refused.repository_path == found.repository_path
+        assert refused.wait_deadline == found.wait_deadline
+        assert refused.runtime_epoch == found.runtime_epoch
+        assert refused.execution_deadline == found.execution_deadline
+        assert refused.lease_held_to_deadline is (hold_kind != "none")
+        assert dict(await _request_row(session, facts.request_id)) == dict(before)
+        await _assert_factory_neighbor_starts(session)
+
+    with_session(body)
+
+
+# --- #4627: cancelling a held run lets another worker terminate it ----------
+
+THIRD_OWNER = "curie-workers-c"
+
+
+async def _full_request(session: AsyncSession, request_id: uuid.UUID) -> dict[str, Any]:
+    row = (
+        (
+            await session.execute(
+                text("SELECT * FROM curie.execution_requests WHERE id = :id"),
+                {"id": request_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    return dict(row)
+
+
+async def _held_for_approval(session: AsyncSession, agent_id: uuid.UUID) -> Admission:
+    facts = await _running(session, agent_id)
+    held = await workitem_dispatch.hold_for_approval(session, facts.request_id, runtime_epoch=1)
+    assert not hasattr(held, "code"), held
+    row = await _request_row(session, facts.request_id)
+    assert row.status == "running"
+    assert row.runtime_heartbeat_expires_at == row.execution_deadline
+    return facts
+
+
+async def _held_for_ci_fix(session: AsyncSession, agent_id: uuid.UUID) -> Admission:
+    """A running request whose lease the CI gate parked for a fix turn."""
+
+    facts = await _running(session, agent_id)
+    row = await _request_row(session, facts.request_id)
+    work_item = await workitems.lock_work_item(session, row.work_item_id)
+    request = await workitems.lock_request(
+        session, work_item_id=row.work_item_id, request_id=facts.request_id
+    )
+    assert work_item is not None and request is not None
+    await _grant_opened_pull_request(
+        session, await workitems.outcome(session, work_item, request), pr=4627
+    )
+    publication_id, head_sha = (
+        await session.execute(
+            text(
+                "SELECT p.id, l.head_sha FROM curie.publications p "
+                "JOIN curie.thread_publication_lineages l ON l.id = p.lineage_id "
+                "WHERE p.execution_request_id = :id"
+            ),
+            {"id": facts.request_id},
+        )
+    ).one()
+    linked = await _request_row(session, facts.request_id)
+    held = await workitems.hold_for_ci_fix(
+        session,
+        work_item_id=linked.work_item_id,
+        request_id=facts.request_id,
+        expected_request_version=linked.version,
+        expected_publication_id=publication_id,
+        expected_head_sha=head_sha,
+    )
+    assert held is True
+    parked = await _request_row(session, facts.request_id)
+    assert parked.status == "running"
+    assert parked.runtime_heartbeat_expires_at == parked.execution_deadline
+    return facts
+
+
+async def _assert_lease_released(
+    session: AsyncSession, request_id: uuid.UUID, *, held: Any
+) -> None:
+    row = await _request_row(session, request_id)
+    assert (row.status, row.terminal_cause) == ("cancellation_requested", "issue_cancelled")
+    assert row.runtime_heartbeat_expires_at <= await _now(session)
+    assert row.execution_deadline == held.execution_deadline
+    assert row.runtime_owner == OWNER
+    assert row.runtime_epoch == held.runtime_epoch
+
+
+async def _assert_successor_terminates(
+    session: AsyncSession, request_id: uuid.UUID, *, prior_epoch: int
+) -> None:
+    claimed = await claim_termination(session, request_id, owner=OTHER_OWNER)
+    assert not hasattr(claimed, "code"), claimed
+    assert claimed.runtime_epoch == prior_epoch + 1
+    claimed_row = await _full_request(session, request_id)
+    assert claimed_row["runtime_owner"] == OTHER_OWNER
+
+    stale_beat = await heartbeat(session, request_id, runtime_epoch=prior_epoch)
+    assert _code(stale_beat) == "stale_owner"
+    stale_record = await record_termination(
+        session, request_id, runtime_epoch=prior_epoch, observation=TERMINATION_OBSERVATION
+    )
+    assert _code(stale_record) == "stale_owner"
+    assert await _full_request(session, request_id) == claimed_row
+
+    settled = await record_termination(
+        session,
+        request_id,
+        runtime_epoch=claimed.runtime_epoch,
+        observation=TERMINATION_OBSERVATION,
+    )
+    assert not hasattr(settled, "code"), settled
+    final = await _full_request(session, request_id)
+    assert (
+        final["status"],
+        final["terminal_cause"],
+        final["termination_observation"],
+        final["teardown_unconfirmed_at"],
+    ) == ("cancelled", "issue_cancelled", TERMINATION_OBSERVATION, None)
+
+
+def test_held_cancel_approval_hold_lets_other_owner_terminate(
+    clean_db: None, allowlisted: None
+) -> None:
+    # #4627: an approval hold parks the lease at the deadline; cancelling it
+    # must release the lease so a successor can terminate the run.
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = await _held_for_approval(session, agent_id)
+        held = await _request_row(session, facts.request_id)
+        cancelled = await cancel(
+            session, work_item_id=held.work_item_id, expected_version=held.work_item_version
+        )
+        assert isinstance(cancelled, workitems.WorkItemOutcome), cancelled
+        await _assert_lease_released(session, facts.request_id, held=held)
+        await _assert_successor_terminates(
+            session, facts.request_id, prior_epoch=held.runtime_epoch
+        )
+
+    with_session(body)
+
+
+def test_held_cancel_http_route_lets_other_owner_terminate(
+    dispatch_client: TestClient,
+) -> None:
+    # #4627: the same approval-hold cancel, driven through the internal
+    # cancel route the worker and intake call.
+    async def setup(session: AsyncSession) -> tuple[Admission, Any]:
+        agent_id = await _agent_with_channel(session)
+        facts = await _held_for_approval(session, agent_id)
+        return facts, await _request_row(session, facts.request_id)
+
+    facts, held = with_session(setup)
+    cancelled = dispatch_client.post(
+        f"{INTERNAL_PREFIX}/{held.work_item_id}/cancel",
+        json={"expected_version": held.work_item_version},
+        headers=WORKER_HEADERS,
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["request"]["status"] == "cancellation_requested"
+    assert cancelled.json()["request"]["terminal_cause"] == "issue_cancelled"
+
+    async def verify(session: AsyncSession) -> None:
+        await _assert_lease_released(session, facts.request_id, held=held)
+        await _assert_successor_terminates(
+            session, facts.request_id, prior_epoch=held.runtime_epoch
+        )
+
+    with_session(verify)
+
+
+def test_held_cancel_ci_fix_hold_lets_other_owner_terminate(
+    clean_db: None, allowlisted: None
+) -> None:
+    # #4627: a CI-fix hold parks the lease the same way; cancel must release it.
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = await _held_for_ci_fix(session, agent_id)
+        held = await _request_row(session, facts.request_id)
+        cancelled = await cancel(
+            session, work_item_id=held.work_item_id, expected_version=held.work_item_version
+        )
+        assert isinstance(cancelled, workitems.WorkItemOutcome), cancelled
+        await _assert_lease_released(session, facts.request_id, held=held)
+        await _assert_successor_terminates(
+            session, facts.request_id, prior_epoch=held.runtime_epoch
+        )
+
+    with_session(body)
+
+
+def test_held_cancel_relabel_stop_releases_the_held_lease(
+    clean_db: None, allowlisted: None
+) -> None:
+    # #4627: the relabel stop path in readmit must release a held lease too.
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = await _held_for_approval(session, agent_id)
+        held = await _request_row(session, facts.request_id)
+        relabeled = await workitems.readmit(
+            session,
+            work_item_id=held.work_item_id,
+            request_id=uuid.uuid4(),
+            wait_deadline=await _now(session) + timedelta(hours=1),
+            objective=OBJECTIVE,
+            requester=REQUESTER,
+            trigger_label=None,
+        )
+        assert isinstance(relabeled, workitems.WorkItemOutcome), relabeled
+        assert relabeled.request is not None
+        assert relabeled.request.id == facts.request_id
+        await _assert_lease_released(session, facts.request_id, held=held)
+        claimed = await claim_termination(session, facts.request_id, owner=OTHER_OWNER)
+        assert not hasattr(claimed, "code"), claimed
+        assert claimed.runtime_epoch == held.runtime_epoch + 1
+        row = await _request_row(session, facts.request_id)
+        assert row.runtime_owner == OTHER_OWNER
+
+    with_session(body)
+
+
+def test_held_cancel_leaves_a_live_unheld_lease_alone(clean_db: None, allowlisted: None) -> None:
+    # #4627: only a parked lease is released; a live short lease keeps fencing.
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        for issue, relabel in ((2573, False), (2574, True)):
+            facts = await _running(session, agent_id, issue=issue)
+            live = await _request_row(session, facts.request_id)
+            assert live.runtime_heartbeat_expires_at > await _now(session)
+            assert live.runtime_heartbeat_expires_at < live.execution_deadline
+            if relabel:
+                stopped = await workitems.readmit(
+                    session,
+                    work_item_id=live.work_item_id,
+                    request_id=uuid.uuid4(),
+                    wait_deadline=await _now(session) + timedelta(hours=1),
+                    objective=OBJECTIVE,
+                    requester=REQUESTER,
+                    trigger_label=None,
+                )
+            else:
+                stopped = await cancel(
+                    session,
+                    work_item_id=live.work_item_id,
+                    expected_version=live.work_item_version,
+                )
+            assert isinstance(stopped, workitems.WorkItemOutcome), stopped
+            row = await _request_row(session, facts.request_id)
+            assert (row.status, row.terminal_cause) == (
+                "cancellation_requested",
+                "issue_cancelled",
+            )
+            assert row.runtime_heartbeat_expires_at == live.runtime_heartbeat_expires_at
+            before = await _full_request(session, facts.request_id)
+            refused = await claim_termination(session, facts.request_id, owner=OTHER_OWNER)
+            assert _code(refused) == "duplicate"
+            assert await _full_request(session, facts.request_id) == before
+
+    with_session(body)
+
+
+def test_held_cancel_with_stale_version_leaves_the_held_row_untouched(
+    clean_db: None, allowlisted: None
+) -> None:
+    # #4627: a refused cancel must not release the parked lease.
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = await _held_for_approval(session, agent_id)
+        held = await _request_row(session, facts.request_id)
+        before = await _full_request(session, facts.request_id)
+        refused = await cancel(
+            session,
+            work_item_id=held.work_item_id,
+            expected_version=held.work_item_version - 1,
+        )
+        assert _code(refused) == "stale_version"
+        assert await _full_request(session, facts.request_id) == before
+        after = await _request_row(session, facts.request_id)
+        assert after.status == "running"
+        assert after.runtime_heartbeat_expires_at == after.execution_deadline
+        assert after.cancelled_at is None
+        assert after.work_item_version == held.work_item_version
+
+    with_session(body)
+
+
+def test_held_cancel_termination_claimant_is_not_displaced(
+    clean_db: None, allowlisted: None
+) -> None:
+    # #4627: once a worker owns the termination, later wakes must not steal it.
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = await _held_for_approval(session, agent_id)
+        held = await _request_row(session, facts.request_id)
+        cancelled = await cancel(
+            session, work_item_id=held.work_item_id, expected_version=held.work_item_version
+        )
+        assert isinstance(cancelled, workitems.WorkItemOutcome), cancelled
+        # The run's own worker may always claim its termination; it is the
+        # successor the later wakes race against.
+        claimed = await claim_termination(session, facts.request_id, owner=OWNER)
+        assert not hasattr(claimed, "code"), claimed
+        assert claimed.runtime_epoch == held.runtime_epoch + 1
+        before = await _full_request(session, facts.request_id)
+        assert before["runtime_heartbeat_expires_at"] > await _now(session)
+        for wake in (OTHER_OWNER, THIRD_OWNER):
+            refused = await claim_termination(session, facts.request_id, owner=wake)
+            assert _code(refused) == "duplicate"
+            assert await _full_request(session, facts.request_id) == before
+        assert (before["runtime_owner"], before["runtime_epoch"]) == (
+            OWNER,
+            claimed.runtime_epoch,
+        )
+
+    with_session(body)

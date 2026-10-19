@@ -56,6 +56,9 @@ _READ_ONLY_COMMANDS = (
     r"cat [\w./-]+(?: [\w./-]+)*",
     r"rg(?: -[nSi]+)? [\w./:][\w./:-]*(?: [\w./][\w./-]*)*",
     r"sed -n '[0-9,$]+p' [\w./-]+",
+    r"find (?!-)[\w./-]+(?: (?!-)[\w./-]+)*"
+    r"(?: -(?:type [fdl]|(?:name|iname|path) (?:'[\w./*?-]+'|\"[\w./*?-]+\")"
+    r"|not|(?:maxdepth|mindepth) [0-9]+))*(?: 2>/dev/null)?",
     r"git status(?: --short)?",
     r"git diff(?: --stat)?",
 )

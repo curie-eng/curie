@@ -3,7 +3,7 @@
   "private": true,
   "packageManager": "pnpm@9.15.9",
   "devDependencies": {
-    "json-schema-to-typescript": "15.0.4",
+    "json-schema-to-typescript": "16.0.0",
     "typescript": "5.9.3"
   }
 }

@@ -130,7 +130,7 @@ fn check_run_args_are_the_exact_offline_argv() {
         plugin_dir: "/tmp/deal-desk".into(),
         timeout_s: 30,
     };
-    let args = spec.run_args();
+    let args = spec.run_args("curie-snapshot-acme-test");
 
     // The argv MUST be exactly this vector, in this order. The check runs
     // untrusted bundle MCP code, so it is offline (--network none) AND hardened
@@ -151,11 +151,15 @@ fn check_run_args_are_the_exact_offline_argv() {
         "--security-opt",
         "no-new-privileges",
         "-v",
-        "/tmp/deal-desk:/plugin:ro",
+        "curie-snapshot-acme-test:/plugin:ro",
         "-e",
         "CURIE_PLUGIN_DIR=/plugin",
         "-e",
         "CURIE_CHECK_TIMEOUT_S=30",
+        "--label",
+        "curietech.ai/managed-by=curie-cli",
+        "--label",
+        "curietech.ai/snapshot-volume=curie-snapshot-acme-test",
         "curie-runner",
         "python",
         "-m",
@@ -176,7 +180,7 @@ fn check_run_args_are_the_exact_offline_argv() {
         "check must run with --network none (offline contract)"
     );
     // Read-only bundle mount.
-    assert!(joined.contains("-v /tmp/deal-desk:/plugin:ro"));
+    assert!(joined.contains("-v curie-snapshot-acme-test:/plugin:ro"));
     // The timeout is plumbed through as the container deadline.
     assert!(joined.contains("-e CURIE_CHECK_TIMEOUT_S=30"));
     // The CMD override runs check mode, not the ACI session entrypoint.
@@ -212,9 +216,9 @@ fn check_run_args_carry_the_specced_timeout() {
         plugin_dir: "/work/bundle".into(),
         timeout_s: 45,
     };
-    let joined = spec.run_args().join(" ");
+    let joined = spec.run_args("curie-snapshot-acme-test").join(" ");
     assert!(joined.contains("-e CURIE_CHECK_TIMEOUT_S=45"));
-    assert!(joined.contains("-v /work/bundle:/plugin:ro"));
+    assert!(joined.contains("-v curie-snapshot-acme-test:/plugin:ro"));
     assert!(joined.contains("ghcr.io/example/curie-runner:1.2.3"));
 }
 

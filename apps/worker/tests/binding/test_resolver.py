@@ -36,6 +36,8 @@ import os
 import time
 import unittest.mock
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import curie_worker.binding as binding_module
@@ -51,6 +53,8 @@ from curie_worker.binding import (
     MEMORY_TOKEN_ENV,
     BindingResolver,
     BoundAgent,
+    FactoryBindingRefused,
+    FactoryContext,
     ResolvedDeployment,
     warn_if_multiple_agents_bound,
 )
@@ -2387,6 +2391,189 @@ def test_routes_for_agent_reads_only_the_resolvers_tenant() -> None:
                 assert scoped == routes
             finally:
                 await _cleanup_tenant(engine, [agent_id], second)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+@asynccontextmanager
+async def _factory_pair(
+    engine: AsyncEngine, *, kind: str, adapter: str | None
+) -> AsyncIterator[tuple[FactoryContext, FactoryContext]]:
+    agent_ids: list[uuid.UUID] = []
+    contexts: list[FactoryContext] = []
+    token = uuid.uuid4().hex[:8]
+    address = f"acme-corp/factory-{token}"
+    try:
+        for index in (1, 2):
+            agent_id = await _seed_unbound_agent(engine, name=f"acme-factory-{index}-{token}")
+            agent_ids.append(agent_id)
+            binding_id = uuid.uuid4()
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        f"INSERT INTO {_SCHEMA}.agent_channels "
+                        "(id, agent_id, kind, address, adapter, endpoint, trigger_label) "
+                        "VALUES (:id, :agent, :kind, :address, :adapter, :endpoint, :label)"
+                    ),
+                    {
+                        "id": binding_id, "agent": agent_id, "kind": kind,
+                        "address": address, "adapter": adapter,
+                        "endpoint": "https://adapter.example.com/" if adapter is not None else None,
+                        "label": f"acme-{index}-work",
+                    },
+                )
+            await _seed_deployment(
+                engine, agent_id=agent_id, environment="prod",
+                bundle_ref=f"bundles/{agent_id}.zip",
+            )
+            contexts.append(FactoryContext(
+                agent_id=agent_id,
+                tenant_id=binding_module.DEFAULT_TENANT_ID,
+                binding_id=binding_id, kind=kind, address=address, adapter=adapter,
+            ))
+        yield contexts[0], contexts[1]
+    finally:
+        await _cleanup(engine, agent_ids)
+
+
+@pytest.mark.parametrize("kind", ["github", "gitlab", "jira"])
+@pytest.mark.parametrize("adapter", [None, "tracker-adapter"])
+def test_factory_shared_location_resolves_only_the_admitted_agent(
+    kind: str, adapter: str | None,
+) -> None:
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            await pg_connect_or_skip(engine)
+            async with _factory_pair(engine, kind=kind, adapter=adapter) as contexts:
+                resolver = _resolver(engine)
+                for context in contexts:
+                    resolved = await resolver.resolve_factory(context)
+                    assert resolved is not None
+                    assert resolved.agent_id == context.agent_id
+                    assert resolved.bundle_ref == f"bundles/{context.agent_id}.zip"
+                    assert resolved.adapter == adapter
+                    assert resolver.boot_env(resolved, "factory-thread")[BUNDLE_REF_ENV] == (
+                        f"bundles/{context.agent_id}.zip"
+                    )
+                if adapter is None:
+                    with pytest.raises(binding_module.AmbiguousRoute):
+                        await resolver.resolve(kind, None, contexts[0].address)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "change, code",
+    [
+        ({"tenant_id": uuid.UUID("99999999-9999-4999-8999-999999999999")},
+         "factory_tenant_mismatch"),
+        ({"agent_id": uuid.UUID("99999999-9999-4999-8999-999999999999")},
+         "factory_binding_missing"),
+        ({"binding_id": uuid.UUID("99999999-9999-4999-8999-999999999999")},
+         "factory_binding_missing"),
+        ({"kind": "gitlab"}, "factory_binding_changed"),
+        ({"address": "acme-corp/other"}, "factory_binding_changed"),
+        ({"adapter": "other-adapter"}, "factory_binding_changed"),
+    ],
+)
+def test_factory_resolver_refuses_changed_authority_while_neighbor_resolves(
+    change: dict[str, object], code: str,
+) -> None:
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            await pg_connect_or_skip(engine)
+            async with _factory_pair(engine, kind="github", adapter=None) as (current, neighbor):
+                resolver = _resolver(engine)
+                with pytest.raises(FactoryBindingRefused) as caught:
+                    await resolver.resolve_factory(current.model_copy(update=change))
+                assert caught.value.code == code
+                valid = await resolver.resolve_factory(neighbor)
+                assert valid is not None
+                assert valid.agent_id == neighbor.agent_id
+                assert valid.bundle_ref == f"bundles/{neighbor.agent_id}.zip"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("mutation", ["removed", "moved", "deployment_missing"])
+def test_factory_current_binding_or_deployment_loss_does_not_select_deployed_sibling(
+    mutation: str,
+) -> None:
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            await pg_connect_or_skip(engine)
+            async with _factory_pair(engine, kind="github", adapter=None) as (current, neighbor):
+                async with engine.begin() as conn:
+                    if mutation == "removed":
+                        await conn.execute(
+                            text(f"DELETE FROM {_SCHEMA}.agent_channels WHERE id = :id"),
+                            {"id": current.binding_id},
+                        )
+                    elif mutation == "moved":
+                        await conn.execute(
+                            text(
+                                f"UPDATE {_SCHEMA}.agent_channels SET address = :address "
+                                "WHERE id = :id"
+                            ),
+                            {"id": current.binding_id, "address": current.address + "-moved"},
+                        )
+                    else:
+                        await conn.execute(
+                            text(f"DELETE FROM {_SCHEMA}.deployments WHERE agent_id = :id"),
+                            {"id": current.agent_id},
+                        )
+                resolver = _resolver(engine)
+                if mutation == "deployment_missing":
+                    assert await resolver.resolve_factory(current) is None
+                    with pytest.raises(binding_module.AmbiguousRoute):
+                        await resolver.resolve(current.kind, None, current.address)
+                else:
+                    with pytest.raises(FactoryBindingRefused) as caught:
+                        await resolver.resolve_factory(current)
+                    expected = (
+                        "factory_binding_missing" if mutation == "removed"
+                        else "factory_binding_changed"
+                    )
+                    assert caught.value.code == expected
+                valid = await resolver.resolve_factory(neighbor)
+                assert valid is not None
+                assert valid.agent_id == neighbor.agent_id
+                assert valid.bundle_ref == f"bundles/{neighbor.agent_id}.zip"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_factory_token_remint_and_label_edit_preserve_current_binding_authority() -> None:
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            await pg_connect_or_skip(engine)
+            async with _factory_pair(engine, kind="github", adapter=None) as (current, neighbor):
+                async with engine.begin() as conn:
+                    await conn.execute(
+                        text(
+                            f"UPDATE {_SCHEMA}.agent_channels "
+                            "SET generation = generation + 1, trigger_label = 'acme-edited-work' "
+                            "WHERE id = :id"
+                        ),
+                        {"id": current.binding_id},
+                    )
+                for context in (current, neighbor):
+                    resolved = await _resolver(engine).resolve_factory(context)
+                    assert resolved is not None
+                    assert resolved.agent_id == context.agent_id
+                    assert resolved.bundle_ref == f"bundles/{context.agent_id}.zip"
         finally:
             await engine.dispose()
 
