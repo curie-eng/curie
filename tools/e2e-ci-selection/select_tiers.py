@@ -106,6 +106,7 @@ FACTORY_UPGRADE_PATHS = frozenset(
 )
 WORKFLOW_PATH = ".github/workflows/ci.yaml"
 CHART_JOB = "e2e-cluster-chart-regressions"
+CHART_LEGS = ("chart", "workload")
 SCENARIO_SCRIPT = re.compile(r"^(?:charts/curie/ci|scripts)/[^\s]+\.sh(?:$|[;|&])")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CARGO_MANIFEST = "cli/Cargo.toml"
@@ -152,6 +153,7 @@ UniqueKeyLoader.add_constructor(
 class ChartScenario:
     step: str
     inputs: tuple[str, ...]
+    leg: str
 
 
 @dataclass(frozen=True)
@@ -248,15 +250,20 @@ def _chart_registry(value: object) -> ChartScenarios:
             raise RegistryError("chart_scenarios contains an invalid scenario id")
         label = f"chart_scenarios.scenarios.{scenario_id}"
         entry = _mapping(value, label)
-        if set(entry) != {"step", "inputs"}:
-            raise RegistryError(f"{label} must define step and inputs")
+        if set(entry) != {"step", "inputs", "leg"}:
+            raise RegistryError(f"{label} must define step, inputs, and leg")
         step = entry["step"]
         if not isinstance(step, str) or not step:
             raise RegistryError(f"{label}.step must be a nonempty string")
+        leg = entry["leg"]
+        if not isinstance(leg, str) or leg not in CHART_LEGS:
+            raise RegistryError(f"{label}.leg must be one of chart, workload")
         if step in step_names:
             raise RegistryError(f"duplicate chart scenario step: {step}")
         step_names.add(step)
-        scenarios[scenario_id] = ChartScenario(step, _inputs(entry["inputs"], f"{label}.inputs"))
+        scenarios[scenario_id] = ChartScenario(
+            step, _inputs(entry["inputs"], f"{label}.inputs"), leg
+        )
     return ChartScenarios(CHART_JOB, shared_inputs, scenarios)
 
 
@@ -575,6 +582,15 @@ def _select_chart_scenarios(
     return sorted(selected)
 
 
+def _chart_legs(registry: Registry, chart_scenarios: list[str]) -> list[str]:
+    # An unregistered step carries no leg condition, so it runs in whichever leg
+    # runs. Selecting every leg keeps the fail-closed behavior.
+    if "unregistered" in chart_scenarios:
+        return list(CHART_LEGS)
+    scenarios = registry.chart_scenarios.scenarios
+    return sorted({scenarios[item].leg for item in chart_scenarios if item in scenarios})
+
+
 def _changed_paths(base: str, head: str) -> list[str]:
     completed = subprocess.run(
         ["git", "diff", "--no-renames", "--name-only", f"{base}...{head}"],
@@ -765,6 +781,7 @@ def _render(
     factory_needed: bool,
     approval_resume_needed: bool,
     chart_scenarios: list[str],
+    chart_legs: list[str],
 ) -> str:
     lines = [f"{OUTPUT_KEYS[tier]}={'true' if tier in selected else 'false'}" for tier in TIERS]
     skill_local = ",".join(tier for tier in TIERS[:2] if tier in selected)
@@ -779,6 +796,7 @@ def _render(
     lines.append(f"factory={'true' if factory_needed else 'false'}")
     lines.append(f"approval_resume={'true' if approval_resume_needed else 'false'}")
     lines.append("chart_scenarios=" + json.dumps(chart_scenarios, separators=(",", ":")))
+    lines.append("chart_legs=" + json.dumps(chart_legs, separators=(",", ":")))
     return "\n".join(lines) + "\n"
 
 
@@ -901,7 +919,9 @@ def _run() -> None:
     chart_scenarios = _select_chart_scenarios(
         registry, paths, selected, args.push, args.head if not args.path else None
     )
+    chart_legs = _chart_legs(registry, chart_scenarios)
     print("chart_scenarios=" + json.dumps(chart_scenarios, separators=(",", ":")))
+    print("chart_legs=" + json.dumps(chart_legs, separators=(",", ":")))
 
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
@@ -920,6 +940,7 @@ def _run() -> None:
                 factory_needed,
                 approval_resume_needed,
                 chart_scenarios,
+                chart_legs,
             )
         )
 

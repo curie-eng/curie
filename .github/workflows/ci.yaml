@@ -2486,6 +2486,7 @@ jobs:
       local_release: ${{ steps.filter.outputs.local_release }}
       cluster: ${{ steps.filter.outputs.cluster }}
       chart_scenarios: ${{ steps.filter.outputs.chart_scenarios }}
+      chart_legs: ${{ steps.filter.outputs.chart_legs }}
       released_upgrade: ${{ steps.filter.outputs.released_upgrade }}
       released_upgrade_full: ${{ steps.filter.outputs.released_upgrade_full }}
       skill_local_tiers: ${{ steps.filter.outputs.skill_local_tiers }}
@@ -3228,11 +3229,17 @@ jobs:
   # assertion and the connector readiness probe are registered runtime
   # assertions (#3391), and a failure here reddens the required verdict exactly
   # as the rung does. Proofs using this job's cluster each own their namespace.
+  # The job runs as two legs, `chart` and `workload`, each on its own runner
+  # and its own kind cluster; the selector's `chart_legs` output picks them.
   e2e-cluster-chart-regressions:
-    name: E2E chart runtime regressions (kind, Calico)
+    name: E2E chart runtime regressions (kind, Calico, ${{ matrix.leg }})
     runs-on: ubuntu-latest
     needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.chart_scenarios != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: ${{ fromJSON(needs.changes.outputs.chart_legs) }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -3258,10 +3265,12 @@ jobs:
           version: v3.16.4
       # The fixture image delays Postgres for the Langfuse startup regression.
       - name: Load the Postgres readiness fixture built by the ci-images job
+        if: ${{ matrix.leg == 'chart' }}
         uses: ./.github/actions/load-ci-images
         with:
           images: postgres-readiness
       - name: Tag the Postgres readiness fixture
+        if: ${{ matrix.leg == 'chart' }}
         run: docker tag curie-ci/postgres-readiness:candidate "curie-postgres-readiness:${GITHUB_SHA}"
       # disableDefaultCNI is load-bearing (#1153). kind's default kindnet
       # implements NO NetworkPolicy controller, so every policy the chart ships
@@ -3338,7 +3347,7 @@ jobs:
           set -euo pipefail
           install -m 600 /home/runner/.kube/config "$KUBECONFIG"
       - name: Installation identity Secret lifecycle
-        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'installation-identity') }}
+        if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'installation-identity') }}
         env:
           KUBECONFIG: ${{ runner.temp }}/curie-upgrade-drain-kubeconfig
           CURIE_UPGRADE_DRAIN_KIND_CONTEXT: kind-curie-e2e
@@ -3350,7 +3359,7 @@ jobs:
       # API server of 1.30 or newer, which this kind node image is. The script
       # names every object from RUN_ID and deletes them on exit.
       - name: End to end connector identity is denied outside its scope
-        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-identity') }}
+        if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-identity') }}
         env:
           CURIE_E2E_IDENTITY_CONTEXT: kind-curie-e2e
           RUN_ID: ${{ github.run_id }}${{ github.run_attempt }}
@@ -3361,7 +3370,7 @@ jobs:
       # Per-agent runner resources (#3209, #3485). A render assertion that
       # lives under ci/runtime, so it runs here through the receipt runner.
       - name: Per-agent runner resource override renders
-        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-resources-render') }}
+        if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-resources-render') }}
         run: |
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
@@ -3372,7 +3381,7 @@ jobs:
       # cluster admin is admitted. Needs a real API server of 1.30 or newer.
       # Every object is named from RUN_ID and verified gone on exit.
       - name: Runner template admission refuses host escapes, token mounts, and unlisted images
-        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-template-admission') }}
+        if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-template-admission') }}
         env:
           CURIE_ADMISSION_CONTEXT: kind-curie-e2e
           RUN_ID: ${{ github.run_id }}${{ github.run_attempt }}
@@ -3381,9 +3390,10 @@ jobs:
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/runner-template-admission-runtime.sh
       - name: Load the Postgres readiness fixture into the kind cluster
+        if: ${{ matrix.leg == 'chart' }}
         run: kind load docker-image "curie-postgres-readiness:${GITHUB_SHA}" --name curie-e2e
       - name: Langfuse web waits for delayed Postgres without restarting
-        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'langfuse-postgres-readiness') }}
+        if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'langfuse-postgres-readiness') }}
         env:
           READINESS_NAMESPACE: curie-1853-${{ github.run_id }}-${{ github.run_attempt }}
           READINESS_RELEASE: curie-1853-${{ github.run_id }}-${{ github.run_attempt }}
@@ -3417,7 +3427,7 @@ jobs:
       # job's kube context is kind-curie-e2e and must be passed explicitly.
       # The namespace is this run's id so a retry does not reuse a leftover.
       - name: Connector that never listens stays not-Ready until it binds
-        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-readiness') }}
+        if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-readiness') }}
         env:
           CONNECTOR_READINESS_CONTEXT: kind-curie-e2e
           CONNECTOR_READINESS_NAMESPACE: c3338-${{ github.run_id }}-${{ github.run_attempt }}
@@ -3435,30 +3445,30 @@ jobs:
       # allowedEgress 0.0.0.0/0 and requires a private-range pod peer it reached
       # under the pre-change shape to be refused (#3842 AC3).
       - name: Runner BYO egress enforces (not just rendered)
-        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-byo-egress') }}
+        if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-byo-egress') }}
         run: bash scripts/check-runner-byo-egress.sh charts/curie
       # The actual packaged-chart hooks must judge a no-restart upgrade and
       # still reject an informer RBAC failure (#4197). The scenario owns and
       # tears down its separate kind cluster; render assertions alone cannot
       # prove Helm leaves a serving release deployed.
       - name: Controller preflight accepts a serving upgrade and refuses broken RBAC
-        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'controller-preflight') }}
+        if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'controller-preflight') }}
         run: |
           set -euo pipefail
           uv run bash charts/curie/ci/scenarios/controller-preflight-kind.sh
       - name: Download the workspace diagnostic CLI
-        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
+        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress')) }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: curie-x86_64-linux-${{ github.sha }}
           path: cli/target/release
       - name: Load the workspace diagnostic candidate images
-        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
+        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress')) }}
         uses: ./.github/actions/load-ci-images
         with:
           images: "{api,worker,runner}"
       - name: Stage the workspace diagnostic images in kind
-        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
+        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress')) }}
         run: |
           set -euo pipefail
           chmod +x cli/target/release/curie
@@ -3470,7 +3480,7 @@ jobs:
             curie-worker:wsdiag-${{ github.sha }} \
             curie-runner:wsdiag-${{ github.sha }} --name curie-e2e
       - name: Workspace dependency failure reaches the terminal diagnostic
-        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') }}
+        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') }}
         timeout-minutes: 30
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
@@ -3510,7 +3520,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: runtime-assertion-receipts-${{ github.job }}
+          name: runtime-assertion-receipts-${{ github.job }}-${{ matrix.leg }}
           path: ${{ runner.temp }}/runtime-assertion-receipts
           if-no-files-found: ignore
 
