@@ -83,6 +83,18 @@ MOVED_STATIC_STEPS = (
 )
 SHARD_COUNT = 6
 CONTAINER_JOB = "python-container-fixtures"
+CI_POLICY_DIRS = (
+    "tools/ci-retry-gate",
+    "tools/ci-workflow-paths",
+    "tools/ci-release-target-parity",
+    "tools/e2e-ci-selection",
+    "tools/helm-ci-gate",
+    "tools/fix-pin-ci",
+    "tools/p0-closes-ci",
+    "tools/runtime-assertion-gate",
+    "tools/dependency-audit-paths",
+    "tools/close-on-next",
+)
 CONTAINER_FILES = (
     "tools/factory-e2e/tests/test_c4_tracker_scope.py",
     "examples/tests/test_sre_bot_observability_runtime.py",
@@ -110,6 +122,8 @@ PYTEST_AGGREGATE_EXPRESSIONS = {
     "shards_result": "${{ needs.python-pytest.result }}",
     "changes_result": "${{ needs.changes.result }}",
     "container_result": "${{ needs.python-container-fixtures.result }}",
+    "ci_policy_selected": "${{ needs.changes.outputs.ci_policy }}",
+    "ci_policy_result": "${{ needs.ci-policy.result }}",
 }
 PYTEST_STEP_EXPRESSIONS = {
     "shard": "${{ matrix.shard }}",
@@ -342,7 +356,7 @@ def test_required_python_job_keeps_ruleset_name_and_is_not_skippable() -> None:
     assert job["name"] == "Python (ruff + mypy + pytest)"
     # It waits for the shards only to aggregate them; always() keeps it
     # reporting the required check whatever the shards did.
-    assert job["needs"] == ["changes", "python-pytest", CONTAINER_JOB, "python-static"]
+    assert job["needs"] == ["changes", "python-pytest", CONTAINER_JOB, "python-static", "ci-policy"]
     assert job["if"] == "always()"
 
     # #4471: the static gates run in their own job, parallel to the shards.
@@ -1107,6 +1121,8 @@ def _run_pytest_aggregate(
     *,
     selected: str,
     container_result: str,
+    ci_policy_selected: str,
+    ci_policy_result: str,
     shards: dict[int, tuple[str, str, str, str, str]] | None = None,
     shards_result: str = "success",
     results_dir: bool = True,
@@ -1144,6 +1160,8 @@ def _run_pytest_aggregate(
         "pytest_deselect": deselect,
         "pytest_scope": scope,
         "container_result": container_result,
+        "ci_policy_selected": ci_policy_selected,
+        "ci_policy_result": ci_policy_result,
     }
     literals = {k: v for k, v in step["env"].items() if "${{" not in v}
     environment = literals | {bindings[k]: v for k, v in state.items()}
@@ -1161,6 +1179,227 @@ def _all_shards(
     }
 
 
+def test_ci_policy_job_runs_after_changes_without_services() -> None:
+    job = _python_job("ci-policy")
+    assert job["name"] == "CI policy (workflow meta-tests)"
+    assert job["needs"] == ["changes"]
+    assert job["if"] == "${{ needs.changes.outputs.ci_policy == 'true' }}"
+    assert "services" not in job
+    assert not job.get("continue-on-error", False)
+    steps = job["steps"]
+    assert len(steps) == 6
+    assert steps[0]["uses"] == "actions/checkout@v7"
+    assert steps[0]["with"] == {"fetch-depth": 0, "persist-credentials": False}
+    assert [step["name"] for step in steps[1:]] == [
+        "Install uv", "Back off before retrying Install uv", "Install uv (retry)",
+        "Sync workspace", "Pytest",
+    ]
+    install, backoff, retry, sync, tests = steps[1:]
+    uv_action = "astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884"
+    assert install["uses"] == retry["uses"] == uv_action
+    assert install["with"] == retry["with"] == {"python-version": "3.13"}
+    assert install["id"] == "install_uv"
+    assert install["continue-on-error"] is True
+    assert backoff["if"] == retry["if"] == "steps.install_uv.outcome == 'failure'"
+    assert "sleep 15" in backoff["run"]
+    assert sync["run"] == "uv sync"
+    assert not sync.get("continue-on-error", False)
+    assert not tests.get("continue-on-error", False)
+    assert "if" not in tests
+    assert _bindings(tests, {"files": "${{ needs.changes.outputs.ci_policy_files }}"})
+    assert "${{" not in tests["run"]
+    outputs = _python_job("changes")["outputs"]
+    for key in ("ci_policy", "ci_policy_files"):
+        assert outputs[key] == "${{ steps.filter.outputs." + key + " }}"
+
+
+@pytest.mark.parametrize("exit_code", [0, 1, 5])
+def test_ci_policy_pytest_passes_exact_files_and_propagates_failure(
+    tmp_path: Path, exit_code: int
+) -> None:
+    files = (
+        "tools/ci-retry-gate/tests/test_retry_eligibility.py",
+        "tools/e2e-ci-selection/tests/test_e2e_ci_selection.py",
+    )
+    for path in files:
+        destination = tmp_path / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("def test_policy_probe():\n    pass\n")
+    step = _named_steps("ci-policy")["Pytest"]
+    bindings = _bindings(step, {"files": "${{ needs.changes.outputs.ci_policy_files }}"})
+    result, arguments = _record_uv_step(
+        tmp_path, step, environment={bindings["files"]: ",".join(files)}, exit_code=exit_code
+    )
+    assert arguments == ["run", "pytest", "-q", "-n", "4", "-rsR", *files]
+    assert result.returncode == exit_code, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("files", [
+    "", ",", ",tools/sample/tests/test_policy.py", "tools/sample/tests/test_policy.py,",
+    "tools/sample/tests/test_policy.py,,tools/sample/tests/test_policy.py",
+    "tools/sample/tests/test_policy.py tools/sample/tests/test_policy.py",
+    "tools/sample/tests/test_policy.py\n", "--help", "/tmp/test_policy.py",
+    "../test_policy.py", "tools/sample/tests/../tests/test_policy.py",
+    "tools/sample/tests/test_*.py", "tools/sample/tests/missing.py", "tools/sample/tests",
+])
+def test_ci_policy_pytest_rejects_bad_file_lists_before_uv(tmp_path: Path, files: str) -> None:
+    destination = tmp_path / "tools/sample/tests/test_policy.py"
+    destination.parent.mkdir(parents=True)
+    destination.write_text("def test_policy_probe():\n    pass\n")
+    step = _named_steps("ci-policy")["Pytest"]
+    bindings = _bindings(step, {"files": "${{ needs.changes.outputs.ci_policy_files }}"})
+    bin_dir, log = _recording_stubs(tmp_path, "uv")
+    result = _run_bash(
+        _string(step, "run"),
+        {"PATH": f"{bin_dir}:{os.environ['PATH']}", bindings["files"]: files},
+        tmp_path,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert not log.exists(), "invalid policy files reached pytest"
+
+
+@pytest.mark.parametrize("event", ["push", "workflow_dispatch"])
+def test_ci_policy_changes_routes_non_pr_events_through_push(tmp_path: Path, event: str) -> None:
+    step = next(step for step in _python_job("changes")["steps"] if step.get("id") == "filter")
+    script = _substitute_expressions(step["run"], {
+        "${{ github.event_name }}": event,
+        "${{ github.ref }}": "refs/heads/next",
+        "${{ github.base_ref }}": "",
+    })
+    bin_dir, log = _recording_stubs(tmp_path, "uv", "git")
+    result = _run_bash(script, {"PATH": f"{bin_dir}:{os.environ['PATH']}"}, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = log.read_text().splitlines()
+    assert len(calls) == 1, calls
+    command = shlex.split(calls[0])
+    assert command[:7] == [
+        "uv", "run", "--no-project", "--with", "pyyaml==6.0.3", "python",
+        "tools/e2e-ci-selection/select_tiers.py",
+    ]
+    assert "--push" in command
+    assert ("--omit-kind" in command) == (event == "push")
+    completed, output = _invoke_selector(tmp_path, push=True)
+    assert completed.returncode == 0, completed.stderr
+    entries = yaml.safe_load(REGISTRY.read_text())["ci_policy_tests"]
+    assert _outputs(output)["ci_policy"] == "true"
+    assert _outputs(output)["ci_policy_files"] == ",".join(sorted(entries))
+
+
+@pytest.mark.parametrize("shard", range(1, SHARD_COUNT + 1))
+@pytest.mark.parametrize("scope", ["full", "cli"])
+def test_ci_policy_exclusions_collect_only_neighbors_on_every_shard(
+    tmp_path: Path, shard: int, scope: str
+) -> None:
+    entries = yaml.safe_load(REGISTRY.read_text())["ci_policy_tests"]
+    neighbors = ("tools/ci-retry-gate-other/tests/test_neighbor.py",)
+    arguments = _run_pytest_step(
+        tmp_path, shard=shard, scope=scope, deselect="",
+        cli_files=(*sorted(entries), *neighbors),
+    )
+    for directory in CI_POLICY_DIRS:
+        assert arguments.count(directory) == 1, arguments
+        assert arguments[arguments.index(directory) - 1] == "--ignore", arguments
+    if scope == "cli":
+        assert not set(entries).intersection(arguments), arguments
+        assert all(path in arguments for path in neighbors)
+    for path in (*entries, *neighbors):
+        destination = tmp_path / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("def test_policy_collection_probe():\n    pass\n")
+    config = tmp_path / "pytest.ini"
+    config.write_text("[pytest]\ntestpaths = tools\naddopts = --import-mode=importlib\n")
+
+    def collected(argv: list[str]) -> set[str]:
+        selection = []
+        index = 2
+        while index < len(argv):
+            if argv[index] in {"-n", "--dist", "--ci-shard", "--reruns"}:
+                index += 2
+                continue
+            selection.append(argv[index])
+            index += 1
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-c", str(config), "--collect-only", *selection],
+            cwd=tmp_path,
+            env={
+                **os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+                "PYTEST_ADDOPTS": "", "PYTEST_PLUGINS": "",
+            },
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return {
+            line.strip() for line in result.stdout.splitlines()
+            if line.strip().endswith("::test_policy_collection_probe")
+        }
+
+    expected = {path + "::test_policy_collection_probe" for path in neighbors}
+    assert collected(arguments) == expected
+    targets = sorted(path for path in entries if path.startswith("tools/close-on-next/"))
+    assert targets
+    if scope == "full":
+        mutated = _without_runtime_exclusion(arguments, "tools/close-on-next")
+        exposed = targets
+    else:
+        exposed = targets[:1]
+        mutated = [*arguments, *exposed]
+    assert collected(mutated) == expected | {
+        path + "::test_policy_collection_probe" for path in exposed
+    }
+
+
+@pytest.mark.parametrize("selected", ["true", "false"])
+@pytest.mark.parametrize("policy_selected", ["true", "false", "", "TRUE", "unknown"])
+@pytest.mark.parametrize("policy_result", ["success", "skipped", "failure", "cancelled", ""])
+def test_ci_policy_aggregate_accepts_only_the_selected_policy_outcome(
+    tmp_path: Path, selected: str, policy_selected: str, policy_result: str
+) -> None:
+    result = _run_pytest_aggregate(
+        tmp_path, ci_policy_selected=policy_selected, ci_policy_result=policy_result,
+        selected=selected, container_result="success" if selected == "true" else "skipped",
+        shards=_all_shards("true", "success") if selected == "true" else None,
+        shards_result="success" if selected == "true" else "skipped",
+        results_dir=selected == "true",
+    )
+    accepted = (policy_selected, policy_result) in {("true", "success"), ("false", "skipped")}
+    assert (result.returncode == 0) == accepted, result.stdout + result.stderr
+    if not accepted:
+        assert "policy" in (result.stdout + result.stderr).lower()
+
+
+def _assert_policy_failure_rejected(tmp_path: Path, selected: str) -> None:
+    result = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="true",
+        ci_policy_result="failure",
+        selected=selected,
+        container_result="success" if selected == "true" else "skipped",
+        shards=_all_shards("true", "success") if selected == "true" else None,
+        shards_result="success" if selected == "true" else "skipped",
+        results_dir=selected == "true",
+    )
+    assert result.returncode != 0, "required Python check accepted failed CI policy"
+
+
+@pytest.mark.parametrize("selected", ["true", "false"])
+def test_ci_policy_aggregate_mutation_exposes_bypassed_result_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected: str
+) -> None:
+    _assert_policy_failure_rejected(tmp_path / "enforced", selected)
+    named_steps = _named_steps
+
+    def bypassed(job_id: str = "python") -> dict[str, dict[str, Any]]:
+        steps = named_steps(job_id)
+        if job_id == "python":
+            step = steps["Require pytest outcome to match selection"]
+            step["run"] = "CI_POLICY_RESULT=success\n" + step["run"]
+        return steps
+
+    monkeypatch.setattr(sys.modules[__name__], "_named_steps", bypassed)
+    with pytest.raises(AssertionError, match="accepted failed CI policy"):
+        _assert_policy_failure_rejected(tmp_path / "bypassed", selected)
+
+
 @pytest.mark.parametrize("scope", ["full", "cli"])
 @pytest.mark.parametrize(("selected", "deselect", "container_selected"), [
     ("true", "", True),
@@ -1175,7 +1414,7 @@ def test_aggregate_requires_the_selected_container_outcome_before_any_skip_exit(
     container_selected: bool, container_result: str,
 ) -> None:
     result = _run_pytest_aggregate(
-        tmp_path,
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
         selected=selected,
         container_result=container_result,
         deselect=deselect,
@@ -1193,7 +1432,12 @@ def test_aggregate_requires_the_selected_container_outcome_before_any_skip_exit(
 @pytest.mark.parametrize("selected", ["", "TRUE", "unknown"])
 def test_aggregate_rejects_invalid_changes_selection(tmp_path: Path, selected: str) -> None:
     result = _run_pytest_aggregate(
-        tmp_path, selected=selected, container_result="skipped", shards_result="skipped",
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected=selected,
+        container_result="skipped",
+        shards_result="skipped",
         results_dir=False,
     )
     assert result.returncode != 0, result.stdout + result.stderr
@@ -1205,7 +1449,7 @@ def test_aggregate_rejects_invalid_changes_scope(
     tmp_path: Path, selected: str, scope: str
 ) -> None:
     result = _run_pytest_aggregate(
-        tmp_path, selected=selected,
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped", selected=selected,
         container_result="success" if selected == "true" else "skipped",
         scope=scope,
         shards=_all_shards("true", "success", scope=scope) if selected == "true" else None,
@@ -1226,7 +1470,12 @@ def test_aggregate_rejects_unsuccessful_record_even_when_matrix_succeeded(
         outcome if field == "stack" else "success", "", "full",
     )
     result = _run_pytest_aggregate(
-        tmp_path, selected="true", container_result="success", shards=shards
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+        shards=shards,
     )
     assert result.returncode != 0, result.stdout + result.stderr
     assert "shard 6" in result.stderr
@@ -1234,33 +1483,61 @@ def test_aggregate_rejects_unsuccessful_record_even_when_matrix_succeeded(
 
 def test_aggregate_rejects_record_with_the_wrong_shard_identity(tmp_path: Path) -> None:
     healthy = _run_pytest_aggregate(
-        tmp_path, selected="true", container_result="success", shards=_all_shards("true", "success")
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+        shards=_all_shards("true", "success"),
     )
     assert healthy.returncode == 0, healthy.stdout + healthy.stderr
     directory = _named_steps()["Download shard results"]["with"]["path"]
     record = tmp_path / directory / "shard-6.txt"
     record.write_text(record.read_text().replace("shard=6 ", "shard=5 "))
-    result = _run_pytest_aggregate(tmp_path, selected="true", container_result="success")
+    result = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+    )
     assert result.returncode != 0, result.stdout + result.stderr
     assert "shard 6" in result.stderr
 
 
 def test_aggregate_rejects_mutated_selected_container_skip(tmp_path: Path) -> None:
     healthy = _run_pytest_aggregate(
-        tmp_path, selected="true", container_result="success", shards=_all_shards("true", "success")
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+        shards=_all_shards("true", "success"),
     )
     assert healthy.returncode == 0, healthy.stdout + healthy.stderr
-    skipped = _run_pytest_aggregate(tmp_path, selected="true", container_result="skipped")
+    skipped = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="skipped",
+    )
     assert skipped.returncode != 0, skipped.stdout + skipped.stderr
     assert "container" in (skipped.stdout + skipped.stderr).lower()
-    restored = _run_pytest_aggregate(tmp_path, selected="true", container_result="success")
+    restored = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+    )
     assert restored.returncode == 0, restored.stdout + restored.stderr
 
 
 def test_pytest_aggregator_accepts_matching_deselect(tmp_path: Path) -> None:
     deselect = "examples/tests/test_sre_bot_observability_runtime.py"
     result = _run_pytest_aggregate(
-        tmp_path,
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
         container_result="success",
         selected="true",
         deselect=deselect,
@@ -1277,7 +1554,7 @@ def test_pytest_aggregator_rejects_independent_shard_deselect_disagreement(
     shards = _all_shards("true", "success")
     shards[shard] = ("true", "success", "success", deselect, "full")
     result = _run_pytest_aggregate(
-        tmp_path,
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
         container_result="success",
         selected="true",
         shards=shards,
@@ -1291,7 +1568,13 @@ def test_pytest_aggregator_rejects_shard_deselect_disagreement(tmp_path: Path) -
     shards = _all_shards("true", "success", deselect)
     shards[2] = ("true", "success", "success", "", "full")
     result = _run_pytest_aggregate(
-        tmp_path, container_result="success", selected="true", deselect=deselect, shards=shards
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="success",
+        selected="true",
+        deselect=deselect,
+        shards=shards,
     )
     assert result.returncode == 1, result.stdout + result.stderr
     assert "shard 2" in result.stderr
@@ -1305,7 +1588,7 @@ def test_pytest_aggregator_accepts_docs_only_skips(tmp_path: Path, results_dir: 
     selected = _outputs(output)["pytest"]
     assert selected == "false"
     result = _run_pytest_aggregate(
-        tmp_path / "run",
+        tmp_path / "run", ci_policy_selected="false", ci_policy_result="skipped",
         container_result="skipped",
         selected=selected,
         shards_result="skipped",
@@ -1334,8 +1617,13 @@ def test_pytest_aggregator_accepts_a_version_only_release_prep(tmp_path: Path) -
         _python_job(CONTAINER_JOB)["if"], outputs["pytest"], outputs["pytest_deselect"]
     )
     result = _run_pytest_aggregate(
-        tmp_path / "run", container_result="skipped", selected=outputs["pytest"],
-        shards_result="skipped", results_dir=False,
+        tmp_path / "run",
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="skipped",
+        selected=outputs["pytest"],
+        shards_result="skipped",
+        results_dir=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -1343,7 +1631,12 @@ def test_pytest_aggregator_accepts_a_version_only_release_prep(tmp_path: Path) -
 def test_pytest_aggregator_rejects_unselected_shards_that_succeeded(tmp_path: Path) -> None:
     """#3858: an unselected run must not show the shard job as having run."""
     result = _run_pytest_aggregate(
-        tmp_path, container_result="skipped", selected="false", shards_result="success"
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="skipped",
+        selected="false",
+        shards_result="success",
     )
     assert result.returncode != 0
 
@@ -1353,7 +1646,7 @@ def test_pytest_aggregator_rejects_an_unselected_skip_with_a_stray_record(
 ) -> None:
     """#3858: a shard record on an unselected run means the selections disagree."""
     result = _run_pytest_aggregate(
-        tmp_path,
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
         container_result="skipped",
         selected="false",
         shards={1: ("false", "skipped", "skipped", "", "full")},
@@ -1368,7 +1661,7 @@ def test_pytest_aggregator_rejects_a_changes_job_that_did_not_succeed(
 ) -> None:
     """#3858: a failed `changes` job skips the shards; that skip must not go green."""
     result = _run_pytest_aggregate(
-        tmp_path,
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
         container_result="skipped",
         selected="false",
         shards_result="skipped",
@@ -1383,7 +1676,7 @@ def test_pytest_aggregator_rejects_selected_changes_with_unselected_records(
 ) -> None:
     """A shard cannot skip tests selected by changes."""
     result = _run_pytest_aggregate(
-        tmp_path,
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
         container_result="success",
         selected="true",
         shards=_all_shards("false", "skipped"),
@@ -1397,7 +1690,7 @@ def test_pytest_aggregator_rejects_unselected_changes_with_selected_records(
 ) -> None:
     """Successful shard records cannot override a skip selected by changes."""
     result = _run_pytest_aggregate(
-        tmp_path,
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
         container_result="skipped",
         selected="false",
         shards=_all_shards("true", "success"),
@@ -1409,7 +1702,7 @@ def test_pytest_aggregator_rejects_unselected_changes_with_selected_records(
 def test_pytest_aggregator_accepts_unselected_when_changes_agrees(tmp_path: Path) -> None:
     """#3858 liveness: a healthy docs-only run still goes green."""
     result = _run_pytest_aggregate(
-        tmp_path,
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
         container_result="skipped",
         selected="false",
         shards_result="skipped",
@@ -1422,8 +1715,13 @@ def test_pytest_aggregator_accepts_unselected_when_changes_agrees(tmp_path: Path
 def test_pytest_aggregator_rejects_selected_with_shards_skipped(tmp_path: Path) -> None:
     """#3858: a selected run whose shard job was skipped never ran pytest."""
     result = _run_pytest_aggregate(
-        tmp_path, container_result="success", selected="true",
-        shards_result="skipped", results_dir=False,
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="success",
+        selected="true",
+        shards_result="skipped",
+        results_dir=False,
     )
     assert result.returncode != 0
 
@@ -1589,7 +1887,11 @@ def test_pytest_aggregator_accepts_selected_success(tmp_path: Path) -> None:
     assert completed.returncode == 0, completed.stderr
     selected = _outputs(output)["pytest"]
     result = _run_pytest_aggregate(
-        tmp_path / "run", container_result="success", selected=selected,
+        tmp_path / "run",
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="success",
+        selected=selected,
         shards=_all_shards(selected, "success"),
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -1597,14 +1899,23 @@ def test_pytest_aggregator_accepts_selected_success(tmp_path: Path) -> None:
 
 def test_pytest_aggregator_rejects_selected_skip(tmp_path: Path) -> None:
     result = _run_pytest_aggregate(
-        tmp_path, container_result="success", selected="true", shards=_all_shards("true", "skipped")
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="success",
+        selected="true",
+        shards=_all_shards("true", "skipped"),
     )
     assert result.returncode != 0
 
 
 def test_pytest_aggregator_rejects_unselected_success(tmp_path: Path) -> None:
     result = _run_pytest_aggregate(
-        tmp_path, container_result="skipped", selected="false",
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="skipped",
+        selected="false",
         shards=_all_shards("false", "success"),
     )
     assert result.returncode != 0
@@ -1614,8 +1925,13 @@ def test_pytest_aggregator_rejects_a_failed_shard(tmp_path: Path) -> None:
     shards = _all_shards("true", "success")
     shards[2] = ("true", "failure", "success", "", "full")
     result = _run_pytest_aggregate(
-        tmp_path, container_result="success", selected="true",
-        shards=shards, shards_result="failure",
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="success",
+        selected="true",
+        shards=shards,
+        shards_result="failure",
     )
     assert result.returncode != 0
     assert "failure" in result.stderr
@@ -1626,7 +1942,7 @@ def test_pytest_aggregator_rejects_shard_jobs_that_did_not_succeed(
     tmp_path: Path, shards_result: str
 ) -> None:
     result = _run_pytest_aggregate(
-        tmp_path,
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
         container_result="success",
         selected="true",
         shards=_all_shards("true", "success"),
@@ -1640,18 +1956,35 @@ def test_pytest_aggregator_rejects_a_shard_that_never_reported(
     tmp_path: Path, missing: int
 ) -> None:
     healthy = _run_pytest_aggregate(
-        tmp_path, selected="true", container_result="success", shards=_all_shards("true", "success")
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+        shards=_all_shards("true", "success"),
     )
     assert healthy.returncode == 0, healthy.stdout + healthy.stderr
     directory = _named_steps()["Download shard results"]["with"]["path"]
     record = tmp_path / directory / f"shard-{missing}.txt"
     original = record.read_text()
     record.unlink()
-    result = _run_pytest_aggregate(tmp_path, container_result="success", selected="true")
+    result = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="success",
+        selected="true",
+    )
     assert result.returncode != 0
     assert f"shard {missing}" in result.stderr
     record.write_text(original)
-    restored = _run_pytest_aggregate(tmp_path, selected="true", container_result="success")
+    restored = _run_pytest_aggregate(
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        selected="true",
+        container_result="success",
+    )
     assert restored.returncode == 0, restored.stdout + restored.stderr
 
 
@@ -1659,7 +1992,12 @@ def test_pytest_aggregator_rejects_a_shard_that_selected_differently(tmp_path: P
     shards = _all_shards("true", "success")
     shards[1] = ("false", "skipped", "skipped", "", "full")
     result = _run_pytest_aggregate(
-        tmp_path, container_result="success", selected="true", shards=shards
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="success",
+        selected="true",
+        shards=shards,
     )
     assert result.returncode != 0
 

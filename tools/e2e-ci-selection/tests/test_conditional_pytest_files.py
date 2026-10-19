@@ -255,6 +255,10 @@ def test_pytest_step_appends_deselect_only_when_selected(
         "--ignore=tools/factory-e2e/tests/test_c4_forge_instances.py",
         "--ignore", SELECTION_TESTS.FACTORY_UPGRADE_RUNTIME,
         "--ignore", SELECTION_TESTS.CLUSTER_UP_MODULE,
+        *(
+            argument for directory in PYTEST_TESTS.CI_POLICY_DIRS
+            for argument in ("--ignore", directory)
+        ),
     ]
     if deselect:
         expected += ["--deselect", "examples/tests/test_sre_bot_observability_runtime.py"]
