@@ -266,6 +266,7 @@ kc rollout status "deployment/$FULLNAME-worker" --timeout=300s >/dev/null
 # The driver captures credentials and arbitrary tool output privately. Only
 # fixed assertions and numeric observations can reach the public test log.
 cat >"$WORKDIR/driver.py" <<'PY'
+import calendar
 import json
 import os
 import pathlib
@@ -549,6 +550,73 @@ assert len(users) == 2 and users[0] == sys.argv[1] and users[1] == sys.argv[2], 
     print("OK: a reclaimed completed thread booted a new runner, resumed history, and retained both turns exactly once")
 
 
+def burst_sixteen():
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    turns = [start(f"burst16-{index}", "[fake:progress-demo] held-open capacity probe burst16 " + str(index))
+             for index in range(16)]
+    deadline = time.monotonic() + 320
+    while True:
+        completed = [finished(turn) for turn in turns]
+        observe()
+        if all(completed):
+            break
+        assert time.monotonic() < deadline, "sixteen-thread burst exceeded its bounded runtime"
+        time.sleep(0.2)
+    logs = run([*kube, "logs", "deployment/" + fullname + "-worker", "--since-time=" + started, "--timestamps"], timeout=60)
+    parks, wakes = {}, {}
+    for line in logs.splitlines():
+        parked_line = "capacity wait parked event_id=" in line
+        woke_line = "capacity wait woke event_id=" in line
+        if not parked_line and not woke_line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            raise AssertionError("malformed capacity wait log")
+        stamp = parts[0]
+        if "T" not in stamp:
+            raise AssertionError("malformed capacity wait timestamp")
+        event_id = ""
+        for token in parts:
+            if token.startswith("event_id="):
+                event_id = token.split("=", 1)[1]
+        if not event_id:
+            raise AssertionError("malformed capacity wait event id")
+        whole, _, fraction = stamp.partition(".")
+        seconds = calendar.timegm(time.strptime(whole, "%Y-%m-%dT%H:%M:%S"))
+        if fraction:
+            digits = ""
+            for character in fraction:
+                if character.isdigit():
+                    digits += character
+                else:
+                    break
+            if digits:
+                seconds += int(digits[:6]) / 1_000_000
+        bucket = parks if parked_line else wakes
+        bucket.setdefault(event_id, []).append(seconds)
+    assert parks, "sixteen-thread burst recorded no park"
+    unmatched = 0
+    longest = 0.0
+    for event_id, park_times in parks.items():
+        wake_times = wakes.get(event_id, [])
+        cursor = 0
+        for park_time in park_times:
+            while cursor < len(wake_times) and wake_times[cursor] < park_time:
+                cursor += 1
+            if cursor >= len(wake_times):
+                unmatched += 1
+                continue
+            longest = max(longest, wake_times[cursor] - park_time)
+            cursor += 1
+    assert unmatched == 0, "a park had no later wake"
+    assert longest <= 12, "a park to wake interval exceeded 12 seconds"
+    print("parked_turn_burst_16")
+    print("finalized_16")
+    print("park_observed")
+    print("unmatched_parks_0")
+    print("max_park_wake_s")
+
+
 try:
     clean_turns, clean_routes, clean_pods = batch("clean", 6, expect_pressure=True)
     history_followup(clean_turns, clean_routes, clean_pods)
@@ -567,6 +635,8 @@ try:
     assert max(route["expires"] for route in stale.values()) < min(route["expires"] for route in reachable), "old unreadable routes do not precede the safe idle candidate"
     batch("stale", 6, stale=stale, expect_pressure=True)
     print("OK: at least four unreadable older routes remained intact ahead of safely reclaimed completed routes")
+    clear_owned_sandboxes()
+    burst_sixteen()
 except AssertionError as error:
     print("FAIL: " + str(error), file=sys.stderr)
     sys.exit(1)
