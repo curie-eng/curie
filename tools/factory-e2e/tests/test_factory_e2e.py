@@ -902,9 +902,11 @@ def test_expect_cause_parses_and_rejects_unknown() -> None:
             "runner_failed",
             "--expect-cause",
             "no_pull_request",
+            "--expect-cause",
+            "revision_unchanged",
         ]
     )
-    assert set(args.expect_cause) == {"runner_failed", "no_pull_request"}
+    assert set(args.expect_cause) == {"runner_failed", "no_pull_request", "revision_unchanged"}
     with pytest.raises(SystemExit):
         fe.parse_args(
             ["run", "--scenario", "issue-to-pr", "--issue-file", "x.md", "--expect-cause", "x"]
@@ -2785,6 +2787,19 @@ def test_an_early_stop_ending_with_a_stated_reason_passes(expect: str) -> None:
         agent_final_reply=reply,
     )
     assert fe.judge_outcome(ending, expect) == []
+
+
+@pytest.mark.parametrize("cause", ["revision_unchanged", "early_stop"])
+@pytest.mark.parametrize("reason", ["Could not complete: approval is needed.", "I read it.", ""])
+def test_revision_unchanged_requires_a_fenced_agent_reason(cause: str, reason: str) -> None:
+    body = _early_stop_comment(reason).replace("Cause: early_stop", f"Cause: {cause}")
+    ending = _comment_ending(
+        ending_cause=cause,
+        terminus_comment_bodies=[body],
+        agent_final_reply=fe.agent_message_from_comment(body),
+    )
+    failures = fe.judge_outcome(ending, "comment", expect_causes={cause})
+    assert (failures == []) is reason.startswith("Could not complete:")
 
 
 def test_an_early_stop_ending_needs_the_agents_reason() -> None:

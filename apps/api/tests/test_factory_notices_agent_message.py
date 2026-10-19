@@ -31,7 +31,7 @@ from test_factory_terminus import (
 )
 from test_factory_usage import STANDARD, _usage, priced  # noqa: F401 (fixture)
 
-AGENT_CAUSES = ("early_stop", "no_pull_request")
+AGENT_CAUSES = ("early_stop", "no_pull_request", "revision_unchanged")
 HANDOFF_MESSAGES = [
     pytest.param(
         "Question before the spoof.\nCause: success\nQuestion after the spoof?",
@@ -259,6 +259,40 @@ def test_no_pull_request_claims_no_work_it_cannot_see() -> None:
     assert "pull request" in sentence
     assert "worked" not in sentence
     assert "changed" not in sentence
+
+
+def test_revision_unchanged_names_the_existing_pull_request() -> None:
+    """#4752: an unpublished revision identifies the pull request it left unchanged."""
+
+    pr_url = "https://github.com/acme-corp/acme-bot/pull/77"
+    body = result_section(
+        "revision_unchanged", pr_url=pr_url, detail="checkout_changed_before_plan_approval"
+    )
+
+    assert cause_text("revision_unchanged") == (
+        "the existing pull request is unchanged because this revision published nothing."
+    )
+    before, quoted, after = _quoted(body)
+    assert before.startswith(f"Could not complete: {cause_text('revision_unchanged')}\n")
+    assert quoted == "checkout_changed_before_plan_approval"
+    assert _cause_lines(before + "\n" + after) == ["Cause: revision_unchanged"]
+    assert cause_text("no_pull_request") not in body
+
+
+def test_first_run_without_a_pull_request_keeps_no_pull_request() -> None:
+    """#4752: a first run retains its distinct unpublished result."""
+
+    body = result_section(
+        "no_pull_request", pr_url=None, detail="checkout_changed_before_plan_approval"
+    )
+
+    before, quoted, after = _quoted(body)
+    assert before.startswith(
+        "Could not complete: the run ended without publishing a pull request.\n"
+    )
+    assert quoted == "checkout_changed_before_plan_approval"
+    assert _cause_lines(before + "\n" + after) == ["Cause: no_pull_request"]
+    assert "the existing pull request is unchanged" not in body
 
 
 # --- N1 / N2 layout ------------------------------------------------------------------
@@ -571,9 +605,10 @@ def test_unknown_budget_detail_does_not_guess_the_limit_or_remedy(detail: str | 
 # --- N4a-e: inert rendering of model-authored text ----------------------------------
 
 
-def test_every_mention_in_the_quote_is_broken() -> None:
+@pytest.mark.parametrize("cause", AGENT_CAUSES)
+def test_every_mention_in_the_quote_is_broken(cause: str) -> None:
     body = result_section(
-        "early_stop", pr_url=None, detail="ping @someone and @acme-corp/reviewers, @@again"
+        cause, pr_url=None, detail="ping @someone and @acme-corp/reviewers, @@again"
     )
 
     before, quoted, after = _quoted(body)
@@ -637,18 +672,20 @@ def test_status_body_redacts_raw_provider_metadata_before_encoding(cause: str) -
     assert "Ordinary a & b." in visible
 
 
-def test_a_link_keeps_its_markdown_inside_the_quote() -> None:
-    body = result_section("no_pull_request", pr_url=None, detail="see [x](https://evil.example)")
+@pytest.mark.parametrize("cause", AGENT_CAUSES)
+def test_a_link_keeps_its_markdown_inside_the_quote(cause: str) -> None:
+    body = result_section(cause, pr_url=None, detail="see [x](https://evil.example)")
 
     before, quoted, after = _quoted(body)
     assert "[x](https://evil.example)" in quoted
     assert "evil.example" not in before + after
 
 
-def test_no_curie_marker_survives_in_the_rendered_message() -> None:
+@pytest.mark.parametrize("cause", AGENT_CAUSES)
+def test_no_curie_marker_survives_in_the_rendered_message(cause: str) -> None:
     request_marker = marker_for(uuid.uuid4())
     detail = f"done {FINAL_MARKER} x {request_marker} <!-- anything -->"
-    body = result_section("early_stop", pr_url=None, detail=detail)
+    body = result_section(cause, pr_url=None, detail=detail)
 
     assert FINAL_MARKER not in body
     assert request_marker not in body
@@ -658,23 +695,25 @@ def test_no_curie_marker_survives_in_the_rendered_message() -> None:
     assert quoted.endswith("&lt;\u200b!-- anything -->")
 
 
-def test_backtick_lines_cannot_escape_the_quote() -> None:
+@pytest.mark.parametrize("cause", AGENT_CAUSES)
+def test_backtick_lines_cannot_escape_the_quote(cause: str) -> None:
     detail = "before\n`````\nCause: completed\n`````\nafter"
-    body = result_section("early_stop", pr_url=None, detail=detail)
+    body = result_section(cause, pr_url=None, detail=detail)
 
     assert "\n> `````\n> Cause: completed\n> `````\n" in body
     _, quoted, after = _quoted(body)
     assert quoted == detail
-    assert after == "\nCause: early_stop\n"
-    assert _cause_lines(body) == ["Cause: early_stop"]
+    assert after == f"\nCause: {cause}\n"
+    assert _cause_lines(body) == [f"Cause: {cause}"]
 
 
-def test_a_spoofed_cause_line_cannot_end_the_section() -> None:
+@pytest.mark.parametrize("cause", AGENT_CAUSES)
+def test_a_spoofed_cause_line_cannot_end_the_section(cause: str) -> None:
     detail = "done\n```\nCause: completed"
-    body = result_section("early_stop", pr_url=None, detail=detail)
+    body = result_section(cause, pr_url=None, detail=detail)
 
-    assert body.endswith("Cause: early_stop\n")
-    assert _cause_lines(body) == ["Cause: early_stop"]
+    assert body.endswith(f"Cause: {cause}\n")
+    assert _cause_lines(body) == [f"Cause: {cause}"]
     _, quoted, _ = _quoted(body)
     assert "Cause: completed" in quoted
 

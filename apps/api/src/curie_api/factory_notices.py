@@ -140,6 +140,9 @@ _CAUSE_TEXT = {
     ),
     "early_stop": "the agent stopped before doing any work on the issue.",
     "no_pull_request": "the run ended without publishing a pull request.",
+    "revision_unchanged": (
+        "the existing pull request is unchanged because this revision published nothing."
+    ),
     "execution_deadline": "the run did not finish before its deadline.",
     "capacity_wait_expired": "no runner capacity came free before the wait expired.",
     "start_failed": "the sandbox did not start.",
@@ -193,7 +196,7 @@ _DETAIL_CAUSES = frozenset(
 )
 # A run that ended without publishing carries the agent's own last message
 # (#3128). Quote each line and neutralize HTML, image syntax and mentions.
-_AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request"})
+_AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request", "revision_unchanged"})
 # Wire classification a text-only consumer reads off the status comment (#3401).
 # Same tokens as the channel reply's ``curie-turn-failure:`` line. Causes with
 # no entry stay unlabeled rather than inventing a class.
