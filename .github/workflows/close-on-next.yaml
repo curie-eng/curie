@@ -15,7 +15,7 @@ name: Issues fixed on next
 
 on:
   push:
-    branches: [next, main, "epic/**"]
+    branches: [next, main]
   workflow_dispatch:
     inputs:
       dry_run:

@@ -6,7 +6,7 @@ on:
     types: [completed]
   workflow_dispatch: {}
   push:
-    branches: [next, "epic/**"]
+    branches: [next]
     paths:
       - .github/workflows/chart-index.yaml
       - cr.yaml
