@@ -173,11 +173,30 @@ class MailProvider(Protocol):
     reply, otherwise a bound in seconds).
     """
 
-    name: str
-    interface_version: tuple[int, int]
-    inbox_address: str
-    verifies_senders: bool
-    sent_visible_within: float
+    @property
+    def name(self) -> str:
+        """The provider's name, as ``CURIE_MAIL_PROVIDER`` selects it."""
+        ...
+
+    @property
+    def interface_version(self) -> tuple[int, int]:
+        """The interface version this provider implements, as major and minor."""
+        ...
+
+    @property
+    def inbox_address(self) -> str:
+        """The one bare address this mailbox receives at."""
+        ...
+
+    @property
+    def verifies_senders(self) -> bool:
+        """Whether a read can ever carry a ``verified`` verdict."""
+        ...
+
+    @property
+    def sent_visible_within(self) -> float:
+        """Zero for read-after-write visibility of a sent reply, else a bound in seconds."""
+        ...
 
     def list_messages(self, cursor: str | None, limit: int) -> MessagePage | Failure:
         """List one page of mail, newest first, with the provider's safe filters."""
@@ -270,9 +289,7 @@ def resolve_factory(
         raise ProviderLoadError(f"{PROVIDER_ENV} is set but empty")
     if wanted == BUILTIN_PROVIDER:
         return builtin
-    lister = entry_points or (
-        lambda: importlib.metadata.entry_points(group=ENTRY_POINT_GROUP)
-    )
+    lister = entry_points or (lambda: importlib.metadata.entry_points(group=ENTRY_POINT_GROUP))
     found = list(lister())
     if any(entry.name == BUILTIN_PROVIDER for entry in found):
         raise ProviderLoadError(

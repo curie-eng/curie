@@ -65,7 +65,8 @@ def test_another_name_resolves_through_its_one_entry_point() -> None:
         _builtin,  # type: ignore[arg-type]
         _points(("example", "json.decoder:JSONDecoder")),
     )
-    assert factory is json.decoder.JSONDecoder
+    loaded: object = factory
+    assert loaded is json.decoder.JSONDecoder
 
 
 @pytest.mark.parametrize(
@@ -192,12 +193,24 @@ def test_a_different_provider_on_a_bound_volume_fails_boot(
 def _schema_three_file(path: Path) -> None:
     """Build a state file as schema 3 left it, with pending rows and a raw listing."""
     store = DurableMailState(str(path), max_pending=10, max_bytes=1 << 24)
-    listing = {"message_id": "msg-body", "thread_id": "thr-body", "from": "a@example.com",
-               "subject": "payroll", "labels": []}
+    listing = {
+        "message_id": "msg-body",
+        "thread_id": "thr-body",
+        "from": "a@example.com",
+        "subject": "payroll",
+        "labels": [],
+    }
     assert store.admit(listing) == "admitted"
     assert store.admit({"message_id": "msg-turn", "thread_id": "thr-turn"}) == "admitted"
-    store.store_turn("msg-turn", {"conversation_id": "thr-turn", "reply_ref": "msg-turn",
-                                  "delivery_id": "msg-turn", "text": "stored, never posted"})
+    store.store_turn(
+        "msg-turn",
+        {
+            "conversation_id": "thr-turn",
+            "reply_ref": "msg-turn",
+            "delivery_id": "msg-turn",
+            "text": "stored, never posted",
+        },
+    )
     assert store.admit({"message_id": "msg-done", "thread_id": "thr-done"}) == "admitted"
     store.store_turn("msg-done", {"conversation_id": "thr-done", "reply_ref": "msg-done"})
     store.accept_ingress("msg-done")

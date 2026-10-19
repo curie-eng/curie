@@ -124,8 +124,14 @@ def test_a_verified_allowed_sender_becomes_a_turn_and_gets_its_reply(
 def test_the_turn_text_falls_back_from_new_text_to_full_text_to_html(
     mail: MailState, ingress: IngressState, verifying: MailAdapter
 ) -> None:
-    _inbound(mail, "msg-full", "thr-a", text=None, full_text="the whole body",
-             verdict=verified("example.com"))
+    _inbound(
+        mail,
+        "msg-full",
+        "thr-a",
+        text=None,
+        full_text="the whole body",
+        verdict=verified("example.com"),
+    )
     _inbound(mail, "msg-html", "thr-b", text=None, verdict=verified("example.com"))
     mail.bodies["msg-html"]["html"] = "<p>only html</p>"
 
@@ -273,8 +279,13 @@ def test_mail_already_in_the_inbox_at_first_boot_never_becomes_a_turn(
 
 def _ask(mail: MailState, adapter: MailAdapter, url: str) -> str:
     """A verified asking turn, its approval card, and the request email it sends."""
-    _inbound(mail, "msg-1", text="Please send the quote", headers=HUMAN_HEADERS,
-             verdict=verified("example.com"))
+    _inbound(
+        mail,
+        "msg-1",
+        text="Please send the quote",
+        headers=HUMAN_HEADERS,
+        verdict=verified("example.com"),
+    )
     adapter.poll_once()
     assert post_event(url, update("Awaiting approval (appr-1): Send the quote"))[0] == 200
     status, ack = post_event(url, approval_card("appr-1", approvers=[APPROVER]))
@@ -282,7 +293,7 @@ def _ask(mail: MailState, adapter: MailAdapter, url: str) -> str:
     assert post_event(url, completed("ev-1", outcome="awaiting-approval"))[0] == 200
     (request_email,) = mail.replies_to("msg-1")
     (reference,) = APPROVAL_REF_PATTERN.findall(request_email)
-    return reference
+    return str(reference)
 
 
 @pytest.mark.parametrize(("word", "decision"), [("APPROVE", "approved"), ("REJECT", "rejected")])
