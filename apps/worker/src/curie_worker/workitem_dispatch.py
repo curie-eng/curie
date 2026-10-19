@@ -681,6 +681,7 @@ class WorkItemRun:
         self.runtime_epoch: int | None = None
         self.claim_name: str | None = None
         self.sandbox_name: str | None = None
+        self.recorded_pr_url: str | None = None
         self.execution_deadline: datetime | None = None
         self.agent_id = grant.agent_id
         self._client = client

@@ -1907,8 +1907,10 @@ When the model provider refused the run,
 a `Provider message:` line follows with the provider's own error text, redacted
 of keys and tokens. An execute turn that ends without publishing is prompted
 once more in the same session. If it still does not publish, it ends as
-`early_stop` (it called no work tool and never reported progress) or
-`no_pull_request`, and an `Agent's last message:` block carries the agent's
+`early_stop` (it called no work tool and never reported progress). Otherwise it
+ends as `no_pull_request`. When the cause would be `no_pull_request` and a pull
+request is already recorded, it ends as `revision_unchanged` instead.
+An `Agent's last message:` block carries the agent's
 final reply as a neutralized Markdown quote. The reply is redacted before
 clipping to at most 4000 characters, including the trailing `...` when
 clipped. CRLF and bare CR line endings are normalized to LF. Before quoting,
@@ -1930,7 +1932,7 @@ paragraphs, rules to literal `---` paragraphs, and flattens nested quote content
 A last `Cause:` line names the platform cause code
 (`capacity_wait_expired`, `start_failed`, `execution_deadline`, `issue_cancelled`,
 `owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
-`no_pull_request`,
+`no_pull_request`, `revision_unchanged`,
 `early_stop`, `publication_denied`, `publication_expired`, `publication_failed`,
 `publication_unrecorded`, or a
 classified run failure: `model_credit_exhausted`, `model_usage_limited`,
