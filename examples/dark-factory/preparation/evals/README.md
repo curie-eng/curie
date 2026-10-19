@@ -69,3 +69,12 @@ its provisional draft. A subsequent developer correction changed both Decisions
 and Acceptance criteria in the complete body without authorizing publication.
 These observations exercise the instructions, not every client, an optimal
 question count, or improved factory completion.
+
+The simplified intake workflow was replayed in a fresh host context with no CLI,
+repository pin or compatibility endpoint. A synthetic existing issue received the
+exact reviewed canonical body; the fake tracker log showed read, update, read,
+one configured label add and final readback. No input prefix was added. The
+separate local report retained a coordinator supplied pilot ID and arm, five
+behavioral questions in two rounds and unknown human preparation minutes. No
+real tracker or factory run was performed. This tests publication behavior and
+honest measurement recording, not the impact on accepted factory outcomes.

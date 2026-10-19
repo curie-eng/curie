@@ -913,6 +913,14 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../examples/dark-factory/preparation/evals/publication-cases.json"),
     ),
     (
+        "preparation/pilot/README.md",
+        include_bytes!("../../examples/dark-factory/preparation/pilot/README.md"),
+    ),
+    (
+        "preparation/pilot/outcomes.csv",
+        include_bytes!("../../examples/dark-factory/preparation/pilot/outcomes.csv"),
+    ),
+    (
         "preparation/release-metadata.json",
         include_bytes!("../../examples/dark-factory/preparation/release-metadata.json"),
     ),

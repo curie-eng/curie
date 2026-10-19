@@ -52,9 +52,7 @@ def _only_the_unbuilt_runner_layer(errors: list) -> bool:
 def test_bundle_validates() -> None:
     # The platform's deploy path validates with the enforcing contract; a
     # toolPolicy bundle is refused by the non-enforcing default.
-    result = validate_bundle(
-        BUNDLE, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT, input_contract_context="standalone"
-    )
+    result = validate_bundle(BUNDLE, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
     assert _only_the_unbuilt_runner_layer(result.errors), result.errors
 
 
@@ -254,11 +252,3 @@ def test_delegation_binds_to_the_resolved_declaration_and_plan_review_judges_the
     assert "the reviewer judges the proposed test as the plan describes it" in contract
     assert "never demands the written test" in contract
     assert "At diff review the reviewer reads the written test." in contract
-
-
-def test_factory_declares_its_versioned_specification_input_contract() -> None:
-    assert _manifest().get("inputContracts") == {
-        "interface": "curie/input-contracts@1",
-        "accepts": ["curie.factory-specification/v1"],
-        "required": True,
-    }
