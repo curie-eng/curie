@@ -37,7 +37,8 @@ from .models import (
 )
 
 _MODELS = (
-    InputContractsDeclaration,    PluginManifest,
+    InputContractsDeclaration,
+    PluginManifest,
     Author,
     SkillFrontmatter,
     McpServer,
