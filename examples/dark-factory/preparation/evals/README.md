@@ -1,7 +1,7 @@
-# Publication behavior evaluation
+# Preparation behavior evaluation
 
 `publication-cases.json` is a portable replay set for the preparation skill.
-These cases describe synthetic inputs and expected tracker effects. They are
+These cases describe synthetic inputs, clarification behavior and tracker effects. They are
 not automated CI tests or proof of a real tracker integration.
 
 ## Replay
@@ -20,6 +20,22 @@ not automated CI tests or proof of a real tracker integration.
    Inspect the final response too: issue publication, selection and unvalidated
    readiness must be reported separately. A model statement that it performed an
    action is insufficient without the recorded effect.
+
+For clarification cases, materialize the supplied `repository_files` in an
+isolated checkout and provide the `user_turn` without the expected answers or
+grading criteria. The agent must inspect actual files rather than a summary of
+their contents. Capture its next questions and subsequent complete draft. Count
+independent decisions, not numbered bullets: unrelated choices bundled into one
+bullet still count separately. Use `follow_up` as a later developer turn when
+present and inspect the resulting specification for the changed decision.
+
+Check the clear case for zero clarification questions, the ambiguous case for
+questions that address its material choices with concrete behavior alternatives,
+and the repository case for inspection instead of asking about documented facts.
+Do not grade a lower question count as better by itself. Check full review and
+corrections in the actual canonical body, separately from report contents. These
+are host-agent observations; a JSON fixture or prompt substring assertion is not
+proof that the behavior ran.
 
 For full review, inspect that every complete canonical body is available before
 intent approval. For selection, verify approved content was persisted and read
@@ -44,3 +60,12 @@ that each case has run on every supported host. Fake tracker results do not prov
 real authentication, permissions, tracker concurrency guarantees, webhooks,
 factory intake or model execution. Record the exact skill revision, host version,
 commands and observed positive and negative outcomes for each actual replay.
+
+The ambiguity-driven revision was also exercised in fresh offline preparation
+contexts. A fully specified export request produced no behavioral questions and
+presented the complete specification for review. An underspecified request
+produced questions about material alternatives and retained unresolved choices in
+its provisional draft. A subsequent developer correction changed both Decisions
+and Acceptance criteria in the complete body without authorizing publication.
+These observations exercise the instructions, not every client, an optimal
+question count, or improved factory completion.

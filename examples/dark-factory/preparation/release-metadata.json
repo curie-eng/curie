@@ -1,4 +1,4 @@
 {
-  "preparation_version": "0.2.0",
+  "preparation_version": "0.2.1",
   "contract_versions": ["curie.factory-specification/v1"]
 }

@@ -110,6 +110,16 @@ decomposition. A prerequisite still needing implementation remains a blocker;
 missing deployment capability remains an operator gap. Neither is silently removed
 by splitting a request.
 
+The number and depth of questions follow the remaining ambiguity and the impact
+of different answers, with no fixed quota or cap. Related questions are grouped
+into manageable rounds, using concrete behavioral examples where useful. A clear
+request can go straight to a draft. Further questions follow investigation and
+revised answers when a material choice remains. Clarification ends when material
+choices are resolved and minor assumptions are explicit for review. Material
+answers become decisions or acceptance criteria.
+The local report counts questions and batches separately from review/publication
+choices, with preparation duration marked unknown unless observed or supplied.
+
 Choose a local output location when needed. The canonical body has the seven
 [factory contract](factory-specification.md) sections. A separate preparation
 report records original identity, inspected/base revisions, unresolved questions,
@@ -214,7 +224,7 @@ Use actual observed identities in place of these illustrative values:
 ```json
 {
   "schema_version": 1,
-  "preparation_version": "0.2.0",
+  "preparation_version": "0.2.1",
   "target": {
     "deployment_id": "00000000-0000-4000-8000-000000000001",
     "bundle_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",

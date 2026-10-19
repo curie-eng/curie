@@ -71,6 +71,12 @@ headings. Use the developer's preferred filenames and preserve existing output.
 - **Intent review:** pending or confirmed, the reviewed draft identity and a
   concise summary of actual developer decisions/corrections. A preparation agent
   cannot approve intent on the developer's behalf.
+- **Preparation effort:** count behavioral clarification questions and question
+  batches separately from intent review and publication choices. Count independent
+  decisions, including those grouped into one message. Record preparation duration
+  only when observed with available timing tools or supplied by the developer;
+  otherwise mark it unknown, and identify estimates as estimates. These local
+  observations are not platform telemetry or evidence of improved completion.
 
 Local evidence applies to the inspected checkout. A passing local command does
 not prove deployment capabilities, permissions, package availability, dependency

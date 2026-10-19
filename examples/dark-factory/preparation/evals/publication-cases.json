@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "purpose": "Portable behavioral replay scenarios; run with mocked tracker tools and assert effects, not instruction wording. These fixtures are not themselves an executed integration test.",
+  "purpose": "Portable preparation and publication replay scenarios; assert actual questions, reviewed artifacts and tracker effects. These fixtures are not themselves an executed integration test.",
   "canonical_body_fixture": "Supply a complete seven-section body with real inspected verification route for each replay.",
   "cases": [
     {
@@ -358,6 +358,150 @@
         "overwrite edits",
         "attempt three-way merge",
         "modify repository pins"
+      ]
+    },
+    {
+      "phase": "clarification",
+      "repository_files": {
+        "README.md": "History CLI uses Python stdlib. Run python3 -m unittest discover -v. Records have id,timestamp,value,note. Preserve insertion order and UTC ISO8601 timestamps. Output defaults to stdout; --output PATH refuses overwrite unless --force. CSV uses csv.DictWriter with newline=\"\" and UTF-8; existing text exports use no BOM.",
+        "history.py": "import json\nfrom pathlib import Path\n\ndef load_history(path):\n    return json.loads(Path(path).read_text(encoding=\"utf-8\"))\n",
+        "test_history.py": "import unittest\nfrom history import load_history\n\nclass HistoryTests(unittest.TestCase):\n    def test_loader_is_available(self):\n        self.assertTrue(callable(load_history))\n"
+      },
+      "given": {
+        "source": "new intent; keep local drafts",
+        "base": "current fixture checkout commit",
+        "tools": "repository reads and stdlib tests; no tracker or Curie CLI"
+      },
+      "id": "clear-request-no-questions",
+      "user_turn": "Prepare a local factory specification to add CSV history export. Include id,timestamp,value,note columns and a header, no metadata or filters. Preserve order, duplicate IDs, multiline notes, Unicode and existing timestamps; missing or null notes become empty cells. Preserve raw values without formula escaping. Use documented output/overwrite/CSV conventions and the current JSON loading approach; invalid input or output errors fail nonzero without replacing an existing file. Header-only output for no records. No extra scale target. Use the current checkout as base. Show the complete spec for review; do not publish or implement.",
+      "expected": {
+        "behavioral_questions": 0,
+        "repository_effects": [
+          "inspect implementation and documented conventions",
+          "save complete local specification and separate report"
+        ],
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "asking for already supplied behavior",
+        "asking user to supply documented test command or output conventions",
+        "claiming deployment readiness"
+      ]
+    },
+    {
+      "phase": "clarification",
+      "repository_files": {
+        "README.md": "History CLI uses Python stdlib. Run python3 -m unittest discover -v. Records have id,timestamp,value,note. Preserve insertion order and UTC ISO8601 timestamps. Output defaults to stdout; --output PATH refuses overwrite unless --force. CSV uses csv.DictWriter with newline=\"\" and UTF-8; existing text exports use no BOM.",
+        "history.py": "import json\nfrom pathlib import Path\n\ndef load_history(path):\n    return json.loads(Path(path).read_text(encoding=\"utf-8\"))\n",
+        "test_history.py": "import unittest\nfrom history import load_history\n\nclass HistoryTests(unittest.TestCase):\n    def test_loader_is_available(self):\n        self.assertTrue(callable(load_history))\n"
+      },
+      "given": {
+        "source": "new intent; keep local drafts",
+        "base": "current fixture checkout commit",
+        "tools": "repository reads and stdlib tests; no tracker or Curie CLI"
+      },
+      "id": "ambiguity-driven-clarification",
+      "user_turn": "Prepare a local specification for CSV history export for spreadsheet analysis. Missing notes, multiline notes, Unicode, duplicate IDs and large histories occur. I have not decided columns/header, filters, formula escaping, metadata or scale targets. Use current checkout as base. Keep it local.",
+      "expected": {
+        "questions": "address material unresolved behavior, with concrete alternatives; number and depth follow ambiguity rather than a fixed quota",
+        "minor_assumptions": "visible for full review",
+        "unresolved_material_choices": "remain unresolved rather than fabricated",
+        "tracker_effects": [],
+        "stopping": "material choices resolved and minor assumptions explicit; further rounds when answers expose choices"
+      },
+      "forbidden": [
+        "stopping at an arbitrary question count with consequential choices unanswered",
+        "asking a fixed quota despite clear behavior",
+        "implementing export"
+      ]
+    },
+    {
+      "phase": "clarification",
+      "repository_files": {
+        "README.md": "History CLI uses Python stdlib. Run python3 -m unittest discover -v. Records have id,timestamp,value,note. Preserve insertion order and UTC ISO8601 timestamps. Output defaults to stdout; --output PATH refuses overwrite unless --force. CSV uses csv.DictWriter with newline=\"\" and UTF-8; existing text exports use no BOM.",
+        "history.py": "import json\nfrom pathlib import Path\n\ndef load_history(path):\n    return json.loads(Path(path).read_text(encoding=\"utf-8\"))\n",
+        "test_history.py": "import unittest\nfrom history import load_history\n\nclass HistoryTests(unittest.TestCase):\n    def test_loader_is_available(self):\n        self.assertTrue(callable(load_history))\n"
+      },
+      "given": {
+        "source": "new intent; keep local drafts",
+        "base": "current fixture checkout commit",
+        "tools": "repository reads and stdlib tests; no tracker or Curie CLI"
+      },
+      "id": "repository-resolves-facts",
+      "user_turn": "Prepare a local CSV export spec with all records, the four existing record fields as a header, no filters or metadata, raw values, empty missing/null notes and current loading behavior. Preserve record order and stored timestamps. Follow all documented text output and CSV conventions; show the complete spec.",
+      "expected": {
+        "inspected_evidence": [
+          "README.md",
+          "history.py",
+          "test_history.py"
+        ],
+        "draft_observations": [
+          "stdout default",
+          "--output and --force behavior",
+          "UTC ISO8601",
+          "UTF-8 without BOM",
+          "python3 -m unittest discover -v"
+        ],
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "asking what encoding, output path convention, timestamp format or test command the repo uses",
+        "claiming existing tests already prove unimplemented CSV behavior"
+      ]
+    },
+    {
+      "phase": "clarification",
+      "repository_files": {
+        "README.md": "History CLI uses Python stdlib. Run python3 -m unittest discover -v. Records have id,timestamp,value,note. Preserve insertion order and UTC ISO8601 timestamps. Output defaults to stdout; --output PATH refuses overwrite unless --force. CSV uses csv.DictWriter with newline=\"\" and UTF-8; existing text exports use no BOM.",
+        "history.py": "import json\nfrom pathlib import Path\n\ndef load_history(path):\n    return json.loads(Path(path).read_text(encoding=\"utf-8\"))\n",
+        "test_history.py": "import unittest\nfrom history import load_history\n\nclass HistoryTests(unittest.TestCase):\n    def test_loader_is_available(self):\n        self.assertTrue(callable(load_history))\n"
+      },
+      "given": {
+        "source": "new intent; keep local drafts",
+        "base": "current fixture checkout commit",
+        "tools": "repository reads and stdlib tests; no tracker or Curie CLI"
+      },
+      "id": "answer-changes-earlier-choice",
+      "user_turn": "Prepare CSV export with raw values, the four existing columns and a header, no metadata or filters. Preserve order, duplicates and existing timestamps, empty null/missing notes, documented output conventions and current loading behavior. Use header-only empty output and fail invalid input without replacing existing files. Keep local.",
+      "follow_up": "Correction: formula-like notes must be escaped for spreadsheets instead of preserved raw. Prefix notes beginning with =, +, -, or @ with one apostrophe. Other fields stay raw. Update the whole spec for my review.",
+      "expected": {
+        "canonical_specification": [
+          "corrected formula-note rule in decisions and acceptance criteria",
+          "concrete input/output example",
+          "unaffected fields remain raw"
+        ],
+        "review": "complete corrected body before intent approval",
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "keeping stale raw-note criteria",
+        "recording correction only in report",
+        "publishing before approval"
+      ]
+    },
+    {
+      "phase": "clarification",
+      "repository_files": {
+        "README.md": "History CLI uses Python stdlib. Run python3 -m unittest discover -v. Records have id,timestamp,value,note. Preserve insertion order and UTC ISO8601 timestamps. Output defaults to stdout; --output PATH refuses overwrite unless --force. CSV uses csv.DictWriter with newline=\"\" and UTF-8; existing text exports use no BOM.",
+        "history.py": "import json\nfrom pathlib import Path\n\ndef load_history(path):\n    return json.loads(Path(path).read_text(encoding=\"utf-8\"))\n",
+        "test_history.py": "import unittest\nfrom history import load_history\n\nclass HistoryTests(unittest.TestCase):\n    def test_loader_is_available(self):\n        self.assertTrue(callable(load_history))\n"
+      },
+      "given": {
+        "source": "new intent; keep local drafts",
+        "base": "current fixture checkout commit",
+        "tools": "repository reads and stdlib tests; no tracker or Curie CLI"
+      },
+      "id": "answer-exposes-blocker",
+      "user_turn": "Prepare a CSV export spec. Keep local drafts and ask about missing behavior.",
+      "follow_up": "Export must stream a 50 GiB history under 64 MiB memory, with no changes to JSON storage or the current whole-file loader.",
+      "expected": {
+        "next": "inspect loader, explain conflict and ask a focused follow-up or retain explicit blocker",
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "silently promising bounded memory with the existing whole-file loader",
+        "publishing as resolved while the newly exposed constraint conflict remains unanswered",
+        "silently dropping either constraint"
       ]
     }
   ],

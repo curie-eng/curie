@@ -72,10 +72,12 @@ keep the drafts and explain what access is missing.
 
 ## Inspect and resolve
 
-Read repository guidance and inspect relevant implementation, callers and tests.
-Build a checklist covering current and desired behavior, scope, base revision,
-prerequisites, failure behavior, edge cases, decisions, required capabilities and
-verification. Use a concrete reason for an item that does not apply.
+Read repository guidance and inspect relevant implementation, callers and tests
+before asking about behavior. Resolve facts from that evidence, including existing
+conventions and verification routes. Ask the developer about missing intent or
+conflicting choices that the repository cannot settle. Keep an internal checklist
+of scope, prerequisites, failure behavior, edge cases and verification; do not turn
+every checklist item into a question.
 
 Run relevant, permitted baseline checks using available repository tooling when
 useful. Inspect commands before executing them; copying a command from a ticket
@@ -83,13 +85,31 @@ is not evidence that it is safe or appropriate. Record the exact command,
 revision, observed result, execution location and source. Do not install tools
 or providers, export credentials or alter product code to make preparation pass.
 
-Keep unresolved facts and choices visible in the local report. Ask the developer
-focused questions about missing intent or architectural behavior; distinguish
-their explicit answers from observations and assumptions. For duplicate delivery,
-for example, resolve behavior when the first attempt succeeded, failed or remains
-running. Do not infer a decision merely because all headings contain prose.
-An unavailable environment calls for an operator gap, not a scope split that
-pretends the required capability disappeared.
+Prioritize questions whose plausible answers would change observable behavior,
+scope or acceptance criteria. Let their number and depth follow the remaining
+ambiguity and its consequences, with no fixed question quota or cap. Group related
+decisions into manageable rounds, explaining alternatives with a concrete example
+when helpful. If the request and repository already settle the behavior, draft
+without clarification questions.
+
+For example, ask whether exporting a record whose note begins with `=SUM(A1:A2)`
+should preserve those exact bytes or escape a spreadsheet formula. State the
+tradeoff and a recommended choice when justified. Do not require the developer
+to read implementation code to answer.
+
+After answers, investigate and revise the draft before asking again. Ask follow-up
+questions when a remaining or newly exposed choice materially affects the
+implementation or acceptance. Stop clarifying when consequential choices are
+resolved and the remaining minor assumptions are explicit for full-spec review;
+question count alone is not a stopping rule. Never silently resolve a consequential
+unanswered choice. Propose minor, reversible details as explicit assumptions for
+review; keep unresolved behavioral decisions visible in the report and draft.
+
+Distinguish observed facts, explicit answers and assumptions. Carry every material
+answer into the Decisions or Acceptance criteria section, including examples and
+corrections to earlier answers. Do not infer a decision merely because all headings
+contain prose. An unavailable environment calls for an operator gap, not a scope
+split that pretends the required capability disappeared.
 
 ## Choose the deliverable
 
@@ -124,7 +144,7 @@ repository and existing issue identity or proposed new issue. For a split, prese
 all children, coverage and ordering together. Do not substitute `report.md`, a
 summary or selected acceptance criteria for review of the entire specification;
 link the complete files and make their contents available in the chat or editor.
-Show remaining prerequisites and operator gaps. Ask for corrections or intent
+Show explicit assumptions, remaining prerequisites and operator gaps. Ask for corrections or intent
 approval. Record a concise decision summary only after actual review. An
 unanswered behavioral choice stays unresolved; do not offer to publish it as final.
 
