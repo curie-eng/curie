@@ -4860,14 +4860,16 @@ mod dark_factory_render_tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/dark-factory")
     }
 
-    /// Every file under the example, relative to its root, excluding the lock
-    /// a local build writes.
+    /// Every file under the example, excluding generated lock and cache files.
     fn source_files() -> Vec<(String, PathBuf)> {
         fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
             for entry in std::fs::read_dir(dir).expect("read example dir") {
                 let path = entry.expect("dir entry").path();
                 if path.is_dir() {
-                    if path.file_name().and_then(|n| n.to_str()) == Some("__pycache__") {
+                    if matches!(
+                        path.file_name().and_then(|n| n.to_str()),
+                        Some("__pycache__" | ".ruff_cache")
+                    ) {
                         continue;
                     }
                     walk(root, &path, out);

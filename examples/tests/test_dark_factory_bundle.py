@@ -154,7 +154,7 @@ def _shipped_files() -> list[Path]:
         p
         for p in BUNDLE.rglob("*")
         if p.is_file()
-        and "__pycache__" not in p.relative_to(BUNDLE).parts
+        and not {"__pycache__", ".ruff_cache"}.intersection(p.relative_to(BUNDLE).parts)
         and p.suffix not in {".pyc", ".pyo"}
     ]
     return [*files, DRIVER]
