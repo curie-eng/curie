@@ -257,7 +257,7 @@ def test_pytest_step_appends_deselect_only_when_selected(
         "--ignore", SELECTION_TESTS.CLUSTER_UP_MODULE,
         *(
             argument for directory in PYTEST_TESTS.CI_POLICY_DIRS
-            for argument in ("--ignore", directory)
+            for argument in ("--ignore", directory, "--ignore-glob", f"{directory}/tests/*")
         ),
     ]
     if deselect:

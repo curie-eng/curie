@@ -820,7 +820,7 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
         "--ignore", CONTAINER_FILES[1],
         *(
             argument for directory in PYTEST_TESTS.CI_POLICY_DIRS
-            for argument in ("--ignore", directory)
+            for argument in ("--ignore", directory, "--ignore-glob", f"{directory}/tests/*")
         ),
     ]
     if deselect:
@@ -901,7 +901,7 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
         "--ignore", CONTAINER_FILES[1],
         *(
             argument for directory in PYTEST_TESTS.CI_POLICY_DIRS
-            for argument in ("--ignore", directory)
+            for argument in ("--ignore", directory, "--ignore-glob", f"{directory}/tests/*")
         ),
         "--deselect", deselect,
     ]

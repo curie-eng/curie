@@ -322,8 +322,11 @@ def _assert_ci_excludes_commenter(workflow: dict[str, Any]) -> None:
         assert len(calls) == 2 and calls[-1] == "", "only pytest may be invoked"
         command = calls[0].split("\0")
         assert command[:2] == ["run", "pytest"]
-        assert [argument for argument in command if "p0-closes" in argument] == [directory]
+        assert [argument for argument in command if "p0-closes" in argument] == [
+            directory, f"{directory}/tests/*",
+        ]
         assert command[command.index(directory) - 1] == "--ignore"
+        assert command[command.index(f"{directory}/tests/*") - 1] == "--ignore-glob"
 
 
 def test_commenter_is_not_wired_into_the_required_python_job() -> None:
@@ -353,7 +356,10 @@ def test_ci_commenter_guard_rejects_a_policy_path_outside_pytest_ignore() -> Non
         "shard pytest caller",
     )
     script = _string(step, "run")
-    mutated = script.replace('pytest_args+=(--ignore "$directory")', 'pytest_args+=("$directory")')
+    mutated = script.replace(
+        'pytest_args+=(--ignore "$directory" --ignore-glob "$directory/tests/*")',
+        'pytest_args+=("$directory")',
+    )
     assert mutated != script
     step["run"] = mutated
     with pytest.raises(AssertionError):

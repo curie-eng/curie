@@ -1200,6 +1200,11 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         ("--ignore", "tools/dependency-audit-paths"),
         ("--ignore", "tools/close-on-next"),
     }
+    runtime_exclusions |= {
+        ("--ignore-glob", f"{path}/tests/*")
+        for option, path in runtime_exclusions
+        if option == "--ignore" and not path.endswith(".py")
+    }
 
     def assert_full_suite(command: list[str], shard: int, deselect: str) -> None:
         assert command[:3] == ["run", "pytest", "-q"]
@@ -1223,11 +1228,11 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         excluded = []
         reporting = []
         for argument in arguments:
-            if argument in {"--ignore", "--deselect"}:
+            if argument in {"--ignore", "--ignore-glob", "--deselect"}:
                 path = next(arguments, None)
                 assert path is not None, f"{argument} requires a path"
                 excluded.append((argument, path))
-            elif argument.startswith(("--ignore=", "--deselect=")):
+            elif argument.startswith(("--ignore=", "--ignore-glob=", "--deselect=")):
                 option, path = argument.split("=", 1)
                 excluded.append((option, path))
             else:
@@ -1283,7 +1288,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
                     reduced: list[str] = []
                     arguments = iter(pytest_command)
                     for argument in arguments:
-                        if argument in {"--ignore", "--deselect"}:
+                        if argument in {"--ignore", "--ignore-glob", "--deselect"}:
                             path = next(arguments)
                             if (argument, path) != (missing_option, missing_path):
                                 reduced.extend((argument, path))

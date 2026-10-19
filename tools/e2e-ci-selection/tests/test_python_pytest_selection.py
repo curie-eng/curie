@@ -604,7 +604,7 @@ def _without_runtime_exclusion(arguments: list[str], runtime: str) -> list[str]:
     while index < len(arguments):
         argument = arguments[index]
         option, separator, value = argument.partition("=")
-        if option in {"--ignore", "--deselect"}:
+        if option in {"--ignore", "--ignore-glob", "--deselect"}:
             if not separator and index + 1 < len(arguments):
                 value = arguments[index + 1]
             if value == runtime:
@@ -662,7 +662,7 @@ def _run_pytest_step(
     if scope == "cli":
         relative = "tools/e2e-ci-selection/cli_pytest_files.txt"
         destination = tmp_path / relative
-        destination.parent.mkdir(parents=True)
+        destination.parent.mkdir(parents=True, exist_ok=True)
         if cli_files is None:
             shutil.copyfile(REPO_ROOT / relative, destination)
         else:
@@ -1292,22 +1292,30 @@ def test_ci_policy_exclusions_collect_only_neighbors_on_every_shard(
 ) -> None:
     entries = yaml.safe_load(REGISTRY.read_text())["ci_policy_tests"]
     neighbors = ("tools/ci-retry-gate-other/tests/test_neighbor.py",)
+    for path in (*entries, *neighbors):
+        destination = tmp_path / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("def test_policy_collection_probe():\n    pass\n")
     arguments = _run_pytest_step(
         tmp_path, shard=shard, scope=scope, deselect="",
         cli_files=(*sorted(entries), *neighbors),
     )
     for directory in CI_POLICY_DIRS:
-        assert arguments.count(directory) == 1, arguments
-        assert arguments[arguments.index(directory) - 1] == "--ignore", arguments
+        for option, value in (
+            ("--ignore", directory), ("--ignore-glob", f"{directory}/tests/*"),
+        ):
+            assert arguments.count(value) == 1, arguments
+            assert arguments[arguments.index(value) - 1] == option, arguments
     if scope == "cli":
         assert not set(entries).intersection(arguments), arguments
         assert all(path in arguments for path in neighbors)
-    for path in (*entries, *neighbors):
-        destination = tmp_path / path
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text("def test_policy_collection_probe():\n    pass\n")
     config = tmp_path / "pytest.ini"
-    config.write_text("[pytest]\ntestpaths = tools\naddopts = --import-mode=importlib\n")
+    roots = [f"{directory}/tests" for directory in CI_POLICY_DIRS]
+    roots += [str(Path(path).parent) for path in neighbors]
+    config.write_text(
+        "[pytest]\ntestpaths =\n" + "".join(f"    {root}\n" for root in roots)
+        + "addopts = --import-mode=importlib\n"
+    )
 
     def collected(argv: list[str]) -> set[str]:
         selection = []
@@ -1335,10 +1343,11 @@ def test_ci_policy_exclusions_collect_only_neighbors_on_every_shard(
 
     expected = {path + "::test_policy_collection_probe" for path in neighbors}
     assert collected(arguments) == expected
-    targets = sorted(path for path in entries if path.startswith("tools/close-on-next/"))
+    directory = "tools/e2e-ci-selection"
+    targets = sorted(path for path in entries if path.startswith(directory + "/"))
     assert targets
     if scope == "full":
-        mutated = _without_runtime_exclusion(arguments, "tools/close-on-next")
+        mutated = _without_runtime_exclusion(arguments, f"{directory}/tests/*")
         exposed = targets
     else:
         exposed = targets[:1]
