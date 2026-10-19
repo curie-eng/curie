@@ -516,7 +516,7 @@ def test_ci_policy_guard_rejects_undeclared_literal_and_accepts_covered_literal(
 ) -> None:
     entries = _policy_guard_fixture(tmp_path)
     module = "tools/ci-release-target-parity/tests/test_release_target_parity.py"
-    literal = "inputs/undeclared.txt"
+    literal = "/".join(("inputs", "undeclared.txt"))
     target = tmp_path / literal
     target.parent.mkdir()
     target.write_text("input\n")

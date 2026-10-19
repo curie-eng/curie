@@ -1189,6 +1189,16 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         ("--deselect", ADMITTED_AGENT_SELECTOR.split("::", 1)[0]),
         ("--ignore", "tools/factory-e2e/tests/test_c4_tracker_scope.py"),
         ("--ignore", "examples/tests/test_sre_bot_observability_runtime.py"),
+        ("--ignore", "tools/ci-retry-gate"),
+        ("--ignore", "tools/ci-workflow-paths"),
+        ("--ignore", "tools/ci-release-target-parity"),
+        ("--ignore", "tools/e2e-ci-selection"),
+        ("--ignore", "tools/helm-ci-gate"),
+        ("--ignore", "tools/fix-pin-ci"),
+        ("--ignore", "tools/p0-closes-ci"),
+        ("--ignore", "tools/runtime-assertion-gate"),
+        ("--ignore", "tools/dependency-audit-paths"),
+        ("--ignore", "tools/close-on-next"),
     }
 
     def assert_full_suite(command: list[str], shard: int, deselect: str) -> None:
@@ -1223,7 +1233,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
             else:
                 reporting.append(argument)
         assert len(excluded) == len(runtime_exclusions) and set(excluded) == runtime_exclusions, (
-            "the Python suite must use exactly the required kind runtime exclusions, "
+            "the Python suite must use exactly the required runtime and CI policy exclusions, "
             f"got {excluded!r}"
         )
         report_chars = set("fEsxXpPaAR")
