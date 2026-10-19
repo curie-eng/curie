@@ -123,6 +123,7 @@ tools/factory-e2e/tests/test_scripted_scenario.py
 tools/factory-e2e/tests/test_tls_code_host.py
 tools/fix-pin-ci/tests/test_fix_pin_ci.py
 tools/helm-ci-gate/tests/test_decide.py
+tools/p0-closes-ci/tests/test_p0_closes_ci.py
 tools/preflight/tests/test_full_preflight.py
 tools/preflight/tests/test_preflight.py
 tools/runtime-assertion-gate/tests/test_runtime_assertion_gate.py
