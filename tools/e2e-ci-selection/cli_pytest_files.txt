@@ -40,6 +40,7 @@ examples/tests/test_alert_path_heartbeat.py
 examples/tests/test_dark_factory_bundle.py
 examples/tests/test_dark_factory_review_gate.py
 examples/tests/test_shipped_connector_tests_are_collected.py
+examples/tests/test_sre_bot_metric_alignment.py
 examples/tests/test_sre_bot_observability_runtime.py
 examples/tests/test_sre_bot_reply_format.py
 packages/aci-protocol/tests/test_exporters.py
