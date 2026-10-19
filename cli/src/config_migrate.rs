@@ -1184,9 +1184,7 @@ fn migrate_factory(
                 ci.insert("required".to_string(), required.clone());
             }
             if let Some(keys) = legacy.metadata.get(&path) {
-                if keys.as_array().is_some_and(|keys| !keys.is_empty()) {
-                    ci.insert("metadataRerunKeys".to_string(), keys.clone());
-                }
+                ci.insert("metadataRerunKeys".to_string(), keys.clone());
             }
             if !ci.is_empty() {
                 repo["ci"] = Value::Object(ci);
@@ -1228,6 +1226,23 @@ fn migrate_factory(
                             "factory.bindings must preserve native repository authority"
                         )
                     })?;
+                if let Some(ci) = retained[0].get("ci") {
+                    if !ci.is_object()
+                        || (!legacy.python.contains_key(&path)
+                            && ci
+                                .get("required")
+                                .is_some_and(|required| !required.is_null()))
+                    {
+                        bail!("factory.bindings conflicts with legacy factory configuration");
+                    }
+                    if !legacy.metadata.contains_key(&path)
+                        && ci
+                            .get("metadataRerunKeys")
+                            .is_some_and(|keys| !factory_equal(keys, &json!([])))
+                    {
+                        bail!("factory.bindings conflicts with legacy factory policy");
+                    }
+                }
                 repo["alias"] = retained[0].get("alias").cloned().ok_or_else(|| {
                     anyhow::anyhow!("factory.bindings requires repository aliases")
                 })?;

@@ -672,7 +672,10 @@ fn legacy_factory_without_required_ci_validates_chart_schema() {
             let mut typed = equal_typed_factory();
             let retained_repo = &mut typed["bindings"][0]["repos"][0];
             if metadata_only {
-                retained_repo["ci"].as_object_mut().unwrap().remove("required");
+                retained_repo["ci"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("required");
             } else {
                 retained_repo.as_object_mut().unwrap().remove("ci");
             }
@@ -745,10 +748,7 @@ fn legacy_factory_without_ci_refuses_retained_metadata_ci_with_setting_names_onl
     assert_factory_error(
         values,
         "factory.bindings",
-        &[
-            "metadata-ci-sentinel-4753",
-            "metadata-status-sentinel-4753",
-        ],
+        &["metadata-ci-sentinel-4753", "metadata-status-sentinel-4753"],
     );
 }
 
