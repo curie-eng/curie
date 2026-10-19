@@ -987,12 +987,13 @@ sequenceDiagram
 
 Not shown above:
 
-- **Settlement.** An approval holds the request until its deadline. A turn
-  without a publication fails as `no_pull_request` or `early_stop`. A turn with
-  one leaves the terminus to the CI gate
-  ([`apps/api/src/curie_api/factory_ci.py::gate`](apps/api/src/curie_api/factory_ci.py)),
-  which reruns failed GitHub Actions jobs once and never treats unreadable CI
-  as success.
+**Settlement.** An approval holds the request until its deadline. An unpublished
+turn fails as `early_stop` for no work, `no_pull_request` for a first run without
+a recorded pull request, or `revision_unchanged` for a revision with a recorded
+pull request. A publication leaves the terminus to the CI gate
+([`apps/api/src/curie_api/factory_ci.py::gate`](apps/api/src/curie_api/factory_ci.py)),
+which reruns failed GitHub Actions jobs once and never treats unreadable CI as success.
+
 - **Stopping.** Unlabel, close, relabel of running work, the deadline, and a
   lost owner move a running request to `cancellation_requested`; a
   `work-item-{id}-terminate` wake tears the sandbox down, and the request
@@ -1327,7 +1328,9 @@ ladder; see the workflow file for the complete, current list. Notable ones:
 
 - `python` (ruff + mypy + pytest) — the one that boots the full compose stack, runs real Alembic migrations on a virgin Postgres (`version_table_schema=curie`, [`apps/api/alembic/env.py::do_run_migrations`](apps/api/alembic/env.py)), and runs the whole workspace pytest suite against those live services
 - `rust`, `rust-build` (the release binary), `contracts-ts`, `ui` (lint + vitest + build + headless Playwright)
-- `ci-images`, `images`, `dispatcher-image-smoke`, `mail-adapter-image-smoke`, `ui-image-smoke` — the **image build gates**. `ci-images` builds every image CI runs (api, dispatcher, worker, ui, runner, mail-adapter, the worker-local overlay, and a Postgres fixture) once per run and uploads each as an artifact; every smoke and ladder job loads those archives instead of rebuilding. `images` cross-builds the two example connectors for both architectures. An operator reading this list to know what protects a release needs them named, since a green `python` says nothing about whether the images build.
+
+The image gates are `ci-images`, `images`, and `image-proofs`. `ci-images` builds every image CI runs (api, dispatcher, worker, ui, runner, mail-adapter, the worker-local overlay, and a Postgres fixture) once per run and uploads each as an artifact; smoke and ladder groups load those archives instead of rebuilding. `image-proofs` groups the Dispatcher, Mail adapter, UI, and Toolchain checks with the Docker daemon build and escape test. `images` cross-builds the two example connectors for both architectures. A green `python` says nothing about whether these images build or run correctly.
+
 - `eval-falsifiability`, `commit-messages` (no AI attribution)
 - `e2e-ladder`, `e2e-ladder-release`, `e2e-ladder-cluster` — the parity ladder's three rungs, each its own job, gated by an internal `changes` path filter
 - `e2e-cluster-chart-regressions` — the chart runtime proofs, run as a matrix chosen by the `chart_legs` selector output: a `workload` leg (workspace dependency diagnostic, quota progress) and a `chart` leg (Langfuse Postgres readiness, connector readiness, runner BYO egress, controller preflight, and the render and admission proofs), each on its own Calico kind cluster, in parallel with the cluster rung and on the same cluster tier; `e2e-cluster-rollout-recovery` — the rollout-free first invocation and dead-consumer recovery proof, on pushes and dispatches (including the nightly kind dispatch on `next`), never on pull requests; `e2e-required` requires its success whenever it is selected and treats it as skipped otherwise; `e2e-cluster-approval-resume-restarts` is the #4016 proof that an approval resolved while Valkey and the worker restart still resumes the original turn within 300 s, on pull requests too, selected by worker and approval paths and gated by `e2e-required` the same way
