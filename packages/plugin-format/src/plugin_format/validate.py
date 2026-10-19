@@ -42,11 +42,6 @@ from .connectors import (
 from .connectors import _is_valid_name as _is_valid_connector_name
 from .deploy_targets import DeployTargetsFile, validate_deploy_targets
 from .gate_summary import check_gate_summary_template
-from .input_contracts import (
-    INPUT_CONTRACT_ENFORCEMENT,
-    InputContractsInvalid,
-    parse_input_contracts,
-)
 from .manifest import resolve_manifest
 from .models import (
     _TRIGGER_TYPES,
@@ -124,19 +119,9 @@ def validate_bundle(
     path: str | Path,
     *,
     enforces_tool_policy: str | None = None,
-    enforces_input_contracts: str | None = None,
-    input_contract_context: str = "tracked-implementation",
     profile: str = PROFILE_CLAUDE_PLUGIN,
 ) -> ValidationResult:
     """Validate the plugin bundle at ``path`` and return a ValidationResult.
-
-    ``enforces_input_contracts`` similarly names admission AND start enforcement
-    of opaque input identity. A declaration-bearing bundle is refused unless the
-    caller passes ``curie/input-contracts@1``; this is never inferred from an ID
-    parser or a passing local authoring report. ``input_contract_context`` is
-    explicit: standalone evaluation has no tracker implementation admission and
-    validates declaration syntax without claiming enforcement. The default is
-    tracked implementation and requires the handshake. Unknown contexts refuse.
 
     ``enforces_tool_policy`` is the CALLER's statement of which vanilla MCP
     tool-policy contract it enforces at runtime. It is the enforcement handshake,
@@ -182,8 +167,6 @@ def validate_bundle(
     passes a profile, so neither can trigger it.
     """
 
-    if input_contract_context not in {"tracked-implementation", "standalone"}:
-        raise ValueError("unknown input contract context")
     if profile not in PROFILES:
         raise ValueError(
             f"unknown validation profile {profile!r}: expected "
@@ -212,24 +195,6 @@ def validate_bundle(
         connector_servers = connector_server_names(root)
         _validate_approval_policy(manifest, mcp_servers, connector_servers, c)
         _validate_tool_policy(manifest, mcp_servers, connector_servers, enforces_tool_policy, c)
-        if "inputContracts" in manifest.model_fields_set:
-            try:
-                parse_input_contracts(manifest.inputContracts)
-            except InputContractsInvalid:
-                c.error(
-                    "input_contracts.invalid",
-                    "invalid inputContracts declaration",
-                    "inputContracts",
-                )
-            if (
-                input_contract_context == "tracked-implementation"
-                and enforces_input_contracts != INPUT_CONTRACT_ENFORCEMENT
-            ):
-                c.error(
-                    "input_contracts.unenforceable",
-                    "inputContracts requires admission and start enforcement",
-                    "inputContracts",
-                )
         _validate_secrets(manifest, c)
         _validate_scripts(root, c)
         _validate_connectors(root, c)

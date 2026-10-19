@@ -114,10 +114,6 @@ class Tracker(Protocol):
         """Whether ``actor`` may start a run on ``issue`` (ADR 0197, "Authority")."""
         ...
 
-    async def read_input_body(self, issue: TrackerIssueRef) -> str:
-        """Current input body without title, comments or presentation changes."""
-        ...
-
     async def read_ticket(self, issue: TrackerIssueRef) -> str:
         """The ticket as markdown for the sandbox. Nothing is stored."""
         ...

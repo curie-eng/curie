@@ -620,39 +620,6 @@
           ],
           "title": "History Token"
         },
-        "input_contract_context": {
-          "anyOf": [
-            {
-              "pattern": "^(standalone|tracked-implementation)$",
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "env": "CURIE_INPUT_CONTRACT_CONTEXT",
-          "producer": [
-            "worker"
-          ],
-          "title": "Input Contract Context"
-        },
-        "input_contract_enforcement": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "env": "CURIE_INPUT_CONTRACT_ENFORCEMENT",
-          "producer": [
-            "worker"
-          ],
-          "title": "Input Contract Enforcement"
-        },
         "issue_read_token": {
           "anyOf": [
             {
@@ -2084,6 +2051,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.24",
-  "title": "ACI Protocol v0.5.24"
+  "protocolVersion": "0.5.23",
+  "title": "ACI Protocol v0.5.23"
 }

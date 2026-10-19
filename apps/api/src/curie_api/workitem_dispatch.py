@@ -34,7 +34,6 @@ from curie_api.workitems.lifecycle import (
     terminalize_execution,
 )
 
-from . import input_contracts
 from .config import Settings, get_settings
 from .factory_notices import start_failed_sentence
 from .factory_reply_target import reply_columns
@@ -87,8 +86,6 @@ RefusalCode = Literal[
     "factory_binding_changed",
     "factory_surface_mismatch",
     "factory_start_failed",
-    "input_contract_unknown",
-    "input_contract_mismatch",
 ]
 
 DispatchResult = WorkItemOutcome | WorkItemConflict
@@ -127,7 +124,6 @@ class Admission:
     # the WorkItem at admission and readmission. None for an admission no label
     # started (a revision, review feedback, the work-items API).
     trigger_label: str | None = None
-    input_contract_receipt: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -146,7 +142,6 @@ class AcquireGrant:
     wait_deadline: datetime
     repository_path: str
     context: FactoryContext
-    input_contract_receipt: dict[str, Any] | None = None
 
 
 class FactoryWake(BaseModel):
@@ -183,7 +178,6 @@ class RunningResult:
     execution_deadline: datetime
     context: FactoryContext | None
     refusal: RefusalCode | None
-    input_contract_receipt: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -265,13 +259,12 @@ def _facts_conversation(facts: Any, adapter: str | None) -> str:
     return route_thread_key(facts.kind, adapter, facts.address, facts.reply_conversation_id)
 
 
-def _snapshot_values(facts: Any) -> dict[str, Any]:
+def _snapshot_values(facts: Any) -> dict[str, str | None]:
     # Only factory review feedback names a pull request reply target; every
     # other admission (an issue label or mention, the work-items API) answers
     # on the tracker issue.
     reply = reply_columns(getattr(facts, "reply_target", None), getattr(facts, "reply_url", None))
     return {
-        "input_contract_receipt": getattr(facts, "input_contract_receipt", None),
         "objective": facts.objective,
         "requester": facts.requester,
         "reply_kind": facts.kind,
@@ -282,11 +275,7 @@ def _snapshot_values(facts: Any) -> dict[str, Any]:
 
 
 def _snapshot_matches(row: ExecutionRequest, facts: Any) -> bool:
-    return all(
-        getattr(row, column) == value
-        for column, value in _snapshot_values(facts).items()
-        if column != "input_contract_receipt" or value is not None
-    )
+    return all(getattr(row, column) == value for column, value in _snapshot_values(facts).items())
 
 
 def _work_item_matches(item: WorkItem, facts: Any, adapter: str | None) -> bool:
@@ -319,18 +308,6 @@ async def _write_snapshot(
             updated_at=func.clock_timestamp(),
         )
     )
-    receipt = getattr(facts, "input_contract_receipt", None)
-    if receipt is not None:
-        await session.execute(
-            update(ExecutionRequest)
-            .where(
-                ExecutionRequest.id == request_id,
-                ExecutionRequest.input_contract_receipt.is_(None),
-                ExecutionRequest.objective == facts.objective,
-                ExecutionRequest.requester == facts.requester,
-            )
-            .values(input_contract_receipt=receipt)
-        )
     row = await reload_request(session, request_id)
     if not _snapshot_matches(row, facts):
         return await _refuse(session, "identity_mismatch", request_id=request_id)
@@ -412,27 +389,6 @@ async def _admission_refusal(session: AsyncSession, facts: Any) -> DispatchConfl
     return binding
 
 
-def _with_input_contract_receipt(facts: Any, receipt: dict[str, Any] | None) -> Admission:
-    """Normalize admitted facts without requiring callers to use a dataclass."""
-    return Admission(
-        agent_id=facts.agent_id,
-        kind=facts.kind,
-        address=facts.address,
-        reply_conversation_id=facts.reply_conversation_id,
-        issue=facts.issue,
-        repository=facts.repository,
-        code_host_installation_id=facts.code_host_installation_id,
-        objective=facts.objective,
-        requester=facts.requester,
-        request_id=facts.request_id,
-        base=getattr(facts, "base", None),
-        reply_target=getattr(facts, "reply_target", None),
-        reply_url=getattr(facts, "reply_url", None),
-        trigger_label=getattr(facts, "trigger_label", None),
-        input_contract_receipt=receipt,
-    )
-
-
 async def admit(
     session: AsyncSession, facts: Any
 ) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
@@ -444,11 +400,6 @@ async def admit(
     )
     if existing is not None:
         return await _replay_existing(session, existing, facts, resolved.adapter)
-    try:
-        receipt = await input_contracts.check_admission_input(session, facts)
-    except input_contracts.InputCompatibilityError as exc:
-        return await _refuse(session, cast(RefusalCode, exc.code))
-    facts = _with_input_contract_receipt(facts, receipt)
     return await _admit_new(session, facts, resolved.adapter)
 
 
@@ -465,11 +416,6 @@ async def admit_revision(
     )
     if existing is not None:
         return await _replay_existing(session, existing, facts, resolved.adapter)
-    try:
-        receipt = await input_contracts.check_admission_input(session, facts)
-    except input_contracts.InputCompatibilityError as exc:
-        return await _refuse(session, cast(RefusalCode, exc.code))
-    facts = _with_input_contract_receipt(facts, receipt)
     work_item = await session.scalar(
         select(WorkItem)
         .where(*lifecycle.for_tracker_issue(facts.issue))
@@ -518,11 +464,6 @@ async def readmit(
     )
     if existing is not None:
         return await _replay_existing(session, existing, facts, resolved.adapter)
-    try:
-        receipt = await input_contracts.check_admission_input(session, facts)
-    except input_contracts.InputCompatibilityError as exc:
-        return await _refuse(session, cast(RefusalCode, exc.code))
-    facts = _with_input_contract_receipt(facts, receipt)
     work_item = await session.scalar(
         select(WorkItem).where(*lifecycle.for_tracker_issue(facts.issue))
     )
@@ -943,7 +884,6 @@ async def acquire(
         wait_deadline=deadline,
         repository_path=work_item.repository_path,
         context=current,
-        input_contract_receipt=request.input_contract_receipt,
     )
     await session.commit()
     return grant
@@ -1110,9 +1050,6 @@ async def start(
     claim_name: str,
     sandbox_name: str,
     context: FactoryContext,
-    runtime_deployment_id: uuid.UUID | None = None,
-    runtime_version_id: uuid.UUID | None = None,
-    runtime_bundle_sha256: str | None = None,
 ) -> StartResult | DispatchConflict:
     locked = await _lock_pair(session, request_id)
     if isinstance(locked, DispatchConflict):
@@ -1148,22 +1085,6 @@ async def start(
     if refusal is not None:
         return await _defer_factory_refusal(
             session, work_item, request, owner=owner, generation=generation, refusal=refusal
-        )
-    try:
-        await input_contracts.check_start_input(
-            session,
-            work_item,
-            request,
-            runtime_deployment_id=runtime_deployment_id,
-            runtime_version_id=runtime_version_id,
-            runtime_bundle_sha256=runtime_bundle_sha256,
-        )
-    except input_contracts.InputCompatibilityError as exc:
-        return await _refuse(
-            session,
-            cast(RefusalCode, exc.code),
-            work_item_id=work_item.id,
-            request_id=request.id,
         )
     settings = get_settings()
     ttl = timedelta(seconds=settings.work_item_runtime_ttl_seconds)
@@ -1764,7 +1685,6 @@ async def running_for_conversation(
         execution_deadline=running.execution_deadline,
         context=current if isinstance(current, FactoryContext) else None,
         refusal=current if isinstance(current, str) else None,
-        input_contract_receipt=running.input_contract_receipt,
     )
     await session.commit()
     return "running", result

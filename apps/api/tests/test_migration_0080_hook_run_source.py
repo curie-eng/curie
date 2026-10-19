@@ -92,7 +92,7 @@ def test_0080_is_expand_after_0079_and_precedes_the_single_candidate_head() -> N
     # #2911 appends tenant scope (0101) after the OIDC login revision, and #3831
     # the reply target (0102), tracker identity (0103), trigger label (0105),
     # identity links (0107) and stable history join (0108) follow that.
-    assert script.get_heads() == ["0109"]
+    assert script.get_heads() == ["0108"]
     candidate = script.get_revision("0081")
     assert candidate is not None
     assert candidate.down_revision == REVISION

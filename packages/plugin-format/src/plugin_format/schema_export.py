@@ -27,7 +27,6 @@ from .models import (
     Author,
     HookDefinition,
     HookMatcherConfig,
-    InputContractsDeclaration,
     McpConfig,
     McpServer,
     PluginManifest,
@@ -37,7 +36,6 @@ from .models import (
 )
 
 _MODELS = (
-    InputContractsDeclaration,
     PluginManifest,
     Author,
     SkillFrontmatter,

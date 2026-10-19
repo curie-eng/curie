@@ -13,7 +13,7 @@ Shapes covered:
     .mcp.json                    McpConfig / McpServer
 """
 
-from typing import Annotated, Any, Final, Literal
+from typing import Any, Final
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -24,23 +24,6 @@ PLATFORM_SLACK_GRANT_FIELDS: Final = ("channelRead", "canvasList", "canvasRead",
 # Forward compatible: accept and keep unknown keys rather than failing a real
 # bundle that carries fields we do not model yet.
 _LENIENT = ConfigDict(extra="allow", populate_by_name=True)
-
-
-InputContractIdentifier = Annotated[
-    str, Field(pattern=r"^[A-Za-z0-9._/:@-]{1,200}$", strict=True)
-]
-
-
-class InputContractsDeclaration(BaseModel):
-    """Strict generic input compatibility shape, not coworker input semantics."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    interface: Literal["curie/input-contracts@1"]
-    accepts: list[InputContractIdentifier] = Field(
-        min_length=1, max_length=32, json_schema_extra={"uniqueItems": True}
-    )
-    required: Literal[True]
 
 
 class Author(BaseModel):
@@ -115,8 +98,6 @@ class PluginManifest(BaseModel):
     # validator error rather than an opaque manifest-level pydantic failure that
     # would reject the whole bundle.
     toolPolicy: dict[str, Any] | None = None
-    # Generic opaque input compatibility, enforced before admission and start.
-    inputContracts: dict[str, Any] | None = None
     # Permission for a platform owned channel read capability under ADR 0100.
     # Only literal true grants it; the value carries no selectors or credentials.
     channelRead: bool = Field(default=False, strict=True)

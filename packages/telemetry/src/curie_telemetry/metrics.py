@@ -377,7 +377,6 @@ _HTTP_OPERATIONS = [
     "/deploy-targets/resolve",
     "/deployments",
     "/deployments/{deployment_id}",
-    "/deployments/{deployment_id}/input-contracts",
     "/evals/matrix",
     "/evals/report",
     "/evals/trigger",

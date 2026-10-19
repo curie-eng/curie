@@ -6621,64 +6621,6 @@
         "title": "HookSupportOut",
         "type": "object"
       },
-      "InputContractsOut": {
-        "properties": {
-          "accepted_contracts": {
-            "items": {
-              "type": "string"
-            },
-            "title": "Accepted Contracts",
-            "type": "array"
-          },
-          "agent_id": {
-            "format": "uuid",
-            "title": "Agent Id",
-            "type": "string"
-          },
-          "bundle_sha256": {
-            "pattern": "^[0-9a-f]{64}$",
-            "title": "Bundle Sha256",
-            "type": "string"
-          },
-          "deployment_id": {
-            "format": "uuid",
-            "title": "Deployment Id",
-            "type": "string"
-          },
-          "enforced": {
-            "const": true,
-            "title": "Enforced",
-            "type": "boolean"
-          },
-          "interface": {
-            "const": "curie/input-contracts@1",
-            "title": "Interface",
-            "type": "string"
-          },
-          "status": {
-            "const": "active",
-            "title": "Status",
-            "type": "string"
-          },
-          "version_id": {
-            "format": "uuid",
-            "title": "Version Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "interface",
-          "deployment_id",
-          "agent_id",
-          "version_id",
-          "bundle_sha256",
-          "accepted_contracts",
-          "status",
-          "enforced"
-        ],
-        "title": "InputContractsOut",
-        "type": "object"
-      },
       "IssueReadContext": {
         "description": "The execution scoped capability and the one issue it names: ``issue`` is\nhow a person names it (``curie-eng/curie#12`` on GitHub, ``PROJ-12`` on Jira).",
         "properties": {
@@ -10563,18 +10505,6 @@
             "title": "Generation",
             "type": "integer"
           },
-          "input_contract_receipt": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Input Contract Receipt"
-          },
           "lease_held_to_deadline": {
             "title": "Lease Held To Deadline",
             "type": "boolean"
@@ -10604,9 +10534,7 @@
                   "factory_binding_ambiguous",
                   "factory_binding_changed",
                   "factory_surface_mismatch",
-                  "factory_start_failed",
-                  "input_contract_unknown",
-                  "input_contract_mismatch"
+                  "factory_start_failed"
                 ],
                 "type": "string"
               },
@@ -11242,42 +11170,6 @@
             "minLength": 1,
             "title": "Owner",
             "type": "string"
-          },
-          "runtime_bundle_sha256": {
-            "anyOf": [
-              {
-                "pattern": "^[0-9a-f]{64}$",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Runtime Bundle Sha256"
-          },
-          "runtime_deployment_id": {
-            "anyOf": [
-              {
-                "format": "uuid",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Runtime Deployment Id"
-          },
-          "runtime_version_id": {
-            "anyOf": [
-              {
-                "format": "uuid",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Runtime Version Id"
           },
           "sandbox_name": {
             "minLength": 1,
@@ -21926,65 +21818,6 @@
           }
         },
         "summary": "Get Deployment",
-        "tags": [
-          "deployments"
-        ]
-      }
-    },
-    "/deployments/{deployment_id}/input-contracts": {
-      "get": {
-        "operationId": "read_input_contracts_deployments__deployment_id__input_contracts_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "deployment_id",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "title": "Deployment Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "x-api-key",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Api-Key"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InputContractsOut"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Read Input Contracts",
         "tags": [
           "deployments"
         ]

@@ -57,9 +57,8 @@ CONTRACT = "0041"
 # factory status replies read the typed reply target columns of 0102, and
 # WorkItems are keyed by their tracker issue (0103 contract, #3831), and
 # channel and WorkItem reads carry the trigger label of 0105 (#4361).
-# The 0108 join requires stable reply selectors and identity links; 0109 adds
-# immutable input contract declarations and accepted execution receipts.
-APP_SCHEMA_MIN = "0109"
+# The 0108 join requires both stable reply selectors (0106) and identity links (0107).
+APP_SCHEMA_MIN = "0108"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -146,7 +145,6 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0106",
             "0107",
             "0108",
-            "0109",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -163,9 +161,8 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0106",
             "0107",
             "0108",
-            "0109",
         }
-    assert current_revision() == "0109"
+    assert current_revision() == "0108"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -249,10 +246,10 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # factory status replies read 0102's typed reply target and 0103 keys
     # WorkItems by their tracker issue (#3831), and 0105 adds the trigger
     # label (#4361). The 0108 join also requires stable reply selectors and
-    # identity links; 0109 adds input compatibility metadata, so earlier schemas refuse.
-    for below_tenant_scope in sorted(known - {"0109"}):
+    # identity links, so every earlier schema is refused.
+    for below_tenant_scope in sorted(known - {"0108"}):
         assert can_serve(below_tenant_scope, window, known) is False
-    assert can_serve("0109", window, known) is True
+    assert can_serve("0108", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

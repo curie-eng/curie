@@ -706,7 +706,7 @@ async def create_revision_request(
     request_id: uuid.UUID,
     wait_deadline: datetime,
     expected_work_item_version: int,
-    snapshot: Mapping[str, Any],
+    snapshot: Mapping[str, str | None],
 ) -> WorkItemResult:
     """Store a mention in sequence without interrupting the live request."""
 

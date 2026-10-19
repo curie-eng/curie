@@ -593,40 +593,6 @@
       "title": "HookMatcherConfig",
       "type": "object"
     },
-    "InputContractsDeclaration": {
-      "additionalProperties": false,
-      "description": "Strict generic input compatibility shape, not coworker input semantics.",
-      "properties": {
-        "accepts": {
-          "items": {
-            "pattern": "^[A-Za-z0-9._/:@-]{1,200}$",
-            "type": "string"
-          },
-          "maxItems": 32,
-          "minItems": 1,
-          "title": "Accepts",
-          "type": "array",
-          "uniqueItems": true
-        },
-        "interface": {
-          "const": "curie/input-contracts@1",
-          "title": "Interface",
-          "type": "string"
-        },
-        "required": {
-          "const": true,
-          "title": "Required",
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "interface",
-        "accepts",
-        "required"
-      ],
-      "title": "InputContractsDeclaration",
-      "type": "object"
-    },
     "McpConfig": {
       "additionalProperties": true,
       "description": "The `.mcp.json` document.",
@@ -858,19 +824,6 @@
           ],
           "default": null,
           "title": "Hooks"
-        },
-        "inputContracts": {
-          "anyOf": [
-            {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Inputcontracts"
         },
         "keywords": {
           "anyOf": [

@@ -724,27 +724,15 @@ async def _process_event(
                     lease=lease,
                 )
                 return
-            # Channel routing remains authoritative even when a running
-            # request resolves an older immutable deployment below.
+            # The normal route source: once a turn has resolved, its egress
+            # target is the binding row's,
+            # because endpoints are server-controlled (D4.1). A row that
+            # names none leaves the server-minted handle standing -- the
+            # dispatcher and CLI bind no endpoint of their own.
             route = TargetRoute(
                 endpoint=resolved.endpoint or handle.endpoint,
                 adapter=routing._bound_egress_adapter(resolved.adapter, handle.adapter),
             )
-            pinned_run = (
-                self._work_item_runs.get(owned_work_item_id)
-                if owned_work_item_id is not None else None
-            )
-            if pinned_run is not None and pinned_run.started and pinned_run.input_contract_receipt:
-                reader = getattr(self._binding, "resolve_deployment", None)
-                pinned = (
-                    await reader(resolved.agent_id, pinned_run.runtime_deployment_id)
-                    if reader is not None and pinned_run.runtime_deployment_id is not None
-                    else None
-                )
-                if pinned is None:
-                    logger.info("accepted input runtime unavailable for %s", event_id)
-                    return
-                resolved = pinned
             constants._TURN_AGENT.set(getattr(resolved, "agent_name", None))
             hook_carry = constants._HOOK_RUN_CARRY.get()
             if (
@@ -833,30 +821,6 @@ async def _process_event(
                 else None
             )
             if caller_for_boot is not None:
-                receipt = caller_for_boot.input_contract_receipt
-                if not caller_for_boot.started:
-                    caller_for_boot.runtime_deployment_id = getattr(resolved, "deployment_id", None)
-                    caller_for_boot.runtime_version_id = getattr(resolved, "version_id", None)
-                    caller_for_boot.runtime_bundle_sha256 = getattr(resolved, "bundle_sha256", None)
-                if receipt is not None:
-                    matches = isinstance(receipt, dict) and (
-                        receipt.get("interface") == "curie/input-contracts@1"
-                        and receipt.get("deployment_id")
-                        == str(getattr(resolved, "deployment_id", None))
-                        and receipt.get("version_id") == str(getattr(resolved, "version_id", None))
-                        and receipt.get("bundle_sha256") == getattr(resolved, "bundle_sha256", None)
-                    )
-                    if not matches:
-                        logger.info("input contract runtime mismatch for %s", event_id)
-                        if not caller_for_boot.started:
-                            try:
-                                await caller_for_boot.defer(
-                                    "input_contract_mismatch", capacity=False
-                                )
-                            except (WorkItemConflict, WorkItemTransportError):
-                                logger.info("input contract deferral unavailable for %s", event_id)
-                        return
-                    boot_env_kwargs["input_contract_enforcement"] = "curie/input-contracts@1"
                 if caller_for_boot.execution_deadline is not None:
                     caller_ceiling = int(caller_for_boot.execution_deadline.timestamp())
                 else:

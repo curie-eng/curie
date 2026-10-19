@@ -496,9 +496,6 @@ class AgentVersion(Base):
     version_label: Mapped[str]
     bundle_ref: Mapped[str | None] = mapped_column(default=None)
     bundle_sha256: Mapped[str | None] = mapped_column(default=None)
-    input_contracts: Mapped[dict[str, Any] | None] = mapped_column(
-        JSONB(none_as_null=True), default=None
-    )
     # The git commit this version was built from (J1); lets promote reuse the
     # already-built bundle instead of rebuilding.
     commit_sha: Mapped[str | None] = mapped_column(default=None, index=True)
@@ -978,30 +975,11 @@ REPLY_TARGET_CHECK = (
 )
 
 
-# Migration 0109 carries a frozen copy of this nullable, exact receipt shape.
-INPUT_CONTRACT_RECEIPT_CHECK = (
-    "input_contract_receipt IS NULL OR CASE "
-    "WHEN jsonb_typeof(input_contract_receipt) = 'object' THEN ("
-    "input_contract_receipt - ARRAY['interface','contract','deployment_id',"
-    "'version_id','bundle_sha256','body_sha256']::text[] = '{}'::jsonb "
-    "AND jsonb_typeof(input_contract_receipt->'interface') = 'string' "
-    "AND jsonb_typeof(input_contract_receipt->'contract') = 'string' "
-    "AND jsonb_typeof(input_contract_receipt->'deployment_id') = 'string' "
-    "AND jsonb_typeof(input_contract_receipt->'version_id') = 'string' "
-    "AND jsonb_typeof(input_contract_receipt->'bundle_sha256') = 'string' "
-    "AND jsonb_typeof(input_contract_receipt->'body_sha256') = 'string'"
-    ") IS TRUE ELSE FALSE END"
-)
-
-
 class ExecutionRequest(Base):
     """One bounded execution attempt owned by a WorkItem."""
 
     __tablename__ = "execution_requests"
     __table_args__ = (
-        CheckConstraint(
-            INPUT_CONTRACT_RECEIPT_CHECK, name="execution_requests_input_contract_receipt_ck"
-        ),
         CheckConstraint("sequence > 0", name="execution_requests_sequence_ck"),
         CheckConstraint("version >= 1", name="execution_requests_version_ck"),
         CheckConstraint(
@@ -1163,9 +1141,6 @@ class ExecutionRequest(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     work_item_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
-    )
-    input_contract_receipt: Mapped[dict[str, Any] | None] = mapped_column(
-        JSONB(none_as_null=True), default=None
     )
     sequence: Mapped[int]
     status: Mapped[str] = mapped_column(default="waiting", server_default="waiting")
