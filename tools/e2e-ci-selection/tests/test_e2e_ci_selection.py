@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -28,6 +29,18 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
 REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+CI_POLICY_DIRS = (
+    "tools/ci-retry-gate",
+    "tools/ci-workflow-paths",
+    "tools/ci-release-target-parity",
+    "tools/e2e-ci-selection",
+    "tools/helm-ci-gate",
+    "tools/fix-pin-ci",
+    "tools/p0-closes-ci",
+    "tools/runtime-assertion-gate",
+    "tools/dependency-audit-paths",
+    "tools/close-on-next",
+)
 INITIAL_BINDING_MODULE = "tools/factory-e2e/tests/test_c4_initial_binding.py"
 CLUSTER_UP_MODULE = "tools/factory-e2e/tests/test_c4_cluster_up.py"
 INITIAL_BINDING_INPUTS = (
@@ -419,8 +432,314 @@ def _expected_conditional_deselect(*paths: str, pytest_needed: bool = True) -> s
     )
 
 
+def _expected_ci_policy_files(
+    *paths: str, registry: Path = REGISTRY, push: bool = False
+) -> tuple[str, ...]:
+    entries = yaml.safe_load(registry.read_text())["ci_policy_tests"]
+    return tuple(sorted(
+        module for module, inputs in entries.items()
+        if push or any(
+            path == prefix or path.startswith(prefix + "/")
+            for path in paths for prefix in inputs
+        )
+    ))
+
+
+def _assert_ci_policy_registry(root: Path, entries: dict[str, list[str]]) -> None:
+    root = root.resolve()
+    discovered = {
+        path.relative_to(root).as_posix()
+        for directory in CI_POLICY_DIRS
+        for path in (root / directory / "tests").rglob("test_*.py")
+        if path.is_file()
+    }
+    assert set(entries) == discovered, (
+        f"missing modules: {sorted(discovered - set(entries))}; "
+        f"stale modules: {sorted(set(entries) - discovered)}"
+    )
+    for module in sorted(discovered):
+        inputs = entries[module]
+        owner = next(
+            directory for directory in CI_POLICY_DIRS if module.startswith(directory + "/")
+        )
+        assert ".github" in inputs, f"{module}: missing .github input"
+        assert owner in inputs, f"{module}: missing {owner} input"
+        assert not {"", ".", "./"}.intersection(inputs), module
+        try:
+            tree = ast.parse((root / module).read_text(), filename=module)
+        except (OSError, UnicodeError, SyntaxError) as error:
+            raise AssertionError(f"{module}: cannot parse required source: {error}") from error
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            literal = node.value
+            if "/" not in literal or Path(literal).is_absolute():
+                continue
+            try:
+                target = (root / literal).resolve()
+                relative = target.relative_to(root).as_posix()
+                exists = target.exists()
+            except (OSError, ValueError):
+                continue
+            if relative == "." or not exists:
+                continue
+            assert any(
+                relative == prefix or relative.startswith(prefix + "/") for prefix in inputs
+            ), f"{module}: undeclared repository path {relative}"
+
+
+def test_ci_policy_registry_covers_modules_and_existing_path_literals() -> None:
+    _assert_ci_policy_registry(REPO_ROOT, yaml.safe_load(REGISTRY.read_text())["ci_policy_tests"])
+
+
+def _policy_guard_fixture(tmp_path: Path) -> dict[str, list[str]]:
+    entries: dict[str, list[str]] = yaml.safe_load(REGISTRY.read_text())["ci_policy_tests"]
+    for directory in CI_POLICY_DIRS:
+        for source in (REPO_ROOT / directory / "tests").rglob("test_*.py"):
+            destination = tmp_path / source.relative_to(REPO_ROOT)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+    return entries
+
+
+def test_ci_policy_guard_covers_existing_ignored_build_directories(tmp_path: Path) -> None:
+    entries = _policy_guard_fixture(tmp_path)
+    for directory in ("target", "dist"):
+        (tmp_path / "cli" / directory).mkdir(parents=True, exist_ok=True)
+    _assert_ci_policy_registry(tmp_path, entries)
+
+    module = "tools/ci-workflow-paths/tests/test_workflow_paths.py"
+    entries[module].remove("cli")
+    with pytest.raises(
+        AssertionError, match=re.escape(module) + r": undeclared repository path cli/(target|dist)"
+    ):
+        _assert_ci_policy_registry(tmp_path, entries)
+    entries[module].append("cli")
+    _assert_ci_policy_registry(tmp_path, entries)
+
+
+def test_ci_policy_guard_rejects_missing_entry(tmp_path: Path) -> None:
+    entries = _policy_guard_fixture(tmp_path)
+    _assert_ci_policy_registry(tmp_path, entries)
+    module = "tools/ci-release-target-parity/tests/test_release_target_parity.py"
+    del entries[module]
+    with pytest.raises(AssertionError, match=re.escape(module)):
+        _assert_ci_policy_registry(tmp_path, entries)
+
+
+def test_ci_policy_guard_rejects_undeclared_literal_and_accepts_covered_literal(
+    tmp_path: Path,
+) -> None:
+    entries = _policy_guard_fixture(tmp_path)
+    module = "tools/ci-release-target-parity/tests/test_release_target_parity.py"
+    literal = "/".join(("inputs", "undeclared.txt"))
+    target = tmp_path / literal
+    target.parent.mkdir()
+    target.write_text("input\n")
+    source = tmp_path / module
+    source.write_text(source.read_text() + f"\nNEW_INPUT = {literal!r}\n")
+    diagnostic = module + ": undeclared repository path " + literal
+    with pytest.raises(AssertionError, match=re.escape(diagnostic)):
+        _assert_ci_policy_registry(tmp_path, entries)
+    entries[module].append("inputs")
+    _assert_ci_policy_registry(tmp_path, entries)
+
+
+def test_ci_policy_guard_accepts_registered_new_nested_module(tmp_path: Path) -> None:
+    entries = _policy_guard_fixture(tmp_path)
+    module = "tools/ci-release-target-parity/tests/nested/test_added_policy.py"
+    source = tmp_path / module
+    source.parent.mkdir()
+    source.write_text("INPUT = './tools/ci-release-target-parity/tests/../tests'\n")
+    with pytest.raises(AssertionError, match=re.escape(module)):
+        _assert_ci_policy_registry(tmp_path, entries)
+    entries[module] = [".github", "tools/ci-release-target-parity"]
+    _assert_ci_policy_registry(tmp_path, entries)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing", "unreadable", "syntax", "stale", "github", "owner"]
+)
+def test_ci_policy_guard_fails_closed_on_required_source_and_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    entries = _policy_guard_fixture(tmp_path)
+    module = "tools/ci-release-target-parity/tests/test_release_target_parity.py"
+    source = tmp_path / module
+    if mutation == "missing":
+        source.unlink()
+    elif mutation == "unreadable":
+        read_text = Path.read_text
+
+        def read(path: Path, *args: Any, **kwargs: Any) -> str:
+            if path == source:
+                raise PermissionError("required source is unreadable")
+            return read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read)
+    elif mutation == "syntax":
+        source.write_text("def broken(\n")
+    elif mutation == "stale":
+        entries[module + ".missing"] = entries[module]
+    else:
+        prefix = ".github" if mutation == "github" else "tools/ci-release-target-parity"
+        entries[module].remove(prefix)
+    with pytest.raises(AssertionError, match=re.escape(module)):
+        _assert_ci_policy_registry(tmp_path, entries)
+
+
+def _assert_policy_output(output: str, expected: tuple[str, ...]) -> None:
+    values = _outputs_of(output)
+    assert values["ci_policy"] == str(bool(expected)).lower()
+    assert values["ci_policy_files"] == ",".join(expected)
+    assert output.count("ci_policy=") == output.count("ci_policy_files=") == 1
+
+
+def test_ci_policy_unrelated_path_is_checked_against_registry(tmp_path: Path) -> None:
+    path = "README.md"
+    assert (REPO_ROOT / path).is_file()
+    assert _expected_ci_policy_files(path) == ()
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    _assert_policy_output(output, ())
+
+
+@pytest.mark.parametrize("directory", CI_POLICY_DIRS)
+def test_ci_policy_tool_change_selects_its_modules_and_guard(
+    tmp_path: Path, directory: str
+) -> None:
+    paths = [
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in (REPO_ROOT / directory / "tests").rglob("test_*.py")
+    ]
+    assert paths
+    expected = _expected_ci_policy_files(paths[0])
+    assert set(paths) <= set(expected)
+    assert Path(__file__).relative_to(REPO_ROOT).as_posix() in expected
+    completed, output = _invoke_selector(tmp_path, paths[0])
+    assert completed.returncode == 0, completed.stderr
+    _assert_policy_output(output, expected)
+
+
+@pytest.mark.parametrize("push,omit_kind", [(False, False), (True, False), (True, True)])
+def test_ci_policy_workflow_and_push_select_all_modules(
+    tmp_path: Path, push: bool, omit_kind: bool
+) -> None:
+    path = ".github/workflows/ci.yaml"
+    entries = yaml.safe_load(REGISTRY.read_text())["ci_policy_tests"]
+    assert all(".github" in inputs for inputs in entries.values())
+    completed, output = _invoke_selector(
+        tmp_path, *(() if push else (path,)), push=push, omit_kind=omit_kind
+    )
+    assert completed.returncode == 0, completed.stderr
+    _assert_policy_output(output, tuple(sorted(entries)))
+
+
+def test_ci_policy_selective_inputs_union_and_order_are_deterministic(tmp_path: Path) -> None:
+    path = "scripts/check-pr-body.sh"
+    expected = _expected_ci_policy_files(path)
+    assert 0 < len(expected) < len(_expected_ci_policy_files(push=True))
+    for paths in ((path,), (path, "README.md", path), ("README.md", path)):
+        completed, output = _invoke_selector(tmp_path, *paths)
+        assert completed.returncode == 0, completed.stderr
+        _assert_policy_output(output, expected)
+    second = ".gitleaks.toml"
+    union = tuple(sorted(set(expected) | set(_expected_ci_policy_files(second))))
+    assert set(expected) < set(union)
+    for paths in ((path, second, path), (second, path)):
+        completed, output = _invoke_selector(tmp_path, *paths)
+        assert completed.returncode == 0, completed.stderr
+        _assert_policy_output(output, union)
+
+
+@pytest.mark.parametrize(
+    "path", ["tools/close-on-next-other/tests/test_new.py", "scripts/check-pr-body.sh.backup"]
+)
+def test_ci_policy_prefix_near_misses_and_unknown_paths_have_no_fallback(
+    tmp_path: Path, path: str
+) -> None:
+    expected = _expected_ci_policy_files(path)
+    target = (
+        "tools/close-on-next/tests/test_close_on_next.py" if path.startswith("tools/")
+        else "tools/ci-retry-gate/tests/test_pr_body.py"
+    )
+    assert target not in expected
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    _assert_policy_output(output, expected)
+
+
+def test_ci_policy_revision_selection_matches_paths_and_empty_diff(tmp_path: Path) -> None:
+    repository = _new_repository(tmp_path)
+    base = _commit_files(repository, {"README.md": "base\n"}, "base")
+    completed, output = _invoke_selector(tmp_path, base=base, head=base, cwd=repository)
+    assert completed.returncode == 0, completed.stderr
+    _assert_policy_output(output, ())
+    assert _outputs_of(output)["pytest"] == "true"
+    path = "scripts/check-pr-body.sh"
+    head = _commit_files(repository, {path: "changed\n"}, "policy input")
+    completed, output = _invoke_selector(tmp_path, base=base, head=head, cwd=repository)
+    assert completed.returncode == 0, completed.stderr
+    _assert_policy_output(output, _expected_ci_policy_files(path))
+    path_mode, path_output = _invoke_selector(tmp_path, path)
+    assert path_mode.returncode == 0, path_mode.stderr
+    assert output == path_output
+
+
+@pytest.mark.parametrize("mutation", [
+    "absent", "not-mapping", "empty", "nonstring-key", "absolute", "traversal", "trailing-slash",
+    "not-test", "comma", "newline", "space", "empty-inputs", "nonlist-inputs", "duplicate-inputs",
+    "absolute-input", "traversal-input", "duplicate-key",
+])
+def test_ci_policy_registry_rejects_malformed_entries(tmp_path: Path, mutation: str) -> None:
+    data = yaml.safe_load(VALID_REGISTRY)
+    module = "tools/e2e-ci-selection/tests/test_e2e_ci_selection.py"
+    entries = data["ci_policy_tests"]
+    if mutation == "absent":
+        del data["ci_policy_tests"]
+    elif mutation in {"not-mapping", "empty"}:
+        data["ci_policy_tests"] = [] if mutation == "not-mapping" else {}
+    elif mutation in {
+        "empty-inputs", "nonlist-inputs", "duplicate-inputs", "absolute-input", "traversal-input"
+    }:
+        entries[module] = {
+            "empty-inputs": [], "nonlist-inputs": ".github",
+            "duplicate-inputs": [".github", ".github"],
+            "absolute-input": ["/tmp/input"], "traversal-input": ["../input"],
+        }[mutation]
+    elif mutation != "duplicate-key":
+        key = {
+            "nonstring-key": 1, "absolute": "/" + module, "traversal": "../" + module,
+            "trailing-slash": module + "/", "not-test": "tools/e2e-ci-selection/readme.py",
+            "comma": module + ",other.py", "newline": module + "\nother.py",
+            "space": module + " other.py",
+        }[mutation]
+        data["ci_policy_tests"] = {key: entries[module]}
+    contents = yaml.safe_dump(data)
+    if mutation == "duplicate-key":
+        contents = VALID_REGISTRY.replace(
+            "ci_policy_tests:\n", "ci_policy_tests:\n  " + module + ": [.github]\n"
+        )
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(contents)
+    completed, output = _invoke_selector(tmp_path, "README.md", registry=registry)
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert output == ""
+
+
+def test_ci_policy_valid_synthetic_registry_remains_live(tmp_path: Path) -> None:
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(VALID_REGISTRY)
+    completed, output = _invoke_selector(tmp_path, ".github/workflows/ci.yaml", registry=registry)
+    assert completed.returncode == 0, completed.stderr
+    _assert_policy_output(
+        output, _expected_ci_policy_files(".github/workflows/ci.yaml", registry=registry)
+    )
+
+
 def _expected_output(
     *selected: str,
+    ci_policy_files: tuple[str, ...],
     pytest_needed: bool = True,
     pytest_deselect: str = "",
     pytest_scope: str = "full",
@@ -441,6 +760,8 @@ def _expected_output(
     lines.append(f"pytest={'true' if pytest_needed else 'false'}")
     lines.append(f"pytest_deselect={pytest_deselect}")
     lines.append(f"pytest_scope={pytest_scope}")
+    lines.append(f"ci_policy={str(bool(ci_policy_files)).lower()}")
+    lines.append("ci_policy_files=" + ",".join(ci_policy_files))
     lines.append(f"images={'true' if images_needed else 'false'}")
     lines.append(f"cli_release={'true' if cli_release_needed else 'false'}")
     lines.append(f"released_upgrade_full={'true' if released_upgrade_full else 'false'}")
@@ -483,6 +804,7 @@ def _assert_selection(
         ),
         released_upgrade_full=False,
         chart_scenarios=_expected_chart_for_path(path),
+        ci_policy_files=_expected_ci_policy_files(path),
     )
 
 
@@ -1487,13 +1809,17 @@ def test_mixed_root_documentation_and_runtime_diff_selects_runtime_tiers(
         "cluster",
         pytest_deselect=ALL_CONDITIONAL,
         chart_scenarios=("quota-progress", "workspace-diagnostic"),
+        ci_policy_files=_expected_ci_policy_files("ARCHITECTURE.md", "apps/api/main.py"),
     )
 
 
 def test_unknown_and_union_selection_are_deterministic(tmp_path: Path) -> None:
     unknown, unknown_output = _invoke_selector(tmp_path, "new-surface/module.py")
     assert unknown.returncode == 0, unknown.stderr
-    assert unknown_output == _expected_output(*BASE_TIERS)
+    assert unknown_output == _expected_output(
+        *BASE_TIERS,
+        ci_policy_files=_expected_ci_policy_files("new-surface/module.py"),
+    )
 
     forward, forward_output = _invoke_selector(
         tmp_path,
@@ -1517,6 +1843,9 @@ def test_unknown_and_union_selection_are_deterministic(tmp_path: Path) -> None:
             "local-release",
             "cluster",
             "released-upgrade",
+            ci_policy_files=_expected_ci_policy_files(
+                "charts/curie/values.yaml", "compose.dev.yaml", "otel/collector.yaml"
+            ),
         )
     )
 
@@ -1532,6 +1861,7 @@ def test_push_selects_every_tier_without_a_repository(tmp_path: Path) -> None:
         released_upgrade_full=True,
         factory=True,
         approval_resume=True,
+        ci_policy_files=_expected_ci_policy_files(push=True),
     )
 
 
@@ -1550,7 +1880,12 @@ def test_omit_kind_drops_cluster_tiers_and_keeps_the_rest(tmp_path: Path) -> Non
     completed, output = _invoke_selector(tmp_path, push=True, omit_kind=True)
     assert completed.returncode == 0, completed.stderr
     # Pushes to both trains omit kind, so they run no upgrade job.
-    assert output == _expected_output(*kept, images_needed=True, cli_release_needed=True)
+    assert output == _expected_output(
+        *kept,
+        images_needed=True,
+        cli_release_needed=True,
+        ci_policy_files=_expected_ci_policy_files(push=True),
+    )
 
     chart, chart_output = _invoke_selector(
         tmp_path,
@@ -1558,7 +1893,10 @@ def test_omit_kind_drops_cluster_tiers_and_keeps_the_rest(tmp_path: Path) -> Non
         omit_kind=True,
     )
     assert chart.returncode == 0, chart.stderr
-    assert chart_output == _expected_output(pytest_needed=True)
+    assert chart_output == _expected_output(
+        pytest_needed=True,
+        ci_policy_files=_expected_ci_policy_files("charts/curie/values.yaml"),
+    )
 
     untouched, untouched_output = _invoke_selector(
         tmp_path,
@@ -1569,6 +1907,7 @@ def test_omit_kind_drops_cluster_tiers_and_keeps_the_rest(tmp_path: Path) -> Non
         "cluster",
         "released-upgrade",
         pytest_needed=True,
+        ci_policy_files=_expected_ci_policy_files("charts/curie/values.yaml"),
     )
 
 
@@ -1624,7 +1963,11 @@ def test_revisions_select_changed_paths_and_unknown_fallback(tmp_path: Path) -> 
         cwd=repository,
     )
     assert known.returncode == 0, known.stderr
-    assert known_output == _expected_output("local", pytest_deselect=ALL_CONDITIONAL)
+    assert known_output == _expected_output(
+        "local",
+        pytest_deselect=ALL_CONDITIONAL,
+        ci_policy_files=_expected_ci_policy_files("compose.dev.yaml"),
+    )
 
     (repository / "new-surface.txt").write_text("new\n")
     subprocess.run(["git", "add", "."], cwd=repository, check=True)
@@ -1643,7 +1986,10 @@ def test_revisions_select_changed_paths_and_unknown_fallback(tmp_path: Path) -> 
         cwd=repository,
     )
     assert unknown.returncode == 0, unknown.stderr
-    assert unknown_output == _expected_output(*BASE_TIERS)
+    assert unknown_output == _expected_output(
+        *BASE_TIERS,
+        ci_policy_files=_expected_ci_policy_files("new-surface.txt"),
+    )
 
 
 # The exact five files of the real v0.11.2 preparation PR #3845, with the
@@ -1665,19 +2011,25 @@ def _version_only_paths(version: str) -> tuple[str, ...]:
 
 # What #3858 runs for a version-only diff: the local-release rung, which
 # exercises version identity on the new commit, and nothing heavier.
-VERSION_ONLY_SELECTION = _expected_output(
-    "local-release",
-    pytest_needed=False,
-    cli_release_needed=True,
-    version_only=True,
-)
+def _version_only_selection() -> str:
+    return _expected_output(
+        "local-release",
+        pytest_needed=False,
+        cli_release_needed=True,
+        version_only=True,
+        ci_policy_files=_expected_ci_policy_files(*_version_only_paths(_repo_version())),
+    )
+
+
 # What the same five paths selected before #3858, and still select whenever
 # the delta is not version-only.
-FULL_PREP_SELECTION = _expected_output(
-    *TIERS,
-    pytest_deselect=_expected_conditional_deselect(*_version_only_paths(_repo_version())),
-    cli_release_needed=True,
-)
+def _full_prep_selection() -> str:
+    return _expected_output(
+        *TIERS,
+        pytest_deselect=_expected_conditional_deselect(*_version_only_paths(_repo_version())),
+        cli_release_needed=True,
+        ci_policy_files=_expected_ci_policy_files(*_version_only_paths(_repo_version())),
+    )
 
 
 @pytest.mark.parametrize("omit_kind", [False, True])
@@ -1689,7 +2041,7 @@ def test_version_only_release_prep_selects_only_the_local_release_rung(
         tmp_path, *_version_only_paths(_repo_version()), omit_kind=omit_kind
     )
     assert completed.returncode == 0, completed.stderr
-    assert output == VERSION_ONLY_SELECTION
+    assert output == _version_only_selection()
 
 
 def test_another_releases_snapshot_is_not_version_only(tmp_path: Path) -> None:
@@ -1697,7 +2049,7 @@ def test_another_releases_snapshot_is_not_version_only(tmp_path: Path) -> None:
     assert _repo_version() != "v9.9.9"
     completed, output = _invoke_selector(tmp_path, *_version_only_paths("v9.9.9"))
     assert completed.returncode == 0, completed.stderr
-    assert output == FULL_PREP_SELECTION
+    assert output == _full_prep_selection()
 
 
 @pytest.mark.parametrize("extra", ["cli/src/main.rs", "README.md"])
@@ -1705,7 +2057,7 @@ def test_any_other_path_makes_the_prep_diff_not_version_only(tmp_path: Path, ext
     """#3858: one path outside the set restores today's selection."""
     completed, output = _invoke_selector(tmp_path, *_version_only_paths(_repo_version()), extra)
     assert completed.returncode == 0, completed.stderr
-    assert output == FULL_PREP_SELECTION
+    assert output == _full_prep_selection()
 
 
 def test_push_is_never_version_only(tmp_path: Path) -> None:
@@ -1774,7 +2126,7 @@ def test_revision_mode_reads_the_version_from_the_head_commit(tmp_path: Path) ->
 
     completed, output = _invoke_selector(tmp_path, base=base, head=head, cwd=repository)
     assert completed.returncode == 0, completed.stderr
-    assert output == VERSION_ONLY_SELECTION
+    assert output == _version_only_selection()
 
     # Negative control: a snapshot named for a version head does not declare
     # is not version-only.
@@ -1814,6 +2166,8 @@ pytest_scopes:
     python_prefixes: [cli/tests]
     test_files: tools/e2e-ci-selection/cli_pytest_files.txt
 conditional_pytest_files: {}
+ci_policy_tests:
+  tools/e2e-ci-selection/tests/test_e2e_ci_selection.py: [.github, tools/e2e-ci-selection]
 rules:
   exact:
     compose.dev.yaml: [local]
@@ -1847,11 +2201,18 @@ def test_exact_path_under_ignored_prefix_is_selected(tmp_path: Path) -> None:
     )
     selected, selected_output = _invoke_selector(tmp_path, "scripts/selected.sh", registry=registry)
     assert selected.returncode == 0, selected.stderr
-    assert selected_output == _expected_output("cluster", chart_scenarios=())
+    assert selected_output == _expected_output(
+        "cluster",
+        chart_scenarios=(),
+        ci_policy_files=_expected_ci_policy_files("scripts/selected.sh", registry=registry),
+    )
     for path in ("scripts/other.sh", "scripts/selected.sh/child.sh"):
         ignored, ignored_output = _invoke_selector(tmp_path, path, registry=registry)
         assert ignored.returncode == 0, ignored.stderr
-        assert ignored_output == _expected_output(pytest_needed=False)
+        assert ignored_output == _expected_output(
+            pytest_needed=False,
+            ci_policy_files=_expected_ci_policy_files(path, registry=registry),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1923,11 +2284,17 @@ def test_exact_ignore_under_selected_prefix_does_not_hide_siblings(tmp_path: Pat
         tmp_path, "charts/curie/README.md/runtime-check.sh", registry=registry
     )
     assert ignored.returncode == sibling.returncode == 0
-    assert ignored_output == _expected_output(pytest_needed=False)
+    assert ignored_output == _expected_output(
+        pytest_needed=False,
+        ci_policy_files=_expected_ci_policy_files("charts/curie/README.md", registry=registry),
+    )
     assert sibling_output == _expected_output(
         "cluster",
         "released-upgrade",
         chart_scenarios=(),
+        ci_policy_files=_expected_ci_policy_files(
+            "charts/curie/README.md/runtime-check.sh", registry=registry
+        ),
     )
 
 
@@ -1936,13 +2303,20 @@ def test_more_specific_ignored_child_of_selected_prefix_is_allowed(tmp_path: Pat
     registry.write_text(VALID_REGISTRY.replace("    docs: []", "    docs: []\n    charts/ci: []"))
     ignored, ignored_output = _invoke_selector(tmp_path, "charts/ci/probe.sh", registry=registry)
     assert ignored.returncode == 0, ignored.stderr
-    assert ignored_output == _expected_output(pytest_needed=False)
+    assert ignored_output == _expected_output(
+        pytest_needed=False,
+        ci_policy_files=_expected_ci_policy_files("charts/ci/probe.sh", registry=registry),
+    )
 
     selected, selected_output = _invoke_selector(
         tmp_path, "charts/curie/values.yaml", registry=registry
     )
     assert selected.returncode == 0, selected.stderr
-    assert selected_output == _expected_output("cluster", "released-upgrade")
+    assert selected_output == _expected_output(
+        "cluster",
+        "released-upgrade",
+        ci_policy_files=_expected_ci_policy_files("charts/curie/values.yaml", registry=registry),
+    )
 
 
 AGGREGATE_EXPRESSIONS = {
@@ -1984,6 +2358,7 @@ def _changes_filter_script() -> str:
     run = next(
         step["run"] for step in workflow["jobs"]["changes"]["steps"] if step.get("id") == "filter"
     )
+    assert isinstance(run, str)
     assert "github.event_name" in run
     assert '"$base_ref" = "next"' in run
     assert run.count("select_tiers.py") == 3
@@ -2042,6 +2417,7 @@ def test_both_trains_omit_kind_on_push_and_keep_full_dispatch(
     full = event == "workflow_dispatch"
     assert output.read_text() == _expected_output(
         *(TIERS if full else TIERS[:3]),
+        ci_policy_files=_expected_ci_policy_files(".github/workflows/ci.yaml"),
         images_needed=True, cli_release_needed=True, released_upgrade_full=full,
         factory=full, approval_resume=full,
     )
@@ -2382,6 +2758,8 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         "pytest": "${{ steps.filter.outputs.pytest }}",
         "pytest_deselect": "${{ steps.filter.outputs.pytest_deselect }}",
         "pytest_scope": "${{ steps.filter.outputs.pytest_scope }}",
+        "ci_policy": "${{ steps.filter.outputs.ci_policy }}",
+        "ci_policy_files": "${{ steps.filter.outputs.ci_policy_files }}",
         "version_only": "${{ steps.filter.outputs.version_only }}",
         "factory": "${{ steps.filter.outputs.factory }}",
         "approval_resume": "${{ steps.filter.outputs.approval_resume }}",
@@ -3200,7 +3578,10 @@ def test_e2e_required_fails_unless_runtime_assertion_registration_succeeds(value
 def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
     selected, output = _invoke_selector(tmp_path, "ARCHITECTURE.md")
     assert selected.returncode == 0, selected.stderr
-    assert output == _expected_output(pytest_needed=False)
+    assert output == _expected_output(
+        pytest_needed=False,
+        ci_policy_files=_expected_ci_policy_files("ARCHITECTURE.md"),
+    )
     outputs = dict(line.split("=", maxsplit=1) for line in output.splitlines())
 
     skipped = _run_aggregate(
@@ -3344,13 +3725,28 @@ def test_aggregate_pull_request_smoke_runs_matrix_and_negative_only(
         "event_name": "pull_request",
         "released_upgrade_selected": "true",
         "released_upgrade_full": "false",
+        "released_upgrade_result": "skipped",
         "released_upgrade_negative_result": "success",
         "upgrade_matrix_result": "success",
     }
-    ok = _run_aggregate(**state)
+    ok = _run_aggregate(
+        event_name=state["event_name"],
+        released_upgrade_selected=state["released_upgrade_selected"],
+        released_upgrade_full=state["released_upgrade_full"],
+        released_upgrade_result=state["released_upgrade_result"],
+        released_upgrade_negative_result=state["released_upgrade_negative_result"],
+        upgrade_matrix_result=state["upgrade_matrix_result"],
+    )
     assert ok.returncode == 0, ok.stdout + ok.stderr
     state[result_name] = result
-    rejected = _run_aggregate(**state)
+    rejected = _run_aggregate(
+        event_name=state["event_name"],
+        released_upgrade_selected=state["released_upgrade_selected"],
+        released_upgrade_full=state["released_upgrade_full"],
+        released_upgrade_result=state["released_upgrade_result"],
+        released_upgrade_negative_result=state["released_upgrade_negative_result"],
+        upgrade_matrix_result=state["upgrade_matrix_result"],
+    )
     assert rejected.returncode != 0, (result_name, result)
 
 
@@ -3363,7 +3759,15 @@ def test_aggregate_requires_released_jobs_skip_when_unselected(
 ) -> None:
     ok = _run_aggregate()
     assert ok.returncode == 0, ok.stdout + ok.stderr
-    rejected = _run_aggregate(**{result_name: result})
+    state = {
+        "released_upgrade_result": "skipped",
+        "released_upgrade_negative_result": "skipped",
+    }
+    state[result_name] = result
+    rejected = _run_aggregate(
+        released_upgrade_result=state["released_upgrade_result"],
+        released_upgrade_negative_result=state["released_upgrade_negative_result"],
+    )
     assert rejected.returncode != 0, (result_name, result)
 
 
@@ -3376,7 +3780,13 @@ def test_aggregate_rejects_missing_or_full_only_negative_expectation(mutation: s
         "released_upgrade_negative_result": "success",
         "upgrade_matrix_result": "success",
     }
-    unmutated = _run_aggregate(**state)
+    unmutated = _run_aggregate(
+        event_name=state["event_name"],
+        released_upgrade_selected=state["released_upgrade_selected"],
+        released_upgrade_full=state["released_upgrade_full"],
+        released_upgrade_negative_result=state["released_upgrade_negative_result"],
+        upgrade_matrix_result=state["upgrade_matrix_result"],
+    )
     assert unmutated.returncode == 0, unmutated.stdout + unmutated.stderr
     check = '"$RELEASED_UPGRADE_NEGATIVE_RESULT" != "$released_upgrade_negative_expected" ||'
 
@@ -3388,7 +3798,14 @@ def test_aggregate_rejects_missing_or_full_only_negative_expectation(mutation: s
         )
         return script.replace(check, replacement, 1)
 
-    rejected = _run_aggregate(script_transform=change_negative, **state)
+    rejected = _run_aggregate(
+        script_transform=change_negative,
+        event_name=state["event_name"],
+        released_upgrade_selected=state["released_upgrade_selected"],
+        released_upgrade_full=state["released_upgrade_full"],
+        released_upgrade_negative_result=state["released_upgrade_negative_result"],
+        upgrade_matrix_result=state["upgrade_matrix_result"],
+    )
     output = rejected.stdout + rejected.stderr
     assert rejected.returncode != 0, output
     if mutation == "omit-negative":
