@@ -1403,7 +1403,13 @@ async def terminalize_execution(
     # The CI gate's causes (#3097) end a request whose pull request already
     # opened, so they share the opened-PR deadline exception. Keep this literal
     # equal to ``factory_ci.CI_CAUSES`` (importing it here would be circular).
-    ci_cause = cause.strip() in {"ci_failed", "ci_timeout", "ci_unverified", "merge_conflict"}
+    ci_cause = cause.strip() in {
+        "ci_failed",
+        "ci_timeout",
+        "ci_unverified",
+        "merge_conflict",
+        "pr_closed",
+    }
     opened = (status == "completed" or ci_cause) and await _opened_pull_request(
         session, work_item, request
     )

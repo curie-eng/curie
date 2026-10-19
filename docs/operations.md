@@ -1602,8 +1602,11 @@ counts. With no required check, zero checks after the 120 s grace complete with
 a note only when GitHub reports the pull request mergeable or already merged.
 A pull request with merge conflicts waits through that grace, then ends as
 `merge_conflict`, regardless of any checks, without a CI fix round. The pull
-request stays open for a person to resolve the conflicts. Unknown mergeability,
-including GitHub's `null` while it computes the result, keeps a zero-check run
+request stays open for a person to resolve the conflicts. A pull request a person
+closes without merging during the wait ends the run at once as `pr_closed`,
+whatever its checks say, and the issue gets `curie-factory:needs-human`; a
+pull request merged during the wait still completes on green or no-CI evidence.
+Unknown mergeability, including GitHub's `null` while it computes the result, keeps a zero-check run
 waiting with reason `mergeability_unknown` until the CI deadline, then ends as
 `ci_unverified` with that reason. Each observation reads mergeability again;
 check-backed verdicts do not depend on unknown mergeability.

@@ -108,6 +108,7 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "ci_timeout",
         "ci_unverified",
         "merge_conflict",
+        "pr_closed",
         "ci_fix_unpublished",
     ],
 )
