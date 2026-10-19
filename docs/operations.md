@@ -1890,9 +1890,11 @@ The reconciler creates it on its first pass after admission and then edits it
 in place; there is no separate final comment. While the run is live the
 comment shows a checklist of the phases the agent reports through
 `report_progress` and a `Status:` line (`QUEUED`, `RUNNING`, `PUBLISHING`,
-`STOPPING`). Its last edit adds the result, marks the comment final, and it is
-not edited again. A comment a person deletes is re-created once on the next
-pass; unlabel the issue to stop the run instead.
+`STOPPING`). A live checklist labels the current phase `in progress` and
+retains its round label when present. Its last edit adds the result, labels
+the current phase `stopped here` without a round label, marks the comment
+final, and it is not edited again. A comment a person deletes is re-created
+once on the next pass; unlabel the issue to stop the run instead.
 
 When publication succeeds, the result names the exact pull request
 URL. A follow-up that needs no change, including a relabel that continues the
@@ -1907,7 +1909,24 @@ of keys and tokens. An execute turn that ends without publishing is prompted
 once more in the same session. If it still does not publish, it ends as
 `early_stop` (it called no work tool and never reported progress) or
 `no_pull_request`, and an `Agent's last message:` block carries the agent's
-final reply, redacted and shown inside a code fence so none of it renders.
+final reply as a neutralized Markdown quote. The reply is redacted before
+clipping to at most 4000 characters, including the trailing `...` when
+clipped. CRLF and bare CR line endings are normalized to LF. Before quoting,
+every `&` is escaped as `&amp;`, then HTML comment openers are broken by
+inserting U+200B after `<`, existing `<` characters are escaped as `&lt;`,
+`![` becomes `!\[`, and U+200B is inserted after every `@`. Emphasis, lists,
+and code marks remain. On GitHub, ordinary Markdown links and references work
+subject to this neutralization. At signs in link targets are also neutralized
+and may prevent navigation. HTML, images, and mentions, including
+entity-encoded mentions, are neutralized. CommonMark does not decode entities
+or backslash escapes inside inline code or fenced code blocks, so escaped characters there show
+their escape spellings. Every line is quoted with `> `; a blank line is
+quoted as `>`. A blank separator follows the quote before platform fields
+such as `Cause:` or `Usage:`.
+Jira's ADF blockquotes disallow headings, rules, and nested quotes. The
+converter decodes entities and backslash escapes only in prose after parsing,
+leaving code content escaped. Within blockquotes it converts headings to
+paragraphs, rules to literal `---` paragraphs, and flattens nested quote content.
 A last `Cause:` line names the platform cause code
 (`capacity_wait_expired`, `start_failed`, `execution_deadline`, `issue_cancelled`,
 `owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
@@ -2146,9 +2165,17 @@ default `no_pull_request` or `early_stop` for `--expect comment`, plus
 `execution_deadline` for `--expect any`. When `--expect comment` or `--expect
 any` accepts a `no_pull_request` or `early_stop` ending, the agent's final reply
 must separately contain `Could not complete:` followed by its reason. The reply
-is read from the final comment's `Agent's last message:` block, and from the
-thread transcript only when the comment has none. Each `--expect-reason` must
-match that reply, ignoring case. The platform
+is read from the final comment's `Agent's last message:` block. The parser
+accepts only the contiguous quote immediately after that label, strips one
+quote prefix from each line, and preserves quoted blank lines. It reverses
+each neutralization substitution once: remove U+200B after `@`, restore
+`!\[` to `![`, decode `&lt;` to `<`, and restore the broken HTML comment
+openers. It decodes `&amp;` to `&` last, without recursively decoding the
+result. Already escaped image openers and preexisting comment-breaking U+200B
+sequences are ambiguous under these substitutions, so their original spelling
+cannot always be recovered. It does not accept a code fence as a fallback.
+The existing thread transcript fallback applies only when no message is recovered from the
+comment. Each `--expect-reason` must match that reply, ignoring case. The platform
 cause does not establish the agent's reason. Only a comment the App posted with
 this run's execution request marker counts, and more than one fails. A rename out of
 `.github/` fails like a change inside it. A known secret or credential-shaped
