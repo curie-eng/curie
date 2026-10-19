@@ -1174,16 +1174,22 @@ fn migrate_factory(
         let mut bindings = factory_list(&factory, "bindings")?;
         for (path, id) in resolved {
             let mut repo = json!({"alias": "repository", "codeHost": code_host, "projectId": id, "path": path,
-                "bases": [], "defaultBase": null, "ci": {"required": null, "metadataRerunKeys": []}});
+                "bases": [], "defaultBase": null});
             if let Some(bases) = legacy.bases.get(&path) {
                 repo["bases"] = bases["bases"].clone();
                 repo["defaultBase"] = bases["defaultBase"].clone();
             }
+            let mut ci = Map::new();
             if let Some(required) = legacy.python.get(&path) {
-                repo["ci"]["required"] = required.clone();
+                ci.insert("required".to_string(), required.clone());
             }
             if let Some(keys) = legacy.metadata.get(&path) {
-                repo["ci"]["metadataRerunKeys"] = keys.clone();
+                if keys.as_array().is_some_and(|keys| !keys.is_empty()) {
+                    ci.insert("metadataRerunKeys".to_string(), keys.clone());
+                }
+            }
+            if !ci.is_empty() {
+                repo["ci"] = Value::Object(ci);
             }
             let matching: Vec<_> = bindings
                 .iter()
