@@ -285,7 +285,21 @@ children = []
 def run(args, *, timeout=30):
     result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     verb = " ".join(args[5:8]) if len(args) > 5 else "command"
-    assert result.returncode == 0, "an owned runtime observation or setup command failed: " + verb + " exit " + str(result.returncode)
+    detail = ""
+    for line in reversed((result.stderr or "").splitlines()):
+        text = line.strip()
+        if not text:
+            continue
+        cleaned = []
+        for character in text:
+            cleaned.append(character if character.isalnum() or character in " _.:=" else " ")
+        detail = " ".join("".join(cleaned).split())[:160]
+        break
+    assert result.returncode == 0, (
+        "an owned runtime observation or setup command failed: "
+        + verb + " exit " + str(result.returncode)
+        + ((" detail " + detail) if detail else "")
+    )
     return result.stdout
 
 
@@ -555,26 +569,37 @@ def burst_sixteen():
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     turns = [start(f"burst16-{index}", "[fake:progress-demo] held-open capacity probe burst16 " + str(index))
              for index in range(16)]
-    def observe_burst():
-        last = None
-        for _attempt in range(5):
-            try:
-                return observe()
-            except AssertionError as error:
-                last = error
-                if "command failed" not in str(error):
-                    raise
-                time.sleep(1)
-        raise last
+    def quota_pods():
+        quota = get("resourcequota", fullname + "-sandbox-quota")
+        assert quota["spec"]["hard"]["pods"] == "2", "sandbox pod quota changed from two"
+        quota_used = int(quota.get("status", {}).get("used", {}).get("pods", 0))
+        assert quota_used <= 2, "observed quota usage exceeded two"
+        priority = quota["spec"]["scopeSelector"]["matchExpressions"][0]["values"][0]
+        pods = [pod for pod in get("pods")["items"]
+                if pod["spec"].get("priorityClassName") == priority
+                and pod.get("status", {}).get("phase") not in {"Failed", "Succeeded"}]
+        assert len(pods) <= 2, "observed more than two chargeable sandbox pods"
 
     deadline = time.monotonic() + 320
     while True:
         completed = [finished(turn) for turn in turns]
-        observe_burst()
+        quota_pods()
         if all(completed):
             break
         assert time.monotonic() < deadline, "sixteen-thread burst exceeded its bounded runtime"
         time.sleep(0.2)
+    last = None
+    for _attempt in range(5):
+        try:
+            observe()
+            break
+        except AssertionError as error:
+            last = error
+            if "command failed" not in str(error):
+                raise
+            time.sleep(2)
+    else:
+        raise last
     logs = ""
     last = None
     for _attempt in range(5):
