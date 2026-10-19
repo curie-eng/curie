@@ -38,6 +38,7 @@ from .provider import (
     Message,
     MessagePage,
     MessageSummary,
+    SenderVerdict,
     ThreadAnswer,
 )
 
@@ -371,8 +372,16 @@ class AgentMailProvider:
                 if isinstance(headers, dict)
                 else None
             ),
-            verdict=UNVERIFIABLE,
+            verdict=self._verdict(full),
         )
+
+    def _verdict(self, full: dict[str, Any]) -> SenderVerdict:
+        """Always ``unverifiable``: AgentMail supplies nothing a sender cannot write.
+
+        Labels, the absence of a rejection label and every header in the map
+        are provider or sender supplied, so none of them is a verdict.
+        """
+        return UNVERIFIABLE
 
     def send_reply(self, message_id: str, text: str, reply_all: bool) -> Accepted | Failure:
         """Reply To Message, sender-only unless ``reply_all``."""
