@@ -491,7 +491,6 @@ async def _apply(
             else:
                 await _cancel(session, scope, label, notice)
         except NotFound:
-            # The issue or a repository it names is gone: nothing to retry.
             await session.rollback()
             logger.info(
                 "tracker intake for binding %s skipped a notice on a missing issue",
@@ -570,7 +569,27 @@ async def _admit(
     if isinstance(chosen, Refusal):
         await _comment(tracker, issue, REPO_REFUSAL_MARKER, refusal_body(chosen))
         return
-    connection, code_host, repository = await _chosen_repository(scope, chosen)
+    try:
+        connection, code_host, repository = await _chosen_repository(scope, chosen)
+    except NotFound:
+        await tracker.ticket_labels(issue)
+        logger.warning(
+            "tracker intake for binding %s refused repository alias %s path %s: "
+            "not found or inaccessible",
+            binding.name,
+            chosen.alias,
+            chosen.path,
+        )
+        await _comment(
+            tracker,
+            issue,
+            REPO_REFUSAL_MARKER,
+            f"Curie did not start this issue: repository `{chosen.alias}` was not found or "
+            "could not be accessed. Check this binding's repository path and code host "
+            "permissions, then re-add the factory label."
+            f"\n\n{REPO_REFUSAL_MARKER}\n",
+        )
+        return
     if existing is None and await _rediscovered(scope, tracker, notice, repository):
         return
     admission = await _admission(
