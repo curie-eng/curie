@@ -1549,12 +1549,31 @@ evidence. The outcome is decided in this order:
 2. More than one open match: the issue is refused, and the status comment
    lists each of them. Close all but one to continue.
 3. A pull request whose author the code host cannot confirm is never
-   evidence and is ignored, with one info log line per check. Bitbucket Cloud
-   cannot read its own identity, and Bitbucket Data Center cannot when its
-   answers omit the `X-AUSERID` header, so on those hosts ownership cannot be
-   verified, rediscovery does not suppress, and a reinstall can still open one
-   duplicate pull request. When nothing matches, the issue is admitted
-   normally.
+   evidence and is ignored, with one info log line per check. Bitbucket Data
+   Center cannot confirm authorship when its answers omit the `X-AUSERID`
+   header, so there ownership cannot be verified, rediscovery does not
+   suppress, and a reinstall can still open one duplicate pull request. When
+   nothing matches, the issue is admitted normally.
+
+   Bitbucket Cloud cannot read its own identity either, so it cannot verify
+   who opened a pull request. It fails closed instead: if any open pull
+   request from a factory publication branch names the issue, a reinstall
+   after storage loss refuses admission, opens no second pull request, and
+   posts one issue comment asking the operator to confirm whether that pull
+   request is the factory's publication. The refusal is per issue: a
+   publication pull request for a different issue does not block it, and a
+   closed or merged one does not trigger it. While the pull request stays open
+   and the issue keeps its trigger label, every intake pass refuses again and
+   keeps that one comment. Closing or confirming the existing pull request
+   clears the block. To confirm it is the factory's, remove the trigger label
+   from the issue and review or merge the pull request as usual; Curie then
+   stops trying to admit the issue. The label has to come off because a merged
+   or declined pull request is ignored on Bitbucket Cloud, so a still-labelled
+   issue would run again. If it is not the factory's, close it: the tracker
+   sweep re-checks every still-labelled issue every
+   `FACTORY_RECONCILE_INTERVAL_S` and admits it on that later pass (re-apply
+   the label when that interval is 0). This is a bounded limitation, because
+   there is no ownership proof for Bitbucket Cloud publications yet.
 4. Only closed or merged matches: the old label is a replay of a run that
    already finished, so it is logged and nothing runs. A label added after the
    most recent close or merge is an intentional rerun and is admitted. When
