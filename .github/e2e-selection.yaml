@@ -318,9 +318,9 @@ rules:
     # image-proofs builds it and runs the escape tests against it.
     apps/docker-daemon: []
     scripts: []
-    # The revision-based selector inspects ci.yaml hunks and runs the full
-    # released-upgrade tier when one of its upgrade jobs changes. Other
-    # workflow edits stay ignored; path-only requests cannot inspect hunks.
+    # The revision-based selector inspects ci.yaml hunks and selects the
+    # released-upgrade smoke shard and negative control for upgrade job edits.
+    # Other workflow edits stay ignored; path-only requests cannot inspect hunks.
     .github/workflows: []
     .github/e2e-selection.yaml: []
     tools: []

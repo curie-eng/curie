@@ -802,7 +802,7 @@ def _assert_selection(
         cli_release_needed=(
             _path_needs_cli_release(path) if cli_release_needed is None else cli_release_needed
         ),
-        released_upgrade_full=path == "cli/src/ops/upgrade.rs",
+        released_upgrade_full=False,
         chart_scenarios=_expected_chart_for_path(path),
         ci_policy_files=_expected_ci_policy_files(path),
     )
@@ -1851,6 +1851,7 @@ def test_unknown_and_union_selection_are_deterministic(tmp_path: Path) -> None:
 
 
 def test_push_selects_every_tier_without_a_repository(tmp_path: Path) -> None:
+    """Dispatches use --push without kind omission."""
     completed, output = _invoke_selector(tmp_path, push=True)
     assert completed.returncode == 0, completed.stderr
     assert output == _expected_output(
@@ -1871,13 +1872,14 @@ def test_pull_request_released_upgrade_runs_the_smoke_shard_only(
     outputs = _selector_outputs(tmp_path, "charts/curie/values.yaml")
     assert outputs["released_upgrade"] == "true"
     assert outputs["released_upgrade_full"] == "false"
+    _assert_upgrade_smoke_shards(tmp_path, outputs)
 
 
 def test_omit_kind_drops_cluster_tiers_and_keeps_the_rest(tmp_path: Path) -> None:
     kept = tuple(tier for tier in TIERS if tier not in {"cluster", "released-upgrade"})
     completed, output = _invoke_selector(tmp_path, push=True, omit_kind=True)
     assert completed.returncode == 0, completed.stderr
-    # The next push omits kind, so it runs no upgrade job at all.
+    # Pushes to both trains omit kind, so they run no upgrade job.
     assert output == _expected_output(
         *kept,
         images_needed=True,
@@ -2347,7 +2349,7 @@ AGGREGATE_EXPRESSIONS = {
 }
 
 
-def test_next_omits_kind_and_dispatch_keeps_it() -> None:
+def _changes_filter_script() -> str:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     trigger = workflow[True]
     assert trigger["workflow_dispatch"] is None
@@ -2356,19 +2358,114 @@ def test_next_omits_kind_and_dispatch_keeps_it() -> None:
     run = next(
         step["run"] for step in workflow["jobs"]["changes"]["steps"] if step.get("id") == "filter"
     )
+    assert isinstance(run, str)
     assert "github.event_name" in run
-    assert "refs/heads/next" in run
     assert '"$base_ref" = "next"' in run
     assert run.count("select_tiers.py") == 3
-    pull_request, rest = run.split("elif", 1)
-    assert "git fetch" in pull_request
-    assert "--omit-kind" in pull_request
-    next_push, main_or_dispatch = rest.split("else", 1)
-    assert "--omit-kind" in next_push
-    assert "--push" in next_push
-    assert "workflow_dispatch" in main_or_dispatch
-    assert "--push" in main_or_dispatch
-    assert "--omit-kind" not in main_or_dispatch
+    return run
+
+
+def _assert_changes_filter_route(script: str, event: str, branch: str) -> list[str]:
+    for expression, value in {
+        "github.event_name": event,
+        "github.ref": f"refs/heads/{branch}",
+        "github.base_ref": branch if event == "pull_request" else "",
+    }.items():
+        script = script.replace("${{ " + expression + " }}", value)
+    assert "${{" not in script
+    completed = subprocess.run(
+        [
+            "bash", "--noprofile", "--norc", "-c",
+            "git() { printf '%s\\0' git \"$@\" >&2; }\n"
+            "uv() { printf '%s\\0' \"$@\"; }\n" + script,
+        ],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    argv = completed.stdout.removesuffix("\0").split("\0")
+    prefix = [
+        "run", "--no-project", "--with", "pyyaml==6.0.3", "python",
+        "tools/e2e-ci-selection/select_tiers.py", "--registry", ".github/e2e-selection.yaml",
+    ]
+    options = (
+        ["--base", f"origin/{branch}", "--head", "HEAD"]
+        if event == "pull_request" else ["--push"]
+    )
+    if event == "push" or (event == "pull_request" and branch == "next"):
+        options.append("--omit-kind")
+    assert argv == prefix + options
+    fetch = f"git\0fetch\0--quiet\0origin\0{branch}\0" if event == "pull_request" else ""
+    assert completed.stderr == fetch
+    return argv[len(prefix):]
+
+
+@pytest.mark.parametrize("event", ("push", "workflow_dispatch", "pull_request"))
+@pytest.mark.parametrize("branch", ("main", "next"))
+def test_both_trains_omit_kind_on_push_and_keep_full_dispatch(
+    tmp_path: Path, event: str, branch: str
+) -> None:
+    options = _assert_changes_filter_route(_changes_filter_script(), event, branch)
+    if event == "pull_request":
+        return
+    output = tmp_path / "filter-output"
+    completed = subprocess.run(
+        [sys.executable, str(SELECTOR), "--registry", str(REGISTRY), *options],
+        cwd=REPO_ROOT, env={**os.environ, "GITHUB_OUTPUT": str(output)},
+        capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    full = event == "workflow_dispatch"
+    assert output.read_text() == _expected_output(
+        *(TIERS if full else TIERS[:3]),
+        ci_policy_files=_expected_ci_policy_files(".github/workflows/ci.yaml"),
+        images_needed=True, cli_release_needed=True, released_upgrade_full=full,
+        factory=full, approval_resume=full,
+    )
+    if full:
+        listed = subprocess.run(
+            ["bash", str(UPGRADE_MATRIX), "--list-shards", "--json"],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+        )
+        expected = [shard["id"] for shard in json.loads(listed.stdout)["shards"]]
+        flags = _outputs_of(output.read_text())
+        matrix = _list_shards(tmp_path, flags["released_upgrade_full"])
+        assert json.loads(matrix.removeprefix("shards=")) == expected
+
+
+@pytest.mark.parametrize(
+    ("mutation", "event", "branch"),
+    [
+        ("next-only", "push", "main"),
+        ("main-only", "push", "next"),
+        ("push-with-kind", "push", "main"),
+        ("push-with-kind", "push", "next"),
+        ("dispatch-without-kind", "workflow_dispatch", "main"),
+        ("dispatch-without-kind", "workflow_dispatch", "next"),
+    ],
+)
+def test_changes_filter_rejects_each_push_and_dispatch_route_mutation(
+    mutation: str, event: str, branch: str
+) -> None:
+    script = _changes_filter_script()
+    _assert_changes_filter_route(script, event, branch)
+    push_route = 'elif [ "$event" = "push" ]; then'
+    assert script.count(push_route) == 1
+    if mutation in {"next-only", "main-only"}:
+        train = mutation.removesuffix("-only")
+        script = script.replace(
+            push_route,
+            'elif [ "$event" = "push" ] && '
+            f'[ "${{{{ github.ref }}}}" = "refs/heads/{train}" ]; then',
+            1,
+        )
+    elif mutation == "push-with-kind":
+        assert script.count("--omit-kind\n") == 1
+        script = script.replace("--omit-kind\n", "\n", 1)
+    else:
+        before, after = script.rsplit("--push", 1)
+        script = before + "--push --omit-kind" + after
+    with pytest.raises(AssertionError):
+        _assert_changes_filter_route(script, event, branch)
 
 
 def test_push_runs_complete_while_pull_requests_and_dispatches_supersede() -> None:
@@ -2608,6 +2705,40 @@ def test_image_proofs_rejects_a_changed_group_contract(mutation: str) -> None:
         _assert_image_proofs(workflow)
 
 
+def _assert_upgrade_job_gates(workflow: dict[str, Any]) -> None:
+    jobs = workflow["jobs"]
+    for job, flag in (
+        ("e2e-released-upgrade", "released_upgrade_full"),
+        ("e2e-released-upgrade-negative", "released_upgrade"),
+    ):
+        condition = jobs[job]["if"]
+        assert condition == "${{ needs.changes.outputs." + flag + " == 'true' }}"
+        match = re.fullmatch(
+            r"\$\{\{ needs\.changes\.outputs\.(released_upgrade(?:_full)?) == 'true' \}\}",
+            condition,
+        )
+        assert match is not None
+        for selected, full in (("false", "false"), ("true", "false"), ("true", "true")):
+            flags = {"released_upgrade": selected, "released_upgrade_full": full}
+            expected = full if job == "e2e-released-upgrade" else selected
+            assert (flags[match[1]] == "true") is (expected == "true")
+
+
+@pytest.mark.parametrize(
+    ("job", "flag"),
+    [
+        ("e2e-released-upgrade-negative", "released_upgrade_full"),
+        ("e2e-released-upgrade", "released_upgrade"),
+    ],
+)
+def test_upgrade_job_gates_reject_using_the_other_selection(job: str, flag: str) -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    _assert_upgrade_job_gates(workflow)
+    workflow["jobs"][job]["if"] = "${{ needs.changes.outputs." + flag + " == 'true' }}"
+    with pytest.raises(AssertionError):
+        _assert_upgrade_job_gates(workflow)
+
+
 def test_workflow_consumes_each_selection_output_exactly() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     jobs = workflow["jobs"]
@@ -2651,10 +2782,7 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         "${{ needs.changes.outputs.local_release == 'true' }}"
     )
     assert jobs["e2e-ladder-cluster"]["if"] == ("${{ needs.changes.outputs.cluster == 'true' }}")
-    assert jobs["e2e-released-upgrade"]["if"] == (
-        "${{ needs.changes.outputs.released_upgrade_full == 'true' }}"
-    )
-    assert jobs["e2e-released-upgrade-negative"]["if"] == (jobs["e2e-released-upgrade"]["if"])
+    _assert_upgrade_job_gates(workflow)
     assert set(jobs["e2e-released-upgrade-negative"]["needs"]) == set(
         jobs["e2e-released-upgrade"]["needs"]
     )
@@ -2837,6 +2965,12 @@ def _list_shards(tmp_path: Path, full: str, smoke: str | None = None) -> str:
     )
     assert completed.returncode == 0, completed.stderr
     return output.read_text()
+
+
+def _assert_upgrade_smoke_shards(tmp_path: Path, output: dict[str, str]) -> None:
+    assert output["released_upgrade"] == "true"
+    assert output["released_upgrade_full"] == "false"
+    assert _list_shards(tmp_path, output["released_upgrade_full"]) == 'shards=["s01"]\n'
 
 
 def test_upgrade_matrix_lists_every_shard_on_full_runs_and_one_on_prs(
@@ -3068,7 +3202,8 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
         "E2E released chart upgrade negative control (nil unsafe helpers)"
     )
     assert negative_job["runs-on"] == "ubuntu-latest"
-    assert negative_job["if"] == job["if"]
+    assert negative_job["if"] == "${{ needs.changes.outputs.released_upgrade == 'true' }}"
+    assert job["if"] == "${{ needs.changes.outputs.released_upgrade_full == 'true' }}"
     assert set(negative_job["needs"]) == set(job["needs"])
     negative_steps = {
         step["name"]: step for step in negative_job["steps"] if isinstance(step.get("name"), str)
@@ -3571,27 +3706,115 @@ def test_aggregate_requires_upgrade_matrix_skip_when_released_upgrade_is_not_sel
         assert rejected.returncode != 0, result
 
 
-def test_aggregate_pull_request_smoke_runs_matrix_without_released_trio() -> None:
+@pytest.mark.parametrize(
+    ("result_name", "result"),
+    [
+        (name, result)
+        for name, results in (
+            ("upgrade_matrix_result", ("skipped", "failure", "cancelled")),
+            ("released_upgrade_negative_result", ("skipped", "failure", "cancelled")),
+            ("released_upgrade_result", ("success", "failure", "cancelled")),
+        )
+        for result in results
+    ],
+)
+def test_aggregate_pull_request_smoke_runs_matrix_and_negative_only(
+    result_name: str, result: str
+) -> None:
+    state = {
+        "event_name": "pull_request",
+        "released_upgrade_selected": "true",
+        "released_upgrade_full": "false",
+        "released_upgrade_result": "skipped",
+        "released_upgrade_negative_result": "success",
+        "upgrade_matrix_result": "success",
+    }
     ok = _run_aggregate(
-        released_upgrade_selected="true",
-        released_upgrade_full="false",
-        upgrade_matrix_result="success",
+        event_name=state["event_name"],
+        released_upgrade_selected=state["released_upgrade_selected"],
+        released_upgrade_full=state["released_upgrade_full"],
+        released_upgrade_result=state["released_upgrade_result"],
+        released_upgrade_negative_result=state["released_upgrade_negative_result"],
+        upgrade_matrix_result=state["upgrade_matrix_result"],
     )
     assert ok.returncode == 0, ok.stdout + ok.stderr
-    for matrix, positive, negative in (
-        ("skipped", "skipped", "skipped"),
-        ("failure", "skipped", "skipped"),
-        ("success", "success", "skipped"),
-        ("success", "skipped", "success"),
-    ):
-        rejected = _run_aggregate(
-            released_upgrade_selected="true",
-            released_upgrade_full="false",
-            upgrade_matrix_result=matrix,
-            released_upgrade_result=positive,
-            released_upgrade_negative_result=negative,
+    state[result_name] = result
+    rejected = _run_aggregate(
+        event_name=state["event_name"],
+        released_upgrade_selected=state["released_upgrade_selected"],
+        released_upgrade_full=state["released_upgrade_full"],
+        released_upgrade_result=state["released_upgrade_result"],
+        released_upgrade_negative_result=state["released_upgrade_negative_result"],
+        upgrade_matrix_result=state["upgrade_matrix_result"],
+    )
+    assert rejected.returncode != 0, (result_name, result)
+
+
+@pytest.mark.parametrize(
+    "result_name", ("released_upgrade_result", "released_upgrade_negative_result")
+)
+@pytest.mark.parametrize("result", ("success", "failure", "cancelled"))
+def test_aggregate_requires_released_jobs_skip_when_unselected(
+    result_name: str, result: str
+) -> None:
+    ok = _run_aggregate()
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    state = {
+        "released_upgrade_result": "skipped",
+        "released_upgrade_negative_result": "skipped",
+    }
+    state[result_name] = result
+    rejected = _run_aggregate(
+        released_upgrade_result=state["released_upgrade_result"],
+        released_upgrade_negative_result=state["released_upgrade_negative_result"],
+    )
+    assert rejected.returncode != 0, (result_name, result)
+
+
+@pytest.mark.parametrize("mutation", ("omit-negative", "full-only-negative"))
+def test_aggregate_rejects_missing_or_full_only_negative_expectation(mutation: str) -> None:
+    state = {
+        "event_name": "pull_request",
+        "released_upgrade_selected": "true",
+        "released_upgrade_full": "false",
+        "released_upgrade_negative_result": "success",
+        "upgrade_matrix_result": "success",
+    }
+    unmutated = _run_aggregate(
+        event_name=state["event_name"],
+        released_upgrade_selected=state["released_upgrade_selected"],
+        released_upgrade_full=state["released_upgrade_full"],
+        released_upgrade_negative_result=state["released_upgrade_negative_result"],
+        upgrade_matrix_result=state["upgrade_matrix_result"],
+    )
+    assert unmutated.returncode == 0, unmutated.stdout + unmutated.stderr
+    check = '"$RELEASED_UPGRADE_NEGATIVE_RESULT" != "$released_upgrade_negative_expected" ||'
+
+    def change_negative(script: str) -> str:
+        assert script.count(check) == 1
+        replacement = (
+            "" if mutation == "omit-negative"
+            else check.replace("$released_upgrade_negative_expected", "$released_upgrade_expected")
         )
-        assert rejected.returncode != 0, (matrix, positive, negative)
+        return script.replace(check, replacement, 1)
+
+    rejected = _run_aggregate(
+        script_transform=change_negative,
+        event_name=state["event_name"],
+        released_upgrade_selected=state["released_upgrade_selected"],
+        released_upgrade_full=state["released_upgrade_full"],
+        released_upgrade_negative_result=state["released_upgrade_negative_result"],
+        upgrade_matrix_result=state["upgrade_matrix_result"],
+    )
+    output = rejected.stdout + rejected.stderr
+    assert rejected.returncode != 0, output
+    if mutation == "omit-negative":
+        assert (
+            "Selected and skipped negative control failed for RELEASED_UPGRADE_NEGATIVE_RESULT"
+            in output
+        )
+    else:
+        assert "E2E required failed" in output
 
 
 @pytest.mark.parametrize("full", ["", "yes"])
