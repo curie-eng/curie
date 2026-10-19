@@ -10,7 +10,7 @@ on:
   # using the historical path list in tools/helm-ci-gate/decide.py. Pushes
   # stay unfiltered in effect because select treats push as chart-relevant.
   push:
-    branches: [main, next]
+    branches: [main, next, "epic/**"]
   pull_request:
     branches: [main, next, "epic/**"]
 

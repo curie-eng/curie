@@ -23,7 +23,7 @@ name: Release images and binaries
 
 on:
   push:
-    branches: [&release_main main, &release_next next]
+    branches: [&release_main main, &release_next next, "epic/**"]
     tags: ["v*"]
 
 permissions:

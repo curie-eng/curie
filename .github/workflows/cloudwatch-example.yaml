@@ -16,7 +16,7 @@ on:
       - examples/tests/test_cloudwatch_alarms.py
       - examples/tests/cloudwatch-alarms.test.yaml
   push:
-    branches: [main, next]
+    branches: [main, next, "epic/**"]
     paths:
       - .github/workflows/cloudwatch-example.yaml
       - examples/sre-bot/observability/cloudwatch-alarms/**
