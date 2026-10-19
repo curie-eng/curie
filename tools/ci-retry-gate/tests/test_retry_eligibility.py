@@ -49,6 +49,12 @@ RETRY_ALLOWLIST = frozenset(
     {
         ("ci.yaml", "adapter-credential-reconciliation", "Install uv"),
         ("ci.yaml", "python-container-fixtures", "Install uv"),
+        ("ci.yaml", "python-container-fixtures", "Install Helm"),
+        (
+            "ci.yaml",
+            "python-container-fixtures",
+            "Install kind and kubectl without creating a cluster",
+        ),
         ("ci.yaml", "python-static", "Install uv"),
         ("ci.yaml", "python-pytest", "Install uv"),
         ("ci.yaml", "turn-canary-contract", "Install uv"),

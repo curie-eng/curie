@@ -568,6 +568,35 @@ def _without_runtime_exclusion(arguments: list[str], runtime: str) -> list[str]:
     return remaining
 
 
+def _without_owned_runtime_exclusions(arguments: list[str]) -> list[str]:
+    expected = {
+        ("--deselect", ADMITTED_AGENT_RUNTIME),
+        *(("--ignore", runtime) for runtime in CONTAINER_FILES),
+    }
+    remaining = []
+    excluded = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        option, separator, value = argument.partition("=")
+        if option in {"--ignore", "--deselect"}:
+            if not separator:
+                assert index + 1 < len(arguments), arguments
+                value = arguments[index + 1]
+            if (option, value) in expected:
+                excluded.append((option, value))
+            else:
+                remaining.append(argument)
+                if not separator:
+                    remaining.append(value)
+            index += 1 if separator else 2
+            continue
+        remaining.append(argument)
+        index += 1
+    assert sorted(excluded) == sorted(expected), arguments
+    return remaining
+
+
 def _run_pytest_step(
     tmp_path: Path,
     *,
@@ -958,15 +987,17 @@ def test_dedicated_runtime_is_excluded_from_every_generic_shard(
         assert collected(ignored) == {expected_neighbor, expected_runtime}
 
 
-@pytest.mark.parametrize("scope", ("full", "cli"))
-@pytest.mark.parametrize("deselect", ("", "examples/tests/test_sre_bot_observability_runtime.py"))
-def test_ordinary_python_shards_exclude_the_owned_kind_modules(
-    tmp_path: Path,
-    scope: str,
-    deselect: str,
-) -> None:
-    argv = _run_pytest_step(tmp_path, shard=1, deselect=deselect, scope=scope)
+def _assert_owned_kind_modules_excluded(argv: list[str]) -> None:
     separate = [index + 1 for index, argument in enumerate(argv) if argument == "--ignore"]
+    option_values = {
+        index + 1
+        for index, argument in enumerate(argv)
+        if argument in {"--ignore", "--deselect"}
+    }
+    ignored = [
+        argument.split("=", 1)[1] for argument in argv if argument.startswith("--ignore=")
+    ]
+    ignored += [argv[index] for index in separate]
     for module in (
         "tools/factory-e2e/tests/test_c4_initial_binding.py",
         "tools/factory-e2e/tests/test_c4_static_token_rotation.py",
@@ -976,15 +1007,35 @@ def test_ordinary_python_shards_exclude_the_owned_kind_modules(
         "tools/factory-e2e/tests/test_c4_forge_instances.py",
         *CONTAINER_FILES,
     ):
-        ignored = [
-            argument.split("=", 1)[1] for argument in argv if argument.startswith("--ignore=")
-        ]
-        ignored += [argv[index] for index in separate]
         assert ignored.count(module) == 1, module
         assert all(
-            index in separate for index, argument in enumerate(argv) if argument == module
+            index in option_values for index, argument in enumerate(argv) if argument == module
         ), f"{module} must not be selected as a positional pytest file"
-    assert argv[argv.index("--ci-shard") + 1] == f"1/{SHARD_COUNT}"
+
+
+@pytest.mark.parametrize("shard", range(1, SHARD_COUNT + 1))
+@pytest.mark.parametrize("scope", ("full", "cli"))
+@pytest.mark.parametrize("deselect", ("", *CONTAINER_FILES, ",".join(CONTAINER_FILES)))
+def test_ordinary_python_shards_exclude_the_owned_kind_modules(
+    tmp_path: Path,
+    shard: int,
+    scope: str,
+    deselect: str,
+) -> None:
+    argv = _run_pytest_step(tmp_path, shard=shard, deselect=deselect, scope=scope)
+    _assert_owned_kind_modules_excluded(argv)
+    assert argv[argv.index("--ci-shard") + 1] == f"{shard}/{SHARD_COUNT}"
+
+
+@pytest.mark.parametrize("scope", ("full", "cli"))
+@pytest.mark.parametrize("module", CONTAINER_FILES)
+def test_owned_kind_module_guard_rejects_positional_files(
+    tmp_path: Path, scope: str, module: str
+) -> None:
+    argv = _run_pytest_step(tmp_path, shard=1, deselect=module, scope=scope)
+    _assert_owned_kind_modules_excluded(argv)
+    with pytest.raises(AssertionError, match="must not be selected as a positional pytest file"):
+        _assert_owned_kind_modules_excluded([*argv, module])
 
 
 def _record_shard(
