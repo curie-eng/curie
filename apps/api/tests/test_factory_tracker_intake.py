@@ -898,7 +898,18 @@ def _assert_held(intake: Intake, issue: jira_fake.JiraIssue) -> None:
     assert _marker(hold) == HOLD_MARKER
     text = jira_fake.flatten(hold.body)
     assert text.strip()
-    for leaked in (DC_SENTINEL, bitbucket_dc.FACTORY_TOKEN, jira_fake.TOKEN, "503", "401"):
+    for leaked in (
+        DC_SENTINEL,
+        bitbucket_dc.FACTORY_TOKEN,
+        jira_fake.TOKEN,
+        "503",
+        "401",
+        "Unauthorized",
+        "CredentialUnreadable",
+        "Unavailable",
+        "FeedbackUnavailable",
+        "the static token file",
+    ):
         assert leaked not in text
 
 
@@ -1117,6 +1128,107 @@ def test_an_unauthorized_dc_notice_holds_only_its_issue(
     intake.poll()
 
     _assert_on_dc(dc_issue)
+    _assert_admitted_once(intake, healthy, event)
+    assert _cursor() is not None
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_rejected_credential_hold_names_the_operator_action(
+    make_intake: Callable[[dict[str, Any]], Intake], status: int
+) -> None:
+    intake = make_intake(_dc_document())
+    dc_issue, healthy, event = _held_tickets(intake)
+    intake.dc_down = True
+    intake.dc_status = status
+    expected_body = (
+        "Curie could not start this issue yet: a tracker or code host credential it "
+        "needs was rejected or could not be read. The operator must replace that "
+        "credential. Curie retries on its next poll."
+    )
+
+    for _ in range(2):
+        intake.poll()
+
+        _assert_held(intake, dc_issue)
+        assert _texts(intake, dc_issue) == [expected_body + "\n"]
+        _assert_admitted_once(intake, healthy, event)
+        assert _cursor() is None
+
+    intake.dc_down = False
+    intake.poll()
+
+    _assert_on_dc(dc_issue)
+    [item] = _work_items(dc_issue)
+    assert len(_requests(item["id"])) == 1
+    _assert_admitted_once(intake, healthy, event)
+    assert _cursor() is not None
+
+
+def test_an_unreadable_credential_hold_names_the_operator_action(
+    make_intake: Callable[[dict[str, Any]], Intake],
+) -> None:
+    intake = make_intake(_dc_document())
+    dc_issue, healthy, event = _held_tickets(intake)
+    [code_host] = [
+        entry
+        for entry in get_settings().forges.code_hosts
+        if entry.name == bitbucket_dc.CODE_HOST_NAME
+    ]
+    credential = code_host.credential
+    assert credential.type == "static_token"
+    assert credential.token_file is not None
+    token_file = Path(credential.token_file)
+    token_file.write_text(f"{bitbucket_dc.FACTORY_TOKEN}\n{DC_SENTINEL}")
+    expected_body = (
+        "Curie could not start this issue yet: a tracker or code host credential it "
+        "needs was rejected or could not be read. The operator must replace that "
+        "credential. Curie retries on its next poll."
+    )
+
+    for _ in range(2):
+        intake.poll()
+
+        _assert_held(intake, dc_issue)
+        assert _texts(intake, dc_issue) == [expected_body + "\n"]
+        assert str(token_file) not in _texts(intake, dc_issue)[0]
+        _assert_admitted_once(intake, healthy, event)
+        assert _cursor() is None
+
+    token_file.write_text(bitbucket_dc.FACTORY_TOKEN)
+    intake.poll()
+
+    _assert_on_dc(dc_issue)
+    [item] = _work_items(dc_issue)
+    assert len(_requests(item["id"])) == 1
+    _assert_admitted_once(intake, healthy, event)
+    assert _cursor() is not None
+
+
+def test_an_unavailable_hold_keeps_the_did_not_answer_text(
+    make_intake: Callable[[dict[str, Any]], Intake],
+) -> None:
+    intake = make_intake(_dc_document())
+    dc_issue, healthy, event = _held_tickets(intake)
+    intake.dc_down = True
+    expected_body = (
+        "Curie could not start this issue yet: a tracker or code host it needs did not "
+        "answer. Curie retries on its next poll; nothing is needed unless this persists."
+    )
+
+    for _ in range(2):
+        intake.poll()
+
+        _assert_held(intake, dc_issue)
+        assert _texts(intake, dc_issue) == [expected_body + "\n"]
+        _assert_admitted_once(intake, healthy, event)
+        assert _cursor() is None
+
+    intake.dc_down = False
+    intake.poll()
+
+    _assert_on_dc(dc_issue)
+    [item] = _work_items(dc_issue)
+    assert len(_requests(item["id"])) == 1
     _assert_admitted_once(intake, healthy, event)
     assert _cursor() is not None
 

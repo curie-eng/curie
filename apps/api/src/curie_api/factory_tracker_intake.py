@@ -342,9 +342,16 @@ async def _hold(
     """Log one issue's deferral and say so on the issue once (upserted)."""
 
     _deferred(scope, label, "notice", exc)
+    body = (
+        "Curie could not start this issue yet: a tracker or code host credential it "
+        "needs was rejected or could not be read. The operator must replace that "
+        "credential. Curie retries on its next poll."
+        if isinstance(exc, (Unauthorized, CredentialUnreadable))
+        else _HOLD_BODY
+    )
     try:
         await tracker.marked_comments.upsert_marked(
-            ReplyTarget.on_issue(issue), HOLD_MARKER, _HOLD_BODY
+            ReplyTarget.on_issue(issue), HOLD_MARKER, body
         )
     except ForgeError as failed:
         # The retained cursor is the retry authority; the hold is a courtesy.
