@@ -775,13 +775,18 @@ async def _claim_next(
         .execution_options(synchronize_session=False)
     )
     target = stored_reply_target(request, work_item)
+    # The pull request belongs to the lineage's first succeeded publication: a
+    # failed attempt never pushed, so it cannot have opened it (#4744).
     opened_pr = (
         pr_number
         if pr_number is not None
         and work_item.publication_lineage_id is not None
         and await session.scalar(
             select(Publication.execution_request_id)
-            .where(Publication.lineage_id == work_item.publication_lineage_id)
+            .where(
+                Publication.lineage_id == work_item.publication_lineage_id,
+                Publication.status == "succeeded",
+            )
             .order_by(Publication.created_at, Publication.id)
             .limit(1)
         )
