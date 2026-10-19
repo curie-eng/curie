@@ -295,7 +295,8 @@ def _assert_ci_excludes_commenter(workflow: dict[str, Any]) -> None:
     assert directory in tokens
     assert all(token == directory for token in tokens if "p0-closes" in token)
     pytest_step["run"] = script.replace(directory, "")
-    assert "p0-closes" not in json.dumps(inspected).lower().replace("_", "-")
+    commenter_present = "p0-closes" in json.dumps(inspected).lower().replace("_", "-")
+    assert not commenter_present, "CI workflow must exclude the p0-closes commenter"
 
     for pytest_scope in ("full", "cli"):
         result = subprocess.run(
