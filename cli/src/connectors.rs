@@ -1218,6 +1218,33 @@ mod tests {
     }
 
     #[test]
+    fn secret_digest_is_sha256_of_canonical_json() {
+        let mut values = BTreeMap::new();
+        values.insert("b".to_string(), "two".to_string());
+        values.insert("a".to_string(), "one".to_string());
+        let mut manifest = json!({
+            "kind": "Deployment",
+            "spec": {"template": {"metadata": {}, "spec": {"containers": [{
+                "env": [
+                    {"valueFrom": {"secretKeyRef": {"name": "owned", "key": "b"}}},
+                    {"valueFrom": {"secretKeyRef": {"name": "owned", "key": "a"}}}
+                ]
+            }]}}}
+        });
+        stamp_secret_digests(std::slice::from_mut(&mut manifest), "owned", &values);
+        let encoded = serde_json::to_vec(&serde_json::json!({"a": "one", "b": "two"})).unwrap();
+        let expect = hex_sha256(&encoded);
+        let got = manifest
+            .pointer("/spec/template/metadata/annotations")
+            .and_then(|annotations| annotations.get(CONNECTOR_SECRET_DIGEST))
+            .and_then(|value| value.as_str())
+            .unwrap();
+        if got != expect {
+            panic!("digest algorithm mismatch");
+        }
+    }
+
+    #[test]
     fn owner_label_is_stamped_without_dropping_existing_labels() {
         let out = label_objects(&objs(), "acme-bot");
         let dep = &out[1]["metadata"]["labels"];

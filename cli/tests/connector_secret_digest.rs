@@ -5,18 +5,25 @@ use std::collections::BTreeMap;
 
 use curie::connectors::{stamp_secret_digests, CONNECTOR_SECRET_DIGEST};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 fn digest_of(pairs: &[(&str, &str)]) -> String {
-    let mut map = BTreeMap::new();
+    let deployment = deployment(
+        "probe",
+        template(
+            pairs
+                .iter()
+                .map(|(key, _)| env_ref(key, "owned", key))
+                .collect(),
+            vec![],
+        ),
+    );
+    let mut values = BTreeMap::new();
     for (key, value) in pairs {
-        map.insert(*key, *value);
+        values.insert((*key).to_string(), (*value).to_string());
     }
-    let encoded = serde_json::to_vec(&map).expect("canonical map");
-    Sha256::digest(encoded)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let mut manifests = vec![deployment];
+    stamp_secret_digests(&mut manifests, "owned", &values);
+    fingerprint(&manifests[0]).expect("probe stamped")
 }
 
 fn deployment(name: &str, spec: Value) -> Value {
