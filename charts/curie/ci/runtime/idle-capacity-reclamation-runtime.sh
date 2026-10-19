@@ -567,7 +567,7 @@ assert len(users) == 2 and users[0] == sys.argv[1] and users[1] == sys.argv[2], 
 
 def burst_sixteen():
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    turns = [start(f"burst16-{index}", "[fake:progress-demo] held-open capacity probe burst16 " + str(index))
+    turns = [start(f"burst16-{index}", "held-open capacity probe burst16 " + str(index))
              for index in range(16)]
     def quota_pods():
         quota = get("resourcequota", fullname + "-sandbox-quota")
