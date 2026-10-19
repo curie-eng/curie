@@ -6267,11 +6267,7 @@ async fn run_prepared_up(
     // fires the pre-upgrade drain hook against Secrets revision 1 never
     // created (#2856). Empty/absent history is a fresh install and is left
     // alone; the Detect gVisor retry still uninstalls an unrecorded abort.
-    if let Err(error) =
-        discard_failed_gvisor_install_if_never_deployed(&cl, &opts.common, true, invocation).await
-    {
-        return Err(convergence::installation_failure(&opts.common, error, invocation).await);
-    }
+    discard_failed_gvisor_install_if_never_deployed(&cl, &opts.common, true, invocation).await?;
     for cmd in &cmds {
         let outcome = match run_install_with_observers(
             &cl,
@@ -6324,18 +6320,13 @@ async fn run_prepared_up(
                 step.warn("retrying");
                 value_plan.set(GVISOR_MODE_KEY, "off");
                 ClusterUpInference::GvisorOffFromAdmission.render(ui);
-                if let Err(error) = discard_failed_gvisor_install_if_never_deployed(
+                discard_failed_gvisor_install_if_never_deployed(
                     &cl,
                     &opts.common,
                     false,
                     invocation,
                 )
-                .await
-                {
-                    return Err(
-                        convergence::installation_failure(&opts.common, error, invocation).await,
-                    );
-                }
+                .await?;
                 let retry = up_commands_with_plan(&opts, &value_plan)
                     .into_iter()
                     .next()
@@ -11304,6 +11295,8 @@ async fn failed_first_revision_read(command: &OpsCommand) -> std::result::Result
 
 /// Remove a never-deployed failed revision so the next Helm command is a
 /// clean install (#2347, #2856).
+/// Data PVC cleanup requires proven first-revision provenance; otherwise,
+/// cleanup is refused.
 ///
 /// `recorded_only` is true for a later `apply` / `cluster up` against whatever
 /// Helm already recorded: an empty history is a fresh install. The Detect
@@ -11407,10 +11400,11 @@ async fn discard_failed_gvisor_install_if_never_deployed(
         pvcs.as_deref().map_err(String::as_str),
     )
     .map_err(|error| {
-        crate::exit::CliError::failure(format!("{error:#}")).with_fix(format!(
+        let fix = format!(
             "inspect the retained PVCs and revision 1 Helm Secret for release {} in namespace {} before retrying",
             common.release, common.namespace
-        ))
+        );
+        crate::exit::CliError::failure(format!("{error:#}; {fix}")).with_fix(fix)
     })?;
     for (name, reason) in &plan.kept {
         ui.note(&format!("keeping PVC {name}: {reason}"));
@@ -11520,11 +11514,12 @@ async fn discard_failed_gvisor_install_if_never_deployed(
         }
     }
     result.map_err(|error| {
-        crate::exit::CliError::failure(format!("{error:#}"))
-            .with_fix(format!(
-                "curie cluster down --yes --namespace {} --release {}",
-                common.namespace, common.release
-            ))
+        let fix = format!(
+            "inspect Helm history and PVC deletion state for release {} in namespace {}; correct the reported cleanup failure before retrying, preserving Helm history and retained PVCs",
+            common.release, common.namespace
+        );
+        crate::exit::CliError::failure(format!("{error:#}; {fix}"))
+            .with_fix(fix)
             .into()
     })
 }
