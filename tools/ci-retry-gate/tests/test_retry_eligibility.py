@@ -49,6 +49,13 @@ ACQUISITION_ACTIONS = frozenset(
 RETRY_ALLOWLIST = frozenset(
     {
         ("ci.yaml", "adapter-credential-reconciliation", "Install uv"),
+        ("ci.yaml", "python-dry-run-fixture", "Install uv"),
+        ("ci.yaml", "python-dry-run-fixture", "Install Helm"),
+        (
+            "ci.yaml",
+            "python-dry-run-fixture",
+            "Install kind and kubectl without creating a cluster",
+        ),
         ("ci.yaml", "python-container-fixtures", "Install uv"),
         ("ci.yaml", "python-container-fixtures", "Install Helm"),
         (
@@ -200,6 +207,7 @@ PROTECTED_STEPS = frozenset(
     {
         ("ci.yaml", "python-pytest", "Pytest"),
         ("ci.yaml", "python-container-fixtures", "Pytest"),
+        ("ci.yaml", "python-dry-run-fixture", "Pytest"),
         ("ci.yaml", "python-static", "Docs gate (catalog drift + agent contract + citations)"),
         ("ci.yaml", "rust-test", "Test"),
         ("ci.yaml", "rust-convergence", "Test"),

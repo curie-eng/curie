@@ -87,6 +87,9 @@ CONTAINER_FILES = (
     "tools/factory-e2e/tests/test_c4_tracker_scope.py",
     "examples/tests/test_sre_bot_observability_runtime.py",
 )
+DRY_RUN_JOB = "python-dry-run-fixture"
+DRY_RUN_FILE = "tools/factory-e2e/tests/test_c4_dry_run.py"
+SHARD_NEIGHBOR = "tools/factory-e2e/tests/test_c4_reinstall_publication.py"
 PRIVATE_IMPORT_STEP = "API private import boundaries"
 ALWAYS_RUN_PYTHON_STEPS = (
     "Alembic revision gate",
@@ -110,6 +113,7 @@ PYTEST_AGGREGATE_EXPRESSIONS = {
     "shards_result": "${{ needs.python-pytest.result }}",
     "changes_result": "${{ needs.changes.result }}",
     "container_result": "${{ needs.python-container-fixtures.result }}",
+    "dry_run_result": "${{ needs.python-dry-run-fixture.result }}",
 }
 PYTEST_STEP_EXPRESSIONS = {
     "shard": "${{ matrix.shard }}",
@@ -342,7 +346,9 @@ def test_required_python_job_keeps_ruleset_name_and_is_not_skippable() -> None:
     assert job["name"] == "Python (ruff + mypy + pytest)"
     # It waits for the shards only to aggregate them; always() keeps it
     # reporting the required check whatever the shards did.
-    assert job["needs"] == ["changes", "python-pytest", CONTAINER_JOB, "python-static"]
+    assert job["needs"] == [
+        "changes", "python-pytest", CONTAINER_JOB, DRY_RUN_JOB, "python-static",
+    ]
     assert job["if"] == "always()"
 
     # #4471: the static gates run in their own job, parallel to the shards.
@@ -606,7 +612,7 @@ def _without_runtime_exclusion(arguments: list[str], runtime: str) -> list[str]:
 def _without_owned_runtime_exclusions(arguments: list[str]) -> list[str]:
     expected = {
         ("--deselect", ADMITTED_AGENT_RUNTIME),
-        *(("--ignore", runtime) for runtime in CONTAINER_FILES),
+        *(("--ignore", runtime) for runtime in (*CONTAINER_FILES, DRY_RUN_FILE)),
     }
     remaining = []
     excluded = []
@@ -855,6 +861,109 @@ def test_container_caller_follows_real_selection_for_pr_push_and_dispatch(
         assert [path for path in argv if path in CONTAINER_FILES] == list(files)
 
 
+def test_dry_run_job_matches_container_setup_and_runs_only_its_file() -> None:
+    job = _python_job(DRY_RUN_JOB)
+    assert job["name"] == "Python dry run fixture (pytest)"
+    assert _needs(job) == ["changes"]
+    assert "python-dry-run-fixture" in _needs(_python_job())
+    named = _named_steps(DRY_RUN_JOB)
+    container = _named_steps(CONTAINER_JOB)
+    for name, step in container.items():
+        if name == "Pytest":
+            continue
+        assert named[name] == step, name
+    pytest_step = named["Pytest"]
+    assert pytest_step["env"] == {
+        "PYTEST_SCOPE": "${{ needs.changes.outputs.pytest_scope }}",
+    }
+    script = _string(pytest_step, "run")
+    assert "uv run pytest -q -n 0 --reruns 1 -rsR --durations=25 " + DRY_RUN_FILE in script
+    assert "wait-for-langfuse.py" not in script
+    manifest = (REPO_ROOT / "tools/e2e-ci-selection/cli_pytest_files.txt").read_text().splitlines()
+    assert DRY_RUN_FILE in manifest
+    assert SHARD_NEIGHBOR in manifest
+    assert SHARD_NEIGHBOR not in (*CONTAINER_FILES, DRY_RUN_FILE)
+
+
+@pytest.mark.parametrize("copy", ["job", "aggregate"])
+def test_dry_run_selection_rejects_a_substring_deselect_token(copy: str) -> None:
+    expression = (
+        _python_job(DRY_RUN_JOB)["if"] if copy == "job" else
+        _named_steps()["Require pytest outcome to match selection"]["env"]["DRY_RUN_SELECTED"]
+    )
+    assert _selection_expression(expression, "true", "") is True
+    assert _selection_expression(expression, "true", DRY_RUN_FILE) is False
+    for near in (DRY_RUN_FILE + "::test_x", "prefix/" + DRY_RUN_FILE):
+        assert _selection_expression(expression, "true", near) is True
+    mutated = re.sub(
+        r"format\(\s*',\{0\},'\s*,\s*needs\.changes\.outputs\.pytest_deselect\s*\)",
+        "needs.changes.outputs.pytest_deselect",
+        expression,
+    )
+    mutated = mutated.replace(f"',{DRY_RUN_FILE},'", f"'{DRY_RUN_FILE}'")
+    assert mutated != expression
+    with pytest.raises(AssertionError):
+        assert _selection_expression(mutated, "true", DRY_RUN_FILE + "::test_x") is True
+
+
+@pytest.mark.parametrize(("event", "paths", "selected"), [
+    ("pull_request", (".github/workflows/ci.yaml",), True),
+    ("pull_request", ("docs/guides/getting-started.md",), False),
+    ("push", (), True),
+    ("workflow_dispatch", (), True),
+])
+def test_dry_run_caller_follows_pr_push_and_dispatch_selection(
+    tmp_path: Path, event: str, paths: tuple[str, ...], selected: bool
+) -> None:
+    completed, output = _invoke_selector(tmp_path, *paths, push=event != "pull_request")
+    assert completed.returncode == 0, completed.stderr
+    selection = _outputs(output)
+    for expression in (
+        _python_job(DRY_RUN_JOB)["if"],
+        _named_steps()["Require pytest outcome to match selection"]["env"]["DRY_RUN_SELECTED"],
+    ):
+        assert _selection_expression(
+            expression, selection["pytest"], selection["pytest_deselect"]
+        ) is selected
+
+
+@pytest.mark.parametrize("scope", ["full", "cli"])
+def test_aggregate_rejects_dry_run_skipped_while_selected_or_run_while_deselected(
+    tmp_path: Path, scope: str
+) -> None:
+    skipped = _run_pytest_aggregate(
+        tmp_path / "skipped",
+        selected="true",
+        container_result="success",
+        dry_run_result="skipped",
+        scope=scope,
+        shards=_all_shards("true", "success", scope=scope),
+    )
+    assert skipped.returncode != 0, skipped.stdout + skipped.stderr
+    assert "dry run" in (skipped.stdout + skipped.stderr).lower()
+    ran = _run_pytest_aggregate(
+        tmp_path / "ran",
+        selected="true",
+        container_result="success",
+        dry_run_result="success",
+        deselect=DRY_RUN_FILE,
+        scope=scope,
+        shards=_all_shards("true", "success", DRY_RUN_FILE, scope),
+    )
+    assert ran.returncode != 0, ran.stdout + ran.stderr
+    assert "dry run" in (ran.stdout + ran.stderr).lower()
+    healthy = _run_pytest_aggregate(
+        tmp_path / "healthy",
+        selected="true",
+        container_result="success",
+        dry_run_result="skipped",
+        deselect=DRY_RUN_FILE,
+        scope=scope,
+        shards=_all_shards("true", "success", DRY_RUN_FILE, scope),
+    )
+    assert healthy.returncode == 0, healthy.stdout + healthy.stderr
+
+
 def _admitted_agent_runtime_owner() -> tuple[dict[str, Any], dict[str, Any]]:
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     owners = []
@@ -949,11 +1058,11 @@ def test_admitted_agent_shards_partition_the_module_in_collection_order() -> Non
 
 @pytest.mark.parametrize("shard", range(1, SHARD_COUNT + 1))
 @pytest.mark.parametrize("scope", ["full", "cli"])
-@pytest.mark.parametrize("runtime", [ADMITTED_AGENT_RUNTIME, *CONTAINER_FILES])
+@pytest.mark.parametrize("runtime", [ADMITTED_AGENT_RUNTIME, *CONTAINER_FILES, DRY_RUN_FILE])
 def test_dedicated_runtime_is_excluded_from_every_generic_shard(
     tmp_path: Path, shard: int, scope: str, runtime: str
 ) -> None:
-    neighbor = "tools/factory-e2e/tests/test_c4_dry_run.py"
+    neighbor = SHARD_NEIGHBOR
     arguments = _run_pytest_step(
         tmp_path,
         shard=shard,
@@ -964,7 +1073,7 @@ def test_dedicated_runtime_is_excluded_from_every_generic_shard(
     without_exclusion = _without_runtime_exclusion(arguments, runtime)
     if scope == "cli":
         assert neighbor in without_exclusion
-        if runtime in CONTAINER_FILES:
+        if runtime in (*CONTAINER_FILES, DRY_RUN_FILE):
             assert runtime not in without_exclusion
             without_exclusion.append(runtime)
         else:
@@ -1041,6 +1150,7 @@ def _assert_owned_kind_modules_excluded(argv: list[str]) -> None:
         "tools/factory-e2e/tests/test_c4_cluster_up.py",
         "tools/factory-e2e/tests/test_c4_forge_instances.py",
         *CONTAINER_FILES,
+        DRY_RUN_FILE,
     ):
         assert ignored.count(module) == 1, module
         assert all(
@@ -1107,6 +1217,7 @@ def _run_pytest_aggregate(
     *,
     selected: str,
     container_result: str,
+    dry_run_result: str | None = None,
     shards: dict[int, tuple[str, str, str, str, str]] | None = None,
     shards_result: str = "success",
     results_dir: bool = True,
@@ -1144,12 +1255,22 @@ def _run_pytest_aggregate(
         "pytest_deselect": deselect,
         "pytest_scope": scope,
         "container_result": container_result,
+        "dry_run_result": "placeholder",
     }
     literals = {k: v for k, v in step["env"].items() if "${{" not in v}
     environment = literals | {bindings[k]: v for k, v in state.items()}
     environment["CONTAINER_SELECTED"] = str(
         _selection_expression(step["env"]["CONTAINER_SELECTED"], selected, deselect)
     ).lower()
+    dry_run_selected = _selection_expression(
+        step["env"]["DRY_RUN_SELECTED"], selected, deselect
+    )
+    environment["DRY_RUN_SELECTED"] = str(dry_run_selected).lower()
+    environment["DRY_RUN_RESULT"] = (
+        ("success" if dry_run_selected else "skipped")
+        if dry_run_result is None
+        else dry_run_result
+    )
     return _run_bash(_string(step, "run"), environment, tmp_path)
 
 
