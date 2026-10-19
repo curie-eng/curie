@@ -230,7 +230,7 @@ def test_conditional_deselection_is_sorted_and_matches_exact_inputs(tmp_path: Pa
     )
 
 
-@pytest.mark.parametrize("shard", [1, 2, 3])
+@pytest.mark.parametrize("shard", range(1, PYTEST_TESTS.SHARD_COUNT + 1))
 @pytest.mark.parametrize("deselect", ["", SRE_RUNTIME])
 def test_pytest_step_appends_deselect_only_when_selected(
     tmp_path: Path, shard: int, deselect: str
@@ -244,7 +244,7 @@ def test_pytest_step_appends_deselect_only_when_selected(
         "--dist",
         "loadgroup",
         "--ci-shard",
-        f"{shard}/3",
+        f"{shard}/{PYTEST_TESTS.SHARD_COUNT}",
         "--reruns",
         "1",
         "-rsR",
@@ -259,13 +259,13 @@ def test_pytest_step_appends_deselect_only_when_selected(
     if deselect:
         expected += ["--deselect", "examples/tests/test_sre_bot_observability_runtime.py"]
     arguments = _run_pytest_step(tmp_path, shard=shard, deselect=deselect)
-    assert PYTEST_TESTS._without_admitted_agent_exclusion(arguments) == expected
+    assert PYTEST_TESTS._without_owned_runtime_exclusions(arguments) == expected
 
 
 def test_pytest_step_preserves_each_deselect_argument(tmp_path: Path) -> None:
     paths = ["examples/tests/test_additional file.py", SRE_RUNTIME]
     argv = _run_pytest_step(tmp_path, shard=2, deselect=",".join(paths))
-    argv = PYTEST_TESTS._without_admitted_agent_exclusion(argv)
+    argv = PYTEST_TESTS._without_owned_runtime_exclusions(argv)
     assert argv[-4:] == ["--deselect", paths[0], "--deselect", paths[1]]
 
 

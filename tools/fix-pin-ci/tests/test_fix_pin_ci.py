@@ -1120,7 +1120,9 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     # The suite runs in the python-pytest shards and the static gates in
     # python-static; the required job only waits for them to aggregate their
     # results, and always() keeps it from skipping.
-    assert job.get("needs") == ["changes", "python-pytest", "python-static"]
+    assert job.get("needs") == [
+        "changes", "python-pytest", "python-container-fixtures", "python-static",
+    ]
     assert job.get("if") == "always()", "the required Python check must not be skippable"
     shard_job, steps = _python_job(document, "python-pytest")
     # #3858: the shards wait for the `changes` selection and run only when it
@@ -1185,6 +1187,8 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         bindings[meaning] = names[0]
     runtime_exclusions = {("--ignore", module) for module in KIND_MODULES} | {
         ("--deselect", ADMITTED_AGENT_SELECTOR.split("::", 1)[0]),
+        ("--ignore", "tools/factory-e2e/tests/test_c4_tracker_scope.py"),
+        ("--ignore", "examples/tests/test_sre_bot_observability_runtime.py"),
     }
 
     def assert_full_suite(command: list[str], shard: int, deselect: str) -> None:
@@ -1199,7 +1203,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
             "--dist",
             "loadgroup",
             "--ci-shard",
-            f"{shard}/3",
+            f"{shard}/6",
             "--reruns",
             "1",
         ]
@@ -1234,7 +1238,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         ), f"the full Python suite permits only reporting flags, got {command!r}"
 
     # Run the unmodified Bash with a recording uv function at its command boundary.
-    for shard in (1, 2, 3):
+    for shard in range(1, 7):
         for deselect in ("", "examples/tests/test_sre_bot_observability_runtime.py"):
             environment = {
                 **os.environ,
