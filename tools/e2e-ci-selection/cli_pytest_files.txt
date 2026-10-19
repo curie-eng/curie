@@ -25,6 +25,7 @@ apps/worker/tests/test_hook_approval_proof_thread_key.py
 apps/worker/tests/test_progress.py
 apps/worker/tests/test_publication_validation.py
 apps/worker/tests/test_stream_retention.py
+charts/curie/ci/repro/test_classify_recovery.py
 charts/curie/ci/test_cron_approval_receipt.py
 charts/curie/ci/test_quota_progress_inputs.py
 charts/curie/ci/test_workspace_diagnostic_inputs.py
