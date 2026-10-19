@@ -48,7 +48,7 @@ ACQUISITION_ACTIONS = frozenset(
 RETRY_ALLOWLIST = frozenset(
     {
         ("ci.yaml", "adapter-credential-reconciliation", "Install uv"),
-        ("ci.yaml", "python", "Install uv"),
+        ("ci.yaml", "python-container-fixtures", "Install uv"),
         ("ci.yaml", "python-static", "Install uv"),
         ("ci.yaml", "python-pytest", "Install uv"),
         ("ci.yaml", "turn-canary-contract", "Install uv"),
@@ -192,6 +192,7 @@ RETRY_ALLOWLIST = frozenset(
 PROTECTED_STEPS = frozenset(
     {
         ("ci.yaml", "python-pytest", "Pytest"),
+        ("ci.yaml", "python-container-fixtures", "Pytest"),
         ("ci.yaml", "python-static", "Docs gate (catalog drift + agent contract + citations)"),
         ("ci.yaml", "rust-test", "Test"),
         ("ci.yaml", "rust-convergence", "Test"),
