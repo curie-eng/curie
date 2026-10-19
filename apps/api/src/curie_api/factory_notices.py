@@ -172,6 +172,7 @@ _CAUSE_TEXT = {
         "no pull request checks. The pull request stays open; resolve the conflicts "
         "to continue."
     ),
+    "pr_closed": "a person closed the pull request without merging it during the CI wait.",
     "ci_fix_unpublished": (
         "a CI fix round ended without pushing a fix. The pull request stays open."
     ),
@@ -185,6 +186,7 @@ _DETAIL_CAUSES = frozenset(
         "ci_timeout",
         "ci_unverified",
         "merge_conflict",
+        "pr_closed",
         "approval_create_failed",
         "publication_unrecorded",
     }
