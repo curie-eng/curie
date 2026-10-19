@@ -8,7 +8,7 @@
 # key material. The removed api.* factory keys are named only by
 # files/legacy-factory-keys.yaml: this script reads them from there and spells
 # none of them, and a release that still sets one is refused with a message
-# that names factory.* and `curie cluster factory`.
+# that names factory.* and `curie cluster upgrade`.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly.
 set -euo pipefail
@@ -16,6 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART="$(cd "$SCRIPT_DIR/.." && pwd)"
 GUARD="$CHART/files/legacy-factory-keys.yaml"
+DAEMON_VECTOR="$CHART/../../tests/vectors/daemon-config.json"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -116,6 +117,13 @@ for doc in docs:
                 fail("repository runner blocks must render CURIE_REPO_RUNNER_POOLS")
             if mode != "tools" and repo_pools:
                 fail("repositories without runner blocks must not render CURIE_REPO_RUNNER_POOLS")
+            if mode == "tools":
+                pools = json.loads(repo_pools[0]["value"])
+                expected_daemon = json.load(open(sys.argv[3]))["daemon"]
+                expected_daemon["namespace"] = "default-rel-curie-docker"
+                expected_daemon["selectorLabels"]["app.kubernetes.io/instance"] = "rel"
+                if pools["acme-corp/api"].get("daemon") != expected_daemon:
+                    fail("Docker repository runner must receive the complete daemon handoff")
         stale = [e["name"] for e in c.get("env", []) or [] if e["name"].startswith(OLD_ENV_PREFIX)]
         if stale:
             fail("%s/%s still renders %s" % (doc["metadata"]["name"], c["name"], stale))
@@ -226,7 +234,7 @@ for entry in (code_host, tracker):
     if projected.get(path) != ("curie-factory-app", "privateKey"):
         fail(f"{path} is not projected from curie-factory-app/privateKey: {projected}")
 print("  ok: factory block renders FACTORY_* env, CURIE_FORGES and a read-only credential mount")
-' "$1" "$GUARD"
+' "$1" "$GUARD" "$DAEMON_VECTOR"
 }
 
 refused() {
@@ -313,10 +321,10 @@ nondefault() {
 nulls=()
 for key in "${LEGACY[@]}"; do
   refused "legacy key $key set" "factory." render -f "$WORK/factory.yaml" --set-json "$key=$(nondefault "${key##*.}")"
-  refused "legacy key $key set" "curie cluster factory" render --set-json "$key=$(nondefault "${key##*.}")"
+  refused "legacy key $key set" "curie cluster upgrade" render --set-json "$key=$(nondefault "${key##*.}")"
   nulls+=(--set-json "$key=null")
 done
-echo "  ok: each of ${#LEGACY[@]} legacy keys set to a non-default value is refused naming factory.* and curie cluster factory"
+echo "  ok: each of ${#LEGACY[@]} legacy keys set to a non-default value is refused naming factory.* and curie cluster upgrade"
 
 # What `curie cluster factory` writes: every legacy key null, beside the block.
 render -f "$WORK/factory.yaml" "${nulls[@]}" | check factory
@@ -336,7 +344,7 @@ refused "an intake outside poll and webhook" "intake" \
 refused "ciWaitSeconds above 10800" "ciWaitSeconds" \
   render -f "$WORK/factory.yaml" --set 'factory.ciWaitSeconds=10801'
 echo "  ok: incomplete or inconsistent factory config is refused"
-render -f "$WORK/factory.yaml" --set 'factory.enabled=false' --set-json 'factory.trackers=[]' >/dev/null
+render -f "$WORK/factory.yaml" --set 'factory.enabled=false' --set-json 'factory.trackers=[]' --set-json 'factory.bindings=[]' >/dev/null
 echo "  ok: a disabled factory needs no tracker"
 
 # Negative control: the refusal comes from the guard file, not a hard-coded key.

@@ -164,3 +164,8 @@ a6ad6a14d49962754a56754da7c216469acd3bb6:runner/tests/test_redact.py:generic-api
 655a83ef1f70ec9434d33665e5a0376da50dc756:examples/dark-factory/preparation/evals/publication-cases.json:cross-repo-issue-ref:73
 655a83ef1f70ec9434d33665e5a0376da50dc756:examples/dark-factory/preparation/evals/publication-cases.json:cross-repo-issue-ref:222
 655a83ef1f70ec9434d33665e5a0376da50dc756:examples/dark-factory/preparation/evals/publication-cases.json:cross-repo-issue-ref:227
+
+# Synthetic planted hex in the Forge harness redaction test (#4706). A later
+# commit on the same branch derives it at runtime; this fingerprint stays
+# because the first commit is still reachable from the pull request branch.
+79fb0fbeea09d12ea223ca4382c9e443dc235bd7:tools/factory-e2e/tests/test_forge_instance_harness.py:generic-api-key:93

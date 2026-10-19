@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from aci_protocol import BootEnv
 from aci_protocol.service_config import API_KEY_ENV
@@ -23,7 +23,8 @@ from aci_protocol.slack_identities import SLACK_CREDENTIAL_ENV_PREFIXES
 from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT
 from plugin_format import is_reserved_boot_env_name
 
-from ..repo_runner_pools import RepoRunnerPool
+if TYPE_CHECKING:
+    from ..repo_runner_pools import RepoRunnerPool
 
 # Substrate-neutral labels: every backend tags its managed objects with these
 # (the Kubernetes adapter on claims, the Docker adapter on containers), so they

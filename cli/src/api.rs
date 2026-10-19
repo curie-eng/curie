@@ -761,6 +761,28 @@ pub struct AgentSchedules {
     pub hooks: Vec<ScheduleHook>,
 }
 
+/// One forge credential's authentication probe (`ForgeCredentialHealth`, #4630).
+/// No field carries credential bytes.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ForgeCredentialHealth {
+    /// `code_host` or `tracker`.
+    pub section: String,
+    pub name: String,
+    pub kind: String,
+    pub credential_type: String,
+    /// `accepted`, `rejected` or `unknown`.
+    pub authentication: String,
+    pub reason: Option<String>,
+    pub observed_at: String,
+}
+
+/// `GET /forges/credentials/health` (`ForgeCredentialHealthReport`, #4630).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ForgeCredentialHealthReport {
+    pub observed_at: String,
+    pub entries: Vec<ForgeCredentialHealth>,
+}
+
 /// `GET /schedules` (`ScheduleListOut`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScheduleList {
@@ -1993,20 +2015,11 @@ pub(crate) fn validate_allowlist_entry(entry: &str) -> Result<()> {
 /// the new agent to that repository rather than 409, which is worse.
 fn agent_create_body(
     name: &str,
-    slack_channel: &str,
+    channel: ChannelBindingWrite,
     repo_full_name: Option<&str>,
-    identity: Option<&str>,
 ) -> AgentCreate {
     AgentCreate {
-        channel: ChannelBindingWrite {
-            // @spec ADR-0168 d8: only a named identity travels; the default is
-            // omitted, exactly as every create sent it before the identity existed.
-            adapter: named_identity("slack", identity).map(str::to_string),
-            address: slack_channel.to_string(),
-            endpoint: None,
-            kind: "slack".to_string(),
-            trigger_label: None,
-        },
+        channel,
         name: name.to_string(),
         repo_full_name: repo_full_name.map(str::to_string),
     }
@@ -2088,7 +2101,7 @@ fn agent_update_body(repo_full_name: Option<&str>) -> AgentUpdate {
 ///
 /// `trigger_label` travels only when named (#4361); `ChannelChange::resolve`
 /// has already refused it on any kind but a tracker surface.
-fn add_channel_body(
+pub(crate) fn add_channel_body(
     kind: &str,
     address: &str,
     endpoint: Option<&str>,
@@ -2592,11 +2605,10 @@ impl ApiClient {
     pub async fn create_agent(
         &self,
         name: &str,
-        slack_channel: &str,
+        channel: ChannelBindingWrite,
         repo_full_name: Option<&str>,
-        identity: Option<&str>,
     ) -> Result<Agent> {
-        let body = agent_create_body(name, slack_channel, repo_full_name, identity);
+        let body = agent_create_body(name, channel, repo_full_name);
         let resp = self
             .send_request(
                 self.http
@@ -2606,10 +2618,17 @@ impl ApiClient {
                 "POST /agents",
             )
             .await?;
-        if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-            if let Some(identity) = named_identity("slack", identity) {
-                let body = resp.text().await.unwrap_or_default();
-                return Err(identity_refusal("slack", slack_channel, identity, &body));
+        if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            && body.channel.kind == "slack"
+        {
+            if let Some(identity) = named_identity("slack", body.channel.adapter.as_deref()) {
+                let response = resp.text().await.unwrap_or_default();
+                return Err(identity_refusal(
+                    "slack",
+                    &body.channel.address,
+                    identity,
+                    &response,
+                ));
             }
         }
         Self::expect_ok(resp, "creating the agent")
@@ -2619,7 +2638,12 @@ impl ApiClient {
             .context("decoding created agent")
     }
 
-    pub async fn find_or_create_agent(&self, name: &str, slack_channel: &str) -> Result<Agent> {
+    pub async fn find_or_create_agent(
+        &self,
+        name: &str,
+        channel: ChannelBindingWrite,
+        repo_full_name: Option<&str>,
+    ) -> Result<Agent> {
         if let Some(existing) = self
             .list_agents()
             .await?
@@ -2628,7 +2652,7 @@ impl ApiClient {
         {
             return Ok(existing);
         }
-        self.create_agent(name, slack_channel, None, None).await
+        self.create_agent(name, channel, repo_full_name).await
     }
 
     /// `PATCH /agents/{id}` with a typed body the caller already built (see
@@ -2995,9 +3019,8 @@ impl ApiClient {
             }
             None => {
                 let channel = slack_channel.unwrap_or(DEFAULT_SLACK_CHANNEL);
-                let agent = self
-                    .create_agent(name, channel, repo_full_name, identity)
-                    .await?;
+                let binding = add_channel_body("slack", channel, None, identity, None);
+                let agent = self.create_agent(name, binding, repo_full_name).await?;
                 // `AgentCreate` still carries the singular channel, so a created
                 // agent holds exactly the one binding it was created with.
                 let outcome = ChannelOutcome::Created(
@@ -3584,6 +3607,29 @@ impl ApiClient {
             .json()
             .await
             .context("decoding connector manifests")
+    }
+
+    /// Read-only authentication probe of every recorded forge credential
+    /// (`GET /forges/credentials/health`, #4630). The request is bounded by
+    /// `timeout`; the response carries no credential bytes.
+    pub async fn forge_credential_health(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<ForgeCredentialHealthReport> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/forges/credentials/health", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .timeout(timeout),
+                "GET /forges/credentials/health",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading forge credential health")
+            .await?
+            .json()
+            .await
+            .context("decoding forge credential health")
     }
 
     pub async fn list_versions(&self, agent_id: &str) -> Result<Vec<Version>> {
@@ -4721,6 +4767,43 @@ impl ApiClient {
         })
     }
 
+    /// Mint a reusable remediation-operator principal (scope
+    /// `remediation.administer`) under the platform key. One-time delivery,
+    /// never cached by the CLI.
+    pub async fn mint_remediation_principal(
+        &self,
+        subject: &str,
+    ) -> Result<OperatorPrincipalDelivery> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/approvals/principals/remediation-operator",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<ApprovalPrincipalMint>(&ApprovalPrincipalMint {
+                        subject: subject.to_string(),
+                    }),
+                "POST /approvals/principals/remediation-operator",
+            )
+            .await?;
+        let body: serde_json::Value = Self::expect_ok(resp, "minting remediation principal")
+            .await?
+            .json()
+            .await
+            .context("decoding remediation principal delivery")?;
+        Ok(OperatorPrincipalDelivery {
+            token: required_response_string(&body, "token", "remediation principal delivery")?,
+            subject: required_response_string(&body, "subject", "remediation principal delivery")?,
+            expires_at: required_response_string(
+                &body,
+                "expires_at",
+                "remediation principal delivery",
+            )?,
+        })
+    }
+
     /// Mint a subject-bound, single-use console login code under the platform
     /// key. The plaintext code is returned once and is never cached by the CLI.
     pub async fn mint_console_login_code(&self, subject: &str) -> Result<ConsoleLoginCodeDelivery> {
@@ -4973,8 +5056,8 @@ mod tests {
     use super::{
         add_channel_body, agent_create_body, agent_update_body, api_key_for_destination,
         is_insecure_endpoint, mint_channel_token_body, prevalidate_series_span,
-        validate_allowlist_entry, ChannelBinding, ListedTargets, ResolvedTarget,
-        DEFAULT_SLACK_IDENTITY,
+        validate_allowlist_entry, ChannelBinding, ChannelBindingWrite, ListedTargets,
+        ResolvedTarget, DEFAULT_SLACK_IDENTITY,
     };
 
     /// A typed request body as it goes on the wire.
@@ -5135,10 +5218,20 @@ mod tests {
         // A value the caller did not pass is not a binding the caller intended.
         // The column is no longer unique (ADR-0091, migration 0018), so an
         // unsolicited value would silently bind rather than 409.
-        let body = wire(&agent_create_body("bot", "C123", None, None));
+        let body = wire(&agent_create_body(
+            "bot",
+            ChannelBindingWrite {
+                kind: "slack".into(),
+                address: "C0EXAMPLE1".into(),
+                adapter: None,
+                endpoint: None,
+                trigger_label: None,
+            },
+            None,
+        ));
         assert_eq!(body["name"], "bot");
         assert_eq!(body["channel"]["kind"], "slack");
-        assert_eq!(body["channel"]["address"], "C123");
+        assert_eq!(body["channel"]["address"], "C0EXAMPLE1");
         assert!(body.get("repo_full_name").is_none());
     }
 
@@ -5146,7 +5239,17 @@ mod tests {
     fn create_agent_body_binds_the_repo_when_asked() {
         // Creation is the first chance to bind, and the only one that needs no
         // second request: AgentUpdate carries repo_full_name too (#1194).
-        let body = wire(&agent_create_body("bot", "C123", Some("acme/bundle"), None));
+        let body = wire(&agent_create_body(
+            "bot",
+            ChannelBindingWrite {
+                kind: "slack".into(),
+                address: "C0EXAMPLE1".into(),
+                adapter: None,
+                endpoint: None,
+                trigger_label: None,
+            },
+            Some("acme/bundle"),
+        ));
         assert_eq!(body["repo_full_name"], "acme/bundle");
     }
 

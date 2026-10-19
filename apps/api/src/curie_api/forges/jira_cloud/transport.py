@@ -2,10 +2,13 @@
 
 Every request carries HTTP basic auth with the bot's Atlassian account email
 and API token (https://developer.atlassian.com/cloud/jira/platform/basic-auth-for-rest-apis/).
-The header is built per request from the `SecretStr` and never stored, logged,
-or put in an exception: a transport failure is raised ``from None`` with only
-the name of the operation, so even an HTTP library that echoes the request's
-headers into its own error text leaks nothing.
+The header is built per request from the operation's `TokenSnapshot` (read at
+the first request, so a replaced token file is used by the next operation,
+#4630) and never stored, logged, or put in an exception: a transport failure
+is raised outside the handler with only the name of the operation, so no cause
+or context keeps an HTTP library error that echoes the request's headers into
+its own text. The log names the API root, the operation and the error class
+only.
 
 Status map (decision 9, the port contract): 429 and 503 are `Unavailable` and
 are never slept on, whatever ``Retry-After`` says, so the poll pass keeps its
@@ -17,17 +20,27 @@ not JSON is `Unavailable`.
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
+import logging
+import secrets
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
-from pydantic import SecretStr
 
 from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
+
+if TYPE_CHECKING:
+    from curie_api.forges.credential_providers import TokenSnapshot
+
+logger = logging.getLogger(__name__)
 
 API_PREFIX = "/rest/api/3"
 # A listing that has not ended after this many pages is not trusted to end.
 MAX_PAGES = 1000
+# Keys `JiraTransport.credential_fingerprint`; never leaves the process.
+_FINGERPRINT_KEY = secrets.token_bytes(32)
 
 
 class Forbidden(Unauthorized):
@@ -42,21 +55,33 @@ class JiraTransport:
         self,
         client: httpx.AsyncClient,
         *,
+        entry: str,
         api_url: str,
         username: str,
-        token: SecretStr,
+        token: TokenSnapshot,
     ) -> None:
         self._client = client
+        # The configured entry's name, so a log line tells two entries apart.
+        self.entry = entry
         self._api = api_url.rstrip("/") + API_PREFIX
         self._username = username
         self._token = token
 
     def __repr__(self) -> str:
-        return f"JiraTransport(api={self._api!r})"
+        return f"JiraTransport(entry={self.entry!r}, api={self._api!r})"
 
     def _authorization(self) -> str:
-        pair = f"{self._username}:{self._token.get_secret_value()}".encode()
+        pair = f"{self._username}:{self._token.value()}".encode()
         return "Basic " + base64.b64encode(pair).decode()
+
+    def credential_fingerprint(self) -> str:
+        """A keyed digest of this operation's credential, so a cached identity
+        can tell the token it was verified with from a replacement. The key is
+        random per process, so the digest names no token outside it."""
+
+        return hmac.new(
+            _FINGERPRINT_KEY, self._authorization().encode(), hashlib.sha256
+        ).hexdigest()
 
     async def request(
         self,
@@ -71,6 +96,7 @@ class JiraTransport:
         None for an empty 2xx body. ``what`` names the operation in errors."""
 
         headers = {"Accept": "application/json", "Authorization": self._authorization()}
+        response = None
         try:
             response = await self._client.request(
                 method,
@@ -80,19 +106,35 @@ class JiraTransport:
                 headers=headers,
                 follow_redirects=False,
             )
-        except httpx.HTTPError:
-            raise Unavailable(what) from None
+        except httpx.HTTPError as error:
+            failure = type(error).__name__
+        if response is None:
+            logger.warning(
+                "Jira %r %s %s at %s failed in transport: %s",
+                self.entry,
+                method,
+                what,
+                self._api,
+                failure,
+            )
+            raise Unavailable(what)
         return _answer(response, what)
 
     async def anonymous_get(self, url: str, *, what: str) -> Any:
         """GET an absolute URL with no credential (the site's ``tenant_info``)."""
 
+        response = None
         try:
             response = await self._client.get(
                 url, headers={"Accept": "application/json"}, follow_redirects=False
             )
-        except httpx.HTTPError:
-            raise Unavailable(what) from None
+        except httpx.HTTPError as error:
+            failure = type(error).__name__
+        if response is None:
+            logger.warning(
+                "Jira %r GET %s at %s failed in transport: %s", self.entry, what, self._api, failure
+            )
+            raise Unavailable(what)
         return _answer(response, what)
 
     async def get(self, path: str, *, what: str, params: Mapping[str, Any] | None = None) -> Any:
@@ -136,10 +178,14 @@ class JiraTransport:
             token = next_token
         raise Unavailable("search")
 
-    async def changelog(self, issue_id: str, *, page_size: int) -> list[dict[str, Any]]:
+    async def changelog(
+        self, issue_id: str, *, page_size: int, strict: bool = False
+    ) -> list[dict[str, Any]]:
         """The issue's whole changelog, oldest first, across every page.
 
         https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-issueidorkey-changelog-get
+        A history that is not an object is skipped, or with ``strict`` raises
+        `Unavailable`, for a caller that must not decide without it.
         """
 
         histories: list[dict[str, Any]] = []
@@ -152,6 +198,8 @@ class JiraTransport:
             )
             values = page.get("values") if isinstance(page, dict) else None
             if not isinstance(values, list):
+                raise Unavailable("changelog")
+            if strict and not all(isinstance(value, dict) for value in values):
                 raise Unavailable("changelog")
             histories.extend(value for value in values if isinstance(value, dict))
             if page.get("isLast") is True:

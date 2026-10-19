@@ -74,7 +74,7 @@ subjects:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ $hookName }}
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Job" "name" $hookName) }}
   namespace: {{ $grafanaNamespace }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}

@@ -7,8 +7,8 @@ from datetime import datetime
 from typing import Any, Literal, Self
 
 from channel_protocol.work_item_events import CI_FIRST_FIX_ROUND, CI_MAX_ROUNDS
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field, model_validator
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field, StrictBool, model_validator
 
 from curie_api.workitems.lifecycle import WorkItemConflict, WorkItemOutcome
 
@@ -88,6 +88,8 @@ class CancelBody(BaseModel):
 class AcquireBody(BaseModel):
     owner: str = Field(min_length=1)
     generation: int = Field(ge=1)
+    wake: workitem_dispatch.FactoryWake
+    context: workitem_dispatch.FactoryContext | None
 
 
 class DeferBody(BaseModel):
@@ -105,6 +107,7 @@ class StartBody(BaseModel):
     generation: int = Field(ge=1)
     claim_name: str = Field(min_length=1)
     sandbox_name: str = Field(min_length=1)
+    context: workitem_dispatch.FactoryContext
 
 
 class HeartbeatBody(BaseModel):
@@ -147,11 +150,19 @@ class TerminationBody(BaseModel):
 
 class RunningWorkItemRequest(BaseModel):
     input_contract_receipt: dict[str, Any] | None = None
+    lease_held_to_deadline: StrictBool
     work_item_id: uuid.UUID
     request_id: uuid.UUID
     runtime_epoch: int
     execution_deadline: datetime
     status: Literal["running"]
+    agent_id: uuid.UUID
+    generation: int
+    conversation_id: str
+    wait_deadline: datetime
+    repository_path: str
+    context: workitem_dispatch.FactoryContext | None
+    refusal: workitem_dispatch.RefusalCode | None
 
 
 def _raise_conflict(result: object) -> None:
@@ -184,24 +195,45 @@ async def admit_work_item(
 
 @router.get("/running", response_model=RunningWorkItemRequest)
 async def running_work_item_request(
-    conversation_id: str, session: SessionDep
+    conversation_id: str,
+    session: SessionDep,
+    wake_kind: str,
+    wake_address: str,
+    wake_conversation_id: str,
+    wake_adapter: str | None = Query(...),
 ) -> RunningWorkItemRequest:
     state, row = await workitem_dispatch.running_for_conversation(
-        session, conversation_id
+        session,
+        conversation_id,
+        wake=workitem_dispatch.FactoryWake(
+            kind=wake_kind,
+            address=wake_address,
+            adapter=wake_adapter or None,
+            conversation_id=wake_conversation_id,
+        ),
     )
-    if state == "absent" or row is None or row.runtime_epoch is None:
+    if isinstance(row, DispatchConflict):
+        _raise_conflict(row)
+    assert not isinstance(row, DispatchConflict)
+    if state == "absent" or row is None:
         if state == "ended":
             raise HTTPException(status.HTTP_409_CONFLICT, {"code": "execution_ended"})
         raise HTTPException(status.HTTP_404_NOT_FOUND, {"code": "not_found"})
-    if row.execution_deadline is None:
-        raise HTTPException(status.HTTP_409_CONFLICT, {"code": "execution_ended"})
     return RunningWorkItemRequest(
+        lease_held_to_deadline=row.lease_held_to_deadline,
         work_item_id=row.work_item_id,
-        request_id=row.id,
+        request_id=row.request_id,
         runtime_epoch=row.runtime_epoch,
         execution_deadline=row.execution_deadline,
         status="running",
         input_contract_receipt=row.input_contract_receipt,
+        agent_id=row.agent_id,
+        generation=row.generation,
+        conversation_id=row.conversation_id,
+        wait_deadline=row.wait_deadline,
+        repository_path=row.repository_path,
+        context=row.context,
+        refusal=row.refusal,
     )
 
 
@@ -259,7 +291,12 @@ async def acquire_work_item_request(
     request_id: uuid.UUID, body: AcquireBody, session: SessionDep
 ) -> dict[str, Any]:
     result = await workitem_dispatch.acquire(
-        session, request_id, owner=body.owner, generation=body.generation
+        session,
+        request_id,
+        owner=body.owner,
+        generation=body.generation,
+        wake=body.wake,
+        context=body.context,
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)
@@ -271,6 +308,7 @@ async def acquire_work_item_request(
         "wait_deadline": result.wait_deadline,
         "repository_path": result.repository_path,
         "input_contract_receipt": result.input_contract_receipt,
+        "context": result.context,
     }
 
 
@@ -310,6 +348,7 @@ async def start_work_item_request(
         runtime_deployment_id=body.runtime_deployment_id,
         runtime_version_id=body.runtime_version_id,
         runtime_bundle_sha256=body.runtime_bundle_sha256,
+        context=body.context,
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)

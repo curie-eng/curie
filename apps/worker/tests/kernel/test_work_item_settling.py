@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -25,11 +26,21 @@ from curie_worker.approvals import (
     CreatedApproval,
     CreatedPublication,
 )
+from curie_worker.binding import FactoryWake
+from curie_worker.consumer_liveness import ConsumerLivenessStore, ThreadLockOwnerLiveness
+from curie_worker.kernel import failures
 from curie_worker.sandbox import RouteState, SandboxHandle
-from curie_worker.workitem_dispatch import WorkItemDispatchClient, WorkItemTransportError
+from curie_worker.workitem_dispatch import (
+    WorkItemDispatchClient,
+    WorkItemStartRefused,
+    WorkItemTransportError,
+)
 from curie_worker.workitem_orphans import WorkItemOrphanSweeper
 
+from apps.worker.tests.queue_fixtures import factory_context, factory_conversation
+
 from .test_work_item_early_stop import (
+    AGENT_ID,
     PUBLISH_TOOL,
     _Binding,
     _patch_snapshot,
@@ -66,6 +77,7 @@ class Api:
         self.clock = clock
         self.owner = ""
         self.running = False
+        self.lease_held_to_deadline = False
         self.fail_finish = False
         self.finish_status = 200
         self.conflict_code = "stale_owner"
@@ -86,6 +98,8 @@ class Api:
         self.holds: list[dict[str, Any]] = []
         self.run: Any = None
         self.kernel: Any = None
+        self.acquire_grant: dict[str, Any] | None = None
+        self.start_grant: dict[str, Any] | None = None
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -100,29 +114,61 @@ class Api:
             self.posts.append((path, body))
         if path.endswith("/acquire"):
             self.owner = body["owner"]
-            return httpx.Response(
-                200,
-                json={
-                    "generation": 1,
+            wake = FactoryWake.model_validate(body["wake"])
+            if self.acquire_grant is None:
+                assert body["context"] is None
+                self.acquire_grant = {
+                    "generation": body["generation"],
                     "work_item_id": str(self.request_id),
-                    "conversation_id": f"work-item-{self.request_id}",
+                    "conversation_id": factory_conversation(wake),
                     "wait_deadline": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
-                    "repo_full_name": "acme-corp/widgets",
-                },
-            )
+                    "repository_path": "acme-corp/widgets",
+                    "context": factory_context(AGENT_ID, wake).model_dump(mode="json"),
+                }
+            else:
+                assert body["context"] == self.acquire_grant["context"]
+            return httpx.Response(200, json=self.acquire_grant)
         if path.endswith("/start"):
+            assert self.acquire_grant is not None
+            assert body["context"] == self.acquire_grant["context"]
             self.running = True
+            self.lease_held_to_deadline = False
             self.run = self.kernel._work_item_runs[self.request_id]
+            self.start_grant = {
+                "runtime_epoch": 1,
+                "execution_deadline": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+                "remaining_s": 3600,
+                "heartbeat_interval_s": self.heartbeat_interval_s,
+            }
+            return httpx.Response(200, json=self.start_grant)
+        if path.endswith("/running"):
+            if self.acquire_grant is None:
+                return httpx.Response(404, json={"detail": {"code": "not_found"}})
+            assert request.url.params["conversation_id"] == self.acquire_grant["conversation_id"]
+            if not self.running:
+                return httpx.Response(409, json={"detail": {"code": "execution_ended"}})
+            assert self.start_grant is not None
+            wake = FactoryWake(
+                kind=request.url.params["wake_kind"],
+                address=request.url.params["wake_address"],
+                adapter=request.url.params["wake_adapter"] or None,
+                conversation_id=request.url.params["wake_conversation_id"],
+            )
+            assert factory_conversation(wake) == self.acquire_grant["conversation_id"]
             return httpx.Response(
                 200,
                 json={
-                    "runtime_epoch": 1,
-                    "execution_deadline": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
-                    "remaining_s": 3600,
-                    "heartbeat_interval_s": self.heartbeat_interval_s,
+                    **self.acquire_grant,
+                    "request_id": str(self.request_id),
+                    "agent_id": str(AGENT_ID),
+                    "runtime_epoch": self.start_grant["runtime_epoch"],
+                    "execution_deadline": self.start_grant["execution_deadline"],
+                    "lease_held_to_deadline": self.lease_held_to_deadline,
+                    "refusal": None,
                 },
             )
         if path.endswith("/issue-read/context"):
+            self.run = self.kernel._work_item_runs[self.request_id]
             return httpx.Response(
                 200,
                 json={
@@ -137,6 +183,7 @@ class Api:
             if self.fail_heartbeat:
                 self.heartbeat_failures += 1
                 raise httpx.ConnectError("Postgres outage behind the API", request=request)
+            self.lease_held_to_deadline = False
             return httpx.Response(
                 200,
                 json={"status": "running", "terminal_cause": None, "work_item_cancelled": False},
@@ -151,6 +198,7 @@ class Api:
             if self.finish_status == 409:
                 return httpx.Response(409, json={"detail": {"code": self.conflict_code}})
             self.running = False
+            self.lease_held_to_deadline = False
             self.finished_posts.append(body)
             if self.lose_committed_finish_response:
                 self.committed_finish_unseen = True
@@ -158,6 +206,7 @@ class Api:
             return httpx.Response(200, json={})
         if path.endswith("/hold-approval"):
             self.holds.append(body)
+            self.lease_held_to_deadline = True
             return httpx.Response(200, json={})
         if path.endswith("/runtime-owners"):
             rows = []
@@ -195,9 +244,6 @@ def _sweeper(
     *,
     observed_ownership: list[tuple[float, bool]] | None = None,
 ) -> WorkItemOrphanSweeper:
-    async def alive(_owner: str) -> bool:
-        return True
-
     def locally_owned(request_id: uuid.UUID) -> bool:
         owned = h.kernel.owns_work_item(request_id)
         if observed_ownership is not None:
@@ -206,7 +252,11 @@ def _sweeper(
 
     return WorkItemOrphanSweeper(
         client,
-        alive,
+        ThreadLockOwnerLiveness(
+            ConsumerLivenessStore(h.async_redis),
+            stream=h.config.stream,
+            group=h.config.consumer_group,
+        ),
         self_name=h.config.consumer_name,
         locally_owned=locally_owned,
         absence_proof_s=30,
@@ -812,6 +862,78 @@ async def _abandon_by_heartbeat_outage(api: Api) -> None:
     assert api.heartbeat_failures == 3
 
 
+@pytest.mark.parametrize("continuation", ["approval", "ci"])
+def test_continuation_stays_pending_while_the_same_request_is_settling(
+    make_harness, monkeypatch: pytest.MonkeyPatch, continuation: str,
+) -> None:
+    from curie_worker.kernel import work_items as kernel_work_items
+
+    async def exercise() -> None:
+        entered = asyncio.Event()
+        retry_finish = asyncio.Event()
+
+        async def wait_for_settlement_retry(_delay: float) -> None:
+            entered.set()
+            await retry_finish.wait()
+
+        monkeypatch.setattr(kernel_work_items, "_settle_sleep", wait_for_settlement_retry)
+        async with _held_execution(make_harness, monkeypatch) as (h, api, execute):
+            api.fail_finish = True
+            api.heartbeat_interval_s = 60.0
+            h.runner.hold = None
+            h.runner.default_script = _provider_failure()
+            try:
+                await h.kernel.process_event(execute)
+                await asyncio.wait_for(entered.wait(), timeout=5)
+                run = api.run
+                assert run.started and not run.finished and run.heartbeat_running
+                assert run.request_id not in h.kernel._work_item_runs
+                settling = h.kernel._settling_work_items[run.request_id]
+                assert settling.run is run and settling.task is not None
+                await h.kernel._work_items.hold_for_approval(
+                    run.request_id, runtime_epoch=run.runtime_epoch,
+                )
+                assert api.lease_held_to_deadline
+                route_before = h.substrate._affinity.get(run.thread_key)
+                assert route_before is not None
+                attempts_before = sum(path.endswith("/finish") for path, _ in api.posts)
+                incoming = _turn(
+                    f"work-item-{run.request_id}-ci-2" if continuation == "ci"
+                    else f"approval-{uuid.uuid4()}-resolved",
+                    "Continue after the current execution",
+                )
+
+                with pytest.raises(failures._FactoryContinuationPending):
+                    await h.kernel.process_event(incoming)
+
+                assert not await h.kernel._markers.is_terminal(incoming.event_id)
+                assert h.kernel._settling_work_items[run.request_id] is settling
+                assert run.request_id not in h.kernel._work_item_runs
+                assert h.kernel.owns_work_item(run.request_id)
+                assert run.heartbeat_running and not run.finished
+                assert h.substrate._affinity.get(run.thread_key) == route_before
+                assert len(h.runner.opened) == 1 and h.runner.steers == []
+                assert api.finished_posts == []
+                assert sum(path.endswith("/finish") for path, _ in api.posts) == attempts_before
+
+                api.fail_finish = False
+                retry_finish.set()
+                await asyncio.wait_for(settling.task, timeout=5)
+                assert run.finished and not run.heartbeat_running
+                assert len(api.finished_posts) == 1
+                assert run.request_id not in h.kernel._settling_work_items
+                assert not h.kernel.owns_work_item(run.request_id)
+                assert not h.fake_k8s.claims
+                await h.kernel.process_event(incoming)
+                assert await h.kernel._markers.is_terminal(incoming.event_id)
+                assert len(h.runner.opened) == 1 and len(api.finished_posts) == 1
+            finally:
+                retry_finish.set()
+                await h.kernel.close()
+
+    asyncio.run(exercise())
+
+
 def test_stale_owner_cleanup_never_deletes_the_successor_claim(make_harness, monkeypatch) -> None:
     """The chaos-run repro at the event handler's finally (#4331).
 
@@ -1147,7 +1269,9 @@ def test_a_run_resumed_onto_a_fresh_claim_releases_that_claim_when_it_settles(
 
                 assert len(h.runner.opened) == 2
                 assert len(api.finished_posts) == 1
-                assert run.finished
+                assert api.run.request_id == run.request_id
+                assert api.run.runtime_epoch == run.runtime_epoch
+                assert api.run.finished
                 # The resume really ran on a different claim than the start.
                 assert h.fake_k8s.claims == {}
                 assert started_claim in h.fake_k8s.deleted_claims
@@ -1429,3 +1553,105 @@ def test_issue_read_context_without_an_issue_reference_is_unusable(
                 **body,
             }
         )
+
+
+
+def test_terminal_renewal_refusal_during_claim_releases_owned_claim_and_neighbor_runs(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    from curie_worker import workitem_dispatch as dispatch_module
+
+    async def go() -> None:
+        request_id, neighbor_id = uuid.uuid4(), uuid.uuid4()
+        clock = ApiClock()
+        api, neighbor = Api(request_id, clock), Api(neighbor_id, clock)
+        renewal_tick = asyncio.Event()
+        workspace_entered, return_workspace = threading.Event(), threading.Event()
+        claims: list[str] = []
+
+        async def renew_sleep(_delay: float) -> None:
+            await renewal_tick.wait()
+            renewal_tick.clear()
+
+        monkeypatch.setattr(dispatch_module, "_renew_sleep", renew_sleep)
+
+        class BlockingWorkspace(_RecordingWorkspace):
+            def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                claimed = super().claim_or_resume_with_handle(**kwargs)
+                if kwargs["caller_run"] == str(request_id):
+                    claims.append(claimed.handle.claim_name)
+                    workspace_entered.set()
+                    if not return_workspace.wait(timeout=5):
+                        raise RuntimeError("test did not release workspace preparation")
+                return claimed
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            payload = json.loads(request.content) if request.content else {}
+            if (
+                str(request_id) in request.url.path
+                or payload.get("execution_request_id") == str(request_id)
+            ):
+                if request.url.path.endswith("/acquire"):
+                    body = json.loads(request.content)
+                    if body["context"] is not None:
+                        api.posts.append((request.url.path, body))
+                        return httpx.Response(
+                            409, json={"detail": {"code": "factory_start_failed"}},
+                        )
+                return api(request)
+            return neighbor(request)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            async with make_harness(
+                binding=_Binding(), workspace_factory=BlockingWorkspace,
+                publication_creator=_PublicationApi(),
+            ) as h:
+                api.kernel = neighbor.kernel = h.kernel
+                h.kernel._work_items = WorkItemDispatchClient(
+                    api_base_url="http://api.example", worker_token="example", client=http,
+                )
+                task = asyncio.create_task(h.kernel.process_event(_event(request_id)))
+                try:
+                    assert await asyncio.to_thread(workspace_entered.wait, 5)
+                    run = h.kernel._work_item_runs[request_id]
+                    assert claims and claims[0] in h.fake_k8s.claims
+                    renewal_tick.set()
+
+                    def renewal_refused() -> bool:
+                        try:
+                            run.ensure_acquired()
+                        except WorkItemStartRefused as exc:
+                            assert exc.code == "factory_start_failed"
+                            return True
+                        return False
+
+                    await _until(renewal_refused)
+                    return_workspace.set()
+                    with caplog.at_level(logging.INFO, logger="curie_worker.kernel"):
+                        await asyncio.wait_for(task, timeout=5)
+                    assert run.finished and not run.started
+                    assert h.runner.opened == []
+                    assert not any(path.endswith("/start") for path, _ in api.posts)
+                    assert len([path for path, _ in api.posts if path.endswith("/acquire")]) == 2
+                    assert api.finished_posts == []
+                    assert h.kernel._workspace.releases == [run.thread_key]
+                    assert claims[0] in h.fake_k8s.deleted_claims
+                    assert not h.fake_k8s.claims
+                    assert h.substrate._affinity.get(run.thread_key) is None
+                    assert any("factory_start_failed" in line for line in caplog.messages)
+                    assert request_id not in h.kernel._work_item_runs
+                    h.runner.default_script = _provider_failure()
+                    await h.kernel.process_event(_event(neighbor_id))
+                    assert len(h.runner.opened) == 1
+                    assert len(neighbor.finished_posts) == 1
+                    assert neighbor.finished_posts[0]["runtime_epoch"] == 1
+                    assert neighbor.run.request_id == neighbor_id
+                    assert neighbor.run.finished
+                    assert not h.fake_k8s.claims
+                finally:
+                    return_workspace.set()
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(go())

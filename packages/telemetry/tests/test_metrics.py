@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import subprocess
+import tarfile
 import time
 import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import anyio
 import pytest
@@ -66,12 +69,13 @@ def _docker(
     *args: str,
     timeout: float = 30,
     check: bool = True,
+    input_data: bytes | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
-        completed = subprocess.run(
+        result = subprocess.run(
             ["docker", *args],
             capture_output=True,
-            text=True,
+            input=input_data,
             timeout=timeout,
             check=False,
         )
@@ -79,6 +83,12 @@ def _docker(
         raise AssertionError("docker is required for the Collector translation proof") from exc
     except subprocess.TimeoutExpired as exc:
         raise AssertionError(f"docker {' '.join(args)} exceeded {timeout} seconds") from exc
+    completed = subprocess.CompletedProcess(
+        result.args,
+        result.returncode,
+        result.stdout.decode(errors="replace"),
+        result.stderr.decode(errors="replace"),
+    )
     if check:
         assert completed.returncode == 0, completed.stderr or completed.stdout
     return completed
@@ -475,21 +485,43 @@ service:
 
     container_id: str | None = None
     provider: MeterProvider | None = None
-    created = _docker(
-        "create",
-        "--pull=never",
-        "--publish",
-        "127.0.0.1::4318",
-        "--publish",
-        "127.0.0.1::8889",
-        "--volume",
-        f"{config.resolve()}:/etc/otel/collector-config.yaml:ro",
-        _COLLECTOR_IMAGE,
-        "--config=/etc/otel/collector-config.yaml",
-    )
-    container_id = created.stdout.strip()
+    collector_name = f"curie-test-history-collector-{uuid4().hex}"
+    collector_image = f"{collector_name}:fixture"
 
     try:
+        with io.BytesIO() as context:
+            with tarfile.open(fileobj=context, mode="w") as archive:
+                dockerfile = (
+                    f"FROM {_COLLECTOR_IMAGE}\n"
+                    "COPY collector.yaml /etc/otel/collector-config.yaml\n"
+                ).encode()
+                entry = tarfile.TarInfo("Dockerfile")
+                entry.size = len(dockerfile)
+                entry.mode = 0o644
+                archive.addfile(entry, io.BytesIO(dockerfile))
+                config_bytes = config.read_bytes()
+                entry = tarfile.TarInfo("collector.yaml")
+                entry.size = len(config_bytes)
+                entry.mode = 0o644
+                archive.addfile(entry, io.BytesIO(config_bytes))
+            _docker(
+                "build", "--tag", collector_image, "-", input_data=context.getvalue(), timeout=120
+            )
+        created = _docker(
+            "create",
+            "--pull=never",
+            "--name",
+            collector_name,
+            "--label",
+            f"curie.test.owner={collector_name}",
+            "--publish",
+            "127.0.0.1::4318",
+            "--publish",
+            "127.0.0.1::8889",
+            collector_image,
+            "--config=/etc/otel/collector-config.yaml",
+        )
+        container_id = created.stdout.strip()
         assert re.fullmatch(r"[0-9a-f]{64}", container_id), created.stdout
         _docker("start", container_id)
         otlp_port = _published_port(container_id, 4318)
@@ -560,9 +592,16 @@ service:
             try:
                 configure_meter_provider(module_provider)
             finally:
-                if container_id is not None:
-                    removed = _docker("rm", "--force", container_id, check=False)
-                    assert removed.returncode == 0, removed.stderr or removed.stdout
+                try:
+                    inspected = _docker("container", "inspect", collector_name, check=False)
+                    if inspected.returncode == 0:
+                        identity = json.loads(inspected.stdout)[0]
+                        assert identity["Config"]["Labels"]["curie.test.owner"] == collector_name
+                        removed = _docker("rm", "--force", identity["Id"], check=False)
+                        assert removed.returncode == 0, removed.stderr or removed.stdout
+                finally:
+                    if _docker("image", "inspect", collector_image, check=False).returncode == 0:
+                        _docker("image", "rm", collector_image)
 
 
 @pytest.mark.parametrize(

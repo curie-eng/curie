@@ -21,6 +21,16 @@ class Unavailable(ForgeError):
     whose pages could not all be read. Retry later and advance no cursor."""
 
 
+class CredentialUnreadable(Unavailable):
+    """The configured credential file cannot be sent now: missing, unreadable,
+    empty or malformed (#4630). Nothing was sent. ``problem`` is fixed text that
+    never names the file's content."""
+
+    def __init__(self, problem: str) -> None:
+        self.problem = problem
+        super().__init__(f"the static token file {problem}")
+
+
 class Unauthorized(ForgeError):
     """The configured credential was refused."""
 

@@ -1,0 +1,60 @@
+{
+  "daemon": {
+    "namespace": "default-t-curie-docker",
+    "image": "registry.example.com/acme/curie-docker-daemon@sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "port": 2376,
+    "selectorLabels": {
+      "app.kubernetes.io/name": "curie",
+      "app.kubernetes.io/instance": "t",
+      "app.kubernetes.io/component": "docker-daemon"
+    },
+    "resources": {
+      "requests": {"cpu": "500m", "memory": "1Gi", "ephemeral-storage": "10Gi"},
+      "limits": {"cpu": "2", "memory": "4Gi", "ephemeral-storage": "20Gi"}
+    },
+    "storageSizeLimit": "20Gi",
+    "maxClaimLifetimeSeconds": 86400,
+    "pingTimeoutSeconds": 2
+  },
+  "quantities": [
+    {"name": "integer", "value": "1", "valid": true},
+    {"name": "millicpu", "value": "500m", "valid": true},
+    {"name": "micro", "value": "1u", "valid": true},
+    {"name": "nano", "value": "1n", "valid": true},
+    {"name": "decimal", "value": "0.5", "valid": true},
+    {"name": "leading-decimal", "value": ".5", "valid": true},
+    {"name": "trailing-decimal", "value": "1.", "valid": true},
+    {"name": "positive-sign", "value": "+1", "valid": true},
+    {"name": "binary-kilo", "value": "1Ki", "valid": true},
+    {"name": "binary-giga", "value": "1Gi", "valid": true},
+    {"name": "binary-fraction", "value": "1.5Gi", "valid": true},
+    {"name": "decimal-kilo", "value": "1k", "valid": true},
+    {"name": "decimal-mega", "value": "1M", "valid": true},
+    {"name": "exponent", "value": "1e3", "valid": true},
+    {"name": "negative-exponent", "value": "1e-3", "valid": true},
+    {"name": "positive-exponent", "value": "1E+3", "valid": true},
+    {"name": "empty", "value": "", "valid": false},
+    {"name": "whitespace", "value": " ", "valid": false},
+    {"name": "zero", "value": "0", "valid": false},
+    {"name": "zero-binary", "value": "0Gi", "valid": false},
+    {"name": "zero-decimal", "value": "00.000m", "valid": false},
+    {"name": "zero-exponent", "value": "0e3", "valid": false},
+    {"name": "negative-zero", "value": "-0", "valid": false},
+    {"name": "negative", "value": "-1Gi", "valid": false},
+    {"name": "nan", "value": "NaN", "valid": false},
+    {"name": "infinity", "value": "Infinity", "valid": false},
+    {"name": "boolean", "value": true, "valid": false},
+    {"name": "false", "value": false, "valid": false},
+    {"name": "number", "value": 1, "valid": false},
+    {"name": "fraction-number", "value": 0.5, "valid": false},
+    {"name": "list", "value": [], "valid": false},
+    {"name": "object", "value": {}, "valid": false},
+    {"name": "space-suffix", "value": "1 Gi", "valid": false},
+    {"name": "trailing-space", "value": "1Gi ", "valid": false},
+    {"name": "bad-suffix", "value": "1MiB", "valid": false},
+    {"name": "wrong-case", "value": "1ki", "valid": false},
+    {"name": "missing-exponent", "value": "1e", "valid": false},
+    {"name": "double-decimal", "value": "1.2.3", "valid": false},
+    {"name": "only-sign", "value": "+", "valid": false}
+  ]
+}

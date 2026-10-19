@@ -182,6 +182,10 @@ REFUSAL_REASONS = frozenset(
 
 _VERDICT = re.compile(r"^\s*VERDICT:\s*(APPROVE|CHANGES)\b", re.MULTILINE)
 _CI_ROUND = re.compile(r"^Curie wait_ci round ([23]) of 3: ")
+# The runner's platform sender frame (curie_runner.sender_frame): five header
+# lines, then the user message.
+_FRAME_OPEN = re.compile(r"\[platform-sender (\S+)\]")
+_FRAME_HEADER_LINES = 5
 # Inserted text that adds a test, for test modules that live inside a source file.
 _ADDS_TEST = re.compile(
     r"#\[(?:tokio::)?test\]|#\[cfg\(test\)\]|\bdef test_\w+\(|\bfunc Test\w+\("
@@ -229,17 +233,32 @@ _INSTALL_FORMS: dict[tuple[str, str], tuple[frozenset[str], ...]] = {
 _LONGEST_KNOWN_BLOCKER = "package_registry"
 
 
+def _message_lines(prompt: str) -> list[str]:
+    """The user message's lines: inside the runner's sender frame when the
+    prompt carries one, else the whole prompt."""
+
+    lines = prompt.split("\n")
+    opened = _FRAME_OPEN.fullmatch(lines[0])
+    if opened is None:
+        return lines
+    start = _FRAME_HEADER_LINES
+    if len(lines) <= start or lines[start] != f"[user-message {opened.group(1)}]":
+        return lines
+    return lines[start + 1 :]
+
+
 def _fresh(prompt: str = "") -> dict[str, Any]:
     """Fresh state for a new run, or for a CI fix round.
 
-    A CI fix round is detected from the prompt's second line only (the
-    hook's own marker, written by the platform); a match anywhere else,
+    A CI fix round is detected from the user message's second line only (the
+    hook's own marker, written by the platform; the runner frames the message
+    with its sender header first); a match anywhere else,
     including inside the untrusted CI JSON that follows, has no effect. A CI
     fix round starts with the plan already approved (plan review already
     happened), the workflow loaded, the stage at ``implement``, and the diff
     loop at round 0.
     """
-    lines = prompt.split("\n")
+    lines = _message_lines(prompt)
     ci_match = _CI_ROUND.match(lines[1]) if len(lines) > 1 else None
     ci_round = int(ci_match.group(1)) if ci_match else None
     plan = {"round": 0, "verdict": "APPROVE"} if ci_round else {"round": 0, "verdict": None}

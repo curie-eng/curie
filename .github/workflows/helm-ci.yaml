@@ -56,6 +56,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
+
       - name: Install Helm
         id: install_helm
         continue-on-error: true
@@ -73,6 +76,30 @@ jobs:
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: v3.16.4
+
+      - name: Ensure kind-registry exists
+        run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Install kind and kubectl without creating a cluster
+        id: install_kind
+        continue-on-error: true
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+          install_only: true
+      - name: Back off before retrying Install kind and kubectl without creating a cluster
+        if: steps.install_kind.outcome == 'failure'
+        run: |
+          echo "Install kind and kubectl without creating a cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          bash cli/scripts/ensure-kind-registry.sh
+          sleep 15
+      - name: Install kind and kubectl without creating a cluster (retry)
+        if: steps.install_kind.outcome == 'failure'
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93
+          install_only: true
 
       - name: Install kubeconform
         run: |
@@ -152,6 +179,9 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/render-assertions.sh
 
+      - name: Release name length assertions
+        run: bash charts/curie/ci/release-name-length-assertions.sh
+
       - name: Per-workload Secret checksum assertions
         run: bash charts/curie/ci/secret-checksum-assertions.sh
 
@@ -177,6 +207,9 @@ jobs:
 
       - name: helm render assertions (NetworkPolicy warning)
         run: bash charts/curie/ci/networkpolicy-notes-assertions.sh
+
+      - name: helm install NOTES (release target)
+        run: bash charts/curie/ci/notes-release-target-assertions.sh
 
       - name: helm render assertions (MCP connector Valkey ingress opt-out)
         run: bash charts/curie/ci/mcp-valkey-ingress-optout-assertions.sh
@@ -773,6 +806,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/approval-principal-wiring-assertions.sh
 
+      # Prove the remediation authority key (ADR 0231, #4231) reaches the API
+      # Deployment only: generated on sealed installs, never equal to apiKey,
+      # never blank, and absent from every other workload, so no platform-key
+      # holder (worker, dispatcher, sandbox) can bind or arm a policy.
+      - name: helm render assertions (remediation authority)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/remediation-authority-assertions.sh
+
       # Prove the inbound-attachment handoff (#2567). The first script pins the
       # shape: an attachments-init container that runs before the runner, mounts
       # the shared volume with a sizeLimit, receives CURIE_ATTACHMENTS_REF, and
@@ -942,7 +984,7 @@ jobs:
       - name: Install uv
         id: install_uv
         continue-on-error: true
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           python-version: "3.13"
       - name: Back off before retrying Install uv
@@ -952,7 +994,7 @@ jobs:
           sleep 15
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           python-version: "3.13"
       - name: Sync workspace

@@ -1959,6 +1959,34 @@ fn plain_reply_observability_seeds_send_an_exact_marker_task() {
 }
 
 #[test]
+fn restored_healthy_control_forbids_tool_calls() {
+    let function = ladder_function("case_local_otel_runner_failure");
+    let assignment = "restored_marker=\"curie-restored-healthy-$$-$RANDOM\"";
+    let prompt =
+        "\"Reply with exactly: $restored_marker. Do not call tools or investigate anything.\"";
+    let assignment_at = function.find(assignment).unwrap_or_else(|| {
+        panic!("the restored healthy control must mint a run-unique marker: {function}")
+    });
+    let prompt_at = function.find(prompt).unwrap_or_else(|| {
+        panic!("the restored healthy control must forbid tool calls: {function}")
+    });
+    assert!(
+        assignment_at < prompt_at,
+        "the marker must be minted before the restored control sends it: {function}"
+    );
+    assert!(
+        function.contains(&format!(
+            "restored_out=\"$(\"$BIN\" --json local message --channel C0LOCALDEV {prompt}"
+        )),
+        "the no-tool prompt must be the restored control message: {function}"
+    );
+    assert!(
+        !function.contains("\"restored healthy control\""),
+        "the bare restored healthy control prompt must not return: {function}"
+    );
+}
+
+#[test]
 fn plain_reply_observability_seeds_reject_nonfinal_replies_and_restore_auth() {
     for function_name in ["seed_ordinary_turn", "case_local_langfuse_invalid_auth"] {
         let (output, invocations, phases) = run_plain_reply_seed(function_name, false);
@@ -3062,7 +3090,14 @@ json.dump(d, open(p, "w"))' "$(cat "$STUB_STATE/last_plugin_dir")/evals/cases.js
         if [ -f "$STUB_STATE/skill_digest" ]; then
             echo "bundle changed: replacing the recorded runner 'curie-e2e-runner' first"
         fi
+        if [ -f "$STUB_STATE/skill_volume" ]; then
+            rm -rf "$STUB_STATE/volumes/$(cat "$STUB_STATE/skill_volume")"
+        fi
         printf '%s' "$(sha_of_bundle "$PWD")" > "$STUB_STATE/skill_digest"
+        snapshot_volume="curie-snapshot-$(python3 -c 'import uuid; print(uuid.uuid4())')"
+        printf '%s' "$snapshot_volume" > "$STUB_STATE/skill_volume"
+        mkdir -p "$STUB_STATE/volumes/$snapshot_volume/plugin"
+        touch "$STUB_STATE/skill_runner"
         rm -rf .curie/snapshots
         snapshot_dir="$PWD/.curie/snapshots/$(cat "$STUB_STATE/skill_digest")"
         mkdir -p "$snapshot_dir"
@@ -3078,10 +3113,12 @@ with open(".curie/runner.json", "w", encoding="utf-8") as handle:
 PYSTATE
         skill=$(find "$PWD/skills" -mindepth 2 -maxdepth 2 -name SKILL.md | sort | head -1)
         if [ -n "$skill" ]; then
-            cp "$skill" "$STUB_STATE/mounted_skill.md"
             snapshot_skill="$snapshot_dir/${skill#"$PWD"/}"
             mkdir -p "$(dirname "$snapshot_skill")"
             cp "$skill" "$snapshot_skill"
+            volume_skill="$STUB_STATE/volumes/$snapshot_volume/plugin/${skill#"$PWD"/}"
+            mkdir -p "$(dirname "$volume_skill")"
+            cp "$snapshot_skill" "$volume_skill"
         fi
         echo "stub: runner up"
         # e2e.sh asserts the boot panel NAMES the model path it resolved, and
@@ -3144,6 +3181,10 @@ print(json.dumps({
 }))' "$PWD/evals/cases.json"
         ;;
     "skill down")
+        if [ -f "$STUB_STATE/skill_volume" ]; then
+            rm -rf "$STUB_STATE/volumes/$(cat "$STUB_STATE/skill_volume")"
+        fi
+        rm -f "$STUB_STATE/skill_volume" "$STUB_STATE/skill_runner" "$STUB_STATE/skill_digest"
         rm -f .curie/runner.json
         rm -rf .curie/snapshots
         echo "stub: runner down"
@@ -3334,25 +3375,52 @@ case "$*" in
         exit 1
         ;;
     "inspect --type container --format {{if eq (index .Config.Labels \"curietech.ai/managed-by\") \"curie-cli\"}}{{with index .Config.Labels \"curietech.ai/snapshot-volume\"}}{{.}}{{end}}{{end}} curie-e2e-runner")
-        # This harness's runner uses a local snapshot bind mount, so its
-        # cleanup read must not invent a remote snapshot volume from worker env.
+        if [ ! -f "$STUB_STATE/skill_runner" ]; then
+            echo 'Error: No such container: curie-e2e-runner' >&2
+            exit 1
+        fi
+        cat "$STUB_STATE/skill_volume"
         ;;
     "inspect --type container --format {{json .Mounts}} curie-e2e-runner")
-        # Report the actual snapshot directory staged by the skill-up arm.
-        python3 - "$STUB_STATE/skill_digest" <<'PYMOUNTS'
-import json, os, sys
+        python3 - "$STUB_STATE/skill_volume" <<'PYMOUNTS'
+import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
-    digest = handle.read()
+    volume = handle.read()
 print(json.dumps([{
-    "Type": "bind",
-    "Source": os.path.join(os.getcwd(), ".curie", "snapshots", digest),
+    "Type": "volume",
+    "Name": volume,
     "Destination": "/plugin",
     "RW": False,
 }]))
 PYMOUNTS
         ;;
     "inspect --type container --format {{range .Mounts}}{{if eq .Destination \"/plugin\"}}{{if eq .Type \"volume\"}}{{.Name}}{{end}}{{end}}{{end}} curie-e2e-runner")
-        # A local bind mount has no Docker volume name at either boot.
+        cat "$STUB_STATE/skill_volume"
+        ;;
+    "volume ls "*)
+        python3 - "$STUB_STATE/volumes" "$@" <<'PYVOLUMES'
+import pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+filters = [sys.argv[i + 1] for i, arg in enumerate(sys.argv) if arg == "--filter"]
+if root.exists():
+    for volume in root.iterdir():
+        if all(re.search(value[5:], volume.name) for value in filters if value.startswith("name=")):
+            print(volume.name)
+PYVOLUMES
+        ;;
+    "volume inspect "*)
+        for volume in "$@"; do :; done
+        [ -d "$STUB_STATE/volumes/$volume" ] || { echo "Error: No such volume: $volume" >&2; exit 1; }
+        printf '%s\n' 'curie-cli skill-snapshot'
+        ;;
+    "volume rm "*)
+        for volume in "$@"; do :; done
+        [ -d "$STUB_STATE/volumes/$volume" ] || { echo "Error: No such volume: $volume" >&2; exit 1; }
+        rm -rf "$STUB_STATE/volumes/$volume"
+        printf '%s\n' "$volume"
+        ;;
+    "rm -f curie-e2e-runner")
+        rm -f "$STUB_STATE/skill_runner"
         ;;
     "inspect curie-ladder-hermetic-"*)
         # Keep the connector-free negative non-vacuous by giving its runner the
@@ -3365,11 +3433,9 @@ PYMOUNTS
         fi
         ;;
     "exec "*" cat /plugin/"*)
-        # e2e.sh proves the /plugin mount is the snapshot packed at skill up,
-        # not the live host file. Replay the SKILL.md bytes that arm saved.
-        if [ -f "$STUB_STATE/mounted_skill.md" ]; then
-            cat "$STUB_STATE/mounted_skill.md"
-        fi
+        for path in "$@"; do :; done
+        volume="$(cat "$STUB_STATE/skill_volume")"
+        cat "$STUB_STATE/volumes/$volume/${path#/}"
         ;;
     "inspect "*)
         # A failed env read, on its own knob: an inspect that dies (the worker
@@ -4464,7 +4530,7 @@ fn parity_passes_when_every_rung_reports_the_same_identity() {
          trust; transcript:\n{transcript}"
     );
     assert!(
-        transcript.contains("confirmed: readonly bind snapshot and recorded published endpoint"),
+        transcript.contains("confirmed: readonly named volume snapshot and recorded published endpoint"),
         "the skill rung must validate its immutable mount and saved endpoint; transcript:\n{transcript}"
     );
     let docker_invocations = fs::read_to_string(docker_log).expect("read Docker invocations");
@@ -4482,6 +4548,16 @@ fn parity_passes_when_every_rung_reports_the_same_identity() {
             .count(),
         2,
         "the skill rung must capture both original and replacement snapshot mounts; invocations:\n{docker_invocations}"
+    );
+    let released_volumes: Vec<_> = docker_invocations
+        .lines()
+        .filter_map(|command| command.strip_prefix("volume ls -q --filter name=^"))
+        .filter_map(|name| name.strip_suffix('$'))
+        .collect();
+    assert_eq!(released_volumes.len(), 2, "{docker_invocations}");
+    assert_ne!(
+        released_volumes[0], released_volumes[1],
+        "replacement must allocate its own snapshot volume: {docker_invocations}"
     );
 }
 
@@ -4545,7 +4621,7 @@ fn skill_up_failure_surfaces_diagnostic_preserves_exit_and_cleans_up() {
         !docker_invocations.lines().any(|command| {
             command.starts_with("volume inspect ") || command.starts_with("volume rm ")
         }),
-        "a bind-mounted runner must not trigger snapshot volume operations; invocations:\n{docker_invocations}"
+        "a refused boot must not invent snapshot volumes; invocations:\n{docker_invocations}"
     );
 }
 
@@ -6206,17 +6282,41 @@ REPO_ROOT="$TEST_REPO_ROOT"
 COMPOSE_PROJECT=acme-private
 LOCAL_OTEL_SINK_NAME=acme-private-sink
 LOCAL_OTEL_SINK_OWNED=0
+LOCAL_OTEL_SINK_ACTIVE=0
+LOCAL_OTEL_SINK_IMAGE=""
+LOCAL_OTEL_IMAGE_OWNED=0
 LOCAL_OTEL_NETWORK_OWNED=0
 LOCAL_OTEL_NETWORK=""
 docker() {{
     printf '%s\n' "$*" >> "$TEST_DOCKER_LOG"
     if [[ "$1 $2" == 'network inspect' ]]; then
         [[ "$TEST_NETWORK_EXISTS" == 1 ]]
+    elif [[ "$1 $2" == 'container inspect' ]]; then
+        echo 'Error: No such container: acme-private-sink' >&2
+        return 1
+    elif [[ "$1" == build ]]; then
+        python3 -c 'import sys, tarfile
+with tarfile.open(fileobj=sys.stdin.buffer, mode="r|*") as archive:
+    entries = {{entry.name: (entry, archive.extractfile(entry).read() if entry.isfile() else None) for entry in archive}}
+assert set(entries) == {{"Dockerfile", "config.yaml", "output"}}, entries
+assert b"COPY config.yaml /etc/otelcol-contrib/config.yaml" in entries["Dockerfile"][1]
+assert b"COPY output/ /var/lib/otel-e2e/" in entries["Dockerfile"][1]
+assert b"service:" in entries["config.yaml"][1]
+assert entries["output"][0].isdir() and entries["output"][0].mode == 0o777
+' || return 1
+        touch "$TEST_WORKDIR/image-built"
+    elif [[ "$1 $2" == 'image inspect' ]]; then
+        [[ -f "$TEST_WORKDIR/image-built" ]]
+    elif [[ "$1 $2" == 'image rm' ]]; then
+        rm "$TEST_WORKDIR/image-built"
     elif [[ "$1" == run ]]; then
         echo 'intentional command-capture boundary; no container is started' >&2
         return 64
-    else
+    elif [[ "$1" == ps || "$1 $2" == 'network create' || "$1 $2" == 'network rm' ]]; then
         return 0
+    else
+        echo "unexpected Docker command: $*" >&2
+        return 93
     fi
 }}
 {}
@@ -6258,6 +6358,22 @@ stop_local_otel_sink
                 .any(|line| line.starts_with("run ")
                     && line.contains(&format!("--network {expected} "))),
             "{calls}"
+        );
+        let build = calls
+            .lines()
+            .find(|line| line.starts_with("build --tag "))
+            .expect("the sink configuration must cross Docker's build API");
+        let image = build.split_whitespace().nth(2).unwrap();
+        assert!(build.ends_with(" -"), "{calls}");
+        assert!(calls.contains(&format!("image rm {image}\n")), "{calls}");
+        assert!(!work.path().join("image-built").exists(), "{calls}");
+        let run = calls
+            .lines()
+            .find(|line| line.starts_with("run "))
+            .expect("the sink must attempt startup after copying its configuration");
+        assert!(run.contains(image), "{calls}");
+        crate::docker_no_host_binds::assert_no_client_host_binds(
+            &run.split_whitespace().map(String::from).collect::<Vec<_>>(),
         );
         if existing {
             assert!(

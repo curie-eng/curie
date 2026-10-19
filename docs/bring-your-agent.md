@@ -82,21 +82,43 @@ Then supply a supported model credential using the
 
 ```bash
 curie skill up
-curie skill message "Count the words in: one two three"
+curie skill message --json "Use the text-stats skill and the text-stats-engine word_count tool to count the words in: one two three. Report the tool result."
 curie skill down
 ```
 
-Inspect that the reply reports three words and that the trace contains the
-`word_count` call. A plausible answer alone can be guessed without the tool.
+Check that the JSON reply reports three words and that the tool activity on
+stderr includes `word count`. The explicit skill and tool request makes the
+adoption check reproducible; a short word-count question can be answered
+without calling the engine. A plausible answer alone is insufficient.
 A `--fake-model` run proves plumbing only; it cannot prove model behavior or MCP
-tool execution. Add falsifiable cases and use `curie skill eval --json` before
-promotion, following the [verification contract](agents.md#the-verification-contract).
+tool execution. The copied example includes numerical cases and a trajectory
+sidecar. Before
+promotion, start the runner again and run:
 
-Next follow [Your first Slack agent](your-first-slack-agent.md) to create the
-Slack app, configure Socket Mode, deploy the same bundle and bind its channel.
+```bash
+curie skill up
+curie skill eval --json
+curie skill down
+```
+
+The trajectory grade requires the requested MCP tool to appear in the observed
+sequence. It grades requests, not successful execution or the numerical answer.
+Check the numerical reply separately. The bare skill CLI exposes request
+activity, not returned MCP payloads; use the workspace run inspection below to
+verify the successful tool result. See the
+[verification contract](agents.md#the-verification-contract) for a falsifiable
+capability-removal control.
+
+Stay in `my-text-agent` and continue at
+[Get the Slack tokens](your-first-slack-agent.md#2-get-the-slack-tokens). Skip
+that guide's scaffold step: `curie init` creates a different bundle. Configure
+Socket Mode, deploy this same bundle with `--plugin-dir .`, and bind its channel.
 One channel binds one agent; exactly one release may connect to a given Slack
-app. Send a fresh Slack mention with the same request, inspect the visible
-workspace reply and its tool trace, and record the release and bundle version.
+app. Send a fresh Slack mention with the same explicit skill-and-tool request.
+Inspect the visible reply, then use the
+[run inspection commands](your-first-slack-agent.md#verify-your-workspace-reply)
+to find that message's successful `word_count` call and result. Record the
+release, bundle version and deployed bundle digest.
 A terminal reply stub without a connected dispatcher does not prove Slack
 transport.
 

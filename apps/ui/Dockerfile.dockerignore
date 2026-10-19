@@ -4,7 +4,6 @@
 # build needs -- the UI sources + lockfile and that one vector stay; everything
 # else (the Python trees, the Rust CLI, the runner, docs, other packages,
 # installed deps and build output) is dropped.
-.git
 **/node_modules
 **/.venv
 **/__pycache__
@@ -34,3 +33,36 @@ packages
 *.md
 **/*.md
 **/.env
+**/.env.*
+!**/.env.example
+!**/.env.sample
+!**/.env.template
+**/.ssh
+**/.aws
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+**/id_rsa
+**/id_dsa
+**/id_ecdsa
+**/id_ed25519
+**/.git
+**/.curie
+**/.projects
+**/.worktrees
+**/.claude
+**/.claude.json*
+**/.agents
+**/.codex
+**/.t3
+**/.cache
+**/.config
+**/.local
+**/.npm
+**/.bun
+**/.netrc
+**/.npmrc
+**/.yarnrc
+**/.yarnrc.yml
+**/.mcp.json

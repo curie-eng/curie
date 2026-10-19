@@ -73,7 +73,7 @@ subjects:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "curie.fullname" . }}-otel-collector
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Service" "name" (printf "%s-otel-collector" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
 spec:

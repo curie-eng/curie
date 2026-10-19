@@ -1,7 +1,10 @@
 """Credential providers the platform holds for a forge (ADR 0197, intake and credentials 2).
 
 A provider either re-mints short-lived tokens (a GitHub App, Jira OAuth client
-credentials) or serves a static token an operator rotates. Each reports the
+credentials) or serves a static token an operator rotates. A static token is
+read from its file at use, never kept from startup: `StaticTokenProvider.get`
+reads it on every call, and `TokenSnapshot` gives one adapter operation one
+consistent value for its requests and its git credential (#4630). Each reports the
 expiry of what the operator holds, so status and doctor output can show it and
 warn before it lapses. The sandbox never holds a provider, only a `Credential`.
 """
@@ -17,7 +20,11 @@ from typing import TYPE_CHECKING, Protocol
 from curie_api.forges.types import Credential, CredentialExpiry, CredentialHeader, CredentialScope
 
 if TYPE_CHECKING:
-    from curie_api.forges.config import CredentialConfig, GitHubAppCredentialConfig
+    from curie_api.forges.config import (
+        CredentialConfig,
+        GitHubAppCredentialConfig,
+        StaticTokenCredentialConfig,
+    )
     from curie_api.github_app import GitHubCredentials
 
 # Re-mint this long before a minted token's expiry, as `github_app` does today.
@@ -131,48 +138,86 @@ class ReMintingProvider:
         return ExpiryReport(self._source.expiry, self._source.expires_at, remints=True)
 
 
-class StaticTokenProvider:
-    """Serves one operator-rotated token for every scope.
+class TokenSnapshot:
+    """One operation's static token: read on the first `value` call, then held.
 
-    ``expires_at`` makes the expiry known; ``never_expires`` declares a token
-    issued without one; neither leaves it unknown.
+    An adapter's transport takes a fresh snapshot each time a connection builds
+    it, so every request of one operation sends the same token and the next
+    operation reads the file again. Building one reads nothing, so a broken
+    file refuses at the first `value` with `CredentialUnreadable`, before any
+    request; a refused read is tried again by the next call.
+    """
+
+    __slots__ = ("_config", "_value")
+
+    def __init__(self, config: StaticTokenCredentialConfig) -> None:
+        self._config = config
+        self._value: str | None = None
+
+    def __repr__(self) -> str:
+        return "TokenSnapshot()"
+
+    def value(self) -> str:
+        if self._value is None:
+            self._value = self._config.current_token()
+        return self._value
+
+
+class StaticTokenProvider:
+    """Serves the operator-rotated token of ``config`` for every scope.
+
+    Every `get` reads the token now (`StaticTokenCredentialConfig.current_token`),
+    so a replaced file is the next git credential and a broken one raises
+    `CredentialUnreadable`; no value is held between calls. A code host adapter
+    instead takes one `snapshot` per operation and builds its git credential
+    with `credential`, so the credential is the token its requests sent. The
+    expiry is the config's (`expiry_for`).
     """
 
     def __init__(
         self,
-        token: str,
+        config: StaticTokenCredentialConfig,
         *,
         origin: str,
         header: CredentialHeader,
         username: str | None = None,
-        expires_at: datetime | None = None,
-        never_expires: bool = False,
     ) -> None:
-        if expires_at is not None and never_expires:
-            raise ValueError("a static token has an expires_at or never_expires, not both")
-        if expires_at is not None:
-            report = ExpiryReport(CredentialExpiry.KNOWN, expires_at)
-        elif never_expires:
-            report = ExpiryReport(CredentialExpiry.NONE)
-        else:
-            report = ExpiryReport(CredentialExpiry.UNKNOWN)
-        self._report = report
-        # Built once so a bad token, origin or header fails at construction.
-        self._credentials = {
-            scope: Credential(
-                origin=origin,
-                header=header,
-                secret=token,
-                scope=scope,
-                expiry=report.expiry,
-                expires_at=report.expires_at,
-                username=username,
-            )
-            for scope in CredentialScope
-        }
+        self._config = config
+        self._origin = origin
+        self._header = header
+        self._username = username
+        self._report = expiry_for(config)
+        # Checked once with a placeholder, so a bad origin, header or username
+        # fails at construction without reading or retaining the secret.
+        self._credential("placeholder", CredentialScope.CLONE)
+
+    def __repr__(self) -> str:
+        return f"StaticTokenProvider(origin={self._origin!r})"
+
+    def _credential(self, secret: str, scope: CredentialScope) -> Credential:
+        return Credential(
+            origin=self._origin,
+            header=self._header,
+            secret=secret,
+            scope=scope,
+            expiry=self._report.expiry,
+            expires_at=self._report.expires_at,
+            username=self._username,
+        )
+
+    def snapshot(self) -> TokenSnapshot:
+        """A fresh `TokenSnapshot` of this provider's token, for one operation."""
+
+        return TokenSnapshot(self._config)
+
+    def credential(self, snapshot: TokenSnapshot, scope: CredentialScope) -> Credential:
+        """The git credential for ``scope`` carrying ``snapshot``'s token, so an
+        operation's git access uses the token its requests already sent."""
+
+        return self._credential(snapshot.value(), scope)
 
     async def get(self, scope: CredentialScope) -> Credential:
-        return self._credentials[scope]
+        return self.credential(self.snapshot(), scope)
 
     def expiry(self) -> ExpiryReport:
         return self._report

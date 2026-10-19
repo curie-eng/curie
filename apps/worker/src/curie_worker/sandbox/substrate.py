@@ -29,7 +29,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aci_protocol import BootEnv
 from curie_telemetry import operation_span, record_metric
@@ -45,7 +45,6 @@ from ..binding import (
     SANDBOX_TOKEN_TTL_SECONDS,
     boot_token_facts,
 )
-from ..repo_runner_pools import RepoRunnerPool
 from ..workitem_dispatch import TerminationObservation
 from .affinity import AffinityStore
 from .docker import DockerSandboxClient
@@ -81,6 +80,9 @@ from .types import (
     is_executor_thread_key,
     repo_runner_entry,
 )
+
+if TYPE_CHECKING:
+    from ..repo_runner_pools import RepoRunnerPool
 
 # The resume overlay writes these into the replacement claim's per-claim env, and
 # the runner reads them out of the same boot contract -- same consumer, so both

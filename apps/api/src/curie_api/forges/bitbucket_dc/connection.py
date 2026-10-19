@@ -3,8 +3,10 @@
 Built from one config entry: ``host`` is the server's hostname and ``api_url``
 its base URL, context path included (decision 5.2). The credential is a project
 or repository HTTP access token, sent as a Bearer header on API calls and git
-alike (decision 4.2); its clone origin is ``api_url``. The adapter module is
-imported when an adapter is built, so registering the kind does not import it.
+alike (decision 4.2). Its clone origin is ``<api_url>/scm``, so the clone URL
+every consumer derives as ``<origin>/<path>.git`` is the server's
+``<api_url>/scm/<KEY>/<slug>.git``. The adapter module is imported when an
+adapter is built, so registering the kind does not import it.
 """
 
 from __future__ import annotations
@@ -36,13 +38,11 @@ class BitbucketDcConnection:
             raise ValueError("bitbucket_dc uses an access token; remove username")
         self.config = config
         self._ca_bundle = ca_bundle
-        self._token = credential.token
+        self._credential = credential
         self._provider = StaticTokenProvider(
-            credential.token.get_secret_value(),
-            origin=config.api_url,
+            credential,
+            origin=f"{config.api_url.rstrip('/')}/scm",
             header=CredentialHeader.AUTHORIZATION_BEARER,
-            expires_at=credential.expires_at,
-            never_expires=credential.never_expires,
         )
 
     def __repr__(self) -> str:
@@ -72,9 +72,13 @@ class BitbucketDcConnection:
 
         return BitbucketDcCodeHost(
             client,
+            entry=self.config.name,
             api_url=self.config.api_url,
             host=self.config.host,
-            token=self._token.get_secret_value(),
+            # A fresh snapshot per adapter: one operation's requests and git
+            # credential carry one token, and the next operation reads the
+            # current file (#4630).
+            token=self._provider.snapshot(),
             credentials=self._provider,
         )
 

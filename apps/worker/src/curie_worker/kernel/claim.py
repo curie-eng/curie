@@ -222,6 +222,12 @@ async def _route_and_start(
     workspace_repo: str | None = None
     owned_run_id = constants._OWNED_WORK_ITEM.get()
     owned_run = self._work_item_runs.get(owned_run_id) if owned_run_id is not None else None
+    if owned_run_id is not None and (owned_run is None or owned_run.event_id != queued_event_id):
+        raise WorkItemStartRefused("factory_wake_mismatch")
+    if owned_run is not None:
+        owned_run.ensure_acquired()
+    if owned_run is not None and owned_run.agent_id != agent_id:
+        raise WorkItemStartRefused("factory_agent_mismatch")
     caller_run = str(owned_run.request_id) if owned_run is not None else None
     lineage: PublicationLineage | None = None
     if workspace_deployment_id is not None:
@@ -555,6 +561,8 @@ async def _route_and_start(
             # get only what is left of it.
             remaining_s = max(0.0, remaining_s - (clock.time.monotonic() - rebuild_started))
         try:
+            if owned_run is not None:
+                owned_run.ensure_acquired()
             handle = await self._claim_or_resume(
                 thread_key,
                 boot_env,
@@ -579,6 +587,10 @@ async def _route_and_start(
             if thread_set is not None:
                 await self._discard_unclaimed_thread_set(thread_key, thread_set, existing_handle)
             raise
+    if owned_run is not None:
+        owned_run.claim_name = handle.claim_name
+        owned_run.sandbox_name = handle.sandbox_name
+        owned_run.ensure_acquired()
     wait = current_wait()
 
     async def check_capacity_before_request() -> float | None:
@@ -910,11 +922,10 @@ async def _route_and_start(
     runs = getattr(self, "_work_item_runs", {})
     owned_id = constants._OWNED_WORK_ITEM.get()
     run = runs.get(owned_id) if owned_id is not None else None
-    if run is None:
-        for candidate in runs.values():
-            if candidate.thread_key == thread_key and candidate.started and not candidate.finished:
-                run = candidate
-                break
+    if owned_id is not None and (run is None or run.event_id != queued_event_id):
+        raise WorkItemStartRefused("factory_wake_mismatch")
+    if run is not None:
+        run.ensure_acquired()
     if run is not None and run.finished:
         raise WorkItemStartRefused("work item authority is finished")
     if run is not None and not run.started:
@@ -962,9 +973,6 @@ async def _route_and_start(
         if run.event_id == queued_event_id:
             run.claim_name = handle.claim_name
             run.sandbox_name = handle.sandbox_name
-    if run is not None and agent_id is not None:
-        # Lets a kill find this run if it later parks for approval (#3564).
-        run.agent_id = agent_id
     if agent_id is not None:
         self._register_run(agent_id, thread_key)
     turn: TurnStream | None = None

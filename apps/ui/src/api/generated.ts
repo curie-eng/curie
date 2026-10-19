@@ -565,7 +565,9 @@ export interface paths {
          * @description Bind, tighten or widen a protected hook's remediation policy.
          *
          *     A new binding starts disarmed; a later write keeps the armed flag. Each
-         *     write creates a generation recorded with the operator principal.
+         *     write creates a generation recorded with the operator principal. Needs the
+         *     remediation authority in ``X-Curie-Remediation-Authority`` (ADR 0231), else
+         *     ``remediation_authority_required``; the operator principal is attribution.
          */
         put: operations["put_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_put"];
         post?: never;
@@ -591,6 +593,10 @@ export interface paths {
         /**
          * Arm Remediation Policy
          * @description Arm the current policy as a new generation.
+         *
+         *     Needs the remediation authority in ``X-Curie-Remediation-Authority``
+         *     (ADR 0231), else ``remediation_authority_required``; the operator principal
+         *     is attribution.
          */
         post: operations["arm_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_arm_post"];
         delete?: never;
@@ -1429,6 +1435,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/approvals/principals/remediation-operator": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Mint Remediation Operator Principal
+         * @description Mint a remediation operator credential (#4228).
+         *
+         *     The token carries the ``remediation.administer`` scope, which remediation
+         *     policy and qualification writes require; it never resolves an approval,
+         *     and an approval operator token never writes remediation policy.  Returned
+         *     once and marked non-cacheable, as the approval operator mint is.
+         */
+        post: operations["mint_remediation_operator_principal_approvals_principals_remediation_operator_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/approvals/{approval_id}": {
         parameters: {
             query?: never;
@@ -2018,23 +2049,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/deployments/{deployment_id}/input-contracts": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Read Input Contracts */
-        get: operations["read_input_contracts_deployments__deployment_id__input_contracts_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/evals/matrix": {
         parameters: {
             query?: never;
@@ -2080,6 +2094,23 @@ export interface paths {
         put?: never;
         /** Trigger Eval */
         post: operations["trigger_eval_evals_trigger_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/forges/credentials/health": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Forge Credential Health */
+        get: operations["get_forge_credential_health_forges_credentials_health_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -3447,10 +3478,12 @@ export interface components {
     schemas: {
         /** AcquireBody */
         AcquireBody: {
+            context: components["schemas"]["FactoryContext"] | null;
             /** Generation */
             generation: number;
             /** Owner */
             owner: string;
+            wake: components["schemas"]["FactoryWake"];
         };
         /**
          * ActionAuditOut
@@ -5802,6 +5835,41 @@ export interface components {
             /** Value */
             value: unknown;
         };
+        /** FactoryContext */
+        FactoryContext: {
+            /** Adapter */
+            adapter: string | null;
+            /** Address */
+            address: string;
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /**
+             * Binding Id
+             * Format: uuid
+             */
+            binding_id: string;
+            /** Kind */
+            kind: string;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+        };
+        /** FactoryWake */
+        FactoryWake: {
+            /** Adapter */
+            adapter: string | null;
+            /** Address */
+            address: string;
+            /** Conversation Id */
+            conversation_id: string;
+            /** Kind */
+            kind: string;
+        };
         /** FinishBody */
         FinishBody: {
             /** Cause */
@@ -5817,6 +5885,48 @@ export interface components {
             outcome: "completed" | "failed";
             /** Runtime Epoch */
             runtime_epoch: number;
+        };
+        /**
+         * ForgeCredentialHealth
+         * @description One configured entry's credential, as its forge answered a read now.
+         */
+        ForgeCredentialHealth: {
+            /**
+             * Authentication
+             * @enum {string}
+             */
+            authentication: "accepted" | "rejected" | "unknown";
+            /** Credential Type */
+            credential_type: string;
+            /** Kind */
+            kind: string;
+            /** Name */
+            name: string;
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /** Reason */
+            reason: string | null;
+            /**
+             * Section
+             * @enum {string}
+             */
+            section: "code_host" | "tracker";
+        };
+        /**
+         * ForgeCredentialHealthReport
+         * @description ``GET /forges/credentials/health``: every configured entry's probe.
+         */
+        ForgeCredentialHealthReport: {
+            /** Entries */
+            entries: components["schemas"]["ForgeCredentialHealth"][];
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
         };
         /**
          * GateKind
@@ -6152,43 +6262,6 @@ export interface components {
             source_generation: string | null;
             /** Supported */
             supported: boolean;
-        };
-        /** InputContractsOut */
-        InputContractsOut: {
-            /** Accepted Contracts */
-            accepted_contracts: string[];
-            /**
-             * Agent Id
-             * Format: uuid
-             */
-            agent_id: string;
-            /** Bundle Sha256 */
-            bundle_sha256: string;
-            /**
-             * Deployment Id
-             * Format: uuid
-             */
-            deployment_id: string;
-            /**
-             * Enforced
-             * @constant
-             */
-            enforced: true;
-            /**
-             * Interface
-             * @constant
-             */
-            interface: "curie/input-contracts@1";
-            /**
-             * Status
-             * @constant
-             */
-            status: "active";
-            /**
-             * Version Id
-             * Format: uuid
-             */
-            version_id: string;
         };
         /**
          * IssueReadContext
@@ -7957,14 +8030,26 @@ export interface components {
         /** RunningWorkItemRequest */
         RunningWorkItemRequest: {
             /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            context: components["schemas"]["FactoryContext"] | null;
+            /** Conversation Id */
+            conversation_id: string;
+            /**
              * Execution Deadline
              * Format: date-time
              */
             execution_deadline: string;
-            /** Input Contract Receipt */
-            input_contract_receipt?: {
-                [key: string]: unknown;
-            } | null;
+            /** Generation */
+            generation: number;
+            /** Lease Held To Deadline */
+            lease_held_to_deadline: boolean;
+            /** Refusal */
+            refusal: ("not_found" | "identity_mismatch" | "active_request" | "work_item_cancelled" | "not_dispatchable" | "not_published" | "duplicate" | "stale_owner" | "not_running" | "waiting_deadline_elapsed" | "binding_missing" | "repository_not_allowed" | "publication_pending" | "factory_wake_mismatch" | "factory_agent_missing" | "factory_agent_mismatch" | "factory_tenant_mismatch" | "factory_binding_missing" | "factory_binding_ambiguous" | "factory_binding_changed" | "factory_surface_mismatch" | "factory_start_failed") | null;
+            /** Repository Path */
+            repository_path: string;
             /**
              * Request Id
              * Format: uuid
@@ -7977,6 +8062,11 @@ export interface components {
              * @constant
              */
             status: "running";
+            /**
+             * Wait Deadline
+             * Format: date-time
+             */
+            wait_deadline: string;
             /**
              * Work Item Id
              * Format: uuid
@@ -8208,16 +8298,11 @@ export interface components {
         StartBody: {
             /** Claim Name */
             claim_name: string;
+            context: components["schemas"]["FactoryContext"];
             /** Generation */
             generation: number;
             /** Owner */
             owner: string;
-            /** Runtime Bundle Sha256 */
-            runtime_bundle_sha256?: string | null;
-            /** Runtime Deployment Id */
-            runtime_deployment_id?: string | null;
-            /** Runtime Version Id */
-            runtime_version_id?: string | null;
             /** Sandbox Name */
             sandbox_name: string;
         };
@@ -10097,6 +10182,7 @@ export interface operations {
             query?: never;
             header?: {
                 "x-api-key"?: string | null;
+                "X-Curie-Remediation-Authority"?: string | null;
                 "X-Curie-Approval-Principal"?: string | null;
             };
             path: {
@@ -10228,6 +10314,7 @@ export interface operations {
             query?: never;
             header?: {
                 "x-api-key"?: string | null;
+                "X-Curie-Remediation-Authority"?: string | null;
                 "X-Curie-Approval-Principal"?: string | null;
             };
             path: {
@@ -12298,6 +12385,41 @@ export interface operations {
             };
         };
     };
+    mint_remediation_operator_principal_approvals_principals_remediation_operator_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApprovalPrincipalMint"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApprovalPrincipalOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_approval_approvals__approval_id__get: {
         parameters: {
             query?: never;
@@ -13406,39 +13528,6 @@ export interface operations {
             };
         };
     };
-    read_input_contracts_deployments__deployment_id__input_contracts_get: {
-        parameters: {
-            query?: never;
-            header?: {
-                "x-api-key"?: string | null;
-            };
-            path: {
-                deployment_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InputContractsOut"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     eval_matrix_evals_matrix_get: {
         parameters: {
             query: {
@@ -13531,6 +13620,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["EvalTriggerResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_forge_credential_health_forges_credentials_health_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ForgeCredentialHealthReport"];
                 };
             };
             /** @description Validation Error */
@@ -15808,6 +15928,10 @@ export interface operations {
         parameters: {
             query: {
                 conversation_id: string;
+                wake_kind: string;
+                wake_address: string;
+                wake_conversation_id: string;
+                wake_adapter: string | null;
             };
             header?: {
                 "X-Curie-Worker-Token"?: string | null;

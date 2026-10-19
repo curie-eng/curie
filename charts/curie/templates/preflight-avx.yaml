@@ -2,10 +2,11 @@
 {{/*
 Preflight (a): CPU-AVX / ClickHouse-pin check.
 
-Newer ClickHouse (>= 25.x) is compiled for AVX and SIGILLs with exit 132 on
-CPUs that only have SSE4.2. The chart default is ClickHouse 25.12, required by
+The x86 build of newer ClickHouse (>= 25.x) requires AVX and SIGILLs with exit
+132 on x86 CPUs that only have SSE4.2. Native ARM64 does not use x86 AVX. The
+chart default is ClickHouse 25.12, required by
 the Langfuse pin (#2210); that tag is not SSE4.2-safe, so AVX is a
-chart-default requirement. This hook catches a missing AVX BEFORE the stores
+chart-default requirement on x86. This hook catches a missing AVX BEFORE the stores
 install: it reads the node's /proc/cpuinfo (a container shares the host kernel,
 so the flags are the node's), and if the node lacks AVX it FAILS the install
 unless the operator pins a tag in clickhouse.sse42SafeTags. That override
@@ -18,7 +19,7 @@ can be read; it is replaced on the next install.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "curie.fullname" . }}-preflight-avx
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Job" "name" (printf "%s-preflight-avx" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
   annotations:
@@ -69,6 +70,24 @@ spec:
               echo "== Curie AVX / ClickHouse-pin preflight =="
               echo "configured ClickHouse image: ${CLICKHOUSE_IMAGE}"
               echo "SSE4.2-safe tag prefixes:    ${SSE42_SAFE_TAGS}"
+
+              node_arch=$(uname -m)
+              echo "node architecture:          ${node_arch}"
+              case "${node_arch}" in
+                aarch64|arm64)
+                  if [ "${FORCE_NO_AVX}" != "true" ]; then
+                    echo "RESULT: PASS - native ARM64 does not require x86 AVX."
+                    exit 0
+                  fi
+                  echo "test override: simulating an x86 node without AVX"
+                  ;;
+                x86_64|amd64) ;;
+                *)
+                  echo "RESULT: FAIL - unsupported node architecture '${node_arch}'."
+                  echo "REMEDY: use native ARM64 or x86_64 nodes with a compatible ClickHouse image."
+                  exit 1
+                  ;;
+              esac
 
               if [ "${FORCE_NO_AVX}" = "true" ]; then
                 avx="absent (forced via preflights.avxCheck.forceNoAvx)"

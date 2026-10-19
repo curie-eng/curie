@@ -431,8 +431,11 @@ def test_chart_scenario_registration_preserves_all_gate_requirements(
         gate.check_registration(workflow, [SCRIPT])
 
 
-def test_real_ci_registers_every_chart_runtime_script() -> None:
-    gate.check_registration(CI, CHART_RUNTIME_SCRIPTS)
+def test_real_ci_registers_every_enabled_chart_runtime_script() -> None:
+    disabled = "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh"
+    gate.check_registration(CI, [s for s in CHART_RUNTIME_SCRIPTS if s != disabled])
+    with pytest.raises(gate.GateError, match="idle-capacity-reclamation-runtime"):
+        gate.check_registration(CI, [disabled])
 
 
 def test_self_test_exercises_the_registry_omission_negative_control(

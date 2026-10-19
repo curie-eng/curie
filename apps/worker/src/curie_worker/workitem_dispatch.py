@@ -22,6 +22,7 @@ from channel_protocol.work_item_events import (
 )
 
 from .api_retry import DEFAULT_BUDGET_S, post_with_retry
+from .binding import FactoryContext, FactoryWake
 
 logger = logging.getLogger(__name__)
 
@@ -74,11 +75,13 @@ class WorkItemAcquireGrant:
     generation: int
     work_item_id: uuid.UUID
     conversation_id: str
-    wait_deadline: str
-    # The repository path frozen on the WorkItem at admission. None only on
-    # the synthetic grant an approval resume rebuilds, which keeps the
-    # thread's existing workspace selection.
-    repository_path: str | None
+    wait_deadline: datetime
+    repository_path: str
+    context: FactoryContext
+
+    @property
+    def agent_id(self) -> uuid.UUID:
+        return self.context.agent_id
     input_contract_receipt: dict[str, Any] | None = None
 
 
@@ -92,10 +95,18 @@ class WorkItemStartGrant:
 
 @dataclass(frozen=True)
 class WorkItemRunning:
+    lease_held_to_deadline: bool
     request_id: uuid.UUID
     work_item_id: uuid.UUID
+    agent_id: uuid.UUID
+    generation: int
+    conversation_id: str
+    wait_deadline: datetime
+    repository_path: str
     runtime_epoch: int
     execution_deadline: datetime
+    context: FactoryContext | None
+    refusal: str | None
     input_contract_receipt: dict[str, Any] | None = None
 
 
@@ -171,6 +182,31 @@ def _conflict_code(response: httpx.Response) -> str:
     return "conflict"
 
 
+_FACTORY_AUTHORITY_REFUSALS = frozenset(
+    {
+        "factory_agent_missing",
+        "factory_agent_mismatch",
+        "factory_tenant_mismatch",
+        "factory_binding_missing",
+        "factory_binding_ambiguous",
+        "factory_binding_changed",
+        "factory_surface_mismatch",
+    }
+)
+
+
+def _required_string(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("required nonempty string missing")
+    return value
+
+
+def _required_positive_int(value: object) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("required positive integer missing")
+    return value
+
+
 def _parse_datetime(value: object) -> datetime:
     if not isinstance(value, str) or not value:
         raise WorkItemTransportError("work-item dispatch returned an unusable timestamp")
@@ -202,25 +238,26 @@ class WorkItemDispatchClient:
         *,
         owner: str,
         generation: int,
+        wake: FactoryWake,
+        context: FactoryContext | None,
     ) -> WorkItemAcquireGrant:
         body = await self._post(
             f"/v1/internal/work-items/requests/{request_id}/acquire",
-            {"owner": owner, "generation": generation},
+            {
+                "owner": owner,
+                "generation": generation,
+                "wake": wake.model_dump(mode="json"),
+                "context": context.model_dump(mode="json") if context is not None else None,
+            },
         )
         try:
             return WorkItemAcquireGrant(
-                generation=int(body["generation"]),
+                generation=_required_positive_int(body["generation"]),
                 work_item_id=uuid.UUID(str(body["work_item_id"])),
-                conversation_id=str(body["conversation_id"]),
-                wait_deadline=str(body["wait_deadline"]),
-                # An API replica from before #2992 omits the field mid-rollout.
-                # The acquisition is already committed, so read absence as "no
-                # WorkItem repository" rather than failing the wake.
-                repository_path=(
-                    str(body["repository_path"])
-                    if body.get("repository_path") is not None
-                    else None
-                ),
+                conversation_id=_required_string(body["conversation_id"]),
+                wait_deadline=_parse_datetime(body["wait_deadline"]),
+                repository_path=_required_string(body["repository_path"]),
+                context=FactoryContext.model_validate(body["context"]),
                 input_contract_receipt=body.get("input_contract_receipt"),
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -267,6 +304,7 @@ class WorkItemDispatchClient:
         generation: int,
         claim_name: str,
         sandbox_name: str,
+        context: FactoryContext,
         runtime_deployment_id: uuid.UUID | None = None,
         runtime_version_id: uuid.UUID | None = None,
         runtime_bundle_sha256: str | None = None,
@@ -279,6 +317,7 @@ class WorkItemDispatchClient:
                     "generation": generation,
                     "claim_name": claim_name,
                     "sandbox_name": sandbox_name,
+                    "context": context.model_dump(mode="json"),
                     **(
                         {"runtime_deployment_id": str(runtime_deployment_id)}
                         if runtime_deployment_id is not None
@@ -328,11 +367,19 @@ class WorkItemDispatchClient:
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError("work-item heartbeat returned an unusable body") from exc
 
-    async def running_for_conversation(self, conversation_id: str) -> WorkItemRunning | None:
+    async def running_for_conversation(
+        self, conversation_id: str, *, wake: FactoryWake
+    ) -> WorkItemRunning | None:
         response = await self._client.get(
             f"{self._base}/v1/internal/work-items/running",
             headers=self._headers,
-            params={"conversation_id": conversation_id},
+            params={
+                "conversation_id": conversation_id,
+                "wake_kind": wake.kind,
+                "wake_address": wake.address,
+                "wake_adapter": wake.adapter or "",
+                "wake_conversation_id": wake.conversation_id,
+            },
         )
         if response.status_code == 404:
             return None
@@ -346,12 +393,36 @@ class WorkItemDispatchClient:
             raise WorkItemConflict(_conflict_code(response))
         try:
             body = response.json()
+            context = (
+                FactoryContext.model_validate(body["context"])
+                if body["context"] is not None
+                else None
+            )
+            refusal = body["refusal"]
+            if (context is None) != (refusal is not None):
+                raise ValueError("running context and refusal disagree")
+            if refusal is not None and refusal not in _FACTORY_AUTHORITY_REFUSALS:
+                raise ValueError("unknown factory refusal")
+            agent_id = uuid.UUID(str(body["agent_id"]))
+            if context is not None and context.agent_id != agent_id:
+                raise ValueError("running context names a different agent")
+            lease_held_to_deadline = body["lease_held_to_deadline"]
+            if type(lease_held_to_deadline) is not bool:
+                raise ValueError("running deadline lease hold must be a boolean")
             return WorkItemRunning(
+                lease_held_to_deadline=lease_held_to_deadline,
                 request_id=uuid.UUID(str(body["request_id"])),
                 work_item_id=uuid.UUID(str(body["work_item_id"])),
-                runtime_epoch=int(body["runtime_epoch"]),
+                agent_id=agent_id,
+                generation=_required_positive_int(body["generation"]),
+                conversation_id=_required_string(body["conversation_id"]),
+                wait_deadline=_parse_datetime(body["wait_deadline"]),
+                repository_path=_required_string(body["repository_path"]),
+                runtime_epoch=_required_positive_int(body["runtime_epoch"]),
                 input_contract_receipt=body.get("input_contract_receipt"),
                 execution_deadline=_parse_datetime(body["execution_deadline"]),
+                context=context,
+                refusal=refusal,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkItemTransportError(
@@ -581,7 +652,8 @@ class WorkItemRun:
         client: WorkItemDispatchClient,
         request_id: uuid.UUID,
         owner: str,
-        grant: WorkItemAcquireGrant,
+        grant: WorkItemAcquireGrant | WorkItemRunning,
+        wake: FactoryWake,
         event_id: str,
         thread_key: str,
         on_stop: StopCallback,
@@ -592,6 +664,9 @@ class WorkItemRun:
         self.owner = owner
         self.generation = grant.generation
         self.repository_path = grant.repository_path
+        self.conversation_id = grant.conversation_id
+        self.wait_deadline = grant.wait_deadline
+        self.context = grant.context
         self.input_contract_receipt = grant.input_contract_receipt
         self.event_id = event_id
         self.thread_key = thread_key
@@ -620,15 +695,16 @@ class WorkItemRun:
         self.claim_name: str | None = None
         self.sandbox_name: str | None = None
         self.execution_deadline: datetime | None = None
-        # The agent the run's turn belongs to, recorded when the turn registers,
-        # so a kill can drop the run if it is parked for approval (#3564).
-        self.agent_id: uuid.UUID | None = None
+        self.agent_id = grant.agent_id
         self._client = client
+        self._wake = wake
         self._on_stop = on_stop
         self._on_stale = on_stale
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._stopping = False
         self._deferred = False
+        self._acquire_refusal: str | None = None
+        self._acquire_lock = asyncio.Lock()
         self._acquire_renew_task: asyncio.Task[None] | None = asyncio.create_task(
             self._acquire_renew_loop(),
             name=f"work-item-acquire-renew-{self.request_id}",
@@ -653,6 +729,10 @@ class WorkItemRun:
             # acquire of this thread to adopt.
             self.finished = True
 
+    def ensure_acquired(self) -> None:
+        if not self.started and self._acquire_refusal is not None:
+            raise WorkItemStartRefused(self._acquire_refusal)
+
     async def start(self, *, claim_name: str, sandbox_name: str) -> WorkItemStartGrant:
         # Recorded before the API call so a start refused on a terminal code
         # (#3208) still knows the claim it made, and its release stays fenced
@@ -666,17 +746,22 @@ class WorkItemRun:
                 "runtime_version_id": self.runtime_version_id,
                 "runtime_bundle_sha256": self.runtime_bundle_sha256,
             }
-        grant = await self._client.start(
-            self.request_id,
-            owner=self.owner,
-            generation=self.generation,
-            claim_name=claim_name,
-            sandbox_name=sandbox_name,
-            **identity,
-        )
-        self.started = True
-        self.runtime_epoch = grant.runtime_epoch
-        self.execution_deadline = grant.execution_deadline
+        async with self._acquire_lock:
+            self.ensure_acquired()
+            if self.context is None:
+                raise WorkItemStartRefused("factory_surface_mismatch")
+            grant = await self._client.start(
+                self.request_id,
+                owner=self.owner,
+                generation=self.generation,
+                claim_name=claim_name,
+                sandbox_name=sandbox_name,
+                context=self.context,
+                **identity,
+            )
+            self.started = True
+            self.runtime_epoch = grant.runtime_epoch
+            self.execution_deadline = grant.execution_deadline
         interval = max(_MIN_HEARTBEAT_INTERVAL_S, grant.heartbeat_interval_s)
         self._heartbeat_task = asyncio.create_task(
             self._heartbeat_loop(interval),
@@ -766,24 +851,37 @@ class WorkItemRun:
     async def _acquire_renew_loop(self) -> None:
         while not (self.started or self.finished or self._stopping or self._deferred):
             await _renew_sleep(_ACQUIRE_RENEW_INTERVAL_S)
-            if self.started or self.finished or self._stopping or self._deferred:
-                return
-            try:
-                await self._client.acquire(
-                    self.request_id, owner=self.owner, generation=self.generation
-                )
-            except WorkItemConflict as exc:
-                logger.info(
-                    "work-item acquire renewal refused for %s: %s",
-                    self.request_id,
-                    exc.code,
-                )
-                return
-            except WorkItemTransportError:
-                logger.warning(
-                    "work-item acquire renewal transport failed for %s",
-                    self.request_id,
-                )
+            async with self._acquire_lock:
+                if self.started or self.finished or self._stopping or self._deferred:
+                    return
+                try:
+                    await self._client.acquire(
+                        self.request_id,
+                        owner=self.owner,
+                        generation=self.generation,
+                        wake=self._wake,
+                        context=self.context,
+                    )
+                except WorkItemConflict as exc:
+                    if not self.started and (
+                        exc.code in _FACTORY_AUTHORITY_REFUSALS
+                        or exc.code == "factory_start_failed"
+                    ):
+                        self._acquire_refusal = exc.code
+                        self._deferred = True
+                        if exc.code == "factory_start_failed":
+                            self.finished = True
+                    logger.info(
+                        "work-item acquire renewal refused for %s: %s",
+                        self.request_id,
+                        exc.code,
+                    )
+                    return
+                except WorkItemTransportError:
+                    logger.warning(
+                        "work-item acquire renewal transport failed for %s",
+                        self.request_id,
+                    )
 
     async def _heartbeat_loop(self, interval_s: float) -> None:
         failures = 0

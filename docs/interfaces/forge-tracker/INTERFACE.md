@@ -1,7 +1,7 @@
 ---
 seam: Forge tracker and code host
 kind: CLEAN
-impls: in-memory pairs behind the Tracker and CodeHost ports, and the Jira Cloud tracker (JiraTracker)
+impls: GitHub and GitLab pairs, Jira tracker, Bitbucket Cloud and Data Center code hosts, and in-memory pairs
 grade: not separately graded
 vision_row: null
 epics: ["#3831"]
@@ -13,7 +13,7 @@ order: 26
 > Part of the Curie swappable seam catalog. See the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** in-memory pairs behind the Tracker and CodeHost ports, and the Jira Cloud tracker (JiraTracker) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** GitHub and GitLab pairs, Jira tracker, Bitbucket Cloud and Data Center code hosts, and in-memory pairs &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol` or typed port class. SOFT = swap through config or wire without a code interface. NONE = not built yet.
@@ -29,11 +29,10 @@ decisions (what admits a run, when CI is good enough, which feedback becomes a
 revision, what a status comment says) and asks the ports only for facts and
 the writes those decisions need.
 
-The ports and their value types are in place. Today the factory still calls
-GitHub code directly, through the adapter-internal package
-`apps/api/src/curie_api/forges/github/`, and the import gate below lists every
-module that does. Later #3831 work moves the GitHub code behind the ports and
-empties that list.
+Production adapters implement both ports, with selection owned by
+`apps/api/src/curie_api/forges/registry.py`. Some legacy API callers still reach
+GitHub directly through `apps/api/src/curie_api/forges/github/`; the import
+allowlist below records those remaining callers.
 
 ## Current contract
 
@@ -46,7 +45,9 @@ marked and described:
    (admit, cancel or mention) plus the next cursor, and re-reads the WorkItems
    already running so a marker removed before the cursor still cancels. A
    listing that cannot be read to its end raises `Unavailable` and yields no
-   cursor. Events by the adapter's own identity are never notices.
+   cursor. Events by the adapter's own identity are never notices. Each notice
+   carries `occurred_at`, the event time the tracker reported, or None when it
+   reported none; admission treats None as unknown.
 2. `verify_current` says whether a notice still describes the issue.
 3. `marking_actor` names who applied the marker that is on the issue now.
 4. `may_start` decides whether that actor may start a run. A native tracker
@@ -59,7 +60,12 @@ marked and described:
    Nothing is stored.
 7. `set_state_label` applies the factory state label and drops others.
 8. `closing_reference` produces the text a pull request body carries.
-9. Optional: `link_pull_request` and `dependencies`.
+9. `publication_references` returns every scope-qualified text by which an
+   earlier factory publication body in a repository names exactly this issue:
+   GitHub's closing reference, GitLab's `Closes #<iid>` only in the issue's own
+   project, and Jira's reference for the current key and every key the issue
+   held before a move. An unreadable answer raises `Unavailable`.
+10. Optional: `link_pull_request` and `dependencies`.
 
 ### CodeHost
 
@@ -67,9 +73,20 @@ marked and described:
 pull requests, CI and review live: `resolve_repository` from an immutable id;
 `credential` for clone or push scope; `branch_head` and `read_commit`;
 `find_pull_request`, `open_pull_request`, `update_pull_request` and
-`read_pull_request`; `observe_ci` on an exact head; `list_review_feedback`
-since a cursor and `verify_feedback`. Optional: `ci_diagnostics`,
-`rerun_failed` and `user_can_write`.
+`read_pull_request`; `list_factory_publications`; `observe_ci` on an exact
+head; `list_review_feedback` since a cursor and `verify_feedback`. Optional:
+`ci_diagnostics`, `rerun_failed` and `user_can_write`.
+
+`list_factory_publications` returns, as `FactoryPublication` values, every pull
+request in any state that the adapter's own identity opened in the repository
+from a branch of that repository (never a fork) whose last path component is
+`publication-<32 hex>`. The whole listing is read: a failed page, an item it
+cannot read, or an own identity it cannot read raises `Unavailable`. Bitbucket
+Cloud cannot read its own account, so it lists every such pull request of the
+repository with `owner_verified` False, as does Bitbucket Data Center when its
+answers omit the `X-AUSERID` header. Such publications are not evidence:
+rediscovery drops them before matching. Every other adapter lists only its
+own, with `owner_verified` True.
 
 `observe_ci` returns a `CiRollup`
 (`apps/api/src/curie_api/forges/types.py::CiRollup`) built by
@@ -203,12 +220,16 @@ rules; GitLab, Jira and both Bitbucket kinds are.
    native pair with every operation supported, and a tracker-only pair that
    declares the optional operations no-op or unsupported, the shape a Jira and
    Bitbucket binding has.
-2. **GitHub:** not yet behind the ports. Its code lives in
-   `apps/api/src/curie_api/forges/github/` and is called directly.
+2. **GitHub:** `GitHubTracker`
+   (`apps/api/src/curie_api/forges/github/tracker.py::GitHubTracker`) and
+   `GitHubCodeHost`
+   (`apps/api/src/curie_api/forges/github/code_host.py::GitHubCodeHost`) form a
+   native pair. Legacy direct callers of the package remain on the import
+   allowlist; their existence does not mean the pair is unimplemented.
 3. **Jira Cloud:** `JiraTracker`
    (`apps/api/src/curie_api/forges/jira_cloud/tracker.py::JiraTracker`) in
    `apps/api/src/curie_api/forges/jira_cloud/`, a tracker-only kind paired
-   with the GitHub code host. It reaches Jira Cloud REST v3 with a static API
+   with a separately configured code host. It reaches Jira Cloud REST v3 with a static API
    token held only by the API, keeps its status comment marker in the
    `curie.factory` comment property, and links each pull request back to the
    issue with a remote link.
@@ -240,13 +261,15 @@ rules; GitLab, Jira and both Bitbucket kinds are.
    worker, which may not import `curie_api.forges` at all. Both lists may only
    shrink; a listed file that stops offending fails the gate until its entry
    is removed.
-2. **Identity columns are still GitHub shaped.** WorkItems are keyed by a
-   GitHub repository id and issue number until the identity migration lands.
-3. **A GitHub identity ignores the host.** To keep existing rows and locks,
+2. **A GitHub request identity ignores the host.** To keep existing rows and locks,
    the GitHub derivations use the repository id and issue number only, so two
-   GitHub hosts with the same repository id would share identities.
+   GitHub hosts with the same repository id would share request identities.
+   WorkItem storage itself has the neutral `tracker_kind`, `tracker_host`,
+   `tracker_scope_id` and `tracker_issue_id` key
+   (`apps/api/src/curie_api/models.py::WorkItem`); the identity migration is
+   already represented in that model.
 
 ## Cross-links
 
-1. **Related seam:** [publication-lineage-authority](../publication-lineage-authority/INTERFACE.md). The worker's publication path reaches GitHub today and moves behind CodeHost through internal API endpoints.
-2. **Related seam:** [channel-ingress](../channel-ingress/INTERFACE.md). The acknowledge-only GitHub reply adapter sits there; factory status comments go through `MarkedComments`.
+1. **Related seam:** [publication-lineage-authority](../publication-lineage-authority/INTERFACE.md). The worker's publication path reaches CodeHost through internal API endpoints, with a separate GitHub authority branch.
+2. **Related seam:** [channel-ingress](../channel-ingress/INTERFACE.md). Acknowledge-only GitHub, GitLab and Jira reply adapters sit there; factory status comments go through `MarkedComments`.

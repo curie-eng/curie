@@ -2786,9 +2786,19 @@ fn cluster_status_lists_forge_credentials_in_the_schema() {
             .collect();
         assert_eq!(
             keys,
-            ["expires_at", "expiry", "name", "section", "type", "warning"]
-                .into_iter()
-                .collect(),
+            [
+                "authentication",
+                "authentication_reason",
+                "expires_at",
+                "expiry",
+                "name",
+                "observed_at",
+                "section",
+                "type",
+                "warning"
+            ]
+            .into_iter()
+            .collect(),
             "{entry}"
         );
     }
@@ -2803,6 +2813,92 @@ fn cluster_status_lists_forge_credentials_in_the_schema() {
     assert!(
         !validator(&schema).is_valid(&invalid),
         "the schema must restrict expiry to known, unknown and none"
+    );
+}
+
+// #4630: each credential carries its authentication state, merged from the
+// API's health report, and the payload stays valid against the schema.
+#[test]
+fn cluster_status_credential_authentication_is_in_the_schema() {
+    let now = time::OffsetDateTime::parse(
+        "2026-10-25T00:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let values = serde_json::json!({"factory": {
+        "codeHosts": [{"name": "github", "kind": "github",
+            "credential": {"type": "github_app", "appId": "7001"}}],
+        "trackers": [
+            {"name": "corp-gitlab", "kind": "gitlab",
+             "credential": {"type": "static_token", "neverExpires": true}},
+            {"name": "jira", "kind": "jira_cloud",
+             "credential": {"type": "static_token", "neverExpires": true}}
+        ]
+    }});
+    let mut credentials = curie::forge_expiry::report(&values, now);
+    let entry = |section: &str, name: &str, authentication: &str, reason: Option<&str>| {
+        curie::api::ForgeCredentialHealth {
+            section: section.into(),
+            name: name.into(),
+            kind: "gitlab".into(),
+            credential_type: "static_token".into(),
+            authentication: authentication.into(),
+            reason: reason.map(Into::into),
+            observed_at: "2026-10-25T00:00:01Z".into(),
+        }
+    };
+    let entries = vec![
+        entry("code_host", "github", "unknown", Some("not_probed")),
+        entry("tracker", "corp-gitlab", "rejected", Some("unauthorized")),
+    ];
+    curie::forge_expiry::merge_authentication(&mut credentials, Some(&entries));
+    let (unhealthy, warnings) = curie::forge_expiry::authentication_diagnoses(&credentials, None);
+    let status = ClusterStatus {
+        namespace: "curie".to_string(),
+        revision: "3".to_string(),
+        release_state: "deployed".to_string(),
+        release_found: true,
+        release_missing_note: None,
+        pods: vec![],
+        ready: 1,
+        total: 1,
+        unhealthy,
+        warnings,
+        pods_listed: true,
+        urls: vec![],
+        upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
+        delivery: curie::completion_outbox::Report::unknown(),
+        credentials,
+    };
+    let value = ClusterStatusOutput::Status(Box::new(status)).to_json();
+    assert_valid("cluster-status.schema.json", &value);
+    let listed = value["credentials"].as_array().expect("credentials list");
+    assert_eq!(listed[0]["authentication"], "unknown", "{value}");
+    assert_eq!(listed[0]["authentication_reason"], "not_probed", "{value}");
+    assert_eq!(listed[0]["observed_at"], "2026-10-25T00:00:01Z", "{value}");
+    assert_eq!(listed[1]["authentication"], "rejected", "{value}");
+    assert_eq!(listed[2]["authentication"], "unknown", "{value}");
+    assert_eq!(
+        listed[2]["authentication_reason"], "api_unavailable",
+        "{value}"
+    );
+    assert!(listed[2]["observed_at"].is_null(), "{value}");
+    assert_eq!(
+        value["healthy"], false,
+        "a rejected credential makes status unhealthy: {value}"
+    );
+    assert_eq!(
+        value["pods"]["unhealthy"],
+        serde_json::json!([
+            "credential tracker corp-gitlab (static_token): authentication rejected"
+        ])
+    );
+    let schema = load_schema("cluster-status.schema.json");
+    let mut invalid = value.clone();
+    invalid["credentials"][0]["authentication"] = serde_json::json!("ok");
+    assert!(
+        !validator(&schema).is_valid(&invalid),
+        "the schema must restrict authentication to accepted, rejected and unknown"
     );
 }
 

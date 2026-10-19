@@ -70,6 +70,13 @@ get_settings.cache_clear()
 os.environ.setdefault(
     "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "approval-chat-attester-test-secret"
 )
+# A dedicated placeholder remediation authority key (ADR 0231) for the policy
+# bind and arm routes. It is intentionally distinct from the platform key: the
+# point of the key is that a holder of the platform key (every worker) cannot
+# satisfy it, so a test suite where the two match would prove nothing.
+os.environ.setdefault(
+    "CURIE_REMEDIATION_AUTHORITY_KEY", "remediation-authority-test-secret"
+)
 
 DB_PREFIX = "curie_test_"
 TS_FORMAT = "%Y%m%d%H%M%S"

@@ -1474,12 +1474,12 @@ pub(crate) struct FactoryQuickstartArgs {
     /// Print the steps and exit without creating a cluster or applying anything.
     #[arg(long)]
     pub(crate) dry_run: bool,
-    /// Code host the factory publishes to. Only github is installed in
-    /// this build.
+    /// Code host the factory publishes to: github, gitlab with --tracker
+    /// gitlab, or bitbucket-cloud or bitbucket-dc with --tracker jira-cloud.
     #[arg(long, value_enum, value_name = "KIND", default_value = "github")]
     pub(crate) code_host: curie::factory_quickstart::CodeHostKind,
-    /// Tracker the factory takes issues from: github, or jira-cloud with
-    /// --code-host github.
+    /// Tracker the factory takes issues from: github, gitlab, or jira-cloud
+    /// with --code-host github, bitbucket-cloud or bitbucket-dc.
     #[arg(long, value_enum, value_name = "KIND", default_value = "github")]
     pub(crate) tracker: curie::factory_quickstart::TrackerKind,
     /// Base URL of a non-GitHub forge. Refused for github.
@@ -1508,6 +1508,14 @@ pub(crate) struct FactoryQuickstartArgs {
     /// Jira groupId whose members may start work. Refused for github.
     #[arg(long, value_name = "GROUP")]
     pub(crate) start_group: Option<String>,
+    /// Jira Cloud site or API gateway URL beside a Bitbucket code host,
+    /// whose own URL is --forge-url. Refused for any other pairing.
+    #[arg(long, value_name = "URL")]
+    pub(crate) tracker_url: Option<String>,
+    /// File holding the Jira API token beside a Bitbucket code host,
+    /// whose own token is --token-file. Refused for any other pairing.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) tracker_token_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]

@@ -19,6 +19,7 @@ from curie_api.forges.types import (
     Commit,
     Credential,
     CredentialScope,
+    FactoryPublication,
     FeedbackPage,
     MarkedComment,
     MarkedNotice,
@@ -144,6 +145,20 @@ class Tracker(Protocol):
         """The text a pull request body carries to reference (and close) the issue."""
         ...
 
+    async def publication_references(
+        self, issue: TrackerIssueRef, repository: RepositoryRef
+    ) -> tuple[str, ...]:
+        """Every text by which a factory publication body in ``repository``
+        names exactly this issue, as this and earlier releases wrote it (#4629).
+
+        Each is scope-qualified: a text that would name another issue in
+        another scope (a bare ``#n`` outside the issue's own project) is never
+        returned. A tracker whose issues can move returns the reference for
+        every key the issue held. A reference that cannot be read raises
+        `Unavailable`; nothing is guessed.
+        """
+        ...
+
     async def link_pull_request(self, issue: TrackerIssueRef, pull_request: PullRequest) -> None:
         """Optional: link the pull request back to the ticket."""
         ...
@@ -216,6 +231,25 @@ class CodeHost(Protocol):
     async def update_pull_request(
         self, pull_request: PullRequestRef, *, title: str | None, body: str | None
     ) -> PullRequest: ...
+
+    async def list_factory_publications(
+        self, repository: RepositoryRef
+    ) -> tuple[FactoryPublication, ...]:
+        """Every pull request, in any state, that a factory publication opened
+        in ``repository`` (#4629).
+
+        That is one opened by the adapter's own identity, from a branch of
+        ``repository`` itself (never a fork), whose last path component is
+        ``publication-<32 hex>`` (`curie_api.publication_policy.is_publication_branch`).
+        A code host that cannot read its own identity lists every such pull
+        request with ``owner_verified=False`` and says so in its docstring;
+        rediscovery ignores such publications.
+
+        The whole listing is read: a page that fails, an item or candidate
+        field that cannot be read, or an own identity that cannot be read
+        raises `Unavailable`, so an empty answer is proof of none.
+        """
+        ...
 
     async def read_pull_request(self, pull_request: PullRequestRef) -> PullRequest: ...
 

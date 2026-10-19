@@ -4,6 +4,11 @@ Date: 2026-09-27
 
 Status: Accepted
 
+**Amended by [ADR-0229](0229-a-hosted-connector-may-declare-the-host-the-caller-proxy-presents-upstream.md)**
+(back-link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+0229 amends decision 5 so a hosted connector may declare the `Host` its caller
+proxy presents upstream on admitted requests. Decision 6 stands as decided.
+
 Accepted with explicit maintainer approval from Brian Conn in the pull request
 that published this status, before implementation.
 

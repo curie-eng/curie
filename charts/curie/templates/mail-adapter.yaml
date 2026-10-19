@@ -238,7 +238,7 @@ Modeled on templates/dispatcher.yaml, with six deliberate divergences:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "curie.fullname" . }}-mail-adapter
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Service" "name" (printf "%s-mail-adapter" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: mail-adapter

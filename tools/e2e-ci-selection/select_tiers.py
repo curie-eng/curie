@@ -31,9 +31,33 @@ OUTPUT_KEYS = {
 KIND_TIERS = frozenset({"cluster", "released-upgrade"})
 # The kind-rung factory scenario runs only when one of these paths changes.
 FACTORY_PREFIXES = (
+    "cli/src/factory_quickstart",
+    "cli/src/factory_intake.rs",
+    "cli/src/api.rs",
+    "cli/src/api_requests.rs",
+    "cli/src/ops/convergence.rs",
     "apps/api/src/curie_api/factory_",
+    "apps/api/src/curie_api/routers/agents.py",
     "apps/api/src/curie_api/routers/publications",
+    "apps/api/src/curie_api/schemas/agents.py",
+    "apps/api/src/curie_api/schemas/channels.py",
+    "apps/api/src/curie_api/crud/channels.py",
+    "apps/api/src/curie_api/workitem_dispatch.py",
+    "apps/api/src/curie_api/routers/work_items.py",
+    "apps/api/src/curie_api/threadkeys.py",
+    "apps/api/src/curie_api/forges/",
+    "apps/api/src/curie_api/forge_credential_health.py",
+    "apps/api/src/curie_api/routers/forge_credential_health.py",
+    "cli/src/forge_expiry.rs",
+    "apps/api/tests/forge_fakes/gitlab.py",
     "apps/worker/src/curie_worker/factory",
+    "apps/worker/src/curie_worker/workitem_dispatch.py",
+    "apps/worker/src/curie_worker/binding.py",
+    "apps/worker/src/curie_worker/kernel/lifecycle.py",
+    "apps/worker/src/curie_worker/kernel/work_items.py",
+    "apps/worker/src/curie_worker/kernel/claim.py",
+    "apps/worker/src/curie_worker/kernel/constants.py",
+    "packages/aci-protocol/src/aci_protocol/turn.py",
     "runner/src/curie_runner/verification.py",
     "runner/src/curie_runner/preflight",
     "examples/dark-factory",
@@ -61,6 +85,23 @@ UPGRADE_WORKFLOW_JOBS = frozenset(
         "e2e-released-upgrade-negative",
         "e2e-cluster-upgrade-matrix-shards",
         "e2e-cluster-upgrade-matrix",
+    }
+)
+FACTORY_UPGRADE_PATHS = frozenset(
+    {
+        "charts/curie/files/legacy-factory-keys.yaml",
+        "charts/curie/files/legacy-factory-env.yaml",
+        "cli/src/config_migrate.rs",
+        "cli/src/factory_app.rs",
+        "cli/src/factory_config_migrate.rs",
+        "cli/src/github_app.rs",
+        "cli/src/ops/up.rs",
+        "cli/src/ops/upgrade.rs",
+        "tools/factory-e2e/factory_e2e.py",
+        "tools/factory-e2e/scripted_kind.py",
+        "tools/factory-e2e/scripted_scenario.py",
+        "tools/factory-e2e/tests/test_c4_upgrade_migration.py",
+        "tools/github-stub/github_stub.py",
     }
 )
 WORKFLOW_PATH = ".github/workflows/ci.yaml"
@@ -121,6 +162,14 @@ class ChartScenarios:
 
 
 @dataclass(frozen=True)
+class PytestScope:
+    prefixes: tuple[str, ...]
+    excluded_prefixes: tuple[str, ...]
+    python_prefixes: tuple[str, ...]
+    test_files: str
+
+
+@dataclass(frozen=True)
 class Registry:
     fallback: tuple[str, ...]
     exact: dict[str, tuple[str, ...]]
@@ -129,6 +178,7 @@ class Registry:
     ignored_prefixes: tuple[str, ...]
     chart_scenarios: ChartScenarios
     conditional_pytest_files: dict[str, tuple[str, ...]]
+    pytest_scopes: dict[str, PytestScope]
 
 
 def _mapping(value: object, label: str) -> dict[str, object]:
@@ -169,9 +219,13 @@ def _matches_prefix(path: str, prefix: str) -> bool:
 
 
 def _inputs(value: object, label: str) -> tuple[str, ...]:
-    if not isinstance(value, list) or not value or any(
-        not isinstance(path, str) or not path or path.startswith("/") or path.endswith("/")
-        for path in value
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(
+            not isinstance(path, str) or not path or path.startswith("/") or path.endswith("/")
+            for path in value
+        )
     ):
         raise RegistryError(f"{label} must be a nonempty list of valid paths")
     return tuple(value)
@@ -204,6 +258,68 @@ def _chart_registry(value: object) -> ChartScenarios:
         step_names.add(step)
         scenarios[scenario_id] = ChartScenario(step, _inputs(entry["inputs"], f"{label}.inputs"))
     return ChartScenarios(CHART_JOB, shared_inputs, scenarios)
+
+
+def _scope_path(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
+        raise RegistryError(
+            f"{label} must be a repository-relative path without slashes at either end"
+        )
+    return value
+
+
+def _scope_prefixes(value: object, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        raise RegistryError(f"{label} must be a nonempty list of valid paths")
+    return tuple(_scope_path(path, label) for path in value)
+
+
+def _pytest_scopes(value: object) -> dict[str, PytestScope]:
+    scopes = _mapping(value, "pytest_scopes")
+    if set(scopes) != {"cli"}:
+        raise RegistryError("pytest_scopes must define exactly the cli scope")
+    label = "pytest_scopes.cli"
+    scope = _mapping(scopes["cli"], label)
+    if set(scope) != {"prefixes", "excluded_prefixes", "python_prefixes", "test_files"}:
+        raise RegistryError(
+            f"{label} must define prefixes, excluded_prefixes, python_prefixes, and test_files"
+        )
+    prefixes = _scope_prefixes(scope["prefixes"], f"{label}.prefixes")
+    excluded_prefixes = _scope_prefixes(scope["excluded_prefixes"], f"{label}.excluded_prefixes")
+    python_prefixes = _scope_prefixes(scope["python_prefixes"], f"{label}.python_prefixes")
+    test_files = _scope_path(scope["test_files"], f"{label}.test_files")
+    try:
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "-z", "--", test_files],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split("\0")
+        if test_files not in tracked:
+            raise RegistryError(f"{label}.test_files must name a tracked file: {test_files}")
+        (REPO_ROOT / test_files).read_text(encoding="utf-8")
+    except (OSError, UnicodeError, subprocess.CalledProcessError) as exc:
+        raise RegistryError(
+            f"{label}.test_files must name a readable tracked file: {test_files}"
+        ) from exc
+    return {"cli": PytestScope(prefixes, excluded_prefixes, python_prefixes, test_files)}
+
+
+def _matches_pytest_scope(scope: PytestScope, path: str) -> bool:
+    return (
+        any(path.startswith(f"{prefix}/") for prefix in scope.prefixes)
+        and not any(path.startswith(f"{prefix}/") for prefix in scope.excluded_prefixes)
+        and (
+            not path.endswith(".py")
+            or any(path.startswith(f"{prefix}/") for prefix in scope.python_prefixes)
+        )
+    )
 
 
 # Fail-closed pytest set. Ignore rules may skip compose+pytest, but never
@@ -271,7 +387,7 @@ def _matches_scenario(path: str, prefixes: tuple[str, ...]) -> bool:
     for prefix in prefixes:
         if path == prefix or path.startswith(f"{prefix}/"):
             return True
-        if not prefix.endswith((".py", ".sh")) and path.startswith(prefix):
+        if not prefix.endswith((".py", ".sh", ".rs")) and path.startswith(prefix):
             return True
     return False
 
@@ -340,9 +456,7 @@ def _load_registry(path: Path) -> Registry:
             raise RegistryError(f"ignored prefix overlaps a selected rule: {ignored}")
 
     chart_scenarios = _chart_registry(root.get("chart_scenarios"))
-    conditional_entries = _mapping(
-        root.get("conditional_pytest_files"), "conditional_pytest_files"
-    )
+    conditional_entries = _mapping(root.get("conditional_pytest_files"), "conditional_pytest_files")
     conditional_pytest_files: dict[str, tuple[str, ...]] = {}
     for test_file, value in conditional_entries.items():
         if not test_file or test_file.startswith("/") or test_file.endswith("/"):
@@ -360,6 +474,7 @@ def _load_registry(path: Path) -> Registry:
         tuple(ignored_prefixes),
         chart_scenarios,
         conditional_pytest_files,
+        _pytest_scopes(root.get("pytest_scopes")),
     )
 
 
@@ -448,8 +563,7 @@ def _select_chart_scenarios(
             scenario_id
             for scenario_id, scenario in chart.scenarios.items()
             if any(
-                _matches_scenario(path, (*chart.shared_inputs, *scenario.inputs))
-                for path in paths
+                _matches_scenario(path, (*chart.shared_inputs, *scenario.inputs)) for path in paths
             )
         }
     registered_steps = {scenario.step for scenario in chart.scenarios.values()}
@@ -531,9 +645,7 @@ def _workflow_job_spans(content: str) -> dict[str, tuple[int, int]]:
             if isinstance(event, yaml.events.AliasEvent) and event.start_mark is not None
         )
         if any(
-            beginning <= line < end
-            for line in alias_lines
-            for beginning, end in spans.values()
+            beginning <= line < end for line in alias_lines for beginning, end in spans.values()
         ):
             raise RegistryError("released-upgrade job uses a YAML alias")
     except yaml.YAMLError as exc:
@@ -584,8 +696,7 @@ def _changes_upgrade_workflow_jobs(base: str, head: str) -> bool:
             (int(new_start), int(new_count or "1"), new_spans),
         ):
             if count and any(
-                start < end and start + count > beginning
-                for beginning, end in spans.values()
+                start < end and start + count > beginning for beginning, end in spans.values()
             ):
                 return True
     return False
@@ -646,6 +757,7 @@ def _render(
     selected: set[str],
     pytest_needed: bool,
     pytest_deselect: list[str],
+    pytest_scope: str,
     images_needed: bool,
     cli_release_needed: bool,
     released_upgrade_full: bool,
@@ -659,16 +771,13 @@ def _render(
     lines.append(f"skill_local_tiers={skill_local}")
     lines.append(f"pytest={'true' if pytest_needed else 'false'}")
     lines.append("pytest_deselect=" + ",".join(pytest_deselect))
+    lines.append(f"pytest_scope={pytest_scope}")
     lines.append(f"images={'true' if images_needed else 'false'}")
     lines.append(f"cli_release={'true' if cli_release_needed else 'false'}")
-    lines.append(
-        f"released_upgrade_full={'true' if released_upgrade_full else 'false'}"
-    )
+    lines.append(f"released_upgrade_full={'true' if released_upgrade_full else 'false'}")
     lines.append(f"version_only={'true' if version_only else 'false'}")
     lines.append(f"factory={'true' if factory_needed else 'false'}")
-    lines.append(
-        f"approval_resume={'true' if approval_resume_needed else 'false'}"
-    )
+    lines.append(f"approval_resume={'true' if approval_resume_needed else 'false'}")
     lines.append("chart_scenarios=" + json.dumps(chart_scenarios, separators=(",", ":")))
     return "\n".join(lines) + "\n"
 
@@ -714,9 +823,7 @@ def _run() -> None:
         elif args.base and args.head:
             paths = _changed_paths(args.base, args.head)
             if WORKFLOW_PATH in paths:
-                workflow_upgrade_changed = _changes_upgrade_workflow_jobs(
-                    args.base, args.head
-                )
+                workflow_upgrade_changed = _changes_upgrade_workflow_jobs(args.base, args.head)
         else:
             raise RegistryError("provide paths, push, or both base and head revisions")
         selected = set().union(*(_select_path(registry, path) for path in paths))
@@ -749,29 +856,47 @@ def _run() -> None:
         selected = set(VERSION_ONLY_TIERS)
         pytest_needed = False
 
+    if factory_needed:
+        images_needed = True
+        cli_release_needed = True
+
     pytest_deselect = []
-    if not args.push and paths and pytest_needed and all(
-        path in registry.exact
-        or path in registry.ignored_exact
-        or any(
-            _matches_prefix(path, prefix)
-            for prefix in (*registry.prefixes, *registry.ignored_prefixes)
+    if (
+        not args.push
+        and paths
+        and pytest_needed
+        and all(
+            path in registry.exact
+            or path in registry.ignored_exact
+            or any(
+                _matches_prefix(path, prefix)
+                for prefix in (*registry.prefixes, *registry.ignored_prefixes)
+            )
+            for path in paths
         )
-        for path in paths
     ):
         pytest_deselect = sorted(
             test_file
             for test_file, inputs in registry.conditional_pytest_files.items()
-            if not any(
-                _matches_prefix(path, prefix) for path in paths for prefix in inputs
-            )
+            if not any(_matches_prefix(path, prefix) for path in paths for prefix in inputs)
         )
 
-    # Ordinary pull requests run one upgrade matrix smoke shard. A change to
-    # the upgrade jobs themselves runs the full matrix and released chart jobs
-    # before merge, as do pushes and dispatches (the nightly).
+    pytest_scope = "full"
+    if (
+        not args.push
+        and paths
+        and pytest_needed
+        and all(_matches_pytest_scope(registry.pytest_scopes["cli"], path) for path in paths)
+    ):
+        pytest_scope = "cli"
+
+    # Ordinary pull requests run one upgrade matrix smoke shard. Factory
+    # migration paths and upgrade job changes run the full matrix and released
+    # chart jobs before merge, as do pushes and dispatches (the nightly).
     released_upgrade_full = (
-        args.push or workflow_upgrade_changed
+        args.push
+        or workflow_upgrade_changed
+        or any(path in FACTORY_UPGRADE_PATHS for path in paths)
     ) and "released-upgrade" in selected
     chart_scenarios = _select_chart_scenarios(
         registry, paths, selected, args.push, args.head if not args.path else None
@@ -787,6 +912,7 @@ def _run() -> None:
                 selected,
                 pytest_needed,
                 pytest_deselect,
+                pytest_scope,
                 images_needed,
                 cli_release_needed,
                 released_upgrade_full,

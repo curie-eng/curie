@@ -560,6 +560,35 @@
       },
       "expect": "accept",
       "codes": []
+    },
+    {
+      "name": "a_hosted_connector_may_declare_readiness_path_and_resources",
+      "why": "Both are optional hosted-form fields for the server container. A reader that refused them would block a bundle the platform renders.",
+      "document": {
+        "connectors": {
+          "docs": {
+            "build": { "context": "connectors/docs", "platforms": ["linux/amd64"] },
+            "readiness_path": "/healthz",
+            "resources": { "requests": { "cpu": "100m" }, "limits": { "memory": "1Gi" } }
+          }
+        }
+      },
+      "expect": "accept",
+      "codes": []
+    },
+    {
+      "name": "an_unknown_resources_key_is_rejected",
+      "why": "The resources block is strict like the rest of connectors.yaml: an unsupported key (here a GPU limit) must be refused, not silently rendered as nothing.",
+      "document": {
+        "connectors": {
+          "docs": {
+            "image": "ghcr.io/example/docs-mcp:1",
+            "resources": { "limits": { "gpu": "1" } }
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.invalid"]
     }
   ]
 }

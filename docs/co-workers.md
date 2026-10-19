@@ -16,7 +16,7 @@ model; it is not a promise that every bundle implements every behavior.
 
 | Behavior | Concrete example and boundary |
 | --- | --- |
-| Receive delegated work | A labelled GitHub issue enters the factory; a workspace message starts an SRE investigation. Intake must be configured. |
+| Receive delegated work | A labelled issue from a supported tracker enters the factory; a workspace message starts an SRE investigation. Intake must be configured. |
 | Inspect and clarify | The factory reads the issue and criteria. Ambiguous work can end with stated questions rather than a pull request. |
 | Show progress and a result | The factory reports execution phases and returns a PR or a failure reason. Bundle and channel behavior determine the available response surface. |
 | Use appropriate context | Memory can supply scoped records and facts. Writes depend on agent configuration and tools; memory is not automatic synthesis of every conversation. |
@@ -31,7 +31,7 @@ or infer broad access from a human approving one action.
 
 | Path | Bundle responsibility | Shared Curie platform |
 | --- | --- | --- |
-| [Software Factory](software-factory.md) | Implement an issue, run bounded review loops, and publish a PR or a reason for failure. | GitHub intake, execution, publication controls, model configuration, and cost visibility. |
+| [Software Factory](software-factory.md) | Implement an issue, run bounded review loops, and publish a PR or a reason for failure. | Supported tracker intake, code-host publication controls, execution, model configuration, and cost visibility. |
 | [SRE co-worker](../examples/sre-bot/README.md) | Investigate using Grafana, Tempo, and the pinned Kubernetes connector. | Deployment, sandbox execution, approval routes, traces, and memory facilities. |
 | [Bring your own agent](bring-your-agent.md) | Package supported skills, instructions, MCP tools, and evals. | The same versioned bundle and operational lifecycle. Arbitrary existing runtimes are not drop-in compatible. |
 
@@ -62,7 +62,7 @@ cannot be verified. Teams has no supported first-party channel. Use the
 scope of GitLab, Jira Cloud, and Bitbucket factory integrations.
 
 The platform and its backing services can run in your infrastructure. Configured
-external model providers, GitHub, and workspace services receive the data needed
+external model providers, issue trackers, code hosts, and workspace services receive the data needed
 for their integrations. A supported local model endpoint changes the model data
 boundary, but does not remove other configured external destinations.
 

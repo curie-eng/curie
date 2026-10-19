@@ -189,7 +189,7 @@ fn start_spec_run_args_are_the_frozen_argv() {
         "-p",
         "7245:8080",
         "-v",
-        "/tmp/deal-desk:/plugin:ro",
+        "curie-snapshot-acme-test:/plugin:ro",
         "-e",
         "CURIE_PLUGIN_DIR=/plugin",
         "-e",
@@ -215,6 +215,8 @@ fn start_spec_run_args_are_the_frozen_argv() {
         "curietech.ai/managed-by=curie-cli",
         "--label",
         "curietech.ai/component=runner",
+        "--label",
+        "curietech.ai/snapshot-volume=curie-snapshot-acme-test",
         "-e",
         "CURIE_FAKE_MODEL=1",
         "-e",
@@ -231,7 +233,7 @@ fn start_spec_run_args_are_the_frozen_argv() {
     .map(|s| s.to_string())
     .collect();
     assert_eq!(
-        spec().run_args(),
+        spec().run_args("curie-snapshot-acme-test"),
         expected,
         "StartSpec::run_args drifted from the frozen boot argv"
     );
@@ -258,7 +260,7 @@ fn every_emitted_env_name_is_a_declared_boot_env_key() {
         env_keys::OTEL_EXPORTER_OTLP_ENDPOINT,
     ];
 
-    let args = spec().run_args();
+    let args = spec().run_args("curie-snapshot-acme-test");
     let names: Vec<&str> = args
         .iter()
         .zip(args.iter().skip(1))
@@ -297,7 +299,10 @@ fn start_spec_always_carries_the_tokenless_dev_flag() {
         ..spec()
     };
 
-    for args in [spec().run_args(), sweep.run_args()] {
+    for args in [
+        spec().run_args("curie-snapshot-acme-test"),
+        sweep.run_args("curie-snapshot-acme-test"),
+    ] {
         let pairs = args
             .iter()
             .zip(args.iter().skip(1))

@@ -51,7 +51,8 @@ returns `None`.
 The current source expects an OpenRouter shaped JSON object with a `data` list.
 Each model entry supplies an `id` and a `pricing` object. `match_price`
 (`apps/api/src/curie_api/factory_usage.py::match_price`) uses an exact model ID
-first, otherwise a unique normalized name. Normalization removes the provider
+after stripping a trailing context-window suffix such as `[1m]`, otherwise a
+unique normalized name. Normalization removes the provider
 prefix, folds case, and replaces dots with hyphens. Ambiguous or absent matches
 return no price. Prompt and completion rates must be finite nonnegative
 numbers; absent or invalid cache rates use the prompt rate
@@ -71,7 +72,7 @@ output token counts using `estimate_cost`
 (`apps/api/src/curie_api/factory_usage.py::estimate_cost`). It stores the
 estimate rounded to six decimal places alongside rate provenance. A missing
 price preserves the token counts with no estimate or provenance. The unique
-request, turn, and model record makes replay a no op.
+request, turn, model, and role record makes replay a no op.
 
 ## Implementations today
 
@@ -97,6 +98,12 @@ Selection is URL based and the concrete instance cache lives in one API
 process. The API records the price available at report time. A replay preserves
 the existing usage row instead of repricing it after a catalog refresh
 (`apps/api/src/curie_api/factory_usage.py::record_usage`).
+
+Eval pricing remains outside `PriceBook`.
+`apps/worker/src/curie_worker/eval/pricing.py::cost_usd` uses its own hardcoded
+model-family table and input/output rates, without cache-read or cache-write
+rates. An unpriced model returns `None`. Changing the factory price source does
+not change eval cost attribution.
 
 ## Cross-links
 

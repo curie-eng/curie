@@ -785,6 +785,8 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                     forge_username,
                     start_accounts,
                     start_group,
+                    tracker_url,
+                    tracker_token_file,
                 } = *options;
                 let forge = curie::factory_quickstart::ForgeFlags {
                     code_host,
@@ -796,6 +798,8 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                     forge_username,
                     start_accounts,
                     start_group,
+                    tracker_url,
+                    tracker_token_file,
                 };
                 // Refuse an unusable forge selection before the chart fetch.
                 curie::factory_quickstart::select_forge(&forge)?;

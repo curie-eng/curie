@@ -41,10 +41,10 @@ frozen ACI field is unchanged; the state-API bearer is a runner-local knob
 
 ## Current contract
 
-- **Resolution.** `resolve_memory(memory_ref, env)`: an absent ref →
+1. **Resolution.** `resolve_memory(memory_ref, env)`: an absent ref →
   `NullMemoryStore`; an `http(s)://` ref → `StateApiMemoryStore`; any other
   scheme (`s3://` …) is reserved for a future loader and rejected loudly.
-- **Load side.** `load()` returns prior records oldest-first (empty when none).
+2. **Load side.** `load()` returns prior records oldest-first (empty when none).
   At boot the runner loads memory and composes it into the effective system
   prompt as a preamble — this is how memory is *delivered into the sandbox*. A
   transient load failure degrades to "no memory" and does not block boot.
@@ -86,10 +86,10 @@ the `MemoryStore` port. A fact is one key `fact-<32 hex>` whose value is
 read with the long-lived memory token and written with the turn's write
 credential (see "The memory credential" below):
 
-- **Agent memory**, at `CURIE_MEMORY_REF`, loaded in every channel. It also
+1. **Agent memory**, at `CURIE_MEMORY_REF`, loaded in every channel. It also
   holds two reserved keys that are never facts: `log` (above) and `guidance`
   (`{"text": ...}`, an operator's replacement for the default guidance).
-- **Channel memory**, at `CURIE_CHANNEL_MEMORY_REF`
+2. **Channel memory**, at `CURIE_CHANNEL_MEMORY_REF`
   (`BootEnv.channel_memory_ref`), the binding-scoped namespace
   `.../agents/<id>/state/bindings/<kind>/<address>/memory`. The worker sets it
   whenever the turn has a binding, whether memory writes are on or off, and
@@ -142,14 +142,14 @@ The state API, not the sandbox, decides what a sandbox may do on the `memory`
 namespace (`apps/api/src/curie_api/routers/state.py::_check_memory_reach`).
 There are two sandbox credentials, both `scope="state"` tokens:
 
-- **Boot env, read-only.** `CURIE_MEMORY_TOKEN` (and `CURIE_HISTORY_TOKEN`),
+1. **Boot env, read-only.** `CURIE_MEMORY_TOKEN` (and `CURIE_HISTORY_TOKEN`),
   minted in `boot_env` with claims `{binding, memory: "read", cred}`. `binding`
   is the boot binding's `"<kind>:<address>"`, or JSON null when the turn has
   none. `cred` is the credential id shared with `CURIE_STATE_TOKEN`. The token
   expires at the turn's stream deadline plus 60 seconds, capped at 24 hours
   (`BindingResolver.boot_env`). When the sandbox claim is
   deleted the worker reports that id and the API refuses the token.
-- **Per turn, write.** Minted by
+2. **Per turn, write.** Minted by
   `apps/worker/src/curie_worker/binding.py::BindingResolver.turn_memory_token`
   only when the agent has memory writes on, the turn names a binding and it is
   not eval-isolated, with claims `{binding, memory: "write", sender, turn}`.
@@ -193,7 +193,7 @@ change.
 
 ## Known leakage
 
-- **Scoped memory token (was: shared API key).** Earlier the state API's one
+1. **Scoped memory token (was: shared API key).** Earlier the state API's one
   shared platform key was forwarded into the sandbox as `CURIE_MEMORY_TOKEN`,
   granting that key's full scope. ADR-0033 (#410) closed that: the worker now
   mints a scoped, agent-bound, HMAC-signed `state` token per claim, accepted only
@@ -216,7 +216,7 @@ change.
   that PUT and is refused; it is not a reporting-only no-op. `NullMemoryStore` and
   stores without the replace capability remain reporting-only. Automatic
   learned-record *extraction* remains later work.
-- **An operator read/write plane sits below the port, not on it.** The
+3. **An operator read/write plane sits below the port, not on it.** The
   inspect, seed, trace-back, edit, and delete surface (#266, #267, #1904) is
   `apps/api/src/curie_api/routers/memory.py`
   (`apps/api/src/curie_api/routers/memory.py::list_memory`,
@@ -245,13 +245,33 @@ change.
   and still leave every operator read returning an empty list and every edit and
   delete 404ing, because the operator plane is addressing a Postgres row that
   loader never writes.
-- **No query on the port; the query and edit surface lives below it.** The port
+4. **No query on the port; the query and edit surface lives below it.** The port
   is still `load`/`append` (plus optional `replace`), with no query language, and
   the runner reads the whole log. Listing, trace-back, edit, and delete do exist
   in the system, as the operator plane above rather than as port methods. The
   load-bearing constraint remains: **memory lives OUTSIDE the sandbox**
   (ADR-0003) — the store is network-reachable and rehydratable, not pod-local
   state.
+
+The operator guidance plane also bypasses `MemoryStore`:
+`get_memory_guidance`, `put_memory_guidance` and `delete_memory_guidance` in
+`apps/api/src/curie_api/routers/memory.py` implement GET, PUT and DELETE on
+`/agents/{agent_id}/memory/guidance`. They directly read or mutate the shared
+`WorkflowStateEntry` at `memory/guidance`; GET returns the effective text and
+whether it is operator supplied or the default, PUT replaces it for the next
+boot, and DELETE restores the default. PUT reuses the state caps. Neither
+mutation calls `state_mutation.record`. The API owns
+`apps/api/src/curie_api/memory_guidance.py::DEFAULT_MEMORY_GUIDANCE`, duplicating
+`runner/src/curie_runner/memory_facts.py::DEFAULT_GUIDANCE`; the byte parity
+check is `tests/test_memory_guidance_parity.py`.
+
+CLI facts have another path below the port:
+`ApiClient::list_memory_facts`, `ApiClient::get_memory_fact` and
+`ApiClient::delete_memory_fact` (`cli/src/api.rs`) use the generic shared or
+binding-scoped state routes, rather than the memory router. Deletion sends
+`expected_version` and refuses a stale row without retrying. A backend swap
+must therefore cover the generic state API as well as the memory router's
+legacy log and guidance ORM paths.
 
 ## Cross-links
 
