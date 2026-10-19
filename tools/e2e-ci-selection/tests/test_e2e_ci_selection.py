@@ -15,7 +15,7 @@ import tomllib
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 import pytest
 import yaml
@@ -182,7 +182,15 @@ CHART_IMAGE_INPUTS = (
     "pyproject.toml",
     "uv.lock",
 )
-CHART_SCENARIOS = {
+
+
+class _ChartScenario(TypedDict):
+    step: str
+    inputs: list[str]
+    leg: str
+
+
+CHART_SCENARIOS: dict[str, _ChartScenario] = {
     "installation-identity": {
         "step": "Installation identity Secret lifecycle",
         "inputs": ["charts/curie/ci/runtime/upgrade-drain-installation-runtime.sh"],
@@ -682,9 +690,9 @@ def _python_input_source(source: str) -> str:
     changed = True
     while changed:
         changed = False
-        for owner, targets, values in assignments:
+        for owner, target_names, values in assignments:
             used = consumed.setdefault(owner, set())
-            if targets & used and not values <= used:
+            if target_names & used and not values <= used:
                 used.update(values)
                 changed = True
 
@@ -2706,6 +2714,35 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
     return step["run"], bindings
 
 
+class _AggregateOverrides(TypedDict, total=False):
+    changes_result: str
+    registration_result: str
+    event_name: str
+    skill_selected: str
+    local_selected: str
+    local_release_selected: str
+    cluster_selected: str
+    chart_scenarios: str
+    released_upgrade_selected: str
+    released_upgrade_full: str
+    approval_resume_selected: str
+    factory_selected: str
+    skill_local_result: str
+    oidc_result: str
+    local_release_result: str
+    cluster_result: str
+    cluster_chart_result: str
+    rollout_recovery_result: str
+    approval_resume_result: str
+    factory_result: str
+    forge_instance_result: str
+    admitted_agent_result: str
+    released_upgrade_result: str
+    released_upgrade_negative_result: str
+    upgrade_matrix_shards_result: str
+    upgrade_matrix_result: str
+
+
 def _run_aggregate(
     *,
     script_transform: Callable[[str], str] | None = None,
@@ -2805,7 +2842,7 @@ def test_e2e_required_accepts_a_version_only_selection(tmp_path: Path) -> None:
     assert selected.returncode == 0, selected.stderr
     outputs = _outputs_of(output)
     assert outputs["version_only"] == "true"
-    selection = {
+    selection: _AggregateOverrides = {
         "event_name": "pull_request",
         "skill_selected": outputs["skill"],
         "local_selected": outputs["local"],
@@ -2865,7 +2902,7 @@ def test_e2e_required_accepts_a_version_only_selection(tmp_path: Path) -> None:
         },
     ],
 )
-def test_aggregate_accepts_exact_selected_outcomes(state: dict[str, str]) -> None:
+def test_aggregate_accepts_exact_selected_outcomes(state: _AggregateOverrides) -> None:
     completed = _run_aggregate(**state)
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
@@ -2996,7 +3033,7 @@ def test_aggregate_requires_upgrade_matrix_shards_success(result: str) -> None:
         },
     ],
 )
-def test_aggregate_rejects_inconsistent_outcomes(state: dict[str, str]) -> None:
+def test_aggregate_rejects_inconsistent_outcomes(state: _AggregateOverrides) -> None:
     completed = _run_aggregate(**state)
     assert completed.returncode != 0
 
@@ -3037,7 +3074,7 @@ def test_aggregate_rollout_recovery_must_skip_when_not_expected(result: str) -> 
 
 
 def test_negative_control_covers_rollout_recovery_result() -> None:
-    state = {
+    state: _AggregateOverrides = {
         "event_name": "push",
         "cluster_selected": "true",
         "cluster_result": "success",
@@ -3329,7 +3366,7 @@ def test_approval_resume_follows_push_and_kind_omission(tmp_path: Path) -> None:
 def test_aggregate_requires_approval_resume_success_when_selected(
     event_name: str,
 ) -> None:
-    state = {
+    state: _AggregateOverrides = {
         "event_name": event_name,
         "cluster_selected": "true",
         "cluster_result": "success",
@@ -3359,7 +3396,7 @@ def test_aggregate_rejects_malformed_approval_resume_selection(selected: str) ->
 
 
 def test_negative_control_covers_approval_resume_result() -> None:
-    state = {
+    state: _AggregateOverrides = {
         "event_name": "pull_request",
         "approval_resume_selected": "true",
         "approval_resume_result": "success",
@@ -3494,7 +3531,7 @@ def test_unrelated_paths_do_not_select_admitted_agent_factory(tmp_path: Path, pa
 def test_aggregate_requires_scripted_factory_success_when_selected(
     event_name: str, result: str
 ) -> None:
-    state = {"event_name": event_name, "factory_selected": "true"}
+    state: _AggregateOverrides = {"event_name": event_name, "factory_selected": "true"}
     ok = _run_aggregate(**state, factory_result="success")
     assert ok.returncode == 0, ok.stdout + ok.stderr
 
@@ -3518,29 +3555,39 @@ def test_aggregate_requires_scripted_factory_skip_when_not_selected(
 @pytest.mark.parametrize("event_name", ["pull_request", "push", "workflow_dispatch"])
 @pytest.mark.parametrize("selected", ["true", "false"])
 def test_aggregate_requires_factory_sibling_results_to_follow_factory_selection(
-    event_name: str, selected: str, sibling: str
+    event_name: str,
+    selected: str,
+    sibling: Literal["forge_instance_result", "admitted_agent_result"],
 ) -> None:
     expected, wrong = ("success", "skipped") if selected == "true" else ("skipped", "success")
-    state = {"event_name": event_name, "factory_selected": selected, "factory_result": expected}
-    ok = _run_aggregate(**state, **{sibling: expected})
+    state: _AggregateOverrides = {
+        "event_name": event_name,
+        "factory_selected": selected,
+        "factory_result": expected,
+    }
+    state[sibling] = expected
+    ok = _run_aggregate(**state)
     assert ok.returncode == 0, ok.stdout + ok.stderr
     for result in (wrong, "failure", "cancelled", ""):
-        rejected = _run_aggregate(**state, **{sibling: result})
+        state[sibling] = result
+        rejected = _run_aggregate(**state)
         assert rejected.returncode != 0, rejected.stdout + rejected.stderr
 
 
 @pytest.mark.parametrize("sibling", sorted(FACTORY_SIBLING_RESULTS))
 @pytest.mark.parametrize(("selected", "result"), [("true", "success"), ("false", "skipped")])
 def test_negative_control_covers_factory_sibling_results(
-    selected: str, result: str, sibling: str
+    selected: str,
+    result: str,
+    sibling: Literal["forge_instance_result", "admitted_agent_result"],
 ) -> None:
     variable = FACTORY_SIBLING_RESULTS[sibling]
-    state = {
+    state: _AggregateOverrides = {
         "event_name": "pull_request",
         "factory_selected": selected,
         "factory_result": result,
-        sibling: result,
     }
+    state[sibling] = result
     check = f'"${variable}" != "$factory_expected" ||'
 
     def accept_drift(script: str) -> str:
@@ -3561,7 +3608,7 @@ def test_aggregate_rejects_malformed_scripted_factory_selection(selected: str) -
 
 @pytest.mark.parametrize(("selected", "result"), [("true", "success"), ("false", "skipped")])
 def test_negative_control_covers_scripted_factory_result(selected: str, result: str) -> None:
-    state = {
+    state: _AggregateOverrides = {
         "event_name": "pull_request",
         "factory_selected": selected,
         "factory_result": result,
@@ -3594,7 +3641,9 @@ def test_registration_seam_changes_select_the_factory_runtime(tmp_path: Path, pa
 @pytest.mark.parametrize("path", ("cli/src/ops/convergence.rs", CLUSTER_UP_MODULE))
 @pytest.mark.parametrize("omit_kind", (False, True))
 def test_convergence_changes_select_the_fresh_install_runtime(
-    tmp_path: Path, path: str, omit_kind: bool,
+    tmp_path: Path,
+    path: str,
+    omit_kind: bool,
 ) -> None:
     completed, output = _invoke_selector(tmp_path, path, omit_kind=omit_kind)
     assert completed.returncode == 0, completed.stderr
@@ -3658,8 +3707,7 @@ SCRIPTED_FACTORY_LEGS = (
     ),
     (
         "fresh-install",
-        lambda run: run
-        == f"uv run pytest -q -n 0 {CLUSTER_UP_MODULE}::{FRESH_INSTALL_TEST}",
+        lambda run: run == f"uv run pytest -q -n 0 {CLUSTER_UP_MODULE}::{FRESH_INSTALL_TEST}",
     ),
 )
 SCRIPTED_FACTORY_EVIDENCE_STEP = "Upload scripted factory evidence"
@@ -3811,7 +3859,8 @@ def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_p
 
 @pytest.mark.parametrize("exit_code", (0, 17))
 def test_fresh_cluster_up_runtime_is_serial_and_propagates_failure(
-    tmp_path: Path, exit_code: int,
+    tmp_path: Path,
+    exit_code: int,
 ) -> None:
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     job = jobs[SCRIPTED_FACTORY_JOB]
@@ -3838,26 +3887,39 @@ def test_fresh_cluster_up_runtime_is_serial_and_propagates_failure(
     executed = subprocess.run(
         ["bash", "-e", "-o", "pipefail", "-c", runtime["run"]],
         cwd=tmp_path,
-        env={**os.environ, "PATH": f"{binaries}:{os.environ['PATH']}",
-             "RUNTIME_ARGV": str(log)},
-        capture_output=True, text=True, check=False,
+        env={
+            **os.environ,
+            "PATH": f"{binaries}:{os.environ['PATH']}",
+            "RUNTIME_ARGV": str(log),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
     )
     assert executed.returncode == exit_code, executed.stdout + executed.stderr
     argv = json.loads(log.read_text())
     assert argv[:2] == ["run", "pytest"]
     assert argv[argv.index("-n") + 1] == "0"
-    assert any(target in argv for target in (
-        CLUSTER_UP_MODULE,
-        CLUSTER_UP_MODULE + "::test_fresh_cluster_up_converges_without_rerun",
-    ))
+    assert any(
+        target in argv
+        for target in (
+            CLUSTER_UP_MODULE,
+            CLUSTER_UP_MODULE + "::test_fresh_cluster_up_converges_without_rerun",
+        )
+    )
     assert not any(arg.startswith(("-k", "-m", "--deselect", "--ignore")) for arg in argv)
 
 
 @functools.cache
 def _collect_forge_instance_cases(*pytest_args: str) -> tuple[str, ...]:
     collected = subprocess.run(
-        [sys.executable, "-m", "pytest", "--collect-only",
-         *(pytest_args or ("-q", "-n", "0", FORGE_INSTANCE_MODULE))],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            *(pytest_args or ("-q", "-n", "0", FORGE_INSTANCE_MODULE)),
+        ],
         cwd=REPO_ROOT,
         env={**os.environ, "PYTEST_ADDOPTS": ""},
         capture_output=True,
@@ -3867,7 +3929,8 @@ def _collect_forge_instance_cases(*pytest_args: str) -> tuple[str, ...]:
     )
     assert collected.returncode == 0, collected.stdout + collected.stderr
     cases = tuple(
-        line.strip() for line in collected.stdout.splitlines()
+        line.strip()
+        for line in collected.stdout.splitlines()
         if line.startswith(FORGE_INSTANCE_MODULE + "::")
     )
     assert cases, collected.stdout + collected.stderr
@@ -3875,7 +3938,8 @@ def _collect_forge_instance_cases(*pytest_args: str) -> tuple[str, ...]:
 
 
 def _assert_forge_instance_legs_map_one_to_one(
-    job: dict[str, Any], collected: tuple[str, ...],
+    job: dict[str, Any],
+    collected: tuple[str, ...],
 ) -> None:
     matrix = job["strategy"]["matrix"]
     assert set(matrix) == {"include"}
@@ -3893,9 +3957,11 @@ def test_forge_instance_job_is_gated_like_the_scripted_factory_and_required() ->
     assert job["timeout-minutes"] == 165
     assert job["strategy"] == {
         "fail-fast": False,
-        "matrix": {"include": [
-            {"suite": suite, "test": test} for suite, test in FORGE_INSTANCE_LEGS.items()
-        ]},
+        "matrix": {
+            "include": [
+                {"suite": suite, "test": test} for suite, test in FORGE_INSTANCE_LEGS.items()
+            ]
+        },
     }
     assert not job.get("continue-on-error")
     assert job["if"] == jobs[SCRIPTED_FACTORY_JOB]["if"]
@@ -3920,10 +3986,7 @@ def test_forge_instance_job_is_gated_like_the_scripted_factory_and_required() ->
     )
     script = required["run"]
     assert '"$FORGE_INSTANCE_RESULT" != "$factory_expected"' in script
-    assert (
-        "FACTORY_RESULT FORGE_INSTANCE_RESULT ADMITTED_AGENT_RESULT"
-        in script
-    )
+    assert "FACTORY_RESULT FORGE_INSTANCE_RESULT ADMITTED_AGENT_RESULT" in script
 
 
 @pytest.mark.parametrize("mutation", ("extra-case", "missing-leg", "duplicate-leg"))
@@ -3945,7 +4008,8 @@ def test_forge_instance_leg_mapping_rejects_missing_or_duplicate_coverage(mutati
 
 @pytest.mark.parametrize("failing_suite", (None, *FORGE_INSTANCE_LEGS))
 def test_forge_instance_matrix_executes_each_case_and_propagates_failure(
-    tmp_path: Path, failing_suite: str | None,
+    tmp_path: Path,
+    failing_suite: str | None,
 ) -> None:
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     job = jobs[FORGE_INSTANCE_JOB]
@@ -3960,7 +4024,7 @@ def test_forge_instance_matrix_executes_each_case_and_propagates_failure(
         "sys.exit(int(os.environ['FORGE_EXIT_CODE']))\n"
     )
     uv.chmod(0o755)
-    selected = []
+    selected: list[str] = []
     results = []
     for leg in job["strategy"]["matrix"]["include"]:
         log = tmp_path / f"{leg['suite']}.json"
@@ -3972,9 +4036,17 @@ def test_forge_instance_matrix_executes_each_case_and_propagates_failure(
         executed = subprocess.run(
             ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", runtime["run"]],
             cwd=tmp_path,
-            env={**os.environ, **environment, "PATH": f"{binaries}:{os.environ['PATH']}",
-                 "FORGE_ARGV": str(log), "FORGE_EXIT_CODE": str(exit_code)},
-            capture_output=True, text=True, check=False, timeout=30,
+            env={
+                **os.environ,
+                **environment,
+                "PATH": f"{binaries}:{os.environ['PATH']}",
+                "FORGE_ARGV": str(log),
+                "FORGE_EXIT_CODE": str(exit_code),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
         )
         assert executed.returncode == exit_code, executed.stdout + executed.stderr
         argv = json.loads(log.read_text())
@@ -4351,7 +4423,7 @@ def test_a_failing_chart_leg_fails_e2e_required() -> None:
     assert CHART_JOB in jobs["e2e-required"]["needs"]
     _script, bindings = _aggregate_contract()
     assert bindings["cluster_chart_result"] == "CLUSTER_CHART_RESULT"
-    state = {
+    state: _AggregateOverrides = {
         "event_name": "pull_request",
         "cluster_selected": "true",
         "cluster_result": "success",
@@ -4510,7 +4582,7 @@ def test_e2e_required_rejects_chart_scenarios_without_list_delimiters(chart_scen
 
 
 def test_negative_control_still_covers_the_chart_job_result() -> None:
-    state = {
+    state: _AggregateOverrides = {
         "event_name": "pull_request",
         "cluster_selected": "true",
         "cluster_result": "success",
