@@ -243,10 +243,9 @@ deploy() {
         }
 }
 
-pod_field() {
-    local connector="$1" field="$2"
-    kcn get pod -l "app.kubernetes.io/name=${RELEASE}-${AGENT}-mcp-${connector}" \
-        -o "jsonpath=${field}"
+pod_json() {
+    local connector="$1"
+    kcn get pod -l "app.kubernetes.io/name=${RELEASE}-${AGENT}-mcp-${connector}" -o json
 }
 
 expect_hash() {
@@ -260,7 +259,15 @@ PY
 container_hash() {
     local connector="$1" mode="$2"
     local pod
-    pod="$(pod_field "$connector" '{.items[0].metadata.name}')"
+    pod="$(pod_json "$connector" | python3 -c '
+import json,sys
+items=json.load(sys.stdin).get("items") or []
+ready=[item for item in items if not item.get("metadata",{}).get("deletionTimestamp")]
+ready.sort(key=lambda item: item.get("metadata",{}).get("creationTimestamp") or "")
+if not ready:
+    raise SystemExit(1)
+print(ready[-1]["metadata"]["name"])
+')"
     [[ -n "$pod" ]] || fail "no pod for $connector"
     if [[ "$mode" == file ]]; then
         kcn exec "$pod" -- sha256sum /secrets/rotate-file | awk '{print $1}'
@@ -281,9 +288,17 @@ assert_content() {
 
 snapshot() {
     local connector="$1"
-    printf '%s %s\n' \
-        "$(pod_field "$connector" '{.items[0].metadata.uid}')" \
-        "$(pod_field "$connector" '{.items[0].metadata.labels.pod-template-hash}')"
+    pod_json "$connector" | python3 -c '
+import json,sys
+items=json.load(sys.stdin).get("items") or []
+ready=[item for item in items if not item.get("metadata",{}).get("deletionTimestamp")]
+ready.sort(key=lambda item: item.get("metadata",{}).get("creationTimestamp") or "")
+if not ready:
+    raise SystemExit(1)
+meta=ready[-1]["metadata"]
+labels=meta.get("labels") or {}
+sys.stdout.write(meta.get("uid","") + " " + labels.get("pod-template-hash",""))
+'
 }
 
 deploy initial
@@ -315,8 +330,13 @@ PY
     source "$SENTINEL_FILE"
     set +a
     deploy "$label"
-    local a_new b_new
+    local a_new b_new i
     a_new="$(snapshot rotate)"
+    for i in $(seq 1 30); do
+        [[ "$a_new" != "$A_OLD" ]] && break
+        sleep 2
+        a_new="$(snapshot rotate)"
+    done
     b_new="$(snapshot other)"
     if [[ "$a_new" == "$A_OLD" ]]; then
         fail "connector A did not roll after $label"
@@ -355,7 +375,7 @@ wait_hash() {
 }
 wait_hash
 BEFORE_FP="$(fingerprint)"
-BEFORE_UID="$(pod_field rotate '{.items[0].metadata.uid}')"
+BEFORE_UID="${A_OLD%% *}"
 kcn label "$DEPLOY" app.kubernetes.io/component=edited --overwrite >/dev/null
 restored=0
 for _ in $(seq 1 60); do
@@ -368,12 +388,13 @@ for _ in $(seq 1 60); do
 done
 (( restored )) || fail "the worker did not restore the connector label"
 AFTER_FP="$(fingerprint)"
-AFTER_UID="$(pod_field rotate '{.items[0].metadata.uid}')"
+AFTER_UID="$(snapshot rotate)"
+AFTER_UID="${AFTER_UID%% *}"
 if [[ "$AFTER_FP" != "$BEFORE_FP" || "$AFTER_UID" != "$BEFORE_UID" ]]; then
     fail "the reconciler apply changed the connector fingerprint or pod"
 fi
 sleep 5
-if [[ "$(fingerprint)" != "$BEFORE_FP" || "$(pod_field rotate '{.items[0].metadata.uid}')" != "$BEFORE_UID" ]]; then
+if [[ "$(fingerprint)" != "$BEFORE_FP" || "$(snapshot rotate)" != "${BEFORE_UID} ${A_OLD##* }" ]]; then
     fail "the connector fingerprint or pod was not stable"
 fi
 echo "connector rotation rolled only the consumer"
