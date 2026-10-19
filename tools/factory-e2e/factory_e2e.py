@@ -174,7 +174,7 @@ import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 if __name__ == "__main__":
     # Forge entry modules import this module by name; run as a script it must
@@ -206,8 +206,12 @@ def _load_by_path(module_name: str, path: Path) -> Any:
 
 
 _forge_base = _load_by_path("factory_e2e_forges.base", FORGE_DIR / FORGE_BASE)
-ChangeRef = _forge_base.ChangeRef
-ForgeDriver = _forge_base.ForgeDriver
+if TYPE_CHECKING:
+    from forges.base import ChangeRef as ChangeRef
+    from forges.base import ForgeDriver as ForgeDriver
+else:
+    ChangeRef = _forge_base.ChangeRef
+    ForgeDriver = _forge_base.ForgeDriver
 ForgeNotInstalled = _forge_base.ForgeNotInstalled
 not_installed_driver = _forge_base.not_installed_driver
 
@@ -4143,15 +4147,15 @@ def select_case_transcript(
 
 
 _AGENT_MESSAGE_LABEL = "Agent's last message:"
-_FENCE_OPENER = re.compile(r"(`{3,})text")
 
 
 def agent_message_from_comment(body: str) -> str | None:
     """The agent's last message from a final issue comment, or None (#3128).
 
-    The API renders it in a ``text`` fence after an ``Agent's last message:``
-    line, with a fence longer than any backtick run inside, so the first line
-    equal to the opening fence closes it.
+    Read only the contiguous quoted block immediately after the exact label.
+    Strip one quote prefix per line and reverse the API's HTML, image, mention
+    and comment-opener substitutions once, then decode ``&amp;`` last to
+    preserve literal entity text.
     """
 
     lines = body.split("\n")
@@ -4159,16 +4163,24 @@ def agent_message_from_comment(body: str) -> str | None:
         label = lines.index(_AGENT_MESSAGE_LABEL)
     except ValueError:
         return None
-    if label + 1 >= len(lines):
+    quoted: list[str] = []
+    for line in lines[label + 1 :]:
+        if line == ">":
+            quoted.append("")
+        elif line.startswith("> "):
+            quoted.append(line[2:])
+        else:
+            break
+    if not quoted:
         return None
-    opener = _FENCE_OPENER.fullmatch(lines[label + 1])
-    if opener is None:
-        return None
-    fence = opener.group(1)
-    for index in range(label + 2, len(lines)):
-        if lines[index] == fence:
-            return "\n".join(lines[label + 2 : index])
-    return None
+    return (
+        "\n".join(quoted)
+        .replace("@\u200b", "@")
+        .replace("!\\[", "![")
+        .replace("&lt;", "<")
+        .replace("<\u200b!--", "<!--")
+        .replace("&amp;", "&")
+    )
 
 
 def _agent_final_reply(p: Preflight, *, final_comment: str | None) -> tuple[str | None, str]:
