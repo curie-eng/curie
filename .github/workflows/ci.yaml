@@ -329,7 +329,7 @@ jobs:
             tools/close-on-next
           )
           for directory in "${ci_policy_dirs[@]}"; do
-            pytest_args+=(--ignore "$directory")
+            pytest_args+=(--ignore "$directory" --ignore-glob "$directory/tests/*")
           done
           if [[ -n "$PYTEST_DESELECT" ]]; then
             IFS=, read -r -a deselect_files <<< "$PYTEST_DESELECT"
