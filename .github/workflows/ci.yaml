@@ -1576,13 +1576,12 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-  # The example connectors are the only images CI does not run, and the
-  # only ones release.yaml publishes for a second architecture. They are
-  # validated here, build only, for both architectures: validating only amd64
+  # The example connectors are the only images release.yaml publishes for a
+  # second architecture. Both architectures are validated here: validating only amd64
   # leaves an arm64-only Dockerfile failure to appear for the first time during
   # a release, failing the release rather than the pull request that caused it.
-  # Nothing consumes them, so they are not in the ci-images job above, whose
-  # archives are native-architecture `docker save` output.
+  # A native image also checks Python server imports. These images do not need
+  # the ci-images archives consumed by downstream jobs.
   images:
     name: Build ${{ matrix.name }} image (no push)
     runs-on: ubuntu-latest
@@ -1657,6 +1656,21 @@ jobs:
           # writing a single layer into the shared namespace.
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+      - name: Build the native connector image
+        if: ${{ hashFiles(format('{0}/server.py', matrix.context)) != '' }}
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: curie-ci-connector/${{ matrix.name }}:candidate
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+      - name: Import the connector server
+        if: ${{ hashFiles(format('{0}/server.py', matrix.context)) != '' }}
+        run: docker run --rm --entrypoint python curie-ci-connector/${{ matrix.name }}:candidate -c "import server"
 
   # The per-run Docker daemon image (ADR 0217 decision 4): the curie-authz
   # plugin crate's fmt, clippy and tests, a build for both release arches (the
