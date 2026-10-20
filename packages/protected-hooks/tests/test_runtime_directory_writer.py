@@ -655,6 +655,97 @@ def test_interrupt_inside_swap_keeps_new_version(
     assert not [name for name in snapshot(root) if name.startswith(".current.")]
 
 
+def test_rollback_keeps_version_when_current_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable current is never rolled back, @spec PROTECTED-HOOK-SOURCE-11."""
+    root = safe_root(tmp_path)
+    first, _ = second_publication(root)
+    real_replace, real_readlink = os.replace, os.readlink
+    state = {"swapped": False}
+
+    def replace(*args: Any, **kwargs: Any) -> None:
+        """Rename for real, then interrupt, @spec PROTECTED-HOOK-SOURCE-11."""
+        real_replace(*args, **kwargs)
+        state["swapped"] = True
+        raise KeyboardInterrupt()
+
+    def readlink(*args: Any, **kwargs: Any) -> Any:
+        """@spec PROTECTED-HOOK-SOURCE-11."""
+        if state["swapped"]:
+            raise PermissionError("injected")
+        return real_readlink(*args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "readlink", readlink)
+    with pytest.raises(KeyboardInterrupt):
+        publish_runtime_directory(str(root), contents(max_readiness_ms=2000))
+    monkeypatch.undo()
+    new = os.readlink(root / "current")
+    assert new != first
+    assert read_current(root) == render_runtime_files(contents(max_readiness_ms=2000)) | {
+        "ca.pem": read_current(root)["ca.pem"]
+    }
+
+
+def test_root_flushed_after_version_created_before_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The version entry is durable before the temp link, @spec PROTECTED-HOOK-SOURCE-11."""
+    root = safe_root(tmp_path)
+    root_inode = root.stat().st_ino
+    events: list[str] = []
+    real = {
+        "fsync": os.fsync,
+        "fcntl": fcntl.fcntl,
+        "mkdir": os.mkdir,
+        "symlink": os.symlink,
+        "replace": os.replace,
+    }
+
+    def on_root(descriptor: int) -> bool:
+        """@spec PROTECTED-HOOK-SOURCE-11."""
+        return os.fstat(descriptor).st_ino == root_inode
+
+    def fsync(descriptor: int) -> None:
+        """@spec PROTECTED-HOOK-SOURCE-11."""
+        if on_root(descriptor):
+            events.append("flush-root")
+        real["fsync"](descriptor)
+
+    def fcntl_call(descriptor: int, command: int, *rest: Any) -> Any:
+        """@spec PROTECTED-HOOK-SOURCE-11."""
+        if command == getattr(fcntl, "F_FULLFSYNC", None) and on_root(descriptor):
+            events.append("flush-root")
+        return real["fcntl"](descriptor, command, *rest)
+
+    def mkdir(*args: Any, **kwargs: Any) -> Any:
+        """@spec PROTECTED-HOOK-SOURCE-11."""
+        events.append("mkdir")
+        return real["mkdir"](*args, **kwargs)
+
+    def symlink(*args: Any, **kwargs: Any) -> Any:
+        """@spec PROTECTED-HOOK-SOURCE-11."""
+        events.append("symlink")
+        return real["symlink"](*args, **kwargs)
+
+    def replace(*args: Any, **kwargs: Any) -> Any:
+        """@spec PROTECTED-HOOK-SOURCE-11."""
+        events.append("replace")
+        return real["replace"](*args, **kwargs)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(fcntl, "fcntl", fcntl_call)
+    monkeypatch.setattr(os, "mkdir", mkdir)
+    monkeypatch.setattr(os, "symlink", symlink)
+    monkeypatch.setattr(os, "replace", replace)
+    publish_runtime_directory(str(root), contents())
+    monkeypatch.undo()
+    created, linked = events.index("mkdir"), events.index("symlink")
+    assert "flush-root" in events[created:linked]
+    assert linked < events.index("replace")
+
+
 def test_failure_while_writing_version_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

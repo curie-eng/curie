@@ -8,6 +8,7 @@ writer breaks the contract, and a clean tree passes.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tomllib
 from pathlib import Path
@@ -58,6 +59,11 @@ def build_tree(tree: Path, sources: list[str], importing: bool) -> None:
             (directory / f"{name}.py").write_text(text)
 
 
+def reported(output: str, source: str) -> bool:
+    """Whether the report names exactly this violator, @spec PROTECTED-HOOK-SOURCE-11."""
+    return re.search(rf"^{re.escape(source)} is not allowed to import", output, re.M) is not None
+
+
 def run_linter(tree: Path, sources: list[str]) -> subprocess.CompletedProcess[str]:
     """lint-imports over a synthetic tree, @spec PROTECTED-HOOK-SOURCE-11."""
     spec = contract()
@@ -101,7 +107,7 @@ def test_every_listed_source_importing_the_writer_breaks_the_contract(tmp_path: 
     assert result.returncode != 0, output
     assert "BROKEN" in output and CONTRACT in output
     for source in sources:
-        assert source in output, source
+        assert reported(output, source), source
 
 
 def test_clean_tree_passes(tmp_path: Path) -> None:
@@ -113,10 +119,12 @@ def test_clean_tree_passes(tmp_path: Path) -> None:
     assert "KEPT" in result.stdout
 
 
-@pytest.mark.parametrize("source", ["curie_api", "curie_worker.__main__"])
+@pytest.mark.parametrize(
+    "source", ["curie_api", "curie_worker.__main__", "curie_protected_hooks.runtime_directory"]
+)
 def test_single_source_is_reported_alone(tmp_path: Path, source: str) -> None:
     """A lone importing source breaks the contract by itself, @spec PROTECTED-HOOK-SOURCE-11."""
     build_tree(tmp_path, [source], importing=True)
     result = run_linter(tmp_path, [source])
     assert result.returncode != 0
-    assert source in result.stdout
+    assert reported(result.stdout, source)
