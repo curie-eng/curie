@@ -197,7 +197,11 @@ def test_captured_signature_cannot_change_hook_or_policy(
     entries = valkey.xrange(runs_stream)
     backlog = _backlog(valkey, hook_agent)
     claim_pattern = f"curie:hook:delivery:{hook_agent}:*"
-    claims = {key: valkey.get(key) for key in valkey.scan_iter(match=claim_pattern)}
+    claims = {
+        key: valkey.get(key)
+        for key in valkey.scan_iter(match=claim_pattern)
+        if not key.endswith(":receipt")
+    }
     assert len(entries) == len(claims) == int(accepted_first)
     assert bool(backlog) == accepted_first
 
@@ -212,7 +216,8 @@ def test_captured_signature_cannot_change_hook_or_policy(
     assert refused.status_code == 401, refused.text
     assert valkey.xrange(runs_stream) == entries
     assert _backlog(valkey, hook_agent) == backlog
-    assert {key: valkey.get(key) for key in valkey.scan_iter(match=claim_pattern)} == claims
+    assert {key: valkey.get(key) for key in valkey.scan_iter(match=claim_pattern)
+            if not key.endswith(":receipt")} == claims
 
     if not accepted_first:
         accepted = hooks_client.post(
@@ -224,7 +229,11 @@ def test_captured_signature_cannot_change_hook_or_policy(
         assert accepted.status_code == 200, accepted.text
     entries = valkey.xrange(runs_stream)
     backlog = _backlog(valkey, hook_agent)
-    claims = {key: valkey.get(key) for key in valkey.scan_iter(match=claim_pattern)}
+    claims = {
+        key: valkey.get(key)
+        for key in valkey.scan_iter(match=claim_pattern)
+        if not key.endswith(":receipt")
+    }
     assert len(entries) == len(claims) == 1
     assert backlog
     duplicate = hooks_client.post(
@@ -237,7 +246,8 @@ def test_captured_signature_cannot_change_hook_or_policy(
     assert duplicate.json() == {**accepted.json(), "duplicate": True}
     assert valkey.xrange(runs_stream) == entries
     assert _backlog(valkey, hook_agent) == backlog
-    assert {key: valkey.get(key) for key in valkey.scan_iter(match=claim_pattern)} == claims
+    assert {key: valkey.get(key) for key in valkey.scan_iter(match=claim_pattern)
+            if not key.endswith(":receipt")} == claims
 
 
 @pytest.mark.parametrize("access", [None, "read-only"])
@@ -314,6 +324,8 @@ def test_trimmed_duplicate_fails_closed_when_original_policy_is_unrecoverable(
     key = _claim(hook_agent)
     claim = valkey.get(key)
     backlog = _backlog(valkey, hook_agent)
+    # @spec HOOK-RECEIPT-4: emulate a legacy producer without retained metadata.
+    valkey.delete(key + ":receipt")
     assert valkey.xdel(runs_stream, first.json()["stream_id"]) == 1
     refused = _post(hooks_client, hook_agent, access=retry)
     assert refused.status_code == 409, refused.text

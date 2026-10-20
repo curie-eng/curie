@@ -97,6 +97,13 @@ _HOLD_BODY = (
     "Curie could not start this issue yet: a tracker or code host it needs did not "
     "answer. Curie retries on its next poll; nothing is needed unless this persists."
 )
+# A hold for a rejected or unreadable credential instead names the operator's
+# action (#4755): fixed text, never the token or the exception's words.
+_CREDENTIAL_HOLD_BODY = (
+    "Curie could not start this issue yet: a tracker or code host credential it "
+    "needs was rejected or could not be read. The operator must replace that "
+    "credential. Curie retries on its next poll."
+)
 
 
 @dataclass(frozen=True)
@@ -339,12 +346,23 @@ def _deferred(scope: _Scope, label: str, what: str, exc: Exception) -> None:
 async def _hold(
     scope: _Scope, tracker: Tracker, label: str, issue: TrackerIssueRef, exc: Exception
 ) -> None:
-    """Log one issue's deferral and say so on the issue once (upserted)."""
+    """Log one issue's deferral and say so on the issue once (upserted).
+
+    The body follows the cause (#4755): a rejected or unreadable credential
+    names the operator's action, anything else says the host did not answer.
+    The credential classes are matched before any generic fallback, since
+    ``CredentialUnreadable`` is an ``Unavailable``.
+    """
 
     _deferred(scope, label, "notice", exc)
+    body = (
+        _CREDENTIAL_HOLD_BODY
+        if isinstance(exc, (CredentialUnreadable, Unauthorized))
+        else _HOLD_BODY
+    )
     try:
         await tracker.marked_comments.upsert_marked(
-            ReplyTarget.on_issue(issue), HOLD_MARKER, _HOLD_BODY
+            ReplyTarget.on_issue(issue), HOLD_MARKER, body
         )
     except ForgeError as failed:
         # The retained cursor is the retry authority; the hold is a courtesy.
