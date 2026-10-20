@@ -2395,7 +2395,9 @@ def _changes_filter_script() -> str:
     )
     assert isinstance(run, str)
     assert "github.event_name" in run
-    assert '"$base_ref" = "next"' in run
+    # Pull requests into next select kind tiers by changed paths exactly like
+    # main, so the script has no branch that singles next out.
+    assert '"next"' not in run
     assert run.count("select_tiers.py") == 3
     return run
 
@@ -2426,7 +2428,7 @@ def _assert_changes_filter_route(script: str, event: str, branch: str) -> list[s
         ["--base", f"origin/{branch}", "--head", "HEAD"]
         if event == "pull_request" else ["--push"]
     )
-    if event == "push" or (event == "pull_request" and branch == "next"):
+    if event == "push":
         options.append("--omit-kind")
     assert argv == prefix + options
     fetch = f"git\0fetch\0--quiet\0origin\0{branch}\0" if event == "pull_request" else ""
@@ -2476,6 +2478,7 @@ def test_both_trains_omit_kind_on_push_and_keep_full_dispatch(
         ("push-with-kind", "push", "next"),
         ("dispatch-without-kind", "workflow_dispatch", "main"),
         ("dispatch-without-kind", "workflow_dispatch", "next"),
+        ("next-pr-omits-kind", "pull_request", "next"),
     ],
 )
 def test_changes_filter_rejects_each_push_and_dispatch_route_mutation(
@@ -2496,6 +2499,20 @@ def test_changes_filter_rejects_each_push_and_dispatch_route_mutation(
     elif mutation == "push-with-kind":
         assert script.count("--omit-kind\n") == 1
         script = script.replace("--omit-kind\n", "\n", 1)
+    elif mutation == "next-pr-omits-kind":
+        # Re-add the old shape: next pull requests drop the kind tiers again.
+        fetch = 'git fetch --quiet origin "$base_ref"\n'
+        head = "--head HEAD\n"
+        assert script.count(fetch) == 1
+        assert script.count(head) == 1
+        script = script.replace(
+            fetch,
+            fetch + 'extra=()\nif [ "$base_ref" = "next" ]; then\n  extra=(--omit-kind)\nfi\n',
+            1,
+        )
+        script = script.replace(head, '--head HEAD \\\n  "${extra[@]}"\n', 1)
+        # The mutation touches next only: the main route must still pass.
+        _assert_changes_filter_route(script, "pull_request", "main")
     else:
         before, after = script.rsplit("--push", 1)
         script = before + "--push --omit-kind" + after
@@ -2503,15 +2520,17 @@ def test_changes_filter_rejects_each_push_and_dispatch_route_mutation(
         _assert_changes_filter_route(script, event, branch)
 
 
-def test_push_runs_complete_while_pull_requests_and_dispatches_supersede() -> None:
+def test_pull_requests_supersede_while_pushes_and_dispatches_queue() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     concurrency = workflow["concurrency"]
     assert set(concurrency) == {"group", "cancel-in-progress"}
     assert concurrency["group"] == (
         "${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}"
     )
-    # Only push runs complete; pull requests and dispatches supersede.
-    assert concurrency["cancel-in-progress"] == "${{ github.event_name != 'push' }}"
+    # Only pull request runs supersede their own in-flight run. A later dispatch
+    # cancelled two dispatched kind runs on 2026-10-20, and a release dispatch
+    # could be cancelled by a scheduled one, so dispatches and pushes queue.
+    assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
     # A new trigger must force a decision about whether its runs cancel.
     assert set(workflow[True]) == {"push", "pull_request", "workflow_dispatch"}
 
