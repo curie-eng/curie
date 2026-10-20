@@ -20,6 +20,7 @@ from curie_runner.harness.registry import (
     UnsupportedHarnessError,
 )
 from curie_runner.history import ConversationMessage, ConversationReplay
+from runner_boot_session import initialized_session, initialized_session_sync
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 
@@ -79,7 +80,7 @@ def test_claude_runner_materializes_history_without_system_prompt_preamble(tmp_p
     )
 
     runner = build_runner(config, conversation_replay=replay)
-    options = runner._factory()._options
+    options = initialized_session_sync(runner)._options
 
     # An ineligible boot preserves the pre-progress model surface exactly.
     assert options.system_prompt is None
@@ -100,7 +101,7 @@ def test_only_an_eligible_boot_mounts_the_progress_tool_and_prompt(
     )
 
     async def tool_names(runner: object) -> set[str]:
-        options = runner._factory()._options  # type: ignore[attr-defined]
+        options = (await initialized_session(runner))._options  # type: ignore[attr-defined]
         server = options.mcp_servers["curie"]
         entry = server["instance"].get_request_handler("tools/list")
         assert entry is not None
@@ -110,17 +111,17 @@ def test_only_an_eligible_boot_mounts_the_progress_tool_and_prompt(
     monkeypatch.delenv(TURN_PROGRESS_ELIGIBILITY_ENV, raising=False)
     ineligible = build_runner(_config(tmp_path / "off"))
     assert TURN_PROGRESS_TOOL not in anyio.run(tool_names, ineligible)
-    assert ineligible._factory()._options.system_prompt is None
+    assert initialized_session_sync(ineligible)._options.system_prompt is None
 
     monkeypatch.setenv(TURN_PROGRESS_ELIGIBILITY_ENV, "1")
     eligible = build_runner(_config(tmp_path / "on"))
     assert TURN_PROGRESS_TOOL in anyio.run(tool_names, eligible)
-    assert eligible._factory()._options.system_prompt == PROGRESS_PREAMBLE
+    assert initialized_session_sync(eligible)._options.system_prompt == PROGRESS_PREAMBLE
 
 
 def test_claude_runner_offers_provider_web_search_by_default(tmp_path) -> None:
     runner = build_runner(_config(tmp_path))
-    options = runner._factory()._options
+    options = initialized_session_sync(runner)._options
 
     assert options.tools == {"type": "preset", "preset": "claude_code"}
     assert "WebSearch" not in options.disallowed_tools
@@ -134,7 +135,7 @@ def test_claude_runner_bundle_opt_out_suppresses_provider_web_search(tmp_path) -
     )
 
     runner = build_runner(config)
-    options = runner._factory()._options
+    options = initialized_session_sync(runner)._options
 
     assert options.tools == {"type": "preset", "preset": "claude_code"}
     assert options.disallowed_tools == ["WebSearch"]
