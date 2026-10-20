@@ -12,6 +12,7 @@ own unconfigurable-to-run state.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from pathlib import Path
 
@@ -75,6 +76,27 @@ def test_ingress_disabled_with_an_empty_allow_list_boots(
         assert proc.poll() is None
     finally:
         stop(proc)
+
+
+def test_the_startup_line_names_the_port_right_after_the_kind(
+    mail: MailState, ingress: IngressState
+) -> None:
+    """The packaged-image fixture and log readers find the bound port by this prefix.
+
+    The provider name is new information and goes after the port, so the line
+    that existing readers match keeps its shape.
+    """
+    port = free_port()
+    proc = spawn_adapter(
+        adapter_env(agentmail_base_url=mail.base_url, api_url=ingress.url, port=port)
+    )
+    try:
+        wait_for_healthz(port, proc)
+    finally:
+        output = stop(proc)
+
+    assert re.search(rf"mail adapter starting: kind=email port={port}\b", output), output
+    assert "provider=agentmail" in output
 
 
 @pytest.mark.parametrize(

@@ -125,9 +125,9 @@ def main() -> None:
         server = make_server(adapter, config.port)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         logger.info(
-            "mail adapter starting: kind=email provider=%s port=%s ingress_enabled=%s",
-            provider.name,
+            "mail adapter starting: kind=email port=%s provider=%s ingress_enabled=%s",
             server.server_address[1],
+            provider.name,
             config.ingress_enabled,
         )
 
