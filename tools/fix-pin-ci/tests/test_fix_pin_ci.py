@@ -1047,7 +1047,7 @@ def test_required_workflows_reach_one_task_branch_without_widening_pushes() -> N
         trigger = _workflow_trigger(_load_workflow(path))
         pull_request = trigger.get("pull_request")
         assert isinstance(pull_request, dict), f"{path.name} must run for pull requests"
-        assert pull_request.get("branches") == ["main", "next", "task/**"], path.name
+        assert pull_request.get("branches") == ["main", "next", "task/**", "epic/**"], path.name
 
         push = trigger.get("push")
         if path.name in {"pr-body.yaml", "fix-pin.yaml"}:

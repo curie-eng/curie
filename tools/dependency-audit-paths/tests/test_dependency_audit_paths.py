@@ -70,7 +70,7 @@ def test_pull_request_filters_exact_dependency_inputs_and_preserves_other_trigge
     assert triggers == {
         "push": {"branches": ["main", "next"]},
         "pull_request": {
-            "branches": ["main", "next", "task/**"],
+            "branches": ["main", "next", "task/**", "epic/**"],
             "paths": EXPECTED_PATHS,
         },
         "schedule": [{"cron": "0 6 * * 2"}],
