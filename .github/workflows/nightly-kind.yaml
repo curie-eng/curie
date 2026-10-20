@@ -93,7 +93,7 @@ jobs:
           error_file=$(mktemp "${RUNNER_TEMP:-/tmp}/dispatch-error.XXXXXX")
           if ! dispatch=$(gh api --method POST "repos/$GH_REPO/actions/workflows/ci.yaml/dispatches" \
             -f "ref=$TARGET_REF" -f "inputs[nightly]=$NIGHTLY" -F return_run_details=true 2> "$error_file"); then
-            error=$(tr -s '[:space:]' ' ' < "$error_file" | sed -e 's/^ //' -e 's/ $//')
+            error=$(tr -s '[:space:]' ' ' < "$error_file" | sed -e 's/^ //')
             error=${error:0:500}
             error=${error% }
             echo "::error title=CI dispatch failed::Dispatch to $TARGET_REF failed: $error"

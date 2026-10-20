@@ -24,8 +24,7 @@ on:
 # push to that ref. A pull request supersedes its own in-flight run. Pushes
 # and dispatches run to completion (GitHub keeps one pending run per group
 # and replaces only an older pending one): a later dispatch cancelled two
-# dispatched kind runs on 2026-10-20, and a scheduled dispatch could
-# otherwise cancel a release dispatch.
+# dispatched kind runs on 2026-10-20.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

@@ -79,8 +79,13 @@ def runner_labels(workflow: dict[str, Any]) -> Iterator[tuple[str, str]]:
                 yield job_id, resolved
 
 
+def _is_floating(label: str) -> bool:
+    # Larger runners embed the alias too, as in ubuntu-latest-8-cores.
+    return "latest" in label.split("-")
+
+
 def floating_labels(workflow: dict[str, Any]) -> list[tuple[str, str]]:
-    return [(job, label) for job, label in runner_labels(workflow) if label.endswith("-latest")]
+    return [(job, label) for job, label in runner_labels(workflow) if _is_floating(label)]
 
 
 def _workflow_paths() -> list[Path]:
@@ -104,7 +109,7 @@ def test_no_workflow_uses_a_floating_runner_label() -> None:
         offenders.extend(
             f"{path.name}: job {job_id!r} runs on floating label {label!r}"
             for job_id, label in labels
-            if label.endswith("-latest")
+            if _is_floating(label)
         )
     assert not offenders, (
         "pin every runner label to a version (for example ubuntu-24.04, macos-26); "
@@ -120,6 +125,11 @@ def test_no_workflow_uses_a_floating_runner_label() -> None:
             {"jobs": {"build": {"runs-on": "ubuntu-latest"}}},
             [("build", "ubuntu-latest")],
             id="plain-string",
+        ),
+        pytest.param(
+            {"jobs": {"build": {"runs-on": "ubuntu-latest-8-cores"}}},
+            [("build", "ubuntu-latest-8-cores")],
+            id="larger-runner",
         ),
         pytest.param(
             {"jobs": {"build": {"runs-on": ["self-hosted", "macos-latest"]}}},

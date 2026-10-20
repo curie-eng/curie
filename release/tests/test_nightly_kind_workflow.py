@@ -1,5 +1,7 @@
 """Execute the nightly workflow shell with GitHub as the external boundary."""
 
+import copy
+import functools
 import json
 import os
 import re
@@ -23,9 +25,7 @@ UNDECLARED_INPUT_ERROR = 'gh: Unexpected inputs provided: ["nightly"] (HTTP 422)
 NOT_A_REPOSITORY_ERROR = (
     "failed to run git: fatal: not a git repository (or any of the parent directories): .git\n"
 )
-NOT_A_REPOSITORY_ONE_LINE = (
-    "failed to run git: fatal: not a git repository (or any of the parent directories): .git"
-)
+NOT_A_REPOSITORY_ONE_LINE = NOT_A_REPOSITORY_ERROR.rstrip("\n")
 DISPATCH_ERROR_PREFIX = "::error title=CI dispatch failed::"
 DISPATCH_ERROR_LIMIT = 500
 CI_RUN_ID = "7601"
@@ -41,10 +41,14 @@ MAIN_DAY_CRONS = ("15 0 * * *", "15 12 * * *", "15 18 * * *")
 SCHEDULES = {"main": MAIN_NIGHTLY_CRON, "next": NEXT_CRON}
 
 
-def _workflow() -> dict[str, Any]:
-    return cast(
-        dict[str, Any], yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
-    )
+@functools.cache
+def _parsed(path: Path) -> dict[str, Any]:
+    """Parse a workflow once. Read-only: callers that mutate go through `_workflow`."""
+    return cast(dict[str, Any], yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader))
+
+
+def _workflow(path: Path = WORKFLOW) -> dict[str, Any]:
+    return copy.deepcopy(_parsed(path))
 
 
 class GitHubCall(TypedDict):
@@ -154,7 +158,7 @@ def _run_job(
     input_nightly: str = "true",
     workflow: dict[str, Any] | None = None,
 ) -> JobResult:
-    job = (_workflow() if workflow is None else workflow)["jobs"][name]
+    job = (_parsed(WORKFLOW) if workflow is None else workflow)["jobs"][name]
     context = {
         "github.repository": REPOSITORY,
         "github.server_url": "https://github.com",
@@ -245,6 +249,18 @@ def _assert_exact_dispatched_ci_run(
     assert fields == [f"ref={target_ref}", f"inputs[nightly]={nightly}"]
     assert arguments[arguments.index("-F") + 1] == "return_run_details=true"
     assert dispatches[0]["repo"] == REPOSITORY
+    # A scheduler input that the dispatched workflow does not declare is rejected with
+    # HTTP 422 before any CI runs, and the scheduler's own tests cannot see that because
+    # gh is faked. Compare what this tree's scheduler sends with this tree's ci.yaml.
+    sent = _dispatched_inputs(dispatches[0])
+    assert sent == {"nightly": nightly}
+    assert _dispatch_input_problems(_parsed(CI_WORKFLOW), sent) == []
+    assert DISPATCH_ERROR_PREFIX not in result.log
+    written = "".join(
+        path.read_text(encoding="utf-8") for path in sorted(tmp_path.glob("dispatch.*.output"))
+    )
+    assert "run_id=" in written
+    assert not any(line.startswith("error=") for line in written.splitlines()), written
     verify = _run_job("verify", tmp_path, github, needs_outputs=result.outputs, workflow=workflow)
     assert verify.returncode == 0, verify.log
     watches = _calls(github, ["run", "watch"])
@@ -299,45 +315,8 @@ def _dispatch_input_problems(ci_workflow: dict[str, Any], sent: dict[str, str]) 
     return problems
 
 
-def _ci_workflow() -> dict[str, Any]:
-    return cast(
-        dict[str, Any], yaml.load(CI_WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
-    )
-
-
-@pytest.mark.parametrize(
-    "event_name,schedule,input_ref,input_nightly,expected_ref,expected_nightly", DISPATCH_CASES
-)
-def test_every_dispatched_input_is_declared_by_ci_workflow_dispatch(
-    tmp_path: Path,
-    github: dict[str, str],
-    event_name: str,
-    schedule: str,
-    input_ref: str,
-    input_nightly: str,
-    expected_ref: str,
-    expected_nightly: str,
-) -> None:
-    # A scheduler input that the dispatched workflow does not declare is rejected with
-    # HTTP 422 before any CI runs, and the scheduler's own tests cannot see that because
-    # gh is faked. Compare what this tree's scheduler sends with this tree's ci.yaml.
-    result = _run_job(
-        "dispatch",
-        tmp_path,
-        github,
-        event_name=event_name,
-        schedule=schedule,
-        input_ref=input_ref,
-        input_nightly=input_nightly,
-    )
-    assert result.returncode == 0, result.log
-    sent = _dispatched_inputs(_calls(github, ["api"])[0])
-    assert sent == {"nightly": expected_nightly}
-    assert _dispatch_input_problems(_ci_workflow(), sent) == []
-
-
 def test_dispatch_input_check_reports_an_input_ci_does_not_declare() -> None:
-    ci_workflow = _ci_workflow()
+    ci_workflow = _workflow(CI_WORKFLOW)
     assert _dispatch_input_problems(ci_workflow, {"nightly": "true"}) == []
     del ci_workflow["on"]["workflow_dispatch"]["inputs"]["nightly"]
     problems = _dispatch_input_problems(ci_workflow, {"nightly": "true"})
@@ -347,7 +326,7 @@ def test_dispatch_input_check_reports_an_input_ci_does_not_declare() -> None:
 
 
 def test_dispatch_input_check_reports_a_value_the_declared_type_rejects() -> None:
-    ci_workflow = _ci_workflow()
+    ci_workflow = _workflow(CI_WORKFLOW)
     problems = _dispatch_input_problems(ci_workflow, {"nightly": "yes"})
     assert len(problems) == 1
     assert "nightly" in problems[0]
@@ -572,17 +551,32 @@ def _failed_dispatch(
     )
 
 
-@pytest.mark.parametrize(
-    "stderr,expected",
-    [
-        (UNDECLARED_INPUT_ERROR, UNDECLARED_INPUT_ERROR),
-        (NOT_A_REPOSITORY_ERROR, NOT_A_REPOSITORY_ONE_LINE),
-        ("  first line\n\n\tsecond   line \r\n", "first line second line"),
-    ],
-    ids=["undeclared-input", "not-a-repository", "whitespace-runs"],
-)
+def _dispatch_annotations(result: JobResult) -> list[str]:
+    return [line for line in result.log.splitlines() if line.startswith(DISPATCH_ERROR_PREFIX)]
+
+
+# (gh stderr, the one-line error the workflow exports, whether the report adds the
+# "merge main into the target" hint). Shared by the dispatch step and the report tests.
+DISPATCH_ERROR_CASES = [
+    pytest.param(UNDECLARED_INPUT_ERROR, UNDECLARED_INPUT_ERROR, True, id="undeclared-input"),
+    pytest.param(NOT_A_REPOSITORY_ERROR, NOT_A_REPOSITORY_ONE_LINE, False, id="not-a-repository"),
+    pytest.param(
+        "  first line\n\n\tsecond   line \r\n",
+        "first line second line",
+        False,
+        id="whitespace-runs",
+    ),
+]
+
+
+@pytest.mark.parametrize("stderr,expected,_has_hint", DISPATCH_ERROR_CASES)
 def test_dispatch_error_is_annotated_and_exported(
-    tmp_path: Path, github: dict[str, str], target_ref: str, stderr: str, expected: str
+    tmp_path: Path,
+    github: dict[str, str],
+    target_ref: str,
+    stderr: str,
+    expected: str,
+    _has_hint: bool,
 ) -> None:
     dispatch = _failed_dispatch(tmp_path, github, target_ref, stderr)
     assert dispatch.returncode != 0, dispatch.log
@@ -592,28 +586,22 @@ def test_dispatch_error_is_annotated_and_exported(
         "run_url": "",
         "error": expected,
     }
-    annotations = [
-        line for line in dispatch.log.splitlines() if line.startswith(DISPATCH_ERROR_PREFIX)
-    ]
+    annotations = _dispatch_annotations(dispatch)
     assert len(annotations) == 1, dispatch.log
     assert target_ref in annotations[0]
     assert expected in annotations[0]
     assert not _calls(github, ["run", "watch"])
 
 
-@pytest.mark.parametrize(
-    "length,expected_length",
-    [(499, 499), (500, 500), (501, 500), (5000, 500)],
-)
+@pytest.mark.parametrize("length", [DISPATCH_ERROR_LIMIT, DISPATCH_ERROR_LIMIT + 1])
 def test_dispatch_error_is_capped_at_500_characters(
-    tmp_path: Path, github: dict[str, str], target_ref: str, length: int, expected_length: int
+    tmp_path: Path, github: dict[str, str], target_ref: str, length: int
 ) -> None:
+    expected_length = min(length, DISPATCH_ERROR_LIMIT)
     dispatch = _failed_dispatch(tmp_path, github, target_ref, "x" * length + "\n")
     assert dispatch.returncode != 0, dispatch.log
     assert dispatch.outputs["error"] == "x" * expected_length
-    annotations = [
-        line for line in dispatch.log.splitlines() if line.startswith(DISPATCH_ERROR_PREFIX)
-    ]
+    annotations = _dispatch_annotations(dispatch)
     assert len(annotations) == 1, dispatch.log
     assert "x" * expected_length in annotations[0]
     assert "x" * (DISPATCH_ERROR_LIMIT + 1) not in annotations[0]
@@ -626,38 +614,6 @@ def test_dispatch_error_is_a_dispatch_job_output() -> None:
     )
     report_env = workflow["jobs"]["report"]["steps"][0]["env"]
     assert report_env["DISPATCH_ERROR"] == "${{ needs.dispatch.outputs.error }}"
-
-
-@pytest.mark.parametrize(
-    "event_name,schedule,input_ref,input_nightly,expected_ref,expected_nightly", DISPATCH_CASES
-)
-def test_successful_dispatch_exports_no_dispatch_error(
-    tmp_path: Path,
-    github: dict[str, str],
-    event_name: str,
-    schedule: str,
-    input_ref: str,
-    input_nightly: str,
-    expected_ref: str,
-    expected_nightly: str,
-) -> None:
-    result = _run_job(
-        "dispatch",
-        tmp_path,
-        github,
-        event_name=event_name,
-        schedule=schedule,
-        input_ref=input_ref,
-        input_nightly=input_nightly,
-    )
-    assert result.returncode == 0, result.log
-    assert result.outputs["error"] == ""
-    assert DISPATCH_ERROR_PREFIX not in result.log
-    written = "".join(
-        path.read_text(encoding="utf-8") for path in sorted(tmp_path.glob("dispatch.*.output"))
-    )
-    assert "run_id=" in written
-    assert not any(line.startswith("error=") for line in written.splitlines()), written
 
 
 def test_issue_filing_failure_does_not_turn_the_nightly_green(
@@ -968,48 +924,34 @@ def test_report_dispatch_failure_has_no_job_list(
     assert len(_calls(github, ["api"])) == 1
 
 
-@pytest.mark.parametrize(
-    "stderr,expected",
-    [
-        (UNDECLARED_INPUT_ERROR, UNDECLARED_INPUT_ERROR),
-        (NOT_A_REPOSITORY_ERROR, NOT_A_REPOSITORY_ONE_LINE),
-    ],
-    ids=["undeclared-input", "not-a-repository"],
-)
-def test_report_dispatch_failure_states_the_dispatch_error(
-    tmp_path: Path, github: dict[str, str], target_ref: str, stderr: str, expected: str
+@pytest.mark.parametrize("stderr,expected,has_hint", DISPATCH_ERROR_CASES)
+def test_report_dispatch_failure_states_the_dispatch_error_and_any_hint(
+    tmp_path: Path,
+    github: dict[str, str],
+    target_ref: str,
+    stderr: str,
+    expected: str,
+    has_hint: bool,
 ) -> None:
     dispatch = _failed_dispatch(tmp_path, github, target_ref, stderr)
     assert dispatch.returncode != 0, dispatch.log
     report = _run_job("report", tmp_path, github, needs_outputs=dispatch.outputs)
     assert report.returncode == 0, report.log
     body = _issue_body(github, target_ref)
-    assert "No CI run was confirmed." in body
-    assert f"Dispatch error: {expected}" in body.splitlines()
-    assert "Failed jobs:" not in body
-    assert CI_RUN_URL not in body
-    if "Unexpected inputs" not in expected:
-        assert "does not declare an input" not in body
-
-
-def test_report_dispatch_failure_explains_an_undeclared_input(
-    tmp_path: Path, github: dict[str, str], target_ref: str
-) -> None:
-    dispatch = _failed_dispatch(tmp_path, github, target_ref, UNDECLARED_INPUT_ERROR)
-    assert dispatch.returncode != 0, dispatch.log
-    report = _run_job("report", tmp_path, github, needs_outputs=dispatch.outputs)
-    assert report.returncode == 0, report.log
-    body = _issue_body(github, target_ref)
+    lines = body.splitlines()
     assert (
         "No CI run was confirmed. "
         "Inspect the nightly workflow logs for the dispatch failure." in body
     )
-    assert f"Dispatch error: {UNDECLARED_INPUT_ERROR}" in body.splitlines()
-    assert (
+    assert f"Dispatch error: {expected}" in lines
+    hint = (
         f"The ci.yaml on {target_ref} does not declare an input this workflow sends. "
         f"Merge main into {target_ref} so both release trains accept the same dispatch inputs."
-    ) in body.splitlines()
+    )
+    assert (hint in lines) == has_hint
+    assert ("does not declare an input" in body) == has_hint
     assert "Failed jobs:" not in body
+    assert CI_RUN_URL not in body
 
 
 @pytest.mark.parametrize(
