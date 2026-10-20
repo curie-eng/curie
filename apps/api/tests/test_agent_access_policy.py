@@ -200,7 +200,8 @@ def test_set_read_clear_and_versions(
     approvers = _team()
 
     first = _put(
-        client, auth_headers, agent_id, invocation=requesters, approver=approvers, expected_version=0
+        client, auth_headers, agent_id,
+        invocation=requesters, approver=approvers, expected_version=0
     )
     assert first.status_code == 200, first.text
     assert first.json()["version"] == 1
@@ -262,7 +263,9 @@ def test_an_unusable_team_is_422_and_stores_nothing(
     assert _policy_rows(agent_id) == []
 
 
-def test_unknown_agent_is_404(client: TestClient, auth_headers: dict[str, str], clean: None) -> None:
+def test_unknown_agent_is_404(
+    client: TestClient, auth_headers: dict[str, str], clean: None,
+) -> None:
     missing = uuid.uuid4()
     assert client.get(_path(missing), headers=auth_headers).status_code == 404
     response = _put(

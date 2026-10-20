@@ -85,7 +85,7 @@ async def replace_policy(
         session.add(policy)
     else:
         policy.version = stored + 1
-        policy.updated_at = func.now()  # type: ignore[assignment]
+        policy.updated_at = func.now()
     policy.invocation_team_id = data.invocation_team_id
     policy.approver_team_id = data.approver_team_id
     await session.flush()
