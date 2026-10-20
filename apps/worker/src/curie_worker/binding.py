@@ -513,6 +513,11 @@ class ResolvedDeployment(BaseModel):
     # 0068 and resolution runs against older schemas, so the kernel reads it
     # with ``memory_writes_for`` and copies it on, as with runner_resources.
     memory_writes: bool = False
+    # Whether the operator turned learned skills on (ADR 0237): with it on the
+    # per-turn credential carries ``skills: "write"``. Read apart from the
+    # resolver statements for the same schema reason (``learned_skills_for``),
+    # but copied on here by every resolve path, degrading to off.
+    learned_skills: bool = False
 
 
 class FactoryWake(BaseModel):
@@ -747,7 +752,7 @@ class BindingResolver:
             return None
         mapped = [dict(row._mapping) for row in matches]
         warn_if_multiple_agents_bound(kind, address, mapped)
-        return _deployment_from_row(mapped[0])
+        return await self._with_learned_skills(_deployment_from_row(mapped[0]))
 
     async def resolve_factory(self, context: FactoryContext) -> ResolvedDeployment | None:
         """Resolve only the authenticated delivery's current agent and binding."""
@@ -768,7 +773,9 @@ class BindingResolver:
             ):
                 raise FactoryBindingRefused("factory_binding_changed")
             row = (await conn.execute(self._resolve_factory_sql, params)).mappings().first()
-        return None if row is None else _deployment_from_row(dict(row))
+        if row is None:
+            return None
+        return await self._with_learned_skills(_deployment_from_row(dict(row)))
 
     async def resolve_agent(self, agent_id: uuid.UUID) -> ResolvedDeployment | None:
         """Resolve an explicit agent to its active deployment, with no binding.
@@ -781,7 +788,9 @@ class BindingResolver:
                 self._resolve_agent_sql, {"agent_id": agent_id, "tenant_id": self._tenant_id}
             )
             row = result.mappings().first()
-        return None if row is None else _deployment_from_row(dict(row))
+        if row is None:
+            return None
+        return await self._with_learned_skills(_deployment_from_row(dict(row)))
 
     async def undeployed_binding(
         self, kind: str, adapter: str | None, address: str
@@ -1122,6 +1131,38 @@ class BindingResolver:
             row = result.first()
         return bool(row is not None and row[0])
 
+    async def learned_skills_for(self, agent_id: uuid.UUID) -> bool:
+        """Whether the operator turned learned skills on for the agent (ADR 0237).
+
+        The same separate read as ``memory_writes_for`` (migration selfimp_skills_0001 adds
+        the column). A missing agent row or a null value reads as off.
+        """
+        sql = text(
+            f"SELECT learned_skills FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
+            row = result.first()
+        return bool(row is not None and row[0])
+
+    async def _with_learned_skills(self, resolved: ResolvedDeployment) -> ResolvedDeployment:
+        """``resolved`` with its learned skills setting. A failed read (a DB
+        error, or a schema from before selfimp_skills_0001) never fails the turn: it runs
+        with learned skills off and a warning, the safe direction."""
+
+        try:
+            on = await self.learned_skills_for(resolved.agent_id)
+        except Exception as exc:  # noqa: BLE001 - degrade to off
+            logger.warning(
+                "learned skills read failed agent=%s error_class=%s;"
+                " running with learned skills off",
+                resolved.agent_id,
+                type(exc).__name__,
+            )
+            return resolved
+        return resolved.model_copy(update={"learned_skills": on}) if on else resolved
+
     async def execution_deadline_seconds_for(self, agent_id: uuid.UUID) -> int:
         """The agent's work item execution span, or the platform default.
 
@@ -1456,21 +1497,26 @@ class BindingResolver:
         turn: str,
         ttl_s: float,
     ) -> str | None:
-        """The per-turn memory write credential (ADR-0188), or None.
+        """The per-turn write credential (ADR-0188, ADR 0237), or None.
 
         Sent as the turn's ``Event.memory_token`` (MEMORY-TOKEN-2), never in the
         boot env: the boot-env token outlives the turn and so cannot name its
-        sender. A ``scope="state"`` token with ``{binding, memory: "write",
-        sender, turn}``; the API writes only fact keys with it, only on the
-        channel ``binding`` names, and stamps ``sender`` as the fact's author.
+        sender. A ``scope="state"`` token with ``{binding, memory, sender, turn,
+        conversation, skills}``. ``memory`` is ``"write"`` only with memory
+        writes on (else ``"read"``, so the API refuses fact writes); the API
+        writes only fact keys with it, only on the channel ``binding`` names,
+        and stamps ``sender`` as the fact's author. ``skills`` is ``"write"``
+        only with learned skills on, and the API stamps ``sender`` and
+        ``conversation`` (the thread key) on each skill change.
 
-        None unless there is a key to sign with, the agent has memory writes on,
-        the turn names a binding, and the thread is not eval-isolated (#1909).
+        None unless there is a key to sign with, the agent has memory writes or
+        learned skills on, the turn names a binding, and the thread is not
+        eval-isolated (#1909).
         The expiry is ``ttl_s``, the turn's own deadline, capped at the boot
         token's lifetime, with no grace: the credential ends with the turn.
         """
 
-        if not self._config.api_key or not resolved.memory_writes:
+        if not self._config.api_key or not (resolved.memory_writes or resolved.learned_skills):
             return None
         binding = _binding_claim(kind, address)
         if binding is None or is_eval_isolate_thread(thread_key):
@@ -1484,9 +1530,11 @@ class BindingResolver:
             exp=exp,
             claims={
                 "binding": binding,
-                "memory": "write",
+                "memory": "write" if resolved.memory_writes else "read",
                 "sender": sender.strip() or NO_PERSON,
                 "turn": turn,
+                "conversation": thread_key,
+                "skills": "write" if resolved.learned_skills else None,
             },
         )
 

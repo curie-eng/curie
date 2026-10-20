@@ -112,7 +112,8 @@ pub(crate) struct ClusterConn {
 }
 
 /// Same connection as [`ClusterConn`], but the flags are global so they parse
-/// after `cluster hook fire` or `cluster hook record` as well as on `cluster hook`.
+/// after a nested verb (`cluster hook fire`, `cluster skills <agent> list`) as
+/// well as on its group.
 #[derive(Args, Debug, Clone)]
 pub(crate) struct ClusterHookConn {
     /// Platform API base URL. Omit to self-plumb a loopback tunnel to the release API.
@@ -449,6 +450,83 @@ impl<C: clap::Args> ActionsCommand<C> {
             | ActionsCommand::Show { conn, .. }
             | ActionsCommand::Undo { conn, .. }
             | ActionsCommand::Execution { conn, .. } => conn,
+        }
+    }
+}
+
+/// `<tier> skills <agent> <verb>`: an agent's learned skills (ADR 0237),
+/// shared by `local` and `cluster`. `C` is the tier's connection flags; they
+/// are global, so they parse after the verb's own arguments too.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SkillsArgs<C: clap::Args> {
+    /// Agent name or id.
+    pub(crate) agent: String,
+    #[command(flatten)]
+    pub(crate) conn: C,
+    #[command(subcommand)]
+    pub(crate) verb: SkillsCommand,
+}
+
+/// [`LocalObservabilityConn`] with global flags, for the `local skills` verbs.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct LocalGlobalConn {
+    /// Platform API base URL.
+    #[arg(
+        long,
+        default_value = message::DEFAULT_LOCAL_API_URL,
+        env = "CURIE_API_URL",
+        global = true
+    )]
+    pub(crate) api_url: String,
+    /// Platform API key.
+    #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default, global = true)]
+    pub(crate) api_key: String,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum SkillsCommand {
+    /// List the agent's active learned skills.
+    List,
+    /// Print one skill (id or slug), deleted ones included.
+    Show { skill: String },
+    /// Unified diff of a skill's SKILL.md between two revisions
+    /// (default: the head against the revision before it).
+    Diff {
+        skill: String,
+        #[arg(long, value_name = "N")]
+        from: Option<u32>,
+        #[arg(long, value_name = "M")]
+        to: Option<u32>,
+    },
+    /// List every revision of a skill, oldest first.
+    History { skill: String },
+    /// Undo a skill's last change, or restore revision N with --to. Works on
+    /// a deleted skill, so it also undoes a delete.
+    Revert {
+        skill: String,
+        #[arg(long, value_name = "N")]
+        to: Option<u32>,
+    },
+    /// Delete a skill. Its history stays, and `revert` brings it back.
+    Delete { skill: String },
+    /// Write every active skill to <DIR>/skills/<slug>/SKILL.md.
+    Export {
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        out: std::path::PathBuf,
+    },
+}
+
+impl From<SkillsCommand> for commands::SkillsVerb {
+    fn from(verb: SkillsCommand) -> Self {
+        use commands::SkillsVerb as V;
+        match verb {
+            SkillsCommand::List => V::List,
+            SkillsCommand::Show { skill } => V::Show { skill },
+            SkillsCommand::Diff { skill, from, to } => V::Diff { skill, from, to },
+            SkillsCommand::History { skill } => V::History { skill },
+            SkillsCommand::Revert { skill, to } => V::Revert { skill, to },
+            SkillsCommand::Delete { skill } => V::Delete { skill },
+            SkillsCommand::Export { out } => V::Export { out },
         }
     }
 }

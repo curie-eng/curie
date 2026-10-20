@@ -248,6 +248,26 @@
       "omissions": []
     },
     {
+      "struct": "LearnedSkill",
+      "schema": "LearnedSkillOut",
+      "omissions": []
+    },
+    {
+      "struct": "LearnedSkillList",
+      "schema": "LearnedSkillList",
+      "omissions": []
+    },
+    {
+      "struct": "LearnedSkillRevision",
+      "schema": "LearnedSkillRevisionOut",
+      "omissions": []
+    },
+    {
+      "struct": "LearnedSkillRevisions",
+      "schema": "LearnedSkillRevisions",
+      "omissions": []
+    },
+    {
       "struct": "MemoryProvenance",
       "schema": "MemoryProvenanceOut",
       "omissions": []
@@ -707,6 +727,11 @@
       ]
     },
     {
+      "struct": "LearnedSkillRevert",
+      "schema": "LearnedSkillRevert",
+      "omissions": []
+    },
+    {
       "struct": "ActionUndo",
       "schema": "ActionUndo",
       "omissions": [
@@ -876,6 +901,12 @@
       "path": "/evals/trigger"
     },
     {
+      "function": "revert_learned_skill",
+      "struct": "LearnedSkillRevert",
+      "method": "post",
+      "path": "/agents/{agent_id}/learned-skills/{ref}/revert"
+    },
+    {
       "function": "undo_action",
       "struct": "ActionUndo",
       "method": "post",
@@ -941,6 +972,7 @@
         {"field": "runner_resources", "why": "Runner resources belong to the overrides command."},
         {"field": "memory", "why": "The shared memory setting is unrelated to hook configuration."},
         {"field": "memory_writes", "why": "The memory tools switch belongs to the overrides command."},
+        {"field": "learned_skills", "why": "The learned skills switch belongs to the overrides command."},
         {"field": "publication_policy", "why": "Publication policy has its own operator command."},
         {"field": "publication_policy_version", "why": "Publication policy has its own operator command."},
         {"field": "publication_draft", "why": "Publication policy has its own operator command."},

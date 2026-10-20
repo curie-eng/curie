@@ -466,6 +466,18 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                 .await?,
             )
         }
+        LocalAction::Skills(args) => emit_boxed(
+            commands::learned_skills(
+                commands::SkillsOpts {
+                    api_url: args.conn.api_url,
+                    api_key: args.conn.api_key,
+                    tier: "local",
+                    agent: args.agent,
+                },
+                args.verb.into(),
+            )
+            .await?,
+        ),
         // @spec AUTOMATED-REMEDIATION-3
         LocalAction::RemediationPolicy { verb } => {
             let (verb, conn) = verb.into_parts();
@@ -536,11 +548,12 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             runner_resources,
             clear_runner_resources,
             memory_writes,
+            learned_skills,
             api_url,
             api_key,
             dry_run,
         } => emit(
-            commands::overrides_with_memory_writes(
+            commands::overrides_with_switches(
                 AgentActionOpts {
                     api_url,
                     api_key,
@@ -562,7 +575,8 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                     runner_resources,
                     clear_runner_resources,
                 )?,
-                commands::memory_writes_flag(memory_writes.as_deref()),
+                commands::on_off_flag(memory_writes.as_deref()),
+                commands::on_off_flag(learned_skills.as_deref()),
             )
             .await?,
         ),

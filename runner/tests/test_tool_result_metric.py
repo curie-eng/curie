@@ -402,6 +402,32 @@ def test_platform_tools_count_as_platform_and_log_nothing(
     assert _connector_warnings(caplog) == []
 
 
+def test_learned_skills_tools_count_as_platform_and_log_nothing(
+    reader: InMemoryMetricReader, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Curie's own learned-skills tools (ADR 0237) are not connectors.
+
+    Every tool of the ``learned_skills`` server, a failed write included, is
+    platform origin and logs no connector WARNING.
+    """
+
+    caplog.set_level(logging.WARNING, logger="curie_runner")
+    names = [
+        f"mcp__learned_skills__{short}"
+        for short in ("list", "read", "create", "patch", "delete", "revert")
+    ]
+    _run(
+        [
+            _use(*((f"toolu_{i}", name, {}) for i, name in enumerate(names))),
+            _answer(*((f"toolu_{i}", "ok", True if i == 2 else None) for i in range(len(names)))),
+            *_done(),
+        ]
+    )
+
+    assert _points(reader) == {("platform", "success"): 5, ("platform", "error"): 1}
+    assert _connector_warnings(caplog) == []
+
+
 def test_a_plugin_mounted_connector_is_a_connector_named_by_its_first_separator(
     reader: InMemoryMetricReader, caplog: pytest.LogCaptureFixture
 ) -> None:

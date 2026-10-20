@@ -20,7 +20,7 @@ from typing import Any
 import anyio
 from aci_protocol import BootEnv
 from aiohttp import web
-from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, SdkPluginConfig
 from curie_telemetry import bootstrap_service_telemetry
 from plugin_format import CHANNEL_READ_SERVER_NAME
 
@@ -73,6 +73,7 @@ from .harness.claude.approval import (
     build_can_use_tool,
     build_memory_tools,
 )
+from .harness.claude.learned_skill_tools import build_learned_skills_server
 from .harness.claude.platform_slack import build_channel_read_server
 from .harness.claude.preflight_blocked import PreflightBlockedSession
 from .harness.contribution import HarnessContribution
@@ -95,6 +96,13 @@ from .history import (
 )
 from .hooks import build_factory_foreground_hooks, build_gated_pre_tool_use_hooks, load_bundle_hooks
 from .issue_read import build_issue_tool, resolve_issue_read
+from .learned_skills import (
+    LEARNED_SKILLS_GUIDANCE,
+    LearnedSkillsClient,
+    MaterializedPlugin,
+    learned_skills_url,
+    load_for_session,
+)
 from .mcp_tool_capability import (
     ConnectorAvailability,
     ConnectorCapabilityFailure,
@@ -148,7 +156,12 @@ from .state import (
 )
 from .subprocess_env import lock_process_environ
 from .tool_access import TurnToolAccess, front_can_use_tool, front_pre_tool_use_hooks
-from .tool_names import STATE_SERVER_NAME, platform_slack_tool_names
+from .tool_names import (
+    LEARNED_SKILL_READ_ONLY_TOOL_NAMES,
+    LEARNED_SKILLS_SERVER_NAME,
+    STATE_SERVER_NAME,
+    platform_slack_tool_names,
+)
 from .turn_progress import (
     PROGRESS_PREAMBLE,
     TurnProgress,
@@ -637,6 +650,7 @@ def _compose_system_prompt(
     progress_preamble: str | None = None,
     facts_preamble: str | None = None,
     guidance_preamble: str | None = None,
+    learned_skills_preamble: str | None = None,
 ) -> str | None:
     """Compose durable memory, mounted-workspace facts, bundle instructions, and model identity.
 
@@ -657,6 +671,9 @@ def _compose_system_prompt(
 
     Image tools (ADR 0216) and the remote Docker contract (ADR 0217) sit beside
     the workspace verification block, before bundle instructions.
+
+    The learned-skills guidance (ADR 0237) follows the memory guidance it is
+    contrasted with, present only when learned skills loaded.
     """
 
     model_preamble = f"Configured model: {model}" if model else None
@@ -666,6 +683,7 @@ def _compose_system_prompt(
             memory_preamble,
             facts_preamble,
             guidance_preamble,
+            learned_skills_preamble,
             workspace_preamble,
             tool_manifest_preamble,
             remote_docker_preamble,
@@ -754,6 +772,7 @@ def build_runner(
     history_capacity_exceeded: bool = False,
     memory_facts_preamble: str | None = None,
     memory_guidance: str | None = None,
+    learned_skills: MaterializedPlugin | None = None,
 ) -> SessionRunner:
     """Wire a SessionRunner backed by the active harness's model session.
 
@@ -769,6 +788,9 @@ def build_runner(
     ``memory_facts_preamble`` is the rendered remembered-facts block and
     ``memory_guidance`` the operator's stored guidance text (None falls back to
     ``DEFAULT_GUIDANCE``), both loaded at boot (#1461).
+
+    ``learned_skills`` is the session's materialized ``curie-learned`` plugin
+    (ADR 0237), None when the toggle is off or the store was unreachable.
     """
 
     # Resolve the active harness's contribution (ADR-0060): its manifest is the
@@ -892,7 +914,22 @@ def build_runner(
         and memory_token is not None
         and not fake_model
     )
-    memory_turn = MemoryTurn() if memory_tools_mounted else None
+    # Learned skills (ADR 0237) mount on the real-model path only. Their tools
+    # read the author and the write credential from the same per-turn holder,
+    # so it exists whenever either set of tools is mounted.
+    learned_url = learned_skills_url(os.environ.get(BootEnv.env_key("state_url"), ""))
+    learned = (
+        learned_skills
+        if learned_skills is not None and not fake_model and learned_url is not None
+        else None
+    )
+    if learned is not None:
+        logger.info(
+            "learned skills loaded session=%s revisions=%s",
+            config.session.session_id,
+            ",".join(learned.loaded),
+        )
+    memory_turn = MemoryTurn() if memory_tools_mounted or learned is not None else None
 
     def turn_write_token() -> str | None:
         # ADR-0188: the tools write with the turn's own credential, carried on
@@ -924,6 +961,7 @@ def build_runner(
             if channel_memory_readable and not config.memory_writes_on
             else None
         ),
+        learned_skills_preamble=LEARNED_SKILLS_GUIDANCE if learned is not None else None,
     )
     # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
     # translated into SDK HookMatcher callbacks. None when the bundle declares none.
@@ -981,6 +1019,8 @@ def build_runner(
         # here rather than in build_approval_gate because only this scope holds
         # both the assembled gate and the bundle directory.
         assert_gates_not_shadowed(config.session.plugin_dir, approval_gate, resolution)
+        if learned is not None:
+            assert_gates_not_shadowed(learned.root, approval_gate)
     except ApprovalPolicyError as exc:
         # Log then re-raise, matching the module's other two fatal boot paths
         # (credential resolution, session start): a bare traceback is the one
@@ -1047,6 +1087,7 @@ def build_runner(
             repo_path=config.repo_path,
         )
         approval_gate.memory_tools_mounted = memory_tools_mounted
+        approval_gate.learned_skills_mounted = learned is not None
     workspace_cwd = str(mounted_workspace) if mounted_workspace is not None else None
     derived_mcp_servers = derive_mcp_servers(
         config.session.plugin_dir,
@@ -1090,8 +1131,10 @@ def build_runner(
 
     def session_tool_access(observed: frozenset[str]) -> TurnToolAccess:
         # @spec RUNNER-TOOL-ACCESS-1: the classifier's set, built once per boot.
+        # The learned list/read tools are in the classifier's platform set.
         return TurnToolAccess(
-            _readonly_tools(harness, observed, approval_gate),
+            _readonly_tools(harness, observed, approval_gate)
+            | (LEARNED_SKILL_READ_ONLY_TOOL_NAMES if learned is not None else frozenset()),
             requires_approval=(
                 approval_gate.requires_approval if approval_gate is not None else None
             ),
@@ -1235,6 +1278,20 @@ def build_runner(
                 if channel_read_turn is not None
                 else {}
             ),
+            **(
+                {
+                    LEARNED_SKILLS_SERVER_NAME: build_learned_skills_server(
+                        client=LearnedSkillsClient(
+                            learned_url,
+                            os.environ.get(MEMORY_TOKEN_ENV),
+                            turn_write_token,
+                        ),
+                        turn=memory_turn,
+                    )
+                }
+                if learned is not None and learned_url is not None and memory_turn is not None
+                else {}
+            ),
         }
         structured_resume = build_structured_resume(
             conversation_replay.messages,
@@ -1244,7 +1301,10 @@ def build_runner(
             system_prompt=system_prompt,
         )
         real_options = build_options(
-            plugins=compiled.plugins,
+            plugins=[
+                *compiled.plugins,
+                *([SdkPluginConfig(type="local", path=learned.root)] if learned else []),
+            ],
             model=config.model,
             reviewer_model=config.reviewer_model,
             system_prompt=system_prompt,
@@ -1270,7 +1330,11 @@ def build_runner(
             hooks=session_hooks,
             # Only the bundle's own skills are listed to the model (#3766,
             # ADR-0189); the CLI's built-in skills stay hidden.
-            skills=bundle_skill_names(config.session.plugin_dir),
+            # Learned skills (ADR 0237) are the one generated plugin admitted beside it.
+            skills=[
+                *bundle_skill_names(config.session.plugin_dir),
+                *(learned.qualified_names if learned else []),
+            ],
             # Platform tools and connectors share the SDK MCP channel. The
             # generic policy pager is present only on an actionable surface;
             # state and publication remain independent platform capabilities.
@@ -1635,6 +1699,7 @@ class _BootFetches:
     # build_runner parameters they feed.
     memory_facts_preamble: str | None = None
     memory_guidance: str | None = None
+    learned_skills: MaterializedPlugin | None = None
 
 
 async def _load_boot_fetches(
@@ -1650,6 +1715,7 @@ async def _load_boot_fetches(
     memory: tuple[MemoryStore, str | None] | None = None
     history: tuple[TranscriptStore, ConversationReplay, bool] | None = None
     facts: tuple[str | None, str | None] = (None, None)
+    learned: MaterializedPlugin | None = None
     capability: McpToolCapabilityProbe | None = None
     derived = derive_mcp_servers(
         config.session.plugin_dir,
@@ -1677,6 +1743,12 @@ async def _load_boot_fetches(
         nonlocal facts
         facts = await _load_memory_facts(config)
 
+    async def load_learned() -> None:
+        nonlocal learned
+        learned = await load_for_session(
+            os.environ, bundle_plugin_dir=config.session.plugin_dir, fake_model=fake_model
+        )
+
     async def probe() -> None:
         nonlocal capability
         capability = await probe_mcp_tool_capability(
@@ -1689,6 +1761,7 @@ async def _load_boot_fetches(
         tg.start_soon(load_memory)
         tg.start_soon(load_history)
         tg.start_soon(load_facts)
+        tg.start_soon(load_learned)
         if not fake_model:
             tg.start_soon(probe)
 
@@ -1707,6 +1780,7 @@ async def _load_boot_fetches(
         history_capacity_exceeded=history[2],
         memory_facts_preamble=facts[0],
         memory_guidance=facts[1],
+        learned_skills=learned,
     )
 
 
@@ -1871,6 +1945,7 @@ def _serve() -> None:
         history_capacity_exceeded=fetches.history_capacity_exceeded,
         memory_facts_preamble=fetches.memory_facts_preamble,
         memory_guidance=fetches.memory_guidance,
+        learned_skills=fetches.learned_skills,
     )
 
     def capture_mounted_workspace() -> WorkspaceSnapshot:

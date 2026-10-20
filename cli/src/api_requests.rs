@@ -75,6 +75,8 @@ pub struct AgentUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_partitions: Option<BTreeMap<String, HookPartitionInput>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_skills: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_writes: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<Option<String>>,
@@ -200,6 +202,15 @@ pub struct EvalTriggerRequest {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suite: Option<String>,
+}
+
+/// `POST /agents/{id}/learned-skills/{ref}/revert` (`LearnedSkillRevert`,
+/// ADR 0237). No `to_revision` undoes the last change.
+#[derive(Debug, Clone, Serialize)]
+pub struct LearnedSkillRevert {
+    pub expected_revision: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_revision: Option<u32>,
 }
 
 // @spec ACTION-EXECUTOR-23 @spec ACTION-EXECUTOR-3

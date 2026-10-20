@@ -81,6 +81,7 @@ from .routers import (
     hook_source_policy,
     hooks,
     identity,
+    learned_skills,
     memory,
     observability,
     provider_installations,
@@ -569,6 +570,7 @@ def create_app() -> FastAPI:
     app.include_router(state.released_router)
     app.include_router(thread_attachments.internal_router)
     app.include_router(memory.router)
+    app.include_router(learned_skills.router)
     # BEFORE approvals.router: GET /approvals/identity-report would otherwise
     # be matched by GET /approvals/{approval_id} and fail as a bad uuid.
     app.include_router(approval_recovery.router)

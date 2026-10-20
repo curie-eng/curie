@@ -989,6 +989,7 @@ async fn overrides_inspect_reads_both_fields_and_writes_nothing() {
             execution_deadline_seconds: _,
             runner_resources: _,
             memory_writes,
+            learned_skills: _,
             changed,
         } => {
             assert_eq!(agent, "deal-desk");
@@ -1386,6 +1387,7 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         execution_deadline_seconds,
         runner_resources,
         memory_writes,
+        learned_skills,
         changed,
     } = &out
     else {
@@ -1415,6 +1417,12 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
     );
     assert!(!memory_writes);
     assert_eq!(
+        json.get("learned_skills"),
+        Some(&serde_json::Value::Bool(false)),
+        "inspect JSON must include learned_skills false: {json}"
+    );
+    assert!(!learned_skills);
+    assert_eq!(
         json.get("runner_resources").map(serde_json::Value::is_null),
         Some(true),
         "inspect JSON must include runner_resources null: {json}"
@@ -1428,11 +1436,12 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         execution_deadline_seconds,
         runner_resources,
         *memory_writes,
+        *learned_skills,
         *changed,
     );
     assert_eq!(
         line,
-        "overrides for deal-desk: model kimi-k2, reviewer model credential default, thinking adaptive, execution deadline platform default, runner resources platform default, memory writes off"
+        "overrides for deal-desk: model kimi-k2, reviewer model credential default, thinking adaptive, execution deadline platform default, runner resources platform default, memory writes off, learned skills off"
     );
 
     let rec = server.recorded();

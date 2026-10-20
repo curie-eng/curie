@@ -2216,6 +2216,151 @@ export const commandManifest = {
           ]
         },
         {
+          "about": "An agent's learned skills (ADR 0237): list, show, diff, history, revert, delete and export",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "default_values": [
+                "http://localhost:28000"
+              ],
+              "env": "CURIE_API_URL",
+              "global": true,
+              "help": "Platform API base URL",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": true,
+              "help": "Platform API key",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "skills",
+          "subcommands": [
+            {
+              "about": "List the agent's active learned skills",
+              "hidden": false,
+              "name": "list"
+            },
+            {
+              "about": "Print one skill (id or slug), deleted ones included",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "show"
+            },
+            {
+              "about": "Unified diff of a skill's SKILL.md between two revisions (default: the head against the revision before it)",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "id": "from",
+                  "long": "from",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "id": "to",
+                  "long": "to",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "diff"
+            },
+            {
+              "about": "List every revision of a skill, oldest first",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "history"
+            },
+            {
+              "about": "Undo a skill's last change, or restore revision N with --to. Works on a deleted skill, so it also undoes a delete",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "id": "to",
+                  "long": "to",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "revert"
+            },
+            {
+              "about": "Delete a skill. Its history stays, and `revert` brings it back",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "delete"
+            },
+            {
+              "about": "Write every active skill to <DIR>/skills/<slug>/SKILL.md",
+              "args": [
+                {
+                  "default_values": [
+                    "."
+                  ],
+                  "global": false,
+                  "id": "out",
+                  "long": "out",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "export"
+            }
+          ]
+        },
+        {
           "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN",
           "hidden": false,
           "name": "remediation-policy",
@@ -3426,6 +3571,18 @@ export const commandManifest = {
               "help": "Turn the agent's remember/update/forget memory tools on or off (`memory_writes`, #1461). Off stops saving only: stored agent and channel memory stays readable. Takes effect at the next sandbox boot",
               "id": "memory_writes",
               "long": "memory-writes",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Turn the agent's learned skills on or off (ADR 0237). Off stops loading and editing them; stored skills and history stay",
+              "id": "learned_skills",
+              "long": "learned-skills",
               "positional": false,
               "possible_values": [
                 "on",
@@ -6430,6 +6587,18 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Turn the agent's learned skills on or off (ADR 0237). Off stops loading and editing them; stored skills and history stay",
+              "id": "learned_skills",
+              "long": "learned-skills",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
+              ],
+              "required": false
+            },
+            {
               "env": "CURIE_API_URL",
               "global": false,
               "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
@@ -8105,6 +8274,171 @@ export const commandManifest = {
               ],
               "hidden": false,
               "name": "execution"
+            }
+          ]
+        },
+        {
+          "about": "An agent's learned skills (ADR 0237): list, show, diff, history, revert, delete and export",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": true,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": true,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": true,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": true,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "skills",
+          "subcommands": [
+            {
+              "about": "List the agent's active learned skills",
+              "hidden": false,
+              "name": "list"
+            },
+            {
+              "about": "Print one skill (id or slug), deleted ones included",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "show"
+            },
+            {
+              "about": "Unified diff of a skill's SKILL.md between two revisions (default: the head against the revision before it)",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "id": "from",
+                  "long": "from",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "id": "to",
+                  "long": "to",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "diff"
+            },
+            {
+              "about": "List every revision of a skill, oldest first",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "history"
+            },
+            {
+              "about": "Undo a skill's last change, or restore revision N with --to. Works on a deleted skill, so it also undoes a delete",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "id": "to",
+                  "long": "to",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "revert"
+            },
+            {
+              "about": "Delete a skill. Its history stays, and `revert` brings it back",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "delete"
+            },
+            {
+              "about": "Write every active skill to <DIR>/skills/<slug>/SKILL.md",
+              "args": [
+                {
+                  "default_values": [
+                    "."
+                  ],
+                  "global": false,
+                  "id": "out",
+                  "long": "out",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "export"
             }
           ]
         },

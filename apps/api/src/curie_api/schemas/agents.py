@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from plugin_format import is_reserved_boot_env_name
 from plugin_format.connector_render import agent_forges_join
 from plugin_format.connectors import ADMITS_SELF
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from ..config import get_settings
 from ..forges import types as forge_types
@@ -612,6 +612,9 @@ class AgentUpdate(BaseModel):
     # it unchanged; the column is NOT NULL, so like `memory` there is no
     # default for a null to clear back to.
     memory_writes: bool | None = None
+    # Whether the agent loads and edits learned skills (ADR 0237). Same
+    # plain-None rule as `memory_writes`, but strict: "yes" is not a boolean.
+    learned_skills: StrictBool | None = None
     # Omitted leaves the current publication policy. Explicit null is refused.
     # ``publication_branch_prefix`` null clears the prefix.
     publication_policy: Literal["approve", "auto"] | None = None
@@ -679,6 +682,8 @@ class AgentOut(BaseModel):
     memory: bool
     # Whether the runner mounts its remember/update/forget tools (#1461).
     memory_writes: bool = False
+    # Whether the agent loads and edits learned skills (ADR 0237).
+    learned_skills: bool = False
     publication_policy: Literal["approve", "auto"] = "approve"
     publication_policy_version: int = 1
     publication_draft: bool = False

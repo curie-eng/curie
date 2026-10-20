@@ -224,6 +224,18 @@ async def update_agent_memory_writes(
     return agent
 
 
+async def update_agent_learned_skills(
+    session: AsyncSession, agent: Agent, learned_skills: bool
+) -> Agent:
+    """Set whether the agent loads and edits learned skills (ADR 0237).
+    Takes effect at the next sandbox boot; stored skills are untouched."""
+
+    agent.learned_skills = learned_skills
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
 async def update_agent_approval_tools(
     session: AsyncSession, agent: Agent, tools: list[str]
 ) -> Agent:

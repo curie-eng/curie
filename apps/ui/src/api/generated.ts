@@ -814,6 +814,104 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/{agent_id}/learned-skills": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Learned Skills
+         * @description Active skills by slug. A sandbox credential sees none while the toggle is off.
+         */
+        get: operations["list_learned_skills_agents__agent_id__learned_skills_get"];
+        put?: never;
+        /** Create Learned Skill */
+        post: operations["create_learned_skill_agents__agent_id__learned_skills_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/learned-skills/{ref}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Learned Skill */
+        get: operations["get_learned_skill_agents__agent_id__learned_skills__ref__get"];
+        put?: never;
+        post?: never;
+        /** Delete Learned Skill */
+        delete: operations["delete_learned_skill_agents__agent_id__learned_skills__ref__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/learned-skills/{ref}/patch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Patch Learned Skill
+         * @description A targeted edit: ``old_string`` must occur exactly once in the body.
+         */
+        post: operations["patch_learned_skill_agents__agent_id__learned_skills__ref__patch_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/learned-skills/{ref}/revert": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revert Learned Skill
+         * @description Restore a revision's content and state. Without ``to_revision`` this is
+         *     undo: back to the revision before the head, or a delete when the head is
+         *     the create. Undo of an undo is a redo. Any caller reaches a deleted skill.
+         */
+        post: operations["revert_learned_skill_agents__agent_id__learned_skills__ref__revert_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/learned-skills/{ref}/revisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Learned Skill Revisions */
+        get: operations["list_learned_skill_revisions_agents__agent_id__learned_skills__ref__revisions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/{agent_id}/memory": {
         parameters: {
             query?: never;
@@ -3910,6 +4008,11 @@ export interface components {
              * Format: uuid
              */
             id: string;
+            /**
+             * Learned Skills
+             * @default false
+             */
+            learned_skills?: boolean;
             /** Memory */
             memory: boolean;
             /**
@@ -4002,6 +4105,8 @@ export interface components {
             hook_partitions?: {
                 [key: string]: components["schemas"]["HookPartitionConfig"];
             } | null;
+            /** Learned Skills */
+            learned_skills?: boolean | null;
             /** Memory */
             memory?: boolean | null;
             /** Memory Writes */
@@ -6324,6 +6429,123 @@ export interface components {
         KillState: {
             /** Killed */
             killed: boolean;
+        };
+        /** LearnedSkillCreate */
+        LearnedSkillCreate: {
+            /** Body */
+            body: string;
+            /** Description */
+            description: string;
+            /** Slug */
+            slug: string;
+        };
+        /** LearnedSkillList */
+        LearnedSkillList: {
+            /** Enabled */
+            enabled: boolean;
+            /** Skills */
+            skills: components["schemas"]["LearnedSkillOut"][];
+        };
+        /** LearnedSkillOut */
+        LearnedSkillOut: {
+            /** Author */
+            author: string;
+            /** Body */
+            body: string;
+            /** Conversation */
+            conversation?: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Deleted */
+            deleted: boolean;
+            /** Description */
+            description: string;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Revision */
+            revision: number;
+            /** Slug */
+            slug: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /**
+         * LearnedSkillPatch
+         * @description A targeted edit: ``old_string`` must occur exactly once in the body and
+         *     is replaced by ``new_string``; ``description`` replaces the description.
+         *     There is deliberately no wholesale ``body`` field.
+         */
+        LearnedSkillPatch: {
+            /** Description */
+            description?: string | null;
+            /** Expected Revision */
+            expected_revision: number;
+            /** New String */
+            new_string?: string | null;
+            /** Old String */
+            old_string?: string | null;
+        };
+        /**
+         * LearnedSkillRevert
+         * @description Restore revision ``to_revision``'s content and state; omitted is undo.
+         */
+        LearnedSkillRevert: {
+            /** Expected Revision */
+            expected_revision: number;
+            /** To Revision */
+            to_revision?: number | null;
+        };
+        /** LearnedSkillRevisionOut */
+        LearnedSkillRevisionOut: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "create" | "patch" | "revert" | "delete";
+            /** Author */
+            author: string;
+            /** Body */
+            body: string;
+            /** Conversation */
+            conversation?: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Deleted */
+            deleted: boolean;
+            /** Description */
+            description: string;
+            /** Digest */
+            digest: string;
+            /** Reverted To */
+            reverted_to: number | null;
+            /** Revision */
+            revision: number;
+            /** Slug */
+            slug: string;
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "agent" | "operator";
+            /** Turn */
+            turn?: string | null;
+        };
+        /** LearnedSkillRevisions */
+        LearnedSkillRevisions: {
+            /** Revisions */
+            revisions: components["schemas"]["LearnedSkillRevisionOut"][];
         };
         /**
          * ListedTargets
@@ -10972,6 +11194,256 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["KillState"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_learned_skills_agents__agent_id__learned_skills_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LearnedSkillList"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_learned_skill_agents__agent_id__learned_skills_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LearnedSkillCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LearnedSkillOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_learned_skill_agents__agent_id__learned_skills__ref__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                ref: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LearnedSkillOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_learned_skill_agents__agent_id__learned_skills__ref__delete: {
+        parameters: {
+            query: {
+                expected_revision: number;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                ref: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LearnedSkillOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    patch_learned_skill_agents__agent_id__learned_skills__ref__patch_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                ref: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LearnedSkillPatch"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LearnedSkillOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    revert_learned_skill_agents__agent_id__learned_skills__ref__revert_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                ref: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LearnedSkillRevert"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LearnedSkillOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_learned_skill_revisions_agents__agent_id__learned_skills__ref__revisions_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                ref: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LearnedSkillRevisions"];
                 };
             };
             /** @description Validation Error */

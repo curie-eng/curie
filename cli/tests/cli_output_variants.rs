@@ -383,6 +383,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 execution_deadline_seconds: Some(90),
                 runner_resources: None,
                 memory_writes: true,
+                learned_skills: true,
                 changed: true,
             },
         ],
