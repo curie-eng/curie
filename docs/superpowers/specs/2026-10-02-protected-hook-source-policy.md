@@ -1393,32 +1393,44 @@ refuses as SOURCE-6 specifies. The writer has two outputs: the mapping from file
 name to bytes, which a Kubernetes provisioner places in the data of a Secret it
 owns, and a host directory publication for a Docker substrate.
 
-A host directory publication takes a root directory owned by the provisioner.
-The root must be a directory that is not a symlink, owned by the writing user
-and not writable by group or others; otherwise the writer refuses before
-writing. Each publication creates a new version directory inside the root with
-mode 0700, creates each file there with exclusive create, without following
-symlinks and with mode 0400, flushes the files and the version directory to
-disk, and then replaces the root's `current` symlink, whose target is the
-relative version name, by one atomic rename. `CURIE_PROTECTED_RUNTIME_DIR`
-names `<root>/current`. A reader opens the directory once and reads every file
-relative to that descriptor, so it observes either the whole previous file set
-or the whole new one, the layout a Kubernetes Secret volume presents through
-`..data`. The writer keeps the current version and the one before it and
-removes only older versions it created, so a reader that opened the previous
-version is not cut off. A failed publication leaves `current` unchanged and
-removes its partial version. No output, error or representation of the writer
-contains a credential value.
+A host directory publication takes a root directory owned by the provisioner,
+named by an absolute, normalized path. Every component of that path is opened
+without following symlinks. Each ancestor must be owned by the superuser or the
+writing user and must not be writable by group or others unless it carries the
+sticky bit. The root itself must be owned by the writing user and must not be
+writable by group or others. Otherwise the writer refuses before writing. One
+publication at a time holds an exclusive lock on the root. Each publication
+creates a new version directory inside the root with mode 0700, creates each
+file there with exclusive create, without following symlinks and with mode
+0400, flushes the files and the version directory to disk (with a full device
+flush where the host offers one), and then replaces the root's `current`
+symlink, whose target is the relative version name, by one atomic rename. A
+`current` that is not a symlink to a version name of this form is refused.
+`CURIE_PROTECTED_RUNTIME_DIR` names `<root>/current`. A reader opens the
+directory once and reads every file relative to that descriptor, so it
+observes either the whole previous file set or the whole new one, the layout a
+Kubernetes Secret volume presents through `..data`. The writer keeps the
+current version and the one before it. It removes an older entry only when it
+has the writer's version name and shape (a directory owned by the writing user
+with mode 0700 that holds only regular runtime files), and it removes leftover
+temporary links, so a reader that opened the previous version is not cut off.
+A publication that fails before the rename leaves `current` unchanged and
+removes its partial version. The rename is the publication: flushing the root
+and pruning after it are best effort and never report a failure for a set that
+readers already see. No output, error, exception context or representation of
+the writer contains a credential value.
 
 Only provisioner composition imports the writer. An import-linter contract
 forbids it, directly or transitively, to the HTTP application and every
-process composition that holds the ordinary platform API key or ordinary
-application credentials: all of `curie_api`, `curie_dispatcher`,
-`curie_runner`, the Discord and mail adapters, the connector proxy and the e2e
-connector, and the ordinary worker process entry `curie_worker.__main__` with
-its `curie_worker.run` composition. The shared grammar module itself imports no
-writer. A provisioner process that writes this directory composes from its own
-entry point.
+package that composes a process holding the ordinary platform API key or
+ordinary application credentials: all of `curie_api`, `curie_worker`,
+`curie_dispatcher`, `curie_runner`, `curie_internal`, `curie_upgrade_pause`,
+the Discord and mail adapters, the connector proxy and the e2e connector. A
+test runs the contract against a forbidden import from each listed package and
+observes it fail. The shared grammar module itself imports no writer. A
+provisioner process that writes this directory composes from its own entry
+point; placing one inside a listed package needs a reviewed exception naming
+that one module.
 
 Not realized here: LANE-8 still owns mounting the directory read only into the
 API alone, never into an ordinary worker, runner or route, on Docker and on
@@ -1502,9 +1514,13 @@ Each test/implementation unit cites its corresponding ID above. Required cases:
   equal to the control reader's, a `default` username), hand written bytes are
   refused by the loader and the writer refuses the same input with nothing
   published; a rotation is observed whole by a new read while a descriptor on
-  the previous version still reads it; a failed publication leaves `current`
-  unchanged; an unsafe root is refused; and the import contract fails when a
-  forbidden composition imports the writer.
+  the previous version still reads it; overlapping publications leave a whole
+  `current`; a publication that fails while writing leaves `current` unchanged
+  with no partial version; an unsafe root (a symlink in any component, a
+  relative or unnormalized path, a writable ancestor or root, a foreign
+  `current`) is refused; pruning skips entries that are not the writer's
+  versions; a refusal carries no exception context; and the import contract
+  fails when any listed package imports the writer.
 
 Run `uv run pytest apps/api/tests/test_hook_tool_access.py
 apps/api/tests/test_hooks.py -q` plus the
