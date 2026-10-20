@@ -1471,7 +1471,15 @@ def test_a_channel_token_is_refused_on_every_other_router(
     if method not in {"GET", "DELETE"}:
         kwargs["json"] = {}
     resp = channels_client.request(method, concrete, **kwargs)
-    assert resp.status_code == 401, resp.text
+    if (method, path) == ("GET", "/identity/connect/{token}"):
+        # This public browser landing page authenticates its single-use path
+        # token, not X-API-Key. A channel credential cannot turn the invalid
+        # path into an account connection. Confirmation remains in the 401
+        # sweep and requires its independently scoped browser proof.
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"] == "invalid or expired account connection"
+    else:
+        assert resp.status_code == 401, resp.text
 
 
 # --- the token dies with the binding it names ---------------------------------
