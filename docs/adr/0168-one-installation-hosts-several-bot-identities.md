@@ -4,6 +4,11 @@ Date: 2026-09-22
 
 Status: Accepted
 
+Partially superseded by [ADR 0239](0239-explicit-shared-connector-applications-resolve-credentials-for-each-authenticated-caller.md)
+for decision 7 in explicit shared mode: Postgres membership keyed by immutable
+agent ID replaces the bundle-rendered `admits:` agent-name list. Refusal
+semantics and dedicated admission stand.
+
 **Superseded in part by [ADR 0198](0198-identity-links-live-in-provider-identity-namespaces.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 decision 1's choice to make a channel identity a row in

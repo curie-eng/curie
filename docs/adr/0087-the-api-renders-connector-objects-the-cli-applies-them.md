@@ -3,6 +3,10 @@
 Date: 2026-07-30
 Status: Accepted
 
+Partially superseded by [ADR 0239](0239-explicit-shared-connector-applications-resolve-credentials-for-each-authenticated-caller.md)
+for explicit shared applications: application-owned objects replace per-agent
+object ownership. The rendering/apply authority split and dedicated mode stand.
+
 Realized by `read_version_connectors` in `apps/api/src/curie_api/routers/agents.py`,
 which renders the objects and applies none of them, and by `version_connectors` in
 `cli/src/api.rs` with the apply and prune in `cli/src/connectors.rs`, which are

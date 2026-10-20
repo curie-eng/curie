@@ -229,6 +229,29 @@ scoped to that connector. Adopting such a service as the default would require
 an explicit decision about unattended capability renewal, revocation and
 recovery. This ADR does not promise that migration is a one function change.
 
+A connector explicitly enabled as a shared application can retain its own provider
+credential custody. It obtains an authenticated identity-only admission from the shared
+resolver before each provider call. That admission names immutable application, agent
+binding and provider account, plus current policy and enabled state. Tool arguments,
+alias spelling and an MCP session identifier cannot choose the credential. The connector
+indexes its private durable credential store by that admitted binding/account and must
+refuse missing, mismatched or disabled context. Its provider credential remains outside
+the runner and the platform receives no provider plaintext.
+
+Connector-owned refresh retains persistence before use and one active owner. Cutover
+requires a verifiable stop/export/ownership transfer contract; an unprovable transfer
+refuses rather than creating another holder. Snapshot seals remain connector-held and
+bind application/binding/account, digest and target version. Existing dedicated custom
+connectors keep their present authoring and custody boundary. This clarification grants
+no Kubernetes write authority, serviceaccount token mount, new egress or automatic
+migration.
+
+[ADR
+0239](0239-explicit-shared-connector-applications-resolve-credentials-for-each-authenticated-caller.md)
+supplies the unattended identity/admission, revocation and recovery contract for this
+explicit mode. It does not claim every existing binary becomes safe to share unchanged
+or that a particular external private-store adapter has been released.
+
 ### 3. Bind Kubernetes authority explicitly
 
 A connector needing Kubernetes authority names a dedicated ServiceAccount.
