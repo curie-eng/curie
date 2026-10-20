@@ -141,6 +141,12 @@ chart_scenarios:
     - cli/scripts/configure-docker-hub-mirror.sh
     - cli/scripts/ensure-kind-registry.sh
   scenarios:
+    failed-first-install-retry:
+      step: Failed first install retry recreates data volumes
+      leg: workload
+      inputs:
+        - charts/curie/ci/runtime/failed-first-install-retry-runtime.sh
+        - cli/src/ops/up.rs
     installation-identity:
       step: Installation identity Secret lifecycle
       leg: chart
