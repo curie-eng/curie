@@ -4,6 +4,12 @@ Date: 2026-09-27
 
 Status: Accepted
 
+Partially superseded by [ADR 0239](0239-explicit-shared-connector-applications-resolve-credentials-for-each-authenticated-caller.md):
+caller v2 replaces decision 4's token prefix and exact claim set; immutable
+installation/agent binding replaces name-only admission from decision 1 for
+shared mode; decision 5's shared-server handoff uses a local invocation handle.
+The paired run/work-item meaning and deadline bound stand.
+
 **Amended by [ADR-0229](0229-a-hosted-connector-may-declare-the-host-the-caller-proxy-presents-upstream.md)**
 (back-link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 0229 amends decision 5 so a hosted connector may declare the `Host` its caller
