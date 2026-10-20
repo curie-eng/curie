@@ -45,9 +45,7 @@ class ApiProcess:
         return self.output
 
 
-def _start_api(
-    request: pytest.FixtureRequest, cwd: Path, extra_env: dict[str, str]
-) -> ApiProcess:
+def _start_api(request: pytest.FixtureRequest, cwd: Path, extra_env: dict[str, str]) -> ApiProcess:
     settings = get_settings()
     # Only the driver's actual backing-service settings cross into the child.
     # The empty working directory also prevents Settings from reading a .env.
@@ -113,9 +111,7 @@ def _start_api(
 
 
 @pytest.fixture
-def plain_api(
-    migrated: None, request: pytest.FixtureRequest, tmp_path: Path
-) -> ApiProcess:
+def plain_api(migrated: None, request: pytest.FixtureRequest, tmp_path: Path) -> ApiProcess:
     return _start_api(request, tmp_path, {})
 
 
@@ -246,3 +242,22 @@ def test_access_log_is_exported_redacted(
     assert exported_access, "no uvicorn.access log record was exported"
     # Safe dynamic arguments may be omitted from OTLP bodies by shared policy.
     assert sum(REDACTION_MARKER in body for body in exported_access) == 2
+
+
+def test_sender_connect_url_is_redacted_at_real_entrypoint(plain_api: ApiProcess) -> None:
+    token = "a" * 43
+    with httpx.Client(base_url=plain_api.url, timeout=5, trust_env=False) as client:
+        response = client.get(f"/identity/connect/{token}")
+        assert response.status_code in (400, 404)
+    stdout, _ = plain_api.stop()
+    assert token not in stdout
+    assert "/identity/connect/[REDACTED:identity_connect_token]" in stdout
+
+
+def test_oidc_callback_query_is_redacted_at_real_entrypoint(plain_api: ApiProcess) -> None:
+    with httpx.Client(base_url=plain_api.url, timeout=5, trust_env=False) as client:
+        response = client.get("/console/oidc/callback", params={"code": CANARY, "state": CANARY})
+        assert response.status_code == 404
+    stdout, _ = plain_api.stop()
+    assert CANARY not in stdout
+    assert "/console/oidc/callback?[REDACTED:oidc_callback_query]" in stdout

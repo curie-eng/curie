@@ -1035,7 +1035,7 @@ pub(crate) enum ClusterAction {
     /// `GET /teams` lists it, and must be an IdP group team of the agent's
     /// tenant. A role left unmentioned keeps its team. The write sends back
     /// the version it read, so a concurrent change is refused rather than
-    /// overwritten. Nothing enforces the policy yet.
+    /// overwritten. Each configured role is enforced on every channel.
     AccessPolicy {
         /// Agent name or id.
         agent: String,
@@ -1054,6 +1054,24 @@ pub(crate) enum ClusterAction {
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Inspect tenant identities or apply IdP configuration, namespace or team JSON.
+    /// Writes use the API's expected-version contract; links and people are read-only.
+    Directory {
+        #[arg(long)]
+        tenant: uuid::Uuid,
+        #[arg(long, value_parser = ["config", "people", "links", "namespaces", "teams"])]
+        resource: String,
+        /// JSON request file. Config uses PUT; namespaces and teams use POST.
+        #[arg(long)]
+        apply: Option<std::path::PathBuf>,
+        /// Continue a bounded people, links or namespaces page.
+        #[arg(long)]
+        after: Option<uuid::Uuid>,
+        #[command(flatten)]
+        conn: ClusterConn,
         #[arg(long)]
         dry_run: bool,
     },

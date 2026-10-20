@@ -30,6 +30,48 @@ use serde::Serialize;
 
 use crate::api::{ApprovalRouteBindingWrite, HookPartitionInput, SourceBindingInput};
 
+/// `PUT /directory/config/{tenant_id}` (`DirectoryConfigIn`).
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryConfigIn {
+    pub expected_version: u64,
+    pub governed_domains: Vec<String>,
+    pub issuer: String,
+    pub managed_by: String,
+}
+
+/// `POST /directory/namespaces` (`DirectoryNamespaceIn`).
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryNamespaceIn {
+    #[serde(
+        default,
+        deserialize_with = "directory_authority",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub authority: Option<String>,
+    pub key: String,
+    pub kind: String,
+    pub provider: String,
+    pub tenant_id: String,
+}
+
+fn directory_authority<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    // Omission asks the server to derive authority; explicit null is invalid.
+    <String as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+/// `POST /directory/teams` (`DirectoryTeamIn`).
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryTeamIn {
+    pub external_id: String,
+    pub name: String,
+    pub tenant_id: String,
+}
+
 /// `POST /agents` (`AgentCreate`). Deploy creates an agent with its one
 /// channel and, when asked, its repository binding; every other setting is
 /// written afterwards by its own verb.

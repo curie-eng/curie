@@ -41,9 +41,9 @@ use curie::api::{
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
     AccessPolicyOutput, ActionsOutput, ApprovalsOutput, BudgetOutput, CallersOutput,
-    ChannelsOutput, DeleteOutput, HookFireOutput, HookOutput, KillOutput, MemoryChannel,
-    MemoryOutput, OverridesOutput, PublicationPolicyOutput, ResetThreadOutput, ResumeOutput,
-    SchedulesOutput, SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
+    ChannelsOutput, DeleteOutput, DirectoryOutput, HookFireOutput, HookOutput, KillOutput,
+    MemoryChannel, MemoryOutput, OverridesOutput, PublicationPolicyOutput, ResetThreadOutput,
+    ResumeOutput, SchedulesOutput, SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::factory_intake::FactoryIntakeOutput;
@@ -435,6 +435,17 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                     trigger_label: None,
                 },
                 changed: true,
+            },
+        ],
+    );
+    m.insert(
+        "DirectoryOutput",
+        samples![
+            "DryRun" => DirectoryOutput::DryRun(plan()),
+            "Done" => DirectoryOutput::Done {
+                tenant_id: "00000000-0000-0000-0000-000000000001".into(),
+                resource: "people".into(),
+                result: serde_json::json!({"items":[],"next_cursor":null}),
             },
         ],
     );

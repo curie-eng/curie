@@ -2,7 +2,7 @@
 //! invoke an agent and approve for it (ADR 0220 section 8,
 //! `GET`/`PUT /agents/{id}/access-policy`).
 //!
-//! Storage and administration only: nothing enforces the policy yet. A write
+//! Both roles are enforced independently on every human channel. A write
 //! reads the stored policy first and sends its version back as
 //! `expected_version`, so a concurrent change by another operator is refused
 //! (409) instead of silently overwritten. A role left unmentioned keeps its

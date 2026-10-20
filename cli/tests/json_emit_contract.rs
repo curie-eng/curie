@@ -47,6 +47,8 @@ fn manifest() -> serde_json::Value {
 fn placeholder(id: &str) -> &'static str {
     match id {
         "limit" => "1",
+        "tenant" => "00000000-0000-0000-0000-000000000001",
+        "resource" => "config",
         // `migrate-store --phase` restricts its values, so the generic "x" is
         // rejected by clap before the verb reaches its dry-run branch -- which
         // would fail this gate on an argument-parsing error rather than on the

@@ -1236,6 +1236,35 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 .await?,
             )
         }
+        ClusterAction::Directory {
+            tenant,
+            resource,
+            apply,
+            after,
+            conn,
+            dry_run,
+        } => {
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
+            emit(
+                commands::directory_admin(
+                    api_url,
+                    api_key,
+                    tenant.to_string(),
+                    resource,
+                    apply,
+                    after,
+                    dry_run,
+                )
+                .await?,
+            )
+        }
         ClusterAction::AccessPolicy {
             agent,
             invocation_team,

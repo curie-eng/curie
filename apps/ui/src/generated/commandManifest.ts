@@ -6928,8 +6928,104 @@ export const commandManifest = {
             }
           ],
           "hidden": false,
-          "long_about": "Show or change which IdP teams may invoke the agent and approve for it (`GET`/`PUT /agents/{id}/access-policy`, ADR 0220).\n\nWith no team flag this shows the policy. A team is named by its id, as `GET /teams` lists it, and must be an IdP group team of the agent's tenant. A role left unmentioned keeps its team. The write sends back the version it read, so a concurrent change is refused rather than overwritten. Nothing enforces the policy yet.",
+          "long_about": "Show or change which IdP teams may invoke the agent and approve for it (`GET`/`PUT /agents/{id}/access-policy`, ADR 0220).\n\nWith no team flag this shows the policy. A team is named by its id, as `GET /teams` lists it, and must be an IdP group team of the agent's tenant. A role left unmentioned keeps its team. The write sends back the version it read, so a concurrent change is refused rather than overwritten. Each configured role is enforced on every channel.",
           "name": "access-policy"
+        },
+        {
+          "about": "Inspect tenant identities or apply IdP configuration, namespace or team JSON. Writes use the API's expected-version contract; links and people are read-only",
+          "args": [
+            {
+              "global": false,
+              "id": "tenant",
+              "long": "tenant",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "id": "resource",
+              "long": "resource",
+              "positional": false,
+              "possible_values": [
+                "config",
+                "people",
+                "links",
+                "namespaces",
+                "teams"
+              ],
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "JSON request file. Config uses PUT; namespaces and teams use POST",
+              "id": "apply",
+              "long": "apply",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Continue a bounded people, links or namespaces page",
+              "id": "after",
+              "long": "after",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "directory"
         },
         {
           "about": "Mint or inspect the mail adapter's channel token (`POST /channels/token`)",
