@@ -27,7 +27,7 @@ permissions:
 jobs:
   adapter-credential-reconciliation:
     name: SRE bot adapter credential reconciliation
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -53,7 +53,7 @@ jobs:
 
   action-pins:
     name: Action SHA pins
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -143,7 +143,7 @@ jobs:
     # step accepts the skipped shard job only when it too selected no pytest.
     needs: [changes]
     if: ${{ needs.changes.outputs.pytest == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     env:
@@ -323,7 +323,7 @@ jobs:
   python-static:
     name: Python static gates
     needs: [changes]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -446,7 +446,7 @@ jobs:
     # succeed.
     needs: [changes, python-pytest, python-static]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A job-level block REPLACES the workflow-level one, so `contents: read` is
     # repeated here. The Issues scope that used to sit alongside it followed the
     # fix pin gate into its own job; the suite never read issue labels.
@@ -609,7 +609,7 @@ jobs:
   # rust-select).
   rust-lint:
     name: Rust (fmt + clippy)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: cli
@@ -677,7 +677,7 @@ jobs:
   rust-select:
     name: Select Rust tests
     needs: [changes]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       tests: ${{ steps.select.outputs.tests }}
     steps:
@@ -729,7 +729,7 @@ jobs:
   # CURIE_TEST_* hooks.
   rust-test-build:
     name: Rust test build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-select]
     if: ${{ needs.rust-select.outputs.tests == 'true' }}
     defaults:
@@ -765,7 +765,7 @@ jobs:
   # suite into three count partitions on separate runners.
   rust-test:
     name: Rust test (partition ${{ matrix.partition }}/3)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-select, rust-test-build]
     if: ${{ needs.rust-select.outputs.tests == 'true' }}
     strategy:
@@ -864,7 +864,7 @@ jobs:
   # Valkey service container; this job has no services for that reason.
   rust-convergence:
     name: Rust convergence regressions (kind)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-select, rust-test-build]
     if: ${{ needs.rust-select.outputs.tests == 'true' }}
     timeout-minutes: 45
@@ -941,7 +941,7 @@ jobs:
 
   rust:
     name: Rust (fmt + clippy + test)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-lint, rust-select, rust-test-build, rust-test, rust-convergence]
     if: ${{ always() }}
     steps:
@@ -993,7 +993,7 @@ jobs:
   # the required set is Compose/Contracts/Python/Rust/UI). Cached independently.
   rust-build:
     name: Build the curie release binary
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     if: ${{ needs.changes.outputs.skill == 'true' || needs.changes.outputs.local == 'true' || needs.changes.outputs.local_release == 'true' || needs.changes.outputs.cluster == 'true' || needs.changes.outputs.released_upgrade == 'true' }}
     defaults:
@@ -1021,7 +1021,7 @@ jobs:
 
   cli-portability:
     name: CLI runs on old glibc (and publishes per-commit binaries)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     # Off the pull request path: in 14 days of PR runs this job caught no
     # failures while adding five minutes of runner time to every CLI PR. It runs
@@ -1171,7 +1171,7 @@ jobs:
 
   contracts-ts:
     name: Contracts (generated TypeScript compiles)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1228,7 +1228,7 @@ jobs:
 
   ui:
     name: UI (lint + vitest + build + Playwright)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: apps/ui
@@ -1305,7 +1305,7 @@ jobs:
 
   compose:
     name: Compose (release stack validates)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1376,7 +1376,7 @@ jobs:
   # toolchain proof) or any end to end tier.
   ci-images:
     name: Build CI images (no push)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     if: ${{ needs.changes.outputs.images == 'true' || needs.changes.outputs.skill == 'true' || needs.changes.outputs.local == 'true' || needs.changes.outputs.local_release == 'true' || needs.changes.outputs.cluster == 'true' || needs.changes.outputs.released_upgrade == 'true' }}
     steps:
@@ -1515,7 +1515,7 @@ jobs:
   # archives are native-architecture `docker save` output.
   images:
     name: Build ${{ matrix.name }} image (no push)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     if: ${{ needs.changes.outputs.images == 'true' }}
     strategy:
@@ -1596,7 +1596,7 @@ jobs:
   # this workflow changed; pushes and dispatches always run it.
   docker-daemon:
     name: Docker daemon image (authz plugin + escape test)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: apps/docker-daemon
@@ -1704,7 +1704,7 @@ jobs:
   # place that gap is observable.
   dispatcher-image-smoke:
     name: Dispatcher image imports resolve
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes, ci-images]
     if: ${{ needs.changes.outputs.images == 'true' }}
     steps:
@@ -1728,7 +1728,7 @@ jobs:
   # builds the image, so this is the one place that is observable.
   mail-adapter-image-smoke:
     name: Mail adapter image imports resolve
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes, ci-images]
     if: ${{ needs.changes.outputs.images == 'true' }}
     steps:
@@ -1755,7 +1755,7 @@ jobs:
   # production caching or compression bug.
   ui-image-smoke:
     name: UI image response headers are correct
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes, ci-images]
     if: ${{ needs.changes.outputs.images == 'true' }}
     steps:
@@ -2049,7 +2049,7 @@ jobs:
   # this job exceeds Python.
   repo-toolchain-proof:
     name: Repository toolchain proof (runner image)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes, ci-images]
     if: ${{ needs.changes.outputs.images == 'true' }}
     env:
@@ -2130,7 +2130,7 @@ jobs:
   # runs a container from the tag.
   eval-falsifiability:
     name: Eval falsifiability gate (fake model, offline)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.skill == 'true' }}
     steps:
@@ -2253,7 +2253,7 @@ jobs:
   # not worth it.
   commit-messages:
     name: Commit messages (no AI attribution)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v7
@@ -2277,7 +2277,7 @@ jobs:
   # this gate's own, succeed without an admin settings change.
   preserve-next:
     name: Preserve next on release merge
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -2295,7 +2295,7 @@ jobs:
   # resolve them (#697/#791/#803).
   e2e-ladder:
     name: E2E parity ladder (skill + local, fake model)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
     # Skip on PRs that can't affect what the ladder tests (docs, UI-only, gtools,
     # non-ladder CI). Not a required check, so skipping never blocks a merge; it
@@ -2347,7 +2347,7 @@ jobs:
   # with the ladder. `curie dev oidc-e2e` runs the same driver locally.
   e2e-oidc:
     name: E2E OIDC console login (real Dex)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.local == 'true' }}
     steps:
@@ -2390,7 +2390,7 @@ jobs:
   # so it loads the images the ci-images job built once for this run.
   e2e-ladder-release:
     name: E2E parity ladder (local-release, fake model)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.local_release == 'true' }}
     steps:
@@ -2479,7 +2479,7 @@ jobs:
   # skill/local signal must never be reddened by a kind or Helm flake.
   changes:
     name: Select end to end tiers
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       skill: ${{ steps.filter.outputs.skill }}
       local: ${{ steps.filter.outputs.local }}
@@ -2569,7 +2569,7 @@ jobs:
 
   e2e-ladder-cluster:
     name: E2E parity ladder (cluster rung on kind, fake model)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.cluster == 'true' }}
     steps:
@@ -2900,7 +2900,7 @@ jobs:
   # every leg succeeds.
   e2e-scripted-factory:
     name: E2E scripted factory (kind, scripted model, ${{ matrix.suite }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.factory == 'true' }}
     timeout-minutes: 120
@@ -3032,7 +3032,7 @@ jobs:
   # the module exactly, and `E2E required` needs every leg.
   factory-admitted-agent:
     name: Admitted agent runtime regressions (kind, shard ${{ matrix.shard }}/5)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     if: ${{ needs.changes.outputs.factory == 'true' }}
     timeout-minutes: 120
@@ -3126,7 +3126,7 @@ jobs:
 
   forge-instance-regression:
     name: Forge instance regression (kind, ${{ matrix.suite }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     if: ${{ needs.changes.outputs.factory == 'true' }}
     timeout-minutes: 165
@@ -3230,7 +3230,7 @@ jobs:
   # as the rung does. Proofs using this job's cluster each own their namespace.
   e2e-cluster-chart-regressions:
     name: E2E chart runtime regressions (kind, Calico)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.chart_scenarios != '[]' }}
     steps:
@@ -3524,7 +3524,7 @@ jobs:
   # assertions.
   e2e-cluster-rollout-recovery:
     name: E2E rollout-free invocation and dead-consumer recovery (kind)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
     if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.cluster == 'true' }}
     steps:
@@ -3775,7 +3775,7 @@ jobs:
   # drops it like every other kind job.
   e2e-cluster-approval-resume-restarts:
     name: E2E approval resume after worker and store restarts (kind)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.approval_resume == 'true' }}
     steps:
@@ -4024,7 +4024,7 @@ jobs:
   # chart, migration, and worker state key changes.
   e2e-released-upgrade:
     name: E2E released chart upgrade (released install to candidate)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.released_upgrade_full == 'true' }}
     steps:
@@ -4509,7 +4509,7 @@ jobs:
   # worker image, the released v0.8.2 chart, the legacy values, and the verifier.
   e2e-released-upgrade-negative:
     name: E2E released chart upgrade negative control (nil unsafe helpers)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.released_upgrade_full == 'true' }}
     steps:
@@ -4695,7 +4695,7 @@ jobs:
   # every shard plus the released chart upgrade jobs above.
   e2e-cluster-upgrade-matrix-shards:
     name: E2E cluster upgrade matrix shards
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     needs: [changes]
     outputs:
@@ -4730,7 +4730,7 @@ jobs:
 
   e2e-cluster-upgrade-matrix:
     name: E2E cluster upgrade matrix (${{ matrix.shard }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [rust-build, changes, e2e-cluster-upgrade-matrix-shards, ci-images]
     if: ${{ needs.changes.outputs.released_upgrade == 'true' }}
@@ -4881,7 +4881,7 @@ jobs:
   # downstream job and hide their evidence; `E2E required` carries its result.
   runtime-assertion-registration:
     name: Runtime assertion registration
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     needs: [changes]
@@ -4927,7 +4927,7 @@ jobs:
 
   e2e-required:
     name: E2E required
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Job-level permissions replace the workflow-level block, so contents:read
     # is repeated. actions:read is required to list this run's jobs for the
     # 20 minute upgrade-matrix wall-clock assertion (#2823).
@@ -5124,7 +5124,7 @@ jobs:
 
   turn-canary-contract:
     name: Turn canary contract
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:

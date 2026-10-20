@@ -2301,7 +2301,7 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
     assert negative_job["name"] == (
         "E2E released chart upgrade negative control (nil unsafe helpers)"
     )
-    assert negative_job["runs-on"] == "ubuntu-latest"
+    assert negative_job["runs-on"] == "ubuntu-24.04"
     assert negative_job["if"] == job["if"]
     assert set(negative_job["needs"]) == set(job["needs"])
     negative_steps = {
@@ -3760,7 +3760,7 @@ def test_forge_instance_job_is_gated_like_the_scripted_factory_and_required() ->
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     job = jobs[FORGE_INSTANCE_JOB]
     assert job["name"] == "Forge instance regression (kind, ${{ matrix.suite }})"
-    assert job["runs-on"] == "ubuntu-latest"
+    assert job["runs-on"] == "ubuntu-24.04"
     assert job["timeout-minutes"] == 165
     assert job["strategy"] == {
         "fail-fast": False,
@@ -3876,7 +3876,7 @@ def test_split_factory_jobs_are_gated_like_the_scripted_factory_and_required(
 ) -> None:
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     job = jobs[job_id]
-    assert job["runs-on"] == "ubuntu-latest"
+    assert job["runs-on"] == "ubuntu-24.04"
     assert job["timeout-minutes"] == 120
     assert job["if"] == jobs[SCRIPTED_FACTORY_JOB]["if"]
     assert job["needs"] == ["changes"]
