@@ -46,10 +46,13 @@ _BLOCKED_PREFIX = (
     "implementation, so no model round ran."
 )
 _HOLD_COMMAND = "hold-check"
-# The check gives up on its own after this many 0.05 s polls (about 60 s), so a
-# lost test never leaves a process behind for long.
-_HOLD_POLLS = 1200
-_ENTER_WATCHDOG_S = 30.0
+# One 30 s watchdog bounds both sides of the barrier: the test gives up waiting
+# for the check to enter it, and the barrier's own shell loop exits on its own
+# after the same time (0.05 s polls), so a lost test never leaves a process
+# behind for long.
+_WATCHDOG_S = 30.0
+_ENTER_WATCHDOG_S = _WATCHDOG_S
+_HOLD_POLLS = int(_WATCHDOG_S / 0.05)
 _HEALTHZ_WITHIN_S = 5.0
 
 

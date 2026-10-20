@@ -2099,6 +2099,93 @@ def test_late_workspace_candidate_never_ready_refuses_once_budget_is_spent(
     asyncio.run(go())
 
 
+def test_late_workspace_candidate_never_ready_refuses_on_configured_deadline_alone(
+    make_harness,
+) -> None:
+    """#4777: with no explicit ``remaining_s`` the only bound on polling a
+    not-ready candidate is the configured ``runner_total_timeout_s``. A
+    candidate that never turns ready is still refused with the attestation
+    failure within that ceiling, after more than one read, and no status
+    call is given a longer budget than the ceiling."""
+
+    deployment_id = uuid.uuid4()
+    ceiling_s = 3.0
+
+    async def go() -> None:
+        async with make_harness(
+            binding=_workspace_binding(deployment_id),
+            runner_total_timeout_s=ceiling_s,
+        ) as h:
+            thread_key = _thread_key("tCandidateConfigDeadline")
+            old, candidate = _late_candidate_handles(
+                h, thread_key, "history/tCandidateConfigDeadline"
+            )
+            candidate_reads = 0
+            seen_remaining: list[float | None] = []
+
+            async def status(
+                base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                nonlocal candidate_reads
+                if base_url == old.base_url:
+                    assert token == old.token
+                    return {
+                        "status": SessionStatus.DONE.value,
+                        "turn_active": False,
+                        "history_durable": True,
+                    }
+                assert base_url == candidate.base_url
+                assert token == candidate.token
+                seen_remaining.append(remaining_s)
+                candidate_reads += 1
+                payload = _safe_candidate_status(candidate)
+                payload["ready"] = False
+                return payload
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+
+            class WorkspaceProbe:
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    revalidate = kwargs.get("revalidate_before_handoff")
+                    assert callable(revalidate)
+                    revalidate()
+                    validate_candidate = kwargs.get("validate_candidate")
+                    assert callable(validate_candidate)
+                    validate_candidate(candidate)
+                    raise AssertionError("a never-ready candidate must never be returned")
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+
+            started = time.monotonic()
+            with pytest.raises(
+                ThreadBusyError, match="did not attest the expected managed checkout"
+            ):
+                await asyncio.wait_for(
+                    h.kernel._claim_or_resume(
+                        thread_key,
+                        {
+                            "CURIE_SESSION_ID": old.session_id,
+                            "CURIE_HISTORY_REF": old.history_ref or "",
+                        },
+                        workspace_deployment_id=deployment_id,
+                        workspace_repo="acme-corp/acme-bot",
+                        replace_handle=old,
+                        remaining_s=None,
+                    ),
+                    timeout=ceiling_s + 10.0,
+                )
+            elapsed = time.monotonic() - started
+
+            assert candidate_reads > 1
+            assert all(r is None or r <= ceiling_s for r in seen_remaining)
+            assert elapsed < ceiling_s + 1.0
+
+    asyncio.run(go())
+
+
 def test_workspace_route_metadata_mismatch_fails_closed_without_claim_or_model(
     make_harness,
 ) -> None:
