@@ -267,6 +267,7 @@ kc rollout status "deployment/$FULLNAME-worker" --timeout=300s >/dev/null
 # fixed assertions and numeric observations can reach the public test log.
 cat >"$WORKDIR/driver.py" <<'PY'
 import calendar
+from datetime import datetime
 import json
 import os
 import pathlib
@@ -349,6 +350,20 @@ def probe():
     return json.loads(run([*kube, "exec", "deployment/" + fullname + "-worker", "--", "python3", "-c", probe_code]))
 
 
+def counts_against_quota(pod, now):
+    # Kubernetes v1.31 QuotaV1Pod also excludes pods past their deletion grace.
+    # https://github.com/kubernetes/kubernetes/blob/v1.31.0/pkg/quota/v1/evaluator/core/pods.go
+    if pod.get("status", {}).get("phase") in {"Failed", "Succeeded"}:
+        return False
+    metadata = pod["metadata"]
+    deleted = metadata.get("deletionTimestamp")
+    grace = metadata.get("deletionGracePeriodSeconds")
+    if deleted is not None and grace is not None:
+        if now > datetime.fromisoformat(deleted).timestamp() + grace:
+            return False
+    return True
+
+
 def observe():
     quota = get("resourcequota", fullname + "-sandbox-quota")
     assert quota["spec"]["hard"]["pods"] == "2", "sandbox pod quota changed from two"
@@ -357,12 +372,9 @@ def observe():
     priority = quota["spec"]["scopeSelector"]["matchExpressions"][0]["values"][0]
     pods = {pod["metadata"]["uid"]: pod for pod in get("pods")["items"]
             if pod["spec"].get("priorityClassName") == priority}
-    # Kubernetes' compute quota `pods` counts only nonterminal Pods; Failed
-    # and Succeeded objects can remain after they stop consuming quota.
-    # https://kubernetes.io/docs/concepts/policy/resource-quotas/#compute-resource-quota
     # Preserve every observed UID below for reclamation and active-route checks.
-    chargeable = [pod for pod in pods.values()
-                  if pod.get("status", {}).get("phase") not in {"Failed", "Succeeded"}]
+    now = time.time()
+    chargeable = [pod for pod in pods.values() if counts_against_quota(pod, now)]
     if len(chargeable) > 2:
         counts = {phase: 0 for phase in ("Pending", "Running", "Succeeded", "Failed", "Unknown", "other")}
         for pod in pods.values():
@@ -575,9 +587,10 @@ def burst_sixteen():
         quota_used = int(quota.get("status", {}).get("used", {}).get("pods", 0))
         assert quota_used <= 2, "observed quota usage exceeded two"
         priority = quota["spec"]["scopeSelector"]["matchExpressions"][0]["values"][0]
+        now = time.time()
         pods = [pod for pod in get("pods")["items"]
                 if pod["spec"].get("priorityClassName") == priority
-                and pod.get("status", {}).get("phase") not in {"Failed", "Succeeded"}]
+                and counts_against_quota(pod, now)]
         assert len(pods) <= 2, "observed more than two chargeable sandbox pods"
 
     deadline = time.monotonic() + 320
