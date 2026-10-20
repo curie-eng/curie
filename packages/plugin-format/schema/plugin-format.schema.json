@@ -253,7 +253,12 @@
     },
     "ConnectorSpec": {
       "additionalProperties": false,
-      "description": "One declared connector. Exactly one of ``image``, ``build`` or ``url``.\n\nStrict, unlike the rest of this package. The leniency mandate exists because\nreal Claude Code plugin bundles carry keys this MVP does not model, and\nrejecting them would reject valid bundles. ``connectors.yaml`` is not a\nClaude Code artifact -- it is Curie's own file with no external producer, so\nan unrecognised key is a typo, and silently ignoring it would mean a\nconnector that renders subtly wrong with no diagnostic.",
+      "description": "A dedicated ``image``, ``build`` or ``url``, or an exclusive ``shared`` reference.\n\nStrict, unlike the rest of this package. The leniency mandate exists because\nreal Claude Code plugin bundles carry keys this MVP does not model, and\nrejecting them would reject valid bundles. ``connectors.yaml`` is not a\nClaude Code artifact -- it is Curie's own file with no external producer, so\nan unrecognised key is a typo, and silently ignoring it would mean a\nconnector that renders subtly wrong with no diagnostic.",
+      "if": {
+        "required": [
+          "shared"
+        ]
+      },
       "properties": {
         "admits": {
           "anyOf": [
@@ -413,6 +418,17 @@
           "title": "Secrets",
           "type": "array"
         },
+        "shared": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SharedConnectorReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "unhosted_url": {
           "anyOf": [
             {
@@ -438,12 +454,22 @@
           "title": "Url"
         }
       },
+      "then": {
+        "maxProperties": 1,
+        "properties": {
+          "shared": {
+            "not": {
+              "type": "null"
+            }
+          }
+        }
+      },
       "title": "ConnectorSpec",
       "type": "object"
     },
     "ConnectorsFile": {
       "additionalProperties": false,
-      "description": "The parsed ``connectors.yaml``.",
+      "description": "The declaration shape, including shared references; parsing does not activate it.",
       "properties": {
         "connectors": {
           "additionalProperties": {
@@ -1072,6 +1098,33 @@
         "from_secret"
       ],
       "title": "SecretRef",
+      "type": "object"
+    },
+    "SharedConnectorReference": {
+      "additionalProperties": false,
+      "description": "An immutable application identity, without dedicated runtime settings.",
+      "properties": {
+        "application": {
+          "maxLength": 36,
+          "minLength": 36,
+          "not": {
+            "const": "00000000-0000-0000-0000-000000000000"
+          },
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "title": "Application",
+          "type": "string"
+        },
+        "contract": {
+          "const": 1,
+          "title": "Contract",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "application",
+        "contract"
+      ],
+      "title": "SharedConnectorReference",
       "type": "object"
     },
     "SkillFrontmatter": {

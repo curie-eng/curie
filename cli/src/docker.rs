@@ -3497,6 +3497,7 @@ impl ConnectorStartSpec {
         secret_values: &std::collections::BTreeMap<String, String>,
         caller_public_key: Option<&str>,
     ) -> Result<Self> {
+        crate::connector_build::refuse_shared_connector(connector, spec)?;
         if crate::connector_build::is_hosted(spec) {
             let key = caller_public_key.unwrap_or("").trim();
             if key.is_empty() {

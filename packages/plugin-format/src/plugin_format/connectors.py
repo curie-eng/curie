@@ -7,7 +7,7 @@ and a NetworkPolicy -- roughly 180 lines of Kubernetes to stand up one server,
 per bundle, each copy independently right or wrong.
 
 ``connectors.yaml`` closes that. A bundle declares intent; the platform derives
-the objects. Three forms:
+the objects. The dedicated forms are:
 
     connectors:
       grafana:                                  # hosted: Curie runs the image
@@ -30,6 +30,10 @@ The ``build`` form (ADR 0113) replaces only where the image comes FROM. Every
 other field keeps its exact meaning, and the resolved digest lives in
 ``connectors.lock.yaml``, never here -- see ``connector_lock``.
 
+The optional ``shared`` form references an application by immutable UUID and
+contract. Models parse that shape, while ``validate_connectors`` refuses its
+activation until an application root exists.
+
 Secrets are NAMES only. Values arrive at deploy time through the existing
 mechanism (ADR-0009), so this introduces no new way to carry a credential and
 a bundle stays safe to commit.
@@ -39,11 +43,20 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import PurePosixPath
-from typing import Any, Final
+from typing import Any, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from .reserved_env import SECRET_NAME_RE, is_reserved_boot_env_name
 
@@ -223,8 +236,36 @@ def is_valid_readiness_path(text: str) -> bool:
     )
 
 
+class SharedConnectorReference(BaseModel):
+    """An immutable application identity, without dedicated runtime settings."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    application: str = Field(
+        min_length=36,
+        max_length=36,
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        json_schema_extra={"not": {"const": "00000000-0000-0000-0000-000000000000"}},
+    )
+    contract: Literal[1]
+
+    @field_validator("application")
+    @classmethod
+    def nonnil_application(cls, value: str) -> str:
+        if value == "00000000-0000-0000-0000-000000000000":
+            raise ValueError("application must be a nonnil canonical UUID")
+        return value
+
+    @field_validator("contract", mode="before")
+    @classmethod
+    def integer_contract(cls, value: Any) -> Any:
+        if type(value) is not int:
+            raise ValueError("contract must be the strict integer 1")
+        return value
+
+
 class ConnectorSpec(BaseModel):
-    """One declared connector. Exactly one of ``image``, ``build`` or ``url``.
+    """A dedicated ``image``, ``build`` or ``url``, or an exclusive ``shared`` reference.
 
     Strict, unlike the rest of this package. The leniency mandate exists because
     real Claude Code plugin bundles carry keys this MVP does not model, and
@@ -234,7 +275,43 @@ class ConnectorSpec(BaseModel):
     connector that renders subtly wrong with no diagnostic.
     """
 
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        json_schema_extra={
+            "if": {"required": ["shared"]},
+            "then": {
+                "maxProperties": 1,
+                "properties": {"shared": {"not": {"type": "null"}}},
+            },
+        },
+    )
+
+    shared: SharedConnectorReference | None = Field(default=None, exclude_if=lambda v: v is None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def exclusive_shared(cls, value: Any) -> Any:
+        if isinstance(value, Mapping) and "shared" in value:
+            if value["shared"] is None or set(value) != {"shared"}:
+                raise ValueError("shared must be nonnull and the sole connector property")
+        return value
+
+    @model_serializer(mode="wrap")
+    def serialize_shape(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        serialized: dict[str, Any] = handler(self)
+        if self.shared is not None:
+            return {key: value for key, value in serialized.items() if key == "shared"}
+        return serialized
+
+    def require_dedicated(self) -> None:
+        """Refuse dedicated activation without an application root."""
+
+        if self.shared is not None:
+            raise ValueError(
+                "shared_connector_requires_application: "
+                "shared connectors require an application root"
+            )
 
     # -- hosted form --
     image: str | None = None
@@ -386,6 +463,7 @@ class ConnectorSpec(BaseModel):
     def secret_names(self) -> list[str]:
         """Env var names this connector needs, any form."""
 
+        self.require_dedicated()
         named = [s if isinstance(s, str) else s.name for s in self.secrets]
         # secret_files are resolved from the same store and land in the same
         # per-agent Secret; only the projection differs, so they belong here.
@@ -415,6 +493,7 @@ class ConnectorSpec(BaseModel):
           an operator for a value here would ask for one the bundle already has.
         """
 
+        self.require_dedicated()
         named = [s for s in self.secrets if isinstance(s, str)]
         # `config` values live in the same per-agent Secret and the renderer
         # points secretKeyRefs at them, so the deploy path must write them too.
@@ -423,6 +502,7 @@ class ConnectorSpec(BaseModel):
     def server_resources(self) -> dict[str, dict[str, str]]:
         """The server container's resources: the defaults, overridden per key."""
 
+        self.require_dedicated()
         merged = {side: dict(values) for side, values in DEFAULT_SERVER_RESOURCES.items()}
         if self.resources is not None:
             for side in ("requests", "limits"):
@@ -437,7 +517,7 @@ class ConnectorSpec(BaseModel):
         # reference has been resolved yet. A `build:` connector with no lock
         # applied is hosted and unrenderable, which `connector_render.render`
         # refuses explicitly rather than emitting `image: null`.
-        return self.image is not None or self.build is not None
+        return self.shared is None and (self.image is not None or self.build is not None)
 
 
 class RunnerSpec(BaseModel):
@@ -454,7 +534,7 @@ class RunnerSpec(BaseModel):
 
 
 class ConnectorsFile(BaseModel):
-    """The parsed ``connectors.yaml``."""
+    """The declaration shape, including shared references; parsing does not activate it."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -670,7 +750,10 @@ def _validate_build(
 
 
 def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[str, str]]]:
-    """Validate parsed ``connectors.yaml`` content.
+    """Validate ``connectors.yaml`` for activation by existing dedicated readers.
+
+    Shape parsing alone uses ``ConnectorsFile.model_validate``. Shared references
+    need an application root and refuse activation of the whole file here.
 
     Returns ``(parsed, errors)`` where each error is ``(code, message)``. A
     non-empty error list means the file must be rejected -- these are all
@@ -688,6 +771,14 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
         parsed = ConnectorsFile.model_validate(data)
     except Exception as exc:  # noqa: BLE001 - pydantic ValidationError -- surface it verbatim
         return None, [("connectors.invalid", str(exc)[:400])]
+
+    if any(spec.shared is not None for spec in parsed.connectors.values()):
+        return None, [
+            (
+                "connectors.shared_connector_requires_application",
+                "Shared connectors require an application root before activation",
+            )
+        ]
 
     hosted = {name for name, spec in parsed.connectors.items() if spec.is_hosted}
     for name, spec in parsed.connectors.items():

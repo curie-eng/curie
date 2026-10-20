@@ -67,6 +67,12 @@
       "omissions": []
     },
     {
+      "struct": "SharedConnectorReferenceDecl",
+      "file": "cli/src/connector_build.rs",
+      "schema": "SharedConnectorReference",
+      "omissions": []
+    },
+    {
       "struct": "ConnectorBuildDecl",
       "file": "cli/src/connector_build.rs",
       "schema": "ConnectorBuild",
