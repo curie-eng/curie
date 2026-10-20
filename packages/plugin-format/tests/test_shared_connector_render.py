@@ -120,6 +120,8 @@ def test_shared_application_isolates_proxy_secrets_and_snapshot(
         for container in (server, proxy)
     ]
     assert socket_mounts[0]["name"] == socket_mounts[1]["name"]
+    assert socket_mounts[0]["readOnly"] is True
+    assert socket_mounts[1]["readOnly"] is False
     assert (
         next(volume for volume in pod["volumes"] if volume["name"] == socket_mounts[0]["name"])[
             "emptyDir"
@@ -179,6 +181,12 @@ def test_shared_application_default_deny_service_and_database_target(managed: bo
     assert APPLICATION in labels.values()
     service = _object(objects, "Service")
     assert service["spec"]["selector"] == selector
+    chart_peer = {
+        "app.kubernetes.io/name": application.app_name,
+        "app.kubernetes.io/instance": application.release,
+    }
+    for shared_labels in (labels, selector, service["spec"]["selector"]):
+        assert not (chart_peer.items() <= shared_labels.items())
     ports = service["spec"]["ports"]
     assert len(ports) == 1 and ports[0]["port"] == application.proxy_port
     pod = deployment["spec"]["template"]["spec"]
