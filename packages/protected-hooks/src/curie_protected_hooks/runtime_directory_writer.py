@@ -253,7 +253,11 @@ def _prune(root_fd: int, keep: tuple[str, str | None]) -> None:
     A stale entry that cannot be removed now is retried by the next
     publication. @spec PROTECTED-HOOK-SOURCE-11.
     """
-    for entry in os.listdir(root_fd):
+    try:
+        entries = os.listdir(root_fd)
+    except OSError:
+        return
+    for entry in entries:
         try:
             if _VERSION.fullmatch(entry) and entry not in keep:
                 if _writer_shaped(root_fd, entry):
@@ -264,6 +268,14 @@ def _prune(root_fd: int, keep: tuple[str, str | None]) -> None:
                     os.unlink(entry, dir_fd=root_fd)
         except OSError:
             pass
+
+
+def _names(root_fd: int, version: str) -> bool:
+    """Whether ``current`` already names ``version``, @spec PROTECTED-HOOK-SOURCE-11."""
+    try:
+        return os.readlink(CURRENT, dir_fd=root_fd) == version
+    except OSError:
+        return False
 
 
 def _publish(root_fd: int, files: dict[str, bytes]) -> None:
@@ -281,7 +293,8 @@ def _publish(root_fd: int, files: dict[str, bytes]) -> None:
         os.symlink(version, link, dir_fd=root_fd)
         os.replace(link, CURRENT, src_dir_fd=root_fd, dst_dir_fd=root_fd)
     except BaseException:
-        _rollback(root_fd, version, link)
+        if not _names(root_fd, version):
+            _rollback(root_fd, version, link)
         raise
     try:
         _flush(root_fd)
