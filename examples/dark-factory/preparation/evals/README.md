@@ -78,3 +78,9 @@ separate local report retained a coordinator supplied pilot ID and arm, five
 behavioral questions in two rounds and unknown human preparation minutes. No
 real tracker or factory run was performed. This tests publication behavior and
 honest measurement recording, not the impact on accepted factory outcomes.
+
+The install-only revision was replayed again in a fresh context after removing
+managed update and repository resolution instructions. The fake tracker received
+one update and one label addition with readbacks, the complete reviewed body was
+preserved, and unknown human time remained unknown in the local pilot record.
+No managed version command or real external operation ran in that replay.
