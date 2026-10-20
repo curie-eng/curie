@@ -267,11 +267,26 @@ spec:
         command = [str(binary), "cluster", "--context", context, "up", "--namespace", namespace,
                    "--release", release, "--chart", str(chart), "--values-file", str(values_file),
                    "--adopt", "--fake-model", "--no-expose"]
-        first = run([*command, "--set-string", f"api.image.repository={bad_image.rsplit(':', 1)[0]}",
-                     "--set-string", f"api.image.tag={bad_image.rsplit(':', 1)[1]}"],
+        first = run([*command, "--set", f"api.image.repository={bad_image.rsplit(':', 1)[0]}",
+                     "--set", f"api.image.tag={bad_image.rsplit(':', 1)[1]}"],
                     "first cluster up", timeout=660, check=False)
         require(first.returncode != 0, "first cluster up unexpectedly succeeded with an unavailable API image")
-        history = json.loads(helm("history", release, "--output", "json").stdout)
+        history_result = helm("history", release, "--output", "json", check=False)
+        if history_result.returncode != 0:
+            category = "unclassified CLI or Helm failure"
+            captured = first.stdout + first.stderr
+            for signature, label in (
+                ("error: unexpected argument ", "CLI argument parsing"),
+                ("values don't meet the specifications of the schema(s)", "chart values schema validation"),
+                ("execution error at (", "chart template execution"),
+                ("template: ", "chart template rendering"),
+            ):
+                if signature in captured:
+                    category = label
+                    break
+            raise ScenarioError(f"first cluster up left no readable Helm history "
+                                f"(CLI exit {first.returncode}; Helm exit {history_result.returncode}; {category})")
+        history = json.loads(history_result.stdout)
         require(len(history) == 1 and history[0]["revision"] == 1
                 and all(row["status"].lower() == "failed" for row in history),
                 "the first attempt must leave only failed revision 1")
