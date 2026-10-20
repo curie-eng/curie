@@ -629,6 +629,32 @@ def test_interrupt_after_swap_keeps_new_version(
     assert json.loads(read_current(root)["bootstrap.json"])["max_readiness_ms"] == "2000"
 
 
+def test_interrupt_inside_swap_keeps_new_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupt right after the rename keeps the new version, @spec PROTECTED-HOOK-SOURCE-11."""
+    root = safe_root(tmp_path)
+    first, _ = second_publication(root)
+    real_replace = os.replace
+
+    def replace(*args: Any, **kwargs: Any) -> None:
+        """Rename for real, then interrupt, @spec PROTECTED-HOOK-SOURCE-11."""
+        real_replace(*args, **kwargs)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(os, "replace", replace)
+    with pytest.raises(KeyboardInterrupt):
+        publish_runtime_directory(str(root), contents(max_readiness_ms=2000))
+    monkeypatch.undo()
+    new = os.readlink(root / "current")
+    assert new != first
+    assert (root / new).is_dir()
+    assert read_current(root) == render_runtime_files(contents(max_readiness_ms=2000)) | {
+        "ca.pem": read_current(root)["ca.pem"]
+    }
+    assert not [name for name in snapshot(root) if name.startswith(".current.")]
+
+
 def test_failure_while_writing_version_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
