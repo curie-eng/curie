@@ -248,6 +248,19 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
         ],
         "leg": "chart",
     },
+    "connector-secret-rotation": {
+        "step": "Hosted connector credential rotation rolls only that connector",
+        "inputs": [
+            "charts/curie/ci/runtime/connector-secret-rotation-runtime.sh",
+            "cli",
+            "apps/api",
+            "apps/worker",
+            "packages",
+            "pyproject.toml",
+            "uv.lock",
+        ],
+        "leg": "workload",
+    },
     "runner-template-admission": {
         "step": "Runner template admission refuses host escapes, token mounts, and unlisted images",
         "inputs": ["charts/curie/ci/runtime/runner-template-admission-runtime.sh"],
@@ -289,7 +302,12 @@ CHART_IDS = tuple(sorted(CHART_SCENARIOS))
 
 CHART_LEGS = ("chart", "workload")
 WORKLOAD_SCENARIOS = frozenset(
-    {"workspace-diagnostic", "quota-progress", "failed-first-install-retry"}
+    {
+        "workspace-diagnostic",
+        "quota-progress",
+        "connector-secret-rotation",
+        "failed-first-install-retry",
+    }
 )
 
 
@@ -1818,7 +1836,11 @@ def test_mixed_root_documentation_and_runtime_diff_selects_runtime_tiers(
         "local-release",
         "cluster",
         pytest_deselect=ALL_CONDITIONAL,
-        chart_scenarios=("quota-progress", "workspace-diagnostic"),
+        chart_scenarios=(
+            "connector-secret-rotation",
+            "quota-progress",
+            "workspace-diagnostic",
+        ),
         ci_policy_files=_expected_ci_policy_files("ARCHITECTURE.md", "apps/api/main.py"),
     )
 
@@ -2556,13 +2578,16 @@ IMAGE_PROOF_GROUPS = {
 
 def _assert_image_proofs(workflow: dict[str, Any]) -> None:
     jobs = workflow["jobs"]
-    assert not {
-        "docker-daemon",
-        "dispatcher-image-smoke",
-        "mail-adapter-image-smoke",
-        "ui-image-smoke",
-        "repo-toolchain-proof",
-    } & jobs.keys()
+    assert (
+        not {
+            "docker-daemon",
+            "dispatcher-image-smoke",
+            "mail-adapter-image-smoke",
+            "ui-image-smoke",
+            "repo-toolchain-proof",
+        }
+        & jobs.keys()
+    )
     assert "image-proofs" in jobs
     job = jobs["image-proofs"]
     assert job["name"] == "Image proofs (smoke, Docker daemon, toolchain)"
@@ -4096,6 +4121,7 @@ WORKLOAD_STAGING_IF = (
     "${{ matrix.leg == 'workload' && "
     "(contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') "
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry')) }}"
 )
 
@@ -5089,7 +5115,7 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             ("apps/api/src/curie_api/main.py",),
             False,
             False,
-            ("quota-progress", "workspace-diagnostic"),
+            ("connector-secret-rotation", "quota-progress", "workspace-diagnostic"),
         ),
         (("charts/curie/templates/agent-sandbox.yaml",), False, False, CHART_IDS),
         (
@@ -5108,13 +5134,23 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             ("packages/plugin-format/src/plugin_format/connector_render.py",),
             False,
             False,
-            ("connector-readiness", "quota-progress", "workspace-diagnostic"),
+            (
+                "connector-readiness",
+                "connector-secret-rotation",
+                "quota-progress",
+                "workspace-diagnostic",
+            ),
         ),
         (
             ("apps/worker/src/curie_worker/connector_k8s.py",),
             False,
             False,
-            ("connector-readiness", "quota-progress", "workspace-diagnostic"),
+            (
+                "connector-readiness",
+                "connector-secret-rotation",
+                "quota-progress",
+                "workspace-diagnostic",
+            ),
         ),
         (("docs/adr/AGENTS.md",), False, False, ()),
         (("newtoplevel/file.txt",), False, False, CHART_IDS),
@@ -5176,7 +5212,7 @@ def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
         ("charts/curie/ci/postgres-readiness-delay.Dockerfile", ("langfuse-postgres-readiness",)),
         (
             "apps/worker/src/curie_worker/connector_k8s.py.bak",
-            ("quota-progress", "workspace-diagnostic"),
+            ("connector-secret-rotation", "quota-progress", "workspace-diagnostic"),
         ),
         ("charts/curie/ci/runtime/connector-readiness-runtime.sh.bak", ()),
         ("charts/curie/ci/runtime/connector-readiness-runtime.sh/child", ("connector-readiness",)),
@@ -5223,6 +5259,7 @@ def test_chart_scenario_union_is_sorted_and_deduplicated(tmp_path: Path) -> None
     assert output == reversed_output
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == [
         "connector-readiness",
+        "connector-secret-rotation",
         "quota-progress",
         "workspace-diagnostic",
     ]
@@ -5521,7 +5558,9 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
     completed, output = _invoke_selector(tmp_path, *paths, **options)
     assert completed.returncode == 0, completed.stderr
     expected = (
-        CHART_IDS if mode in {"push", "revisions"} else ("quota-progress", "workspace-diagnostic")
+        CHART_IDS
+        if mode in {"push", "revisions"}
+        else ("connector-secret-rotation", "quota-progress", "workspace-diagnostic")
     )
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == sorted((*expected, "unregistered"))
     # An unregistered step has no leg condition, so it must run in every leg.
@@ -5595,3 +5634,26 @@ def test_negative_control_still_covers_the_chart_job_result() -> None:
     mutated = _run_aggregate(script_transform=omit_chart_check, **state)
     assert mutated.returncode != 0, mutated.stdout + mutated.stderr
     assert "Selected and skipped negative control failed" in mutated.stdout + mutated.stderr
+
+
+def test_connector_secret_rotation_selects_candidate_runtime(tmp_path: Path) -> None:
+    positive = (
+        "charts/curie/ci/runtime/connector-secret-rotation-runtime.sh",
+        "cli/src/connectors.rs",
+        "apps/api/src/curie_api/bundles.py",
+        "apps/worker/src/curie_worker/connector_reconcile.py",
+        "packages/plugin-format/src/plugin_format/connector_render.py",
+        "pyproject.toml",
+        "uv.lock",
+    )
+    for path in positive:
+        completed, output = _invoke_selector(tmp_path, path)
+        assert completed.returncode == 0, completed.stderr
+        selected = json.loads(_outputs_of(output)["chart_scenarios"])
+        if "connector-secret-rotation" not in selected:
+            raise AssertionError("changed connector rotation input was not selected")
+    completed, output = _invoke_selector(tmp_path, "docs/agents.md")
+    assert completed.returncode == 0, completed.stderr
+    selected = json.loads(_outputs_of(output)["chart_scenarios"])
+    if "connector-secret-rotation" in selected:
+        raise AssertionError("an unrelated path selected connector rotation")
