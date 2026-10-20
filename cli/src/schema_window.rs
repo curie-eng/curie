@@ -262,7 +262,7 @@ pub fn parse_alembic_current_output(stdout: &str) -> Option<String> {
             continue;
         }
         let token = line.split_whitespace().next()?;
-        if !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric()) {
+        if !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Some(token.to_string());
         }
     }
@@ -464,6 +464,10 @@ print(json.dumps(graph))
             Some("0038")
         );
         assert_eq!(parse_alembic_current_output("INFO only\n"), None);
+        assert_eq!(
+            parse_alembic_current_output("selfimp_safety_0001 (head)\n").as_deref(),
+            Some("selfimp_safety_0001")
+        );
     }
 
     #[test]
@@ -565,7 +569,7 @@ print(json.dumps(graph))
         // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
         assert_eq!(candidate.schema_min, "0108");
-        assert_eq!(candidate.schema_head, "0108");
+        assert_eq!(candidate.schema_head, "selfimp_safety_0001");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -607,8 +611,8 @@ print(json.dumps(graph))
             assert!(!live_in_window(revision, &published_stable));
         }
         let candidate_release = window_for("0.13.0").expect("feature candidate is catalogued");
-        assert_eq!(candidate_release.schema_min, candidate.schema_min);
-        assert_eq!(candidate_release.schema_head, candidate.schema_head);
+        assert_eq!(candidate_release.schema_min, "0108");
+        assert_eq!(candidate_release.schema_head, "0108");
         assert!(live_in_window("0108", &candidate_release));
         assert!(!live_in_window("0100", &candidate_release));
         assert!(!live_in_window("0075", &candidate_release));

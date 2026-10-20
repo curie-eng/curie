@@ -249,6 +249,9 @@ class TurnStream:
                 frame = parse_ndjson_line(line)
                 if isinstance(frame, Final):
                     self._saw_final = True
+                    from .schedule_safety import remember_reported_usage
+
+                    remember_reported_usage(frame.input_tokens, frame.output_tokens)
                 yield frame
                 if isinstance(frame, Final):
                     # Final is terminal for every consumer, including evals that

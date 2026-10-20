@@ -128,7 +128,9 @@ def test_required_projection_column_missing_refuses(
     sql_dicts(f"ALTER TABLE curie.{table} RENAME COLUMN {column} TO renamed_required_column")
     with pytest.raises(RuntimeError, match="schema_structure_unavailable"):
         invoke()
-    assert sql_dicts("SELECT version_num FROM curie.alembic_version") == [{"version_num": "0108"}]
+    assert sql_dicts("SELECT version_num FROM curie.alembic_version") == [
+        {"version_num": "selfimp_safety_0001"}
+    ]
 
 
 @pytest.mark.parametrize(
@@ -146,7 +148,9 @@ def test_incompatible_actual_column_type_refuses(
     sql_dicts(f"ALTER TABLE curie.{table} ALTER COLUMN {column} TYPE {kind}")
     with pytest.raises(RuntimeError, match="schema_structure_unavailable"):
         invoke()
-    assert sql_dicts("SELECT version_num FROM curie.alembic_version") == [{"version_num": "0108"}]
+    assert sql_dicts("SELECT version_num FROM curie.alembic_version") == [
+        {"version_num": "selfimp_safety_0001"}
+    ]
 
 
 @pytest.mark.parametrize("mode", ["multiple", "empty", "missing"])

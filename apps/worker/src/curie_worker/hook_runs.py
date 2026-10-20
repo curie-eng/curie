@@ -38,6 +38,7 @@ HookRunReason = Literal[
     "live_session",
     "enqueue_failed",
     "claim_expired",
+    "daily_budget",
 ]
 
 logger = logging.getLogger(__name__)
@@ -262,6 +263,7 @@ class HookRunRecorder:
             )
         key = _parse_ref(ref)
         closed = False
+        notice: str | None = None
         try:
             async with self._engine.begin() as connection:
                 updated = (
@@ -284,6 +286,27 @@ class HookRunRecorder:
                 ).one_or_none()
                 if updated is not None:
                     closed = True
+                    from .schedule_safety import account_closed_run, take_reported_usage
+
+                    usage = take_reported_usage()
+                    input_tokens, output_tokens = usage if usage is not None else (None, None)
+                    model = (
+                        await connection.execute(
+                            text(f"SELECT model FROM {self._schema}.agents WHERE id = :agent_id"),
+                            {"agent_id": key.agent_id},
+                        )
+                    ).scalar()
+                    notice = await account_closed_run(
+                        connection,
+                        self._schema,
+                        agent_id=key.agent_id,
+                        name=key.name,
+                        outcome=outcome,
+                        when=key.slot_utc,
+                        model=model if isinstance(model, str) else None,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                    )
                 else:
                     existing = (
                         await connection.execute(
@@ -312,6 +335,14 @@ class HookRunRecorder:
                 code="backend",
             ) from exc
         if closed:
+            if notice:
+                try:
+                    from .schedule_safety import post_notice
+
+                    async with self._engine.connect() as connection:
+                        await post_notice(connection, self._schema, key.agent_id, notice)
+                except Exception:
+                    logger.exception("schedule pause notice failed after outcome commit")
             try:
                 record_metric(
                     "curie.schedule.fire",
