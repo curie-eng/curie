@@ -11,6 +11,10 @@
 //! https://kubernetes.io/docs/reference/labels-annotations-taints/#kubernetesiometadataname
 //! Secret data and resource versions follow the Kubernetes API:
 //! https://kubernetes.io/docs/reference/kubernetes-api/config-and-storage-resources/secret-v1/
+//! PVC and StatefulSet inventories and Secret timestamps follow the Kubernetes API:
+//! https://kubernetes.io/docs/reference/kubernetes-api/config-and-storage-resources/persistent-volume-claim-v1/
+//! https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/stateful-set-v1/
+//! https://kubernetes.io/docs/reference/kubernetes-api/common-definitions/object-meta/
 
 #![cfg(unix)]
 
@@ -253,6 +257,15 @@ if tool == 'kubectl':
     if 'rollout' in args or 'label' in args or 'patch' in args: print('fixture command completed'); sys.exit(0)
     if 'get' in args:
         ix = args.index('get'); kind = args[ix+1]; name = args[ix+2] if len(args) > ix+2 else ''
+        if kind == 'pvc' and args[ix:] == ['get','pvc','-n',ns,'-o','json','-l','app.kubernetes.io/instance='+release+',app.kubernetes.io/component in (postgres,clickhouse,rustfs,valkey)']:
+            emit({'apiVersion':'v1','kind':'PersistentVolumeClaimList','items':[]})
+        if kind == 'statefulset' and args[ix:] == ['get','statefulset','-n',ns,'-o','json']:
+            emit({'apiVersion':'apps/v1','kind':'StatefulSetList','items':[]})
+        if kind == 'secret' and name == 'sh.helm.release.v1.'+release+'.v1':
+            if args[ix:] != ['get','secret',name,'-n',ns,'-o','json']:
+                print('unexpected fixture command: '+tool+' '+str(args), file=sys.stderr)
+                sys.exit(64)
+            emit({'apiVersion':'v1','kind':'Secret','type':'helm.sh/release.v1','metadata':{'name':name,'namespace':ns,'creationTimestamp':'2026-10-17T10:00:00Z','labels':{'owner':'helm','name':release,'version':'1','status':'failed'}}})
         if kind == 'runtimeclass': print('Error from server (Forbidden): runtimeclasses.node.k8s.io "'+name+'" is forbidden: User "fixture" cannot get resource "runtimeclasses" in API group "node.k8s.io" at the cluster scope', file=sys.stderr); sys.exit(1)
         if kind == 'apiservices.apiregistration.k8s.io': emit({'apiVersion':'v1','kind':'List','items':[]})
         if kind == 'pvc' and args[ix+2:] == ['-n',ns,'-o','json','-l','app.kubernetes.io/instance='+release+',app.kubernetes.io/component in (postgres,clickhouse,rustfs,valkey)']:
