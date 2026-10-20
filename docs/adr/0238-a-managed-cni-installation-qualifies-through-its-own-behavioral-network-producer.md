@@ -2,12 +2,14 @@
 
 Date: 2026-10-19
 
-Status: Draft
+Status: Accepted
 
-This draft proposes the managed cloud CNI producer and the production
+Accepted on 2026-10-20 with explicit maintainer approval.
+
+This decides the managed cloud CNI producer and the production
 installation form that
 [ADR 0236](0236-the-commissioning-operator-splits-provisioner-and-control-processes.md)
-leaves open. It does not authorize implementation while Draft.
+leaves open.
 
 Ref [#4557](https://github.com/curie-eng/curie/issues/4557).
 
