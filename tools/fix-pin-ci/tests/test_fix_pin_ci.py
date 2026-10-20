@@ -17,7 +17,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -1037,7 +1037,7 @@ def _load_ci() -> dict[str, Any]:
 
 
 def _workflow_trigger(document: dict[str, Any]) -> dict[str, Any]:
-    trigger = document.get("on", document.get(True))
+    trigger = document.get("on", cast(dict[object, Any], document).get(True))
     assert isinstance(trigger, dict), "ci.yaml must declare an on mapping"
     return trigger
 
@@ -1126,6 +1126,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         "python-container-fixtures",
         "python-dry-run-fixture",
         "python-static",
+        "ci-policy",
     ]
     assert job.get("if") == "always()", "the required Python check must not be skippable"
     shard_job, steps = _python_job(document, "python-pytest")
@@ -1194,6 +1195,21 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         ("--ignore", "tools/factory-e2e/tests/test_c4_tracker_scope.py"),
         ("--ignore", "examples/tests/test_sre_bot_observability_runtime.py"),
         ("--ignore", "tools/factory-e2e/tests/test_c4_dry_run.py"),
+        ("--ignore", "tools/ci-retry-gate"),
+        ("--ignore", "tools/ci-workflow-paths"),
+        ("--ignore", "tools/ci-release-target-parity"),
+        ("--ignore", "tools/e2e-ci-selection"),
+        ("--ignore", "tools/helm-ci-gate"),
+        ("--ignore", "tools/fix-pin-ci"),
+        ("--ignore", "tools/p0-closes-ci"),
+        ("--ignore", "tools/runtime-assertion-gate"),
+        ("--ignore", "tools/dependency-audit-paths"),
+        ("--ignore", "tools/close-on-next"),
+    }
+    runtime_exclusions |= {
+        ("--ignore-glob", f"{path}/tests/*")
+        for option, path in runtime_exclusions
+        if option == "--ignore" and not path.endswith(".py")
     }
 
     def assert_full_suite(command: list[str], shard: int, deselect: str) -> None:
@@ -1218,17 +1234,17 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         excluded = []
         reporting = []
         for argument in arguments:
-            if argument in {"--ignore", "--deselect"}:
+            if argument in {"--ignore", "--ignore-glob", "--deselect"}:
                 path = next(arguments, None)
                 assert path is not None, f"{argument} requires a path"
                 excluded.append((argument, path))
-            elif argument.startswith(("--ignore=", "--deselect=")):
+            elif argument.startswith(("--ignore=", "--ignore-glob=", "--deselect=")):
                 option, path = argument.split("=", 1)
                 excluded.append((option, path))
             else:
                 reporting.append(argument)
         assert len(excluded) == len(runtime_exclusions) and set(excluded) == runtime_exclusions, (
-            "the Python suite must use exactly the required kind runtime exclusions, "
+            "the Python suite must use exactly the required runtime and CI policy exclusions, "
             f"got {excluded!r}"
         )
         report_chars = set("fEsxXpPaAR")
@@ -1275,10 +1291,10 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
                     with pytest.raises(AssertionError):
                         assert_full_suite([*pytest_command, *mutation], shard, deselect)
                 for missing_option, missing_path in runtime_exclusions:
-                    reduced = []
+                    reduced: list[str] = []
                     arguments = iter(pytest_command)
                     for argument in arguments:
-                        if argument in {"--ignore", "--deselect"}:
+                        if argument in {"--ignore", "--ignore-glob", "--deselect"}:
                             path = next(arguments)
                             if (argument, path) != (missing_option, missing_path):
                                 reduced.extend((argument, path))

@@ -8,9 +8,17 @@ on:
     # Commit events only. A title or body edit must not cancel an in-flight
     # run and restart kind shards. Body-edit guards live in their own workflows.
     types: [opened, synchronize, reopened]
-  # Manual run of the full suite, including kind. The scheduled workflow on
-  # the default branch dispatches this against main or next.
+  # Manual run of the full suite. nightly selects the three nightly kind
+  # jobs. The scheduled workflow on the default branch dispatches this
+  # against main or next. A release dispatch omits inputs, so nightly stays
+  # false and those three jobs do not run.
   workflow_dispatch:
+    inputs:
+      nightly:
+        description: Run the nightly kind jobs
+        required: false
+        type: boolean
+        default: false
 
 # The event name is part of the group so a dispatch is not cancelled by a
 # push to that ref. A pull request or dispatch supersedes its own in-flight
@@ -130,10 +138,56 @@ jobs:
           print(f"Verified {checked} third party action references")
           PY
 
+  ci-policy:
+    name: CI policy (workflow meta-tests)
+    needs: [changes]
+    if: ${{ needs.changes.outputs.ci_policy == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: "3.13"
+      - name: Sync workspace
+        run: uv sync
+      - name: Pytest
+        env:
+          CI_POLICY_FILES: ${{ needs.changes.outputs.ci_policy_files }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$CI_POLICY_FILES" || "$CI_POLICY_FILES" == ,* || "$CI_POLICY_FILES" == *, || "$CI_POLICY_FILES" == *,,* || "$CI_POLICY_FILES" =~ [[:space:]] ]]; then
+            echo "CI policy requires a nonempty comma-separated list of test files" >&2
+            exit 1
+          fi
+          IFS=, read -r -a ci_policy_files <<< "$CI_POLICY_FILES"
+          for path in "${ci_policy_files[@]}"; do
+            if [[ ! "$path" =~ ^tools/[A-Za-z0-9_-]+/tests/([A-Za-z0-9_-]+/)*test_[A-Za-z0-9_-]+\.py$ || ! -f "$path" ]]; then
+              echo "CI policy requires valid existing test files" >&2
+              exit 1
+            fi
+          done
+          uv run pytest -q -n 4 -rsR "${ci_policy_files[@]}"
+
   # The suite runs as six parallel shards, each with its own runner and dev
   # stack. Container fixtures run in `python-container-fixtures`, the kind dry
-  # run regression runs in `python-dry-run-fixture`, and static gates run in
-  # `python-static`. The required `Python (ruff + mypy + pytest)` job below
+  # run regression in `python-dry-run-fixture`, static gates in `python-static`,
+  # and workflow meta-tests in `ci-policy`. The required Python job below
   # aggregates all of them.
   python-pytest:
     name: Python pytest (shard ${{ matrix.shard }}/6)
@@ -272,6 +326,21 @@ jobs:
           pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_tracker_scope.py)
           pytest_args+=(--ignore examples/tests/test_sre_bot_observability_runtime.py)
           pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_dry_run.py)
+          ci_policy_dirs=(
+            tools/ci-retry-gate
+            tools/ci-workflow-paths
+            tools/ci-release-target-parity
+            tools/e2e-ci-selection
+            tools/helm-ci-gate
+            tools/fix-pin-ci
+            tools/p0-closes-ci
+            tools/runtime-assertion-gate
+            tools/dependency-audit-paths
+            tools/close-on-next
+          )
+          for directory in "${ci_policy_dirs[@]}"; do
+            pytest_args+=(--ignore "$directory" --ignore-glob "$directory/tests/*")
+          done
           if [[ -n "$PYTEST_DESELECT" ]]; then
             IFS=, read -r -a deselect_files <<< "$PYTEST_DESELECT"
             for path in "${deselect_files[@]}"; do
@@ -281,6 +350,16 @@ jobs:
           if [[ "$PYTEST_SCOPE" == "cli" ]]; then
             mapfile -t cli_pytest_files < tools/e2e-ci-selection/cli_pytest_files.txt
             for path in "${cli_pytest_files[@]}"; do
+              ci_policy_file=false
+              for directory in "${ci_policy_dirs[@]}"; do
+                if [[ "$path" == "$directory/"* ]]; then
+                  ci_policy_file=true
+                  break
+                fi
+              done
+              if [[ "$ci_policy_file" == "true" ]]; then
+                continue
+              fi
               if [[ "$path" != "tools/factory-e2e/tests/test_c4_initial_binding.py" && "$path" != "tools/factory-e2e/tests/test_c4_static_token_rotation.py" && "$path" != "tools/factory-e2e/tests/test_c4_upgrade_migration.py" && "$path" != "tools/factory-e2e/tests/test_c4_held_cancellation.py" && "$path" != "tools/factory-e2e/tests/test_c4_cluster_up.py" && "$path" != "tools/factory-e2e/tests/test_c4_forge_instances.py" && "$path" != "tools/factory-e2e/tests/test_c4_tracker_scope.py" && "$path" != "examples/tests/test_sre_bot_observability_runtime.py" && "$path" != "tools/factory-e2e/tests/test_c4_dry_run.py" ]]; then
                 pytest_args+=("$path")
               fi
@@ -647,9 +726,10 @@ jobs:
     # running (and so reporting the required check) whatever the shards did.
     # A failed or cancelled shard fails the aggregate step below, and so does a
     # skipped shard job unless `changes` selected no pytest (#3858). It checks
-    # the container fixtures and the dry run fixture against that selection and
-    # requires `python-static` to succeed.
-    needs: [changes, python-pytest, python-container-fixtures, python-dry-run-fixture, python-static]
+    # the container fixtures and dry run fixture against that selection,
+    # requires `python-static` to succeed, and checks `ci-policy` against its
+    # own selection.
+    needs: [changes, python-pytest, python-container-fixtures, python-dry-run-fixture, python-static, ci-policy]
     if: always()
     runs-on: ubuntu-latest
     # A job-level block REPLACES the workflow-level one, so `contents: read` is
@@ -697,6 +777,8 @@ jobs:
           SHARDS_RESULT: ${{ needs.python-pytest.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           CONTAINER_RESULT: ${{ needs.python-container-fixtures.result }}
+          CI_POLICY_SELECTED: ${{ needs.changes.outputs.ci_policy }}
+          CI_POLICY_RESULT: ${{ needs.ci-policy.result }}
           CONTAINER_SELECTED: >-
             ${{ needs.changes.outputs.pytest == 'true' &&
                 (!contains(format(',{0},', needs.changes.outputs.pytest_deselect), ',tools/factory-e2e/tests/test_c4_tracker_scope.py,') ||
@@ -711,6 +793,18 @@ jobs:
           set -euo pipefail
           if [[ "$CHANGES_RESULT" != "success" ]]; then
             echo "the changes job finished $CHANGES_RESULT; pytest selection cannot be trusted" >&2
+            exit 1
+          fi
+          if [[ "$CI_POLICY_SELECTED" == "true" ]]; then
+            ci_policy_expected=success
+          elif [[ "$CI_POLICY_SELECTED" == "false" ]]; then
+            ci_policy_expected=skipped
+          else
+            echo "CI policy selection must be true or false, got ${CI_POLICY_SELECTED:-<empty>}" >&2
+            exit 1
+          fi
+          if [[ "$CI_POLICY_RESULT" != "$ci_policy_expected" ]]; then
+            echo "CI policy finished ${CI_POLICY_RESULT:-<empty>}; expected $ci_policy_expected" >&2
             exit 1
           fi
           if [[ "$PYTEST_SELECTED" != "true" && "$PYTEST_SELECTED" != "false" ]]; then
@@ -2689,6 +2783,8 @@ jobs:
       pytest: ${{ steps.filter.outputs.pytest }}
       pytest_deselect: ${{ steps.filter.outputs.pytest_deselect }}
       pytest_scope: ${{ steps.filter.outputs.pytest_scope }}
+      ci_policy: ${{ steps.filter.outputs.ci_policy }}
+      ci_policy_files: ${{ steps.filter.outputs.ci_policy_files }}
       version_only: ${{ steps.filter.outputs.version_only }}
       factory: ${{ steps.filter.outputs.factory }}
       approval_resume: ${{ steps.filter.outputs.approval_resume }}
@@ -3322,7 +3418,7 @@ jobs:
     name: Forge instance regression (kind, ${{ matrix.suite }})
     runs-on: ubuntu-latest
     needs: [changes]
-    if: ${{ needs.changes.outputs.factory == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.nightly == true && needs.changes.outputs.factory == 'true' }}
     timeout-minutes: 165
     strategy:
       fail-fast: false
@@ -3687,8 +3783,7 @@ jobs:
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh
       - name: Quota progress regression
-        # Temporarily disabled pending idle-capacity runtime repair (#4740).
-        if: ${{ false }}
+        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
         timeout-minutes: 30
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
@@ -3717,18 +3812,16 @@ jobs:
           path: ${{ runner.temp }}/runtime-assertion-receipts
           if-no-files-found: ignore
 
-  # ROLLOUT-FREE FIRST INVOCATION AND DEAD-CONSUMER RECOVERY (QA4-02), off the
-  # pull request path. It needs a full platform install of its own, which on a
-  # pull request would sit on the cluster rung's critical path. It runs on every
-  # dispatch of main or next (nightly-kind.yaml), whenever the cluster tier is
-  # selected. The pull request cluster rung still drives the first no-Slack
-  # `cluster message` through the parity ladder; this job adds the rollout-free
-  # and PEL recovery assertions.
+  # ROLLOUT-FREE FIRST INVOCATION AND DEAD-CONSUMER RECOVERY (QA4-02). It needs
+  # a full platform install of its own. It runs on a nightly dispatch whenever
+  # the cluster tier is selected. The pull request cluster rung still drives
+  # the first no-Slack `cluster message` through the parity ladder; this job
+  # adds the rollout-free and PEL recovery assertions.
   e2e-cluster-rollout-recovery:
     name: E2E rollout-free invocation and dead-consumer recovery (kind)
     runs-on: ubuntu-latest
     needs: [rust-build, changes, ci-images]
-    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.cluster == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.nightly == true && needs.changes.outputs.cluster == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -4228,7 +4321,7 @@ jobs:
     name: E2E released chart upgrade (released install to candidate)
     runs-on: ubuntu-latest
     needs: [rust-build, changes, ci-images]
-    if: ${{ needs.changes.outputs.released_upgrade_full == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.nightly == true && needs.changes.outputs.released_upgrade_full == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -5145,6 +5238,7 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           REGISTRATION_RESULT: ${{ needs.runtime-assertion-registration.result }}
           EVENT_NAME: ${{ github.event_name }}
+          NIGHTLY: ${{ inputs.nightly }}
           SKILL_SELECTED: ${{ needs.changes.outputs.skill }}
           LOCAL_SELECTED: ${{ needs.changes.outputs.local }}
           LOCAL_RELEASE_SELECTED: ${{ needs.changes.outputs.local_release }}
@@ -5180,7 +5274,7 @@ jobs:
                   "$ROLLOUT_RECOVERY_RESULT" != "$rollout_recovery_expected" ||
                   "$APPROVAL_RESUME_RESULT" != "$approval_resume_expected" ||
                   "$FACTORY_RESULT" != "$factory_expected" ||
-                  "$FORGE_INSTANCE_RESULT" != "$factory_expected" ||
+                  "$FORGE_INSTANCE_RESULT" != "$forge_instance_expected" ||
                   "$ADMITTED_AGENT_RESULT" != "$factory_expected" ||
                   "$RELEASED_UPGRADE_RESULT" != "$released_upgrade_expected" ||
                   "$RELEASED_UPGRADE_NEGATIVE_RESULT" != "$released_upgrade_negative_expected" ||
@@ -5229,9 +5323,15 @@ jobs:
           if [[ "$CHART_SCENARIOS" != "[]" ]]; then
             cluster_chart_expected="success"
           fi
-          # Mirrors the rollout recovery job's if: pushes and dispatches only.
+          # Nightly is the workflow_dispatch input. Pull requests and pushes
+          # leave it empty, which is not a nightly dispatch.
+          nightly_dispatch="false"
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$NIGHTLY" == "true" ]]; then
+            nightly_dispatch="true"
+          fi
+          # Mirrors the rollout recovery job's if: nightly dispatch and cluster.
           rollout_recovery_expected="skipped"
-          if [[ "$CLUSTER_SELECTED" == "true" && "$EVENT_NAME" != "pull_request" ]]; then
+          if [[ "$nightly_dispatch" == "true" && "$CLUSTER_SELECTED" == "true" ]]; then
             rollout_recovery_expected="success"
           fi
           # Mirrors the approval resume job's if (#4016), pull requests included.
@@ -5239,16 +5339,21 @@ jobs:
           if [[ "$APPROVAL_RESUME_SELECTED" == "true" ]]; then
             approval_resume_expected="success"
           fi
-          # Mirrors the scripted factory and forge instance jobs' if, pull requests
-          # included.
+          # Scripted factory and admitted agent stay on factory selection.
+          # Forge instance runs only on a nightly dispatch that selected factory.
           factory_expected="skipped"
           if [[ "$FACTORY_SELECTED" == "true" ]]; then
             factory_expected="success"
           fi
-          # Dispatches run the positive upgrade. Every selected upgrade tier
-          # runs its negative control and all selected matrix shards.
+          forge_instance_expected="skipped"
+          if [[ "$nightly_dispatch" == "true" && "$FACTORY_SELECTED" == "true" ]]; then
+            forge_instance_expected="success"
+          fi
+          # The positive upgrade runs only on a nightly dispatch that selected
+          # the full history. Every selected upgrade tier still runs its
+          # negative control and all selected matrix shards.
           released_upgrade_expected="skipped"
-          if [[ "$RELEASED_UPGRADE_FULL" == "true" ]]; then
+          if [[ "$nightly_dispatch" == "true" && "$RELEASED_UPGRADE_FULL" == "true" ]]; then
             released_upgrade_expected="success"
           fi
           released_upgrade_negative_expected="skipped"

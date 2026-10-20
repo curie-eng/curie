@@ -65,9 +65,10 @@ including streamed text, and submits it to
 `POST /v1/internal/remediation/nominations` with the turn's event id
 ([`apps/api/src/curie_api/routers/remediation_nominations.py::submit_remediation_nominations`](../apps/api/src/curie_api/routers/remediation_nominations.py)).
 The capture half is the protected worker's runner client wrapper
-(AUTOMATED-REMEDIATION-6, plan task 14), which reads the same vector. Until it
-ships no turn can submit a block, though the route and the parser exist. The
-block still stays in the protected conversation's own history, and a later turn
+([`apps/worker/src/curie_worker/protected_nomination.py`](../apps/worker/src/curie_worker/protected_nomination.py),
+AUTOMATED-REMEDIATION-6), which reads the same vector. It applies to turns the
+protected worker runs; a turn of an ordinary hook is not captured and its fence
+is plain text. The block still stays in the protected conversation's own history, and a later turn
 that repeats an old block makes a new submission, evaluated afresh. The
 agent, hook, policy generation and reply surface are resolved by the platform
 from the protected delivery's binding, never from the block. The first accepted

@@ -65,6 +65,7 @@ RETRY_ALLOWLIST = frozenset(
         ),
         ("ci.yaml", "python-static", "Install uv"),
         ("ci.yaml", "python-pytest", "Install uv"),
+        ("ci.yaml", "ci-policy", "Install uv"),
         ("ci.yaml", "turn-canary-contract", "Install uv"),
         ("fix-pin.yaml", "fix-pin", "Install uv"),
         (
@@ -206,6 +207,7 @@ RETRY_ALLOWLIST = frozenset(
 PROTECTED_STEPS = frozenset(
     {
         ("ci.yaml", "python-pytest", "Pytest"),
+        ("ci.yaml", "ci-policy", "Pytest"),
         ("ci.yaml", "python-container-fixtures", "Pytest"),
         ("ci.yaml", "python-dry-run-fixture", "Pytest"),
         ("ci.yaml", "python-static", "Docs gate (catalog drift + agent contract + citations)"),
@@ -917,7 +919,7 @@ def test_grouped_acquisition_names_and_trios() -> None:
             assert f"no `{missing}` step" in _trio_problems(base, _locate_trio(reduced, base))
 
 
-def test_a_grouped_proof_retry_is_rejected(monkeypatch) -> None:
+def test_a_grouped_proof_retry_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     base = "Toolchain: Repository toolchain proof"
     assert ("ci.yaml", "image-proofs", base) in PROTECTED_STEPS
     retry = ("ci.yaml", "image-proofs", 0, {"name": base + RETRY_SUFFIX})

@@ -820,6 +820,10 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
         "--ignore", CONTAINER_FILES[0],
         "--ignore", CONTAINER_FILES[1],
         "--ignore", DRY_RUN_FILE,
+        *(
+            argument for directory in PYTEST_TESTS.CI_POLICY_DIRS
+            for argument in ("--ignore", directory, "--ignore-glob", f"{directory}/tests/*")
+        ),
     ]
     if deselect:
         for path in deselect.split(","):
@@ -830,7 +834,11 @@ def test_pytest_step_passes_cli_files_only_in_cli_scope(
         assert set(CONTAINER_FILES) <= set(files)
         assert DRY_RUN_FILE in files
         expected.extend(
-            path for path in files if path not in (*KIND_MODULES, *CONTAINER_FILES, DRY_RUN_FILE)
+            path for path in files
+            if path not in (*KIND_MODULES, *CONTAINER_FILES, DRY_RUN_FILE)
+            and not any(
+                path.startswith(directory + "/") for directory in PYTEST_TESTS.CI_POLICY_DIRS
+            )
         )
     arguments = PYTEST_TESTS._run_pytest_step(tmp_path, shard=shard, deselect=deselect, scope=scope)
     assert arguments == expected
@@ -895,6 +903,10 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
         "--ignore", CONTAINER_FILES[0],
         "--ignore", CONTAINER_FILES[1],
         "--ignore", DRY_RUN_FILE,
+        *(
+            argument for directory in PYTEST_TESTS.CI_POLICY_DIRS
+            for argument in ("--ignore", directory, "--ignore-glob", f"{directory}/tests/*")
+        ),
         "--deselect", deselect,
     ]
     if scope == "cli":
@@ -902,6 +914,9 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
             path
             for path in (tmp_path / LIST_PATH).read_text().splitlines()
             if path not in (*KIND_MODULES, *CONTAINER_FILES, DRY_RUN_FILE)
+            and not any(
+                path.startswith(directory + "/") for directory in PYTEST_TESTS.CI_POLICY_DIRS
+            )
         )
     assert recorded["argv"] == expected
 
@@ -910,7 +925,7 @@ def test_pytest_step_keeps_scope_out_of_child_environment(tmp_path: Path, scope:
 def test_pytest_aggregator_accepts_matching_scope(tmp_path: Path, scope: str) -> None:
     deselect = SELECTION_TESTS.SRE_RUNTIME
     result = PYTEST_TESTS._run_pytest_aggregate(
-        tmp_path,
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
         container_result="success",
         selected="true",
         scope=scope,
@@ -934,7 +949,7 @@ def test_pytest_aggregator_rejects_independent_scope_disagreement(
 ) -> None:
     other = "full" if scope == "cli" else "cli"
     result = PYTEST_TESTS._run_pytest_aggregate(
-        tmp_path,
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
         container_result="skipped" if selected == "false" else "success",
         selected=selected,
         scope=scope,
@@ -959,7 +974,13 @@ def test_pytest_aggregator_rejects_shard_scope_disagreement(
     shards = PYTEST_TESTS._all_shards("true", "success", scope=scope)
     shards[shard] = ("true", "success", "success", "", "full" if scope == "cli" else "cli")
     result = PYTEST_TESTS._run_pytest_aggregate(
-        tmp_path, container_result="success", selected="true", scope=scope, shards=shards
+        tmp_path,
+        ci_policy_selected="false",
+        ci_policy_result="skipped",
+        container_result="success",
+        selected="true",
+        scope=scope,
+        shards=shards,
     )
     assert result.returncode == 1, result.stdout + result.stderr
     assert f"shard {shard}" in result.stderr
@@ -968,7 +989,7 @@ def test_pytest_aggregator_rejects_shard_scope_disagreement(
 @pytest.mark.parametrize("results_dir", [False, True])
 def test_pytest_aggregator_accepts_full_scope_skip(tmp_path: Path, results_dir: bool) -> None:
     result = PYTEST_TESTS._run_pytest_aggregate(
-        tmp_path,
+        tmp_path, ci_policy_selected="false", ci_policy_result="skipped",
         container_result="skipped",
         selected="false",
         scope="full",
