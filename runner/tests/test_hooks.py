@@ -22,6 +22,7 @@ from curie_runner.mcp_tool_capability import (
     McpToolCapabilityProbe,
 )
 from curie_runner.progress import PROGRESS_TOKEN_ENV, PROGRESS_URL_ENV
+from runner_boot_session import initialized_session_sync
 
 
 def _factory_session_options(tmp_path, monkeypatch, *, progress_url=None, progress_token=None):
@@ -53,7 +54,7 @@ def _factory_session_options(tmp_path, monkeypatch, *, progress_url=None, progre
             tool_count=0,
         ),
     )
-    return runner._factory()._options
+    return initialized_session_sync(runner)._options
 
 
 def test_factory_progress_credentials_wire_foreground_guard_into_session_options(
