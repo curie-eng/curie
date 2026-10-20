@@ -467,6 +467,13 @@ def _resolvable(argv0: str, workspace: Path) -> bool:
     return shutil.which(argv0) is not None
 
 
+async def _kill_group_and_reap(process: asyncio.subprocess.Process) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(process.pid, signal.SIGKILL)
+    if process.returncode is None:
+        await asyncio.shield(process.wait())
+
+
 async def _run(
     argv: tuple[str, ...],
     workspace: Path,
@@ -478,11 +485,14 @@ async def _run(
 
     if not _resolvable(argv[0], workspace):
         return _Result("unavailable", missing=(_binary_name(argv[0]),))
-    try:
-        # An asyncio child in its own process group, not subprocess.run on a
-        # worker thread: a thread cannot be cancelled, so shutting down during
-        # a held check waited out the whole timeout (#4777).
-        process = await asyncio.create_subprocess_exec(
+    # An asyncio child in its own process group, not subprocess.run on a
+    # worker thread: a thread cannot be cancelled, so shutting down during
+    # a held check waited out the whole timeout (#4777). Creation runs as its
+    # own task behind a shield: a cancel that lands mid-spawn would otherwise
+    # skip the group kill below, and asyncio's own cleanup kills only the
+    # leader, so descendants of the new group could survive (#4777).
+    creation = asyncio.ensure_future(
+        asyncio.create_subprocess_exec(
             *argv,
             cwd=workspace,
             env=env,
@@ -490,6 +500,18 @@ async def _run(
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
+    )
+    try:
+        process = await asyncio.shield(creation)
+    except asyncio.CancelledError:
+        # Spawning cannot be interrupted safely, so let it finish, then take
+        # down whatever it started before propagating the cancellation.
+        while not creation.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait([creation])
+        if not creation.cancelled() and creation.exception() is None:
+            await _kill_group_and_reap(creation.result())
+        raise
     except OSError as exc:
         # ``which`` and process creation can race if the image is changing.
         # Do not expose arbitrary exception text in the progress record.
@@ -531,10 +553,7 @@ async def _run(
         # and keep the output pipes open, and it would survive a timeout or
         # cancellation if only a live leader triggered the kill. An already
         # empty group (the normal completed run) raises ProcessLookupError.
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(process.pid, signal.SIGKILL)
-        if process.returncode is None:
-            await asyncio.shield(process.wait())
+        await _kill_group_and_reap(process)
     if process.returncode == 0:
         return _Result("passed", exit_status=0)
     output = f"{_subprocess_text(bytes(stdout))}\n{_subprocess_text(bytes(stderr))}"
