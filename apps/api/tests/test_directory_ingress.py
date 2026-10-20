@@ -458,3 +458,106 @@ def test_invalid_later_person_rolls_back_earlier_projection_and_links(
         {"tenant": uuid.UUID(tenant_id)},
     )
     assert failures == [{"details": {"epoch": 0, "error": "invalid_snapshot"}}]
+
+
+def test_http_directory_email_links_resolve_only_under_current_configured_issuer(
+    directory_client: TestClient,
+) -> None:
+    import asyncio
+
+    from curie_api.team_authorization import resolve_email
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    client = directory_client
+    tenant_id, team_id, _, admin = setup_directory(client)
+    namespace_id, token = namespace_credential(
+        client, tenant_id, team_id, admin, "example.com", "email"
+    )
+    path = f"/directory/teams/{team_id}/snapshot"
+    snapshot = {
+        "expected_epoch": 0,
+        "complete": True,
+        "people": [{"subject": "mailbox-person", "email": "person@example.com", "accounts": []}],
+    }
+    assert (
+        client.put(path, json=snapshot, headers={"X-Curie-Directory-Credential": token}).status_code
+        == 200
+    )
+
+    async def resolve():
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                return await resolve_email(
+                    session, tenant_id=uuid.UUID(tenant_id), email="person@example.com"
+                )
+        finally:
+            await engine.dispose()
+
+    first_person = asyncio.run(resolve())
+    assert first_person is not None
+    updated = {
+        "issuer": "https://new-idp.example.com",
+        "governed_domains": ["example.com"],
+        "managed_by": "example-adapter",
+        "expected_version": 1,
+    }
+    assert (
+        client.put(f"/directory/config/{tenant_id}", json=updated, headers=admin).status_code == 200
+    )
+    assert asyncio.run(resolve()) is None
+    refused = client.post(
+        "/directory/credentials",
+        json={
+            "tenant_id": tenant_id,
+            "expected_config_version": 2,
+            "team_ids": [team_id],
+            "namespace_ids": [namespace_id],
+        },
+        headers=admin,
+    )
+    assert refused.status_code == 403
+    hostile = client.post(
+        "/directory/namespaces",
+        json={
+            "tenant_id": tenant_id,
+            "provider": "email",
+            "kind": "email_domain",
+            "key": "example.com",
+            "authority": "https://other-idp.example.com",
+        },
+        headers=admin,
+    )
+    assert hostile.status_code == 422
+    fresh = client.post(
+        "/directory/namespaces",
+        json={
+            "tenant_id": tenant_id,
+            "provider": "email",
+            "kind": "email_domain",
+            "key": "example.com",
+        },
+        headers=admin,
+    )
+    assert fresh.status_code == 201 and fresh.json()["id"] != namespace_id
+    credential = client.post(
+        "/directory/credentials",
+        json={
+            "tenant_id": tenant_id,
+            "expected_config_version": 2,
+            "team_ids": [team_id],
+            "namespace_ids": [fresh.json()["id"]],
+        },
+        headers=admin,
+    )
+    assert credential.status_code == 201, credential.text
+    snapshot["expected_epoch"] = 1
+    assert (
+        client.put(
+            path,
+            json=snapshot,
+            headers={"X-Curie-Directory-Credential": credential.json()["credential"]},
+        ).status_code
+        == 200
+    )
+    assert asyncio.run(resolve()) not in {None, first_person}

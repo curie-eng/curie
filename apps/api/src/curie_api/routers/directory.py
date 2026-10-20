@@ -409,15 +409,17 @@ async def provision_directory_namespace(
             body.kind == "email_domain"
             and body.provider == "email"
             and body.key in config.governed_domains
-            and body.authority == ""
+            and body.authority in {"", config.issuer}
         )
         if not valid:
             raise directory_sync.DirectorySyncError("invalid_namespace")
+        # Email authority is the configured IdP, never a caller-chosen mapping.
+        authority = config.issuer if body.kind == "email_domain" else body.authority
         namespace = await session.scalar(
             select(IdentityNamespace).where(
                 IdentityNamespace.tenant_id == body.tenant_id,
                 IdentityNamespace.provider == body.provider,
-                IdentityNamespace.authority == body.authority,
+                IdentityNamespace.authority == authority,
                 IdentityNamespace.kind == body.kind,
                 IdentityNamespace.key == body.key,
             )
@@ -426,7 +428,7 @@ async def provision_directory_namespace(
             namespace = IdentityNamespace(
                 tenant_id=body.tenant_id,
                 provider=body.provider,
-                authority=body.authority,
+                authority=authority,
                 kind=body.kind,
                 key=body.key,
             )

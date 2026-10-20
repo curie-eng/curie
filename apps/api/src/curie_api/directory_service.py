@@ -119,7 +119,9 @@ async def scoped_namespaces(
     if len(rows) != len(claims.namespace_ids):
         raise directory_sync.DirectorySyncError("namespace_out_of_scope")
     for row in rows:
-        if row.kind == "email_domain" and row.key not in config.governed_domains:
+        if row.kind == "email_domain" and (
+            row.key not in config.governed_domains or row.authority != config.issuer
+        ):
             raise directory_sync.DirectorySyncError("namespace_out_of_scope")
     return {row.id: row for row in rows}
 
