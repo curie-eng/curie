@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable
 import pytest
 from curie_api import directory_sync as sync
 from curie_api.config import get_settings
-from curie_api.models import Principal, PrincipalTeam, Team, Tenant
+from curie_api.models import IdentityAuditEvent, Principal, PrincipalTeam, Team, Tenant
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
@@ -346,7 +346,7 @@ def test_two_snapshot_writers_cannot_restore_a_removed_member(migrated: None) ->
                 from sqlalchemy import delete
 
                 async with engine.begin() as conn:
-                    for model in (PrincipalTeam, Team, Principal, Tenant):
+                    for model in (IdentityAuditEvent, PrincipalTeam, Team, Principal, Tenant):
                         key = model.id if model is Tenant else model.tenant_id
                         await conn.execute(delete(model).where(key == tenant_id))
             await engine.dispose()

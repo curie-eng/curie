@@ -2,8 +2,8 @@
 
 This is a transaction primitive, not a remotely exposed ingestion API. A
 DirectoryScope is supplied only by a trusted in-process caller; constructing
-one is not authentication. Credential verification and identity audit must be
-provided before exposing this primitive to a directory adapter.
+one is not authentication. The directory router verifies a scoped credential
+before calling this primitive. Audit rows share each projection transaction.
 
 The caller owns the transaction and commits on success. Each operation uses a
 savepoint so a failed write cannot leave a partially replaced team in a caller
@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from . import identity_audit
 from .models import Principal, PrincipalTeam, Team
 
 MAX_MEMBERS = 10_000
@@ -163,6 +164,14 @@ async def apply_snapshot(
         )
         team.epoch, team.member_count, team.digest = epoch, len(ids), digest
         team.last_synced_at, team.last_attempt_at, team.last_error = now, now, None
+        identity_audit.record(
+            session,
+            tenant_id=scope.tenant_id,
+            event_type="identity.directory_snapshot_applied",
+            actor=scope.managed_by,
+            team_id=team.id,
+            details={"epoch": epoch, "member_count": len(ids), "digest": digest},
+        )
         await session.flush()
     return SnapshotResult(epoch, len(ids), digest)
 
@@ -181,6 +190,14 @@ async def record_failure(
     async with session.begin_nested():
         team = await locked_team(session, scope, team_id, expected_epoch)
         team.last_attempt_at, team.last_error = datetime.now(UTC), error
+        identity_audit.record(
+            session,
+            tenant_id=scope.tenant_id,
+            event_type="identity.directory_sync_failed",
+            actor=scope.managed_by,
+            team_id=team.id,
+            details={"epoch": team.epoch, "error": error},
+        )
         await session.flush()
 
 
@@ -215,5 +232,13 @@ async def set_account_status(
         principal.status = status
         principal.authorization_version += 1
         version = principal.authorization_version
+        identity_audit.record(
+            session,
+            tenant_id=scope.tenant_id,
+            event_type="identity.account_status_changed",
+            actor=scope.managed_by,
+            principal_id=principal.id,
+            details={"authorization_version": version, "status": status},
+        )
         await session.flush()
     return version
