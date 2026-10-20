@@ -105,7 +105,14 @@ def test_issue_hashes_short_lived_token_and_limits_account(migrated: None) -> No
         assert row.identity_namespace_id == ns.id
         assert timedelta(minutes=9) < row.expires_at - datetime.now(UTC) <= timedelta(minutes=10)
         assert await issue(s, tenant) is None
-        assert await s.scalar(select(func.count()).select_from(IdentityConnectToken)) == 1
+        assert (
+            await s.scalar(
+                select(func.count())
+                .select_from(IdentityConnectToken)
+                .where(IdentityConnectToken.tenant_id == tenant.id)
+            )
+            == 1
+        )
 
     run(body)
 
@@ -231,11 +238,14 @@ def test_email_link_uses_only_validated_verified_governed_claim(
                 ISSUER, "alice", "alice@example.com", "Alice", raw={"email_verified": verified}
             ),
         )
-        assert not list(await s.scalars(select(IdentityLink)))
+        assert not list(
+            await s.scalars(select(IdentityLink).where(IdentityLink.tenant_id == tenant.id))
+        )
         await connect.confirm(s, token=raw, principal=person)
         email_links = list(
             await s.scalars(
                 select(IdentityLink)
+                .where(IdentityLink.tenant_id == tenant.id)
                 .join(IdentityNamespace, IdentityNamespace.id == IdentityLink.identity_namespace_id)
                 .where(IdentityNamespace.provider == "email")
             )
@@ -263,7 +273,14 @@ def test_email_outside_governed_domain_and_directory_mapping_are_preserved(migra
             ),
         )
         await connect.confirm(s, token=raw, principal=person)
-        assert len(list(await s.scalars(select(IdentityLink)))) == 1
+        assert (
+            len(
+                list(
+                    await s.scalars(select(IdentityLink).where(IdentityLink.tenant_id == tenant.id))
+                )
+            )
+            == 1
+        )
         ns = IdentityNamespace(
             tenant_id=tenant.id,
             provider="email",
@@ -303,7 +320,11 @@ def test_prompt_budget_is_bounded_and_old_rows_are_reclaimed(migrated: None) -> 
         tenant, _, _, _ = await seed(s)
         for _ in range(connect.MAX_ACCOUNT_TOKENS):
             assert await issue(s, tenant)
-            rows = list(await s.scalars(select(IdentityConnectToken)))
+            rows = list(
+                await s.scalars(
+                    select(IdentityConnectToken).where(IdentityConnectToken.tenant_id == tenant.id)
+                )
+            )
             for row in rows:
                 row.created_at -= timedelta(minutes=2)
             await s.flush()
@@ -312,7 +333,14 @@ def test_prompt_budget_is_bounded_and_old_rows_are_reclaimed(migrated: None) -> 
             row.expires_at = datetime.now(UTC) - timedelta(seconds=1)
         await s.flush()
         assert await issue(s, tenant)
-        assert await s.scalar(select(func.count()).select_from(IdentityConnectToken)) == 1
+        assert (
+            await s.scalar(
+                select(func.count())
+                .select_from(IdentityConnectToken)
+                .where(IdentityConnectToken.tenant_id == tenant.id)
+            )
+            == 1
+        )
 
     run(body)
 
