@@ -33,6 +33,11 @@ Installations can also opt into [scheduled job health alerts](docs/SCHEDULED-JOB
 The renderer requires an explicit namespace and impact description; it does not
 change the default installation or treat intentionally suspended templates as healthy.
 
+Installations preparing automated remediation can opt into the
+[remediation scaler connector](#remediation-scaler-connector-opt-in), an
+acting connector whose replies the platform can record and qualify. The default
+bundle does not declare it.
+
 Installations with existing paired adapter reply credentials can opt into
 the worker map reconciler described in
 [`docs/ADAPTER-CREDENTIALS.md`](docs/ADAPTER-CREDENTIALS.md). Its inventory is
@@ -278,6 +283,70 @@ Kubernetes connector, and its kubeconfig is never shared with it.
 A leaked connector token can still select the platform-upgrader ServiceAccount
 on Job create (PR #2163). Draft ADR-0141 proposes the admission pin; the
 installer does not apply it.
+
+## Remediation scaler connector (opt-in)
+
+Automated remediation
+([ADR 0203](../../docs/adr/0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md),
+[operator guide](../../docs/operations.md#automated-remediation)) runs an action
+only through a connector whose replies the platform can record: a sealed prior
+state, the version the write left, and the target
+([writing a reversible connector](../../docs/writing-a-reversible-connector.md)).
+The pinned Kubernetes connector replies in plain text, so no action through it
+can be qualified, idempotent or reversible. The `scaler` connector in
+[`connectors/scaler`](connectors/scaler/server.py) is the acting connector for
+one such action, restoring a stopped workload by setting its replica count.
+
+It is **off by default**. The bundle does not declare it, `plugin.json` names
+none of its tools, and the installer applies nothing for it, so an installation
+that does not opt in is unchanged.
+
+What it serves:
+
+- `scale_deployment(name, replicas)`: sets one allowlisted Deployment's replica
+  count to exactly `replicas` through the `scale` subresource, in the one
+  namespace it is configured for. It is gated for the model. The arguments are
+  flat scalars, so a remediation policy can bound them: `name` as the target
+  argument with the allowed names, and `replicas` as a range.
+- `observe_version(target)`: the live version, read-only and never gated.
+- `restore(target, prior_state, expected_version)`: puts the sealed prior count
+  back. The runner hides it from the model; only the platform's executor calls
+  it, and an undo always needs a person's approval.
+
+The version names the state a write left, the Deployment's uid and its replica
+count, not a random value per write. Scaling to a count already in force writes
+nothing and replies with the same version, which is what an idempotent
+qualification compares: two approved forwards with the same arguments that left
+the same `post_version`. Any change of the count, or the Deployment deleted and
+recreated, is a different version, so an undo refuses with `version_conflict`
+after someone has moved the count. A concurrent change between the connector's
+read and its write is refused the same way, because the write carries the read's
+`resourceVersion`.
+
+To opt in, in your copy of the bundle:
+
+1. Merge [`connectors/scaler/opt-in.yaml`](connectors/scaler/opt-in.yaml): its
+   `connector` entry into `connectors.yaml` and its `plugin` entries into
+   `.claude-plugin/plugin.json`. Set `SCALER_NAMESPACE`, `SCALER_DEPLOYMENTS` and
+   `SCALER_MAX_REPLICAS` for your workload. An empty namespace or allowlist
+   refuses every call.
+2. Edit and apply [`manifests/scaler-access.yaml`](manifests/scaler-access.yaml)
+   so its Role's namespace and `resourceNames` match those settings. It is a
+   separate identity from `manifests/kubernetes-access.yaml`, limited to `get`
+   and `update` on `deployments/scale` for the named Deployments.
+3. Assemble a kubeconfig for `sre-bot-scaler` from its token Secret and store it
+   as the connector secret `SCALER_KUBECONFIG`.
+4. Create the Kubernetes Secret `sre-bot-scaler-sealing` with the keys
+   `SNAPSHOT_SEALING_KEY` (`<kid>:<base64 of 32 bytes>`) and
+   `SNAPSHOT_SEALING_KEYS_RETAINED` (empty until a key rotation).
+5. Build the connector image with `curie build --plugin-dir <bundle> --registry <ref>`,
+   then deploy the bundle.
+
+The connector does not make anything automatic. A remediation policy, its
+qualification drills and a verifier through a different connector are still
+required, in the [drill order](../../docs/operations.md#qualifying-an-action-the-drill-order).
+`examples/tests/test_sre_bot_scaler_opt_in.py` applies the opt-in file to the
+shipped bundle and runs the intake validators on the result.
 
 ## Live demo
 

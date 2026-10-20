@@ -172,7 +172,35 @@ legitimate Job.
 authorized while the ADR is Draft. If the proposed control is not acceptable,
 do not install the upgrade connector.
 
-## Retention and evidence
+## `scale_deployment()` (opt-in scaler connector)
+
+Tool: `mcp__scaler__scale_deployment(name, replicas)`, only after an operator
+opts in. The default bundle does not declare the `scaler` connector, names none
+of its tools, and does not apply its credential, so none of this exists on an
+installation that has not opted in. The opt-in declaration is
+`connectors/scaler/opt-in.yaml`; it adds `scaler/scale_deployment` as
+`approval-required` with its own `sre-approvals` gate and `scaler/observe_version`
+as `allow`.
+
+The tool sets one Deployment's replica count to an exact value in the one
+namespace the connector is configured for (`SCALER_NAMESPACE`), only for a name
+on its allowlist (`SCALER_DEPLOYMENTS`) and only up to `SCALER_MAX_REPLICAS`.
+Every reply carries the prior count sealed for the platform's undo, the version
+the write left and the target, so a platform executed remediation can record and
+qualify it (see the README's scaler section). `observe_version` is a read the
+platform's executor calls without approval. `restore` is hidden from the model;
+the platform gates it with a one-shot grant once the capability probe records the
+pair, and an undo is always a person's approval.
+
+The connector identity is a separate ServiceAccount, `sre-bot-scaler`, from
+`manifests/scaler-access.yaml`. Its Role grants `get` and `update` on
+`deployments/scale` only, in the one namespace, with `resourceNames` limited to
+the allowlisted Deployments. It cannot read or change a Deployment's pod
+template, image, command, environment or Secret references, cannot list
+anything, and cannot act in another namespace. A leaked token can set those
+Deployments' replica counts, zero included, and nothing else; RBAC stays the
+ceiling even if the connector's own allowlist is wider than the Role.
+
 
 Kubernetes Events and pod logs are short-lived. Approval records show a call
 was authorized, not that the API accepted it or the workload became healthy.
