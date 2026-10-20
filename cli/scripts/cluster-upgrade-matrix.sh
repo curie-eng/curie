@@ -1507,11 +1507,98 @@ retag_candidate_versions() {
 }
 
 load_kind_images() (
-    local platform archive
+    local platform raw archive=""
     platform="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')" || exit $?
+    raw="$(mktemp "${TMPDIR:-/tmp}/curie-kind-images-raw.XXXXXX.tar")" || exit $?
+    trap 'rm -f -- "$raw" "$archive"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     archive="$(mktemp "${TMPDIR:-/tmp}/curie-kind-images.XXXXXX.tar")" || exit $?
-    trap 'rm -f -- "$archive"' EXIT
-    docker image save --platform="$platform" --output "$archive" "$@" || exit $?
+    docker image save --output "$raw" "$@" || exit $?
+    python3 - "$raw" "$archive" "$platform" "$@" <<'PY' || exit $?
+import io
+import json
+import sys
+import tarfile
+
+raw, output, platform, *requested = sys.argv[1:]
+native = platform.split("/")
+if len(native) != 2 or not all(native) or not requested:
+    raise ValueError("require a daemon OS/architecture and requested image tags")
+
+
+def normalized(tag):
+    if ":" not in tag.rsplit("/", 1)[-1] and "@" not in tag:
+        tag += ":latest"
+    parts = tag.split("/")
+    if parts[0] in ("docker.io", "index.docker.io", "registry-1.docker.io"):
+        parts = parts[1:]
+    elif len(parts) > 1 and ("." in parts[0] or ":" in parts[0] or parts[0] == "localhost"):
+        return tag
+    if len(parts) == 1:
+        parts.insert(0, "library")
+    return "docker.io/" + "/".join(parts)
+
+
+with tarfile.open(raw, "r:*") as source:
+    members = source.getmembers()
+    if len({member.name for member in members}) != len(members):
+        raise ValueError("duplicate archive members")
+
+    def required(name):
+        if not isinstance(name, str) or not name or any(
+            part in ("", ".", "..") for part in name.split("/")
+        ):
+            raise ValueError("invalid required archive member name")
+        member = source.getmember(name)
+        if not (member.isfile() or member.islnk()):
+            raise ValueError("required archive member is not a regular file or hardlink")
+        stream = source.extractfile(member)
+        if stream is None:
+            raise ValueError("unreadable required archive member")
+        return stream
+
+    with required("manifest.json") as stream:
+        manifest = json.load(stream)
+    if not isinstance(manifest, list) or not manifest:
+        raise ValueError("require a nonempty Docker v2 manifest")
+    selected, needed, tags = [], set(), set()
+    for entry in manifest:
+        if not isinstance(entry, dict):
+            raise ValueError("invalid Docker manifest entry")
+        config, layers, refs = (entry.get(key) for key in ("Config", "Layers", "RepoTags"))
+        if not isinstance(config, str) or not config or any(
+            not isinstance(items, list) or any(not isinstance(item, str) or not item for item in items)
+            for items in (layers, refs)
+        ):
+            raise ValueError("invalid Docker Config, Layers or RepoTags")
+        with required(config) as stream:
+            identity = json.load(stream)
+        if not isinstance(identity, dict) or any(
+            not isinstance(identity.get(key), str) or not identity[key]
+            for key in ("os", "architecture")
+        ):
+            raise ValueError("invalid Docker image config platform")
+        if [identity["os"], identity["architecture"]] != native:
+            continue
+        selected.append({"Config": config, "Layers": layers, "RepoTags": refs})
+        needed.update([config, *layers])
+        tags.update(normalized(ref) for ref in refs)
+    if not selected or not {normalized(ref) for ref in requested}.issubset(tags):
+        raise ValueError("requested image tag has no native Docker manifest entry")
+    with tarfile.open(output, "w") as target:
+        for name in sorted(needed):
+            with required(name) as stream:
+                size = stream.seek(0, io.SEEK_END)
+                stream.seek(0)
+                member = tarfile.TarInfo(name)
+                member.size = size
+                target.addfile(member, stream)
+        data = json.dumps(selected).encode()
+        member = tarfile.TarInfo("manifest.json")
+        member.size = len(data)
+        target.addfile(member, io.BytesIO(data))
+PY
     kind load image-archive "$archive" --name "$KIND_CLUSTER" || exit $?
 )
 

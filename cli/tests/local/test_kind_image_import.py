@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import subprocess
+import tarfile
 import uuid
 from pathlib import Path
 
@@ -17,6 +19,22 @@ RELEASED = "ghcr.io/curie-eng/curie-api:0.8.8"
 NODE_IMAGE = (
     "kindest/node:v1.31.0@sha256:25a3504b2b340954595fa7a6ed1575ef2edadf5abd83c0776a4308b64bf47c93"
 )
+
+
+def _containerd_ref(ref: str) -> str:
+    for prefix in ("index.docker.io/", "registry-1.docker.io/"):
+        if ref.startswith(prefix):
+            ref = "docker.io/" + ref[len(prefix) :]
+    first = ref.split("/", 1)[0]
+    if "/" not in ref:
+        ref = f"docker.io/library/{ref}"
+    elif "." not in first and ":" not in first and first != "localhost":
+        ref = f"docker.io/{ref}"
+    elif first == "docker.io" and ref.count("/") == 1:
+        ref = ref.replace("docker.io/", "docker.io/library/", 1)
+    if ":" not in ref.rsplit("/", 1)[-1]:
+        ref += ":latest"
+    return ref
 
 
 def _run(
@@ -96,10 +114,34 @@ class KindImageImport:
             "docker", "version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"
         ).stdout.strip()
         _run("docker", "pull", f"--platform={self.platform}", RELEASED)
-        for ref in (RELEASED, self.candidate):
-            self.configs[ref] = _run(
-                "docker", "image", "inspect", "--format", "{{.Id}}", ref
-            ).stdout.strip()
+        raw = self.root / "expected-images.tar"
+        try:
+            _run("docker", "image", "save", "--output", str(raw), RELEASED, self.candidate)
+            native: dict[str, str] = {}
+            with tarfile.open(raw) as archive:
+                manifest_file = archive.extractfile("manifest.json")
+                if manifest_file is None:
+                    raise RuntimeError("Plain docker save has no readable Docker manifest")
+                with manifest_file:
+                    manifest = json.load(manifest_file)
+                for entry in manifest:
+                    config_file = archive.extractfile(entry["Config"])
+                    if config_file is None:
+                        raise RuntimeError("Plain docker save has no readable image config")
+                    with config_file:
+                        config_bytes = config_file.read()
+                    config = json.loads(config_bytes)
+                    if f"{config['os']}/{config['architecture']}" != self.platform:
+                        continue
+                    digest = "sha256:" + hashlib.sha256(config_bytes).hexdigest()
+                    for tag in entry["RepoTags"]:
+                        normalized = _containerd_ref(tag)
+                        if normalized in native and native[normalized] != digest:
+                            raise RuntimeError("Plain docker save has ambiguous native configs")
+                        native[normalized] = digest
+            self.configs = {ref: native[_containerd_ref(ref)] for ref in (RELEASED, self.candidate)}
+        finally:
+            raw.unlink(missing_ok=True)
         clusters = _run("kind", "get", "clusters").stdout.split()
         if {self.name, f"{self.name}-missing"} & set(clusters) or self.owned_nodes():
             raise RuntimeError("Refusing an existing kind cluster or node")
@@ -135,6 +177,7 @@ class KindImageImport:
                 "CURIE_E2E_KIND_CLUSTER": self.name + ("-missing" if missing_cluster else ""),
                 "CURIE_E2E_KUBECONFIG": str(self.kubeconfig),
                 "TMPDIR": str(self.archives),
+                "DOCKER_API_VERSION": "1.45",
             }
         )
         return _run(
@@ -201,9 +244,13 @@ def kind_image_import(tmp_path: Path, request: pytest.FixtureRequest) -> KindIma
 
 def test_kind_image_import_released_and_candidate(kind_image_import: KindImageImport) -> None:
     probe = kind_image_import
-    # Observed Docker 29 native-only 0.8.8 pull: plain save retained absent arm64
-    # descriptors; kind v0.24 imports --all-platforms and failed on a missing digest.
-    # --platform exported a complete archive which the same kind node imported:
+    # Observed Docker 29: plain 0.8.8 save retained absent arm64 OCI descriptors;
+    # kind v0.24 failed on that graph, then imported its native Docker v2 members.
+    # inspect .Id was the OCI index digest, so setup hashes actual config bytes
+    # from an independent plain save. Filenames need not encode the config SHA.
+    # containerd prefers oci-layout over manifest.json when both are present:
+    # https://github.com/containerd/containerd/blob/v1.7.18/images/archive/importer.go
+    # --platform on save requires API 1.48; the loader runs at baseline API 1.45:
     # https://docs.docker.com/reference/cli/docker/image/save/#platform
     # https://github.com/kubernetes-sigs/kind/blob/v0.24.0/pkg/cluster/nodeutils/util.go
     for refs in ((RELEASED,), (RELEASED, probe.candidate)):
@@ -216,12 +263,7 @@ def test_kind_image_import_released_and_candidate(kind_image_import: KindImageIm
     ).stdout.splitlines()
     os_name, architecture = probe.platform.split("/")
     for index, ref in enumerate((RELEASED, probe.candidate)):
-        first = ref.split("/", 1)[0]
-        normalized = ref
-        if "/" not in ref:
-            normalized = f"docker.io/library/{ref}"
-        elif "." not in first and ":" not in first and first != "localhost":
-            normalized = f"docker.io/{ref}"
+        normalized = _containerd_ref(ref)
         matches = [row.split()[2] for row in tags[1:] if row.split()[0] == normalized]
         assert len(matches) == 1, f"Missing containerd tag: {normalized}"
         manifest = probe.content(matches[0])
