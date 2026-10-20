@@ -3746,18 +3746,18 @@ jobs:
           set -euo pipefail
           uv run bash charts/curie/ci/scenarios/controller-preflight-kind.sh
       - name: Download the workspace diagnostic CLI
-        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress')) }}
+        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation')) }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: curie-x86_64-linux-${{ github.sha }}
           path: cli/target/release
       - name: Load the workspace diagnostic candidate images
-        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress')) }}
+        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation')) }}
         uses: ./.github/actions/load-ci-images
         with:
           images: "{api,worker,runner}"
       - name: Stage the workspace diagnostic images in kind
-        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress')) }}
+        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation')) }}
         run: |
           set -euo pipefail
           chmod +x cli/target/release/curie
@@ -3782,6 +3782,20 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh
+      - name: Hosted connector credential rotation rolls only that connector
+        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') }}
+        timeout-minutes: 45
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
+          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/connector-secret-rotation-runtime.sh
       - name: Quota progress regression
         if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
         timeout-minutes: 30
