@@ -300,6 +300,14 @@ Python image. Its Service is named `alert-signer` in Alertmanager's namespace.
 The webhook overlay mounts only the bearer token into Alertmanager; the
 derived Curie hook secret stays in the signer pod.
 
+Signer diagnostics (`SIGNER-DIAGNOSTICS-1`): upstream non-success responses
+remain HTTP 502 to the source and emit one warning with only the numeric upstream
+status. Transport failures also return 502 and emit only the fixed reason
+`transport_error`. No diagnostic includes a URL, response body, payload, delivery
+identity, authentication header or exception text. Successful forwarding and
+local authentication or payload refusals do not emit this warning. A 502 never
+changes the stable delivery ID or retries inside the signer.
+
 For an existing installation, update the API and every custom signer together
 to the context format in the [trigger contract](../../docs/interfaces/triggers/INTERFACE.md).
 The signed bytes are `b"curie.hook.delivery.v2\n"` followed by

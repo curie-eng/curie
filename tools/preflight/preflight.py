@@ -601,9 +601,9 @@ def select_ci_only(root: Path, paths: list[str], base: str, head: str) -> list[s
     if flags.get("factory") == "true":
         selected.append("factory scenario on e2e-ladder-cluster")
     if flags.get("released_upgrade") == "true":
-        selected.append("e2e-cluster-upgrade-matrix")
+        selected.extend(("e2e-cluster-upgrade-matrix", "e2e-released-upgrade-negative"))
     if flags.get("released_upgrade_full") == "true":
-        selected.extend(("e2e-released-upgrade", "e2e-released-upgrade-negative"))
+        selected.append("e2e-released-upgrade")
     return selected
 
 

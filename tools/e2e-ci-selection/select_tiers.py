@@ -87,23 +87,6 @@ UPGRADE_WORKFLOW_JOBS = frozenset(
         "e2e-cluster-upgrade-matrix",
     }
 )
-FACTORY_UPGRADE_PATHS = frozenset(
-    {
-        "charts/curie/files/legacy-factory-keys.yaml",
-        "charts/curie/files/legacy-factory-env.yaml",
-        "cli/src/config_migrate.rs",
-        "cli/src/factory_app.rs",
-        "cli/src/factory_config_migrate.rs",
-        "cli/src/github_app.rs",
-        "cli/src/ops/up.rs",
-        "cli/src/ops/upgrade.rs",
-        "tools/factory-e2e/factory_e2e.py",
-        "tools/factory-e2e/scripted_kind.py",
-        "tools/factory-e2e/scripted_scenario.py",
-        "tools/factory-e2e/tests/test_c4_upgrade_migration.py",
-        "tools/github-stub/github_stub.py",
-    }
-)
 WORKFLOW_PATH = ".github/workflows/ci.yaml"
 CHART_JOB = "e2e-cluster-chart-regressions"
 CHART_LEGS = ("chart", "workload")
@@ -181,6 +164,7 @@ class Registry:
     chart_scenarios: ChartScenarios
     conditional_pytest_files: dict[str, tuple[str, ...]]
     pytest_scopes: dict[str, PytestScope]
+    ci_policy_tests: dict[str, tuple[str, ...]]
 
 
 def _mapping(value: object, label: str) -> dict[str, object]:
@@ -316,6 +300,25 @@ def _pytest_scopes(value: object) -> dict[str, PytestScope]:
             f"{label}.test_files must name a readable tracked file: {test_files}"
         ) from exc
     return {"cli": PytestScope(prefixes, excluded_prefixes, python_prefixes, test_files)}
+
+
+def _ci_policy_tests(value: object) -> dict[str, tuple[str, ...]]:
+    entries = _mapping(value, "ci_policy_tests")
+    if not entries:
+        raise RegistryError("ci_policy_tests must not be empty")
+    tests: dict[str, tuple[str, ...]] = {}
+    for test_file, value in entries.items():
+        if not re.fullmatch(
+            r"tools/[A-Za-z0-9_-]+/tests/(?:[A-Za-z0-9_-]+/)*test_[A-Za-z0-9_-]+\.py",
+            test_file,
+        ):
+            raise RegistryError("ci_policy_tests contains an invalid test file path")
+        label = f"ci_policy_tests.{test_file}"
+        inputs = _scope_prefixes(value, label)
+        if len(set(inputs)) != len(inputs):
+            raise RegistryError(f"{label} contains duplicate inputs")
+        tests[test_file] = inputs
+    return tests
 
 
 def _matches_pytest_scope(scope: PytestScope, path: str) -> bool:
@@ -482,6 +485,7 @@ def _load_registry(path: Path) -> Registry:
         chart_scenarios,
         conditional_pytest_files,
         _pytest_scopes(root.get("pytest_scopes")),
+        _ci_policy_tests(root.get("ci_policy_tests")),
     )
 
 
@@ -774,6 +778,7 @@ def _render(
     pytest_needed: bool,
     pytest_deselect: list[str],
     pytest_scope: str,
+    ci_policy_files: list[str],
     images_needed: bool,
     cli_release_needed: bool,
     released_upgrade_full: bool,
@@ -789,6 +794,8 @@ def _render(
     lines.append(f"pytest={'true' if pytest_needed else 'false'}")
     lines.append("pytest_deselect=" + ",".join(pytest_deselect))
     lines.append(f"pytest_scope={pytest_scope}")
+    lines.append(f"ci_policy={'true' if ci_policy_files else 'false'}")
+    lines.append("ci_policy_files=" + ",".join(ci_policy_files))
     lines.append(f"images={'true' if images_needed else 'false'}")
     lines.append(f"cli_release={'true' if cli_release_needed else 'false'}")
     lines.append(f"released_upgrade_full={'true' if released_upgrade_full else 'false'}")
@@ -908,14 +915,15 @@ def _run() -> None:
     ):
         pytest_scope = "cli"
 
-    # Ordinary pull requests run one upgrade matrix smoke shard. Factory
-    # migration paths and upgrade job changes run the full matrix and released
-    # chart jobs before merge, as do pushes and dispatches (the nightly).
-    released_upgrade_full = (
-        args.push
-        or workflow_upgrade_changed
-        or any(path in FACTORY_UPGRADE_PATHS for path in paths)
-    ) and "released-upgrade" in selected
+    ci_policy_files = sorted(
+        test_file
+        for test_file, inputs in registry.ci_policy_tests.items()
+        if args.push or any(_matches_prefix(path, prefix) for path in paths for prefix in inputs)
+    )
+
+    # Dispatch callers use --push without --omit-kind for the full matrix.
+    # Pull requests selecting released-upgrade run the smoke shard.
+    released_upgrade_full = args.push and not args.omit_kind
     chart_scenarios = _select_chart_scenarios(
         registry, paths, selected, args.push, args.head if not args.path else None
     )
@@ -933,6 +941,7 @@ def _run() -> None:
                 pytest_needed,
                 pytest_deselect,
                 pytest_scope,
+                ci_policy_files,
                 images_needed,
                 cli_release_needed,
                 released_upgrade_full,

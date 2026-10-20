@@ -59,7 +59,19 @@ class GenuineReplyRelay:
         if not isinstance(command, list) or len(command) < 2:
             return False
         if self.phase == "claim":
-            return command[0].upper() == b"SET" and command[1].startswith(b"curie:hook:delivery:")
+            if command[0].upper() == b"SET":
+                return command[1].startswith(b"curie:hook:delivery:")
+            # @spec HOOK-RECEIPT-1, HOOK-RECEIPT-6: hold only the completed
+            # receipt-aware claim, not quota, receipt reads or owned enqueue.
+            return (
+                command[0].upper() == b"EVAL"
+                and len(command) == 7
+                and command[2] == b"2"
+                and command[3].startswith(b"curie:hook:delivery:")
+                and command[4] == command[3] + b":receipt"
+                and command[5].startswith(b"pending:")
+                and response == b":1\r\n"
+            )
         if command[0].upper() != b"EVAL" or len(command) < 4:
             return False
         if self.phase == "quota":
