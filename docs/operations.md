@@ -2805,10 +2805,12 @@ section is the administrator's.
   close keep the platform key plus the principal. The CLI `apply` and `arm`
   verbs do not yet send the header (follow-up to #4225), so until then bind and
   arm over the API with the header.
-- The protected worker is deployed. The capture of a nomination block from a
-  protected turn is its runner client wrapper (AUTOMATED-REMEDIATION-6); without
-  it no turn can submit a block, though the policy and qualification routes
-  work.
+- The protected worker is deployed. It captures a nomination block from a
+  protected turn in its runner client wrapper
+  ([`apps/worker/src/curie_worker/protected_nomination.py`](../apps/worker/src/curie_worker/protected_nomination.py),
+  AUTOMATED-REMEDIATION-6) and submits it to the API. A turn that is not run by
+  the protected worker submits nothing, though the policy and qualification
+  routes work.
 
 ### Policies
 
@@ -2823,11 +2825,16 @@ curie cluster remediation-policy apply <agent> <hook> --file policy.json --expec
 curie cluster remediation-policy arm <agent> <hook> --expected-generation <N>
 curie cluster remediation-policy disarm <agent> <hook> --expected-generation <N>
 curie cluster remediation-policy remove <agent> <hook> --expected-generation <N>
+curie cluster remediation-policy breakers <agent> <hook> [--state open|closed|all]
 curie cluster remediation-policy close-breaker <agent> <hook> <breaker id> --reason "<why>"
 ```
 
 `curie local remediation-policy` is the same group, for staging and inspecting
-a policy on a local stack; remediation executes on the cluster tier only. Every
+a policy on a local stack; remediation executes on the cluster tier only. Two
+sibling groups exist at both tiers: `curie cluster remediation list|show` reads
+nomination receipts ([Reading what happened](#reading-what-happened)), and
+`curie cluster remediation-qualification record|start-run|show-run` is the CLI
+form of the qualification routes in the drill order below. Every
 verb prints one JSON object under `--json`. `apply` validates the document with
 the platform's own rules first
 ([`cli/src/remediation_policy.rs`](../cli/src/remediation_policy.rs)),
@@ -2928,6 +2935,16 @@ ordinary approval path on a **disposable target inside the policy's bounds**:
      out of band after a forward drill and then asking for the undo;
    - an **idempotent** action: two `confirmed` approved forward executions with
      the same canonical arguments, the second leaving the same `post_version`.
+     The `post_version` is recorded only from a **sealed** reply: the acting
+     connector's write must answer with a sealed `prior` envelope, a valid
+     `version` and a `target` object, and the reply must not be redacted
+     ([`_snapshot`](../apps/worker/src/curie_worker/actions.py)). See
+     [Writing a connector the platform can undo](writing-a-reversible-connector.md#the-paired-verbs)
+     for the reply shape and the `SNAPSHOT_SEALING_KEY` custody.
+     A connector that answers in plain text, or with a cleartext `prior`,
+     leaves the ledger record without a `post_version`, so it cannot produce
+     this evidence: recording the qualification is refused
+     `evidence_not_idempotent` and the action cannot be made automatic.
 4. **Run the verifier twice** against a literal member of the action's allowed
    targets, with the target recovered (outcome `verified`) and not recovered
    (`not-recovered`), under the same verifier declaration:
@@ -2995,9 +3012,11 @@ curie cluster remediation-policy close-breaker <agent> <hook> <breaker id> \
   --reason "target repaired by hand, verifier checked"
 ```
 
-The reason is required and recorded with the closing operator. The breaker id is
-logged by the API when it opens (`remediation breaker opened breaker=<id>`) and
-is a `remediation_breakers` row; there is no list verb yet. Closing an already
+The reason is required and recorded with the closing operator. Find the breaker
+id with `curie cluster remediation-policy breakers <agent> <hook>` (`--state`
+is `open`, the default, `closed` or `all`; read only, newest first); the API
+also logs it when the breaker opens (`remediation breaker opened breaker=<id>`).
+Closing an already
 closed breaker changes nothing, and an id that is not under that hook's policy is
 `404`. Close a breaker only after you have looked at why the action did not
 recover.
@@ -3020,11 +3039,33 @@ in the policy route's approver set.
 `curie cluster actions list|show|undo|execution` read the ledger: a
 policy-executed record carries its authority, the generation, the delivery event
 and nomination ids, an `actor_kind` of `policy` and the verification outcome.
-Approval cards are posted by the worker to the route's card channel. Thread
-receipts for each nomination stage, a `remediation list|show` verb and the
-`curie.remediation.lifecycle` counter belong to plan task 13 and are not
-described here until they ship; until then read nomination rows from the
-database.
+Approval cards are posted by the worker to the route's card channel.
+
+`curie cluster remediation list [<agent>] [--state <state>] [--limit <N>]`
+(`curie local` at the local tier) and `curie cluster remediation show
+<nomination id>` read the operator receipt of each nomination, newest first
+(`GET /remediation-nominations`, `GET /remediation-nominations/{id}`). A receipt
+carries the nomination's state, its stage (`refused`, `nominated`,
+`approval_requested`, `executed`, the verification outcome, `escalated`,
+`undo_requested`, `undone`), its authority (`none`, `policy` or `approval`) and
+a code from the closed vocabulary
+([`apps/api/src/curie_api/remediation_receipts.py`](../apps/api/src/curie_api/remediation_receipts.py)).
+Reads use the platform key and need no operator principal, and a receipt never
+contains the arguments, the model's reason, a read result or the alert body.
+
+With remediation on, the worker also posts one **thread receipt** per stage
+reached, as separate messages in the protected delivery's thread after the
+investigation's reply
+([`apps/worker/src/curie_worker/remediation_receipts.py`](../apps/worker/src/curie_worker/remediation_receipts.py)).
+Each stage posts once across worker replicas and a failed post is retried. A
+message names only the stage, the action, the target key, the authority and a
+code, and names the action only when a policy generation of the hook declares
+it.
+
+Each posted receipt records the counter `curie.remediation.lifecycle` (closed
+attributes `stage`, `kind`, `authority` and `code`) and one span carrying the
+same attributes and the nomination id. No metric, span or log carries
+arguments, read values, the reason text or the alert body.
 
 ### The honest policy boundary
 
@@ -3047,7 +3088,7 @@ A chart upgrade is a **full** upgrade: anything the new chart does not render is
 deleted. For a Deployment that means a restart. For a StatefulSet it means the
 data too.
 
-### Connector action executor (0.13.0, unreleased)
+### Connector action executor (0.13.0)
 
 0.13.0 adds the connector action executor
 ([ARCHITECTURE.md](../ARCHITECTURE.md#the-action-ledger-and-the-connector-action-executor)):
@@ -3090,7 +3131,7 @@ What changes for existing installs:
 * `curie local actions` and `curie cluster actions` (`list`, `show`, `undo`,
   `execution`) are new; `execution <id>` is the receipt of a restore.
 
-### Automated remediation (0.13.0, unreleased)
+### Automated remediation (0.13.0)
 
 0.13.0 adds automated remediation for protected hooks
 ([Automated remediation](#automated-remediation),
@@ -3125,7 +3166,8 @@ below.
   `/agents/{agent}/hooks/{hook}/remediation-policy`, the qualification routes under
   `/agents/{agent}/remediation-qualifications/{id}`, the internal
   `POST /v1/internal/remediation/nominations` route, `POST /action-executions/{id}/samples`,
-  and `curie local|cluster remediation-policy`. The approvals `purpose` gains
+  and `curie local|cluster remediation-policy`, `remediation` and
+  `remediation-qualification`. The approvals `purpose` gains
   `remediation`, which resolves without waking a model.
 - **Nothing frozen changes.** `packages/aci-protocol` and `packages/plugin-format`
   are untouched, and no bundle needs to change.
