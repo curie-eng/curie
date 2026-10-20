@@ -34,6 +34,8 @@ PROTECTED_RUNNER_FILES = frozenset(
         # The closed protected projection fixes the external runner peer at 8080.
         # These source fixtures share that host port, while owning separate brokers.
         "apps/api/tests/test_guarded_nomination_api_integration.py",
+        "apps/worker/tests/protected_settlement/test_actual_source.py",
+        "apps/worker/tests/protected_settlement/test_terminal_launch_gate.py",
         "apps/worker/tests/test_protected_consumer_recovery.py",
         "apps/worker/tests/test_protected_entry_runtime.py",
         "apps/worker/tests/test_protected_launch_server_integration.py",

@@ -71,20 +71,51 @@ local function append()
   end
   return redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2])
 end
+-- @spec HOOK-RECEIPT-1, HOOK-RECEIPT-5. Optional metadata never touches legacy callers.
+local with_receipt = #KEYS == 3
+if with_receipt then
+  local kind = redis.call('TYPE', KEYS[1]).ok
+  if kind ~= 'none' and kind ~= 'string' then return {-1, ''} end
+  if kind == 'string' and redis.call('STRLEN', KEYS[1]) > 128 then
+    return {-1, ''}
+  end
+end
 local cur = redis.call('GET', KEYS[1])
-if cur == ARGV[1] then
+if cur == ARGV[1] or not cur then
+  if with_receipt and redis.call('EXISTS', KEYS[3]) == 1 then return {-1, ''} end
+  if not cur then redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[4]) end
   local id = append()
-  redis.call('SET', KEYS[1], id)
-  return {1, id}
-elseif not cur then
-  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[4])
-  local id = append()
-  redis.call('SET', KEYS[1], id)
+  if with_receipt then
+    -- All validation precedes XADD. MSET publishes both retained keys together;
+    -- there is no post-append JSON parser or second independent metadata write.
+    redis.call('MSET', KEYS[1], id, KEYS[3], ARGV[7] .. id .. '"}')
+  else
+    redis.call('SET', KEYS[1], id)
+  end
   return {1, id}
 else
   return {0, cur}
 end
 """
+
+# @spec HOOK-RECEIPT-4: reject orphan evidence before claim or quota mutation.
+_RECEIPT_CLAIM_SCRIPT = """
+local kind = redis.call('TYPE', KEYS[1]).ok
+if kind ~= 'none' and kind ~= 'string' then return -1 end
+if kind == 'string' and redis.call('STRLEN', KEYS[1]) > 128 then return -1 end
+local cur = redis.call('GET', KEYS[1])
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  if not cur or string.sub(cur, 1, 8) == 'pending:' then return -1 end
+end
+if cur then return 0 end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return 1
+"""
+
+
+class DeliveryReceiptConflict(ValueError):
+    """Unverifiable retained evidence. @spec HOOK-RECEIPT-3, HOOK-RECEIPT-4, HOOK-RECEIPT-5."""
+
 
 # Record the attempt token with the increment so cleanup can verify a charge
 # even when the request never observed the result. Both keys expire together.
@@ -185,7 +216,9 @@ def sha16(delivery_id: str) -> str:
     return hashlib.sha256(delivery_id.encode()).hexdigest()[:16]
 
 
-async def claim_delivery(client: redis.Redis, key: str, owner: str, lease_s: int) -> bool:
+async def claim_delivery(
+    client: redis.Redis, key: str, owner: str, lease_s: int, *, receipt_key: str | None = None
+) -> bool:
     """Claim one delivery for THIS request: ``SET NX EX``, first writer wins.
 
     The structural sibling of the dispatcher's ``already_enqueued`` guard, with
@@ -208,6 +241,14 @@ async def claim_delivery(client: redis.Redis, key: str, owner: str, lease_s: int
         True when this request took the claim.
     """
 
+    # @spec HOOK-RECEIPT-4. Callers without metadata retain their original path.
+    if receipt_key is not None:
+        if receipt_key == key:
+            raise ValueError("receipt and claim keys must differ")
+        result = await client.eval(_RECEIPT_CLAIM_SCRIPT, 2, key, receipt_key, owner, lease_s)
+        if result == -1:
+            raise DeliveryReceiptConflict("invalid hook receipt evidence")
+        return bool(result)
     return bool(await client.set(key, owner, nx=True, ex=lease_s))
 
 
@@ -222,6 +263,8 @@ async def enqueue_owned(
     lease_s: int,
     transport_field: str | None = None,
     transport_value: str | None = None,
+    receipt_key: str | None = None,
+    receipt_prefix: str | None = None,
 ) -> tuple[bool, str]:
     """Enqueue the payload if this request still owns the claim.
 
@@ -241,19 +284,28 @@ async def enqueue_owned(
         naming the current owner when it did not.
     """
 
+    # @spec HOOK-RECEIPT-1, HOOK-RECEIPT-5. The hook codec validates and bounds this prefix
+    # before claiming. Lua only appends the server's canonical stream ID.
+    if (receipt_key is None) != (receipt_prefix is None):
+        raise ValueError("receipt key and prefix must be supplied together")
+    if receipt_key in (key, stream):
+        raise ValueError("receipt key must be separate from claim and stream")
+    keys = [key, stream] if receipt_key is None else [key, stream, receipt_key]
     result: Any = await client.eval(
         _ENQUEUE_SCRIPT,
-        2,
-        key,
-        stream,
+        len(keys),
+        *keys,
         owner,
         payload,
         payload_field,
         str(lease_s),
         transport_field or "",
         transport_value or "",
+        receipt_prefix or "",
     )
     enqueued, current = result
+    if enqueued == -1:
+        raise DeliveryReceiptConflict("invalid hook receipt evidence")
     return bool(enqueued), text(current)
 
 

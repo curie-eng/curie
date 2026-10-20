@@ -1,5 +1,76 @@
 version: 1
 fallback: [skill, local, local-release, cluster]
+ci_policy_tests:
+  tools/ci-release-target-parity/tests/test_release_target_parity.py:
+    [.github, tools/ci-release-target-parity, conftest.py, pyproject.toml, uv.lock]
+  tools/ci-retry-gate/tests/test_ci_flake_retries.py:
+    [.github, tools/ci-retry-gate, conftest.py, pyproject.toml, uv.lock,
+     cli/scripts/cluster-upgrade-matrix.sh, cli/scripts/ensure-kind-registry.sh,
+     cli/scripts/configure-docker-hub-mirror.sh]
+  tools/ci-retry-gate/tests/test_gitleaks_scope.py:
+    [.github, tools/ci-retry-gate, conftest.py, pyproject.toml, uv.lock,
+     .gitleaks.toml, apps/ui/pnpm-lock.yaml, cli/Cargo.lock]
+  tools/ci-retry-gate/tests/test_pr_body.py:
+    [.github, tools/ci-retry-gate, conftest.py, pyproject.toml, uv.lock,
+     scripts/check-pr-body.sh]
+  tools/ci-retry-gate/tests/test_retry_eligibility.py:
+    [.github, tools/ci-retry-gate, conftest.py, pyproject.toml, uv.lock]
+  tools/ci-workflow-paths/tests/test_workflow_paths.py:
+    [.github, tools/ci-workflow-paths, conftest.py, pyproject.toml, uv.lock,
+     apps/ui, cli, scripts/check-glibc-floor.sh, scripts/check-version-consistency.sh]
+  tools/close-on-next/tests/test_close_on_next.py:
+    [.github, tools/close-on-next, conftest.py, pyproject.toml, uv.lock]
+  tools/dependency-audit-paths/tests/test_dependency_audit_paths.py:
+    [.github, tools/dependency-audit-paths, conftest.py, pyproject.toml, uv.lock,
+     apps/docker-daemon, apps/ui, cli, packages/aci-protocol/generated/rust,
+     tools/contract-codegen]
+  tools/e2e-ci-selection/tests/test_cli_pytest_scope.py:
+    [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
+     apps, cli, release/atlas.py, release/tests/test_sdk_approval_gate_workflow.py,
+     runner/tests/test_dockerfile_registry_layer.py, tests, tools/doclint,
+     tools/factory-e2e]
+  tools/e2e-ci-selection/tests/test_conditional_pytest_files.py:
+    [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
+     apps/api, charts/curie, cli, docs/architecture-atlas, examples/sre-bot,
+     examples/tests, otel, packages/channel-protocol, packages/plugin-format,
+     packages/telemetry-schema, release/atlas.py, runner, tests/vectors]
+  tools/e2e-ci-selection/tests/test_e2e_ci_selection.py:
+    [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
+     apps, charts/curie, cli, docs, examples, otel, packages, release, runner,
+     scripts, tests, tools]
+  tools/e2e-ci-selection/tests/test_factory_upgrade_selection.py:
+    [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
+     apps/api, charts/curie, cli, release/atlas.py, tools/factory-e2e,
+     tools/github-stub]
+  tools/e2e-ci-selection/tests/test_live_manifest_parity.py:
+    [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
+     charts/curie]
+  tools/e2e-ci-selection/tests/test_python_pytest_selection.py:
+    [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
+     apps, charts/curie/Chart.yaml, cli, docs/architecture-atlas, examples/tests,
+     packages, release/atlas.py, runner, scripts/check-docs.sh, tools]
+  tools/e2e-ci-selection/tests/test_upgrade_matrix_budget.py:
+    [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock]
+  tools/e2e-ci-selection/tests/test_workflow_hunk_selection.py:
+    [.github, tools/e2e-ci-selection, conftest.py, pyproject.toml, uv.lock,
+     charts/curie/values.yaml, cli/Cargo.toml, release/atlas.py]
+  tools/fix-pin-ci/tests/test_fix_pin_ci.py:
+    [.github, tools/fix-pin-ci, conftest.py, pyproject.toml, uv.lock,
+     AGENTS.md, apps/api/tests, charts/curie/ci, cli/scripts/verify-fix-pin.sh,
+     examples/tests/test_sre_bot_observability_runtime.py, tools/factory-e2e,
+     tools/ci-release-target-parity, tools/ci-retry-gate, tools/ci-workflow-paths,
+     tools/close-on-next, tools/dependency-audit-paths, tools/e2e-ci-selection,
+     tools/helm-ci-gate, tools/p0-closes-ci, tools/runtime-assertion-gate]
+  tools/helm-ci-gate/tests/test_decide.py:
+    [.github, tools/helm-ci-gate, conftest.py, pyproject.toml, uv.lock,
+     apps, charts/curie, cli, compose/generate_release_compose.py,
+     docs/adr/README.md, packages/aci-protocol, scripts/check-docs.sh]
+  tools/p0-closes-ci/tests/test_p0_closes_ci.py:
+    [.github, tools/p0-closes-ci, conftest.py, pyproject.toml, uv.lock,
+     tools/e2e-ci-selection/cli_pytest_files.txt]
+  tools/runtime-assertion-gate/tests/test_runtime_assertion_gate.py:
+    [.github, tools/runtime-assertion-gate, conftest.py, pyproject.toml, uv.lock,
+     charts/curie/ci/runtime, charts/curie/templates]
 pytest_scopes:
   cli:
     prefixes: [cli]
@@ -253,9 +324,9 @@ rules:
     # image-proofs builds it and runs the escape tests against it.
     apps/docker-daemon: []
     scripts: []
-    # The revision-based selector inspects ci.yaml hunks and runs the full
-    # released-upgrade tier when one of its upgrade jobs changes. Other
-    # workflow edits stay ignored; path-only requests cannot inspect hunks.
+    # The revision-based selector inspects ci.yaml hunks and selects the
+    # released-upgrade smoke shard and negative control for upgrade job edits.
+    # Other workflow edits stay ignored; path-only requests cannot inspect hunks.
     .github/workflows: []
     .github/e2e-selection.yaml: []
     tools: []
