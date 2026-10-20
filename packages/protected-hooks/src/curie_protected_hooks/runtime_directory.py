@@ -117,7 +117,8 @@ def parse_bootstrap(manifest_raw: bytes, ca_raw: bytes, bootstrap_raw: bytes) ->
     try:
         return _parse_bootstrap(manifest_raw, ca_raw, bootstrap_raw)
     except Exception:  # noqa: BLE001  Any parse failure is the one invalid runtime refusal.
-        raise RuntimeDirectoryInvalid() from None
+        pass
+    raise RuntimeDirectoryInvalid()
 
 
 def _parse_source_writer(raw: bytes, reader: MetadataReaderCredential) -> SourceWriterCredential:
@@ -142,7 +143,8 @@ def parse_source_writer(raw: bytes, reader: MetadataReaderCredential) -> SourceW
     try:
         return _parse_source_writer(raw, reader)
     except Exception:  # noqa: BLE001  Any parse failure is the one invalid runtime refusal.
-        raise RuntimeDirectoryInvalid() from None
+        pass
+    raise RuntimeDirectoryInvalid()
 
 
 def _parse_enqueue(raw: bytes, bootstrap: RuntimeBootstrap) -> EnqueueCredential:
@@ -173,7 +175,8 @@ def parse_enqueue(raw: bytes, bootstrap: RuntimeBootstrap) -> EnqueueCredential:
     try:
         return _parse_enqueue(raw, bootstrap)
     except Exception:  # noqa: BLE001  Any parse failure is the one invalid runtime refusal.
-        raise RuntimeDirectoryInvalid() from None
+        pass
+    raise RuntimeDirectoryInvalid()
 
 
 def _principal(credential: Any, kind: type) -> dict[str, str]:

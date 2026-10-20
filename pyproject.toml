@@ -119,22 +119,25 @@ source_modules = ["curie_protected_hooks"]
 forbidden_modules = ["curie_api", "curie_worker", "curie_runner", "claude_agent_sdk"]
 
 # @spec PROTECTED-HOOK-SOURCE-11: only provisioner composition imports the
-# runtime directory writer. The HTTP application and every composition that
-# holds the ordinary platform key or ordinary application credentials cannot
-# reach it, and the shared grammar the API reads never imports it.
+# runtime directory writer. The HTTP application and every package that
+# composes a process holding the ordinary platform key or ordinary application
+# credentials cannot reach it, and the shared grammar the API reads never
+# imports it. A provisioner entry inside a listed package needs a reviewed
+# ignore_imports exception naming that one module.
 [[tool.importlinter.contracts]]
 name = "The runtime directory writer stays out of ordinary compositions"
 type = "forbidden"
 source_modules = [
     "curie_api",
+    "curie_worker",
     "curie_dispatcher",
     "curie_runner",
+    "curie_internal",
+    "curie_upgrade_pause",
     "curie_discord_adapter",
     "curie_mail_adapter",
     "curie_connector_proxy",
     "curie_e2e_connector",
-    "curie_worker.__main__",
-    "curie_worker.run",
     "curie_protected_hooks.runtime_directory",
 ]
 forbidden_modules = ["curie_protected_hooks.runtime_directory_writer"]
