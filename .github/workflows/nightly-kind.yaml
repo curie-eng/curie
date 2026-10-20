@@ -5,7 +5,10 @@ name: Scheduled kind CI
 on:
   schedule:
     - cron: "30 9 * * *"
-    - cron: "15 0,6,12,18 * * *"
+    - cron: "15 6 * * *"
+    - cron: "15 0 * * *"
+    - cron: "15 12 * * *"
+    - cron: "15 18 * * *"
   workflow_dispatch:
     inputs:
       ref:
@@ -14,6 +17,11 @@ on:
         type: choice
         options: [main, next]
         default: next
+      nightly:
+        description: Run the nightly kind jobs
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -40,14 +48,20 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           SCHEDULE: ${{ github.event.schedule }}
           INPUT_REF: ${{ inputs.ref }}
+          INPUT_NIGHTLY: ${{ inputs.nightly }}
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
             schedule)
               case "$SCHEDULE" in
                 '30 9 * * *') target_ref=next ;;
-                '15 0,6,12,18 * * *') target_ref=main ;;
+                '15 6 * * *') target_ref=main ;;
+                '15 0 * * *'|'15 12 * * *'|'15 18 * * *') target_ref=main ;;
                 *) echo "Unknown kind schedule" >&2; exit 1 ;;
+              esac
+              case "$SCHEDULE" in
+                '30 9 * * *'|'15 6 * * *') nightly=true ;;
+                *) nightly=false ;;
               esac
               ;;
             workflow_dispatch)
@@ -55,17 +69,22 @@ jobs:
                 main|next) target_ref="$INPUT_REF" ;;
                 *) echo "Invalid kind target ref" >&2; exit 1 ;;
               esac
+              case "$INPUT_NIGHTLY" in
+                true|false) nightly="$INPUT_NIGHTLY" ;;
+                *) echo "Invalid nightly input" >&2; exit 1 ;;
+              esac
               ;;
             *) echo "Unsupported kind trigger" >&2; exit 1 ;;
           esac
-          printf 'ref=%s\n' "$target_ref" >> "$GITHUB_OUTPUT"
+          printf 'ref=%s\nnightly=%s\n' "$target_ref" "$nightly" >> "$GITHUB_OUTPUT"
       - name: Dispatch the CI workflow
         id: dispatch_ci
         env:
           TARGET_REF: ${{ steps.target.outputs.ref }}
+          NIGHTLY: ${{ steps.target.outputs.nightly }}
         run: |
           dispatch=$(gh api --method POST "repos/$GH_REPO/actions/workflows/ci.yaml/dispatches" \
-            -f "ref=$TARGET_REF" -F return_run_details=true)
+            -f "ref=$TARGET_REF" -f "inputs[nightly]=$NIGHTLY" -F return_run_details=true)
           run_id=$(jq -er '.workflow_run_id | select(type == "number" and . > 0 and . == floor)' <<< "$dispatch")
           run_url=$(jq -er '.html_url | select(type == "string" and length > 0)' <<< "$dispatch")
           printf 'run_id=%s\nrun_url=%s\n' "$run_id" "$run_url" >> "$GITHUB_OUTPUT"

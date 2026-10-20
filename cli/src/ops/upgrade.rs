@@ -1541,6 +1541,9 @@ trait UpgradeDriver {
     fn runner_layer_plan(&self) -> RunnerLayerPlan {
         RunnerLayerPlan::default()
     }
+    fn runner_layer_pending(&self) -> Option<String> {
+        None
+    }
     /// Retire the SandboxClaims of every agent [`Self::runner_layer_plan`]
     /// rebinds or clears after Apply (#3422, #4321), so a live thread's next
     /// turn cold-starts on its new runner instead of keeping the old layer.
@@ -1622,6 +1625,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         &host.runner_layer_plan(),
         host.helm_timeout_seconds(),
     );
+    plan.extend(host.runner_layer_pending());
     if same_version {
         // #2861: the rerun runs no Helm upgrade, so the plan must not show one.
         plan.retain(|line| {
@@ -2095,6 +2099,7 @@ struct LiveHost {
     schema_refusal: Option<String>,
     /// What the upgrade does to each layered agent (#3218, #4321).
     runner_layers: RunnerLayerPlan,
+    runner_layer_pending: Option<String>,
     /// The target chart's own `fullnameOverride` and `nameOverride` defaults,
     /// read once with the runner defaults; the canary names templates from
     /// them under the retained overlay (#4321).
@@ -2311,6 +2316,7 @@ impl LiveHost {
             schema_decision: None,
             schema_refusal: None,
             runner_layers: RunnerLayerPlan::default(),
+            runner_layer_pending: None,
             chart_name_defaults: None,
             helm_timeout_seconds: HELM_TIMEOUT_DEFAULT_SECS,
             timeout_refusal: None,
@@ -2890,12 +2896,14 @@ impl LiveHost {
     /// The deploy guard guarantees every bound layer was built on the current
     /// installation's runner, so they all stop matching exactly when the
     /// target runner's digest differs from the current one. A release with no
-    /// layered agent costs no extra read. Either runner being unknown counts
+    /// layered agent costs no extra read. Either observed runner being unknown counts
     /// as a change: keeping an old layer under a new worker is the failure this
     /// exists to prevent, and running the platform runner is always servable.
     /// A stock dark factory binding asks the registry for the layer published
     /// for `--to` and is rebound to it when its base is the target runner.
-    /// Otherwise Validate refuses unless the operator consents to clearing it.
+    /// An unobserved target runner in a cold release defers stock rebinding
+    /// until chart download and verification by the live run. Otherwise
+    /// Validate refuses unless the operator consents to clearing it.
     fn compute_runner_layers(&mut self) {
         let Some(overlay) = self
             .overlay
@@ -2904,7 +2912,7 @@ impl LiveHost {
         else {
             return;
         };
-        let bindings = crate::cluster_secrets::layered_bindings(&overlay);
+        let mut bindings = crate::cluster_secrets::layered_bindings(&overlay);
         if bindings.is_empty() {
             return;
         }
@@ -2926,21 +2934,42 @@ impl LiveHost {
             };
             return;
         }
+        let target_reference = target_runner_ref(chart_default.as_ref(), &overlay, &self.opts.to);
+        if self.opts.chart.pending_release().is_some() && target_reference.is_none() {
+            let stock_agents: Vec<_> = bindings
+                .iter()
+                .filter(|(_, binding)| is_stock_layer(binding))
+                .map(|(agent, _)| agent.as_str())
+                .collect();
+            if !stock_agents.is_empty() {
+                self.runner_layer_pending = Some(format!(
+                    "runner layers conditional rebind: {} to the dark factory runner layer \
+                     published for {} if the platform runner changes and the published layer \
+                     matches the target runner base; the target runner is unobserved until \
+                     release chart download, so runner and published-layer compatibility \
+                     checks are pending",
+                    stock_agents.join(", "),
+                    self.opts.to
+                ));
+            }
+            bindings.retain(|_, binding| !is_stock_layer(binding));
+            if bindings.is_empty() {
+                return;
+            }
+        }
         let current = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(crate::cluster_secrets::installed_runner(&self.opts.common))
         })
         .ok()
         .map(|(_, pinned)| pinned);
-        let target = target_runner_ref(chart_default.as_ref(), &overlay, &self.opts.to).and_then(
-            |reference| {
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(crate::cluster_secrets::pin_runner_reference(&reference))
-                })
-                .ok()
-            },
-        );
+        let target = target_reference.and_then(|reference| {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(crate::cluster_secrets::pin_runner_reference(&reference))
+            })
+            .ok()
+        });
         let stock = if needs_stock_lookup(&bindings, current.as_deref(), target.as_deref()) {
             let published = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
@@ -3860,6 +3889,10 @@ impl UpgradeDriver for LiveHost {
     }
     fn runner_layer_plan(&self) -> RunnerLayerPlan {
         self.runner_layers.clone()
+    }
+
+    fn runner_layer_pending(&self) -> Option<String> {
+        self.runner_layer_pending.clone()
     }
 
     fn helm_timeout_seconds(&self) -> u64 {

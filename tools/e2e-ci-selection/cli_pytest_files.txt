@@ -41,6 +41,7 @@ examples/tests/test_alert_path_heartbeat.py
 examples/tests/test_dark_factory_bundle.py
 examples/tests/test_dark_factory_review_gate.py
 examples/tests/test_shipped_connector_tests_are_collected.py
+examples/tests/test_sre_bot_metric_alignment.py
 examples/tests/test_sre_bot_observability_runtime.py
 examples/tests/test_sre_bot_reply_format.py
 packages/aci-protocol/tests/test_exporters.py
@@ -124,6 +125,7 @@ tools/factory-e2e/tests/test_scripted_scenario.py
 tools/factory-e2e/tests/test_tls_code_host.py
 tools/fix-pin-ci/tests/test_fix_pin_ci.py
 tools/helm-ci-gate/tests/test_decide.py
+tools/p0-closes-ci/tests/test_p0_closes_ci.py
 tools/preflight/tests/test_full_preflight.py
 tools/preflight/tests/test_preflight.py
 tools/runtime-assertion-gate/tests/test_runtime_assertion_gate.py
