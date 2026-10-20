@@ -194,12 +194,23 @@ class DatabaseTarget(_Contract):
     @field_validator("cidrs")
     @classmethod
     def valid_cidrs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        ipv4: list[ipaddress.IPv4Network] = []
+        ipv6: list[ipaddress.IPv6Network] = []
         for cidr in value:
             network = ipaddress.ip_network(cidr, strict=True)
             if network.prefixlen == 0 or str(network) != cidr:
                 raise ValueError("database CIDRs must be canonical and cannot use /0")
+            if isinstance(network, ipaddress.IPv4Network):
+                ipv4.append(network)
+            else:
+                ipv6.append(network)
         if len(set(value)) != len(value):
             raise ValueError("database CIDRs must be unique")
+        if (
+            any(network.prefixlen == 0 for network in ipaddress.collapse_addresses(ipv4))
+            or any(network.prefixlen == 0 for network in ipaddress.collapse_addresses(ipv6))
+        ):
+            raise ValueError("database CIDRs cannot collectively cover /0")
         return value
 
     @model_validator(mode="after")
