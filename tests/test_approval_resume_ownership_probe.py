@@ -15,7 +15,7 @@ import os
 import subprocess
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "cli/scripts/e2e-cluster-approval-resume-restarts.sh"
 
 ROUTE = "e2e_resume_fixture"
