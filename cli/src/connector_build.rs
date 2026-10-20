@@ -3040,7 +3040,7 @@ mod shared_connector_reference_tests {
     #[test]
     fn shared_connector_load_refuses_activation_and_keeps_dedicated_live() {
         let bundle = tempfile::tempdir().unwrap();
-        for case in cases().into_iter().filter(|case| case["accept"] == true) {
+        for case in cases() {
             let document = document(&case);
             std::fs::write(
                 bundle.path().join(CONNECTORS_FILE),
@@ -3048,16 +3048,11 @@ mod shared_connector_reference_tests {
             )
             .unwrap();
             let loaded = load(bundle.path());
-            if document["connectors"]
-                .as_object()
-                .unwrap()
-                .values()
-                .any(|spec| spec.get("shared").is_some())
-            {
+            let activation = case["activation"].as_bool().unwrap();
+            assert_eq!(loaded.is_ok(), activation, "{case}: {loaded:?}");
+            if case["accept"] == true && !activation {
                 let error = loaded.unwrap_err();
                 assert!(format!("{error:#}").contains("shared_connector_requires_application"));
-            } else {
-                assert!(loaded.is_ok(), "{case}: {loaded:?}");
             }
         }
     }

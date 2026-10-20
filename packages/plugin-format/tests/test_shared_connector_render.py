@@ -19,7 +19,10 @@ AGENT = "22345678-1234-4234-8234-123456789abc"
 OTHER_AGENT = "32345678-1234-4234-8234-123456789abc"
 SERVER_IMAGE = "example.com/acme/server@sha256:" + "a" * 64
 PROXY_IMAGE = "example.com/acme/proxy@sha256:" + "b" * 64
-DB_LABELS = {"curie.ai/shared-application": APPLICATION, "app.kubernetes.io/component": "database"}
+DB_LABELS = {
+    "curietech.ai/shared-application": APPLICATION,
+    "app.kubernetes.io/component": "database",
+}
 
 
 def _application(**changes) -> SharedApplication:
@@ -59,7 +62,7 @@ def _member(application: SharedApplication, agent: str = AGENT) -> SharedMember:
             "app.kubernetes.io/name": application.app_name,
             "app.kubernetes.io/instance": application.release,
             "app.kubernetes.io/component": "runner-sandbox",
-            "curie.ai/agent-id": agent,
+            "curietech.ai/agent-id": agent,
         },
     )
 
@@ -172,7 +175,7 @@ def test_shared_application_default_deny_service_and_database_target(managed: bo
     labels = deployment["spec"]["template"]["metadata"]["labels"]
     assert selector and selector.items() <= labels.items()
     assert labels["app.kubernetes.io/component"] == "shared-connector-application"
-    assert "curietech.ai/agent" not in labels and "curie.ai/agent-id" not in labels
+    assert "curietech.ai/agent" not in labels and "curietech.ai/agent-id" not in labels
     assert APPLICATION in labels.values()
     service = _object(objects, "Service")
     assert service["spec"]["selector"] == selector
@@ -243,7 +246,8 @@ def test_member_reach_is_exact_and_leaves_application_template_unchanged() -> No
     assert render_application(application) == original
 
 
-def test_shared_names_are_bounded_deterministic_and_identity_scoped() -> None:
+@pytest.mark.parametrize("release", ["r" * 63, "1" + "r" * 62])
+def test_shared_names_are_bounded_deterministic_and_identity_scoped(release: str) -> None:
     name_sets = []
     for changes in (
         {},
@@ -251,7 +255,7 @@ def test_shared_names_are_bounded_deterministic_and_identity_scoped() -> None:
         {"installation": "opaque:installation/2"},
         {"installation": "é" * 64},
     ):
-        application = _application(release="r" * 63, app_name="a" * 63, **changes)
+        application = _application(release=release, app_name="a" * 63, **changes)
         objects = render_application(application) + render_member_reach(
             application, _member(application)
         )
@@ -389,7 +393,7 @@ def test_member_identity_and_fields_validate_on_construction(change: dict) -> No
 @pytest.mark.parametrize(
     "missing",
     [
-        "curie.ai/agent-id",
+        "curietech.ai/agent-id",
         "app.kubernetes.io/instance",
         "app.kubernetes.io/name",
         "app.kubernetes.io/component",

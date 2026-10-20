@@ -31,22 +31,19 @@ def _document(case: dict) -> dict:
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case["name"])
 def test_shared_connector_reference_vectors(case: dict) -> None:
     document = _document(case)
+    activated, errors = validate_connectors(document)
+    assert (not errors) is case["activation"], case["name"]
+    assert (activated is not None) is case["activation"], case["name"]
     if not case["accept"]:
         with pytest.raises(ValidationError):
             ConnectorsFile.model_validate(document)
-        _, errors = validate_connectors(document)
         assert errors, case["name"]
         return
     parsed = ConnectorsFile.model_validate(document)
-    activated, errors = validate_connectors(document)
-    if any("shared" in declaration for declaration in document["connectors"].values()):
-        assert activated is None
+    if not case["activation"]:
         assert {code.rsplit(".", 1)[-1] for code, _ in errors} == {
             "shared_connector_requires_application"
         }
-    else:
-        assert errors == []
-        assert activated is not None
     for alias, declaration in document["connectors"].items():
         spec = parsed.connectors[alias]
         if "shared" in declaration:
@@ -56,6 +53,16 @@ def test_shared_connector_reference_vectors(case: dict) -> None:
         else:
             field = "image" if "image" in declaration else "url"
             assert getattr(spec, field) == declaration[field]
+
+
+@pytest.mark.parametrize(
+    "case", [case for case in CASES if case["activation"]], ids=lambda case: case["name"]
+)
+def test_dedicated_model_dump_omits_shared_and_roundtrips(case: dict) -> None:
+    spec = ConnectorSpec.model_validate(_document(case)["connectors"]["docs"])
+    dumped = spec.model_dump()
+    assert "shared" not in dumped
+    assert ConnectorSpec.model_validate(dumped) == spec
 
 
 # JSON Schema regards 1 and 1.0 as equal; both production parsers enforce strict integers.
