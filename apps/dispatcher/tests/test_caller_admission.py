@@ -61,6 +61,25 @@ TTL = 30.0
 STALE = 300.0
 
 
+@pytest.fixture
+def redis_client(redis_client: redis.Redis) -> Iterator[redis.Redis]:
+    # This file deliberately changes the fixed production fence key. Keep its
+    # authority separate from API tests running on other xdist workers; the
+    # ordinary per-test cache prefix cannot namespace that fixed key.
+    options = dict(redis_client.connection_pool.connection_kwargs, db=14)
+    pool = redis.ConnectionPool(**options)
+    client = redis.Redis(connection_pool=pool)
+    try:
+        client.ping()
+        yield client
+    finally:
+        try:
+            client.delete("curie:identity:admission-fence")
+        finally:
+            client.close()
+            pool.disconnect()
+
+
 class _Clock:
     """A settable monotonic clock, so cache expiry is driven without sleeping."""
 
