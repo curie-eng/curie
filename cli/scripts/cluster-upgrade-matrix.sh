@@ -1507,7 +1507,7 @@ retag_candidate_versions() {
 }
 
 load_tag_images() {
-    local tag="$1" img ref
+    local tag="$1" img ref platform archive
     EXCLUSIVE_KIND_TAG=""
     for img in "${IMAGES[@]}"; do
         ref="$(image_for "$img" "$tag")"
@@ -1520,9 +1520,18 @@ load_tag_images() {
             docker pull "$ref"
         fi
         log "kind load $ref"
-        kind load docker-image "$ref" --name "$KIND_CLUSTER"
-        if docker image inspect "${img}:${tag}" >/dev/null 2>&1; then
-            kind load docker-image "${img}:${tag}" --name "$KIND_CLUSTER" || true
+        platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$ref")"
+        archive="$WORKDIR/${img}-${tag}.tar"
+        # Save only the inspected platform; other descriptors may lack local content.
+        # https://docs.docker.com/reference/cli/docker/image/save/#save-a-specific-platform---platform
+        docker image save --platform "$platform" --output "$archive" "$ref"
+        kind load image-archive "$archive" --name "$KIND_CLUSTER"
+        rm -f "$archive"
+        if [[ "$ref" != "${img}:${tag}" ]] && docker image inspect "${img}:${tag}" >/dev/null 2>&1; then
+            archive="$WORKDIR/${img}-${tag}-short.tar"
+            docker image save --platform "$platform" --output "$archive" "${img}:${tag}"
+            kind load image-archive "$archive" --name "$KIND_CLUSTER" || true
+            rm -f "$archive"
         fi
     done
 }
