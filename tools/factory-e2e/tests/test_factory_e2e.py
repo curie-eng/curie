@@ -2833,6 +2833,7 @@ def test_an_early_stop_ending_needs_the_agents_reason() -> None:
         "at entities &#64;someone &#x40;someone &commat;someone\n"
         "URL https://example.com/path?a=1&b=2",
         "[label](https://example.com) and [label](javascript:alert(1))",
+        *("custom" + "\\" * count + "://example.com" for count in range(5)),
         *("\\" * count + "[label](https://example.com)" for count in range(5)),
         r"!\[image](https://example.com/x.png) and \![image](https://example.com/x.png)",
         r"literal [brackets] and C:\temp\\files; escaped closing \] and repeated \\\\ here",
@@ -2852,10 +2853,10 @@ def test_agent_message_parser_reverses_only_quote_escapes_once() -> None:
         "Agent's last message:\n"
         "> &lt;\u200b!-- curie-status:final -->\n"
         "> &lt;img src=x>\n"
-        "> !\\[x](https://example.invalid/x.png)\n"
-        r"> \[label](https://example.com)" "\n"
+        "> !\\[x](https\\://example.invalid/x.png)\n"
+        r"> \[label](https\://example.com)" "\n"
         r"> \\\[escaped](javascript:alert(1))" "\n"
-        r"> !\\\[image](https://example.com/x.png)" "\n"
+        r"> !\\\[image](https\://example.com/x.png)" "\n"
         r"> literal \[brackets] and C:\\temp\\\\files" "\n"
         r"> repeated \\\\\\\\ backslashes" "\n"
         "> @\u200bsomeone\n"
@@ -2863,7 +2864,7 @@ def test_agent_message_parser_reverses_only_quote_escapes_once() -> None:
         "> &amp;lt; is a literal less-than entity\n"
         "> &amp;amp; is a literal ampersand entity\n"
         "> &amp;#64;someone &amp;#x40;someone &amp;commat;someone\n"
-        "> a &amp; b &amp;&amp; https://example.com/path?a=1&amp;b=2\n"
+        "> a &amp; b &amp;&amp; https\\://example.com/path?a=1&amp;b=2\n"
         "> &lt;lt; is not decoded twice\n"
         "> > nested quote\n"
         ">\n"
@@ -2891,6 +2892,23 @@ def test_agent_message_parser_reverses_only_quote_escapes_once() -> None:
         "\n"
         "Last question?"
     )
+
+
+@pytest.mark.parametrize(
+    ("encoded", "original"),
+    [
+        (r"custom\://example.com", "custom://example.com"),
+        (r"custom\\\://example.com", r"custom\://example.com"),
+        (r"custom\\\\\://example.com", r"custom\\://example.com"),
+        (r"custom\\\\\\\://example.com", r"custom\\\://example.com"),
+        (r"custom\\\\\\\\\://example.com", r"custom\\\\://example.com"),
+    ],
+)
+def test_agent_message_parser_restores_scheme_separator_backslashes(
+    encoded: str, original: str
+) -> None:
+    body = f"Agent's last message:\n> {encoded}\n\nCause: early_stop\n"
+    assert fe.agent_message_from_comment(body) == original
 
 
 @pytest.mark.parametrize("blank", [">", "> "])

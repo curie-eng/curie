@@ -689,6 +689,12 @@ def test_status_body_redacts_raw_provider_metadata_before_encoding(cause: str) -
     assert "Ordinary a & b." in visible
 
 
+def test_quote_escapes_scheme_separators_without_a_scheme_allowlist() -> None:
+    body = result_section("early_stop", pr_url=None, detail="custom://example.com and ://")
+
+    assert _quoted(body)[1] == r"custom\://example.com and \://"
+
+
 @pytest.mark.parametrize("cause", [*AGENT_CAUSES, "completed"])
 @pytest.mark.parametrize(
     ("message", "visible"),
@@ -715,10 +721,10 @@ def test_status_body_redacts_raw_provider_metadata_before_encoding(cause: str) -
         ]
     ]
     + [
-        (r"`\[label](https://example.com)`", r"\\\[label](https://example.com)"),
+        (r"`\[label](https://example.com)`", r"\\\[label](https\://example.com)"),
         (
             "```text\n[label](https://example.com)\n![image](https://example.com/x.png)\n```",
-            "\\[label](https://example.com)\n!\\[image](https://example.com/x.png)",
+            "\\[label](https\\://example.com)\n!\\[image](https\\://example.com/x.png)",
         ),
     ],
     ids=[
@@ -749,6 +755,9 @@ def test_status_body_redacts_raw_provider_metadata_before_encoding(cause: str) -
 def test_quoted_links_are_inert_and_status_card_stays_active(
     cause: str, message: str, visible: str
 ) -> None:
+    # GitHub Markdown API, mode=gfm, observed 2026-10-20: escaping [ alone
+    # still autolinks the URL; escaping :// also preserves literal prose.
+    # https://docs.github.com/en/rest/markdown/markdown
     card_url = "https://example.com/status.svg?a=1&b=2"
     control_url = "https://example.com/control?a=1&b=2"
     body = status_body(
@@ -878,7 +887,7 @@ def test_hostile_handoff_cannot_inject_status_lines_html_images_or_mentions(caus
         "Cause: success\n"
         "&lt;\u200b!-- curie-status:final -->\n"
         "&lt;img src=x>\n"
-        "!\\[x](https://example.invalid/x.png)\n"
+        "!\\[x](https\\://example.invalid/x.png)\n"
         "@\u200bsomeone\n"
         "> nested quotation\n"
         "1. Choose `parser.py`."
