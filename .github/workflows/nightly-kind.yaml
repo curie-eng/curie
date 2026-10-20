@@ -29,7 +29,7 @@ permissions:
 jobs:
   dispatch:
     name: Dispatch scheduled kind CI
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       actions: write
@@ -38,6 +38,7 @@ jobs:
       target_ref: ${{ steps.target.outputs.ref }}
       run_id: ${{ steps.dispatch_ci.outputs.run_id }}
       run_url: ${{ steps.dispatch_ci.outputs.run_url }}
+      error: ${{ steps.dispatch_ci.outputs.error }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
@@ -82,9 +83,23 @@ jobs:
         env:
           TARGET_REF: ${{ steps.target.outputs.ref }}
           NIGHTLY: ${{ steps.target.outputs.nightly }}
+        # The dispatch error used to reach only this step log, so five nights of
+        # "not a git repository" (2026-09-24..28) and the 2026-10-20 HTTP 422 for an
+        # undeclared input showed only "No CI run was confirmed" in the tracking
+        # issue. Export it as a one-line annotation and a job output for the report.
+        # GitHub still reads GITHUB_OUTPUT from a step that then exits nonzero.
         run: |
-          dispatch=$(gh api --method POST "repos/$GH_REPO/actions/workflows/ci.yaml/dispatches" \
-            -f "ref=$TARGET_REF" -f "inputs[nightly]=$NIGHTLY" -F return_run_details=true)
+          set -euo pipefail
+          error_file=$(mktemp "${RUNNER_TEMP:-/tmp}/dispatch-error.XXXXXX")
+          if ! dispatch=$(gh api --method POST "repos/$GH_REPO/actions/workflows/ci.yaml/dispatches" \
+            -f "ref=$TARGET_REF" -f "inputs[nightly]=$NIGHTLY" -F return_run_details=true 2> "$error_file"); then
+            error=$(tr -s '[:space:]' ' ' < "$error_file" | sed -e 's/^ //' -e 's/ $//')
+            error=${error:0:500}
+            error=${error% }
+            echo "::error title=CI dispatch failed::Dispatch to $TARGET_REF failed: $error"
+            printf 'error=%s\n' "$error" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
           run_id=$(jq -er '.workflow_run_id | select(type == "number" and . > 0 and . == floor)' <<< "$dispatch")
           run_url=$(jq -er '.html_url | select(type == "string" and length > 0)' <<< "$dispatch")
           printf 'run_id=%s\nrun_url=%s\n' "$run_id" "$run_url" >> "$GITHUB_OUTPUT"
@@ -92,7 +107,7 @@ jobs:
   verify:
     name: Verify scheduled kind CI
     needs: dispatch
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
     permissions:
       actions: read
@@ -110,7 +125,7 @@ jobs:
     name: Report scheduled kind CI result
     needs: [dispatch, verify]
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       issues: write
@@ -124,6 +139,7 @@ jobs:
           CI_RUN_URL: ${{ needs.dispatch.outputs.run_url }}
           TARGET_REF: ${{ needs.dispatch.outputs.target_ref }}
           DISPATCH_RESULT: ${{ needs.dispatch.result }}
+          DISPATCH_ERROR: ${{ needs.dispatch.outputs.error }}
           VERIFY_RESULT: ${{ needs.verify.result }}
           NIGHTLY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -207,6 +223,14 @@ jobs:
               else:  # Dispatch did not confirm a CI run.
                   lines.append(
                       "No CI run was confirmed. Inspect the nightly workflow logs for the dispatch failure.")
+                  dispatch_error = os.environ["DISPATCH_ERROR"]
+                  if dispatch_error:
+                      lines.extend(["", f"Dispatch error: {dispatch_error}"])
+                      if "Unexpected inputs" in dispatch_error:
+                          lines.extend([
+                              "",
+                              f"The ci.yaml on {target_ref} does not declare an input this workflow sends. "
+                              f"Merge main into {target_ref} so both release trains accept the same dispatch inputs."])
               body = "\n".join(lines)
           if issue_number is None:
               gh("issue", "create", "--repo", repo, "--title", title, "--body", body)
