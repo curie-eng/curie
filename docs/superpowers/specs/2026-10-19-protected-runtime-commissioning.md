@@ -539,10 +539,14 @@ its own campaign, and ADR 0236 lets the operator command qualify only disposable
 local installations until a producer exists for the target CNI, naming source
 identity, spoof measurement and retained connection refusal as part of that
 producer's realization. No Accepted ADR covers such a producer. Production
-qualification on a managed CNI therefore depends on a separate Draft ADR for a
-managed CNI qualification producer, which must be Accepted before any
-specification or code for it. Until then, ADR 0236's explicit outcome holds:
-such an installation refuses before the campaign starts.
+qualification on a managed CNI therefore depends on Draft
+<!-- doclint:ignore-line -->
+[ADR 0238](https://github.com/curie-eng/curie/blob/task/managed-cni-qualification-adr/docs/adr/0238-a-managed-cni-installation-qualifies-through-its-own-behavioral-network-producer.md),
+a managed CNI qualification producer, proposed in
+[#4803](https://github.com/curie-eng/curie/pull/4803). It must be Accepted
+before any specification or code for that producer. Until then, ADR 0236's
+explicit outcome holds: such an installation refuses before the campaign
+starts.
 
 ### 4. The activation transition is demonstrated before implementation
 
