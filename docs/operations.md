@@ -629,7 +629,7 @@ and runs every target check before mutation.
 | `--to <version>` | Target Curie version. Required. |
 | `--chart` | Chart path or ref override. |
 | `--yes` | Skip the confirmation prompt. |
-| `--dry-run` | Print the redacted plan and exit without changing the installed release or downloading the default release chart archive. It still reads the installed release from the cluster, and retained-configuration checks always run. Available local charts and Helm refs also run target chart and schema checks; Helm may fetch an explicit repository or OCI ref for those metadata checks. A cold default release archive records those checks as pending until download. A plan that ends in a validate refusal exits nonzero, like the real run. The printed `helm upgrade` line is the command Apply runs, including `--install` and `-f <retained-values>` when it passes them. |
+| `--dry-run` | Print the redacted plan and exit without changing the installed release or downloading the default release chart archive. It still reads the installed release from the cluster, and retained-configuration checks always run. Available local charts and Helm refs also run target chart and schema checks; Helm may fetch an explicit repository or OCI ref for those metadata checks. A cold default release archive records those checks as pending until download; if its target runner is unobserved, stock layer rebind remains conditional until a live run downloads the chart and verifies it, with no refusal solely for that unobserved runner. A plan that ends in a validate refusal exits nonzero, like the real run. The printed `helm upgrade` line is the command Apply runs, including `--install` and `-f <retained-values>` when it passes them. |
 | `--forward-only` | Apply pending contract or irreversible schema migrations. Without this flag, Validate refuses those migrations before mutation so a patch rollback window stays intact. |
 | `--allow-stock-layer-clear` | Proceed when a stock dark factory runner layer cannot be rebound for `--to`: clear its binding so the agent runs the platform runner without its layer until it is rebound. Refused by default. |
 
@@ -1770,7 +1770,7 @@ resolved in the registry) and refuses a mismatch, or a runner it cannot
 determine, with the fix `curie build --plugin-dir <dir> --registry <ref>
 --runner-image <installed runner>`. `curie cluster upgrade` compares the current
 runner with the one the target release renders. When they differ, or either
-cannot be determined, it names every agent in `agentSandbox.runnerImages` before
+observed runner cannot be determined, it names every agent in `agentSandbox.runnerImages` before
 upgrading, in the plan and `--dry-run` output too, and clears those entries in
 the same `helm upgrade` by deleting the keys from the retained values document.
 It does not pass a null override. A null map entry is not a deletion, and the
@@ -1784,8 +1784,11 @@ to the project's published dark factory layer
 (`ghcr.io/curie-eng/curie-dark-factory-runner@...`) is instead rebound to the
 layer published for the target version when that layer's base is the target
 runner. The plan lists it separately, and its sandboxes are retired the same
-way. When it cannot be rebound (no published layer, another base, an
-unreachable registry, or an unknown target runner), the upgrade refuses at
+way. For a cold release chart with an unobserved target runner, stock rebind
+remains conditional pending chart download and verification by a live run;
+that unobserved runner alone causes no refusal or remediation notice.
+When it cannot be rebound (no published layer, another base, an
+unreachable registry, or an unknown observed target runner), the upgrade refuses at
 Validate with the reason and remediation. It is cleared only with
 `--allow-stock-layer-clear`; then the notice names `curie cluster factory
 --runner-image <agent>=<repository>@sha256:<digest>`, or `curie example
