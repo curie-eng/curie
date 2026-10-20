@@ -1001,12 +1001,87 @@ fn failing_api() -> MockServer {
     })
 }
 
-/// A base URL nothing listens on: bound, then released.
-fn dead_url() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
-    let port = listener.local_addr().expect("local addr").port();
-    drop(listener);
-    format!("http://127.0.0.1:{port}")
+/// A loopback port reserved until this value is dropped, and never listened on.
+///
+/// `connect` fails at once with connection refused. The reservation is held for
+/// the whole negative transport case so a parallel HTTP fixture cannot bind the
+/// same port and answer with a real policy row.
+struct DeadUrl {
+    _reservation: std::os::fd::OwnedFd,
+    url: String,
+}
+
+impl DeadUrl {
+    fn as_str(&self) -> &str {
+        &self.url
+    }
+}
+
+fn dead_url() -> DeadUrl {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    assert!(
+        fd >= 0,
+        "reserve a loopback socket: {}",
+        std::io::Error::last_os_error()
+    );
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    assert!(
+        flags >= 0,
+        "read socket flags: {}",
+        std::io::Error::last_os_error()
+    );
+    let cloexec = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    assert_eq!(
+        cloexec,
+        0,
+        "keep the reservation out of child processes: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    addr.sin_family = libc::AF_INET as libc::sa_family_t;
+    addr.sin_port = 0;
+    // `s_addr` is network order. Native bytes keep 127.0.0.1 in that order.
+    addr.sin_addr = libc::in_addr {
+        s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+    };
+    let bound = unsafe {
+        libc::bind(
+            fd,
+            &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(
+        bound,
+        0,
+        "bind the reserved port: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let named = unsafe {
+        libc::getsockname(
+            fd,
+            &mut addr as *mut libc::sockaddr_in as *mut libc::sockaddr,
+            &mut len,
+        )
+    };
+    assert_eq!(
+        named,
+        0,
+        "read the reserved port: {}",
+        std::io::Error::last_os_error()
+    );
+    let port = u16::from_be(addr.sin_port);
+    assert_ne!(port, 0, "the kernel assigned a port");
+    let probe = std::net::TcpListener::bind(("127.0.0.1", port));
+    assert!(
+        probe.is_err(),
+        "another listener rebound the reserved port {port}"
+    );
+    DeadUrl {
+        _reservation: unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) },
+        url: format!("http://127.0.0.1:{port}"),
+    }
 }
 
 fn assert_valid(schema_file: &str, value: &Value, what: &str) {
