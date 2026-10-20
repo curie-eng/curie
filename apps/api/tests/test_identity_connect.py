@@ -758,18 +758,17 @@ def test_actual_proxy_prefix_is_preserved_through_connect_oidc_and_confirm(conne
 
 
 def test_connect_browser_proof_is_private_scoped_and_rechecks_deactivation(connect_browser):
-    import re
-
-    from curie_api.routers.identity_connect import PROOF_COOKIE
+    from curie_api.routers.identity_connect import CSRF_COOKIE, PROOF_COOKIE
 
     client, raw, tenant_id, principal_id, proof, _ = connect_browser
     path = f"/identity/connect/{raw}"
     client.cookies.set(PROOF_COOKIE, proof)
     page = client.get(path)
     assert "Confirm account connection" in page.text
-    csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
     client.cookies.set(PROOF_COOKIE, "x" * 43)
     assert "Sign in with your organization" in client.get(path).text
+    # Every GET rotates CSRF; isolate proof rejection with the current value.
+    csrf = client.cookies.get(CSRF_COOKIE)
     refused = client.post(
         path + "/confirm", data={"csrf": csrf}, headers={"Origin": "https://testserver"}
     )
