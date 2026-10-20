@@ -974,7 +974,10 @@ class SessionRunner:
             # Accepted turn still in connector recovery: no query has been
             # sent, and run_turn checks the flag before sending one.
             return
-        if self._session is not None:
+        # The session object exists before connect() finishes; interrupting the
+        # unconnected SDK client raises and turns POST /v1/interrupt into a 500
+        # (#4777). `_started` is set right after connect in `_initialize`.
+        if self._session is not None and self._started:
             await self._session.interrupt()
 
     async def timeout(self, turn_epoch: str) -> bool:
