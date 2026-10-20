@@ -665,10 +665,10 @@ async def resolve_approval(
             team_digest=team_decision.digest if team_decision.restricted else None,
         )
 
-    if decision.allowed:
-        # Re-read after external membership lookups, including when no team
-        # was configured initially. A new policy must not be bypassed while a
-        # lookup is in flight. Keep the reader fence through the CAS commit.
+    async def _refresh_authority() -> None:
+        nonlocal team_decision, decision
+        # A committing read helper releases transaction advisory locks. Every
+        # refresh re-acquires the fence and reads the current actor and policy.
         was_restricted = team_decision.restricted
         await lock_identity_reader(session)
         team_decision = await approval_team_decision(session, approval, principal)
@@ -680,6 +680,8 @@ async def resolve_approval(
             decision = AuthzDecision(False, "approver team membership or policy changed",
                                      evidence={"kind": "idp_team", "reason": team_decision.reason})
 
+    if decision.allowed:
+        await _refresh_authority()
     if not decision.allowed:
         await _audit("denied", authorized=False, reason=decision.reason)
         raise HTTPException(status.HTTP_403_FORBIDDEN, decision.reason)
@@ -796,6 +798,12 @@ async def resolve_approval(
         if refused is not None:
             await _audit("remediation_refused", authorized=True, reason=refused.code)
             raise _remediation_refused(refused)
+        # resolution_refusal commits its read transaction. Do not let that
+        # release create an authorization gap before the resolution claim.
+        await _refresh_authority()
+        if not decision.allowed:
+            await _audit("denied", authorized=False, reason=decision.reason)
+            raise HTTPException(status.HTTP_403_FORBIDDEN, decision.reason)
 
     with operation_span(
         "curie.approval.resolve",

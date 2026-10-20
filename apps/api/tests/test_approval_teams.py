@@ -530,3 +530,164 @@ def test_serving_mail_adapter_cannot_answer_fixed_slack_card_with_team_membershi
         headers={"X-Curie-Adapter-Principal": token, "X-Curie-Approval-Actor": "alice@example.com"},
     )
     assert response.status_code == 403, response.text
+
+
+@pytest.mark.parametrize("revocation", ["membership", "status"])
+def test_remediation_rechecks_authority_after_preclaim_helper_commit(team_client, revocation):
+    """The real remediation judge commits; revocation must win before claim."""
+    import hashlib
+    from concurrent.futures import ThreadPoolExecutor
+
+    from curie_api.identity_fence import mutation
+    from curie_api.models import (
+        ActionExecution,
+        RemediationApprovalRequest,
+        RemediationNomination,
+        RemediationNominationSubmission,
+        RemediationPolicy,
+        RemediationPolicyGeneration,
+    )
+    from sqlalchemy import event
+    from sqlalchemy.orm import Session
+
+    client, world = team_client
+    nomination_id = uuid.uuid4()
+    digest = hashlib.sha256(b"{}").hexdigest()
+
+    async def prepare(s):
+        approval = await s.get(Approval, world["approval"])
+        approval.purpose = "remediation"
+        approval.granted_tool, approval.granted_arguments = "mcp__example__apply", {}
+        operation = uuid.uuid4()
+        s.add_all(
+            [
+                RemediationPolicy(
+                    agent_id=world["agent"],
+                    hook="example-alert",
+                    generation=1,
+                    operation_id=operation,
+                    armed=True,
+                    active=True,
+                ),
+                RemediationPolicyGeneration(
+                    agent_id=world["agent"],
+                    hook="example-alert",
+                    generation=1,
+                    operation_id=operation,
+                    intent_sha256="0" * 64,
+                    armed=True,
+                    active=True,
+                    bound_by="example-operator",
+                    document={
+                        "actions": [
+                            {
+                                "name": "example-action",
+                                "kind": "remediate",
+                                "connector": "example",
+                                "tool": "apply",
+                            }
+                        ]
+                    },
+                ),
+                RemediationNominationSubmission(
+                    event_id=str(nomination_id),
+                    agent_id=world["agent"],
+                    hook="example-alert",
+                    block_sha256="0" * 64,
+                ),
+            ]
+        )
+        await s.flush()
+        s.add(
+            RemediationNomination(
+                id=nomination_id,
+                agent_id=world["agent"],
+                hook="example-alert",
+                event_id=str(nomination_id),
+                admitted_generation=1,
+                current_generation=1,
+                action="example-action",
+                kind="remediate",
+                arguments="{}",
+                arguments_sha256=digest,
+                target="example",
+                reason="Example action",
+                state="approval_requested",
+                approval_id=world["approval"],
+            )
+        )
+        await s.flush()
+        s.add(
+            RemediationApprovalRequest(
+                approval_id=world["approval"],
+                nomination_id=nomination_id,
+                agent_id=world["agent"],
+                hook="example-alert",
+                action="example-action",
+                arguments_sha256=digest,
+                failed_check="precondition_not_met",
+            )
+        )
+
+    db(prepare)
+
+    async def revoke(s):
+        # Exercise the actual identity writer fence, not an uncoordinated SQL
+        # edit that could ignore a reader still holding its transaction lock.
+        engine = create_async_engine(get_settings().database_url)
+        redis = Redis.from_url(get_settings().valkey_dsn())
+        try:
+            async with mutation(async_sessionmaker(engine), redis):
+                if revocation == "membership":
+                    await s.execute(
+                        delete(PrincipalTeam).where(PrincipalTeam.team_id == world["team"])
+                    )
+                    team = await s.get(Team, world["team"])
+                    team.epoch, team.member_count, team.digest = 2, 0, "c" * 64
+                else:
+                    (await s.get(Principal, world["principal"])).status = "disabled"
+                await s.commit()
+        finally:
+            await redis.aclose()
+            await engine.dispose()
+
+    engine = client.app.state.sessionmaker.kw["bind"]
+    commits = 0
+    revoked = False
+    with ThreadPoolExecutor(max_workers=1) as writer:
+
+        def after_commit(session):
+            nonlocal commits, revoked
+            if session.get_bind() is not engine.sync_engine:
+                return
+            commits += 1
+            if commits == 2:
+                # Commit one releases the initial read before group lookups;
+                # commit two is resolution_refusal's actual read transaction.
+                writer.submit(db, revoke).result(timeout=10)
+                revoked = True
+
+        event.listen(Session, "after_commit", after_commit)
+        try:
+            response = client.post(
+                f"/approvals/{world['approval']}/resolve",
+                json={"decision": "approved"},
+                headers=headers(world),
+            )
+        finally:
+            event.remove(Session, "after_commit", after_commit)
+    assert revoked
+    assert response.status_code == 403, response.text
+
+    async def outcomes(s):
+        approval = await s.get(Approval, world["approval"])
+        nomination = await s.get(RemediationNomination, nomination_id)
+        executions = list(
+            await s.scalars(
+                select(ActionExecution).where(ActionExecution.agent_id == world["agent"])
+            )
+        )
+        assert approval.status == "pending" and nomination.state == "approval_requested"
+        assert not executions
+
+    db(outcomes)
