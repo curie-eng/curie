@@ -2578,7 +2578,7 @@ def _assert_image_proofs(workflow: dict[str, Any]) -> None:
     assert "image-proofs" in jobs
     job = jobs["image-proofs"]
     assert job["name"] == "Image proofs (smoke, Docker daemon, toolchain)"
-    assert job["runs-on"] == "ubuntu-latest"
+    assert job["runs-on"] == "ubuntu-24.04"
     assert job["needs"] == ["changes", "ci-images"]
     assert job["if"] == IMAGE_PROOFS_IF
     assert job["env"] == {"CURIE_REPO_TOOLCHAIN_PROOF": "required"}
@@ -2830,7 +2830,7 @@ def _connector_image_contexts() -> set[str]:
 
 def _assert_connector_image_import_coverage(job: dict[str, Any]) -> None:
     assert job["name"] == "Build ${{ matrix.name }} image (no push)"
-    assert job["runs-on"] == "ubuntu-latest"
+    assert job["runs-on"] == "ubuntu-24.04"
     assert job["strategy"]["fail-fast"] is False
     rows = job["strategy"]["matrix"]["include"]
     contexts = _connector_image_contexts()
@@ -3220,7 +3220,7 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
     assert negative_job["name"] == (
         "E2E released chart upgrade negative control (nil unsafe helpers)"
     )
-    assert negative_job["runs-on"] == "ubuntu-latest"
+    assert negative_job["runs-on"] == "ubuntu-24.04"
     assert negative_job["if"] == "${{ needs.changes.outputs.released_upgrade == 'true' }}"
     assert job["if"] == _nightly_if("needs.changes.outputs.released_upgrade_full == 'true'")
     assert set(negative_job["needs"]) == set(job["needs"])
@@ -4855,7 +4855,7 @@ def test_forge_instance_job_is_gated_like_the_scripted_factory_and_required() ->
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     job = jobs[FORGE_INSTANCE_JOB]
     assert job["name"] == "Forge instance regression (kind, ${{ matrix.suite }})"
-    assert job["runs-on"] == "ubuntu-latest"
+    assert job["runs-on"] == "ubuntu-24.04"
     assert job["timeout-minutes"] == 165
     assert job["strategy"] == {
         "fail-fast": False,
@@ -5036,7 +5036,7 @@ def test_split_factory_jobs_are_gated_like_the_scripted_factory_and_required(
 ) -> None:
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     job = jobs[job_id]
-    assert job["runs-on"] == "ubuntu-latest"
+    assert job["runs-on"] == "ubuntu-24.04"
     assert job["timeout-minutes"] == 120
     assert job["if"] == jobs[SCRIPTED_FACTORY_JOB]["if"]
     assert job["needs"] == ["changes"]
