@@ -14,8 +14,9 @@ shared bootstrap grammar of [#4076](https://github.com/curie-eng/curie/issues/40
 This specification is proposed for maintainer review. It changes no code, no
 record format and no ADR. It precedes any change to authority evaluation or to
 the closed record formats, as ADR 0224 requires. It claims no qualification,
-provisioning or activation evidence. Questions it deliberately leaves to the
-maintainer are listed under [Open decisions](#open-decisions).
+provisioning or activation evidence. The design choices that the Accepted ADRs
+leave to a realizing specification are fixed under
+[Design decisions](#design-decisions), each with the clauses it rests on.
 
 ## Scope
 
@@ -28,10 +29,13 @@ uses the actual signed ingress, protected broker, worker, mediator, runner and
 reply path. Fake-model plumbing and direct provider replies do not satisfy it.
 
 Out of scope until separately decided: the Docker substrate (no commissioning
-composition is declared for it, so it refuses), a managed cloud CNI producer, a
+composition is declared for it, so it refuses), a managed cloud CNI producer and
+the qualification of any production installation that depends on one, a
 `curie cluster` command form, any connector-bearing profile, and any choice of
-static Skill projection beyond the existing `kubernetes-cold-pod-v1`. This
-specification depends on no ADR other than those linked above.
+static Skill projection beyond the existing `kubernetes-cold-pod-v1`. Every
+slice of this specification rests only on the ADRs linked above. Production
+qualification of a managed CNI installation additionally depends on a separate
+ADR (decision 3 under [Design decisions](#design-decisions)).
 
 Implementation lands in four dependent slices. A slice cannot enable production
 or claim that a later slice passed.
@@ -468,32 +472,136 @@ controls. Only the complete campaign of clause 5 on a fresh installation proves
 installation delivery. No slice claims production activation or release
 eligibility.
 
-## Open decisions
+## Design decisions
 
-The following questions are for the maintainer. This specification does not
-resolve them, and no slice that depends on one starts until it is ruled.
+These decisions fix what the Accepted ADRs leave to a realizing specification.
+Each states what the design does, why, and the Accepted clauses it rests on. A
+slice that would need a different answer stops and returns to review; it does
+not reinterpret the decision.
 
-1. **Chart or provisioner.** Phase 4 of the delivery lane has the main Helm
-   chart render the protected broker, worker and guard, with an out of band
-   owner provisioning credentials. ADR 0236 has the provisioner process create
-   the installation from its pinned profile. Should the main chart render
-   protected lane objects at all, or should only the provisioner create them?
-   Clause 6 needs the production workloads present at their final templates
-   before the campaign either way.
-2. **Qualifying a managed CNI cluster.** ADR 0224 requires every production
-   installation to run its own campaign. ADR 0236 limits the operator command to
-   disposable local installations until a producer exists for the target CNI,
-   for example a managed CNI such as a cloud provider's VPC CNI. Read together,
-   no managed cluster can obtain Qualification or Readiness today. Can a managed
-   CNI producer be specified under ADR 0236, or does it need its own ADR first?
-3. **A first remediation profile with `qualified_connectors=[]`.** ADR 0224's
-   initial profile is connector-empty, and the current execution configuration
-   codec (`apps/worker/src/curie_worker/protected_configuration.py::parse_execution_config`)
-   requires an empty list. Under the automated remediation specification the
-   protected turn would only read the alert and nominate, while preconditions
-   and verifiers run in executor sandboxes outside the lane. May a first
-   remediation profile run on a connector-empty commissioned installation, or
-   must a connector-bearing profile be decided first?
-4. **Evidence bar for the remediation issues.** What evidence closes the
-   automated remediation issues: a freshly commissioned disposable installation,
-   or a commissioned production installation?
+### 1. Only the provisioner creates the protected lane
+
+The protected lane is created only by the independent provisioner process. The
+main Helm chart and the Compose files render no protected broker, protected
+worker, guard, commissioning ingress or protected runtime directory, and expose
+no value that turns them on. An installation obtains a protected lane only from
+the provisioner's pinned profile, projection and images.
+
+Reasoning. ADR 0191 makes protected runtime provisioning out of band from the
+ordinary API key: an independently controlled provisioning authority owns
+credential issuance, image qualification and deployment policy. ADR 0236 gives
+the provisioner process the creation of the installation and the registration
+of ownership of every resource before it is created, and keeps its signing key
+out of the control Pod. A chart rendering would make the ordinary release and
+values path a second creator of the same objects, so the measured pod templates,
+mounts and Secret references of clause 6 would have two owners and the guard
+configuration G could not attribute them. A single creator also keeps the
+predeclared entry points of ADR 0224 (both fixed in the immutable bootstrap
+before the campaign) out of reach of a values override.
+
+Phase 4 of the [delivery lane](2026-10-02-protected-hook-lane.md) plans
+protected worker, broker and guard surfaces under `charts/curie/templates/`.
+Where that wording conflicts with this decision, this specification supersedes
+it: no protected lane object is added to the main chart or to Compose. The
+phase 4 rule that an out of band owner provisions guards and credentials, and
+that API routes never mint an administrative credential, stands and is realized
+by the provisioner.
+
+### 2. The first remediation profile is connector-empty
+
+The first automated remediation profile runs on a commissioned installation
+whose execution profile has `qualified_connectors=[]`. The protected turn reads
+the delivered alert and nominates a pre-qualified action; it holds no connector
+credential and calls no connector. Precondition and verifier reads run as read
+executions in executor sandboxes outside the protected lane, under the read
+connector's own binding (AUTOMATED-REMEDIATION-12), and actions run through the
+connector action executor.
+
+Reasoning. ADR 0224 fixes the initial profile as strictly
+`qualified_connectors=[]` and does not authorize a connector-bearing profile;
+the current execution configuration codec
+(`apps/worker/src/curie_worker/protected_configuration.py::parse_execution_config`)
+already requires an empty list. ADR 0203 makes remediation an action the
+platform executes and verifies, and AUTOMATED-REMEDIATION-12 already places
+every precondition and verifier read in an executor sandbox rather than in the
+worker. Nothing in the nominate path therefore needs a connector inside the
+lane. A connector-bearing protected profile stays out of scope and requires its
+own ADR before any specification work.
+
+### 3. Production qualification on a managed CNI is a separate dependency
+
+This specification qualifies only disposable local installations with the
+local Cilium producer. It does not specify, and no slice claims, qualification
+of a production installation whose CNI is a managed cloud CNI.
+
+Reasoning. ADR 0224 requires every installation intended for production to run
+its own campaign, and ADR 0236 lets the operator command qualify only disposable
+local installations until a producer exists for the target CNI, naming source
+identity, spoof measurement and retained connection refusal as part of that
+producer's realization. No Accepted ADR covers such a producer. Production
+qualification on a managed CNI therefore depends on a separate Draft ADR for a
+managed CNI qualification producer, which must be Accepted before any
+specification or code for it. Until then, ADR 0236's explicit outcome holds:
+such an installation refuses before the campaign starts.
+
+### 4. The activation transition is demonstrated before implementation
+
+ADR 0224 requires activation to change only independently controlled
+authorization state for the measured production entry point, and requires the
+realizing specification to demonstrate that transition or return for a revised
+decision. Clause 6 is that demonstration, and it is a precondition for slice 1:
+no slice starts while any row below cannot hold. If review finds a row that
+cannot hold, this specification returns to ADR review rather than redefining
+"unchanged tuple".
+
+| State | Measured by the campaign | Changed by activation | Writer at activation |
+| --- | --- | --- | --- |
+| Bootstrap B, entry points, credential assignments | Yes | No | None |
+| Guard configuration G: ACL rules, RBAC, network and admission policy | Yes | No | None |
+| Manifest M, its `credential_refs` and `qualification_id` | Yes | No | None |
+| Execution configuration and its digest | Yes | No | None |
+| Production ingress and worker pod templates, images, mounts, Secret references | Yes | No | None |
+| Artifact measurement file | Yes | No | None |
+| Mediator and gateway configuration naming both entry points | Yes | No | None |
+| Selection record, all members except `admission_open` | Yes | No | None |
+| Selection `admission_open` | Yes, as `false` | `false` to `true` | Provisioner |
+| Commissioning journal | Yes | `closing` to `closed` | Commissioning control |
+| Candidate ACL users' enabled state and live sessions | Rules only | Disabled, sessions killed | Provisioner |
+| `commissioning_acceptance` | No | Created | Commissioning issuer |
+| Qualification and Readiness | Absent | Created | Verifier's publishers |
+
+Every changed row is broker state written by a principal whose identity and
+rules G already measured, and, as clause 6 requires, none is an input to
+`sha256(B)`, `sha256(G)`, `sha256(M)` or the execution configuration digest.
+No pod template, image, mount, Secret reference, ACL rule or guard revision
+changes. The only measured value that changes is the selection's
+`admission_open`, the predeclared authorization switch; its other members stay
+equal under compare and set. The verifier re-reads B, G, M and the execution
+digest after the last write and records that they equal the premeasured values. Before
+activation the production worker refuses in `open_runtime` and the support
+probe answers `qualification_unavailable`; after it, the same unchanged readers
+accept because the records they already require now exist.
+
+### 5. Evidence bar
+
+An upstream automated remediation issue closes on evidence from a freshly
+commissioned disposable installation: the complete clause 5 campaign, accepted
+by the ADR 0236 verifier, on an installation created for that run. Code, fake
+model plumbing, direct provider replies or a reused installation do not close
+it. Closing an upstream issue is not production activation: each production
+installation still runs its own campaign against its own final tuple and is
+activated only through clause 6.
+
+Reasoning. ADR 0224 states that success in one installation does not qualify
+another and that installation observations are never rebound to another
+manifest. ADR 0236 limits the command to disposable local installations, so a
+fresh disposable installation is the strongest evidence the upstream project can
+produce, and it is installation independent by construction.
+
+### 6. ADR status lines are authoritative
+
+Where an Accepted ADR's body still reads as a proposal or a Draft (for example
+ADR 0224's "Proposed decision" heading), its `Status:` line decides its
+authority. ADR 0045 makes the status line the mutable part of an immutable ADR,
+and ADR 0085 makes the Accepted status the authority for implementation. This
+specification edits no ADR file and cites each ADR at its current status.
