@@ -45,7 +45,6 @@ BINARY_ASSETS = (
     "curie-aarch64-apple-darwin",
 )
 COMPOSE_ASSET = "compose.release.yaml"
-PREPARATION_ASSET = "factory-preparation.json"
 
 
 class IntegrityError(Exception):
@@ -59,7 +58,7 @@ def chart_asset(version: str) -> str:
 
 def required_assets(version: str) -> list[str]:
     """Every asset the release must publish, in a stable order."""
-    return [*BINARY_ASSETS, chart_asset(version), COMPOSE_ASSET, PREPARATION_ASSET]
+    return [*BINARY_ASSETS, chart_asset(version), COMPOSE_ASSET]
 
 
 def _is_integrity_artifact(name: str) -> bool:

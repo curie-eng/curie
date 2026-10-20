@@ -46,8 +46,7 @@ integrity = load_module()
 BINARIES = integrity.BINARY_ASSETS
 CHART = f"curie-{VERSION}.tgz"
 COMPOSE = "compose.release.yaml"
-PREPARATION = "factory-preparation.json"
-ASSETS = (*BINARIES, CHART, COMPOSE, PREPARATION)
+ASSETS = (*BINARIES, CHART, COMPOSE)
 
 
 def write_sbom(path: Path, subject: str) -> None:
@@ -334,33 +333,3 @@ def test_declared_binaries_match_the_workflow_matrix() -> None:
         "job. Add it to BINARY_ASSETS (and give it an SBOM) or drop it from the "
         "matrix."
     )
-
-
-class TestPreparationAsset:
-    def test_preparation_is_a_required_release_asset(self):
-        assert PREPARATION in integrity.required_assets(VERSION)
-
-    def test_missing_preparation_asset_is_rejected(self, tmp_path):
-        legacy_assets = (*BINARIES, CHART, COMPOSE)
-        dist = make_dist(tmp_path, assets=legacy_assets, sboms=legacy_assets)
-        with pytest.raises(integrity.IntegrityError, match=PREPARATION):
-            integrity.build_manifest(dist, VERSION)
-
-    def test_preparation_asset_requires_its_own_sbom(self, tmp_path):
-        dist = make_dist(tmp_path, sboms=[asset for asset in ASSETS if asset != PREPARATION])
-        with pytest.raises(integrity.IntegrityError, match="SBOM"):
-            integrity.build_manifest(dist, VERSION)
-
-    def test_release_workflow_packages_and_inventories_preparation(self):
-        workflow = (REPO_ROOT / ".github/workflows/release.yaml").read_text()
-        # Use the freshly built host-compatible release executable, not cargo or
-        # a preinstalled CLI that might package assets from another revision.
-        assert re.search(
-            r"(?:\./)?dist/curie-x86_64-unknown-linux-gnu[^\n]*"
-            r"factory prepare package[^\n]*--out(?:=|\s+)[\"]?"
-            r"dist/factory-preparation\.json",
-            workflow,
-        ), "package the preparation release using this run's Linux binary"
-        assert "dist/factory-preparation.json.spdx.json" in workflow, (
-            "publish the generated SPDX companion with the preparation asset"
-        )

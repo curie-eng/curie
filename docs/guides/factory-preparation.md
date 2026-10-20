@@ -182,113 +182,34 @@ contributor tests. It is not loaded into the API or installed on users' computer
 [ADR 0222](../adr/0222-coworker-bundles-own-workflow-policy-and-curie-enforces-execution.md)
 sets that ownership boundary; #4589 tracks the minimum isolated evaluation support.
 
-## Versions and upgrades
+## Manual upgrades
 
-A preparation version identifies the installed instructions. An output contract
-identifies the specification format used by those instructions. Optional repository
-pins select a preparation version and format for that repository. These are local
-authoring choices, not a declaration of deployment compatibility or readiness.
+The installer copies the skill bundled with the selected Curie CLI build. It
+accepts an identical existing copy and refuses a different, edited or incomplete
+copy before writing. This release has no automatic update check, managed updater,
+rollback command, release cache or repository version resolver.
 
-The installer records a managed receipt and original file hashes outside the
-client's discovered skill folder. Check for a release without changing files:
+To replace an installed skill, review the new instructions, preserve the old skill
+folder outside every directory your client discovers, then rerun the install
+command using the chosen newer CLI build. Keep the original until the replacement
+works. Reapply any local customizations manually after checking that they still
+fit the new workflow; installation does not merge or discard them.
 
-```bash
-curie factory prepare update --agent codex --global --check
-```
-
-After reviewing the notification, apply an update or restore its backup:
-
-```bash
-curie factory prepare update --agent codex --global
-curie factory prepare update --agent codex --global --rollback
-```
-
-Both operations refuse to overwrite edited managed files. There is no three-way
-merge. Preserve customizations separately or reconcile them manually, then retry.
-Updates retain local preferences and unrelated files, stage the complete payload,
-retain the previous installation and recover interrupted activation on the next
-explicit update. A rollback also checks for edits rather than discarding them.
-Read-only checks and dry runs never repair or modify an installation.
-
-An unmanaged older installation has no trustworthy original receipt. It must be
-reviewed and backed up before adopting managed installation; the updater does not
-pretend its current files are an unmodified released version. The prior CLI build
-used in early branch testing still embeds its original files until rebuilt.
-
-## One agent, multiple repository pins
-
-Optionally keep a repository pin in `.curie-factory.json`, which can be committed.
-Unlike `.curie/`, this file is not ignored by the default repository configuration.
-For example:
-
-```json
-{
-  "schema_version": 2,
-  "preparation_version": "0.3.0",
-  "contract_version": "curie.factory-specification/v1"
-}
-```
-
-`preparation_release` is an optional exact package locator, not the factory's
-platform version or proof of compatibility. The named release must actually carry
-`factory-preparation.json`; an older release without that new asset cannot provide
-it. Use cached assets or an explicitly supplied local release for unpublished
-branch testing. The CLI never guesses a release tag from a preparation version.
-
-Resolve the pin for the current checkout with the installed client's scope:
+For example, after backing up and moving the existing skill folder:
 
 ```bash
-curie factory prepare resolve --agent codex --global --repo /path/to/repository
+curie factory prepare install --agent codex
 ```
 
-The result identifies the matching versioned instructions, preferences file and
-specification format. Each repository can select a different cached release through the
-same global entry skill. Cached versions remain outside the client's discovery
-directories, avoiding duplicate skill names. Resolution checks file hashes and
-contract support; it does not change the repository's pin or another repository's
-active workflow. Use `--offline` when only existing cached assets may be used.
-A missing uncached pin requires its actual release locator or a local `--source`
-directory containing the self-contained `release.json` package.
+Use the same `--global` or `--dir` scope as the installation being replaced. Keep
+existing drafts and evidence intact. If instructions change an ongoing draft,
+review its complete updated specification before publication.
 
-An invocation checks for entry skill updates once per preparation session when the
-CLI and network are available, then notifies before an update is applied. It
-records and keeps the selected workflow for the draft. Moving a draft to another
-version or format requires review of the entire changed specification. A network
-failure does not discard a compatible cached release. This is an on-use check,
-not an idle background service installed into the coding agent.
-
-Local preferences live in the checkout's `.curie` directory, in
-`factory-preparation.local.json`:
-
-```json
-{
-  "schema_version": 1,
-  "preferences": {
-    "output_directory": ".projects/preparation",
-    "review_style": "Show the complete specification in the chat",
-    "repository_notes": "Preserve the documented public API"
-  }
-}
-```
-
-The skill checks these preferences when loading them, explains unknown or
-incompatible choices, and keeps the original file intact. Preferences cannot
-change the output contract or grant publication authority.
-
-A repository pin is optional. Without one, use the installed skill and record its
-version and format in the local report. The CLI and a pin are not prerequisites
-for reviewing, publishing or selecting work through the existing factory label.
-Do not borrow another repository's pin. A legacy schema 1 pin containing a
-`target` is refused with migration guidance: review its preparation version and
-format, then explicitly replace it with schema 2. Deployment IDs and bundle hashes
-are not fields in the new pin.
-
-This release publishes the reviewed canonical body through the existing tracker
-workflow. It adds no versioned input prefix, deployment compatibility endpoint or
-runtime admission gate. An optional pin can select instructions that produce a
-known format; it cannot prove that an installed factory can execute the resulting
-work. Confirm the actual repository, configured label and prerequisites as part
-of the normal selection review.
+Managed updates and repository specific instruction versions are follow-up work.
+This workflow does not interpret `.curie-factory.json` or promise compatibility
+with an installed factory version. Follow the current repository's guidance and
+resolve any conflicting format requirement during review. Reviewed publication
+uses existing tracker tools and the confirmed configured factory label.
 
 ## Measure whether preparation helps
 
