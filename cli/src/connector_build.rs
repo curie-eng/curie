@@ -3219,6 +3219,18 @@ mod shared_connector_reference_tests {
                 parse_connectors(&serde_norway::to_string(&document(&case)).unwrap()).unwrap();
             let spec = &declaration.connectors["docs"];
             let errors = [
+                build_plan(
+                    Path::new("acme-missing-bundle"),
+                    "acme",
+                    "docs",
+                    spec,
+                    None,
+                    "linux/amd64",
+                    Path::new("acme-missing-metadata"),
+                    &[],
+                )
+                .unwrap_err(),
+                refuse_out_of_band_secrets("docs", spec).unwrap_err(),
                 resolved_image("docs", spec, &lock).unwrap_err(),
                 compose_overlay(&lock, &declaration, &identity, "acme-run", &volumes, None)
                     .unwrap_err(),

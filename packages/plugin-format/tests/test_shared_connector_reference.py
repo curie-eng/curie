@@ -144,7 +144,11 @@ def test_shared_reference_identity_is_immutable() -> None:
 
 
 @pytest.mark.parametrize(
-    "helper", ["render", "mcp_entry", "unhosted_mcp_entry", "secret_names", "resolved_secrets"]
+    "helper",
+    [
+        "render", "mcp_entry", "unhosted_mcp_entry",
+        "secret_names", "resolved_secrets", "server_resources",
+    ],
 )
 def test_shared_activation_helpers_refuse_without_application(helper: str) -> None:
     spec = ConnectorSpec(shared=REFERENCE)

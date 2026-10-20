@@ -185,8 +185,13 @@ def test_shared_application_default_deny_service_and_database_target(managed: bo
         "app.kubernetes.io/name": application.app_name,
         "app.kubernetes.io/instance": application.release,
     }
+    valkey_peer = {
+        "app.kubernetes.io/part-of": application.release,
+        "app.kubernetes.io/component": "mcp-connector",
+    }
     for shared_labels in (labels, selector, service["spec"]["selector"]):
         assert not (chart_peer.items() <= shared_labels.items())
+        assert not (valkey_peer.items() <= shared_labels.items())
     ports = service["spec"]["ports"]
     assert len(ports) == 1 and ports[0]["port"] == application.proxy_port
     pod = deployment["spec"]["template"]["spec"]
@@ -289,6 +294,134 @@ def test_shared_resources_preserve_explicit_bounds() -> None:
     assert all(container["resources"] == resources for container in containers)
 
 
+def _assert_validation_branch(error: ValidationError, field: str, reason: str) -> None:
+    issues = error.errors()
+    assert [(issue["loc"], issue["type"]) for issue in issues] == [((field,), "value_error")]
+    assert reason in issues[0]["msg"]
+
+
+@pytest.mark.parametrize("field", ["server_resources", "proxy_resources"])
+@pytest.mark.parametrize("side,resource,value,reason", [
+    ("requests", "cpu", "2000m", "requests cannot exceed limits"),
+    ("requests", "memory", "1Gi", "requests cannot exceed limits"),
+    ("limits", "memory", "unbounded", "positive bounded"),
+    ("limits", "memory", str(2**63), "positive bounded"),
+    ("limits", "memory", "9" * 65, "positive bounded"),
+    ("requests", "cpu", "0.5m", "one millicore"),
+    ("requests", "cpu", "1.5m", "one millicore"),
+])
+def test_shared_resource_quantities_reject_intended_invalid_bounds(
+    field: str, side: str, resource: str, value: str, reason: str,
+) -> None:
+    resources = {
+        "requests": {"cpu": "25m", "memory": "128Mi"},
+        "limits": {"cpu": "1000m", "memory": "512Mi"},
+    }
+    resources[side][resource] = value
+    with pytest.raises(ValidationError) as error:
+        _application(**{field: resources})
+    _assert_validation_branch(error.value, field, reason)
+
+
+@pytest.mark.parametrize("cpu,memory", [("1m", "128Mi"), ("1000m", str(2**63 - 1))])
+def test_shared_resource_quantities_accept_adjacent_bounds(cpu: str, memory: str) -> None:
+    resources = {"requests": {"cpu": cpu, "memory": memory},
+                 "limits": {"cpu": cpu, "memory": memory}}
+    application = _application(server_resources=resources, proxy_resources=resources)
+    pod = _object(render_application(application), "Deployment")["spec"]["template"]["spec"]
+    assert all(container["resources"] == resources for container in pod["containers"])
+
+
+@pytest.mark.parametrize("path,reason", [
+    ("/run/curie-shared-proxy/resolver.sock", "separate from Secret mounts"),
+    ("/run/curie-shared-proxy/nested/resolver.sock", "separate from Secret mounts"),
+    ("/run/curie-shared-snapshot/resolver.sock", "separate from Secret mounts"),
+    ("/run/resolver.sock", "separate from Secret mounts"),
+    ("/resolver.sock", "canonical absolute path"),
+    ("/run/acme/../resolver.sock", "canonical absolute path"),
+    ("/run/" + "s" * 103, "canonical absolute path"),
+    ("/run/acme/" + "é" * 50, "canonical absolute path"),
+    ("/run/acme resolver/socket", "canonical absolute path"),
+    ("/run/acme/\x00resolver.sock", "canonical absolute path"),
+    ("/run/acme/\x7fresolver.sock", "canonical absolute path"),
+])
+def test_resolver_socket_rejects_unsafe_mount_paths(path: str, reason: str) -> None:
+    with pytest.raises(ValidationError) as error:
+        _application(resolver_socket=path)
+    _assert_validation_branch(error.value, "resolver_socket", reason)
+
+
+def test_resolver_socket_accepts_safe_byte_limit() -> None:
+    directory = "/run/acme-resolver/"
+    path = directory + "s" * (107 - len(directory))
+    application = _application(resolver_socket=path)
+    pod = _object(render_application(application), "Deployment")["spec"]["template"]["spec"]
+    assert all(any(mount["mountPath"] == directory.rstrip("/")
+                   for mount in container["volumeMounts"]) for container in pod["containers"])
+
+
+@pytest.mark.parametrize("field,value,reason", [
+    ("server_env", {"CURIE_SHARED_APPLICATION": "value"}, "cannot override"),
+    ("server_env", {"SHARED_TOKEN": "value"}, "cannot override"),
+    ("server_env", {"MODE": "bad\x00value"}, "cannot contain NUL"),
+    ("server_args", ("--mode", "bad\x00value"), "cannot contain NUL"),
+])
+def test_server_env_and_args_reject_reserved_or_nul_literals(
+    field: str, value: object, reason: str,
+) -> None:
+    with pytest.raises(ValidationError) as error:
+        _application(**{field: value})
+    _assert_validation_branch(error.value, field, reason)
+
+
+def test_server_env_and_args_accept_nonreserved_literals() -> None:
+    env = {"CURIEISH_MODE": "read", "SHAREDISH_MODE": "read"}
+    application = _application(server_env=env, server_args=("--mode", "read"))
+    pod = _object(render_application(application), "Deployment")["spec"]["template"]["spec"]
+    server = next(
+        container for container in pod["containers"] if container["image"] == SERVER_IMAGE
+    )
+    assert env.items() <= {entry["name"]: entry["value"] for entry in server["env"]}.items()
+    assert server["args"] == ["--mode", "read"]
+
+
+@pytest.mark.parametrize("lane", ["database", "runner"])
+def test_shared_selectors_reject_dedicated_owner_key(lane: str) -> None:
+    if lane == "database":
+        valid = DatabaseTarget(namespace="acme-data", pod_labels=dict(DB_LABELS), port=5432)
+        field = "pod_labels"
+    else:
+        valid = _member(_application())
+        field = "runner_labels"
+    values = valid.model_dump(mode="python")
+    values[field]["curie.dev/connector-owner"] = "acme-bot"
+    with pytest.raises(ValidationError) as error:
+        type(valid)(**values)
+    _assert_validation_branch(error.value, field, "dedicated connector ownership")
+    assert type(valid).model_validate(valid.model_dump(mode="python")) == valid
+
+
+@pytest.mark.parametrize("cidrs", [
+    ("0.0.0.0/1", "128.0.0.0/1"), ("::/1", "8000::/1"),
+])
+def test_database_target_rejects_complete_cidr_unions(cidrs: tuple[str, ...]) -> None:
+    with pytest.raises(ValidationError) as error:
+        DatabaseTarget(cidrs=cidrs, port=5432)
+    assert all(issue["type"] == "value_error" for issue in error.value.errors())
+
+
+def test_database_target_accepts_adjacent_subnet_union() -> None:
+    cidrs = ("192.0.2.0/25", "192.0.2.128/25")
+    application = _application(database_target={"cidrs": cidrs, "port": 5432})
+    policies = [item["spec"] for item in render_application(application)
+                if item["kind"] == "NetworkPolicy" and item["spec"]["policyTypes"] == ["Egress"]]
+    assert len(policies) == 1
+    assert policies[0]["egress"] == [{
+        "to": [{"ipBlock": {"cidr": cidr}} for cidr in cidrs],
+        "ports": [{"protocol": "TCP", "port": 5432}],
+    }]
+
+
 def test_shared_outputs_omit_dedicated_prune_ownership() -> None:
     application = _application()
 
@@ -369,8 +502,6 @@ def test_render_revalidates_mutable_and_unvalidated_inputs(invalid: str) -> None
         {"credential_slots": ("",)},
         {"credential_slots": ("../token",)},
         {"credential_slots": ("access_token", "access_token")},
-        {"server_resources": {"limits": {"memory": "unbounded"}}},
-        {"proxy_resources": {"requests": {"cpu": "2000m"}, "limits": {"cpu": "1000m"}}},
         {"members": {}},
         {"alias": "docs"},
         {"policy": {}},
