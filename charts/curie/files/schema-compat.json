@@ -855,8 +855,16 @@
       ],
       "revision": "0108",
       "sha256": "c91142341e5c8255e36c6123b8dd04d79a8d366b339db829518c7e6c2e90949a"
+    },
+    {
+      "kind": "expand",
+      "parents": [
+        "0108"
+      ],
+      "revision": "selfimp_safety_0001",
+      "sha256": "ef33c37a71fb56f117f1950b39455043103b9693da16b1f6f7e38c805c7ba153"
     }
   ],
-  "schema_head": "0108",
+  "schema_head": "selfimp_safety_0001",
   "schema_min": "0108"
 }

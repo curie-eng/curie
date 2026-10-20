@@ -24,6 +24,7 @@ HookRunReason = Literal[
     "live_session",
     "enqueue_failed",
     "claim_expired",
+    "daily_budget",
 ]
 
 

@@ -64,6 +64,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -465,6 +466,7 @@ class CronSchedulerLoop:
         # A version's declared triggers are immutable, so one fetch per version.
         self._triggers: dict[tuple[uuid.UUID, str], list[dict[str, Any]]] = {}
         # Table identifiers are not user input; the schema comes from config.
+        self._db_schema = db_schema
         self._targets_sql = text(_TARGETS_SQL.format(schema=db_schema))
         self._target_sql = text(
             _TARGETS_SQL.replace("ORDER BY a.id", "WHERE a.id=:agent_id\nORDER BY a.id").format(
@@ -558,16 +560,30 @@ class CronSchedulerLoop:
             self._triggers[cache_key] = cached
         return cached
 
-    def _budget_spent(self, target: _Target) -> bool:
-        # No daily-spend ledger exists in the worker, so the only spent budget
-        # knowable here is one configured to nothing.
+    async def _budget_block(self, target: _Target, slot: datetime) -> str | None:
+        """Why this slot cannot run, or None when the daily ledger still has room.
+
+        A cap configured to nothing stays ``budget_exhausted``. A positive cap
+        that today's scheduled spend has reached is ``daily_budget``.
+        """
+
+        from .schedule_safety import spent_usd
+
         usd = target.max_usd_per_day if target.max_usd_per_day is not None else self._default_usd
         tokens = (
             target.max_output_tokens_per_run
             if target.max_output_tokens_per_run is not None
             else self._default_tokens
         )
-        return usd <= 0 or tokens <= 0
+        if usd <= 0 or tokens <= 0:
+            return "budget_exhausted"
+        async with self._engine.connect() as conn:
+            spent = await spent_usd(
+                conn, self._db_schema, target.agent_id, slot.astimezone(UTC).date()
+            )
+        if spent >= Decimal(str(usd)):
+            return "daily_budget"
+        return None
 
     async def _insert(
         self,
@@ -701,28 +717,37 @@ class CronSchedulerLoop:
         name = str(trigger["name"])
         context = self._validate_source_context(source_context, target, name)
         block_reason: str | None = None
+        skip_reason: str | None = None
         if await self._is_killed(target.agent_id):
             block_reason = "agent_killed"
-        elif self._budget_spent(target):
-            block_reason = "budget_exhausted"
-        if block_reason is not None:
+        else:
+            budget_reason = await self._budget_block(target, slot)
+            if budget_reason == "budget_exhausted":
+                block_reason = budget_reason
+            elif budget_reason == "daily_budget":
+                skip_reason = budget_reason
+        if block_reason is not None or skip_reason is not None:
             async with self._engine.begin() as conn:
                 reclaimed = await self._lock_and_reclaim(
                     conn, target, name, slot, summary, source_context=context
                 )
+                terminal = "skipped" if skip_reason is not None else "blocked"
                 run_id = await self._insert(
                     conn,
                     target,
                     name,
                     slot,
-                    "blocked",
-                    reason=block_reason,
+                    terminal,
+                    reason=skip_reason or block_reason,
                     source_context=context,
                 )
             self._record_reclaimed(target, name, reclaimed, summary)
             if run_id is not None:
-                _record_fire("blocked")
-                summary.blocked += 1
+                _record_fire(terminal)
+                if terminal == "skipped":
+                    summary.skipped += 1
+                else:
+                    summary.blocked += 1
             else:
                 summary.lost += 1
             return
