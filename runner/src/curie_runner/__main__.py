@@ -2,8 +2,11 @@
 
 Reads the ACI ``CURIE_*`` / ``OTEL_EXPORTER_OTLP_*`` env into a RunnerConfig,
 wires the real claude-agent-sdk session (validated plugin bundle, budget, OTel),
-and serves the HTTP channel. The session is started in ``on_startup`` so a plugin
-or connect failure fails the process visibly rather than after the port is up.
+and serves the HTTP channel. Boot refusals (credential, approval policy, plugin
+bundle) still fail the process before the port is up. The declared verification
+preflight and the session connect run after it binds (#4777), so a slow check
+never holds the readiness probe; a turn waits for them, and their failure fails
+each turn visibly.
 """
 
 from __future__ import annotations
@@ -690,7 +693,6 @@ def build_runner(
     # operator silently replace the prompt the bundle ships (#488) -- and the
     # bundle's plugins feed the session factory below.
     compiled = harness.compile_bundle(config.session.plugin_dir)
-    system_prompt = compiled.system_prompt
     web_search_enabled = load_bundle_web_search_enabled(config.session.plugin_dir)
     mounted_workspace = (
         workspace_path
@@ -699,29 +701,9 @@ def build_runner(
         and (workspace_path / ".git").exists()
         else None
     )
-    verification: dict[str, Any] | None = None
-    if mounted_workspace is not None and not fake_model:
-        verification_url = os.environ.get(PROGRESS_URL_ENV)
-        verification_token = os.environ.get(PROGRESS_TOKEN_ENV)
-        if verification_url and verification_token:
-            verification = anyio.run(
-                preflight_workspace_verification,
-                mounted_workspace,
-                Path(config.session.plugin_dir),
-                verification_url,
-                verification_token,
-            )
-    # A declared check that could not run here and is not delegated to CI is
-    # blocked (#3873): the session factory then answers offline and the model
-    # never starts. A rejected report already raised above, before this point.
+    # Set by ``initialize`` below, which runs the declared verification
+    # preflight after the listener binds (#4777).
     preflight_block: str | None = None
-    if blocked_checks(verification):
-        assert verification is not None
-        logger.warning(
-            "verification preflight blocked; the model will not start checks=%s",
-            ",".join(str(check.get("id")) for check in blocked_checks(verification)),
-        )
-        preflight_block = _preflight_blocked_explanation(verification)
     # Prior memory (#264) still leads the system prompt. Workspace facts are a
     # mounted-only boot block after memory. Conversation history (#20)
     # deliberately does not: ADR-0119 sends its ordered messages through the
@@ -801,22 +783,27 @@ def build_runner(
         turn_token=turn_write_token,
         max_facts=config.memory_max_facts,
     )
-    system_prompt = _compose_system_prompt(
-        system_prompt,
-        memory_preamble,
-        model=config.model,
-        workspace_preamble=format_workspace_preamble(mounted_workspace, verification),
-        attachment_preamble=format_attachment_preamble(attachment_view),
-        progress_preamble=PROGRESS_PREAMBLE if turn_progress is not None else None,
-        facts_preamble=memory_facts_preamble,
-        guidance_preamble=(
-            (memory_guidance or DEFAULT_GUIDANCE)
-            if memory_tools_mounted
-            else WRITES_OFF_NOTICE
-            if channel_memory_readable and not config.memory_writes_on
-            else None
-        ),
-    )
+
+    def compose_system_prompt(verification: dict[str, Any] | None) -> str | None:
+        # The workspace block names the preflight result, so the prompt is
+        # composed only once ``initialize`` has it.
+        return _compose_system_prompt(
+            compiled.system_prompt,
+            memory_preamble,
+            model=config.model,
+            workspace_preamble=format_workspace_preamble(mounted_workspace, verification),
+            attachment_preamble=format_attachment_preamble(attachment_view),
+            progress_preamble=PROGRESS_PREAMBLE if turn_progress is not None else None,
+            facts_preamble=memory_facts_preamble,
+            guidance_preamble=(
+                (memory_guidance or DEFAULT_GUIDANCE)
+                if memory_tools_mounted
+                else WRITES_OFF_NOTICE
+                if channel_memory_readable and not config.memory_writes_on
+                else None
+            ),
+        )
+
     # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
     # translated into SDK HookMatcher callbacks. None when the bundle declares none.
     bundle_hooks = load_bundle_hooks(config.session.plugin_dir)
@@ -974,6 +961,7 @@ def build_runner(
         materialize_connector_caller_headers(derived_mcp_servers, spawn_env, os.environ)
 
     real_options: ClaudeAgentOptions | None = None
+    build_real_options: Callable[[str | None], ClaudeAgentOptions] | None = None
     observed_readonly_tools: frozenset[str] = frozenset()
 
     def session_tool_access(observed: frozenset[str]) -> TurnToolAccess:
@@ -1124,74 +1112,114 @@ def build_runner(
                 else {}
             ),
         }
-        structured_resume = build_structured_resume(
-            conversation_replay.messages,
-            curie_session_id=config.session.session_id,
-            cwd=workspace_cwd,
-            harness_replay=conversation_replay.harness_replay,
-            system_prompt=system_prompt,
-        )
-        real_options = build_options(
-            plugins=compiled.plugins,
-            model=config.model,
-            reviewer_model=config.reviewer_model,
-            system_prompt=system_prompt,
-            max_turns=config.max_turns,
-            max_budget_usd=config.max_usd_per_day,
-            # Curie's durable contract is ordered role/content messages. The
-            # Claude adapter prefers its optional opaque checkpoint to preserve
-            # native cache shape, and otherwise materializes a deterministic
-            # process-local SDK resume envelope from the portable messages.
-            resume=structured_resume.resume,
-            session_id=structured_resume.session_id,
-            session_store=structured_resume.session_store,
-            # Operator-set thinking depth (#1182, ADR-0098); None omits the SDK
-            # option entirely rather than defaulting it.
-            thinking=config.thinking,
-            task_budget_hint=config.session.budget.task_budget_hint,
-            env=sdk_env or {},
-            # The approval gate's PreToolUse matcher rides here alongside the
-            # bundle's own (#1852): can_use_tool is skipped by any permission
-            # rule that already allows the call (claude_agent_sdk/types.py:
-            # 1932-1948), and a skill's allowed-tools frontmatter is exactly
-            # such a rule, so the hook is the only layer that sees every call.
-            hooks=session_hooks,
-            # Only the bundle's own skills are listed to the model (#3766,
-            # ADR-0189); the CLI's built-in skills stay hidden.
-            skills=bundle_skill_names(config.session.plugin_dir),
-            # Platform tools and connectors share the SDK MCP channel. The
-            # generic policy pager is present only on an actionable surface;
-            # state and publication remain independent platform capabilities.
-            mcp_servers={
-                # strict_mcp_config drops plugin-loaded servers (#2899), so the
-                # bundle's own servers ride the same channel under the name the
-                # plugin loader would have given them.
-                **bundle_servers,
-                **build_mcp_servers(
-                    platform=platform_servers,
-                    derived=derived_mcp_servers,
+
+        def options_for(system_prompt: str | None) -> ClaudeAgentOptions:
+            # Built by ``initialize`` once the preflight has shaped the prompt.
+            structured_resume = build_structured_resume(
+                conversation_replay.messages,
+                curie_session_id=config.session.session_id,
+                cwd=workspace_cwd,
+                harness_replay=conversation_replay.harness_replay,
+                system_prompt=system_prompt,
+            )
+            return build_options(
+                plugins=compiled.plugins,
+                model=config.model,
+                reviewer_model=config.reviewer_model,
+                system_prompt=system_prompt,
+                max_turns=config.max_turns,
+                max_budget_usd=config.max_usd_per_day,
+                # Curie's durable contract is ordered role/content messages. The
+                # Claude adapter prefers its optional opaque checkpoint to preserve
+                # native cache shape, and otherwise materializes a deterministic
+                # process-local SDK resume envelope from the portable messages.
+                resume=structured_resume.resume,
+                session_id=structured_resume.session_id,
+                session_store=structured_resume.session_store,
+                # Operator-set thinking depth (#1182, ADR-0098); None omits the SDK
+                # option entirely rather than defaulting it.
+                thinking=config.thinking,
+                task_budget_hint=config.session.budget.task_budget_hint,
+                env=sdk_env or {},
+                # The approval gate's PreToolUse matcher rides here alongside the
+                # bundle's own (#1852): can_use_tool is skipped by any permission
+                # rule that already allows the call (claude_agent_sdk/types.py:
+                # 1932-1948), and a skill's allowed-tools frontmatter is exactly
+                # such a rule, so the hook is the only layer that sees every call.
+                hooks=session_hooks,
+                # Only the bundle's own skills are listed to the model (#3766,
+                # ADR-0189); the CLI's built-in skills stay hidden.
+                skills=bundle_skill_names(config.session.plugin_dir),
+                # Platform tools and connectors share the SDK MCP channel. The
+                # generic policy pager is present only on an actionable surface;
+                # state and publication remain independent platform capabilities.
+                mcp_servers={
+                    # strict_mcp_config drops plugin-loaded servers (#2899), so the
+                    # bundle's own servers ride the same channel under the name the
+                    # plugin loader would have given them.
+                    **bundle_servers,
+                    **build_mcp_servers(
+                        platform=platform_servers,
+                        derived=derived_mcp_servers,
+                    ),
+                },
+                # Fronted only when a gate exists: with no callback the session keeps
+                # bypassPermissions, where the PreToolUse front above is the refusal
+                # layer (RUNNER-TOOL-ACCESS-7).
+                can_use_tool=(
+                    front_can_use_tool(build_can_use_tool(approval_gate), tool_access)
+                    if approval_gate is not None
+                    else None
                 ),
-            },
-            # Fronted only when a gate exists: with no callback the session keeps
-            # bypassPermissions, where the PreToolUse front above is the refusal
-            # layer (RUNNER-TOOL-ACCESS-7).
-            can_use_tool=(
-                front_can_use_tool(build_can_use_tool(approval_gate), tool_access)
-                if approval_gate is not None
-                else None
-            ),
-            cwd=workspace_cwd,
-            web_search_enabled=web_search_enabled,
-            policy_disallowed_tools=policy_hidden_tools,
-            disallowed_tools=config.catalogue_disallowed_tools,
-            hidden_restore_tools=hidden_restore_tools(
-                derived_mcp_servers,
-                capability.observed_tools,
-                frozenset(capability.failures)
-                | frozenset(failure.connector for failure in boot_connector_failures),
-                probe_complete=capability.complete,
-            ),
-        )
+                cwd=workspace_cwd,
+                web_search_enabled=web_search_enabled,
+                policy_disallowed_tools=policy_hidden_tools,
+                disallowed_tools=config.catalogue_disallowed_tools,
+                hidden_restore_tools=hidden_restore_tools(
+                    derived_mcp_servers,
+                    capability.observed_tools,
+                    frozenset(capability.failures)
+                    | frozenset(failure.connector for failure in boot_connector_failures),
+                    probe_complete=capability.complete,
+                ),
+            )
+
+        build_real_options = options_for
+
+    # Read at boot, as before #4777, so the preflight sees the env this build saw.
+    verification_url = os.environ.get(PROGRESS_URL_ENV)
+    verification_token = os.environ.get(PROGRESS_TOKEN_ENV)
+
+    async def initialize() -> None:
+        # Runs in the runner's shared start task after the listener binds
+        # (#4777): the preflight can take minutes, past the worker's claim.
+        nonlocal preflight_block, real_options
+        verification: dict[str, Any] | None = None
+        if (
+            mounted_workspace is not None
+            and not fake_model
+            and verification_url
+            and verification_token
+        ):
+            # A rejected report raises here and fails every turn.
+            verification = await preflight_workspace_verification(
+                mounted_workspace,
+                Path(config.session.plugin_dir),
+                verification_url,
+                verification_token,
+            )
+        # A declared check that could not run here and is not delegated to CI
+        # is blocked (#3873): the session factory then answers offline and the
+        # model never starts.
+        if blocked_checks(verification):
+            assert verification is not None
+            logger.warning(
+                "verification preflight blocked; the model will not start checks=%s",
+                ",".join(str(check.get("id")) for check in blocked_checks(verification)),
+            )
+            preflight_block = _preflight_blocked_explanation(verification)
+        if build_real_options is not None:
+            real_options = build_real_options(compose_system_prompt(verification))
 
     sdk_generation = 0
 
@@ -1290,6 +1318,7 @@ def build_runner(
             tool_access=tool_access,
             attachment_notice=format_attachment_notice(attachment_view),
             channel_kind=config.channel_kind,
+            initializer=initialize,
         ),
         session_id=config.session.session_id,
         sandbox_id=config.session.sandbox_id,
@@ -1777,17 +1806,8 @@ def _serve() -> None:
 
     snapshot_callback = capture_mounted_workspace if workspace_path is not None else None
 
+    # create_app schedules the runner's start on startup without awaiting it.
     app = create_app(runner, token=serving_token, snapshotter=snapshot_callback)
-
-    async def _startup(_app: web.Application) -> None:
-        try:
-            await runner.start()
-        except Exception as exc:
-            logger.error("session start failed error_class=%s: %s", type(exc).__name__, exc)
-            raise
-        logger.info("session started session=%s", config.session.session_id)
-
-    app.on_startup.append(_startup)
     web.run_app(app, host="0.0.0.0", port=config.port)
 
 

@@ -46,6 +46,7 @@ from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
 from curie_runner.platform_slack.capability import ChannelReadTurn
 from curie_runner.tool_names import CHANNEL_READ_TOOL_NAMES, STATE_SERVER_NAME
 from plugin_format import CHANNEL_READ_SERVER_NAME
+from runner_boot_session import initialized_session_sync
 from test_connectors import _boot_env, _published_live_tool_names
 from test_tool_policy_enforcement import _interception_reason
 
@@ -376,7 +377,7 @@ def _boot_options(
 ) -> tuple[Any, Any]:
     sessions = _patch_sdk(monkeypatch)
     runner = build_runner(_config(monkeypatch, tmp_path, **config), fake_model=False)
-    session = runner._factory()  # noqa: SLF001 - the options the SDK receives
+    session = initialized_session_sync(runner)  # noqa: SLF001 - the options the SDK receives
     assert isinstance(session, _Sdk)
     assert sessions[-1] is session
     return runner, session.options

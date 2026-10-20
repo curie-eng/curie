@@ -22,18 +22,18 @@ before the model starts. A ``not_declared`` record takes no route.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import os
 import re
 import shlex
 import shutil
-import subprocess
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
-
-import anyio
 
 from .progress import ProgressClient
 from .subprocess_env import shell_and_hook_env
@@ -467,6 +467,13 @@ def _resolvable(argv0: str, workspace: Path) -> bool:
     return shutil.which(argv0) is not None
 
 
+async def _kill_group_and_reap(process: asyncio.subprocess.Process) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(process.pid, signal.SIGKILL)
+    if process.returncode is None:
+        await asyncio.shield(process.wait())
+
+
 async def _run(
     argv: tuple[str, ...],
     workspace: Path,
@@ -478,28 +485,33 @@ async def _run(
 
     if not _resolvable(argv[0], workspace):
         return _Result("unavailable", missing=(_binary_name(argv[0]),))
+    # An asyncio child in its own process group, not subprocess.run on a
+    # worker thread: a thread cannot be cancelled, so shutting down during
+    # a held check waited out the whole timeout (#4777). Creation runs as its
+    # own task behind a shield: a cancel that lands mid-spawn would otherwise
+    # skip the group kill below, and asyncio's own cleanup kills only the
+    # leader, so descendants of the new group could survive (#4777).
+    creation = asyncio.ensure_future(
+        asyncio.create_subprocess_exec(
+            *argv,
+            cwd=workspace,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+    )
     try:
-        result = await anyio.to_thread.run_sync(
-            lambda: subprocess.run(
-                list(argv),
-                cwd=workspace,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=_TIMEOUT_SECONDS,
-                check=False,
-            )
-        )
-    except subprocess.TimeoutExpired as exc:
-        output = "\n".join((_subprocess_text(exc.stdout), _subprocess_text(exc.stderr)))
-        missing, blocked = _failures(output, names)
-        if missing or blocked:
-            return _Result("unavailable", missing=tuple(missing), blocked=tuple(blocked))
-        return _Result(
-            "failed",
-            exit_status=124,
-            failure_reason=f"{label} timed out after {_TIMEOUT_SECONDS:g} seconds",
-        )
+        process = await asyncio.shield(creation)
+    except asyncio.CancelledError:
+        # Spawning cannot be interrupted safely, so let it finish, then take
+        # down whatever it started before propagating the cancellation.
+        while not creation.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait([creation])
+        if not creation.cancelled() and creation.exception() is None:
+            await _kill_group_and_reap(creation.result())
+        raise
     except OSError as exc:
         # ``which`` and process creation can race if the image is changing.
         # Do not expose arbitrary exception text in the progress record.
@@ -511,12 +523,44 @@ async def _run(
             exit_status=126 if isinstance(exc, PermissionError) else 125,
             failure_reason=f"{label} could not start ({type(exc).__name__})",
         )
-    if result.returncode == 0:
+    stdout = bytearray()
+    stderr = bytearray()
+
+    async def drain(stream: asyncio.StreamReader | None, into: bytearray) -> None:
+        if stream is None:
+            return
+        while chunk := await stream.read(65536):
+            into.extend(chunk)
+
+    try:
+        async with asyncio.timeout(_TIMEOUT_SECONDS):
+            await asyncio.gather(drain(process.stdout, stdout), drain(process.stderr, stderr))
+            await process.wait()
+    except TimeoutError:
+        output = "\n".join((_subprocess_text(bytes(stdout)), _subprocess_text(bytes(stderr))))
+        missing, blocked = _failures(output, names)
+        if missing or blocked:
+            return _Result("unavailable", missing=tuple(missing), blocked=tuple(blocked))
+        return _Result(
+            "failed",
+            exit_status=124,
+            failure_reason=f"{label} timed out after {_TIMEOUT_SECONDS:g} seconds",
+        )
+    finally:
+        # Every exit kills the whole group and reaps the child, so no check
+        # outlives the preflight that started it. The kill does not depend on
+        # the leader still running: a descendant can outlive an exited leader
+        # and keep the output pipes open, and it would survive a timeout or
+        # cancellation if only a live leader triggered the kill. An already
+        # empty group (the normal completed run) raises ProcessLookupError.
+        await _kill_group_and_reap(process)
+    if process.returncode == 0:
         return _Result("passed", exit_status=0)
-    missing, blocked = _failures(f"{result.stdout}\n{result.stderr}", names)
+    output = f"{_subprocess_text(bytes(stdout))}\n{_subprocess_text(bytes(stderr))}"
+    missing, blocked = _failures(output, names)
     if missing or blocked:
         return _Result("unavailable", missing=tuple(missing), blocked=tuple(blocked))
-    return _Result("failed", exit_status=result.returncode)
+    return _Result("failed", exit_status=process.returncode)
 
 
 def _fit_stored_size(record: dict[str, Any]) -> dict[str, Any]:

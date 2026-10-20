@@ -156,7 +156,12 @@ def create_app(
     token: str | None = None,
     snapshotter: Snapshotter | None = None,
 ) -> web.Application:
-    """Build the aiohttp application bound to a started SessionRunner.
+    """Build the aiohttp application that starts ``runner`` in the background.
+
+    Startup schedules the runner's initialization without awaiting it, so the
+    listener binds and ``/healthz`` answers while a declared verification
+    preflight runs (#4777); a turn waits for that initialization itself.
+    Cleanup closes the runner, cancelling an initialization still in flight.
 
     When ``token`` is set, the runner control routes require a matching bearer
     token. A ``None`` token builds an unauthenticated app, which exists only for
@@ -193,6 +198,7 @@ def create_app(
             web.post("/v1/snapshot", _snapshot),
         ]
     )
+    app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     return app
 
@@ -278,6 +284,11 @@ async def _execute(request: web.Request) -> web.Response:
     except ExecuteRefusal as refusal:
         return web.json_response(refusal.body(), status=refusal.status)
     return web.json_response(answer)
+
+
+async def _on_startup(app: web.Application) -> None:
+    # Scheduled, not awaited: binding must not wait for the preflight (#4777).
+    app[RUNNER].begin_start()
 
 
 async def _on_cleanup(app: web.Application) -> None:
