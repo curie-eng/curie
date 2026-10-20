@@ -1141,6 +1141,14 @@ def test_recorder_reads_and_writes_the_configured_schema() -> None:
                 )
                 await conn.execute(
                     text(
+                        f"CREATE TABLE {schema}.schedule_failure_streaks ("
+                        "agent_id uuid NOT NULL, name text NOT NULL, "
+                        "consecutive integer NOT NULL, "
+                        "PRIMARY KEY (agent_id, name))"
+                    )
+                )
+                await conn.execute(
+                    text(
                         f"INSERT INTO {schema}.agents (id, model) "
                         "VALUES (:id, :model)"
                     ),
