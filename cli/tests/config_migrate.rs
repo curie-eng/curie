@@ -2368,6 +2368,7 @@ fn removed_metadata_ci_extra_env_is_refused_by_the_chart() {
 /// forces a choice: a successor in `config_migrate.rs`, or a line here.
 const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     // Next feature settings were introduced as Helm values, not extraEnv overrides.
+    "CURIE_ACTION_EXECUTOR_CONNECTOR_READS",
     "CURIE_ACTION_EXECUTOR_ENABLED",
     "CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES",
     "CURIE_ATTACHMENT_THREAD_MAX_BYTES",
