@@ -1135,6 +1135,19 @@ def test_recorder_reads_and_writes_the_configured_schema() -> None:
                     )
                 await conn.execute(
                     text(
+                        f"CREATE TABLE {schema}.agents ("
+                        "id uuid PRIMARY KEY, model text)"
+                    )
+                )
+                await conn.execute(
+                    text(
+                        f"INSERT INTO {schema}.agents (id, model) "
+                        "VALUES (:id, :model)"
+                    ),
+                    {"id": agent_id, "model": "anthropic/claude-haiku-5.5"},
+                )
+                await conn.execute(
+                    text(
                         f"INSERT INTO {schema}.hook_runs "
                         "(id, agent_id, name, slot_utc, version_id, started_at, "
                         "lease_expires_at) VALUES (:id, :agent_id, :name, "

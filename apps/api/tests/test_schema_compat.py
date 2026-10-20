@@ -145,6 +145,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0106",
             "0107",
             "0108",
+            "selfimp_safety_0001",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -161,8 +162,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0106",
             "0107",
             "0108",
+            "selfimp_safety_0001",
         }
-    assert current_revision() == "0108"
+    assert current_revision() == "selfimp_safety_0001"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
