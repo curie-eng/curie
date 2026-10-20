@@ -444,7 +444,9 @@ def test_no_review_kickback_means_no_arc() -> None:
     )
     assert _with_class(root, "loop-arc") == []
     assert _with_class(root, "loop-badge") == []
-    assert "approved, 1 round" in _all_text(root)
+    review_text = "".join(_slot(root, "plan_review").itertext())
+    assert "completed, 1 round" in review_text
+    assert "approved" not in review_text
 
 
 def test_a_diff_review_approved_after_three_rounds_badges_two() -> None:
@@ -466,7 +468,9 @@ def test_a_diff_review_approved_after_three_rounds_badges_two() -> None:
     )
     assert len(_with_class(root, "loop-arc")) == 1
     assert _badge(root, "implement") == "2"
-    assert "approved · 3 rounds" in _all_text(root)
+    review_text = "".join(_stage(root, "review_diff").itertext())
+    assert "completed · 3 rounds" in review_text
+    assert "approved" not in review_text
     assert "current" in _classes(_stage(root, "review_diff"))
 
 
