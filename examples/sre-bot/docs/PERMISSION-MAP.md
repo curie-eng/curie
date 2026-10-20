@@ -201,6 +201,7 @@ anything, and cannot act in another namespace. A leaked token can set those
 Deployments' replica counts, zero included, and nothing else; RBAC stays the
 ceiling even if the connector's own allowlist is wider than the Role.
 
+## Retention and evidence
 
 Kubernetes Events and pod logs are short-lived. Approval records show a call
 was authorized, not that the API accepted it or the workload became healthy.
