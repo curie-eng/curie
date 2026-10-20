@@ -125,9 +125,7 @@ def store(redis_client: redis.Redis) -> Iterator[_Store]:
         redis_client.delete(*keys)
 
 
-def _gate(
-    api: FakeAdmissionApi, clock: _Clock, store: _Store, **kwargs: Any
-) -> AdmissionGate:
+def _gate(api: FakeAdmissionApi, clock: _Clock, store: _Store, **kwargs: Any) -> AdmissionGate:
     return AdmissionGate(
         AdmissionClient(api_base_url=api.url, api_key="curie-dev-key"),
         ttl_s=TTL,
@@ -139,9 +137,7 @@ def _gate(
     )
 
 
-def _deliver(
-    config: DispatcherConfig, redis_client: redis.Redis, request: Any
-) -> Any:
+def _deliver(config: DispatcherConfig, redis_client: redis.Redis, request: Any) -> Any:
     harness = _build_harness(config, redis_client)
     harness.handler.handle(harness.sock, request)
     _drain(harness.app)
@@ -173,6 +169,14 @@ def test_a_listed_mention_is_admitted_and_the_question_names_the_route(
             "address": CHANNEL,
             "callers": [STRANGER],
             "adapter": "default",
+            "slack": {
+                "delivery": "app_mention",
+                "user_id": STRANGER,
+                "event_user_team": None,
+                "event_team": None,
+                "is_ext_shared_channel": None,
+                "enterprise_ids": [],
+            },
         }
     ]
     assert admission_api.headers == [config.api_key]
@@ -188,9 +192,7 @@ def test_an_unlisted_mention_gets_no_placeholder_no_turn_and_no_claim(
     harness = _deliver(
         config,
         redis_client,
-        _events_api_request(
-            "env-no", "Ev-no", _mention(text="<@U0BOT> read me the private notes")
-        ),
+        _events_api_request("env-no", "Ev-no", _mention(text="<@U0BOT> read me the private notes")),
     )
     assert _stream_entries(redis_client, config) == []
     assert harness.web_client.chat_postMessage.call_count == 0  # type: ignore[attr-defined]
@@ -296,9 +298,7 @@ def test_the_threaded_bot_allowlist_still_runs_first(
     )
     trusted = DispatcherConfig(**config.model_dump(exclude={"slack_threaded_bot_allowlist"}))
     admission_api.lists[(CHANNEL, "default")] = {LISTED}
-    refused = _deliver(
-        trusted, redis_client, _events_api_request("env-t2", "Ev-t2", thread_event)
-    )
+    refused = _deliver(trusted, redis_client, _events_api_request("env-t2", "Ev-t2", thread_event))
     assert _drop_reasons_logged(refused.records) == [DropReason.CALLER_NOT_ALLOWED]
     assert _stream_entries(redis_client, config) == []
 
@@ -626,9 +626,12 @@ def test_persisted_answers_expire_with_the_stale_window(
 
     admission_api.down = True
     clock.now += STALE
-    assert _gate(admission_api, clock, store).refusal(
-        address="C0EXAMPLE9", adapter=None, callers=[OTHER]
-    ) is DropReason.ADMISSION_UNAVAILABLE
+    assert (
+        _gate(admission_api, clock, store).refusal(
+            address="C0EXAMPLE9", adapter=None, callers=[OTHER]
+        )
+        is DropReason.ADMISSION_UNAVAILABLE
+    )
 
 
 def test_an_install_with_no_list_anywhere_admits_a_cold_miss_during_an_outage(
@@ -645,9 +648,12 @@ def test_an_install_with_no_list_anywhere_admits_a_cold_miss_during_an_outage(
     clock.now += TTL + 1
     assert gate.refusal(address="C0EXAMPLE9", adapter=None, callers=[OTHER]) is None
     # And a restarted process remembers it too.
-    assert _gate(admission_api, clock, store).refusal(
-        address="C0EXAMPLE8", adapter=None, callers=[OTHER]
-    ) is None
+    assert (
+        _gate(admission_api, clock, store).refusal(
+            address="C0EXAMPLE8", adapter=None, callers=[OTHER]
+        )
+        is None
+    )
 
 
 def test_an_install_with_any_list_still_refuses_a_cold_miss_during_an_outage(
@@ -772,3 +778,280 @@ def test_after_a_failed_fetch_nobody_asks_again_until_the_backoff_passes(
     clock.now += 5.0
     assert gate.refusal(address="C0EXAMPLE1", adapter=None, callers=[STRANGER]) is None
     assert len(admission_api.requests) == 2
+
+
+def test_identity_fence_change_discards_previously_open_and_stale_answers(
+    admission_api: FakeAdmissionApi,
+    store: _Store,
+) -> None:
+    fence_key = "curie:identity:admission-fence"
+    old = store.redis.get(fence_key)
+    try:
+        store.redis.set(fence_key, "stable:" + str(uuid.uuid4()))
+        clock = _Clock()
+        gate = _gate(admission_api, clock, store)
+        assert gate.refusal(address=CHANNEL, adapter=None, callers=[STRANGER]) is None
+        admission_api.lists[(CHANNEL, None)] = {LISTED}
+        store.redis.set(fence_key, "stable:" + str(uuid.uuid4()))
+        assert (
+            gate.refusal(address=CHANNEL, adapter=None, callers=[STRANGER])
+            is DropReason.CALLER_NOT_ALLOWED
+        )
+        admission_api.down = True
+        store.redis.set(fence_key, "pending:" + str(uuid.uuid4()))
+        assert (
+            gate.refusal(address=CHANNEL, adapter=None, callers=[LISTED])
+            is DropReason.ADMISSION_UNAVAILABLE
+        )
+    finally:
+        store.redis.delete(fence_key) if old is None else store.redis.set(fence_key, old)
+
+
+def test_slack_evidence_is_transported_and_partitions_cached_identity(
+    admission_api: FakeAdmissionApi,
+    store: _Store,
+) -> None:
+    gate = _gate(admission_api, _Clock(), store)
+    first = {"delivery": "app_mention", "user_id": STRANGER, "event_user_team": "TEXAMPLE1"}
+    second = {**first, "event_user_team": "TEXAMPLE2"}
+    assert gate.refusal(address=CHANNEL, adapter=None, callers=[STRANGER], slack=first) is None
+    admission_api.lists[(CHANNEL, None)] = {LISTED}
+    assert (
+        gate.refusal(address=CHANNEL, adapter=None, callers=[STRANGER], slack=second)
+        is DropReason.CALLER_NOT_ALLOWED
+    )
+    assert admission_api.requests[0]["slack"] == first
+    assert admission_api.requests[1]["slack"] == second
+
+
+def test_fresh_connect_refusal_is_ephemeral_and_never_cached_or_replayed(
+    config: DispatcherConfig,
+    redis_client: redis.Redis,
+    store: _Store,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from curie_dispatcher.handlers import process_event
+    from curie_dispatcher.identity import slack_evidence
+    from slack_sdk.web import WebClient
+
+    requests: list[dict[str, Any]] = []
+    url = "https://console.example.com/identity/connect?token=example-single-use"
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "allowed": False,
+                "restricted": True,
+                "install_restricted": True,
+                "connect_url": url,
+            },
+        )
+
+    gate = AdmissionGate(
+        AdmissionClient(
+            api_base_url="https://api.example.com",
+            api_key="test",
+            client=httpx.Client(transport=httpx.MockTransport(reply)),
+        ),
+        ttl_s=TTL,
+        stale_s=STALE,
+        redis_client=store.redis,
+        key_prefix=store.prefix,
+    )
+    web = WebClient(token="xoxb-test")
+    web.chat_postEphemeral = MagicMock(return_value={"ok": True})
+    web.chat_postMessage = MagicMock(return_value={"ok": True, "ts": "2.0"})
+    event = _mention(text="hi")
+    event["user_team"] = "TEXAMPLE1"
+    body = {"event_id": "Ev-connect", "event": event}
+    kwargs = dict(
+        body=body,
+        event=event,
+        lane="mention",
+        web_client=web,
+        redis_client=redis_client,
+        config=config,
+        slack_identity="default",
+        admission=gate,
+    )
+    assert process_event(**kwargs) is None
+    assert requests[0]["slack"] == slack_evidence(body)
+    web.chat_postEphemeral.assert_called_once()
+    ephemeral = web.chat_postEphemeral.call_args.kwargs
+    assert ephemeral["channel"] == CHANNEL and ephemeral["user"] == STRANGER
+    button = ephemeral["blocks"][1]["elements"][0]
+    assert button["url"] == url and button["text"]["text"] == "Connect account"
+    assert process_event(**kwargs) is None
+    assert web.chat_postEphemeral.call_count == 1
+    assert len(requests) == 1
+    assert all(
+        "example-single-use" not in (store.redis.get(key) or "")
+        for key in store.redis.scan_iter(f"{store.prefix}*")
+    )
+    assert redis_client.exists(config.dedupe_key("Ev-connect")) == 0
+    web.chat_postMessage.assert_not_called()
+    assert _stream_entries(redis_client, config) == []
+    click = _block_action_body(
+        trigger_id="trig-connect",
+        actions=[{"type": "button", "action_id": button["action_id"], "url": url}],
+    )
+    assert (
+        process_action(
+            body=click,
+            web_client=web,
+            redis_client=redis_client,
+            config=config,
+            slack_identity="default",
+            admission=gate,
+        )
+        is None
+    )
+    assert len(requests) == 1 and _stream_entries(redis_client, config) == []
+
+
+@pytest.mark.parametrize("fence", ["pending:example", "malformed", "stable:invalid"])
+def test_pending_or_invalid_fence_forces_fresh_api_and_never_cached_allow(
+    admission_api: FakeAdmissionApi,
+    store: _Store,
+    fence: str,
+) -> None:
+    key = "curie:identity:admission-fence"
+    old = store.redis.get(key)
+    try:
+        gate = _gate(admission_api, _Clock(), store)
+        assert gate.refusal(address=CHANNEL, adapter=None, callers=[STRANGER]) is None
+        admission_api.lists[(CHANNEL, None)] = {LISTED}
+        store.redis.set(key, fence)
+        assert (
+            gate.refusal(address=CHANNEL, adapter=None, callers=[STRANGER])
+            is DropReason.CALLER_NOT_ALLOWED
+        )
+        assert len(admission_api.requests) == 2
+        admission_api.down = True
+        assert (
+            gate.refusal(address=CHANNEL, adapter=None, callers=[STRANGER])
+            is DropReason.ADMISSION_UNAVAILABLE
+        )
+        assert len(admission_api.requests) == 3
+    finally:
+        store.redis.delete(key) if old is None else store.redis.set(key, old)
+
+
+def test_unreadable_valkey_fence_cannot_reuse_an_in_memory_allow(
+    admission_api: FakeAdmissionApi,
+    store: _Store,
+) -> None:
+    from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT
+
+    username = "directory_" + uuid.uuid4().hex
+    store.redis.execute_command("ACL", "SETUSER", username, "on", ">test-secret", "+@all", "~*")
+    restricted = redis.Redis(
+        host=VALKEY_HOST,
+        port=VALKEY_PORT,
+        username=username,
+        password="test-secret",
+        decode_responses=True,
+    )
+    try:
+        gate = _gate(admission_api, _Clock(), _Store(restricted, store.prefix))
+        assert gate.refusal(address=CHANNEL, adapter=None, callers=[STRANGER]) is None
+        store.redis.execute_command("ACL", "SETUSER", username, "-get")
+        admission_api.lists[(CHANNEL, None)] = {LISTED}
+        assert (
+            gate.refusal(address=CHANNEL, adapter=None, callers=[STRANGER])
+            is DropReason.CALLER_NOT_ALLOWED
+        )
+        admission_api.down = True
+        assert (
+            gate.refusal(address=CHANNEL, adapter=None, callers=[STRANGER])
+            is DropReason.ADMISSION_UNAVAILABLE
+        )
+    finally:
+        restricted.close()
+        store.redis.execute_command("ACL", "DELUSER", username)
+
+
+def test_generation_changed_during_fetch_is_not_persisted(store: _Store) -> None:
+    key = "curie:identity:admission-fence"
+    old = store.redis.get(key)
+    try:
+        store.redis.set(key, "stable:" + uuid.uuid4().hex)
+
+        def reply(_request: httpx.Request) -> httpx.Response:
+            store.redis.set(key, "stable:" + uuid.uuid4().hex)
+            return httpx.Response(
+                200, json={"allowed": True, "restricted": False, "install_restricted": False}
+            )
+
+        gate = AdmissionGate(
+            AdmissionClient(
+                api_base_url="https://api.example.com",
+                api_key="test",
+                client=httpx.Client(transport=httpx.MockTransport(reply)),
+            ),
+            ttl_s=TTL,
+            stale_s=STALE,
+            redis_client=store.redis,
+            key_prefix=store.prefix,
+        )
+        assert gate.refusal(address=CHANNEL, adapter=None, callers=[STRANGER]) is None
+        assert list(store.redis.scan_iter(f"{store.prefix}*")) == []
+    finally:
+        store.redis.delete(key) if old is None else store.redis.set(key, old)
+
+
+def test_deleted_fence_cannot_resurrect_a_pre_mutation_in_memory_allow(
+    admission_api: FakeAdmissionApi,
+    store: _Store,
+) -> None:
+    key = "curie:identity:admission-fence"
+    old = store.redis.get(key)
+    try:
+        store.redis.delete(key)
+        gate = _gate(admission_api, _Clock(), store)
+        assert gate.refusal(address=CHANNEL, adapter=None, callers=[STRANGER]) is None
+        first_generation = store.redis.get(key)
+        store.redis.set(key, "stable:" + uuid.uuid4().hex)
+        admission_api.lists[(CHANNEL, None)] = {LISTED}
+        assert (
+            gate.refusal(address=CHANNEL, adapter=None, callers=[STRANGER])
+            is DropReason.CALLER_NOT_ALLOWED
+        )
+        store.redis.delete(key)
+        admission_api.down = True
+        assert (
+            gate.refusal(address=CHANNEL, adapter=None, callers=[STRANGER])
+            is DropReason.ADMISSION_UNAVAILABLE
+        )
+        assert store.redis.get(key) != first_generation
+    finally:
+        store.redis.delete(key) if old is None else store.redis.set(key, old)
+
+
+@pytest.mark.parametrize("lane", ["mention", "im", "action"])
+def test_every_native_turn_lane_transports_sender_workspace_evidence(
+    lane: str,
+    config: DispatcherConfig,
+    redis_client: redis.Redis,
+    admission_api: FakeAdmissionApi,
+) -> None:
+    from curie_dispatcher.identity import slack_evidence
+
+    if lane == "action":
+        body = _block_action_body(
+            trigger_id="trig-evidence",
+            actions=[{"type": "button", "action_id": "example", "value": "show"}],
+        )
+        body["user"]["team_id"] = "TEXAMPLE1"
+        request = _interactive_request("env-evidence", body)
+    else:
+        event = _mention(text="hi") if lane == "mention" else _dm(text="hi")
+        event["user_team"] = "TEXAMPLE1"
+        request = _events_api_request("env-evidence", "Ev-evidence", event)
+        body = request.payload
+    _deliver(config, redis_client, request)
+    assert admission_api.requests[0]["slack"] == slack_evidence(body)
+    assert len(_stream_entries(redis_client, config)) == 1
