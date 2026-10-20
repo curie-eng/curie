@@ -11,7 +11,7 @@ Tracked in [#4557](https://github.com/curie-eng/curie/issues/4557). It builds on
 [source policy](2026-10-02-protected-hook-source-policy.md) contracts, and the
 shared bootstrap grammar of [#4076](https://github.com/curie-eng/curie/issues/4076).
 
-This specification is proposed for maintainer review. It changes no code, no
+This specification was approved by the maintainer on 2026-10-20. It changes no code, no
 record format and no ADR. It precedes any change to authority evaluation or to
 the closed record formats, as ADR 0224 requires. It claims no qualification,
 provisioning or activation evidence. The design choices that the Accepted ADRs
@@ -538,15 +538,12 @@ Reasoning. ADR 0224 requires every installation intended for production to run
 its own campaign, and ADR 0236 lets the operator command qualify only disposable
 local installations until a producer exists for the target CNI, naming source
 identity, spoof measurement and retained connection refusal as part of that
-producer's realization. No Accepted ADR covers such a producer. Production
-qualification on a managed CNI therefore depends on Draft
-<!-- doclint:ignore-line -->
-[ADR 0238](https://github.com/curie-eng/curie/blob/task/managed-cni-qualification-adr/docs/adr/0238-a-managed-cni-installation-qualifies-through-its-own-behavioral-network-producer.md),
-a managed CNI qualification producer, proposed in
-[#4803](https://github.com/curie-eng/curie/pull/4803). It must be Accepted
-before any specification or code for that producer. Until then, ADR 0236's
-explicit outcome holds: such an installation refuses before the campaign
-starts.
+producer's realization.
+[ADR 0238](../../adr/0238-a-managed-cni-installation-qualifies-through-its-own-behavioral-network-producer.md)
+(Accepted) decides that producer and the production installation form. Its
+realization is a separate specification and is out of this specification's
+scope; until it ships, ADR 0236's explicit outcome holds and a managed CNI
+installation refuses before the campaign starts.
 
 ### 4. The activation transition is demonstrated before implementation
 
