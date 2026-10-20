@@ -1121,7 +1121,12 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     # python-static; the required job only waits for them to aggregate their
     # results, and always() keeps it from skipping.
     assert job.get("needs") == [
-        "changes", "python-pytest", "python-container-fixtures", "python-static", "ci-policy",
+        "changes",
+        "python-pytest",
+        "python-container-fixtures",
+        "python-dry-run-fixture",
+        "python-static",
+        "ci-policy",
     ]
     assert job.get("if") == "always()", "the required Python check must not be skippable"
     shard_job, steps = _python_job(document, "python-pytest")
@@ -1189,6 +1194,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
         ("--deselect", ADMITTED_AGENT_SELECTOR.split("::", 1)[0]),
         ("--ignore", "tools/factory-e2e/tests/test_c4_tracker_scope.py"),
         ("--ignore", "examples/tests/test_sre_bot_observability_runtime.py"),
+        ("--ignore", "tools/factory-e2e/tests/test_c4_dry_run.py"),
         ("--ignore", "tools/ci-retry-gate"),
         ("--ignore", "tools/ci-workflow-paths"),
         ("--ignore", "tools/ci-release-target-parity"),
