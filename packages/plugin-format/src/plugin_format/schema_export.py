@@ -19,6 +19,7 @@ from .connectors import (
     ConnectorSpec,
     RunnerSpec,
     SecretRef,
+    SharedConnectorReference,
 )
 from .deploy_targets import DeployTarget, DeployTargetsFile
 from .models import (
@@ -52,6 +53,7 @@ _MODELS = (
     # ride the same drift gate (#1128).
     ConnectorsFile,
     ConnectorSpec,
+    SharedConnectorReference,
     ConnectorBuild,
     ConnectorResources,
     ConnectorResourceQuantities,

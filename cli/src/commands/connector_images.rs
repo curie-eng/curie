@@ -1246,6 +1246,7 @@ pub fn skill_connector_plan(
     decl: &crate::connector_build::ConnectorsFileDecl,
     lock: &crate::connector_build::ConnectorLockFileDecl,
 ) -> Result<Vec<(String, String)>> {
+    crate::connector_build::refuse_shared_connectors(decl)?;
     let mut plan = Vec::new();
     for (connector, spec) in &decl.connectors {
         if spec.url.is_some() || spec.unhosted_url.is_some() {

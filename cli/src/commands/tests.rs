@@ -3266,6 +3266,87 @@ async fn docker_subpath_preflight_skill_bring_up_refuses_old_engine_before_any_v
 }
 
 #[tokio::test]
+async fn shared_connector_local_bring_up_refuses_before_docker() {
+    let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+    let bin = tempfile::tempdir().expect("bin dir");
+    let plugin = tempfile::tempdir().expect("plugin dir");
+    let log = bin.path().join("docker.log");
+    let _restore = install_subpath_docker_stub(bin.path(), &log, "1.56", "v2.25.0");
+    std::fs::write(
+        bin.path().join("docker"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in ps) exit 0 ;; *) exit 64 ;; esac\n",
+            log.display(),
+        ),
+    )
+    .unwrap();
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/vectors/shared-connector-reference.json"
+    ))
+    .unwrap();
+    let lock = crate::connector_build::ConnectorLockFileDecl {
+        version: crate::connector_build::LOCK_VERSION,
+        ..Default::default()
+    };
+    for vector in vectors["vectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|vector| vector["accept"] == true && vector["activation"] == false)
+    {
+        let decl = crate::connector_build::parse_connectors(
+            &serde_norway::to_string(&vector["document"]).unwrap(),
+        )
+        .unwrap();
+        let error = super::bring_up_local(
+            plugin.path(),
+            &decl,
+            &lock,
+            &subpath_scope(),
+            "test-project",
+        )
+        .await
+        .expect_err("shared declarations must refuse before local reconciliation");
+        assert!(
+            format!("{error:#}").contains("shared_connector_requires_application"),
+            "{}: {error:#}",
+            vector["name"]
+        );
+        assert!(
+            !log.exists(),
+            "no Docker command may run for {}",
+            vector["name"]
+        );
+        assert!(plugin.path().read_dir().unwrap().next().is_none());
+    }
+    let neighbor = vectors["vectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|vector| vector["name"] == "dedicated_url")
+        .unwrap();
+    let dedicated = crate::connector_build::parse_connectors(
+        &serde_norway::to_string(&neighbor["document"]).unwrap(),
+    )
+    .unwrap();
+    super::bring_up_local(
+        plugin.path(),
+        &dedicated,
+        &lock,
+        &subpath_scope(),
+        "test-project",
+    )
+    .await
+    .expect("a dedicated remote declaration still reconciles successfully");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap().trim_end(),
+        crate::docker::agent_connectors_argv("test-project", &subpath_scope().agent).join(" "),
+        "the dedicated remote neighbor reaches only the existing reconciliation listing",
+    );
+    assert!(plugin.path().read_dir().unwrap().next().is_none());
+}
+
+#[tokio::test]
 async fn docker_subpath_preflight_local_bring_up_refuses_old_compose_before_any_volume() {
     let _lock = crate::PROCESS_ENV_LOCK.lock().await;
     let bin = tempfile::tempdir().expect("bin dir");

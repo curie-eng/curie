@@ -28,6 +28,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -76,9 +77,11 @@ pub const RUNNER_BASE_ARG: &str = "CURIE_RUNNER_IMAGE";
 pub const RUNNER_DIGEST_KEY: &str = "@runner";
 
 /// One declared connector, a full mirror of `plugin_format.ConnectorSpec`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectorSpecDecl {
+    #[serde(default)]
+    pub shared: Option<SharedConnectorReferenceDecl>,
     // -- hosted form --
     pub image: Option<String>,
     pub build: Option<ConnectorBuildDecl>,
@@ -138,6 +141,77 @@ pub struct ConnectorSpecDecl {
     /// sandbox. See [`declared_secret_names`] and [`bearer_secret_name`].
     #[serde(default)]
     pub config: Vec<String>,
+}
+
+impl Serialize for ConnectorSpecDecl {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(shared) = &self.shared {
+            map.serialize_entry("shared", shared)?;
+        } else {
+            map.serialize_entry("image", &self.image)?;
+            map.serialize_entry("build", &self.build)?;
+            map.serialize_entry("args", &self.args)?;
+            map.serialize_entry("env", &self.env)?;
+            map.serialize_entry("port", &self.port)?;
+            map.serialize_entry("unhosted_url", &self.unhosted_url)?;
+            map.serialize_entry("admits", &self.admits)?;
+            map.serialize_entry("proxy_upstream_host", &self.proxy_upstream_host)?;
+            map.serialize_entry("readiness_path", &self.readiness_path)?;
+            map.serialize_entry("resources", &self.resources)?;
+            map.serialize_entry("url", &self.url)?;
+            map.serialize_entry("headers", &self.headers)?;
+            map.serialize_entry("secrets", &self.secrets)?;
+            map.serialize_entry("bearer_secret", &self.bearer_secret)?;
+            map.serialize_entry("no_client_auth", &self.no_client_auth)?;
+            map.serialize_entry("sealed_secrets", &self.sealed_secrets)?;
+            map.serialize_entry("secret_files", &self.secret_files)?;
+            map.serialize_entry("config", &self.config)?;
+        }
+        map.end()
+    }
+}
+
+/// An application reference with no per-agent runtime configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedConnectorReferenceDecl {
+    #[serde(deserialize_with = "deserialize_shared_application")]
+    pub application: String,
+    #[serde(deserialize_with = "deserialize_shared_contract")]
+    pub contract: u32,
+}
+
+fn deserialize_shared_application<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let application = String::deserialize(deserializer)?;
+    let valid = uuid::Uuid::parse_str(&application)
+        .is_ok_and(|id| !id.is_nil() && id.to_string() == application);
+    if !valid {
+        return Err(serde::de::Error::custom(
+            "application must be a nonnil canonical lowercase hyphenated UUID",
+        ));
+    }
+    Ok(application)
+}
+
+fn deserialize_shared_contract<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match serde_norway::Value::deserialize(deserializer)? {
+        serde_norway::Value::Number(number) if number.is_u64() && number.as_u64() == Some(1) => {
+            Ok(1)
+        }
+        _ => Err(serde::de::Error::custom(
+            "contract must be the strict integer 1",
+        )),
+    }
 }
 
 /// `resources:` on a hosted connector: either side may be omitted.
@@ -201,6 +275,7 @@ fn default_dockerfile() -> String {
 impl Default for ConnectorSpecDecl {
     fn default() -> Self {
         Self {
+            shared: None,
             image: None,
             build: None,
             args: Vec::new(),
@@ -308,7 +383,15 @@ fn field_names_of<T: Serialize>(value: T) -> BTreeSet<String> {
 }
 
 pub fn spec_field_names() -> BTreeSet<String> {
-    field_names::<ConnectorSpecDecl>()
+    let mut fields = field_names::<ConnectorSpecDecl>();
+    fields.extend(field_names_of(ConnectorSpecDecl {
+        shared: Some(SharedConnectorReferenceDecl {
+            application: "12345678-1234-4234-8234-123456789abc".to_string(),
+            contract: 1,
+        }),
+        ..Default::default()
+    }));
+    fields
 }
 
 pub fn build_field_names() -> BTreeSet<String> {
@@ -343,13 +426,16 @@ pub fn lock_entry_field_names() -> BTreeSet<String> {
 
 // ─── Parsing ─────────────────────────────────────────────────────────────────
 
-/// Parse and check a `connectors.yaml` document.
+/// Parse shared reference shape and retain dedicated name, form and build checks.
 ///
-/// Accept/reject parity with the Python validator is the property that matters:
-/// a document the CLI accepts and the platform rejects means an operator builds
-/// and pushes an image for a bundle that can never deploy, and the reverse
-/// means a bundle that deploys through git flow but cannot be built locally.
+/// Shared references are metadata, as in Python's `ConnectorsFile.model_validate`.
+/// That model alone does not perform all dedicated validations done here.
+/// Activation uses [`load`], paired with Python's `validate_connectors`, and
+/// refuses shared references until an application root exists.
 pub fn parse_connectors(document: &str) -> Result<ConnectorsFileDecl> {
+    let raw: serde_norway::Value =
+        serde_norway::from_str(document).with_context(|| format!("parse {CONNECTORS_FILE}"))?;
+    check_shared_keys(&raw)?;
     let file: ConnectorsFileDecl =
         serde_norway::from_str(document).with_context(|| format!("parse {CONNECTORS_FILE}"))?;
     for (name, spec) in &file.connectors {
@@ -360,6 +446,44 @@ pub fn parse_connectors(document: &str) -> Result<ConnectorsFileDecl> {
         check_build("runner", &runner.build)?;
     }
     Ok(file)
+}
+
+fn check_shared_keys(document: &serde_norway::Value) -> Result<()> {
+    let Some(connectors) = document
+        .get("connectors")
+        .and_then(serde_norway::Value::as_mapping)
+    else {
+        return Ok(());
+    };
+    for (name, spec) in connectors {
+        if let Some(shared) = spec.get("shared") {
+            if shared.is_null() || spec.as_mapping().map(|fields| fields.len()) != Some(1) {
+                bail!(
+                    "connectors.{}: shared must be nonnull and the sole connector property",
+                    name.as_str().unwrap_or("<invalid>")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse dedicated operations on a shared reference before producing a plan.
+pub fn refuse_shared_connector(connector: &str, spec: &ConnectorSpecDecl) -> Result<()> {
+    if spec.shared.is_some() {
+        bail!(
+            "shared_connector_requires_application: connectors.{connector} requires an application root"
+        );
+    }
+    Ok(())
+}
+
+/// Refuse the whole declaration before activating any dedicated neighbors.
+pub fn refuse_shared_connectors(decl: &ConnectorsFileDecl) -> Result<()> {
+    for (connector, spec) in &decl.connectors {
+        refuse_shared_connector(connector, spec)?;
+    }
+    Ok(())
 }
 
 /// The connector name cap and shape, mirroring `plugin_format.connectors`
@@ -595,7 +719,8 @@ fn delivery_shape(delivery: Delivery) -> (&'static str, &'static str) {
     }
 }
 
-/// Read a bundle's `connectors.yaml`, or an empty declaration when it has none.
+/// Read a bundle's declaration for dedicated activation, refusing shared references.
+/// A bundle with no `connectors.yaml` returns an empty declaration.
 pub fn load(bundle_dir: &Path) -> Result<ConnectorsFileDecl> {
     let path = bundle_dir.join(CONNECTORS_FILE);
     if !path.is_file() {
@@ -603,7 +728,9 @@ pub fn load(bundle_dir: &Path) -> Result<ConnectorsFileDecl> {
     }
     let body =
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    parse_connectors(&body)
+    let decl = parse_connectors(&body)?;
+    refuse_shared_connectors(&decl)?;
+    Ok(decl)
 }
 
 /// Read a bundle's `connectors.lock.yaml`, or `None` when it has none.
@@ -661,6 +788,9 @@ pub fn locked_runner_image(bundle_dir: &Path) -> Result<Option<String>> {
 }
 
 fn check_spec(name: &str, spec: &ConnectorSpecDecl) -> Result<()> {
+    if spec.shared.is_some() {
+        return Ok(());
+    }
     let forms = [
         spec.image.is_some(),
         spec.build.is_some(),
@@ -1320,6 +1450,7 @@ pub fn build_plan(
     metadata_dir: &Path,
     platforms: &[String],
 ) -> Result<ConnectorBuildPlan> {
+    refuse_shared_connector(connector, spec)?;
     let build = spec.build.as_ref().ok_or_else(|| {
         anyhow!("connectors.{connector}: declares no `build` block, so there is nothing to build")
     })?;
@@ -1750,6 +1881,7 @@ impl ConnectorSecretVolumes {
         connector: &str,
         spec: &ConnectorSpecDecl,
     ) -> Result<Vec<ConnectorSecretMount>> {
+        refuse_shared_connector(connector, spec)?;
         spec.secret_files
             .values()
             .map(|target| {
@@ -2020,7 +2152,7 @@ pub(crate) fn compose_service_ids_command(
 /// Whether a declared connector is one Curie runs (as opposed to one already
 /// running somewhere else).
 pub(crate) fn is_hosted(spec: &ConnectorSpecDecl) -> bool {
-    spec.url.is_none() && spec.unhosted_url.is_none()
+    spec.shared.is_none() && spec.url.is_none() && spec.unhosted_url.is_none()
 }
 
 /// The image a hosted connector starts from: the locked digest when the bundle
@@ -2040,6 +2172,7 @@ pub fn resolved_image(
     spec: &ConnectorSpecDecl,
     lock: &ConnectorLockFileDecl,
 ) -> Result<String> {
+    refuse_shared_connector(connector, spec)?;
     if spec.build.is_some() {
         if let Some(entry) = lock.connectors.get(connector) {
             return Ok(entry.image.clone());
@@ -2071,6 +2204,7 @@ pub fn compose_overlay(
     secret_volumes: &ConnectorSecretVolumes,
     caller_public_key: Option<&str>,
 ) -> Result<serde_json::Value> {
+    refuse_shared_connectors(decl)?;
     let network = crate::local::current_resources()?.docker_network;
     let mut services = serde_json::Map::new();
     let mut external_volumes = serde_json::Map::new();
@@ -2420,6 +2554,7 @@ pub fn missing_secrets_error(missing: &[String]) -> anyhow::Error {
 /// give a server that 401s on every call, which reads as a broken connector
 /// rather than a missing prerequisite, so bring-up fails closed.
 pub fn refuse_out_of_band_secrets(connector: &str, spec: &ConnectorSpecDecl) -> Result<()> {
+    refuse_shared_connector(connector, spec)?;
     for declared in &spec.secrets {
         if let SecretDecl::Ref {
             name, from_secret, ..
@@ -2989,5 +3124,154 @@ mod dark_factory_runner_digest_tests {
             digest(),
             "editing runner.Dockerfile must move the runner source digest"
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_connector_reference_tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn cases() -> Vec<Value> {
+        serde_json::from_str::<Value>(include_str!(
+            "../../tests/vectors/shared-connector-reference.json"
+        ))
+        .unwrap()["vectors"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    fn document(case: &Value) -> Value {
+        if let Some(sibling) = case.get("sibling") {
+            let mut document = cases()[0]["document"].clone();
+            document["connectors"]["docs"]
+                .as_object_mut()
+                .unwrap()
+                .extend(sibling.as_object().unwrap().clone());
+            document
+        } else {
+            case["document"].clone()
+        }
+    }
+
+    #[test]
+    fn shared_connector_reference_vectors() {
+        for case in cases() {
+            let document = document(&case);
+            let parsed = parse_connectors(&serde_norway::to_string(&document).unwrap());
+            assert_eq!(parsed.is_ok(), case["accept"].as_bool().unwrap(), "{case}");
+            if let Ok(parsed) = parsed {
+                let output = serde_json::to_value(parsed).unwrap();
+                for (alias, spec) in document["connectors"].as_object().unwrap() {
+                    if let Some(reference) = spec.get("shared") {
+                        assert_eq!(&output["connectors"][alias]["shared"], reference);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_and_mixed_serialization_roundtrips_exclusive_shape() {
+        for case in cases().into_iter().filter(|case| case["accept"] == true) {
+            let document = document(&case);
+            let parsed = parse_connectors(&serde_norway::to_string(&document).unwrap()).unwrap();
+            let serialized = serde_json::to_value(&parsed).unwrap();
+            for (alias, spec) in document["connectors"].as_object().unwrap() {
+                if spec.get("shared").is_some() {
+                    assert_eq!(
+                        &serde_json::to_value(&parsed.connectors[alias]).unwrap(),
+                        spec
+                    );
+                    assert_eq!(&serialized["connectors"][alias], spec);
+                }
+            }
+            if case["name"] == "shared" {
+                assert_eq!(serialized, document);
+            }
+            let reparsed =
+                parse_connectors(&serde_norway::to_string(&serialized).unwrap()).unwrap();
+            assert_eq!(serde_json::to_value(reparsed).unwrap(), serialized);
+        }
+    }
+
+    #[test]
+    fn direct_builders_refuse_shared_shape_before_activation() {
+        let lock = ConnectorLockFileDecl {
+            version: LOCK_VERSION,
+            ..Default::default()
+        };
+        let identity = ConnectorScope {
+            release: "acme".into(),
+            agent: "acme-bot".into(),
+            namespace: "acme".into(),
+        };
+        let volumes = ConnectorSecretVolumes {
+            run_id: "acme-run".into(),
+            volumes: BTreeMap::new(),
+        };
+        for case in cases()
+            .into_iter()
+            .filter(|case| case["accept"] == true && case["activation"] == false)
+        {
+            let declaration =
+                parse_connectors(&serde_norway::to_string(&document(&case)).unwrap()).unwrap();
+            let spec = &declaration.connectors["docs"];
+            let errors = [
+                build_plan(
+                    Path::new("acme-missing-bundle"),
+                    "acme",
+                    "docs",
+                    spec,
+                    None,
+                    "linux/amd64",
+                    Path::new("acme-missing-metadata"),
+                    &[],
+                )
+                .unwrap_err(),
+                refuse_out_of_band_secrets("docs", spec).unwrap_err(),
+                resolved_image("docs", spec, &lock).unwrap_err(),
+                compose_overlay(&lock, &declaration, &identity, "acme-run", &volumes, None)
+                    .unwrap_err(),
+                volumes.mounts("docs", spec).unwrap_err(),
+                crate::commands::skill_connector_plan(&declaration, &lock).unwrap_err(),
+                crate::docker::ConnectorStartSpec::from_declaration(
+                    "docs",
+                    spec,
+                    "example.com/acme/server:1",
+                    &identity,
+                    "acme-network",
+                    "acme-run",
+                    &volumes,
+                    &BTreeMap::new(),
+                    None,
+                )
+                .unwrap_err(),
+            ];
+            for error in errors {
+                assert!(format!("{error:#}").contains("shared_connector_requires_application"));
+            }
+        }
+    }
+
+    #[test]
+    fn shared_connector_load_refuses_activation_and_keeps_dedicated_live() {
+        let bundle = tempfile::tempdir().unwrap();
+        for case in cases() {
+            let document = document(&case);
+            std::fs::write(
+                bundle.path().join(CONNECTORS_FILE),
+                serde_norway::to_string(&document).unwrap(),
+            )
+            .unwrap();
+            let loaded = load(bundle.path());
+            let activation = case["activation"].as_bool().unwrap();
+            assert_eq!(loaded.is_ok(), activation, "{case}: {loaded:?}");
+            if case["accept"] == true && !activation {
+                let error = loaded.unwrap_err();
+                assert!(format!("{error:#}").contains("shared_connector_requires_application"));
+            }
+        }
     }
 }

@@ -193,6 +193,7 @@ class ConnectorProxy:
 def caller_proxy_port(spec: ConnectorSpec) -> int:
     """The port the caller proxy takes in this connector's pod."""
 
+    spec.require_dedicated()
     return CALLER_PROXY_ALTERNATE_PORT if spec.port == CALLER_PROXY_PORT else CALLER_PROXY_PORT
 
 
@@ -204,6 +205,7 @@ def resolved_admits(spec: ConnectorSpec, agent: str) -> list[str]:
     into the token, and a list naming both collapses to one entry.
     """
 
+    spec.require_dedicated()
     if spec.admits is None:
         return [agent]
     admitted: list[str] = []
@@ -362,6 +364,7 @@ def render_service(
     """The Service the sandbox dials. It keeps ``spec.port``, so the URL and the
     allowed hosts do not move; with a proxy it lands on the proxy's port."""
 
+    spec.require_dedicated()
     name = object_name(release, agent, connector)
     target = _CALLER_PORT_NAME if proxy is not None else "http"
     return {
@@ -387,6 +390,7 @@ def render_direct_service(
     caller through it.
     """
 
+    spec.require_dedicated()
     return {
         "apiVersion": "v1",
         "kind": "Service",
@@ -471,6 +475,7 @@ def _server_readiness_probe(spec: ConnectorSpec) -> dict[str, Any]:
     that carries two.
     """
 
+    spec.require_dedicated()
     if spec.readiness_path is None:
         return _readiness_probe()
     return {
@@ -493,6 +498,7 @@ def render_deployment(
     gated_tools: tuple[str, ...] = (),
     grant_store_url: str = "",
 ) -> dict[str, Any]:
+    spec.require_dedicated()
     name = object_name(release, agent, connector)
     subs = substitutions(release, agent, connector, namespace, spec.port)
     env: list[dict[str, Any]] = [
@@ -677,6 +683,7 @@ def _proxy_container(
     is roughly three times the proxy's measured peak.
     """
 
+    spec.require_dedicated()
     port = caller_proxy_port(spec)
     env: list[dict[str, str]] = [
         {"name": "CURIE_CALLER_PROXY_PORT", "value": str(port)},
@@ -724,6 +731,7 @@ def _proxy_container(
 
 
 def _policy_port(spec: ConnectorSpec, proxy: ConnectorProxy | None) -> int:
+    spec.require_dedicated()
     # NetworkPolicy matches the destination pod port after the Service DNAT
     # (see the module docstring), so with a proxy both policies name the
     # proxy's port and nothing Curie renders opens `spec.port`.
@@ -744,6 +752,7 @@ def render_networkpolicy(
     the Service ClusterIP silently never matches.
     """
 
+    spec.require_dedicated()
     return {
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
@@ -813,6 +822,7 @@ def render_ingress_networkpolicy(
     enough to readmit every hostNetwork pod this rule exists to keep out.
     """
 
+    spec.require_dedicated()
     return {
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
@@ -879,6 +889,7 @@ def render(
     is what resolves it, so the message names the artifact that is missing.
     """
 
+    spec.require_dedicated()
     if not spec.is_hosted:
         return []
     if spec.image is None:
@@ -940,6 +951,7 @@ def _derived_headers(spec: ConnectorSpec) -> dict[str, Any]:
     the runner can diagnose its missing sandbox value honestly.
     """
 
+    spec.require_dedicated()
     if spec.no_client_auth is not None:
         return {}
     if spec.bearer_secret:
@@ -964,6 +976,7 @@ def unhosted_mcp_entry(spec: ConnectorSpec) -> dict[str, Any] | None:
     placeholder expands there the same way it does in a cluster sandbox.
     """
 
+    spec.require_dedicated()
     if not spec.is_hosted:
         return mcp_entry("", "", "", "", spec)
     if not spec.unhosted_url:
@@ -983,6 +996,7 @@ def mcp_entry(
     reason, so the author writes no header either -- see ``_derived_headers``.
     """
 
+    spec.require_dedicated()
     if spec.is_hosted:
         return {
             "type": "http",

@@ -19,6 +19,65 @@ they must stay backward-compatible with existing valid bundles and land as their
 own reviewed change; the schema-compat gate (`tests/test_schema_compat.py`)
 fails on any drift between the models and the committed schema.
 
+## Shared application references
+
+Maintainer approval on 2026-10-20 authorizes this optional frozen-contract
+extension as a separate prerequisite. It changes no ACI wire message or
+`PROTOCOL_VERSION` and introduces no separate plugin-format version. Existing
+dedicated connector declarations retain their behavior and serialization.
+
+A connector map key remains its alias. A shared declaration supplies only
+`shared`, with a canonical lowercase hyphenated nonnil application UUID and the
+strict integer contract `1`:
+
+```yaml
+connectors:
+  docs:
+    shared:
+      application: 12345678-1234-4234-8234-123456789abc
+      contract: 1
+```
+
+Every sibling property is forbidden, including explicit nulls, empty
+collections and defaults. An absent `shared` field stays absent when a dedicated
+model is serialized. The exported JSON Schema expresses the same exclusivity
+and nonnull rule. JSON Schema treats `1.0` as an integer; Python and Rust also
+enforce the strict integer representation.
+
+Python `ConnectorsFile.model_validate` and Rust `parse_connectors` parse
+shared reference shape without activation. For dedicated declarations, Rust
+retains its previous name, form and build validations; Python model parsing
+alone does not replace those checks. The existing hand-mirror schema-parity
+contract remains unchanged (ADR 0194). Python `validate_connectors` and Rust
+`load` are activation gates: any shared reference refuses the entire
+declaration with `shared_connector_requires_application`. Direct dedicated
+render, MCP entry and activation helpers also refuse shared references. Metadata
+inspection, including sealing-key custody inspection, grants no activation.
+
+`shared_connector_render.render_application(application)` and
+`render_member_reach(application, member)` are pure render functions with
+explicit validated inputs. Application inputs describe the installation,
+immutable application identity, images, ports, Secret key references, resources
+and database destination. Membership is separate from application pod settings;
+changing membership must not change the Deployment template. Tool narrowing
+uses the manifest's existing `toolPolicy`, with no new per-reference policy
+field and no claim of runtime policy enforcement.
+
+The `dsn_encoding` input is explicitly `bundled-sealed` or `managed-raw`.
+Encryption-key, database-DSN and grant-store Secret key references belong only
+to the proxy. An optional snapshot-sealing reference belongs only to the server
+and must use a distinct Secret name from every proxy-only reference.
+
+Shared application objects carry the application UUID label
+`curietech.ai/shared-application` and distinct shared ownership. They omit
+`curie.dev/connector-owner`, keeping them outside dedicated per-agent pruning.
+
+These are output contracts without a working shared runtime. Before activation,
+future platform roots own the UUID sandbox label writers, data-tier ingress
+allow policies, DNS, provider and grant-store egress policies,
+persistence and the shared proxy implementation. Rendered policies alone do not
+prove deployed connectivity or isolation.
+
 ## Format surface
 
 Pydantic models mirroring the Claude Code shapes:

@@ -917,7 +917,22 @@ class Installation:
         return values
 
     def releases(self) -> list[dict[str, Any]]:
-        listed = json.loads(self.helm("list", "--all", "-o", "json").stdout or "[]")
+        # Helm 4 removed --all; these status flags are shared by Helm 3 and 4.
+        # https://raw.githubusercontent.com/helm/helm/v4.0.0/pkg/cmd/list.go
+        listed = json.loads(
+            self.helm(
+                "list",
+                "--deployed",
+                "--failed",
+                "--pending",
+                "--superseded",
+                "--uninstalled",
+                "--uninstalling",
+                "-o",
+                "json",
+            ).stdout
+            or "[]"
+        )
         if not isinstance(listed, list):
             raise InfrastructureError("Helm did not return a release list")
         return [entry for entry in listed if isinstance(entry, dict)]
