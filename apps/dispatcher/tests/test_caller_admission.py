@@ -880,6 +880,10 @@ def test_fresh_connect_refusal_is_ephemeral_and_never_cached_or_replayed(
     assert process_event(**kwargs) is None
     assert requests[0]["slack"] == slack_evidence(body)
     web.chat_postEphemeral.assert_called_once()
+    # Slack documents private channel+user delivery with Block Kit, and URL
+    # buttons still emit an interaction that must be acked without a new turn:
+    # https://docs.slack.dev/reference/methods/chat.postEphemeral/
+    # https://docs.slack.dev/reference/block-kit/block-elements/button-element/
     ephemeral = web.chat_postEphemeral.call_args.kwargs
     assert ephemeral["channel"] == CHANNEL and ephemeral["user"] == STRANGER
     button = ephemeral["blocks"][1]["elements"][0]
