@@ -2,7 +2,7 @@ name: Fix pin verification
 
 on:
   pull_request:
-    branches: [main, next, "task/**"]
+    branches: [main, next, "task/**", "epic/**"]
     types: [opened, synchronize, reopened, edited]
 
 permissions:
