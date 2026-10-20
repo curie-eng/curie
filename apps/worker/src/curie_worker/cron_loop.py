@@ -1036,22 +1036,31 @@ class CronSchedulerLoop:
                     summary.lost += 1
                 continue
             retry_block: str | None = None
+            retry_outcome = "blocked"
             if await self._is_killed(target.agent_id):
                 retry_block = "agent_killed"
-            elif self._budget_spent(target):
-                retry_block = "budget_exhausted"
+            else:
+                budget_reason = await self._budget_block(target, slot)
+                if budget_reason == "daily_budget":
+                    retry_block = budget_reason
+                    retry_outcome = "skipped"
+                elif budget_reason == "budget_exhausted":
+                    retry_block = budget_reason
             if retry_block is not None:
                 async with self._engine.begin() as conn:
                     await context.ensure_before_effect(target.agent_id, name)
                     settled = (
                         await conn.execute(
                             self._settle_deferred_sql,
-                            {**key, "outcome": "blocked", "reason": retry_block},
+                            {**key, "outcome": retry_outcome, "reason": retry_block},
                         )
                     ).first()
                 if settled is not None:
-                    _record_fire("blocked")
-                    summary.blocked += 1
+                    _record_fire(retry_outcome)
+                    if retry_outcome == "skipped":
+                        summary.skipped += 1
+                    else:
+                        summary.blocked += 1
                 else:
                     summary.lost += 1
                 continue
