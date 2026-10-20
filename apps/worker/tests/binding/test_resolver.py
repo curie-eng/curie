@@ -2578,3 +2578,106 @@ def test_factory_token_remint_and_label_edit_preserve_current_binding_authority(
             await engine.dispose()
 
     asyncio.run(go())
+
+
+# --- learned skills (ADR 0237) ---------------------------------------------------
+
+
+async def _set_learned_skills(engine: AsyncEngine, agent_id: uuid.UUID, on: bool) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(f"UPDATE {_SCHEMA}.agents SET learned_skills = :on WHERE id = :id"),
+            {"on": on, "id": agent_id},
+        )
+
+
+@pytest.mark.parametrize("on", [True, False])
+def test_resolve_carries_the_agents_learned_skills_setting(on: bool) -> None:
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            await pg_connect_or_skip(engine)
+            token = uuid.uuid4().hex[:8]
+            channel = f"C-learned-{token}"
+            agent_id = await _seed_agent(
+                engine, channel=channel, name=f"learned-{token}", max_usd=None, max_tokens=None
+            )
+            try:
+                await _seed_deployment(
+                    engine, agent_id=agent_id, environment="prod",
+                    bundle_ref=f"bundles/{token}.zip",
+                )
+                await _set_learned_skills(engine, agent_id, on)
+                resolved = await _resolver(engine).resolve("slack", None, channel)
+                assert resolved is not None
+                assert resolved.agent_id == agent_id
+                assert resolved.learned_skills is on
+                assert await _resolver(engine).learned_skills_for(agent_id) is on
+            finally:
+                await _cleanup(engine, [agent_id])
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_resolve_factory_carries_the_agents_learned_skills_setting() -> None:
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            await pg_connect_or_skip(engine)
+            async with _factory_pair(engine, kind="github", adapter=None) as (on, off):
+                await _set_learned_skills(engine, on.agent_id, True)
+                resolver = _resolver(engine)
+                resolved_on = await resolver.resolve_factory(on)
+                resolved_off = await resolver.resolve_factory(off)
+                assert resolved_on is not None
+                assert resolved_off is not None
+                assert resolved_on.learned_skills is True
+                assert resolved_off.learned_skills is False
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_a_failed_learned_skills_read_degrades_to_off(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The read is tolerant: a failure (a schema that predates the column, a
+    dropped connection) resolves the turn with learned skills off, never fails it."""
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            await pg_connect_or_skip(engine)
+            token = uuid.uuid4().hex[:8]
+            channel = f"C-learned-fail-{token}"
+            agent_id = await _seed_agent(
+                engine, channel=channel, name=f"learned-fail-{token}",
+                max_usd=None, max_tokens=None,
+            )
+            try:
+                await _seed_deployment(
+                    engine, agent_id=agent_id, environment="prod",
+                    bundle_ref=f"bundles/{token}.zip",
+                )
+                await _set_learned_skills(engine, agent_id, True)
+                resolver = _resolver(engine)
+
+                async def boom(_agent_id: uuid.UUID) -> bool:
+                    raise ProgrammingError("SELECT learned_skills", {}, Exception("no column"))
+
+                resolver.learned_skills_for = boom  # type: ignore[method-assign]
+                with caplog.at_level(logging.WARNING):
+                    resolved = await resolver.resolve("slack", None, channel)
+                assert resolved is not None
+                assert resolved.agent_id == agent_id
+                assert resolved.learned_skills is False
+                assert any("learned" in r.getMessage() for r in caplog.records)
+            finally:
+                await _cleanup(engine, [agent_id])
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())

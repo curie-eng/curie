@@ -122,6 +122,7 @@ mod installation_plan_parity;
 mod json_contract;
 mod json_emit_contract;
 mod kube_spawn_inventory;
+mod learned_skills_cli;
 mod lease_expiry_cluster_proof;
 mod local_connectedness_probe;
 mod local_resources;

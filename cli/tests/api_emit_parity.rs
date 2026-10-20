@@ -303,3 +303,41 @@ impl crate::ui::CliOutput for DriftedOutput {
     );
     assert!(vs.is_empty(), "{vs:#?}");
 }
+
+#[test]
+fn a_field_name_does_not_pull_in_a_same_named_fn() {
+    // A pattern field that shares its name with an unrelated fn must not make
+    // that fn's `json!` keys count as emitted: here `beta` is only reachable
+    // through the `beta` fn, so the declared omission must stay honest.
+    const FIELD_NAMED_LIKE_FN_SRC: &str = r#"
+pub enum DriftedOutput {
+    Done { alpha: String, beta: bool },
+}
+
+fn beta() -> serde_json::Value {
+    serde_json::json!({ "beta": 1 })
+}
+
+impl crate::ui::CliOutput for DriftedOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            DriftedOutput::Done { alpha, beta: flag } => serde_json::json!({
+                "alpha": alpha,
+                "flag": flag,
+            }),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {}
+}
+"#;
+    let manifest = drifted_manifest(serde_json::json!([
+        { "field": "beta", "why": "emitted under another key" }
+    ]));
+    let vs = violations(
+        DRIFTED_STRUCT_SRC,
+        &[("field_named_like_fn.rs", FIELD_NAMED_LIKE_FN_SRC)],
+        &manifest,
+    );
+    assert!(vs.is_empty(), "{vs:#?}");
+}

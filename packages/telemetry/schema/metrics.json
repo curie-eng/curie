@@ -442,6 +442,11 @@
           "/agents/{agent_id}/cost",
           "/agents/{agent_id}/hook-secret",
           "/agents/{agent_id}/kill",
+          "/agents/{agent_id}/learned-skills",
+          "/agents/{agent_id}/learned-skills/{ref}",
+          "/agents/{agent_id}/learned-skills/{ref}/patch",
+          "/agents/{agent_id}/learned-skills/{ref}/revert",
+          "/agents/{agent_id}/learned-skills/{ref}/revisions",
           "/agents/{agent_id}/memory",
           "/agents/{agent_id}/memory/guidance",
           "/agents/{agent_id}/memory/{index}",
@@ -601,7 +606,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1296,
+      "cardinality_bound": 1336,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -631,6 +636,11 @@
           "/agents/{agent_id}/cost",
           "/agents/{agent_id}/hook-secret",
           "/agents/{agent_id}/kill",
+          "/agents/{agent_id}/learned-skills",
+          "/agents/{agent_id}/learned-skills/{ref}",
+          "/agents/{agent_id}/learned-skills/{ref}/patch",
+          "/agents/{agent_id}/learned-skills/{ref}/revert",
+          "/agents/{agent_id}/learned-skills/{ref}/revisions",
           "/agents/{agent_id}/memory",
           "/agents/{agent_id}/memory/guidance",
           "/agents/{agent_id}/memory/{index}",
@@ -797,7 +807,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 6480,
+      "cardinality_bound": 6680,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -827,6 +837,11 @@
           "/agents/{agent_id}/cost",
           "/agents/{agent_id}/hook-secret",
           "/agents/{agent_id}/kill",
+          "/agents/{agent_id}/learned-skills",
+          "/agents/{agent_id}/learned-skills/{ref}",
+          "/agents/{agent_id}/learned-skills/{ref}/patch",
+          "/agents/{agent_id}/learned-skills/{ref}/revert",
+          "/agents/{agent_id}/learned-skills/{ref}/revisions",
           "/agents/{agent_id}/memory",
           "/agents/{agent_id}/memory/guidance",
           "/agents/{agent_id}/memory/{index}",
@@ -993,7 +1008,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 6480,
+      "cardinality_bound": 6680,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

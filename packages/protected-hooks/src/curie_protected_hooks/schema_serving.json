@@ -323,8 +323,11 @@
     ],
     "selfimp_safety_0001": [
       "0108"
+    ],
+    "selfimp_skills_0001": [
+      "selfimp_safety_0001"
     ]
   },
-  "schema_head": "selfimp_safety_0001",
-  "schema_min": "0108"
+  "schema_head": "selfimp_skills_0001",
+  "schema_min": "selfimp_skills_0001"
 }

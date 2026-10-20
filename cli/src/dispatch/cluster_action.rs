@@ -1117,6 +1117,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             runner_resources,
             clear_runner_resources,
             memory_writes,
+            learned_skills,
             conn,
             dry_run,
         } => {
@@ -1148,7 +1149,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             )
             .await?;
             emit(
-                commands::overrides_with_memory_writes(
+                commands::overrides_with_switches(
                     AgentActionOpts {
                         api_url,
                         api_key,
@@ -1160,7 +1161,8 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     thinking,
                     execution_deadline,
                     runner_resources,
-                    commands::memory_writes_flag(memory_writes.as_deref()),
+                    commands::on_off_flag(memory_writes.as_deref()),
+                    commands::on_off_flag(learned_skills.as_deref()),
                 )
                 .await?,
             )
@@ -1617,6 +1619,33 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                         api_url,
                         api_key,
                         tier: "cluster",
+                    },
+                    verb,
+                )
+                .await?,
+            )
+        }
+        ClusterAction::Skills(args) => {
+            let verb: commands::SkillsVerb = args.verb.into();
+            let conn = args.conn;
+            // Validated before the connection is resolved, so a malformed ref
+            // never reaches discovery or the API.
+            verb.validate()?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                false,
+            )
+            .await?;
+            emit_boxed(
+                commands::learned_skills(
+                    commands::SkillsOpts {
+                        api_url,
+                        api_key,
+                        tier: "cluster",
+                        agent: args.agent,
                     },
                     verb,
                 )

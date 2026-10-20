@@ -55,7 +55,8 @@ STATE_TOKEN_ENV = BootEnv.env_key("state_token")
 # Namespaces already owned by the memory (#264) and history (#20) ports. A skill
 # must not read or write them through the general state door, so both are fenced
 # off in one place (a bundle that wants durable memory uses the remember tool).
-RESERVED_NAMESPACES = frozenset({"memory", "transcript"})
+# ``learned_skills`` (ADR 0237) is never stored here; its own router is the door.
+RESERVED_NAMESPACES = frozenset({"memory", "transcript", "learned_skills"})
 
 # How long any single state call may take. The store is one Postgres round-trip;
 # a longer hang is a fault the tool should surface rather than wedge the turn on.

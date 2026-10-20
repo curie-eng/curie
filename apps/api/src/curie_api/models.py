@@ -323,6 +323,9 @@ class Agent(Base):
     # agent (#1461, ADR-0167). Operator-owned; off by default. When on, the
     # worker hands the runner the binding-scoped channel memory URL.
     memory_writes: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # Whether the agent loads and may edit its learned skills (ADR 0237).
+    # Operator-owned; off by default, like ``memory_writes``.
+    learned_skills: Mapped[bool] = mapped_column(default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     versions: Mapped[list[AgentVersion]] = relationship(
@@ -3617,3 +3620,72 @@ class IdentityLink(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class LearnedSkill(Base):
+    """One learned skill's head (ADR 0237): its current content and the revision
+    number every change compare-and-sets. History is ``LearnedSkillRevision``."""
+
+    __tablename__ = "learned_skills"
+    __table_args__ = (
+        Index(
+            "uq_learned_skills_active_slug",
+            "agent_id",
+            "slug",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    slug: Mapped[str] = mapped_column(Text)
+    description: Mapped[str] = mapped_column(Text)
+    body: Mapped[str] = mapped_column(Text)
+    revision: Mapped[int]
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class LearnedSkillRevision(Base):
+    """One immutable, insert-only change to a learned skill (ADR 0237). ``deleted``
+    is the skill's state after this revision, so a revert restores it too."""
+
+    __tablename__ = "learned_skill_revisions"
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('create', 'patch', 'revert', 'delete')",
+            name="learned_skill_revisions_action_ck",
+        ),
+        CheckConstraint(
+            "source IN ('agent', 'operator')", name="learned_skill_revisions_source_ck"
+        ),
+        UniqueConstraint("skill_id", "revision", name="uq_learned_skill_revisions_revision"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    skill_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.learned_skills.id", ondelete="CASCADE")
+    )
+    revision: Mapped[int]
+    action: Mapped[str] = mapped_column(Text)
+    slug: Mapped[str] = mapped_column(Text)
+    description: Mapped[str] = mapped_column(Text)
+    body: Mapped[str] = mapped_column(Text)
+    digest: Mapped[str] = mapped_column(Text)
+    deleted: Mapped[bool]
+    reverted_to: Mapped[int | None] = mapped_column(default=None)
+    author: Mapped[str] = mapped_column(Text)
+    conversation: Mapped[str | None] = mapped_column(Text, default=None)
+    turn: Mapped[str | None] = mapped_column(Text, default=None)
+    source: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

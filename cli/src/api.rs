@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::api_requests::{
     ActionUndo, AgentCreate, AgentUpdate, ApprovalPrincipalMint, ApprovalRecover, ApprovalResolve,
     ChannelBindingWrite, ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint,
-    DeploymentCreate, EvalTriggerRequest, MemoryEntryCreate, MemoryGuidanceIn,
+    DeploymentCreate, EvalTriggerRequest, LearnedSkillRevert, MemoryEntryCreate, MemoryGuidanceIn,
     RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
     RemediationQualificationWrite, RemediationVerifierRunStart, ResolveTargetRequest,
     RoutingCheckRequest, VersionCreate,
@@ -348,6 +348,10 @@ pub struct Agent {
     /// as off, which is what it does.
     #[serde(default)]
     pub memory_writes: bool,
+    /// Whether the runner loads and may edit this agent's learned skills
+    /// (ADR 0237). Defaulted so an older platform reads as off.
+    #[serde(default)]
+    pub learned_skills: bool,
     /// Who resolves publication approval. Missing responses stay on human approval.
     #[serde(default = "default_publication_policy")]
     pub publication_policy: String,
@@ -827,6 +831,56 @@ pub struct MemoryEntry {
     pub version: u64,
     #[serde(default)]
     pub provenance: MemoryProvenance,
+}
+
+/// One learned skill (`LearnedSkillOut`, ADR 0237). `author` and
+/// `conversation` come from the head's latest revision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearnedSkill {
+    pub id: String,
+    pub slug: String,
+    pub description: String,
+    pub body: String,
+    pub revision: u32,
+    pub author: String,
+    pub conversation: Option<String>,
+    pub updated_at: String,
+    pub created_at: String,
+    pub deleted: bool,
+}
+
+/// `GET /agents/{id}/learned-skills` (`LearnedSkillList`): active skills
+/// ordered by slug, plus whether the agent's toggle is on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LearnedSkillList {
+    pub enabled: bool,
+    pub skills: Vec<LearnedSkill>,
+}
+
+/// One immutable learned-skill revision (`LearnedSkillRevisionOut`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearnedSkillRevision {
+    pub revision: u32,
+    pub action: String,
+    pub slug: String,
+    pub description: String,
+    pub body: String,
+    pub digest: String,
+    pub author: String,
+    pub conversation: Option<String>,
+    pub turn: Option<String>,
+    pub source: String,
+    pub reverted_to: Option<u32>,
+    pub created_at: String,
+    /// The skill's state after this revision: true for a tombstone.
+    pub deleted: bool,
+}
+
+/// `GET .../learned-skills/{ref}/revisions` (`LearnedSkillRevisions`),
+/// ascending.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LearnedSkillRevisions {
+    pub revisions: Vec<LearnedSkillRevision>,
 }
 
 /// A row from the existing state routes (`StateEntryOut`). The memory command
@@ -3793,6 +3847,127 @@ impl ApiClient {
             .await?;
         Self::expect_ok(response, "deleting memory fact").await?;
         Ok(())
+    }
+
+    /// An agent's active learned skills: `GET /agents/{id}/learned-skills`.
+    pub async fn list_learned_skills(&self, agent_id: &str) -> Result<LearnedSkillList> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/learned-skills",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/learned-skills",
+            )
+            .await?;
+        Self::expect_ok(resp, "listing learned skills")
+            .await?
+            .json()
+            .await
+            .context("decoding learned skills")
+    }
+
+    /// One learned skill by id or slug, deleted ones included for the
+    /// operator: `GET /agents/{id}/learned-skills/{ref}`.
+    pub async fn get_learned_skill(&self, agent_id: &str, skill: &str) -> Result<LearnedSkill> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/learned-skills/{skill}",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/learned-skills/{ref}",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading learned skill")
+            .await?
+            .json()
+            .await
+            .context("decoding learned skill")
+    }
+
+    /// A learned skill's revisions, ascending:
+    /// `GET /agents/{id}/learned-skills/{ref}/revisions`.
+    pub async fn learned_skill_revisions(
+        &self,
+        agent_id: &str,
+        skill: &str,
+    ) -> Result<Vec<LearnedSkillRevision>> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/learned-skills/{skill}/revisions",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/learned-skills/{ref}/revisions",
+            )
+            .await?;
+        let list: LearnedSkillRevisions = Self::expect_ok(resp, "reading learned skill history")
+            .await?
+            .json()
+            .await
+            .context("decoding learned skill revisions")?;
+        Ok(list.revisions)
+    }
+
+    /// Revert a learned skill, compare-and-swap on its head revision:
+    /// `POST /agents/{id}/learned-skills/{ref}/revert`.
+    pub async fn revert_learned_skill(
+        &self,
+        agent_id: &str,
+        skill: &str,
+        body: &LearnedSkillRevert,
+    ) -> Result<LearnedSkill> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/learned-skills/{skill}/revert",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<LearnedSkillRevert>(body),
+                "POST /agents/{id}/learned-skills/{ref}/revert",
+            )
+            .await?;
+        Self::expect_ok(resp, "reverting learned skill")
+            .await?
+            .json()
+            .await
+            .context("decoding reverted learned skill")
+    }
+
+    /// Delete a learned skill at exactly `expected_revision`:
+    /// `DELETE /agents/{id}/learned-skills/{ref}?expected_revision=N`.
+    pub async fn delete_learned_skill(
+        &self,
+        agent_id: &str,
+        skill: &str,
+        expected_revision: u32,
+    ) -> Result<LearnedSkill> {
+        let resp = self
+            .send_request(
+                self.http
+                    .delete(format!(
+                        "{}/agents/{agent_id}/learned-skills/{skill}",
+                        self.base_url
+                    ))
+                    .query(&[("expected_revision", expected_revision)])
+                    .header("X-API-Key", &self.api_key),
+                "DELETE /agents/{id}/learned-skills/{ref}",
+            )
+            .await?;
+        Self::expect_ok(resp, "deleting learned skill")
+            .await?
+            .json()
+            .await
+            .context("decoding deleted learned skill")
     }
 
     /// List an agent's learned memory, oldest first: `GET /agents/{id}/memory`.

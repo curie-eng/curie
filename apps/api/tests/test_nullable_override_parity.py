@@ -97,6 +97,7 @@ KNOWN_BODY_MODULES = frozenset(
         "curie_api.schemas.deployments",
         "curie_api.schemas.evals",
         "curie_api.schemas.identity",
+        "curie_api.schemas.learned_skills",
         "curie_api.schemas.observability",
         "curie_api.schemas.provider_installations",
         "curie_api.schemas.publications",

@@ -5,9 +5,11 @@ Two credentials, both ``scope="state"`` so an old API still accepts them:
 * the long-lived boot-env token (``CURIE_MEMORY_TOKEN`` / ``CURIE_HISTORY_TOKEN``)
   carries ``{binding, memory: "read"}``;
 * the per-turn token from ``BindingResolver.turn_memory_token`` carries
-  ``{binding, memory: "write", sender, turn}`` and a short expiry. It is only
-  minted when the agent has memory writes on, the turn names a binding, and the
-  thread is not eval-isolated.
+  ``{binding, memory, sender, turn, conversation, skills}`` and a short expiry.
+  It is only minted when the agent has memory writes or learned skills on
+  (ADR 0237), the turn names a binding, and the thread is not eval-isolated.
+  ``memory`` is ``"write"`` only with memory writes on; ``skills`` is
+  ``"write"`` only with learned skills on.
 
 DB-free: both are exercised on a bare resolver with a real ``WorkerConfig``, like
 ``test_channel_memory_ref.py``. Claims are read back by an independent decoder
@@ -158,7 +160,13 @@ def test_turn_token_claims_and_bounded_expiry() -> None:
     assert claims["memory"] == "write"
     assert claims["sender"] == "U0SENDER1"
     assert claims["turn"] == "evt-0001"
-    assert set(claims) == {"agent", "scope", "exp", "binding", "memory", "sender", "turn"}
+    # The conversation the turn belongs to rides along (learned skills stamp
+    # it as provenance); learned skills off leaves the skills claim null.
+    assert claims["conversation"] == _THREAD
+    assert claims["skills"] is None
+    assert set(claims) == {
+        "agent", "scope", "exp", "binding", "memory", "sender", "turn", "conversation", "skills",
+    }
     # Review M2: the credential ends with the turn. exp is at most now plus the
     # turn's remaining budget (rounded up to a whole second), with no grace
     # beyond the turn's own deadline; ``_CLOCK_SKEW_S`` allows only for skew.
@@ -214,3 +222,72 @@ def test_eval_isolated_turn_gets_no_turn_token() -> None:
     assert _turn_token(thread_key="eval:case-1") is None
     # A thread that merely starts with "eval-" is a normal turn.
     assert _turn_token(thread_key="eval-case-1") is not None
+
+
+# --- learned skills (ADR 0237) -------------------------------------------------------
+
+
+def test_learned_skills_alone_mints_a_skills_writer_that_reads_memory() -> None:
+    token = _turn_token(
+        _resolved(memory_writes=False, learned_skills=True),
+        sender="U0SENDER1",
+        turn="evt-0002",
+        thread_key="slack:C0123:1700000000.000100",
+    )
+    assert token is not None
+    claims = _claims(token)
+    assert claims["binding"] == "slack:C0123"
+    # The API keeps refusing memory fact writes with this credential.
+    assert claims["memory"] == "read"
+    assert claims["skills"] == "write"
+    assert claims["conversation"] == "slack:C0123:1700000000.000100"
+    assert claims["sender"] == "U0SENDER1"
+    assert claims["turn"] == "evt-0002"
+    assert set(claims) == {
+        "agent", "scope", "exp", "binding", "memory", "sender", "turn", "conversation", "skills",
+    }
+
+
+def test_both_on_mints_memory_write_and_skills_write() -> None:
+    token = _turn_token(_resolved(memory_writes=True, learned_skills=True))
+    assert token is not None
+    claims = _claims(token)
+    assert claims["memory"] == "write"
+    assert claims["skills"] == "write"
+    assert claims["conversation"] == _THREAD
+
+
+def test_both_off_mints_no_turn_token() -> None:
+    assert _turn_token(_resolved(memory_writes=False, learned_skills=False)) is None
+    # Liveness: either one on mints.
+    assert _turn_token(_resolved(memory_writes=False, learned_skills=True)) is not None
+    assert _turn_token(_resolved(memory_writes=True, learned_skills=False)) is not None
+
+
+def test_memory_writes_alone_keeps_the_memory_writer_with_no_skills() -> None:
+    token = _turn_token(_resolved(memory_writes=True, learned_skills=False))
+    assert token is not None
+    claims = _claims(token)
+    assert claims["memory"] == "write"
+    assert claims["skills"] is None
+
+
+def test_learned_skills_turn_token_is_still_scoped_and_eval_isolated() -> None:
+    on = _resolved(memory_writes=False, learned_skills=True)
+    assert _turn_token(on, thread_key="eval:case-1") is None
+    assert _turn_token(on, kind=None) is None
+    assert _turn_token(on, config=WorkerConfig(api_key="")) is None
+    assert _turn_token(on, thread_key="eval-case-1") is not None
+
+
+def test_learned_skills_cron_turn_names_no_person() -> None:
+    # The API refuses skill writes for a sender that is not a person.
+    from curie_worker.binding import NO_PERSON
+
+    token = _turn_token(_resolved(memory_writes=False, learned_skills=True), sender="  ")
+    assert token is not None
+    assert _claims(token)["sender"] == NO_PERSON
+
+
+def test_resolved_deployment_defaults_learned_skills_off() -> None:
+    assert _resolved().learned_skills is False

@@ -505,6 +505,9 @@ pub(crate) enum LocalAction {
         #[command(subcommand)]
         verb: ActionsCommand<LocalObservabilityConn>,
     },
+    /// An agent's learned skills (ADR 0237): list, show, diff, history,
+    /// revert, delete and export.
+    Skills(SkillsArgs<LocalGlobalConn>),
     /// A protected hook's remediation policy: show it, apply a document, arm,
     /// disarm or remove it, or close an open circuit breaker. Writes run as the
     /// operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN.
@@ -649,6 +652,10 @@ pub(crate) enum LocalAction {
         /// channel memory stays readable. Takes effect at the next sandbox boot.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         memory_writes: Option<String>,
+        /// Turn the agent's learned skills on or off (ADR 0237). Off stops
+        /// loading and editing them; stored skills and history stay.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        learned_skills: Option<String>,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
         #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]

@@ -80,8 +80,11 @@ STATE_APP_SCOPE = "state.app"
 # (``runner/src/curie_runner/state.py``) and ``memory.MEMORY_NAMESPACE`` /
 # the history transcript key -- a bundle wanting durable memory uses the remember
 # tool, not raw state. A future fixed namespace must be added here too.
+# ``learned_skills`` is never stored in raw state at all (ADR 0237): its own
+# router is the only door, so every sandbox credential is refused on it.
 MEMORY_NAMESPACE = "memory"
-RESERVED_NAMESPACES = frozenset({MEMORY_NAMESPACE, TRANSCRIPT_NAMESPACE})
+LEARNED_SKILLS_NAMESPACE = "learned_skills"
+RESERVED_NAMESPACES = frozenset({MEMORY_NAMESPACE, TRANSCRIPT_NAMESPACE, LEARNED_SKILLS_NAMESPACE})
 
 # The only memory keys a sandbox credential may write (ADR-0188): the fact ids
 # the runner's memory tools mint. Mirrors ``memory_facts._FACT_ID`` in the
@@ -121,7 +124,8 @@ class StatePrincipal:
     """Who a state-router request is, as far as the router needs to know.
 
     ``binding``, ``memory``, ``sender`` and ``turn`` are the ADR-0188 claims of a
-    STATE token (all None for the platform key and the app token). A STATE token
+    STATE token (all None for the platform key and the app token); ``skills``
+    and ``conversation`` are the per-turn learned-skill claims (ADR 0237). A STATE token
     with no ``memory`` claim was minted by a pre-ADR-0188 worker: ``legacy``,
     which fails closed on memory (read-only, agent memory only)."""
 
@@ -130,6 +134,8 @@ class StatePrincipal:
     memory: Literal["read", "write"] | None = None
     sender: str | None = None
     turn: str | None = None
+    skills: Literal["write"] | None = None
+    conversation: str | None = None
 
     @property
     def legacy(self) -> bool:
@@ -152,6 +158,9 @@ def _state_principal(payload: dict[str, Any]) -> StatePrincipal:
         memory=memory,
         sender=_str_claim(payload, "sender"),
         turn=_str_claim(payload, "turn"),
+        # Only an exact "write" grants learned-skill writes: fail closed.
+        skills="write" if payload.get("skills") == "write" else None,
+        conversation=_str_claim(payload, "conversation"),
     )
 
 
@@ -424,14 +433,21 @@ async def _check_turn_open(
     worker has reported ended, even though the credential has not expired.
 
     Runs after ``_check_memory_reach`` on every write route. Reads are not
-    checked, and the platform key (no turn claim) is unaffected. A Valkey
-    failure is a 503, never a silently accepted write."""
+    checked, and the platform key (no turn claim) is unaffected."""
 
-    if (
-        principal.caller is not StateCaller.STATE
-        or namespace != MEMORY_NAMESPACE
-        or principal.turn is None
-    ):
+    if principal.caller is StateCaller.STATE and namespace == MEMORY_NAMESPACE:
+        await require_turn_open(principal, agent_id, request, path)
+
+
+async def require_turn_open(
+    principal: StatePrincipal, agent_id: uuid.UUID, request: Request, path: str
+) -> None:
+    """Refuse a STATE credential whose ``turn`` the worker has reported ended
+    (#3776), for memory facts and learned skills (ADR 0237) alike. The caller
+    decides which writes are turn-bound. A Valkey failure is a 503, never a
+    silently accepted write. A credential with no turn claim is not turn-bound."""
+
+    if principal.turn is None:
         return
     client: redis.Redis = request.app.state.valkey
     try:
@@ -520,6 +536,12 @@ async def forbid_reserved_namespace(
     refusal by composing ``CURIE_STATE_URL`` directly with the token it holds;
     here the token it holds is simply refused. The broad token's narrower reach
     on ``memory`` (ADR-0188) is ``_check_memory_reach``."""
+    if principal.caller is not StateCaller.PLATFORM and namespace == LEARNED_SKILLS_NAMESPACE:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"namespace {namespace!r} is reserved by the platform; "
+            "use the learned skills tools instead",
+        )
     if principal.caller is StateCaller.APP and namespace in RESERVED_NAMESPACES:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
