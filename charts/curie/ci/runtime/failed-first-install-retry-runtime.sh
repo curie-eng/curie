@@ -291,11 +291,15 @@ spec:
                 and all(row["status"].lower() == "failed" for row in history),
                 "the first attempt must leave only failed revision 1")
         pods = read("pods")["items"]
+        # PodStatus separates init and app container statuses.
+        # https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#PodStatus
         require(any(pod["metadata"].get("labels", {}).get("app.kubernetes.io/component") == "api"
                     and container.get("image") == bad_image
                     and container.get("state", {}).get("waiting", {}).get("reason")
                     in {"ErrImageNeverPull", "ErrImagePull", "ImagePullBackOff"}
-                    for pod in pods for container in pod.get("status", {}).get("containerStatuses", [])),
+                    for pod in pods
+                    for status_field in ("initContainerStatuses", "containerStatuses")
+                    for container in pod.get("status", {}).get(status_field, [])),
                 "the first failure did not leave the unavailable API image waiting")
         anchor = read(f"secret/sh.helm.release.v1.{release}.v1")
         anchor_time = timestamp(anchor["metadata"].get("creationTimestamp"))
