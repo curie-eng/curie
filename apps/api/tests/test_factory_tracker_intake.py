@@ -1264,7 +1264,7 @@ def test_an_unauthorized_dc_notice_holds_only_its_issue(
     logged = "\n".join(record.getMessage() for record in caplog.records)
     assert DC_SENTINEL not in logged
     assert bitbucket_dc.FACTORY_TOKEN not in logged
-    assert "Unauthorized" in logged
+    assert "authentication rejected" in logged
 
     intake.dc_down = False
     intake.poll()
@@ -1272,6 +1272,88 @@ def test_an_unauthorized_dc_notice_holds_only_its_issue(
     _assert_on_dc(dc_issue)
     _assert_admitted_once(intake, healthy, event)
     assert _cursor() is not None
+
+
+# --- a rejected or unreadable credential names the operator's action (#4755) ---
+
+
+# The two hold bodies, as independent literals: a change to either module
+# constant must stay visible here rather than following it silently.
+REPLACE_CREDENTIAL = (
+    "Curie could not start this issue yet: a tracker or code host credential it "
+    "needs was rejected or could not be read. The operator must replace that "
+    "credential. Curie retries on its next poll."
+)
+DID_NOT_ANSWER = (
+    "Curie could not start this issue yet: a tracker or code host it needs did not "
+    "answer. Curie retries on its next poll; nothing is needed unless this persists."
+)
+
+
+def _hold_text(intake: Intake, issue: jira_fake.JiraIssue) -> str:
+    """The one bot comment on ``issue``, flattened to text; ``_assert_held`` checks
+    its marker and that it leaks nothing."""
+
+    [hold] = _bot_comments(intake, issue)
+    return jira_fake.flatten(hold.body).strip()
+
+
+def test_a_rejected_credential_hold_names_the_operator_action(
+    make_intake: Callable[[dict[str, Any]], Intake],
+) -> None:
+    # A refused credential is not an outage: the hold tells the operator to act.
+    intake = make_intake(_dc_document())
+    dc_issue, healthy, event = _held_tickets(intake)
+    intake.dc_down = True
+    # A refused credential, its error body echoing the token.
+    intake.dc_status = 401
+
+    intake.poll()
+
+    _assert_admitted_once(intake, healthy, event)
+    _assert_held(intake, dc_issue)
+    assert _hold_text(intake, dc_issue) == REPLACE_CREDENTIAL
+
+
+def test_an_unreadable_credential_hold_names_the_operator_action(
+    make_intake: Callable[[dict[str, Any]], Intake],
+) -> None:
+    intake = make_intake(_dc_document())
+    dc_issue, healthy, event = _held_tickets(intake)
+    # The DC token file the env loader reads, emptied so the adapter's read of
+    # it fails before any request.
+    token_file = intake.key_dir / "code_hosts-bitbucket-dc" / "token"
+    assert token_file.exists()
+    token_file.write_text("")
+
+    intake.poll()
+
+    _assert_admitted_once(intake, healthy, event)
+    _assert_held(intake, dc_issue)
+    assert _hold_text(intake, dc_issue) == REPLACE_CREDENTIAL
+
+
+def test_an_unavailable_hold_keeps_the_did_not_answer_text(
+    make_intake: Callable[[dict[str, Any]], Intake],
+) -> None:
+    intake = make_intake(_dc_document())
+    dc_issue, healthy, event = _held_tickets(intake)
+    intake.dc_down = True
+    intake.dc_status = 401
+
+    intake.poll()
+    [first] = _bot_comments(intake, dc_issue)
+    assert _hold_text(intake, dc_issue) == REPLACE_CREDENTIAL
+
+    # The host itself did not answer: the same marked comment, updated in
+    # place, switches to today's text.
+    intake.dc_status = 503
+    intake.poll()
+
+    _assert_admitted_once(intake, healthy, event)
+    [second] = _bot_comments(intake, dc_issue)
+    assert second.id == first.id
+    assert jira_fake.flatten(second.body).strip() == DID_NOT_ANSWER
 
 
 def test_a_failed_hold_comment_does_not_starve_other_issues(
