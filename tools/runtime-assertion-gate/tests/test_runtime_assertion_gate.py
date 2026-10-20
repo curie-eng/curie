@@ -487,5 +487,3 @@ def test_self_test_exercises_the_registry_omission_negative_control(
     output = capsys.readouterr().out
     assert "negative control rejected" in output
     assert "registry" in output.lower()
-
-
