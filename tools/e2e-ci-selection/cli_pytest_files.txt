@@ -64,6 +64,7 @@ runner/tests/test_preflight_blocked.py
 runner/tests/test_repository_verification.py
 runner/tests/test_tool_policy_enforcement.py
 runner/tests/test_workspace_preamble.py
+tests/test_approval_resume_ownership_probe.py
 tests/test_repository_facts.py
 tests/test_scripts_pipefail_grep.py
 tests/test_wire_state.py
@@ -72,6 +73,7 @@ tools/ci-retry-gate/tests/test_ci_flake_retries.py
 tools/ci-retry-gate/tests/test_gitleaks_scope.py
 tools/ci-retry-gate/tests/test_pr_body.py
 tools/ci-retry-gate/tests/test_retry_eligibility.py
+tools/ci-workflow-paths/tests/test_runner_labels.py
 tools/ci-workflow-paths/tests/test_workflow_paths.py
 tools/dependency-audit-paths/tests/test_dependency_audit_paths.py
 tools/doclint/tests/test_adr_citations.py

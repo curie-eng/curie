@@ -227,10 +227,10 @@ jobs:
                   if dispatch_error:
                       lines.extend(["", f"Dispatch error: {dispatch_error}"])
                       if "Unexpected inputs" in dispatch_error:
-                          lines.extend([
-                              "",
+                          hint = (
                               f"The ci.yaml on {target_ref} does not declare an input this workflow sends. "
-                              f"Merge main into {target_ref} so both release trains accept the same dispatch inputs."])
+                              f"Merge main into {target_ref} so both release trains accept the same dispatch inputs.")
+                          lines.extend(["", hint])
               body = "\n".join(lines)
           if issue_number is None:
               gh("issue", "create", "--repo", repo, "--title", title, "--body", body)
