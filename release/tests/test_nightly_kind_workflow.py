@@ -20,7 +20,10 @@ TRACKING_TITLES = {
     "main": "Scheduled kind CI on main is failing",
     "next": "Nightly kind CI on next is failing",
 }
-SCHEDULES = {"main": "15 0,6,12,18 * * *", "next": "30 9 * * *"}
+NEXT_CRON = "30 9 * * *"
+MAIN_NIGHTLY_CRON = "15 6 * * *"
+MAIN_DAY_CRONS = ("15 0 * * *", "15 12 * * *", "15 18 * * *")
+SCHEDULES = {"main": MAIN_NIGHTLY_CRON, "next": NEXT_CRON}
 
 
 def _workflow() -> dict[str, Any]:
@@ -131,6 +134,7 @@ def _run_job(
     event_name: str = "workflow_dispatch",
     schedule: str = "",
     input_ref: str = "next",
+    input_nightly: str = "true",
     workflow: dict[str, Any] | None = None,
 ) -> JobResult:
     job = (_workflow() if workflow is None else workflow)["jobs"][name]
@@ -141,6 +145,7 @@ def _run_job(
         "github.event_name": event_name,
         "github.event.schedule": schedule,
         "inputs.ref": input_ref,
+        "inputs.nightly": input_nightly,
         "secrets.GITHUB_TOKEN": "test-token",
         "needs.dispatch.result": needs_result,
         "needs.verify.result": verify_result,
@@ -211,6 +216,7 @@ def _assert_exact_dispatched_ci_run(
     github: dict[str, str],
     target_ref: str,
     workflow: dict[str, Any] | None = None,
+    nightly: str = "true",
 ) -> None:
     assert result.returncode == 0, result.log
     dispatches = _calls(github, ["api"])
@@ -218,7 +224,8 @@ def _assert_exact_dispatched_ci_run(
     arguments = dispatches[0]["args"]
     assert arguments[arguments.index("--method") + 1] == "POST"
     assert f"repos/{REPOSITORY}/actions/workflows/ci.yaml/dispatches" in arguments
-    assert arguments[arguments.index("-f") + 1] == f"ref={target_ref}"
+    fields = [arguments[index + 1] for index, arg in enumerate(arguments) if arg == "-f"]
+    assert fields == [f"ref={target_ref}", f"inputs[nightly]={nightly}"]
     assert arguments[arguments.index("-F") + 1] == "return_run_details=true"
     assert dispatches[0]["repo"] == REPOSITORY
     verify = _run_job("verify", tmp_path, github, needs_outputs=result.outputs, workflow=workflow)
@@ -235,12 +242,15 @@ def _assert_exact_dispatched_ci_run(
 
 
 @pytest.mark.parametrize(
-    "event_name,schedule,input_ref,expected_ref",
+    "event_name,schedule,input_ref,input_nightly,expected_ref,expected_nightly",
     [
-        ("schedule", SCHEDULES["next"], "main", "next"),
-        ("schedule", SCHEDULES["main"], "next", "main"),
-        ("workflow_dispatch", SCHEDULES["main"], "next", "next"),
-        ("workflow_dispatch", SCHEDULES["next"], "main", "main"),
+        ("schedule", SCHEDULES["next"], "main", "false", "next", "true"),
+        ("schedule", SCHEDULES["main"], "next", "false", "main", "true"),
+        ("schedule", MAIN_DAY_CRONS[0], "next", "true", "main", "false"),
+        ("schedule", MAIN_DAY_CRONS[1], "next", "true", "main", "false"),
+        ("schedule", MAIN_DAY_CRONS[2], "next", "true", "main", "false"),
+        ("workflow_dispatch", SCHEDULES["main"], "next", "true", "next", "true"),
+        ("workflow_dispatch", SCHEDULES["next"], "main", "false", "main", "false"),
     ],
 )
 def test_nightly_tracks_the_exact_dispatched_ci_run(
@@ -249,12 +259,22 @@ def test_nightly_tracks_the_exact_dispatched_ci_run(
     event_name: str,
     schedule: str,
     input_ref: str,
+    input_nightly: str,
     expected_ref: str,
+    expected_nightly: str,
 ) -> None:
     result = _run_job(
-        "dispatch", tmp_path, github, event_name=event_name, schedule=schedule, input_ref=input_ref
+        "dispatch",
+        tmp_path,
+        github,
+        event_name=event_name,
+        schedule=schedule,
+        input_ref=input_ref,
+        input_nightly=input_nightly,
     )
-    _assert_exact_dispatched_ci_run(result, tmp_path, github, expected_ref)
+    _assert_exact_dispatched_ci_run(
+        result, tmp_path, github, expected_ref, nightly=expected_nightly
+    )
 
 
 def test_schedule_and_manual_default_cover_both_release_trains(
@@ -263,21 +283,23 @@ def test_schedule_and_manual_default_cover_both_release_trains(
     workflow = _workflow()
     assert workflow["name"] == "Scheduled kind CI"
     crons = [entry["cron"] for entry in workflow["on"]["schedule"]]
-    assert sorted(crons) == sorted(SCHEDULES.values())
-    minute, hours, *_ = next(cron for cron in crons if cron == SCHEDULES["main"]).split()
-    assert [f"{int(hour):02d}:{minute}" for hour in hours.split(",")] == [
-        "00:15",
-        "06:15",
-        "12:15",
-        "18:15",
-    ]
+    assert sorted(crons) == sorted([NEXT_CRON, MAIN_NIGHTLY_CRON, *MAIN_DAY_CRONS])
+    clocks = sorted(
+        f"{int(cron.split()[1]):02d}:{cron.split()[0]}" for cron in crons if cron != NEXT_CRON
+    )
+    assert clocks == ["00:15", "06:15", "12:15", "18:15"]
     ref_input = workflow["on"]["workflow_dispatch"]["inputs"]["ref"]
     assert ref_input["type"] == "choice"
     assert ref_input["required"] == "true"
     assert ref_input["options"] == ["main", "next"]
     assert ref_input["default"] == "next"
-    result = _run_job("dispatch", tmp_path, github, input_ref=ref_input["default"])
-    _assert_exact_dispatched_ci_run(result, tmp_path, github, "next")
+    nightly_input = workflow["on"]["workflow_dispatch"]["inputs"]["nightly"]
+    assert nightly_input["type"] == "boolean"
+    assert nightly_input["default"] == "true"
+    result = _run_job(
+        "dispatch", tmp_path, github, input_ref=ref_input["default"], input_nightly="true"
+    )
+    _assert_exact_dispatched_ci_run(result, tmp_path, github, "next", nightly="true")
 
 
 @pytest.mark.parametrize(
