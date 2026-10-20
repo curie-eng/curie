@@ -328,7 +328,8 @@ class SessionRunner:
         self._factory = session_factory
         # Boot work that must finish before the first session exists, such as
         # the declared verification preflight. It runs inside the shared start
-        # task, after the listener binds, never before it (#4777).
+        # task, which is scheduled at application startup and does not block
+        # the listener from binding (#4777).
         self._initializer = initializer
         self._start_task: asyncio.Task[None] | None = None
         # The attachments this boot found, named on the first prompt sent

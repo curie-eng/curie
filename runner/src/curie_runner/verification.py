@@ -525,11 +525,15 @@ async def _run(
             failure_reason=f"{label} timed out after {_TIMEOUT_SECONDS:g} seconds",
         )
     finally:
-        # Timeout and cancellation both kill the whole group and reap the
-        # child, so no check outlives the preflight that started it.
+        # Every exit kills the whole group and reaps the child, so no check
+        # outlives the preflight that started it. The kill does not depend on
+        # the leader still running: a descendant can outlive an exited leader
+        # and keep the output pipes open, and it would survive a timeout or
+        # cancellation if only a live leader triggered the kill. An already
+        # empty group (the normal completed run) raises ProcessLookupError.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
         if process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
             await asyncio.shield(process.wait())
     if process.returncode == 0:
         return _Result("passed", exit_status=0)
