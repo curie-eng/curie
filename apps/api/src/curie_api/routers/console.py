@@ -64,8 +64,10 @@ from ..approval_auth import enforce_console_cookie_origin, set_console_session_c
 from ..auth import CONSOLE_SESSION_COOKIE, require_platform_key, require_principal_session
 from ..config import get_settings
 from ..deps import SessionDep
+from ..identity import connect as identity_connect
 from ..models import Principal
 from ..rate_limit import require_rate_limit
+from .identity_connect import CONNECT_COOKIE, clear_connect_cookies, connect_path
 
 logger = logging.getLogger(__name__)
 
@@ -376,14 +378,45 @@ async def oidc_callback(
     if not oidc.meets_required_claims(claims, get_settings().oidc_required_claims):
         return _refuse_callback("ID token lacks a required claim")
 
-    principal = await crud_console.resolve_principal(session, claims)
+    response: Response
+    connect_token = request.cookies.get(CONNECT_COOKIE)
+    connect_row = None
+    if connect_token:
+        try:
+            connect_row = await identity_connect.live_token(session, connect_token)
+        except identity_connect.ConnectRefused:
+            response = _refuse_callback("invalid account connection")
+            clear_connect_cookies(response)
+            return response
+        if claims.issuer != connect_row.idp_issuer:
+            response = _refuse_callback("account connection issuer mismatch")
+            clear_connect_cookies(response)
+            return response
+    principal = await crud_console.resolve_principal(
+        session, claims, **({"tenant_id": connect_row.tenant_id} if connect_row else {})
+    )
     if not await crud_console.principal_is_active(session, principal):
         # Undo the attribute refresh: a refused login changes nothing.
         await session.rollback()
         return _refuse_callback("principal or tenant is not active")
+    if connect_token:
+        try:
+            await identity_connect.preserve_verified_claims(
+                session, token=connect_token, principal=principal, claims=claims
+            )
+        except identity_connect.ConnectRefused:
+            await session.rollback()
+            response = _refuse_callback("account connection no longer valid")
+            clear_connect_cookies(response)
+            return response
     token, _ = await crud_console.create_principal_console_session(session, principal)
 
-    response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER, headers=_NO_STORE)
+    destination = connect_path(request, connect_token) if connect_token else "/"
+    response = RedirectResponse(
+        destination, status_code=status.HTTP_303_SEE_OTHER, headers=_NO_STORE
+    )
+    if connect_token:
+        response.headers["Referrer-Policy"] = "no-referrer"
     # The same cookie, with the same flags and reasons, as exchange_login_code.
     set_console_session_cookie(response, token)
     _clear_state_cookie(response)
