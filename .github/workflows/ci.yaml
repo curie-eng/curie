@@ -240,6 +240,10 @@ jobs:
           python-version: "3.13"
       - name: Sync workspace
         run: uv sync
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
       # The job-level gate above already skips the shards when `changes` did
       # not select pytest. The shard still recomputes the selection itself and
       # records it, so the required job can cross-check that every shard agreed
