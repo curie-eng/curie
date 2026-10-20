@@ -262,7 +262,7 @@ pub fn parse_alembic_current_output(stdout: &str) -> Option<String> {
             continue;
         }
         let token = line.split_whitespace().next()?;
-        if !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric()) {
+        if !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Some(token.to_string());
         }
     }
@@ -464,6 +464,10 @@ print(json.dumps(graph))
             Some("0038")
         );
         assert_eq!(parse_alembic_current_output("INFO only\n"), None);
+        assert_eq!(
+            parse_alembic_current_output("selfimp_safety_0001 (head)\n").as_deref(),
+            Some("selfimp_safety_0001")
+        );
     }
 
     #[test]
