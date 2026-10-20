@@ -54,10 +54,14 @@ jobs:
           case "$EVENT_NAME" in
             schedule)
               case "$SCHEDULE" in
-                '30 9 * * *') target_ref=next; nightly=true ;;
-                '15 6 * * *') target_ref=main; nightly=true ;;
-                '15 0 * * *'|'15 12 * * *'|'15 18 * * *') target_ref=main; nightly=false ;;
+                '30 9 * * *') target_ref=next ;;
+                '15 6 * * *') target_ref=main ;;
+                '15 0 * * *'|'15 12 * * *'|'15 18 * * *') target_ref=main ;;
                 *) echo "Unknown kind schedule" >&2; exit 1 ;;
+              esac
+              case "$SCHEDULE" in
+                '30 9 * * *'|'15 6 * * *') nightly=true ;;
+                *) nightly=false ;;
               esac
               ;;
             workflow_dispatch)
