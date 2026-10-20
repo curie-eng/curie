@@ -428,7 +428,7 @@ run_self_test() {
     fi
     if awk '/^exclusive_kind_tag\(\)/,/^}/' "$script_path" | awk '
         index($0, "\"$EXCLUSIVE_KIND_TAG\" == \"$keep\"") { early=NR }
-        /kind load docker-image/ { if (!load) load=NR }
+        /load_kind_images/ { if (!load) load=NR }
         index($0, "EXCLUSIVE_KIND_TAG=\"$keep\"") { set=NR }
         /untag_kind_siblings/ { last_untag=NR }
         END { exit (early && load && early < load && set > last_untag) ? 0 : 1 }
@@ -451,7 +451,7 @@ run_self_test() {
     fi
     if awk '/^exclusive_kind_tag\(\)/,/^}/' "$script_path" | awk '
         /untag_kind_siblings/ { untag++ }
-        /kind load docker-image/ { load=1 }
+        /load_kind_images/ { load=1 }
         END { exit (untag >= 2 && load) ? 0 : 1 }
     '; then
         log "exclusive_kind_tag untags siblings before and after load"
@@ -1506,8 +1506,20 @@ retag_candidate_versions() {
     done
 }
 
+load_kind_images() {
+    local platform archive status=0
+    platform="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')" || return $?
+    archive="$(mktemp "$WORKDIR/kind-images.XXXXXX.tar")" || return $?
+    docker image save --platform "$platform" --output "$archive" "$@" || status=$?
+    if (( status == 0 )); then
+        kind load image-archive "$archive" --name "$KIND_CLUSTER" || status=$?
+    fi
+    rm -f "$archive"
+    return "$status"
+}
+
 load_tag_images() {
-    local tag="$1" img ref platform archive
+    local tag="$1" img ref
     EXCLUSIVE_KIND_TAG=""
     for img in "${IMAGES[@]}"; do
         ref="$(image_for "$img" "$tag")"
@@ -1520,18 +1532,9 @@ load_tag_images() {
             docker pull "$ref"
         fi
         log "kind load $ref"
-        platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$ref")"
-        archive="$WORKDIR/${img}-${tag}.tar"
-        # Save only the inspected platform; other descriptors may lack local content.
-        # https://docs.docker.com/reference/cli/docker/image/save/#save-a-specific-platform---platform
-        docker image save --platform "$platform" --output "$archive" "$ref"
-        kind load image-archive "$archive" --name "$KIND_CLUSTER"
-        rm -f "$archive"
-        if [[ "$ref" != "${img}:${tag}" ]] && docker image inspect "${img}:${tag}" >/dev/null 2>&1; then
-            archive="$WORKDIR/${img}-${tag}-short.tar"
-            docker image save --platform "$platform" --output "$archive" "${img}:${tag}"
-            kind load image-archive "$archive" --name "$KIND_CLUSTER" || true
-            rm -f "$archive"
+        load_kind_images "$ref"
+        if docker image inspect "${img}:${tag}" >/dev/null 2>&1; then
+            load_kind_images "${img}:${tag}" || true
         fi
     done
 }
@@ -1592,7 +1595,7 @@ exclusive_kind_tag() {
             continue
         fi
         log "kind load $ref"
-        kind load docker-image "$ref" --name "$KIND_CLUSTER"
+        load_kind_images "$ref"
     done
     untag_kind_siblings "$keep"
     EXCLUSIVE_KIND_TAG="$keep"
@@ -2568,7 +2571,7 @@ EOF
         from_id="$(docker image inspect --format '{{.Id}}' "$from_image")"
         to_id="$(docker image inspect --format '{{.Id}}' "$to_image")"
         [[ "$from_id" != "$to_id" ]] || die "$img 0.10.0 and 0.10.1 image digests must differ"
-        kind load docker-image "$from_image" "$to_image" --name "$KIND_CLUSTER"
+        load_kind_images "$from_image" "$to_image"
         log "$img has distinct 0.10.0 and 0.10.1 image digests on kind"
     done
 
@@ -3338,7 +3341,7 @@ run_runner_layer_retire() {
         docker tag "$target_runner" curie-runner:0.10.1
     fi
     EXCLUSIVE_KIND_TAG=""
-    kind load docker-image "$target_runner" --name "$KIND_CLUSTER" >&2
+    load_kind_images "$target_runner" >&2
     target_digest="$(kind_runner_digest "$target_runner")"
     [[ "$target_digest" != "$(kind_runner_digest "$current_runner")" ]] \
         || die "runner-layer-retire needs distinct 0.10.0 and 0.10.1 runner digests"
@@ -3351,7 +3354,7 @@ run_runner_layer_retire() {
     layer_tag="ghcr.io/acme-corp/acme-runner:matrix-${KIND_CLUSTER}"
     docker tag "$current_runner" "$layer_tag"
     RETIRE_LAYER_TAG="$layer_tag"
-    kind load docker-image "$layer_tag" --name "$KIND_CLUSTER" >&2
+    load_kind_images "$layer_tag" >&2
     layer_digest="$(kind_runner_digest "$layer_tag")"
     layer_image="${layer_tag%:*}@${layer_digest}"
     docker exec "$node" ctr -n k8s.io images tag --force "$layer_tag" "$layer_image" >/dev/null
