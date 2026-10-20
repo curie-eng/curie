@@ -607,8 +607,8 @@ print(json.dumps(graph))
             assert!(!live_in_window(revision, &published_stable));
         }
         let candidate_release = window_for("0.13.0").expect("feature candidate is catalogued");
-        assert_eq!(candidate_release.schema_min, candidate.schema_min);
-        assert_eq!(candidate_release.schema_head, candidate.schema_head);
+        assert_eq!(candidate_release.schema_min, "0108");
+        assert_eq!(candidate_release.schema_head, "0108");
         assert!(live_in_window("0108", &candidate_release));
         assert!(!live_in_window("0100", &candidate_release));
         assert!(!live_in_window("0075", &candidate_release));
