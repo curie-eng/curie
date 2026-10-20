@@ -25,6 +25,112 @@ fn script() -> PathBuf {
     repo_root().join("cli/scripts/cluster-upgrade-matrix.sh")
 }
 
+#[cfg(unix)]
+fn run_kind_image_loader(
+    save_status: i32,
+    import_status: i32,
+) -> (std::process::Output, String, bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = tempfile::tempdir().expect("image loader fixture");
+    let archives = fixture.path().join("archives");
+    fs::create_dir(&archives).expect("archive directory");
+    // Shell sequencing only. The real Docker 29 / kind v0.24.0 regression is
+    // exercised by cli/tests/local/test_kind_image_import.py. Docker documents
+    // --platform and missing-platform export failures at:
+    // https://docs.docker.com/reference/cli/docker/image/save/#platform
+    for (name, body) in [
+        (
+            "docker",
+            r#"#!/usr/bin/env bash
+printf 'docker %s\n' "$*" >> "$TRACE"
+if [[ "$1" == version ]]; then printf 'linux/arm64\n'; exit 0; fi
+[[ "$1 $2 $3 $4" == 'image save --platform=linux/arm64 --output' ]] || exit 86
+printf 'exported %s\n' "${@:6}" > "$5" || exit $?
+exit "$SAVE_STATUS"
+"#,
+        ),
+        (
+            "kind",
+            r#"#!/usr/bin/env bash
+printf 'kind %s\n' "$*" >> "$TRACE"
+[[ "$1 $2 $4 $5" == 'load image-archive --name acme-import' ]] || exit 87
+cat "$3" >> "$TRACE" || exit $?
+exit "$IMPORT_STATUS"
+"#,
+        ),
+    ] {
+        let path = fixture.path().join(name);
+        fs::write(&path, body).expect("write external command fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("make executable");
+    }
+    let trace = fixture.path().join("trace");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"
+KIND_CLUSTER=acme-import
+status=0
+load_kind_images acme-api:released ghcr.io/acme-corp/acme-api:candidate || status=$?
+exit "$status""#,
+            "image-loader-test",
+        ])
+        .arg(script())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fixture.path().display(),
+                std::env::var("PATH").expect("PATH")
+            ),
+        )
+        .env("TMPDIR", &archives)
+        .env("TRACE", &trace)
+        .env("SAVE_STATUS", save_status.to_string())
+        .env("IMPORT_STATUS", import_status.to_string())
+        .output()
+        .expect("source matrix and execute image loader");
+    let trace = fs::read_to_string(trace).unwrap_or_default();
+    let empty = fs::read_dir(archives)
+        .expect("read archive directory")
+        .next()
+        .is_none();
+    (output, trace, empty)
+}
+
+#[test]
+#[cfg(unix)]
+fn kind_image_loader_exports_daemon_platform_and_imports_all_requested_refs() {
+    let (output, trace, empty) = run_kind_image_loader(0, 0);
+    assert!(output.status.success(), "{}\n{trace}", output_text(&output));
+    assert!(trace.contains("kind load image-archive "), "{trace}");
+    assert!(trace.contains("exported acme-api:released\n"), "{trace}");
+    assert!(
+        trace.contains("exported ghcr.io/acme-corp/acme-api:candidate\n"),
+        "{trace}"
+    );
+    assert!(empty, "successful import must remove its private archive");
+}
+
+#[test]
+#[cfg(unix)]
+fn kind_image_loader_propagates_failures_and_cleans_up_when_errexit_is_ignored() {
+    for (save_status, import_status, expected) in [(73, 0, 73), (0, 74, 74)] {
+        let (output, trace, empty) = run_kind_image_loader(save_status, import_status);
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{}\n{trace}",
+            output_text(&output)
+        );
+        assert_eq!(trace.contains("kind load "), save_status == 0, "{trace}");
+        assert!(
+            empty,
+            "failed export/import must remove its private archive"
+        );
+    }
+}
+
 #[test]
 fn cluster_upgrade_matrix_script_is_present_and_executable() {
     let path = script();
