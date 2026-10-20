@@ -17,7 +17,11 @@
 //!
 //! Every write sends the ADR 0106 operator principal from
 //! `CURIE_APPROVAL_PRINCIPAL_TOKEN` in `X-Curie-Approval-Principal`, and is a
-//! usage error (exit 2) before any request without one. `apply` validates the
+//! usage error (exit 2) before any request without one. `apply` and `arm`
+//! also send the ADR 0231 remediation authority from
+//! `CURIE_REMEDIATION_AUTHORITY_KEY` in `X-Curie-Remediation-Authority`, and are
+//! a usage error before any request without it; `disarm`, `remove` and
+//! `close-breaker` never send it. `apply` validates the
 //! document with the mirrored validator first and refuses with the API's code
 //! and path (`tests/vectors/remediation-policy.json`) before any request.
 //!
@@ -44,6 +48,9 @@ use support::{serve, MockServer, Request, Response};
 
 const TEST_API_KEY: &str = "test-platform-key";
 const OPERATOR_PRINCIPAL: &str = "apr.test.operator-principal-that-must-not-leak";
+/// The ADR 0231 remediation authority the stub expects on bind and arm.
+const AUTHORITY: &str = "test-remediation-authority-that-must-not-leak";
+const AUTHORITY_HEADER: &str = "X-Curie-Remediation-Authority";
 
 const AGENT_ID: &str = "55555555-5555-5555-5555-555555555555";
 const AGENT_NAME: &str = "acme-bot";
@@ -169,6 +176,18 @@ fn api() -> MockServer {
                 Some("/route"),
                 Some("is not one of the agent's approval routes"),
             ),
+            ("PUT", p) | ("POST", p)
+                if (method == "PUT" && p == base(HOOK)
+                    || method == "POST" && p == format!("{}/arm", base(HOOK)))
+                    && request.header(AUTHORITY_HEADER) != Some(AUTHORITY) =>
+            {
+                refusal(
+                    403,
+                    "remediation_authority_required",
+                    None,
+                    Some("binding or arming a remediation policy needs the remediation authority"),
+                )
+            }
             ("PUT", p) if p == base(HOOK) => {
                 Response::json(200, &policy_out(HOOK, "5", true, true).to_string())
             }
@@ -193,7 +212,8 @@ fn api() -> MockServer {
 }
 
 /// Run `curie <tier> remediation-policy <args..> --api-url .. --api-key ..`
-/// with no ambient connection or principal from the developer's shell.
+/// with no ambient connection or principal from the developer's shell, and
+/// with the remediation authority the stub expects.
 fn run_group(
     tier: &str,
     group: &str,
@@ -214,6 +234,27 @@ fn run_at(
     principal: Option<&str>,
     json_mode: bool,
 ) -> Output {
+    run_with_authority(
+        tier,
+        group,
+        args,
+        base_url,
+        principal,
+        Some(AUTHORITY),
+        json_mode,
+    )
+}
+
+/// [`run_at`] with the remediation authority chosen (`None` leaves it unset).
+fn run_with_authority(
+    tier: &str,
+    group: &str,
+    args: &[&str],
+    base_url: &str,
+    principal: Option<&str>,
+    authority: Option<&str>,
+    json_mode: bool,
+) -> Output {
     let mut command = Command::new(bin());
     command.arg(tier).arg(group).args(args).args([
         "--api-url",
@@ -228,10 +269,14 @@ fn run_at(
         .env_remove("CURIE_API_URL")
         .env_remove("CURIE_API_KEY")
         .env_remove("CURIE_APPROVAL_PRINCIPAL_TOKEN")
+        .env_remove("CURIE_REMEDIATION_AUTHORITY_KEY")
         .env("KUBECONFIG", "/nonexistent/curie-test-kubeconfig")
         .env("NO_COLOR", "1");
     if let Some(principal) = principal {
         command.env("CURIE_APPROVAL_PRINCIPAL_TOKEN", principal);
+    }
+    if let Some(authority) = authority {
+        command.env("CURIE_REMEDIATION_AUTHORITY_KEY", authority);
     }
     command
         .output()
@@ -653,6 +698,158 @@ fn every_write_without_a_principal_is_refused_before_any_request() {
 }
 
 // @spec AUTOMATED-REMEDIATION-3
+/// ADR 0231: `apply` and `arm` send the remediation authority; `disarm`,
+/// `remove` and `close-breaker` only reduce what runs automatically and never
+/// send it. The authority is never printed.
+#[test]
+fn only_apply_and_arm_send_the_remediation_authority() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_file(dir.path(), "policy.json", &base_document().to_string());
+    for tier in ["local", "cluster"] {
+        for verb in ["apply", "arm", "disarm", "remove", "close-breaker"] {
+            let server = api();
+            let output = run(
+                tier,
+                &write_argv(verb, &file),
+                &server,
+                Some(OPERATOR_PRINCIPAL),
+            );
+            let what = format!("{tier} remediation-policy {verb}");
+            assert_eq!(output.status.code(), Some(0), "{what}:\n{}", text(&output));
+            let sent = writes(&server);
+            assert_eq!(sent.len(), 1, "{what}: one write");
+            let expected = matches!(verb, "apply" | "arm").then_some(AUTHORITY);
+            assert_eq!(sent[0].header(AUTHORITY_HEADER), expected, "{what}");
+            for request in server.recorded().iter().filter(|r| r.method == "GET") {
+                assert_eq!(
+                    request.header(AUTHORITY_HEADER),
+                    None,
+                    "{what}: the agent lookup never carries the authority"
+                );
+            }
+            assert!(
+                !text(&output).contains(AUTHORITY),
+                "{what}: the authority is never printed"
+            );
+        }
+    }
+}
+
+// @spec AUTOMATED-REMEDIATION-3
+/// `apply` and `arm` without the remediation authority (absent or blank) are a
+/// usage error naming CURIE_REMEDIATION_AUTHORITY_KEY, raised before any
+/// request; `disarm`, `remove` and `close-breaker` still succeed without it.
+#[test]
+fn bind_and_arm_without_the_remediation_authority_are_refused_before_any_request() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_file(dir.path(), "policy.json", &base_document().to_string());
+    for tier in ["local", "cluster"] {
+        for authority in [None, Some("   ")] {
+            for verb in ["apply", "arm"] {
+                let server = api();
+                let output = run_with_authority(
+                    tier,
+                    "remediation-policy",
+                    &write_argv(verb, &file),
+                    &server.base_url,
+                    Some(OPERATOR_PRINCIPAL),
+                    authority,
+                    true,
+                );
+                let what = format!("{tier} remediation-policy {verb} authority={authority:?}");
+                assert_eq!(output.status.code(), Some(2), "{what}:\n{}", text(&output));
+                let value = one_object(&output, &what);
+                assert_error_object(&value, &what);
+                assert!(
+                    value["error"]
+                        .as_str()
+                        .is_some_and(|e| e.contains("CURIE_REMEDIATION_AUTHORITY_KEY")),
+                    "{what}: the error names the env-backed authority: {value}"
+                );
+                assert!(
+                    value["fix"]
+                        .as_str()
+                        .is_some_and(|f| f.contains("remediationAuthorityKey")),
+                    "{what}: the fix says where to read the authority: {value}"
+                );
+                assert!(
+                    server.recorded().is_empty(),
+                    "{what}: no request is sent: {:?}",
+                    server
+                        .recorded()
+                        .iter()
+                        .map(|r| &r.path)
+                        .collect::<Vec<_>>()
+                );
+            }
+            for verb in ["disarm", "remove", "close-breaker"] {
+                let server = api();
+                let output = run_with_authority(
+                    tier,
+                    "remediation-policy",
+                    &write_argv(verb, &file),
+                    &server.base_url,
+                    Some(OPERATOR_PRINCIPAL),
+                    authority,
+                    true,
+                );
+                let what = format!("{tier} remediation-policy {verb} authority={authority:?}");
+                assert_eq!(output.status.code(), Some(0), "{what}:\n{}", text(&output));
+                assert_eq!(writes(&server).len(), 1, "{what}: one write");
+            }
+        }
+    }
+}
+
+// @spec AUTOMATED-REMEDIATION-3
+/// A wrong authority is the API's `403 remediation_authority_required`: one
+/// error object (exit 1) whose fix names CURIE_REMEDIATION_AUTHORITY_KEY, not
+/// the operator principal, and never echoes the value sent.
+#[test]
+fn a_wrong_remediation_authority_is_the_api_refusal_with_the_authority_fix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_file(dir.path(), "policy.json", &base_document().to_string());
+    let wrong = "wrong-remediation-authority-that-must-not-leak";
+    for tier in ["local", "cluster"] {
+        for verb in ["apply", "arm"] {
+            let server = api();
+            let output = run_with_authority(
+                tier,
+                "remediation-policy",
+                &write_argv(verb, &file),
+                &server.base_url,
+                Some(OPERATOR_PRINCIPAL),
+                Some(wrong),
+                true,
+            );
+            let what = format!("{tier} remediation-policy {verb} (wrong authority)");
+            assert_eq!(output.status.code(), Some(1), "{what}:\n{}", text(&output));
+            let value = one_object(&output, &what);
+            assert_error_object(&value, &what);
+            assert!(
+                value["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("remediation_authority_required")),
+                "{what}: the error carries the API code: {value}"
+            );
+            assert!(
+                value["fix"]
+                    .as_str()
+                    .is_some_and(|f| f.contains("CURIE_REMEDIATION_AUTHORITY_KEY")
+                        && !f.contains("CURIE_APPROVAL_PRINCIPAL_TOKEN")),
+                "{what}: the fix names the authority, not the principal: {value}"
+            );
+            assert_eq!(
+                writes(&server)[0].header(AUTHORITY_HEADER),
+                Some(wrong),
+                "{what}: the configured value is what was sent"
+            );
+            assert!(!text(&output).contains(wrong), "{what}: never printed");
+        }
+    }
+}
+
+// @spec AUTOMATED-REMEDIATION-3
 /// API refusals are one error object carrying the API's code, with the
 /// ADR-0021 class: 409 and 404 fail (1), a 422 store refusal is usage (2).
 #[test]
@@ -833,7 +1030,11 @@ fn apply_of_an_unreadable_file_is_one_usage_error() {
 // cluster tier: input errors before connection discovery
 // --------------------------------------------------------------------------
 
-fn run_cluster_undiscovered(args: &[&str], principal: Option<&str>) -> Output {
+fn run_cluster_undiscovered(
+    args: &[&str],
+    principal: Option<&str>,
+    authority: Option<&str>,
+) -> Output {
     let dir = tempfile::tempdir().expect("tempdir");
     let empty_path = dir.path().join("empty-path");
     std::fs::create_dir_all(&empty_path).expect("create empty PATH");
@@ -851,6 +1052,9 @@ fn run_cluster_undiscovered(args: &[&str], principal: Option<&str>) -> Output {
         .env("CI", "1");
     if let Some(principal) = principal {
         command.env("CURIE_APPROVAL_PRINCIPAL_TOKEN", principal);
+    }
+    if let Some(authority) = authority {
+        command.env("CURIE_REMEDIATION_AUTHORITY_KEY", authority);
     }
     command
         .output()
@@ -882,9 +1086,14 @@ fn cluster_tier_refuses_input_errors_before_discovering_the_connection() {
     let bad = write_file(dir.path(), "over.json", &case["document"].to_string());
     let good = write_file(dir.path(), "good.json", &base_document().to_string());
 
-    let refused_document =
-        run_cluster_undiscovered(&write_argv("apply", &bad), Some(OPERATOR_PRINCIPAL));
-    let no_principal = run_cluster_undiscovered(&write_argv("apply", &good), None);
+    let refused_document = run_cluster_undiscovered(
+        &write_argv("apply", &bad),
+        Some(OPERATOR_PRINCIPAL),
+        Some(AUTHORITY),
+    );
+    let no_principal = run_cluster_undiscovered(&write_argv("apply", &good), None, Some(AUTHORITY));
+    let no_authority =
+        run_cluster_undiscovered(&write_argv("apply", &good), Some(OPERATOR_PRINCIPAL), None);
     for (output, what, needle) in [
         (
             &refused_document,
@@ -895,6 +1104,11 @@ fn cluster_tier_refuses_input_errors_before_discovering_the_connection() {
             &no_principal,
             "no principal",
             "CURIE_APPROVAL_PRINCIPAL_TOKEN",
+        ),
+        (
+            &no_authority,
+            "no remediation authority",
+            "CURIE_REMEDIATION_AUTHORITY_KEY",
         ),
     ] {
         let what = format!("cluster remediation-policy apply ({what}, no --api-url)");
