@@ -93,6 +93,10 @@ class _Model:
     constructed: int = 0
     connected: int = 0
     queries: int = 0
+    connecting: int = 0
+    interrupts: int = 0
+    # When set, connect() waits on it, so a test can hold the session unconnected.
+    connect_gate: asyncio.Event | None = None
 
 
 @dataclass
@@ -317,10 +321,15 @@ async def _harness(
 
             def __init__(self, options: Any, *_args: Any, **_kwargs: Any) -> None:
                 self.options = options
+                self.is_connected = False
                 h.model.constructed += 1
                 h.events.append("model:constructed")
 
             async def connect(self) -> None:
+                h.model.connecting += 1
+                if h.model.connect_gate is not None:
+                    await h.model.connect_gate.wait()
+                self.is_connected = True
                 h.model.connected += 1
                 h.events.append("model:connected")
 
@@ -333,7 +342,10 @@ async def _harness(
                 yield _result(_ANSWER)
 
             async def interrupt(self) -> None:
-                return None
+                h.model.interrupts += 1
+                if not self.is_connected:
+                    # The real SDK client refuses (CLIConnectionError) before connect.
+                    raise RuntimeError("not connected")
 
             async def close(self) -> None:
                 return None
@@ -458,6 +470,53 @@ def test_http_ready_while_declared_check_running(
     asyncio.run(bounded())
 
 
+# --- an interrupt while the session is still connecting ----------------------------
+
+
+def test_interrupt_before_session_connected_is_a_noop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        async with _harness(tmp_path, monkeypatch, checks=[]) as h:
+            h.model.connect_gate = asyncio.Event()
+            try:
+                await h.wait_served(timeout=_HEALTHZ_WITHIN_S)
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 10
+                while h.model.connecting < 1 and loop.time() < deadline:
+                    await asyncio.sleep(0.05)
+                assert h.model.constructed == 1 and h.model.connecting == 1
+                assert h.model.connected == 0
+                assert (await h.runner_status())["ready"] is False
+
+                assert h.base_url is not None
+                body = {"kind": "interrupt", "reason": "stop"}
+                async with h.client.post(
+                    h.base_url + "/v1/interrupt",
+                    json=body,
+                    headers=_AUTH,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    text = await resp.text()
+                    assert resp.status == 200, (resp.status, text)
+                assert h.model.interrupts == 0, "an unconnected session must not be interrupted"
+            finally:
+                h.model.connect_gate.set()
+
+            await h.wait_ready()
+            outbound = await h.turn("Add a kilometres-to-miles conversion.")
+            finals = _finals(outbound)
+            assert len(finals) == 1 and outbound[-1] is finals[0], outbound
+            assert finals[0].status is SessionStatus.DONE, finals[0]
+            assert h.model.interrupts == 0
+
+    async def bounded() -> None:
+        with anyio.fail_after(120):
+            await scenario()
+
+    asyncio.run(bounded())
+
+
 # --- an early turn shares the one initialization ------------------------------------
 
 
@@ -489,11 +548,11 @@ def test_early_turn_waits_for_shared_preflight(
                 "model:connected",
                 "model:query",
             ]
-            assert h.model == _Model(constructed=1, connected=1, queries=1)
+            assert h.model == _Model(constructed=1, connected=1, queries=1, connecting=1)
 
             second = await h.turn("Continue.")
             assert len(_finals(second)) == 1 and isinstance(second[-1], Final), second
-            assert h.model == _Model(constructed=1, connected=1, queries=2)
+            assert h.model == _Model(constructed=1, connected=1, queries=2, connecting=1)
             assert len(h.verification) == 1, "the preflight must not run again"
 
     async def bounded() -> None:
