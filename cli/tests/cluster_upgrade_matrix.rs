@@ -25,6 +25,295 @@ fn script() -> PathBuf {
     repo_root().join("cli/scripts/cluster-upgrade-matrix.sh")
 }
 
+#[cfg(unix)]
+fn run_kind_image_loader(
+    save_status: i32,
+    import_status: i32,
+    archive_case: &str,
+) -> (std::process::Output, String, bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = tempfile::tempdir().expect("image loader fixture");
+    let archives = fixture.path().join("archives");
+    fs::create_dir(&archives).expect("archive directory");
+    let bsd_mktemp = archive_case == "bsd-mktemp-stale";
+    let sentinels = [
+        ("curie-kind-images-raw.XXXXXX.tar", "unrelated raw sentinel"),
+        ("curie-kind-images.XXXXXX.tar", "unrelated import sentinel"),
+    ];
+    if bsd_mktemp {
+        for (name, contents) in sentinels {
+            fs::write(archives.join(name), contents).expect("write stale archive sentinel");
+        }
+        // BSD mktemp substitutes only trailing Xs and creates mode 0600 files:
+        // https://github.com/apple-oss-distributions/shell_cmds/blob/main/mktemp/mktemp.1
+        // See also scripts/chart-runtime-e2e.sh for literal suffix names and EEXIST.
+        let path = fixture.path().join("mktemp");
+        fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import os, sys, tempfile
+template, = sys.argv[1:]
+directory, name = os.path.split(template)
+prefix = name.rstrip('X')
+if prefix != name:
+    fd, path = tempfile.mkstemp(prefix=prefix, dir=directory)
+else:
+    path = template
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+os.close(fd)
+print(path)
+"#,
+        )
+        .expect("write BSD mktemp fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("make executable");
+    }
+    // Independently authored Docker v2 fixtures exercise the shell boundary,
+    // not a real daemon. containerd 1.7.18 prefers OCI when oci-layout exists:
+    // https://github.com/containerd/containerd/blob/v1.7.18/images/archive/importer.go
+    // Plain image save supports the documented Engine 26 baseline; --platform
+    // requires API 1.48: https://docs.docker.com/reference/cli/docker/image/save/
+    for (name, body) in [
+        (
+            "docker",
+            r#"#!/usr/bin/env python3
+import hashlib, io, json, os, sys, tarfile
+args = sys.argv[1:]
+with open(os.environ['TRACE'], 'a') as trace:
+    trace.write('docker ' + ' '.join(args) + '\n')
+if args == ['version', '--format', '{{.Server.Os}}/{{.Server.Arch}}']:
+    print('linux/arm64')
+    sys.exit(0)
+assert args[:3] == ['image', 'save', '--output'], args
+assert args[4:] == ['acme-api:released', 'ghcr.io/acme-corp/acme-api:candidate'], args
+if int(os.environ['SAVE_STATUS']):
+    sys.exit(int(os.environ['SAVE_STATUS']))
+case = os.environ['ARCHIVE_CASE']
+def layer(payload):
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode='w') as archive:
+        member = tarfile.TarInfo('payload.txt')
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+    return buffer.getvalue()
+def config(arch, layers):
+    return json.dumps({'os': 'linux', 'architecture': arch,
+        'rootfs': {'type': 'layers', 'diff_ids': [
+            'sha256:' + hashlib.sha256(data).hexdigest() for data in layers
+        ]}, 'config': {}}).encode()
+native, shared_data, foreign = (layer(b'native payload\x00\xff'),
+    layer(b'native neighbor\x00\xff'), layer(b'foreign payload'))
+if case == 'hardlinks':
+    shared_data = native
+payloads = [config('arm64', [native, shared_data]), config('arm64', [shared_data]),
+            config('amd64', [foreign]), native, shared_data, foreign]
+names = ['native.json', 'candidate.json', 'foreign.json', 'native/layer.tar',
+         'shared/layer.tar', 'foreign/layer.tar']
+if case != 'classic':
+    names = ['blobs/sha256/' + hashlib.sha256(data).hexdigest() for data in payloads]
+if case == 'hardlinks':
+    names[4] = 'shared/layer.tar'
+nc, cc, fc, nl, shared, fl = names
+manifest = [
+    {'Config': nc, 'RepoTags': ['docker.io/library/acme-api:released'], 'Layers': [nl, shared]},
+    {'Config': cc, 'RepoTags': ['ghcr.io/acme-corp/acme-api:candidate'], 'Layers': [shared]},
+    {'Config': fc, 'RepoTags': ['acme-api:released'], 'Layers': [fl]},
+]
+if case == 'absent-native':
+    manifest[0]['Config'] = fc
+if case == 'unmatched-tag':
+    manifest[0]['RepoTags'] = ['acme-api:unrequested']
+if case == 'malformed-entry':
+    manifest[0]['Layers'] = None
+files = dict(zip(names, payloads))
+files.update({'oci-layout': b'{"imageLayoutVersion":"1.0.0"}',
+         'index.json': json.dumps({'schemaVersion': 2, 'manifests': [
+             {'digest': 'sha256:' + 'a' * 64, 'mediaType': 'application/vnd.oci.image.manifest.v1+json',
+              'size': 123, 'platform': {'os': 'linux', 'architecture': 'arm64'}}]}).encode(),
+         'manifest.json': b'{' if case == 'malformed-manifest' else json.dumps(manifest).encode()})
+if case in ('missing-layer', 'missing-config', 'missing-manifest'):
+    del files[{'missing-layer': nl, 'missing-config': nc, 'missing-manifest': 'manifest.json'}[case]]
+with open(os.environ['TRACE'], 'a') as trace:
+    for name in (nc, cc):
+        if name in files:
+            trace.write('saved-config ' + name + ' ' + hashlib.sha256(files[name]).hexdigest() + '\n')
+with tarfile.open(args[3], 'w') as archive:
+    for name, data in files.items():
+        member = tarfile.TarInfo(name)
+        if case == 'hardlinks' and name == shared:
+            member.type, member.linkname = tarfile.LNKTYPE, nl
+            archive.addfile(member)
+        else:
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+"#,
+        ),
+        (
+            "kind",
+            r#"#!/usr/bin/env python3
+import hashlib, io, json, os, sys, tarfile
+args = sys.argv[1:]
+with open(os.environ['TRACE'], 'a') as trace:
+    trace.write('kind ' + ' '.join(args) + '\n')
+assert args[:2] == ['load', 'image-archive'] and args[3:] == ['--name', 'acme-import'], args
+with open(os.environ['TRACE']) as trace:
+    configs = dict(line.split()[1:] for line in trace if line.startswith('saved-config '))
+with tarfile.open(args[2]) as archive:
+    members = archive.getmembers()
+    assert all(member.isfile() for member in members)
+    manifest = json.load(archive.extractfile('manifest.json'))
+    assert len(manifest) == 2, manifest
+    assert [entry['RepoTags'] for entry in manifest] == [
+        ['docker.io/library/acme-api:released'], ['ghcr.io/acme-corp/acme-api:candidate']]
+    expected = {'manifest.json'}
+    for entry, count in zip(manifest, [2, 1]):
+        config_bytes = archive.extractfile(entry['Config']).read()
+        assert hashlib.sha256(config_bytes).hexdigest() == configs[entry['Config']]
+        config = json.loads(config_bytes)
+        assert config['os'] == 'linux' and config['architecture'] == 'arm64', config
+        assert len(entry['Layers']) == count
+        expected.update([entry['Config'], *entry['Layers']])
+        for name, digest in zip(entry['Layers'], config['rootfs']['diff_ids']):
+            data = archive.extractfile(name).read()
+            assert 'sha256:' + hashlib.sha256(data).hexdigest() == digest
+            with tarfile.open(fileobj=io.BytesIO(data)) as layer:
+                assert layer.extractfile('payload.txt').read() in (
+                    b'native payload\x00\xff', b'native neighbor\x00\xff')
+    assert {member.name for member in members} == expected
+with open(os.environ['TRACE'], 'a') as trace:
+    trace.write('native tags and all payloads preserved; no OCI graph\n')
+sys.exit(int(os.environ['IMPORT_STATUS']))
+"#,
+        ),
+    ] {
+        let path = fixture.path().join(name);
+        fs::write(&path, body).expect("write external command fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("make executable");
+    }
+    let trace = fixture.path().join("trace");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"
+KIND_CLUSTER=acme-import
+status=0
+load_kind_images acme-api:released ghcr.io/acme-corp/acme-api:candidate || status=$?
+exit "$status""#,
+            "image-loader-test",
+        ])
+        .arg(script())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fixture.path().display(),
+                std::env::var("PATH").expect("PATH")
+            ),
+        )
+        .env("TMPDIR", &archives)
+        .env("TRACE", &trace)
+        .env("SAVE_STATUS", save_status.to_string())
+        .env("IMPORT_STATUS", import_status.to_string())
+        .env(
+            "ARCHIVE_CASE",
+            if bsd_mktemp { "valid" } else { archive_case },
+        )
+        .output()
+        .expect("source matrix and execute image loader");
+    let trace = fs::read_to_string(trace).unwrap_or_default();
+    if bsd_mktemp {
+        for (name, contents) in sentinels {
+            let path = archives.join(name);
+            assert_eq!(
+                fs::read_to_string(&path).expect("stale archive sentinel must survive"),
+                contents,
+                "loader must preserve unrelated sentinel {name}"
+            );
+            fs::remove_file(path).expect("remove verified fixture sentinel");
+        }
+    }
+    let empty = fs::read_dir(archives)
+        .expect("read archive directory")
+        .next()
+        .is_none();
+    (output, trace, empty)
+}
+
+#[test]
+#[cfg(unix)]
+fn kind_image_loader_preserves_native_docker_payloads_and_all_requested_tags() {
+    for case in ["valid", "classic", "hardlinks"] {
+        let (output, trace, empty) = run_kind_image_loader(0, 0, case);
+        assert!(
+            output.status.success(),
+            "{case}: {}\n{trace}",
+            output_text(&output)
+        );
+        assert!(
+            trace.contains("native tags and all payloads preserved; no OCI graph"),
+            "{trace}"
+        );
+        assert!(empty, "successful import must remove both private archives");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn kind_image_loader_uses_private_bsd_tempfiles_despite_stale_literal_archives() {
+    let (output, trace, empty) = run_kind_image_loader(0, 0, "bsd-mktemp-stale");
+    assert!(output.status.success(), "{}\n{trace}", output_text(&output));
+    assert!(
+        trace.contains("native tags and all payloads preserved; no OCI graph"),
+        "{trace}"
+    );
+    assert!(empty, "loader must remove all invocation-owned archives");
+}
+
+#[test]
+#[cfg(unix)]
+fn kind_image_loader_rejects_incomplete_native_archives_before_kind() {
+    for case in [
+        "absent-native",
+        "unmatched-tag",
+        "malformed-manifest",
+        "malformed-entry",
+        "missing-manifest",
+        "missing-config",
+        "missing-layer",
+    ] {
+        let (output, trace, empty) = run_kind_image_loader(0, 0, case);
+        assert!(
+            !output.status.success(),
+            "{case}: {}\n{trace}",
+            output_text(&output)
+        );
+        assert!(!trace.contains("kind load "), "{case}: {trace}");
+        assert!(
+            empty,
+            "{case}: failed normalization must remove both private archives"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn kind_image_loader_propagates_failures_and_cleans_up_when_errexit_is_ignored() {
+    for (save_status, import_status, expected) in [(73, 0, 73), (0, 74, 74)] {
+        let (output, trace, empty) = run_kind_image_loader(save_status, import_status, "valid");
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{}\n{trace}",
+            output_text(&output)
+        );
+        assert_eq!(trace.contains("kind load "), save_status == 0, "{trace}");
+        assert!(
+            empty,
+            "failed export/import must remove its private archive"
+        );
+    }
+}
+
 #[test]
 fn cluster_upgrade_matrix_script_is_present_and_executable() {
     let path = script();
