@@ -1507,13 +1507,13 @@ retag_candidate_versions() {
 }
 
 load_kind_images() (
-    local platform raw archive=""
-    platform="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')" || exit $?
-    raw="$(mktemp "${TMPDIR:-/tmp}/curie-kind-images-raw.XXXXXX.tar")" || exit $?
+    local platform raw="" archive=""
     trap 'rm -f -- "$raw" "$archive"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    archive="$(mktemp "${TMPDIR:-/tmp}/curie-kind-images.XXXXXX.tar")" || exit $?
+    platform="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')" || exit $?
+    raw="$(mktemp "${TMPDIR:-/tmp}/curie-kind-images-raw.XXXXXX")" || exit $?
+    archive="$(mktemp "${TMPDIR:-/tmp}/curie-kind-images.XXXXXX")" || exit $?
     docker image save --output "$raw" "$@" || exit $?
     python3 - "$raw" "$archive" "$platform" "$@" <<'PY' || exit $?
 import io

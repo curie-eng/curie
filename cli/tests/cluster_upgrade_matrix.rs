@@ -36,6 +36,38 @@ fn run_kind_image_loader(
     let fixture = tempfile::tempdir().expect("image loader fixture");
     let archives = fixture.path().join("archives");
     fs::create_dir(&archives).expect("archive directory");
+    let bsd_mktemp = archive_case == "bsd-mktemp-stale";
+    let sentinels = [
+        ("curie-kind-images-raw.XXXXXX.tar", "unrelated raw sentinel"),
+        ("curie-kind-images.XXXXXX.tar", "unrelated import sentinel"),
+    ];
+    if bsd_mktemp {
+        for (name, contents) in sentinels {
+            fs::write(archives.join(name), contents).expect("write stale archive sentinel");
+        }
+        // BSD mktemp substitutes only trailing Xs and creates mode 0600 files:
+        // https://github.com/apple-oss-distributions/shell_cmds/blob/main/mktemp/mktemp.1
+        // See also scripts/chart-runtime-e2e.sh for literal suffix names and EEXIST.
+        let path = fixture.path().join("mktemp");
+        fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import os, sys, tempfile
+template, = sys.argv[1:]
+directory, name = os.path.split(template)
+prefix = name.rstrip('X')
+if prefix != name:
+    fd, path = tempfile.mkstemp(prefix=prefix, dir=directory)
+else:
+    path = template
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+os.close(fd)
+print(path)
+"#,
+        )
+        .expect("write BSD mktemp fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("make executable");
+    }
     // Independently authored Docker v2 fixtures exercise the shell boundary,
     // not a real daemon. containerd 1.7.18 prefers OCI when oci-layout exists:
     // https://github.com/containerd/containerd/blob/v1.7.18/images/archive/importer.go
@@ -182,10 +214,24 @@ exit "$status""#,
         .env("TRACE", &trace)
         .env("SAVE_STATUS", save_status.to_string())
         .env("IMPORT_STATUS", import_status.to_string())
-        .env("ARCHIVE_CASE", archive_case)
+        .env(
+            "ARCHIVE_CASE",
+            if bsd_mktemp { "valid" } else { archive_case },
+        )
         .output()
         .expect("source matrix and execute image loader");
     let trace = fs::read_to_string(trace).unwrap_or_default();
+    if bsd_mktemp {
+        for (name, contents) in sentinels {
+            let path = archives.join(name);
+            assert_eq!(
+                fs::read_to_string(&path).expect("stale archive sentinel must survive"),
+                contents,
+                "loader must preserve unrelated sentinel {name}"
+            );
+            fs::remove_file(path).expect("remove verified fixture sentinel");
+        }
+    }
     let empty = fs::read_dir(archives)
         .expect("read archive directory")
         .next()
@@ -209,6 +255,18 @@ fn kind_image_loader_preserves_native_docker_payloads_and_all_requested_tags() {
         );
         assert!(empty, "successful import must remove both private archives");
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn kind_image_loader_uses_private_bsd_tempfiles_despite_stale_literal_archives() {
+    let (output, trace, empty) = run_kind_image_loader(0, 0, "bsd-mktemp-stale");
+    assert!(output.status.success(), "{}\n{trace}", output_text(&output));
+    assert!(
+        trace.contains("native tags and all payloads preserved; no OCI graph"),
+        "{trace}"
+    );
+    assert!(empty, "loader must remove all invocation-owned archives");
 }
 
 #[test]
