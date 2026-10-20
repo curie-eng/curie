@@ -8,6 +8,7 @@ and refused inputs that write nothing, and redaction. No mocks.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -539,29 +540,122 @@ def test_lookalike_versions_survive_and_stale_temp_links_go(tmp_path: Path) -> N
     assert len(versions(root)) == 5
 
 
-def test_fsync_after_swap_is_best_effort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A failed flush after the swap does not fail publication, @spec PROTECTED-HOOK-SOURCE-11."""
-    root = safe_root(tmp_path)
+class AfterSwap:
+    """Fault injection that arms once ``os.replace`` has run, @spec PROTECTED-HOOK-SOURCE-11."""
+
+    def __init__(
+        self, monkeypatch: pytest.MonkeyPatch, root: Path, fault: Any, target: str
+    ) -> None:
+        """@spec PROTECTED-HOOK-SOURCE-11."""
+        self.swapped = False
+        self.hits = 0
+        self.root_inode = root.stat().st_ino
+        self.fault = fault
+        real_replace, real_fsync = os.replace, os.fsync
+        real_fcntl, real_listdir = fcntl.fcntl, os.listdir
+
+        def replace(*args: Any, **kwargs: Any) -> Any:
+            """@spec PROTECTED-HOOK-SOURCE-11."""
+            result = real_replace(*args, **kwargs)
+            self.swapped = True
+            return result
+
+        def trip() -> None:
+            """@spec PROTECTED-HOOK-SOURCE-11."""
+            if self.swapped:
+                self.hits += 1
+                if self.hits == 1:
+                    raise self.fault
+
+        def fsync(descriptor: int) -> None:
+            """@spec PROTECTED-HOOK-SOURCE-11."""
+            if target == "flush":
+                trip()
+            real_fsync(descriptor)
+
+        def fcntl_call(descriptor: int, command: int, *rest: Any) -> Any:
+            """@spec PROTECTED-HOOK-SOURCE-11."""
+            if target == "flush" and command == getattr(fcntl, "F_FULLFSYNC", None):
+                trip()
+            return real_fcntl(descriptor, command, *rest)
+
+        def listdir(path: Any = ".") -> Any:
+            """@spec PROTECTED-HOOK-SOURCE-11."""
+            if target == "listdir" and isinstance(path, int):
+                if os.fstat(path).st_ino == self.root_inode:
+                    trip()
+            return real_listdir(path)
+
+        monkeypatch.setattr(os, "replace", replace)
+        monkeypatch.setattr(os, "fsync", fsync)
+        monkeypatch.setattr(fcntl, "fcntl", fcntl_call)
+        monkeypatch.setattr(os, "listdir", listdir)
+
+
+def second_publication(root: Path) -> tuple[str, dict[str, bytes]]:
+    """Publish once and return the first version name, @spec PROTECTED-HOOK-SOURCE-11."""
     publish_runtime_directory(str(root), contents(max_readiness_ms=1000))
-    real_replace, real_fsync = os.replace, os.fsync
-    swapped = {"done": False}
+    return os.readlink(root / "current"), read_current(root)
 
-    def replace(*args: Any, **kwargs: Any) -> Any:
-        """@spec PROTECTED-HOOK-SOURCE-11."""
-        result = real_replace(*args, **kwargs)
-        swapped["done"] = True
-        return result
 
-    def fsync(descriptor: int) -> None:
-        """@spec PROTECTED-HOOK-SOURCE-11."""
-        if swapped["done"]:
-            raise OSError("injected")
-        real_fsync(descriptor)
-
-    monkeypatch.setattr(runtime_directory_writer.os, "replace", replace)
-    monkeypatch.setattr(runtime_directory_writer.os, "fsync", fsync)
+@pytest.mark.parametrize("target", ["flush", "listdir"])
+def test_failure_after_swap_is_best_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    """A failed flush or listing after the swap is ignored, @spec PROTECTED-HOOK-SOURCE-11."""
+    root = safe_root(tmp_path)
+    first, _ = second_publication(root)
+    injected = AfterSwap(monkeypatch, root, OSError("injected"), target)
     publish_runtime_directory(str(root), contents(max_readiness_ms=2000))
+    assert injected.hits >= 1
+    assert os.readlink(root / "current") != first
     assert json.loads(read_current(root)["bootstrap.json"])["max_readiness_ms"] == "2000"
+
+
+@pytest.mark.parametrize("target", ["flush", "listdir"])
+def test_interrupt_after_swap_keeps_new_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    """An interrupt after the swap keeps the new version, @spec PROTECTED-HOOK-SOURCE-11."""
+    root = safe_root(tmp_path)
+    first, _ = second_publication(root)
+    injected = AfterSwap(monkeypatch, root, KeyboardInterrupt(), target)
+    with pytest.raises(KeyboardInterrupt):
+        publish_runtime_directory(str(root), contents(max_readiness_ms=2000))
+    assert injected.hits == 1
+    assert os.readlink(root / "current") != first
+    expected = render_runtime_files(contents(max_readiness_ms=2000))
+    assert set(read_current(root)) == set(expected)
+    assert json.loads(read_current(root)["bootstrap.json"])["max_readiness_ms"] == "2000"
+
+
+def test_failure_while_writing_version_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write failing on the second file changes nothing, @spec PROTECTED-HOOK-SOURCE-11."""
+    root = safe_root(tmp_path)
+    first, first_bytes = second_publication(root)
+    before = tree_state(root)
+    real_write = os.write
+    calls = {"count": 0}
+
+    def write(descriptor: int, data: Any) -> int:
+        """@spec PROTECTED-HOOK-SOURCE-11."""
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OSError("injected")
+        return real_write(descriptor, data)
+
+    monkeypatch.setattr(os, "write", write)
+    with pytest.raises(RuntimeDirectoryInvalid):
+        publish_runtime_directory(str(root), contents(max_readiness_ms=2000))
+    monkeypatch.undo()
+    assert calls["count"] >= 2
+    assert os.readlink(root / "current") == first
+    assert read_current(root) == first_bytes
+    assert tree_state(root) == before
+    assert versions(root) == [first]
+    assert not [name for name in snapshot(root) if name.startswith(".current.")]
 
 
 def test_refusals_carry_no_exception_context(tmp_path: Path) -> None:

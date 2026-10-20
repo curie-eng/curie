@@ -1438,7 +1438,10 @@ Kubernetes; who may read the mount (the files are owner only, and read access
 for the API comes from that installation's mount and ownership); provisioning
 of the broker principals the files name; and qualification. The writer
 produces and validates bytes. It does not establish that application
-identities cannot change the mounted directory.
+identities cannot change the mounted directory. The ancestor and ownership
+checks above run in the writer only: the API loader resolves
+`CURIE_PROTECTED_RUNTIME_DIR` afresh on every load without them, so the
+integrity of that path inside the API rests on the LANE-8 read only mount.
 
 ## Acceptance cases and commands
 
