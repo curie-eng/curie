@@ -444,7 +444,7 @@ def test_ownership_transition_table_is_exhaustive(
     before = ownership(current[0], current[1], 4)
     after = ownership(proposed[0], proposed[1], 5)
     expected = (current[0], proposed[0]) in ALLOWED and not (current[1] and not proposed[1])
-    needs_evidence = proposed[0] == "retired" and not current[1]
+    needs_evidence = proposed[0] == "retired"
     if expected and needs_evidence:
         with pytest.raises(r.CampaignRecordInvalid):
             r.next_ownership(before, after, trusted_guard_identity=GUARD)
@@ -495,6 +495,33 @@ def test_transition_requires_same_launch_and_next_revision() -> None:
             r.next_ownership(
                 before, ownership("uncertain", False, 2, **changes), trusted_guard_identity=GUARD
             )
+
+
+def test_bound_retirement_also_requires_matching_not_found() -> None:
+    for state in ("retiring", "uncertain"):
+        before = ownership(state, True, 1)
+        after = ownership("retired", True, 2)
+        with pytest.raises(r.CampaignRecordInvalid):
+            r.next_ownership(before, after, trusted_guard_identity=GUARD)
+        for bad in (
+            evidence(pod_uid=UUID_C),
+            evidence(pod_name="runner-2"),
+            evidence(namespace="campaign-2"),
+            evidence(guard_identity=GUARD | {"revision": "4"}),
+        ):
+            with pytest.raises(r.CampaignRecordInvalid):
+                r.next_ownership(before, after, not_found=bad, trusted_guard_identity=GUARD)
+        with pytest.raises(r.CampaignRecordInvalid):
+            r.next_ownership(
+                before,
+                after,
+                not_found=evidence(),
+                trusted_guard_identity=GUARD | {"config_sha256": "8" * 64},
+            )
+        assert (
+            r.next_ownership(before, after, not_found=evidence(), trusted_guard_identity=GUARD)
+            is after
+        )
 
 
 def test_one_plain_not_found_never_retires_an_ambiguous_create() -> None:

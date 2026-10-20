@@ -355,9 +355,11 @@ def next_ownership(
 
     Pure and side-effect free. The launch, campaign, delivery and workload
     identities stay fixed, the revision advances by one, a bound UID never
-    changes or unbinds, ``retired`` is terminal, and an unbound workload becomes
-    ``retired`` only with an unambiguous NotFound matching its recorded name,
-    the retired UID and the trusted guard. @spec PROTECTED-COMMISSIONING-7.
+    changes or unbinds, and ``retired`` is terminal. Every transition into
+    ``retired``, from a bound or an unbound workload, needs an unambiguous
+    NotFound matching the recorded name, the retired UID and the trusted guard,
+    so no uncertain ownership reaches acceptance unobserved.
+    @spec PROTECTED-COMMISSIONING-7.
     """
     _require(type(current) is CampaignLaunchOwnership)
     _require(type(proposed) is CampaignLaunchOwnership)
@@ -381,7 +383,7 @@ def next_ownership(
         _require(old[member] == new[member])
     if old["kind"] == "bound":
         _require(new["kind"] == "bound" and new["pod_uid"] == old["pod_uid"])
-    if after["state"] == "retired" and old["kind"] == "unbound":
+    if after["state"] == "retired":
         if type(not_found) is not UnambiguousNotFound:
             _refuse()
         _require(
