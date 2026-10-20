@@ -320,8 +320,11 @@
     "0108": [
       "0107",
       "0106"
+    ],
+    "selfimp_safety_0001": [
+      "0108"
     ]
   },
-  "schema_head": "0108",
+  "schema_head": "selfimp_safety_0001",
   "schema_min": "0108"
 }

@@ -50,6 +50,7 @@ _PRICES: dict[str, _Price] = {
     "claude-sonnet-4-5": _Price(3.0, 15.0),
     "claude-sonnet-4": _Price(3.0, 15.0),
     "claude-haiku-4-5": _Price(1.0, 5.0),
+    "claude-haiku-5": _Price(1.0, 5.0),
 }
 
 # Longest key first: ``claude-opus-4-8`` must be tried before ``claude-opus-4``

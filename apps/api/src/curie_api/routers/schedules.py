@@ -285,6 +285,15 @@ async def _change_pause(
     await session.execute(text(_LOCK_SQL), {"agent_id": str(agent.id), "name": name})
     statement = _PAUSE_SQL if pause else _RESUME_SQL
     await session.execute(text(statement.format(schema=SCHEMA)), params)
+    if not pause:
+        await session.execute(
+            text(
+                f"INSERT INTO {SCHEMA}.schedule_failure_streaks "
+                "(agent_id, name, consecutive) VALUES (:agent_id, :name, 0) "
+                "ON CONFLICT (agent_id, name) DO UPDATE SET consecutive = 0"
+            ),
+            params,
+        )
     await session.commit()
     return ScheduleControlOut(agent=agent.name, name=name, paused=pause)
 

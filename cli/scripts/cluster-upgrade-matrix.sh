@@ -342,7 +342,7 @@ run_self_test() {
         log "self-test: published v0.8.9 checksum pins are malformed"
         failed=1
     fi
-    if [[ "$PUBLISHED_HEAD" =~ ^[0-9]{4}$ && "$TARGET_HEAD" =~ ^[0-9]{4}$ && "$SUPPORTED_ROLLBACK_HEAD" =~ ^[0-9]{4}$ ]]; then
+    if [[ "$PUBLISHED_HEAD" =~ ^[0-9]{4}$ && "$TARGET_HEAD" =~ ^([0-9]{4}|selfimp_[a-z]+_[0-9]{4})$ && "$SUPPORTED_ROLLBACK_HEAD" =~ ^[0-9]{4}$ ]]; then
         log "schema heads published=$PUBLISHED_HEAD candidate=$TARGET_HEAD supported-rollback=$SUPPORTED_ROLLBACK_HEAD"
     else
         log "self-test: schema heads are malformed published='$PUBLISHED_HEAD' target='$TARGET_HEAD' supported-rollback='$SUPPORTED_ROLLBACK_HEAD'"

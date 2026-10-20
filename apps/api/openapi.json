@@ -6169,7 +6169,8 @@
                   "hook_paused",
                   "live_session",
                   "enqueue_failed",
-                  "claim_expired"
+                  "claim_expired",
+                  "daily_budget"
                 ],
                 "type": "string"
               },
@@ -10700,7 +10701,8 @@
                   "hook_paused",
                   "live_session",
                   "enqueue_failed",
-                  "claim_expired"
+                  "claim_expired",
+                  "daily_budget"
                 ],
                 "type": "string"
               },
@@ -10747,7 +10749,8 @@
                   "hook_paused",
                   "live_session",
                   "enqueue_failed",
-                  "claim_expired"
+                  "claim_expired",
+                  "daily_budget"
                 ],
                 "type": "string"
               },

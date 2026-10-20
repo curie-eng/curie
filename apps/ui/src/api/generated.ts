@@ -6092,7 +6092,7 @@ export interface components {
             /** Outcome */
             outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
             /** Reason */
-            reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired") | null;
+            reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired" | "daily_budget") | null;
             /**
              * Slot Utc
              * Format: date-time
@@ -8112,11 +8112,11 @@ export interface components {
             /** Last Manual Outcome */
             last_manual_outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
             /** Last Manual Reason */
-            last_manual_reason: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired") | null;
+            last_manual_reason: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired" | "daily_budget") | null;
             /** Last Outcome */
             last_outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
             /** Last Reason */
-            last_reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired") | null;
+            last_reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired" | "daily_budget") | null;
             /** Name */
             name: string;
             /** Paused */

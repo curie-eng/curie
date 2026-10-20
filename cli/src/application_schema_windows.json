@@ -1,6 +1,6 @@
 {
   "candidate": {
-    "schema_head": "0108",
+    "schema_head": "selfimp_safety_0001",
     "schema_min": "0108"
   },
   "revisions": [
@@ -110,7 +110,8 @@
     "0103",
     "0105",
     "0107",
-    "0108"
+    "0108",
+    "selfimp_safety_0001"
   ],
   "windows": {
     "0.10.0": {
