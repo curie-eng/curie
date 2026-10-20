@@ -565,7 +565,7 @@ print(json.dumps(graph))
         // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
         assert_eq!(candidate.schema_min, "0108");
-        assert_eq!(candidate.schema_head, "0108");
+        assert_eq!(candidate.schema_head, "selfimp_safety_0001");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
