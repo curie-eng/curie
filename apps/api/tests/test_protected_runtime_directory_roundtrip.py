@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -203,7 +204,7 @@ REFUSED: list[tuple[str, str, Callable[[], dict[str, bytes]], Callable[[], dict[
         lambda: {"ca_pem": "café\n" + CA_PEM},
     ),
     (
-        "ca-over-bound",
+        "ca-over-bound-pem-grammar",
         "load_bootstrap",
         lambda: {"ca.pem": (CA_PEM + "#" * 70000).encode("ascii")},
         lambda: {"ca_pem": CA_PEM + "#" * 70000},
@@ -297,3 +298,36 @@ def test_default_username_refused_everywhere(tmp_path: Path, which: str) -> None
         getattr(loader, name)(directory)
     with pytest.raises(BrokerMetadataUnavailable):
         credential("default", "secret-0123456789")
+
+
+def test_overlapping_publications_always_load(tmp_path: Path) -> None:
+    """Concurrent publishers leave loadable files, @spec PROTECTED-HOOK-SOURCE-11."""
+    for round_number in range(5):
+        root = safe_root(tmp_path, f"race-{round_number}")
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(2)
+
+        def work(
+            readiness: int,
+            root: Path = root,
+            barrier: threading.Barrier = barrier,
+            errors: list[BaseException] = errors,
+        ) -> None:
+            """@spec PROTECTED-HOOK-SOURCE-11."""
+            try:
+                barrier.wait()
+                for _ in range(3):
+                    publish_runtime_directory(str(root), make_contents(max_readiness_ms=readiness))
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+
+        threads = [threading.Thread(target=work, args=(value,)) for value in (1000, 2000)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert errors == []
+        current = str(root / "current")
+        assert loader.load_bootstrap(current).max_readiness_ms in (1000, 2000)
+        assert loader.load_administration(current).writer.username == WRITER
+        assert loader.load_ingress(current).enqueue.username == ENQUEUE

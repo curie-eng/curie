@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -19,15 +20,21 @@ from typing import Any
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509.oid import NameOID
+from curie_protected_hooks import runtime_directory, runtime_directory_writer
 from curie_protected_hooks.authority_records import Manifest, parse_manifest
 from curie_protected_hooks.broker_transport import (
     EnqueueCredential,
     MetadataReaderCredential,
     SourceWriterCredential,
 )
-from curie_protected_hooks.runtime_directory import RuntimeDirectoryInvalid
+from curie_protected_hooks.runtime_directory import (
+    RuntimeDirectoryInvalid,
+    parse_bootstrap,
+    parse_enqueue,
+    parse_source_writer,
+)
 from curie_protected_hooks.runtime_directory_writer import (
     RuntimeDirectoryContents,
     publish_runtime_directory,
@@ -347,3 +354,263 @@ def test_repr_and_errors_hold_no_secret(tmp_path: Path) -> None:
         render_runtime_files(contents(max_readiness_ms=0))
     for secret in SECRETS:
         assert secret not in str(refused.value) + repr(refused.value)
+
+
+def small_ec_ca_pem() -> str:
+    """PEM of a small EC CA, shorter than the manifest, @spec PROTECTED-HOOK-SOURCE-11."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = datetime.now(UTC)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ec")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM).decode()
+
+
+def tree_state(root: Path) -> dict[str, Any]:
+    """Names, modes and bytes of everything under root, @spec PROTECTED-HOOK-SOURCE-11."""
+    state: dict[str, Any] = {}
+    for path in sorted(root.rglob("*")):
+        mode = path.lstat().st_mode
+        key = str(path.relative_to(root))
+        if stat.S_ISLNK(mode):
+            state[key] = ("link", os.readlink(path))
+        elif stat.S_ISREG(mode):
+            state[key] = (stat.S_IMODE(mode), path.read_bytes())
+        else:
+            state[key] = (stat.S_IMODE(mode), None)
+    return state
+
+
+def test_overlapping_publications_leave_complete_current(tmp_path: Path) -> None:
+    """Concurrent publishers always leave a whole file set, @spec PROTECTED-HOOK-SOURCE-11."""
+    for round_number in range(5):
+        root = safe_root(tmp_path, f"race-{round_number}")
+        first, second = contents(max_readiness_ms=1000), contents(max_readiness_ms=2000)
+        expected = [render_runtime_files(first), render_runtime_files(second)]
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(2)
+
+        def work(
+            value: RuntimeDirectoryContents,
+            root: Path = root,
+            barrier: threading.Barrier = barrier,
+            errors: list[BaseException] = errors,
+        ) -> None:
+            """@spec PROTECTED-HOOK-SOURCE-11."""
+            try:
+                barrier.wait()
+                for _ in range(3):
+                    publish_runtime_directory(str(root), value)
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+
+        threads = [threading.Thread(target=work, args=(v,)) for v in (first, second)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert errors == []
+        assert read_current(root) in expected
+        assert len(versions(root)) <= 2
+        assert not [name for name in snapshot(root) if name.startswith(".current.")]
+
+
+def failing_once(target: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``os.<target>`` raise OSError on its next call only, @spec PROTECTED-HOOK-SOURCE-11."""
+    real = getattr(os, target)
+    state = {"armed": True}
+
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        """@spec PROTECTED-HOOK-SOURCE-11."""
+        if state["armed"]:
+            state["armed"] = False
+            raise OSError("injected")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(runtime_directory_writer.os, target, wrapper)
+
+
+@pytest.mark.parametrize("target", ["replace", "symlink"])
+def test_failure_while_publishing_leaves_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    """A failed second publication changes nothing, @spec PROTECTED-HOOK-SOURCE-11."""
+    root = safe_root(tmp_path)
+    publish_runtime_directory(str(root), contents(max_readiness_ms=1000))
+    first = os.readlink(root / "current")
+    before = tree_state(root)
+    failing_once(target, monkeypatch)
+    with pytest.raises(RuntimeDirectoryInvalid):
+        publish_runtime_directory(str(root), contents(max_readiness_ms=2000))
+    assert os.readlink(root / "current") == first
+    assert tree_state(root) == before
+    assert versions(root) == [first]
+    assert not [name for name in snapshot(root) if name.startswith(".current.")]
+
+
+def test_relative_and_unnormalized_roots_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Relative and unnormalized roots are refused, @spec PROTECTED-HOOK-SOURCE-11."""
+    root = safe_root(tmp_path)
+    other = safe_root(tmp_path, "other")
+    monkeypatch.chdir(tmp_path)
+    for text in ("root", f"{root}/", f"{root}/.", f"{other}/../root", f"{tmp_path}/./root"):
+        with pytest.raises(RuntimeDirectoryInvalid):
+            publish_runtime_directory(text, contents())
+    assert snapshot(root) == []
+
+
+def test_symlink_ancestor_refused(tmp_path: Path) -> None:
+    """A symlink anywhere in the root path is refused, @spec PROTECTED-HOOK-SOURCE-11."""
+    real = safe_root(tmp_path, "real")
+    inner = real / "root"
+    inner.mkdir(mode=0o700)
+    (tmp_path / "link").symlink_to(real)
+    with pytest.raises(RuntimeDirectoryInvalid):
+        publish_runtime_directory(str(tmp_path / "link" / "root"), contents())
+    assert snapshot(inner) == []
+
+
+def test_ancestor_writability(tmp_path: Path) -> None:
+    """A world-writable ancestor needs the sticky bit, @spec PROTECTED-HOOK-SOURCE-11."""
+    ancestor = safe_root(tmp_path, "shared")
+    root = ancestor / "root"
+    root.mkdir(mode=0o700)
+    try:
+        ancestor.chmod(0o777)
+        with pytest.raises(RuntimeDirectoryInvalid):
+            publish_runtime_directory(str(root), contents())
+        assert snapshot(root) == []
+        ancestor.chmod(0o1777)
+        assert publish_runtime_directory(str(root), contents()) == f"{root}/current"
+    finally:
+        ancestor.chmod(0o700)
+
+
+def test_tmp_path_itself_is_accepted(tmp_path: Path) -> None:
+    """The test temp directory is a valid root, @spec PROTECTED-HOOK-SOURCE-11."""
+    assert publish_runtime_directory(str(tmp_path), contents()) == f"{tmp_path}/current"
+
+
+@pytest.mark.parametrize("target", ["elsewhere", "/etc"])
+def test_foreign_current_symlink_refused(tmp_path: Path, target: str) -> None:
+    """A current link not naming a version is refused untouched, @spec PROTECTED-HOOK-SOURCE-11."""
+    root = safe_root(tmp_path)
+    (root / "current").symlink_to(target)
+    before = tree_state(root)
+    with pytest.raises(RuntimeDirectoryInvalid):
+        publish_runtime_directory(str(root), contents())
+    assert tree_state(root) == before
+
+
+def test_lookalike_versions_survive_and_stale_temp_links_go(tmp_path: Path) -> None:
+    """Lookalike versions survive, stale temp links go, @spec PROTECTED-HOOK-SOURCE-11."""
+    root = safe_root(tmp_path)
+    nested = root / ("v." + "1" * 32)
+    nested.mkdir(mode=0o700)
+    (nested / "manifest.json").write_bytes(b"x")
+    (nested / "sub").mkdir()
+    unknown = root / ("v." + "2" * 32)
+    unknown.mkdir(mode=0o700)
+    (unknown / "notes.txt").write_bytes(b"x")
+    loose = root / ("v." + "3" * 32)
+    loose.mkdir()
+    (loose / "manifest.json").write_bytes(b"x")
+    (loose / "manifest.json").chmod(0o400)
+    loose.chmod(0o755)
+    stale = root / (".current." + "4" * 32)
+    stale.symlink_to("v." + "5" * 32)
+    shapes = {name: tree_state(root / name) for name in (nested.name, unknown.name, loose.name)}
+    for _ in range(4):
+        publish_runtime_directory(str(root), contents())
+    for name, state in shapes.items():
+        assert tree_state(root / name) == state
+    assert not stale.is_symlink()
+    assert len(versions(root)) == 5
+
+
+def test_fsync_after_swap_is_best_effort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed flush after the swap does not fail publication, @spec PROTECTED-HOOK-SOURCE-11."""
+    root = safe_root(tmp_path)
+    publish_runtime_directory(str(root), contents(max_readiness_ms=1000))
+    real_replace, real_fsync = os.replace, os.fsync
+    swapped = {"done": False}
+
+    def replace(*args: Any, **kwargs: Any) -> Any:
+        """@spec PROTECTED-HOOK-SOURCE-11."""
+        result = real_replace(*args, **kwargs)
+        swapped["done"] = True
+        return result
+
+    def fsync(descriptor: int) -> None:
+        """@spec PROTECTED-HOOK-SOURCE-11."""
+        if swapped["done"]:
+            raise OSError("injected")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(runtime_directory_writer.os, "replace", replace)
+    monkeypatch.setattr(runtime_directory_writer.os, "fsync", fsync)
+    publish_runtime_directory(str(root), contents(max_readiness_ms=2000))
+    assert json.loads(read_current(root)["bootstrap.json"])["max_readiness_ms"] == "2000"
+
+
+def test_refusals_carry_no_exception_context(tmp_path: Path) -> None:
+    """Refusals have neither cause nor context, @spec PROTECTED-HOOK-SOURCE-11."""
+    root = safe_root(tmp_path)
+    root.chmod(0o770)
+    try:
+        with pytest.raises(RuntimeDirectoryInvalid) as bad_root:
+            publish_runtime_directory(str(root), contents())
+    finally:
+        root.chmod(0o700)
+    with pytest.raises(RuntimeDirectoryInvalid) as bad_input:
+        publish_runtime_directory(str(root), contents(max_readiness_ms=0))
+    with pytest.raises(RuntimeDirectoryInvalid) as bad_render:
+        render_runtime_files(contents(max_readiness_ms=0))
+    files = render_runtime_files(contents())
+    reader = MetadataReaderCredential(READER, READER_SECRET)
+    bootstrap = parse_bootstrap(files["manifest.json"], files["ca.pem"], files["bootstrap.json"])
+    with pytest.raises(RuntimeDirectoryInvalid) as bad_bootstrap:
+        parse_bootstrap(b"{", b"x", b"{")
+    with pytest.raises(RuntimeDirectoryInvalid) as bad_writer:
+        parse_source_writer(b"{", reader)
+    with pytest.raises(RuntimeDirectoryInvalid) as bad_enqueue:
+        parse_enqueue(b"{", bootstrap)
+    for raised in (bad_root, bad_input, bad_render, bad_bootstrap, bad_writer, bad_enqueue):
+        assert raised.value.__context__ is None
+        assert raised.value.__cause__ is None
+
+
+def test_real_size_bound_on_ca_and_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The byte bound itself refuses a valid CA or manifest, @spec PROTECTED-HOOK-SOURCE-11."""
+    big = contents(ca=ca_pem() + ca_pem())
+    big_files = render_runtime_files(big)
+    small = contents(ca=small_ec_ca_pem())
+    small_files = render_runtime_files(small)
+    names = ("manifest.json", "ca.pem", "bootstrap.json")
+    cases = [
+        (big_files, len(big_files["ca.pem"]) - 1),
+        (small_files, len(small_files["manifest.json"]) - 1),
+    ]
+    assert len(big_files["ca.pem"]) > max(
+        len(big_files[n]) for n in ("manifest.json", "bootstrap.json")
+    )
+    assert len(small_files["ca.pem"]) < len(small_files["manifest.json"]) - 1
+    assert len(small_files["bootstrap.json"]) < len(small_files["manifest.json"]) - 1
+    for files, bound in cases:
+        parse_bootstrap(*(files[n] for n in names))
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime_directory, "MAX_FILE_BYTES", bound)
+            with pytest.raises(RuntimeDirectoryInvalid):
+                parse_bootstrap(*(files[n] for n in names))
+        parse_bootstrap(*(files[n] for n in names))
