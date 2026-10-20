@@ -2051,7 +2051,10 @@ class ActionAuditEntry(Base):
     actor_channel: Mapped[str | None] = mapped_column(default=None)
     # The authorizer snapshot, as on an approval: which implementation decided,
     # its verdict, and its stated reason at the time of the attempt.
-    authorizer: Mapped[str]
+    authorizer: Mapped[str | None] = mapped_column(default=None)
+    team_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    team_epoch: Mapped[int | None] = mapped_column(Integer, default=None)
+    team_digest: Mapped[str | None] = mapped_column(default=None)
     authorized: Mapped[bool]
     reason: Mapped[str | None] = mapped_column(default=None)
     # For a conflict refusal, the two states that disagreed. Naming both is the

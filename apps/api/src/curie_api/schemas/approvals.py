@@ -588,6 +588,9 @@ class ApprovalAuditOut(BaseModel):
     # (ADR-0154); `actor` is the sender it authenticated. NULL otherwise.
     principal_subject: str | None
     decision: str
+    team_id: uuid.UUID | None = None
+    team_epoch: int | None = None
+    team_digest: str | None = None
     authorizer: str | None
     authorized: bool
     reason: str | None

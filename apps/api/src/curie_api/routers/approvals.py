@@ -17,8 +17,6 @@ point remains here, on the server that owns the record, never in the sandbox.
 
 import logging
 import uuid
-from collections.abc import Mapping
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
@@ -52,17 +50,21 @@ from ..action_forward import ForwardRefused
 from ..admission import admit
 from ..approval_auth import (
     ApprovalPrincipalDep,
-    AuthenticatedApprovalPrincipal,
     platform_key_or_adapter,
     require_adapter_principal,
 )
-from ..approvers import IdpTeamApprovers, card_on_requesting_surface, shown_off_slack
+from ..approval_teams import (
+    approval_team_decision,
+    authenticated_actor_evidence,
+    team_restriction,
+)
+from ..approvers import IdpTeamApprovers, card_on_requesting_surface
 from ..auth import require_api_key, require_platform_key
 from ..authorizer import AuthzDecision, authorize_approval
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep, get_store
 from ..identity_fence import lock_identity_reader
-from ..models import Agent, AgentChannel, Approval, ApprovalStatus
+from ..models import Approval, ApprovalStatus
 from ..remediation_approvals import (
     REMEDIATION_PURPOSE,
     execute_approved,
@@ -75,9 +77,7 @@ from ..resumequeue import (
     build_expiry_resume_turn,
     build_resume_turn,
 )
-from ..slack_approvers import approval_token_identity
 from ..storage import ObjectStore
-from ..team_authorization import TeamDecision, check_binding
 from ..wirebody import ApprovalRequestBody
 from .actions import rule_undo
 
@@ -491,70 +491,6 @@ async def _admit_adapter_answer(session: AsyncSession, approval: Approval, sende
         raise HTTPException(status.HTTP_403_FORBIDDEN, CALLER_NOT_ALLOWED_DETAIL)
 
 
-async def approval_team_decision(
-    session: AsyncSession, approval: Approval, principal: AuthenticatedApprovalPrincipal
-) -> TeamDecision:
-    if approval.agent_id is None:
-        return TeamDecision(True, False, "unrestricted")
-    agent = await session.get(Agent, approval.agent_id, populate_existing=True)
-    if agent is None:
-        return TeamDecision(False, True, "agent_unavailable")
-    # This is the authenticated actor's receiving context, never inserted as
-    # an agent binding. A fixed Slack card can belong to an email-originated
-    # request; its Slack installation is approval_token_identity, not mail's.
-    context = AgentChannel(
-        agent_id=agent.id,
-        tenant_id=agent.tenant_id,
-        kind="email" if principal.kind == "adapter" and approval.reply_kind == "email" else "slack",
-        adapter=(
-            approval.reply_adapter
-            if principal.kind == "adapter"
-            else approval_token_identity(approval)
-        ),
-        address=principal.actor_channel or approval.reply_channel,
-    )
-    decision = await check_binding(
-        session,
-        context,
-        role="approver",
-        slack=principal.slack if principal.kind == "chat" else None,
-        email=(
-            principal.subject
-            if principal.kind == "adapter" and approval.reply_kind == "email"
-            else None
-        ),
-        principal_id=principal.principal_id if principal.kind == "console" else None,
-    )
-    if decision.restricted and principal.kind in {"operator", "test_driver"}:
-        return TeamDecision(
-            False,
-            True,
-            "idp_sign_in_required",
-            team_id=decision.team_id,
-            epoch=decision.epoch,
-            digest=decision.digest,
-        )
-    if decision.restricted:
-        binding = await crud_approvals.get_approval_route_binding(session, approval)
-        off_slack = shown_off_slack(approval, binding)
-        if (
-            principal.kind == "adapter"
-            and not (approval.reply_kind == "email" and off_slack)
-            or principal.kind == "chat"
-            and off_slack
-        ):
-            return replace(decision, allowed=False, reason="wrong_resolution_surface")
-    return decision
-
-
-def team_restriction(approval: Approval, binding: object) -> bool:
-    """Only explicit route restrictions narrow the team; no channel default."""
-    if approval.route and binding is None:
-        return True
-    if binding is not None and not isinstance(binding, Mapping):
-        return True
-    return isinstance(binding, Mapping) and binding.get("approvers") is not None
-
 @router.post("/{approval_id}/resolve", response_model=ApprovalOut)
 async def resolve_approval(
     approval_id: uuid.UUID,
@@ -659,7 +595,11 @@ async def resolve_approval(
             authorizer=authorizer_name,
             authorized=authorized,
             reason=reason,
-            evidence=decision.evidence,
+            evidence=(
+                {**(decision.evidence or {}),
+                 "authenticated_actor": authenticated_actor_evidence(principal)}
+                if action == "resolved" and authorized else decision.evidence
+            ),
             team_id=team_decision.team_id if team_decision.restricted else None,
             team_epoch=team_decision.epoch if team_decision.restricted else None,
             team_digest=team_decision.digest if team_decision.restricted else None,

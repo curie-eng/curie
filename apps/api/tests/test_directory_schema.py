@@ -169,3 +169,33 @@ def test_0122_downgrade_refuses_team_only_audit_before_mutating_schema(
         "AND table_name='approval_audit_entries' AND column_name='authorizer'"
     ) == [{"is_nullable": "NO"}]
     command.upgrade(alembic_config(), "head")
+
+
+def test_0122_downgrade_preserves_team_only_action_audit(isolated_migration_db) -> None:
+    import pytest
+    from _migration_support import alembic_config, column_names, sql_dicts
+    from alembic import command
+
+    isolated_migration_db.at("0122")
+    action_id, audit_id = uuid.uuid4(), uuid.uuid4()
+    sql_dicts(
+        "INSERT INTO curie.agent_actions (id,conversation_id,call_id,tool,dedupe_key) "
+        "VALUES (:id,'example-thread','example-call','example-tool',:dedupe)",
+        {"id": action_id, "dedupe": uuid.uuid4().hex},
+    )
+    sql_dicts(
+        "INSERT INTO curie.action_audit_entries (id,action_id,action,actor,authorizer,authorized) "
+        "VALUES (:id,:action,'authorized','U0EXAMPLE1',NULL,true)",
+        {"id": audit_id, "action": action_id},
+    )
+    before = column_names("action_audit_entries")
+    with pytest.raises(RuntimeError, match="action audit"):
+        command.downgrade(alembic_config(), "0121")
+    assert column_names("action_audit_entries") == before
+    assert sql_dicts("SELECT version_num FROM curie.alembic_version") == [{"version_num": "0122"}]
+    assert sql_dicts(
+        "SELECT authorizer FROM curie.action_audit_entries WHERE id=:id", {"id": audit_id}
+    ) == [{"authorizer": None}]
+    sql_dicts("DELETE FROM curie.action_audit_entries WHERE id=:id", {"id": audit_id})
+    command.downgrade(alembic_config(), "0121")
+    command.upgrade(alembic_config(), "head")

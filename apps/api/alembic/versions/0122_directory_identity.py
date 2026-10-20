@@ -20,6 +20,11 @@ U = postgresql.UUID(as_uuid=True)
 
 def upgrade() -> None:
     op.alter_column("approval_audit_entries", "authorizer", nullable=True, schema=S)
+    op.alter_column("action_audit_entries", "authorizer", nullable=True, schema=S)
+    for name, datatype in [
+        ("team_id", U), ("team_epoch", sa.Integer()), ("team_digest", sa.String()),
+    ]:
+        op.add_column("action_audit_entries", sa.Column(name, datatype), schema=S)
     op.create_table(
         "tenant_identity_providers",
         sa.Column("tenant_id", U, sa.ForeignKey(f"{S}.tenants.id"), primary_key=True),
@@ -140,10 +145,16 @@ def downgrade() -> None:
     # Team-only decisions never evaluated a legacy set. Do not invent legacy
     # authority or silently discard that audit history to fit the old schema.
     if op.get_bind().scalar(sa.text(
-        "SELECT EXISTS (SELECT 1 FROM curie.approval_audit_entries WHERE authorizer IS NULL)"
+        "SELECT EXISTS (SELECT 1 FROM curie.approval_audit_entries WHERE authorizer IS NULL) OR "
+        "EXISTS (SELECT 1 FROM curie.action_audit_entries WHERE authorizer IS NULL)"
     )):
-        raise RuntimeError("cannot downgrade while team-only approval audit rows exist")
+        raise RuntimeError(
+            "cannot downgrade while team-only approval audit or action audit rows exist"
+        )
     op.alter_column("approval_audit_entries", "authorizer", nullable=False, schema=S)
+    op.alter_column("action_audit_entries", "authorizer", nullable=False, schema=S)
+    for name in ["team_digest", "team_epoch", "team_id"]:
+        op.drop_column("action_audit_entries", name, schema=S)
     # No truthful old-format representation exists for directory-authored rows.
     op.execute("DELETE FROM curie.identity_links WHERE verification_source = 'idp_directory'")
     op.drop_table("identity_connect_tokens", schema=S)
