@@ -52,12 +52,26 @@ client settings and activation consent still apply. See the
 [preparation guide](../docs/guides/factory-preparation.md) for client paths,
 manual installation, specification review, publication and factory selection.
 
-To upgrade, install the desired Curie CLI release, review your existing skill
-for local edits, and move its folder to a backup location outside the client's
-skill directories. Run the install command again and reapply any customizations
-after reviewing the new instructions. Keep the backup until you have verified
-the new skill in your coding agent. Automatic updates and repository version
-pins are deferred.
+Managed installations record the original version and hashes outside the skill
+folder. `curie factory prepare update --agent codex --global --check` reports an
+upstream release without changing files. Omit `--check` after reviewing the update;
+use `--rollback` to restore the previous managed release. Edited managed files are
+refused and preserved; there is no automatic merge. Per-repository
+`.curie-factory.json` optionally pins local preparation and specification versions:
+
+```json
+{"schema_version": 2, "preparation_version": "0.3.0", "contract_version": "curie.factory-specification/v1"}
+```
+
+`curie factory prepare resolve --agent codex --global --repo DIR` selects that
+exact release and format from local cache or an explicit source. Without a pin,
+it uses the installed managed release. Different repositories can use different
+cached versions through the same global entry skill. Pins do not bind deployments
+or enforce factory admission. Legacy schema 1 deployment bindings require manual
+migration: copy `target.contract_version` to `contract_version`, remove `target`,
+and change `schema_version` to 2. The command refuses legacy bindings and leaves
+files unchanged. Separate local preferences retain their own schema version 1.
+See the guide for preferences, release locators, offline behavior and recovery.
 
 ## Interactive mode
 

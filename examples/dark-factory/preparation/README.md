@@ -40,12 +40,14 @@ They use synthetic tracker state to exercise approval, publication, selection an
 recovery without writing real issues. These are opt-in host-agent evaluations,
 not automated CI tests or proof of deployed factory intake.
 
-Installation uses the Markdown bundled with the chosen CLI build. It refuses to
-overwrite a different or edited copy. Upgrades are manual: preserve the old folder
-outside the client's skill discovery paths, install the reviewed replacement and
-reapply customizations deliberately. Automatic update checks, managed upgrades,
-rollback and repository version resolution are deferred to follow-up work. See
-the [preparation guide](../../../docs/guides/factory-preparation.md#manual-upgrades).
+Managed installation supports update checks, unchanged-file upgrades and rollback.
+Optional repository pins in `.curie-factory.json` select preparation instructions
+and output format independently for each checkout. They do not bind a deployment
+or gate existing label intake. Without a pin or CLI, the installed text workflow
+can still prepare, review, publish and select work. Local preferences remain
+outside managed assets. The factory retains ownership of specification semantics.
+See the [preparation guide](../../../docs/guides/factory-preparation.md#versions-and-upgrades)
+for version and customization details.
 
 The optional [pilot protocol](pilot/README.md) and blank [ledger](pilot/outcomes.csv)
 compare usual intake with prepared intake. They measure accepted outcomes,
