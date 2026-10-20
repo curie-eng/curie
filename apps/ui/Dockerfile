@@ -62,6 +62,34 @@ server {
         return 404;
     }
 
+    # These URLs carry account capabilities or OIDC codes/state. Both access
+    # and upstream-error logs otherwise include the raw request URI, including
+    # when the API is unavailable and cannot set its own privacy headers.
+    location ^~ /api/identity/connect/ {
+        access_log off;
+        error_log /dev/null;
+        add_header Cache-Control "private, no-store" always;
+        add_header Referrer-Policy "no-referrer" always;
+        gzip off;
+        proxy_pass ${CURIE_API_TARGET}/identity/connect/;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+    location = /api/console/oidc/callback {
+        access_log off;
+        error_log /dev/null;
+        add_header Cache-Control "private, no-store" always;
+        add_header Referrer-Policy "no-referrer" always;
+        gzip off;
+        proxy_pass ${CURIE_API_TARGET}/console/oidc/callback;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
     # Reverse-proxy operator API calls, stripping the /api prefix.
     location /api/ {
         # gzip is on at server scope and application/json is in gzip_types,
