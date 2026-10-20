@@ -588,7 +588,7 @@ class ApprovalAuditOut(BaseModel):
     # (ADR-0154); `actor` is the sender it authenticated. NULL otherwise.
     principal_subject: str | None
     decision: str
-    authorizer: str
+    authorizer: str | None
     authorized: bool
     reason: str | None
     # The membership facts that decided it (#420): the group and the actor's

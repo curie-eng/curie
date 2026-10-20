@@ -212,8 +212,9 @@ def governed_email(email: str, domains: list[str]) -> tuple[str, str] | None:
     domain = domain.lower()
     if not local or not domain or domain not in domains or any(ord(c) < 33 for c in email):
         return None
-    # Exact mailbox local-part, canonical DNS domain. Never profile matching.
-    return f"{local}@{domain}", domain
+    # The mail transport and directory both use the normalized mailbox form
+    # from schemas.channels.normalize_caller_id, including the local part.
+    return f"{local}@{domain}".lower(), domain
 
 
 async def link_verified_email(

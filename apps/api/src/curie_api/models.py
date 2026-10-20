@@ -1823,7 +1823,8 @@ class ApprovalAuditEntry(Base):
     decision: Mapped[str]
     # The authorizer snapshot: which implementation decided, its verdict, and
     # its stated reason at the time of the attempt.
-    authorizer: Mapped[str]
+    # Null when no legacy approver set was evaluated (IdP team-only decision).
+    authorizer: Mapped[str | None] = mapped_column(default=None)
     authorized: Mapped[bool]
     reason: Mapped[str | None] = mapped_column(default=None)
     # The membership facts the authorizer decided on (#420): the group ID and

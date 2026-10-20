@@ -132,3 +132,40 @@ def test_0122_round_trip_and_tenant_provenance_constraints(isolated_migration_db
     assert "created_by_directory" not in column_names("identity_links")
     assert sql_dicts("SELECT id FROM curie.identity_links") == [{"id": old_link}]
     command.upgrade(alembic_config(), "head")
+
+
+def test_0122_downgrade_refuses_team_only_audit_before_mutating_schema(
+    isolated_migration_db,
+) -> None:
+    import pytest
+    from _migration_support import alembic_config, column_names, sql_dicts
+    from alembic import command
+
+    isolated_migration_db.at("0122")
+    approval_id, audit_id = uuid.uuid4(), uuid.uuid4()
+    sql_dicts(
+        "INSERT INTO curie.approvals (id,conversation_id,author,summary,reply_kind,reply_channel,"
+        "reply_placeholder,dedupe_key) VALUES (:id,'example-thread','U0EXAMPLE1','Example',"
+        "'slack','C0EXAMPLE1','example-ts',:dedupe)",
+        {"id": approval_id, "dedupe": uuid.uuid4().hex},
+    )
+    sql_dicts(
+        "INSERT INTO curie.approval_audit_entries (id,approval_id,action,actor,decision,authorizer,"
+        "authorized) VALUES (:id,:approval,'resolved','U0EXAMPLE1','approved',NULL,true)",
+        {"id": audit_id, "approval": approval_id},
+    )
+    before = column_names("approval_audit_entries")
+    with pytest.raises(RuntimeError, match="team-only approval audit"):
+        command.downgrade(alembic_config(), "0121")
+    assert column_names("approval_audit_entries") == before
+    assert sql_dicts("SELECT version_num FROM curie.alembic_version") == [{"version_num": "0122"}]
+    assert sql_dicts(
+        "SELECT authorizer FROM curie.approval_audit_entries WHERE id=:id", {"id": audit_id}
+    ) == [{"authorizer": None}]
+    sql_dicts("DELETE FROM curie.approval_audit_entries WHERE id=:id", {"id": audit_id})
+    command.downgrade(alembic_config(), "0121")
+    assert sql_dicts(
+        "SELECT is_nullable FROM information_schema.columns WHERE table_schema='curie' "
+        "AND table_name='approval_audit_entries' AND column_name='authorizer'"
+    ) == [{"is_nullable": "NO"}]
+    command.upgrade(alembic_config(), "head")

@@ -613,3 +613,25 @@ def test_form_parser_errors_are_private_and_do_not_link(connect_browser) -> None
     assert response.headers["cache-control"] == "private, no-store"
     assert response.headers["referrer-policy"] == "no-referrer"
     assert browser_links(tenant_id) == []
+
+
+def test_mixed_case_verified_email_resolves_canonical_authenticated_sender(migrated: None) -> None:
+    from curie_api.oidc import OidcClaims
+    from curie_api.team_authorization import resolve_email
+
+    async def body(s: AsyncSession) -> None:
+        tenant, person, _, _ = await seed(s)
+        raw = await issue(s, tenant)
+        assert raw
+        await connect.preserve_verified_claims(
+            s,
+            token=raw,
+            principal=person,
+            claims=OidcClaims(
+                ISSUER, "alice", "Alice@EXAMPLE.COM", "Alice", raw={"email_verified": True}
+            ),
+        )
+        await connect.confirm(s, token=raw, principal=person)
+        assert await resolve_email(s, tenant_id=tenant.id, email="alice@example.com") == person.id
+
+    run(body)
