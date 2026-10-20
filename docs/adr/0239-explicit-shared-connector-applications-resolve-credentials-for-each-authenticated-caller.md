@@ -48,8 +48,9 @@ paths already implement shared applications.
 1. New exclusive bundle form: `shared: {application: <immutable UUID>, contract: 1}`. It
    excludes image/build/url, secrets/secret_files, provider account, endpoint and
    credential source overrides. Alias and tools may only narrow the operator-approved
-   application policy. Operator application records pin digest, declared slots, origins
-   and policy. No arbitrary bundle-provided resolver URL.
+   application policy. Operator application records pin digest, declared slots, origins,
+   policy and, when the application emits undoable records, a separate connector-owned
+   snapshot-sealing Secret reference. No arbitrary bundle-provided resolver URL.
 
 2. Caller token v2 is `cct2.<base64url canonical JSON>.<base64url Ed25519 signature>`;
    canonical JSON uses sorted keys and no whitespace, signatures cover prefix and
@@ -81,16 +82,16 @@ paths already implement shared applications.
    /v1/resolve` accepts invocation handle, declared slot and purpose. It returns
    binding/account/revision/origins/expiry plus credential fields, or identity-only
    admission for connector-managed custody. Purpose is audit metadata and never grants
-   authority. Unknown slots, foreign handles and revoked contexts refuse before a
-   provider request.
+   authority. Unknown slots, missing or foreign handles and revoked contexts refuse
+   before a provider request.
 
 5. Resolve transaction commit is the admission boundary. Each provider API call requires
    a new resolve. No lease or cached client can authorize the next call. The reference
    SDK is one dependency-free Python 3.12-compatible source file. Adopters vendor it
    into their own Docker build directories and exercise each copy against the same
-   executable wire corpus; they never install the Python 3.13 worker package. This is a
-   new parity seam, with copies owned by each adopter. Other languages implement the
-   wire directly. The SDK builds request-local clients, restricts declared origins,
+   executable wire corpus; they never install the Python 3.13 worker package. The
+   canonical file and corpus live with the resolver in this repository; each vendored
+   copy is owned by its adopter. Other languages implement the wire directly. The SDK builds request-local clients, restricts declared origins,
    refuses credential forwarding on redirects, and partitions auth/cache state by
    binding/account/revision. A trusted connector is responsible for obeying this
    contract.
@@ -127,7 +128,9 @@ paths already implement shared applications.
 
 2. The existing proxy container also runs the resolver. Only it mounts the application
    credential private key and per-application database DSN. Server does not mount
-   either, the caller signer or a service-account token. Pod has
+   either, the caller signer or a service-account token. When required, the
+   snapshot-sealing Secret is mounted only into the server container. The proxy/resolver
+   never mounts or reads it, and it is never a resolver credential slot. Pod has
    `automountServiceAccountToken: false`, `shareProcessNamespace: false`, non-root UID,
    dropped capabilities, read-only roots and no host paths. The Unix socket uses a
    dedicated emptyDir.
@@ -291,8 +294,10 @@ paths already implement shared applications.
 2. Partially supersedes [ADR 0178](0178-the-connector-caller-token-names-the-run-and-work-item.md)
    decision 4's prefix and exact claim set, decision 1's name-only admission for
    shared mode, and decision 5's shared-server handoff. The paired claims and
-   deadline bound stand. Extends ADR 0168 decision 7 with immutable shared
-   admission. Draft ADR 0141 is context, not evidence of installed enforcement.
+   deadline bound stand. Partially supersedes ADR 0168 decision 7 for shared mode:
+   Postgres membership keyed by immutable agent ID replaces the bundle-rendered
+   `admits:` agent-name list. Its refusal semantics stand. Draft ADR 0141 is context,
+   not evidence of installed enforcement.
 
 3. Preserves ADR 0008's company boundary and ADR 0009's credential non-disclosure.
    Extends [ADR 0094](0094-a-bundle-carries-its-own-sealed-connector-keys.md) with a
