@@ -2832,6 +2832,14 @@ def test_an_early_stop_ending_needs_the_agents_reason() -> None:
         "ordinary a & b; repeated &&; entities &lt; &amp; &amp;lt;\n"
         "at entities &#64;someone &#x40;someone &commat;someone\n"
         "URL https://example.com/path?a=1&b=2",
+        "[label](https://example.com) and [label](javascript:alert(1))",
+        *("\\" * count + "[label](https://example.com)" for count in range(5)),
+        r"!\[image](https://example.com/x.png) and \![image](https://example.com/x.png)",
+        r"literal [brackets] and C:\temp\\files; escaped closing \] and repeated \\\\ here",
+        "[label][ref]\n[ref]: https://example.com/?a=1&amp;b=2",
+        "[![image](https://example.com/x.png)](https://example.com)",
+        r"`\[label](https://example.com) and \\`",
+        "```text\n\\[label](https://example.com)\n!\\[image](https://example.com/x.png)\n```",
     ],
 )
 def test_the_agent_message_round_trips_out_of_the_final_comment(message: str, newline: str) -> None:
@@ -2845,6 +2853,11 @@ def test_agent_message_parser_reverses_only_quote_escapes_once() -> None:
         "> &lt;\u200b!-- curie-status:final -->\n"
         "> &lt;img src=x>\n"
         "> !\\[x](https://example.invalid/x.png)\n"
+        r"> \[label](https://example.com)" "\n"
+        r"> \\\[escaped](javascript:alert(1))" "\n"
+        r"> !\\\[image](https://example.com/x.png)" "\n"
+        r"> literal \[brackets] and C:\\temp\\\\files" "\n"
+        r"> repeated \\\\\\\\ backslashes" "\n"
         "> @\u200bsomeone\n"
         "> &amp;amp;lt; stays an entity\n"
         "> &amp;lt; is a literal less-than entity\n"
@@ -2862,6 +2875,11 @@ def test_agent_message_parser_reverses_only_quote_escapes_once() -> None:
         "<!-- curie-status:final -->\n"
         "<img src=x>\n"
         "![x](https://example.invalid/x.png)\n"
+        "[label](https://example.com)\n"
+        r"\[escaped](javascript:alert(1))" "\n"
+        r"!\[image](https://example.com/x.png)" "\n"
+        r"literal [brackets] and C:\temp\\files" "\n"
+        r"repeated \\\\ backslashes" "\n"
         "@someone\n"
         "&amp;lt; stays an entity\n"
         "&lt; is a literal less-than entity\n"

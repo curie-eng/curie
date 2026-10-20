@@ -202,13 +202,15 @@ async def test_jira_comments_raw_markdown_obeys_commonmark_entity_rules() -> Non
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    "url", ["https://example.com/?a=1&b=2", "https://example.com/?a=1&amp;b=2"]
+    "url",
+    ["https://example.com/?a=1&b=2", "https://example.com/?a=1&amp;b=2", "javascript:alert(1)"],
 )
-async def test_jira_comments_handoff_decodes_link_urls_exactly_once(url: str) -> None:
+async def test_jira_comments_handoff_links_stay_inert_and_visible(url: str) -> None:
     fake, tracker, target = _setup()
+    card_url = "https://example.com/status.svg?a=1&b=2"
     body = status_body(
         request_id=REQUEST_ID,
-        card_url=None,
+        card_url=card_url,
         pill_label="FAILED",
         phase_view=None,
         result=result_section("no_pull_request", pr_url=None, detail=f"[query]({url})"),
@@ -217,13 +219,17 @@ async def test_jira_comments_handoff_decodes_link_urls_exactly_once(url: str) ->
     assert written.written is True
     (create,) = fake.requests_of("comment_create")
     (quote,) = [node for node in create.json["body"]["content"] if node["type"] == "blockquote"]
-    assert flatten(quote).strip() == "query"
+    assert flatten(quote).strip() == f"[query]({url})"
     nodes = [quote]
     for node in nodes:
         nodes.extend(node.get("content", []))
-    links = [mark for node in nodes for mark in node.get("marks", []) if mark["type"] == "link"]
-    # https://go.atlassian.com/adf-json-schema #/definitions/link_mark
-    assert links == [{"type": "link", "attrs": {"href": url}}]
+    assert not any(mark["type"] == "link" for node in nodes for mark in node.get("marks", []))
+    outside = [node for node in create.json["body"]["content"] if node["type"] != "blockquote"]
+    for node in outside:
+        outside.extend(node.get("content", []))
+    assert [
+        mark for node in outside for mark in node.get("marks", []) if mark["type"] == "link"
+    ] == [{"type": "link", "attrs": {"href": card_url}}]
 
 
 @pytest.mark.anyio
