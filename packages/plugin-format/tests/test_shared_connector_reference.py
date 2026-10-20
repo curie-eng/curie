@@ -65,6 +65,51 @@ def test_dedicated_model_dump_omits_shared_and_roundtrips(case: dict) -> None:
     assert ConnectorSpec.model_validate(dumped) == spec
 
 
+@pytest.mark.parametrize(
+    "case",
+    [case for case in CASES if case["accept"] and not case["activation"]],
+    ids=lambda case: case["name"],
+)
+def test_shared_and_mixed_serialization_roundtrips_exclusive_shape(case: dict) -> None:
+    document = _document(case)
+    bundle = ConnectorsFile.model_validate(document)
+    for serialized in (bundle.model_dump(), json.loads(bundle.model_dump_json())):
+        assert ConnectorsFile.model_validate(serialized) == bundle
+        for alias, declaration in document["connectors"].items():
+            if "shared" in declaration:
+                spec = bundle.connectors[alias]
+                assert spec.model_dump() == declaration
+                assert json.loads(spec.model_dump_json()) == declaration
+                assert serialized["connectors"][alias] == declaration
+                assert ConnectorSpec.model_validate(spec.model_dump()) == spec
+                assert ConnectorSpec.model_validate_json(spec.model_dump_json()) == spec
+    assert ConnectorsFile.model_validate_json(bundle.model_dump_json()) == bundle
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda spec: connector_render.caller_proxy_port(spec),
+        lambda spec: connector_render.resolved_admits(spec, "acme-bot"),
+        lambda spec: connector_render.render_service("acme", "acme-bot", "docs", spec),
+        lambda spec: connector_render.render_direct_service("acme", "acme-bot", "docs", spec),
+        lambda spec: connector_render.render_deployment(
+            "acme", "acme-bot", "acme", "docs", spec, "acme-secrets"
+        ),
+        lambda spec: connector_render.render_networkpolicy(
+            "acme", "acme-bot", "curie", "docs", spec
+        ),
+        lambda spec: connector_render.render_ingress_networkpolicy(
+            "acme", "acme-bot", "curie", "docs", spec
+        ),
+    ],
+    ids=["proxy-port", "admits", "service", "direct-service", "deployment", "egress", "ingress"],
+)
+def test_direct_dedicated_render_helpers_refuse_shared(call) -> None:
+    with pytest.raises(ValueError, match="shared_connector_requires_application"):
+        call(ConnectorSpec(shared=REFERENCE))
+
+
 # JSON Schema regards 1 and 1.0 as equal; both production parsers enforce strict integers.
 @pytest.mark.parametrize(
     "case",

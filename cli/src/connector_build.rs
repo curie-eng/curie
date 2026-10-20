@@ -3038,6 +3038,77 @@ mod shared_connector_reference_tests {
     }
 
     #[test]
+    fn shared_and_mixed_serialization_roundtrips_exclusive_shape() {
+        for case in cases().into_iter().filter(|case| case["accept"] == true) {
+            let document = document(&case);
+            let parsed = parse_connectors(&serde_norway::to_string(&document).unwrap()).unwrap();
+            let serialized = serde_json::to_value(&parsed).unwrap();
+            for (alias, spec) in document["connectors"].as_object().unwrap() {
+                if spec.get("shared").is_some() {
+                    assert_eq!(
+                        &serde_json::to_value(&parsed.connectors[alias]).unwrap(),
+                        spec
+                    );
+                    assert_eq!(&serialized["connectors"][alias], spec);
+                }
+            }
+            if case["name"] == "shared" {
+                assert_eq!(serialized, document);
+            }
+            let reparsed =
+                parse_connectors(&serde_norway::to_string(&serialized).unwrap()).unwrap();
+            assert_eq!(serde_json::to_value(reparsed).unwrap(), serialized);
+        }
+    }
+
+    #[test]
+    fn direct_builders_refuse_shared_shape_before_activation() {
+        let lock = ConnectorLockFileDecl {
+            version: LOCK_VERSION,
+            ..Default::default()
+        };
+        let identity = ConnectorScope {
+            release: "acme".into(),
+            agent: "acme-bot".into(),
+            namespace: "acme".into(),
+        };
+        let volumes = ConnectorSecretVolumes {
+            run_id: "acme-run".into(),
+            volumes: BTreeMap::new(),
+        };
+        for case in cases()
+            .into_iter()
+            .filter(|case| case["accept"] == true && case["activation"] == false)
+        {
+            let declaration =
+                parse_connectors(&serde_norway::to_string(&document(&case)).unwrap()).unwrap();
+            let spec = &declaration.connectors["docs"];
+            let errors = [
+                resolved_image("docs", spec, &lock).unwrap_err(),
+                compose_overlay(&lock, &declaration, &identity, "acme-run", &volumes, None)
+                    .unwrap_err(),
+                volumes.mounts("docs", spec).unwrap_err(),
+                crate::commands::skill_connector_plan(&declaration, &lock).unwrap_err(),
+                crate::docker::ConnectorStartSpec::from_declaration(
+                    "docs",
+                    spec,
+                    "example.com/acme/server:1",
+                    &identity,
+                    "acme-network",
+                    "acme-run",
+                    &volumes,
+                    &BTreeMap::new(),
+                    None,
+                )
+                .unwrap_err(),
+            ];
+            for error in errors {
+                assert!(format!("{error:#}").contains("shared_connector_requires_application"));
+            }
+        }
+    }
+
+    #[test]
     fn shared_connector_load_refuses_activation_and_keeps_dedicated_live() {
         let bundle = tempfile::tempdir().unwrap();
         for case in cases() {

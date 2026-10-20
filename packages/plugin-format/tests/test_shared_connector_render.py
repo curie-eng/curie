@@ -281,6 +281,47 @@ def test_shared_resources_preserve_explicit_bounds() -> None:
     assert all(container["resources"] == resources for container in containers)
 
 
+def test_shared_outputs_omit_dedicated_prune_ownership() -> None:
+    application = _application()
+
+    def check(value) -> None:
+        if isinstance(value, dict):
+            assert "curie.dev/connector-owner" not in value
+            for child in value.values():
+                check(child)
+        elif isinstance(value, list):
+            for child in value:
+                check(child)
+
+    check(render_application(application) + render_member_reach(application, _member(application)))
+
+
+@pytest.mark.parametrize("invalid", ["runner-selector", "snapshot-overlap", "secret-ref"])
+def test_render_revalidates_mutable_and_unvalidated_inputs(invalid: str) -> None:
+    neighbor = _application()
+    expected = render_application(neighbor), render_member_reach(neighbor, _member(neighbor))
+    application = _application()
+    member = _member(application)
+    if invalid == "runner-selector":
+        member.runner_labels.clear()
+    else:
+        field = "snapshot_seal" if invalid == "snapshot-overlap" else "encryption_key"
+        reference = (
+            application.encryption_key
+            if invalid == "snapshot-overlap"
+            else (SecretKeyRef.model_construct(name="../invalid", key="private"))
+        )
+        application = application.model_copy(update={field: reference})
+        with pytest.raises(ValueError):
+            render_application(application)
+    with pytest.raises(ValueError):
+        render_member_reach(application, member)
+    assert (
+        render_application(neighbor),
+        render_member_reach(neighbor, _member(neighbor)),
+    ) == expected
+
+
 @pytest.mark.parametrize(
     "changes",
     [{"installation": value} for value in ("", "a b", "a\tb", "a\x00b", "x" * 129, "é" * 65, 1)]
