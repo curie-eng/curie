@@ -20,6 +20,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -48,9 +49,16 @@ ACQUISITION_ACTIONS = frozenset(
 RETRY_ALLOWLIST = frozenset(
     {
         ("ci.yaml", "adapter-credential-reconciliation", "Install uv"),
-        ("ci.yaml", "python", "Install uv"),
+        ("ci.yaml", "python-container-fixtures", "Install uv"),
+        ("ci.yaml", "python-container-fixtures", "Install Helm"),
+        (
+            "ci.yaml",
+            "python-container-fixtures",
+            "Install kind and kubectl without creating a cluster",
+        ),
         ("ci.yaml", "python-static", "Install uv"),
         ("ci.yaml", "python-pytest", "Install uv"),
+        ("ci.yaml", "ci-policy", "Install uv"),
         ("ci.yaml", "turn-canary-contract", "Install uv"),
         ("fix-pin.yaml", "fix-pin", "Install uv"),
         (
@@ -83,8 +91,8 @@ RETRY_ALLOWLIST = frozenset(
         ),
         ("ci.yaml", "images", "Set up QEMU"),
         ("ci.yaml", "images", "Set up Buildx"),
-        ("ci.yaml", "docker-daemon", "Set up Buildx"),
-        ("ci.yaml", "repo-toolchain-proof", "Install uv"),
+        ("ci.yaml", "image-proofs", "Docker daemon: Set up Buildx"),
+        ("ci.yaml", "image-proofs", "Toolchain: Install uv"),
         ("ci.yaml", "changes", "Install uv"),
         ("ci.yaml", "e2e-ladder-cluster", "Install Helm"),
         ("ci.yaml", "e2e-ladder-cluster", "Install uv for publication proof"),
@@ -192,6 +200,8 @@ RETRY_ALLOWLIST = frozenset(
 PROTECTED_STEPS = frozenset(
     {
         ("ci.yaml", "python-pytest", "Pytest"),
+        ("ci.yaml", "ci-policy", "Pytest"),
+        ("ci.yaml", "python-container-fixtures", "Pytest"),
         ("ci.yaml", "python-static", "Docs gate (catalog drift + agent contract + citations)"),
         ("ci.yaml", "rust-test", "Test"),
         ("ci.yaml", "rust-convergence", "Test"),
@@ -200,10 +210,10 @@ PROTECTED_STEPS = frozenset(
         ("ci.yaml", "commit-messages", "Check the PR's commit messages"),
         (
             "ci.yaml",
-            "repo-toolchain-proof",
-            "Absent image fails in required mode (negative control)",
+            "image-proofs",
+            "Toolchain: Absent image fails in required mode (negative control)",
         ),
-        ("ci.yaml", "repo-toolchain-proof", "Repository toolchain proof"),
+        ("ci.yaml", "image-proofs", "Toolchain: Repository toolchain proof"),
         # Security gates. Retrying any of these reruns a scan or a verification
         # against the very same tree or the very same asset set, so a second
         # attempt cannot recover anything and can only bury a true positive.
@@ -297,8 +307,8 @@ RUN_RETRY_EXEMPT: frozenset[tuple[str, str, str]] = frozenset(
         # is already reachable. Neither re invokes repository code, and neither
         # retries a mutation whose failure would be a defect: if either never
         # becomes ready the step fails the job rather than papering over it.
-        ("ci.yaml", "ui-image-smoke", "Start the stub API upstream"),
-        ("ci.yaml", "ui-image-smoke", "Start the UI container"),
+        ("ci.yaml", "image-proofs", "UI: Start the stub API upstream"),
+        ("ci.yaml", "image-proofs", "UI: Start the UI container"),
     }
 )
 
@@ -387,11 +397,13 @@ def _step_name(step: dict[str, Any]) -> str | None:
 
 def _base_name(name: str) -> str:
     """Fold a backoff step or a retry copy back onto its attempt 1 name."""
-    if name.startswith(BACKOFF_PREFIX):
-        return name[len(BACKOFF_PREFIX) :]
-    if name.endswith(RETRY_SUFFIX):
-        return name[: -len(RETRY_SUFFIX)]
-    return name
+    group, separator, label = name.rpartition(": ")
+    return group + separator + label.removeprefix(BACKOFF_PREFIX).removesuffix(RETRY_SUFFIX)
+
+
+def _backoff_name(base: str) -> str:
+    group, separator, label = base.rpartition(": ")
+    return group + separator + BACKOFF_PREFIX + label
 
 
 def _continue_on_error(step: dict[str, Any]) -> bool:
@@ -434,7 +446,7 @@ def _carries_retry(step: dict[str, Any]) -> bool:
     if isinstance(condition, str) and OUTCOME_REFERENCE.search(condition):
         return True
     name = _step_name(step)
-    if name is not None and (name.endswith(RETRY_SUFFIX) or name.startswith(BACKOFF_PREFIX)):
+    if name is not None and name != _base_name(name):
         return True
     body = step.get("run")
     if isinstance(body, str) and RUN_LOOP_SENTINEL in body:
@@ -498,7 +510,7 @@ def _locate_trio(steps: list[Any], base: str) -> Trio:
         name = _step_name(step)
         if name == base:
             attempt = LocatedStep(index, step)
-        elif name == BACKOFF_PREFIX + base:
+        elif name == _backoff_name(base):
             backoff = LocatedStep(index, step)
         elif name == base + RETRY_SUFFIX:
             retry = LocatedStep(index, step)
@@ -556,7 +568,7 @@ def _trio_problems(base: str, trio: Trio) -> list[str]:
     if attempt is None:
         return ["no attempt step"]
     if backoff is None:
-        problems.append(f"no `{BACKOFF_PREFIX}{base}` step")
+        problems.append(f"no `{_backoff_name(base)}` step")
     if retry is None:
         problems.append(f"no `{base}{RETRY_SUFFIX}` step")
     if backoff is None or retry is None:
@@ -672,7 +684,7 @@ def test_rule_3_every_allowlisted_step_is_an_acquisition_step() -> None:
     ineligible: list[Identity] = []
     for filename, job_id, _index, step in _iter_steps():
         name = _step_name(step)
-        if name is None or name.startswith(BACKOFF_PREFIX):
+        if name is None or name == _backoff_name(_base_name(name)):
             # The backoff step is a sleep, not an attempt, so it is not held to
             # the acquisition rule.
             continue
@@ -885,6 +897,27 @@ def test_rule_6_every_allowlisted_wrap_is_a_complete_faithful_trio() -> None:
         f"implies {expected}. Either a wrap's attempt step vanished or it stopped "
         "being a `uses:` step, and this rule silently stopped checking it"
     )
+
+
+def test_grouped_acquisition_names_and_trios() -> None:
+    steps = _load_workflows()["ci.yaml"]["jobs"]["image-proofs"]["steps"]
+    for base in ("Docker daemon: Set up Buildx", "Toolchain: Install uv"):
+        assert ("ci.yaml", "image-proofs", base) in RETRY_ALLOWLIST
+        assert _base_name(_backoff_name(base)) == _base_name(base + RETRY_SUFFIX) == base
+        assert _carries_retry({"name": _backoff_name(base)})
+        assert not _trio_problems(base, _locate_trio(steps, base))
+        for missing in (_backoff_name(base), base + RETRY_SUFFIX):
+            reduced = [step for step in steps if step.get("name") != missing]
+            assert f"no `{missing}` step" in _trio_problems(base, _locate_trio(reduced, base))
+
+
+def test_a_grouped_proof_retry_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = "Toolchain: Repository toolchain proof"
+    assert ("ci.yaml", "image-proofs", base) in PROTECTED_STEPS
+    retry = ("ci.yaml", "image-proofs", 0, {"name": base + RETRY_SUFFIX})
+    monkeypatch.setitem(globals(), "_iter_steps", lambda: iter([retry]))
+    with pytest.raises(AssertionError, match="not on RETRY_ALLOWLIST"):
+        test_rule_1_every_retry_carrying_step_is_allowlisted()
 
 
 def test_run_retry_construct_detects_every_constructed_shape() -> None:

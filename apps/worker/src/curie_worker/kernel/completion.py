@@ -151,6 +151,12 @@ async def _complete(
                     cause = "no_pull_request"
                 else:
                     cause = failures._unpublished_cause(turn.tools_called)
+                if (
+                    cause == "no_pull_request"
+                    and run.recorded_pr_url is not None
+                    and run.recorded_pr_url.strip()
+                ):
+                    cause = "revision_unchanged"
                 try:
                     await self._finish_or_settle(
                         run,

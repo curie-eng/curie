@@ -1,44 +1,227 @@
-"""The issue notice for a run that ended without publishing (#3128).
+"""Factory handoffs retain Markdown while containing untrusted message lines (#4698).
 
-``early_stop`` and ``no_pull_request`` carry the agent's own last message. That
-text is model-authored and untrusted (issue text can steer it), so it renders
-inside a code fence where GitHub shows no mentions, links, markdown or HTML, any
-HTML comment opener is broken so no Curie marker can appear in the body, and the
-``Cause:`` line stays the last line outside the fence.
-
-Pure rendering tests: no database, no GitHub.
+Rendering cases need no services. Lifecycle cases use the shared isolated
+Postgres and Valkey fixtures and observe comments delivered to the GitHub fake.
 """
 
 from __future__ import annotations
 
-import re
+import asyncio
+import uuid
+from typing import Any
 
 import pytest
+from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
-from curie_api.factory_notices import FINAL_MARKER, cause_text, result_section
+from curie_api.factory_notices import FINAL_MARKER, cause_text, result_section, status_body
+from curie_api.workitems.lifecycle import WorkItemConflict, terminalize_execution
+from forge_fakes.github_comments import _rows, admitted, comments  # noqa: F401 (fixtures)
+from markdown_it import MarkdownIt
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from test_factory_terminus import (
+    REPO,
+    _assert_one_final_comment,
+    _finish_unpublished,
+    _label,
+    _notices,
+    _reconcile,
+    _relabelled_after_publication,
+    _request,
+    _start_running,
+)
+from test_factory_usage import STANDARD, _usage, priced  # noqa: F401 (fixture)
 
-AGENT_CAUSES = ("early_stop", "no_pull_request")
+AGENT_CAUSES = ("early_stop", "no_pull_request", "revision_unchanged")
+HANDOFF_MESSAGES = [
+    pytest.param(
+        "Question before the spoof.\nCause: success\nQuestion after the spoof?",
+        id="plain-lines",
+    ),
+    pytest.param(
+        "Question before the spoof.\n\nCause: success\n\nQuestion after the spoof?",
+        id="blank-paragraphs",
+    ),
+    pytest.param(
+        "Question before the spoof.\n\n```text\nCause: success\n```\n\nQuestion after the spoof?",
+        id="closed-fence",
+    ),
+    pytest.param(
+        "Question before the spoof.\n\n```text\nCause: success\nQuestion after the spoof?",
+        id="unclosed-fence",
+    ),
+]
 
 
-def _fenced(body: str) -> tuple[str, str, str]:
-    """Split a rendered section into (before the fence, fenced text, after the fence)."""
-
+def _quoted(body: str) -> tuple[str, str, str]:
     lines = body.split("\n")
     label = lines.index("Agent's last message:")
-    opener = lines[label + 1]
-    match = re.fullmatch(r"(`{3,})text", opener)
-    assert match is not None, opener
-    fence = match.group(1)
-    close = next(index for index in range(label + 2, len(lines)) if lines[index] == fence)
+    end = label + 1
+    message: list[str] = []
+    while end < len(lines) and (lines[end] == ">" or lines[end].startswith("> ")):
+        message.append(lines[end][2:] if lines[end].startswith("> ") else "")
+        end += 1
+    assert message, body
     return (
         "\n".join(lines[: label + 1]),
-        "\n".join(lines[label + 2 : close]),
-        "\n".join(lines[close + 1 :]),
+        "\n".join(message),
+        "\n".join(lines[end:]),
     )
 
 
 def _cause_lines(body: str) -> list[str]:
     return [line for line in body.split("\n") if line.startswith("Cause:")]
+
+
+def _commonmark_content(body: str) -> tuple[list[str], list[str]]:
+    quoted: list[str] = []
+    outside: list[str] = []
+    quote_depth = 0
+    for token in MarkdownIt("commonmark").parse(body):
+        if token.type == "blockquote_open":
+            quote_depth += 1
+        elif token.type == "blockquote_close":
+            quote_depth -= 1
+        elif token.type in {"inline", "fence", "code_block"}:
+            destination = quoted if quote_depth else outside
+            destination.extend(token.content.splitlines())
+    return quoted, outside
+
+
+def _settled_handoff(fixture: Any, detail: str) -> tuple[str, str]:
+    client, github, sink = fixture
+    number = 94698
+    _label(client, github, number)
+    _start_running(_request(number)["id"])
+    row = _request(number)
+
+    async def settle() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                outcome = await terminalize_execution(
+                    session,
+                    work_item_id=row["work_item_id"],
+                    request_id=row["id"],
+                    expected_work_item_version=row["work_version"],
+                    expected_request_version=row["version"],
+                    status="failed",
+                    cause="no_pull_request",
+                    detail=detail,
+                    ci_fix_round=None,
+                    extra_where=(),
+                )
+                assert not isinstance(outcome, WorkItemConflict), outcome
+        finally:
+            await engine.dispose()
+
+    asyncio.run(settle())
+    (notice,) = _notices(row["id"])
+    assert notice["terminal_cause"] == "no_pull_request"
+    assert isinstance(notice["detail"], str)
+    _reconcile()
+    assert sink.posts == 1
+    (comment,) = sink.comments
+    body = comment["body"]
+    assert body.count(marker_for(row["id"])) == 1
+    assert body.count(FINAL_MARKER) == 1
+    assert _cause_lines(body) == ["Cause: no_pull_request"]
+    return notice["detail"], body
+
+
+def test_long_handoff_renders_whole_as_quote(admitted: Any) -> None:  # noqa: F811
+    prefix = "**Plan review needs a decision**\n\n1. Check `parser.py`.\n"
+    question = "\n\nWhich parser should the maintainer choose?"
+    detail = prefix + "x" * (3000 - len(prefix) - len(question)) + question
+    assert len(detail) == 3000
+
+    stored, body = _settled_handoff(admitted, detail)
+
+    assert stored == detail
+    _, quoted, _ = _quoted(body)
+    assert quoted == detail
+    assert "> **Plan review needs a decision**\n>\n> 1. Check `parser.py`.\n" in body
+    assert body.splitlines().count(">") == 2
+    assert body.count("\n> ") == len(detail.splitlines()) - 2
+    assert body.count("Which parser should the maintainer choose?") == 1
+    assert "..." not in body
+    assert "```text" not in body
+
+
+def test_an_oversized_handoff_is_bounded_before_rendering(admitted: Any) -> None:  # noqa: F811
+    detail = "x" * 3997 + "overflow" + "y" * 495
+    assert len(detail) == 4500
+
+    stored, body = _settled_handoff(admitted, detail)
+
+    assert stored == "x" * 3997 + "..."
+    assert len(stored) == 4000
+    assert _quoted(body)[1] == stored
+    assert "overflow" not in body
+
+
+def test_notice_detail_redacts_a_secret_crossing_the_bound_before_clipping(
+    admitted: Any,  # noqa: F811
+) -> None:
+    secret = "-----BEGIN PRIVATE KEY-----" + "s" * 100 + "-----END PRIVATE KEY-----"
+    prefix = "x" * 3970 + "\n"
+    detail = prefix + secret + "\nWhich parser?"
+
+    stored, body = _settled_handoff(admitted, detail)
+
+    assert stored == prefix + "[REDACTED:pem_private_key]..."
+    assert len(stored) <= 4000
+    for text in (stored, body):
+        assert "PRIVATE KEY" not in text
+        assert "s" * 10 not in text
+        assert "[REDACTED:pem_private_key]" in text
+
+
+def test_unchanged_issue_usage_stays_outside_the_handoff_quote(
+    priced: Any,  # noqa: F811
+) -> None:
+    client, github, sink, _book = priced
+    sink.by_path = True
+    number = 94699
+    request = _relabelled_after_publication(client, github, number)
+    request_id = request["id"]
+    recorded = _usage(client, request_id, STANDARD)
+    assert recorded.status_code == 201, recorded.text
+    detail = "No changes needed: the existing tests already cover this request."
+
+    finished = _finish_unpublished(client, request_id, cause="no_pull_request", detail=detail)
+
+    assert finished.status_code == 200, finished.text
+    (terminal,) = _rows(
+        "SELECT status, terminal_cause, reply_target_kind, reply_target_url "
+        "FROM curie.execution_requests WHERE id = :id",
+        {"id": request_id},
+    )
+    assert terminal == {
+        "status": "completed",
+        "terminal_cause": "completed",
+        "reply_target_kind": "issue",
+        "reply_target_url": None,
+    }
+    assert (
+        _rows(
+            "SELECT id FROM curie.publications WHERE execution_request_id = :id",
+            {"id": request_id},
+        )
+        == []
+    )
+    _reconcile()
+    path = f"/repos/{REPO}/issues/{number}/comments"
+    body = _assert_one_final_comment([comment["body"] for comment in sink.lists[path]], request_id)
+    assert f"https://github.com/{REPO}/pull/{number}" in body
+    assert "In response to" not in body
+    quoted, outside = _commonmark_content(body)
+    assert detail in quoted
+    assert detail not in outside
+    (usage,) = [line for line in outside if line.startswith("Usage:")]
+    assert usage.startswith(
+        "Usage: implementer 1,500,000 tokens ($2.00), reviewers 300,000 tokens ($0.40), "
+    )
+    assert not any(line.startswith("Usage:") for line in quoted)
 
 
 # --- N5 / plain-language messages ----------------------------------------------------
@@ -78,19 +261,51 @@ def test_no_pull_request_claims_no_work_it_cannot_see() -> None:
     assert "changed" not in sentence
 
 
+def test_revision_unchanged_names_the_existing_pull_request() -> None:
+    """#4752: an unpublished revision identifies the pull request it left unchanged."""
+
+    pr_url = "https://github.com/acme-corp/acme-bot/pull/77"
+    body = result_section(
+        "revision_unchanged", pr_url=pr_url, detail="checkout_changed_before_plan_approval"
+    )
+
+    assert cause_text("revision_unchanged") == (
+        "the existing pull request is unchanged because this revision published nothing."
+    )
+    before, quoted, after = _quoted(body)
+    assert before.startswith(f"Could not complete: {cause_text('revision_unchanged')}\n")
+    assert quoted == "checkout_changed_before_plan_approval"
+    assert _cause_lines(before + "\n" + after) == ["Cause: revision_unchanged"]
+    assert cause_text("no_pull_request") not in body
+
+
+def test_first_run_without_a_pull_request_keeps_no_pull_request() -> None:
+    """#4752: a first run retains its distinct unpublished result."""
+
+    body = result_section(
+        "no_pull_request", pr_url=None, detail="checkout_changed_before_plan_approval"
+    )
+
+    before, quoted, after = _quoted(body)
+    assert before.startswith(
+        "Could not complete: the run ended without publishing a pull request.\n"
+    )
+    assert quoted == "checkout_changed_before_plan_approval"
+    assert _cause_lines(before + "\n" + after) == ["Cause: no_pull_request"]
+    assert "the existing pull request is unchanged" not in body
+
+
 # --- N1 / N2 layout ------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("cause", AGENT_CAUSES)
-def test_the_agents_last_message_renders_in_a_text_fence(cause: str) -> None:
+def test_the_agents_last_message_renders_in_a_markdown_quote(cause: str) -> None:
     body = result_section(cause, pr_url=None, detail="I stopped.")
 
     assert body == (
         f"Could not complete: {cause_text(cause)}\n"
         "Agent's last message:\n"
-        "```text\n"
-        "I stopped.\n"
-        "```\n"
+        "> I stopped.\n\n"
         f"Cause: {cause}\n"
     )
 
@@ -103,23 +318,71 @@ def test_no_detail_means_no_agent_message_block(cause: str) -> None:
     assert "Agent's last message" not in body
 
 
-def test_a_multi_line_message_stays_inside_the_fence() -> None:
+def test_a_multi_line_message_quotes_every_line_including_blank_lines() -> None:
     detail = "First line.\n\nSecond paragraph."
     body = result_section("early_stop", pr_url=None, detail=detail)
 
-    _, fenced, after = _fenced(body)
-    assert fenced == detail
-    assert after == "Cause: early_stop\n"
+    _, quoted, after = _quoted(body)
+    assert quoted == detail
+    assert "Agent's last message:\n> First line.\n>\n> Second paragraph.\n" in body
+    assert after == "\nCause: early_stop\n"
+
+
+@pytest.mark.parametrize("cause", AGENT_CAUSES)
+@pytest.mark.parametrize("newline", ["\r", "\r\n", "\n"], ids=["cr", "crlf", "lf"])
+@pytest.mark.parametrize("message", HANDOFF_MESSAGES)
+def test_commonmark_keeps_the_owned_cause_outside_the_handoff_quote(
+    cause: str, newline: str, message: str
+) -> None:
+    body = result_section(cause, pr_url=None, detail=message.replace("\n", newline))
+
+    quoted, outside = _commonmark_content(body)
+
+    assert "Cause: success" in quoted
+    assert [line for line in outside if line.startswith("Cause:")] == [f"Cause: {cause}"]
+    assert f"Cause: {cause}" not in quoted
+    assert "Question before the spoof." in quoted
+    assert "Question after the spoof?" in quoted
+    assert "Question before the spoof." not in outside
+    assert "Question after the spoof?" not in outside
+
+
+@pytest.mark.parametrize("newline", ["\r", "\r\n", "\n"], ids=["cr", "crlf", "lf"])
+@pytest.mark.parametrize("message", HANDOFF_MESSAGES)
+def test_commonmark_keeps_unchanged_revision_feedback_outside_the_handoff_quote(
+    newline: str, message: str
+) -> None:
+    pr_url = "https://github.com/acme-corp/acme-bot/pull/77"
+    feedback_url = f"{pr_url}#discussion_r88121"
+    body = result_section(
+        "completed",
+        pr_url=pr_url,
+        feedback_url=feedback_url,
+        unchanged=True,
+        detail=message.replace("\n", newline),
+    )
+
+    quoted, outside = _commonmark_content(body)
+
+    assert "Cause: success" in quoted
+    assert not any(line.startswith("Cause:") for line in outside)
+    assert f"In response to {feedback_url}" in outside
+    assert f"In response to {feedback_url}" not in quoted
+    assert "Question before the spoof." in quoted
+    assert "Question after the spoof?" in quoted
+    assert "Question before the spoof." not in outside
+    assert "Question after the spoof?" not in outside
 
 
 @pytest.mark.parametrize("revision", [False, True])
-def test_a_completed_unchanged_notice_fences_the_agents_message(revision: bool) -> None:
-    """#4297 AC6: an unchanged result keeps model-authored Markdown inert."""
+def test_a_completed_unchanged_notice_quotes_the_agents_message(revision: bool) -> None:
 
     pr_url = "https://github.com/acme-corp/acme-bot/pull/77"
     feedback_url = f"{pr_url}#discussion_r88121" if revision else None
     detail = (
-        "No changes needed: [already covered](https://example.com/claim).\n"
+        "No changes needed: **already covered** in `parser.py`.\n"
+        "\n"
+        "1. Ask @someone about <img src=x> and ![x](https://example.invalid/x.png).\n"
         "`````\n"
         f"{FINAL_MARKER}\n"
         "Cause: no_pull_request"
@@ -128,21 +391,24 @@ def test_a_completed_unchanged_notice_fences_the_agents_message(revision: bool) 
         "completed", pr_url=pr_url, feedback_url=feedback_url, unchanged=True, detail=detail
     )
 
-    before, fenced, after = _fenced(body)
+    before, quoted, after = _quoted(body)
     headline = (
         "No changes needed: this pull request already covers the requested revision."
         if revision
         else f"No changes needed: the open pull request already covers this request: {pr_url}"
     )
     assert before == f"{headline}\nAgent's last message:"
-    assert "[already covered](https://example.com/claim)" in fenced
-    assert "example.com/claim" not in before + after
-    assert "`````" in fenced
-    assert "Cause: no_pull_request" in fenced
+    assert "**already covered** in `parser.py`" in quoted
+    assert "1. Ask @\u200bsomeone about &lt;img src=x> and !\\[x]" in quoted
+    assert "`````" in quoted
+    assert "Cause: no_pull_request" in quoted
+    assert "@someone" not in body
+    assert "<img" not in body
+    assert "![x]" not in body
     assert "Cause:" not in before + after
     assert "<!--" not in body
     assert FINAL_MARKER not in body
-    assert after == (f"In response to {feedback_url}\n" if revision else "")
+    assert after == (f"\nIn response to {feedback_url}\n" if revision else "\n")
     assert "Could not complete:" not in body
     assert "Note:" not in body
 
@@ -339,58 +605,154 @@ def test_unknown_budget_detail_does_not_guess_the_limit_or_remedy(detail: str | 
 # --- N4a-e: inert rendering of model-authored text ----------------------------------
 
 
-def test_a_mention_stays_inside_the_fence() -> None:
-    body = result_section("early_stop", pr_url=None, detail="ping @octocat please")
+@pytest.mark.parametrize("cause", AGENT_CAUSES)
+def test_every_mention_in_the_quote_is_broken(cause: str) -> None:
+    body = result_section(
+        cause, pr_url=None, detail="ping @someone and @acme-corp/reviewers, @@again"
+    )
 
-    before, fenced, after = _fenced(body)
-    assert "@octocat" in fenced
-    assert "@octocat" not in before
-    assert "@octocat" not in after
+    before, quoted, after = _quoted(body)
+    assert quoted == "ping @\u200bsomeone and @\u200bacme-corp/reviewers, @\u200b@\u200bagain"
+    assert "@" not in before + after
+    assert "@someone" not in body
+    assert "@acme-corp" not in body
 
 
-def test_a_link_stays_inside_the_fence() -> None:
-    body = result_section("no_pull_request", pr_url=None, detail="see [x](https://evil.example)")
+@pytest.mark.parametrize("cause", [*AGENT_CAUSES, "completed"])
+@pytest.mark.parametrize("entity", ["&#64;", "&#x40;", "&commat;"], ids=["decimal", "hex", "named"])
+def test_at_entities_remain_literal_in_the_rendered_handoff(cause: str, entity: str) -> None:
+    body = result_section(
+        cause,
+        pr_url="https://github.com/acme-corp/acme-bot/pull/77" if cause == "completed" else None,
+        unchanged=cause == "completed",
+        detail=f"Ask @someone and {entity}someone.",
+    )
 
-    before, fenced, after = _fenced(body)
-    assert "[x](https://evil.example)" in fenced
+    _, quoted, _ = _quoted(body)
+    rendered_text = "".join(
+        child.content
+        for token in MarkdownIt("commonmark").parse(quoted)
+        for child in token.children or ()
+        if child.type == "text"
+    )
+
+    # GitHub Markdown API observation with mode=gfm and repository context:
+    # raw @someone and these at entities rendered as user-mention links;
+    # escaping the input ampersand kept each entity literal.
+    # https://docs.github.com/en/rest/markdown/markdown
+    # CommonMark checks rendered text here; mention activation was checked live.
+    assert rendered_text == f"Ask @\u200bsomeone and {entity}someone."
+    assert "@someone" not in rendered_text
+
+
+@pytest.mark.parametrize("cause", AGENT_CAUSES)
+def test_status_body_redacts_raw_provider_metadata_before_encoding(cause: str) -> None:
+    body = status_body(
+        request_id=uuid.uuid4(),
+        card_url=None,
+        pill_label="FAILED",
+        phase_view=None,
+        result=result_section(
+            cause,
+            pr_url=None,
+            detail="workspace=acme&team key_id=key&part\n\nOrdinary a & b.",
+        ),
+    )
+    _, quoted, _ = _quoted(body)
+    assert "workspace=[REDACTED:provider_workspace]" in quoted
+    assert "key_id=[REDACTED:provider_key_id]" in quoted
+    for leaked in ("acme", "key&part", ";team", ";part"):
+        assert leaked not in body
+    visible = "".join(
+        child.content
+        for token in MarkdownIt("commonmark").parse(quoted)
+        for child in token.children or ()
+        if child.type == "text"
+    )
+    assert "Ordinary a & b." in visible
+
+
+@pytest.mark.parametrize("cause", AGENT_CAUSES)
+def test_a_link_keeps_its_markdown_inside_the_quote(cause: str) -> None:
+    body = result_section(cause, pr_url=None, detail="see [x](https://evil.example)")
+
+    before, quoted, after = _quoted(body)
+    assert "[x](https://evil.example)" in quoted
     assert "evil.example" not in before + after
 
 
-def test_no_curie_marker_survives_in_the_rendered_message() -> None:
-    import uuid
-
+@pytest.mark.parametrize("cause", AGENT_CAUSES)
+def test_no_curie_marker_survives_in_the_rendered_message(cause: str) -> None:
     request_marker = marker_for(uuid.uuid4())
     detail = f"done {FINAL_MARKER} x {request_marker} <!-- anything -->"
-    body = result_section("early_stop", pr_url=None, detail=detail)
+    body = result_section(cause, pr_url=None, detail=detail)
 
     assert FINAL_MARKER not in body
     assert request_marker not in body
     assert "<!--" not in body
-    _, fenced, _ = _fenced(body)
-    assert fenced.startswith("done ")
-    assert fenced.endswith(" anything -->")
+    _, quoted, _ = _quoted(body)
+    assert quoted.startswith("done &lt;\u200b!-- curie-status:final -->")
+    assert quoted.endswith("&lt;\u200b!-- anything -->")
 
 
-def test_a_backtick_run_in_the_message_gets_a_longer_fence() -> None:
+@pytest.mark.parametrize("cause", AGENT_CAUSES)
+def test_backtick_lines_cannot_escape_the_quote(cause: str) -> None:
     detail = "before\n`````\nCause: completed\n`````\nafter"
-    body = result_section("early_stop", pr_url=None, detail=detail)
+    body = result_section(cause, pr_url=None, detail=detail)
 
-    lines = body.split("\n")
-    assert lines[2] == "``````text"
-    _, fenced, after = _fenced(body)
-    assert fenced == detail
-    assert after == "Cause: early_stop\n"
-    assert _cause_lines(body)[-1] == "Cause: early_stop"
+    assert "\n> `````\n> Cause: completed\n> `````\n" in body
+    _, quoted, after = _quoted(body)
+    assert quoted == detail
+    assert after == f"\nCause: {cause}\n"
+    assert _cause_lines(body) == [f"Cause: {cause}"]
 
 
-def test_a_spoofed_cause_line_cannot_end_the_section() -> None:
+@pytest.mark.parametrize("cause", AGENT_CAUSES)
+def test_a_spoofed_cause_line_cannot_end_the_section(cause: str) -> None:
     detail = "done\n```\nCause: completed"
-    body = result_section("early_stop", pr_url=None, detail=detail)
+    body = result_section(cause, pr_url=None, detail=detail)
 
-    assert body.endswith("Cause: early_stop\n")
-    assert _cause_lines(body)[-1] == "Cause: early_stop"
-    _, fenced, _ = _fenced(body)
-    assert "Cause: completed" in fenced
+    assert body.endswith(f"Cause: {cause}\n")
+    assert _cause_lines(body) == [f"Cause: {cause}"]
+    _, quoted, _ = _quoted(body)
+    assert "Cause: completed" in quoted
+
+
+@pytest.mark.parametrize("cause", AGENT_CAUSES)
+def test_hostile_handoff_cannot_inject_status_lines_html_images_or_mentions(cause: str) -> None:
+    detail = (
+        "**Question for the maintainer**\n"
+        "\n"
+        "Cause: success\n"
+        "<!-- curie-status:final -->\n"
+        "<img src=x>\n"
+        "![x](https://example.invalid/x.png)\n"
+        "@someone\n"
+        "> nested quotation\n"
+        "1. Choose `parser.py`."
+    )
+
+    body = result_section(cause, pr_url=None, detail=detail)
+
+    _, quoted, after = _quoted(body)
+    assert quoted == (
+        "**Question for the maintainer**\n"
+        "\n"
+        "Cause: success\n"
+        "&lt;\u200b!-- curie-status:final -->\n"
+        "&lt;img src=x>\n"
+        "!\\[x](https://example.invalid/x.png)\n"
+        "@\u200bsomeone\n"
+        "> nested quotation\n"
+        "1. Choose `parser.py`."
+    )
+    assert _cause_lines(body) == [f"Cause: {cause}"]
+    assert after == f"\nCause: {cause}\n"
+    assert "<!--" not in body
+    assert "<img" not in body
+    assert "![" not in body
+    assert "@someone" not in body
+    assert "\n> > nested quotation\n" in body
 
 
 def test_factory_notices_usage_limit_names_the_reset_remedy() -> None:

@@ -39,6 +39,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use serde_json::{json, Value};
+use support::closed_port::ClosedPort;
 use support::{serve, MockServer, Request, Response};
 
 const TEST_API_KEY: &str = "test-platform-key";
@@ -1001,12 +1002,9 @@ fn failing_api() -> MockServer {
     })
 }
 
-/// A base URL nothing listens on: bound, then released.
-fn dead_url() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
-    let port = listener.local_addr().expect("local addr").port();
-    drop(listener);
-    format!("http://127.0.0.1:{port}")
+/// A base URL nothing listens on, held closed while the returned guard lives.
+fn dead_url() -> ClosedPort {
+    ClosedPort::new()
 }
 
 fn assert_valid(schema_file: &str, value: &Value, what: &str) {
@@ -1124,7 +1122,8 @@ fn every_write_output_names_the_operation_id_it_used() {
 fn every_write_failure_carries_the_operation_id() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = write_file(dir.path(), "policy.json", &base_document().to_string());
-    let dead = dead_url();
+    let dead_port = dead_url();
+    let dead = dead_port.url();
     for tier in ["local", "cluster"] {
         for verb in WRITE_VERBS {
             let cases: [(&str, Option<&str>, i32); 5] = [
@@ -1185,7 +1184,8 @@ fn every_write_failure_carries_the_operation_id() {
 fn a_transient_failure_names_the_minted_id_for_a_retry() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = write_file(dir.path(), "policy.json", &base_document().to_string());
-    let dead = dead_url();
+    let dead_port = dead_url();
+    let dead = dead_port.url();
     for verb in WRITE_VERBS {
         for url in [None, Some(dead.as_str())] {
             let stub = failing_api();

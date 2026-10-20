@@ -8,13 +8,15 @@ reviews. Ordinary bugfixes that close neither label stay skipped.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
+import shlex
 import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -273,15 +275,100 @@ def test_malformed_event_exits_nonzero(tmp_path: Path) -> None:
     assert "event" in completed.stderr.lower() or "json" in completed.stderr.lower()
 
 
+def _assert_ci_excludes_commenter(workflow: dict[str, Any]) -> None:
+    jobs = workflow.get("jobs")
+    assert isinstance(jobs, dict) and {"python", "python-pytest"} <= jobs.keys()
+    for permission_scope in (workflow, *jobs.values()):
+        permissions = permission_scope.get("permissions", {})
+        assert isinstance(permissions, dict)
+        assert all(permissions.get(key) != "write" for key in ("issues", "pull-requests"))
+
+    inspected = copy.deepcopy(workflow)
+    pytest_step = _single_step(
+        inspected["jobs"]["python-pytest"]["steps"],
+        lambda step: step.get("id") == "pytest",
+        "shard pytest caller",
+    )
+    script = _string(pytest_step, "run")
+    directory = "tools/p0-closes-ci"
+    tokens = shlex.split(script)
+    assert directory in tokens
+    assert all(token == directory for token in tokens if "p0-closes" in token)
+    pytest_step["run"] = script.replace(directory, "")
+    commenter_present = "p0-closes" in json.dumps(inspected).lower().replace("_", "-")
+    assert not commenter_present, "CI workflow must exclude the p0-closes commenter"
+
+    for pytest_scope in ("full", "cli"):
+        result = subprocess.run(
+            [
+                "/bin/bash", "--noprofile", "--norc", "-eu", "-o", "pipefail", "-c",
+                script,
+            ],
+            cwd=REPO_ROOT,
+            env={
+                **os.environ,
+                "PATH": "",
+                "BASH_FUNC_uv%%": "() { printf '%s\\0' \"$@\"; printf '\\0'; }",
+                "SHARD": "1",
+                "PYTEST_DESELECT": "",
+                "PYTEST_SCOPE": pytest_scope,
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        calls = result.stdout.split("\0\0")
+        assert len(calls) == 2 and calls[-1] == "", "only pytest may be invoked"
+        command = calls[0].split("\0")
+        assert command[:2] == ["run", "pytest"]
+        assert [argument for argument in command if "p0-closes" in argument] == [
+            directory, f"{directory}/tests/*",
+        ]
+        assert command[command.index(directory) - 1] == "--ignore"
+        assert command[command.index(f"{directory}/tests/*") - 1] == "--ignore-glob"
+
+
 def test_commenter_is_not_wired_into_the_required_python_job() -> None:
-    ci = CI_WORKFLOW.read_text(encoding="utf-8")
-    assert "p0-closes" not in ci
-    assert "tools/p0-closes-ci/check.py" not in ci
+    _assert_ci_excludes_commenter(_load_workflow(CI_WORKFLOW))
+
+
+@pytest.mark.parametrize("job_id", ("python", "python-pytest", "ci-policy"))
+def test_ci_commenter_guard_rejects_calls_posts_and_gates(job_id: str) -> None:
+    commenter_steps = _load_workflow(WORKFLOW)["jobs"]["remind"]["steps"]
+    mutations = [
+        *commenter_steps[1:],
+        {"uses": "./.github/workflows/p0-closes.yaml"},
+        {"if": "needs.p0-closes.result == 'success'", "run": "true"},
+    ]
+    for step in mutations:
+        workflow = _load_workflow(CI_WORKFLOW)
+        workflow["jobs"][job_id]["steps"].append(step)
+        with pytest.raises(AssertionError):
+            _assert_ci_excludes_commenter(workflow)
+
+
+def test_ci_commenter_guard_rejects_a_policy_path_outside_pytest_ignore() -> None:
+    workflow = _load_workflow(CI_WORKFLOW)
+    step = _single_step(
+        workflow["jobs"]["python-pytest"]["steps"],
+        lambda step: step.get("id") == "pytest",
+        "shard pytest caller",
+    )
+    script = _string(step, "run")
+    mutated = script.replace(
+        'pytest_args+=(--ignore "$directory" --ignore-glob "$directory/tests/*")',
+        'pytest_args+=("$directory")',
+    )
+    assert mutated != script
+    step["run"] = mutated
+    with pytest.raises(AssertionError):
+        _assert_ci_excludes_commenter(workflow)
 
 
 def test_workflow_comments_on_body_edits_and_never_requires_a_review() -> None:
     workflow = _load_workflow(WORKFLOW)
-    trigger = workflow.get("on", workflow.get(True))
+    trigger = workflow.get("on", cast(dict[object, Any], workflow).get(True))
     assert isinstance(trigger, dict)
     pull_request = trigger.get("pull_request")
     assert isinstance(pull_request, dict)

@@ -9,6 +9,7 @@
 // uses a different subset of it; a helper only some modules call is not dead code.
 #![allow(dead_code)]
 
+pub mod closed_port;
 pub mod emit_parity;
 pub mod enum_variants;
 pub mod executable;

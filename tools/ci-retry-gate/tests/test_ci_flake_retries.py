@@ -18,6 +18,7 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -72,6 +73,11 @@ def _run(step: dict) -> str:
     return body if isinstance(body, str) else ""
 
 
+def _backoff_name(base: str) -> str:
+    group, separator, label = base.rpartition(": ")
+    return group + separator + BACKOFF_PREFIX + label
+
+
 def test_acquisition_actions_in_ci_and_helm_have_a_retry_trio() -> None:
     """Each tool-install and kind-create step retries once, with backoff."""
     missing: list[str] = []
@@ -86,13 +92,14 @@ def test_acquisition_actions_in_ci_and_helm_have_a_retry_trio() -> None:
                     continue
                 name = step.get("name")
                 if isinstance(name, str) and (
-                    name.endswith(RETRY_SUFFIX) or name.startswith(BACKOFF_PREFIX)
+                    name.endswith(RETRY_SUFFIX)
+                    or name.rpartition(": ")[2].startswith(BACKOFF_PREFIX)
                 ):
                     continue
                 if not isinstance(name, str) or not name:
                     missing.append(f"{filename} :: {job_id} :: <unnamed {action}>")
                     continue
-                if f"{BACKOFF_PREFIX}{name}" not in names or f"{name}{RETRY_SUFFIX}" not in names:
+                if _backoff_name(name) not in names or f"{name}{RETRY_SUFFIX}" not in names:
                     missing.append(f"{filename} :: {job_id} :: {name}")
                 if step.get("continue-on-error") is not True or not isinstance(step.get("id"), str):
                     missing.append(f"{filename} :: {job_id} :: {name} (attempt is not continuable)")
@@ -100,6 +107,18 @@ def test_acquisition_actions_in_ci_and_helm_have_a_retry_trio() -> None:
         "these acquisition steps need the #1106 trio (continue-on-error attempt, "
         "backoff, exact retry copy):\n  " + "\n  ".join(missing)
     )
+
+
+def test_missing_grouped_backoff_fails_acquisition_presence(monkeypatch) -> None:
+    steps = _load("ci.yaml")["jobs"]["image-proofs"]["steps"]
+    reduced = [
+        step
+        for step in steps
+        if step.get("name") != "Toolchain: Back off before retrying Install uv"
+    ]
+    monkeypatch.setitem(globals(), "_jobs", lambda _: iter([("image-proofs", reduced)]))
+    with pytest.raises(AssertionError, match="Toolchain: Install uv"):
+        test_acquisition_actions_in_ci_and_helm_have_a_retry_trio()
 
 
 def test_tool_and_chart_downloads_retry_with_backoff() -> None:
@@ -184,7 +203,7 @@ def test_kind_creation_recreates_a_missing_kind_registry() -> None:
                         candidate
                         for candidate in steps[index + 1 :]
                         if isinstance(candidate, dict)
-                        and candidate.get("name") == f"{BACKOFF_PREFIX}{name}"
+                        and candidate.get("name") == _backoff_name(name)
                     ),
                     None,
                 )

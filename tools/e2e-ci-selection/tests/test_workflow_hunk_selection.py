@@ -25,8 +25,8 @@ TARGETS = (
 JOBS = ("before", *TARGETS, "after")
 
 
-def _selector() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("select_tiers_workflow_test", SELECTOR)
+def _load_module(name: str, path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -34,7 +34,10 @@ def _selector() -> ModuleType:
     return module
 
 
-SELECTOR_MODULE = _selector()
+SELECTOR_MODULE = _load_module("select_tiers_workflow_test", SELECTOR)
+SELECTION_TESTS = _load_module(
+    "e2e_selection_workflow_test", Path(__file__).with_name("test_e2e_ci_selection.py")
+)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -102,11 +105,11 @@ def _invoke_selector(
 
 
 @pytest.mark.parametrize("target", TARGETS)
-def test_each_upgrade_job_edit_selects_full_upgrade(
+def test_each_upgrade_job_edit_selects_upgrade(
     git_repo: tuple[Path, str], target: str
 ) -> None:
     repo, base = git_repo
-    head = _commit_workflow(repo, _workflow().replace(f"echo {target}", "echo changed"))
+    head = _commit_workflow(repo, _workflow().replace(f"echo {target}\n", "echo changed\n"))
 
     assert SELECTOR_MODULE._changes_upgrade_workflow_jobs(base, head) is True
 
@@ -319,12 +322,13 @@ def test_aliased_upgrade_job_fails_closed(
 
 
 @pytest.mark.parametrize("omit_kind", (False, True), ids=("main", "next"))
-def test_relevant_workflow_edit_runs_full_upgrade_before_merge(
-    git_repo: tuple[Path, str], tmp_path: Path, omit_kind: bool
+@pytest.mark.parametrize("target", TARGETS)
+def test_relevant_workflow_edit_runs_upgrade_smoke_before_merge(
+    git_repo: tuple[Path, str], tmp_path: Path, omit_kind: bool, target: str
 ) -> None:
     repo, base = git_repo
     head = _commit_workflow(
-        repo, _workflow().replace("echo e2e-released-upgrade", "echo changed", 1)
+        repo, _workflow().replace(f"echo {target}\n", "echo changed\n", 1)
     )
     options = ("--base", base, "--head", head)
     if omit_kind:
@@ -334,8 +338,9 @@ def test_relevant_workflow_edit_runs_full_upgrade_before_merge(
 
     assert result.returncode == 0, result.stderr
     assert output["released_upgrade"] == "true"
-    assert output["released_upgrade_full"] == "true"
+    assert output["released_upgrade_full"] == "false"
     assert output["cluster"] == "false"
+    SELECTION_TESTS._assert_upgrade_smoke_shards(tmp_path, output)
 
 
 def test_unrelated_workflow_edit_keeps_upgrade_tier_off(
