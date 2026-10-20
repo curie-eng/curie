@@ -918,6 +918,14 @@ addresses your Data Center host resolves to on its port.
 
 ## Label an issue
 
+For guided issue preparation, install the
+[preparation skill](factory-preparation.md#install-prepare-and-hand-off) in your
+coding agent. It helps clarify the request, presents the full specification for
+review, and can publish and select it after explicit approval using your tracker
+connection. The guide includes the install command, supported clients and source
+build instructions while the feature awaits release. This uses the factory you
+configured above; skill installation alone does not create one.
+
 In the GitHub website, open an issue on the repository and add the label
 `curie-factory`. The person who adds the label must have write or admin access.
 Anyone else's label is ignored.

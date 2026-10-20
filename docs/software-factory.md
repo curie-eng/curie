@@ -51,15 +51,38 @@ are not baked into the stock image. The
 [managed sandbox toolchain guide](guides/repository-toolchain-in-the-managed-sandbox.md)
 and bundle reference explain locked installs, absent services, and resource limits.
 
+## Install the preparation skill
+
+Use the `prepare-factory-ticket` skill in the coding agent where you work on the
+repository. A CLI build containing the installer can copy it locally:
+
+```bash
+curie factory prepare install --agent codex
+```
+
+In Codex, invoke `$prepare-factory-ticket <issue-url>` or give it new feature
+intent. The skill inspects the checkout, asks about consequential ambiguity and
+presents the entire specification for review. After review, choose **publish and
+start the factory** to publish through your existing tracker tools and select
+eligible issues with the configured factory label. Reports stay local.
+
+The [preparation guide](guides/factory-preparation.md) has the installation and
+invocation table for Codex, Claude Code, Copilot, Gemini and Cursor, global
+installation, manual upgrades, and a source build option until the installer is
+released. Installation needs no Python or running Curie service. Starting work
+still needs a configured factory, tracker access and the start authority described
+below. The skill does not deploy a factory or guarantee that a task can finish.
+
 ## Delegate, inspect, and refine
 
 The GitHub workflow is below. The GitLab and Jira Cloud quickstarts above
 provide the equivalent provider-specific steps.
 
-1. **Write a bounded GitHub issue.** Describe the behavior, acceptance criteria, and
-   how to verify it. Use Codex, Claude Code, or another coding agent to help
-   investigate and draft the issue if useful; Curie's factory runner takes over
-   after admission. Start with a small change. The sandbox receives the
+1. **Prepare a bounded GitHub issue.** Describe the behavior, acceptance criteria,
+   and how to verify it. Use the [preparation skill](#install-the-preparation-skill)
+   to investigate, clarify and review the complete issue, or prepare it yourself.
+   Curie's factory runner takes over after admission. Start with a small change.
+   The sandbox receives the
    repository checkout and reads the issue and comments through a scoped
    platform tool; it holds no GitHub publication credential.
 2. **Add the configured label.** The default is `curie-factory`. A permitted

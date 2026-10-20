@@ -12,6 +12,43 @@ can execute a specification. Publication uses your coding agent's existing track
 connection, and selection uses the deployment's configured issue label. Connected
 validation and validated handoff remain tracked in #4488 and #4490.
 
+## Install, prepare and hand off
+
+For guided preparation, open the repository the factory will change and install
+the skill for your coding agent. With a CLI build containing this command:
+
+```bash
+curie factory prepare install --agent codex
+```
+
+In Codex, start a new session if the skill is not visible, then use this minimal
+prompt with the actual issue URL:
+
+```text
+$prepare-factory-ticket <issue-url>
+```
+
+For new work, replace the URL with your intent, for example:
+
+```text
+$prepare-factory-ticket Add CSV export for the counter history.
+```
+
+Answer questions about unresolved behavior and review the complete specification.
+When it matches your intent, choose **publish and start the factory**. The skill
+uses your coding agent's authenticated tracker tools to create or update the
+reviewed issue, verifies it, and adds the confirmed configured factory label to
+eligible work. You can instead publish without starting or keep the draft local.
+The [client table](#get-the-skill) below covers the other coding agents.
+
+Installing the skill does not install or configure the factory. You can draft
+before a deployment exists; starting implementation requires a configured factory
+watching that repository and an account permitted to start work. Follow the
+[factory quickstart](../software-factory.md#what-you-are-trying) if it is not set up.
+Your coding agent's tracker connection is separate from the factory's connection.
+If the agent cannot write issues, publish the reviewed body yourself, then give
+it the actual issue link for verification and any separately approved selection.
+
 ## Get the skill
 
 Use a Curie CLI built from this change, or a release that contains it. From the
@@ -84,6 +121,31 @@ If your agent cannot discover skills, open the copied `SKILL.md` and ask it to
 follow that file and its linked reference. Keep the folder intact. The fallback
 uses the same instructions and canonical format rather than a different parser.
 Do not overwrite an existing local skill or draft without reviewing the change.
+
+## Install from a source checkout
+
+Check whether your CLI contains the installer:
+
+```bash
+curie factory prepare install --help
+```
+
+An older released CLI will report an unknown command. Until a release contains
+this feature, use a checkout containing the preparation change and a Rust/Cargo
+toolchain to build and run just the installer. From any directory, replace the
+two absolute paths with your Curie checkout and the repository you want to work on:
+
+```bash
+cargo run --locked --manifest-path /path/to/curie/cli/Cargo.toml -- \
+  factory prepare install --agent codex --dir /path/to/your/repository
+```
+
+The target directory must already exist. Use the client names from the table
+above, or replace `--dir ...` with `--global` for personal installation. This
+builds the CLI and copies the skill; it does not start containers, deploy a
+factory or install Python on the client. Factory setup still follows its own
+quickstart and released runner requirements. Once a released CLI contains the
+installer, no Curie source checkout or Rust toolchain is needed to install it.
 
 ## Prepare and review
 
