@@ -5,6 +5,7 @@ import secrets
 from collections.abc import Callable, Coroutine
 from html import escape
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Form, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -12,14 +13,14 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.routing import APIRoute
 
 from ..approval_auth import enforce_console_cookie_origin
-from ..auth import CONSOLE_SESSION_COOKIE
-from ..crud.console import live_principal_session
+from ..config import get_settings
 from ..deps import SessionDep
 from ..identity import connect
 from ..models import IdentityNamespace
 
 CONNECT_COOKIE = "__Host-curie_identity_connect"
 CSRF_COOKIE = "__Host-curie_identity_connect_csrf"
+PROOF_COOKIE = "__Host-curie_identity_connect_proof"
 PRIVATE_HEADERS = {
     "Cache-Control": "private, no-store",
     "Referrer-Policy": "no-referrer",
@@ -59,14 +60,29 @@ router = APIRouter(
 )
 
 
+def public_api_prefix() -> str:
+    """Trusted proxy prefix from the configured OIDC callback, never a return URL."""
+    path = urlsplit(get_settings().oidc_redirect_uri).path
+    suffix = "/console/oidc/callback"
+    return path[: -len(suffix)] if path.endswith(suffix) else ""
+
+
+def public_path(request: Request, path: str) -> str:
+    return public_api_prefix() + path
+
+
 def connect_path(request: Request, token: str) -> str:
-    # Fixed route, never a browser-provided return URL. live_token validated
-    # the alphabet before this is used for an OIDC callback redirect.
-    return f"{request.scope.get('root_path', '')}/identity/connect/{token}"
+    return public_path(request, f"/identity/connect/{token}")
+
+
+def set_browser_proof_cookie(response: Response, proof: str) -> None:
+    response.set_cookie(
+        PROOF_COOKIE, proof, max_age=600, path="/", secure=True, httponly=True, samesite="lax"
+    )
 
 
 def clear_connect_cookies(response: Response) -> None:
-    for name in (CONNECT_COOKIE, CSRF_COOKIE):
+    for name in (CONNECT_COOKIE, CSRF_COOKIE, PROOF_COOKIE):
         response.delete_cookie(name, path="/", secure=True, httponly=True, samesite="lax")
 
 
@@ -83,8 +99,8 @@ async def connect_page(token: str, request: Request, session: SessionDep) -> HTM
     namespace = await session.get(IdentityNamespace, row.identity_namespace_id)
     assert namespace is not None  # live_token checked it
     account = f"{namespace.provider} user {row.provider_native_id} in workspace {namespace.key}"
-    principal = await live_principal_session(
-        session, request.cookies.get(CONSOLE_SESSION_COOKIE, "")
+    principal = await connect.browser_principal(
+        session, token=token, proof=request.cookies.get(PROOF_COOKIE, "")
     )
     if principal is not None and (
         principal.tenant_id != row.tenant_id or principal.idp_issuer != row.idp_issuer
@@ -92,7 +108,7 @@ async def connect_page(token: str, request: Request, session: SessionDep) -> HTM
         raise refused()
     csrf = secrets.token_urlsafe(32)
     if principal is None:
-        login = escape(f"{request.scope.get('root_path', '')}/console/oidc/login", quote=True)
+        login = escape(public_path(request, "/console/oidc/login"), quote=True)
         action = f'<p><a href="{login}">Sign in with your organization</a></p>'
     else:
         who = escape(principal.display_name or principal.idp_subject)
@@ -133,8 +149,8 @@ async def confirm_connection(
         or not hmac.compare_digest(csrf.encode(), expected.encode())
     ):
         raise refused()
-    principal = await live_principal_session(
-        session, request.cookies.get(CONSOLE_SESSION_COOKIE, "")
+    principal = await connect.browser_principal(
+        session, token=token, proof=request.cookies.get(PROOF_COOKIE, ""), lock=True
     )
     if principal is None:
         raise HTTPException(401, "sign in required", headers=PRIVATE_HEADERS)

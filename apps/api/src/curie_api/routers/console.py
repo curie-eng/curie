@@ -67,7 +67,12 @@ from ..deps import SessionDep
 from ..identity import connect as identity_connect
 from ..models import Principal
 from ..rate_limit import require_rate_limit
-from .identity_connect import CONNECT_COOKIE, clear_connect_cookies, connect_path
+from .identity_connect import (
+    CONNECT_COOKIE,
+    clear_connect_cookies,
+    connect_path,
+    set_browser_proof_cookie,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -356,8 +361,10 @@ async def oidc_callback(
     """
     _require_oidc_enabled()
     await limit_oidc(request, route="console_oidc_callback")
-    if not state or not state_cookie or not hmac.compare_digest(
-        state.encode("utf-8"), state_cookie.encode("utf-8")
+    if (
+        not state
+        or not state_cookie
+        or not hmac.compare_digest(state.encode("utf-8"), state_cookie.encode("utf-8"))
     ):
         return _refuse_callback("state does not match the state cookie")
     attempt = await crud_console.consume_oidc_login_attempt(session, state)
@@ -372,18 +379,12 @@ async def oidc_callback(
         claims = await oidc.validate_id_token(id_token, nonce=attempt.nonce)
     except oidc.OidcError as exc:
         return _refuse_callback(str(exc))
-    # Before resolve_principal, so a refused person gets no principal row and
-    # an existing principal's attributes are not refreshed by a login that
-    # does not happen.
-    if not oidc.meets_required_claims(claims, get_settings().oidc_required_claims):
-        return _refuse_callback("ID token lacks a required claim")
-
     response: Response
     connect_token = request.cookies.get(CONNECT_COOKIE)
     connect_row = None
     if connect_token:
         try:
-            connect_row = await identity_connect.live_token(session, connect_token)
+            connect_row = await identity_connect.live_token(session, connect_token, lock=True)
         except identity_connect.ConnectRefused:
             response = _refuse_callback("invalid account connection")
             clear_connect_cookies(response)
@@ -392,6 +393,12 @@ async def oidc_callback(
             response = _refuse_callback("account connection issuer mismatch")
             clear_connect_cookies(response)
             return response
+    # Ordinary account connection authenticates a person, never an admin.
+    # Console sign-in retains its existing administrator admission policy.
+    if not connect_token and not oidc.meets_required_claims(
+        claims, get_settings().oidc_required_claims
+    ):
+        return _refuse_callback("ID token lacks a required claim")
     principal = await crud_console.resolve_principal(
         session, claims, **({"tenant_id": connect_row.tenant_id} if connect_row else {})
     )
@@ -401,7 +408,7 @@ async def oidc_callback(
         return _refuse_callback("principal or tenant is not active")
     if connect_token:
         try:
-            await identity_connect.preserve_verified_claims(
+            proof = await identity_connect.bind_browser_proof(
                 session, token=connect_token, principal=principal, claims=claims
             )
         except identity_connect.ConnectRefused:
@@ -409,16 +416,19 @@ async def oidc_callback(
             response = _refuse_callback("account connection no longer valid")
             clear_connect_cookies(response)
             return response
-    token, _ = await crud_console.create_principal_console_session(session, principal)
-
-    destination = connect_path(request, connect_token) if connect_token else "/"
-    response = RedirectResponse(
-        destination, status_code=status.HTTP_303_SEE_OTHER, headers=_NO_STORE
-    )
     if connect_token:
+        await session.commit()
+        response = RedirectResponse(
+            connect_path(request, connect_token),
+            status_code=status.HTTP_303_SEE_OTHER,
+            headers=_NO_STORE,
+        )
         response.headers["Referrer-Policy"] = "no-referrer"
-    # The same cookie, with the same flags and reasons, as exchange_login_code.
-    set_console_session_cookie(response, token)
+        set_browser_proof_cookie(response, proof)
+    else:
+        token, _ = await crud_console.create_principal_console_session(session, principal)
+        response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER, headers=_NO_STORE)
+        set_console_session_cookie(response, token)
     _clear_state_cookie(response)
     return response
 

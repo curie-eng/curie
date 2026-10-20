@@ -66,6 +66,7 @@ def upgrade() -> None:
         sa.Column("idp_issuer", sa.String(), nullable=False),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("consumed_at", sa.DateTime(timezone=True)),
+        sa.Column("browser_proof_hash", sa.String(64)),
         sa.Column("verified_email", sa.String(320)),
         sa.Column("verified_principal_id", U),
         sa.Column("verified_at", sa.DateTime(timezone=True)),

@@ -3780,6 +3780,7 @@ class IdentityConnectToken(Base):
     idp_issuer: Mapped[str] = mapped_column(String)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    browser_proof_hash: Mapped[str | None] = mapped_column(String(64), default=None)
     verified_email: Mapped[str | None] = mapped_column(String(320), default=None)
     verified_principal_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), default=None

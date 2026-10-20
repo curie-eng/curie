@@ -8,6 +8,7 @@ chosen by an administrator. Token plaintext never enters a database row.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import re
 import secrets
 import uuid
@@ -48,14 +49,20 @@ def hash_token(token: str) -> str:
 async def configured_provider(
     session: AsyncSession, tenant_id: uuid.UUID
 ) -> TenantIdentityProvider | None:
+    tenant_status = await session.scalar(
+        select(Tenant.status)
+        .where(Tenant.id == tenant_id)
+        .with_for_update(read=True, key_share=True)
+    )
+    if tenant_status != "active":
+        return None
     config = await session.scalar(
         select(TenantIdentityProvider)
         .where(TenantIdentityProvider.tenant_id == tenant_id)
         .with_for_update(read=True)
         .execution_options(populate_existing=True)
     )
-    tenant_status = await session.scalar(select(Tenant.status).where(Tenant.id == tenant_id))
-    if config is None or tenant_status != "active":
+    if config is None:
         return None
     # A configured issuer alone must not turn an empty projection into an
     # identity authority. A successful full snapshot is required once.
@@ -203,6 +210,55 @@ async def preserve_verified_claims(
     row.verified_principal_id = principal.id
     row.verified_at = datetime.now(UTC)
     await session.flush()
+
+
+async def bind_browser_proof(
+    session: AsyncSession,
+    *,
+    token: str,
+    principal: Principal,
+    claims: OidcClaims,
+) -> str:
+    """Bind validated OIDC identity to this browser without admin authority."""
+    await preserve_verified_claims(session, token=token, principal=principal, claims=claims)
+    row = await live_token(session, token, lock=True)
+    proof = secrets.token_urlsafe(32)
+    row.browser_proof_hash = hash_token(proof)
+    await session.flush()
+    return proof
+
+
+async def browser_principal(
+    session: AsyncSession,
+    *,
+    token: str,
+    proof: str,
+    lock: bool = False,
+) -> Principal | None:
+    """Authenticate only this account confirmation; never a console session."""
+    if not TOKEN_PATTERN.fullmatch(proof):
+        return None
+    try:
+        row = await live_token(session, token, lock=lock)
+    except ConnectRefused:
+        return None
+    if (
+        row.browser_proof_hash is None
+        or row.verified_principal_id is None
+        or row.verified_at is None
+        or not hmac.compare_digest(row.browser_proof_hash, hash_token(proof))
+    ):
+        return None
+    person = await session.get(Principal, row.verified_principal_id, populate_existing=True)
+    if (
+        person is None
+        or person.tenant_id != row.tenant_id
+        or person.type != "human"
+        or person.idp_issuer != row.idp_issuer
+        or not await principal_is_active(session, person)
+    ):
+        return None
+    return person
 
 
 def governed_email(email: str, domains: list[str]) -> tuple[str, str] | None:

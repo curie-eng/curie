@@ -346,23 +346,25 @@ def test_prompt_budget_is_bounded_and_old_rows_are_reclaimed(migrated: None) -> 
 
 
 @pytest.fixture
-def connect_browser(migrated: None):
+def connect_browser(migrated: None, request: pytest.FixtureRequest):
     """Production browser routes, real SQL/Valkey, external IdP HTTP fixture."""
     from contextlib import asynccontextmanager
 
     from curie_api import oidc
-    from curie_api.crud import console as crud_console
-    from curie_api.routers import console, identity_connect
+    from curie_api.routers import agent_access, console, identity_connect
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from oidc_test_idp import AUDIENCE, CLIENT_SECRET, REDIRECT_URI, TestIdP, enabled_env, oidc_env
     from redis.asyncio import Redis
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
+    prefix = getattr(request, "param", "")
     with TestIdP(
         client_id=AUDIENCE,
         client_secret=CLIENT_SECRET,
-        redirect_uri=REDIRECT_URI,
+        redirect_uri=REDIRECT_URI.replace(
+            "/console/oidc/callback", prefix + "/console/oidc/callback"
+        ),
         subject="alice",
         extra_claims={"email_verified": True},
     ) as idp:
@@ -381,9 +383,21 @@ def connect_browser(migrated: None):
                         await s.flush()
                         raw = await issue(s, tenant)
                         assert raw
-                        session_token, _ = await crud_console.create_principal_console_session(
-                            s, person
+                        from curie_api.oidc import OidcClaims
+
+                        session_token = await connect.bind_browser_proof(
+                            s,
+                            token=raw,
+                            principal=person,
+                            claims=OidcClaims(
+                                issuer=idp.issuer,
+                                subject="alice",
+                                email=None,
+                                display_name=None,
+                                raw={},
+                            ),
                         )
+                        await s.commit()
                         return raw, tenant.id, person.id, session_token
                 finally:
                     await engine.dispose()
@@ -402,10 +416,26 @@ def connect_browser(migrated: None):
                     await engine.dispose()
 
             app = FastAPI(lifespan=lifespan)
+            app.include_router(agent_access.router)
             app.include_router(console.router)
             app.include_router(identity_connect.router)
+
+            async def proxy(scope, receive, send):
+                if prefix and scope["type"] == "http":
+                    if not scope["path"].startswith(prefix + "/"):
+                        from starlette.responses import Response
+
+                        await Response(status_code=404)(scope, receive, send)
+                        return
+                    scope = {
+                        **scope,
+                        "path": scope["path"][len(prefix) :],
+                        "raw_path": scope["raw_path"][len(prefix) :],
+                    }
+                await app(scope, receive, send)
+
             with TestClient(
-                app,
+                proxy,
                 base_url="https://testserver",
                 client=(f"2001:db8::{uuid.uuid4().int & 65535:x}", 5000),
             ) as client:
@@ -436,7 +466,7 @@ def browser_links(tenant_id: uuid.UUID) -> list[tuple[str, uuid.UUID | None]]:
 def test_browser_requires_explicit_confirm_and_never_replays(connect_browser) -> None:
     import re
 
-    from curie_api.auth import CONSOLE_SESSION_COOKIE
+    from curie_api.routers.identity_connect import PROOF_COOKIE
 
     client, raw, tenant_id, principal_id, session_token, _ = connect_browser
     path = f"/identity/connect/{raw}"
@@ -448,7 +478,7 @@ def test_browser_requires_explicit_confirm_and_never_replays(connect_browser) ->
     for value in page.headers.get_list("set-cookie"):
         assert "Secure" in value and "HttpOnly" in value and "SameSite=lax" in value
     assert browser_links(tenant_id) == []
-    client.cookies.set(CONSOLE_SESSION_COOKIE, session_token)
+    client.cookies.set(PROOF_COOKIE, session_token)
     page = client.get(path)
     assert "Confirm account connection" in page.text
     csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
@@ -465,11 +495,10 @@ def test_browser_requires_explicit_confirm_and_never_replays(connect_browser) ->
 def test_browser_blocks_csrf_and_unbound_confirmation(connect_browser, bad: str) -> None:
     import re
 
-    from curie_api.auth import CONSOLE_SESSION_COOKIE
-    from curie_api.routers.identity_connect import CONNECT_COOKIE
+    from curie_api.routers.identity_connect import CONNECT_COOKIE, PROOF_COOKIE
 
     client, raw, tenant_id, _, session_token, _ = connect_browser
-    client.cookies.set(CONSOLE_SESSION_COOKIE, session_token)
+    client.cookies.set(PROOF_COOKIE, session_token)
     path = f"/identity/connect/{raw}"
     page = client.get(path)
     csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
@@ -483,7 +512,7 @@ def test_browser_blocks_csrf_and_unbound_confirmation(connect_browser, bad: str)
     elif bad == "token":
         client.cookies.delete(CONNECT_COOKIE)
     else:
-        client.cookies.delete(CONSOLE_SESSION_COOKIE)
+        client.cookies.delete(PROOF_COOKIE)
     response = client.post(f"{path}/confirm", data={"csrf": csrf}, headers=headers)
     assert response.status_code in {400, 401, 403}
     assert browser_links(tenant_id) == []
@@ -635,3 +664,132 @@ def test_mixed_case_verified_email_resolves_canonical_authenticated_sender(migra
         assert await resolve_email(s, tenant_id=tenant.id, email="alice@example.com") == person.id
 
     run(body)
+
+
+def test_ordinary_connect_login_never_mints_console_administration(
+    connect_browser,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import re
+    from urllib.parse import urlsplit
+
+    import httpx
+    from curie_api.auth import CONSOLE_SESSION_COOKIE
+    from curie_api.models import ConsoleSession
+
+    client, raw, tenant_id, principal_id, _, _ = connect_browser
+    monkeypatch.setenv("CURIE_OIDC_REQUIRED_CLAIMS", '{"groups":"platform-admins"}')
+    monkeypatch.setenv("CURIE_OIDC_ADMIT_ALL_AUTHENTICATED", "false")
+    get_settings.cache_clear()
+
+    def console_sessions():
+        async def count():
+            engine = create_async_engine(get_settings().database_url)
+            try:
+                async with AsyncSession(engine) as session:
+                    return await session.scalar(
+                        select(func.count())
+                        .select_from(ConsoleSession)
+                        .where(ConsoleSession.principal_id == principal_id)
+                    )
+            finally:
+                await engine.dispose()
+
+        return asyncio.run(count())
+
+    before = console_sessions()
+    assert before == 0
+    path = f"/identity/connect/{raw}"
+    assert client.get(path).status_code == 200
+    login = client.get("/console/oidc/login", follow_redirects=False)
+    assert login.status_code == 302, login.text
+    with httpx.Client(trust_env=False, follow_redirects=False, timeout=10) as browser:
+        authorized = browser.get(login.headers["location"])
+    back = urlsplit(authorized.headers["location"])
+    callback = client.get(f"{back.path}?{back.query}", follow_redirects=False)
+    assert callback.status_code == 303, callback.text
+    assert not any(
+        CONSOLE_SESSION_COOKIE in value for value in callback.headers.get_list("set-cookie")
+    )
+    assert console_sessions() == before
+    assert client.get("/console/session").status_code == 401
+    denied = client.put(
+        f"/agents/{uuid.uuid4()}/access-policy",
+        json={"expected_version": 0},
+        headers={"Origin": "https://testserver"},
+    )
+    assert denied.status_code == 401
+    page = client.get(path)
+    csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
+    confirmed = client.post(
+        f"{path}/confirm", data={"csrf": csrf}, headers={"Origin": "https://testserver"}
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert ("UALICE001", principal_id) in browser_links(tenant_id)
+    assert console_sessions() == before
+
+
+@pytest.mark.parametrize("connect_browser", ["/api"], indirect=True)
+def test_actual_proxy_prefix_is_preserved_through_connect_oidc_and_confirm(connect_browser):
+    import re
+    from urllib.parse import urlsplit
+
+    import httpx
+
+    client, raw, tenant_id, principal_id, _, _ = connect_browser
+    path = f"/api/identity/connect/{raw}"
+    page = client.get(path)
+    login_path = re.search(r'<a href="([^"]+)">', page.text).group(1)
+    assert login_path == "/api/console/oidc/login"
+    login = client.get(login_path, follow_redirects=False)
+    assert login.status_code == 302, login.text
+    with httpx.Client(trust_env=False, follow_redirects=False, timeout=10) as browser:
+        authorized = browser.get(login.headers["location"])
+    back = urlsplit(authorized.headers["location"])
+    callback = client.get(f"{back.path}?{back.query}", follow_redirects=False)
+    assert callback.status_code == 303 and callback.headers["location"] == path
+    page = client.get(callback.headers["location"])
+    target = re.search(r'<form method="post" action="([^"]+)">', page.text).group(1)
+    assert target == path + "/confirm"
+    csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
+    response = client.post(target, data={"csrf": csrf}, headers={"Origin": "https://testserver"})
+    assert response.status_code == 200, response.text
+    assert ("UALICE001", principal_id) in browser_links(tenant_id)
+
+
+def test_connect_browser_proof_is_private_scoped_and_rechecks_deactivation(connect_browser):
+    import re
+
+    from curie_api.routers.identity_connect import PROOF_COOKIE
+
+    client, raw, tenant_id, principal_id, proof, _ = connect_browser
+    path = f"/identity/connect/{raw}"
+    client.cookies.set(PROOF_COOKIE, proof)
+    page = client.get(path)
+    assert "Confirm account connection" in page.text
+    csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
+    client.cookies.set(PROOF_COOKIE, "x" * 43)
+    assert "Sign in with your organization" in client.get(path).text
+    refused = client.post(
+        path + "/confirm", data={"csrf": csrf}, headers={"Origin": "https://testserver"}
+    )
+    assert refused.status_code == 401
+    client.cookies.set(PROOF_COOKIE, proof)
+
+    async def disable():
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                person = await session.get(Principal, principal_id)
+                person.status = "disabled"
+                row = await session.get(IdentityConnectToken, connect.hash_token(raw))
+                assert row.browser_proof_hash != proof and len(row.browser_proof_hash) == 64
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(disable())
+    refused = client.post(
+        path + "/confirm", data={"csrf": csrf}, headers={"Origin": "https://testserver"}
+    )
+    assert refused.status_code == 401 and browser_links(tenant_id) == []
