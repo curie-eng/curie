@@ -45,8 +45,11 @@ and nonnull rule. JSON Schema treats `1.0` as an integer; Python and Rust also
 enforce the strict integer representation.
 
 Python `ConnectorsFile.model_validate` and Rust `parse_connectors` parse
-declaration shape, including shared references. Python `validate_connectors`
-and Rust `load` are activation gates: any shared reference refuses the entire
+shared reference shape without activation. For dedicated declarations, Rust
+retains its previous name, form and build validations; Python model parsing
+alone does not replace those checks. The existing hand-mirror schema-parity
+contract remains unchanged (ADR 0194). Python `validate_connectors` and Rust
+`load` are activation gates: any shared reference refuses the entire
 declaration with `shared_connector_requires_application`. Direct dedicated
 render, MCP entry and activation helpers also refuse shared references. Metadata
 inspection, including sealing-key custody inspection, grants no activation.

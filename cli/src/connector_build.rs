@@ -80,7 +80,7 @@ pub const RUNNER_DIGEST_KEY: &str = "@runner";
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectorSpecDecl {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub shared: Option<SharedConnectorReferenceDecl>,
     // -- hosted form --
     pub image: Option<String>,
@@ -426,10 +426,12 @@ pub fn lock_entry_field_names() -> BTreeSet<String> {
 
 // ─── Parsing ─────────────────────────────────────────────────────────────────
 
-/// Parse declaration shape, paired with Python's `ConnectorsFile.model_validate`.
+/// Parse shared reference shape and retain dedicated name, form and build checks.
 ///
-/// Shared references are valid metadata. Activation uses [`load`], paired with
-/// Python's `validate_connectors`, and refuses them until an application root exists.
+/// Shared references are metadata, as in Python's `ConnectorsFile.model_validate`.
+/// That model alone does not perform all dedicated validations done here.
+/// Activation uses [`load`], paired with Python's `validate_connectors`, and
+/// refuses shared references until an application root exists.
 pub fn parse_connectors(document: &str) -> Result<ConnectorsFileDecl> {
     let raw: serde_norway::Value =
         serde_norway::from_str(document).with_context(|| format!("parse {CONNECTORS_FILE}"))?;

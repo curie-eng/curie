@@ -348,10 +348,27 @@ class SharedMember(_Contract):
         return self
 
 
+def _object_name(
+    application: SharedApplication,
+    role: str,
+    member: SharedMember | None = None,
+) -> str:
+    identity = [
+        application.namespace,
+        application.release,
+        application.installation,
+        application.application,
+        member.agent if member is not None else None,
+    ]
+    encoded = json.dumps(identity, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    return f"shared-{role}-{digest[:32]}"
+
+
 def _application_labels(application: SharedApplication) -> dict[str, str]:
     return {
-        "app.kubernetes.io/name": application.app_name,
-        "app.kubernetes.io/instance": application.release,
+        "app.kubernetes.io/name": _object_name(application, "app"),
+        "app.kubernetes.io/part-of": application.release,
         "app.kubernetes.io/component": _COMPONENT,
         _APPLICATION_LABEL: application.application,
         _INSTALLATION_LABEL: (
@@ -367,16 +384,6 @@ def _object(
     spec: dict[str, Any],
     member: SharedMember | None = None,
 ) -> dict[str, Any]:
-    identity = [
-        application.namespace,
-        application.release,
-        application.app_name,
-        application.installation,
-        application.application,
-        member.agent if member is not None else None,
-    ]
-    encoded = json.dumps(identity, separators=(",", ":")).encode("utf-8")
-    digest = hashlib.sha256(encoded).hexdigest()
     labels = _application_labels(application)
     if member is not None:
         labels[_AGENT_LABEL] = member.agent
@@ -388,7 +395,7 @@ def _object(
         }[kind],
         "kind": kind,
         "metadata": {
-            "name": f"shared-{role}-{digest[:32]}",
+            "name": _object_name(application, role, member),
             "namespace": application.namespace,
             "labels": labels,
         },
@@ -469,7 +476,7 @@ def render_application(application: SharedApplication) -> list[dict[str, Any]]:
         **application.server_env,
         "CURIE_SHARED_RESOLVER_SOCKET": application.resolver_socket,
     }
-    server_mounts = [_mount("resolver", socket_dir, read_only=False)]
+    server_mounts = [_mount("resolver", socket_dir, read_only=True)]
     proxy_mounts = [_mount("resolver", socket_dir, read_only=False)]
     volumes: list[dict[str, Any]] = [{"name": "resolver", "emptyDir": {}}]
     proxy_env = {

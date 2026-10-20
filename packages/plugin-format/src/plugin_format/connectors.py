@@ -287,7 +287,7 @@ class ConnectorSpec(BaseModel):
         },
     )
 
-    shared: SharedConnectorReference | None = Field(default=None, exclude_if=lambda v: v is None)
+    shared: SharedConnectorReference | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -302,6 +302,7 @@ class ConnectorSpec(BaseModel):
         serialized: dict[str, Any] = handler(self)
         if self.shared is not None:
             return {key: value for key, value in serialized.items() if key == "shared"}
+        serialized.pop("shared", None)
         return serialized
 
     def require_dedicated(self) -> None:
