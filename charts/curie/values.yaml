@@ -792,6 +792,17 @@ connectorCaller:
 # (ACTION-EXECUTOR-12, -14); with the executor off that grant is absent and
 # actions record no digest, so they are not undoable.
 #
+# connectorReadsWithoutReconciler (#4800, default false) is for an installation
+# that keeps worker.connectorReconciler off, for example because its hosted
+# connectors are pinned and managed outside Curie. On, the worker Role gains
+# only that single-object `get` on Deployments, none of the reconciler's rules,
+# and the worker reads the acting connector's Deployment and the in-force digest
+# itself; the reconcile loop stays off. An execution whose Deployment cannot be
+# read, or does not serve the in-force digest, is refused
+# `connector_digest_unavailable` before dispatch. Capability probes are still
+# requested only by a reconcile pass, so restores need a recorded capability.
+# Requires enabled: true; a render with the reconciler on fails.
+#
 # maxConcurrentSandboxes (AUTOMATED-REMEDIATION-12, executor amendment E9) is the
 # most executions live (claimed or dispatched) across the installation at once,
 # rendered as CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES into both the API,
@@ -801,6 +812,7 @@ connectorCaller:
 # write. It leaves sandbox quota to ordinary turns; an integer of at least 1.
 actionExecutor:
   enabled: false
+  connectorReadsWithoutReconciler: false
   maxConcurrentSandboxes: 2
 
 # Automated remediation (AUTOMATED-REMEDIATION-1). One switch, rendered as
