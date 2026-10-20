@@ -2991,3 +2991,74 @@ mod dark_factory_runner_digest_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod shared_connector_reference_tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn cases() -> Vec<Value> {
+        serde_json::from_str::<Value>(include_str!(
+            "../../tests/vectors/shared-connector-reference.json"
+        ))
+        .unwrap()["vectors"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    fn document(case: &Value) -> Value {
+        if let Some(sibling) = case.get("sibling") {
+            let mut document = cases()[0]["document"].clone();
+            document["connectors"]["docs"]
+                .as_object_mut()
+                .unwrap()
+                .extend(sibling.as_object().unwrap().clone());
+            document
+        } else {
+            case["document"].clone()
+        }
+    }
+
+    #[test]
+    fn shared_connector_reference_vectors() {
+        for case in cases() {
+            let document = document(&case);
+            let parsed = parse_connectors(&serde_norway::to_string(&document).unwrap());
+            assert_eq!(parsed.is_ok(), case["accept"].as_bool().unwrap(), "{case}");
+            if let Ok(parsed) = parsed {
+                let output = serde_json::to_value(parsed).unwrap();
+                for (alias, spec) in document["connectors"].as_object().unwrap() {
+                    if let Some(reference) = spec.get("shared") {
+                        assert_eq!(&output["connectors"][alias]["shared"], reference);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_connector_load_refuses_activation_and_keeps_dedicated_live() {
+        let bundle = tempfile::tempdir().unwrap();
+        for case in cases().into_iter().filter(|case| case["accept"] == true) {
+            let document = document(&case);
+            std::fs::write(
+                bundle.path().join(CONNECTORS_FILE),
+                serde_norway::to_string(&document).unwrap(),
+            )
+            .unwrap();
+            let loaded = load(bundle.path());
+            if document["connectors"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|spec| spec.get("shared").is_some())
+            {
+                let error = loaded.unwrap_err();
+                assert!(format!("{error:#}").contains("shared_connector_requires_application"));
+            } else {
+                assert!(loaded.is_ok(), "{case}: {loaded:?}");
+            }
+        }
+    }
+}
