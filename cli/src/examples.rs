@@ -829,20 +829,7 @@ pub fn install_factory_preparation(
         .iter()
         .filter_map(|(name, bytes)| name.strip_prefix(PREFIX).map(|relative| (relative, *bytes)))
         .collect();
-    let release = crate::managed_skills::embedded(&files)?;
-    crate::managed_skills::preflight_install(&options)?;
-    let result = crate::agent_skills::install("prepare-factory-ticket", &files, options.clone())?;
-    crate::managed_skills::record_install(release, &options)?;
-    Ok(result)
-}
-
-pub fn package_factory_preparation(out: &std::path::Path) -> Result<Box<dyn CliOutput>> {
-    const PREFIX: &str = "preparation/skills/prepare-factory-ticket/";
-    let files: Vec<(&str, &[u8])> = DARK_FACTORY_BUNDLE_FILES
-        .iter()
-        .filter_map(|(name, bytes)| name.strip_prefix(PREFIX).map(|relative| (relative, *bytes)))
-        .collect();
-    crate::managed_skills::package(crate::managed_skills::embedded(&files)?, out)
+    crate::agent_skills::install("prepare-factory-ticket", &files, options)
 }
 
 /// Every tracked file of `examples/dark-factory`, embedded so a released
@@ -919,10 +906,6 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
     (
         "preparation/pilot/outcomes.csv",
         include_bytes!("../../examples/dark-factory/preparation/pilot/outcomes.csv"),
-    ),
-    (
-        "preparation/release-metadata.json",
-        include_bytes!("../../examples/dark-factory/preparation/release-metadata.json"),
     ),
     (
         "preparation/README.md",
