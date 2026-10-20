@@ -171,6 +171,17 @@ chart_scenarios:
         - apps/worker/src/curie_worker/connector_k8s.py
         - pyproject.toml
         - uv.lock
+    connector-secret-rotation:
+      step: Hosted connector credential rotation rolls only that connector
+      leg: workload
+      inputs:
+        - charts/curie/ci/runtime/connector-secret-rotation-runtime.sh
+        - cli
+        - apps/api
+        - apps/worker
+        - packages
+        - pyproject.toml
+        - uv.lock
     runner-template-admission:
       step: Runner template admission refuses host escapes, token mounts, and unlisted images
       leg: chart
