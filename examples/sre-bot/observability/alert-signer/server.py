@@ -23,7 +23,8 @@ with the hook's scoped source key, never the shared agent secret. Before each
 delivery it posts the signed support probe to ``<hook path>/support``, which
 creates no claim, queue entry, message or turn, and forwards only when the API
 answers 200 ``supported``. Each success receipt must report ``read-only`` as its
-requested, effective and alias policy and name a source generation. Any other
+requested, effective and alias policy and name the source generation the probe
+reported. Any other
 answer is refused with HTTP 502 to the source and one warning naming only a
 fixed reason. The default ``ordinary`` mode is unchanged.
 
@@ -235,8 +236,10 @@ def _exchange(url: str, body: bytes, headers: dict[str, str]) -> tuple[int, Any]
     return status, answer if isinstance(answer, dict) else None
 
 
-def check_support(hook: str, secret: str, delivery: str) -> None:
+def check_support(hook: str, secret: str, delivery: str) -> str:
     """Refuse unless the API reports supported protected admission for this hook.
+
+    Returns the source generation the probe reported.
 
     The probe is observational: no hook claim, queue entry, Slack post or turn.
     A shared or revoked key answers 401 and an unconfigured hook 503; neither
@@ -277,12 +280,17 @@ def check_support(hook: str, secret: str, delivery: str) -> None:
         or answer.get("requested_tool_access") != READ_ONLY
         or answer.get("effective_tool_access") != READ_ONLY
         or not all(isinstance(member, str) and member for member in runtime)
+        or not isinstance(answer.get("source_generation"), str)
+        or not answer["source_generation"]
     ):
         raise ProtectedRefusal("support_malformed")
+    return str(answer["source_generation"])
 
 
-def verify_receipt(receipt: Any) -> None:
+def verify_receipt(receipt: Any, generation: str) -> None:
     """Refuse a success receipt that does not attest protected read-only admission.
+
+    Its source generation must be the one the support probe reported.
 
     @spec HOOK-SOURCE-POLICY-6 @spec PROTECTED-HOOK-SOURCE-8.
     """
@@ -292,8 +300,7 @@ def verify_receipt(receipt: Any) -> None:
     for field in ("requested_tool_access", "effective_tool_access", "tool_access"):
         if receipt.get(field) != READ_ONLY:
             raise ProtectedRefusal("receipt_not_read_only")
-    generation = receipt.get("source_generation")
-    if not isinstance(generation, str) or not generation:
+    if receipt.get("source_generation") != generation:
         raise ProtectedRefusal("receipt_unbound_source")
     if receipt.get("acceptance_status") not in ("accepted", "preparing"):
         raise ProtectedRefusal("receipt_not_admitted")
@@ -305,7 +312,7 @@ def deliver(body: bytes, signature: str, delivery: str, timestamp: str) -> int:
     if source_mode() != PROTECTED:
         return forward(body, signature, delivery, timestamp)
     hook, _tool_access, secret = target()
-    check_support(hook, secret, delivery)
+    generation = check_support(hook, secret, delivery)
     status, receipt = _exchange(
         os.environ["CURIE_HOOK_URL"],
         body,
@@ -316,7 +323,7 @@ def deliver(body: bytes, signature: str, delivery: str, timestamp: str) -> int:
         },
     )
     if 200 <= status < 300:
-        verify_receipt(receipt)
+        verify_receipt(receipt, generation)
     return status
 
 

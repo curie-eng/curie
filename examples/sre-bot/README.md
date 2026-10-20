@@ -431,7 +431,8 @@ For each alert the signer then:
 2. Forwards the delivery signed under the scoped key with `read-only` in the
    signed context.
 3. Checks the receipt: `requested_tool_access`, `effective_tool_access` and
-   `tool_access` must each be `read-only`, `source_generation` must be present,
+   `tool_access` must each be `read-only`, `source_generation` must equal the
+   generation the support probe reported,
    and `acceptance_status` must be `accepted` or `preparing`. A duplicate is
    checked the same way.
 

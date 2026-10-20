@@ -448,6 +448,7 @@ def test_protected_source_probes_support_then_forwards_read_only(
         ((503, {**_SUPPORTED}), "support_malformed"),
         ((200, {**_SUPPORTED, "effective_tool_access": None}), "support_malformed"),
         ((200, {**_SUPPORTED, "runtime_generation": None}), "support_malformed"),
+        ((200, {**_SUPPORTED, "source_generation": None}), "support_malformed"),
     ],
 )
 def test_protected_source_refuses_before_delivery_without_support(
@@ -489,6 +490,7 @@ def test_protected_source_with_shared_agent_key_is_refused_before_delivery(
         ({key: value for key, value in _RECEIPT.items() if key != "effective_tool_access"},
          "receipt_not_read_only"),
         ({**_RECEIPT, "source_generation": None}, "receipt_unbound_source"),
+        ({**_RECEIPT, "source_generation": "4"}, "receipt_unbound_source"),
         ({**_RECEIPT, "acceptance_status": "pending"}, "receipt_not_admitted"),
         (b"not json", "receipt_malformed"),
     ],
