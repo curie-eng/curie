@@ -66,6 +66,16 @@ one does not imply support for the other.
 | Measured ROI | Unavailable as an automatic promise | Usage and estimates help evaluate economics. Savings require a baseline, accepted outcomes, and measured human review effort. Follow the outcome measurement guide. |
 | Traces, versions, and operator control | Released with limits | The console and API expose runs, costs, versions, approvals, and memory. Retained telemetry depends on the configured stores and exporters. Trace visibility is not a blanket tamper-proof audit guarantee. See [observability](../ARCHITECTURE.md#the-observability-pipeline) and [operations](operations.md). |
 
+## Hooks, undo, and automated remediation
+
+| Capability | Status | What to expect and where to check |
+| --- | --- | --- |
+| Automated hook turns | Released with limits | An alert or event delivered through a hook starts a turn whose tool access cannot be widened by the source, and which stays `read-only`. See [read-only adoption](superpowers/specs/2026-09-30-hook-read-only-adoption.md) and [ADR 0190](adr/0190-automated-hook-sources-cannot-widen-their-tool-access.md). |
+| Protected hook lane | Released with limits | A hook with an active protected source policy runs its turns through the protected worker. It is the only lane that can nominate remediation. An ordinary hook is unaffected. See [protected hook lane](superpowers/specs/2026-10-02-protected-hook-lane.md) and [source policy](superpowers/specs/2026-10-02-protected-hook-source-policy.md). |
+| Undo of a recorded action | Released with limits | The platform restores a recorded action through the connector's own `restore` verb, with no model in the path. It needs a hosted connector at a pinned digest that serves `observe_version` and `restore` and replies to writes with a sealed snapshot. Actions recorded before 0.13.0 and cleartext replies are not undoable, and undo runs on the cluster tier only. See [writing a reversible connector](writing-a-reversible-connector.md) and the [action ledger](../ARCHITECTURE.md#the-action-ledger-and-the-connector-action-executor). |
+| Automated remediation | Released with limits | Off by default, cluster tier only, protected hooks only. A turn nominates a bounded action the administrator's policy already declares; the platform admits, executes and verifies it without a model, or asks an approver. Nothing runs unattended until the installation has recorded drills for that action, and an `idempotent` action also needs a connector whose write replies are sealed. Automated alert turns do not change alert rules. See [operations](operations.md#automated-remediation), [writing nominations](writing-remediation-nominations.md) and [ARCHITECTURE](../ARCHITECTURE.md#automated-remediation). |
+| Autonomous incident resolution | Unavailable | Remediation is bounded and opt-in per action; it is not a promise that an incident is diagnosed, fixed or kept stable without a person. Which paths are verified is your installation's recorded evidence, not a platform guarantee. |
+
 ## Deployment ownership
 
 The local platform runs through Docker Compose; cluster deployments run in an
