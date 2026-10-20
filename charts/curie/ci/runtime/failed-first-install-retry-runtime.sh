@@ -291,11 +291,13 @@ spec:
                 and all(row["status"].lower() == "failed" for row in history),
                 "the first attempt must leave only failed revision 1")
         pods = read("pods")["items"]
+        # schema-wait uses the API image and may fail before the regular container starts.
         require(any(pod["metadata"].get("labels", {}).get("app.kubernetes.io/component") == "api"
                     and container.get("image") == bad_image
                     and container.get("state", {}).get("waiting", {}).get("reason")
                     in {"ErrImageNeverPull", "ErrImagePull", "ImagePullBackOff"}
-                    for pod in pods for container in pod.get("status", {}).get("containerStatuses", [])),
+                    for pod in pods for status_key in ("initContainerStatuses", "containerStatuses")
+                    for container in pod.get("status", {}).get(status_key, [])),
                 "the first failure did not leave the unavailable API image waiting")
         anchor = read(f"secret/sh.helm.release.v1.{release}.v1")
         anchor_time = timestamp(anchor["metadata"].get("creationTimestamp"))
