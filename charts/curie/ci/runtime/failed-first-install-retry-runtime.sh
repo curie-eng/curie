@@ -267,8 +267,8 @@ spec:
         command = [str(binary), "cluster", "--context", context, "up", "--namespace", namespace,
                    "--release", release, "--chart", str(chart), "--values-file", str(values_file),
                    "--adopt", "--fake-model", "--no-expose"]
-        first = run([*command, "--set-string", f"api.image.repository={bad_image.rsplit(':', 1)[0]}",
-                     "--set-string", f"api.image.tag={bad_image.rsplit(':', 1)[1]}"],
+        first = run([*command, "--set", f"api.image.repository={bad_image.rsplit(':', 1)[0]}",
+                     "--set", f"api.image.tag={bad_image.rsplit(':', 1)[1]}"],
                     "first cluster up", timeout=660, check=False)
         require(first.returncode != 0, "first cluster up unexpectedly succeeded with an unavailable API image")
         history = json.loads(helm("history", release, "--output", "json").stdout)

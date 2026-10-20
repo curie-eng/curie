@@ -255,6 +255,12 @@ if tool == 'kubectl':
         ix = args.index('get'); kind = args[ix+1]; name = args[ix+2] if len(args) > ix+2 else ''
         if kind == 'runtimeclass': print('Error from server (Forbidden): runtimeclasses.node.k8s.io "'+name+'" is forbidden: User "fixture" cannot get resource "runtimeclasses" in API group "node.k8s.io" at the cluster scope', file=sys.stderr); sys.exit(1)
         if kind == 'apiservices.apiregistration.k8s.io': emit({'apiVersion':'v1','kind':'List','items':[]})
+        if kind == 'pvc' and args[ix+2:] == ['-n',ns,'-o','json','-l','app.kubernetes.io/instance='+release+',app.kubernetes.io/component in (postgres,clickhouse,rustfs,valkey)']:
+            emit({'apiVersion':'v1','kind':'PersistentVolumeClaimList','items':[]})
+        if kind == 'statefulset' and args[ix+2:] == ['-n',ns,'-o','json']:
+            emit({'apiVersion':'apps/v1','kind':'StatefulSetList','items':[]})
+        if kind == 'secret' and args[ix+2:] == ['sh.helm.release.v1.'+release+'.v1','-n',ns,'-o','json']:
+            emit({'apiVersion':'v1','kind':'Secret','type':'helm.sh/release.v1','metadata':{'name':name,'namespace':ns,'creationTimestamp':'2026-10-17T10:00:00Z','labels':{'owner':'helm','name':release,'version':'1','status':'failed'}}})
         if kind == 'events' and '--watch' in args:
             deadline = time.monotonic() + 5
             while not (root / 'retried').exists():
