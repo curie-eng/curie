@@ -61,9 +61,11 @@ STATIC_TOKEN_ROTATION_MODULE = "tools/factory-e2e/tests/test_c4_static_token_rot
 FORGE_INSTANCE_JOB = "forge-instance-regression"
 ADMITTED_AGENT_JOB = "factory-admitted-agent"
 FACTORY_SIBLING_RESULTS = {
-    "forge_instance_result": "FORGE_INSTANCE_RESULT",
     "admitted_agent_result": "ADMITTED_AGENT_RESULT",
 }
+NIGHTLY_DISPATCH = (
+    "github.event_name == 'workflow_dispatch' && inputs.nightly == true"
+)
 FORGE_INSTANCE_MODULE = "tools/factory-e2e/tests/test_c4_forge_instances.py"
 FORGE_INSTANCE_LEGS = {
     "second-gitlab": "test_second_gitlab_registration_preserves_first",
@@ -2323,6 +2325,7 @@ AGGREGATE_EXPRESSIONS = {
     "changes_result": "${{ needs.changes.result }}",
     "registration_result": "${{ needs.runtime-assertion-registration.result }}",
     "event_name": "${{ github.event_name }}",
+    "nightly": "${{ inputs.nightly }}",
     "skill_selected": "${{ needs.changes.outputs.skill }}",
     "local_selected": "${{ needs.changes.outputs.local }}",
     "local_release_selected": "${{ needs.changes.outputs.local_release }}",
@@ -2352,7 +2355,9 @@ AGGREGATE_EXPRESSIONS = {
 def _changes_filter_script() -> str:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     trigger = workflow[True]
-    assert trigger["workflow_dispatch"] is None
+    nightly = trigger["workflow_dispatch"]["inputs"]["nightly"]
+    assert nightly["type"] == "boolean"
+    assert nightly["default"] is False
     group = workflow["concurrency"]["group"]
     assert group == ("${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}")
     run = next(
@@ -2705,23 +2710,17 @@ def test_image_proofs_rejects_a_changed_group_contract(mutation: str) -> None:
         _assert_image_proofs(workflow)
 
 
+def _nightly_if(selection: str) -> str:
+    return "${{ " + NIGHTLY_DISPATCH + " && " + selection + " }}"
+
+
 def _assert_upgrade_job_gates(workflow: dict[str, Any]) -> None:
     jobs = workflow["jobs"]
-    for job, flag in (
-        ("e2e-released-upgrade", "released_upgrade_full"),
-        ("e2e-released-upgrade-negative", "released_upgrade"),
-    ):
-        condition = jobs[job]["if"]
-        assert condition == "${{ needs.changes.outputs." + flag + " == 'true' }}"
-        match = re.fullmatch(
-            r"\$\{\{ needs\.changes\.outputs\.(released_upgrade(?:_full)?) == 'true' \}\}",
-            condition,
-        )
-        assert match is not None
-        for selected, full in (("false", "false"), ("true", "false"), ("true", "true")):
-            flags = {"released_upgrade": selected, "released_upgrade_full": full}
-            expected = full if job == "e2e-released-upgrade" else selected
-            assert (flags[match[1]] == "true") is (expected == "true")
+    positive = jobs["e2e-released-upgrade"]["if"]
+    assert positive == _nightly_if("needs.changes.outputs.released_upgrade_full == 'true'")
+    negative = jobs["e2e-released-upgrade-negative"]["if"]
+    assert negative == "${{ needs.changes.outputs.released_upgrade == 'true' }}"
+    assert NIGHTLY_DISPATCH not in negative
 
 
 @pytest.mark.parametrize(
@@ -3203,7 +3202,7 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
     )
     assert negative_job["runs-on"] == "ubuntu-latest"
     assert negative_job["if"] == "${{ needs.changes.outputs.released_upgrade == 'true' }}"
-    assert job["if"] == "${{ needs.changes.outputs.released_upgrade_full == 'true' }}"
+    assert job["if"] == _nightly_if("needs.changes.outputs.released_upgrade_full == 'true'")
     assert set(negative_job["needs"]) == set(job["needs"])
     negative_steps = {
         step["name"]: step for step in negative_job["steps"] if isinstance(step.get("name"), str)
@@ -3486,6 +3485,7 @@ class _AggregateOverrides(TypedDict, total=False):
     changes_result: str
     registration_result: str
     event_name: str
+    nightly: str
     skill_selected: str
     local_selected: str
     local_release_selected: str
@@ -3523,6 +3523,7 @@ def _run_aggregate(
         "changes_result": "success",
         "registration_result": "success",
         "event_name": "push",
+        "nightly": "false",
         "skill_selected": "false",
         "local_selected": "false",
         "local_release_selected": "false",
@@ -3546,12 +3547,20 @@ def _run_aggregate(
         "upgrade_matrix_result": "skipped",
     }
     state.update(overrides)
-    # The forge instance and admitted agent jobs are gated
-    # exactly like the scripted factory job, so they follow the scripted
-    # result unless a test overrides them.
+    # Admitted agent stays on the scripted factory gate. Forge runs only on a
+    # nightly dispatch, so a test that does not name it gets a skip unless
+    # that dispatch selected factory.
     for name in FACTORY_SIBLING_RESULTS:
         if name not in overrides:
             state[name] = state["factory_result"]
+    if "forge_instance_result" not in overrides:
+        nightly = (
+            state["event_name"] == "workflow_dispatch" and state["nightly"] == "true"
+        )
+        if nightly and state["factory_selected"] == "true":
+            state["forge_instance_result"] = state["factory_result"]
+        else:
+            state["forge_instance_result"] = "skipped"
     if "chart_scenarios" not in overrides and state["cluster_selected"] == "true":
         state["chart_scenarios"] = '["workspace-diagnostic"]'
     environment = os.environ.copy()
@@ -3648,7 +3657,7 @@ def test_e2e_required_accepts_a_version_only_selection(tmp_path: Path) -> None:
             "local_release_result": "success",
             "cluster_result": "success",
             "cluster_chart_result": "success",
-            "rollout_recovery_result": "success",
+            "rollout_recovery_result": "skipped",
         },
         {
             "event_name": "pull_request",
@@ -3659,12 +3668,15 @@ def test_e2e_required_accepts_a_version_only_selection(tmp_path: Path) -> None:
         },
         {
             "event_name": "workflow_dispatch",
+            "nightly": "true",
             "cluster_selected": "true",
             "cluster_result": "success",
             "cluster_chart_result": "success",
             "rollout_recovery_result": "success",
         },
         {
+            "event_name": "workflow_dispatch",
+            "nightly": "true",
             "released_upgrade_selected": "true",
             "released_upgrade_full": "true",
             "released_upgrade_result": "success",
@@ -3680,6 +3692,8 @@ def test_aggregate_accepts_exact_selected_outcomes(state: _AggregateOverrides) -
 
 def test_aggregate_requires_upgrade_matrix_when_released_upgrade_is_selected() -> None:
     ok = _run_aggregate(
+        event_name="workflow_dispatch",
+        nightly="true",
         released_upgrade_selected="true",
         released_upgrade_full="true",
         released_upgrade_result="success",
@@ -3689,6 +3703,8 @@ def test_aggregate_requires_upgrade_matrix_when_released_upgrade_is_selected() -
     assert ok.returncode == 0, ok.stdout + ok.stderr
     for result in ("skipped", "failure", "cancelled"):
         rejected = _run_aggregate(
+            event_name="workflow_dispatch",
+            nightly="true",
             released_upgrade_selected="true",
             released_upgrade_full="true",
             released_upgrade_result="success",
@@ -3897,15 +3913,13 @@ def test_aggregate_rejects_inconsistent_outcomes(state: _AggregateOverrides) -> 
     assert completed.returncode != 0
 
 
-@pytest.mark.parametrize("event_name", ["push", "workflow_dispatch"])
 @pytest.mark.parametrize("result", ["failure", "skipped", "cancelled"])
-def test_aggregate_requires_rollout_recovery_success_when_selected(
-    event_name: str, result: str
+def test_aggregate_requires_rollout_recovery_success_when_nightly_selected(
+    result: str,
 ) -> None:
-    # failure is the 2026-09-29 next dispatch run 36551160014 shape: the
-    # rollout recovery job failed while E2E required stayed green.
     completed = _run_aggregate(
-        event_name=event_name,
+        event_name="workflow_dispatch",
+        nightly="true",
         cluster_selected="true",
         cluster_result="success",
         cluster_chart_result="success",
@@ -3930,11 +3944,21 @@ def test_aggregate_rollout_recovery_must_skip_when_not_expected(result: str) -> 
         rollout_recovery_result=result,
     )
     assert unselected.returncode != 0
+    plain_dispatch = _run_aggregate(
+        event_name="workflow_dispatch",
+        nightly="false",
+        cluster_selected="true",
+        cluster_result="success",
+        cluster_chart_result="success",
+        rollout_recovery_result=result,
+    )
+    assert plain_dispatch.returncode != 0
 
 
 def test_negative_control_covers_rollout_recovery_result() -> None:
     state: _AggregateOverrides = {
-        "event_name": "push",
+        "event_name": "workflow_dispatch",
+        "nightly": "true",
         "cluster_selected": "true",
         "cluster_result": "success",
         "cluster_chart_result": "success",
@@ -4056,9 +4080,7 @@ def test_single_regression_proofs_run_outside_the_cluster_rung() -> None:
     assert "e2e-cluster-chart-regressions" in jobs["e2e-required"]["needs"]
 
     rollout = jobs["e2e-cluster-rollout-recovery"]
-    assert rollout["if"] == (
-        "${{ github.event_name != 'pull_request' && needs.changes.outputs.cluster == 'true' }}"
-    )
+    assert rollout["if"] == _nightly_if("needs.changes.outputs.cluster == 'true'")
     assert "e2e-cluster-rollout-recovery" in jobs["e2e-required"]["needs"]
 
 
@@ -4230,7 +4252,7 @@ def test_aggregate_requires_approval_resume_success_when_selected(
         "cluster_selected": "true",
         "cluster_result": "success",
         "cluster_chart_result": "success",
-        "rollout_recovery_result": ("skipped" if event_name == "pull_request" else "success"),
+        "rollout_recovery_result": "skipped",
         "approval_resume_selected": "true",
     }
     ok = _run_aggregate(**state, approval_resume_result="success")
@@ -4823,7 +4845,8 @@ def test_forge_instance_job_is_gated_like_the_scripted_factory_and_required() ->
         },
     }
     assert not job.get("continue-on-error")
-    assert job["if"] == jobs[SCRIPTED_FACTORY_JOB]["if"]
+    assert job["if"] == _nightly_if("needs.changes.outputs.factory == 'true'")
+    assert job["if"] != jobs[SCRIPTED_FACTORY_JOB]["if"]
     assert "needs.changes.outputs.factory == 'true'" in job["if"]
     assert job["needs"] == ["changes"]
     assert FORGE_INSTANCE_JOB in jobs["e2e-required"]["needs"]
@@ -4844,8 +4867,63 @@ def test_forge_instance_job_is_gated_like_the_scripted_factory_and_required() ->
         "${{ needs.forge-instance-regression.result }}"
     )
     script = required["run"]
-    assert '"$FORGE_INSTANCE_RESULT" != "$factory_expected"' in script
+    assert '"$FORGE_INSTANCE_RESULT" != "$forge_instance_expected"' in script
     assert "FACTORY_RESULT FORGE_INSTANCE_RESULT ADMITTED_AGENT_RESULT" in script
+
+
+NIGHTLY_JOBS = {
+    FORGE_INSTANCE_JOB: "needs.changes.outputs.factory == 'true'",
+    "e2e-cluster-rollout-recovery": "needs.changes.outputs.cluster == 'true'",
+    "e2e-released-upgrade": "needs.changes.outputs.released_upgrade_full == 'true'",
+}
+
+
+def test_nightly_jobs_keep_their_selector_and_reject_a_missing_condition() -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    for job_id, selection in NIGHTLY_JOBS.items():
+        assert jobs[job_id]["if"] == _nightly_if(selection)
+        missing = jobs[job_id]["if"].replace("inputs.nightly == true && ", "")
+        assert missing != jobs[job_id]["if"]
+        assert "inputs.nightly" not in missing
+    for unchanged in ("cli-portability", "cli-darwin", "e2e-released-upgrade-negative"):
+        assert "inputs.nightly" not in jobs[unchanged]["if"]
+    assert jobs["cli-portability"]["if"] == jobs["cli-darwin"]["if"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "event_name": "workflow_dispatch",
+            "nightly": "true",
+            "factory_selected": "true",
+            "factory_result": "success",
+            "forge_instance_result": "skipped",
+        },
+        {
+            "event_name": "workflow_dispatch",
+            "nightly": "true",
+            "cluster_selected": "true",
+            "cluster_result": "success",
+            "cluster_chart_result": "success",
+            "rollout_recovery_result": "skipped",
+        },
+        {
+            "event_name": "workflow_dispatch",
+            "nightly": "true",
+            "released_upgrade_selected": "true",
+            "released_upgrade_full": "true",
+            "released_upgrade_result": "skipped",
+            "released_upgrade_negative_result": "success",
+            "upgrade_matrix_result": "success",
+        },
+    ],
+)
+def test_aggregate_rejects_a_skip_on_a_nightly_dispatch(
+    overrides: dict[str, str],
+) -> None:
+    completed = _run_aggregate(**overrides)
+    assert completed.returncode != 0, completed.stdout + completed.stderr
 
 
 @pytest.mark.parametrize("mutation", ("extra-case", "missing-leg", "duplicate-leg"))
@@ -4917,7 +4995,8 @@ def test_forge_instance_matrix_executes_each_case_and_propagates_failure(
         results.append(executed.returncode)
     assert sorted(selected) == sorted(_collect_forge_instance_cases())
     aggregate = _run_aggregate(
-        event_name="pull_request",
+        event_name="workflow_dispatch",
+        nightly="true",
         factory_selected="true",
         factory_result="success",
         forge_instance_result="failure" if any(results) else "success",

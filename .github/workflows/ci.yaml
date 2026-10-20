@@ -8,9 +8,17 @@ on:
     # Commit events only. A title or body edit must not cancel an in-flight
     # run and restart kind shards. Body-edit guards live in their own workflows.
     types: [opened, synchronize, reopened]
-  # Manual run of the full suite, including kind. The scheduled workflow on
-  # the default branch dispatches this against main or next.
+  # Manual run of the full suite. nightly selects the three nightly kind
+  # jobs. The scheduled workflow on the default branch dispatches this
+  # against main or next. A release dispatch omits inputs, so nightly stays
+  # false and those three jobs do not run.
   workflow_dispatch:
+    inputs:
+      nightly:
+        description: Run the nightly kind jobs
+        required: false
+        type: boolean
+        default: false
 
 # The event name is part of the group so a dispatch is not cancelled by a
 # push to that ref. A pull request or dispatch supersedes its own in-flight
@@ -3307,7 +3315,7 @@ jobs:
     name: Forge instance regression (kind, ${{ matrix.suite }})
     runs-on: ubuntu-latest
     needs: [changes]
-    if: ${{ needs.changes.outputs.factory == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.nightly == true && needs.changes.outputs.factory == 'true' }}
     timeout-minutes: 165
     strategy:
       fail-fast: false
@@ -3702,18 +3710,16 @@ jobs:
           path: ${{ runner.temp }}/runtime-assertion-receipts
           if-no-files-found: ignore
 
-  # ROLLOUT-FREE FIRST INVOCATION AND DEAD-CONSUMER RECOVERY (QA4-02), off the
-  # pull request path. It needs a full platform install of its own, which on a
-  # pull request would sit on the cluster rung's critical path. It runs on every
-  # dispatch of main or next (nightly-kind.yaml), whenever the cluster tier is
-  # selected. The pull request cluster rung still drives the first no-Slack
-  # `cluster message` through the parity ladder; this job adds the rollout-free
-  # and PEL recovery assertions.
+  # ROLLOUT-FREE FIRST INVOCATION AND DEAD-CONSUMER RECOVERY (QA4-02). It needs
+  # a full platform install of its own. It runs on a nightly dispatch whenever
+  # the cluster tier is selected. The pull request cluster rung still drives
+  # the first no-Slack `cluster message` through the parity ladder; this job
+  # adds the rollout-free and PEL recovery assertions.
   e2e-cluster-rollout-recovery:
     name: E2E rollout-free invocation and dead-consumer recovery (kind)
     runs-on: ubuntu-latest
     needs: [rust-build, changes, ci-images]
-    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.cluster == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.nightly == true && needs.changes.outputs.cluster == 'true' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -4213,7 +4219,7 @@ jobs:
     name: E2E released chart upgrade (released install to candidate)
     runs-on: ubuntu-latest
     needs: [rust-build, changes, ci-images]
-    if: ${{ needs.changes.outputs.released_upgrade_full == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.nightly == true && needs.changes.outputs.released_upgrade_full == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -5130,6 +5136,7 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           REGISTRATION_RESULT: ${{ needs.runtime-assertion-registration.result }}
           EVENT_NAME: ${{ github.event_name }}
+          NIGHTLY: ${{ inputs.nightly }}
           SKILL_SELECTED: ${{ needs.changes.outputs.skill }}
           LOCAL_SELECTED: ${{ needs.changes.outputs.local }}
           LOCAL_RELEASE_SELECTED: ${{ needs.changes.outputs.local_release }}
@@ -5165,7 +5172,7 @@ jobs:
                   "$ROLLOUT_RECOVERY_RESULT" != "$rollout_recovery_expected" ||
                   "$APPROVAL_RESUME_RESULT" != "$approval_resume_expected" ||
                   "$FACTORY_RESULT" != "$factory_expected" ||
-                  "$FORGE_INSTANCE_RESULT" != "$factory_expected" ||
+                  "$FORGE_INSTANCE_RESULT" != "$forge_instance_expected" ||
                   "$ADMITTED_AGENT_RESULT" != "$factory_expected" ||
                   "$RELEASED_UPGRADE_RESULT" != "$released_upgrade_expected" ||
                   "$RELEASED_UPGRADE_NEGATIVE_RESULT" != "$released_upgrade_negative_expected" ||
@@ -5214,9 +5221,15 @@ jobs:
           if [[ "$CHART_SCENARIOS" != "[]" ]]; then
             cluster_chart_expected="success"
           fi
-          # Mirrors the rollout recovery job's if: pushes and dispatches only.
+          # Nightly is the workflow_dispatch input. Pull requests and pushes
+          # leave it empty, which is not a nightly dispatch.
+          nightly_dispatch="false"
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$NIGHTLY" == "true" ]]; then
+            nightly_dispatch="true"
+          fi
+          # Mirrors the rollout recovery job's if: nightly dispatch and cluster.
           rollout_recovery_expected="skipped"
-          if [[ "$CLUSTER_SELECTED" == "true" && "$EVENT_NAME" != "pull_request" ]]; then
+          if [[ "$nightly_dispatch" == "true" && "$CLUSTER_SELECTED" == "true" ]]; then
             rollout_recovery_expected="success"
           fi
           # Mirrors the approval resume job's if (#4016), pull requests included.
@@ -5224,16 +5237,21 @@ jobs:
           if [[ "$APPROVAL_RESUME_SELECTED" == "true" ]]; then
             approval_resume_expected="success"
           fi
-          # Mirrors the scripted factory and forge instance jobs' if, pull requests
-          # included.
+          # Scripted factory and admitted agent stay on factory selection.
+          # Forge instance runs only on a nightly dispatch that selected factory.
           factory_expected="skipped"
           if [[ "$FACTORY_SELECTED" == "true" ]]; then
             factory_expected="success"
           fi
-          # Dispatches run the positive upgrade. Every selected upgrade tier
-          # runs its negative control and all selected matrix shards.
+          forge_instance_expected="skipped"
+          if [[ "$nightly_dispatch" == "true" && "$FACTORY_SELECTED" == "true" ]]; then
+            forge_instance_expected="success"
+          fi
+          # The positive upgrade runs only on a nightly dispatch that selected
+          # the full history. Every selected upgrade tier still runs its
+          # negative control and all selected matrix shards.
           released_upgrade_expected="skipped"
-          if [[ "$RELEASED_UPGRADE_FULL" == "true" ]]; then
+          if [[ "$nightly_dispatch" == "true" && "$RELEASED_UPGRADE_FULL" == "true" ]]; then
             released_upgrade_expected="success"
           fi
           released_upgrade_negative_expected="skipped"
