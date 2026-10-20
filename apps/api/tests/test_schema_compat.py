@@ -249,9 +249,11 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # WorkItems by their tracker issue (#3831), and 0105 adds the trigger
     # label (#4361). The 0108 join also requires stable reply selectors and
     # identity links, so every earlier schema is refused.
-    for below_tenant_scope in sorted(known - {"0108"}):
+    served = {window.schema_min, window.schema_head}
+    for below_tenant_scope in sorted(known - served):
         assert can_serve(below_tenant_scope, window, known) is False
-    assert can_serve("0108", window, known) is True
+    for revision in served:
+        assert can_serve(revision, window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:
