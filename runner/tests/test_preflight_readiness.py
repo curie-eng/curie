@@ -13,9 +13,11 @@ server) and the declared check (a shell script held at a release barrier).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import pathlib
+import signal
 import threading
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -219,22 +221,33 @@ def _declare(root: Path, checks: list[dict[str, Any]]) -> tuple[Path, Path]:
     return plugin, workspace
 
 
-def _hold_check(bindir: Path, h: _Harness, exit_status: int) -> None:
-    """A check that records its pid, enters the barrier, and waits for release."""
+def _barrier(h: _Harness, exit_status: int) -> str:
+    """Shell lines that wait for the release file, then exit with ``exit_status``."""
 
-    bindir.mkdir(exist_ok=True)
-    script = bindir / _HOLD_COMMAND
-    script.write_text(
-        "#!/bin/sh\n"
-        f"echo $$ > '{h.pidfile}'\n"
-        f": > '{h.entered}'\n"
+    return (
         "i=0\n"
         f"while [ ! -e '{h.release}' ]; do\n"
         "  i=$((i + 1))\n"
         f'  if [ "$i" -ge {_HOLD_POLLS} ]; then exit 70; fi\n'
         "  sleep 0.05\n"
         "done\n"
-        f"exit {exit_status}\n",
+        f"exit {exit_status}\n"
+    )
+
+
+def _hold_check(bindir: Path, h: _Harness, exit_status: int, body: str | None = None) -> None:
+    """A check that records its pid, enters the barrier, and waits for release.
+
+    ``body`` replaces everything after the pid line when a test needs a
+    different check shape.
+    """
+
+    bindir.mkdir(exist_ok=True)
+    script = bindir / _HOLD_COMMAND
+    if body is None:
+        body = f": > '{h.entered}'\n" + _barrier(h, exit_status)
+    script.write_text(
+        f"#!/bin/sh\necho $$ > '{h.pidfile}'\n{body}",
         encoding="utf-8",
     )
     script.chmod(0o755)
@@ -256,6 +269,7 @@ async def _harness(
     checks: list[dict[str, Any]] | None = None,
     report_status: int = 201,
     fake_model: bool = False,
+    script_body: Callable[[_Harness], str] | None = None,
 ) -> AsyncIterator[_Harness]:
     """Boot ``_serve`` in a thread against an in-test progress API; clean up all."""
 
@@ -268,7 +282,7 @@ async def _harness(
             client=client,
         )
         bindir = tmp_path / "bin"
-        _hold_check(bindir, h, exit_status)
+        _hold_check(bindir, h, exit_status, None if script_body is None else script_body(h))
         plugin, workspace = _declare(
             tmp_path,
             checks
@@ -521,15 +535,19 @@ def test_rejected_verification_report_fails_every_turn_without_a_model(
             await h.wait_entered()
             await h.wait_served(timeout=_HEALTHZ_WITHIN_S)
 
-            held = asyncio.create_task(h.turn("Start on the issue."))
-            await asyncio.sleep(0.3)
-            assert not held.done()
+            # Both turns are in flight on the shared initialization before the
+            # check is released, so neither reads an already-settled outcome.
+            first = asyncio.create_task(h.turn("Start on the issue."))
+            second = asyncio.create_task(h.turn("Try again."))
+            await asyncio.sleep(0.5)
+            assert not first.done() and not second.done()
+            assert h.verification == []
+            assert h.model.constructed == 0
             h.release.touch()
             with anyio.fail_after(30):
-                outbound_held = await held
-            outbound_after = await h.turn("Try again.")
+                outbounds = await asyncio.gather(first, second)
 
-            for outbound in (outbound_held, outbound_after):
+            for outbound in outbounds:
                 finals = _finals(outbound)
                 assert len(finals) == 1 and outbound[-1] is finals[0], outbound
                 assert finals[0].status is SessionStatus.CLASSIFIED_FAILURE, finals[0]
@@ -607,5 +625,91 @@ def test_cleanup_while_check_held_kills_the_check_and_leaves_no_task(
     async def bounded() -> None:
         with anyio.fail_after(120):
             await scenario()
+
+    asyncio.run(bounded())
+
+
+# --- a descendant that outlives the check's leader -----------------------------------
+
+
+def _descendant_body(leader_exits: bool) -> Callable[[_Harness], str]:
+    """Background a long sleep that inherits the check's output pipes.
+
+    Its stdout and stderr are deliberately not redirected, so the pipes stay
+    open after the leader is gone and initialization keeps draining them.
+    """
+
+    def body(h: _Harness) -> str:
+        descendant = h.tmp / "descendant-pid"
+        lines = f"sleep 120 &\necho $! > '{descendant}'\n: > '{h.entered}'\n"
+        return lines + ("exit 0\n" if leader_exits else _barrier(h, 0))
+
+    return body
+
+
+@pytest.mark.parametrize("leader_exits", [True, False], ids=["leader-exits", "leader-held"])
+def test_cleanup_kills_a_descendant_holding_the_check_pipes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, leader_exits: bool
+) -> None:
+    descendant_file = tmp_path / "descendant-pid"
+
+    async def scenario() -> None:
+        async with _harness(tmp_path, monkeypatch, script_body=_descendant_body(leader_exits)) as h:
+            await h.wait_entered()
+            await h.wait_served(timeout=_HEALTHZ_WITHIN_S)
+            descendant = int(descendant_file.read_text(encoding="utf-8").strip())
+            leader = h.pid()
+
+            loop = asyncio.get_running_loop()
+            if leader_exits:
+                # The leader is gone (or a zombie awaiting its reap); only the
+                # descendant still holds the pipes.
+                deadline = loop.time() + 5
+                while loop.time() < deadline:
+                    try:
+                        state = Path(f"/proc/{leader}/stat").read_text(encoding="utf-8")
+                    except FileNotFoundError:
+                        break
+                    if state.rsplit(")", 1)[1].split()[0] == "Z":
+                        break
+                    await asyncio.sleep(0.05)
+                else:
+                    raise AssertionError(f"check leader {leader} never exited")
+            await asyncio.sleep(0.5)
+            # Initialization is still waiting on the open pipes.
+            assert not _process_gone(descendant), "the descendant must still be running"
+            assert h.verification == []
+            assert (await h.runner_status())["ready"] is False
+            assert h.model.constructed == 0
+
+            assert h.app_runner is not None
+            with anyio.fail_after(5):
+                await h.app_runner.cleanup()
+            h.cleaned = True
+            assert not h.release.exists(), "cleanup must not depend on the barrier"
+
+            deadline = loop.time() + 2
+            while loop.time() < deadline and not (
+                _process_gone(descendant) and _process_gone(leader)
+            ):
+                await asyncio.sleep(0.05)
+            assert _process_gone(descendant), (
+                f"descendant {descendant} of the check survived cleanup"
+            )
+            assert _process_gone(leader), f"check leader {leader} was not reaped"
+            assert h.model.constructed == 0
+
+    async def bounded() -> None:
+        try:
+            with anyio.fail_after(120):
+                await scenario()
+        finally:
+            # A regression must not leave the sleep behind for two minutes.
+            if descendant_file.exists():
+                with contextlib.suppress(ProcessLookupError, ValueError):
+                    os.kill(
+                        int(descendant_file.read_text(encoding="utf-8").strip()),
+                        signal.SIGKILL,
+                    )
 
     asyncio.run(bounded())

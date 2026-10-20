@@ -1801,7 +1801,6 @@ def test_late_workspace_candidate_attestation_uses_exact_authenticated_handle(
         pytest.param("sandbox_id", "other-sandbox", id="sandbox-id"),
         pytest.param("managed_workspace", False, id="managed-workspace"),
         pytest.param("cwd", "/tmp", id="cwd"),
-        pytest.param("ready", False, id="ready"),
         pytest.param("status", SessionStatus.DONE.value, id="status"),
         pytest.param("turn_active", True, id="turn-active"),
         pytest.param("history_durable", False, id="history-durable"),
@@ -1838,6 +1837,7 @@ def test_late_workspace_candidate_attestation_mismatch_refuses_handoff(
                 workspace_repo="acme-corp/acme-bot",
                 generation=old.generation + 1,
             )
+            candidate_reads: list[str] = []
 
             async def status(
                 base_url: str,
@@ -1855,8 +1855,13 @@ def test_late_workspace_candidate_attestation_mismatch_refuses_handoff(
                     }
                 assert base_url == candidate.base_url
                 assert token == candidate.token
+                candidate_reads.append(field)
                 payload = _safe_candidate_status(candidate)
                 payload[field] = invalid_value
+                # A still-connecting candidate is polled, so each real mismatch
+                # here also reports ``ready`` false: the refusal must still be
+                # immediate rather than waiting out the readiness budget.
+                payload["ready"] = False
                 return payload
 
             h.kernel._runner.status = status  # type: ignore[method-assign]
@@ -1875,7 +1880,9 @@ def test_late_workspace_candidate_attestation_mismatch_refuses_handoff(
 
             h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
 
-            with pytest.raises(ThreadBusyError):
+            with pytest.raises(
+                ThreadBusyError, match="did not attest the expected managed checkout"
+            ):
                 await h.kernel._claim_or_resume(
                     thread_key,
                     {
@@ -1885,7 +1892,209 @@ def test_late_workspace_candidate_attestation_mismatch_refuses_handoff(
                     workspace_deployment_id=deployment_id,
                     workspace_repo="acme-corp/acme-bot",
                     replace_handle=old,
+                    remaining_s=5.0,
                 )
+
+            # Exactly one read: a real mismatch is refused without polling.
+            assert candidate_reads == [field]
+
+    asyncio.run(go())
+
+
+def _late_candidate_handles(
+    h: Any, thread_key: str, history_ref: str
+) -> tuple[SandboxHandle, SandboxHandle]:
+    old = h.substrate.claim(
+        thread_key,
+        env={
+            "CURIE_RUNNER_TOKEN": "old-runner-token",
+            "CURIE_SESSION_ID": "logical-session",
+            "CURIE_HISTORY_REF": history_ref,
+        },
+    )
+    candidate = SandboxHandle(
+        thread_key=thread_key,
+        claim_name="candidate-claim",
+        sandbox_name="candidate-sandbox",
+        namespace=old.namespace,
+        service_fqdn="candidate.test-ns.svc.cluster.local",
+        port=old.port,
+        session_id=old.session_id,
+        history_ref=old.history_ref,
+        token="candidate-runner-token",
+        workspace_repo="acme-corp/acme-bot",
+        generation=old.generation + 1,
+    )
+    return old, candidate
+
+
+def test_late_workspace_candidate_still_connecting_is_polled_until_ready(
+    make_harness,
+) -> None:
+    """#4777: a candidate whose runner is up but whose session is still
+    connecting reports ``ready: False`` with every other fact safe. The
+    handoff keeps reading its status and accepts the same handle once it
+    turns ready, instead of refusing on the first not-ready read."""
+
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id)) as h:
+            thread_key = _thread_key("tCandidateConnecting")
+            old, candidate = _late_candidate_handles(h, thread_key, "history/tCandidateConnecting")
+            ordering: list[str] = []
+            candidate_reads: list[bool] = []
+
+            async def status(
+                base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                del remaining_s
+                if base_url == old.base_url:
+                    assert token == old.token
+                    ordering.append("old-runner-revalidated")
+                    return {
+                        "status": SessionStatus.DONE.value,
+                        "turn_active": False,
+                        "history_durable": True,
+                    }
+                assert base_url == candidate.base_url
+                assert token == candidate.token
+                ready = len(candidate_reads) >= 3
+                candidate_reads.append(ready)
+                ordering.append("candidate-attested")
+                payload = _safe_candidate_status(candidate)
+                payload["ready"] = ready
+                return payload
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+
+            class WorkspaceProbe:
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    ordering.append("prepared-and-verified")
+                    revalidate = kwargs.get("revalidate_before_handoff")
+                    assert callable(revalidate)
+                    revalidate()
+                    validate_candidate = kwargs.get("validate_candidate")
+                    assert callable(validate_candidate)
+                    validate_candidate(candidate)
+                    return SimpleNamespace(handle=candidate, prepared=None)
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+
+            # The explicit budget bounds a regression that never stops
+            # polling, so it fails instead of hanging.
+            result = await asyncio.wait_for(
+                h.kernel._claim_or_resume(
+                    thread_key,
+                    {
+                        "CURIE_SESSION_ID": old.session_id,
+                        "CURIE_HISTORY_REF": old.history_ref or "",
+                    },
+                    workspace_deployment_id=deployment_id,
+                    workspace_repo="acme-corp/acme-bot",
+                    replace_handle=old,
+                    remaining_s=10.0,
+                ),
+                timeout=20.0,
+            )
+
+            assert result is candidate
+            assert candidate_reads == [False, False, False, True]
+            assert ordering == [
+                "prepared-and-verified",
+                "old-runner-revalidated",
+                "candidate-attested",
+                "candidate-attested",
+                "candidate-attested",
+                "candidate-attested",
+            ]
+
+    asyncio.run(go())
+
+
+def test_late_workspace_candidate_never_ready_refuses_once_budget_is_spent(
+    make_harness,
+) -> None:
+    """#4777: polling a not-ready candidate is bounded by the delivery's
+    remaining budget. A candidate that never turns ready is refused with
+    the attestation failure, not the bridge timeout, once that budget is
+    spent, after more than one read."""
+
+    deployment_id = uuid.uuid4()
+    budget_s = 3.0
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id)) as h:
+            thread_key = _thread_key("tCandidateNeverReady")
+            old, candidate = _late_candidate_handles(h, thread_key, "history/tCandidateNeverReady")
+            candidate_reads = 0
+
+            async def status(
+                base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                nonlocal candidate_reads
+                if base_url == old.base_url:
+                    assert token == old.token
+                    return {
+                        "status": SessionStatus.DONE.value,
+                        "turn_active": False,
+                        "history_durable": True,
+                    }
+                assert base_url == candidate.base_url
+                assert token == candidate.token
+                if remaining_s is not None:
+                    assert remaining_s <= budget_s
+                candidate_reads += 1
+                payload = _safe_candidate_status(candidate)
+                payload["ready"] = False
+                return payload
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+
+            class WorkspaceProbe:
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    revalidate = kwargs.get("revalidate_before_handoff")
+                    assert callable(revalidate)
+                    revalidate()
+                    validate_candidate = kwargs.get("validate_candidate")
+                    assert callable(validate_candidate)
+                    validate_candidate(candidate)
+                    raise AssertionError("a never-ready candidate must never be returned")
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+
+            started = time.monotonic()
+            with pytest.raises(
+                ThreadBusyError, match="did not attest the expected managed checkout"
+            ):
+                await asyncio.wait_for(
+                    h.kernel._claim_or_resume(
+                        thread_key,
+                        {
+                            "CURIE_SESSION_ID": old.session_id,
+                            "CURIE_HISTORY_REF": old.history_ref or "",
+                        },
+                        workspace_deployment_id=deployment_id,
+                        workspace_repo="acme-corp/acme-bot",
+                        replace_handle=old,
+                        remaining_s=budget_s,
+                    ),
+                    timeout=budget_s + 10.0,
+                )
+            elapsed = time.monotonic() - started
+
+            # Polled, not refused on the first not-ready read, and with a
+            # pause between reads rather than a tight loop.
+            assert 1 < candidate_reads < 1000
+            # The match above proves the probe's own deadline fired rather than
+            # the coordinator bridge timeout; this bounds how long it took.
+            assert elapsed < budget_s + 3.0
 
     asyncio.run(go())
 
