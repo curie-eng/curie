@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import fnmatch
 import importlib.util
 import json
@@ -487,3 +488,37 @@ def test_self_test_exercises_the_registry_omission_negative_control(
     output = capsys.readouterr().out
     assert "negative control rejected" in output
     assert "registry" in output.lower()
+
+
+@pytest.mark.parametrize(
+    ("phase", "deleting", "grace", "now", "expected"),
+    [
+        ("Failed", False, None, 111.0, False), ("Succeeded", False, None, 111.0, False),
+        ("Pending", False, None, 111.0, True), ("Running", False, None, 111.0, True),
+        ("Unknown", False, None, 111.0, True),
+        ("Pending", True, 10, 109.0, True), ("Pending", True, 10, 110.0, True),
+        ("Pending", True, 10, 111.0, False),
+        ("Pending", True, None, 111.0, True), ("Pending", False, 10, 111.0, True),
+        ("Failed", True, 10, 109.0, False), ("Succeeded", True, 10, 109.0, False),
+    ],
+)
+def test_idle_capacity_pod_consumes_quota(
+    phase: str, deleting: bool, grace: int | None, now: float, expected: bool,
+) -> None:
+    # QuotaV1Pod: https://raw.githubusercontent.com/kubernetes/kubernetes/v1.31.0/pkg/quota/v1/evaluator/core/pods.go
+    script = REPO_ROOT / "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh"
+    driver = script.read_text().split('cat >"$WORKDIR/driver.py" <<\'PY\'\n', 1)[1]
+    tree = ast.parse(driver.split("\nPY\n", 1)[0])
+    tree.body = [
+        node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))
+        or isinstance(node, ast.FunctionDef) and node.name == "pod_consumes_quota"
+    ]
+    namespace = dict(globals())
+    exec(compile(tree, str(script), "exec"), namespace)
+    metadata = {"name": "acme-runner", "uid": "00000000-0000-4000-8000-000000000001"}
+    if deleting:
+        metadata["deletionTimestamp"] = "1970-01-01T00:01:40Z"
+    if grace is not None:
+        metadata["deletionGracePeriodSeconds"] = grace
+    pod = {"metadata": metadata, "status": {"phase": phase}}
+    assert namespace["pod_consumes_quota"](pod, now) is expected
