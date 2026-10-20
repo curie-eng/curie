@@ -721,6 +721,30 @@ def test_status_body_redacts_raw_provider_metadata_before_encoding(cause: str) -
             "\\[label](https://example.com)\n!\\[image](https://example.com/x.png)",
         ),
     ],
+    ids=[
+        "https",
+        "javascript",
+        "inline-link",
+        "query-ampersand",
+        "query-entity",
+        "backslash-1",
+        "backslash-2",
+        "backslash-3",
+        "backslash-4",
+        "image",
+        "escaped-image-bracket",
+        "escaped-image-bang",
+        "windows-path",
+        "reference-full",
+        "reference-collapsed",
+        "reference-shortcut",
+        "nested-label",
+        "linked-image",
+        "entity-brackets",
+        "checklist",
+        "inline-code",
+        "fenced-code",
+    ],
 )
 def test_quoted_links_are_inert_and_status_card_stays_active(
     cause: str, message: str, visible: str
@@ -735,7 +759,9 @@ def test_quoted_links_are_inert_and_status_card_stays_active(
         base_line=f"[active]({control_url})",
         result=result_section(
             cause,
-            pr_url="https://github.com/acme-corp/acme-bot/pull/77" if cause == "completed" else None,
+            pr_url=(
+                "https://github.com/acme-corp/acme-bot/pull/77" if cause == "completed" else None
+            ),
             unchanged=cause == "completed",
             detail=f"**Kept bold** and `code`.\n\n{message}",
         ),

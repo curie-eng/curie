@@ -1918,12 +1918,11 @@ final reply as a neutralized Markdown quote. The reply is redacted before
 clipping to at most 4000 characters, including the trailing `...` when
 clipped. CRLF and bare CR line endings are normalized to LF. Before quoting,
 every `&` is escaped as `&amp;`, then HTML comment openers are broken by
-inserting U+200B after `<`, existing `<` characters are escaped as `&lt;`,
-`![` becomes `!\[`, and U+200B is inserted after every `@`. Emphasis, lists,
-and code marks remain. On GitHub, ordinary Markdown links and references work
-subject to this neutralization. At signs in link targets are also neutralized
-and may prevent navigation. HTML, images, and mentions, including
-entity-encoded mentions, are neutralized. CommonMark does not decode entities
+inserting U+200B after `<`. Original backslashes are doubled before every `[` is
+escaped as `\[`; existing `<` becomes `&lt;`, and U+200B follows every `@`.
+Bracket links, references, and images become inert text. Emphasis, lists, and
+code marks remain. HTML and literal or entity-encoded mentions are neutralized.
+CommonMark does not decode entities
 or backslash escapes inside inline code or fenced code blocks, so escaped characters there show
 their escape spellings. Every line is quoted with `> `; a blank line is
 quoted as `>`. A blank separator follows the quote before platform fields
@@ -2174,11 +2173,10 @@ is read from the final comment's `Agent's last message:` block. The parser
 accepts only the contiguous quote immediately after that label, strips one
 quote prefix from each line, and preserves quoted blank lines. It reverses
 each neutralization substitution once: remove U+200B after `@`, restore
-`!\[` to `![`, decode `&lt;` to `<`, and restore the broken HTML comment
-openers. It decodes `&amp;` to `&` last, without recursively decoding the
-result. Already escaped image openers and preexisting comment-breaking U+200B
-sequences are ambiguous under these substitutions, so their original spelling
-cannot always be recovered. It does not accept a code fence as a fallback.
+`\[` to `[`, then collapse doubled backslashes to preserve original escapes.
+Decode `&lt;` to `<` and restore broken HTML comment openers; decode `&amp;`
+to `&` last, without recursively decoding the result. Preexisting comment-breaking
+U+200B sequences remain ambiguous. It does not accept a code fence as a fallback.
 The existing thread transcript fallback applies only when no message is recovered from the
 comment. Each `--expect-reason` must match that reply, ignoring case. The platform
 cause does not establish the agent's reason. Only a comment the App posted with

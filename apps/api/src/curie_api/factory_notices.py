@@ -523,9 +523,10 @@ def _agent_message_block(message: str) -> str:
 
     Normalize CRLF and lone CR to LF before quoting every line, so the message
     cannot spoof a top-level ``Cause:`` line. Escape ``&`` before breaking HTML
-    comment openers for the raw marker scan, escaping ``<`` and ``![``, and
-    inserting U+200B after every ``@``. This neutralizes HTML, images and
-    literal or entity-encoded mentions. A blank line separates the quote from
+    comment openers for the raw marker scan. Double backslashes before escaping
+    ``[`` so existing escapes cannot activate links or images. Escape ``<`` and
+    insert U+200B after every ``@`` to neutralize HTML and literal or
+    entity-encoded mentions. A blank line separates the quote from
     Curie's following lines.
     """
 
@@ -533,7 +534,12 @@ def _agent_message_block(message: str) -> str:
     message = redact_factory_comment(message)
     message = message.replace("&", "&amp;")
     message = _break_html_comments(message)
-    message = message.replace("<", "&lt;").replace("![", "!\\[").replace("@", "@\u200b")
+    message = (
+        message.replace("\\", "\\\\")
+        .replace("<", "&lt;")
+        .replace("[", "\\[")
+        .replace("@", "@\u200b")
+    )
     quoted = "\n".join(f"> {line}" if line else ">" for line in message.split("\n"))
     return f"Agent's last message:\n{quoted}\n\n"
 
