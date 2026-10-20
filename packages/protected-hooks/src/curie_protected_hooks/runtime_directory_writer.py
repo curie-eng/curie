@@ -271,11 +271,14 @@ def _prune(root_fd: int, keep: tuple[str, str | None]) -> None:
 
 
 def _names(root_fd: int, version: str) -> bool:
-    """Whether ``current`` already names ``version``, @spec PROTECTED-HOOK-SOURCE-11."""
+    """Whether ``current`` may already name ``version``, @spec PROTECTED-HOOK-SOURCE-11."""
     try:
         return os.readlink(CURRENT, dir_fd=root_fd) == version
-    except OSError:
+    except FileNotFoundError:
         return False
+    except OSError:
+        # Unknown: never remove a version ``current`` may already name.
+        return True
 
 
 def _publish(root_fd: int, files: dict[str, bytes]) -> None:
@@ -290,6 +293,7 @@ def _publish(root_fd: int, files: dict[str, bytes]) -> None:
     link = f".current.{secrets.token_hex(16)}"
     try:
         _write_version(root_fd, version, files)
+        _flush(root_fd)
         os.symlink(version, link, dir_fd=root_fd)
         os.replace(link, CURRENT, src_dir_fd=root_fd, dst_dir_fd=root_fd)
     except BaseException:
