@@ -917,7 +917,7 @@ class Installation:
         return values
 
     def releases(self) -> list[dict[str, Any]]:
-        listed = json.loads(self.helm("list", "--all", "-o", "json").stdout or "[]")
+        listed = json.loads(self.helm("list", "-o", "json").stdout or "[]")
         if not isinstance(listed, list):
             raise InfrastructureError("Helm did not return a release list")
         return [entry for entry in listed if isinstance(entry, dict)]
