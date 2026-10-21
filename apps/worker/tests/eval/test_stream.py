@@ -27,7 +27,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 import httpx
 import pytest
@@ -93,6 +93,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from queue_fixtures import wait_until as _wait_until  # noqa: E402
+
+if TYPE_CHECKING:
+    from curie_worker.sandbox.types import ToolDaemonMount
 
 CONTAINS = GraderKind.CONTAINS
 _DB_URL = os.environ.get(
@@ -395,9 +398,12 @@ class _FakeK8s:
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        deadline: float,
         runner_resources: dict[str, object] | None = None,
         agent_name: str | None = None,
+        tool_daemon: ToolDaemonMount | None = None,
     ) -> None:
+        assert deadline > 0 and tool_daemon is None
         self.claim_envs.append(dict(env or {}))
         self.created_pools.append(pool)
         self.created_labels.append(
@@ -466,6 +472,23 @@ class _FakeK8s:
         del rejection
         assert 0 < request_timeout_seconds <= 1.0
         return False
+
+    # No Docker repository pool is configured in this suite, so the substrate
+    # never reaches the tool-daemon seam (ADR 0217); any call is a test bug.
+    def create_daemon_object(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is provisioned in this suite")
+
+    def list_daemon_objects(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is listed in this suite")
+
+    def delete_daemon_object(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is retired in this suite")
+
+    def get_daemon_pod(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon pod is read in this suite")
+
+    def open_daemon_stream(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is pinged in this suite")
 
     def set_sandbox_mode(self, name: str, mode: str) -> None:  # pragma: no cover - unused here
         pass
@@ -1249,11 +1272,20 @@ def test_provisioned_runner_reviewer_model_end_to_end(
                         pool: str,
                         env: dict[str, str] | None = None,
                         labels: dict[str, str] | None = None,
+                        deadline: float,
                         runner_resources: dict[str, object] | None = None,
                         agent_name: str | None = None,
+                        tool_daemon: ToolDaemonMount | None = None,
                     ) -> None:
                         fake.responses["report model"] = (env or {}).get(MODEL_ENV, "unset")
-                        super().create_claim(name, pool=pool, env=env, labels=labels)
+                        super().create_claim(
+                            name,
+                            pool=pool,
+                            env=env,
+                            labels=labels,
+                            deadline=deadline,
+                            tool_daemon=tool_daemon,
+                        )
 
                 fake_k8s = _ModelEchoK8s()
                 substrate = SandboxSubstrate(

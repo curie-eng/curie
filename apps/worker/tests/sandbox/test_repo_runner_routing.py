@@ -14,6 +14,7 @@ in-memory Kubernetes fake and the real Valkey affinity store.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -408,7 +409,7 @@ def _lose_race_to(
         runner_digests=runner_digests,
         runner_docker=False,
     )
-    k8s.create_claim("claim-winner", pool=POOL)
+    k8s.create_claim("claim-winner", pool=POOL, deadline=time.monotonic() + 300)
     original_create = k8s.create_claim
     fired: list[bool] = []
 
@@ -657,7 +658,7 @@ def test_legacy_route_without_runner_fields_is_reused_when_no_entry_applies(
     key_prefix: str,
 ) -> None:
     # A route a pre-upgrade worker wrote: no runner_digests, no runner_docker.
-    probing_k8s.create_claim("legacy-claim", pool=BASE_POOL)
+    probing_k8s.create_claim("legacy-claim", pool=BASE_POOL, deadline=time.monotonic() + 300)
     legacy = {
         "thread_key": "T-legacy",
         "claim_name": "legacy-claim",

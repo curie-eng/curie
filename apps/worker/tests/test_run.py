@@ -14,6 +14,7 @@ import logging
 import signal
 import socket
 import subprocess
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -393,7 +394,9 @@ def test_docker_runner_uses_its_network_specific_otlp_endpoint(
     )
     assert isinstance(client, DockerSandboxClient)
     monkeypatch.setattr(client, "_docker", docker._docker)
-    client.create_claim("acme-sandbox", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
+    client.create_claim(
+        "acme-sandbox", pool="pool", env={"CURIE_FAKE_MODEL": "1"}, deadline=time.monotonic() + 300
+    )
     assert all(timeout > 0 for timeout in docker.timeouts)
     (runner_args,) = [
         args
@@ -447,6 +450,7 @@ def test_docker_runner_snapshot_checks_the_claims_code_host_origin(
             "CURIE_REPO_ORIGIN": origin,
             "CURIE_REPO_PATH": repo_name,
         },
+        deadline=time.monotonic() + 300,
     )
     assert all(timeout > 0 for timeout in docker.timeouts)
     (runner_args,) = [

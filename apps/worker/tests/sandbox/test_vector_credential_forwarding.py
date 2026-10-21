@@ -13,6 +13,7 @@ worker's implementation of it lives at
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from .conftest import _FakeBundleStore, _flag_values, _RecordingDocker
@@ -90,7 +91,7 @@ def _run_vector(vector: dict[str, object]) -> list[str]:
     client = _RecordingDocker(
         image="curie-runner", bundle_store=_FakeBundleStore(), environ=environ
     )
-    client.create_claim("t1", pool="pool", env=env)
+    client.create_claim("t1", pool="pool", env=env, deadline=time.monotonic() + 300)
     argv = client.calls[0]
     assert all("PLACEHOLDER" not in a for a in argv)  # no credential value in argv
     # The by-name forwards: `-e NAME` args, not the `-e KEY=VALUE` pairs the

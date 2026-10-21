@@ -16,7 +16,7 @@ import copy
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aci_protocol import BootEnv
 
@@ -26,6 +26,9 @@ from .resources import (
     claim_resources_spec,
     resources_object_name,
 )
+
+if TYPE_CHECKING:
+    from .types import ToolDaemonMount
 
 # The label every per-claim object carries, valued with the claim name. The
 # chart's cleanup and worker-secrets admission policies key on it, and the
@@ -116,6 +119,10 @@ def executor_withheld_names(env: Mapping[str, str]) -> frozenset[str]:
 
 
 _SECRET_SUFFIX = "-tokens"
+# Where a Docker-enabled runner reads its daemon client files (ADR 0217):
+# ca.pem, cert.pem and key.pem from the per-claim token Secret, read-only.
+DOCKER_CERT_DIR = "/var/run/curie/docker"
+_DOCKER_CERT_VOLUME = "curie-docker-tls"
 # Kubernetes object names and label values are capped at 63 characters; the
 # pool carries the longest suffix.
 _MAX_NAME = 63
@@ -171,6 +178,7 @@ def claim_template_spec(
     claim: str,
     executor_secret_names: frozenset[str] | None = None,
     executor_withheld: Iterable[str] = (),
+    tool_daemon: ToolDaemonMount | None = None,
 ) -> dict[str, Any]:
     """Copy ``source_spec`` with each token read from ``secret_name`` on the runner.
 
@@ -192,6 +200,11 @@ def claim_template_spec(
     copy cannot read (a ``valueFrom`` one) raises ``ValueError``. Kept entries
     stay verbatim and in order; init containers and the rest of the pod spec
     are untouched.
+
+    ``tool_daemon`` set (ADR 0217) gives the runner alone its daemon's four
+    DOCKER_* values, mounts only the client file keys of ``secret_name``
+    read-only at ``DOCKER_CERT_DIR``, and bounds the pod by the absolute claim
+    lifetime. No file content enters the spec.
     """
 
     spec = (
@@ -220,8 +233,22 @@ def claim_template_spec(
                 },
             }
         )
-    runner["env"] = env
     pod_template = spec["podTemplate"]
+    if tool_daemon is not None:
+        env = [entry for entry in env if entry.get("name") not in tool_daemon.env]
+        env.extend({"name": key, "value": value} for key, value in tool_daemon.env.items())
+        runner["volumeMounts"] = [
+            *(runner.get("volumeMounts") or []),
+            {"name": _DOCKER_CERT_VOLUME, "mountPath": DOCKER_CERT_DIR, "readOnly": True},
+        ]
+        pod = pod_template["spec"]
+        items = [{"key": key, "path": key} for key in sorted(tool_daemon.files)]
+        pod["volumes"] = [
+            *(pod.get("volumes") or []),
+            {"name": _DOCKER_CERT_VOLUME, "secret": {"secretName": secret_name, "items": items}},
+        ]
+        pod["activeDeadlineSeconds"] = tool_daemon.active_deadline_seconds
+    runner["env"] = env
     pod_template.setdefault("metadata", {}).setdefault("labels", {})[CLAIM_LABEL] = claim
     return spec
 
