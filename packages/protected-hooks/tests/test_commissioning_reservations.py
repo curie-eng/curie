@@ -169,47 +169,104 @@ def limited(principals: Any, counter: str, limit: str) -> Campaign:
 # --- Reservation charges and limits -------------------------------------------------------
 
 
-@pytest.mark.parametrize("counter", COUNTERS)
-def test_each_counter_limit_boundary(pworker_service, principals, counter) -> None:
-    """Below the limit dispatches; past it refuses; reaching it closes the campaign."""
-    campaign = limited(principals, counter, "3")
-    kind = KIND_OF[counter]
+def amount_of(counter: str, n: int) -> Any:
+    """n units of ``counter``; token and spend charges ride on one model call."""
+    if counter in ("deliveries", "launches", "model_calls"):
+        return charge(**{counter: n})
+    return minimum(KIND_OF[counter], **{counter: n})
 
-    def amount(n: int) -> Any:
-        # Counter-kind charges carry n of their own counter; token and spend
-        # charges ride on one model call, whose limit is large here.
-        if counter in ("deliveries", "launches", "model_calls"):
-            return charge(**{counter: n})
-        return minimum(kind, **{counter: n})
+
+@pytest.mark.parametrize("limit", [1, 3])
+@pytest.mark.parametrize("counter", COUNTERS)
+def test_a_limit_of_n_permits_exactly_n_operations(
+    pworker_service, principals, counter, limit
+) -> None:
+    """Each of N one-unit operations dispatches; the one reaching the limit closes the campaign."""
+    campaign = limited(principals, counter, str(limit))
+    kind = KIND_OF[counter]
 
     async def scenario() -> None:
         async with Running(principals, campaign) as reservations:
-            # Counter at 0 of 3. Charge 2: below the limit, dispatchable.
-            first = await reservations.reserve(OP.format(1), kind, DIGEST, amount(2))
-            assert first.fresh and first.status == "reserved" and first.journal_state == "running"
-            dispatched = await reservations.dispatch(OP.format(1))
-            assert dispatched.fresh and dispatched.status == "dispatched"
-            before = snapshot(pworker_service)
-            # Charge 2 more would pass the limit: refused, nothing recorded or counted.
-            with refused("limit"):
-                await reservations.reserve(OP.format(2), kind, DIGEST, amount(2))
-            assert snapshot(pworker_service) == before
-            # Charge 1 reaches the limit: recorded, journal closing, counter named.
-            last = await reservations.reserve(OP.format(3), kind, DIGEST, amount(1))
-            assert last.fresh and last.status == "reserved"
-            assert last.journal_state == "closing" and last.exhausted == counter
+            for n in range(1, limit + 1):
+                reserved = await reservations.reserve(
+                    OP.format(n), kind, DIGEST, amount_of(counter, 1)
+                )
+                assert reserved.fresh and reserved.status == "reserved"
+                last = n == limit
+                assert reserved.journal_state == ("closing" if last else "running")
+                assert reserved.exhausted == (counter if last else None)
+                # The reservation that reaches the limit was charged within it.
+                dispatched = await reservations.dispatch(OP.format(n))
+                assert dispatched.fresh and dispatched.status == "dispatched"
             journal = stored_journal(pworker_service, campaign)
-            assert journal["counters"][counter] == "3" and journal["exhausted"] == counter
-            # Nothing dispatches after exhaustion, not even the charged reservation.
+            assert journal["counters"][counter] == str(limit)
+            assert journal["state"] == "closing" and journal["exhausted"] == counter
+            # Operation N+1 refuses, and a replayed dispatch of operation N is not authority.
             before = snapshot(pworker_service)
             with refused("state"):
-                await reservations.dispatch(OP.format(3))
-            with refused("state"):
-                await reservations.reserve(OP.format(4), kind, DIGEST, minimum(kind))
+                await reservations.reserve(OP.format(limit + 1), kind, DIGEST, minimum(kind))
+            assert not (await reservations.dispatch(OP.format(limit))).fresh
             assert snapshot(pworker_service) == before
-            status = await reservations.journal.status()
-            assert status.state == "closing" and status.exhausted == counter
-            assert status.counters[counter] == 3
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("counter", COUNTERS)
+def test_a_charge_past_a_limit_refuses_and_changes_nothing(
+    pworker_service, principals, counter
+) -> None:
+    campaign = limited(principals, counter, "3")
+    kind = KIND_OF[counter]
+
+    async def scenario() -> None:
+        async with Running(principals, campaign) as reservations:
+            await reservations.reserve(OP.format(1), kind, DIGEST, amount_of(counter, 2))
+            before = snapshot(pworker_service)
+            with refused("limit"):
+                await reservations.reserve(OP.format(2), kind, DIGEST, amount_of(counter, 2))
+            assert snapshot(pworker_service) == before
+            assert (await reservations.journal.status()).state == "running"
+
+    run(scenario())
+
+
+def test_exhaustion_blocks_every_other_charged_reservation(pworker_service, principals) -> None:
+    """Only the reservation that reached the limit still dispatches after exhaustion."""
+    campaign = limited(principals, "deliveries", "3")
+
+    async def scenario() -> None:
+        async with Running(principals, campaign) as reservations:
+            for n in (1, 2, 3):
+                await reservations.reserve(OP.format(n), "delivery", DIGEST, charge(deliveries=1))
+            assert (await reservations.journal.status()).state == "closing"
+            before = snapshot(pworker_service)
+            for n in (1, 2):
+                with refused("state"):
+                    await reservations.dispatch(OP.format(n))
+            assert snapshot(pworker_service) == before
+            assert (await reservations.dispatch(OP.format(3))).fresh
+            # A closed campaign dispatches nothing, not even the exhausting reservation.
+            state = await reservations.journal.status()
+            await reservations.journal.confirm_closed(state.generation)
+            assert not (await reservations.dispatch(OP.format(3))).fresh
+
+    run(scenario())
+
+
+def test_exhausting_reservation_is_not_dispatchable_once_the_campaign_closes(
+    pworker_service, principals
+) -> None:
+    campaign = limited(principals, "deliveries", "1")
+
+    async def scenario() -> None:
+        async with Running(principals, campaign) as reservations:
+            await reservations.reserve(OP.format(1), "delivery", DIGEST, charge(deliveries=1))
+            state = await reservations.journal.status()
+            await reservations.journal.fail(state.generation)
+            before = snapshot(pworker_service)
+            with refused("state"):
+                await reservations.dispatch(OP.format(1))
+            assert snapshot(pworker_service) == before
 
     run(scenario())
 
@@ -573,7 +630,7 @@ def test_the_reservation_key_must_derive_from_the_campaign_and_id(
 
 @pytest.mark.parametrize(
     "corruption",
-    ["not json", "extra", "kind", "status", "charge", "digest", "operation_id"],
+    ["not json", "extra", "kind", "status", "charge", "digest", "operation_id", "exhausts"],
 )
 def test_a_corrupt_reservation_refuses_and_is_not_rewritten(
     pworker_service, principals, corruption
@@ -595,6 +652,8 @@ def test_a_corrupt_reservation_refuses_and_is_not_rewritten(
                 value["permit_digest"] = "0" * 64
             elif corruption == "operation_id":
                 value["operation_id"] = OP.format(2)
+            elif corruption == "exhausts":
+                value["exhausts"] = "yes"
             raw = "not json" if corruption == "not json" else json.dumps(value)
             pworker_service.command("SET", key, raw)
             before = snapshot(pworker_service)
@@ -969,3 +1028,41 @@ def test_the_script_refuses_ownership_bound_to_another_campaign(
         client.close()
     assert reply == [b"refused", b"binding"]
     assert snapshot(pworker_service) == before
+
+
+def test_a_launch_limit_of_one_still_launches_once(pworker_service, principals) -> None:
+    """The exhausting launch reservation dispatches and gets its ownership record."""
+    campaign = limited(principals, "launches", "1")
+
+    async def scenario() -> None:
+        async with Running(principals, campaign) as reservations:
+            await consumed_launch(reservations)
+            assert (await reservations.journal.status()).state == "closing"
+            initial = ownership(campaign)
+            await reservations.create_ownership(initial, launch_reservation_id=OP.format(1))
+            assert await reservations.read_ownership(LAUNCH.format(1)) == initial
+            with refused("state"):
+                await reservations.reserve(OP.format(2), "launch", DIGEST, charge(launches=1))
+
+    run(scenario())
+
+
+def test_ownership_after_exhaustion_needs_the_exhausting_launch_reservation(
+    pworker_service, principals
+) -> None:
+    """A launch reserved before another counter ran out cannot start afterwards."""
+    campaign = limited(principals, "deliveries", "1")
+
+    async def scenario() -> None:
+        async with Running(principals, campaign) as reservations:
+            await consumed_launch(reservations)
+            await reservations.reserve(OP.format(2), "delivery", DIGEST, charge(deliveries=1))
+            assert (await reservations.journal.status()).state == "closing"
+            before = snapshot(pworker_service)
+            with refused("state"):
+                await reservations.create_ownership(
+                    ownership(campaign), launch_reservation_id=OP.format(1)
+                )
+            assert snapshot(pworker_service) == before
+
+    run(scenario())

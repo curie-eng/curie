@@ -4,10 +4,13 @@ Before each delivery, launch or provider request the control principal
 reserves the worst case charge in one atomic broker script. The script reads
 broker ``TIME`` and the live ``run_id``, checks the exact permit and journal
 binding and the ``running`` state, and adds the charge to the journal's
-aggregate counters. Counters only grow; there are no refunds. A charge that
-would pass a limit refuses. A charge that reaches a limit is recorded and moves
-the journal to ``closing`` in the same step, naming the exhausted counter, so
-no reservation dispatches after it, including the one that reached it.
+aggregate counters. Counters only grow; there are no refunds. A limit of N
+permits exactly N charged operations. A charge that would pass a limit
+refuses. A charge that reaches a limit is recorded and moves the journal to
+``closing`` in the same step, naming the exhausted counter. That reservation
+was charged within the limit, so it alone may still dispatch and back its
+launch ownership; every later reservation, and the dispatch of every other
+undispatched reservation, refuses.
 
 A reservation's operation ID is bound to the campaign, the operation kind, the
 request digest and the exact charge. A replay with the same ID returns the

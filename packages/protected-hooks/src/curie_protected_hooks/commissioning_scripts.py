@@ -188,7 +188,7 @@ JOURNAL_SCRIPT = PRELUDE + _JOURNAL_BODY
 _RECORDS = r"""
 local KINDS = {delivery=1, launch=2, model_call=3}
 local RESERVATION = {record_type=true, permit_digest=true, operation_id=true, kind=true,
-                     request_digest=true, charge=true, status=true, claim=true}
+                     request_digest=true, charge=true, status=true, claim=true, exhausts=true}
 local function uuid(s)
   return type(s) == 'string' and #s == 36 and
     string.match(s, '^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$') ~= nil and
@@ -208,11 +208,19 @@ local function load_reservation(key)
   if r.record_type ~= 'commissioning_reservation' or r.permit_digest ~= permit_digest or
      not uuid(r.operation_id) or key ~= reservation_key(r.operation_id) or not KINDS[r.kind] or
      not sha256(r.request_digest) or (r.status ~= 'reserved' and r.status ~= 'dispatched') or
-     type(r.claim) ~= 'string' or (r.claim ~= '' and not uuid(r.claim)) then return nil, 'corrupt' end
+     type(r.claim) ~= 'string' or (r.claim ~= '' and not uuid(r.claim)) or
+     (r.exhausts ~= '0' and r.exhausts ~= '1') then return nil, 'corrupt' end
   for _, name in ipairs(COUNTERS) do
     if not decimal(r.charge[name], true) then return nil, 'corrupt' end
   end
   return r, nil
+end
+-- A limit of N permits exactly N charged operations. The reservation that
+-- reached a limit was charged within it, so it alone may still dispatch (and
+-- back its launch ownership) while the journal is closing for that exhaustion.
+local function may_proceed(j, r)
+  if j.state == 'running' then return true end
+  return j.state == 'closing' and j.exhausted ~= '' and r.exhausts == '1'
 end
 local function reservation_reply(r, j, fresh)
   local reply = {'reservation', r.status, r.kind, r.request_digest}
@@ -263,10 +271,11 @@ if verb == 'reserve' then
   j.counters = totals
   r = {record_type='commissioning_reservation', permit_digest=permit_digest,
        operation_id=operation_id, kind=kind, request_digest=request_digest,
-       charge=charge, status='reserved', claim=''}
+       charge=charge, status='reserved', claim='', exhausts=exhausted and '1' or '0'}
   redis.call('SET', reservation_key_name, cjson.encode(r))
   if exhausted then
-    -- Reaching a limit closes the campaign in the same step; nothing dispatches after it.
+    -- Reaching a limit closes the campaign in the same step; only this reservation
+    -- may still dispatch, and every later reservation refuses.
     j.exhausted = exhausted
     local reply = advance(j, 'closing')
     if reply[1] ~= 'journal' then return reply end
@@ -280,7 +289,7 @@ if verb == 'read' then return reservation_reply(r, j, false) end
 if verb ~= 'dispatch' then return refuse('verb') end
 -- Consumed before forwarding: a second dispatch of one ID is never authority.
 if r.status == 'dispatched' then return reservation_reply(r, j, false) end
-if j.state ~= 'running' then return refuse('state') end
+if not may_proceed(j, r) then return refuse('state') end
 local denied = authority()
 if denied then return refuse(denied) end
 r.status = 'dispatched'
@@ -338,15 +347,15 @@ if verb == 'create' then
   -- for a launch reservation already consumed for dispatch and not yet claimed.
   if current then return refuse('exists') end
   if proposed.state ~= 'creating' or proposed.revision ~= '1' then return refuse('ownership') end
-  if j.state ~= 'running' then return refuse('state') end
-  local denied = authority()
-  if denied then return refuse(denied) end
   local reservation_key_name = KEYS[6]
   local reservation_id = ARGV[7]
   if not uuid(reservation_id) or reservation_key_name ~= reservation_key(reservation_id) then return refuse('binding') end
   local r
   r, problem = load_reservation(reservation_key_name)
   if not r then return refuse(problem) end
+  if not may_proceed(j, r) then return refuse('state') end
+  local denied = authority()
+  if denied then return refuse(denied) end
   if r.kind ~= 'launch' or r.status ~= 'dispatched' or
      r.request_digest ~= proposed.launch_request_digest then return refuse('ownership') end
   if r.claim ~= '' then return refuse('claimed') end
