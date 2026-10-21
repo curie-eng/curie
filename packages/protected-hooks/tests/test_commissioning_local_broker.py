@@ -13,6 +13,7 @@ the full install.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import importlib
 import importlib.util
 import json
@@ -147,7 +148,7 @@ def test_the_provisioner_never_holds_another_principals_password(tmp_path: Path)
     admin.issue()
     issued = admin.credentials()
     grant = admin.grant()
-    workload = {"enqueue", "control_reader", "source_writer"} & set(issued)
+    workload = {"enqueue", "control_reader", "source_writer", "worker"} & set(issued)
     assert set(grant.workload) == workload and "enqueue" in workload
     assert grant.provisioner == issued["provisioner"]
     held = repr(vars(cluster)) + json.dumps(
@@ -173,7 +174,9 @@ def test_the_provisioner_never_holds_another_principals_password(tmp_path: Path)
         for key in runner.objects
         if key.startswith(f"v1/Secret/{boot.credentials_namespace(NAMESPACE)}/")
     }
-    assert credential_keys == {boot.credential_secret_name(name) for name in issued}
+    assert credential_keys == {boot.credential_secret_name(name) for name in issued} | {
+        boot.MEDIATOR_SECRET
+    }
     for name, user in issued.items():
         data = secrets_created[boot.credential_secret_name(name)]["data"]
         assert base64.b64decode(data["password"]).decode() == user.password
@@ -709,9 +712,10 @@ def test_the_minted_kubeconfig_is_a_token_identity_for_the_same_cluster(tmp_path
     token = next(argv for argv, _ in runner.calls if argv[5:7] == ["create", "token"])
     assert token[7:] == [boot.PROVISIONER_ACCOUNT, "--namespace", NAMESPACE, "--duration", "24h"]
     created = [key for key in runner.objects]
-    assert created[:5] == [
+    assert created[:6] == [
         f"v1/Namespace//{NAMESPACE}",
         f"v1/Namespace//{boot.credentials_namespace(NAMESPACE)}",
+        f"v1/Namespace//{boot.worker_namespace(NAMESPACE)}",
         f"v1/ServiceAccount/{NAMESPACE}/{boot.PROVISIONER_ACCOUNT}",
         f"rbac.authorization.k8s.io/v1/Role/{NAMESPACE}/{boot.PROVISIONER_ACCOUNT}",
         f"rbac.authorization.k8s.io/v1/RoleBinding/{NAMESPACE}/{boot.PROVISIONER_ACCOUNT}",
@@ -756,3 +760,190 @@ def test_a_forward_to_another_port_is_refused() -> None:
     )
     api._stop(process)
     assert port == 41234
+
+
+def test_the_bootstrap_mints_the_launch_identity_and_keeps_its_keys(tmp_path: Path) -> None:
+    """The provisioner gets the public half; each private key goes into its own Secret."""
+    boot = bootstrap()
+    ledger, runner, cluster = admin_cluster(tmp_path)
+    admin = bootstrap_for(cluster, ledger, tmp_path)
+    admin.issue()
+    grant = admin.grant()
+    held = boot.credentials_namespace(NAMESPACE)
+    mediator = runner.objects[f"v1/Secret/{held}/{boot.MEDIATOR_SECRET}"]["data"]
+    worker_ns = boot.worker_namespace(NAMESPACE)
+    client = runner.objects[f"v1/Secret/{worker_ns}/{boot.WORKER_CLIENT_SECRET}"]["data"]
+    assert set(mediator) == {"ca.crt", "tls.crt", "tls.key"}
+    assert set(client) == {"launch-client.pem", "launch-client.key"}
+    server = x509.load_pem_x509_certificate(base64.b64decode(mediator["tls.crt"]))
+    ca = x509.load_pem_x509_certificate(grant.launch.ca_pem.encode())
+    server.verify_directly_issued_by(ca)
+    assert api_spki(server) == grant.launch.server_spki_sha256
+    assert grant.launch.server_name == boot.mediator_name(NAMESPACE)
+    for key in (mediator["tls.key"], client["launch-client.key"]):
+        private = base64.b64decode(key).decode()
+        assert "PRIVATE KEY" in private
+        assert private not in repr([getattr(grant, f.name) for f in dataclasses.fields(grant)])
+    assert "PRIVATE KEY" not in json.dumps(dataclasses.asdict(grant.launch))
+    # The provisioner may not read either Secret.
+    from curie_protected_hooks.commissioning_local_bootstrap import PROVISIONER_SECRETS
+
+    assert boot.WORKER_CLIENT_SECRET not in PROVISIONER_SECRETS
+
+
+def api_spki(certificate: Any) -> str:
+    return module()._spki_sha256(certificate)
+
+
+def test_the_provisioner_cannot_create_pods_where_the_worker_key_is() -> None:
+    boot = bootstrap()
+    role, binding = boot.provisioner_worker_rbac(
+        OWNER, boot.worker_namespace(NAMESPACE), account_namespace=NAMESPACE
+    )
+    assert role["metadata"]["namespace"] == boot.worker_namespace(NAMESPACE)
+    verbs = {(tuple(r["apiGroups"]), tuple(r["resources"])): set(r["verbs"]) for r in role["rules"]}
+    assert verbs == {
+        (("",), ("secrets",)): {"create"},
+        (("",), ("pods",)): {"get", "list", "watch"},
+        (("",), ("pods/log",)): {"get"},
+        (("apps",), ("deployments",)): {"get", "list", "watch"},
+    }
+    assert binding["subjects"] == [
+        {"kind": "ServiceAccount", "name": boot.PROVISIONER_ACCOUNT, "namespace": NAMESPACE}
+    ]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"kind": "Pod"},
+        {"metadata": {"name": "curie-protected-worker", "namespace": NAMESPACE}},
+        {"metadata": {"name": "other", "namespace": NAMESPACE + "-worker"}},
+    ],
+)
+def test_the_administrator_installs_only_the_worker_deployment(
+    tmp_path: Path, change: dict[str, Any]
+) -> None:
+    boot = bootstrap()
+    ledger, runner, cluster = admin_cluster(tmp_path)
+    admin = bootstrap_for(cluster, ledger, tmp_path)
+    deployment = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "curie-protected-worker", "namespace": NAMESPACE + "-worker"},
+        **change,
+    }
+    with pytest.raises(boot.BootstrapRefused):
+        admin.install_worker(deployment, worker_image=WORKER_IMAGE)
+    assert runner.objects == {}
+
+
+WORKER_IMAGE = "localhost:5000/" + OWNER + "/worker@sha256:" + "b" * 64
+
+
+def worker_template(image: str = WORKER_IMAGE) -> dict[str, Any]:
+    from curie_protected_hooks.commissioning_local_worker import worker_objects
+
+    paths = (
+        "manifest.json",
+        "execution_config.json",
+        "worker.json",
+        "process.json",
+        "ca.pem",
+        "launch-ca.pem",
+        "measurements/" + "1" * 64 + ".json",
+        "projections/" + "2" * 64 + ".json",
+    )
+    _, deployment = worker_objects(
+        OWNER, bootstrap().worker_namespace(NAMESPACE), image, {p: b"{}" for p in paths}
+    )
+    return deployment
+
+
+def test_the_administrator_creates_its_own_rendering_of_the_worker(tmp_path: Path) -> None:
+    ledger, runner, cluster = admin_cluster(tmp_path)
+    admin = bootstrap_for(cluster, ledger, tmp_path)
+    admin.install_worker(worker_template(), worker_image=WORKER_IMAGE)
+    (created,) = [o for o in runner.objects.values() if o["kind"] == "Deployment"]
+    assert created["spec"] == worker_template()["spec"]
+
+
+def _pod(deployment: dict[str, Any]) -> dict[str, Any]:
+    pod: dict[str, Any] = deployment["spec"]["template"]["spec"]
+    return pod
+
+
+def _print_client_key(d: dict[str, Any]) -> None:
+    _pod(d)["containers"][0]["command"] = ["cat", "/run/curie/protected-worker/launch-client.key"]
+
+
+def _other_image(d: dict[str, Any]) -> None:
+    _pod(d)["containers"][0]["image"] = WORKER_IMAGE.replace("b" * 64, "c" * 64)
+
+
+def _env(d: dict[str, Any]) -> None:
+    _pod(d)["containers"][0]["env"].append({"name": "EXTRA", "value": "1"})
+
+
+def _volume(d: dict[str, Any]) -> None:
+    _pod(d)["volumes"].append({"name": "extra", "secret": {"secretName": "other"}})
+
+
+def _mount(d: dict[str, Any]) -> None:
+    _pod(d)["containers"][0]["volumeMounts"].append({"name": "source", "mountPath": "/source"})
+
+
+def _container(d: dict[str, Any]) -> None:
+    _pod(d)["containers"].append(dict(_pod(d)["containers"][0], name="extra"))
+
+
+def _stage(d: dict[str, Any]) -> None:
+    _pod(d)["initContainers"][0]["command"] = ["sh", "-c", "cat /run/curie/*/launch-client.key"]
+
+
+def _extra_path(d: dict[str, Any]) -> None:
+    _pod(d)["volumes"][0]["projected"]["sources"][0]["secret"]["items"].append(
+        {"key": "extra", "path": "extra"}
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [_print_client_key, _other_image, _env, _volume, _mount, _container, _stage, _extra_path],
+)
+def test_the_administrator_refuses_a_changed_worker_rendering(tmp_path: Path, change: Any) -> None:
+    boot = bootstrap()
+    ledger, runner, cluster = admin_cluster(tmp_path)
+    admin = bootstrap_for(cluster, ledger, tmp_path)
+    deployment = worker_template()
+    change(deployment)
+    with pytest.raises(boot.BootstrapRefused):
+        admin.install_worker(deployment, worker_image=WORKER_IMAGE)
+    assert runner.objects == {}
+
+
+def test_the_administrator_renders_with_its_own_image(tmp_path: Path) -> None:
+    """A rendering that matches itself but names another image is still refused."""
+    boot = bootstrap()
+    ledger, runner, cluster = admin_cluster(tmp_path)
+    admin = bootstrap_for(cluster, ledger, tmp_path)
+    other = WORKER_IMAGE.replace("b" * 64, "c" * 64)
+    with pytest.raises(boot.BootstrapRefused):
+        admin.install_worker(worker_template(other), worker_image=WORKER_IMAGE)
+    assert runner.objects == {}
+
+
+def test_issue_binds_the_provisioner_in_the_worker_namespace(tmp_path: Path) -> None:
+    boot = bootstrap()
+    ledger, runner, cluster = admin_cluster(tmp_path)
+    bootstrap_for(cluster, ledger, tmp_path).issue()
+    worker_ns = boot.worker_namespace(NAMESPACE)
+    rbac = "rbac.authorization.k8s.io/v1"
+    for kind in ("Role", "RoleBinding"):
+        key = f"{rbac}/{kind}/{worker_ns}/{boot.PROVISIONER_ACCOUNT}"
+        assert key in runner.objects, kind
+    role = runner.objects[f"{rbac}/Role/{worker_ns}/{boot.PROVISIONER_ACCOUNT}"]
+    assert (
+        role["rules"]
+        == boot.provisioner_worker_rbac(OWNER, worker_ns, account_namespace=NAMESPACE)[0]["rules"]
+    )

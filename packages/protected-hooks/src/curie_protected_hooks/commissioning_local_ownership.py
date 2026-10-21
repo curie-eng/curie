@@ -117,6 +117,8 @@ _KUBECTL_FLAGS = frozenset(
         "--subresource",
         "--overwrite",
         "--duration",
+        "--container",
+        "--previous",
     }
 )
 _MINIKUBE_COMMANDS = frozenset({"start", "status", "stop", "delete", "ip", "image", "addons"})

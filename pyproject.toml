@@ -167,6 +167,7 @@ forbidden_modules = [
     "curie_protected_hooks.commissioning_local_broker",
     "curie_protected_hooks.commissioning_local_installation",
     "curie_protected_hooks.commissioning_local_ownership",
+    "curie_protected_hooks.commissioning_local_worker",
     "curie_protected_hooks.commissioning_local_workloads",
     "curie_protected_hooks.commissioning_operator_guard",
     "curie_protected_hooks.commissioning_operator_protocol",

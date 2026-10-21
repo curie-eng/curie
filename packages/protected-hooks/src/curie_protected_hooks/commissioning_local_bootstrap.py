@@ -26,10 +26,15 @@ import os
 import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, Self
 
 import yaml
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from redis.exceptions import AuthenticationError, ResponseError
 
 from .commissioning_acl import CANDIDATE_ROLES
@@ -40,6 +45,7 @@ from .commissioning_local_broker import (
     BrokerUser,
     LocalBroker,
     Principal,
+    _spki_sha256,
     namespace_object,
     pinned_session,
 )
@@ -49,6 +55,13 @@ from .commissioning_provisioner import GUARD_PRINCIPALS
 
 __all__ = [
     "INSTALLER_SECRET",
+    "MEDIATOR_NAME",
+    "MEDIATOR_SECRET",
+    "WORKER_CLIENT_SECRET",
+    "WORKER_NAME",
+    "LaunchMaterial",
+    "LaunchPublic",
+    "mediator_name",
     "PROVISIONER_ACCOUNT",
     "PROVISIONER_KUBECONFIG",
     "PROVISIONER_SECRETS",
@@ -59,6 +72,8 @@ __all__ = [
     "close_installer",
     "credential_secret_name",
     "credentials_namespace",
+    "provisioner_worker_rbac",
+    "worker_namespace",
     "enroll_users",
     "issue_credentials",
     "provisioner_rbac",
@@ -72,7 +87,7 @@ PROVISIONER_KUBECONFIG = "provisioner-kubeconfig"
 # The only Secrets the provisioner's identity may read or delete by name.
 PROVISIONER_SECRETS = (BROKER_TLS_SECRET,)
 # Credentials the provisioner writes into the runtime files it renders, when G has them.
-WORKLOAD_PRINCIPALS = ("enqueue", "control_reader", "source_writer")
+WORKLOAD_PRINCIPALS = ("enqueue", "control_reader", "source_writer", "worker")
 _BASELINE = "acl-baseline.json"
 
 
@@ -91,6 +106,135 @@ def _refuse() -> NoReturn:
 def _require(condition: bool) -> None:
     if not condition:
         _refuse()
+
+
+# @spec PROTECTED-COMMISSIONING-6: the launch identity the bootstrap mints.
+MEDIATOR_NAME = "commissioning-launch-mediator"
+MEDIATOR_SECRET = MEDIATOR_NAME + "-tls"
+WORKER_NAME = "curie-protected-worker"
+WORKER_CLIENT_SECRET = WORKER_NAME + "-launch-client"
+_LAUNCH_CERT_DAYS = 30
+
+
+def _pem(key: ec.EllipticCurvePrivateKey) -> str:
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("ascii")
+
+
+def _certificate(
+    subject: str,
+    key: ec.EllipticCurvePrivateKey,
+    issuer: x509.Name,
+    issuer_key: ec.EllipticCurvePrivateKey,
+    usage: x509.ObjectIdentifier,
+    names: list[x509.GeneralName],
+) -> x509.Certificate:
+    now = datetime.now(UTC)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, subject)]))
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=_LAUNCH_CERT_DAYS))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([usage]), False)
+        .add_extension(
+            x509.KeyUsage(True, False, False, False, False, False, False, False, False), True
+        )
+    )
+    if names:
+        builder = builder.add_extension(x509.SubjectAlternativeName(names), False)
+    return builder.sign(issuer_key, hashes.SHA256())
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class LaunchMaterial:
+    """The launch mediator's TLS identity and the worker's client certificate.
+
+    One per-installation CA signs both; its key is discarded after signing.
+    @spec PROTECTED-COMMISSIONING-6.
+    """
+
+    server_name: str
+    ca_pem: str
+    server_certificate_pem: str
+    server_key_pem: str = field(repr=False)
+    server_spki_sha256: str
+    client_certificate_pem: str
+    client_key_pem: str = field(repr=False)
+    client_spki_sha256: str
+
+    def __repr__(self) -> str:
+        """@spec PROTECTED-COMMISSIONING-6."""
+        return "LaunchMaterial()"
+
+    @classmethod
+    def generate(cls, server_name: str) -> Self:
+        """@spec PROTECTED-COMMISSIONING-6."""
+        now = datetime.now(UTC)
+        ca_key = ec.generate_private_key(ec.SECP256R1())
+        ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "commissioning-launch-ca")])
+        ca = (
+            x509.CertificateBuilder()
+            .subject_name(ca_name)
+            .issuer_name(ca_name)
+            .public_key(ca_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=1))
+            .not_valid_after(now + timedelta(days=_LAUNCH_CERT_DAYS))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+            .add_extension(
+                x509.KeyUsage(False, False, False, False, False, True, True, False, False), True
+            )
+            .sign(ca_key, hashes.SHA256())
+        )
+        server_key = ec.generate_private_key(ec.SECP256R1())
+        server = _certificate(
+            MEDIATOR_NAME,
+            server_key,
+            ca_name,
+            ca_key,
+            ExtendedKeyUsageOID.SERVER_AUTH,
+            [x509.DNSName(server_name)],
+        )
+        client_key = ec.generate_private_key(ec.SECP256R1())
+        client = _certificate(
+            WORKER_NAME, client_key, ca_name, ca_key, ExtendedKeyUsageOID.CLIENT_AUTH, []
+        )
+        pem = serialization.Encoding.PEM
+        return cls(
+            server_name,
+            ca.public_bytes(pem).decode("ascii"),
+            server.public_bytes(pem).decode("ascii"),
+            _pem(server_key),
+            _spki_sha256(server),
+            client.public_bytes(pem).decode("ascii"),
+            _pem(client_key),
+            _spki_sha256(client),
+        )
+
+
+def mediator_name(namespace: str) -> str:
+    """The reserved launch mediator Service name, @spec PROTECTED-COMMISSIONING-6."""
+    return f"{MEDIATOR_NAME}.{namespace}.svc.cluster.local"
+
+
+@dataclass(frozen=True, slots=True)
+class LaunchPublic:
+    """The launch identity's public half: what the provisioner may hold.
+
+    @spec PROTECTED-COMMISSIONING-6.
+    """
+
+    server_name: str
+    ca_pem: str
+    server_spki_sha256: str
+    client_spki_sha256: str
 
 
 def credentials_namespace(namespace: str) -> str:
@@ -116,6 +260,8 @@ class ProvisionerGrant:
     workload: Mapping[str, BrokerUser] = field(repr=False)
     # The provisioner's own Kubernetes identity: a ServiceAccount token kubeconfig.
     kubeconfig: Path
+    # The launch identity's public half; its private keys stay in their own Secrets.
+    launch: LaunchPublic
 
     def __repr__(self) -> str:
         """@spec PROTECTED-COMMISSIONING-1."""
@@ -182,6 +328,60 @@ def provisioner_rbac(
             },
             "subjects": [
                 {"kind": "ServiceAccount", "name": PROVISIONER_ACCOUNT, "namespace": namespace}
+            ],
+        },
+    ]
+
+
+def worker_namespace(namespace: str) -> str:
+    """The namespace the protected worker runs in, @spec PROTECTED-COMMISSIONING-6."""
+    return namespace + "-worker"
+
+
+def provisioner_worker_rbac(
+    owner: str, namespace: str, *, account_namespace: str
+) -> list[dict[str, Any]]:
+    """The provisioner's rights in the worker namespace: its runtime Secret and status only.
+
+    It may create the worker's runtime-directory Secret and read Pod and
+    Deployment status and Pod logs. It may not create, change or delete any
+    Pod or Deployment, read any Secret or port-forward, so no Pod of its making
+    can mount the worker's client key. The administrator creates the worker
+    Deployment. @spec PROTECTED-COMMISSIONING-6.
+    """
+    labels = {OWNER_LABEL: owner}
+    meta = {"name": PROVISIONER_ACCOUNT, "namespace": namespace, "labels": labels}
+    return [
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "Role",
+            "metadata": dict(meta),
+            "rules": [
+                {"apiGroups": [""], "resources": ["secrets"], "verbs": ["create"]},
+                {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "watch"]},
+                {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
+                {
+                    "apiGroups": ["apps"],
+                    "resources": ["deployments"],
+                    "verbs": ["get", "list", "watch"],
+                },
+            ],
+        },
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": dict(meta),
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": PROVISIONER_ACCOUNT,
+            },
+            "subjects": [
+                {
+                    "kind": "ServiceAccount",
+                    "name": PROVISIONER_ACCOUNT,
+                    "namespace": account_namespace,
+                }
             ],
         },
     ]
@@ -312,6 +512,7 @@ class AdministratorBootstrap:
         self.__credentials: dict[str, BrokerUser] = {}
         self.__installer: str | None = None
         self._kubeconfig: Path | None = None
+        self._launch: LaunchPublic | None = None
 
     def __repr__(self) -> str:
         """@spec PROTECTED-COMMISSIONING-1."""
@@ -331,7 +532,13 @@ class AdministratorBootstrap:
         # Every principal's credential lives in a namespace the provisioner has no
         # right in: no Secret read and no Pod, so no volume can reach it either.
         self._cluster.create(namespace_object(owner, self._credentials_namespace))
+        # The worker runs apart: the provisioner may not create Pods where its client key is.
+        self._cluster.create(namespace_object(owner, worker_namespace(self._namespace)))
         for item in provisioner_rbac(owner, self._namespace, readable_secrets=PROVISIONER_SECRETS):
+            self._cluster.create(item)
+        for item in provisioner_worker_rbac(
+            owner, worker_namespace(self._namespace), account_namespace=self._namespace
+        ):
             self._cluster.create(item)
         for name, user in credentials.items():
             self._cluster.create(
@@ -362,6 +569,43 @@ class AdministratorBootstrap:
                 "data": {"password": _b64(installer)},
             }
         )
+        launch = LaunchMaterial.generate(mediator_name(self._namespace))
+        # The mediator's key waits in the credentials namespace for the mediator slice;
+        # the worker's client key sits in the worker namespace, where only the
+        # administrator creates Pods.
+        for name, namespace, data in (
+            (
+                MEDIATOR_SECRET,
+                self._credentials_namespace,
+                {
+                    "ca.crt": launch.ca_pem,
+                    "tls.crt": launch.server_certificate_pem,
+                    "tls.key": launch.server_key_pem,
+                },
+            ),
+            (
+                WORKER_CLIENT_SECRET,
+                worker_namespace(self._namespace),
+                {
+                    "launch-client.pem": launch.client_certificate_pem,
+                    "launch-client.key": launch.client_key_pem,
+                },
+            ),
+        ):
+            self._cluster.create(
+                {
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "metadata": {"name": name, "namespace": namespace, "labels": owned},
+                    "type": "Opaque",
+                    "immutable": True,
+                    "data": {key: _b64(value) for key, value in data.items()},
+                }
+            )
+        self._launch = LaunchPublic(
+            launch.server_name, launch.ca_pem, launch.server_spki_sha256, launch.client_spki_sha256
+        )
+        del launch
         self.__credentials, self.__installer = credentials, installer
         self._kubeconfig = self._mint_kubeconfig()
 
@@ -394,9 +638,10 @@ class AdministratorBootstrap:
         @spec PROTECTED-COMMISSIONING-1.
         """
         _require(bool(self.__credentials) and self._kubeconfig is not None)
-        assert self._kubeconfig is not None
+        assert self._kubeconfig is not None and self._launch is not None
         return ProvisionerGrant(
             kubeconfig=self._kubeconfig,
+            launch=self._launch,
             principals=dict(self._principals),
             provisioner=self.__credentials["provisioner"],
             workload={
@@ -405,6 +650,36 @@ class AdministratorBootstrap:
                 if name in self.__credentials
             },
         )
+
+    def install_worker(self, deployment: Mapping[str, Any], *, worker_image: str) -> str:
+        """Create the protected worker Deployment from the administrator's own rendering.
+
+        Protected workloads are installation: the provisioner renders the
+        template and writes the worker's runtime Secret, and the administrator
+        creates the Deployment in the worker namespace, where the provisioner
+        cannot create Pods. The administrator re-renders the Deployment with
+        its own pinned ``worker_image`` and the runtime file set, and refuses
+        any difference, so no provisioner rendering can mount or print the
+        worker's client key. @spec PROTECTED-COMMISSIONING-6.
+        """
+        # Imported here: the worker module builds on this one.
+        from .commissioning_local_worker import (
+            WorkerRefused,
+            deployment_paths,
+            worker_deployment,
+        )
+
+        try:
+            own = worker_deployment(
+                self._cluster.owner,
+                worker_namespace(self._namespace),
+                worker_image,
+                deployment_paths(deployment),
+            )
+        except WorkerRefused:
+            _refuse()
+        _require(type(deployment) is dict and deployment == own)
+        return self._cluster.create(own)
 
     def enroll(self, broker: LocalBroker) -> dict[str, AclPrincipalState]:
         """Create every ACL user, record the baseline, then turn the installer off.
