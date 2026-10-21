@@ -208,6 +208,13 @@ counter, and blocks every positive operation, including dispatch of an already
 charged reservation. Changing scope or limits requires a new campaign. Retries,
 parked deliveries, a new control process or a restored broker cannot renew one.
 
+Clarification (2026-10-20): a limit of N permits exactly N charged operations.
+The reservation whose charge reaches a limit was charged within it, so it alone
+stays dispatchable, and a launch it reserved may record its ownership, while
+the journal is `closing` for that exhaustion. Every later reservation, and the
+dispatch of every other already charged reservation, refuses. A `closed` or
+`failed` journal dispatches nothing.
+
 At `expires_at_ms`, at limit exhaustion, on a broker `run_id` change or on
 revocation, the campaign refuses new positive work and the supervisor terminates
 every recorded owned SDK and runner session. Status, stop and retire stay
