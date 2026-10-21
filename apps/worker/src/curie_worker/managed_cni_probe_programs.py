@@ -59,11 +59,30 @@ def bind(kind, port):
     return s
 def nonce(data):
     return data[:64].decode("ascii", "replace").strip()
+HOLD = cfg.get("hold", False)
+def serve(c, peer, port):
+    # Retained-connection mode (case 5): keep the accepted socket open and log
+    # every segment's nonce, so a flow that keeps passing data after a trigger
+    # is observed. Default mode closes after one recv, unchanged.
+    c.settimeout(30.0)
+    try:
+        while True:
+            data = c.recv(256)
+            if not data:
+                break
+            emit({"ev": "tcp", "peer": peer, "port": port, "nonce": nonce(data)})
+    except OSError:
+        pass
+    finally:
+        c.close()
 def tcp(port):
     s = bind(socket.SOCK_STREAM, port)
     s.listen(64)
     while True:
         c, a = s.accept()
+        if HOLD:
+            threading.Thread(target=serve, args=(c, norm(a[0]), port), daemon=True).start()
+            continue
         c.settimeout(1.0)
         data = b""
         try:
@@ -200,8 +219,124 @@ sys.stdout.write(json.dumps(doc, sort_keys=True) + "\n")
 sys.stdout.flush()
 """
 
+# Case 3 raw-socket sender. It forges the IP source address, so it never
+# receives the reply and only the owned listener decides the verdict. IPv4 only:
+# a forged IPv6 source needs L2 crafting that NET_RAW alone does not give, so the
+# case code marks any IPv6 spoof entry unavailable rather than widen rights. The
+# only capability this adds is NET_RAW, in probe-a (clause 2).
+SPOOF_PROGRAM = r"""
+import json, os, socket, struct, sys, time
+cfg = json.loads(sys.argv[1])
+def checksum(data):
+    if len(data) % 2:
+        data += b"\x00"
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) + data[i + 1]
+    total = (total >> 16) + (total & 0xffff)
+    total += total >> 16
+    return (~total) & 0xffff
+def ip_header(src, dst, proto, payload_len):
+    total = 20 + payload_len
+    fields = (0x45, 0, total, os.getpid() & 0xffff, 0, 64, proto, 0,
+              socket.inet_aton(src), socket.inet_aton(dst))
+    chk = checksum(struct.pack(">BBHHHBBH4s4s", *fields))
+    fields = fields[:7] + (chk,) + fields[8:]
+    return struct.pack(">BBHHHBBH4s4s", *fields)
+def tcp_segment(src, dst, sport, dport, seq, ack, flags, payload):
+    base = (sport, dport, seq, ack, 5 << 4, flags, 1024, 0, 0)
+    pseudo = socket.inet_aton(src) + socket.inet_aton(dst) + struct.pack(
+        ">BBH", 0, 6, 20 + len(payload))
+    chk = checksum(pseudo + struct.pack(">HHLLBBHHH", *base) + payload)
+    base = base[:7] + (chk, 0)
+    return struct.pack(">HHLLBBHHH", *base) + payload
+def udp_datagram(src, dst, sport, dport, payload):
+    length = 8 + len(payload)
+    pseudo = socket.inet_aton(src) + socket.inet_aton(dst) + struct.pack(">BBH", 0, 17, length)
+    chk = checksum(pseudo + struct.pack(">HHHH", sport, dport, length, 0) + payload) or 0xffff
+    return struct.pack(">HHHH", sport, dport, length, chk) + payload
+results = []
+for item in cfg["packets"]:
+    src, dst, dport = item["src"], item["addr"], item["port"]
+    proto, nonce = item["proto"], item["nonce"]
+    sport = int(item.get("sport") or (40000 + os.getpid() % 20000))
+    if ":" in src or ":" in dst:
+        results.append([nonce, "unsupported_family"])
+        continue
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        if proto == "udp":
+            seg = udp_datagram(src, dst, sport, dport, nonce.encode("ascii"))
+            packet = ip_header(src, dst, 17, len(seg)) + seg
+        else:
+            seq = int(item.get("seq") or int.from_bytes(os.urandom(4), "big"))
+            ack = int(item.get("ack") or 0)
+            flags = int(item.get("flags") or 0x02)  # SYN
+            payload = nonce.encode("ascii") if item.get("with_payload") else b""
+            seg = tcp_segment(src, dst, sport, dport, seq, ack, flags, payload)
+            packet = ip_header(src, dst, 6, len(seg)) + seg
+        for _ in range(int(cfg.get("repeat", 1))):
+            s.sendto(packet, (dst, 0))
+            time.sleep(cfg.get("interval_ms", 0) / 1000.0)
+        s.close()
+        results.append([nonce, "sent"])
+    except Exception as exc:  # the forged send cannot be observed here; the twin decides
+        results.append([nonce, "error:" + type(exc).__name__])
+sys.stdout.write(json.dumps({"ev": "result", "packets": results,
+                             "t": int(time.time() * 1000)}, sort_keys=True) + "\n")
+sys.stdout.flush()
+"""
+
+# Case 5 retained sender: establish a TCP flow, then send sequence-numbered
+# heartbeat nonces at a fixed interval, past the triggering event. Each send is
+# logged with its wall time so the kit can tell which heartbeats were sent after
+# the trigger plus the bound.
+RETAINED_SENDER_PROGRAM = r"""
+import json, socket, sys, time
+cfg = json.loads(sys.argv[1])
+addr, port = cfg["addr"], cfg["port"]
+family = socket.AF_INET6 if ":" in addr else socket.AF_INET
+s = socket.socket(family, socket.SOCK_STREAM)
+s.settimeout(cfg["timeout_ms"] / 1000.0)
+out = {"ev": "result", "connected": False, "laddr": None, "lport": None, "sent": []}
+def emit(doc):
+    doc["t"] = int(time.time() * 1000)
+    sys.stdout.write(json.dumps(doc, sort_keys=True) + "\n")
+    sys.stdout.flush()
+try:
+    s.connect((addr, port))
+    out["connected"] = True
+    out["laddr"], out["lport"] = s.getsockname()[0], s.getsockname()[1]
+    emit({"ev": "established", "laddr": out["laddr"], "lport": out["lport"]})
+    for nonce in cfg["nonces"]:
+        try:
+            s.sendall(nonce.encode("ascii"))
+            out["sent"].append([nonce, int(time.time() * 1000), "ok"])
+        except OSError:
+            out["sent"].append([nonce, int(time.time() * 1000), "error"])
+        time.sleep(cfg["interval_ms"] / 1000.0)
+except Exception:
+    pass
+finally:
+    s.close()
+emit(out)
+"""
+
+# Case 7 node_origin: an idle pod whose readiness probe makes kubelet connect to
+# a twin from the node itself. The container runs no network code; the readiness
+# probe the template carries is the only traffic.
+IDLE_PROGRAM = r"""
+import json, sys, time
+sys.stdout.write(json.dumps({"ev": "ready"}) + "\n")
+sys.stdout.flush()
+while True:
+    time.sleep(3600)
+"""
+
 # Template name -> (program, namespace role). The bootstrap installs these and
-# the guard admits probe pods only from them (a later slice installs both).
+# the guard admits probe pods only from them (a later slice installs both). The
+# ``spoofing`` template adds NET_RAW (clause 2); every other template drops all.
 TEMPLATES: dict[str, tuple[str, str]] = {
     "twin": ("listener", "protected"),
     "allowed_sender": ("sender", "protected"),
@@ -210,18 +345,27 @@ TEMPLATES: dict[str, tuple[str, str]] = {
     "probe_listener": ("listener", "probe"),
     "probe_sender": ("sender", "probe"),
     "release_probe": ("sender", "release"),
+    "spoofing": ("spoof", "probe"),
+    "retained_sender": ("retained_sender", "protected"),
+    "kubelet_probe": ("idle", "probe"),
 }
-_PROGRAMS = {"listener": LISTENER_PROGRAM, "sender": SENDER_PROGRAM}
+# Only the spoofing template adds a capability, and only NET_RAW (clause 2).
+NET_RAW_TEMPLATES = frozenset({"spoofing"})
+_PROGRAMS = {
+    "listener": LISTENER_PROGRAM,
+    "sender": SENDER_PROGRAM,
+    "spoof": SPOOF_PROGRAM,
+    "retained_sender": RETAINED_SENDER_PROGRAM,
+    "idle": IDLE_PROGRAM,
+}
 _NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _NODE = re.compile(r"[a-z0-9][a-z0-9.-]{0,252}")
 
 
 def probe_kit_digest() -> str:
-    """sha256 over the probe image and both programs, recorded with the evidence."""
+    """sha256 over the probe image and every program, recorded with the evidence."""
     return hashlib.sha256(
-        canonical_json(
-            {"image": PROBE_IMAGE, "listener": LISTENER_PROGRAM, "sender": SENDER_PROGRAM}
-        )
+        canonical_json({"image": PROBE_IMAGE, "programs": dict(sorted(_PROGRAMS.items()))})
     ).hexdigest()
 
 
@@ -253,9 +397,48 @@ def probe_pod(
         "runAsGroup": 65534,
         "seccompProfile": {"type": "RuntimeDefault"},
     }
-    if program_kind == "listener":
-        # A namespaced safe sysctl, so a twin can hold a target's low port unprivileged.
+    if program_kind in ("listener", "retained_sender"):
+        # A namespaced safe sysctl, so a twin can hold a target's low port, and a
+        # retained sender can bind the original low source port, unprivileged.
         pod_security["sysctls"] = [{"name": "net.ipv4.ip_unprivileged_port_start", "value": "0"}]
+    capabilities: dict[str, Any] = {"drop": ["ALL"]}
+    if template in NET_RAW_TEMPLATES:
+        capabilities["add"] = ["NET_RAW"]
+    container: dict[str, Any] = {
+        "name": "probe",
+        "image": PROBE_IMAGE,
+        "imagePullPolicy": "IfNotPresent",
+        "command": [
+            "python3",
+            "-I",
+            "-c",
+            _PROGRAMS[program_kind],
+            json.dumps(argument, sort_keys=True),
+        ],
+        "env": [{"name": "PYTHONDONTWRITEBYTECODE", "value": "1"}],
+        "resources": {
+            "requests": {"cpu": "20m", "memory": "32Mi"},
+            "limits": {"cpu": "200m", "memory": "96Mi"},
+        },
+        "securityContext": {
+            "privileged": False,
+            "allowPrivilegeEscalation": False,
+            "readOnlyRootFilesystem": True,
+            "capabilities": capabilities,
+        },
+    }
+    if program_kind == "idle":
+        # Case 7: kubelet connects to the twin from the node to run this probe.
+        require("probe_host" in argument and "probe_port" in argument)
+        host, port = argument["probe_host"], argument["probe_port"]
+        require(type(host) is str and type(port) is int and bool(_NODE.fullmatch(host)))
+        require(0 < port < 65536)
+        container["readinessProbe"] = {
+            "tcpSocket": {"host": host, "port": port},
+            "initialDelaySeconds": 1,
+            "periodSeconds": 2,
+            "failureThreshold": 60,
+        }
     return {
         "apiVersion": "v1",
         "kind": "Pod",
@@ -270,31 +453,7 @@ def probe_pod(
             "hostIPC": False,
             "terminationGracePeriodSeconds": 1,
             "securityContext": pod_security,
-            "containers": [
-                {
-                    "name": "probe",
-                    "image": PROBE_IMAGE,
-                    "imagePullPolicy": "IfNotPresent",
-                    "command": [
-                        "python3",
-                        "-I",
-                        "-c",
-                        _PROGRAMS[program_kind],
-                        json.dumps(argument, sort_keys=True),
-                    ],
-                    "env": [{"name": "PYTHONDONTWRITEBYTECODE", "value": "1"}],
-                    "resources": {
-                        "requests": {"cpu": "20m", "memory": "32Mi"},
-                        "limits": {"cpu": "200m", "memory": "96Mi"},
-                    },
-                    "securityContext": {
-                        "privileged": False,
-                        "allowPrivilegeEscalation": False,
-                        "readOnlyRootFilesystem": True,
-                        "capabilities": {"drop": ["ALL"]},
-                    },
-                }
-            ],
+            "containers": [container],
         },
     }
 
@@ -438,4 +597,64 @@ def parse_sender_log(log: str) -> SenderRecord:
         )
     return SenderRecord(
         start_ms=int(document["start"]), end_ms=int(document["end"]), attempts=tuple(attempts)
+    )
+
+
+SPOOF_RESULTS = frozenset({"sent", "unsupported_family"})
+
+
+@dataclass(frozen=True, slots=True)
+class SpoofRecord:
+    # (nonce, result): ``sent`` means the forged packet left the raw socket. The
+    # listener, not this record, decides whether it was delivered.
+    packets: tuple[tuple[str, str], ...]
+
+    @property
+    def sent(self) -> bool:
+        return bool(self.packets) and all(result == "sent" for _nonce, result in self.packets)
+
+
+def parse_spoof_log(log: str) -> SpoofRecord:
+    documents = [document for document in _lines(log) if document.get("ev") == "result"]
+    require(len(documents) == 1)
+    packets = []
+    for nonce, result in documents[0]["packets"]:
+        prefix = result.split(":", 1)[0]
+        require(result in SPOOF_RESULTS or prefix == "error")
+        packets.append((str(nonce), str(result)))
+    return SpoofRecord(packets=tuple(packets))
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedSenderRecord:
+    connected: bool
+    local_address: str | None
+    local_port: int | None
+    established_ms: int | None
+    # (nonce, send wall time ms, result)
+    sent: tuple[tuple[str, int, str], ...]
+
+
+def parse_retained_sender_log(log: str) -> RetainedSenderRecord:
+    established_ms = None
+    result: dict[str, Any] | None = None
+    for document in _lines(log):
+        if document.get("ev") == "established":
+            established_ms = int(document["t"])
+        elif document.get("ev") == "result":
+            result = document
+    require(result is not None)
+    assert result is not None
+    sent = []
+    for nonce, at, outcome in result["sent"]:
+        require(outcome in ("ok", "error"))
+        sent.append((str(nonce), int(at), str(outcome)))
+    local_address = None if result["laddr"] is None else _canonical_ip(result["laddr"])
+    local_port = None if result["lport"] is None else int(result["lport"])
+    return RetainedSenderRecord(
+        connected=result["connected"] is True,
+        local_address=local_address,
+        local_port=local_port,
+        established_ms=established_ms,
+        sent=tuple(sent),
     )

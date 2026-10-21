@@ -149,6 +149,12 @@ class ProbeCluster(Protocol):
 
     async def list_items(self, collection: str) -> list[dict[str, Any]] | None: ...
 
+    async def create_network_policy(
+        self, namespace: str, document: dict[str, Any]
+    ) -> dict[str, Any]: ...
+
+    async def delete_network_policy(self, namespace: str, name: str) -> None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class Target:
@@ -255,8 +261,12 @@ class _Run:
     clock: Callable[[], float]
     sleep: Callable[[float], Awaitable[None]]
     created: list[tuple[str, str, str]] = field(default_factory=list)
+    # Probe NetworkPolicies this run created in the probe namespace (case 5).
+    created_policies: list[tuple[str, str]] = field(default_factory=list)
     evidence: list[dict[str, Any]] = field(default_factory=list)
     counter: int = 0
+    # Set by case 7 when node-local traffic reaches but a capability entry is not pass.
+    node_authority_refusal: str | None = None
     # Every nonce a denial probe or its control sent in this run.
     nonces: set[str] = field(default_factory=set)
     # One sender per node from creation until its listener window closes, so no
@@ -1059,8 +1069,13 @@ async def case_eight_reviews(run: _Run, identities: Sequence[Subject] | None) ->
 
 
 async def _cleanup(run: _Run) -> list[str]:
-    """Delete every pod this run created, by UID, and confirm absence."""
+    """Delete every pod and probe policy this run created, by UID, and confirm absence."""
     leftovers = []
+    for namespace, name in run.created_policies:
+        try:
+            await run.cluster.delete_network_policy(namespace, name)
+        except ProbeKitRefused:
+            pass
     for namespace, name, uid in run.created:
         try:
             await run.cluster.delete_pod(namespace, name, uid)
@@ -1138,6 +1153,14 @@ class ProbeKit:
         identities = await ordinary_identities(run)
         entries += await case_two(run, twins, identities)
         snapshots.append(await policy_snapshot(run))
+        # Cases 3, 4, 5 and 7 (this slice), built on the same twins and run.
+        from .managed_cni_timing import case_five, case_four, case_seven, case_three
+
+        entries += await case_three(run, twins)
+        entries += await case_four(run, twins)
+        entries += await case_five(run, twins)
+        entries += await case_seven(run, identities)
+        snapshots.append(await policy_snapshot(run))
         entries += await case_six(run)
         snapshots.append(await policy_snapshot(run))
         entries.append(await case_eight_reviews(run, identities))
@@ -1152,7 +1175,8 @@ class ProbeKit:
             )
         )
         refused = next((item for item in entries if item.outcome != "pass"), None)
-        return Measurement(tuple(entries), None if refused is None else refused.reason)
+        reason = run.node_authority_refusal or (None if refused is None else refused.reason)
+        return Measurement(tuple(entries), reason)
 
 
 def required_entries(layout: ProbeLayout) -> frozenset[EntryKey]:
@@ -1182,4 +1206,7 @@ def required_entries(layout: ProbeLayout) -> frozenset[EntryKey]:
         (8, "all_policies_present"),
     ):
         keys.add((case, sub_case, *NONE))
+    from .managed_cni_timing import required_timing_entries
+
+    keys |= required_timing_entries(layout)
     return frozenset(keys)

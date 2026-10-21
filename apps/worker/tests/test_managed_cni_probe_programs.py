@@ -162,7 +162,8 @@ def test_every_template_is_unprivileged_and_tokenless(template: str) -> None:
         node="node-a",
         campaign="c1",
         role_labels={"curietech.ai/role": "x"},
-        argument={"attempts": []},
+        # Only the kubelet-probe template reads these; the others ignore them.
+        argument={"probe_host": "10.0.0.5", "probe_port": 16379, "attempts": []},
     )
     spec = pod["spec"]
     assert spec["automountServiceAccountToken"] is False
@@ -170,23 +171,58 @@ def test_every_template_is_unprivileged_and_tokenless(template: str) -> None:
     assert "volumes" not in spec
     (container,) = spec["containers"]
     assert container["image"] == PROBE_IMAGE and "@sha256:" in PROBE_IMAGE
-    assert container["securityContext"] == {
-        "privileged": False,
-        "allowPrivilegeEscalation": False,
-        "readOnlyRootFilesystem": True,
-        "capabilities": {"drop": ["ALL"]},
-    }
+    security = container["securityContext"]
+    assert (security["privileged"], security["allowPrivilegeEscalation"]) == (False, False)
+    assert security["readOnlyRootFilesystem"] is True
+    # The spoofing template adds NET_RAW and nothing else; every other template
+    # drops all capabilities (clause 2).
+    expected = {"drop": ["ALL"]} | ({"add": ["NET_RAW"]} if template == "spoofing" else {})
+    assert security["capabilities"] == expected
     assert "volumeMounts" not in container and "envFrom" not in container
     assert spec["nodeName"] == "node-a"
     assert pod["metadata"]["labels"]["curietech.ai/managed-cni-probe-template"] == template
 
 
+def test_spoofing_is_the_only_template_that_adds_a_capability() -> None:
+    adders = [
+        template
+        for template in TEMPLATES
+        if probe_pod(
+            template=template,
+            name="p",
+            namespace="probe-a",
+            node="n",
+            campaign="c1",
+            role_labels={},
+            argument={"probe_host": "10.0.0.5", "probe_port": 16379},
+        )["spec"]["containers"][0]["securityContext"]["capabilities"].get("add")
+    ]
+    assert adders == ["spoofing"]
+
+
+def test_kubelet_probe_carries_a_tcp_readiness_probe_to_the_twin() -> None:
+    pod = probe_pod(
+        template="kubelet_probe",
+        name="p",
+        namespace="probe-a",
+        node="n",
+        campaign="c1",
+        role_labels={},
+        argument={"probe_host": "10.0.0.9", "probe_port": 16379},
+    )
+    (container,) = pod["spec"]["containers"]
+    assert container["readinessProbe"]["tcpSocket"] == {"host": "10.0.0.9", "port": 16379}
+
+
 @pytest.mark.parametrize(
     "changes",
     [
-        {"template": "spoofing"},
+        {"template": "unknown_template"},
         {"node": "Node_A"},
         {"role_labels": {"curietech.ai/managed-cni-probe-template": "twin"}},
+        # A kubelet probe without a valid target host and port is refused.
+        {"template": "kubelet_probe", "argument": {"probe_host": "10.0.0.5", "probe_port": 0}},
+        {"template": "kubelet_probe", "argument": {}},
     ],
 )
 def test_template_refuses_what_it_does_not_allow(changes: dict[str, Any]) -> None:

@@ -99,6 +99,25 @@ class ModelCluster:
         self.busy_until: dict[str, float] = {}
         self.overlaps: list[str] = []
         self.extra_bindings: list[dict[str, Any]] = []
+        # Freed pod addresses, handed back out when ``recycle`` is set, so address
+        # reuse (cases 4 and 5) can be provoked deterministically.
+        self.free_ips: list[str] = []
+        self.recycle = True
+        self.node_ips = {"n1": "192.168.49.2", "n2": "192.168.49.3"}
+        # Retained connections (case 5), finalized once their window elapses.
+        self.retained: dict[tuple[str, str], dict[str, Any]] = {}
+        self.ret_deny_ms: int | None = None
+        self.ret_deny_name: str | None = None
+        self.policies: dict[str, dict[str, Any]] = {}
+        # A CNI that lets a forged source through even while enforcing (case 3), or
+        # a connection-tracking engine that keeps a flow after a policy change
+        # (case 5), each a failing cluster.
+        self.spoof_leaks = False
+        self.retained_leaks = False
+        # Case 7: the model's CNI admits node-local (kubelet) traffic to local pods.
+        self.node_local_reaches = True
+        # Any ordinary identity allowed node-capable rights, by (identity, resource).
+        self.extra_pods: list[dict[str, Any]] = []
 
     def clock(self) -> float:
         return self.now
@@ -110,15 +129,29 @@ class ModelCluster:
     def _ms(self) -> int:
         return int(self.now * 1000)
 
+    def _program(self, argument: dict[str, Any]) -> str:
+        if "packets" in argument:
+            return "spoof"
+        if "nonces" in argument:
+            return "retained_sender"
+        if "phases" in argument:
+            return "sender"
+        if "probe_host" in argument:
+            return "idle"
+        return "listener"
+
     async def create_pod(self, namespace: str, document: dict[str, Any]) -> dict[str, Any]:
         name = document["metadata"]["name"]
         assert (namespace, name) not in self.pods
         self.now += 1.0  # pod start latency
         self.created += 1
-        ip = f"10.0.{self.next_ip // 250}.{self.next_ip % 250 + 1}"
-        self.next_ip += 1
+        if self.recycle and self.free_ips:
+            ip = self.free_ips.pop(0)
+        else:
+            ip = f"10.0.{self.next_ip // 250}.{self.next_ip % 250 + 1}"
+            self.next_ip += 1
         uid = f"uid-{self.created}"
-        command = document["spec"]["containers"][0]["command"]
+        argument = json.loads(document["spec"]["containers"][0]["command"][4])
         pod = {
             "metadata": {
                 "name": name,
@@ -128,18 +161,96 @@ class ModelCluster:
             },
             "spec": {"nodeName": document["spec"]["nodeName"]},
             "status": {"phase": "Running", "podIPs": [{"ip": ip}]},
-            "program": "listener" if "accept" in command[3] else "sender",
-            "argument": json.loads(command[4]),
+            "program": self._program(argument),
+            "argument": argument,
         }
         self.pods[(namespace, name)] = pod
         self.ip_owner[ip] = (namespace, name)
         self.logs[(namespace, name)] = []
-        if pod["program"] == "listener":
+        kind = pod["program"]
+        if kind == "listener":
             self.logs[(namespace, name)].append({"ev": "ready", "t": self._ms()})
+        elif kind == "idle":
+            self.logs[(namespace, name)].append({"ev": "ready", "t": self._ms()})
+            self._kubelet(pod)
+        elif kind == "spoof":
+            self._spoof_send(pod)
+            pod["status"]["phase"] = "Succeeded"
+        elif kind == "retained_sender":
+            self._retained_create(pod)
         else:
             self._send(pod)
             pod["status"]["phase"] = "Succeeded"
         return {"metadata": {"uid": uid}}
+
+    def _spoof_send(self, sender: dict[str, Any]) -> None:
+        packets = []
+        for item in sender["argument"]["packets"]:
+            nonce = item["nonce"]
+            owner = self.ip_owner.get(item["addr"])
+            # The CNI drops a forged source address when enforcing; otherwise the
+            # listener records the spoofed packet.
+            if owner is not None and (not self.enforcing or self.spoof_leaks):
+                self.logs[owner].append(
+                    {"ev": item["proto"] if item["proto"] in ("tcp", "udp") else "tcp",
+                     "peer": item["src"], "port": item["port"], "nonce": nonce, "t": self._ms()}
+                )
+            packets.append([nonce, "sent" if ":" not in item["src"] else "unsupported_family"])
+        self.now += 0.2
+        self.logs[(sender["metadata"]["namespace"], sender["metadata"]["name"])].append(
+            {"ev": "result", "packets": packets, "t": self._ms()}
+        )
+
+    def _kubelet(self, pod: dict[str, Any]) -> None:
+        argument = pod["argument"]
+        owner = self.ip_owner.get(argument["probe_host"])
+        node_ip = self.node_ips.get(pod["spec"]["nodeName"])
+        if owner is not None and node_ip is not None and self.node_local_reaches:
+            self.logs[owner].append(
+                {"ev": "tcp", "peer": node_ip, "port": argument["probe_port"], "nonce": "",
+                 "t": self._ms()}
+            )
+
+    def _retained_create(self, pod: dict[str, Any]) -> None:
+        key = (pod["metadata"]["namespace"], pod["metadata"]["name"])
+        ip = pod["status"]["podIPs"][0]["ip"]
+        argument = pod["argument"]
+        owner = self.ip_owner.get(argument["addr"])
+        self.logs[key].append({"ev": "established", "laddr": ip, "lport": 54321, "t": self._ms()})
+        self.retained[key] = {
+            "established_ms": self._ms(),
+            "nonces": argument["nonces"],
+            "interval": argument["interval_ms"],
+            "owner": owner,
+            "ip": ip,
+            "finalized": False,
+        }
+
+    def _finalize_retained(self, key: tuple[str, str]) -> None:
+        state = self.retained[key]
+        if state["finalized"]:
+            return
+        established, interval = state["established_ms"], state["interval"]
+        sent = []
+        for i, nonce in enumerate(state["nonces"]):
+            at = established + i * interval
+            if at > self._ms():
+                break
+            sent.append([nonce, at, "ok"])
+            # Enforcing cuts the flow at the policy change; a conntrack engine that
+            # retains the flow (retained_leaks), or a non-enforcing CNI, keeps it.
+            delivered = self.enforcing and (self.ret_deny_ms is None or at < self.ret_deny_ms)
+            if not self.enforcing or self.retained_leaks:
+                delivered = True
+            if delivered and state["owner"] is not None:
+                self.logs[state["owner"]].append(
+                    {"ev": "tcp", "peer": state["ip"], "port": 0, "nonce": nonce, "t": at}
+                )
+        self.logs[key].append(
+            {"ev": "result", "connected": True, "laddr": state["ip"], "lport": 54321, "sent": sent}
+        )
+        self.pods[key]["status"]["phase"] = "Succeeded"
+        state["finalized"] = True
 
     def _admits(self, sender: dict[str, Any], listener: dict[str, Any], port: int) -> bool:
         if not self.enforcing:
@@ -194,15 +305,25 @@ class ModelCluster:
         self.now += 2.0
         # A denial sender's address may be reused once it ends while its listener
         # window still runs; no other probe pod may start on that node meanwhile.
+        # Nonce-attributed senders (first-packet) are exempt: they never attribute a
+        # delivery by source address, so sharing a node cannot misattribute.
         template = sender["metadata"]["labels"]["curietech.ai/managed-cni-probe-template"]
-        if template in ("probe_sender", "protected_probe", "release_probe"):
+        if template in ("probe_sender", "protected_probe", "release_probe") and not sender[
+            "argument"
+        ].get("nonce_only"):
             self.busy_until[node] = self.now + 5.0
         self.logs[(sender["metadata"]["namespace"], sender["metadata"]["name"])].append(
             {"ev": "result", "start": start, "end": self._ms(), "attempts": results}
         )
 
     async def read_pod(self, namespace: str, name: str) -> dict[str, Any] | None:
-        return self.pods.get((namespace, name))
+        key = (namespace, name)
+        state = self.retained.get(key)
+        if state is not None and not state["finalized"]:
+            finish = state["established_ms"] + len(state["nonces"]) * state["interval"]
+            if self._ms() >= finish:
+                self._finalize_retained(key)
+        return self.pods.get(key)
 
     async def pod_log(self, namespace: str, name: str) -> str:
         pod = self.pods[(namespace, name)]
@@ -218,7 +339,32 @@ class ModelCluster:
     async def delete_pod(self, namespace: str, name: str, uid: str) -> None:
         pod = self.pods.get((namespace, name))
         if pod is not None and pod["metadata"]["uid"] == uid:
+            for item in pod["status"].get("podIPs", []):
+                ip = item.get("ip")
+                if ip is not None:
+                    self.ip_owner.pop(ip, None)
+                    self.free_ips.append(ip)
             del self.pods[(namespace, name)]
+            self.retained.pop((namespace, name), None)
+
+    async def create_network_policy(
+        self, namespace: str, document: dict[str, Any]
+    ) -> dict[str, Any]:
+        name = document["metadata"]["name"]
+        self.policies[name] = document
+        spec = document["spec"]
+        role = spec.get("podSelector", {}).get("matchLabels", {}).get(
+            "curietech.ai/managed-cni-probe-role"
+        )
+        # An empty-ingress policy on the retained listener removes the allowance.
+        if role == "ret-listener" and not spec.get("ingress"):
+            self.ret_deny_ms, self.ret_deny_name = self._ms(), name
+        return {"metadata": {"uid": f"np-{name}"}}
+
+    async def delete_network_policy(self, namespace: str, name: str) -> None:
+        self.policies.pop(name, None)
+        if name == self.ret_deny_name:
+            self.ret_deny_ms, self.ret_deny_name = None, None
 
     async def dry_run_create_pod(
         self, namespace: str, document: dict[str, Any]
@@ -248,6 +394,16 @@ class ModelCluster:
                     "status": {"addresses": [{"type": "InternalIP", "address": "192.168.49.3"}]},
                 },
             ]
+        if collection == "pods":
+            return [
+                {
+                    "metadata": {"name": pod["metadata"]["name"],
+                                 "namespace": pod["metadata"]["namespace"]},
+                    "spec": pod["spec"],
+                    "status": pod["status"],
+                }
+                for pod in self.pods.values()
+            ] + self.extra_pods
         if collection == "clusterrolebindings":
             return [
                 {
@@ -410,7 +566,9 @@ def test_a_destination_nobody_can_reach_is_unavailable_not_pass() -> None:
 def test_each_target_is_forged_separately_and_each_must_be_refused() -> None:
     cluster = ModelCluster()
     assert measure(cluster).refusal is None
-    roles = sorted(labels[ROLE] for labels in cluster.forgeries)
+    # Case 2 forges the broker and mediator selector labels; case 7's node-capable
+    # dry-runs carry no role label and are not these forgeries.
+    roles = sorted(labels[ROLE] for labels in cluster.forgeries if ROLE in labels)
     assert roles == ["broker", "mediator"]
     admitted = ModelCluster()
     admitted.admit_forgery_roles = {"broker"}
@@ -445,3 +603,107 @@ def test_real_targets_are_probed_on_every_protocol_they_serve() -> None:
         "udp",
     }
     assert {proto for address, proto in cluster.real_attempts if address == "10.96.0.11"} == {"tcp"}
+
+
+# --- Cases 3, 4, 5 and 7 flow through the model (this slice) ---
+
+
+def test_an_enforcing_cluster_passes_every_timing_case() -> None:
+    result = outcomes(measure(ModelCluster()))
+    for sub_case in ("spoof_live", "spoof_terminated"):
+        assert result[(3, sub_case, "ipv4", "same_node", "raw_socket")] == ("pass", "denied")
+    assert result[(4, "new_pod", "ipv4", "same_node", "protected_unselected")] == ("pass", "denied")
+    assert result[(4, "address_reuse", "ipv4", "same_node", "protected_unselected")] == (
+        "pass",
+        "denied",
+    )
+    assert result[(5, "policy_changed", "ipv4", "same_node", "retained_peer")] == ("pass", "denied")
+    assert result[(5, "workload_replaced", "ipv4", "same_node", "retained_peer")] == (
+        "pass",
+        "denied",
+    )
+    assert result[(7, "node_origin", "ipv4", "same_node", "node")] == ("pass", "reaches")
+    assert result[(7, "rbac_node_capability", "none", "none", "none")] == ("pass", "reviews_denied")
+    assert result[(7, "admission_node_capability", "none", "none", "none")] == (
+        "pass",
+        "guard_refused",
+    )
+    assert result[(7, "running_node_capability", "none", "none", "none")] == (
+        "pass",
+        "reviews_denied",
+    )
+
+
+def test_a_spoofed_source_that_reaches_a_twin_fails_case_three() -> None:
+    cluster = ModelCluster()
+    cluster.spoof_leaks = True
+    measurement = measure(cluster)
+    assert measurement.refusal == "delivered"
+    result = outcomes(measurement)
+    assert result[(3, "spoof_live", "ipv4", "same_node", "raw_socket")] == ("fail", "delivered")
+
+
+def test_unprovoked_reuse_is_unavailable_and_refuses_the_campaign() -> None:
+    cluster = ModelCluster()
+    cluster.recycle = False  # the terminated address is never handed back out
+    measurement = measure(cluster)
+    assert measurement.refusal == "reuse_not_provoked"
+    result = outcomes(measurement)
+    assert result[(4, "address_reuse", "ipv4", "same_node", "protected_unselected")] == (
+        "unavailable",
+        "reuse_not_provoked",
+    )
+    assert result[(5, "workload_replaced", "ipv4", "same_node", "retained_peer")] == (
+        "unavailable",
+        "reuse_not_provoked",
+    )
+
+
+def test_a_retained_flow_after_a_policy_change_fails_case_five() -> None:
+    cluster = ModelCluster()
+    cluster.retained_leaks = True
+    measurement = measure(cluster)
+    assert measurement.refusal == "retained_flow"
+    result = outcomes(measurement)
+    assert result[(5, "policy_changed", "ipv4", "same_node", "retained_peer")] == (
+        "fail",
+        "retained_flow",
+    )
+
+
+def test_node_local_blocked_is_a_recorded_fact_not_a_refusal() -> None:
+    cluster = ModelCluster()
+    cluster.node_local_reaches = False
+    measurement = measure(cluster)
+    assert measurement.refusal is None
+    result = outcomes(measurement)
+    assert result[(7, "node_origin", "ipv4", "same_node", "node")] == ("pass", "blocked")
+
+
+def test_node_capable_rights_when_node_local_reaches_force_a_separate_domain() -> None:
+    cluster = ModelCluster()
+    # A privileged pod of an ordinary identity on an eligible node.
+    cluster.extra_pods = [
+        {
+            "metadata": {"name": "intruder", "namespace": "kube-system"},
+            "spec": {
+                "nodeName": "n1",
+                "containers": [{"securityContext": {"privileged": True}}],
+            },
+            "status": {},
+        }
+    ]
+    measurement = measure(cluster)
+    assert measurement.refusal == "separate_authority_domain_required"
+    result = outcomes(measurement)
+    assert result[(7, "running_node_capability", "none", "none", "none")] == (
+        "fail",
+        "node_capable_pod",
+    )
+
+
+def test_nodes_proxy_allowed_fails_rbac_node_capability() -> None:
+    cluster = ModelCluster()
+    cluster.allowed_reviews = {("alice", "nodes")}
+    result = outcomes(measure(cluster))
+    assert result[(7, "rbac_node_capability", "none", "none", "none")] == ("fail", "review_allowed")

@@ -55,6 +55,17 @@ PLACEMENTS = ("same_node", "cross_node")
 SUB_CASES: dict[int, frozenset[str]] = {
     1: frozenset({"non_vacuity"}),
     2: frozenset({"broker", "mediator", "guard_refusal", "rbac_refusal"}),
+    3: frozenset({"spoof_live", "spoof_terminated"}),
+    4: frozenset({"new_pod", "address_reuse"}),
+    5: frozenset({"workload_replaced", "policy_changed"}),
+    7: frozenset(
+        {
+            "node_origin",
+            "rbac_node_capability",
+            "admission_node_capability",
+            "running_node_capability",
+        }
+    ),
     6: frozenset(
         {
             "internet",
@@ -71,12 +82,24 @@ SUB_CASES: dict[int, frozenset[str]] = {
 SOURCE_KINDS: dict[int, frozenset[str]] = {
     1: frozenset({"foreign_namespace", "protected_unselected"}),
     2: frozenset({"foreign_namespace", "protected_unselected", "release_namespace", "none"}),
+    3: frozenset({"raw_socket"}),
+    4: frozenset({"foreign_namespace", "protected_unselected"}),
+    5: frozenset({"retained_peer"}),
+    7: frozenset({"node", "none"}),
     6: frozenset({"runner_policy"}),
     8: frozenset({"none"}),
 }
 # Entries that are not per-address carry family, placement and source kind ``none``.
 NON_ADDRESS_SUB_CASES = frozenset(
-    {"guard_refusal", "rbac_refusal", "rbac_policy", "all_policies_present"}
+    {
+        "guard_refusal",
+        "rbac_refusal",
+        "rbac_policy",
+        "all_policies_present",
+        "rbac_node_capability",
+        "admission_node_capability",
+        "running_node_capability",
+    }
 )
 # External egress destinations have no placement (clause 4, case 6).
 UNPLACED_SUB_CASES = frozenset(
@@ -116,6 +139,17 @@ REASONS = frozenset(
         "review_unavailable",
         "policy_set_unchanged",
         "policy_set_changed",
+        # Cases 3, 4, 5 and 7 (this slice).
+        "admitted_before_propagation",
+        "reuse_not_provoked",
+        "address_reassigned",
+        "retained_flow",
+        "trigger_unconfirmed",
+        "reaches",
+        "blocked",
+        "node_probe_unavailable",
+        "node_capable_pod",
+        "separate_authority_domain_required",
     }
 )
 # Clause 1, channel digests. The CNI digest is built from the fact (later slice).
@@ -365,6 +399,115 @@ def judge_policy_sets(snapshots: Sequence[PolicySet | None]) -> Verdict:
     if len(set(snapshots)) != 1:
         return ("fail", "policy_set_changed")
     return ("pass", "policy_set_unchanged")
+
+
+@dataclass(frozen=True, slots=True)
+class SpoofEvidence:
+    """Case 3: a raw-socket sender forges a source address (clause 4)."""
+
+    sender_ready: bool
+    listener_ready: bool
+    on_requested_node: bool
+    forged_family_address: bool
+    listener_deliveries: int
+    sockets_sampled: bool
+    window_covered: bool
+    overflow_moved: bool
+    control_succeeded: bool
+    # ``spoof_terminated`` only: the forged address was handed to a pod before the probe.
+    address_reassigned: bool = False
+
+
+def judge_spoof(evidence: SpoofEvidence) -> Verdict:
+    """Case 3. A spoofed sender never receives the reply, so only the twin decides.
+
+    ``pass`` when the twin recorded no datagram and no socket entry for the forged
+    address; a delivery is ``fail``. A ``spoof_terminated`` address that was reused
+    before the probe no longer measures a recently terminated address, so it is
+    ``unavailable``, never a pass.
+    """
+    if evidence.listener_deliveries:
+        return ("fail", "delivered")
+    if evidence.address_reassigned:
+        return ("unavailable", "address_reassigned")
+    if not evidence.forged_family_address:
+        return ("unavailable", "no_family_address")
+    if not (evidence.sender_ready and evidence.listener_ready):
+        return ("unavailable", "phase_timeout")
+    if not evidence.on_requested_node:
+        return ("unavailable", "wrong_node")
+    if not (evidence.sockets_sampled and evidence.window_covered):
+        return ("unavailable", "listener_incomplete")
+    if evidence.overflow_moved:
+        return ("unavailable", "listener_overflow")
+    if not evidence.control_succeeded:
+        return ("unavailable", "control_failed")
+    return ("pass", "denied")
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedEvidence:
+    """Case 5: a flow allowed when established must pass no data past the trigger."""
+
+    established: bool
+    listener_ready: bool
+    on_requested_node: bool
+    family_address: bool
+    post_trigger_deliveries: int
+    sockets_sampled: bool
+    window_covered: bool
+    overflow_moved: bool
+    # The triggering event completed: the workload's absence was confirmed, or the
+    # probe policy change was applied.
+    trigger_confirmed: bool
+    # The heartbeat was delivered while still allowed, so the flow truly worked.
+    control_succeeded: bool
+    # ``workload_replaced`` only: the terminated sender's address was reused.
+    reuse_provoked: bool = True
+
+
+def judge_retained(evidence: RetainedEvidence) -> Verdict:
+    """Case 5. ``fail`` if any heartbeat or data arrives after the trigger plus the bound."""
+    if evidence.post_trigger_deliveries:
+        return ("fail", "retained_flow")
+    if not evidence.reuse_provoked:
+        return ("unavailable", "reuse_not_provoked")
+    if not evidence.family_address:
+        return ("unavailable", "no_family_address")
+    if not (evidence.established and evidence.listener_ready):
+        return ("unavailable", "phase_timeout")
+    if not evidence.on_requested_node:
+        return ("unavailable", "wrong_node")
+    if not (evidence.sockets_sampled and evidence.window_covered):
+        return ("unavailable", "listener_incomplete")
+    if evidence.overflow_moved:
+        return ("unavailable", "listener_overflow")
+    if not evidence.trigger_confirmed:
+        return ("unavailable", "trigger_unconfirmed")
+    if not evidence.control_succeeded:
+        return ("unavailable", "control_failed")
+    return ("pass", "denied")
+
+
+def judge_node_origin(*, observed: bool, reached: bool) -> Verdict:
+    """Case 7 ``node_origin``: a recorded fact, not a denial.
+
+    ``pass`` with ``reaches`` or ``blocked`` when the observation was made, and
+    ``unavailable`` when it could not be. Most CNIs admit node-to-local-pod
+    traffic for kubelet health checks, so ``reaches`` is the expected result.
+    """
+    if not observed:
+        return ("unavailable", "node_probe_unavailable")
+    return ("pass", "reaches" if reached else "blocked")
+
+
+def judge_running_nodes(violations: int | None) -> Verdict:
+    """Case 7 ``running_node_capability``: a non-system node-capable pod on an eligible node."""
+    if violations is None:
+        return ("unavailable", "review_unavailable")
+    if violations:
+        return ("fail", "node_capable_pod")
+    return ("pass", "reviews_denied")
 
 
 def address_family(address: str) -> str:
