@@ -38,10 +38,10 @@ bytes down by the route the sandbox *can* use.
 
 **Never raises, on any payload.** The same contract ``derive_text`` promises, for
 a sharper reason: this runs *after* the idempotency claim and *after* the
-placeholder is already visible in the thread, so a raise here is strictly worse
-than a dropped ref. Bolt has acked, the claim survives its TTL, the placeholder
+placeholder post (usually visible in the thread), so a raise here is strictly worse
+than a dropped ref. Bolt has acked, the claim survives its TTL, any placeholder
 sits in the channel forever, and Slack's redelivery is refused as an already-seen
-delivery (``queue.release_event``'s asymmetry, #2006). A ref that cannot be built
+delivery (the claim is held from here on). A ref that cannot be built
 is therefore skipped and the turn is minted anyway, and the loss is bounded to
 that one entry rather than to the whole array -- Slack ships new file fields on
 its own schedule, and one unreadable entry must not cost a multi-file upload
